@@ -1,0 +1,16 @@
+[package]
+name = "truthdb"
+version = "0.1.0"
+edition = "2024"
+
+[workspace]
+members = [
+    "crates/truthdb_core",
+]
+
+[dependencies]
+truthdb_core = { path = "crates/truthdb_core", version = "0.1.0" }
+
+[profile.dev.package."*"]
+opt-level = 3
+debug = false
