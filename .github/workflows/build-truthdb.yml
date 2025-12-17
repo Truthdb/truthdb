@@ -1,0 +1,15 @@
+name: Build and test truthdb
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - 'v*.*.*'
+
+jobs:
+    build-test-publish:
+        uses: ./.github/workflows/build-test-truthdb.yml
+        with:
+          publish_artifact: true
+    
