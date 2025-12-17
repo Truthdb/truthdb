@@ -12,7 +12,7 @@ jobs:
     runs-on: ubuntu-latest
 
     container:
-      image: rust:stable
+      image: rust:latest
 
     steps:
     - name: Cleanup
