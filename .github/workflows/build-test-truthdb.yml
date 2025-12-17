@@ -1,0 +1,46 @@
+name: Build and test truthdb
+
+on:
+  workflow_call:
+    inputs:
+      publish_artifact:
+        description: 'Whether to publish the build artifact'
+        required: false
+        type: boolean
+        default: false
+
+jobs:
+  build-and-push:
+    runs-on: ubuntu-latest
+
+    permissions:
+      contents: read
+
+    container:
+      image: rust:latest
+
+    steps:
+      - name: Cleanup
+        uses: FraBle/clean-after-action@v1
+
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Build debug
+        run: cargo build --verbose --workspace
+
+      - name: Run tests debug
+        run: cargo test --verbose --workspace
+
+      - name: Build release
+        run: cargo build --release --verbose --workspace
+
+      - name: Run tests release
+        run: cargo test --release --verbose --workspace
+
+      - name: Upload release artifact
+        if: ${{ inputs.publish_artifact }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: truthdb-linux-release
+          path: target/release/truthdb

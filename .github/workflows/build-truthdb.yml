@@ -1,12 +1,15 @@
-name: Build and Test
+name: Build and test truthdb
 
 on:
-  pull_request:
+  push:
     branches:
       - main
+    tags:
+      - 'v*.*.*'
 
 jobs:
     validate-pr:
         uses: ./.github/workflows/build-test-truthdb.yml
         with:
-          publish_artifact: false
+          publish_artifact: true
+    
