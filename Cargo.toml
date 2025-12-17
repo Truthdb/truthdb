@@ -8,6 +8,9 @@ members = [
     "crates/truthdb_core",
 ]
 
+[workspace.dependencies]
+rstest = "0.26.1"
+
 [dependencies]
 truthdb_core = { path = "crates/truthdb_core", version = "0.1.0" }
 
