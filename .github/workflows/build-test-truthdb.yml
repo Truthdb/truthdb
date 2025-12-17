@@ -10,7 +10,7 @@ on:
         default: false
 
 jobs:
-  build-and-push:
+  build-test-publish:
     runs-on: ubuntu-latest
 
     permissions:
