@@ -11,20 +11,20 @@ on:
 
 jobs:
   build-test-publish:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
 
     permissions:
       contents: read
 
     container:
-      image: rust:latest
+      image: rust:1.85-bookworm
 
     steps:
       - name: Cleanup
-        uses: FraBle/clean-after-action@v1
+        uses: FraBle/clean-after-action@b4cc12128d2ad0fd0feb639ef8c48c97f5b75dbb
 
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5
 
       - name: Build debug
         run: cargo build --verbose --workspace
@@ -40,7 +40,7 @@ jobs:
 
       - name: Upload release artifact
         if: ${{ inputs.publish_artifact }}
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: truthdb-linux-release
           path: target/release/truthdb

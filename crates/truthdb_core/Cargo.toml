@@ -6,6 +6,3 @@ edition = "2024"
 [dev-dependencies]
 rstest = { workspace = true }
 
-[profile.dev]
-debug = 2
-

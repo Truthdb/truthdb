@@ -17,3 +17,6 @@ truthdb_core = { path = "crates/truthdb_core", version = "0.1.0" }
 [profile.dev.package."*"]
 opt-level = 3
 debug = false
+
+[profile.dev.package.truthdb_core]
+debug = 2
