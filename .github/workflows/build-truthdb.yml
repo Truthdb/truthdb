@@ -2,10 +2,8 @@ name: Build and test truthdb
 
 on:
   push:
-    branches:
-      - main
     tags:
-      - 'v*.*.*'
+      - '*.*.*'
 
 jobs:
     build-test-publish:
