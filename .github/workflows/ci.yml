@@ -6,122 +6,14 @@ on:
   pull_request:
     branches: [ main ]
 
-env:
-  CARGO_TERM_COLOR: always
-  CARGO_HOME: ${{ github.workspace }}/.cargo
-  RUST_BACKTRACE: 1
-
 permissions:
   contents: read
 
 jobs:
-  lint:
-    name: Lint
-    runs-on: ubuntu-latest
-    container:
-      image: rust:1.92-bookworm
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Install Rust components
-        run: rustup component add rustfmt clippy
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: .cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: .cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-target-lint-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Check formatting
-        run: cargo fmt -- --check
-
-      - name: Run clippy
-        run: cargo clippy --all-targets --all-features -- -D warnings
-
-  test:
-    name: Test
-    runs-on: ubuntu-latest
-    container:
-      image: rust:1.92-bookworm
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: .cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: .cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-target-test-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Run tests
-        run: cargo test --workspace
-
-  build:
-    name: Build
-    runs-on: ubuntu-latest
-    container:
-      image: rust:1.92-bookworm
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Cache cargo registry
-        uses: actions/cache@v4
-        with:
-          path: .cargo/registry
-          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache cargo index
-        uses: actions/cache@v4
-        with:
-          path: .cargo/git
-          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Cache target directory
-        uses: actions/cache@v4
-        with:
-          path: target
-          key: ${{ runner.os }}-target-build-${{ hashFiles('**/Cargo.lock') }}
-
-      - name: Build release
-        run: cargo build --release --workspace
-
-      - name: Check binary
-        run: |
-          ls -lh target/release/truthdb
-          file target/release/truthdb
-
-      - name: Upload artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: truthdb
-          path: target/release/truthdb
-          if-no-files-found: error
+  ci:
+    uses: Truthdb/.github/.github/workflows/rust-ci.yml@issue-17-workflows
+    with:
+      cargo_test_command: cargo test --workspace
+      cargo_build_command: cargo build --release --workspace
+      artifact_name: truthdb
+      artifact_path: target/release/truthdb

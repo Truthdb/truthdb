@@ -9,121 +9,17 @@ permissions:
   contents: write
 
 jobs:
-  create-release:
-    name: Create Release
-    runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
-      version: ${{ steps.get_version.outputs.version }}
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
+  release:
+    uses: Truthdb/.github/.github/workflows/rust-release.yml@issue-17-workflows
+    with:
+      binary_name: truthdb
+      cargo_build_args: --workspace
+      artifact_target_name: x86_64-linux-gnu
+      extra_body: |
+        ### Installation
 
-      - name: Get version from tag
-        id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
+        Download the `truthdb` binary for your platform and verify the checksum.
 
-      - name: Generate release notes
-        id: release_notes
-        run: |
-          # Get the previous tag
-          PREV_TAG=$(git describe --abbrev=0 --tags $(git rev-list --tags --skip=1 --max-count=1) 2>/dev/null || echo "")
+        ### Usage
 
-          # Generate changelog
-          if [ -z "$PREV_TAG" ]; then
-            echo "First release"
-            CHANGELOG="Initial release of truthdb"
-          else
-            CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s" --no-merges)
-          fi
-
-          # Create release body
-          cat > release_notes.md << EOF
-          ## truthdb ${GITHUB_REF#refs/tags/v}
-
-          ### Changes
-          $CHANGELOG
-
-          ### Installation
-
-          Download the truthdb binary for your platform and verify the checksum.
-
-          ### Usage
-
-          See README.md for details.
-          EOF
-
-          echo "notes<<EOF" >> $GITHUB_OUTPUT
-          cat release_notes.md >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ steps.get_version.outputs.version }}
-          body: ${{ steps.release_notes.outputs.notes }}
-          draft: false
-          prerelease: false
-
-  build:
-    name: Build
-    needs: create-release
-    runs-on: ubuntu-latest
-    container:
-      image: rust:1.92-bookworm
-    steps:
-      - uses: actions/checkout@v4
-
-      - name: Build release
-        run: cargo build --release --workspace
-
-      - name: Package binary
-        run: |
-          cd target/release
-          tar czf truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.tar.gz truthdb
-          sha256sum truthdb > truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.sha256
-
-      - name: Upload artifacts
-        uses: actions/upload-artifact@v4
-        with:
-          name: release-assets
-          path: |
-            target/release/truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.tar.gz
-            target/release/truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.sha256
-          if-no-files-found: error
-
-  upload:
-    name: Upload
-    needs: [create-release, build]
-    runs-on: ubuntu-latest
-    steps:
-      - name: Download artifacts
-        uses: actions/download-artifact@v4
-        with:
-          name: release-assets
-          path: dist
-
-      - name: Upload Release Asset - Binary Archive
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./dist/truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.tar.gz
-          asset_name: truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.tar.gz
-          asset_content_type: application/gzip
-
-      - name: Upload Release Asset - Checksum
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./dist/truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.sha256
-          asset_name: truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.sha256
-          asset_content_type: text/plain
+        See README.md for details.
