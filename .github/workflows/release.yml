@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   release:
-    uses: Truthdb/.github/.github/workflows/rust-release.yml@issue-17-workflows
+    uses: Truthdb/.github/.github/workflows/rust-release.yml@workflows-v1
     with:
       binary_name: truthdb
       cargo_build_args: --workspace

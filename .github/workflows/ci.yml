@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   ci:
-    uses: Truthdb/.github/.github/workflows/rust-ci.yml@issue-17-workflows
+    uses: Truthdb/.github/.github/workflows/rust-ci.yml@workflows-v1
     with:
       cargo_test_command: cargo test --workspace
       cargo_build_command: cargo build --release --workspace
