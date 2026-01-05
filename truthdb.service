@@ -8,17 +8,19 @@ Type=simple
 User=truthdb
 Group=truthdb
 
+# TruthDB is expected to run as a long-lived process and stop on SIGTERM.
 ExecStart=/usr/local/bin/truthdb
-WorkingDirectory=/var/lib/truthdb
 
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=30
 KillSignal=SIGTERM
 
+# Create and manage writable state directories.
 StateDirectory=truthdb
 RuntimeDirectory=truthdb
 
+# Sensible hardening defaults for a service.
 NoNewPrivileges=yes
 PrivateTmp=yes
 ProtectSystem=strict
@@ -32,6 +34,7 @@ RestrictSUIDSGID=yes
 MemoryDenyWriteExecute=yes
 UMask=0077
 
+# Allow writes only to the managed state/runtime dirs.
 ReadWritePaths=/var/lib/truthdb /run/truthdb
 
 [Install]
