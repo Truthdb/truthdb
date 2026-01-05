@@ -5,9 +5,21 @@ use std::sync::{
 use std::time::Duration;
 
 use tracing::info;
+use tracing_subscriber::EnvFilter;
 use truthdb_core::storage::Storage;
 
 fn main() {
+    // Emit tracing logs to stdout/stderr. Under systemd, these show up in journald.
+    // Override levels with RUST_LOG, e.g. RUST_LOG=debug.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
+        )
+        .with_target(false)
+        .with_thread_ids(false)
+        .with_level(true)
+        .init();
+
     info!("Starting TruthDB...");
 
     let _storage = Storage {};
