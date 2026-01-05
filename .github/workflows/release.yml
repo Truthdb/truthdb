@@ -76,6 +76,9 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: rust:1.92-bookworm
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@v4
 
