@@ -84,9 +84,13 @@ jobs:
 
       - name: Package binary
         run: |
-          cd target/release
-          tar czf truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.tar.gz truthdb
-          sha256sum truthdb > truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.sha256
+          # Bundle both the executable and the systemd unit.
+          tar czf truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.tar.gz \
+            -C target/release truthdb \
+            -C . truthdb.service
+
+          # Keep a simple checksum file (binary checksum). Consumers may also checksum the archive.
+          sha256sum target/release/truthdb > truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.sha256
 
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
