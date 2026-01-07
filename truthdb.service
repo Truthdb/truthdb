@@ -8,7 +8,7 @@ Type=simple
 User=truthdb
 Group=truthdb
 
-# TruthDB is expected to run as a long-lived process and stop on SIGTERM.
+# TruthDB is expected to run as a long-lived Tokio process and stop on SIGTERM.
 ExecStart=/usr/local/bin/truthdb
 
 Restart=on-failure
