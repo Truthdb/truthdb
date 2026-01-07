@@ -17,7 +17,6 @@ async fn wait_for_shutdown_signal() {
             _ = sigterm.recv() => {},
             _ = sigint.recv() => {},
         }
-        return;
     }
 
     #[cfg(not(unix))]
