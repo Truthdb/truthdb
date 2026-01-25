@@ -13,62 +13,46 @@ jobs:
     name: Create Release
     runs-on: ubuntu-latest
     outputs:
-      upload_url: ${{ steps.create_release.outputs.upload_url }}
       version: ${{ steps.get_version.outputs.version }}
+      tag: ${{ steps.get_tag.outputs.tag }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
+      - name: Get tag
+        id: get_tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
       - name: Get version from tag
         id: get_version
         run: echo "version=${GITHUB_REF#refs/tags/v}" >> $GITHUB_OUTPUT
 
-      - name: Generate release notes
-        id: release_notes
-        run: |
-          # Get the previous tag
-          PREV_TAG=$(git describe --abbrev=0 --tags $(git rev-list --tags --skip=1 --max-count=1) 2>/dev/null || echo "")
-
-          # Generate changelog
-          if [ -z "$PREV_TAG" ]; then
-            echo "First release"
-            CHANGELOG="Initial release of truthdb"
-          else
-            CHANGELOG=$(git log ${PREV_TAG}..HEAD --pretty=format:"- %s" --no-merges)
-          fi
-
-          # Create release body
-          cat > release_notes.md << EOF
-          ## truthdb ${GITHUB_REF#refs/tags/v}
-
-          ### Changes
-          $CHANGELOG
-
-          ### Installation
-
-          Download the truthdb binary for your platform and verify the checksum.
-
-          ### Usage
-
-          See README.md for details.
-          EOF
-
-          echo "notes<<EOF" >> $GITHUB_OUTPUT
-          cat release_notes.md >> $GITHUB_OUTPUT
-          echo "EOF" >> $GITHUB_OUTPUT
-
-      - name: Create Release
-        id: create_release
-        uses: actions/create-release@v1
+      - name: Create GitHub Release (generate notes, mark latest)
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          tag_name: ${{ github.ref }}
-          release_name: Release ${{ steps.get_version.outputs.version }}
-          body: ${{ steps.release_notes.outputs.notes }}
-          draft: false
-          prerelease: false
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          TAG="${{ steps.get_tag.outputs.tag }}"
+          VERSION="${{ steps.get_version.outputs.version }}"
+          NOTES_FILE="${RUNNER_TEMP}/release-notes-${TAG}.md"
+          gh api -X POST "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+            -f tag_name="$TAG" \
+            -f target_commitish="${GITHUB_SHA}" \
+            --jq .body > "$NOTES_FILE"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release edit "$TAG" \
+              --title "Release ${VERSION}" \
+              --notes-file "$NOTES_FILE" \
+              --latest
+          else
+            gh release create "$TAG" \
+              --title "Release ${VERSION}" \
+              --notes-file "$NOTES_FILE" \
+              --latest
+          fi
 
   build:
     name: Build
@@ -123,22 +107,16 @@ jobs:
           name: release-assets
           path: dist
 
-      - name: Upload Release Asset - Binary Archive
-        uses: actions/upload-release-asset@v1
+      - name: Upload release assets
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./dist/truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.tar.gz
-          asset_name: truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.tar.gz
-          asset_content_type: application/gzip
-
-      - name: Upload Release Asset - Checksum
-        uses: actions/upload-release-asset@v1
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        with:
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
-          asset_path: ./dist/truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.sha256
-          asset_name: truthdb-v${{ needs.create-release.outputs.version }}-x86_64-linux-gnu.sha256
-          asset_content_type: text/plain
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          files=(./dist/*)
+          if (( ${#files[@]} == 0 )); then
+            echo "No release assets found; skipping upload."
+            exit 0
+          fi
+          gh release upload "${{ needs.create-release.outputs.tag }}" "${files[@]}" --clobber
