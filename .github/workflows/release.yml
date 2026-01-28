@@ -42,15 +42,17 @@ jobs:
             -f target_commitish="${GITHUB_SHA}" \
             --jq .body > "$NOTES_FILE"
 
-          if gh release view "$TAG" >/dev/null 2>&1; then
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
             gh release edit "$TAG" \
               --title "Release ${VERSION}" \
               --notes-file "$NOTES_FILE" \
+              --repo "$GITHUB_REPOSITORY" \
               --latest
           else
             gh release create "$TAG" \
               --title "Release ${VERSION}" \
               --notes-file "$NOTES_FILE" \
+              --repo "$GITHUB_REPOSITORY" \
               --latest
           fi
 
@@ -119,4 +121,4 @@ jobs:
             echo "No release assets found; skipping upload."
             exit 0
           fi
-          gh release upload "${{ needs.create-release.outputs.tag }}" "${files[@]}" --clobber
+          gh release upload "${{ needs.create-release.outputs.tag }}" "${files[@]}" --clobber --repo "$GITHUB_REPOSITORY"
