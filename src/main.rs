@@ -1,5 +1,3 @@
-use std::fs;
-use std::path::Path;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use truthdb_core::storage::Storage;

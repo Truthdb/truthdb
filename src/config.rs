@@ -35,7 +35,6 @@ impl Config {
             if config_path.exists() {
                 if let Ok(contents) = fs::read_to_string(&config_path) {
                     if let Ok(override_cfg) = toml::from_str::<Config>(&contents) {
-                        // Override fields if present in file
                         config.port = override_cfg.port;
                     }
                 }
