@@ -1,6 +1,8 @@
 use tracing::info;
 use tracing_subscriber::EnvFilter;
 use truthdb_core::storage::Storage;
+mod config;
+use config::Config;
 
 async fn wait_for_shutdown_signal() {
     // systemd stops services by sending SIGTERM. Also handle SIGINT for dev convenience.
@@ -37,6 +39,13 @@ async fn main() {
         .with_thread_ids(false)
         .with_level(true)
         .init();
+
+    // Load layered config: embedded default, then OS-standard config file if present
+    let config = Config::load();
+    info!("Loaded config: port={}", config.port);
+
+    // TODO: Use config.port for server startup when implementing the server.
+    // Example: start_server(config.port).await;
 
     info!("Starting TruthDB...");
 
