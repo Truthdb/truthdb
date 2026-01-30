@@ -32,12 +32,11 @@ impl Config {
         if let Some(proj_dirs) = ProjectDirs::from("org", "truthdb", "truthdb") {
             let mut config_path = PathBuf::from(proj_dirs.config_dir());
             config_path.push("truthdb.toml");
-            if config_path.exists() {
-                if let Ok(contents) = fs::read_to_string(&config_path) {
-                    if let Ok(override_cfg) = toml::from_str::<Config>(&contents) {
-                        config.port = override_cfg.port;
-                    }
-                }
+            if config_path.exists()
+                && let Ok(contents) = fs::read_to_string(&config_path)
+                && let Ok(override_cfg) = toml::from_str::<Config>(&contents)
+            {
+                config.port = override_cfg.port;
             }
         }
         config
