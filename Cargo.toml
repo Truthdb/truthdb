@@ -4,26 +4,36 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace]
-members = ["crates/truthdb_core"]
+members = [
+    "crates/truthdb-core",
+    "crates/truthdb-cli",
+    "crates/truthdb-proto",
+    "crates/truthdb-net",
+]
 
 [workspace.dependencies]
 rstest = "0.26.1"
-
-[dependencies]
-tokio = { version = "1", features = ["macros", "rt-multi-thread", "signal"] }
+thiserror = "2.0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-truthdb_core = { path = "crates/truthdb_core", version = "0.1.0" }
-
-# For config file parsing
 serde = { version = "1.0", features = ["derive"] }
 toml = "0.8"
-
 directories = "5.0"
+tokio = { version = "1.39.0", features = ["full"] }
+truthdb-proto = { path = "crates/truthdb-proto", version = "0.1.0" }
+
+[dependencies]
+truthdb-core = { path = "crates/truthdb-core", version = "0.1.0" }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+serde = { workspace = true }
+toml = { workspace = true }
+directories = { workspace = true }
+tokio = { workspace = true }
 
 [profile.dev.package."*"]
 opt-level = 3
 debug = false
 
-[profile.dev.package.truthdb_core]
+[profile.dev.package.truthdb-core]
 debug = 2

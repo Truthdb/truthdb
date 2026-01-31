@@ -1,0 +1,8 @@
+[package]
+name = "truthdb-net"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+tokio = { workspace = true }
+truthdb-proto = { workspace = true }
