@@ -1,8 +1,7 @@
 [package]
-name = "truthdb_core"
+name = "truthdb-core"
 version = "0.1.0"
 edition = "2024"
 
 [dev-dependencies]
 rstest = { workspace = true }
-
