@@ -1,16 +1,23 @@
+mod config;
+
 use std::io::{self, Write};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
+use config::Config;
 
 #[derive(Parser, Debug)]
 #[command(name = "truthdb-cli")]
 #[command(about = "Command-line client for TruthDB")]
 #[command(version)]
 struct Cli {
-    /// Address of the TruthDB server (host:port).
-    #[arg(long, env = "TRUTHDB_ADDR", default_value = "127.0.0.1:7777")]
-    addr: String,
+    /// Host of the TruthDB server.
+    #[arg(long, env = "TRUTHDB_HOST")]
+    host: Option<String>,
+
+    /// Port of the TruthDB server.
+    #[arg(long, env = "TRUTHDB_PORT")]
+    port: Option<u16>,
 
     /// Command to run (defaults to an interactive REPL).
     #[command(subcommand)]
@@ -21,20 +28,17 @@ struct Cli {
 enum Command {
     /// Start an interactive session (psql-like REPL).
     Repl,
-
-    /// Print the resolved server address and exit.
-    ShowAddr,
 }
 
 fn main() -> Result<()> {
+    let config = Config::load();
     let cli = Cli::parse();
+    let host = cli.host.unwrap_or(config.host);
+    let port = cli.port.unwrap_or(config.port);
+    let addr = format!("{host}:{port}");
 
     match cli.command.unwrap_or(Command::Repl) {
-        Command::Repl => repl(&cli.addr),
-        Command::ShowAddr => {
-            println!("{}", cli.addr);
-            Ok(())
-        }
+        Command::Repl => repl(&addr),
     }
 }
 

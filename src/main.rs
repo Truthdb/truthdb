@@ -42,10 +42,10 @@ async fn main() {
 
     // Load layered config: embedded default, then OS-standard config file if present
     let config = Config::load();
-    info!("Loaded config: port={}", config.port);
+    info!("Loaded config: addr={} port={}", config.addr, config.port);
 
-    // TODO: Use config.port for server startup when implementing the server.
-    // Example: start_server(config.port).await;
+    // TODO: Use config.addr/config.port for server startup when implementing the server.
+    // Example: start_server(config.addr, config.port).await;
 
     info!("Starting TruthDB...");
 
