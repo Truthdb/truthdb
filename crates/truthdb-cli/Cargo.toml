@@ -10,3 +10,6 @@ thiserror = { workspace = true }
 serde = { workspace = true }
 toml = { workspace = true }
 directories = { workspace = true }
+tokio = { workspace = true }
+truthdb-proto = { workspace = true }
+truthdb-net = { workspace = true }

@@ -1,7 +1,8 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use truthdb_proto::{
-    Frame, HeartbeatReq, HeartbeatResp, MsgType, ProtoError, decode_message, encode_message,
+    CommandReq, CommandResp, Frame, HeartbeatReq, HeartbeatResp, HelloReq, HelloResp, MsgType,
+    PROTOCOL_VERSION, ProtoError, decode_message, encode_message,
 };
 
 #[derive(Debug, Default)]
@@ -14,11 +15,21 @@ impl Dispatcher {
 
     pub fn dispatch(&self, frame: Frame) -> Result<Option<Frame>, ProtoError> {
         match frame.msg_type {
-            MsgType::HelloReq => Ok(Some(Frame {
-                msg_type: MsgType::HelloResp,
-                flags: 0,
-                payload: Vec::new(),
-            })),
+            MsgType::HelloReq => {
+                let _req: HelloReq = decode_message(&frame.payload)?;
+                let resp = HelloResp {
+                    protocol_version: PROTOCOL_VERSION,
+                    server_name: "truthdb".to_string(),
+                    server_version: env!("CARGO_PKG_VERSION").to_string(),
+                    capabilities: 0,
+                };
+
+                Ok(Some(Frame {
+                    msg_type: MsgType::HelloResp,
+                    flags: 0,
+                    payload: encode_message(&resp)?,
+                }))
+            }
             MsgType::HeartbeatReq => {
                 let req: HeartbeatReq = decode_message(&frame.payload)?;
                 let server_time_ms = SystemTime::now()
@@ -33,6 +44,20 @@ impl Dispatcher {
 
                 Ok(Some(Frame {
                     msg_type: MsgType::HeartbeatResp,
+                    flags: 0,
+                    payload: encode_message(&resp)?,
+                }))
+            }
+            MsgType::CommandReq => {
+                let req: CommandReq = decode_message(&frame.payload)?;
+                let resp = CommandResp {
+                    id: req.id,
+                    ok: false,
+                    message: format!("not implemented: {}", req.command),
+                };
+
+                Ok(Some(Frame {
+                    msg_type: MsgType::CommandResp,
                     flags: 0,
                     payload: encode_message(&resp)?,
                 }))
