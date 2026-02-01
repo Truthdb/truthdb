@@ -17,10 +17,12 @@ thiserror = "2.0.18"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
+bincode = "1.3.3"
 toml = "0.8"
 directories = "5.0"
 tokio = { version = "1.39.0", features = ["full"] }
 truthdb-proto = { path = "crates/truthdb-proto", version = "0.1.0" }
+truthdb-net = { path = "crates/truthdb-net", version = "0.1.0" }
 
 [dependencies]
 truthdb-core = { path = "crates/truthdb-core", version = "0.1.0" }
