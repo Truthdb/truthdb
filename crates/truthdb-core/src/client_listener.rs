@@ -31,10 +31,7 @@ impl ClientListener {
         Ok(ClientListener { addr })
     }
 
-    pub async fn run(
-        self,
-        mut shutdown: watch::Receiver<bool>,
-    ) -> Result<(), ClientListenerError> {
+    pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), ClientListenerError> {
         let listener = TcpListener::bind(self.addr).await?;
 
         loop {
