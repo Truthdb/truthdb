@@ -838,7 +838,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "directories",
+ "serde",
  "thiserror 2.0.18",
+ "toml",
 ]
 
 [[package]]
