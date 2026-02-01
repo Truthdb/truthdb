@@ -1,5 +1,7 @@
+use tokio::sync::watch;
 use tracing::info;
 use tracing_subscriber::EnvFilter;
+use truthdb_core::client_listener::ClientListener;
 use truthdb_core::storage::Storage;
 mod config;
 use config::Config;
@@ -44,8 +46,20 @@ async fn main() {
     let config = Config::load();
     info!("Loaded config: addr={} port={}", config.addr, config.port);
 
-    // TODO: Use config.addr/config.port for server startup when implementing the server.
-    // Example: start_server(config.addr, config.port).await;
+    let client_listener = match ClientListener::new(&config.addr, config.port) {
+        Ok(client_listener) => client_listener,
+        Err(err) => {
+            eprintln!("Failed to initialize server: {err}");
+            return;
+        }
+    };
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let listener_task = tokio::spawn(async move {
+        if let Err(err) = client_listener.run(shutdown_rx).await {
+            eprintln!("Client listener error: {err}");
+        }
+    });
 
     info!("Starting TruthDB...");
 
@@ -55,5 +69,7 @@ async fn main() {
     wait_for_shutdown_signal().await;
 
     info!("Stop signal received; shutting down...");
+    let _ = shutdown_tx.send(true);
+    let _ = listener_task.await;
     info!("TruthDB exiting");
 }
