@@ -1,3 +1,18 @@
 # Embedded default config for truthdb
+[network]
 addr = "0.0.0.0"
 port = 9623
+
+[storage]
+path = "truth.db"
+size_gib = 10
+wal_ratio = 0.05
+metadata_ratio = 0.08
+snapshot_ratio = 0.02
+allocator_ratio = 0.02
+reserved_ratio = 0.17
+group_sync_batches = 32
+group_sync_ms = 5
+backpressure_timeout_ms = 50
+snapshot_min_interval_ms = 1000
+snapshot_wal_threshold = 0.7
