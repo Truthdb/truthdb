@@ -44,9 +44,16 @@ async fn main() {
 
     // Load layered config: embedded default, then OS-standard config file if present
     let config = Config::load();
-    info!("Loaded config: addr={} port={}", config.addr, config.port);
+    let storage_path = config.storage.resolved_path();
+    info!(
+        "Loaded config: addr={} port={} storage_path={} storage_size_gib={}",
+        config.network.addr,
+        config.network.port,
+        storage_path.display(),
+        config.storage.size_gib
+    );
 
-    let client_listener = match ClientListener::new(&config.addr, config.port) {
+    let client_listener = match ClientListener::new(&config.network.addr, config.network.port) {
         Ok(client_listener) => client_listener,
         Err(err) => {
             eprintln!("Failed to initialize server: {err}");
