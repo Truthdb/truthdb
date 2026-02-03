@@ -1,5 +1,5 @@
 use tokio::sync::watch;
-use tracing::info;
+use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 use truthdb_core::client_listener::ClientListener;
 use truthdb_core::storage::Storage;
@@ -44,6 +44,7 @@ async fn main() {
 
     // Load layered config: embedded default, then OS-standard config file if present
     let config = Config::load();
+    debug!(?config, "Loaded config");
     let storage_path = config.storage.resolved_path();
     info!(
         "Loaded config: addr={} port={} storage_path={} storage_size_gib={}",
