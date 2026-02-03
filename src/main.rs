@@ -71,7 +71,7 @@ async fn main() {
 
     info!("Starting TruthDB...");
 
-    let _storage = Storage {};
+    let _storage = Storage::new(storage_path);
 
     info!("TruthDB running (waiting for stop signal)");
     wait_for_shutdown_signal().await;
