@@ -3,7 +3,7 @@ use serde::Deserialize;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 pub struct Config {
     #[serde(default)]
     pub network: NetworkConfig,
@@ -114,15 +114,6 @@ fn default_storage_snapshot_min_interval_ms() -> u64 {
 
 fn default_storage_snapshot_wal_threshold() -> f64 {
     0.7
-}
-
-impl Default for Config {
-    fn default() -> Self {
-        Config {
-            network: NetworkConfig::default(),
-            storage: StorageConfig::default(),
-        }
-    }
 }
 
 impl Default for NetworkConfig {
