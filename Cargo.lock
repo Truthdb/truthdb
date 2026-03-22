@@ -865,6 +865,7 @@ dependencies = [
  "tokio",
  "truthdb-net",
  "truthdb-proto",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -1071,3 +1072,9 @@ checksum = "5a5364e9d77fcdeeaa6062ced926ee3381faa2ee02d3eb83a5c27a8825540829"
 dependencies = [
  "memchr",
 ]
+
+[[package]]
+name = "xxhash-rust"
+version = "0.8.15"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "fdd20c5420375476fbd4394763288da7eb0cc0b8c11deed431a91562af7335d3"

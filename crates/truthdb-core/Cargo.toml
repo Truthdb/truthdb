@@ -8,6 +8,7 @@ tokio = { workspace = true }
 truthdb-proto = { workspace = true }
 truthdb-net = { workspace = true }
 thiserror = { workspace = true }
+xxhash-rust = { workspace = true }
 
 [dev-dependencies]
 rstest = { workspace = true }
