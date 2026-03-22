@@ -71,7 +71,32 @@ async fn main() {
 
     info!("Starting TruthDB...");
 
-    let _storage = Storage::new(storage_path);
+    let storage_opts = truthdb_core::storage::StorageOptions {
+        size_gib: config.storage.size_gib,
+        wal_ratio: config.storage.wal_ratio,
+        metadata_ratio: config.storage.metadata_ratio,
+        snapshot_ratio: config.storage.snapshot_ratio,
+        allocator_ratio: config.storage.allocator_ratio,
+        reserved_ratio: config.storage.reserved_ratio,
+    };
+
+    let _storage = if storage_path.exists() {
+        match Storage::open(storage_path) {
+            Ok(storage) => storage,
+            Err(err) => {
+                eprintln!("Failed to open storage: {err}");
+                return;
+            }
+        }
+    } else {
+        match Storage::create(storage_path, storage_opts) {
+            Ok(storage) => storage,
+            Err(err) => {
+                eprintln!("Failed to create storage: {err}");
+                return;
+            }
+        }
+    };
 
     info!("TruthDB running (waiting for stop signal)");
     wait_for_shutdown_signal().await;
