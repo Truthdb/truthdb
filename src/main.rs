@@ -1,7 +1,10 @@
+use std::sync::{Arc, Mutex};
+
 use tokio::sync::watch;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 use truthdb_core::client_listener::ClientListener;
+use truthdb_core::engine::Engine;
 use truthdb_core::storage::Storage;
 mod config;
 use config::Config;
@@ -54,23 +57,6 @@ async fn main() {
         config.storage.size_gib
     );
 
-    let client_listener = match ClientListener::new(&config.network.addr, config.network.port) {
-        Ok(client_listener) => client_listener,
-        Err(err) => {
-            eprintln!("Failed to initialize server: {err}");
-            return;
-        }
-    };
-
-    let (shutdown_tx, shutdown_rx) = watch::channel(false);
-    let listener_task = tokio::spawn(async move {
-        if let Err(err) = client_listener.run(shutdown_rx).await {
-            eprintln!("Client listener error: {err}");
-        }
-    });
-
-    info!("Starting TruthDB...");
-
     let storage_opts = truthdb_core::storage::StorageOptions {
         size_gib: config.storage.size_gib,
         wal_ratio: config.storage.wal_ratio,
@@ -80,7 +66,7 @@ async fn main() {
         reserved_ratio: config.storage.reserved_ratio,
     };
 
-    let _storage = if storage_path.exists() {
+    let storage = if storage_path.exists() {
         match Storage::open(storage_path) {
             Ok(storage) => storage,
             Err(err) => {
@@ -97,6 +83,35 @@ async fn main() {
             }
         }
     };
+
+    let engine = match Engine::new(storage) {
+        Ok(engine) => Arc::new(Mutex::new(engine)),
+        Err(err) => {
+            eprintln!("Failed to initialize engine: {err}");
+            return;
+        }
+    };
+
+    let client_listener = match ClientListener::new(
+        &config.network.addr,
+        config.network.port,
+        Arc::clone(&engine),
+    ) {
+        Ok(client_listener) => client_listener,
+        Err(err) => {
+            eprintln!("Failed to initialize server: {err}");
+            return;
+        }
+    };
+
+    let (shutdown_tx, shutdown_rx) = watch::channel(false);
+    let listener_task = tokio::spawn(async move {
+        if let Err(err) = client_listener.run(shutdown_rx).await {
+            eprintln!("Client listener error: {err}");
+        }
+    });
+
+    info!("Starting TruthDB...");
 
     info!("TruthDB running (waiting for stop signal)");
     wait_for_shutdown_signal().await;
