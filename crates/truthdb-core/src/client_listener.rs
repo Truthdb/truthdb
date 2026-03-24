@@ -43,10 +43,10 @@ impl ClientListener {
                     let (stream, _) = res?;
                     let mut conn_shutdown = shutdown.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_client(stream, &mut conn_shutdown).await {
-                            if !is_expected_disconnect(&err) {
-                                eprintln!("client handler error: {err}");
-                            }
+                        if let Err(err) = handle_client(stream, &mut conn_shutdown).await
+                            && !is_expected_disconnect(&err)
+                        {
+                            eprintln!("client handler error: {err}");
                         }
                     });
                 }
