@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("TruthDB must be built for Linux targets. Use Docker or a Linux environment.");
+
 use std::sync::{Arc, Mutex};
 
 use tokio::sync::watch;

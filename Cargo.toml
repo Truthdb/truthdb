@@ -25,6 +25,8 @@ tokio = { version = "1.39.0", features = ["full"] }
 truthdb-proto = { path = "crates/truthdb-proto", version = "0.1.0" }
 truthdb-net = { path = "crates/truthdb-net", version = "0.1.0" }
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
+libc = "0.2"
+io-uring = "0.7"
 
 [dependencies]
 truthdb-core = { path = "crates/truthdb-core", version = "0.1.0" }

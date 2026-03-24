@@ -57,6 +57,7 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: rust:1.92-bookworm
+      options: --security-opt seccomp=unconfined
     permissions:
       contents: read
     steps:

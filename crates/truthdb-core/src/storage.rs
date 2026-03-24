@@ -1,14 +1,13 @@
-use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
 
+use crate::direct_io::DirectFile;
 use crate::storage_layout::{
     FileHeader, SUPERBLOCK_ACTIVE_A, SUPERBLOCK_ACTIVE_B, Superblock, WAL_ENTRY_FOOTER_SIZE,
     WAL_ENTRY_HEADER_SIZE, WAL_ENTRY_TYPE_COMMIT, WAL_ENTRY_TYPE_RECORD, WAL_MAX_BYTES,
     WAL_MIN_BYTES, WalEntryFooter, WalEntryHeader, align_down, assert_layout_invariants,
-    wal_entry_padded_len, wal_entry_padding_len, wal_payload_crc,
+    wal_entry_padded_len, wal_payload_crc,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -129,7 +128,7 @@ impl Storage {
 
 struct StorageFile {
     path: PathBuf,
-    file: File,
+    file: DirectFile,
     layout: StorageLayout,
     header: FileHeader,
     superblock_a: Superblock,
@@ -139,9 +138,9 @@ struct StorageFile {
 
 impl StorageFile {
     fn open_existing(path: PathBuf) -> Result<Self, StorageError> {
-        let mut file = OpenOptions::new().read(true).write(true).open(&path)?;
+        let mut file = DirectFile::open_existing(path.clone())?;
         let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
-        file.read_exact(&mut header_bytes)?;
+        file.read_exact_at(0, &mut header_bytes)?;
         let header = FileHeader::from_le_bytes(&header_bytes);
         let expected_header_checksum = header.compute_checksum();
 
@@ -160,9 +159,8 @@ impl StorageFile {
             ));
         }
 
-        file.seek(SeekFrom::Start(header.superblock_a_offset))?;
         let mut sb_a_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
-        file.read_exact(&mut sb_a_bytes)?;
+        file.read_exact_at(header.superblock_a_offset, &mut sb_a_bytes)?;
         let superblock_a = Superblock::from_le_bytes(&sb_a_bytes);
         let expected_sb_a_checksum = superblock_a.compute_checksum();
         if superblock_a.checksum != expected_sb_a_checksum {
@@ -171,9 +169,8 @@ impl StorageFile {
             ));
         }
 
-        file.seek(SeekFrom::Start(header.superblock_b_offset))?;
         let mut sb_b_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
-        file.read_exact(&mut sb_b_bytes)?;
+        file.read_exact_at(header.superblock_b_offset, &mut sb_b_bytes)?;
         let superblock_b = Superblock::from_le_bytes(&sb_b_bytes);
         let expected_sb_b_checksum = superblock_b.compute_checksum();
         if superblock_b.checksum != expected_sb_b_checksum {
@@ -183,7 +180,7 @@ impl StorageFile {
         }
 
         let layout = StorageLayout {
-            total_size: file.metadata()?.len(),
+            total_size: file.len(),
             header_offset: 0,
             superblock_a_offset: header.superblock_a_offset,
             superblock_b_offset: header.superblock_b_offset,
@@ -246,20 +243,18 @@ impl StorageFile {
         superblock_b.active = crate::storage_layout::SUPERBLOCK_ACTIVE_B;
         superblock_b.checksum = superblock_b.compute_checksum();
 
-        let mut file = OpenOptions::new()
-            .create_new(true)
-            .read(true)
-            .write(true)
-            .open(&path)?;
+        let mut file = DirectFile::create_new(path.clone(), layout.total_size)?;
 
-        file.set_len(layout.total_size)?;
-        file.seek(SeekFrom::Start(layout.header_offset))?;
-        file.write_all(&header.to_le_bytes_with_checksum())?;
-        file.seek(SeekFrom::Start(layout.superblock_a_offset))?;
-        file.write_all(&superblock_a.to_le_bytes_with_checksum())?;
-        file.seek(SeekFrom::Start(layout.superblock_b_offset))?;
-        file.write_all(&superblock_b.to_le_bytes_with_checksum())?;
-        file.flush()?;
+        file.write_all_at(layout.header_offset, &header.to_le_bytes_with_checksum())?;
+        file.write_all_at(
+            layout.superblock_a_offset,
+            &superblock_a.to_le_bytes_with_checksum(),
+        )?;
+        file.write_all_at(
+            layout.superblock_b_offset,
+            &superblock_b.to_le_bytes_with_checksum(),
+        )?;
+        file.sync_data()?;
 
         let wal_state = WalRingState {
             head: superblock_a.wal_head,
@@ -327,14 +322,12 @@ impl StorageFile {
 
         if needs_wrap && bytes_to_end > 0 {
             let write_pos = self.wal_state.offset + tail_offset as u64;
-            self.file.seek(SeekFrom::Start(write_pos))?;
             let zeroes = vec![0u8; bytes_to_end];
-            self.file.write_all(&zeroes)?;
+            self.file.write_all_at(write_pos, &zeroes)?;
             self.wal_state.tail = self.wal_state.tail.saturating_add(bytes_to_end as u64);
         }
 
         let write_pos = self.wal_state.offset + (self.wal_state.tail % self.wal_state.size);
-        self.file.seek(SeekFrom::Start(write_pos))?;
 
         let payload_crc = wal_payload_crc(payload);
         let header = WalEntryHeader::new(
@@ -346,24 +339,21 @@ impl StorageFile {
             payload_crc,
         );
 
-        self.file.write_all(&header.to_le_bytes())?;
-        self.file.write_all(payload)?;
-
         let footer = WalEntryFooter {
             payload_len: payload_len as u32,
             payload_crc,
         };
-        self.file.write_all(&footer.to_le_bytes())?;
+        let mut entry_bytes = Vec::with_capacity(entry_len);
+        entry_bytes.extend_from_slice(&header.to_le_bytes());
+        entry_bytes.extend_from_slice(payload);
+        entry_bytes.extend_from_slice(&footer.to_le_bytes());
+        entry_bytes.resize(entry_len, 0);
 
-        let padding = wal_entry_padding_len(payload_len);
-        if padding > 0 {
-            let zeroes = vec![0u8; padding];
-            self.file.write_all(&zeroes)?;
-        }
+        self.file.write_all_at(write_pos, &entry_bytes)?;
 
         self.wal_state.tail = self.wal_state.tail.saturating_add(entry_len as u64);
         self.sync_superblocks(seq_no)?;
-        self.file.flush()?;
+        self.file.sync_data()?;
 
         debug_assert!(self.verify_wal_entry_at(write_pos).unwrap_or(false));
 
@@ -371,9 +361,8 @@ impl StorageFile {
     }
 
     fn verify_wal_entry_at(&mut self, position: u64) -> Result<bool, StorageError> {
-        self.file.seek(SeekFrom::Start(position))?;
         let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
-        self.file.read_exact(&mut header_bytes)?;
+        self.file.read_exact_at(position, &mut header_bytes)?;
         let header = WalEntryHeader::from_le_bytes(&header_bytes);
         if !header.verify_header_crc() {
             return Ok(false);
@@ -381,14 +370,18 @@ impl StorageFile {
 
         let payload_len = header.payload_len as usize;
         let mut payload = vec![0u8; payload_len];
-        self.file.read_exact(&mut payload)?;
+        self.file
+            .read_exact_at(position + WAL_ENTRY_HEADER_SIZE as u64, &mut payload)?;
         let payload_crc = wal_payload_crc(&payload);
         if payload_crc != header.payload_crc {
             return Ok(false);
         }
 
         let mut footer_bytes = [0u8; WAL_ENTRY_FOOTER_SIZE];
-        self.file.read_exact(&mut footer_bytes)?;
+        self.file.read_exact_at(
+            position + WAL_ENTRY_HEADER_SIZE as u64 + payload_len as u64,
+            &mut footer_bytes,
+        )?;
         let footer = WalEntryFooter::from_le_bytes(&footer_bytes);
         if footer.payload_len != header.payload_len || footer.payload_crc != header.payload_crc {
             return Ok(false);
@@ -423,10 +416,9 @@ impl StorageFile {
             }
 
             let file_pos = wal_offset + ring_pos;
-            self.file.seek(SeekFrom::Start(file_pos))?;
 
             let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
-            self.file.read_exact(&mut header_bytes)?;
+            self.file.read_exact_at(file_pos, &mut header_bytes)?;
             if header_bytes.iter().all(|b| *b == 0) {
                 cursor = cursor.saturating_add(bytes_to_end);
                 bytes_scanned = bytes_scanned.saturating_add(bytes_to_end);
@@ -450,14 +442,18 @@ impl StorageFile {
             }
 
             let mut payload = vec![0u8; payload_len];
-            self.file.read_exact(&mut payload)?;
+            self.file
+                .read_exact_at(file_pos + WAL_ENTRY_HEADER_SIZE as u64, &mut payload)?;
             let payload_crc = wal_payload_crc(&payload);
             if payload_crc != header.payload_crc {
                 break;
             }
 
             let mut footer_bytes = [0u8; WAL_ENTRY_FOOTER_SIZE];
-            self.file.read_exact(&mut footer_bytes)?;
+            self.file.read_exact_at(
+                file_pos + WAL_ENTRY_HEADER_SIZE as u64 + payload_len as u64,
+                &mut footer_bytes,
+            )?;
             let footer = WalEntryFooter::from_le_bytes(&footer_bytes);
             if footer.payload_len != header.payload_len || footer.payload_crc != header.payload_crc
             {
@@ -503,10 +499,9 @@ impl StorageFile {
             }
 
             let file_pos = wal_offset + ring_pos;
-            self.file.seek(SeekFrom::Start(file_pos))?;
 
             let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
-            self.file.read_exact(&mut header_bytes)?;
+            self.file.read_exact_at(file_pos, &mut header_bytes)?;
             if header_bytes.iter().all(|b| *b == 0) {
                 cursor = cursor.saturating_add(bytes_to_end);
                 continue;
@@ -529,14 +524,18 @@ impl StorageFile {
             }
 
             let mut payload = vec![0u8; payload_len];
-            self.file.read_exact(&mut payload)?;
+            self.file
+                .read_exact_at(file_pos + WAL_ENTRY_HEADER_SIZE as u64, &mut payload)?;
             let payload_crc = wal_payload_crc(&payload);
             if payload_crc != header.payload_crc {
                 break;
             }
 
             let mut footer_bytes = [0u8; WAL_ENTRY_FOOTER_SIZE];
-            self.file.read_exact(&mut footer_bytes)?;
+            self.file.read_exact_at(
+                file_pos + WAL_ENTRY_HEADER_SIZE as u64 + payload_len as u64,
+                &mut footer_bytes,
+            )?;
             let footer = WalEntryFooter::from_le_bytes(&footer_bytes);
             if footer.payload_len != header.payload_len || footer.payload_crc != header.payload_crc
             {
@@ -578,14 +577,14 @@ impl StorageFile {
         self.superblock_b.last_committed_seq = last_committed_seq;
         self.superblock_b.checksum = self.superblock_b.compute_checksum();
 
-        self.file
-            .seek(SeekFrom::Start(self.layout.superblock_a_offset))?;
-        self.file
-            .write_all(&self.superblock_a.to_le_bytes_with_checksum())?;
-        self.file
-            .seek(SeekFrom::Start(self.layout.superblock_b_offset))?;
-        self.file
-            .write_all(&self.superblock_b.to_le_bytes_with_checksum())?;
+        self.file.write_all_at(
+            self.layout.superblock_a_offset,
+            &self.superblock_a.to_le_bytes_with_checksum(),
+        )?;
+        self.file.write_all_at(
+            self.layout.superblock_b_offset,
+            &self.superblock_b.to_le_bytes_with_checksum(),
+        )?;
         Ok(())
     }
 }
