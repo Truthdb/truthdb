@@ -43,7 +43,9 @@ impl ClientListener {
                     let (stream, _) = res?;
                     let mut conn_shutdown = shutdown.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle_client(stream, &mut conn_shutdown).await {
+                        if let Err(err) = handle_client(stream, &mut conn_shutdown).await
+                            && !is_expected_disconnect(&err)
+                        {
                             eprintln!("client handler error: {err}");
                         }
                     });
@@ -74,5 +76,34 @@ async fn handle_client(
         if let Some(resp) = dispatcher.dispatch(frame)? {
             write_frame(&mut stream, &resp).await?;
         }
+    }
+}
+
+fn is_expected_disconnect(err: &ClientListenerError) -> bool {
+    let ClientListenerError::Proto(ProtoError::Decode(msg)) = err else {
+        return false;
+    };
+
+    let msg = msg.to_ascii_lowercase();
+    msg.contains("early eof")
+        || msg.contains("unexpected eof")
+        || msg.contains("connection reset")
+        || msg.contains("broken pipe")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn early_eof_is_treated_as_expected_disconnect() {
+        let err = ClientListenerError::Proto(ProtoError::Decode("early eof".to_string()));
+        assert!(is_expected_disconnect(&err));
+    }
+
+    #[test]
+    fn other_proto_errors_are_not_treated_as_expected_disconnect() {
+        let err = ClientListenerError::Proto(ProtoError::Decode("payload too large".to_string()));
+        assert!(!is_expected_disconnect(&err));
     }
 }
