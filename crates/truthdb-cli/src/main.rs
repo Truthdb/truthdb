@@ -1,3 +1,6 @@
+#[cfg(not(target_os = "linux"))]
+compile_error!("truthdb-cli must be built for Linux targets. Use Docker or a Linux environment.");
+
 mod config;
 
 use anyhow::Result;
