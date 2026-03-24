@@ -5,10 +5,10 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::storage_layout::{
-    FileHeader, Superblock, WAL_ENTRY_FOOTER_SIZE, WAL_ENTRY_HEADER_SIZE, WAL_ENTRY_TYPE_COMMIT,
-    WAL_ENTRY_TYPE_RECORD, WAL_MAX_BYTES, WAL_MIN_BYTES, WalEntryFooter, WalEntryHeader,
-    align_down, assert_layout_invariants, wal_entry_padded_len, wal_entry_padding_len,
-    wal_payload_crc,
+    FileHeader, SUPERBLOCK_ACTIVE_A, SUPERBLOCK_ACTIVE_B, Superblock, WAL_ENTRY_FOOTER_SIZE,
+    WAL_ENTRY_HEADER_SIZE, WAL_ENTRY_TYPE_COMMIT, WAL_ENTRY_TYPE_RECORD, WAL_MAX_BYTES,
+    WAL_MIN_BYTES, WalEntryFooter, WalEntryHeader, align_down, assert_layout_invariants,
+    wal_entry_padded_len, wal_entry_padding_len, wal_payload_crc,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -120,6 +120,10 @@ impl Storage {
 
     pub fn recover_wal(&mut self) -> Result<RecoveryState, StorageError> {
         self.file.recover_wal()
+    }
+
+    pub fn replay_wal_entries(&mut self) -> Result<Vec<WalRecord>, StorageError> {
+        self.file.replay_wal_entries()
     }
 }
 
@@ -358,6 +362,7 @@ impl StorageFile {
         }
 
         self.wal_state.tail = self.wal_state.tail.saturating_add(entry_len as u64);
+        self.sync_superblocks(seq_no)?;
         self.file.flush()?;
 
         debug_assert!(self.verify_wal_entry_at(write_pos).unwrap_or(false));
@@ -476,6 +481,113 @@ impl StorageFile {
             bytes_scanned,
         })
     }
+
+    fn replay_wal_entries(&mut self) -> Result<Vec<WalRecord>, StorageError> {
+        let wal_offset = self.layout.wal_offset;
+        let wal_size = self.layout.wal_size;
+        let mut cursor = self.wal_state.head;
+        let tail = self.wal_state.tail;
+        let mut entries = Vec::new();
+
+        if wal_size == 0 || tail <= cursor {
+            return Ok(entries);
+        }
+
+        while cursor < tail {
+            let ring_pos = cursor % wal_size;
+            let bytes_to_end = wal_size - ring_pos;
+
+            if bytes_to_end < WAL_ENTRY_HEADER_SIZE as u64 {
+                cursor = cursor.saturating_add(bytes_to_end);
+                continue;
+            }
+
+            let file_pos = wal_offset + ring_pos;
+            self.file.seek(SeekFrom::Start(file_pos))?;
+
+            let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
+            self.file.read_exact(&mut header_bytes)?;
+            if header_bytes.iter().all(|b| *b == 0) {
+                cursor = cursor.saturating_add(bytes_to_end);
+                continue;
+            }
+
+            let header = WalEntryHeader::from_le_bytes(&header_bytes);
+            if !header.verify_header_crc() {
+                break;
+            }
+
+            let payload_len = header.payload_len as usize;
+            let entry_len = wal_entry_padded_len(payload_len) as u64;
+            if entry_len > wal_size {
+                break;
+            }
+
+            let total_len = (WAL_ENTRY_HEADER_SIZE + payload_len + WAL_ENTRY_FOOTER_SIZE) as u64;
+            if total_len > bytes_to_end {
+                break;
+            }
+
+            let mut payload = vec![0u8; payload_len];
+            self.file.read_exact(&mut payload)?;
+            let payload_crc = wal_payload_crc(&payload);
+            if payload_crc != header.payload_crc {
+                break;
+            }
+
+            let mut footer_bytes = [0u8; WAL_ENTRY_FOOTER_SIZE];
+            self.file.read_exact(&mut footer_bytes)?;
+            let footer = WalEntryFooter::from_le_bytes(&footer_bytes);
+            if footer.payload_len != header.payload_len || footer.payload_crc != header.payload_crc
+            {
+                break;
+            }
+
+            entries.push(WalRecord {
+                entry_type: header.entry_type,
+                entry_version: header.entry_version,
+                seq_no: header.seq_no,
+                logical_ts: header.logical_ts,
+                payload,
+            });
+
+            cursor = cursor.saturating_add(entry_len);
+        }
+
+        Ok(entries)
+    }
+
+    fn sync_superblocks(&mut self, last_committed_seq: u64) -> Result<(), StorageError> {
+        let generation = self
+            .superblock_a
+            .generation
+            .max(self.superblock_b.generation)
+            .saturating_add(1);
+
+        self.superblock_a.generation = generation;
+        self.superblock_a.active = SUPERBLOCK_ACTIVE_A;
+        self.superblock_a.wal_head = self.wal_state.head;
+        self.superblock_a.wal_tail = self.wal_state.tail;
+        self.superblock_a.last_committed_seq = last_committed_seq;
+        self.superblock_a.checksum = self.superblock_a.compute_checksum();
+
+        self.superblock_b.generation = generation;
+        self.superblock_b.active = SUPERBLOCK_ACTIVE_B;
+        self.superblock_b.wal_head = self.wal_state.head;
+        self.superblock_b.wal_tail = self.wal_state.tail;
+        self.superblock_b.last_committed_seq = last_committed_seq;
+        self.superblock_b.checksum = self.superblock_b.compute_checksum();
+
+        self.file
+            .seek(SeekFrom::Start(self.layout.superblock_a_offset))?;
+        self.file
+            .write_all(&self.superblock_a.to_le_bytes_with_checksum())?;
+        self.file
+            .seek(SeekFrom::Start(self.layout.superblock_b_offset))?;
+        self.file
+            .write_all(&self.superblock_b.to_le_bytes_with_checksum())?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -491,6 +603,15 @@ pub struct RecoveryState {
     pub last_valid_seq: Option<u64>,
     pub last_committed_seq: Option<u64>,
     pub bytes_scanned: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct WalRecord {
+    pub entry_type: u16,
+    pub entry_version: u16,
+    pub seq_no: u64,
+    pub logical_ts: u64,
+    pub payload: Vec<u8>,
 }
 
 fn compute_layout(opts: StorageOptions) -> Result<StorageLayout, StorageError> {

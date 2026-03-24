@@ -8,6 +8,7 @@ clap = { version = "4.5.53", features = ["derive", "env"] }
 anyhow = "1.0.100"
 thiserror = { workspace = true }
 serde = { workspace = true }
+serde_json = { workspace = true }
 toml = { workspace = true }
 directories = { workspace = true }
 tokio = { workspace = true }

@@ -1,4 +1,5 @@
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use thiserror::Error;
 use tokio::net::{TcpListener, TcpStream};
@@ -8,6 +9,7 @@ use truthdb_net::{read_frame, write_frame};
 use truthdb_proto::ProtoError;
 
 use crate::dispatcher::Dispatcher;
+use crate::engine::Engine;
 
 #[derive(Error, Debug)]
 pub enum ClientListenerError {
@@ -23,12 +25,17 @@ pub enum ClientListenerError {
 
 pub struct ClientListener {
     addr: SocketAddr,
+    engine: Arc<Mutex<Engine>>,
 }
 
 impl ClientListener {
-    pub fn new(host: &str, port: u16) -> Result<Self, ClientListenerError> {
+    pub fn new(
+        host: &str,
+        port: u16,
+        engine: Arc<Mutex<Engine>>,
+    ) -> Result<Self, ClientListenerError> {
         let addr: SocketAddr = format!("{host}:{port}").parse()?;
-        Ok(ClientListener { addr })
+        Ok(ClientListener { addr, engine })
     }
 
     pub async fn run(self, mut shutdown: watch::Receiver<bool>) -> Result<(), ClientListenerError> {
@@ -42,8 +49,9 @@ impl ClientListener {
                 res = listener.accept() => {
                     let (stream, _) = res?;
                     let mut conn_shutdown = shutdown.clone();
+                    let engine = Arc::clone(&self.engine);
                     tokio::spawn(async move {
-                        if let Err(err) = handle_client(stream, &mut conn_shutdown).await
+                        if let Err(err) = handle_client(stream, engine, &mut conn_shutdown).await
                             && !is_expected_disconnect(&err)
                         {
                             eprintln!("client handler error: {err}");
@@ -59,9 +67,10 @@ impl ClientListener {
 
 async fn handle_client(
     mut stream: TcpStream,
+    engine: Arc<Mutex<Engine>>,
     shutdown: &mut watch::Receiver<bool>,
 ) -> Result<(), ClientListenerError> {
-    let dispatcher = Dispatcher::new();
+    let dispatcher = Dispatcher::new(engine);
 
     loop {
         let frame = tokio::select! {

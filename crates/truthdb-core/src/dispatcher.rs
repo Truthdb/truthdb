@@ -1,3 +1,4 @@
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use truthdb_proto::{
@@ -5,12 +6,15 @@ use truthdb_proto::{
     PROTOCOL_VERSION, ProtoError, decode_message, encode_message,
 };
 
-#[derive(Debug, Default)]
-pub struct Dispatcher;
+use crate::engine::Engine;
+
+pub struct Dispatcher {
+    engine: Arc<Mutex<Engine>>,
+}
 
 impl Dispatcher {
-    pub fn new() -> Self {
-        Dispatcher
+    pub fn new(engine: Arc<Mutex<Engine>>) -> Self {
+        Dispatcher { engine }
     }
 
     pub fn dispatch(&self, frame: Frame) -> Result<Option<Frame>, ProtoError> {
@@ -50,10 +54,24 @@ impl Dispatcher {
             }
             MsgType::CommandReq => {
                 let req: CommandReq = decode_message(&frame.payload)?;
-                let resp = CommandResp {
-                    id: req.id,
-                    ok: false,
-                    message: format!("not implemented: {}", req.command),
+                let resp = match self.engine.lock() {
+                    Ok(mut engine) => match engine.execute(&req.command) {
+                        Ok(message) => CommandResp {
+                            id: req.id,
+                            ok: true,
+                            message,
+                        },
+                        Err(err) => CommandResp {
+                            id: req.id,
+                            ok: false,
+                            message: err.to_string(),
+                        },
+                    },
+                    Err(_) => CommandResp {
+                        id: req.id,
+                        ok: false,
+                        message: "engine lock poisoned".to_string(),
+                    },
                 };
 
                 Ok(Some(Frame {

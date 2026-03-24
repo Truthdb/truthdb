@@ -59,33 +59,111 @@ async fn repl(addr: &str) -> Result<()> {
     let mut stdout = io::stdout();
     let mut reader = io::BufReader::new(stdin);
     let mut line = String::new();
+    let mut buffer = String::new();
     let mut next_id: u64 = 1;
 
     loop {
-        stdout.write_all(b"truthdb> ").await?;
+        let prompt = if buffer.trim().is_empty() {
+            b"truthdb> ".as_slice()
+        } else {
+            b"......> ".as_slice()
+        };
+        stdout.write_all(prompt).await?;
         stdout.flush().await?;
 
         line.clear();
         let bytes = reader.read_line(&mut line).await?;
         if bytes == 0 {
+            if buffer.trim().is_empty() {
+                break;
+            }
+            anyhow::bail!("incomplete command at end of input");
+        }
+
+        let chunk = line.trim_end_matches(['\n', '\r']);
+        let trimmed = chunk.trim();
+
+        if buffer.trim().is_empty() && (trimmed == "\\q" || trimmed == "quit" || trimmed == "exit")
+        {
             break;
         }
 
-        let trimmed = line.trim();
-        if trimmed.is_empty() {
+        if trimmed.is_empty() && buffer.trim().is_empty() {
             continue;
         }
-        if trimmed == "\\q" || trimmed == "quit" || trimmed == "exit" {
-            break;
+
+        if !buffer.is_empty() {
+            buffer.push('\n');
+        }
+        buffer.push_str(chunk);
+
+        if !command_is_complete(&buffer) {
+            continue;
         }
 
-        let resp = send_command(&mut stream, next_id, trimmed).await?;
+        let command = buffer.trim();
+        if command.is_empty() {
+            buffer.clear();
+            continue;
+        }
+
+        let resp = send_command(&mut stream, next_id, command).await?;
         next_id = next_id.wrapping_add(1);
         let status = if resp.ok { "ok" } else { "err" };
-        println!("[{status}] {}", resp.message);
+        if resp.message.contains('\n') {
+            println!("[{status}]");
+            println!("{}", resp.message);
+        } else {
+            println!("[{status}] {}", resp.message);
+        }
+        buffer.clear();
     }
 
     Ok(())
+}
+
+fn command_is_complete(input: &str) -> bool {
+    let trimmed = input.trim();
+    if trimmed.is_empty() {
+        return false;
+    }
+
+    let Some(start) = trimmed.find(['{', '[']) else {
+        return true;
+    };
+
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    for ch in trimmed[start..].chars() {
+        if in_string {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            match ch {
+                '\\' => escaped = true,
+                '"' => in_string = false,
+                _ => {}
+            }
+            continue;
+        }
+
+        match ch {
+            '"' => in_string = true,
+            '{' | '[' => depth += 1,
+            '}' | ']' => {
+                depth -= 1;
+                if depth < 0 {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    depth == 0 && !in_string
 }
 
 async fn send_hello(stream: &mut TcpStream) -> Result<()> {
