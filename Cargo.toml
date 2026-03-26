@@ -7,6 +7,7 @@ edition = "2024"
 members = [
     "crates/truthdb-core",
     "crates/truthdb-cli",
+    "crates/truthdb-bench",
     "crates/truthdb-proto",
     "crates/truthdb-net",
 ]
