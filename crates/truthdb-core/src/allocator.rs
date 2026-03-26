@@ -8,7 +8,7 @@ pub struct PageAllocator {
 impl PageAllocator {
     pub fn new(data_region_size: u64) -> Self {
         let total_pages = data_region_size / PAGE_SIZE as u64;
-        let bitmap_bytes = ((total_pages + 7) / 8) as usize;
+        let bitmap_bytes = total_pages.div_ceil(8) as usize;
         PageAllocator {
             bitmap: vec![0u8; bitmap_bytes],
             total_pages,

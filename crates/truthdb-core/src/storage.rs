@@ -652,8 +652,8 @@ impl StorageFile {
         next_doc_id: u64,
     ) -> Result<(), StorageError> {
         let page_size = PAGE_SIZE as u64;
-        let padded_len = ((data.len() as u64 + page_size - 1) / page_size) * page_size;
-        let num_pages = padded_len / page_size;
+        let num_pages = (data.len() as u64).div_ceil(page_size);
+        let padded_len = num_pages * page_size;
 
         if padded_len > self.layout.data_size {
             return Err(StorageError::InvalidConfig(
@@ -794,13 +794,8 @@ impl StorageFile {
             let mut desc_bytes = [0u8; SNAPSHOT_DESCRIPTOR_SIZE];
             self.file.read_exact_at(desc_offset, &mut desc_bytes)?;
             let desc = SnapshotDescriptor::from_le_bytes(&desc_bytes);
-            if desc.is_valid() {
-                if best
-                    .as_ref()
-                    .map_or(true, |b| desc.generation > b.generation)
-                {
-                    best = Some(desc);
-                }
+            if desc.is_valid() && best.as_ref().is_none_or(|b| desc.generation > b.generation) {
+                best = Some(desc);
             }
         }
 
@@ -835,7 +830,7 @@ impl StorageFile {
         if self.layout.allocator_size == 0 {
             return Ok(PageAllocator::new(self.layout.data_size));
         }
-        let bitmap_len = ((self.layout.data_size / PAGE_SIZE as u64 + 7) / 8) as usize;
+        let bitmap_len = (self.layout.data_size / PAGE_SIZE as u64).div_ceil(8) as usize;
         let read_len = bitmap_len.min(self.layout.allocator_size as usize);
         let mut bitmap = vec![0u8; bitmap_len];
         self.file
