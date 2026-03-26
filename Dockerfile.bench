@@ -1,0 +1,30 @@
+FROM rust:1-bookworm AS builder
+
+WORKDIR /src
+
+COPY Cargo.toml Cargo.lock ./
+COPY src ./src
+COPY config ./config
+COPY crates ./crates
+
+RUN cargo build --release -p truthdb --bin truthdb \
+  && cargo build --release -p truthdb-bench --bin truthdb-bench
+
+FROM debian:bookworm-slim AS runtime
+
+RUN apt-get update \
+  && apt-get install -y --no-install-recommends netcat-openbsd \
+  && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+COPY --from=builder /src/target/release/truthdb /usr/local/bin/truthdb
+COPY --from=builder /src/target/release/truthdb-bench /usr/local/bin/truthdb-bench
+COPY docker-bench-entrypoint.sh /usr/local/bin/docker-bench-entrypoint.sh
+
+RUN chmod 0755 /usr/local/bin/docker-bench-entrypoint.sh \
+  && mkdir -p /data
+
+ENV STATE_DIRECTORY=/data
+
+ENTRYPOINT ["/usr/local/bin/docker-bench-entrypoint.sh"]
