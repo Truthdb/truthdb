@@ -425,6 +425,117 @@ pub fn align_down(value: u64, alignment: u64) -> u64 {
     value - (value % alignment)
 }
 
+pub const SNAPSHOT_DESCRIPTOR_SIZE: usize = PAGE_SIZE;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub struct SnapshotDescriptor {
+    pub magic: [u8; 8],
+    pub generation: u64,
+    pub slot: u8,
+    pub slot_padding: [u8; 7],
+    pub checkpoint_seq: u64,
+    pub data_offset: u64,
+    pub data_len: u64,
+    pub data_checksum: u64,
+    pub next_seq_no: u64,
+    pub next_doc_id: u64,
+    pub checksum: u64,
+    pub reserved: [u8; SNAPSHOT_DESCRIPTOR_RESERVED_SIZE],
+}
+
+pub const SNAPSHOT_MAGIC: [u8; 8] = *b"TDBSNAP\0";
+
+const SNAPSHOT_DESCRIPTOR_FIXED_SIZE: usize = 8 + 8 + 1 + 7 + (7 * 8);
+const SNAPSHOT_DESCRIPTOR_RESERVED_SIZE: usize =
+    SNAPSHOT_DESCRIPTOR_SIZE - SNAPSHOT_DESCRIPTOR_FIXED_SIZE;
+
+impl Default for SnapshotDescriptor {
+    fn default() -> Self {
+        SnapshotDescriptor {
+            magic: SNAPSHOT_MAGIC,
+            generation: 0,
+            slot: 0,
+            slot_padding: [0; 7],
+            checkpoint_seq: 0,
+            data_offset: 0,
+            data_len: 0,
+            data_checksum: 0,
+            next_seq_no: 0,
+            next_doc_id: 0,
+            checksum: 0,
+            reserved: [0; SNAPSHOT_DESCRIPTOR_RESERVED_SIZE],
+        }
+    }
+}
+
+impl fmt::Debug for SnapshotDescriptor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SnapshotDescriptor")
+            .field("generation", &self.generation)
+            .field("slot", &self.slot)
+            .field("checkpoint_seq", &self.checkpoint_seq)
+            .field("data_offset", &self.data_offset)
+            .field("data_len", &self.data_len)
+            .field("data_checksum", &self.data_checksum)
+            .field("next_seq_no", &self.next_seq_no)
+            .field("next_doc_id", &self.next_doc_id)
+            .field("checksum", &self.checksum)
+            .finish()
+    }
+}
+
+impl SnapshotDescriptor {
+    pub fn to_le_bytes_with_checksum(self) -> [u8; SNAPSHOT_DESCRIPTOR_SIZE] {
+        let mut out = [0u8; SNAPSHOT_DESCRIPTOR_SIZE];
+        out[0..8].copy_from_slice(&self.magic);
+        out[8..16].copy_from_slice(&self.generation.to_le_bytes());
+        out[16] = self.slot;
+        out[17..24].copy_from_slice(&self.slot_padding);
+        out[24..32].copy_from_slice(&self.checkpoint_seq.to_le_bytes());
+        out[32..40].copy_from_slice(&self.data_offset.to_le_bytes());
+        out[40..48].copy_from_slice(&self.data_len.to_le_bytes());
+        out[48..56].copy_from_slice(&self.data_checksum.to_le_bytes());
+        out[56..64].copy_from_slice(&self.next_seq_no.to_le_bytes());
+        out[64..72].copy_from_slice(&self.next_doc_id.to_le_bytes());
+        out[72..80].copy_from_slice(&0u64.to_le_bytes());
+        out[80..].copy_from_slice(&self.reserved);
+
+        let checksum = xxh64(&out, 0);
+        out[72..80].copy_from_slice(&checksum.to_le_bytes());
+        out
+    }
+
+    pub fn from_le_bytes(bytes: &[u8; SNAPSHOT_DESCRIPTOR_SIZE]) -> Self {
+        let mut desc = SnapshotDescriptor::default();
+        desc.magic.copy_from_slice(&bytes[0..8]);
+        desc.generation = u64::from_le_bytes(bytes[8..16].try_into().unwrap());
+        desc.slot = bytes[16];
+        desc.slot_padding.copy_from_slice(&bytes[17..24]);
+        desc.checkpoint_seq = u64::from_le_bytes(bytes[24..32].try_into().unwrap());
+        desc.data_offset = u64::from_le_bytes(bytes[32..40].try_into().unwrap());
+        desc.data_len = u64::from_le_bytes(bytes[40..48].try_into().unwrap());
+        desc.data_checksum = u64::from_le_bytes(bytes[48..56].try_into().unwrap());
+        desc.next_seq_no = u64::from_le_bytes(bytes[56..64].try_into().unwrap());
+        desc.next_doc_id = u64::from_le_bytes(bytes[64..72].try_into().unwrap());
+        desc.checksum = u64::from_le_bytes(bytes[72..80].try_into().unwrap());
+        desc.reserved.copy_from_slice(&bytes[80..]);
+        desc
+    }
+
+    pub fn compute_checksum(self) -> u64 {
+        let mut out = self.to_le_bytes_with_checksum();
+        out[72..80].copy_from_slice(&0u64.to_le_bytes());
+        xxh64(&out, 0)
+    }
+
+    pub fn is_valid(&self) -> bool {
+        self.magic == SNAPSHOT_MAGIC
+            && self.checksum == self.compute_checksum()
+            && self.data_len > 0
+    }
+}
+
 pub(crate) fn assert_layout_invariants() {
     use core::mem::size_of;
 
@@ -438,6 +549,7 @@ pub(crate) fn assert_layout_invariants() {
 
     debug_assert_eq!(size_of::<FileHeader>(), FILE_HEADER_SIZE);
     debug_assert_eq!(size_of::<Superblock>(), SUPERBLOCK_SIZE);
+    debug_assert_eq!(size_of::<SnapshotDescriptor>(), SNAPSHOT_DESCRIPTOR_SIZE);
     debug_assert_eq!(size_of::<WalEntryHeader>(), WAL_ENTRY_HEADER_SIZE);
 
     let footer = WalEntryFooter {

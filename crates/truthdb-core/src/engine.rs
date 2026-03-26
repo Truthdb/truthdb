@@ -8,6 +8,7 @@ use crate::storage::{Storage, StorageError};
 
 const ENGINE_WAL_ENTRY_VERSION: u16 = 1;
 const ENGINE_WAL_ENTRY_TYPE: u16 = 1;
+const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
 
 type Document = Map<String, Value>;
 
@@ -19,8 +20,7 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn new(mut storage: Storage) -> Result<Self, EngineError> {
-        let records = storage.replay_wal_entries()?;
+    pub fn new(storage: Storage) -> Result<Self, EngineError> {
         let mut engine = Engine {
             storage,
             state: EngineState::default(),
@@ -28,6 +28,21 @@ impl Engine {
             next_doc_id: 1,
         };
 
+        // Try to load a snapshot first
+        if let Some(snapshot) = engine.storage.load_snapshot()? {
+            let state: EngineState = bincode::deserialize(&snapshot.data)
+                .map_err(|err| EngineError::Replay(format!("failed to decode snapshot: {err}")))?;
+            engine.state = state;
+            engine.next_seq_no = snapshot.next_seq_no;
+            engine.next_doc_id = snapshot.next_doc_id;
+            // Rebuild postings (not serialized)
+            for index_state in engine.state.indices.values_mut() {
+                index_state.rebuild_postings()?;
+            }
+        }
+
+        // Replay any WAL entries after the snapshot
+        let records = engine.storage.replay_wal_entries()?;
         for record in records {
             let event: WalEvent = serde_json::from_slice(&record.payload)
                 .map_err(|err| EngineError::Replay(format!("failed to decode wal event: {err}")))?;
@@ -48,6 +63,7 @@ impl Engine {
                 };
                 self.persist_event(&event)?;
                 self.apply_event(&event)?;
+                self.maybe_checkpoint()?;
                 render_json(&json!({
                     "acknowledged": true,
                     "index": name,
@@ -63,6 +79,7 @@ impl Engine {
                 };
                 self.persist_event(&event)?;
                 self.apply_event(&event)?;
+                self.maybe_checkpoint()?;
                 render_json(&json!({
                     "_id": doc_id,
                     "_index": index,
@@ -83,6 +100,26 @@ impl Engine {
                 }))
             }
         }
+    }
+
+    pub fn checkpoint(&mut self) -> Result<(), EngineError> {
+        let data = bincode::serialize(&self.state)
+            .map_err(|err| EngineError::Replay(format!("failed to serialize state: {err}")))?;
+        let checkpoint_seq = self.next_seq_no.saturating_sub(1);
+        self.storage
+            .write_checkpoint(&data, checkpoint_seq, self.next_seq_no, self.next_doc_id)?;
+        Ok(())
+    }
+
+    pub fn wal_usage_ratio(&self) -> f64 {
+        self.storage.wal_usage_ratio()
+    }
+
+    fn maybe_checkpoint(&mut self) -> Result<(), EngineError> {
+        if self.wal_usage_ratio() >= WAL_CHECKPOINT_THRESHOLD {
+            self.checkpoint()?;
+        }
+        Ok(())
     }
 
     fn persist_event(&mut self, event: &WalEvent) -> Result<(), EngineError> {
@@ -159,16 +196,18 @@ impl Engine {
     }
 }
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize, Deserialize)]
 struct EngineState {
     indices: BTreeMap<String, IndexState>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Serialize, Deserialize)]
 struct IndexState {
     mappings: BTreeMap<String, FieldType>,
     documents: BTreeMap<String, Document>,
+    #[serde(skip)]
     text_postings: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
+    #[serde(skip)]
     exact_postings: BTreeMap<String, BTreeMap<String, BTreeSet<String>>>,
 }
 
@@ -180,6 +219,17 @@ impl IndexState {
             text_postings: BTreeMap::new(),
             exact_postings: BTreeMap::new(),
         }
+    }
+
+    fn rebuild_postings(&mut self) -> Result<(), EngineError> {
+        self.text_postings.clear();
+        self.exact_postings.clear();
+        let doc_ids: Vec<String> = self.documents.keys().cloned().collect();
+        for doc_id in doc_ids {
+            let document = self.documents.get(&doc_id).unwrap().clone();
+            self.index_document(&doc_id, &document)?;
+        }
+        Ok(())
     }
 
     fn validate_document(&self, document: &Document) -> Result<(), EngineError> {
