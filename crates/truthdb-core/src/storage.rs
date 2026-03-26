@@ -1,13 +1,15 @@
 use std::path::{Path, PathBuf};
 
 use thiserror::Error;
+use xxhash_rust::xxh64::xxh64;
 
+use crate::allocator::PageAllocator;
 use crate::direct_io::DirectFile;
 use crate::storage_layout::{
-    FileHeader, SUPERBLOCK_ACTIVE_A, SUPERBLOCK_ACTIVE_B, Superblock, WAL_ENTRY_FOOTER_SIZE,
-    WAL_ENTRY_HEADER_SIZE, WAL_ENTRY_TYPE_COMMIT, WAL_ENTRY_TYPE_RECORD, WAL_MAX_BYTES,
-    WAL_MIN_BYTES, WalEntryFooter, WalEntryHeader, align_down, assert_layout_invariants,
-    wal_entry_padded_len, wal_payload_crc,
+    FileHeader, PAGE_SIZE, SNAPSHOT_DESCRIPTOR_SIZE, SUPERBLOCK_ACTIVE_A, SUPERBLOCK_ACTIVE_B,
+    SnapshotDescriptor, Superblock, WAL_ENTRY_FOOTER_SIZE, WAL_ENTRY_HEADER_SIZE,
+    WAL_ENTRY_TYPE_COMMIT, WAL_ENTRY_TYPE_RECORD, WAL_MAX_BYTES, WAL_MIN_BYTES, WalEntryFooter,
+    WalEntryHeader, align_down, assert_layout_invariants, wal_entry_padded_len, wal_payload_crc,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -124,6 +126,32 @@ impl Storage {
     pub fn replay_wal_entries(&mut self) -> Result<Vec<WalRecord>, StorageError> {
         self.file.replay_wal_entries()
     }
+
+    pub fn write_checkpoint(
+        &mut self,
+        data: &[u8],
+        checkpoint_seq: u64,
+        next_seq_no: u64,
+        next_doc_id: u64,
+    ) -> Result<(), StorageError> {
+        self.file
+            .write_checkpoint(data, checkpoint_seq, next_seq_no, next_doc_id)
+    }
+
+    pub fn load_snapshot(&mut self) -> Result<Option<SnapshotData>, StorageError> {
+        self.file.load_snapshot()
+    }
+
+    pub fn wal_usage_ratio(&self) -> f64 {
+        self.file.wal_usage_ratio()
+    }
+}
+
+pub struct SnapshotData {
+    pub data: Vec<u8>,
+    pub checkpoint_seq: u64,
+    pub next_seq_no: u64,
+    pub next_doc_id: u64,
 }
 
 struct StorageFile {
@@ -133,7 +161,31 @@ struct StorageFile {
     header: FileHeader,
     superblock_a: Superblock,
     superblock_b: Superblock,
+    active_superblock: ActiveSuperblock,
     wal_state: WalRingState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ActiveSuperblock {
+    A,
+    B,
+}
+
+impl ActiveSuperblock {
+    fn from_superblocks(a: &Superblock, b: &Superblock, a_valid: bool, b_valid: bool) -> Self {
+        match (a_valid, b_valid) {
+            (true, true) => {
+                if b.generation > a.generation {
+                    ActiveSuperblock::B
+                } else {
+                    ActiveSuperblock::A
+                }
+            }
+            (true, false) => ActiveSuperblock::A,
+            (false, true) => ActiveSuperblock::B,
+            (false, false) => ActiveSuperblock::A,
+        }
+    }
 }
 
 impl StorageFile {
@@ -162,22 +214,21 @@ impl StorageFile {
         let mut sb_a_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
         file.read_exact_at(header.superblock_a_offset, &mut sb_a_bytes)?;
         let superblock_a = Superblock::from_le_bytes(&sb_a_bytes);
-        let expected_sb_a_checksum = superblock_a.compute_checksum();
-        if superblock_a.checksum != expected_sb_a_checksum {
-            return Err(StorageError::InvalidFile(
-                "superblock A checksum mismatch".to_string(),
-            ));
-        }
+        let sb_a_valid = superblock_a.checksum == superblock_a.compute_checksum();
 
         let mut sb_b_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
         file.read_exact_at(header.superblock_b_offset, &mut sb_b_bytes)?;
         let superblock_b = Superblock::from_le_bytes(&sb_b_bytes);
-        let expected_sb_b_checksum = superblock_b.compute_checksum();
-        if superblock_b.checksum != expected_sb_b_checksum {
+        let sb_b_valid = superblock_b.checksum == superblock_b.compute_checksum();
+
+        if !sb_a_valid && !sb_b_valid {
             return Err(StorageError::InvalidFile(
-                "superblock B checksum mismatch".to_string(),
+                "both superblocks have checksum mismatch".to_string(),
             ));
         }
+
+        let active_superblock =
+            ActiveSuperblock::from_superblocks(&superblock_a, &superblock_b, sb_a_valid, sb_b_valid);
 
         let layout = StorageLayout {
             total_size: file.len(),
@@ -198,9 +249,13 @@ impl StorageFile {
             reserved_size: header.reserved_size,
         };
 
+        let active_sb = match active_superblock {
+            ActiveSuperblock::A => &superblock_a,
+            ActiveSuperblock::B => &superblock_b,
+        };
         let wal_state = WalRingState {
-            head: superblock_a.wal_head,
-            tail: superblock_a.wal_tail,
+            head: active_sb.wal_head,
+            tail: active_sb.wal_tail,
             offset: header.wal_offset,
             size: header.wal_size,
         };
@@ -212,6 +267,7 @@ impl StorageFile {
             header,
             superblock_a,
             superblock_b,
+            active_superblock,
             wal_state,
         };
         file.touch();
@@ -270,6 +326,7 @@ impl StorageFile {
             header,
             superblock_a,
             superblock_b,
+            active_superblock: ActiveSuperblock::A,
             wal_state,
         };
         file.touch();
@@ -352,7 +409,7 @@ impl StorageFile {
         self.file.write_all_at(write_pos, &entry_bytes)?;
 
         self.wal_state.tail = self.wal_state.tail.saturating_add(entry_len as u64);
-        self.sync_superblocks(seq_no)?;
+        self.sync_active_superblock(seq_no)?;
         self.file.sync_data()?;
 
         debug_assert!(self.verify_wal_entry_at(write_pos).unwrap_or(false));
@@ -556,36 +613,240 @@ impl StorageFile {
         Ok(entries)
     }
 
-    fn sync_superblocks(&mut self, last_committed_seq: u64) -> Result<(), StorageError> {
+    fn sync_active_superblock(&mut self, last_committed_seq: u64) -> Result<(), StorageError> {
         let generation = self
             .superblock_a
             .generation
             .max(self.superblock_b.generation)
             .saturating_add(1);
 
-        self.superblock_a.generation = generation;
-        self.superblock_a.active = SUPERBLOCK_ACTIVE_A;
-        self.superblock_a.wal_head = self.wal_state.head;
-        self.superblock_a.wal_tail = self.wal_state.tail;
-        self.superblock_a.last_committed_seq = last_committed_seq;
-        self.superblock_a.checksum = self.superblock_a.compute_checksum();
+        let (sb, offset) = match self.active_superblock {
+            ActiveSuperblock::A => (&mut self.superblock_a, self.layout.superblock_a_offset),
+            ActiveSuperblock::B => (&mut self.superblock_b, self.layout.superblock_b_offset),
+        };
 
-        self.superblock_b.generation = generation;
-        self.superblock_b.active = SUPERBLOCK_ACTIVE_B;
-        self.superblock_b.wal_head = self.wal_state.head;
-        self.superblock_b.wal_tail = self.wal_state.tail;
-        self.superblock_b.last_committed_seq = last_committed_seq;
-        self.superblock_b.checksum = self.superblock_b.compute_checksum();
+        sb.generation = generation;
+        sb.active = match self.active_superblock {
+            ActiveSuperblock::A => SUPERBLOCK_ACTIVE_A,
+            ActiveSuperblock::B => SUPERBLOCK_ACTIVE_B,
+        };
+        sb.wal_head = self.wal_state.head;
+        sb.wal_tail = self.wal_state.tail;
+        sb.last_committed_seq = last_committed_seq;
+        sb.checksum = sb.compute_checksum();
 
-        self.file.write_all_at(
-            self.layout.superblock_a_offset,
-            &self.superblock_a.to_le_bytes_with_checksum(),
-        )?;
-        self.file.write_all_at(
-            self.layout.superblock_b_offset,
-            &self.superblock_b.to_le_bytes_with_checksum(),
-        )?;
+        self.file.write_all_at(offset, &sb.to_le_bytes_with_checksum())?;
         Ok(())
+    }
+
+    fn write_checkpoint(
+        &mut self,
+        data: &[u8],
+        checkpoint_seq: u64,
+        next_seq_no: u64,
+        next_doc_id: u64,
+    ) -> Result<(), StorageError> {
+        let page_size = PAGE_SIZE as u64;
+        let padded_len = ((data.len() as u64 + page_size - 1) / page_size) * page_size;
+        let num_pages = padded_len / page_size;
+
+        if padded_len > self.layout.data_size {
+            return Err(StorageError::InvalidConfig(
+                "checkpoint data exceeds data region size".to_string(),
+            ));
+        }
+
+        let mut allocator = self.load_allocator()?;
+
+        let current_snapshot = self.load_active_snapshot_descriptor()?;
+        let target_slot: u8 = if let Some(ref desc) = current_snapshot {
+            if desc.slot == 0 { 1 } else { 0 }
+        } else {
+            0
+        };
+
+        // Two-slot A/B strategy: slot 0 = first half of data region, slot 1 = second half.
+        let half_pages = self.layout.data_size / page_size / 2;
+        let slot_start_page = if target_slot == 0 { 0 } else { half_pages };
+
+        if num_pages > half_pages {
+            return Err(StorageError::InvalidConfig(
+                "checkpoint data exceeds half of data region (slot capacity)".to_string(),
+            ));
+        }
+
+        // Free the target slot region and reallocate
+        allocator.free(slot_start_page, half_pages);
+        let alloc_start = allocator.allocate(num_pages).ok_or_else(|| {
+            StorageError::InvalidConfig("cannot allocate pages for checkpoint".to_string())
+        })?;
+
+        let data_write_offset = self.layout.data_offset + alloc_start * page_size;
+
+        // Write the data (padded to page alignment)
+        let mut padded_data = data.to_vec();
+        padded_data.resize(padded_len as usize, 0);
+        self.file.write_all_at(data_write_offset, &padded_data)?;
+        self.file.sync_data()?;
+
+        // Write allocator bitmap
+        self.save_allocator(&allocator)?;
+        self.file.sync_data()?;
+
+        // Write snapshot descriptor
+        let data_checksum = xxh64(data, 0);
+        let generation = self
+            .superblock_a
+            .generation
+            .max(self.superblock_b.generation)
+            .saturating_add(1);
+
+        let mut desc = SnapshotDescriptor::default();
+        desc.generation = generation;
+        desc.slot = target_slot;
+        desc.checkpoint_seq = checkpoint_seq;
+        desc.data_offset = data_write_offset;
+        desc.data_len = data.len() as u64;
+        desc.data_checksum = data_checksum;
+        desc.next_seq_no = next_seq_no;
+        desc.next_doc_id = next_doc_id;
+        desc.checksum = desc.compute_checksum();
+
+        let desc_offset = self.layout.snapshot_offset
+            + (target_slot as u64) * SNAPSHOT_DESCRIPTOR_SIZE as u64;
+        self.file
+            .write_all_at(desc_offset, &desc.to_le_bytes_with_checksum())?;
+        self.file.sync_data()?;
+
+        // Advance wal_head to reclaim entries covered by this checkpoint
+        self.wal_state.head = self.wal_state.tail;
+
+        // Flip to the inactive superblock and write it with the new state
+        let new_active = match self.active_superblock {
+            ActiveSuperblock::A => ActiveSuperblock::B,
+            ActiveSuperblock::B => ActiveSuperblock::A,
+        };
+        self.active_superblock = new_active;
+
+        // Build the new superblock state for both
+        let new_sb = |active_flag: u8| -> Superblock {
+            let mut sb = Superblock::default();
+            sb.generation = generation;
+            sb.active = active_flag;
+            sb.wal_head = self.wal_state.head;
+            sb.wal_tail = self.wal_state.tail;
+            sb.last_committed_seq = checkpoint_seq;
+            sb.snapshot_root = desc_offset;
+            sb.data_root = data_write_offset;
+            sb.checksum = sb.compute_checksum();
+            sb
+        };
+
+        self.superblock_a = new_sb(SUPERBLOCK_ACTIVE_A);
+        self.superblock_b = new_sb(SUPERBLOCK_ACTIVE_B);
+
+        // Write primary (new active) first, then backup
+        let (primary_offset, primary_sb, backup_offset, backup_sb) = match new_active {
+            ActiveSuperblock::A => (
+                self.layout.superblock_a_offset,
+                &self.superblock_a,
+                self.layout.superblock_b_offset,
+                &self.superblock_b,
+            ),
+            ActiveSuperblock::B => (
+                self.layout.superblock_b_offset,
+                &self.superblock_b,
+                self.layout.superblock_a_offset,
+                &self.superblock_a,
+            ),
+        };
+
+        self.file
+            .write_all_at(primary_offset, &primary_sb.to_le_bytes_with_checksum())?;
+        self.file.sync_data()?;
+
+        self.file
+            .write_all_at(backup_offset, &backup_sb.to_le_bytes_with_checksum())?;
+        self.file.sync_data()?;
+
+        Ok(())
+    }
+
+    fn load_active_snapshot_descriptor(&mut self) -> Result<Option<SnapshotDescriptor>, StorageError> {
+        // Try slot 0 and slot 1, return the one with higher generation
+        let mut best: Option<SnapshotDescriptor> = None;
+
+        for slot in 0..2u8 {
+            let desc_offset = self.layout.snapshot_offset
+                + (slot as u64) * SNAPSHOT_DESCRIPTOR_SIZE as u64;
+            if desc_offset + SNAPSHOT_DESCRIPTOR_SIZE as u64
+                > self.layout.snapshot_offset + self.layout.snapshot_size
+            {
+                continue;
+            }
+            let mut desc_bytes = [0u8; SNAPSHOT_DESCRIPTOR_SIZE];
+            self.file.read_exact_at(desc_offset, &mut desc_bytes)?;
+            let desc = SnapshotDescriptor::from_le_bytes(&desc_bytes);
+            if desc.is_valid() {
+                if best.as_ref().map_or(true, |b| desc.generation > b.generation) {
+                    best = Some(desc);
+                }
+            }
+        }
+
+        Ok(best)
+    }
+
+    fn load_snapshot(&mut self) -> Result<Option<SnapshotData>, StorageError> {
+        let desc = match self.load_active_snapshot_descriptor()? {
+            Some(d) => d,
+            None => return Ok(None),
+        };
+
+        let mut data = vec![0u8; desc.data_len as usize];
+        self.file.read_exact_at(desc.data_offset, &mut data)?;
+
+        let actual_checksum = xxh64(&data, 0);
+        if actual_checksum != desc.data_checksum {
+            return Err(StorageError::InvalidFile(
+                "snapshot data checksum mismatch".to_string(),
+            ));
+        }
+
+        Ok(Some(SnapshotData {
+            data,
+            checkpoint_seq: desc.checkpoint_seq,
+            next_seq_no: desc.next_seq_no,
+            next_doc_id: desc.next_doc_id,
+        }))
+    }
+
+    fn load_allocator(&mut self) -> Result<PageAllocator, StorageError> {
+        if self.layout.allocator_size == 0 {
+            return Ok(PageAllocator::new(self.layout.data_size));
+        }
+        let bitmap_len = ((self.layout.data_size / PAGE_SIZE as u64 + 7) / 8) as usize;
+        let read_len = bitmap_len.min(self.layout.allocator_size as usize);
+        let mut bitmap = vec![0u8; bitmap_len];
+        self.file
+            .read_exact_at(self.layout.allocator_offset, &mut bitmap[..read_len])?;
+        Ok(PageAllocator::from_bitmap(bitmap, self.layout.data_size))
+    }
+
+    fn save_allocator(&mut self, allocator: &PageAllocator) -> Result<(), StorageError> {
+        let bitmap = allocator.bitmap();
+        let write_len = bitmap.len().min(self.layout.allocator_size as usize);
+        self.file
+            .write_all_at(self.layout.allocator_offset, &bitmap[..write_len])?;
+        Ok(())
+    }
+
+    fn wal_usage_ratio(&self) -> f64 {
+        if self.wal_state.size == 0 {
+            return 1.0;
+        }
+        let used = self.wal_state.tail.saturating_sub(self.wal_state.head);
+        used as f64 / self.wal_state.size as f64
     }
 }
 
