@@ -447,7 +447,8 @@ pub struct SnapshotDescriptor {
 pub const SNAPSHOT_MAGIC: [u8; 8] = *b"TDBSNAP\0";
 
 const SNAPSHOT_DESCRIPTOR_FIXED_SIZE: usize = 8 + 8 + 1 + 7 + (7 * 8);
-const SNAPSHOT_DESCRIPTOR_RESERVED_SIZE: usize = SNAPSHOT_DESCRIPTOR_SIZE - SNAPSHOT_DESCRIPTOR_FIXED_SIZE;
+const SNAPSHOT_DESCRIPTOR_RESERVED_SIZE: usize =
+    SNAPSHOT_DESCRIPTOR_SIZE - SNAPSHOT_DESCRIPTOR_FIXED_SIZE;
 
 impl Default for SnapshotDescriptor {
     fn default() -> Self {
@@ -529,7 +530,9 @@ impl SnapshotDescriptor {
     }
 
     pub fn is_valid(&self) -> bool {
-        self.magic == SNAPSHOT_MAGIC && self.checksum == self.compute_checksum() && self.data_len > 0
+        self.magic == SNAPSHOT_MAGIC
+            && self.checksum == self.compute_checksum()
+            && self.data_len > 0
     }
 }
 

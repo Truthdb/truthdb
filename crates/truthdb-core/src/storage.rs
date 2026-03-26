@@ -227,8 +227,12 @@ impl StorageFile {
             ));
         }
 
-        let active_superblock =
-            ActiveSuperblock::from_superblocks(&superblock_a, &superblock_b, sb_a_valid, sb_b_valid);
+        let active_superblock = ActiveSuperblock::from_superblocks(
+            &superblock_a,
+            &superblock_b,
+            sb_a_valid,
+            sb_b_valid,
+        );
 
         let layout = StorageLayout {
             total_size: file.len(),
@@ -635,7 +639,8 @@ impl StorageFile {
         sb.last_committed_seq = last_committed_seq;
         sb.checksum = sb.compute_checksum();
 
-        self.file.write_all_at(offset, &sb.to_le_bytes_with_checksum())?;
+        self.file
+            .write_all_at(offset, &sb.to_le_bytes_with_checksum())?;
         Ok(())
     }
 
@@ -712,8 +717,8 @@ impl StorageFile {
         desc.next_doc_id = next_doc_id;
         desc.checksum = desc.compute_checksum();
 
-        let desc_offset = self.layout.snapshot_offset
-            + (target_slot as u64) * SNAPSHOT_DESCRIPTOR_SIZE as u64;
+        let desc_offset =
+            self.layout.snapshot_offset + (target_slot as u64) * SNAPSHOT_DESCRIPTOR_SIZE as u64;
         self.file
             .write_all_at(desc_offset, &desc.to_le_bytes_with_checksum())?;
         self.file.sync_data()?;
@@ -772,13 +777,15 @@ impl StorageFile {
         Ok(())
     }
 
-    fn load_active_snapshot_descriptor(&mut self) -> Result<Option<SnapshotDescriptor>, StorageError> {
+    fn load_active_snapshot_descriptor(
+        &mut self,
+    ) -> Result<Option<SnapshotDescriptor>, StorageError> {
         // Try slot 0 and slot 1, return the one with higher generation
         let mut best: Option<SnapshotDescriptor> = None;
 
         for slot in 0..2u8 {
-            let desc_offset = self.layout.snapshot_offset
-                + (slot as u64) * SNAPSHOT_DESCRIPTOR_SIZE as u64;
+            let desc_offset =
+                self.layout.snapshot_offset + (slot as u64) * SNAPSHOT_DESCRIPTOR_SIZE as u64;
             if desc_offset + SNAPSHOT_DESCRIPTOR_SIZE as u64
                 > self.layout.snapshot_offset + self.layout.snapshot_size
             {
@@ -788,7 +795,10 @@ impl StorageFile {
             self.file.read_exact_at(desc_offset, &mut desc_bytes)?;
             let desc = SnapshotDescriptor::from_le_bytes(&desc_bytes);
             if desc.is_valid() {
-                if best.as_ref().map_or(true, |b| desc.generation > b.generation) {
+                if best
+                    .as_ref()
+                    .map_or(true, |b| desc.generation > b.generation)
+                {
                     best = Some(desc);
                 }
             }

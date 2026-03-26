@@ -106,12 +106,8 @@ impl Engine {
         let data = bincode::serialize(&self.state)
             .map_err(|err| EngineError::Replay(format!("failed to serialize state: {err}")))?;
         let checkpoint_seq = self.next_seq_no.saturating_sub(1);
-        self.storage.write_checkpoint(
-            &data,
-            checkpoint_seq,
-            self.next_seq_no,
-            self.next_doc_id,
-        )?;
+        self.storage
+            .write_checkpoint(&data, checkpoint_seq, self.next_seq_no, self.next_doc_id)?;
         Ok(())
     }
 
