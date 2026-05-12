@@ -1,0 +1,170 @@
+name: Debian packages
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build .deb
+    runs-on: ubuntu-latest
+    # Build inside Ubuntu 22.04 so the resulting binaries link against glibc 2.35,
+    # the oldest libc across our four target distros (Debian 12/13, Ubuntu 22.04/24.04).
+    container:
+      image: ubuntu:22.04
+    defaults:
+      run:
+        shell: bash
+    outputs:
+      version: ${{ steps.get_version.outputs.version }}
+      tag: ${{ steps.get_tag.outputs.tag }}
+    steps:
+      - name: Install build prerequisites
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends \
+            ca-certificates curl build-essential pkg-config \
+            dpkg-dev lintian git
+
+      - uses: actions/checkout@v4
+
+      - name: Install Rust 1.92
+        run: |
+          set -euo pipefail
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --default-toolchain 1.92.0 --profile minimal
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+
+      - name: Install cargo-deb
+        run: cargo install cargo-deb --locked
+
+      - name: Get tag
+        id: get_tag
+        run: echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+
+      - name: Get version from tag
+        id: get_version
+        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build release binaries
+        run: cargo build --release --workspace
+
+      - name: Build .deb packages
+        run: |
+          set -euo pipefail
+          cargo deb -p truthdb --no-build
+          cargo deb -p truthdb-cli --no-build
+          ls -la target/debian/
+
+      - name: Lintian (warn-only)
+        continue-on-error: true
+        run: lintian --no-tag-display-limit target/debian/*.deb || true
+
+      - name: Upload .deb artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: debs
+          path: target/debian/*.deb
+          if-no-files-found: error
+
+  smoke-test:
+    name: Smoke test (${{ matrix.image }})
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        image:
+          - debian:12
+          - debian:13
+          - ubuntu:22.04
+          - ubuntu:24.04
+    container:
+      image: ${{ matrix.image }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Install minimal deps
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: debs
+          path: debs
+
+      - name: Install both packages
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          # Install with apt-get so dependencies (adduser, init-system-helpers) resolve.
+          # In a non-systemd container the maintainer scripts no-op the deb-systemd-* calls,
+          # but user/group creation and file placement still happen.
+          apt-get install -y ./debs/truthdb-server_*.deb ./debs/truthdb-cli_*.deb
+
+      - name: Verify install
+        run: |
+          set -euo pipefail
+          test -x /usr/bin/truthdb
+          test -x /usr/bin/truthdb-cli
+          test -f /etc/truthdb/truthdb.toml
+          test -f /lib/systemd/system/truthdb.service
+          getent passwd truthdb
+          getent group truthdb
+          /usr/bin/truthdb-cli --help
+
+      - name: Verify purge cleanup
+        run: |
+          set -euo pipefail
+          export DEBIAN_FRONTEND=noninteractive
+          apt-get purge -y truthdb-server truthdb-cli
+          ! getent passwd truthdb
+          ! test -d /var/lib/truthdb
+          ! test -f /etc/truthdb/truthdb.toml
+
+  publish:
+    name: Publish to GitHub Release and dispatch apt repo
+    needs: [build, smoke-test]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: debs
+          path: debs
+
+      - name: Upload .debs to GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # Tag must already exist as a release (release.yml runs in parallel and creates it).
+          # If not yet created, retry briefly.
+          TAG="${{ needs.build.outputs.tag }}"
+          for i in 1 2 3 4 5; do
+            if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+              break
+            fi
+            echo "Release $TAG not found yet, retry $i/5..."
+            sleep 10
+          done
+          gh release upload "$TAG" debs/*.deb --clobber --repo "$GITHUB_REPOSITORY"
+
+      - name: Dispatch publish to Truthdb/apt
+        env:
+          GH_TOKEN: ${{ secrets.APT_REPO_DISPATCH_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh api -X POST repos/Truthdb/apt/dispatches \
+            -f event_type=new-debs \
+            -F "client_payload[tag]=${{ needs.build.outputs.tag }}" \
+            -F "client_payload[version]=${{ needs.build.outputs.version }}"

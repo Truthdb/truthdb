@@ -2,6 +2,8 @@
 name = "truthdb-cli"
 version = "0.1.0"
 edition = "2024"
+description = "Command-line client and REPL for TruthDB, speaking the truthdb binary protocol on TCP/9623."
+license = "MIT"
 
 [dependencies]
 clap = { version = "4.5.53", features = ["derive", "env"] }
@@ -14,3 +16,18 @@ directories = { workspace = true }
 tokio = { workspace = true }
 truthdb-proto = { workspace = true }
 truthdb-net = { workspace = true }
+
+[package.metadata.deb]
+name = "truthdb-cli"
+maintainer = "TruthDB Maintainers <contact@truthdb.io>"
+section = "database"
+priority = "optional"
+extended-description = """\
+Command-line client and interactive REPL for TruthDB. Connects to a \
+truthdb-server over its binary protocol on TCP/9623 (default host \
+127.0.0.1; override with --host/--port or TRUTHDB_HOST/TRUTHDB_PORT)."""
+depends = "libc6 (>= 2.35)"
+suggests = "truthdb-server"
+assets = [
+    ["target/release/truthdb-cli", "usr/bin/", "755"],
+]

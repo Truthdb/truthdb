@@ -1,0 +1,35 @@
+#!/bin/sh
+# postrm for truthdb-server.
+#   remove: mask the unit so a stale enabled symlink can't auto-start a half-removed service.
+#   purge:  delete state directory, system user/group, and helper state. Conffiles
+#           (/etc/truthdb/truthdb.toml) are removed by dpkg itself.
+set -e
+
+case "$1" in
+    purge)
+        if [ -x /usr/bin/deb-systemd-helper ]; then
+            deb-systemd-helper purge truthdb.service >/dev/null || true
+            deb-systemd-helper unmask truthdb.service >/dev/null || true
+        fi
+        rm -rf /var/lib/truthdb
+        if getent passwd truthdb >/dev/null; then
+            deluser --system --quiet truthdb || true
+        fi
+        if getent group truthdb >/dev/null; then
+            delgroup --system --quiet truthdb || true
+        fi
+        ;;
+    remove)
+        if [ -x /usr/bin/deb-systemd-helper ]; then
+            deb-systemd-helper mask truthdb.service >/dev/null || true
+        fi
+        ;;
+    upgrade|failed-upgrade|abort-install|abort-upgrade|disappear)
+        ;;
+    *)
+        echo "postrm called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0
