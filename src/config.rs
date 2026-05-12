@@ -177,36 +177,62 @@ fn systemd_state_directory() -> Option<PathBuf> {
     Some(Path::new(first).to_path_buf())
 }
 
+/// Path of the system-wide config file installed by the Debian package.
+const SYSTEM_CONFIG_PATH: &str = "/etc/truthdb/truthdb.toml";
+
 impl Config {
-    /// Load config: embedded default, then override with OS-standard config file if present.
+    /// Load config: embedded default, then per-user XDG override, then system-wide override.
+    ///
+    /// Apply order is lowest-priority first so later applications win for fields they set.
+    /// `/etc/truthdb/truthdb.toml` is the highest priority — when a sysadmin uncomments a
+    /// value there, it overrides anything in `~/.config/org.truthdb/truthdb/truthdb.toml`.
+    /// Missing files no-op.
     pub fn load() -> Self {
-        // Load embedded default config
         let default_str = include_str!("../config/default.toml");
         let mut config: Config = toml::from_str(default_str).unwrap_or_default();
 
-        // Try to override with OS-standard config file
+        // Per-user XDG config (dev convenience).
         if let Some(proj_dirs) = ProjectDirs::from("org", "truthdb", "truthdb") {
             let mut config_path = PathBuf::from(proj_dirs.config_dir());
             config_path.push("truthdb.toml");
-            if config_path.exists()
-                && let Ok(contents) = fs::read_to_string(&config_path)
-                && let Ok(override_cfg) = toml::from_str::<ConfigOverride>(&contents)
-            {
-                if let Some(addr) = override_cfg.addr {
-                    config.network.addr = addr;
-                }
-                if let Some(port) = override_cfg.port {
-                    config.network.port = port;
-                }
-                if let Some(network) = override_cfg.network {
-                    apply_network_override(&mut config.network, network);
-                }
-                if let Some(storage) = override_cfg.storage {
-                    apply_storage_override(&mut config.storage, storage);
-                }
-            }
+            apply_override_file(&config_path, &mut config);
         }
+
+        // System-wide config installed by the .deb (highest priority).
+        apply_override_file(Path::new(SYSTEM_CONFIG_PATH), &mut config);
+
         config
+    }
+}
+
+/// Read a TOML override file at `path` and apply it to `config`. No-op if the file
+/// does not exist, cannot be read, or fails to parse.
+fn apply_override_file(path: &Path, config: &mut Config) {
+    if !path.exists() {
+        return;
+    }
+    let Ok(contents) = fs::read_to_string(path) else {
+        return;
+    };
+    let Ok(override_cfg) = toml::from_str::<ConfigOverride>(&contents) else {
+        return;
+    };
+    apply_override(override_cfg, config);
+}
+
+/// Apply a parsed override to `config`. Each field is set only if the override specifies it.
+fn apply_override(override_cfg: ConfigOverride, config: &mut Config) {
+    if let Some(addr) = override_cfg.addr {
+        config.network.addr = addr;
+    }
+    if let Some(port) = override_cfg.port {
+        config.network.port = port;
+    }
+    if let Some(network) = override_cfg.network {
+        apply_network_override(&mut config.network, network);
+    }
+    if let Some(storage) = override_cfg.storage {
+        apply_storage_override(&mut config.storage, storage);
     }
 }
 
@@ -285,5 +311,88 @@ fn apply_storage_override(target: &mut StorageConfig, source: StorageConfigOverr
     }
     if let Some(snapshot_wal_threshold) = source.snapshot_wal_threshold {
         target.snapshot_wal_threshold = snapshot_wal_threshold;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn default_config() -> Config {
+        let default_str = include_str!("../config/default.toml");
+        toml::from_str(default_str).unwrap()
+    }
+
+    #[test]
+    fn override_sets_only_specified_fields() {
+        let toml = r#"
+            [network]
+            port = 12345
+
+            [storage]
+            size_gib = 42
+        "#;
+        let mut config = default_config();
+        let override_cfg: ConfigOverride = toml::from_str(toml).unwrap();
+        apply_override(override_cfg, &mut config);
+
+        assert_eq!(config.network.port, 12345);
+        assert_eq!(config.storage.size_gib, 42);
+        // Unset fields keep defaults.
+        assert_eq!(config.network.addr, "0.0.0.0");
+        assert_eq!(config.storage.path, "truth.db");
+    }
+
+    #[test]
+    fn override_file_missing_is_noop() {
+        let mut config = default_config();
+        apply_override_file(
+            Path::new("/nonexistent/truthdb-test-missing.toml"),
+            &mut config,
+        );
+        // Still default.
+        assert_eq!(config.network.port, 9623);
+    }
+
+    #[test]
+    fn override_file_malformed_is_noop() {
+        let dir = std::env::temp_dir().join(format!(
+            "truthdb-config-test-{}-malformed",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("truthdb.toml");
+        fs::write(&path, "this is not valid toml === {{{").unwrap();
+
+        let mut config = default_config();
+        apply_override_file(&path, &mut config);
+        assert_eq!(config.network.port, 9623);
+
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn override_file_applies_when_valid() {
+        let dir =
+            std::env::temp_dir().join(format!("truthdb-config-test-{}-valid", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("truthdb.toml");
+        fs::write(
+            &path,
+            r#"
+                [network]
+                addr = "127.0.0.1"
+                port = 7777
+            "#,
+        )
+        .unwrap();
+
+        let mut config = default_config();
+        apply_override_file(&path, &mut config);
+
+        assert_eq!(config.network.addr, "127.0.0.1");
+        assert_eq!(config.network.port, 7777);
+
+        fs::remove_dir_all(&dir).ok();
     }
 }

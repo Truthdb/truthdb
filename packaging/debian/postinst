@@ -1,0 +1,43 @@
+#!/bin/sh
+# postinst for truthdb-server. Creates the system user/group and integrates with systemd.
+set -e
+
+case "$1" in
+    configure)
+        # Create the truthdb system group/user if not already present.
+        if ! getent group truthdb >/dev/null; then
+            addgroup --system --quiet truthdb
+        fi
+        if ! getent passwd truthdb >/dev/null; then
+            adduser --system --ingroup truthdb --no-create-home \
+                    --home /var/lib/truthdb --gecos "TruthDB service" \
+                    --shell /usr/sbin/nologin --quiet truthdb
+        fi
+
+        # Reload systemd so it sees the newly-installed unit, then enable + start it.
+        if [ -d /run/systemd/system ]; then
+            systemctl --system daemon-reload >/dev/null || true
+        fi
+        if [ -x /usr/bin/deb-systemd-helper ]; then
+            deb-systemd-helper enable truthdb.service >/dev/null || true
+        fi
+        if [ -d /run/systemd/system ] && [ -x /usr/bin/deb-systemd-invoke ]; then
+            if [ -z "$2" ]; then
+                # Fresh install.
+                deb-systemd-invoke start truthdb.service >/dev/null || true
+            else
+                # Upgrade ($2 is the previously-installed version) — restart so
+                # the new binary takes effect.
+                deb-systemd-invoke try-restart truthdb.service >/dev/null || true
+            fi
+        fi
+        ;;
+    abort-upgrade|abort-remove|abort-deconfigure)
+        ;;
+    *)
+        echo "postinst called with unknown argument \`$1'" >&2
+        exit 1
+        ;;
+esac
+
+exit 0

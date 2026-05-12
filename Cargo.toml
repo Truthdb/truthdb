@@ -2,6 +2,8 @@
 name = "truthdb"
 version = "0.1.0"
 edition = "2024"
+description = "TruthDB database service: io_uring-backed storage with a custom binary protocol on TCP/9623."
+license = "MIT"
 
 [workspace]
 members = [
@@ -44,3 +46,23 @@ debug = false
 
 [profile.dev.package.truthdb-core]
 debug = 2
+
+[package.metadata.deb]
+name = "truthdb-server"
+maintainer = "TruthDB Maintainers <contact@truthdb.io>"
+section = "database"
+priority = "optional"
+extended-description = """\
+TruthDB is a database service with io_uring-backed storage and a custom \
+binary protocol on TCP/9623. This package installs the truthdb daemon, its \
+hardened systemd unit, and a system user to run the service. Configuration \
+lives in /etc/truthdb/truthdb.toml; data lives in /var/lib/truthdb."""
+depends = "libc6 (>= 2.35), adduser, init-system-helpers (>= 1.52)"
+suggests = "truthdb-cli"
+assets = [
+    ["target/release/truthdb", "usr/bin/", "755"],
+    ["packaging/truthdb.service", "lib/systemd/system/", "644"],
+    ["packaging/truthdb.toml.example", "etc/truthdb/truthdb.toml", "644"],
+]
+conf-files = ["/etc/truthdb/truthdb.toml"]
+maintainer-scripts = "packaging/debian"

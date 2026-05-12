@@ -84,7 +84,7 @@ jobs:
           # Bundle both the executable and the systemd unit.
           tar czf "target/release/${ARCHIVE}" \
             -C target/release truthdb \
-            -C "${ROOT}" truthdb.service
+            -C "${ROOT}/packaging" truthdb.service
 
           # Keep a simple checksum file (binary checksum). Consumers may also checksum the archive.
           sha256sum target/release/truthdb > "target/release/${CHECKSUM}"
