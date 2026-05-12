@@ -308,7 +308,7 @@ async fn connect(addr: &str) -> Result<TcpStream> {
     let req = HelloReq {
         protocol_version: PROTOCOL_VERSION,
         client_name: "truthdb-bench".to_string(),
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        client_version: env!("TRUTHDB_VERSION").to_string(),
     };
 
     let frame = Frame {

@@ -63,6 +63,8 @@ jobs:
           echo "deb_version=$DEB_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build release binaries
+        env:
+          TRUTHDB_VERSION: ${{ steps.get_version.outputs.version }}
         run: cargo build --release --workspace
 
       - name: Build .deb packages
