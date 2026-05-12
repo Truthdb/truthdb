@@ -50,7 +50,17 @@ jobs:
 
       - name: Get version from tag
         id: get_version
-        run: echo "version=${GITHUB_REF#refs/tags/v}" >> "$GITHUB_OUTPUT"
+        # The Cargo.toml version is intentionally pinned at 0.1.0; releases are
+        # driven entirely by the git tag. Translate the tag into a Debian-valid
+        # version: strip the leading `v`, replace `-` with `~` so prereleases like
+        # v0.1.40-rc1 sort BEFORE v0.1.40 (apt uses `~` as a "less than" marker),
+        # then append `-1` as the Debian revision.
+        run: |
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF#refs/tags/v}"
+          DEB_VERSION="${TAG_VERSION//-/\~}-1"
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          echo "deb_version=$DEB_VERSION" >> "$GITHUB_OUTPUT"
 
       - name: Build release binaries
         run: cargo build --release --workspace
@@ -58,8 +68,9 @@ jobs:
       - name: Build .deb packages
         run: |
           set -euo pipefail
-          cargo deb -p truthdb --no-build
-          cargo deb -p truthdb-cli --no-build
+          DEB_VERSION="${{ steps.get_version.outputs.deb_version }}"
+          cargo deb -p truthdb --no-build --deb-version "$DEB_VERSION"
+          cargo deb -p truthdb-cli --no-build --deb-version "$DEB_VERSION"
           ls -la target/debian/
 
       - name: Lintian (warn-only)
