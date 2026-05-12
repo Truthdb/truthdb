@@ -24,7 +24,7 @@ impl Dispatcher {
                 let resp = HelloResp {
                     protocol_version: PROTOCOL_VERSION,
                     server_name: "truthdb".to_string(),
-                    server_version: env!("CARGO_PKG_VERSION").to_string(),
+                    server_version: env!("TRUTHDB_VERSION").to_string(),
                     capabilities: 0,
                 };
 

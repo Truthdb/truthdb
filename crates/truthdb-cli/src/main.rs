@@ -18,7 +18,7 @@ use truthdb_proto::{
 #[derive(Parser, Debug)]
 #[command(name = "truthdb-cli")]
 #[command(about = "Command-line client for TruthDB")]
-#[command(version)]
+#[command(version = env!("TRUTHDB_VERSION"))]
 struct Cli {
     /// Host of the TruthDB server.
     #[arg(long, env = "TRUTHDB_HOST")]
@@ -173,7 +173,7 @@ async fn send_hello(stream: &mut TcpStream) -> Result<()> {
     let req = HelloReq {
         protocol_version: PROTOCOL_VERSION,
         client_name: "truthdb-cli".to_string(),
-        client_version: env!("CARGO_PKG_VERSION").to_string(),
+        client_version: env!("TRUTHDB_VERSION").to_string(),
     };
 
     let frame = Frame {
