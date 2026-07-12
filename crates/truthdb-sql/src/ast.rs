@@ -28,6 +28,24 @@ pub enum Statement {
     },
     /// `SET` session option (XACT_ABORT / TRANSACTION ISOLATION LEVEL).
     Set(SetStatement),
+    /// `ALTER TABLE ...`.
+    AlterTable(AlterTable),
+}
+
+/// `ALTER TABLE <table> <action>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterTable {
+    pub table: Name,
+    pub action: AlterAction,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum AlterAction {
+    /// `ADD [CONSTRAINT name] CHECK (expr)`.
+    AddCheck(CheckConstraint),
+    /// `DROP CONSTRAINT <name>`.
+    DropConstraint(Name),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -150,8 +168,15 @@ pub struct Insert {
     pub table: Name,
     /// Explicit column list, or None for "all columns in table order".
     pub columns: Option<Vec<Name>>,
-    pub rows: Vec<Vec<Expr>>,
+    pub source: InsertSource,
     pub span: Span,
+}
+
+/// The rows an `INSERT` supplies: literal `VALUES` tuples or a `SELECT`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum InsertSource {
+    Values(Vec<Vec<Expr>>),
+    Select(Box<Select>),
 }
 
 #[derive(Debug, Clone, PartialEq)]

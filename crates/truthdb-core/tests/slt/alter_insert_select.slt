@@ -1,0 +1,46 @@
+# ALTER TABLE ADD/DROP CONSTRAINT + INSERT ... SELECT (Stage 10 part 2)
+
+statement ok
+CREATE TABLE src (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20), keep BIT)
+
+statement ok
+INSERT INTO src VALUES (1, 'a', 1), (2, 'b', 0), (3, 'c', 1)
+
+statement ok
+CREATE TABLE dst (id INT NOT NULL PRIMARY KEY, label NVARCHAR(20))
+
+# INSERT ... SELECT with a WHERE filter and projection.
+statement ok
+INSERT INTO dst (id, label) SELECT id, name FROM src WHERE keep = 1
+
+query IT
+SELECT id, label FROM dst ORDER BY id
+----
+1 a
+3 c
+
+# Column-count mismatch between the SELECT list and the insert list.
+statement error
+INSERT INTO dst (id) SELECT id, name FROM src
+
+# ADD CONSTRAINT validates existing rows and then enforces on new rows.
+statement ok
+ALTER TABLE dst ADD CONSTRAINT ck_id CHECK (id > 0)
+
+statement error
+INSERT INTO dst VALUES (-5, 'z')
+
+# ADD CONSTRAINT that an existing row violates is rejected.
+statement error
+ALTER TABLE dst ADD CONSTRAINT ck_big CHECK (id > 100)
+
+# DROP CONSTRAINT removes enforcement.
+statement ok
+ALTER TABLE dst DROP CONSTRAINT ck_id
+
+statement ok
+INSERT INTO dst VALUES (-5, 'z')
+
+# Dropping an unknown constraint errors.
+statement error
+ALTER TABLE dst DROP CONSTRAINT nope

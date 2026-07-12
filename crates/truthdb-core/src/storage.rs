@@ -1027,6 +1027,35 @@ impl Storage {
         Ok(Some(first))
     }
 
+    /// Replaces a table's CHECK constraints (ALTER TABLE ADD/DROP CONSTRAINT)
+    /// and persists the mutated catalog row. Undoable within its own statement.
+    pub(crate) fn rel_set_check_constraints(
+        &mut self,
+        name: &str,
+        check_constraints: Vec<catalog::CheckDef>,
+    ) -> Result<(), StorageError> {
+        self.file.ensure_rel_usable()?;
+        let mut def = self
+            .file
+            .rel
+            .tables
+            .get(name)
+            .cloned()
+            .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{name}'")))?;
+        def.check_constraints = check_constraints;
+        let catalog_root = self
+            .file
+            .rel
+            .catalog_root
+            .ok_or_else(|| StorageError::InvalidConfig("catalog root missing".to_string()))?;
+        let persisted = def.clone();
+        self.file.rel_statement(move |ctx, txn| {
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &persisted)
+        })?;
+        self.file.rel.tables.insert(name.to_string(), def);
+        Ok(())
+    }
+
     /// Test hook: run an insert's ops durably but never commit — the state a
     /// crash mid-statement leaves behind (loser transaction for recovery).
     #[cfg(test)]
