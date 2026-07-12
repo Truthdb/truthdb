@@ -16,3 +16,14 @@ group_sync_ms = 5
 backpressure_timeout_ms = 50
 snapshot_min_interval_ms = 1000
 snapshot_wal_threshold = 0.7
+
+# TDS (SQL Server protocol) gateway. Disabled by default. When enabled, real
+# SQL Server drivers (pytds, go-mssqldb with encrypt=disable) can connect.
+# [tds]
+# enabled = true
+# addr = "0.0.0.0"
+# port = 1433
+# database = "truthdb"
+#
+# [tds.auth]           # username = password (plaintext; TLS arrives in Stage 9)
+# sa = "change-me"

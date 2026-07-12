@@ -126,3 +126,98 @@ jobs:
           name: truthdb
           path: target/release/truthdb
           if-no-files-found: error
+
+  conformance:
+    name: TDS Conformance
+    runs-on: ubuntu-latest
+    container:
+      image: rust:1.92-bookworm
+      # io_uring at runtime needs the seccomp profile relaxed, same as tests.
+      options: --security-opt seccomp=unconfined
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: .cargo/registry
+          key: ${{ runner.os }}-cargo-registry-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache cargo index
+        uses: actions/cache@v4
+        with:
+          path: .cargo/git
+          key: ${{ runner.os }}-cargo-git-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache target directory
+        uses: actions/cache@v4
+        with:
+          path: target
+          key: ${{ runner.os }}-target-conformance-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build server
+        run: cargo build --release -p truthdb
+
+      - name: Install Python TDS driver (pytds)
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 python3-pip
+          pip install --break-system-packages python-tds==1.17.1
+
+      - name: Install Go
+        run: |
+          curl -fsSL https://go.dev/dl/go1.22.4.linux-amd64.tar.gz | tar -C /usr/local -xz
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+      - name: Configure and start server
+        run: |
+          mkdir -p /etc/truthdb /var/lib/truthdb
+          cat > /etc/truthdb/truthdb.toml <<'EOF'
+          [storage]
+          size_gib = 1
+
+          [tds]
+          enabled = true
+          addr = "127.0.0.1"
+          port = 1433
+          database = "truthdb"
+
+          [tds.auth]
+          sa = "secret"
+          EOF
+          STATE_DIRECTORY=/var/lib/truthdb ./target/release/truthdb &
+          echo $! > /tmp/truthdb.pid
+
+      - name: Wait for the TDS port
+        run: |
+          python3 - <<'EOF'
+          import socket, sys, time
+          for _ in range(60):
+              try:
+                  socket.create_connection(("127.0.0.1", 1433), timeout=1).close()
+                  sys.exit(0)
+              except OSError:
+                  time.sleep(0.5)
+          print("TDS port 1433 never opened", file=sys.stderr)
+          sys.exit(1)
+          EOF
+
+      - name: Conformance — pytds (Python)
+        run: python3 scripts/tds_conformance.py 127.0.0.1 1433 sa secret
+
+      - name: Conformance — go-mssqldb (Go)
+        run: |
+          repo="$PWD"
+          work="$(mktemp -d)"
+          cp "$repo/scripts/tds_conformance.go" "$work/main.go"
+          cd "$work"
+          go mod init conf
+          go get github.com/microsoft/go-mssqldb@v1.8.0
+          go run . 127.0.0.1 1433 sa secret
+
+      - name: Stop server
+        if: always()
+        run: |
+          if [ -f /tmp/truthdb.pid ]; then kill "$(cat /tmp/truthdb.pid)" || true; fi

@@ -1,5 +1,6 @@
 use directories::ProjectDirs;
 use serde::Deserialize;
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -10,6 +11,50 @@ pub struct Config {
 
     #[serde(default)]
     pub storage: StorageConfig,
+
+    #[serde(default)]
+    pub tds: TdsConfig,
+}
+
+/// TDS (SQL Server protocol) gateway settings. Disabled by default; when
+/// enabled it listens on `port` (default 1433) and authenticates against the
+/// `[tds.auth]` username→password map.
+#[derive(Debug, Deserialize)]
+pub struct TdsConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_addr")]
+    pub addr: String,
+
+    #[serde(default = "default_tds_port")]
+    pub port: u16,
+
+    #[serde(default = "default_tds_database")]
+    pub database: String,
+
+    #[serde(default)]
+    pub auth: HashMap<String, String>,
+}
+
+impl Default for TdsConfig {
+    fn default() -> Self {
+        TdsConfig {
+            enabled: false,
+            addr: default_addr(),
+            port: default_tds_port(),
+            database: default_tds_database(),
+            auth: HashMap::new(),
+        }
+    }
+}
+
+fn default_tds_port() -> u16 {
+    1433
+}
+
+fn default_tds_database() -> String {
+    "truthdb".to_string()
 }
 
 #[derive(Debug, Deserialize)]
@@ -234,6 +279,9 @@ fn apply_override(override_cfg: ConfigOverride, config: &mut Config) {
     if let Some(storage) = override_cfg.storage {
         apply_storage_override(&mut config.storage, storage);
     }
+    if let Some(tds) = override_cfg.tds {
+        apply_tds_override(&mut config.tds, tds);
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]
@@ -242,6 +290,34 @@ struct ConfigOverride {
     port: Option<u16>,
     network: Option<NetworkConfigOverride>,
     storage: Option<StorageConfigOverride>,
+    tds: Option<TdsConfigOverride>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+struct TdsConfigOverride {
+    enabled: Option<bool>,
+    addr: Option<String>,
+    port: Option<u16>,
+    database: Option<String>,
+    auth: Option<HashMap<String, String>>,
+}
+
+fn apply_tds_override(target: &mut TdsConfig, source: TdsConfigOverride) {
+    if let Some(enabled) = source.enabled {
+        target.enabled = enabled;
+    }
+    if let Some(addr) = source.addr {
+        target.addr = addr;
+    }
+    if let Some(port) = source.port {
+        target.port = port;
+    }
+    if let Some(database) = source.database {
+        target.database = database;
+    }
+    if let Some(auth) = source.auth {
+        target.auth = auth;
+    }
 }
 
 #[derive(Debug, Deserialize, Default)]

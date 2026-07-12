@@ -1,0 +1,13 @@
+[package]
+name = "truthdb-tds"
+version = "0.1.0"
+edition = "2024"
+description = "TruthDB TDS (Tabular Data Stream) gateway: a plaintext SQL Server-protocol front end on TCP/1433, so real SQL Server drivers (pymssql, go-mssqldb) can talk to TruthDB."
+license = "MIT"
+
+[dependencies]
+tokio = { workspace = true }
+tracing = { workspace = true }
+truthdb-core = { path = "../truthdb-core", version = "0.1.0" }
+
+[dev-dependencies]

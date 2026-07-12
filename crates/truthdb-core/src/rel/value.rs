@@ -6,26 +6,59 @@ use truthdb_sql::error::SqlError;
 
 use crate::relstore::types::{ColumnType, Datum};
 
-/// A projected result cell: the value used for evaluation/ordering and its
-/// rendered form (`None` = SQL NULL).
-#[derive(Debug, Clone)]
-pub struct Cell {
-    pub value: SqlValue,
-    pub display: Option<String>,
-}
-
-impl Cell {
-    pub fn from_datum(datum: &Datum, column_type: &ColumnType) -> Cell {
-        Cell {
-            value: datum_to_sql(datum),
-            display: datum_display(datum, column_type),
+/// Infers a concrete result column type for a projected (computed) column
+/// from its values across all rows: string wins (NVARCHAR sized to the
+/// widest), then float, then integer (BIGINT holds any i64), then bit; an
+/// all-NULL column defaults to INT.
+pub fn infer_type(values: &[SqlValue]) -> ColumnType {
+    let mut has_str = false;
+    let mut has_float = false;
+    let mut has_int = false;
+    let mut has_bool = false;
+    let mut max_len = 1usize;
+    for value in values {
+        match value {
+            SqlValue::Str(s) => {
+                has_str = true;
+                max_len = max_len.max(s.encode_utf16().count().max(1));
+            }
+            SqlValue::Float(_) => has_float = true,
+            SqlValue::Int(_) => has_int = true,
+            SqlValue::Bool(_) => has_bool = true,
+            SqlValue::Null => {}
         }
     }
-
-    pub fn from_sql(value: SqlValue) -> Cell {
-        let display = sql_display(&value);
-        Cell { value, display }
+    if has_str {
+        ColumnType::NVarChar {
+            max_len: max_len.min(4000) as u16,
+        }
+    } else if has_float {
+        ColumnType::Float
+    } else if has_int {
+        ColumnType::BigInt
+    } else if has_bool {
+        ColumnType::Bit
+    } else {
+        ColumnType::Int
     }
+}
+
+/// SQL value -> storage value using the value's own natural type (computed
+/// result columns): integers widen to BIGINT, strings to NVARCHAR. Pairs
+/// with [`infer_type`].
+pub fn sql_to_datum_loose(value: &SqlValue) -> Datum {
+    match value {
+        SqlValue::Null => Datum::Null,
+        SqlValue::Int(v) => Datum::BigInt(*v),
+        SqlValue::Float(v) => Datum::Float(*v),
+        SqlValue::Bool(v) => Datum::Bit(*v),
+        SqlValue::Str(s) => Datum::NVarChar(s.clone()),
+    }
+}
+
+/// Renders a datum to its result-cell display string (`None` = NULL).
+pub fn display(datum: &Datum, column_type: &ColumnType) -> Option<String> {
+    datum_display(datum, column_type)
 }
 
 /// Storage value -> SQL value for expression evaluation. Lossy for types the
@@ -156,16 +189,6 @@ fn datum_display(datum: &Datum, column_type: &ColumnType) -> Option<String> {
             serde_json::Value::String(s) => Some(s),
             other => Some(other.to_string()),
         },
-    }
-}
-
-fn sql_display(value: &SqlValue) -> Option<String> {
-    match value {
-        SqlValue::Null => None,
-        SqlValue::Bool(b) => Some(if *b { "1" } else { "0" }.to_string()),
-        SqlValue::Int(v) => Some(v.to_string()),
-        SqlValue::Float(v) => Some(format_float(*v)),
-        SqlValue::Str(s) => Some(s.clone()),
     }
 }
 
