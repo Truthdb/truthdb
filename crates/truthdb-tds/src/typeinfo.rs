@@ -1,8 +1,7 @@
-//! TDS TYPE_INFO and value codecs for the Stage 4 type set: INTN, BITN,
-//! FLTN, NVARCHAR, and BIGVARCHR (MS-TDS 2.2.5.4 / 2.2.5.5).
-//!
-//! Every Stage 3 result column maps to one of these nullable ("N") variants
-//! so a NULL is always representable.
+//! TDS TYPE_INFO and value codecs (MS-TDS 2.2.5.4 / 2.2.5.5). Covers INTN,
+//! BITN, FLTN, DECIMALN, DATE, DATETIME2, UNIQUEIDENTIFIER, NVARCHAR,
+//! BIGVARCHR, and BIGVARBINARY — one per storage column type. Nullable ("N")
+//! variants make a NULL always representable via a zero (or 0xFFFF) length.
 
 use truthdb_core::relstore::types::{ColumnType, Datum};
 
@@ -10,8 +9,13 @@ use truthdb_core::relstore::types::{ColumnType, Datum};
 const INTN: u8 = 0x26;
 const BITN: u8 = 0x68;
 const FLTN: u8 = 0x6d;
+const DECIMALN: u8 = 0x6a;
+const DATEN: u8 = 0x28;
+const DATETIME2N: u8 = 0x2a;
+const GUID: u8 = 0x24;
 const NVARCHAR: u8 = 0xe7;
 const BIGVARCHR: u8 = 0xa7;
+const BIGVARBINARY: u8 = 0xa5;
 
 /// A 5-byte collation for a Latin1-general, case-insensitive, accent-
 /// sensitive locale (LCID 0x0409, SortId 0x34 = code page 1252). Character
@@ -25,11 +29,16 @@ const MAX_USHORT_UCS2_UNITS: usize = 32767;
 /// The TDS type a result column is sent as.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TdsType {
-    Int(u8),   // INTN with max byte length 1/2/4/8
-    Bit,       // BITN
-    Float(u8), // FLTN with max byte length 4/8
+    Int(u8),         // INTN with max byte length 1/2/4/8
+    Bit,             // BITN
+    Float(u8),       // FLTN with max byte length 4/8
+    Decimal(u8, u8), // DECIMALN (precision, scale)
+    Date,            // DATEN
+    DateTime2,       // DATETIME2N (scale 7)
+    Guid,            // UNIQUEIDENTIFIER
     NVarChar(u16),
     VarChar(u16),
+    VarBinary(u16),
 }
 
 fn tds_type(column_type: &ColumnType) -> TdsType {
@@ -41,11 +50,26 @@ fn tds_type(column_type: &ColumnType) -> TdsType {
         ColumnType::Bit => TdsType::Bit,
         ColumnType::Real => TdsType::Float(4),
         ColumnType::Float => TdsType::Float(8),
+        ColumnType::Decimal { precision, scale } => TdsType::Decimal(*precision, *scale),
+        ColumnType::Date => TdsType::Date,
+        ColumnType::DateTime2 => TdsType::DateTime2,
+        ColumnType::UniqueIdentifier => TdsType::Guid,
         ColumnType::NVarChar { max_len } => TdsType::NVarChar((*max_len).max(1)),
         ColumnType::VarChar { max_len } => TdsType::VarChar((*max_len).max(1)),
-        // Types not producible by Stage 3/4 SQL fall back to NVARCHAR of the
-        // rendered text.
+        ColumnType::VarBinary { max_len } => TdsType::VarBinary((*max_len).max(1)),
+        // TIME (rare) falls back to NVARCHAR of its rendered text.
         _ => TdsType::NVarChar(4000),
+    }
+}
+
+/// Bytes a DECIMAL of `precision` occupies on the wire: 1 sign byte + magnitude
+/// (4/8/12/16 bytes by precision bucket).
+fn decimal_len(precision: u8) -> u8 {
+    match precision {
+        0..=9 => 5,
+        10..=19 => 9,
+        20..=28 => 13,
+        _ => 17,
     }
 }
 
@@ -64,6 +88,25 @@ pub fn encode_type_info(column_type: &ColumnType) -> Vec<u8> {
         TdsType::Float(len) => {
             out.push(FLTN);
             out.push(len);
+        }
+        TdsType::Decimal(precision, scale) => {
+            out.push(DECIMALN);
+            out.push(decimal_len(precision));
+            out.push(precision.max(1));
+            out.push(scale);
+        }
+        TdsType::Date => out.push(DATEN),
+        TdsType::DateTime2 => {
+            out.push(DATETIME2N);
+            out.push(7); // 100ns scale
+        }
+        TdsType::Guid => {
+            out.push(GUID);
+            out.push(16);
+        }
+        TdsType::VarBinary(max_len) => {
+            out.push(BIGVARBINARY);
+            out.extend_from_slice(&max_len.to_le_bytes());
         }
         TdsType::NVarChar(max_len) => {
             out.push(NVARCHAR);
@@ -114,6 +157,46 @@ pub fn encode_value(datum: &Datum, column_type: &ColumnType) -> Vec<u8> {
                 }
             }
             None => out.push(0),
+        },
+        TdsType::Decimal(precision, _) => match datum {
+            Datum::Decimal(unscaled) => {
+                let len = decimal_len(precision);
+                out.push(len);
+                out.push(if *unscaled >= 0 { 1 } else { 0 }); // sign
+                let mag = unscaled.unsigned_abs();
+                out.extend_from_slice(&mag.to_le_bytes()[..(len - 1) as usize]);
+            }
+            _ => out.push(0), // NULL
+        },
+        TdsType::Date => match datum {
+            Datum::Date(days) => {
+                out.push(3);
+                out.extend_from_slice(&days.to_le_bytes()[..3]);
+            }
+            _ => out.push(0),
+        },
+        TdsType::DateTime2 => match datum {
+            Datum::DateTime2(days, ticks) => {
+                out.push(8); // 5 time bytes (scale 7) + 3 date bytes
+                out.extend_from_slice(&ticks.to_le_bytes()[..5]);
+                out.extend_from_slice(&days.to_le_bytes()[..3]);
+            }
+            _ => out.push(0),
+        },
+        TdsType::Guid => match datum {
+            Datum::UniqueIdentifier(bytes) => {
+                out.push(16);
+                out.extend_from_slice(bytes);
+            }
+            _ => out.push(0),
+        },
+        TdsType::VarBinary(_) => match datum {
+            Datum::VarBinary(bytes) => {
+                let capped = &bytes[..bytes.len().min(u16::MAX as usize)];
+                out.extend_from_slice(&(capped.len() as u16).to_le_bytes());
+                out.extend_from_slice(capped);
+            }
+            _ => out.extend_from_slice(&0xffffu16.to_le_bytes()),
         },
         TdsType::NVarChar(_) => match string_value(datum) {
             Some(s) => {
@@ -302,5 +385,67 @@ mod tests {
         let declared = u16::from_le_bytes([value[0], value[1]]) as usize;
         assert_eq!(declared, MAX_USHORT_UCS2_UNITS * 2); // 65534
         assert_eq!(value.len(), 2 + declared);
+    }
+
+    #[test]
+    fn decimal_type_info_and_value() {
+        let ct = ColumnType::Decimal {
+            precision: 10,
+            scale: 2,
+        };
+        // DECIMALN token, max_len 9 (precision bucket 10-19), precision, scale.
+        assert_eq!(encode_type_info(&ct), vec![DECIMALN, 9, 10, 2]);
+        // 123.45 -> unscaled 12345, positive sign, LE magnitude in 8 bytes.
+        let value = encode_value(&Datum::Decimal(12345), &ct);
+        assert_eq!(value[0], 9); // length
+        assert_eq!(value[1], 1); // sign = positive
+        assert_eq!(&value[2..], &12345u64.to_le_bytes());
+        // Negative sign byte is 0.
+        let neg = encode_value(&Datum::Decimal(-12345), &ct);
+        assert_eq!(neg[1], 0);
+        assert_eq!(&neg[2..], &12345u64.to_le_bytes());
+        // NULL is a zero length.
+        assert_eq!(encode_value(&Datum::Null, &ct), vec![0]);
+    }
+
+    #[test]
+    fn date_and_datetime2_codecs() {
+        // DATE: bare token, value = len 3 + 3 LE date bytes.
+        assert_eq!(encode_type_info(&ColumnType::Date), vec![DATEN]);
+        let d = encode_value(&Datum::Date(738000), &ColumnType::Date);
+        assert_eq!(d[0], 3);
+        assert_eq!(&d[1..], &738000u32.to_le_bytes()[..3]);
+
+        // DATETIME2: token + scale 7; value = len 8 + 5 time + 3 date.
+        assert_eq!(
+            encode_type_info(&ColumnType::DateTime2),
+            vec![DATETIME2N, 7]
+        );
+        let dt = encode_value(&Datum::DateTime2(738000, 12345678), &ColumnType::DateTime2);
+        assert_eq!(dt[0], 8);
+        assert_eq!(&dt[1..6], &12345678u64.to_le_bytes()[..5]);
+        assert_eq!(&dt[6..9], &738000u32.to_le_bytes()[..3]);
+    }
+
+    #[test]
+    fn guid_codec() {
+        let bytes = [
+            0xff, 0x19, 0x96, 0x6f, 0x86, 0x8b, 0x11, 0xd0, 0xb4, 0x2d, 0x00, 0xc0, 0x4f, 0xc9,
+            0x64, 0xff,
+        ];
+        assert_eq!(
+            encode_type_info(&ColumnType::UniqueIdentifier),
+            vec![GUID, 16]
+        );
+        let value = encode_value(
+            &Datum::UniqueIdentifier(bytes),
+            &ColumnType::UniqueIdentifier,
+        );
+        assert_eq!(value[0], 16);
+        assert_eq!(&value[1..], &bytes);
+        assert_eq!(
+            encode_value(&Datum::Null, &ColumnType::UniqueIdentifier),
+            vec![0]
+        );
     }
 }
