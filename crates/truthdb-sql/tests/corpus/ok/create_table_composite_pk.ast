@@ -24,6 +24,9 @@
                         false,
                     ),
                     primary_key: false,
+                    default: None,
+                    identity: None,
+                    collation: None,
                     span: Span {
                         start: 31,
                         end: 52,
@@ -43,6 +46,9 @@
                         false,
                     ),
                     primary_key: false,
+                    default: None,
+                    identity: None,
+                    collation: None,
                     span: Span {
                         start: 58,
                         end: 83,
@@ -60,6 +66,9 @@
                     data_type: Int,
                     nullable: None,
                     primary_key: false,
+                    default: None,
+                    identity: None,
+                    collation: None,
                     span: Span {
                         start: 89,
                         end: 96,

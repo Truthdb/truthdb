@@ -2,11 +2,11 @@
     CreateTable(
         CreateTable {
             table: Name {
-                value: "products",
+                value: "items",
                 quoted: false,
                 span: Span {
                     start: 13,
-                    end: 21,
+                    end: 18,
                 },
             },
             columns: [
@@ -15,8 +15,8 @@
                         value: "id",
                         quoted: false,
                         span: Span {
-                            start: 28,
-                            end: 30,
+                            start: 25,
+                            end: 27,
                         },
                     },
                     data_type: Int,
@@ -25,35 +25,40 @@
                     ),
                     primary_key: true,
                     default: None,
-                    identity: None,
+                    identity: Some(
+                        Identity {
+                            seed: 1,
+                            increment: 1,
+                        },
+                    ),
                     collation: None,
                     span: Span {
-                        start: 28,
-                        end: 55,
+                        start: 25,
+                        end: 67,
                     },
                 },
                 ColumnDef {
                     name: Name {
-                        value: "name",
+                        value: "code",
                         quoted: false,
                         span: Span {
-                            start: 61,
-                            end: 65,
+                            start: 73,
+                            end: 77,
                         },
                     },
-                    data_type: NVarChar(
-                        50,
+                    data_type: VarChar(
+                        20,
                     ),
-                    nullable: Some(
-                        false,
-                    ),
+                    nullable: None,
                     primary_key: false,
                     default: None,
                     identity: None,
-                    collation: None,
+                    collation: Some(
+                        "Finnish_Swedish_CI_AS",
+                    ),
                     span: Span {
-                        start: 61,
-                        end: 87,
+                        start: 73,
+                        end: 119,
                     },
                 },
                 ColumnDef {
@@ -61,41 +66,64 @@
                         value: "price",
                         quoted: false,
                         span: Span {
-                            start: 93,
-                            end: 98,
+                            start: 125,
+                            end: 130,
                         },
                     },
-                    data_type: Float,
-                    nullable: Some(
-                        true,
-                    ),
+                    data_type: Decimal {
+                        precision: 10,
+                        scale: 2,
+                    },
+                    nullable: None,
                     primary_key: false,
-                    default: None,
+                    default: Some(
+                        "0",
+                    ),
                     identity: None,
                     collation: None,
                     span: Span {
-                        start: 93,
-                        end: 109,
+                        start: 125,
+                        end: 155,
                     },
                 },
                 ColumnDef {
                     name: Name {
-                        value: "in_stock",
+                        value: "created",
                         quoted: false,
                         span: Span {
-                            start: 115,
-                            end: 123,
+                            start: 161,
+                            end: 168,
                         },
                     },
-                    data_type: Bit,
+                    data_type: DateTime2,
                     nullable: None,
                     primary_key: false,
                     default: None,
                     identity: None,
                     collation: None,
                     span: Span {
-                        start: 115,
-                        end: 127,
+                        start: 161,
+                        end: 178,
+                    },
+                },
+                ColumnDef {
+                    name: Name {
+                        value: "tag",
+                        quoted: false,
+                        span: Span {
+                            start: 184,
+                            end: 187,
+                        },
+                    },
+                    data_type: UniqueIdentifier,
+                    nullable: None,
+                    primary_key: false,
+                    default: None,
+                    identity: None,
+                    collation: None,
+                    span: Span {
+                        start: 184,
+                        end: 204,
                     },
                 },
             ],
@@ -104,14 +132,14 @@
                     value: "id",
                     quoted: false,
                     span: Span {
-                        start: 28,
-                        end: 30,
+                        start: 25,
+                        end: 27,
                     },
                 },
             ],
             span: Span {
                 start: 0,
-                end: 129,
+                end: 206,
             },
         },
     ),

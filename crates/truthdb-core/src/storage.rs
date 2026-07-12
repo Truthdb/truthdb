@@ -10,7 +10,7 @@ use crate::relstore::btree::{BTree, TreeInsert};
 use crate::relstore::buffer_pool::DEFAULT_CAPACITY_BYTES;
 use crate::relstore::catalog::{self, FIRST_USER_OBJECT_ID, TableDef};
 use crate::relstore::ctx::{OpMode, PoolIo, RelCtx, TxnLink};
-use crate::relstore::heap::Heap;
+use crate::relstore::heap::{Heap, Rid};
 use crate::relstore::key::encode_key;
 use crate::relstore::recovery as rel_recovery;
 use crate::relstore::row::{Column, Schema, decode_row, encode_row};
@@ -207,6 +207,8 @@ impl Storage {
         name: &str,
         columns: Vec<Column>,
         key_names: &[String],
+        defaults: Vec<Option<String>>,
+        identity: Option<catalog::IdentitySpec>,
     ) -> Result<(), StorageError> {
         self.file.ensure_rel_usable()?;
         if self.file.rel.tables.contains_key(name) {
@@ -251,6 +253,7 @@ impl Storage {
             .iter()
             .map(|c| (c.name.clone(), c.column_type.name(), c.nullable))
             .collect();
+        let collations: Vec<Option<String>> = columns.iter().map(|c| c.collation.clone()).collect();
         let table_name = name.to_string();
         let is_tree = !key_columns.is_empty();
 
@@ -266,6 +269,9 @@ impl Storage {
                 columns: def_columns,
                 key_columns,
                 root_page,
+                defaults,
+                collations,
+                identity,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
@@ -592,6 +598,207 @@ impl Storage {
         }
     }
 
+    /// Full scan returning each row with an opaque locator that addresses it
+    /// for a later targeted delete/update. The caller filters the whole
+    /// materialized set before any mutation, so this is Halloween-safe by
+    /// construction (matched targets are chosen from a snapshot of the table).
+    pub(crate) fn rel_scan_located(
+        &mut self,
+        name: &str,
+    ) -> Result<Vec<(RowLocator, Vec<Datum>)>, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(name)?;
+        let mut ctx = self.file.rel_ctx();
+        let mut out = Vec::new();
+        if def.is_tree() {
+            let tree = BTree {
+                object_id: def.object_id,
+                root: def.root_page,
+            };
+            for (key, row) in tree.scan(&mut ctx)? {
+                out.push((RowLocator::Key(key), decode_row(&schema, &row)?));
+            }
+        } else {
+            let heap = Heap {
+                object_id: def.object_id,
+                first_page: def.root_page,
+            };
+            for (rid, row) in heap.scan(&mut ctx)? {
+                out.push((RowLocator::Rid(rid), decode_row(&schema, &row)?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// Deletes the located rows in one atomic statement; returns the count.
+    pub(crate) fn rel_delete_located(
+        &mut self,
+        name: &str,
+        locators: Vec<RowLocator>,
+    ) -> Result<usize, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let (def, _schema) = self.rel_def(name)?;
+        let count = locators.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        if def.is_tree() {
+            let tree = BTree {
+                object_id: def.object_id,
+                root: def.root_page,
+            };
+            self.file.rel_statement(move |ctx, txn| {
+                for loc in &locators {
+                    if let RowLocator::Key(key) = loc {
+                        tree.delete(ctx, &mut OpMode::Txn(txn), key)?;
+                    }
+                }
+                Ok(())
+            })?;
+        } else {
+            let heap = Heap {
+                object_id: def.object_id,
+                first_page: def.root_page,
+            };
+            self.file.rel_statement(move |ctx, txn| {
+                for loc in &locators {
+                    if let RowLocator::Rid(rid) = loc {
+                        heap.delete(ctx, txn, *rid)?;
+                    }
+                }
+                Ok(())
+            })?;
+        }
+        Ok(count)
+    }
+
+    /// Applies full-row updates (each already type-checked and NOT-NULL-checked
+    /// by the caller) in one atomic statement. For a clustered table a row
+    /// whose key changed is re-keyed (delete + insert with uniqueness
+    /// enforced); heaps update in place by RID. Returns the count.
+    pub(crate) fn rel_update_located(
+        &mut self,
+        name: &str,
+        updates: Vec<(RowLocator, Vec<Datum>)>,
+    ) -> Result<usize, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(name)?;
+        let count = updates.len();
+        if count == 0 {
+            return Ok(0);
+        }
+        if def.is_tree() {
+            let tree = BTree {
+                object_id: def.object_id,
+                root: def.root_page,
+            };
+            // Partition into in-place (key unchanged) and re-key (key changed).
+            let mut in_place: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+            let mut rekey: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+            for (loc, values) in updates {
+                let RowLocator::Key(old_key) = loc else {
+                    return Err(StorageError::InvalidConfig(
+                        "expected key locator for clustered table".to_string(),
+                    ));
+                };
+                validate_not_null(&schema, &values)?;
+                let row = encode_row(&schema, &values)?;
+                let new_key = encode_key(&schema, &def.key_columns, &values)?;
+                if new_key == old_key {
+                    in_place.push((old_key, row));
+                } else {
+                    rekey.push((old_key, new_key, row));
+                }
+            }
+            self.file.rel_statement(move |ctx, txn| {
+                // Delete all re-keyed olds first so a new key may reuse one.
+                for (old_key, _, _) in &rekey {
+                    tree.delete(ctx, &mut OpMode::Txn(txn), old_key)?;
+                }
+                for (_, new_key, row) in &rekey {
+                    match tree.insert_unique(ctx, &mut OpMode::Txn(txn), new_key, row)? {
+                        TreeInsert::Inserted => {}
+                        TreeInsert::DuplicateKey => {
+                            return Err(StorageError::Constraint(
+                                "duplicate primary key".to_string(),
+                            ));
+                        }
+                    }
+                }
+                for (key, row) in &in_place {
+                    tree.update(ctx, &mut OpMode::Txn(txn), key, row)?;
+                }
+                Ok(())
+            })?;
+        } else {
+            let heap = Heap {
+                object_id: def.object_id,
+                first_page: def.root_page,
+            };
+            let mut encoded: Vec<(Rid, Vec<u8>)> = Vec::with_capacity(count);
+            for (loc, values) in updates {
+                let RowLocator::Rid(rid) = loc else {
+                    return Err(StorageError::InvalidConfig(
+                        "expected rid locator for heap".to_string(),
+                    ));
+                };
+                validate_not_null(&schema, &values)?;
+                encoded.push((rid, encode_row(&schema, &values)?));
+            }
+            self.file.rel_statement(move |ctx, txn| {
+                for (rid, row) in &encoded {
+                    heap.update(ctx, txn, *rid, row)?;
+                }
+                Ok(())
+            })?;
+        }
+        Ok(count)
+    }
+
+    /// Reserves `count` identity values for a table's IDENTITY column,
+    /// advancing and persisting the counter in its own committed statement so
+    /// the values survive a crash and are never reused. Returns the first
+    /// value; the caller steps subsequent rows by `increment`. Returns `None`
+    /// if the table has no identity column.
+    pub(crate) fn rel_reserve_identity(
+        &mut self,
+        name: &str,
+        count: usize,
+    ) -> Result<Option<i64>, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let mut def = self
+            .file
+            .rel
+            .tables
+            .get(name)
+            .cloned()
+            .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{name}'")))?;
+        let Some(mut spec) = def.identity else {
+            return Ok(None);
+        };
+        let first = spec.next;
+        if count > 0 {
+            let advance = (count as i64)
+                .checked_mul(spec.increment)
+                .and_then(|delta| spec.next.checked_add(delta))
+                .ok_or_else(|| {
+                    StorageError::InvalidConfig("identity value overflow".to_string())
+                })?;
+            spec.next = advance;
+            def.identity = Some(spec);
+            let catalog_root =
+                self.file.rel.catalog_root.ok_or_else(|| {
+                    StorageError::InvalidConfig("catalog root missing".to_string())
+                })?;
+            let persisted = def.clone();
+            self.file.rel_statement(move |ctx, txn| {
+                catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &persisted)
+            })?;
+            self.file.rel.tables.insert(name.to_string(), def);
+        }
+        Ok(Some(first))
+    }
+
     /// Test hook: run an insert's ops durably but never commit — the state a
     /// crash mid-statement leaves behind (loser transaction for recovery).
     #[cfg(test)]
@@ -684,6 +891,14 @@ fn validate_not_null(schema: &Schema, values: &[Datum]) -> Result<(), StorageErr
         }
     }
     Ok(())
+}
+
+/// Opaque handle to a stored row, addressing it for a targeted UPDATE/DELETE.
+/// Clustered tables locate by encoded PK key; heaps by RID.
+#[derive(Debug, Clone)]
+pub(crate) enum RowLocator {
+    Key(Vec<u8>),
+    Rid(Rid),
 }
 
 pub struct SnapshotData {

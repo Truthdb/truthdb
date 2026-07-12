@@ -20,6 +20,9 @@ const MAX_EXPR_DEPTH: usize = 64;
 const MAX_EXPR_NODES: usize = 2000;
 
 pub struct Parser {
+    /// The original SQL source, for slicing sub-expression text (e.g. a
+    /// column DEFAULT) by span.
+    src: String,
     tokens: Vec<Token>,
     pos: usize,
     /// Current expression recursion depth.
@@ -30,15 +33,25 @@ pub struct Parser {
 
 impl Parser {
     /// Builds a parser over an already-tokenized batch (the token stream
-    /// always ends with an `Eof` token).
-    pub fn from_tokens(tokens: Vec<Token>) -> Self {
+    /// always ends with an `Eof` token). `src` is the original SQL the tokens
+    /// were produced from, used to recover sub-expression source text.
+    pub fn from_tokens(src: &str, tokens: Vec<Token>) -> Self {
         debug_assert!(tokens.last().map(|t| &t.kind) == Some(&TokenKind::Eof));
         Parser {
+            src: src.to_string(),
             tokens,
             pos: 0,
             depth: 0,
             nodes: 0,
         }
+    }
+
+    /// The source text covered by `span`.
+    fn slice(&self, span: Span) -> String {
+        self.src
+            .get(span.start..span.end)
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn too_deep() -> SqlError {
@@ -60,7 +73,17 @@ impl Parser {
     /// Convenience for tests: tokenize then parse.
     #[cfg(test)]
     pub fn parse_str(sql: &str) -> SqlResult<Vec<Statement>> {
-        Parser::from_tokens(crate::lexer::Lexer::new(sql).tokenize()?).parse_statements()
+        Parser::from_tokens(sql, crate::lexer::Lexer::new(sql).tokenize()?).parse_statements()
+    }
+
+    /// Parses exactly one expression followed by EOF (for a re-parsed DEFAULT).
+    pub fn parse_single_expr(mut self) -> SqlResult<Expr> {
+        let expr = self.parse_expr()?;
+        if !self.at_eof() {
+            let token = self.peek().clone();
+            return Err(SqlError::syntax(self.token_text(&token), token.span));
+        }
+        Ok(expr)
     }
 
     /// Parses a whole batch of `;`-separated statements.
@@ -85,6 +108,8 @@ impl Parser {
             Some("CREATE") => self.parse_create_table(),
             Some("DROP") => self.parse_drop_table(),
             Some("INSERT") => self.parse_insert(),
+            Some("UPDATE") => self.parse_update(),
+            Some("DELETE") => self.parse_delete(),
             Some("SELECT") => Ok(Statement::Select(self.parse_select()?)),
             _ => {
                 let token = self.peek().clone();
@@ -152,6 +177,9 @@ impl Parser {
         let (data_type, type_span) = self.parse_data_type()?;
         let mut nullable = None;
         let mut primary_key = false;
+        let mut default = None;
+        let mut identity = None;
+        let mut collation = None;
         let mut end = type_span;
         loop {
             match self.peek_keyword().as_deref() {
@@ -173,6 +201,24 @@ impl Parser {
                         nullable = Some(false);
                     }
                 }
+                Some("DEFAULT") => {
+                    self.bump();
+                    let expr = self.parse_expr()?;
+                    end = expr.span;
+                    default = Some(self.slice(expr.span));
+                }
+                Some("IDENTITY") => {
+                    self.bump();
+                    let (id, id_end) = self.parse_identity(type_span)?;
+                    end = id_end;
+                    identity = Some(id);
+                }
+                Some("COLLATE") => {
+                    self.bump();
+                    let coll = self.parse_ident()?;
+                    end = coll.span;
+                    collation = Some(coll.value);
+                }
                 _ => break,
             }
         }
@@ -182,7 +228,25 @@ impl Parser {
             data_type,
             nullable,
             primary_key,
+            default,
+            identity,
+            collation,
         })
+    }
+
+    /// Parses an optional `(seed, increment)` after the IDENTITY keyword.
+    /// Bare `IDENTITY` defaults to `(1, 1)`, as in SQL Server.
+    fn parse_identity(&mut self, fallback: Span) -> SqlResult<(Identity, Span)> {
+        let mut seed = 1i64;
+        let mut increment = 1i64;
+        let mut end = fallback;
+        if self.eat(&TokenKind::LParen) {
+            seed = self.parse_i64_literal()?;
+            self.expect(&TokenKind::Comma)?;
+            increment = self.parse_i64_literal()?;
+            end = self.expect(&TokenKind::RParen)?;
+        }
+        Ok((Identity { seed, increment }, end))
     }
 
     fn parse_data_type(&mut self) -> SqlResult<(DataType, Span)> {
@@ -212,7 +276,16 @@ impl Parser {
             "INT" | "INTEGER" => DataType::Int,
             "BIGINT" => DataType::BigInt,
             "BIT" => DataType::Bit,
-            "FLOAT" | "REAL" => DataType::Float,
+            "REAL" => DataType::Real,
+            "FLOAT" => DataType::Float,
+            "DATE" => DataType::Date,
+            "TIME" => DataType::Time,
+            "DATETIME2" => DataType::DateTime2,
+            "UNIQUEIDENTIFIER" => DataType::UniqueIdentifier,
+            "DECIMAL" | "NUMERIC" => {
+                let (precision, scale, end) = self.parse_decimal_args(span)?;
+                return Ok((DataType::Decimal { precision, scale }, span.to(end)));
+            }
             "VARCHAR" | "CHAR" => {
                 let (n, end) = with_len(self, 1)?;
                 return Ok((DataType::VarChar(n), span.to(end)));
@@ -220,6 +293,10 @@ impl Parser {
             "NVARCHAR" | "NCHAR" => {
                 let (n, end) = with_len(self, 1)?;
                 return Ok((DataType::NVarChar(n), span.to(end)));
+            }
+            "VARBINARY" | "BINARY" => {
+                let (n, end) = with_len(self, 1)?;
+                return Ok((DataType::VarBinary(n), span.to(end)));
             }
             other => {
                 return Err(SqlError::message_only(
@@ -230,6 +307,32 @@ impl Parser {
             }
         };
         Ok((data_type, span))
+    }
+
+    /// Parses an optional `(precision[, scale])` for DECIMAL/NUMERIC. Defaults
+    /// to `(18, 0)` (SQL Server's), validating p in 1..=38 and s <= p (error
+    /// 2749/2750-style range messages folded into a 102 for simplicity).
+    fn parse_decimal_args(&mut self, span: Span) -> SqlResult<(u8, u8, Span)> {
+        let mut precision: u32 = 18;
+        let mut scale: u32 = 0;
+        let mut end = span;
+        if self.eat(&TokenKind::LParen) {
+            precision = self.parse_u32_literal()?;
+            if self.eat(&TokenKind::Comma) {
+                scale = self.parse_u32_literal()?;
+            }
+            end = self.expect(&TokenKind::RParen)?;
+        }
+        if precision == 0 || precision > 38 || scale > precision {
+            return Err(SqlError::message_only(
+                2749,
+                format!(
+                    "The precision {precision} and scale {scale} are invalid (precision 1..=38, scale <= precision)."
+                ),
+            )
+            .at(span));
+        }
+        Ok((precision as u8, scale as u8, end))
     }
 
     // ---- DROP TABLE -----------------------------------------------------
@@ -302,6 +405,59 @@ impl Parser {
             columns,
             rows,
         }))
+    }
+
+    // ---- UPDATE ---------------------------------------------------------
+
+    fn parse_update(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("UPDATE")?;
+        let table = self.parse_name()?;
+        self.expect_keyword("SET")?;
+        let mut assignments = Vec::new();
+        loop {
+            let column = self.parse_name()?;
+            self.expect(&TokenKind::Eq)?;
+            let value = self.parse_expr()?;
+            assignments.push(Assignment { column, value });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let where_clause = self.parse_optional_where()?;
+        let end = self.prev_span();
+        Ok(Statement::Update(Update {
+            span: start.to(end),
+            table,
+            assignments,
+            where_clause,
+        }))
+    }
+
+    // ---- DELETE ---------------------------------------------------------
+
+    fn parse_delete(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("DELETE")?;
+        // Optional FROM.
+        if self.peek_keyword().as_deref() == Some("FROM") {
+            self.bump();
+        }
+        let table = self.parse_name()?;
+        let where_clause = self.parse_optional_where()?;
+        let end = self.prev_span();
+        Ok(Statement::Delete(Delete {
+            span: start.to(end),
+            table,
+            where_clause,
+        }))
+    }
+
+    fn parse_optional_where(&mut self) -> SqlResult<Option<Expr>> {
+        if self.peek_keyword().as_deref() == Some("WHERE") {
+            self.bump();
+            Ok(Some(self.parse_expr()?))
+        } else {
+            Ok(None)
+        }
     }
 
     // ---- SELECT ---------------------------------------------------------
@@ -670,6 +826,20 @@ impl Parser {
         let value = self.parse_u64_literal()?;
         u32::try_from(value)
             .map_err(|_| SqlError::message_only(1073, "Length value is out of range."))
+    }
+
+    /// Parses a signed integer literal (optional leading `-`), for IDENTITY
+    /// seed/increment.
+    fn parse_i64_literal(&mut self) -> SqlResult<i64> {
+        let negative = self.eat(&TokenKind::Minus);
+        let token = self.peek().clone();
+        match token.kind {
+            TokenKind::Int(v) => {
+                self.bump();
+                Ok(if negative { -v } else { v })
+            }
+            _ => Err(SqlError::syntax(self.token_text(&token), token.span)),
+        }
     }
 
     fn parse_u64_literal(&mut self) -> SqlResult<u64> {

@@ -8,6 +8,8 @@ pub enum Statement {
     CreateTable(CreateTable),
     DropTable(DropTable),
     Insert(Insert),
+    Update(Update),
+    Delete(Delete),
     Select(Select),
 }
 
@@ -27,7 +29,21 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub nullable: Option<bool>,
     pub primary_key: bool,
+    /// `DEFAULT <expr>` source text — re-parsed and evaluated at INSERT so a
+    /// non-constant default (e.g. a niladic function) is applied per row.
+    pub default: Option<String>,
+    /// `IDENTITY(seed, increment)` — server-generated values.
+    pub identity: Option<Identity>,
+    /// `COLLATE <name>` on a character column.
+    pub collation: Option<String>,
     pub span: Span,
+}
+
+/// `IDENTITY(seed, increment)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity {
+    pub seed: i64,
+    pub increment: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,9 +53,16 @@ pub enum DataType {
     Int,
     BigInt,
     Bit,
+    Real,
     Float,
+    Decimal { precision: u8, scale: u8 },
+    Date,
+    Time,
+    DateTime2,
+    UniqueIdentifier,
     VarChar(u32),
     NVarChar(u32),
+    VarBinary(u32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +78,28 @@ pub struct Insert {
     /// Explicit column list, or None for "all columns in table order".
     pub columns: Option<Vec<Name>>,
     pub rows: Vec<Vec<Expr>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Update {
+    pub table: Name,
+    /// `SET col = expr` assignments, in source order.
+    pub assignments: Vec<Assignment>,
+    pub where_clause: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assignment {
+    pub column: Name,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delete {
+    pub table: Name,
+    pub where_clause: Option<Expr>,
     pub span: Span,
 }
 

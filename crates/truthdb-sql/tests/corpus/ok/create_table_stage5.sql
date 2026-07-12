@@ -1,0 +1,7 @@
+CREATE TABLE items (
+    id INT NOT NULL PRIMARY KEY IDENTITY(1, 1),
+    code VARCHAR(20) COLLATE Finnish_Swedish_CI_AS,
+    price DECIMAL(10, 2) DEFAULT 0,
+    created DATETIME2,
+    tag UNIQUEIDENTIFIER
+)

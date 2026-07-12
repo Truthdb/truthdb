@@ -1,0 +1,45 @@
+[
+    Delete(
+        Delete {
+            table: Name {
+                value: "products",
+                quoted: false,
+                span: Span {
+                    start: 12,
+                    end: 20,
+                },
+            },
+            where_clause: Some(
+                Expr {
+                    kind: IsNull {
+                        expr: Expr {
+                            kind: Column(
+                                Name {
+                                    value: "price",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 27,
+                                        end: 32,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 27,
+                                end: 32,
+                            },
+                        },
+                        negated: false,
+                    },
+                    span: Span {
+                        start: 27,
+                        end: 40,
+                    },
+                },
+            ),
+            span: Span {
+                start: 0,
+                end: 40,
+            },
+        },
+    ),
+]

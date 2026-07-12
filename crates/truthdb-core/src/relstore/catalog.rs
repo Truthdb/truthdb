@@ -19,6 +19,17 @@ pub const CATALOG_OBJECT_ID: u32 = 1;
 /// First object id handed to user tables.
 pub const FIRST_USER_OBJECT_ID: u32 = 2;
 
+/// An `IDENTITY(seed, increment)` column: which column it is (schema index),
+/// its seed/increment, and the next value to hand out (persisted so identity
+/// values continue across restarts and are never reused after DELETE).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct IdentitySpec {
+    pub column: usize,
+    pub seed: i64,
+    pub increment: i64,
+    pub next: i64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub object_id: u32,
@@ -29,6 +40,15 @@ pub struct TableDef {
     pub key_columns: Vec<usize>,
     /// Tree root page or heap first page.
     pub root_page: u64,
+    /// Per-column `DEFAULT` source text (parallel to `columns`; empty = none).
+    #[serde(default)]
+    pub defaults: Vec<Option<String>>,
+    /// Per-column collation name (parallel to `columns`; empty = default).
+    #[serde(default)]
+    pub collations: Vec<Option<String>>,
+    /// The single IDENTITY column, if any.
+    #[serde(default)]
+    pub identity: Option<IdentitySpec>,
 }
 
 impl TableDef {
@@ -36,12 +56,14 @@ impl TableDef {
         let columns = self
             .columns
             .iter()
-            .map(|(name, spec, nullable)| {
+            .enumerate()
+            .map(|(i, (name, spec, nullable))| {
                 Ok(Column {
                     name: name.clone(),
                     column_type: ColumnType::parse(spec)
                         .map_err(|err| StorageError::InvalidFile(err.to_string()))?,
                     nullable: *nullable,
+                    collation: self.collations.get(i).cloned().flatten(),
                 })
             })
             .collect::<Result<Vec<_>, StorageError>>()?;
@@ -50,6 +72,11 @@ impl TableDef {
 
     pub fn is_tree(&self) -> bool {
         !self.key_columns.is_empty()
+    }
+
+    /// The DEFAULT source text for column `index`, if any.
+    pub fn default_for(&self, index: usize) -> Option<&str> {
+        self.defaults.get(index).and_then(|d| d.as_deref())
     }
 }
 
@@ -106,6 +133,21 @@ pub(crate) fn insert_table(
             def.object_id
         ))),
     }
+}
+
+/// Overwrites an existing table's catalog row in place (same object id/key),
+/// used to persist a mutated IDENTITY counter. Undoable within the statement.
+pub(crate) fn update_table(
+    ctx: &mut RelCtx<'_>,
+    mode: &mut OpMode<'_>,
+    catalog_root: u64,
+    def: &TableDef,
+) -> Result<(), StorageError> {
+    let row = serde_json::to_vec(def)
+        .map_err(|err| StorageError::InvalidFile(format!("encode catalog row: {err}")))?;
+    let tree = catalog_tree(catalog_root);
+    tree.update(ctx, mode, &catalog_key(def.object_id), &row)?;
+    Ok(())
 }
 
 /// Removes a table's catalog row. Stage 3 does a *logical* drop: the row is
