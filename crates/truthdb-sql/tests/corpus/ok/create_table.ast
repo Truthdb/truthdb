@@ -1,0 +1,106 @@
+[
+    CreateTable(
+        CreateTable {
+            table: Name {
+                value: "products",
+                quoted: false,
+                span: Span {
+                    start: 13,
+                    end: 21,
+                },
+            },
+            columns: [
+                ColumnDef {
+                    name: Name {
+                        value: "id",
+                        quoted: false,
+                        span: Span {
+                            start: 28,
+                            end: 30,
+                        },
+                    },
+                    data_type: Int,
+                    nullable: Some(
+                        false,
+                    ),
+                    primary_key: true,
+                    span: Span {
+                        start: 28,
+                        end: 55,
+                    },
+                },
+                ColumnDef {
+                    name: Name {
+                        value: "name",
+                        quoted: false,
+                        span: Span {
+                            start: 61,
+                            end: 65,
+                        },
+                    },
+                    data_type: NVarChar(
+                        50,
+                    ),
+                    nullable: Some(
+                        false,
+                    ),
+                    primary_key: false,
+                    span: Span {
+                        start: 61,
+                        end: 87,
+                    },
+                },
+                ColumnDef {
+                    name: Name {
+                        value: "price",
+                        quoted: false,
+                        span: Span {
+                            start: 93,
+                            end: 98,
+                        },
+                    },
+                    data_type: Float,
+                    nullable: Some(
+                        true,
+                    ),
+                    primary_key: false,
+                    span: Span {
+                        start: 93,
+                        end: 109,
+                    },
+                },
+                ColumnDef {
+                    name: Name {
+                        value: "in_stock",
+                        quoted: false,
+                        span: Span {
+                            start: 115,
+                            end: 123,
+                        },
+                    },
+                    data_type: Bit,
+                    nullable: None,
+                    primary_key: false,
+                    span: Span {
+                        start: 115,
+                        end: 127,
+                    },
+                },
+            ],
+            primary_key: [
+                Name {
+                    value: "id",
+                    quoted: false,
+                    span: Span {
+                        start: 28,
+                        end: 30,
+                    },
+                },
+            ],
+            span: Span {
+                start: 0,
+                end: 129,
+            },
+        },
+    ),
+]

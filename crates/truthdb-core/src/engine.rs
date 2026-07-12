@@ -4,8 +4,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
-use crate::relstore::row::{Column, Schema};
-use crate::relstore::types::{ColumnType, Datum};
 use crate::storage::{Storage, StorageError};
 
 const ENGINE_WAL_ENTRY_VERSION: u16 = 1;
@@ -63,7 +61,16 @@ impl Engine {
     }
 
     pub fn execute(&mut self, input: &str) -> Result<String, EngineError> {
+        // Routing: the legacy ES commands all carry a `{` JSON body; that
+        // shape routes to the frozen search path. Everything else is SQL.
         match parse_command(input)? {
+            Some(command) => self.execute_es(command),
+            None => self.execute_sql(input),
+        }
+    }
+
+    fn execute_es(&mut self, command: Command) -> Result<String, EngineError> {
+        match command {
             Command::CreateIndex { name, mappings } => {
                 self.validate_create_index(&name, &mappings)?;
                 let event = WalEvent::CreateIndex {
@@ -108,68 +115,17 @@ impl Engine {
                     }
                 }))
             }
-            Command::Table(table_command) => self.execute_table(table_command),
         }
     }
 
-    /// Temporary Stage 2 debug surface over the relational store; replaced
-    /// by SQL in Stage 3.
-    fn execute_table(&mut self, command: TableCommand) -> Result<String, EngineError> {
-        match command {
-            TableCommand::Create { name, body } => {
-                let (columns, key_names) = parse_table_create_body(&body)?;
-                self.storage.rel_create_table(&name, columns, &key_names)?;
-                self.maybe_checkpoint()?;
-                render_json(&json!({ "acknowledged": true, "table": name }))
-            }
-            TableCommand::Insert { name, body } => {
-                let schema = self.table_schema(&name)?;
-                let values = parse_row_values(&schema, &body)?;
-                self.storage.rel_insert(&name, values)?;
-                self.maybe_checkpoint()?;
-                render_json(&json!({ "rows_affected": 1 }))
-            }
-            TableCommand::Scan { name } => {
-                let schema = self.table_schema(&name)?;
-                let rows = self.storage.rel_scan(&name)?;
-                let rendered: Vec<Value> = rows
-                    .iter()
-                    .map(|row| {
-                        let mut object = Map::new();
-                        for (column, value) in schema.columns.iter().zip(row) {
-                            object.insert(column.name.clone(), value.to_json(&column.column_type));
-                        }
-                        Value::Object(object)
-                    })
-                    .collect();
-                render_json(&json!({ "count": rendered.len(), "rows": rendered }))
-            }
-            TableCommand::Update { name, body } => {
-                let schema = self.table_schema(&name)?;
-                let (column, value) = parse_where(&schema, &body)?;
-                let assignments = parse_set(&schema, &body)?;
-                let count = self
-                    .storage
-                    .rel_update_where(&name, &column, &value, &assignments)?;
-                self.maybe_checkpoint()?;
-                render_json(&json!({ "rows_affected": count }))
-            }
-            TableCommand::Delete { name, body } => {
-                let schema = self.table_schema(&name)?;
-                let (column, value) = parse_where(&schema, &body)?;
-                let count = self.storage.rel_delete_where(&name, &column, &value)?;
-                self.maybe_checkpoint()?;
-                render_json(&json!({ "rows_affected": count }))
-            }
-        }
-    }
-
-    fn table_schema(&self, name: &str) -> Result<Schema, EngineError> {
-        let def = self
-            .storage
-            .rel_table(name)
-            .ok_or_else(|| CommandError::InvalidCommand(format!("unknown table '{name}'")))?;
-        Ok(def.schema()?)
+    /// Executes a SQL batch. Statements before an error have already
+    /// committed (each is autocommit in Stage 3), so their results ride
+    /// along with any error in one envelope, transported as a normal
+    /// response (TDS-like) rather than failing the connection.
+    fn execute_sql(&mut self, input: &str) -> Result<String, EngineError> {
+        let outcome = crate::rel::execute_batch(&mut self.storage, input);
+        self.maybe_checkpoint()?;
+        Ok(render_sql_outcome(&outcome))
     }
 
     pub fn checkpoint(&mut self) -> Result<(), EngineError> {
@@ -510,17 +466,6 @@ enum Command {
         index: String,
         query: SearchQuery,
     },
-    Table(TableCommand),
-}
-
-/// Temporary Stage 2 debug commands over the relational store.
-#[derive(Debug, Clone)]
-enum TableCommand {
-    Create { name: String, body: Document },
-    Insert { name: String, body: Document },
-    Scan { name: String },
-    Update { name: String, body: Document },
-    Delete { name: String, body: Document },
 }
 
 #[derive(Debug, Clone)]
@@ -647,7 +592,11 @@ pub enum CommandError {
     },
 }
 
-fn parse_command(input: &str) -> Result<Command, CommandError> {
+/// Parses a legacy ES command. Returns `Ok(None)` when the input is not an
+/// ES command (a `{`-bodied create index / insert document / search) — the
+/// caller then routes it to the SQL engine. `Ok(Some(_))` is a well-formed
+/// ES command; `Err` is a malformed one.
+fn parse_command(input: &str) -> Result<Option<Command>, CommandError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(CommandError::InvalidCommand(
@@ -658,55 +607,23 @@ fn parse_command(input: &str) -> Result<Command, CommandError> {
     if let Some((header, body)) = split_command(trimmed, "create index")? {
         let name = parse_single_name(header, "create index")?;
         let mappings = parse_create_index_body(body)?;
-        return Ok(Command::CreateIndex { name, mappings });
+        return Ok(Some(Command::CreateIndex { name, mappings }));
     }
 
     if let Some((header, body)) = split_command(trimmed, "insert document")? {
         let index = parse_single_name(header, "insert document")?;
         let document = parse_document_body(body)?;
-        return Ok(Command::InsertDocument { index, document });
+        return Ok(Some(Command::InsertDocument { index, document }));
     }
 
     if let Some((header, body)) = split_command(trimmed, "search")? {
         let index = parse_single_name(header, "search")?;
         let query = parse_search_body(body)?;
-        return Ok(Command::Search { index, query });
+        return Ok(Some(Command::Search { index, query }));
     }
 
-    if let Some((header, body)) = split_command(trimmed, "table create")? {
-        let name = parse_single_name(header, "table create")?;
-        let body = parse_document_body(body)?;
-        return Ok(Command::Table(TableCommand::Create { name, body }));
-    }
-    if let Some((header, body)) = split_command(trimmed, "table insert")? {
-        let name = parse_single_name(header, "table insert")?;
-        let body = parse_document_body(body)?;
-        return Ok(Command::Table(TableCommand::Insert { name, body }));
-    }
-    if let Some((header, body)) = split_command(trimmed, "table update")? {
-        let name = parse_single_name(header, "table update")?;
-        let body = parse_document_body(body)?;
-        return Ok(Command::Table(TableCommand::Update { name, body }));
-    }
-    if let Some((header, body)) = split_command(trimmed, "table delete")? {
-        let name = parse_single_name(header, "table delete")?;
-        let body = parse_document_body(body)?;
-        return Ok(Command::Table(TableCommand::Delete { name, body }));
-    }
-    if let Some((header, _body)) = split_command(trimmed, "table scan")? {
-        let name = parse_single_name(header, "table scan")?;
-        return Ok(Command::Table(TableCommand::Scan { name }));
-    }
-    // `table scan` takes no body, so also accept the bodyless form (every
-    // other route requires a `{`, which split_command enforces).
-    if trimmed.to_ascii_lowercase().starts_with("table scan") {
-        let name = parse_single_name(trimmed, "table scan")?;
-        return Ok(Command::Table(TableCommand::Scan { name }));
-    }
-
-    Err(CommandError::InvalidCommand(
-        "expected one of: create index, insert document, search, table create/insert/scan/update/delete".to_string(),
-    ))
+    // Not an ES command: route to SQL.
+    Ok(None)
 }
 
 fn split_command<'a>(
@@ -783,120 +700,6 @@ fn parse_document_body(body: &str) -> Result<Document, CommandError> {
     let value = parse_json(body)?;
     let object = as_object(&value, "document body")?;
     Ok(object.clone())
-}
-
-/// Parses `{"columns": [{"name","type","nullable"?}...], "primary_key": [..]?}`.
-fn parse_table_create_body(body: &Document) -> Result<(Vec<Column>, Vec<String>), EngineError> {
-    let bad = |msg: &str| EngineError::Command(CommandError::InvalidCommand(msg.to_string()));
-    let columns_value = body
-        .get("columns")
-        .and_then(Value::as_array)
-        .ok_or_else(|| bad("table create requires a 'columns' array"))?;
-    let mut columns = Vec::with_capacity(columns_value.len());
-    for column_value in columns_value {
-        let object = column_value
-            .as_object()
-            .ok_or_else(|| bad("each column must be an object"))?;
-        let name = object
-            .get("name")
-            .and_then(Value::as_str)
-            .ok_or_else(|| bad("column missing 'name'"))?;
-        let type_spec = object
-            .get("type")
-            .and_then(Value::as_str)
-            .ok_or_else(|| bad("column missing 'type'"))?;
-        let nullable = object
-            .get("nullable")
-            .map(|v| v.as_bool().ok_or_else(|| bad("'nullable' must be a bool")))
-            .transpose()?
-            .unwrap_or(true);
-        let column_type = ColumnType::parse(type_spec)
-            .map_err(|err| EngineError::Command(CommandError::InvalidCommand(err.0)))?;
-        columns.push(Column {
-            name: name.to_string(),
-            column_type,
-            nullable,
-        });
-    }
-    let key_names = match body.get("primary_key") {
-        None => Vec::new(),
-        Some(value) => value
-            .as_array()
-            .ok_or_else(|| bad("'primary_key' must be an array"))?
-            .iter()
-            .map(|v| {
-                v.as_str()
-                    .map(str::to_string)
-                    .ok_or_else(|| bad("'primary_key' entries must be strings"))
-            })
-            .collect::<Result<Vec<_>, _>>()?,
-    };
-    Ok((columns, key_names))
-}
-
-/// Converts an insert body (column -> JSON value) into a full row in schema
-/// order; absent columns become NULL.
-fn parse_row_values(schema: &Schema, body: &Document) -> Result<Vec<Datum>, EngineError> {
-    for field in body.keys() {
-        if !schema.columns.iter().any(|c| &c.name == field) {
-            return Err(CommandError::InvalidCommand(format!("unknown column '{field}'")).into());
-        }
-    }
-    schema
-        .columns
-        .iter()
-        .map(|column| {
-            let value = body.get(&column.name).unwrap_or(&Value::Null);
-            Datum::from_json(&column.column_type, value)
-                .map_err(|err| CommandError::InvalidCommand(err.0).into())
-        })
-        .collect()
-}
-
-/// Parses `{"where": {"col": value}}` into a typed equality predicate.
-fn parse_where(schema: &Schema, body: &Document) -> Result<(String, Datum), EngineError> {
-    let bad = |msg: &str| EngineError::Command(CommandError::InvalidCommand(msg.to_string()));
-    let object = body
-        .get("where")
-        .and_then(Value::as_object)
-        .ok_or_else(|| bad("expected a 'where' object with exactly one column"))?;
-    if object.len() != 1 {
-        return Err(bad("'where' must contain exactly one column"));
-    }
-    let (name, value) = object.iter().next().expect("one entry");
-    let column = schema
-        .columns
-        .iter()
-        .find(|c| &c.name == name)
-        .ok_or_else(|| bad(&format!("unknown column '{name}'")))?;
-    let datum = Datum::from_json(&column.column_type, value)
-        .map_err(|err| EngineError::Command(CommandError::InvalidCommand(err.0)))?;
-    Ok((name.clone(), datum))
-}
-
-/// Parses `{"set": {"col": value, ...}}` into typed assignments.
-fn parse_set(schema: &Schema, body: &Document) -> Result<Vec<(String, Datum)>, EngineError> {
-    let bad = |msg: &str| EngineError::Command(CommandError::InvalidCommand(msg.to_string()));
-    let object = body
-        .get("set")
-        .and_then(Value::as_object)
-        .ok_or_else(|| bad("expected a 'set' object"))?;
-    if object.is_empty() {
-        return Err(bad("'set' must assign at least one column"));
-    }
-    object
-        .iter()
-        .map(|(name, value)| {
-            let column = schema
-                .columns
-                .iter()
-                .find(|c| &c.name == name)
-                .ok_or_else(|| bad(&format!("unknown column '{name}'")))?;
-            let datum = Datum::from_json(&column.column_type, value)
-                .map_err(|err| EngineError::Command(CommandError::InvalidCommand(err.0)))?;
-            Ok((name.clone(), datum))
-        })
-        .collect()
 }
 
 fn parse_search_body(body: &str) -> Result<SearchQuery, CommandError> {
@@ -1042,6 +845,51 @@ fn value_type_name(value: &Value) -> &'static str {
     }
 }
 
+/// Renders a SQL batch outcome (statement results + an optional trailing
+/// error) as the `{"kind":"sql",...}` envelope the CLI turns into aligned
+/// tables, `(N rows affected)` lines, and `Msg <n>` errors.
+fn render_sql_outcome(outcome: &crate::rel::BatchOutcome) -> String {
+    use crate::rel::StatementResult;
+    let rendered: Vec<Value> = outcome
+        .results
+        .iter()
+        .map(|result| match result {
+            StatementResult::Rows(rowset) => {
+                let rows: Vec<Value> = rowset
+                    .rows
+                    .iter()
+                    .map(|row| {
+                        Value::Array(
+                            row.iter()
+                                .map(|cell| match cell {
+                                    Some(text) => Value::String(text.clone()),
+                                    None => Value::Null,
+                                })
+                                .collect(),
+                        )
+                    })
+                    .collect();
+                json!({
+                    "type": "rows",
+                    "columns": rowset.columns,
+                    "rows": rows,
+                })
+            }
+            StatementResult::RowsAffected(n) => json!({ "type": "count", "rows_affected": n }),
+            StatementResult::Done => json!({ "type": "done" }),
+        })
+        .collect();
+    let error = outcome.error.as_ref().map(|err| {
+        json!({
+            "number": err.number,
+            "level": err.level,
+            "state": err.state,
+            "message": err.message,
+        })
+    });
+    json!({ "kind": "sql", "results": rendered, "error": error }).to_string()
+}
+
 fn render_json(value: &Value) -> Result<String, EngineError> {
     serde_json::to_string_pretty(value)
         .map_err(|err| EngineError::Replay(format!("failed to render json response: {err}")))
@@ -1064,7 +912,7 @@ fn decode_snapshot(data: &[u8]) -> Result<EngineState, EngineError> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::PathBuf;
+    use std::path::{Path, PathBuf};
 
     use super::*;
     use crate::storage::StorageOptions;
@@ -1086,7 +934,7 @@ mod tests {
         .expect("command should parse");
 
         match cmd {
-            Command::CreateIndex { name, mappings } => {
+            Some(Command::CreateIndex { name, mappings }) => {
                 assert_eq!(name, "products");
                 assert_eq!(mappings["name"], FieldType::Text);
                 assert_eq!(mappings["category"], FieldType::Keyword);
@@ -1322,9 +1170,7 @@ mod tests {
             )
             .expect("create index");
         engine
-            .execute(
-                r#"table create items { "columns": [ {"name":"id","type":"int","nullable":false}, {"name":"label","type":"nvarchar(50)"} ], "primary_key": ["id"] }"#,
-            )
+            .execute("CREATE TABLE items (id INT NOT NULL PRIMARY KEY, label NVARCHAR(50))")
             .expect("create table");
         // Interleave the two subsystems in one ring.
         for i in 0..10 {
@@ -1334,14 +1180,9 @@ mod tests {
                 ))
                 .expect("insert doc");
             engine
-                .execute(&format!(
-                    r#"table insert items {{ "id": {i}, "label": "row {i}" }}"#
-                ))
+                .execute(&format!("INSERT INTO items VALUES ({i}, 'row {i}')"))
                 .expect("insert row");
         }
-        engine
-            .execute(r#"table delete items { "where": { "id": 3 } }"#)
-            .expect("delete row");
         drop(engine); // crash: everything lives in the shared WAL only
 
         let storage = Storage::open(path.clone()).expect("reopen");
@@ -1353,46 +1194,40 @@ mod tests {
         let response: Value = serde_json::from_str(&response).expect("json");
         assert_eq!(response["hits"]["total"].as_u64(), Some(10));
 
-        let response = engine.execute(r#"table scan items {}"#).expect("scan");
-        let response: Value = serde_json::from_str(&response).expect("json");
-        assert_eq!(response["count"].as_u64(), Some(9));
-        let ids: Vec<i64> = response["rows"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|r| r["id"].as_i64().unwrap())
-            .collect();
-        assert_eq!(ids, vec![0, 1, 2, 4, 5, 6, 7, 8, 9], "key order, id 3 gone");
+        let ids = sql_column_i64(&mut engine, "SELECT id FROM items ORDER BY id", 0);
+        assert_eq!(
+            ids,
+            (0..10).collect::<Vec<_>>(),
+            "all rows recovered in key order"
+        );
 
         // Both surfaces stay writable after recovery.
         engine
-            .execute(
-                r#"table update items { "where": { "id": 4 }, "set": { "label": "updated" } }"#,
-            )
-            .expect("update after recovery");
+            .execute("INSERT INTO items VALUES (10, 'after recovery')")
+            .expect("insert after recovery");
+        let ids = sql_column_i64(
+            &mut engine,
+            "SELECT id FROM items WHERE id > 8 ORDER BY id",
+            0,
+        );
+        assert_eq!(ids, vec![9, 10]);
         let _ = std::fs::remove_file(path);
     }
 
-    #[test]
-    fn table_scan_accepts_bodyless_form() {
-        let path = unique_temp_path("scan-bodyless");
-        let storage =
-            Storage::create(path.clone(), test_storage_options()).expect("storage create");
-        let mut engine = Engine::new(storage).expect("engine create");
-        engine
-            .execute(
-                r#"table create t { "columns": [ {"name":"id","type":"int","nullable":false} ], "primary_key": ["id"] }"#,
-            )
-            .expect("create table");
-        engine
-            .execute(r#"table insert t { "id": 1 }"#)
-            .expect("insert");
-        for command in ["table scan t", "table scan t {}"] {
-            let response = engine.execute(command).expect("scan");
-            let response: Value = serde_json::from_str(&response).expect("json");
-            assert_eq!(response["count"].as_u64(), Some(1), "for '{command}'");
-        }
-        let _ = std::fs::remove_file(path);
+    /// Extracts one integer column from a SELECT via the SQL envelope.
+    fn sql_column_i64(engine: &mut Engine, sql: &str, column: usize) -> Vec<i64> {
+        let response = engine.execute(sql).expect("sql");
+        let response: Value = serde_json::from_str(&response).expect("json");
+        assert_eq!(
+            response["kind"], "sql",
+            "expected a rows envelope: {response}"
+        );
+        response["results"][0]["rows"]
+            .as_array()
+            .expect("rows array")
+            .iter()
+            .map(|row| row[column].as_str().expect("cell").parse().expect("i64"))
+            .collect()
     }
 
     #[test]
@@ -1427,6 +1262,394 @@ mod tests {
         assert_eq!(response["hits"]["total"].as_u64(), Some(1));
         let _ = extent;
 
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Runs SQL and returns the parsed envelope.
+    fn sql(engine: &mut Engine, text: &str) -> Value {
+        let response = engine.execute(text).expect("execute");
+        serde_json::from_str(&response).expect("json envelope")
+    }
+
+    /// Runs SQL expected to error and returns the SQL error number from the
+    /// envelope's trailing `error`.
+    fn sql_error_number(engine: &mut Engine, text: &str) -> i64 {
+        let env = sql(engine, text);
+        env["error"]["number"]
+            .as_i64()
+            .unwrap_or_else(|| panic!("expected an error envelope, got {env}"))
+    }
+
+    /// Runs a single-statement SELECT and returns its (columns, rows) where
+    /// each cell is `Option<String>` (None = NULL).
+    fn sql_rows(engine: &mut Engine, text: &str) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+        let env = sql(engine, text);
+        assert_eq!(env["kind"], "sql", "expected rows, got {env}");
+        let result = &env["results"][0];
+        assert_eq!(result["type"], "rows", "expected a rowset, got {result}");
+        let columns = result["columns"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|c| c.as_str().unwrap().to_string())
+            .collect();
+        let rows = result["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|row| {
+                row.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|cell| cell.as_str().map(str::to_string))
+                    .collect()
+            })
+            .collect();
+        (columns, rows)
+    }
+
+    fn new_engine(path: &Path) -> Engine {
+        let storage = Storage::create(path.to_path_buf(), test_storage_options()).expect("create");
+        Engine::new(storage).expect("engine")
+    }
+
+    #[test]
+    fn sql_create_insert_select_survive_restart() {
+        let path = unique_temp_path("sql-roundtrip");
+        let mut engine = new_engine(&path);
+
+        engine
+            .execute(
+                "CREATE TABLE products (id INT NOT NULL PRIMARY KEY, name NVARCHAR(50), price FLOAT)",
+            )
+            .expect("create");
+        engine
+            .execute("INSERT INTO products VALUES (1, 'Skor', 79.99), (2, 'Kangor', 129.5), (3, 'Sockar', NULL)")
+            .expect("insert");
+
+        let (columns, rows) = sql_rows(&mut engine, "SELECT id, name FROM products ORDER BY id");
+        assert_eq!(columns, vec!["id", "name"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("1".into()), Some("Skor".into())],
+                vec![Some("2".into()), Some("Kangor".into())],
+                vec![Some("3".into()), Some("Sockar".into())],
+            ]
+        );
+        drop(engine);
+
+        // Restart: schema + rows recovered.
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("engine");
+        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM products WHERE price IS NULL");
+        assert_eq!(rows, vec![vec![Some("Sockar".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_duplicate_pk_reports_error_2627() {
+        let path = unique_temp_path("sql-pk-dup");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT PRIMARY KEY)")
+            .expect("create");
+        engine.execute("INSERT INTO t VALUES (1)").expect("insert");
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO t VALUES (1)"),
+            2627
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_where_order_top_projection() {
+        let path = unique_temp_path("sql-select");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE nums (n INT NOT NULL PRIMARY KEY, label NVARCHAR(10))")
+            .expect("create");
+        for n in 1..=10 {
+            engine
+                .execute(&format!("INSERT INTO nums VALUES ({n}, 'r{n}')"))
+                .expect("insert");
+        }
+        // WHERE + ORDER DESC + TOP + computed projection.
+        let (columns, rows) = sql_rows(
+            &mut engine,
+            "SELECT TOP 3 n, n * 10 AS ten FROM nums WHERE n > 4 ORDER BY n DESC",
+        );
+        assert_eq!(columns, vec!["n", "ten"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("10".into()), Some("100".into())],
+                vec![Some("9".into()), Some("90".into())],
+                vec![Some("8".into()), Some("80".into())],
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_three_valued_where_keeps_only_true_rows() {
+        let path = unique_temp_path("sql-3vl");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30)")
+            .expect("insert");
+        // v <> 10 is UNKNOWN for the NULL row, which is filtered out.
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE v <> 10 ORDER BY id");
+        assert_eq!(rows, vec![vec![Some("3".into())]]);
+        // IS NULL is two-valued.
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE v IS NULL");
+        assert_eq!(rows, vec![vec![Some("2".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_sys_catalog_is_queryable() {
+        let path = unique_temp_path("sql-syscat");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE alpha (id INT PRIMARY KEY, name NVARCHAR(20))")
+            .expect("create alpha");
+        engine
+            .execute("CREATE TABLE beta (x BIGINT NOT NULL)")
+            .expect("create beta");
+        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM sys.tables ORDER BY name");
+        assert_eq!(
+            rows,
+            vec![vec![Some("alpha".into())], vec![Some("beta".into())]]
+        );
+        // sys.columns: alpha has two columns.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT name, type FROM sys.columns WHERE object_id = 2 ORDER BY column_id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("id".into()), Some("int".into())],
+                vec![Some("name".into()), Some("nvarchar(20)".into())],
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_drop_table_and_errors() {
+        let path = unique_temp_path("sql-drop");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT PRIMARY KEY)")
+            .expect("create");
+        // Selecting a missing table -> 208.
+        assert_eq!(sql_error_number(&mut engine, "SELECT * FROM nope"), 208);
+        // Duplicate CREATE -> 2714.
+        assert_eq!(
+            sql_error_number(&mut engine, "CREATE TABLE t (id INT)"),
+            2714
+        );
+        // DROP then it's gone; DROP IF EXISTS is a no-op; bare DROP -> 3701.
+        engine.execute("DROP TABLE t").expect("drop");
+        assert_eq!(sql_error_number(&mut engine, "SELECT * FROM t"), 208);
+        engine
+            .execute("DROP TABLE IF EXISTS t")
+            .expect("drop if exists");
+        assert_eq!(sql_error_number(&mut engine, "DROP TABLE t"), 3701);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_not_null_violation_reports_515() {
+        let path = unique_temp_path("sql-notnull");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(10) NOT NULL)")
+            .expect("create");
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO t (id) VALUES (1)"),
+            515
+        );
+        // String too long -> 8152.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "INSERT INTO t VALUES (1, 'this is far too long')"
+            ),
+            8152
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_and_search_share_the_engine() {
+        // The SQL front door must not disturb the frozen ES surface.
+        let path = unique_temp_path("sql-es-coexist");
+        let mut engine = new_engine(&path);
+        engine
+            .execute(r#"create index docs { "mappings": { "properties": { "body": { "type": "text" } } } }"#)
+            .expect("create index");
+        engine
+            .execute(r#"insert document docs { "body": "hello world" }"#)
+            .expect("insert doc");
+        engine
+            .execute("CREATE TABLE t (id INT PRIMARY KEY)")
+            .expect("create table");
+        engine
+            .execute("INSERT INTO t VALUES (42)")
+            .expect("insert row");
+
+        let search = sql(
+            &mut engine,
+            r#"search docs { "query": { "match": { "body": "hello" } } }"#,
+        );
+        assert_eq!(search["hits"]["total"], 1);
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t");
+        assert_eq!(rows, vec![vec![Some("42".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_bit_column_compares_to_integer_literal() {
+        let path = unique_temp_path("sql-bit-cmp");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, active BIT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 1), (2, 0), (3, NULL)")
+            .expect("insert");
+        // `active = 1` (BIT vs int) must work, not clash.
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE active = 1 ORDER BY id");
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_multi_row_insert_is_atomic() {
+        let path = unique_temp_path("sql-insert-atomic");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine.execute("INSERT INTO t VALUES (5)").expect("seed");
+        // The 3rd row duplicates PK 5: the whole INSERT must roll back, so
+        // rows 10 and 11 must NOT be present.
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO t VALUES (10), (11), (5)"),
+            2627
+        );
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t ORDER BY id");
+        assert_eq!(rows, vec![vec![Some("5".into())]], "no partial rows");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_batch_keeps_earlier_results_before_an_error() {
+        let path = unique_temp_path("sql-batch-partial");
+        let mut engine = new_engine(&path);
+        // One batch: a good CREATE + INSERT, then a failing INSERT.
+        let env = sql(
+            &mut engine,
+            "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t VALUES (1); INSERT INTO t VALUES (1);",
+        );
+        assert_eq!(env["kind"], "sql");
+        // Two statements succeeded (done, count) before the error.
+        assert_eq!(env["results"].as_array().unwrap().len(), 2);
+        assert_eq!(env["results"][1]["rows_affected"], 1);
+        assert_eq!(env["error"]["number"], 2627);
+        // The first row is durably present.
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t");
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_non_boolean_where_is_rejected_4145() {
+        let path = unique_temp_path("sql-where-4145");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine.execute("INSERT INTO t VALUES (1)").expect("insert");
+        // `WHERE id + 1` is numeric, not boolean.
+        assert_eq!(
+            sql_error_number(&mut engine, "SELECT id FROM t WHERE id + 1"),
+            4145
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_schema_qualified_names_resolve() {
+        let path = unique_temp_path("sql-dbo");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE dbo.products (id INT NOT NULL PRIMARY KEY)")
+            .expect("create dbo.");
+        engine
+            .execute("INSERT INTO dbo.products VALUES (1)")
+            .expect("insert dbo.");
+        // Reachable by both qualified and bare names.
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM products");
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM dbo.products");
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_unicode_round_trips_through_insert_and_select() {
+        let path = unique_temp_path("sql-unicode");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(50))")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 'café åäö 😀')")
+            .expect("insert");
+        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM t");
+        assert_eq!(rows, vec![vec![Some("café åäö 😀".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_bigint_overflow_literal_errors_not_saturates() {
+        let path = unique_temp_path("sql-bigint-of");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, big BIGINT)")
+            .expect("create");
+        // 1e30 overflows i64; must error, not silently saturate.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "INSERT INTO t VALUES (1, 1000000000000000000000000000000)"
+            ),
+            220
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_table_level_pk_column_is_not_null() {
+        let path = unique_temp_path("sql-tablepk");
+        let mut engine = new_engine(&path);
+        // A table-level PK on a column with no explicit nullability succeeds
+        // (the column is promoted to NOT NULL).
+        engine
+            .execute("CREATE TABLE t (id INT, v NVARCHAR(10), PRIMARY KEY (id))")
+            .expect("create");
+        // Inserting NULL into the PK column is then a NOT NULL violation.
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO t (v) VALUES ('x')"),
+            515
+        );
         let _ = std::fs::remove_file(path);
     }
 

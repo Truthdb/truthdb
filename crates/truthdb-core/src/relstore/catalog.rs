@@ -107,3 +107,18 @@ pub(crate) fn insert_table(
         ))),
     }
 }
+
+/// Removes a table's catalog row. Stage 3 does a *logical* drop: the row is
+/// deleted (undoable, part of the DROP statement) and the table's data pages
+/// are left allocated (leaked until a future page-reclamation stage) — same
+/// accepted trade-off as rolled-back allocations.
+pub(crate) fn delete_table(
+    ctx: &mut RelCtx<'_>,
+    mode: &mut OpMode<'_>,
+    catalog_root: u64,
+    object_id: u32,
+) -> Result<(), StorageError> {
+    let tree = catalog_tree(catalog_root);
+    tree.delete(ctx, mode, &catalog_key(object_id))?;
+    Ok(())
+}

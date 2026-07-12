@@ -1,0 +1,262 @@
+[
+    Select(
+        Select {
+            top: Some(
+                5,
+            ),
+            items: [
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "id",
+                                quoted: false,
+                                span: Span {
+                                    start: 13,
+                                    end: 15,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 13,
+                            end: 15,
+                        },
+                    },
+                    alias: None,
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "name",
+                                quoted: false,
+                                span: Span {
+                                    start: 17,
+                                    end: 21,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 17,
+                            end: 21,
+                        },
+                    },
+                    alias: Some(
+                        Name {
+                            value: "product",
+                            quoted: false,
+                            span: Span {
+                                start: 25,
+                                end: 32,
+                            },
+                        },
+                    ),
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Binary {
+                            op: Mul,
+                            left: Expr {
+                                kind: Column(
+                                    Name {
+                                        value: "price",
+                                        quoted: false,
+                                        span: Span {
+                                            start: 34,
+                                            end: 39,
+                                        },
+                                    },
+                                ),
+                                span: Span {
+                                    start: 34,
+                                    end: 39,
+                                },
+                            },
+                            right: Expr {
+                                kind: Int(
+                                    2,
+                                ),
+                                span: Span {
+                                    start: 42,
+                                    end: 43,
+                                },
+                            },
+                        },
+                        span: Span {
+                            start: 34,
+                            end: 43,
+                        },
+                    },
+                    alias: None,
+                },
+            ],
+            from: Some(
+                Name {
+                    value: "products",
+                    quoted: false,
+                    span: Span {
+                        start: 49,
+                        end: 57,
+                    },
+                },
+            ),
+            where_clause: Some(
+                Expr {
+                    kind: Binary {
+                        op: Or,
+                        left: Expr {
+                            kind: Binary {
+                                op: And,
+                                left: Expr {
+                                    kind: Binary {
+                                        op: Gt,
+                                        left: Expr {
+                                            kind: Column(
+                                                Name {
+                                                    value: "price",
+                                                    quoted: false,
+                                                    span: Span {
+                                                        start: 64,
+                                                        end: 69,
+                                                    },
+                                                },
+                                            ),
+                                            span: Span {
+                                                start: 64,
+                                                end: 69,
+                                            },
+                                        },
+                                        right: Expr {
+                                            kind: Int(
+                                                50,
+                                            ),
+                                            span: Span {
+                                                start: 72,
+                                                end: 74,
+                                            },
+                                        },
+                                    },
+                                    span: Span {
+                                        start: 64,
+                                        end: 74,
+                                    },
+                                },
+                                right: Expr {
+                                    kind: Binary {
+                                        op: Eq,
+                                        left: Expr {
+                                            kind: Column(
+                                                Name {
+                                                    value: "in_stock",
+                                                    quoted: false,
+                                                    span: Span {
+                                                        start: 79,
+                                                        end: 87,
+                                                    },
+                                                },
+                                            ),
+                                            span: Span {
+                                                start: 79,
+                                                end: 87,
+                                            },
+                                        },
+                                        right: Expr {
+                                            kind: Int(
+                                                1,
+                                            ),
+                                            span: Span {
+                                                start: 90,
+                                                end: 91,
+                                            },
+                                        },
+                                    },
+                                    span: Span {
+                                        start: 79,
+                                        end: 91,
+                                    },
+                                },
+                            },
+                            span: Span {
+                                start: 64,
+                                end: 91,
+                            },
+                        },
+                        right: Expr {
+                            kind: IsNull {
+                                expr: Expr {
+                                    kind: Column(
+                                        Name {
+                                            value: "name",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 95,
+                                                end: 99,
+                                            },
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 95,
+                                        end: 99,
+                                    },
+                                },
+                                negated: true,
+                            },
+                            span: Span {
+                                start: 95,
+                                end: 111,
+                            },
+                        },
+                    },
+                    span: Span {
+                        start: 64,
+                        end: 111,
+                    },
+                },
+            ),
+            order_by: [
+                OrderItem {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "price",
+                                quoted: false,
+                                span: Span {
+                                    start: 121,
+                                    end: 126,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 121,
+                            end: 126,
+                        },
+                    },
+                    descending: true,
+                },
+                OrderItem {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "id",
+                                quoted: false,
+                                span: Span {
+                                    start: 133,
+                                    end: 135,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 133,
+                            end: 135,
+                        },
+                    },
+                    descending: false,
+                },
+            ],
+            span: Span {
+                start: 0,
+                end: 135,
+            },
+        },
+    ),
+]

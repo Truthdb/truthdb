@@ -1,0 +1,61 @@
+[
+    Select(
+        Select {
+            top: None,
+            items: [
+                Wildcard,
+            ],
+            from: Some(
+                Name {
+                    value: "products",
+                    quoted: false,
+                    span: Span {
+                        start: 32,
+                        end: 40,
+                    },
+                },
+            ),
+            where_clause: Some(
+                Expr {
+                    kind: Binary {
+                        op: Eq,
+                        left: Expr {
+                            kind: Column(
+                                Name {
+                                    value: "id",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 47,
+                                        end: 49,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 47,
+                                end: 49,
+                            },
+                        },
+                        right: Expr {
+                            kind: Int(
+                                1,
+                            ),
+                            span: Span {
+                                start: 52,
+                                end: 53,
+                            },
+                        },
+                    },
+                    span: Span {
+                        start: 47,
+                        end: 53,
+                    },
+                },
+            ),
+            order_by: [],
+            span: Span {
+                start: 18,
+                end: 53,
+            },
+        },
+    ),
+]

@@ -485,7 +485,7 @@ mod tests {
                     "round {round}: page {page_no} content diverged from oracle"
                 );
 
-                if rng.next() % 2 == 0 {
+                if rng.next().is_multiple_of(2) {
                     let marker = (rng.next() % 255) as u8 + 1;
                     write_page_payload(&mut pool, id, page_no, next_lsn, marker);
                     oracle.insert(page_no, marker);
@@ -493,7 +493,7 @@ mod tests {
                 }
                 pool.unpin(id);
 
-                if rng.next() % 64 == 0 {
+                if rng.next().is_multiple_of(64) {
                     pool.flush_all(&mut backend).expect("flush_all");
                 }
                 assert!(pool.cached_pages() <= pool.capacity());
