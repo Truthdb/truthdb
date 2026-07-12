@@ -257,11 +257,13 @@ mod tests {
                     name: "a".to_string(),
                     column_type: ColumnType::VarChar { max_len: 10 },
                     nullable: true,
+                    collation: None,
                 },
                 Column {
                     name: "b".to_string(),
                     column_type: ColumnType::Int,
                     nullable: true,
+                    collation: None,
                 },
             ],
         };

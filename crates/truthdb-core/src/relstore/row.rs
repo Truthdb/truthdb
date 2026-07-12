@@ -17,6 +17,9 @@ pub struct Column {
     pub name: String,
     pub column_type: ColumnType,
     pub nullable: bool,
+    /// Collation name for character columns (`None` = database default). Used
+    /// for comparison/sort/key-encoding; irrelevant to the row byte codec.
+    pub collation: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -217,11 +220,13 @@ mod tests {
                     name: "id".to_string(),
                     column_type: ColumnType::Int,
                     nullable: false,
+                    collation: None,
                 },
                 Column {
                     name: "name".to_string(),
                     column_type: ColumnType::NVarChar { max_len: 50 },
                     nullable: true,
+                    collation: None,
                 },
                 Column {
                     name: "price".to_string(),
@@ -230,16 +235,19 @@ mod tests {
                         scale: 2,
                     },
                     nullable: true,
+                    collation: None,
                 },
                 Column {
                     name: "blob".to_string(),
                     column_type: ColumnType::VarBinary { max_len: 100 },
                     nullable: true,
+                    collation: None,
                 },
                 Column {
                     name: "flag".to_string(),
                     column_type: ColumnType::Bit,
                     nullable: true,
+                    collation: None,
                 },
             ],
         }
@@ -296,6 +304,7 @@ mod tests {
                 name: "big".to_string(),
                 column_type: ColumnType::VarBinary { max_len: u16::MAX },
                 nullable: false,
+                collation: None,
             }],
         };
         let values = vec![Datum::VarBinary(vec![0u8; MAX_ROW_BYTES + 1])];

@@ -8,6 +8,8 @@ pub enum Statement {
     CreateTable(CreateTable),
     DropTable(DropTable),
     Insert(Insert),
+    Update(Update),
+    Delete(Delete),
     Select(Select),
 }
 
@@ -27,7 +29,21 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub nullable: Option<bool>,
     pub primary_key: bool,
+    /// `DEFAULT <expr>` source text — re-parsed and evaluated at INSERT so a
+    /// non-constant default (e.g. a niladic function) is applied per row.
+    pub default: Option<String>,
+    /// `IDENTITY(seed, increment)` — server-generated values.
+    pub identity: Option<Identity>,
+    /// `COLLATE <name>` on a character column.
+    pub collation: Option<String>,
     pub span: Span,
+}
+
+/// `IDENTITY(seed, increment)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Identity {
+    pub seed: i64,
+    pub increment: i64,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -37,9 +53,16 @@ pub enum DataType {
     Int,
     BigInt,
     Bit,
+    Real,
     Float,
+    Decimal { precision: u8, scale: u8 },
+    Date,
+    Time,
+    DateTime2,
+    UniqueIdentifier,
     VarChar(u32),
     NVarChar(u32),
+    VarBinary(u32),
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -55,6 +78,28 @@ pub struct Insert {
     /// Explicit column list, or None for "all columns in table order".
     pub columns: Option<Vec<Name>>,
     pub rows: Vec<Vec<Expr>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Update {
+    pub table: Name,
+    /// `SET col = expr` assignments, in source order.
+    pub assignments: Vec<Assignment>,
+    pub where_clause: Option<Expr>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Assignment {
+    pub column: Name,
+    pub value: Expr,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct Delete {
+    pub table: Name,
+    pub where_clause: Option<Expr>,
     pub span: Span,
 }
 
@@ -130,6 +175,44 @@ pub enum ExprKind {
     IsNull {
         expr: Box<Expr>,
         negated: bool,
+    },
+    /// `expr [NOT] LIKE pattern [ESCAPE 'c']`.
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        escape: Option<char>,
+        negated: bool,
+    },
+    /// `expr [NOT] IN (v1, v2, ...)`.
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
+    /// `expr [NOT] BETWEEN low AND high`.
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        negated: bool,
+    },
+    /// `CASE [operand] WHEN cond THEN result ... [ELSE result] END`. When
+    /// `operand` is set it is a simple CASE (compared to each WHEN value).
+    Case {
+        operand: Option<Box<Expr>>,
+        branches: Vec<(Expr, Expr)>,
+        else_result: Option<Box<Expr>>,
+    },
+    /// `CAST(expr AS type)` / `CONVERT(type, expr)`.
+    Cast {
+        expr: Box<Expr>,
+        target: DataType,
+    },
+    /// A scalar function call: `name(arg, ...)` (incl. ISNULL/COALESCE/IIF and
+    /// niladic functions like GETDATE()).
+    Function {
+        name: String,
+        args: Vec<Expr>,
     },
 }
 

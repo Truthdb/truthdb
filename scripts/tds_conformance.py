@@ -104,6 +104,32 @@ def main() -> int:
         print("FAIL: large multi-packet value did not round-trip")
         return 1
 
+    # Stage 5 types over the wire: DECIMAL, DATE, DATETIME2, UNIQUEIDENTIFIER.
+    import datetime
+    import decimal as decimal_mod
+    cur.execute(
+        "CREATE TABLE typed (id INT NOT NULL PRIMARY KEY, amount DECIMAL(10,2), "
+        "d DATE, ts DATETIME2, g UNIQUEIDENTIFIER)"
+    )
+    cur.execute(
+        "INSERT INTO typed VALUES (1, 1234.56, '2020-06-15', "
+        "'2020-06-15 13:45:30.5', '6F9619FF-8B86-D011-B42D-00C04FC964FF')"
+    )
+    cur.execute("SELECT amount, d, ts, g FROM typed")
+    amount, d, ts, g = cur.fetchone()
+    if amount != decimal_mod.Decimal("1234.56"):
+        print(f"FAIL: DECIMAL round-trip: {amount!r}")
+        return 1
+    if d != datetime.date(2020, 6, 15):
+        print(f"FAIL: DATE round-trip: {d!r}")
+        return 1
+    if ts != datetime.datetime(2020, 6, 15, 13, 45, 30, 500000):
+        print(f"FAIL: DATETIME2 round-trip: {ts!r}")
+        return 1
+    if str(g).upper() != "6F9619FF-8B86-D011-B42D-00C04FC964FF":
+        print(f"FAIL: UNIQUEIDENTIFIER round-trip: {g!r}")
+        return 1
+
     conn.close()
     print("tds conformance: OK")
     return 0

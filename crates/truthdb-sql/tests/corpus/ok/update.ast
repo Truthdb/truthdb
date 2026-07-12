@@ -1,0 +1,119 @@
+[
+    Update(
+        Update {
+            table: Name {
+                value: "products",
+                quoted: false,
+                span: Span {
+                    start: 7,
+                    end: 15,
+                },
+            },
+            assignments: [
+                Assignment {
+                    column: Name {
+                        value: "price",
+                        quoted: false,
+                        span: Span {
+                            start: 20,
+                            end: 25,
+                        },
+                    },
+                    value: Expr {
+                        kind: Binary {
+                            op: Mul,
+                            left: Expr {
+                                kind: Column(
+                                    Name {
+                                        value: "price",
+                                        quoted: false,
+                                        span: Span {
+                                            start: 28,
+                                            end: 33,
+                                        },
+                                    },
+                                ),
+                                span: Span {
+                                    start: 28,
+                                    end: 33,
+                                },
+                            },
+                            right: Expr {
+                                kind: Int(
+                                    2,
+                                ),
+                                span: Span {
+                                    start: 36,
+                                    end: 37,
+                                },
+                            },
+                        },
+                        span: Span {
+                            start: 28,
+                            end: 37,
+                        },
+                    },
+                },
+                Assignment {
+                    column: Name {
+                        value: "name",
+                        quoted: false,
+                        span: Span {
+                            start: 39,
+                            end: 43,
+                        },
+                    },
+                    value: Expr {
+                        kind: Str(
+                            "x",
+                        ),
+                        span: Span {
+                            start: 46,
+                            end: 49,
+                        },
+                    },
+                },
+            ],
+            where_clause: Some(
+                Expr {
+                    kind: Binary {
+                        op: Eq,
+                        left: Expr {
+                            kind: Column(
+                                Name {
+                                    value: "id",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 56,
+                                        end: 58,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 56,
+                                end: 58,
+                            },
+                        },
+                        right: Expr {
+                            kind: Int(
+                                5,
+                            ),
+                            span: Span {
+                                start: 61,
+                                end: 62,
+                            },
+                        },
+                    },
+                    span: Span {
+                        start: 56,
+                        end: 62,
+                    },
+                },
+            ),
+            span: Span {
+                start: 0,
+                end: 62,
+            },
+        },
+    ),
+]

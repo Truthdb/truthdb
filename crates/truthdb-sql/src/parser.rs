@@ -20,6 +20,9 @@ const MAX_EXPR_DEPTH: usize = 64;
 const MAX_EXPR_NODES: usize = 2000;
 
 pub struct Parser {
+    /// The original SQL source, for slicing sub-expression text (e.g. a
+    /// column DEFAULT) by span.
+    src: String,
     tokens: Vec<Token>,
     pos: usize,
     /// Current expression recursion depth.
@@ -30,15 +33,25 @@ pub struct Parser {
 
 impl Parser {
     /// Builds a parser over an already-tokenized batch (the token stream
-    /// always ends with an `Eof` token).
-    pub fn from_tokens(tokens: Vec<Token>) -> Self {
+    /// always ends with an `Eof` token). `src` is the original SQL the tokens
+    /// were produced from, used to recover sub-expression source text.
+    pub fn from_tokens(src: &str, tokens: Vec<Token>) -> Self {
         debug_assert!(tokens.last().map(|t| &t.kind) == Some(&TokenKind::Eof));
         Parser {
+            src: src.to_string(),
             tokens,
             pos: 0,
             depth: 0,
             nodes: 0,
         }
+    }
+
+    /// The source text covered by `span`.
+    fn slice(&self, span: Span) -> String {
+        self.src
+            .get(span.start..span.end)
+            .unwrap_or_default()
+            .to_string()
     }
 
     fn too_deep() -> SqlError {
@@ -60,7 +73,17 @@ impl Parser {
     /// Convenience for tests: tokenize then parse.
     #[cfg(test)]
     pub fn parse_str(sql: &str) -> SqlResult<Vec<Statement>> {
-        Parser::from_tokens(crate::lexer::Lexer::new(sql).tokenize()?).parse_statements()
+        Parser::from_tokens(sql, crate::lexer::Lexer::new(sql).tokenize()?).parse_statements()
+    }
+
+    /// Parses exactly one expression followed by EOF (for a re-parsed DEFAULT).
+    pub fn parse_single_expr(mut self) -> SqlResult<Expr> {
+        let expr = self.parse_expr()?;
+        if !self.at_eof() {
+            let token = self.peek().clone();
+            return Err(SqlError::syntax(self.token_text(&token), token.span));
+        }
+        Ok(expr)
     }
 
     /// Parses a whole batch of `;`-separated statements.
@@ -85,6 +108,8 @@ impl Parser {
             Some("CREATE") => self.parse_create_table(),
             Some("DROP") => self.parse_drop_table(),
             Some("INSERT") => self.parse_insert(),
+            Some("UPDATE") => self.parse_update(),
+            Some("DELETE") => self.parse_delete(),
             Some("SELECT") => Ok(Statement::Select(self.parse_select()?)),
             _ => {
                 let token = self.peek().clone();
@@ -152,6 +177,9 @@ impl Parser {
         let (data_type, type_span) = self.parse_data_type()?;
         let mut nullable = None;
         let mut primary_key = false;
+        let mut default = None;
+        let mut identity = None;
+        let mut collation = None;
         let mut end = type_span;
         loop {
             match self.peek_keyword().as_deref() {
@@ -173,6 +201,24 @@ impl Parser {
                         nullable = Some(false);
                     }
                 }
+                Some("DEFAULT") => {
+                    self.bump();
+                    let expr = self.parse_expr()?;
+                    end = expr.span;
+                    default = Some(self.slice(expr.span));
+                }
+                Some("IDENTITY") => {
+                    self.bump();
+                    let (id, id_end) = self.parse_identity(type_span)?;
+                    end = id_end;
+                    identity = Some(id);
+                }
+                Some("COLLATE") => {
+                    self.bump();
+                    let coll = self.parse_ident()?;
+                    end = coll.span;
+                    collation = Some(coll.value);
+                }
                 _ => break,
             }
         }
@@ -182,7 +228,25 @@ impl Parser {
             data_type,
             nullable,
             primary_key,
+            default,
+            identity,
+            collation,
         })
+    }
+
+    /// Parses an optional `(seed, increment)` after the IDENTITY keyword.
+    /// Bare `IDENTITY` defaults to `(1, 1)`, as in SQL Server.
+    fn parse_identity(&mut self, fallback: Span) -> SqlResult<(Identity, Span)> {
+        let mut seed = 1i64;
+        let mut increment = 1i64;
+        let mut end = fallback;
+        if self.eat(&TokenKind::LParen) {
+            seed = self.parse_i64_literal()?;
+            self.expect(&TokenKind::Comma)?;
+            increment = self.parse_i64_literal()?;
+            end = self.expect(&TokenKind::RParen)?;
+        }
+        Ok((Identity { seed, increment }, end))
     }
 
     fn parse_data_type(&mut self) -> SqlResult<(DataType, Span)> {
@@ -212,7 +276,16 @@ impl Parser {
             "INT" | "INTEGER" => DataType::Int,
             "BIGINT" => DataType::BigInt,
             "BIT" => DataType::Bit,
-            "FLOAT" | "REAL" => DataType::Float,
+            "REAL" => DataType::Real,
+            "FLOAT" => DataType::Float,
+            "DATE" => DataType::Date,
+            "TIME" => DataType::Time,
+            "DATETIME2" => DataType::DateTime2,
+            "UNIQUEIDENTIFIER" => DataType::UniqueIdentifier,
+            "DECIMAL" | "NUMERIC" => {
+                let (precision, scale, end) = self.parse_decimal_args(span)?;
+                return Ok((DataType::Decimal { precision, scale }, span.to(end)));
+            }
             "VARCHAR" | "CHAR" => {
                 let (n, end) = with_len(self, 1)?;
                 return Ok((DataType::VarChar(n), span.to(end)));
@@ -220,6 +293,10 @@ impl Parser {
             "NVARCHAR" | "NCHAR" => {
                 let (n, end) = with_len(self, 1)?;
                 return Ok((DataType::NVarChar(n), span.to(end)));
+            }
+            "VARBINARY" | "BINARY" => {
+                let (n, end) = with_len(self, 1)?;
+                return Ok((DataType::VarBinary(n), span.to(end)));
             }
             other => {
                 return Err(SqlError::message_only(
@@ -230,6 +307,32 @@ impl Parser {
             }
         };
         Ok((data_type, span))
+    }
+
+    /// Parses an optional `(precision[, scale])` for DECIMAL/NUMERIC. Defaults
+    /// to `(18, 0)` (SQL Server's), validating p in 1..=38 and s <= p (error
+    /// 2749/2750-style range messages folded into a 102 for simplicity).
+    fn parse_decimal_args(&mut self, span: Span) -> SqlResult<(u8, u8, Span)> {
+        let mut precision: u32 = 18;
+        let mut scale: u32 = 0;
+        let mut end = span;
+        if self.eat(&TokenKind::LParen) {
+            precision = self.parse_u32_literal()?;
+            if self.eat(&TokenKind::Comma) {
+                scale = self.parse_u32_literal()?;
+            }
+            end = self.expect(&TokenKind::RParen)?;
+        }
+        if precision == 0 || precision > 38 || scale > precision {
+            return Err(SqlError::message_only(
+                2749,
+                format!(
+                    "The precision {precision} and scale {scale} are invalid (precision 1..=38, scale <= precision)."
+                ),
+            )
+            .at(span));
+        }
+        Ok((precision as u8, scale as u8, end))
     }
 
     // ---- DROP TABLE -----------------------------------------------------
@@ -302,6 +405,59 @@ impl Parser {
             columns,
             rows,
         }))
+    }
+
+    // ---- UPDATE ---------------------------------------------------------
+
+    fn parse_update(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("UPDATE")?;
+        let table = self.parse_name()?;
+        self.expect_keyword("SET")?;
+        let mut assignments = Vec::new();
+        loop {
+            let column = self.parse_name()?;
+            self.expect(&TokenKind::Eq)?;
+            let value = self.parse_expr()?;
+            assignments.push(Assignment { column, value });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let where_clause = self.parse_optional_where()?;
+        let end = self.prev_span();
+        Ok(Statement::Update(Update {
+            span: start.to(end),
+            table,
+            assignments,
+            where_clause,
+        }))
+    }
+
+    // ---- DELETE ---------------------------------------------------------
+
+    fn parse_delete(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("DELETE")?;
+        // Optional FROM.
+        if self.peek_keyword().as_deref() == Some("FROM") {
+            self.bump();
+        }
+        let table = self.parse_name()?;
+        let where_clause = self.parse_optional_where()?;
+        let end = self.prev_span();
+        Ok(Statement::Delete(Delete {
+            span: start.to(end),
+            table,
+            where_clause,
+        }))
+    }
+
+    fn parse_optional_where(&mut self) -> SqlResult<Option<Expr>> {
+        if self.peek_keyword().as_deref() == Some("WHERE") {
+            self.bump();
+            Ok(Some(self.parse_expr()?))
+        } else {
+            Ok(None)
+        }
     }
 
     // ---- SELECT ---------------------------------------------------------
@@ -474,6 +630,21 @@ impl Parser {
                 },
             });
         }
+        // [NOT] LIKE / IN / BETWEEN (the trailing-NOT predicate form).
+        let negated = self.peek_keyword().as_deref() == Some("NOT")
+            && matches!(
+                self.peek_keyword_at(1).as_deref(),
+                Some("LIKE") | Some("IN") | Some("BETWEEN")
+            );
+        if negated {
+            self.bump();
+        }
+        match self.peek_keyword().as_deref() {
+            Some("LIKE") => return self.parse_like(left, negated),
+            Some("IN") => return self.parse_in(left, negated),
+            Some("BETWEEN") => return self.parse_between(left, negated),
+            _ => {}
+        }
         let op = match self.peek().kind {
             TokenKind::Eq => BinaryOp::Eq,
             TokenKind::Ne => BinaryOp::Ne,
@@ -487,6 +658,173 @@ impl Parser {
         let right = self.parse_additive()?;
         self.node()?;
         Ok(binary(op, left, right))
+    }
+
+    fn parse_like(&mut self, left: Expr, negated: bool) -> SqlResult<Expr> {
+        self.bump(); // LIKE
+        let pattern = self.parse_additive()?;
+        let mut end = pattern.span;
+        let escape = if self.peek_keyword().as_deref() == Some("ESCAPE") {
+            self.bump();
+            let token = self.bump();
+            end = token.span;
+            match &token.kind {
+                TokenKind::String(s) if s.chars().count() == 1 => s.chars().next(),
+                _ => return Err(SqlError::syntax(self.token_text(&token), token.span)),
+            }
+        } else {
+            None
+        };
+        self.node()?;
+        Ok(Expr {
+            span: left.span.to(end),
+            kind: ExprKind::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                escape,
+                negated,
+            },
+        })
+    }
+
+    fn parse_in(&mut self, left: Expr, negated: bool) -> SqlResult<Expr> {
+        self.bump(); // IN
+        self.expect(&TokenKind::LParen)?;
+        let mut list = Vec::new();
+        loop {
+            list.push(self.parse_expr()?);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(&TokenKind::RParen)?;
+        self.node()?;
+        Ok(Expr {
+            span: left.span.to(end),
+            kind: ExprKind::InList {
+                expr: Box::new(left),
+                list,
+                negated,
+            },
+        })
+    }
+
+    fn parse_between(&mut self, left: Expr, negated: bool) -> SqlResult<Expr> {
+        self.bump(); // BETWEEN
+        // `low`/`high` parse at additive precedence so BETWEEN's `AND` is not
+        // swallowed as a boolean connective.
+        let low = self.parse_additive()?;
+        self.expect_keyword("AND")?;
+        let high = self.parse_additive()?;
+        self.node()?;
+        Ok(Expr {
+            span: left.span.to(high.span),
+            kind: ExprKind::Between {
+                expr: Box::new(left),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated,
+            },
+        })
+    }
+
+    fn parse_function(&mut self, name: Name) -> SqlResult<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let mut args = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let end = self.expect(&TokenKind::RParen)?;
+        self.node()?;
+        Ok(Expr {
+            span: name.span.to(end),
+            kind: ExprKind::Function {
+                name: name.value,
+                args,
+            },
+        })
+    }
+
+    fn parse_case(&mut self) -> SqlResult<Expr> {
+        let start = self.bump().span; // CASE
+        // A simple CASE has an operand before the first WHEN.
+        let operand = if self.peek_keyword().as_deref() == Some("WHEN") {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+        let mut branches = Vec::new();
+        while self.peek_keyword().as_deref() == Some("WHEN") {
+            self.bump();
+            let cond = self.parse_expr()?;
+            self.expect_keyword("THEN")?;
+            let result = self.parse_expr()?;
+            self.node()?;
+            branches.push((cond, result));
+        }
+        if branches.is_empty() {
+            let token = self.peek().clone();
+            return Err(SqlError::syntax(self.token_text(&token), token.span));
+        }
+        let else_result = if self.peek_keyword().as_deref() == Some("ELSE") {
+            self.bump();
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        let end = self.expect_keyword("END")?;
+        self.node()?;
+        Ok(Expr {
+            span: start.to(end),
+            kind: ExprKind::Case {
+                operand,
+                branches,
+                else_result,
+            },
+        })
+    }
+
+    fn parse_cast(&mut self) -> SqlResult<Expr> {
+        let start = self.bump().span; // CAST
+        self.expect(&TokenKind::LParen)?;
+        let expr = self.parse_expr()?;
+        self.expect_keyword("AS")?;
+        let (target, _) = self.parse_data_type()?;
+        let end = self.expect(&TokenKind::RParen)?;
+        self.node()?;
+        Ok(Expr {
+            span: start.to(end),
+            kind: ExprKind::Cast {
+                expr: Box::new(expr),
+                target,
+            },
+        })
+    }
+
+    fn parse_convert(&mut self) -> SqlResult<Expr> {
+        let start = self.bump().span; // CONVERT
+        self.expect(&TokenKind::LParen)?;
+        let (target, _) = self.parse_data_type()?;
+        self.expect(&TokenKind::Comma)?;
+        let expr = self.parse_expr()?;
+        // An optional style argument is accepted and ignored for now.
+        if self.eat(&TokenKind::Comma) {
+            let _ = self.parse_expr()?;
+        }
+        let end = self.expect(&TokenKind::RParen)?;
+        self.node()?;
+        Ok(Expr {
+            span: start.to(end),
+            kind: ExprKind::Cast {
+                expr: Box::new(expr),
+                target,
+            },
+        })
     }
 
     fn parse_additive(&mut self) -> SqlResult<Expr> {
@@ -608,15 +946,23 @@ impl Parser {
                             span: token.span,
                         })
                     }
+                    Some("CASE") if !quoted => self.parse_case(),
+                    Some("CAST") if !quoted => self.parse_cast(),
+                    Some("CONVERT") if !quoted => self.parse_convert(),
                     Some(kw) if !quoted && is_reserved(kw) => {
                         Err(SqlError::syntax(self.token_text(&token), token.span))
                     }
                     _ => {
                         let name = self.parse_name()?;
-                        Ok(Expr {
-                            span: name.span,
-                            kind: ExprKind::Column(name),
-                        })
+                        // A single identifier followed by `(` is a function call.
+                        if !name.value.contains('.') && self.check(&TokenKind::LParen) {
+                            self.parse_function(name)
+                        } else {
+                            Ok(Expr {
+                                span: name.span,
+                                kind: ExprKind::Column(name),
+                            })
+                        }
                     }
                 }
             }
@@ -672,6 +1018,20 @@ impl Parser {
             .map_err(|_| SqlError::message_only(1073, "Length value is out of range."))
     }
 
+    /// Parses a signed integer literal (optional leading `-`), for IDENTITY
+    /// seed/increment.
+    fn parse_i64_literal(&mut self) -> SqlResult<i64> {
+        let negative = self.eat(&TokenKind::Minus);
+        let token = self.peek().clone();
+        match token.kind {
+            TokenKind::Int(v) => {
+                self.bump();
+                Ok(if negative { -v } else { v })
+            }
+            _ => Err(SqlError::syntax(self.token_text(&token), token.span)),
+        }
+    }
+
     fn parse_u64_literal(&mut self) -> SqlResult<u64> {
         let token = self.peek().clone();
         match token.kind {
@@ -689,6 +1049,14 @@ impl Parser {
 
     fn peek_keyword(&self) -> Option<String> {
         self.peek().keyword()
+    }
+
+    /// The keyword `offset` tokens ahead of the cursor (for two-token lookahead
+    /// like `NOT LIKE`).
+    fn peek_keyword_at(&self, offset: usize) -> Option<String> {
+        self.tokens
+            .get((self.pos + offset).min(self.tokens.len() - 1))
+            .and_then(|t| t.keyword())
     }
 
     fn bump(&mut self) -> Token {

@@ -59,6 +59,7 @@ fn int_column(name: &str, nullable: bool) -> Column {
         name: name.to_string(),
         column_type: ColumnType::Int,
         nullable,
+        collation: None,
     }
 }
 
@@ -67,6 +68,7 @@ fn varchar_column(name: &str, max_len: u16) -> Column {
         name: name.to_string(),
         column_type: ColumnType::VarChar { max_len },
         nullable: true,
+        collation: None,
     }
 }
 
@@ -76,6 +78,8 @@ fn create_tree_table(storage: &mut Storage, name: &str) {
             name,
             vec![int_column("id", false), varchar_column("payload", 4000)],
             &["id".to_string()],
+            Vec::new(),
+            None,
         )
         .expect("create tree table");
 }
@@ -86,6 +90,8 @@ fn create_heap_table(storage: &mut Storage, name: &str) {
             name,
             vec![int_column("id", false), varchar_column("payload", 4000)],
             &[],
+            Vec::new(),
+            None,
         )
         .expect("create heap table");
 }
@@ -572,9 +578,12 @@ fn heap_update_on_stub_starved_page_fails_cleanly() {
                     name: "v".to_string(),
                     column_type: ColumnType::VarBinary { max_len: 200 },
                     nullable: true,
+                    collation: None,
                 },
             ],
             &[],
+            Vec::new(),
+            None,
         )
         .expect("create heap");
     // Fill page 1 to exactly 2 free bytes: 336 null-v rows (12 bytes each

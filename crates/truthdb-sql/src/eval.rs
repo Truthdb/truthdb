@@ -5,9 +5,13 @@
 //! resolver mapping a column [`Name`] to its index. Arithmetic and
 //! comparisons follow three-valued logic (see [`value`](crate::value)).
 
-use crate::ast::{BinaryOp, Expr, ExprKind, UnaryOp};
+use std::cmp::Ordering;
+
+use crate::ast::{BinaryOp, DataType, Expr, ExprKind, Name, UnaryOp};
+use crate::decimal::Decimal;
 use crate::error::{SqlError, SqlResult};
-use crate::value::{self, SqlValue};
+use crate::functions;
+use crate::value::{self, Numeric, SqlValue};
 
 /// Resolves a column name to its position in the row, case-insensitively.
 pub trait ColumnResolver {
@@ -26,54 +30,461 @@ impl ColumnResolver for Vec<String> {
     }
 }
 
+/// Maximum expression-evaluation recursion depth. A long operator chain
+/// (`1 OR 1 OR ...`) recurses ~1 frame per operator, so — like the parser's
+/// node budget — eval must bound its own depth to fail cleanly (error 191)
+/// instead of overflowing the stack. Generous for real queries; the frame is
+/// kept small (heavy arms delegate to out-of-line helpers) so this is safe.
+const MAX_EVAL_DEPTH: usize = 500;
+
 /// Evaluates `expr` against `row`, resolving columns via `resolver`.
 pub fn eval(expr: &Expr, row: &[SqlValue], resolver: &impl ColumnResolver) -> SqlResult<SqlValue> {
+    eval_at(expr, row, resolver, 0)
+}
+
+fn eval_at(
+    expr: &Expr,
+    row: &[SqlValue],
+    resolver: &impl ColumnResolver,
+    depth: usize,
+) -> SqlResult<SqlValue> {
+    if depth > MAX_EVAL_DEPTH {
+        return Err(SqlError::message_only(
+            191,
+            "Some part of your SQL statement is nested too deeply. Rewrite the query or break it into smaller queries.",
+        ));
+    }
     match &expr.kind {
         ExprKind::Null => Ok(SqlValue::Null),
         ExprKind::Int(v) => Ok(SqlValue::Int(*v)),
-        ExprKind::Number(text) => text
-            .parse::<f64>()
-            .map(SqlValue::Float)
-            .map_err(|_| SqlError::conversion(format!("cannot parse numeric literal '{text}'"))),
+        ExprKind::Number(text) => eval_number_literal(text),
         ExprKind::Str(s) => Ok(SqlValue::Str(s.clone())),
         ExprKind::Bool(b) => Ok(SqlValue::Bool(*b)),
-        ExprKind::Column(name) => {
-            let index = resolver
-                .resolve(&name.value)
-                .ok_or_else(|| SqlError::invalid_column(&name.value).at(name.span))?;
-            Ok(row[index].clone())
-        }
+        ExprKind::Column(name) => eval_column(name, row, resolver),
         ExprKind::Unary { op, expr: inner } => {
-            let value = eval(inner, row, resolver)?;
-            match op {
-                UnaryOp::Neg => match value {
-                    SqlValue::Null => Ok(SqlValue::Null),
-                    SqlValue::Int(v) => Ok(SqlValue::Int(v.wrapping_neg())),
-                    SqlValue::Float(v) => Ok(SqlValue::Float(-v)),
-                    other => Err(SqlError::conversion(format!(
-                        "operator '-' is not valid on {}",
-                        other.type_name()
-                    ))),
-                },
-                UnaryOp::Not => Ok(three_valued(value::not(value.as_predicate()))),
-            }
+            let value = eval_at(inner, row, resolver, depth + 1)?;
+            eval_unary(*op, value)
         }
         ExprKind::IsNull {
             expr: inner,
             negated,
         } => {
-            let value = eval(inner, row, resolver)?;
-            let is_null = value.is_null();
-            Ok(SqlValue::Bool(is_null != *negated))
+            let value = eval_at(inner, row, resolver, depth + 1)?;
+            Ok(SqlValue::Bool(value.is_null() != *negated))
         }
         ExprKind::Binary { op, left, right } => {
-            let l = eval(left, row, resolver)?;
-            let r = eval(right, row, resolver)?;
+            let l = eval_at(left, row, resolver, depth + 1)?;
+            let r = eval_at(right, row, resolver, depth + 1)?;
             eval_binary(*op, l, r)
         }
+        ExprKind::Like {
+            expr,
+            pattern,
+            escape,
+            negated,
+        } => eval_like_expr(expr, pattern, *escape, *negated, row, resolver, depth),
+        ExprKind::InList {
+            expr,
+            list,
+            negated,
+        } => eval_in_expr(expr, list, *negated, row, resolver, depth),
+        ExprKind::Between {
+            expr,
+            low,
+            high,
+            negated,
+        } => eval_between_expr(expr, low, high, *negated, row, resolver, depth),
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => eval_case_expr(
+            operand.as_deref(),
+            branches,
+            else_result.as_deref(),
+            row,
+            resolver,
+            depth,
+        ),
+        ExprKind::Cast { expr, target } => {
+            let v = eval_at(expr, row, resolver, depth + 1)?;
+            cast_value(v, target)
+        }
+        ExprKind::Function { name, args } => eval_call(name, args, row, resolver, depth),
     }
 }
 
+#[inline(never)]
+fn eval_column(
+    name: &Name,
+    row: &[SqlValue],
+    resolver: &impl ColumnResolver,
+) -> SqlResult<SqlValue> {
+    let index = resolver
+        .resolve(&name.value)
+        .ok_or_else(|| SqlError::invalid_column(&name.value).at(name.span))?;
+    Ok(row[index].clone())
+}
+
+#[inline(never)]
+fn eval_unary(op: UnaryOp, value: SqlValue) -> SqlResult<SqlValue> {
+    match op {
+        UnaryOp::Neg => match value {
+            SqlValue::Null => Ok(SqlValue::Null),
+            SqlValue::Int(v) => Ok(SqlValue::Int(v.wrapping_neg())),
+            SqlValue::Float(v) => Ok(SqlValue::Float(-v)),
+            SqlValue::Decimal(d) => Ok(SqlValue::Decimal(Box::new(Decimal::new(
+                -d.value,
+                d.precision,
+                d.scale,
+            )))),
+            other => Err(SqlError::conversion(format!(
+                "operator '-' is not valid on {}",
+                other.type_name()
+            ))),
+        },
+        UnaryOp::Not => Ok(three_valued(value::not(value.as_predicate()))),
+    }
+}
+
+// Compound-expression handlers are kept out of line so `eval_at`'s frame — the
+// one that recurses down a long operator chain — stays small.
+
+#[inline(never)]
+fn eval_like_expr<R: ColumnResolver>(
+    expr: &Expr,
+    pattern: &Expr,
+    escape: Option<char>,
+    negated: bool,
+    row: &[SqlValue],
+    resolver: &R,
+    depth: usize,
+) -> SqlResult<SqlValue> {
+    let value = eval_at(expr, row, resolver, depth + 1)?;
+    let pat = eval_at(pattern, row, resolver, depth + 1)?;
+    if value.is_null() || pat.is_null() {
+        return Ok(SqlValue::Null);
+    }
+    let (SqlValue::Str(text), SqlValue::Str(pattern)) = (&value, &pat) else {
+        return Err(SqlError::conversion(
+            "LIKE requires character-string operands".to_string(),
+        ));
+    };
+    let matched = crate::like::like_match(text, pattern, escape);
+    Ok(SqlValue::Bool(matched != negated))
+}
+
+#[inline(never)]
+fn eval_in_expr<R: ColumnResolver>(
+    expr: &Expr,
+    list: &[Expr],
+    negated: bool,
+    row: &[SqlValue],
+    resolver: &R,
+    depth: usize,
+) -> SqlResult<SqlValue> {
+    let value = eval_at(expr, row, resolver, depth + 1)?;
+    if value.is_null() {
+        return Ok(SqlValue::Null);
+    }
+    // `x IN (list)` is `x=a OR x=b OR ...` under three-valued logic.
+    let mut any_unknown = false;
+    for item in list {
+        let candidate = eval_at(item, row, resolver, depth + 1)?;
+        match value.compare(&candidate)? {
+            Some(std::cmp::Ordering::Equal) => return Ok(SqlValue::Bool(!negated)),
+            None => any_unknown = true,
+            _ => {}
+        }
+    }
+    if any_unknown {
+        Ok(SqlValue::Null)
+    } else {
+        Ok(SqlValue::Bool(negated))
+    }
+}
+
+#[inline(never)]
+fn eval_between_expr<R: ColumnResolver>(
+    expr: &Expr,
+    low: &Expr,
+    high: &Expr,
+    negated: bool,
+    row: &[SqlValue],
+    resolver: &R,
+    depth: usize,
+) -> SqlResult<SqlValue> {
+    let value = eval_at(expr, row, resolver, depth + 1)?;
+    let lo = eval_at(low, row, resolver, depth + 1)?;
+    let hi = eval_at(high, row, resolver, depth + 1)?;
+    // `x BETWEEN a AND b` is `x>=a AND x<=b` (three-valued).
+    let ge = value.compare(&lo)?.map(|o| o != Ordering::Less);
+    let le = value.compare(&hi)?.map(|o| o != Ordering::Greater);
+    let within = value::and(ge, le);
+    Ok(three_valued(if negated {
+        value::not(within)
+    } else {
+        within
+    }))
+}
+
+#[inline(never)]
+fn eval_case_expr<R: ColumnResolver>(
+    operand: Option<&Expr>,
+    branches: &[(Expr, Expr)],
+    else_result: Option<&Expr>,
+    row: &[SqlValue],
+    resolver: &R,
+    depth: usize,
+) -> SqlResult<SqlValue> {
+    let operand_value = match operand {
+        Some(o) => Some(eval_at(o, row, resolver, depth + 1)?),
+        None => None,
+    };
+    for (cond, result) in branches {
+        let matched = match &operand_value {
+            // Simple CASE: operand = WHEN value (NULL never matches).
+            Some(ov) => {
+                let cv = eval_at(cond, row, resolver, depth + 1)?;
+                matches!(ov.compare(&cv)?, Some(Ordering::Equal))
+            }
+            // Searched CASE: WHEN is a boolean predicate.
+            None => matches!(
+                eval_at(cond, row, resolver, depth + 1)?,
+                SqlValue::Bool(true)
+            ),
+        };
+        if matched {
+            return eval_at(result, row, resolver, depth + 1);
+        }
+    }
+    match else_result {
+        Some(e) => eval_at(e, row, resolver, depth + 1),
+        None => Ok(SqlValue::Null),
+    }
+}
+
+#[inline(never)]
+fn eval_call<R: ColumnResolver>(
+    name: &str,
+    args: &[Expr],
+    row: &[SqlValue],
+    resolver: &R,
+    depth: usize,
+) -> SqlResult<SqlValue> {
+    let mut values = Vec::with_capacity(args.len());
+    for arg in args {
+        values.push(eval_at(arg, row, resolver, depth + 1)?);
+    }
+    functions::eval_function(name, values)
+}
+
+/// CAST/CONVERT: converts a value to a target [`DataType`], producing a value
+/// of that type. Numeric overflow is 8115; a failed parse is 241.
+#[inline(never)]
+fn cast_value(value: SqlValue, target: &DataType) -> SqlResult<SqlValue> {
+    if value.is_null() {
+        return Ok(SqlValue::Null);
+    }
+    let overflow = || {
+        SqlError::new(
+            8115,
+            16,
+            2,
+            format!(
+                "Arithmetic overflow error converting to data type {}.",
+                type_label(target)
+            ),
+        )
+    };
+    let cfail = |t: &str| {
+        SqlError::message_only(
+            241,
+            format!("Conversion failed when converting to data type {t}."),
+        )
+    };
+    match target {
+        DataType::TinyInt => cast_int(&value, 0, u8::MAX as i64, overflow),
+        DataType::SmallInt => cast_int(&value, i16::MIN as i64, i16::MAX as i64, overflow),
+        DataType::Int => cast_int(&value, i32::MIN as i64, i32::MAX as i64, overflow),
+        DataType::BigInt => cast_int(&value, i64::MIN, i64::MAX, overflow),
+        DataType::Bit => Ok(SqlValue::Bool(
+            cast_to_i64(&value).ok_or_else(|| cfail("bit"))? != 0,
+        )),
+        DataType::Real => Ok(SqlValue::Float(
+            cast_to_f64(&value).ok_or_else(|| cfail("real"))? as f32 as f64,
+        )),
+        DataType::Float => Ok(SqlValue::Float(
+            cast_to_f64(&value).ok_or_else(|| cfail("float"))?,
+        )),
+        DataType::Decimal { precision, scale } => {
+            let d = cast_to_decimal(&value).ok_or_else(|| cfail("decimal"))?;
+            d.coerce(*precision, *scale)
+                .map(|d| SqlValue::Decimal(Box::new(d)))
+                .map_err(|_| overflow())
+        }
+        DataType::VarChar(n) | DataType::NVarChar(n) => {
+            // CAST to a char type truncates silently.
+            let s: String = cast_to_string(&value).chars().take(*n as usize).collect();
+            Ok(SqlValue::Str(s))
+        }
+        DataType::Date => match &value {
+            SqlValue::Date(d) => Ok(SqlValue::Date(*d)),
+            SqlValue::DateTime2(d, _) => Ok(SqlValue::Date(*d)),
+            SqlValue::Str(s) => crate::temporal::parse_date(s)
+                .map(SqlValue::Date)
+                .ok_or_else(|| cfail("date")),
+            _ => Err(cfail("date")),
+        },
+        DataType::Time => match &value {
+            SqlValue::Time(t) => Ok(SqlValue::Time(*t)),
+            SqlValue::DateTime2(_, t) => Ok(SqlValue::Time(*t)),
+            SqlValue::Str(s) => crate::temporal::parse_time(s)
+                .map(SqlValue::Time)
+                .ok_or_else(|| cfail("time")),
+            _ => Err(cfail("time")),
+        },
+        DataType::DateTime2 => match &value {
+            SqlValue::DateTime2(d, t) => Ok(SqlValue::DateTime2(*d, *t)),
+            SqlValue::Date(d) => Ok(SqlValue::DateTime2(*d, 0)),
+            SqlValue::Str(s) => crate::temporal::parse_datetime2(s)
+                .map(|(d, t)| SqlValue::DateTime2(d, t))
+                .ok_or_else(|| cfail("datetime2")),
+            _ => Err(cfail("datetime2")),
+        },
+        DataType::UniqueIdentifier => match &value {
+            SqlValue::Guid(b) => Ok(SqlValue::Guid(*b)),
+            SqlValue::Str(s) => crate::guid::parse(s)
+                .map(SqlValue::Guid)
+                .ok_or_else(|| cfail("uniqueidentifier")),
+            _ => Err(cfail("uniqueidentifier")),
+        },
+        DataType::VarBinary(n) => match &value {
+            SqlValue::Binary(b) => Ok(SqlValue::Binary(
+                b.iter().take(*n as usize).copied().collect(),
+            )),
+            _ => Err(cfail("varbinary")),
+        },
+    }
+}
+
+fn type_label(target: &DataType) -> &'static str {
+    match target {
+        DataType::TinyInt => "tinyint",
+        DataType::SmallInt => "smallint",
+        DataType::Int => "int",
+        DataType::BigInt => "bigint",
+        DataType::Bit => "bit",
+        DataType::Real => "real",
+        DataType::Float => "float",
+        DataType::Decimal { .. } => "decimal",
+        DataType::Date => "date",
+        DataType::Time => "time",
+        DataType::DateTime2 => "datetime2",
+        DataType::UniqueIdentifier => "uniqueidentifier",
+        DataType::VarChar(_) => "varchar",
+        DataType::NVarChar(_) => "nvarchar",
+        DataType::VarBinary(_) => "varbinary",
+    }
+}
+
+fn cast_int(
+    value: &SqlValue,
+    min: i64,
+    max: i64,
+    overflow: impl Fn() -> SqlError,
+) -> SqlResult<SqlValue> {
+    let v = cast_to_i64(value).ok_or_else(|| {
+        SqlError::message_only(
+            245,
+            format!(
+                "Conversion failed converting {} to an integer.",
+                value.type_name()
+            ),
+        )
+    })?;
+    if v < min || v > max {
+        return Err(overflow());
+    }
+    Ok(SqlValue::Int(v))
+}
+
+fn cast_to_i64(value: &SqlValue) -> Option<i64> {
+    match value {
+        SqlValue::Int(v) => Some(*v),
+        SqlValue::Bool(b) => Some(*b as i64),
+        // CAST to an integer type truncates toward zero (SQL Server); a float
+        // out of i64 range fails rather than saturating.
+        SqlValue::Float(f) => {
+            let t = f.trunc();
+            (t.is_finite() && t >= i64::MIN as f64 && t <= i64::MAX as f64).then_some(t as i64)
+        }
+        SqlValue::Decimal(d) => i64::try_from(d.truncated_to_int()).ok(),
+        SqlValue::Str(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn cast_to_f64(value: &SqlValue) -> Option<f64> {
+    match value {
+        SqlValue::Int(v) => Some(*v as f64),
+        SqlValue::Float(v) => Some(*v),
+        SqlValue::Bool(b) => Some(*b as i64 as f64),
+        SqlValue::Decimal(d) => Some(d.to_f64()),
+        SqlValue::Str(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
+fn cast_to_decimal(value: &SqlValue) -> Option<Decimal> {
+    match value {
+        SqlValue::Decimal(d) => Some(**d),
+        SqlValue::Int(v) => Some(Decimal::from_i64(*v)),
+        SqlValue::Bool(b) => Some(Decimal::from_i64(*b as i64)),
+        SqlValue::Str(s) => Decimal::parse(s),
+        SqlValue::Float(f) => Decimal::parse(&format!("{f}")),
+        _ => None,
+    }
+}
+
+fn cast_to_string(value: &SqlValue) -> String {
+    match value {
+        SqlValue::Str(s) => s.clone(),
+        SqlValue::Int(v) => v.to_string(),
+        SqlValue::Bool(b) => if *b { "1" } else { "0" }.to_string(),
+        SqlValue::Float(f) => format!("{f}"),
+        SqlValue::Decimal(d) => d.render(),
+        SqlValue::Date(days) => crate::temporal::render_date(*days),
+        SqlValue::Time(t) => crate::temporal::render_time(*t),
+        SqlValue::DateTime2(d, t) => crate::temporal::render_datetime2(*d, *t),
+        SqlValue::Guid(b) => crate::guid::render(b),
+        SqlValue::Binary(_) => String::new(),
+        SqlValue::Null => String::new(),
+    }
+}
+
+// The literal-parsing and arithmetic helpers are kept out of line so the
+// deep-recursing `eval` frame stays small: a long operator chain recurses ~1
+// `eval` frame per operator, and folding these (with their format!/parse
+// temporaries) into `eval` would blow a 2 MiB stack (see the node-budget
+// rationale in the parser).
+
+/// A literal with a decimal point is DECIMAL/NUMERIC; one with an exponent is
+/// FLOAT (SQL Server literal typing).
+#[inline(never)]
+fn eval_number_literal(text: &str) -> SqlResult<SqlValue> {
+    if text.contains(['e', 'E']) {
+        text.parse::<f64>()
+            .map(SqlValue::Float)
+            .map_err(|_| SqlError::conversion(format!("cannot parse float literal '{text}'")))
+    } else {
+        Decimal::parse(text)
+            .map(|d| SqlValue::Decimal(Box::new(d)))
+            .ok_or_else(|| SqlError::conversion(format!("cannot parse numeric literal '{text}'")))
+    }
+}
+
+#[inline(never)]
 fn eval_binary(op: BinaryOp, l: SqlValue, r: SqlValue) -> SqlResult<SqlValue> {
     use BinaryOp::*;
     match op {
@@ -104,39 +515,108 @@ fn arithmetic(op: BinaryOp, l: SqlValue, r: SqlValue) -> SqlResult<SqlValue> {
     if l.is_null() || r.is_null() {
         return Ok(SqlValue::Null);
     }
-    // Integer arithmetic stays integer (T-SQL: int / int truncates); any
-    // float operand promotes the whole expression to float.
-    match (&l, &r) {
-        (SqlValue::Int(a), SqlValue::Int(b)) => int_arithmetic(op, *a, *b),
-        _ => {
-            let (Some(a), Some(b)) = (as_f64(&l), as_f64(&r)) else {
-                return Err(SqlError::conversion(format!(
-                    "arithmetic operand type clash: {} vs {}",
-                    l.type_name(),
-                    r.type_name()
-                )));
-            };
-            let value = match op {
-                BinaryOp::Add => a + b,
-                BinaryOp::Sub => a - b,
-                BinaryOp::Mul => a * b,
-                BinaryOp::Div => {
-                    if b == 0.0 {
-                        return Err(SqlError::divide_by_zero());
-                    }
-                    a / b
-                }
-                BinaryOp::Mod => {
-                    if b == 0.0 {
-                        return Err(SqlError::divide_by_zero());
-                    }
-                    a % b
-                }
-                _ => unreachable!(),
-            };
-            Ok(SqlValue::Float(value))
+    // `+` over two character operands is concatenation, not addition.
+    if op == BinaryOp::Add
+        && let (SqlValue::Str(a), SqlValue::Str(b)) = (&l, &r)
+    {
+        return Ok(SqlValue::Str(format!("{a}{b}")));
+    }
+    let a = coerce_numeric(&l)?;
+    let b = coerce_numeric(&r)?;
+    numeric_arithmetic(op, a, b)
+}
+
+/// A value as a number for arithmetic; a character operand is parsed (int, then
+/// decimal), matching SQL Server's implicit conversion.
+fn coerce_numeric(value: &SqlValue) -> SqlResult<Numeric> {
+    if let Some(n) = value.as_numeric() {
+        return Ok(n);
+    }
+    if let SqlValue::Str(s) = value {
+        if let Ok(v) = s.trim().parse::<i64>() {
+            return Ok(Numeric::Int(v));
+        }
+        if let Some(d) = Decimal::parse(s) {
+            return Ok(Numeric::Decimal(d));
         }
     }
+    Err(SqlError::conversion(format!(
+        "operator is not valid on operand of type {}",
+        value.type_name()
+    )))
+}
+
+/// Promotes two numerics (float > decimal > int) and applies the operator.
+fn numeric_arithmetic(op: BinaryOp, a: Numeric, b: Numeric) -> SqlResult<SqlValue> {
+    use Numeric::*;
+    match (a, b) {
+        (Float(_), _) | (_, Float(_)) => float_arithmetic(op, num_to_f64(a), num_to_f64(b)),
+        (Decimal(x), Decimal(y)) => decimal_arithmetic(op, x, y),
+        (Decimal(x), Int(y)) => decimal_arithmetic(op, x, crate::decimal::Decimal::from_i64(y)),
+        (Int(x), Decimal(y)) => decimal_arithmetic(op, crate::decimal::Decimal::from_i64(x), y),
+        (Int(x), Int(y)) => int_arithmetic(op, x, y),
+    }
+}
+
+fn num_to_f64(n: Numeric) -> f64 {
+    match n {
+        Numeric::Int(v) => v as f64,
+        Numeric::Float(v) => v,
+        Numeric::Decimal(d) => d.to_f64(),
+    }
+}
+
+fn float_arithmetic(op: BinaryOp, a: f64, b: f64) -> SqlResult<SqlValue> {
+    let value = match op {
+        BinaryOp::Add => a + b,
+        BinaryOp::Sub => a - b,
+        BinaryOp::Mul => a * b,
+        BinaryOp::Div => {
+            if b == 0.0 {
+                return Err(SqlError::divide_by_zero());
+            }
+            a / b
+        }
+        BinaryOp::Mod => {
+            if b == 0.0 {
+                return Err(SqlError::divide_by_zero());
+            }
+            a % b
+        }
+        _ => unreachable!(),
+    };
+    Ok(SqlValue::Float(value))
+}
+
+fn decimal_arithmetic(op: BinaryOp, a: Decimal, b: Decimal) -> SqlResult<SqlValue> {
+    let overflow = || SqlError::new(8115, 16, 2, "Arithmetic overflow error.");
+    let result = match op {
+        BinaryOp::Add => a.add(b).map_err(|_| overflow())?,
+        BinaryOp::Sub => a.sub(b).map_err(|_| overflow())?,
+        BinaryOp::Mul => a.mul(b).map_err(|_| overflow())?,
+        BinaryOp::Div => match a.div(b).map_err(|_| overflow())? {
+            Some(d) => d,
+            None => return Err(SqlError::divide_by_zero()),
+        },
+        BinaryOp::Mod => {
+            if b.is_zero() {
+                return Err(SqlError::divide_by_zero());
+            }
+            let scale = a.scale.max(b.scale);
+            let (Some(x), Some(y)) = (a.rescaled(scale), b.rescaled(scale)) else {
+                return Err(overflow());
+            };
+            // SQL Server: precision = min(p1-s1, p2-s2) + max(s1, s2).
+            let int_digits = a
+                .precision
+                .saturating_sub(a.scale)
+                .min(b.precision.saturating_sub(b.scale));
+            let precision = (int_digits as u16 + scale as u16).clamp(1, 38) as u8;
+            Decimal::new(x % y, precision, scale)
+        }
+        _ => unreachable!(),
+    };
+    Ok(SqlValue::Decimal(Box::new(result)))
 }
 
 fn int_arithmetic(op: BinaryOp, a: i64, b: i64) -> SqlResult<SqlValue> {
@@ -161,14 +641,6 @@ fn int_arithmetic(op: BinaryOp, a: i64, b: i64) -> SqlResult<SqlValue> {
     checked
         .map(SqlValue::Int)
         .ok_or_else(|| SqlError::new(8115, 16, 2, "Arithmetic overflow error."))
-}
-
-fn as_f64(value: &SqlValue) -> Option<f64> {
-    match value {
-        SqlValue::Int(v) => Some(*v as f64),
-        SqlValue::Float(v) => Some(*v),
-        _ => None,
-    }
 }
 
 /// Wraps a three-valued result as a SQL boolean value (UNKNOWN -> NULL).
@@ -273,11 +745,25 @@ mod tests {
 
     #[test]
     fn large_valid_chain_evaluates_without_overflow() {
-        // A left-leaning OR chain near the parser's node budget (~1801 nodes)
-        // must evaluate — recursing ~900 deep down its spine — without
-        // overflowing the stack.
-        let sql = format!("1{}", " OR 1".repeat(900));
+        // A left-leaning OR chain within the eval depth budget evaluates,
+        // recursing down its spine without overflowing the stack.
+        let sql = format!("1{}", " OR 1".repeat(400));
         assert_eq!(eval_predicate(&sql, &[], &[]), SqlValue::Bool(true));
+    }
+
+    #[test]
+    fn over_deep_chain_errors_not_overflow() {
+        // Past the depth budget eval fails cleanly (191), never overflowing.
+        let sql = format!("1{}", " OR 1".repeat(700));
+        let statements = Parser::parse_str(&format!("SELECT {sql}")).unwrap();
+        let crate::ast::Statement::Select(select) = &statements[0] else {
+            panic!()
+        };
+        let crate::ast::SelectItem::Expr { expr, .. } = &select.items[0] else {
+            panic!()
+        };
+        let empty: Vec<String> = Vec::new();
+        assert_eq!(eval(expr, &[], &empty).unwrap_err().number, 191);
     }
 
     #[test]

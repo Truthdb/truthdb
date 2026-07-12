@@ -1362,6 +1362,349 @@ mod tests {
     }
 
     #[test]
+    fn sql_update_and_delete_with_where() {
+        let path = unique_temp_path("sql-update-delete");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT, label NVARCHAR(20))")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 10, 'a'), (2, 20, 'b'), (3, 30, 'c')")
+            .expect("insert");
+
+        // UPDATE a non-key column; SET expression sees the pre-update row.
+        engine
+            .execute("UPDATE t SET n = n + 5, label = 'x' WHERE id = 2")
+            .expect("update");
+        let (_, rows) = sql_rows(&mut engine, "SELECT n, label FROM t WHERE id = 2");
+        assert_eq!(rows, vec![vec![Some("25".into()), Some("x".into())]]);
+
+        // DELETE a subset.
+        engine
+            .execute("DELETE FROM t WHERE n < 20")
+            .expect("delete");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t ORDER BY id");
+        assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_update_primary_key_rekeys() {
+        let path = unique_temp_path("sql-update-pk");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 100), (2, 200)")
+            .expect("insert");
+        // Move row 1 to key 5 (delete + insert under the hood).
+        engine
+            .execute("UPDATE t SET id = 5 WHERE id = 1")
+            .expect("update");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id, v FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("2".into()), Some("200".into())],
+                vec![Some("5".into()), Some("100".into())],
+            ]
+        );
+        // Re-keying onto an existing key collides (2627).
+        assert_eq!(
+            sql_error_number(&mut engine, "UPDATE t SET id = 2 WHERE id = 5"),
+            2627
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_delete_all_and_update_null_violation() {
+        let path = unique_temp_path("sql-del-all");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT NOT NULL)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+            .expect("insert");
+        // Updating a NOT NULL column to NULL is 515.
+        assert_eq!(
+            sql_error_number(&mut engine, "UPDATE t SET n = NULL WHERE id = 1"),
+            515
+        );
+        // DELETE with no WHERE clears the table.
+        engine.execute("DELETE FROM t").expect("delete all");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t");
+        assert!(rows.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_default_values_applied() {
+        let path = unique_temp_path("sql-default");
+        let mut engine = new_engine(&path);
+        engine
+            .execute(
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, \
+                 n INT NOT NULL DEFAULT 7, label NVARCHAR(10) DEFAULT 'none')",
+            )
+            .expect("create");
+        // Omit the defaulted columns.
+        engine
+            .execute("INSERT INTO t (id) VALUES (1)")
+            .expect("insert");
+        // An explicit NULL into a nullable column is kept (not defaulted).
+        engine
+            .execute("INSERT INTO t (id, label) VALUES (2, NULL)")
+            .expect("insert2");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id, n, label FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("1".into()), Some("7".into()), Some("none".into())],
+                vec![Some("2".into()), Some("7".into()), None],
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_identity_assigns_and_survives_restart() {
+        let path = unique_temp_path("sql-identity");
+        let mut engine = new_engine(&path);
+        engine
+            .execute(
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY IDENTITY(1,1), name NVARCHAR(10))",
+            )
+            .expect("create");
+        engine
+            .execute("INSERT INTO t (name) VALUES ('a')")
+            .expect("i1");
+        engine
+            .execute("INSERT INTO t (name) VALUES ('b'), ('c')")
+            .expect("i2");
+        // Deleting the max row must not let its identity be reused.
+        engine.execute("DELETE FROM t WHERE id = 3").expect("del");
+        engine
+            .execute("INSERT INTO t (name) VALUES ('d')")
+            .expect("i3");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id, name FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("1".into()), Some("a".into())],
+                vec![Some("2".into()), Some("b".into())],
+                vec![Some("4".into()), Some("d".into())],
+            ]
+        );
+        // Providing an explicit value for an identity column is rejected.
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO t (id, name) VALUES (9, 'z')"),
+            8101
+        );
+        // Identity cannot be updated.
+        assert_eq!(
+            sql_error_number(&mut engine, "UPDATE t SET id = 100 WHERE id = 1"),
+            8102
+        );
+        drop(engine);
+
+        // Restart: the counter continues from 5, never reusing 3.
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("engine");
+        engine
+            .execute("INSERT INTO t (name) VALUES ('e')")
+            .expect("i4");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE name = 'e'");
+        assert_eq!(rows, vec![vec![Some("5".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_decimal_arithmetic_and_rendering() {
+        let path = unique_temp_path("sql-decimal");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, price DECIMAL(10,2))")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 12.50), (2, 3.30)")
+            .expect("insert");
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT price, price * 2 AS dbl, price + 0.05 AS bump FROM t ORDER BY id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Some("12.50".into()),
+                    Some("25.00".into()),
+                    Some("12.55".into())
+                ],
+                vec![
+                    Some("3.30".into()),
+                    Some("6.60".into()),
+                    Some("3.35".into())
+                ],
+            ]
+        );
+        // Division derives scale = max(6, ...) per SQL Server.
+        let (_, rows) = sql_rows(&mut engine, "SELECT price / 3 FROM t WHERE id = 1");
+        assert_eq!(rows, vec![vec![Some("4.166667".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_temporal_types_round_trip() {
+        let path = unique_temp_path("sql-temporal");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, d DATE, dt DATETIME2)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, '2020-06-15', '2020-06-15 13:45:30.5')")
+            .expect("insert");
+        let (_, rows) = sql_rows(&mut engine, "SELECT d, dt FROM t");
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("2020-06-15".into()),
+                Some("2020-06-15 13:45:30.5000000".into())
+            ]]
+        );
+        // A character literal implicitly converts to DATE for the comparison.
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE d = '2020-06-15'");
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_expression_operators() {
+        let path = unique_temp_path("sql-expr-ops");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20), score INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 'Alice', 90), (2, 'Bob', NULL), (3, 'Carol', 70)")
+            .expect("insert");
+
+        // LIKE + IN + BETWEEN combine in a WHERE.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM t WHERE name LIKE 'A%' OR id IN (3) OR score BETWEEN 85 AND 95 ORDER BY id",
+        );
+        assert_eq!(rows, vec![vec![Some("1".into())], vec![Some("3".into())]]);
+
+        // CASE (searched) + ISNULL + a scalar function.
+        let (cols, rows) = sql_rows(
+            &mut engine,
+            "SELECT UPPER(name) AS u, ISNULL(score, 0) AS s, \
+             CASE WHEN score >= 85 THEN 'hi' WHEN score IS NULL THEN 'none' ELSE 'lo' END AS grade \
+             FROM t ORDER BY id",
+        );
+        assert_eq!(cols, vec!["u", "s", "grade"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("ALICE".into()), Some("90".into()), Some("hi".into())],
+                vec![Some("BOB".into()), Some("0".into()), Some("none".into())],
+                vec![Some("CAROL".into()), Some("70".into()), Some("lo".into())],
+            ]
+        );
+
+        // CAST and NOT LIKE.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT CAST(score AS NVARCHAR(10)) FROM t WHERE id = 1",
+        );
+        assert_eq!(rows, vec![vec![Some("90".into())]]);
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM t WHERE name NOT LIKE '%o%' ORDER BY id",
+        );
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_swedish_collation_order_by() {
+        let path = unique_temp_path("sql-collation");
+        let mut engine = new_engine(&path);
+        engine
+            .execute(
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, \
+                 w NVARCHAR(20) COLLATE Finnish_Swedish_CI_AS)",
+            )
+            .expect("create");
+        engine
+            .execute(
+                "INSERT INTO t VALUES (1, 'öl'), (2, 'apa'), (3, 'åre'), \
+                 (4, 'zebra'), (5, 'ängel'), (6, 'björn')",
+            )
+            .expect("insert");
+        // Swedish sorts å, ä, ö after z: apa, björn, zebra, åre, ängel, öl.
+        let (_, rows) = sql_rows(&mut engine, "SELECT w FROM t ORDER BY w");
+        let order: Vec<String> = rows.into_iter().map(|r| r[0].clone().unwrap()).collect();
+        assert_eq!(order, vec!["apa", "björn", "zebra", "åre", "ängel", "öl"]);
+        // The collation is surfaced in sys.columns.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT collation_name FROM sys.columns WHERE name = 'w'",
+        );
+        assert_eq!(rows, vec![vec![Some("Finnish_Swedish_CI_AS".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_stage5_review_fixes() {
+        let path = unique_temp_path("sql-review-fixes");
+        let mut engine = new_engine(&path);
+        // CAST decimal/float to int truncates toward zero (not rounds).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT CAST(10.6496 AS INT), CAST(2.9 AS INT), CAST(-10.6496 AS INT)",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("10".into()),
+                Some("2".into()),
+                Some("-10".into())
+            ]]
+        );
+        // REPLICATE with a huge count is bounded (no panic / mutex-poison DoS).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT LEN(REPLICATE('abc', 9223372036854775807)) AS n",
+        );
+        assert_eq!(rows, vec![vec![Some("999999".into())]]);
+        // A mixed int/decimal computed column infers enough precision (no 220).
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1), (2)")
+            .expect("insert");
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT CASE WHEN id = 1 THEN 100000 ELSE 0.5 END AS v FROM t ORDER BY id",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Some("100000.0".into())], vec![Some("0.5".into())]]
+        );
+        // UPDATE with a duplicated SET column is rejected (264).
+        assert_eq!(
+            sql_error_number(&mut engine, "UPDATE t SET id = 3, id = 4 WHERE id = 1"),
+            264
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_duplicate_pk_reports_error_2627() {
         let path = unique_temp_path("sql-pk-dup");
         let mut engine = new_engine(&path);
