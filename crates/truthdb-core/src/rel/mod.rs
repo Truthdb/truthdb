@@ -7,6 +7,7 @@
 //! sources built from the catalog. Storage errors are mapped to SQL Server
 //! error numbers.
 
+pub mod collation;
 mod value;
 
 use truthdb_sql::ast::{
@@ -610,6 +611,9 @@ fn predicate_true(
 
 struct Source {
     columns: Vec<ResultColumn>,
+    /// Per-column collation names (parallel to `columns`; `None` = database
+    /// default). Used by ORDER BY on character columns.
+    collations: Vec<Option<String>>,
     /// Rows of typed values (real-table Datums; virtual sources build them).
     rows: Vec<Vec<Datum>>,
 }
@@ -669,7 +673,13 @@ fn exec_select(storage: &mut Storage, select: &Select) -> Result<RowSet, SqlErro
     // ORDER BY (evaluated against the source row; stable so equal keys keep
     // input order).
     if !select.order_by.is_empty() {
-        order_rows(&mut rows, &select.order_by, &types, &resolver)?;
+        order_rows(
+            &mut rows,
+            &select.order_by,
+            &types,
+            &source.collations,
+            &resolver,
+        )?;
     }
 
     // TOP.
@@ -684,8 +694,32 @@ fn order_rows(
     rows: &mut [Vec<Datum>],
     order_by: &[OrderItem],
     types: &[ColumnType],
+    collations: &[Option<String>],
     resolver: &Vec<String>,
 ) -> Result<(), SqlError> {
+    use std::cmp::Ordering;
+    // A bare character column is ordered by its collation (its COLLATE clause,
+    // else the database default); anything else uses value ordering.
+    let collators: Vec<Option<collation::Collation>> = order_by
+        .iter()
+        .map(|item| {
+            let index = bare_column_index(&item.expr, resolver)?;
+            let is_char = matches!(
+                types.get(index),
+                Some(ColumnType::VarChar { .. }) | Some(ColumnType::NVarChar { .. })
+            );
+            if !is_char {
+                return None;
+            }
+            let name = collations
+                .get(index)
+                .cloned()
+                .flatten()
+                .unwrap_or_else(|| collation::DEFAULT_COLLATION.to_string());
+            Some(collation::Collation::from_name(&name))
+        })
+        .collect();
+
     // Precompute sort keys to keep comparisons cheap and to surface eval
     // errors before sorting.
     let mut keyed: Vec<(Vec<SqlValue>, usize)> = Vec::with_capacity(rows.len());
@@ -699,9 +733,16 @@ fn order_rows(
     }
     keyed.sort_by(|(a, ai), (b, bi)| {
         for (col, item) in order_by.iter().enumerate() {
-            let ord = order_key_cmp(&a[col], &b[col]);
+            let ord = match (&collators[col], &a[col], &b[col]) {
+                (Some(coll), SqlValue::Str(x), SqlValue::Str(y)) => coll.compare(x, y),
+                // NULL still sorts first even under a collation.
+                (Some(_), SqlValue::Null, SqlValue::Null) => Ordering::Equal,
+                (Some(_), SqlValue::Null, _) => Ordering::Less,
+                (Some(_), _, SqlValue::Null) => Ordering::Greater,
+                _ => order_key_cmp(&a[col], &b[col]),
+            };
             let ord = if item.descending { ord.reverse() } else { ord };
-            if ord != std::cmp::Ordering::Equal {
+            if ord != Ordering::Equal {
                 return ord;
             }
         }
@@ -816,6 +857,7 @@ fn build_source(storage: &mut Storage, from: Option<&Name>) -> Result<Source, Sq
         // No FROM: one row, no columns (constant SELECT).
         return Ok(Source {
             columns: Vec::new(),
+            collations: Vec::new(),
             rows: vec![Vec::new()],
         });
     };
@@ -837,7 +879,12 @@ fn build_source(storage: &mut Storage, from: Option<&Name>) -> Result<Source, Sq
                     column_type: c.column_type,
                 })
                 .collect();
-            Ok(Source { columns, rows })
+            let collations = schema.columns.iter().map(|c| c.collation.clone()).collect();
+            Ok(Source {
+                columns,
+                collations,
+                rows,
+            })
         }
     }
 }
@@ -865,7 +912,12 @@ fn sys_tables(storage: &Storage) -> Source {
         .into_iter()
         .map(|def| vec![Datum::Int(def.object_id as i32), Datum::NVarChar(def.name)])
         .collect();
-    Source { columns, rows }
+    let collations = vec![None; columns.len()];
+    Source {
+        columns,
+        collations,
+        rows,
+    }
 }
 
 fn sys_columns(storage: &Storage) -> Source {
@@ -878,20 +930,34 @@ fn sys_columns(storage: &Storage) -> Source {
             name: "is_nullable".to_string(),
             column_type: ColumnType::Bit,
         },
+        nvarchar("collation_name", 128),
     ];
     let mut rows = Vec::new();
     for def in storage.rel_tables() {
         for (index, (name, type_spec, nullable)) in def.columns.iter().enumerate() {
+            let collation = def
+                .collations
+                .get(index)
+                .cloned()
+                .flatten()
+                .map(Datum::NVarChar)
+                .unwrap_or(Datum::Null);
             rows.push(vec![
                 Datum::Int(def.object_id as i32),
                 Datum::NVarChar(name.clone()),
                 Datum::Int(index as i32 + 1),
                 Datum::NVarChar(type_spec.clone()),
                 Datum::Bit(*nullable),
+                collation,
             ]);
         }
     }
-    Source { columns, rows }
+    let collations = vec![None; columns.len()];
+    Source {
+        columns,
+        collations,
+        rows,
+    }
 }
 
 // ---- helpers ------------------------------------------------------------

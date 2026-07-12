@@ -1630,6 +1630,35 @@ mod tests {
     }
 
     #[test]
+    fn sql_swedish_collation_order_by() {
+        let path = unique_temp_path("sql-collation");
+        let mut engine = new_engine(&path);
+        engine
+            .execute(
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, \
+                 w NVARCHAR(20) COLLATE Finnish_Swedish_CI_AS)",
+            )
+            .expect("create");
+        engine
+            .execute(
+                "INSERT INTO t VALUES (1, 'öl'), (2, 'apa'), (3, 'åre'), \
+                 (4, 'zebra'), (5, 'ängel'), (6, 'björn')",
+            )
+            .expect("insert");
+        // Swedish sorts å, ä, ö after z: apa, björn, zebra, åre, ängel, öl.
+        let (_, rows) = sql_rows(&mut engine, "SELECT w FROM t ORDER BY w");
+        let order: Vec<String> = rows.into_iter().map(|r| r[0].clone().unwrap()).collect();
+        assert_eq!(order, vec!["apa", "björn", "zebra", "åre", "ängel", "öl"]);
+        // The collation is surfaced in sys.columns.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT collation_name FROM sys.columns WHERE name = 'w'",
+        );
+        assert_eq!(rows, vec![vec![Some("Finnish_Swedish_CI_AS".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_duplicate_pk_reports_error_2627() {
         let path = unique_temp_path("sql-pk-dup");
         let mut engine = new_engine(&path);
