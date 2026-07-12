@@ -575,6 +575,9 @@ pub enum EngineError {
 
     #[error("{0}")]
     Replay(String),
+
+    #[error("engine is shutting down")]
+    Unavailable,
 }
 
 #[derive(Debug, Error)]

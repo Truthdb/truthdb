@@ -1,8 +1,6 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("TruthDB must be built for Linux targets. Use Docker or a Linux environment.");
 
-use std::sync::{Arc, Mutex};
-
 use tokio::sync::watch;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
@@ -88,24 +86,24 @@ async fn main() {
     };
 
     let engine = match Engine::new(storage) {
-        Ok(engine) => Arc::new(Mutex::new(engine)),
+        Ok(engine) => engine,
         Err(err) => {
             eprintln!("Failed to initialize engine: {err}");
             return;
         }
     };
+    // The engine runs on its own thread behind a message channel; the async
+    // listeners talk to it through a cloneable handle.
+    let (engine, engine_join) = truthdb_core::session::spawn_engine(engine);
 
-    let client_listener = match ClientListener::new(
-        &config.network.addr,
-        config.network.port,
-        Arc::clone(&engine),
-    ) {
-        Ok(client_listener) => client_listener,
-        Err(err) => {
-            eprintln!("Failed to initialize server: {err}");
-            return;
-        }
-    };
+    let client_listener =
+        match ClientListener::new(&config.network.addr, config.network.port, engine.clone()) {
+            Ok(client_listener) => client_listener,
+            Err(err) => {
+                eprintln!("Failed to initialize server: {err}");
+                return;
+            }
+        };
 
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let listener_task = tokio::spawn(async move {
@@ -123,7 +121,7 @@ async fn main() {
         match truthdb_tds::TdsListener::bind(
             &config.tds.addr,
             config.tds.port,
-            Arc::clone(&engine),
+            engine.clone(),
             tds_config,
         )
         .await
@@ -160,5 +158,8 @@ async fn main() {
     if let Some(tds_task) = tds_task {
         let _ = tds_task.await;
     }
+    // Stop the engine thread and wait for it to drain/exit.
+    engine.shutdown();
+    let _ = tokio::task::spawn_blocking(move || engine_join.join()).await;
     info!("TruthDB exiting");
 }

@@ -5,10 +5,11 @@
 //! DONE, ERROR) without needing an external SQL Server driver.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use truthdb_core::engine::Engine;
+use truthdb_core::session::{EngineHandle, spawn_engine};
 use truthdb_core::storage::{Storage, StorageOptions};
 use truthdb_tds::server::{TdsConfig, serve_connection};
 
@@ -27,7 +28,7 @@ fn temp_path(label: &str) -> std::path::PathBuf {
     path
 }
 
-fn engine(path: &std::path::Path) -> Arc<Mutex<Engine>> {
+fn engine(path: &std::path::Path) -> EngineHandle {
     let opts = StorageOptions {
         size_gib: 1,
         wal_ratio: 0.05,
@@ -37,7 +38,9 @@ fn engine(path: &std::path::Path) -> Arc<Mutex<Engine>> {
         reserved_ratio: 0.17,
     };
     let storage = Storage::create(path.to_path_buf(), opts).expect("storage");
-    Arc::new(Mutex::new(Engine::new(storage).expect("engine")))
+    // The JoinHandle is dropped; the engine thread exits when the last
+    // EngineHandle drops at end of test.
+    spawn_engine(Engine::new(storage).expect("engine")).0
 }
 
 fn config() -> TdsConfig {
@@ -371,7 +374,7 @@ fn parse_row(bytes: &[u8], meta: &[ColType]) -> (Vec<Cell>, usize) {
     (cells, i)
 }
 
-async fn connect(engine: Arc<Mutex<Engine>>) -> Client {
+async fn connect(engine: EngineHandle) -> Client {
     let (client_half, server_half) = tokio::io::duplex(64 * 1024);
     let cfg = Arc::new(config());
     tokio::spawn(async move {
@@ -386,7 +389,7 @@ async fn connect(engine: Arc<Mutex<Engine>>) -> Client {
 async fn full_handshake_query_and_error() {
     let path = temp_path("e2e");
     let engine = engine(&path);
-    let mut client = connect(Arc::clone(&engine)).await;
+    let mut client = connect(engine.clone()).await;
 
     client.prelogin().await;
     let login = client.login("sa", "secret").await;

@@ -1,11 +1,11 @@
 //! TDS connection handler: PRELOGIN -> LOGIN7 (auth) -> SQLBatch loop.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::io::{self, AsyncRead, AsyncWrite};
-use truthdb_core::engine::Engine;
 use truthdb_core::rel::{BatchOutcome, StatementResult};
+use truthdb_core::session::{EngineHandle, SessionId};
 
 use crate::login::{self, parse_login7};
 use crate::packet::{
@@ -26,7 +26,7 @@ pub struct TdsConfig {
 /// Handles one TDS connection to completion (or disconnect).
 pub async fn serve_connection<S>(
     mut stream: S,
-    engine: Arc<Mutex<Engine>>,
+    engine: EngineHandle,
     config: Arc<TdsConfig>,
 ) -> io::Result<()>
 where
@@ -97,9 +97,25 @@ where
     token::done(&mut out, false, false, None);
     write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
 
-    // --- request loop ---
+    // Each connection gets an engine-side session; it is closed (rolling back
+    // any open transaction) whenever the connection ends, cleanly or not.
+    let session = engine.open_session().await;
+    let result = request_loop(&mut stream, &engine, session, packet_size).await;
+    engine.close_session(session);
+    result
+}
+
+async fn request_loop<S>(
+    stream: &mut S,
+    engine: &EngineHandle,
+    session: SessionId,
+    packet_size: usize,
+) -> io::Result<()>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+{
     loop {
-        let message = match read_message(&mut stream).await {
+        let message = match read_message(stream).await {
             Ok(message) => message,
             // Clean disconnect.
             Err(err) if err.kind() == io::ErrorKind::UnexpectedEof => return Ok(()),
@@ -108,8 +124,8 @@ where
         match message.kind {
             PKT_SQL_BATCH => {
                 let sql = batch_sql(&message.payload)?;
-                let response = run_batch(&engine, &sql);
-                write_message(&mut stream, PKT_TABULAR_RESULT, &response, packet_size).await?;
+                let response = run_batch(engine, session, &sql).await;
+                write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?;
             }
             PKT_ATTENTION => {
                 // Acknowledge cancel with a DONE(attention). True mid-batch
@@ -117,7 +133,7 @@ where
                 // completion.
                 let mut out = Vec::new();
                 token::done_attention(&mut out);
-                write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
+                write_message(stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
             }
             _ => return Err(protocol_err("unexpected TDS message type")),
         }
@@ -131,13 +147,9 @@ fn authenticate(config: &TdsConfig, username: &str, password: &str) -> bool {
         .is_some_and(|expected| expected == password)
 }
 
-/// Runs a SQL batch through the engine and builds its token stream.
-fn run_batch(engine: &Arc<Mutex<Engine>>, sql: &str) -> Vec<u8> {
-    let outcome = {
-        let mut engine = engine.lock().expect("engine mutex poisoned");
-        engine.sql_batch(sql)
-    };
-    match outcome {
+/// Runs a SQL batch through the engine actor and builds its token stream.
+async fn run_batch(engine: &EngineHandle, session: SessionId, sql: &str) -> Vec<u8> {
+    match engine.run_batch(session, sql.to_string()).await {
         Ok(outcome) => build_batch_tokens(&outcome),
         Err(err) => {
             // A genuine engine/storage failure (not a SQL-level error).

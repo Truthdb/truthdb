@@ -12,19 +12,19 @@ pub mod server;
 pub mod token;
 pub mod typeinfo;
 
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info};
-use truthdb_core::engine::Engine;
+use truthdb_core::session::EngineHandle;
 
 pub use server::{TdsConfig, serve_connection};
 
 /// A TDS listener bound to an address; serves connections until shutdown.
 pub struct TdsListener {
     listener: TcpListener,
-    engine: Arc<Mutex<Engine>>,
+    engine: EngineHandle,
     config: Arc<TdsConfig>,
 }
 
@@ -33,7 +33,7 @@ impl TdsListener {
     pub async fn bind(
         addr: &str,
         port: u16,
-        engine: Arc<Mutex<Engine>>,
+        engine: EngineHandle,
         config: TdsConfig,
     ) -> std::io::Result<Self> {
         let listener = TcpListener::bind((addr, port)).await?;
@@ -55,7 +55,7 @@ impl TdsListener {
                 accepted = self.listener.accept() => {
                     let (stream, peer) = accepted?;
                     debug!(%peer, "TDS connection accepted");
-                    let engine = Arc::clone(&self.engine);
+                    let engine = self.engine.clone();
                     let config = Arc::clone(&self.config);
                     tokio::spawn(async move {
                         if let Err(err) = handle(stream, engine, config).await {
@@ -76,7 +76,7 @@ impl TdsListener {
 
 async fn handle(
     stream: TcpStream,
-    engine: Arc<Mutex<Engine>>,
+    engine: EngineHandle,
     config: Arc<TdsConfig>,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();

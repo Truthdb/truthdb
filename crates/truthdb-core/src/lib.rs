@@ -5,6 +5,7 @@ pub mod dispatcher;
 pub mod engine;
 pub mod rel;
 pub mod relstore;
+pub mod session;
 pub mod storage;
 mod storage_layout;
 pub mod wal;
