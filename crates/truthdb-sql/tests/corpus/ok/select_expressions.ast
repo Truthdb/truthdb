@@ -257,13 +257,16 @@
                 },
             ],
             from: Some(
-                Name {
-                    value: "students",
-                    quoted: false,
-                    span: Span {
-                        start: 195,
-                        end: 203,
+                Table {
+                    name: Name {
+                        value: "students",
+                        quoted: false,
+                        span: Span {
+                            start: 195,
+                            end: 203,
+                        },
                     },
+                    alias: None,
                 },
             ),
             where_clause: Some(

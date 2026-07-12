@@ -1,0 +1,78 @@
+# Joins (Stage 8 part 2)
+
+statement ok
+CREATE TABLE cust (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))
+
+statement ok
+CREATE TABLE ord (id INT NOT NULL PRIMARY KEY, cust_id INT, amount INT)
+
+statement ok
+INSERT INTO cust VALUES (1,'alice'),(2,'bob'),(3,'carol')
+
+statement ok
+INSERT INTO ord VALUES (10,1,100),(11,1,200),(12,2,50),(13,99,7)
+
+# INNER JOIN
+query TI
+SELECT c.name, o.amount FROM cust c JOIN ord o ON c.id = o.cust_id ORDER BY o.id
+----
+alice 100
+alice 200
+bob 50
+
+# LEFT JOIN keeps carol with a NULL amount.
+query TI
+SELECT c.name, o.amount FROM cust c LEFT JOIN ord o ON c.id = o.cust_id ORDER BY c.id, o.id
+----
+alice 100
+alice 200
+bob 50
+carol NULL
+
+# CROSS JOIN cardinality.
+query I
+SELECT COUNT(*) FROM cust CROSS JOIN ord
+----
+12
+
+# Aggregate over a join, grouped.
+query TI
+SELECT c.name, SUM(o.amount) FROM cust c JOIN ord o ON c.id = o.cust_id GROUP BY c.name ORDER BY c.name
+----
+alice 300
+bob 50
+
+# Ambiguous unqualified column is rejected.
+statement error
+SELECT id FROM cust c JOIN ord o ON c.id = o.cust_id
+
+# Duplicate exposed table name (self-join without correlation names) is
+# rejected up front (SQL Server 1013) rather than binding ambiguously.
+statement error
+SELECT cust.name FROM cust JOIN cust ON cust.id = cust.id
+
+# A reused correlation name is likewise rejected.
+statement error
+SELECT c.name FROM cust c JOIN ord c ON c.id = c.id
+
+# A proper self-join with distinct aliases is fine.
+query II
+SELECT a.id, b.id FROM cust a JOIN cust b ON a.id = b.id ORDER BY a.id
+----
+1 1
+2 2
+3 3
+
+# Comma-FROM binds looser than JOIN: `cust, ord RIGHT JOIN cust2`
+# associates as `cust CROSS JOIN (ord RIGHT JOIN cust2)`, so every cust
+# row multiplies the right side rather than joining into it.
+statement ok
+CREATE TABLE cust2 (id INT NOT NULL PRIMARY KEY, cust_id INT)
+
+statement ok
+INSERT INTO cust2 VALUES (100, 1)
+
+query I
+SELECT COUNT(*) FROM cust, ord RIGHT JOIN cust2 ON ord.cust_id = cust2.id
+----
+3

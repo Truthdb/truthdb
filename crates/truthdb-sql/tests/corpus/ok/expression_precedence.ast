@@ -225,13 +225,16 @@
                 },
             ],
             from: Some(
-                Name {
-                    value: "t",
-                    quoted: false,
-                    span: Span {
-                        start: 61,
-                        end: 62,
+                Table {
+                    name: Name {
+                        value: "t",
+                        quoted: false,
+                        span: Span {
+                            start: 61,
+                            end: 62,
+                        },
                     },
+                    alias: None,
                 },
             ),
             where_clause: None,

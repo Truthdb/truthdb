@@ -7,13 +7,16 @@
                 Wildcard,
             ],
             from: Some(
-                Name {
-                    value: "products",
-                    quoted: false,
-                    span: Span {
-                        start: 32,
-                        end: 40,
+                Table {
+                    name: Name {
+                        value: "products",
+                        quoted: false,
+                        span: Span {
+                            start: 32,
+                            end: 40,
+                        },
                     },
+                    alias: None,
                 },
             ),
             where_clause: Some(
