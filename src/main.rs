@@ -114,6 +114,41 @@ async fn main() {
         }
     });
 
+    // Optional TDS (SQL Server protocol) gateway.
+    let tds_task = if config.tds.enabled {
+        let tds_config = truthdb_tds::TdsConfig {
+            users: config.tds.auth.clone(),
+            database: config.tds.database.clone(),
+        };
+        match truthdb_tds::TdsListener::bind(
+            &config.tds.addr,
+            config.tds.port,
+            Arc::clone(&engine),
+            tds_config,
+        )
+        .await
+        {
+            Ok(listener) => {
+                info!(
+                    "TDS gateway listening on {}:{}",
+                    config.tds.addr, config.tds.port
+                );
+                let shutdown_rx = shutdown_tx.subscribe();
+                Some(tokio::spawn(async move {
+                    if let Err(err) = listener.run(shutdown_rx).await {
+                        eprintln!("TDS listener error: {err}");
+                    }
+                }))
+            }
+            Err(err) => {
+                eprintln!("Failed to start TDS gateway: {err}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     info!("Starting TruthDB...");
 
     info!("TruthDB running (waiting for stop signal)");
@@ -122,5 +157,8 @@ async fn main() {
     info!("Stop signal received; shutting down...");
     let _ = shutdown_tx.send(true);
     let _ = listener_task.await;
+    if let Some(tds_task) = tds_task {
+        let _ = tds_task.await;
+    }
     info!("TruthDB exiting");
 }

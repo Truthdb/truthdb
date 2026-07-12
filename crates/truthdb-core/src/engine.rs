@@ -128,6 +128,16 @@ impl Engine {
         Ok(render_sql_outcome(&outcome))
     }
 
+    /// Runs a SQL batch and returns the typed outcome (result sets +
+    /// optional error). The TDS gateway uses this to emit COLMETADATA / ROW
+    /// / DONE / ERROR token streams; a TDS client only ever speaks SQL, so
+    /// there is no ES routing here.
+    pub fn sql_batch(&mut self, input: &str) -> Result<crate::rel::BatchOutcome, EngineError> {
+        let outcome = crate::rel::execute_batch(&mut self.storage, input);
+        self.maybe_checkpoint()?;
+        Ok(outcome)
+    }
+
     pub fn checkpoint(&mut self) -> Result<(), EngineError> {
         // JSON, not bincode: documents hold serde_json::Value, which bincode
         // can serialize but never deserialize (`deserialize_any`), so bincode
@@ -855,15 +865,19 @@ fn render_sql_outcome(outcome: &crate::rel::BatchOutcome) -> String {
         .iter()
         .map(|result| match result {
             StatementResult::Rows(rowset) => {
+                let columns: Vec<&str> = rowset.columns.iter().map(|c| c.name.as_str()).collect();
                 let rows: Vec<Value> = rowset
                     .rows
                     .iter()
                     .map(|row| {
                         Value::Array(
                             row.iter()
-                                .map(|cell| match cell {
-                                    Some(text) => Value::String(text.clone()),
-                                    None => Value::Null,
+                                .zip(&rowset.columns)
+                                .map(|(datum, column)| {
+                                    match crate::rel::render_cell(datum, &column.column_type) {
+                                        Some(text) => Value::String(text),
+                                        None => Value::Null,
+                                    }
                                 })
                                 .collect(),
                         )
@@ -871,7 +885,7 @@ fn render_sql_outcome(outcome: &crate::rel::BatchOutcome) -> String {
                     .collect();
                 json!({
                     "type": "rows",
-                    "columns": rowset.columns,
+                    "columns": columns,
                     "rows": rows,
                 })
             }
@@ -1388,6 +1402,24 @@ mod tests {
                 vec![Some("8".into()), Some("80".into())],
             ]
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_bare_column_alias_is_preserved() {
+        let path = unique_temp_path("sql-alias");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE nums (n INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO nums VALUES (1)")
+            .expect("insert");
+        // A bare column with an alias must report the alias, not the source
+        // column name (regression guard for the typed-projection refactor).
+        let (columns, rows) = sql_rows(&mut engine, "SELECT n AS foo FROM nums");
+        assert_eq!(columns, vec!["foo"]);
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
         let _ = std::fs::remove_file(path);
     }
 

@@ -869,6 +869,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "truthdb-core",
+ "truthdb-tds",
 ]
 
 [[package]]
@@ -936,6 +937,15 @@ dependencies = [
 [[package]]
 name = "truthdb-sql"
 version = "0.1.0"
+
+[[package]]
+name = "truthdb-tds"
+version = "0.1.0"
+dependencies = [
+ "tokio",
+ "tracing",
+ "truthdb-core",
+]
 
 [[package]]
 name = "unicode-ident"

@@ -19,9 +19,8 @@ use truthdb_sql::{ast, eval};
 
 use crate::relstore::catalog::TableDef;
 use crate::relstore::row::{Column, Schema};
-use crate::relstore::types::ColumnType;
+use crate::relstore::types::{ColumnType, Datum};
 use crate::storage::{Storage, StorageError};
-use value::Cell;
 
 /// Result of one executed statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,11 +31,19 @@ pub enum StatementResult {
     Done,
 }
 
+/// A result column: its name and resolved SQL type (drives TDS
+/// COLMETADATA and display rendering alike).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ResultColumn {
+    pub name: String,
+    pub column_type: ColumnType,
+}
+
+/// A typed result set: column metadata plus rows of typed [`Datum`]s.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RowSet {
-    pub columns: Vec<String>,
-    /// Cells; `None` renders as NULL.
-    pub rows: Vec<Vec<Option<String>>>,
+    pub columns: Vec<ResultColumn>,
+    pub rows: Vec<Vec<Datum>>,
 }
 
 /// A batch's outcome: the results of the statements that ran, plus the error
@@ -329,23 +336,34 @@ fn exec_insert(storage: &mut Storage, insert: &Insert) -> Result<StatementResult
 // ---- SELECT -------------------------------------------------------------
 
 struct Source {
-    columns: Vec<String>,
-    rows: Vec<Vec<Cell>>,
+    columns: Vec<ResultColumn>,
+    /// Rows of typed values (real-table Datums; virtual sources build them).
+    rows: Vec<Vec<Datum>>,
+}
+
+impl Source {
+    fn names(&self) -> Vec<String> {
+        self.columns.iter().map(|c| c.name.clone()).collect()
+    }
+}
+
+/// SqlValues of a row, for expression evaluation.
+fn row_values(row: &[Datum]) -> Vec<SqlValue> {
+    row.iter().map(value::datum_to_sql).collect()
 }
 
 fn exec_select(storage: &mut Storage, select: &Select) -> Result<RowSet, SqlError> {
     let source = build_source(storage, select.from.as_ref())?;
-    let resolver = source.columns.clone();
+    let resolver = source.names();
 
     // WHERE. The predicate must be boolean-typed (SQL Server 4145): a bare
     // numeric/string expression is rejected rather than silently coerced.
-    let mut rows: Vec<Vec<Cell>> = Vec::new();
+    let mut rows: Vec<Vec<Datum>> = Vec::new();
     for row in source.rows {
         let keep = match &select.where_clause {
             None => true,
             Some(predicate) => {
-                let values: Vec<SqlValue> = row.iter().map(|c| c.value.clone()).collect();
-                let value = eval::eval(predicate, &values, &resolver)?;
+                let value = eval::eval(predicate, &row_values(&row), &resolver)?;
                 match value {
                     SqlValue::Bool(b) => b,
                     SqlValue::Null => false,
@@ -377,12 +395,11 @@ fn exec_select(storage: &mut Storage, select: &Select) -> Result<RowSet, SqlErro
         rows.truncate(top as usize);
     }
 
-    // Projection.
     project(&select.items, &source.columns, &rows, &resolver)
 }
 
 fn order_rows(
-    rows: &mut [Vec<Cell>],
+    rows: &mut [Vec<Datum>],
     order_by: &[OrderItem],
     resolver: &Vec<String>,
 ) -> Result<(), SqlError> {
@@ -390,7 +407,7 @@ fn order_rows(
     // errors before sorting.
     let mut keyed: Vec<(Vec<SqlValue>, usize)> = Vec::with_capacity(rows.len());
     for (index, row) in rows.iter().enumerate() {
-        let values: Vec<SqlValue> = row.iter().map(|c| c.value.clone()).collect();
+        let values = row_values(row);
         let mut key = Vec::with_capacity(order_by.len());
         for item in order_by {
             key.push(eval::eval(&item.expr, &values, resolver)?);
@@ -408,34 +425,33 @@ fn order_rows(
         ai.cmp(bi) // stable tie-break
     });
     let order: Vec<usize> = keyed.into_iter().map(|(_, i)| i).collect();
-    apply_permutation(rows, &order);
-    Ok(())
-}
-
-fn apply_permutation(rows: &mut [Vec<Cell>], order: &[usize]) {
-    let reordered: Vec<Vec<Cell>> = order.iter().map(|&i| rows[i].clone()).collect();
+    let reordered: Vec<Vec<Datum>> = order.iter().map(|&i| rows[i].clone()).collect();
     rows.clone_from_slice(&reordered);
+    Ok(())
 }
 
 fn project(
     items: &[SelectItem],
-    source_columns: &[String],
-    rows: &[Vec<Cell>],
+    source_columns: &[ResultColumn],
+    rows: &[Vec<Datum>],
     resolver: &Vec<String>,
 ) -> Result<RowSet, SqlError> {
-    // Output column plan: (name, projector).
+    // Output column plan: a source column (typed, pass-through) or a
+    // computed expression (evaluated then typed by inference).
     enum Proj<'a> {
-        SourceColumn(usize),
-        Expr(&'a Expr),
+        SourceColumn { index: usize, name: String },
+        Expr { name: String, expr: &'a Expr },
     }
-    let mut names = Vec::new();
+    let source_names: Vec<String> = source_columns.iter().map(|c| c.name.clone()).collect();
     let mut projs = Vec::new();
     for item in items {
         match item {
             SelectItem::Wildcard => {
-                for (index, name) in source_columns.iter().enumerate() {
-                    names.push(name.clone());
-                    projs.push(Proj::SourceColumn(index));
+                for (index, column) in source_columns.iter().enumerate() {
+                    projs.push(Proj::SourceColumn {
+                        index,
+                        name: column.name.clone(),
+                    });
                 }
             }
             SelectItem::Expr { expr, alias } => {
@@ -444,32 +460,51 @@ fn project(
                     .map(|a| a.value.clone())
                     .or_else(|| bare_column_name(expr))
                     .unwrap_or_default();
-                names.push(name);
-                match bare_column_index(expr, source_columns) {
-                    Some(index) => projs.push(Proj::SourceColumn(index)),
-                    None => projs.push(Proj::Expr(expr)),
+                match bare_column_index(expr, &source_names) {
+                    // A bare column still carries its resolved output name so an
+                    // `AS alias` (or the referenced name's casing) is preserved.
+                    Some(index) => projs.push(Proj::SourceColumn { index, name }),
+                    None => projs.push(Proj::Expr { name, expr }),
                 }
             }
         }
     }
 
-    let mut out_rows = Vec::with_capacity(rows.len());
-    for row in rows {
-        let mut out = Vec::with_capacity(projs.len());
-        for proj in &projs {
-            match proj {
-                Proj::SourceColumn(index) => out.push(row[*index].display.clone()),
-                Proj::Expr(expr) => {
-                    let values: Vec<SqlValue> = row.iter().map(|c| c.value.clone()).collect();
-                    let value = eval::eval(expr, &values, resolver)?;
-                    out.push(Cell::from_sql(value).display);
+    // Precompute all row values once for expression evaluation.
+    let row_sql: Vec<Vec<SqlValue>> = rows.iter().map(|r| row_values(r)).collect();
+
+    let mut columns = Vec::with_capacity(projs.len());
+    let mut out_rows: Vec<Vec<Datum>> = vec![Vec::with_capacity(projs.len()); rows.len()];
+    for proj in &projs {
+        match proj {
+            Proj::SourceColumn { index, name } => {
+                columns.push(ResultColumn {
+                    name: name.clone(),
+                    column_type: source_columns[*index].column_type,
+                });
+                for (out, row) in out_rows.iter_mut().zip(rows) {
+                    out.push(row[*index].clone());
+                }
+            }
+            Proj::Expr { name, expr } => {
+                // Evaluate the column for every row, then infer one type.
+                let mut values = Vec::with_capacity(rows.len());
+                for row in &row_sql {
+                    values.push(eval::eval(expr, row, resolver)?);
+                }
+                let column_type = value::infer_type(&values);
+                columns.push(ResultColumn {
+                    name: name.clone(),
+                    column_type,
+                });
+                for (out, value) in out_rows.iter_mut().zip(&values) {
+                    out.push(value::sql_to_datum_loose(value));
                 }
             }
         }
-        out_rows.push(out);
     }
     Ok(RowSet {
-        columns: names,
+        columns,
         rows: out_rows,
     })
 }
@@ -505,18 +540,15 @@ fn build_source(storage: &mut Storage, from: Option<&Name>) -> Result<Source, Sq
             let def = resolve_table(storage, &from.value)
                 .ok_or_else(|| SqlError::invalid_object(&from.value).at(from.span))?;
             let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
-            let raw = storage
+            let rows = storage
                 .rel_scan(&def.name)
                 .map_err(|err| map_storage_err(err, &def.name))?;
-            let columns: Vec<String> = schema.columns.iter().map(|c| c.name.clone()).collect();
-            let rows = raw
-                .into_iter()
-                .map(|datums| {
-                    datums
-                        .iter()
-                        .zip(&schema.columns)
-                        .map(|(d, c)| Cell::from_datum(d, &c.column_type))
-                        .collect()
+            let columns = schema
+                .columns
+                .iter()
+                .map(|c| ResultColumn {
+                    name: c.name.clone(),
+                    column_type: c.column_type,
                 })
                 .collect();
             Ok(Source { columns, rows })
@@ -526,38 +558,50 @@ fn build_source(storage: &mut Storage, from: Option<&Name>) -> Result<Source, Sq
 
 // ---- sys.* virtual sources ---------------------------------------------
 
+fn nvarchar(name: &str, max_len: u16) -> ResultColumn {
+    ResultColumn {
+        name: name.to_string(),
+        column_type: ColumnType::NVarChar { max_len },
+    }
+}
+
+fn int_col(name: &str) -> ResultColumn {
+    ResultColumn {
+        name: name.to_string(),
+        column_type: ColumnType::Int,
+    }
+}
+
 fn sys_tables(storage: &Storage) -> Source {
-    let columns = vec!["object_id".to_string(), "name".to_string()];
+    let columns = vec![int_col("object_id"), nvarchar("name", 128)];
     let rows = storage
         .rel_tables()
         .into_iter()
-        .map(|def| {
-            vec![
-                Cell::from_sql(SqlValue::Int(def.object_id as i64)),
-                Cell::from_sql(SqlValue::Str(def.name)),
-            ]
-        })
+        .map(|def| vec![Datum::Int(def.object_id as i32), Datum::NVarChar(def.name)])
         .collect();
     Source { columns, rows }
 }
 
 fn sys_columns(storage: &Storage) -> Source {
     let columns = vec![
-        "object_id".to_string(),
-        "name".to_string(),
-        "column_id".to_string(),
-        "type".to_string(),
-        "is_nullable".to_string(),
+        int_col("object_id"),
+        nvarchar("name", 128),
+        int_col("column_id"),
+        nvarchar("type", 128),
+        ResultColumn {
+            name: "is_nullable".to_string(),
+            column_type: ColumnType::Bit,
+        },
     ];
     let mut rows = Vec::new();
     for def in storage.rel_tables() {
         for (index, (name, type_spec, nullable)) in def.columns.iter().enumerate() {
             rows.push(vec![
-                Cell::from_sql(SqlValue::Int(def.object_id as i64)),
-                Cell::from_sql(SqlValue::Str(name.clone())),
-                Cell::from_sql(SqlValue::Int(index as i64 + 1)),
-                Cell::from_sql(SqlValue::Str(type_spec.clone())),
-                Cell::from_sql(SqlValue::Bool(*nullable)),
+                Datum::Int(def.object_id as i32),
+                Datum::NVarChar(name.clone()),
+                Datum::Int(index as i32 + 1),
+                Datum::NVarChar(type_spec.clone()),
+                Datum::Bit(*nullable),
             ]);
         }
     }
@@ -623,3 +667,9 @@ fn map_storage_err(err: StorageError, table: &str) -> SqlError {
 }
 
 pub use ast::Statement as SqlStatement;
+
+/// Renders a result cell to its display string (`None` = NULL). Shared by
+/// the JSON envelope and any text renderer.
+pub fn render_cell(datum: &Datum, column_type: &ColumnType) -> Option<String> {
+    value::display(datum, column_type)
+}
