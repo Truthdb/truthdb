@@ -47,6 +47,15 @@ pub struct IndexDef {
     pub root_page: u64,
 }
 
+/// A `CHECK` constraint. The predicate is stored as source text (re-parsed and
+/// evaluated per row at INSERT/UPDATE, like a column `DEFAULT`) so the catalog
+/// row need not carry a serialized AST.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CheckDef {
+    pub name: String,
+    pub predicate: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub object_id: u32,
@@ -69,6 +78,9 @@ pub struct TableDef {
     /// Secondary indexes over this table.
     #[serde(default)]
     pub indexes: Vec<IndexDef>,
+    /// `CHECK` constraints enforced on INSERT/UPDATE.
+    #[serde(default)]
+    pub check_constraints: Vec<CheckDef>,
 }
 
 impl TableDef {

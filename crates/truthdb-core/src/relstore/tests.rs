@@ -80,6 +80,7 @@ fn create_tree_table(storage: &mut Storage, name: &str) {
             &["id".to_string()],
             Vec::new(),
             None,
+            Vec::new(),
         )
         .expect("create tree table");
 }
@@ -92,6 +93,7 @@ fn create_heap_table(storage: &mut Storage, name: &str) {
             &[],
             Vec::new(),
             None,
+            Vec::new(),
         )
         .expect("create heap table");
 }
@@ -617,6 +619,7 @@ fn heap_update_on_stub_starved_page_fails_cleanly() {
             &[],
             Vec::new(),
             None,
+            Vec::new(),
         )
         .expect("create heap");
     // Fill page 1 to exactly 2 free bytes: 336 null-v rows (12 bytes each

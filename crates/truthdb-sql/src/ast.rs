@@ -79,6 +79,18 @@ pub struct CreateTable {
     /// Column names named in a table-level `PRIMARY KEY (...)`, or the single
     /// column that carried an inline `PRIMARY KEY`.
     pub primary_key: Vec<Name>,
+    /// Table-level `[CONSTRAINT name] CHECK (expr)` constraints.
+    pub check_constraints: Vec<CheckConstraint>,
+    pub span: Span,
+}
+
+/// A `[CONSTRAINT name] CHECK (predicate)` constraint (table- or column-level).
+/// The predicate is kept as source text (re-parsed at bind/enforcement time,
+/// like a column `DEFAULT`) so the catalog need not serialize an AST.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CheckConstraint {
+    pub name: Option<Name>,
+    pub predicate: String,
     pub span: Span,
 }
 
@@ -95,6 +107,8 @@ pub struct ColumnDef {
     pub identity: Option<Identity>,
     /// `COLLATE <name>` on a character column.
     pub collation: Option<String>,
+    /// Column-level `[CONSTRAINT name] CHECK (expr)` constraints.
+    pub checks: Vec<CheckConstraint>,
     pub span: Span,
 }
 

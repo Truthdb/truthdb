@@ -32,6 +32,7 @@
                         },
                     ),
                     collation: None,
+                    checks: [],
                     span: Span {
                         start: 25,
                         end: 67,
@@ -56,6 +57,7 @@
                     collation: Some(
                         "Finnish_Swedish_CI_AS",
                     ),
+                    checks: [],
                     span: Span {
                         start: 73,
                         end: 119,
@@ -81,6 +83,7 @@
                     ),
                     identity: None,
                     collation: None,
+                    checks: [],
                     span: Span {
                         start: 125,
                         end: 155,
@@ -101,6 +104,7 @@
                     default: None,
                     identity: None,
                     collation: None,
+                    checks: [],
                     span: Span {
                         start: 161,
                         end: 178,
@@ -121,6 +125,7 @@
                     default: None,
                     identity: None,
                     collation: None,
+                    checks: [],
                     span: Span {
                         start: 184,
                         end: 204,
@@ -137,6 +142,7 @@
                     },
                 },
             ],
+            check_constraints: [],
             span: Span {
                 start: 0,
                 end: 206,

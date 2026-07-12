@@ -1560,6 +1560,116 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Runs SQL expected to error and returns the SQL error message.
+    fn sql_error_message(engine: &mut Engine, text: &str) -> String {
+        let env = sql(engine, text);
+        env["error"]["message"]
+            .as_str()
+            .unwrap_or_else(|| panic!("expected an error envelope, got {env}"))
+            .to_string()
+    }
+
+    #[test]
+    fn sql_check_constraints_enforced_on_insert_and_update() {
+        let path = unique_temp_path("sql-check");
+        let mut engine = new_engine(&path);
+        engine
+            .execute(
+                "CREATE TABLE items (\
+                   id INT NOT NULL PRIMARY KEY, \
+                   qty INT CHECK (qty >= 0), \
+                   price INT, \
+                   CONSTRAINT ck_price CHECK ((price - qty) > 0))",
+            )
+            .expect("create");
+
+        // A row satisfying both checks inserts.
+        engine
+            .execute("INSERT INTO items VALUES (1, 5, 10)")
+            .expect("insert ok");
+
+        // Column check violation (qty < 0) → 547.
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO items VALUES (2, -1, 10)"),
+            547
+        );
+        // Named table check violation (price <= qty) → 547, name in message.
+        let msg = sql_error_message(&mut engine, "INSERT INTO items VALUES (3, 5, 5)");
+        assert!(
+            msg.contains("ck_price"),
+            "message should name the constraint: {msg}"
+        );
+
+        // A NULL in a checked column yields UNKNOWN, which passes.
+        engine
+            .execute("INSERT INTO items VALUES (4, NULL, 10)")
+            .expect("null qty passes check");
+
+        // UPDATE is checked against the new row.
+        assert_eq!(
+            sql_error_number(&mut engine, "UPDATE items SET qty = -3 WHERE id = 1"),
+            547
+        );
+        engine
+            .execute("UPDATE items SET qty = 2 WHERE id = 1")
+            .expect("update ok");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM items ORDER BY id");
+        assert_eq!(rows, vec![vec![Some("1".into())], vec![Some("4".into())],]);
+
+        // The constraint survives a restart and still fires.
+        drop(engine);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("engine");
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO items VALUES (5, -9, 10)"),
+            547
+        );
+        // sys.check_constraints lists both (the auto-named column check and the
+        // explicitly named table check).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT name FROM sys.check_constraints ORDER BY name",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("CK__items__1".into())],
+                vec![Some("ck_price".into())],
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_check_constraint_rejects_unknown_column_and_duplicate_name() {
+        let path = unique_temp_path("sql-check-invalid");
+        let mut engine = new_engine(&path);
+        // A CHECK referencing a non-existent column is rejected at CREATE (207).
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, CHECK (missing > 0))",
+            ),
+            207
+        );
+        // Two constraints with the same explicit name collide (2714).
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, \
+                   CONSTRAINT c CHECK (id > 0), CONSTRAINT c CHECK (id < 100))",
+            ),
+            2714
+        );
+        // A multi-part (qualified) identifier in a CHECK is rejected at CREATE
+        // (4104) rather than producing a table that rejects every INSERT.
+        assert_eq!(
+            sql_error_number(&mut engine, "CREATE TABLE t (col INT, CHECK (t.col > 0))",),
+            4104
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn sql_decimal_arithmetic_and_rendering() {
         let path = unique_temp_path("sql-decimal");

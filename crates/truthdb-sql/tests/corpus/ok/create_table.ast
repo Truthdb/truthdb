@@ -27,6 +27,7 @@
                     default: None,
                     identity: None,
                     collation: None,
+                    checks: [],
                     span: Span {
                         start: 28,
                         end: 55,
@@ -51,6 +52,7 @@
                     default: None,
                     identity: None,
                     collation: None,
+                    checks: [],
                     span: Span {
                         start: 61,
                         end: 87,
@@ -73,6 +75,7 @@
                     default: None,
                     identity: None,
                     collation: None,
+                    checks: [],
                     span: Span {
                         start: 93,
                         end: 109,
@@ -93,6 +96,7 @@
                     default: None,
                     identity: None,
                     collation: None,
+                    checks: [],
                     span: Span {
                         start: 115,
                         end: 127,
@@ -109,6 +113,7 @@
                     },
                 },
             ],
+            check_constraints: [],
             span: Span {
                 start: 0,
                 end: 129,

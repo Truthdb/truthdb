@@ -210,6 +210,7 @@ impl Storage {
         key_names: &[String],
         defaults: Vec<Option<String>>,
         identity: Option<catalog::IdentitySpec>,
+        check_constraints: Vec<catalog::CheckDef>,
     ) -> Result<(), StorageError> {
         self.file.ensure_rel_usable()?;
         if self.file.rel.tables.contains_key(name) {
@@ -274,6 +275,7 @@ impl Storage {
                 collations,
                 identity,
                 indexes: Vec::new(),
+                check_constraints,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)

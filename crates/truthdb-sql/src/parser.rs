@@ -333,36 +333,50 @@ impl Parser {
 
         let mut columns = Vec::new();
         let mut primary_key: Vec<Name> = Vec::new();
+        let mut check_constraints: Vec<CheckConstraint> = Vec::new();
         loop {
-            if self.peek_keyword().as_deref() == Some("PRIMARY") {
-                if !primary_key.is_empty() {
-                    return Err(SqlError::message_only(
-                        8110,
-                        "Cannot add multiple PRIMARY KEY constraints to a table.",
-                    ));
-                }
-                self.bump();
-                self.expect_keyword("KEY")?;
-                self.expect(&TokenKind::LParen)?;
-                loop {
-                    primary_key.push(self.parse_name()?);
-                    if !self.eat(&TokenKind::Comma) {
-                        break;
-                    }
-                }
-                self.expect(&TokenKind::RParen)?;
-            } else {
-                let column = self.parse_column_def()?;
-                if column.primary_key {
+            // A leading `CONSTRAINT name` introduces a named table constraint.
+            let constraint_name = self.parse_optional_constraint_name()?;
+            match self.peek_keyword().as_deref() {
+                Some("PRIMARY") => {
                     if !primary_key.is_empty() {
                         return Err(SqlError::message_only(
                             8110,
                             "Cannot add multiple PRIMARY KEY constraints to a table.",
                         ));
                     }
-                    primary_key.push(column.name.clone());
+                    self.bump();
+                    self.expect_keyword("KEY")?;
+                    self.expect(&TokenKind::LParen)?;
+                    loop {
+                        primary_key.push(self.parse_name()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    self.expect(&TokenKind::RParen)?;
                 }
-                columns.push(column);
+                Some("CHECK") => {
+                    check_constraints.push(self.parse_check_constraint(constraint_name)?);
+                }
+                _ if constraint_name.is_some() => {
+                    // `CONSTRAINT name` must be followed by a table constraint.
+                    let token = self.peek().clone();
+                    return Err(SqlError::syntax(self.token_text(&token), token.span));
+                }
+                _ => {
+                    let column = self.parse_column_def()?;
+                    if column.primary_key {
+                        if !primary_key.is_empty() {
+                            return Err(SqlError::message_only(
+                                8110,
+                                "Cannot add multiple PRIMARY KEY constraints to a table.",
+                            ));
+                        }
+                        primary_key.push(column.name.clone());
+                    }
+                    columns.push(column);
+                }
             }
             if !self.eat(&TokenKind::Comma) {
                 break;
@@ -373,8 +387,41 @@ impl Parser {
             table,
             columns,
             primary_key,
+            check_constraints,
             span: start.to(end),
         }))
+    }
+
+    /// Consumes an optional `CONSTRAINT name` prefix, returning the name.
+    fn parse_optional_constraint_name(&mut self) -> SqlResult<Option<Name>> {
+        if self.peek_keyword().as_deref() == Some("CONSTRAINT") {
+            self.bump();
+            Ok(Some(self.parse_name()?))
+        } else {
+            Ok(None)
+        }
+    }
+
+    /// Parses `CHECK (predicate)` (the `CONSTRAINT name` prefix, if any, is
+    /// already consumed). The predicate is kept as source text.
+    fn parse_check_constraint(&mut self, name: Option<Name>) -> SqlResult<CheckConstraint> {
+        let start = self.expect_keyword("CHECK")?;
+        let lparen = self.expect(&TokenKind::LParen)?;
+        self.parse_expr()?;
+        let end = self.expect(&TokenKind::RParen)?;
+        // Slice the exact source between the CHECK's own parentheses. An
+        // expression node's span drops any outer parentheses of a boundary
+        // subexpression, so `self.slice(expr.span)` would capture unbalanced
+        // parens (e.g. `(a + b) > 0` -> `a + b) > 0`); slicing between our own
+        // parens keeps nested parentheses balanced.
+        Ok(CheckConstraint {
+            name,
+            predicate: self
+                .slice(Span::new(lparen.end, end.start))
+                .trim()
+                .to_string(),
+            span: start.to(end),
+        })
     }
 
     fn parse_column_def(&mut self) -> SqlResult<ColumnDef> {
@@ -385,9 +432,21 @@ impl Parser {
         let mut default = None;
         let mut identity = None;
         let mut collation = None;
+        let mut checks = Vec::new();
         let mut end = type_span;
         loop {
             match self.peek_keyword().as_deref() {
+                Some("CHECK") => {
+                    let check = self.parse_check_constraint(None)?;
+                    end = check.span;
+                    checks.push(check);
+                }
+                Some("CONSTRAINT") => {
+                    let constraint_name = self.parse_optional_constraint_name()?;
+                    let check = self.parse_check_constraint(constraint_name)?;
+                    end = check.span;
+                    checks.push(check);
+                }
                 Some("NOT") => {
                     self.bump();
                     end = self.expect_keyword("NULL")?;
@@ -436,6 +495,7 @@ impl Parser {
             default,
             identity,
             collation,
+            checks,
         })
     }
 
