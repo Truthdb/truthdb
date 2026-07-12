@@ -1,0 +1,140 @@
+[
+    Insert(
+        Insert {
+            table: Name {
+                value: "archive",
+                quoted: false,
+                span: Span {
+                    start: 12,
+                    end: 19,
+                },
+            },
+            columns: Some(
+                [
+                    Name {
+                        value: "id",
+                        quoted: false,
+                        span: Span {
+                            start: 21,
+                            end: 23,
+                        },
+                    },
+                    Name {
+                        value: "name",
+                        quoted: false,
+                        span: Span {
+                            start: 25,
+                            end: 29,
+                        },
+                    },
+                ],
+            ),
+            source: Select(
+                Select {
+                    top: None,
+                    distinct: false,
+                    items: [
+                        Expr {
+                            expr: Expr {
+                                kind: Column(
+                                    Name {
+                                        value: "id",
+                                        quoted: false,
+                                        span: Span {
+                                            start: 38,
+                                            end: 40,
+                                        },
+                                    },
+                                ),
+                                span: Span {
+                                    start: 38,
+                                    end: 40,
+                                },
+                            },
+                            alias: None,
+                        },
+                        Expr {
+                            expr: Expr {
+                                kind: Column(
+                                    Name {
+                                        value: "name",
+                                        quoted: false,
+                                        span: Span {
+                                            start: 42,
+                                            end: 46,
+                                        },
+                                    },
+                                ),
+                                span: Span {
+                                    start: 42,
+                                    end: 46,
+                                },
+                            },
+                            alias: None,
+                        },
+                    ],
+                    from: Some(
+                        Table {
+                            name: Name {
+                                value: "users",
+                                quoted: false,
+                                span: Span {
+                                    start: 52,
+                                    end: 57,
+                                },
+                            },
+                            alias: None,
+                        },
+                    ),
+                    where_clause: Some(
+                        Expr {
+                            kind: Binary {
+                                op: Eq,
+                                left: Expr {
+                                    kind: Column(
+                                        Name {
+                                            value: "active",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 64,
+                                                end: 70,
+                                            },
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 64,
+                                        end: 70,
+                                    },
+                                },
+                                right: Expr {
+                                    kind: Int(
+                                        1,
+                                    ),
+                                    span: Span {
+                                        start: 73,
+                                        end: 74,
+                                    },
+                                },
+                            },
+                            span: Span {
+                                start: 64,
+                                end: 74,
+                            },
+                        },
+                    ),
+                    group_by: [],
+                    having: None,
+                    order_by: [],
+                    span: Span {
+                        start: 31,
+                        end: 74,
+                    },
+                },
+            ),
+            span: Span {
+                start: 0,
+                end: 74,
+            },
+        },
+    ),
+]

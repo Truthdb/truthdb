@@ -106,6 +106,7 @@ impl Parser {
     fn parse_statement(&mut self) -> SqlResult<Statement> {
         match self.peek_keyword().as_deref() {
             Some("CREATE") => self.parse_create(),
+            Some("ALTER") => self.parse_alter(),
             Some("DROP") => self.parse_drop(),
             Some("INSERT") => self.parse_insert(),
             Some("UPDATE") => self.parse_update(),
@@ -600,6 +601,41 @@ impl Parser {
         Ok((precision as u8, scale as u8, end))
     }
 
+    // ---- ALTER TABLE ----------------------------------------------------
+
+    fn parse_alter(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("ALTER")?;
+        self.expect_keyword("TABLE")?;
+        let table = self.parse_name()?;
+        let (action, end) = match self.peek_keyword().as_deref() {
+            Some("ADD") => {
+                self.bump();
+                // Stage 10 part 2: only `ADD [CONSTRAINT name] CHECK (expr)`.
+                // ADD column arrives in a later part.
+                let name = self.parse_optional_constraint_name()?;
+                let check = self.parse_check_constraint(name)?;
+                let end = check.span;
+                (AlterAction::AddCheck(check), end)
+            }
+            Some("DROP") => {
+                self.bump();
+                self.expect_keyword("CONSTRAINT")?;
+                let name = self.parse_name()?;
+                let end = name.span;
+                (AlterAction::DropConstraint(name), end)
+            }
+            _ => {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+        };
+        Ok(Statement::AlterTable(AlterTable {
+            table,
+            action,
+            span: start.to(end),
+        }))
+    }
+
     // ---- DROP TABLE -----------------------------------------------------
 
     /// Dispatches `DROP TABLE` vs `DROP INDEX`.
@@ -669,30 +705,35 @@ impl Parser {
         } else {
             None
         };
-        self.expect_keyword("VALUES")?;
-        let mut rows = Vec::new();
-        loop {
-            self.expect(&TokenKind::LParen)?;
-            let mut values = Vec::new();
+        // The row source is either a SELECT or literal VALUES tuples.
+        let source = if self.peek_keyword().as_deref() == Some("SELECT") {
+            InsertSource::Select(Box::new(self.parse_select()?))
+        } else {
+            self.expect_keyword("VALUES")?;
+            let mut rows = Vec::new();
             loop {
-                values.push(self.parse_expr()?);
+                self.expect(&TokenKind::LParen)?;
+                let mut values = Vec::new();
+                loop {
+                    values.push(self.parse_expr()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+                rows.push(values);
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
             }
-            let end = self.expect(&TokenKind::RParen)?;
-            rows.push(values);
-            let _ = end;
-            if !self.eat(&TokenKind::Comma) {
-                break;
-            }
-        }
+            InsertSource::Values(rows)
+        };
         let end = self.prev_span();
         Ok(Statement::Insert(Insert {
             span: start.to(end),
             table,
             columns,
-            rows,
+            source,
         }))
     }
 

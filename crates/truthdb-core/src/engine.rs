@@ -1366,6 +1366,19 @@ mod tests {
         Engine::new(storage).expect("engine")
     }
 
+    /// A table's catalog object id (via `sys.tables`).
+    fn table_object_id(engine: &mut Engine, name: &str) -> u32 {
+        let (_, rows) = sql_rows(
+            engine,
+            &format!("SELECT object_id FROM sys.tables WHERE name = '{name}'"),
+        );
+        rows[0][0]
+            .as_ref()
+            .expect("object_id")
+            .parse()
+            .expect("u32")
+    }
+
     #[test]
     fn sql_create_insert_select_survive_restart() {
         let path = unique_temp_path("sql-roundtrip");
@@ -1667,6 +1680,207 @@ mod tests {
             sql_error_number(&mut engine, "CREATE TABLE t (col INT, CHECK (t.col > 0))",),
             4104
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_insert_select_copies_rows() {
+        let path = unique_temp_path("sql-insert-select");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE src (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20), keep BIT)")
+            .expect("create src");
+        engine
+            .execute("INSERT INTO src VALUES (1, 'a', 1), (2, 'b', 0), (3, 'c', 1)")
+            .expect("seed src");
+        // Target has an IDENTITY and a DEFAULT; the SELECT feeds the two named
+        // columns and the rest are server-generated / defaulted.
+        engine
+            .execute(
+                "CREATE TABLE dst (rid INT NOT NULL PRIMARY KEY IDENTITY(1,1), \
+                   id INT, label NVARCHAR(20), note NVARCHAR(10) DEFAULT 'copied')",
+            )
+            .expect("create dst");
+        engine
+            .execute(
+                "INSERT INTO dst (id, label) SELECT id, name FROM src WHERE keep = 1 ORDER BY id",
+            )
+            .expect("insert select");
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT rid, id, label, note FROM dst ORDER BY rid",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Some("1".into()),
+                    Some("1".into()),
+                    Some("a".into()),
+                    Some("copied".into())
+                ],
+                vec![
+                    Some("2".into()),
+                    Some("3".into()),
+                    Some("c".into()),
+                    Some("copied".into())
+                ],
+            ]
+        );
+
+        // Column-count mismatch between SELECT list and insert list.
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO dst (id) SELECT id, name FROM src"),
+            121
+        );
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "INSERT INTO dst (id, label) SELECT id FROM src"
+            ),
+            120
+        );
+
+        // Self-insert is Halloween-safe: the SELECT is fully materialized
+        // before any row is inserted, so it doubles the table exactly once.
+        engine
+            .execute("INSERT INTO dst (id, label) SELECT id, label FROM dst")
+            .expect("self insert select");
+        let (_, rows) = sql_rows(&mut engine, "SELECT COUNT(*) FROM dst");
+        assert_eq!(rows, vec![vec![Some("4".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn insert_select_locks_source_table_shared() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("insert-select-locks");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
+            .expect("t1");
+        engine
+            .execute("CREATE TABLE t2 (v INT NOT NULL)")
+            .expect("t2");
+        let t1 = table_object_id(&mut engine, "t1");
+        let t2 = table_object_id(&mut engine, "t2");
+
+        // The SELECT's source table must be read-locked (Shared) and the target
+        // write-locked (Exclusive); without the Shared lock this INSERT could
+        // read another transaction's uncommitted rows.
+        let locks = engine.analyze_locks(
+            "INSERT INTO t2 (v) SELECT v FROM t1",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            locks.contains(&(Resource::Table(t1), LockMode::Shared)),
+            "source t1 must be Shared: {locks:?}"
+        );
+        assert!(
+            locks.contains(&(Resource::Table(t2), LockMode::Exclusive)),
+            "target t2 must be Exclusive: {locks:?}"
+        );
+
+        // A self-insert combines the read and write into a single Exclusive lock.
+        let self_locks = engine.analyze_locks(
+            "INSERT INTO t1 (id, v) SELECT id, v FROM t1",
+            Isolation::ReadCommitted,
+        );
+        let t1_locks: Vec<_> = self_locks
+            .iter()
+            .filter(|(r, _)| *r == Resource::Table(t1))
+            .collect();
+        assert_eq!(
+            t1_locks,
+            vec![&(Resource::Table(t1), LockMode::Exclusive)],
+            "self-insert takes a single Exclusive lock on t1"
+        );
+
+        // READ UNCOMMITTED takes no read lock on the source.
+        let ru = engine.analyze_locks(
+            "INSERT INTO t2 (v) SELECT v FROM t1",
+            Isolation::ReadUncommitted,
+        );
+        assert!(
+            !ru.iter()
+                .any(|(r, m)| *r == Resource::Table(t1) && *m == LockMode::Shared),
+            "READ UNCOMMITTED takes no shared lock: {ru:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_alter_table_add_drop_check() {
+        let path = unique_temp_path("sql-alter-check");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, qty INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 5), (2, 10)")
+            .expect("seed");
+
+        // ADD CONSTRAINT validates existing rows: a constraint every row
+        // satisfies is accepted and then enforced on new writes.
+        engine
+            .execute("ALTER TABLE t ADD CONSTRAINT ck_qty CHECK (qty >= 0)")
+            .expect("add check");
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO t VALUES (3, -1)"),
+            547
+        );
+
+        // ADD CONSTRAINT that an existing row violates is rejected (547) and
+        // not persisted (a later insert violating it still succeeds after DROP).
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "ALTER TABLE t ADD CONSTRAINT ck_big CHECK (qty > 8)"
+            ),
+            547
+        );
+        // ck_big was not added, so it is not enforced.
+        engine
+            .execute("INSERT INTO t VALUES (4, 1)")
+            .expect("insert allowed (ck_big not added)");
+
+        // DROP CONSTRAINT removes enforcement.
+        engine
+            .execute("ALTER TABLE t DROP CONSTRAINT ck_qty")
+            .expect("drop check");
+        engine
+            .execute("INSERT INTO t VALUES (5, -7)")
+            .expect("insert allowed after drop");
+
+        // Dropping an unknown constraint errors.
+        assert_eq!(
+            sql_error_number(&mut engine, "ALTER TABLE t DROP CONSTRAINT nope"),
+            3728
+        );
+        // ALTER TABLE is DDL and is not allowed inside an explicit transaction
+        // (needs a persistent txn context, so run it as one batch).
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &mut engine,
+            &mut ctx,
+            "BEGIN TRANSACTION; ALTER TABLE t ADD CHECK (qty < 100)",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(226));
+        batch(&mut engine, &mut ctx, "ROLLBACK");
+
+        // A constraint added via ALTER survives a restart.
+        engine
+            .execute("ALTER TABLE t ADD CONSTRAINT ck_id CHECK (id > 0)")
+            .expect("add ck_id");
+        drop(engine);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("engine");
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT name FROM sys.check_constraints ORDER BY name",
+        );
+        assert_eq!(rows, vec![vec![Some("ck_id".into())]]);
         let _ = std::fs::remove_file(path);
     }
 

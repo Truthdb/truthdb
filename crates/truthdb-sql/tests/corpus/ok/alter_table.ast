@@ -1,0 +1,89 @@
+[
+    AlterTable(
+        AlterTable {
+            table: Name {
+                value: "items",
+                quoted: false,
+                span: Span {
+                    start: 12,
+                    end: 17,
+                },
+            },
+            action: AddCheck(
+                CheckConstraint {
+                    name: Some(
+                        Name {
+                            value: "ck_qty",
+                            quoted: false,
+                            span: Span {
+                                start: 33,
+                                end: 39,
+                            },
+                        },
+                    ),
+                    predicate: "qty >= 0",
+                    span: Span {
+                        start: 40,
+                        end: 56,
+                    },
+                },
+            ),
+            span: Span {
+                start: 0,
+                end: 56,
+            },
+        },
+    ),
+    AlterTable(
+        AlterTable {
+            table: Name {
+                value: "items",
+                quoted: false,
+                span: Span {
+                    start: 70,
+                    end: 75,
+                },
+            },
+            action: AddCheck(
+                CheckConstraint {
+                    name: None,
+                    predicate: "(price - qty) > 0",
+                    span: Span {
+                        start: 80,
+                        end: 105,
+                    },
+                },
+            ),
+            span: Span {
+                start: 58,
+                end: 105,
+            },
+        },
+    ),
+    AlterTable(
+        AlterTable {
+            table: Name {
+                value: "items",
+                quoted: false,
+                span: Span {
+                    start: 119,
+                    end: 124,
+                },
+            },
+            action: DropConstraint(
+                Name {
+                    value: "ck_qty",
+                    quoted: false,
+                    span: Span {
+                        start: 141,
+                        end: 147,
+                    },
+                },
+            ),
+            span: Span {
+                start: 107,
+                end: 147,
+            },
+        },
+    ),
+]

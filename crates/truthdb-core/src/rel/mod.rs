@@ -13,9 +13,9 @@ mod plan;
 mod value;
 
 use truthdb_sql::ast::{
-    CheckConstraint, ColumnDef, CreateIndex, CreateTable, DataType, Delete, DropIndex, DropTable,
-    Expr, ExprKind, Insert, IsolationLevel, JoinKind, Name, OrderItem, Select, SelectItem,
-    SetStatement, Statement, TableRef, Update,
+    AlterAction, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable, DataType,
+    Delete, DropIndex, DropTable, Expr, ExprKind, Insert, InsertSource, IsolationLevel, JoinKind,
+    Name, OrderItem, Select, SelectItem, SetStatement, Statement, TableRef, Update,
 };
 use truthdb_sql::error::SqlError;
 use truthdb_sql::eval::EvalContext;
@@ -212,9 +212,32 @@ pub fn analyze_locks(
                     }
                 }
             }
-            Statement::Insert(Insert { table, .. })
-            | Statement::Update(Update { table, .. })
-            | Statement::Delete(Delete { table, .. }) => {
+            Statement::Insert(insert) => {
+                if let Some(def) = resolve_table(storage, &insert.table.value) {
+                    add(Resource::Database, LockMode::IntentExclusive);
+                    add(Resource::Table(def.object_id), LockMode::Exclusive);
+                }
+                // INSERT ... SELECT also reads its source tables; lock them
+                // like a SELECT so it cannot read another txn's uncommitted
+                // rows (they combine to SIX on the target if it is a source).
+                if reads_lock
+                    && let InsertSource::Select(select) = &insert.source
+                    && let Some(from) = &select.from
+                {
+                    let mut tables = Vec::new();
+                    collect_table_names(from, &mut tables);
+                    for name in tables {
+                        if name.value.to_ascii_lowercase().starts_with("sys.") {
+                            continue;
+                        }
+                        if let Some(def) = resolve_table(storage, &name.value) {
+                            add(Resource::Database, LockMode::IntentShared);
+                            add(Resource::Table(def.object_id), LockMode::Shared);
+                        }
+                    }
+                }
+            }
+            Statement::Update(Update { table, .. }) | Statement::Delete(Delete { table, .. }) => {
                 if let Some(def) = resolve_table(storage, &table.value) {
                     add(Resource::Database, LockMode::IntentExclusive);
                     add(Resource::Table(def.object_id), LockMode::Exclusive);
@@ -225,7 +248,8 @@ pub fn analyze_locks(
             Statement::CreateTable(_)
             | Statement::DropTable(_)
             | Statement::CreateIndex(_)
-            | Statement::DropIndex(_) => {
+            | Statement::DropIndex(_)
+            | Statement::AlterTable(_) => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // Transaction control and SET take no data locks.
@@ -302,6 +326,13 @@ fn exec_statement(
                 return Err(ddl_in_txn_err());
             }
             exec_drop_index(storage, drop)
+        }
+        Statement::AlterTable(alter) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            let eval_ctx = txn_ctx.eval_context();
+            exec_alter_table(storage, alter, &eval_ctx)
         }
         Statement::Insert(insert) => {
             let eval_ctx = txn_ctx.eval_context();
@@ -603,63 +634,79 @@ fn exec_create_table(
     Ok(StatementResult::Done)
 }
 
-/// Collects a table's CHECK constraints (column-level, then table-level),
-/// validates each predicate parses and references only real columns, assigns
-/// a name to unnamed constraints, and rejects duplicate names.
+/// Collects a table's CHECK constraints (column-level, then table-level) and
+/// binds each ([`bind_check`]), threading the running name list so unnamed
+/// constraints get unique auto names and duplicate explicit names are caught.
 fn build_check_defs(
     create: &CreateTable,
     columns: &[Column],
     table_name: &str,
 ) -> Result<Vec<catalog::CheckDef>, SqlError> {
-    let raw: Vec<&CheckConstraint> = create
+    let raw = create
         .columns
         .iter()
         .flat_map(|c| c.checks.iter())
-        .chain(create.check_constraints.iter())
-        .collect();
+        .chain(create.check_constraints.iter());
 
-    // Explicit names must be unique within the table (case-insensitive).
     let mut names: Vec<String> = Vec::new();
-    for check in &raw {
-        if let Some(name) = &check.name {
-            if names.iter().any(|n| n.eq_ignore_ascii_case(&name.value)) {
+    let mut defs = Vec::new();
+    for check in raw {
+        let def = bind_check(check, columns, table_name, &names)?;
+        names.push(def.name.clone());
+        defs.push(def);
+    }
+    Ok(defs)
+}
+
+/// Validates one CHECK constraint against a table's columns and its existing
+/// constraint names: the predicate must parse and reference only real columns
+/// (207/4104); an explicit name must not collide (2714); an unnamed check is
+/// assigned the first free `CK__<table>__<n>`.
+fn bind_check(
+    check: &CheckConstraint,
+    columns: &[Column],
+    table_name: &str,
+    existing_names: &[String],
+) -> Result<catalog::CheckDef, SqlError> {
+    let expr = truthdb_sql::parse_expr(&check.predicate)?;
+    validate_check_columns(&expr, columns)?;
+    let name = match &check.name {
+        Some(n) => {
+            if existing_names
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&n.value))
+            {
                 return Err(SqlError::new(
                     2714,
                     16,
                     5,
                     format!(
                         "There is already an object named '{}' in the database.",
-                        name.value
+                        n.value
                     ),
                 )
-                .at(name.span));
+                .at(n.span));
             }
-            names.push(name.value.clone());
+            n.value.clone()
         }
-    }
-
-    let mut defs = Vec::with_capacity(raw.len());
-    let mut auto_seq = 0u32;
-    for check in raw {
-        let expr = truthdb_sql::parse_expr(&check.predicate)?;
-        validate_check_columns(&expr, columns)?;
-        let name = match &check.name {
-            Some(n) => n.value.clone(),
-            None => loop {
-                auto_seq += 1;
-                let candidate = format!("CK__{table_name}__{auto_seq}");
-                if !names.iter().any(|n| n.eq_ignore_ascii_case(&candidate)) {
-                    names.push(candidate.clone());
+        None => {
+            let mut seq = 0u32;
+            loop {
+                seq += 1;
+                let candidate = format!("CK__{table_name}__{seq}");
+                if !existing_names
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(&candidate))
+                {
                     break candidate;
                 }
-            },
-        };
-        defs.push(catalog::CheckDef {
-            name,
-            predicate: check.predicate.clone(),
-        });
-    }
-    Ok(defs)
+            }
+        }
+    };
+    Ok(catalog::CheckDef {
+        name,
+        predicate: check.predicate.clone(),
+    })
 }
 
 /// Rejects a CHECK predicate that references a column the table does not have
@@ -935,6 +982,96 @@ fn exec_drop_index(storage: &mut Storage, drop: &DropIndex) -> Result<StatementR
     Ok(StatementResult::Done)
 }
 
+// ---- ALTER TABLE --------------------------------------------------------
+
+fn exec_alter_table(
+    storage: &mut Storage,
+    alter: &AlterTable,
+    eval_ctx: &EvalContext,
+) -> Result<StatementResult, SqlError> {
+    let def = resolve_table(storage, &alter.table.value)
+        .ok_or_else(|| SqlError::invalid_object(&alter.table.value).at(alter.table.span))?;
+    match &alter.action {
+        AlterAction::AddCheck(check) => alter_add_check(storage, &def, check, eval_ctx),
+        AlterAction::DropConstraint(name) => alter_drop_constraint(storage, &def, name),
+    }
+}
+
+/// `ALTER TABLE ... ADD [CONSTRAINT name] CHECK (expr)`. Validates the new
+/// constraint against every existing row (SQL Server's default WITH CHECK); a
+/// violating row is error 547 and the constraint is not added.
+fn alter_add_check(
+    storage: &mut Storage,
+    def: &TableDef,
+    check: &CheckConstraint,
+    eval_ctx: &EvalContext,
+) -> Result<StatementResult, SqlError> {
+    let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
+    let existing: Vec<String> = def
+        .check_constraints
+        .iter()
+        .map(|c| c.name.clone())
+        .collect();
+    let new_def = bind_check(check, &schema.columns, &def.name, &existing)?;
+
+    // WITH CHECK: no existing row may violate the new constraint.
+    let compiled = vec![(
+        new_def.name.clone(),
+        truthdb_sql::parse_expr(&new_def.predicate)?,
+    )];
+    let resolver = schema_names(&schema);
+    let types = schema_types(&schema);
+    let rows = storage
+        .rel_scan(&def.name)
+        .map_err(|e| map_storage_err(e, &def.name))?;
+    for row in &rows {
+        let scope = row_values(row, &types);
+        enforce_checks(
+            &compiled,
+            &scope,
+            &resolver,
+            eval_ctx,
+            "ALTER TABLE",
+            &def.name,
+        )?;
+    }
+
+    let mut checks = def.check_constraints.clone();
+    checks.push(new_def);
+    storage
+        .rel_set_check_constraints(&def.name, checks)
+        .map_err(|e| map_storage_err(e, &def.name))?;
+    Ok(StatementResult::Done)
+}
+
+/// `ALTER TABLE ... DROP CONSTRAINT name`. Removes a CHECK constraint by name
+/// (case-insensitive); an unknown name is error 3728.
+fn alter_drop_constraint(
+    storage: &mut Storage,
+    def: &TableDef,
+    name: &Name,
+) -> Result<StatementResult, SqlError> {
+    let checks: Vec<catalog::CheckDef> = def
+        .check_constraints
+        .iter()
+        .filter(|c| !c.name.eq_ignore_ascii_case(&name.value))
+        .cloned()
+        .collect();
+    if checks.len() == def.check_constraints.len() {
+        return Err(SqlError::new(
+            3728,
+            16,
+            1,
+            format!("'{}' is not a constraint.", name.value),
+        )
+        .at(name.span));
+    }
+    storage
+        .rel_set_check_constraints(&def.name, checks)
+        .map_err(|e| map_storage_err(e, &def.name))?;
+    Ok(StatementResult::Done)
+}
+
 // ---- INSERT -------------------------------------------------------------
 
 fn exec_insert(
@@ -995,39 +1132,35 @@ fn exec_insert(
         None => (0..ncols).filter(|i| Some(*i) != identity_col).collect(),
     };
 
+    // Gather the input rows (each of length `target.len()`) from either the
+    // VALUES tuples or a SELECT. A SELECT is fully materialized before any
+    // insert, so `INSERT INTO t SELECT ... FROM t` is Halloween-safe.
+    let input_rows = insert_input_rows(storage, &insert.source, target.len(), eval_ctx)?;
+
     // Reserve identity values for the whole batch up front. A failed insert
     // consumes them (a gap), but a value is never reused (SQL Server-faithful).
     let identity_first = if identity_col.is_some() {
         storage
-            .rel_reserve_identity(&def.name, insert.rows.len())
+            .rel_reserve_identity(&def.name, input_rows.len())
             .map_err(|e| map_storage_err(e, &def.name))?
     } else {
         None
     };
 
     // Build every row up front; insert them as one atomic statement.
-    let mut rows = Vec::with_capacity(insert.rows.len());
-    for (row_no, row_exprs) in insert.rows.iter().enumerate() {
-        if row_exprs.len() != target.len() {
-            return Err(SqlError::new(
-                110,
-                15,
-                1,
-                "There are fewer or more columns in the INSERT statement than values specified in the VALUES clause.",
-            ));
-        }
+    let mut rows = Vec::with_capacity(input_rows.len());
+    for (row_no, input) in input_rows.iter().enumerate() {
         // Full row in schema order: unspecified columns start NULL.
         let mut values = vec![Datum::Null; ncols];
-        for (position, expr) in target.iter().zip(row_exprs) {
+        for (position, sql_value) in target.iter().zip(input) {
             let column = &schema.columns[*position];
-            let sql_value = eval_constant(expr, eval_ctx)?;
             if sql_value.is_null() && !column.nullable {
                 return Err(SqlError::null_into_not_null(
                     &column.name,
                     &insert.table.value,
                 ));
             }
-            values[*position] = value::sql_to_datum(&sql_value, &column.column_type, &column.name)?;
+            values[*position] = value::sql_to_datum(sql_value, &column.column_type, &column.name)?;
         }
         // Server-generated identity value for this row.
         if let (Some(col), Some(first)) = (identity_col, identity_first) {
@@ -1072,6 +1205,63 @@ fn exec_insert(
         .rel_insert_many(&def.name, rows, scope)
         .map_err(|err| map_storage_err(err, &def.name))?;
     Ok(StatementResult::RowsAffected(inserted))
+}
+
+/// Produces the input rows an INSERT supplies, each already in target-column
+/// order and as [`SqlValue`]s: `VALUES` tuples are evaluated as constants; a
+/// `SELECT` is executed and its rows converted. Rejects an arity mismatch
+/// against the target column count (110 for VALUES, 120/121 for SELECT).
+fn insert_input_rows(
+    storage: &mut Storage,
+    source: &InsertSource,
+    target_len: usize,
+    eval_ctx: &EvalContext,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    match source {
+        InsertSource::Values(rows) => {
+            let mut out = Vec::with_capacity(rows.len());
+            for exprs in rows {
+                if exprs.len() != target_len {
+                    return Err(SqlError::new(
+                        110,
+                        15,
+                        1,
+                        "There are fewer or more columns in the INSERT statement than values specified in the VALUES clause.",
+                    ));
+                }
+                let mut vals = Vec::with_capacity(target_len);
+                for expr in exprs {
+                    vals.push(eval_constant(expr, eval_ctx)?);
+                }
+                out.push(vals);
+            }
+            Ok(out)
+        }
+        InsertSource::Select(select) => {
+            let rowset = exec_select(storage, select, eval_ctx)?;
+            if rowset.columns.len() != target_len {
+                let (number, more_or_fewer) = if rowset.columns.len() < target_len {
+                    (120, "fewer")
+                } else {
+                    (121, "more")
+                };
+                return Err(SqlError::new(
+                    number,
+                    15,
+                    1,
+                    format!(
+                        "The select list for the INSERT statement contains {more_or_fewer} items than the insert list. The number of SELECT values must match the number of INSERT columns."
+                    ),
+                ));
+            }
+            let types: Vec<ColumnType> = rowset.columns.iter().map(|c| c.column_type).collect();
+            Ok(rowset
+                .rows
+                .iter()
+                .map(|row| row_values(row, &types))
+                .collect())
+        }
+    }
 }
 
 /// Evaluates a column DEFAULT (re-parsed from its stored source text).
