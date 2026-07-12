@@ -44,6 +44,16 @@ pub(crate) struct WalWriter {
     ring_size: u64,
     head: u64,
     buffer: LogBuffer,
+    /// Tail position up to which the log is known fsync-durable. Appends
+    /// with `sync = false` advance the tail but not this watermark.
+    flushed: u64,
+    /// Ring bytes reserved for compensation records: forward relational
+    /// appends stop at `ring_size - reserve` so rollback and recovery undo
+    /// always have room to write their CLRs.
+    reserve: u64,
+    /// Set when a page write failed mid-append: the in-memory tail no longer
+    /// matches the disk and no further appends can be trusted.
+    poisoned: bool,
     bytes_since_superblock: u64,
     superblock_interval: u64,
 }
@@ -73,6 +83,9 @@ impl WalWriter {
             ring_size,
             head,
             buffer,
+            flushed: tail,
+            reserve: ring_size / 4,
+            poisoned: false,
             bytes_since_superblock: 0,
             superblock_interval: SUPERBLOCK_REWRITE_INTERVAL,
         })
@@ -124,6 +137,31 @@ impl WalWriter {
         }
     }
 
+    /// The tail position up to which the log is fsync-durable.
+    pub fn flushed_lsn(&self) -> u64 {
+        self.flushed
+    }
+
+    /// Makes the log durable at least up to and including the record that
+    /// STARTS at `lsn` (page writes always happen at append time; this only
+    /// issues the missing fsync). `flushed` counts covered bytes, so a
+    /// record starting exactly at the watermark is not yet durable.
+    pub fn sync_to(&mut self, lsn: u64) -> Result<(), StorageError> {
+        if lsn >= self.flushed {
+            self.sync_all()?;
+        }
+        Ok(())
+    }
+
+    /// Fsyncs everything appended so far.
+    pub fn sync_all(&mut self) -> Result<(), StorageError> {
+        if self.flushed < self.tail() {
+            self.file.sync_data()?;
+            self.flushed = self.tail();
+        }
+        Ok(())
+    }
+
     /// Appends one entry, makes it durable (whole-page flush + fsync) and
     /// returns its LSN.
     pub fn append_entry(
@@ -133,6 +171,40 @@ impl WalWriter {
         seq_no: u64,
         payload: &[u8],
     ) -> Result<u64, StorageError> {
+        self.append_entry_opts(entry_type, entry_version, seq_no, payload, true)
+    }
+
+    /// Appends one entry; page images are written immediately, but the fsync
+    /// is skipped when `sync` is false (force-at-commit: the caller fsyncs
+    /// via [`WalWriter::sync_all`] before acknowledging anything).
+    pub fn append_entry_opts(
+        &mut self,
+        entry_type: u16,
+        entry_version: u16,
+        seq_no: u64,
+        payload: &[u8],
+        sync: bool,
+    ) -> Result<u64, StorageError> {
+        self.append_entry_reserve(entry_type, entry_version, seq_no, payload, sync, true)
+    }
+
+    /// Like [`WalWriter::append_entry_opts`], but with explicit access to the
+    /// compensation reserve: forward relational appends pass
+    /// `allow_reserve = false` so rollback/recovery CLRs always have room.
+    pub fn append_entry_reserve(
+        &mut self,
+        entry_type: u16,
+        entry_version: u16,
+        seq_no: u64,
+        payload: &[u8],
+        sync: bool,
+        allow_reserve: bool,
+    ) -> Result<u64, StorageError> {
+        if self.poisoned {
+            return Err(StorageError::InvalidFile(
+                "wal writer disabled after a failed page write; restart to recover".to_string(),
+            ));
+        }
         if self.ring_size == 0 {
             return Err(StorageError::InvalidFile(
                 "wal region size is zero".to_string(),
@@ -164,7 +236,12 @@ impl WalWriter {
         } else {
             align_down(new_tail, page) + page
         };
-        if flush_end.saturating_sub(self.head) > self.ring_size {
+        let capacity = if allow_reserve {
+            self.ring_size
+        } else {
+            self.ring_size - self.reserve
+        };
+        if flush_end.saturating_sub(self.head) > capacity {
             return Err(StorageError::WalFull("wal ring full".to_string()));
         }
 
@@ -194,13 +271,25 @@ impl WalWriter {
         entry_bytes.resize(entry_len, 0);
 
         completed.extend(self.buffer.append(&entry_bytes));
-        self.write_pages(&completed)?;
+        // A failed page write leaves the in-memory tail ahead of the disk:
+        // nothing appended afterwards could be trusted, so poison the writer
+        // (restart recovers to the last durable prefix).
+        if let Err(err) = self.write_pages(&completed) {
+            self.poisoned = true;
+            return Err(err);
+        }
         if !self.buffer.current_page_is_empty() {
             let (page_start, page) = self.buffer.current_page();
             let file_offset = self.ring_offset + page_start % self.ring_size;
-            self.file.write_page_from(file_offset, page)?;
+            if let Err(err) = self.file.write_page_from(file_offset, page) {
+                self.poisoned = true;
+                return Err(err.into());
+            }
         }
-        self.file.sync_data()?;
+        if sync {
+            self.file.sync_data()?;
+            self.flushed = self.tail();
+        }
 
         self.bytes_since_superblock += gap + entry_len as u64;
         Ok(lsn)

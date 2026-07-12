@@ -19,6 +19,10 @@ use crate::storage_layout::PAGE_SIZE;
 pub const PAGE_HEADER_SIZE: usize = 32;
 
 pub const PAGE_TYPE_FREE: u16 = 0;
+/// B+ tree page (leaf vs internal distinguished by the structure header's
+/// level field).
+pub const PAGE_TYPE_TREE: u16 = 1;
+pub const PAGE_TYPE_HEAP: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PageHeader {
