@@ -1,0 +1,51 @@
+# CHECK constraints (Stage 10 part 1)
+
+statement ok
+CREATE TABLE items (id INT NOT NULL PRIMARY KEY, qty INT CHECK (qty >= 0), price INT, CONSTRAINT ck_price CHECK ((price - qty) > 0))
+
+statement ok
+INSERT INTO items VALUES (1, 5, 10)
+
+# Column check violation (qty < 0).
+statement error
+INSERT INTO items VALUES (2, -1, 10)
+
+# Table check violation (price <= qty).
+statement error
+INSERT INTO items VALUES (3, 5, 5)
+
+# NULL in a checked column yields UNKNOWN, which passes.
+statement ok
+INSERT INTO items VALUES (4, NULL, 10)
+
+# UPDATE is checked against the new row.
+statement error
+UPDATE items SET qty = -3 WHERE id = 1
+
+statement ok
+UPDATE items SET qty = 2 WHERE id = 1
+
+query I
+SELECT id FROM items ORDER BY id
+----
+1
+4
+
+# Both constraints are visible: the auto-named column check and the named one.
+query T
+SELECT name FROM sys.check_constraints ORDER BY name
+----
+CK__items__1
+ck_price
+
+# A CHECK referencing an unknown column is rejected at CREATE.
+statement error
+CREATE TABLE bad (id INT NOT NULL PRIMARY KEY, CHECK (missing > 0))
+
+# Duplicate explicit constraint names collide.
+statement error
+CREATE TABLE dup (id INT NOT NULL PRIMARY KEY, CONSTRAINT c CHECK (id > 0), CONSTRAINT c CHECK (id < 9))
+
+# A qualified column reference in a CHECK is rejected at CREATE.
+statement error
+CREATE TABLE qual (col INT, CHECK (qual.col > 0))

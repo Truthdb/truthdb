@@ -1,0 +1,158 @@
+[
+    CreateTable(
+        CreateTable {
+            table: Name {
+                value: "items",
+                quoted: false,
+                span: Span {
+                    start: 13,
+                    end: 18,
+                },
+            },
+            columns: [
+                ColumnDef {
+                    name: Name {
+                        value: "id",
+                        quoted: false,
+                        span: Span {
+                            start: 25,
+                            end: 27,
+                        },
+                    },
+                    data_type: Int,
+                    nullable: Some(
+                        false,
+                    ),
+                    primary_key: true,
+                    default: None,
+                    identity: None,
+                    collation: None,
+                    checks: [],
+                    span: Span {
+                        start: 25,
+                        end: 52,
+                    },
+                },
+                ColumnDef {
+                    name: Name {
+                        value: "qty",
+                        quoted: false,
+                        span: Span {
+                            start: 58,
+                            end: 61,
+                        },
+                    },
+                    data_type: Int,
+                    nullable: None,
+                    primary_key: false,
+                    default: None,
+                    identity: None,
+                    collation: None,
+                    checks: [
+                        CheckConstraint {
+                            name: None,
+                            predicate: "qty >= 0",
+                            span: Span {
+                                start: 66,
+                                end: 82,
+                            },
+                        },
+                    ],
+                    span: Span {
+                        start: 58,
+                        end: 82,
+                    },
+                },
+                ColumnDef {
+                    name: Name {
+                        value: "price",
+                        quoted: false,
+                        span: Span {
+                            start: 88,
+                            end: 93,
+                        },
+                    },
+                    data_type: Int,
+                    nullable: None,
+                    primary_key: false,
+                    default: None,
+                    identity: None,
+                    collation: None,
+                    checks: [
+                        CheckConstraint {
+                            name: Some(
+                                Name {
+                                    value: "ck_pos",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 109,
+                                        end: 115,
+                                    },
+                                },
+                            ),
+                            predicate: "price > 0",
+                            span: Span {
+                                start: 116,
+                                end: 133,
+                            },
+                        },
+                    ],
+                    span: Span {
+                        start: 88,
+                        end: 133,
+                    },
+                },
+            ],
+            primary_key: [
+                Name {
+                    value: "id",
+                    quoted: false,
+                    span: Span {
+                        start: 25,
+                        end: 27,
+                    },
+                },
+            ],
+            check_constraints: [
+                CheckConstraint {
+                    name: Some(
+                        Name {
+                            value: "ck_price",
+                            quoted: false,
+                            span: Span {
+                                start: 150,
+                                end: 158,
+                            },
+                        },
+                    ),
+                    predicate: "(price - qty) > 0",
+                    span: Span {
+                        start: 159,
+                        end: 184,
+                    },
+                },
+                CheckConstraint {
+                    name: Some(
+                        Name {
+                            value: "ck_range",
+                            quoted: false,
+                            span: Span {
+                                start: 201,
+                                end: 209,
+                            },
+                        },
+                    ),
+                    predicate: "qty > 0 AND (price < 100 OR price > 200)",
+                    span: Span {
+                        start: 210,
+                        end: 258,
+                    },
+                },
+            ],
+            span: Span {
+                start: 0,
+                end: 260,
+            },
+        },
+    ),
+]

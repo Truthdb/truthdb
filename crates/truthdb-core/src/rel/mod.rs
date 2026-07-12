@@ -13,9 +13,9 @@ mod plan;
 mod value;
 
 use truthdb_sql::ast::{
-    ColumnDef, CreateIndex, CreateTable, DataType, Delete, DropIndex, DropTable, Expr, ExprKind,
-    Insert, IsolationLevel, JoinKind, Name, OrderItem, Select, SelectItem, SetStatement, Statement,
-    TableRef, Update,
+    CheckConstraint, ColumnDef, CreateIndex, CreateTable, DataType, Delete, DropIndex, DropTable,
+    Expr, ExprKind, Insert, IsolationLevel, JoinKind, Name, OrderItem, Select, SelectItem,
+    SetStatement, Statement, TableRef, Update,
 };
 use truthdb_sql::error::SqlError;
 use truthdb_sql::eval::EvalContext;
@@ -586,10 +586,213 @@ fn exec_create_table(
         });
     }
 
+    // CHECK constraints (column-level + table-level): validate, name, and
+    // fold into the catalog. Validation needs the bound columns.
+    let check_constraints = build_check_defs(create, &columns, table_name)?;
+
     storage
-        .rel_create_table(table_name, columns, &key_names, defaults, identity)
+        .rel_create_table(
+            table_name,
+            columns,
+            &key_names,
+            defaults,
+            identity,
+            check_constraints,
+        )
         .map_err(|err| map_storage_err(err, table_name))?;
     Ok(StatementResult::Done)
+}
+
+/// Collects a table's CHECK constraints (column-level, then table-level),
+/// validates each predicate parses and references only real columns, assigns
+/// a name to unnamed constraints, and rejects duplicate names.
+fn build_check_defs(
+    create: &CreateTable,
+    columns: &[Column],
+    table_name: &str,
+) -> Result<Vec<catalog::CheckDef>, SqlError> {
+    let raw: Vec<&CheckConstraint> = create
+        .columns
+        .iter()
+        .flat_map(|c| c.checks.iter())
+        .chain(create.check_constraints.iter())
+        .collect();
+
+    // Explicit names must be unique within the table (case-insensitive).
+    let mut names: Vec<String> = Vec::new();
+    for check in &raw {
+        if let Some(name) = &check.name {
+            if names.iter().any(|n| n.eq_ignore_ascii_case(&name.value)) {
+                return Err(SqlError::new(
+                    2714,
+                    16,
+                    5,
+                    format!(
+                        "There is already an object named '{}' in the database.",
+                        name.value
+                    ),
+                )
+                .at(name.span));
+            }
+            names.push(name.value.clone());
+        }
+    }
+
+    let mut defs = Vec::with_capacity(raw.len());
+    let mut auto_seq = 0u32;
+    for check in raw {
+        let expr = truthdb_sql::parse_expr(&check.predicate)?;
+        validate_check_columns(&expr, columns)?;
+        let name = match &check.name {
+            Some(n) => n.value.clone(),
+            None => loop {
+                auto_seq += 1;
+                let candidate = format!("CK__{table_name}__{auto_seq}");
+                if !names.iter().any(|n| n.eq_ignore_ascii_case(&candidate)) {
+                    names.push(candidate.clone());
+                    break candidate;
+                }
+            },
+        };
+        defs.push(catalog::CheckDef {
+            name,
+            predicate: check.predicate.clone(),
+        });
+    }
+    Ok(defs)
+}
+
+/// Rejects a CHECK predicate that references a column the table does not have
+/// (error 207). Only column existence is checked here; type/boolean validity
+/// is left to per-row evaluation.
+fn validate_check_columns(expr: &Expr, columns: &[Column]) -> Result<(), SqlError> {
+    match &expr.kind {
+        ExprKind::Column(name) => {
+            // A CHECK may only reference columns of its own table by their bare
+            // name. A multi-part identifier (`t.col`) can't be resolved by the
+            // bare-name enforcement resolver, so reject it here (4104) rather
+            // than accept a table that then rejects every INSERT with 207.
+            if name.value.contains('.') {
+                return Err(SqlError::new(
+                    4104,
+                    16,
+                    1,
+                    format!(
+                        "The multi-part identifier \"{}\" could not be bound.",
+                        name.value
+                    ),
+                )
+                .at(name.span));
+            }
+            if columns
+                .iter()
+                .any(|c| c.name.eq_ignore_ascii_case(&name.value))
+            {
+                Ok(())
+            } else {
+                Err(SqlError::invalid_column(&name.value).at(name.span))
+            }
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::Cast { expr, .. }
+        | ExprKind::IsNull { expr, .. } => validate_check_columns(expr, columns),
+        ExprKind::Binary { left, right, .. } => {
+            validate_check_columns(left, columns)?;
+            validate_check_columns(right, columns)
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            validate_check_columns(expr, columns)?;
+            validate_check_columns(pattern, columns)
+        }
+        ExprKind::InList { expr, list, .. } => {
+            validate_check_columns(expr, columns)?;
+            list.iter()
+                .try_for_each(|e| validate_check_columns(e, columns))
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            validate_check_columns(expr, columns)?;
+            validate_check_columns(low, columns)?;
+            validate_check_columns(high, columns)
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            if let Some(op) = operand {
+                validate_check_columns(op, columns)?;
+            }
+            for (when, then) in branches {
+                validate_check_columns(when, columns)?;
+                validate_check_columns(then, columns)?;
+            }
+            if let Some(e) = else_result {
+                validate_check_columns(e, columns)?;
+            }
+            Ok(())
+        }
+        ExprKind::Function { args, .. } => args
+            .iter()
+            .try_for_each(|a| validate_check_columns(a, columns)),
+        ExprKind::Aggregate { arg, .. } => arg
+            .as_ref()
+            .map_or(Ok(()), |a| validate_check_columns(a, columns)),
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::GlobalVar(_) => Ok(()),
+    }
+}
+
+/// Parses a table's stored CHECK predicates once (per statement) for row
+/// enforcement, pairing each with its constraint name.
+fn parse_checks(def: &TableDef) -> Result<Vec<(String, Expr)>, SqlError> {
+    def.check_constraints
+        .iter()
+        .map(|c| Ok((c.name.clone(), truthdb_sql::parse_expr(&c.predicate)?)))
+        .collect()
+}
+
+/// Enforces CHECK constraints against a fully-built row (schema order). A
+/// constraint passes on TRUE or UNKNOWN (NULL); FALSE is error 547.
+fn enforce_checks(
+    checks: &[(String, Expr)],
+    row: &[SqlValue],
+    resolver: &Vec<String>,
+    eval_ctx: &EvalContext,
+    verb: &str,
+    table: &str,
+) -> Result<(), SqlError> {
+    for (name, expr) in checks {
+        match eval::eval(expr, row, resolver, eval_ctx)? {
+            SqlValue::Bool(false) => {
+                return Err(SqlError::new(
+                    547,
+                    16,
+                    0,
+                    format!(
+                        "The {verb} statement conflicted with the CHECK constraint \"{name}\". The conflict occurred in database \"truthdb\", table \"dbo.{table}\".",
+                    ),
+                ));
+            }
+            SqlValue::Bool(true) | SqlValue::Null => {}
+            _ => {
+                return Err(SqlError::new(
+                    4145,
+                    15,
+                    1,
+                    format!(
+                        "An expression of non-boolean type specified in a context where a condition is expected, near the CHECK constraint \"{name}\"."
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn bind_column(column: &ColumnDef) -> Result<Column, SqlError> {
@@ -747,6 +950,11 @@ fn exec_insert(
     let identity_col = def.identity.map(|s| s.column);
     let increment = def.identity.map(|s| s.increment).unwrap_or(0);
 
+    // CHECK constraints are parsed once and evaluated against each built row.
+    let checks = parse_checks(&def)?;
+    let check_resolver = schema_names(&schema);
+    let check_types = schema_types(&schema);
+
     // Target column indices. An explicit list may not name the identity column
     // (8101) or repeat a column (264); an omitted list targets every
     // non-identity column in order (identity is server-generated).
@@ -845,6 +1053,17 @@ fn exec_insert(
                 ));
             }
         }
+        if !checks.is_empty() {
+            let scope = row_values(&values, &check_types);
+            enforce_checks(
+                &checks,
+                &scope,
+                &check_resolver,
+                eval_ctx,
+                "INSERT",
+                &def.name,
+            )?;
+        }
         rows.push(values);
     }
 
@@ -900,6 +1119,7 @@ fn exec_update(
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let resolver = schema_names(&schema);
     let identity_col = def.identity.map(|s| s.column);
+    let checks = parse_checks(&def)?;
 
     // Resolve each SET target once; an IDENTITY column cannot be updated.
     let mut assignments: Vec<(usize, &Expr)> = Vec::with_capacity(update.assignments.len());
@@ -960,6 +1180,10 @@ fn exec_update(
                 ));
             }
             new_row[*index] = value::sql_to_datum(&sql_value, &column.column_type, &column.name)?;
+        }
+        if !checks.is_empty() {
+            let scope = row_values(&new_row, &types);
+            enforce_checks(&checks, &scope, &resolver, eval_ctx, "UPDATE", &def.name)?;
         }
         updates.push((locator, old_values, new_row));
     }
@@ -1590,6 +1814,7 @@ fn build_table_source(
         "sys.tables" => sys_tables(storage),
         "sys.columns" => sys_columns(storage),
         "sys.indexes" => sys_indexes(storage),
+        "sys.check_constraints" => sys_check_constraints(storage),
         _ => {
             let def = resolve_table(storage, &name.value)
                 .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
@@ -1867,6 +2092,32 @@ fn sys_indexes(storage: &Storage) -> Source {
                 Datum::Int(index.object_id as i32),
                 Datum::NVarChar(index.name.clone()),
                 Datum::Bit(index.unique),
+            ]);
+        }
+    }
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows,
+    }
+}
+
+fn sys_check_constraints(storage: &Storage) -> Source {
+    let columns = vec![
+        nvarchar("name", 128),
+        int_col("parent_object_id"),
+        nvarchar("definition", 4000),
+    ];
+    let mut rows = Vec::new();
+    for def in storage.rel_tables() {
+        for check in &def.check_constraints {
+            rows.push(vec![
+                Datum::NVarChar(check.name.clone()),
+                Datum::Int(def.object_id as i32),
+                Datum::NVarChar(format!("({})", check.predicate)),
             ]);
         }
     }
