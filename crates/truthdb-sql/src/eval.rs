@@ -413,8 +413,13 @@ fn cast_to_i64(value: &SqlValue) -> Option<i64> {
     match value {
         SqlValue::Int(v) => Some(*v),
         SqlValue::Bool(b) => Some(*b as i64),
-        SqlValue::Float(f) => Some(f.round() as i64),
-        SqlValue::Decimal(d) => d.rescaled(0).and_then(|v| i64::try_from(v).ok()),
+        // CAST to an integer type truncates toward zero (SQL Server); a float
+        // out of i64 range fails rather than saturating.
+        SqlValue::Float(f) => {
+            let t = f.trunc();
+            (t.is_finite() && t >= i64::MIN as f64 && t <= i64::MAX as f64).then_some(t as i64)
+        }
+        SqlValue::Decimal(d) => i64::try_from(d.truncated_to_int()).ok(),
         SqlValue::Str(s) => s.trim().parse().ok(),
         _ => None,
     }
@@ -601,7 +606,13 @@ fn decimal_arithmetic(op: BinaryOp, a: Decimal, b: Decimal) -> SqlResult<SqlValu
             let (Some(x), Some(y)) = (a.rescaled(scale), b.rescaled(scale)) else {
                 return Err(overflow());
             };
-            Decimal::new(x % y, a.precision.max(b.precision), scale)
+            // SQL Server: precision = min(p1-s1, p2-s2) + max(s1, s2).
+            let int_digits = a
+                .precision
+                .saturating_sub(a.scale)
+                .min(b.precision.saturating_sub(b.scale));
+            let precision = (int_digits as u16 + scale as u16).clamp(1, 38) as u8;
+            Decimal::new(x % y, precision, scale)
         }
         _ => unreachable!(),
     };

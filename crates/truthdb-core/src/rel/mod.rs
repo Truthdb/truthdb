@@ -516,6 +516,18 @@ fn exec_update(storage: &mut Storage, update: &Update) -> Result<StatementResult
             )
             .at(assignment.column.span));
         }
+        if assignments.iter().any(|(i, _)| *i == index) {
+            return Err(SqlError::new(
+                264,
+                16,
+                1,
+                format!(
+                    "The column name '{}' is specified more than once in the SET clause or column list of an INSERT. A column cannot be assigned more than one value in the same clause.",
+                    assignment.column.value
+                ),
+            )
+            .at(assignment.column.span));
+        }
         assignments.push((index, &assignment.value));
     }
 

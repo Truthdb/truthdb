@@ -1659,6 +1659,52 @@ mod tests {
     }
 
     #[test]
+    fn sql_stage5_review_fixes() {
+        let path = unique_temp_path("sql-review-fixes");
+        let mut engine = new_engine(&path);
+        // CAST decimal/float to int truncates toward zero (not rounds).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT CAST(10.6496 AS INT), CAST(2.9 AS INT), CAST(-10.6496 AS INT)",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("10".into()),
+                Some("2".into()),
+                Some("-10".into())
+            ]]
+        );
+        // REPLICATE with a huge count is bounded (no panic / mutex-poison DoS).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT LEN(REPLICATE('abc', 9223372036854775807)) AS n",
+        );
+        assert_eq!(rows, vec![vec![Some("999999".into())]]);
+        // A mixed int/decimal computed column infers enough precision (no 220).
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1), (2)")
+            .expect("insert");
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT CASE WHEN id = 1 THEN 100000 ELSE 0.5 END AS v FROM t ORDER BY id",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Some("100000.0".into())], vec![Some("0.5".into())]]
+        );
+        // UPDATE with a duplicated SET column is rejected (264).
+        assert_eq!(
+            sql_error_number(&mut engine, "UPDATE t SET id = 3, id = 4 WHERE id = 1"),
+            264
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_duplicate_pk_reports_error_2627() {
         let path = unique_temp_path("sql-pk-dup");
         let mut engine = new_engine(&path);

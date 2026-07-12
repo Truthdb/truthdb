@@ -260,7 +260,16 @@ fn replicate(args: &[SqlValue]) -> SqlResult<SqlValue> {
     if n < 0 {
         return Ok(SqlValue::Null);
     }
-    Ok(SqlValue::Str(s.repeat(n as usize)))
+    // Bound the output so a huge client-supplied count cannot overflow the
+    // allocation (`str::repeat` panics on capacity overflow) and wedge the
+    // server. 1M chars is far beyond any real REPLICATE use.
+    const MAX_LEN: usize = 1_000_000;
+    let unit = s.chars().count();
+    if unit == 0 {
+        return Ok(SqlValue::Str(String::new()));
+    }
+    let count = (n as usize).min(MAX_LEN / unit);
+    Ok(SqlValue::Str(s.repeat(count)))
 }
 
 fn concat(args: &[SqlValue]) -> SqlResult<SqlValue> {
@@ -329,7 +338,13 @@ fn round(args: &[SqlValue]) -> SqlResult<SqlValue> {
     let rounded = |v: f64| (v * factor).round() / factor;
     match &args[0] {
         SqlValue::Float(f) => Ok(SqlValue::Float(rounded(*f))),
-        SqlValue::Int(i) => Ok(SqlValue::Int(*i)),
+        // A negative length rounds an integer to tens/hundreds/... (ROUND stays
+        // integer); a non-negative length leaves it unchanged.
+        SqlValue::Int(i) => Ok(SqlValue::Int(if places < 0 {
+            rounded(*i as f64) as i64
+        } else {
+            *i
+        })),
         other => {
             let v = as_f64(other).ok_or_else(|| convert_err(other))?;
             Ok(SqlValue::Float(rounded(v)))
@@ -420,25 +435,39 @@ fn dateadd(args: &[SqlValue]) -> SqlResult<SqlValue> {
     };
     let ticks_per_day = temporal::TICKS_PER_DAY as i64;
     let (mut total_days, mut total_ticks) = (days, ticks);
+    // The count is client-controlled; all arithmetic is checked so a huge
+    // value errors cleanly instead of panicking on overflow.
+    let add_ticks = |unit: i64| -> Result<i64, SqlError> {
+        n.checked_mul(unit)
+            .and_then(|d| total_ticks.checked_add(d))
+            .ok_or_else(date_overflow)
+    };
     match part.as_str() {
         "year" | "yy" | "yyyy" => {
             let (y, m, d) = temporal::ymd_from_days(total_days as u32);
-            let nd = temporal::days_from_ymd(y + n, m, d.min(28)).ok_or_else(date_overflow)?;
+            let ny = y.checked_add(n).ok_or_else(date_overflow)?;
+            // Clamp the day to the target month's length (SQL Server keeps the
+            // day, or the last day of the month for e.g. Feb 29 -> non-leap).
+            let clamped = d.min(temporal::days_in_month(ny, m));
+            let nd = temporal::days_from_ymd(ny, m, clamped).ok_or_else(date_overflow)?;
             total_days = nd as i64;
         }
         "month" | "mm" | "m" => {
             let (y, m, d) = temporal::ymd_from_days(total_days as u32);
-            let mut total_month = (y * 12 + (m as i64 - 1)) + n;
-            let ny = total_month.div_euclid(12);
-            total_month = total_month.rem_euclid(12);
-            let nd = temporal::days_from_ymd(ny, total_month as u32 + 1, d.min(28))
+            let total_month = (y * 12 + (m as i64 - 1))
+                .checked_add(n)
                 .ok_or_else(date_overflow)?;
+            let ny = total_month.div_euclid(12);
+            let target_month = total_month.rem_euclid(12) as u32 + 1;
+            let clamped = d.min(temporal::days_in_month(ny, target_month));
+            let nd =
+                temporal::days_from_ymd(ny, target_month, clamped).ok_or_else(date_overflow)?;
             total_days = nd as i64;
         }
-        "day" | "dd" | "d" => total_days += n,
-        "hour" | "hh" => total_ticks += n * 3600 * temporal::TICKS_PER_SEC as i64,
-        "minute" | "mi" | "n" => total_ticks += n * 60 * temporal::TICKS_PER_SEC as i64,
-        "second" | "ss" | "s" => total_ticks += n * temporal::TICKS_PER_SEC as i64,
+        "day" | "dd" | "d" => total_days = total_days.checked_add(n).ok_or_else(date_overflow)?,
+        "hour" | "hh" => total_ticks = add_ticks(3600 * temporal::TICKS_PER_SEC as i64)?,
+        "minute" | "mi" | "n" => total_ticks = add_ticks(60 * temporal::TICKS_PER_SEC as i64)?,
+        "second" | "ss" | "s" => total_ticks = add_ticks(temporal::TICKS_PER_SEC as i64)?,
         other => {
             return Err(SqlError::message_only(
                 9810,
@@ -479,11 +508,15 @@ fn datediff(args: &[SqlValue]) -> SqlResult<SqlValue> {
     let ticks_per_day = temporal::TICKS_PER_DAY as i64;
     let start_ticks = sd as i64 * ticks_per_day + st as i64;
     let end_ticks = ed as i64 * ticks_per_day + et as i64;
+    // DATEDIFF counts boundary crossings, not elapsed whole units: the number
+    // of unit boundaries between the two instants (floor(end/unit) -
+    // floor(start/unit)); the tick totals are non-negative so this is a floor.
+    let boundaries = |unit: i64| end_ticks / unit - start_ticks / unit;
     let diff = match part.as_str() {
         "day" | "dd" | "d" => ed as i64 - sd as i64,
-        "hour" | "hh" => (end_ticks - start_ticks) / (3600 * temporal::TICKS_PER_SEC as i64),
-        "minute" | "mi" | "n" => (end_ticks - start_ticks) / (60 * temporal::TICKS_PER_SEC as i64),
-        "second" | "ss" | "s" => (end_ticks - start_ticks) / temporal::TICKS_PER_SEC as i64,
+        "hour" | "hh" => boundaries(3600 * temporal::TICKS_PER_SEC as i64),
+        "minute" | "mi" | "n" => boundaries(60 * temporal::TICKS_PER_SEC as i64),
+        "second" | "ss" | "s" => boundaries(temporal::TICKS_PER_SEC as i64),
         "year" | "yy" | "yyyy" => {
             let (sy, _, _) = temporal::ymd_from_days(sd);
             let (ey, _, _) = temporal::ymd_from_days(ed);
@@ -604,6 +637,24 @@ mod tests {
         assert_eq!(
             added,
             SqlValue::Date(temporal::parse_date("2020-06-25").unwrap())
+        );
+        // Month add keeps the day when the target month is long enough...
+        let mar30 = SqlValue::Date(temporal::parse_date("2020-03-30").unwrap());
+        assert_eq!(
+            call(
+                "DATEADD",
+                vec![SqlValue::Str("month".into()), SqlValue::Int(1), mar30]
+            ),
+            SqlValue::Date(temporal::parse_date("2020-04-30").unwrap())
+        );
+        // ...and clamps to the last day when it is not (Jan 31 + 1 month).
+        let jan31 = SqlValue::Date(temporal::parse_date("2021-01-31").unwrap());
+        assert_eq!(
+            call(
+                "DATEADD",
+                vec![SqlValue::Str("month".into()), SqlValue::Int(1), jan31]
+            ),
+            SqlValue::Date(temporal::parse_date("2021-02-28").unwrap())
         );
         let diff = call(
             "DATEDIFF",

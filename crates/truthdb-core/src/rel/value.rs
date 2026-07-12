@@ -19,7 +19,10 @@ pub fn infer_type(values: &[SqlValue]) -> ColumnType {
     let mut has_int = false;
     let mut has_bool = false;
     let mut max_len = 1usize;
-    let mut decimal: Option<(u8, u8)> = None; // (precision, scale) maxed
+    let mut decimal_scale: Option<u8> = None;
+    // Widest integer-part digit count across every numeric value; a mixed
+    // int/decimal column must reserve precision for the largest whole part.
+    let mut max_int_digits = 1u8;
     let mut temporal_type: Option<ColumnType> = None;
     let mut max_bin = 1usize;
     for value in values {
@@ -29,11 +32,14 @@ pub fn infer_type(values: &[SqlValue]) -> ColumnType {
                 max_len = max_len.max(s.encode_utf16().count().max(1));
             }
             SqlValue::Float(_) => has_float = true,
-            SqlValue::Int(_) => has_int = true,
+            SqlValue::Int(v) => {
+                has_int = true;
+                max_int_digits = max_int_digits.max(int_digits(*v));
+            }
             SqlValue::Bool(_) => has_bool = true,
             SqlValue::Decimal(d) => {
-                let (p, s) = decimal.unwrap_or((1, 0));
-                decimal = Some((p.max(d.precision), s.max(d.scale)));
+                decimal_scale = Some(decimal_scale.unwrap_or(0).max(d.scale));
+                max_int_digits = max_int_digits.max(d.precision.saturating_sub(d.scale).max(1));
             }
             SqlValue::Date(_) => temporal_type = Some(ColumnType::Date),
             SqlValue::Time(_) => temporal_type = Some(ColumnType::Time),
@@ -54,9 +60,11 @@ pub fn infer_type(values: &[SqlValue]) -> ColumnType {
         }
     } else if has_float {
         ColumnType::Float
-    } else if let Some((precision, scale)) = decimal {
+    } else if let Some(scale) = decimal_scale {
+        // Precision must cover the widest integral part plus the scale.
+        let precision = (max_int_digits as u16 + scale as u16).clamp(1, 38) as u8;
         ColumnType::Decimal {
-            precision: precision.min(38),
+            precision: precision.max(scale),
             scale,
         }
     } else if has_int {
@@ -225,8 +233,9 @@ pub fn sql_to_datum(
     }
 }
 
-/// Converts a value to i64 with SQL Server assignment rounding (decimal/float
-/// round half away from zero), then range-checks.
+/// Converts a value to i64 for an integer target, truncating toward zero
+/// (SQL Server assignment/conversion to an integer type truncates), then
+/// range-checks. Out-of-range floats/decimals error rather than saturate.
 fn int_in_range(
     value: &SqlValue,
     min: i64,
@@ -236,11 +245,14 @@ fn int_in_range(
     let v = match value {
         SqlValue::Int(v) => *v,
         SqlValue::Bool(b) => *b as i64,
-        SqlValue::Float(f) => round_f64(*f),
-        SqlValue::Decimal(d) => {
-            let rounded = d.rescaled(0).ok_or_else(&overflow)?;
-            i64::try_from(rounded).map_err(|_| overflow())?
+        SqlValue::Float(f) => {
+            let t = f.trunc();
+            if !t.is_finite() || t < i64::MIN as f64 || t > i64::MAX as f64 {
+                return Err(overflow());
+            }
+            t as i64
         }
+        SqlValue::Decimal(d) => i64::try_from(d.truncated_to_int()).map_err(|_| overflow())?,
         SqlValue::Str(s) => s
             .trim()
             .parse::<i64>()
@@ -256,10 +268,6 @@ fn int_in_range(
         return Err(overflow());
     }
     Ok(v)
-}
-
-fn round_f64(f: f64) -> i64 {
-    f.round() as i64
 }
 
 fn to_f64(value: &SqlValue) -> Option<f64> {
@@ -340,6 +348,14 @@ fn format_float(v: f64) -> String {
     } else {
         format!("{v}")
     }
+}
+
+/// Decimal digit count of an integer's magnitude (at least 1).
+fn int_digits(v: i64) -> u8 {
+    v.unsigned_abs()
+        .checked_ilog10()
+        .map(|l| l as u8 + 1)
+        .unwrap_or(1)
 }
 
 fn hex(bytes: &[u8]) -> String {

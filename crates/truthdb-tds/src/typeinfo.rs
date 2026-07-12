@@ -106,7 +106,8 @@ pub fn encode_type_info(column_type: &ColumnType) -> Vec<u8> {
         }
         TdsType::VarBinary(max_len) => {
             out.push(BIGVARBINARY);
-            out.extend_from_slice(&max_len.to_le_bytes());
+            // Clamp below 0xFFFF, which drivers read as VARBINARY(MAX)/PLP.
+            out.extend_from_slice(&max_len.min(8000).to_le_bytes());
         }
         TdsType::NVarChar(max_len) => {
             out.push(NVARCHAR);
@@ -116,7 +117,8 @@ pub fn encode_type_info(column_type: &ColumnType) -> Vec<u8> {
         }
         TdsType::VarChar(max_len) => {
             out.push(BIGVARCHR);
-            out.extend_from_slice(&max_len.to_le_bytes());
+            // Clamp below 0xFFFF, which drivers read as VARCHAR(MAX)/PLP.
+            out.extend_from_slice(&max_len.min(8000).to_le_bytes());
             out.extend_from_slice(&COLLATION);
         }
     }

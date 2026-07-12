@@ -57,6 +57,12 @@ impl Decimal {
         self.value as f64 / pow10(self.scale) as f64
     }
 
+    /// Integral part, truncated toward zero (i128 division truncates), for a
+    /// conversion to an integer type (SQL Server CAST/assignment truncate).
+    pub fn truncated_to_int(self) -> i128 {
+        self.value / pow10(self.scale)
+    }
+
     pub fn is_zero(self) -> bool {
         self.value == 0
     }
@@ -178,15 +184,23 @@ impl Decimal {
     }
 
     pub fn mul(self, other: Decimal) -> Result<Decimal, DecimalOverflow> {
-        // precision = p1 + p2 + 1; scale = s1 + s2.
+        // precision = p1 + p2 + 1; scale = s1 + s2 (both capped at 38).
         let (precision, scale) = cap(
             self.precision as u16 + other.precision as u16 + 1,
             self.scale + other.scale,
         );
-        let raw = self.value.checked_mul(other.value).ok_or(DecimalOverflow)?;
-        // raw is at scale s1+s2; rescale to the (possibly reduced) result scale.
-        let src = Decimal::new(raw, precision, self.scale + other.scale);
-        let value = src.rescaled(scale).ok_or(DecimalOverflow)?;
+        // Rescale the operands so their scales already sum to the (possibly
+        // reduced) result scale, split between them, so the product is computed
+        // directly at the result scale and does not overflow i128 for
+        // high-scale operands (SQL Server reduces scale rather than erroring).
+        let ta = (scale / 2)
+            .max(scale.saturating_sub(other.scale))
+            .min(self.scale)
+            .min(scale);
+        let tb = scale - ta;
+        let a = self.rescaled(ta).ok_or(DecimalOverflow)?;
+        let b = other.rescaled(tb).ok_or(DecimalOverflow)?;
+        let value = a.checked_mul(b).ok_or(DecimalOverflow)?;
         Decimal::new(value, precision, scale).coerce(precision, scale)
     }
 
@@ -323,6 +337,23 @@ mod tests {
     #[test]
     fn coerce_overflow_errors() {
         assert_eq!(dec("1000").coerce(3, 0), Err(DecimalOverflow));
+    }
+
+    #[test]
+    fn high_scale_multiply_does_not_spuriously_overflow() {
+        // 1.5 * 1.5 at DECIMAL(38,20) each: the exact product (scale 40) does
+        // not fit i128, but SQL Server reduces scale to 6 and returns 2.25.
+        let a = dec("1.5").coerce(38, 20).unwrap();
+        let b = dec("1.5").coerce(38, 20).unwrap();
+        let r = a.mul(b).unwrap();
+        assert_eq!(r.to_f64(), 2.25);
+    }
+
+    #[test]
+    fn truncates_toward_zero() {
+        assert_eq!(dec("10.6496").truncated_to_int(), 10);
+        assert_eq!(dec("-10.6496").truncated_to_int(), -10);
+        assert_eq!(dec("2.9").truncated_to_int(), 2);
     }
 
     #[test]
