@@ -1,0 +1,2 @@
+-- error: 8110
+CREATE TABLE t (a INT, PRIMARY KEY (a), PRIMARY KEY (a));

@@ -12,6 +12,7 @@ members = [
     "crates/truthdb-bench",
     "crates/truthdb-proto",
     "crates/truthdb-net",
+    "crates/truthdb-sql",
 ]
 
 [workspace.dependencies]
@@ -27,6 +28,7 @@ directories = "5.0"
 tokio = { version = "1.39.0", features = ["full"] }
 truthdb-proto = { path = "crates/truthdb-proto", version = "0.1.0" }
 truthdb-net = { path = "crates/truthdb-net", version = "0.1.0" }
+truthdb-sql = { path = "crates/truthdb-sql", version = "0.1.0" }
 xxhash-rust = { version = "0.8.12", features = ["xxh64"] }
 libc = "0.2"
 io-uring = "0.7"

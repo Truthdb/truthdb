@@ -912,6 +912,7 @@ dependencies = [
  "tokio",
  "truthdb-net",
  "truthdb-proto",
+ "truthdb-sql",
  "xxhash-rust",
 ]
 
@@ -931,6 +932,10 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
 ]
+
+[[package]]
+name = "truthdb-sql"
+version = "0.1.0"
 
 [[package]]
 name = "unicode-ident"

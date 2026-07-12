@@ -1,0 +1,133 @@
+[
+    Insert(
+        Insert {
+            table: Name {
+                value: "products",
+                quoted: false,
+                span: Span {
+                    start: 12,
+                    end: 20,
+                },
+            },
+            columns: Some(
+                [
+                    Name {
+                        value: "id",
+                        quoted: false,
+                        span: Span {
+                            start: 22,
+                            end: 24,
+                        },
+                    },
+                    Name {
+                        value: "name",
+                        quoted: false,
+                        span: Span {
+                            start: 26,
+                            end: 30,
+                        },
+                    },
+                    Name {
+                        value: "price",
+                        quoted: false,
+                        span: Span {
+                            start: 32,
+                            end: 37,
+                        },
+                    },
+                ],
+            ),
+            rows: [
+                [
+                    Expr {
+                        kind: Int(
+                            1,
+                        ),
+                        span: Span {
+                            start: 51,
+                            end: 52,
+                        },
+                    },
+                    Expr {
+                        kind: Str(
+                            "Skor",
+                        ),
+                        span: Span {
+                            start: 54,
+                            end: 60,
+                        },
+                    },
+                    Expr {
+                        kind: Number(
+                            "79.99",
+                        ),
+                        span: Span {
+                            start: 62,
+                            end: 67,
+                        },
+                    },
+                ],
+                [
+                    Expr {
+                        kind: Int(
+                            2,
+                        ),
+                        span: Span {
+                            start: 75,
+                            end: 76,
+                        },
+                    },
+                    Expr {
+                        kind: Str(
+                            "Kangor",
+                        ),
+                        span: Span {
+                            start: 78,
+                            end: 86,
+                        },
+                    },
+                    Expr {
+                        kind: Number(
+                            "129.50",
+                        ),
+                        span: Span {
+                            start: 88,
+                            end: 94,
+                        },
+                    },
+                ],
+                [
+                    Expr {
+                        kind: Int(
+                            3,
+                        ),
+                        span: Span {
+                            start: 102,
+                            end: 103,
+                        },
+                    },
+                    Expr {
+                        kind: Str(
+                            "Sockar",
+                        ),
+                        span: Span {
+                            start: 105,
+                            end: 113,
+                        },
+                    },
+                    Expr {
+                        kind: Null,
+                        span: Span {
+                            start: 115,
+                            end: 119,
+                        },
+                    },
+                ],
+            ],
+            span: Span {
+                start: 0,
+                end: 120,
+            },
+        },
+    ),
+]

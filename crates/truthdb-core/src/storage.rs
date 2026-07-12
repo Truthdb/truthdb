@@ -280,24 +280,78 @@ impl Storage {
         self.file.rel.tables.get(name).cloned()
     }
 
+    /// All user table definitions, ordered by object id (for sys.tables /
+    /// sys.columns).
+    pub fn rel_tables(&self) -> Vec<TableDef> {
+        let mut defs: Vec<TableDef> = self.file.rel.tables.values().cloned().collect();
+        defs.sort_by_key(|d| d.object_id);
+        defs
+    }
+
+    /// Drops a table (logical: removes the catalog row; data pages leak
+    /// until a later reclamation stage). Returns false if the table does not
+    /// exist.
+    pub fn rel_drop_table(&mut self, name: &str) -> Result<bool, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let Some(def) = self.file.rel.tables.get(name).cloned() else {
+            return Ok(false);
+        };
+        let Some(catalog_root) = self.file.rel.catalog_root else {
+            return Ok(false);
+        };
+        self.file.rel_statement(move |ctx, txn| {
+            catalog::delete_table(ctx, &mut OpMode::Txn(txn), catalog_root, def.object_id)
+        })?;
+        self.file.rel.tables.remove(name);
+        Ok(true)
+    }
+
     pub fn rel_insert(&mut self, name: &str, values: Vec<Datum>) -> Result<(), StorageError> {
+        self.rel_insert_many(name, vec![values])
+    }
+
+    /// Inserts many rows as ONE atomic statement: all rows land or none do
+    /// (a later row's constraint failure rolls back the whole statement,
+    /// matching T-SQL multi-row `INSERT ... VALUES` semantics).
+    pub fn rel_insert_many(
+        &mut self,
+        name: &str,
+        rows: Vec<Vec<Datum>>,
+    ) -> Result<(), StorageError> {
         self.file.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(name)?;
-        validate_not_null(&schema, &values)?;
-        let row = encode_row(&schema, &values)?;
+        // Encode and validate every row up front (cheap failures before any
+        // mutation), keeping the key alongside for tree tables.
+        let mut encoded: Vec<(Option<Vec<u8>>, Vec<u8>)> = Vec::with_capacity(rows.len());
+        for values in &rows {
+            validate_not_null(&schema, values)?;
+            let row = encode_row(&schema, values)?;
+            let key = if def.is_tree() {
+                Some(encode_key(&schema, &def.key_columns, values)?)
+            } else {
+                None
+            };
+            encoded.push((key, row));
+        }
+
         if def.is_tree() {
-            let key = encode_key(&schema, &def.key_columns, &values)?;
             let tree = BTree {
                 object_id: def.object_id,
                 root: def.root_page,
             };
             self.file.rel_statement(move |ctx, txn| {
-                match tree.insert_unique(ctx, &mut OpMode::Txn(txn), &key, &row)? {
-                    TreeInsert::Inserted => Ok(()),
-                    TreeInsert::DuplicateKey => Err(StorageError::Constraint(
-                        "duplicate primary key".to_string(),
-                    )),
+                for (key, row) in &encoded {
+                    let key = key.as_ref().expect("tree row has a key");
+                    match tree.insert_unique(ctx, &mut OpMode::Txn(txn), key, row)? {
+                        TreeInsert::Inserted => {}
+                        TreeInsert::DuplicateKey => {
+                            return Err(StorageError::Constraint(
+                                "duplicate primary key".to_string(),
+                            ));
+                        }
+                    }
                 }
+                Ok(())
             })
         } else {
             let heap = Heap {
@@ -305,7 +359,9 @@ impl Storage {
                 first_page: def.root_page,
             };
             self.file.rel_statement(move |ctx, txn| {
-                heap.insert(ctx, txn, &row)?;
+                for (_, row) in &encoded {
+                    heap.insert(ctx, txn, row)?;
+                }
                 Ok(())
             })
         }
@@ -2297,7 +2353,7 @@ mod tests {
         let mut storage = create_small(&path);
         storage.file.wal.set_superblock_interval(400);
         for seq in 1..=4u64 {
-            append_search_entry(&mut storage, seq, &vec![seq as u8; 100]);
+            append_search_entry(&mut storage, seq, &[seq as u8; 100]);
         }
         drop(storage);
         let entry_len = wal_entry_padded_len(100) as u64;
@@ -2322,7 +2378,7 @@ mod tests {
         // must see [entry 1, new entry] and never resurrect old entries 3/4.
         let mut storage = Storage::open(path.clone()).expect("reopen");
         storage.replay_wal_entries().expect("drain");
-        append_search_entry(&mut storage, 2, &vec![9u8; 60]);
+        append_search_entry(&mut storage, 2, &[9u8; 60]);
         drop(storage);
         let mut storage = Storage::open(path.clone()).expect("final reopen");
         let records = storage.replay_wal_entries().expect("replay");
@@ -2342,16 +2398,11 @@ mod tests {
         // Fill the ring for large and small entries alike.
         let mut seq = 1u64;
         for payload_len in [8000usize, 1000, 100, 8] {
-            loop {
-                match storage.append_wal_entry(
-                    WAL_ENTRY_TYPE_RECORD,
-                    1,
-                    seq,
-                    &vec![7u8; payload_len],
-                ) {
-                    Ok(_) => seq += 1,
-                    Err(_) => break,
-                }
+            while storage
+                .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, seq, &vec![7u8; payload_len])
+                .is_ok()
+            {
+                seq += 1;
                 assert!(seq < 1000, "ring must fill up");
             }
         }

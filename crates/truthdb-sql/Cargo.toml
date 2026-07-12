@@ -1,0 +1,10 @@
+[package]
+name = "truthdb-sql"
+version = "0.1.0"
+edition = "2024"
+description = "TruthDB SQL front end: hand-rolled T-SQL-flavored lexer, parser, AST, 3VL evaluator and SQL Server error codes. Pure (no I/O)."
+license = "MIT"
+
+[dependencies]
+
+[dev-dependencies]

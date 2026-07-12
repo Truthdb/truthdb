@@ -2,6 +2,7 @@
 compile_error!("truthdb-cli must be built for Linux targets. Use Docker or a Linux environment.");
 
 mod config;
+mod render;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -91,6 +92,17 @@ async fn repl(addr: &str) -> Result<()> {
             break;
         }
 
+        // A standalone `GO` (T-SQL batch separator) submits the buffered
+        // statements without becoming part of them.
+        if trimmed.eq_ignore_ascii_case("go") {
+            let command = buffer.trim();
+            if !command.is_empty() {
+                submit(&mut stream, &mut next_id, command).await?;
+            }
+            buffer.clear();
+            continue;
+        }
+
         if trimmed.is_empty() && buffer.trim().is_empty() {
             continue;
         }
@@ -104,33 +116,57 @@ async fn repl(addr: &str) -> Result<()> {
             continue;
         }
 
-        let command = buffer.trim();
+        let command = buffer.trim().to_string();
         if command.is_empty() {
             buffer.clear();
             continue;
         }
 
-        let resp = send_command(&mut stream, next_id, command).await?;
-        next_id = next_id.wrapping_add(1);
-        let status = if resp.ok { "ok" } else { "err" };
-        if resp.message.contains('\n') {
-            println!("[{status}]");
-            println!("{}", resp.message);
-        } else {
-            println!("[{status}] {}", resp.message);
-        }
+        submit(&mut stream, &mut next_id, &command).await?;
         buffer.clear();
     }
 
     Ok(())
 }
 
+/// Sends a completed command and prints the rendered response.
+async fn submit(stream: &mut TcpStream, next_id: &mut u64, command: &str) -> Result<()> {
+    let resp = send_command(stream, *next_id, command).await?;
+    *next_id = next_id.wrapping_add(1);
+    let rendered = render::render(resp.ok, &resp.message);
+    if !rendered.is_empty() {
+        println!("{rendered}");
+    }
+    Ok(())
+}
+
+/// Decides when a buffered command is ready to submit. Legacy ES commands
+/// (a `{`-bodied create index / insert document / search) complete when
+/// their JSON braces balance; everything else is SQL and completes on a
+/// top-level `;` (string/comment/bracket aware). A `GO` line is handled by
+/// the caller.
 fn command_is_complete(input: &str) -> bool {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return false;
     }
+    // An ES command is a `{`-bodied create index / insert document / search.
+    // Requiring the `{` avoids misreading SQL that merely starts with the
+    // same word (e.g. `INSERT document VALUES ...` into a table named
+    // `document`) as ES and then waiting forever for a brace.
+    let lower = trimmed.to_ascii_lowercase();
+    let is_es = (lower.starts_with("create index")
+        || lower.starts_with("insert document")
+        || lower.starts_with("search"))
+        && trimmed.contains('{');
+    if is_es {
+        es_braces_balanced(trimmed)
+    } else {
+        sql_has_terminator(trimmed)
+    }
+}
 
+fn es_braces_balanced(trimmed: &str) -> bool {
     let Some(start) = trimmed.find(['{', '[']) else {
         return true;
     };
@@ -167,6 +203,84 @@ fn command_is_complete(input: &str) -> bool {
     }
 
     depth == 0 && !in_string
+}
+
+/// True when the SQL buffer holds a top-level `;`, ignoring `;` inside
+/// string literals `'…'`, delimited identifiers `[…]` / `"…"`, and
+/// `--` / `/* */` comments.
+fn sql_has_terminator(input: &str) -> bool {
+    let bytes = input.as_bytes();
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\'' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'\'' {
+                        // `''` is an escaped quote; stay in the string.
+                        if bytes.get(i + 1) == Some(&b'\'') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'"' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b'"' {
+                        if bytes.get(i + 1) == Some(&b'"') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'[' => {
+                i += 1;
+                while i < bytes.len() {
+                    if bytes[i] == b']' {
+                        if bytes.get(i + 1) == Some(&b']') {
+                            i += 2;
+                            continue;
+                        }
+                        break;
+                    }
+                    i += 1;
+                }
+            }
+            b'-' if bytes.get(i + 1) == Some(&b'-') => {
+                while i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            b'/' if bytes.get(i + 1) == Some(&b'*') => {
+                i += 2;
+                let mut depth = 1;
+                while i < bytes.len() && depth > 0 {
+                    if bytes[i] == b'/' && bytes.get(i + 1) == Some(&b'*') {
+                        depth += 1;
+                        i += 2;
+                    } else if bytes[i] == b'*' && bytes.get(i + 1) == Some(&b'/') {
+                        depth -= 1;
+                        i += 2;
+                    } else {
+                        i += 1;
+                    }
+                }
+                continue;
+            }
+            b';' => return true,
+            _ => {}
+        }
+        i += 1;
+    }
+    false
 }
 
 async fn send_hello(stream: &mut TcpStream) -> Result<()> {

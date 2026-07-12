@@ -1,0 +1,93 @@
+[
+    CreateTable(
+        CreateTable {
+            table: Name {
+                value: "order_lines",
+                quoted: false,
+                span: Span {
+                    start: 13,
+                    end: 24,
+                },
+            },
+            columns: [
+                ColumnDef {
+                    name: Name {
+                        value: "order_id",
+                        quoted: false,
+                        span: Span {
+                            start: 31,
+                            end: 39,
+                        },
+                    },
+                    data_type: Int,
+                    nullable: Some(
+                        false,
+                    ),
+                    primary_key: false,
+                    span: Span {
+                        start: 31,
+                        end: 52,
+                    },
+                },
+                ColumnDef {
+                    name: Name {
+                        value: "line_no",
+                        quoted: false,
+                        span: Span {
+                            start: 58,
+                            end: 65,
+                        },
+                    },
+                    data_type: SmallInt,
+                    nullable: Some(
+                        false,
+                    ),
+                    primary_key: false,
+                    span: Span {
+                        start: 58,
+                        end: 83,
+                    },
+                },
+                ColumnDef {
+                    name: Name {
+                        value: "qty",
+                        quoted: false,
+                        span: Span {
+                            start: 89,
+                            end: 92,
+                        },
+                    },
+                    data_type: Int,
+                    nullable: None,
+                    primary_key: false,
+                    span: Span {
+                        start: 89,
+                        end: 96,
+                    },
+                },
+            ],
+            primary_key: [
+                Name {
+                    value: "order_id",
+                    quoted: false,
+                    span: Span {
+                        start: 115,
+                        end: 123,
+                    },
+                },
+                Name {
+                    value: "line_no",
+                    quoted: false,
+                    span: Span {
+                        start: 125,
+                        end: 132,
+                    },
+                },
+            ],
+            span: Span {
+                start: 0,
+                end: 135,
+            },
+        },
+    ),
+]

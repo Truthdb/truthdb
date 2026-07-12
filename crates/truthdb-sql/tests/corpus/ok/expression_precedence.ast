@@ -1,0 +1,244 @@
+[
+    Select(
+        Select {
+            top: None,
+            items: [
+                Expr {
+                    expr: Expr {
+                        kind: Binary {
+                            op: Sub,
+                            left: Expr {
+                                kind: Binary {
+                                    op: Add,
+                                    left: Expr {
+                                        kind: Int(
+                                            1,
+                                        ),
+                                        span: Span {
+                                            start: 7,
+                                            end: 8,
+                                        },
+                                    },
+                                    right: Expr {
+                                        kind: Binary {
+                                            op: Mul,
+                                            left: Expr {
+                                                kind: Int(
+                                                    2,
+                                                ),
+                                                span: Span {
+                                                    start: 11,
+                                                    end: 12,
+                                                },
+                                            },
+                                            right: Expr {
+                                                kind: Int(
+                                                    3,
+                                                ),
+                                                span: Span {
+                                                    start: 15,
+                                                    end: 16,
+                                                },
+                                            },
+                                        },
+                                        span: Span {
+                                            start: 11,
+                                            end: 16,
+                                        },
+                                    },
+                                },
+                                span: Span {
+                                    start: 7,
+                                    end: 16,
+                                },
+                            },
+                            right: Expr {
+                                kind: Binary {
+                                    op: Div,
+                                    left: Expr {
+                                        kind: Int(
+                                            4,
+                                        ),
+                                        span: Span {
+                                            start: 19,
+                                            end: 20,
+                                        },
+                                    },
+                                    right: Expr {
+                                        kind: Int(
+                                            2,
+                                        ),
+                                        span: Span {
+                                            start: 23,
+                                            end: 24,
+                                        },
+                                    },
+                                },
+                                span: Span {
+                                    start: 19,
+                                    end: 24,
+                                },
+                            },
+                        },
+                        span: Span {
+                            start: 7,
+                            end: 24,
+                        },
+                    },
+                    alias: None,
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Unary {
+                            op: Not,
+                            expr: Expr {
+                                kind: Binary {
+                                    op: And,
+                                    left: Expr {
+                                        kind: Binary {
+                                            op: Eq,
+                                            left: Expr {
+                                                kind: Column(
+                                                    Name {
+                                                        value: "a",
+                                                        quoted: false,
+                                                        span: Span {
+                                                            start: 31,
+                                                            end: 32,
+                                                        },
+                                                    },
+                                                ),
+                                                span: Span {
+                                                    start: 31,
+                                                    end: 32,
+                                                },
+                                            },
+                                            right: Expr {
+                                                kind: Int(
+                                                    1,
+                                                ),
+                                                span: Span {
+                                                    start: 35,
+                                                    end: 36,
+                                                },
+                                            },
+                                        },
+                                        span: Span {
+                                            start: 31,
+                                            end: 36,
+                                        },
+                                    },
+                                    right: Expr {
+                                        kind: Binary {
+                                            op: Lt,
+                                            left: Expr {
+                                                kind: Column(
+                                                    Name {
+                                                        value: "b",
+                                                        quoted: false,
+                                                        span: Span {
+                                                            start: 41,
+                                                            end: 42,
+                                                        },
+                                                    },
+                                                ),
+                                                span: Span {
+                                                    start: 41,
+                                                    end: 42,
+                                                },
+                                            },
+                                            right: Expr {
+                                                kind: Int(
+                                                    2,
+                                                ),
+                                                span: Span {
+                                                    start: 45,
+                                                    end: 46,
+                                                },
+                                            },
+                                        },
+                                        span: Span {
+                                            start: 41,
+                                            end: 46,
+                                        },
+                                    },
+                                },
+                                span: Span {
+                                    start: 31,
+                                    end: 46,
+                                },
+                            },
+                        },
+                        span: Span {
+                            start: 26,
+                            end: 46,
+                        },
+                    },
+                    alias: None,
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Binary {
+                            op: Mod,
+                            left: Expr {
+                                kind: Unary {
+                                    op: Neg,
+                                    expr: Expr {
+                                        kind: Column(
+                                            Name {
+                                                value: "x",
+                                                quoted: false,
+                                                span: Span {
+                                                    start: 50,
+                                                    end: 51,
+                                                },
+                                            },
+                                        ),
+                                        span: Span {
+                                            start: 50,
+                                            end: 51,
+                                        },
+                                    },
+                                },
+                                span: Span {
+                                    start: 49,
+                                    end: 51,
+                                },
+                            },
+                            right: Expr {
+                                kind: Int(
+                                    3,
+                                ),
+                                span: Span {
+                                    start: 54,
+                                    end: 55,
+                                },
+                            },
+                        },
+                        span: Span {
+                            start: 49,
+                            end: 55,
+                        },
+                    },
+                    alias: None,
+                },
+            ],
+            from: Some(
+                Name {
+                    value: "t",
+                    quoted: false,
+                    span: Span {
+                        start: 61,
+                        end: 62,
+                    },
+                },
+            ),
+            where_clause: None,
+            order_by: [],
+            span: Span {
+                start: 0,
+                end: 62,
+            },
+        },
+    ),
+]

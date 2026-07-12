@@ -367,11 +367,8 @@ mod tests {
         let mut page = SlottedPage::format(&mut data, 0);
         let cell = vec![7u8; 100];
         let mut slots = Vec::new();
-        loop {
-            match page.insert_stable(&cell) {
-                Ok(slot) => slots.push(slot),
-                Err(PageFull) => break,
-            }
+        while let Ok(slot) = page.insert_stable(&cell) {
+            slots.push(slot);
         }
         assert!(slots.len() >= 35, "expected ~39 cells, got {}", slots.len());
         // Free every other cell: contiguous space stays tiny, but compaction

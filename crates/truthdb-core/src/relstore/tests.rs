@@ -237,14 +237,15 @@ fn btree_matches_btreemap_oracle_through_splits_and_crash() {
             0 | 1 => {
                 let payload = format!("{id}-{}", "x".repeat(180 + (rng.next() % 200) as usize));
                 let result = storage.rel_insert("t", row(id, &payload));
-                if oracle.contains_key(&id) {
-                    assert!(
+                match oracle.entry(id) {
+                    std::collections::btree_map::Entry::Occupied(_) => assert!(
                         matches!(result, Err(StorageError::Constraint(_))),
                         "duplicate insert must fail"
-                    );
-                } else {
-                    result.expect("insert");
-                    oracle.insert(id, payload);
+                    ),
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        result.expect("insert");
+                        slot.insert(payload);
+                    }
                 }
             }
             2 => {

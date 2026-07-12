@@ -1,0 +1,19 @@
+[
+    DropTable(
+        DropTable {
+            table: Name {
+                value: "products",
+                quoted: false,
+                span: Span {
+                    start: 21,
+                    end: 29,
+                },
+            },
+            if_exists: true,
+            span: Span {
+                start: 0,
+                end: 29,
+            },
+        },
+    ),
+]
