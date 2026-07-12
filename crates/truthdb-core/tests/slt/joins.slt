@@ -45,3 +45,34 @@ bob 50
 # Ambiguous unqualified column is rejected.
 statement error
 SELECT id FROM cust c JOIN ord o ON c.id = o.cust_id
+
+# Duplicate exposed table name (self-join without correlation names) is
+# rejected up front (SQL Server 1013) rather than binding ambiguously.
+statement error
+SELECT cust.name FROM cust JOIN cust ON cust.id = cust.id
+
+# A reused correlation name is likewise rejected.
+statement error
+SELECT c.name FROM cust c JOIN ord c ON c.id = c.id
+
+# A proper self-join with distinct aliases is fine.
+query II
+SELECT a.id, b.id FROM cust a JOIN cust b ON a.id = b.id ORDER BY a.id
+----
+1 1
+2 2
+3 3
+
+# Comma-FROM binds looser than JOIN: `cust, ord RIGHT JOIN cust2`
+# associates as `cust CROSS JOIN (ord RIGHT JOIN cust2)`, so every cust
+# row multiplies the right side rather than joining into it.
+statement ok
+CREATE TABLE cust2 (id INT NOT NULL PRIMARY KEY, cust_id INT)
+
+statement ok
+INSERT INTO cust2 VALUES (100, 1)
+
+query I
+SELECT COUNT(*) FROM cust, ord RIGHT JOIN cust2 ON ord.cust_id = cust2.id
+----
+3

@@ -1102,24 +1102,28 @@ impl JoinScope {
 
 impl truthdb_sql::eval::ColumnResolver for JoinScope {
     fn resolve(&self, name: &str) -> Option<usize> {
-        if let Some((qualifier, column)) = name.rsplit_once('.') {
-            self.columns.iter().position(|(q, c)| {
+        // Both branches reject an ambiguous match (more than one column) by
+        // returning None, so eval raises an invalid-column error rather than
+        // silently picking the first.
+        let mut found = None;
+        let matches = |q: &Option<String>, c: &str| -> bool {
+            if let Some((qualifier, column)) = name.rsplit_once('.') {
                 q.as_deref()
                     .is_some_and(|q| q.eq_ignore_ascii_case(qualifier))
                     && c.eq_ignore_ascii_case(column)
-            })
-        } else {
-            let mut found = None;
-            for (index, (_, column)) in self.columns.iter().enumerate() {
-                if column.eq_ignore_ascii_case(name) {
-                    if found.is_some() {
-                        return None; // ambiguous
-                    }
-                    found = Some(index);
-                }
+            } else {
+                c.eq_ignore_ascii_case(name)
             }
-            found
+        };
+        for (index, (qualifier, column)) in self.columns.iter().enumerate() {
+            if matches(qualifier, column) {
+                if found.is_some() {
+                    return None; // ambiguous
+                }
+                found = Some(index);
+            }
         }
+        found
     }
 }
 
@@ -1494,7 +1498,60 @@ fn collect_table_names<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
     }
 }
 
+/// A table's exposed name: its alias, else its (schema-stripped) name.
+fn exposed_name(name: &Name, alias: Option<&Name>) -> String {
+    alias
+        .map(|a| a.value.clone())
+        .unwrap_or_else(|| strip_schema(&name.value).to_string())
+}
+
+/// Collects the exposed names of every table in a FROM tree.
+fn collect_exposed_names(tref: &TableRef, out: &mut Vec<String>) {
+    match tref {
+        TableRef::Table { name, alias } => out.push(exposed_name(name, alias.as_ref())),
+        TableRef::Join { left, right, .. } => {
+            collect_exposed_names(left, out);
+            collect_exposed_names(right, out);
+        }
+    }
+}
+
+/// Rejects a FROM clause with duplicate exposed table names / correlation
+/// names (SQL Server 1013), which would otherwise bind ambiguously.
+fn check_exposed_names(from: &TableRef) -> Result<(), SqlError> {
+    let mut names = Vec::new();
+    collect_exposed_names(from, &mut names);
+    for i in 0..names.len() {
+        for j in (i + 1)..names.len() {
+            if names[i].eq_ignore_ascii_case(&names[j]) {
+                return Err(SqlError::new(
+                    1013,
+                    16,
+                    1,
+                    format!(
+                        "The objects \"{}\" and \"{}\" in the FROM clause have the same exposed names. Use correlation names to distinguish them.",
+                        names[i], names[j]
+                    ),
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn build_source(
+    storage: &mut Storage,
+    from: Option<&TableRef>,
+    where_clause: &Option<Expr>,
+    eval_ctx: &EvalContext,
+) -> Result<Source, SqlError> {
+    if let Some(from) = from {
+        check_exposed_names(from)?;
+    }
+    build_source_inner(storage, from, where_clause, eval_ctx)
+}
+
+fn build_source_inner(
     storage: &mut Storage,
     from: Option<&TableRef>,
     where_clause: &Option<Expr>,

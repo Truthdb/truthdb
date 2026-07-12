@@ -844,19 +844,27 @@ impl Parser {
 
     /// Parses a FROM clause: a table primary followed by zero or more joins
     /// (comma = CROSS JOIN). Joins are left-associative.
+    /// Parses a FROM clause. Comma has the LOWEST precedence (each operand is
+    /// a full joined table), so `a, b RIGHT JOIN c` is `a CROSS JOIN (b RIGHT
+    /// JOIN c)`, matching SQL Server.
     fn parse_from(&mut self) -> SqlResult<TableRef> {
+        let mut left = self.parse_joined_table()?;
+        while self.eat(&TokenKind::Comma) {
+            let right = self.parse_joined_table()?;
+            left = TableRef::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                kind: JoinKind::Cross,
+                on: None,
+            };
+        }
+        Ok(left)
+    }
+
+    /// Parses one table reference followed by its JOIN operators (no comma).
+    fn parse_joined_table(&mut self) -> SqlResult<TableRef> {
         let mut left = self.parse_table_primary()?;
         loop {
-            if self.eat(&TokenKind::Comma) {
-                let right = self.parse_table_primary()?;
-                left = TableRef::Join {
-                    left: Box::new(left),
-                    right: Box::new(right),
-                    kind: JoinKind::Cross,
-                    on: None,
-                };
-                continue;
-            }
             let kind = match self.peek_keyword().as_deref() {
                 Some("INNER") => {
                     self.bump();
