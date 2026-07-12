@@ -7,6 +7,8 @@ use crate::lexer::Span;
 pub enum Statement {
     CreateTable(CreateTable),
     DropTable(DropTable),
+    CreateIndex(CreateIndex),
+    DropIndex(DropIndex),
     Insert(Insert),
     Update(Update),
     Delete(Delete),
@@ -32,6 +34,34 @@ pub enum Statement {
 pub enum SetStatement {
     XactAbort(bool),
     IsolationLevel(IsolationLevel),
+    /// `SET SHOWPLAN_TEXT ON|OFF` — when on, statements return their plan text
+    /// instead of executing.
+    ShowplanText(bool),
+}
+
+/// `CREATE [UNIQUE] INDEX <name> ON <table> (<col> [ASC|DESC], ...)`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateIndex {
+    pub name: Name,
+    pub table: Name,
+    pub unique: bool,
+    pub columns: Vec<IndexColumn>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct IndexColumn {
+    pub name: Name,
+    /// Ascending (`ASC`, the default) or descending (`DESC`).
+    pub ascending: bool,
+}
+
+/// `DROP INDEX <name> ON <table>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropIndex {
+    pub name: Name,
+    pub table: Name,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1,0 +1,113 @@
+[
+    CreateIndex(
+        CreateIndex {
+            name: Name {
+                value: "ix_users_email",
+                quoted: false,
+                span: Span {
+                    start: 20,
+                    end: 34,
+                },
+            },
+            table: Name {
+                value: "users",
+                quoted: false,
+                span: Span {
+                    start: 38,
+                    end: 43,
+                },
+            },
+            unique: true,
+            columns: [
+                IndexColumn {
+                    name: Name {
+                        value: "email",
+                        quoted: false,
+                        span: Span {
+                            start: 45,
+                            end: 50,
+                        },
+                    },
+                    ascending: true,
+                },
+            ],
+            span: Span {
+                start: 0,
+                end: 51,
+            },
+        },
+    ),
+    CreateIndex(
+        CreateIndex {
+            name: Name {
+                value: "ix_orders_customer",
+                quoted: false,
+                span: Span {
+                    start: 66,
+                    end: 84,
+                },
+            },
+            table: Name {
+                value: "orders",
+                quoted: false,
+                span: Span {
+                    start: 88,
+                    end: 94,
+                },
+            },
+            unique: false,
+            columns: [
+                IndexColumn {
+                    name: Name {
+                        value: "customer_id",
+                        quoted: false,
+                        span: Span {
+                            start: 96,
+                            end: 107,
+                        },
+                    },
+                    ascending: true,
+                },
+                IndexColumn {
+                    name: Name {
+                        value: "created_at",
+                        quoted: false,
+                        span: Span {
+                            start: 109,
+                            end: 119,
+                        },
+                    },
+                    ascending: false,
+                },
+            ],
+            span: Span {
+                start: 53,
+                end: 125,
+            },
+        },
+    ),
+    DropIndex(
+        DropIndex {
+            name: Name {
+                value: "ix_users_email",
+                quoted: false,
+                span: Span {
+                    start: 138,
+                    end: 152,
+                },
+            },
+            table: Name {
+                value: "users",
+                quoted: false,
+                span: Span {
+                    start: 156,
+                    end: 161,
+                },
+            },
+            span: Span {
+                start: 127,
+                end: 161,
+            },
+        },
+    ),
+]

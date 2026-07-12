@@ -8,9 +8,10 @@ use crate::direct_io::{AlignedPageBuf, DirectFile};
 use crate::relstore::RelState;
 use crate::relstore::btree::{BTree, TreeInsert};
 use crate::relstore::buffer_pool::DEFAULT_CAPACITY_BYTES;
-use crate::relstore::catalog::{self, FIRST_USER_OBJECT_ID, TableDef};
+use crate::relstore::catalog::{self, FIRST_USER_OBJECT_ID, IndexDef, TableDef};
 use crate::relstore::ctx::{OpMode, PoolIo, RelCtx, TxnLink};
 use crate::relstore::heap::{Heap, Rid};
+use crate::relstore::index::{self, Locator};
 use crate::relstore::key::encode_key;
 use crate::relstore::recovery as rel_recovery;
 use crate::relstore::row::{Column, Schema, decode_row, encode_row};
@@ -272,6 +273,7 @@ impl Storage {
                 defaults,
                 collations,
                 identity,
+                indexes: Vec::new(),
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
@@ -312,6 +314,174 @@ impl Storage {
         Ok(true)
     }
 
+    /// Creates a secondary index over `table` and backfills it from the
+    /// current rows (blocking build). A duplicate on a UNIQUE index during the
+    /// build fails the whole statement (error 2601). The index is persisted in
+    /// the table's catalog row.
+    pub(crate) fn rel_create_index(
+        &mut self,
+        table: &str,
+        index_name: String,
+        columns: Vec<(usize, bool)>,
+        unique: bool,
+    ) -> Result<(), StorageError> {
+        self.file.ensure_rel_usable()?;
+        let mut def = self
+            .file
+            .rel
+            .tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{table}'")))?;
+        if def
+            .indexes
+            .iter()
+            .any(|i| i.name.eq_ignore_ascii_case(&index_name))
+        {
+            return Err(StorageError::Constraint(format!(
+                "index '{index_name}' already exists"
+            )));
+        }
+        let catalog_root = self
+            .file
+            .rel
+            .catalog_root
+            .ok_or_else(|| StorageError::InvalidFile("catalog root missing".to_string()))?;
+        let object_id = self.file.rel.next_object_id;
+        // Snapshot the rows to backfill (materialized before any mutation).
+        let located = self.rel_scan_located(table)?;
+
+        let updated = self.file.rel_statement(move |ctx, txn| {
+            let tree = BTree::create(ctx, object_id)?;
+            for (loc, values) in &located {
+                let locator = match loc {
+                    RowLocator::Key(key) => Locator::Key(key.clone()),
+                    RowLocator::Rid(rid) => Locator::Rid(*rid),
+                };
+                let index_key = index::encode_index_columns(values, &columns)
+                    .map_err(|err| StorageError::InvalidConfig(err.0))?;
+                let (key, value) = index::leaf_entry(&index_key, &locator, unique);
+                // Backfill is system-logged: the fresh tree is not in the
+                // rollback roots, so a failure leaks it (the catalog entry
+                // below is undone, leaving it unreferenced).
+                match tree.insert_unique_bulk(ctx, &key, &value)? {
+                    TreeInsert::Inserted => {}
+                    TreeInsert::DuplicateKey => {
+                        return Err(StorageError::Constraint(format!(
+                            "duplicate unique index '{index_name}'"
+                        )));
+                    }
+                }
+            }
+            def.indexes.push(IndexDef {
+                object_id,
+                name: index_name,
+                columns,
+                unique,
+                root_page: tree.root,
+            });
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
+            Ok(def)
+        })?;
+        self.file.rel.next_object_id += 1;
+        self.file.rel.tables.insert(table.to_string(), updated);
+        Ok(())
+    }
+
+    /// Drops a secondary index by name (logical: index pages leak). Returns
+    /// false if no such index exists on any table.
+    pub(crate) fn rel_drop_index(
+        &mut self,
+        table: &str,
+        index_name: &str,
+    ) -> Result<bool, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let Some(catalog_root) = self.file.rel.catalog_root else {
+            return Ok(false);
+        };
+        // Index names are scoped to their table, so confine the lookup there.
+        // The caller passes the table's canonical name.
+        let Some((table_key, mut def)) = self
+            .file
+            .rel
+            .tables
+            .iter()
+            .find(|(name, _)| name.eq_ignore_ascii_case(table))
+            .map(|(name, def)| (name.clone(), def.clone()))
+        else {
+            return Ok(false);
+        };
+        if !def
+            .indexes
+            .iter()
+            .any(|i| i.name.eq_ignore_ascii_case(index_name))
+        {
+            return Ok(false);
+        }
+        def.indexes
+            .retain(|i| !i.name.eq_ignore_ascii_case(index_name));
+        let updated = self.file.rel_statement(move |ctx, txn| {
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
+            Ok(def)
+        })?;
+        self.file.rel.tables.insert(table_key, updated);
+        Ok(true)
+    }
+
+    /// Candidate rows for an index access path: walks the index tree over
+    /// `[lower, upper]`, then fetches each row by its locator. Returns a
+    /// superset the caller re-filters with the full WHERE (so loose bounds are
+    /// safe).
+    pub(crate) fn rel_index_scan(
+        &mut self,
+        table: &str,
+        index_object_id: u32,
+        lower: Option<Vec<u8>>,
+        upper: Option<Vec<u8>>,
+    ) -> Result<Vec<Vec<Datum>>, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(table)?;
+        let index = def
+            .indexes
+            .iter()
+            .find(|i| i.object_id == index_object_id)
+            .cloned()
+            .ok_or_else(|| StorageError::InvalidConfig("unknown index".to_string()))?;
+        let mut ctx = self.file.rel_ctx();
+        let index_tree = BTree {
+            object_id: index.object_id,
+            root: index.root_page,
+        };
+        let entries = index_tree.scan_range(&mut ctx, lower.as_deref(), upper.as_deref())?;
+        let mut rows = Vec::with_capacity(entries.len());
+        if def.is_tree() {
+            let base = BTree {
+                object_id: def.object_id,
+                root: def.root_page,
+            };
+            for (_, value) in entries {
+                if let Locator::Key(pk) = index::decode_locator(&value)
+                    && let Some(row) = base.get(&mut ctx, &pk)?
+                {
+                    rows.push(decode_row(&schema, &row)?);
+                }
+            }
+        } else {
+            let heap = Heap {
+                object_id: def.object_id,
+                first_page: def.root_page,
+            };
+            for (_, value) in entries {
+                if let Locator::Rid(rid) = index::decode_locator(&value)
+                    && let Some(row) = heap.read_row(&mut ctx, rid)?
+                {
+                    rows.push(decode_row(&schema, &row)?);
+                }
+            }
+        }
+        Ok(rows)
+    }
+
     pub fn rel_insert(&mut self, name: &str, values: Vec<Datum>) -> Result<(), StorageError> {
         self.rel_insert_many(name, vec![values], &mut TxnScope::Auto)
     }
@@ -341,13 +511,14 @@ impl Storage {
             encoded.push((key, row));
         }
 
+        let indexes = def.indexes.clone();
         if def.is_tree() {
             let tree = BTree {
                 object_id: def.object_id,
                 root: def.root_page,
             };
             self.file.rel_statement_scoped(scope, move |ctx, txn| {
-                for (key, row) in &encoded {
+                for ((key, row), values) in encoded.iter().zip(rows.iter()) {
                     let key = key.as_ref().expect("tree row has a key");
                     match tree.insert_unique(ctx, &mut OpMode::Txn(txn), key, row)? {
                         TreeInsert::Inserted => {}
@@ -357,6 +528,8 @@ impl Storage {
                             ));
                         }
                     }
+                    // Clustered rows locate by PK key.
+                    index_insert_row(ctx, txn, &indexes, values, &Locator::Key(key.clone()))?;
                 }
                 Ok(())
             })
@@ -366,8 +539,10 @@ impl Storage {
                 first_page: def.root_page,
             };
             self.file.rel_statement_scoped(scope, move |ctx, txn| {
-                for (_, row) in &encoded {
-                    heap.insert(ctx, txn, row)?;
+                for ((_, row), values) in encoded.iter().zip(rows.iter()) {
+                    // Heap rows locate by their home RID.
+                    let rid = heap.insert(ctx, txn, row)?;
+                    index_insert_row(ctx, txn, &indexes, values, &Locator::Rid(rid))?;
                 }
                 Ok(())
             })
@@ -631,28 +806,31 @@ impl Storage {
         Ok(out)
     }
 
-    /// Deletes the located rows in one atomic statement; returns the count.
+    /// Deletes the located rows (each carrying its old values for index
+    /// upkeep) in one atomic statement; returns the count.
     pub(crate) fn rel_delete_located(
         &mut self,
         name: &str,
-        locators: Vec<RowLocator>,
+        targets: Vec<(RowLocator, Vec<Datum>)>,
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
         self.file.ensure_rel_usable()?;
         let (def, _schema) = self.rel_def(name)?;
-        let count = locators.len();
+        let count = targets.len();
         if count == 0 {
             return Ok(0);
         }
+        let indexes = def.indexes.clone();
         if def.is_tree() {
             let tree = BTree {
                 object_id: def.object_id,
                 root: def.root_page,
             };
             self.file.rel_statement_scoped(scope, move |ctx, txn| {
-                for loc in &locators {
+                for (loc, values) in &targets {
                     if let RowLocator::Key(key) = loc {
                         tree.delete(ctx, &mut OpMode::Txn(txn), key)?;
+                        index_delete_row(ctx, txn, &indexes, values, &Locator::Key(key.clone()))?;
                     }
                 }
                 Ok(())
@@ -663,9 +841,10 @@ impl Storage {
                 first_page: def.root_page,
             };
             self.file.rel_statement_scoped(scope, move |ctx, txn| {
-                for loc in &locators {
+                for (loc, values) in &targets {
                     if let RowLocator::Rid(rid) = loc {
                         heap.delete(ctx, txn, *rid)?;
+                        index_delete_row(ctx, txn, &indexes, values, &Locator::Rid(*rid))?;
                     }
                 }
                 Ok(())
@@ -674,14 +853,17 @@ impl Storage {
         Ok(count)
     }
 
-    /// Applies full-row updates (each already type-checked and NOT-NULL-checked
-    /// by the caller) in one atomic statement. For a clustered table a row
-    /// whose key changed is re-keyed (delete + insert with uniqueness
-    /// enforced); heaps update in place by RID. Returns the count.
+    /// Applies full-row updates (each carrying its old and new values; already
+    /// type-checked and NOT-NULL-checked by the caller) in one atomic
+    /// statement. For a clustered table a row whose key changed is re-keyed
+    /// (delete + insert with uniqueness enforced); heaps update in place by
+    /// RID. Secondary indexes are maintained by deleting every old entry then
+    /// inserting every new one (so a unique index tolerates value swaps).
+    /// Returns the count.
     pub(crate) fn rel_update_located(
         &mut self,
         name: &str,
-        updates: Vec<(RowLocator, Vec<Datum>)>,
+        updates: Vec<(RowLocator, Vec<Datum>, Vec<Datum>)>,
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
         self.file.ensure_rel_usable()?;
@@ -690,6 +872,9 @@ impl Storage {
         if count == 0 {
             return Ok(0);
         }
+        let indexes = def.indexes.clone();
+        // (old values, old locator, new values, new locator) for index upkeep.
+        let mut idx_ops: Vec<(Vec<Datum>, Locator, Vec<Datum>, Locator)> = Vec::new();
         if def.is_tree() {
             let tree = BTree {
                 object_id: def.object_id,
@@ -698,15 +883,23 @@ impl Storage {
             // Partition into in-place (key unchanged) and re-key (key changed).
             let mut in_place: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             let mut rekey: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
-            for (loc, values) in updates {
+            for (loc, old_values, new_values) in updates {
                 let RowLocator::Key(old_key) = loc else {
                     return Err(StorageError::InvalidConfig(
                         "expected key locator for clustered table".to_string(),
                     ));
                 };
-                validate_not_null(&schema, &values)?;
-                let row = encode_row(&schema, &values)?;
-                let new_key = encode_key(&schema, &def.key_columns, &values)?;
+                validate_not_null(&schema, &new_values)?;
+                let row = encode_row(&schema, &new_values)?;
+                let new_key = encode_key(&schema, &def.key_columns, &new_values)?;
+                if !indexes.is_empty() {
+                    idx_ops.push((
+                        old_values,
+                        Locator::Key(old_key.clone()),
+                        new_values,
+                        Locator::Key(new_key.clone()),
+                    ));
+                }
                 if new_key == old_key {
                     in_place.push((old_key, row));
                 } else {
@@ -731,6 +924,7 @@ impl Storage {
                 for (key, row) in &in_place {
                     tree.update(ctx, &mut OpMode::Txn(txn), key, row)?;
                 }
+                apply_index_updates(ctx, txn, &indexes, &idx_ops)?;
                 Ok(())
             })?;
         } else {
@@ -739,19 +933,24 @@ impl Storage {
                 first_page: def.root_page,
             };
             let mut encoded: Vec<(Rid, Vec<u8>)> = Vec::with_capacity(count);
-            for (loc, values) in updates {
+            for (loc, old_values, new_values) in updates {
                 let RowLocator::Rid(rid) = loc else {
                     return Err(StorageError::InvalidConfig(
                         "expected rid locator for heap".to_string(),
                     ));
                 };
-                validate_not_null(&schema, &values)?;
-                encoded.push((rid, encode_row(&schema, &values)?));
+                validate_not_null(&schema, &new_values)?;
+                encoded.push((rid, encode_row(&schema, &new_values)?));
+                if !indexes.is_empty() {
+                    // Heap RIDs are stable across an update.
+                    idx_ops.push((old_values, Locator::Rid(rid), new_values, Locator::Rid(rid)));
+                }
             }
             self.file.rel_statement_scoped(scope, move |ctx, txn| {
                 for (rid, row) in &encoded {
                     heap.update(ctx, txn, *rid, row)?;
                 }
+                apply_index_updates(ctx, txn, &indexes, &idx_ops)?;
                 Ok(())
             })?;
         }
@@ -894,6 +1093,78 @@ impl Storage {
         let schema = def.schema()?;
         Ok((def, schema))
     }
+}
+
+/// Inserts one row's entries into every secondary index. A duplicate on a
+/// UNIQUE index surfaces as a constraint error the SQL layer maps to 2601.
+fn index_insert_row(
+    ctx: &mut RelCtx<'_>,
+    txn: &mut TxnLink,
+    indexes: &[IndexDef],
+    values: &[Datum],
+    locator: &Locator,
+) -> Result<(), StorageError> {
+    for index in indexes {
+        let index_key = index::encode_index_columns(values, &index.columns)
+            .map_err(|err| StorageError::InvalidConfig(err.0))?;
+        let (key, value) = index::leaf_entry(&index_key, locator, index.unique);
+        let tree = BTree {
+            object_id: index.object_id,
+            root: index.root_page,
+        };
+        match tree.insert_unique(ctx, &mut OpMode::Txn(txn), &key, &value)? {
+            TreeInsert::Inserted => {}
+            TreeInsert::DuplicateKey => {
+                return Err(StorageError::Constraint(format!(
+                    "duplicate unique index '{}'",
+                    index.name
+                )));
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Reindexes a set of updated rows: deletes every old entry first, then
+/// inserts every new one, so a UNIQUE index tolerates value swaps within one
+/// statement.
+fn apply_index_updates(
+    ctx: &mut RelCtx<'_>,
+    txn: &mut TxnLink,
+    indexes: &[IndexDef],
+    ops: &[(Vec<Datum>, Locator, Vec<Datum>, Locator)],
+) -> Result<(), StorageError> {
+    if indexes.is_empty() {
+        return Ok(());
+    }
+    for (old_values, old_locator, _, _) in ops {
+        index_delete_row(ctx, txn, indexes, old_values, old_locator)?;
+    }
+    for (_, _, new_values, new_locator) in ops {
+        index_insert_row(ctx, txn, indexes, new_values, new_locator)?;
+    }
+    Ok(())
+}
+
+/// Removes one row's entries from every secondary index.
+fn index_delete_row(
+    ctx: &mut RelCtx<'_>,
+    txn: &mut TxnLink,
+    indexes: &[IndexDef],
+    values: &[Datum],
+    locator: &Locator,
+) -> Result<(), StorageError> {
+    for index in indexes {
+        let index_key = index::encode_index_columns(values, &index.columns)
+            .map_err(|err| StorageError::InvalidConfig(err.0))?;
+        let (key, _) = index::leaf_entry(&index_key, locator, index.unique);
+        let tree = BTree {
+            object_id: index.object_id,
+            root: index.root_page,
+        };
+        tree.delete(ctx, &mut OpMode::Txn(txn), &key)?;
+    }
+    Ok(())
 }
 
 fn column_index(schema: &Schema, name: &str) -> Result<usize, StorageError> {
@@ -1237,11 +1508,17 @@ impl StorageFile {
             rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &roots)?;
             self.reload_catalog()?;
         }
+        // Object ids are shared by tables and their secondary indexes, so the
+        // next id must clear both (an index can outrank every table).
         self.rel.next_object_id = self
             .rel
             .tables
             .values()
-            .map(|def| def.object_id + 1)
+            .flat_map(|def| {
+                std::iter::once(def.object_id)
+                    .chain(def.indexes.iter().map(|index| index.object_id))
+            })
+            .map(|object_id| object_id + 1)
             .max()
             .unwrap_or(FIRST_USER_OBJECT_ID)
             .max(FIRST_USER_OBJECT_ID);

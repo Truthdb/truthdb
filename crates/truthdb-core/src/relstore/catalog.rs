@@ -30,6 +30,23 @@ pub struct IdentitySpec {
     pub next: i64,
 }
 
+/// A nonclustered (secondary) B+ index over a base table. Its own tree (keyed
+/// by [`object_id`](IndexDef::object_id)) maps encoded index-key bytes to a
+/// row locator (the base table's PK key for a clustered table, or the heap
+/// RID). Indexes live embedded in their owning [`TableDef`] so they load and
+/// mutate with the catalog row.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct IndexDef {
+    pub object_id: u32,
+    pub name: String,
+    /// (schema column index, ascending) for each index key column, in order.
+    pub columns: Vec<(usize, bool)>,
+    /// UNIQUE index: duplicate key values are rejected (error 2601).
+    pub unique: bool,
+    /// The index tree's root page.
+    pub root_page: u64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub object_id: u32,
@@ -49,6 +66,9 @@ pub struct TableDef {
     /// The single IDENTITY column, if any.
     #[serde(default)]
     pub identity: Option<IdentitySpec>,
+    /// Secondary indexes over this table.
+    #[serde(default)]
+    pub indexes: Vec<IndexDef>,
 }
 
 impl TableDef {
