@@ -10,9 +10,14 @@ use truthdb_core::session::{EngineHandle, SessionId};
 use crate::login::{self, parse_login7};
 use crate::packet::{
     self, DEFAULT_PACKET_SIZE, Message, PKT_ATTENTION, PKT_LOGIN7, PKT_PRELOGIN, PKT_SQL_BATCH,
-    PKT_TABULAR_RESULT, read_message, write_message,
+    PKT_TABULAR_RESULT, PKT_TRANSACTION_MANAGER, read_message, write_message,
 };
 use crate::token;
+
+// Transaction Manager request types (MS-TDS 2.2.6.9).
+const TM_BEGIN_XACT: u16 = 5;
+const TM_COMMIT_XACT: u16 = 7;
+const TM_ROLLBACK_XACT: u16 = 8;
 
 /// Server-side TDS configuration: the login users and the reported database.
 #[derive(Debug, Clone)]
@@ -66,7 +71,7 @@ where
             14,
             &format!("Login failed for user '{}'.", login.username),
         );
-        token::done(&mut out, false, true, None);
+        token::done(&mut out, false, true, false, None);
         write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
         return Ok(());
     }
@@ -94,7 +99,7 @@ where
         10,
         &format!("Changed database context to '{database}'."),
     );
-    token::done(&mut out, false, false, None);
+    token::done(&mut out, false, false, false, None);
     write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
 
     // Each connection gets an engine-side session; it is closed (rolling back
@@ -114,6 +119,10 @@ async fn request_loop<S>(
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
+    // The connection's current transaction descriptor (0 = none). A fresh
+    // value is minted per BEGIN so the client can echo it in ALL_HEADERS.
+    let mut tran_descriptor: u64 = 0;
+    let mut next_descriptor: u64 = 1;
     loop {
         let message = match read_message(stream).await {
             Ok(message) => message,
@@ -125,6 +134,17 @@ where
             PKT_SQL_BATCH => {
                 let sql = batch_sql(&message.payload)?;
                 let response = run_batch(engine, session, &sql).await;
+                write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?;
+            }
+            PKT_TRANSACTION_MANAGER => {
+                let response = handle_tm_request(
+                    engine,
+                    session,
+                    &message.payload,
+                    &mut tran_descriptor,
+                    &mut next_descriptor,
+                )
+                .await?;
                 write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?;
             }
             PKT_ATTENTION => {
@@ -140,6 +160,109 @@ where
     }
 }
 
+/// Handles a Transaction Manager request (`db.BeginTx()` / `Commit` /
+/// `Rollback` in drivers). Translates it to the equivalent SQL transaction
+/// statement, runs it through the session, and answers with the matching
+/// transaction ENVCHANGE (types 8/9/10) plus a final DONE.
+async fn handle_tm_request(
+    engine: &EngineHandle,
+    session: SessionId,
+    payload: &[u8],
+    tran_descriptor: &mut u64,
+    next_descriptor: &mut u64,
+) -> io::Result<Vec<u8>> {
+    let (request_type, isolation) = parse_tm_request(payload)?;
+    let sql = match request_type {
+        TM_BEGIN_XACT => match isolation_set_clause(isolation) {
+            Some(set) => format!("{set}; BEGIN TRANSACTION"),
+            None => "BEGIN TRANSACTION".to_string(),
+        },
+        TM_COMMIT_XACT => "COMMIT TRANSACTION".to_string(),
+        TM_ROLLBACK_XACT => "ROLLBACK TRANSACTION".to_string(),
+        other => {
+            return Err(protocol_err(&format!(
+                "unsupported transaction manager request type {other}"
+            )));
+        }
+    };
+
+    let reply = match engine.run_batch(session, sql).await {
+        Ok(reply) => reply,
+        Err(err) => {
+            let mut out = Vec::new();
+            token::error(&mut out, 50000, 1, 16, &err.to_string());
+            token::done(&mut out, false, true, false, None);
+            return Ok(out);
+        }
+    };
+
+    let mut out = Vec::new();
+    // A SQL-level failure (e.g. COMMIT with no matching BEGIN) is reported as
+    // an ERROR with no ENVCHANGE; the descriptor is left unchanged.
+    if let Some(error) = &reply.outcome.error {
+        token::error(
+            &mut out,
+            error.number,
+            error.state,
+            error.level,
+            &error.message,
+        );
+        token::done(&mut out, false, true, reply.in_transaction, None);
+        return Ok(out);
+    }
+
+    match request_type {
+        TM_BEGIN_XACT => {
+            let descriptor = *next_descriptor;
+            *next_descriptor += 1;
+            *tran_descriptor = descriptor;
+            token::envchange_begin_tran(&mut out, descriptor);
+        }
+        TM_COMMIT_XACT => {
+            token::envchange_commit_tran(&mut out, *tran_descriptor);
+            *tran_descriptor = 0;
+        }
+        TM_ROLLBACK_XACT => {
+            token::envchange_rollback_tran(&mut out, *tran_descriptor);
+            *tran_descriptor = 0;
+        }
+        _ => unreachable!("request type validated above"),
+    }
+    token::done(&mut out, false, false, reply.in_transaction, None);
+    Ok(out)
+}
+
+/// Parses a Transaction Manager request payload: an ALL_HEADERS block, then a
+/// `RequestType` (u16 LE), then for `TM_BEGIN_XACT` an isolation-level byte.
+/// Returns the request type and (for BEGIN) the isolation byte.
+fn parse_tm_request(payload: &[u8]) -> io::Result<(u16, u8)> {
+    let body = skip_all_headers(payload);
+    if body.len() < 2 {
+        return Err(protocol_err("transaction manager request too short"));
+    }
+    let request_type = u16::from_le_bytes([body[0], body[1]]);
+    // TM_BEGIN_XACT carries: IsolationLevel (u8), then a B_VARCHAR name.
+    let isolation = if request_type == TM_BEGIN_XACT {
+        body.get(2).copied().unwrap_or(0)
+    } else {
+        0
+    };
+    Ok((request_type, isolation))
+}
+
+/// Maps a TDS isolation-level byte to the equivalent `SET TRANSACTION
+/// ISOLATION LEVEL` statement, or `None` to keep the session default.
+fn isolation_set_clause(isolation: u8) -> Option<&'static str> {
+    match isolation {
+        1 => Some("SET TRANSACTION ISOLATION LEVEL READ UNCOMMITTED"),
+        2 => Some("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
+        3 => Some("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"),
+        4 => Some("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
+        // 0 (unspecified) and 5 (snapshot, unsupported) keep the default.
+        _ => None,
+    }
+}
+
 fn authenticate(config: &TdsConfig, username: &str, password: &str) -> bool {
     config
         .users
@@ -150,19 +273,21 @@ fn authenticate(config: &TdsConfig, username: &str, password: &str) -> bool {
 /// Runs a SQL batch through the engine actor and builds its token stream.
 async fn run_batch(engine: &EngineHandle, session: SessionId, sql: &str) -> Vec<u8> {
     match engine.run_batch(session, sql.to_string()).await {
-        Ok(outcome) => build_batch_tokens(&outcome),
+        Ok(reply) => build_batch_tokens(&reply.outcome, reply.in_transaction),
         Err(err) => {
             // A genuine engine/storage failure (not a SQL-level error).
             let mut out = Vec::new();
             token::error(&mut out, 50000, 1, 16, &err.to_string());
-            token::done(&mut out, false, true, None);
+            token::done(&mut out, false, true, false, None);
             out
         }
     }
 }
 
 /// Builds the COLMETADATA/ROW/DONE/ERROR token stream for a batch outcome.
-fn build_batch_tokens(outcome: &BatchOutcome) -> Vec<u8> {
+/// `in_transaction` sets `DONE_INXACT` so the client knows the connection is
+/// still inside a transaction.
+fn build_batch_tokens(outcome: &BatchOutcome, in_transaction: bool) -> Vec<u8> {
     let mut out = Vec::new();
     let has_error = outcome.error.is_some();
     let last_index = outcome.results.len().saturating_sub(1);
@@ -176,13 +301,19 @@ fn build_batch_tokens(outcome: &BatchOutcome) -> Vec<u8> {
                 for row in &rowset.rows {
                     token::row(&mut out, row, &rowset.columns);
                 }
-                token::done(&mut out, more, false, Some(rowset.rows.len() as u64));
+                token::done(
+                    &mut out,
+                    more,
+                    false,
+                    in_transaction,
+                    Some(rowset.rows.len() as u64),
+                );
             }
             StatementResult::RowsAffected(n) => {
-                token::done(&mut out, more, false, Some(*n));
+                token::done(&mut out, more, false, in_transaction, Some(*n));
             }
             StatementResult::Done => {
-                token::done(&mut out, more, false, None);
+                token::done(&mut out, more, false, in_transaction, None);
             }
         }
     }
@@ -194,28 +325,35 @@ fn build_batch_tokens(outcome: &BatchOutcome) -> Vec<u8> {
             error.level,
             &error.message,
         );
-        token::done(&mut out, false, true, None);
+        token::done(&mut out, false, true, in_transaction, None);
     } else if outcome.results.is_empty() {
         // Empty batch (e.g. only comments): a single final DONE.
-        token::done(&mut out, false, false, None);
+        token::done(&mut out, false, false, in_transaction, None);
     }
     out
+}
+
+/// Skips a request payload's ALL_HEADERS block, returning the bytes after it.
+/// ALL_HEADERS starts with a `TotalLength u32` covering the whole block (incl.
+/// itself); a missing or malformed block means the payload has no headers.
+fn skip_all_headers(payload: &[u8]) -> &[u8] {
+    let start = if payload.len() >= 4 {
+        let total = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+        if (4..=payload.len()).contains(&total) {
+            total
+        } else {
+            0
+        }
+    } else {
+        0
+    };
+    &payload[start..]
 }
 
 /// Extracts the SQL text from a SQLBatch payload: an ALL_HEADERS block
 /// (`TotalLength u32` covering the headers) followed by the UCS-2LE query.
 fn batch_sql(payload: &[u8]) -> io::Result<String> {
-    let sql_start = if payload.len() >= 4 {
-        let total = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-        if (4..=payload.len()).contains(&total) {
-            total
-        } else {
-            0 // No (or malformed) ALL_HEADERS: treat the whole payload as SQL.
-        }
-    } else {
-        0
-    };
-    let text = &payload[sql_start..];
+    let text = skip_all_headers(payload);
     if !text.len().is_multiple_of(2) {
         return Err(protocol_err("SQLBatch text is not UCS-2 aligned"));
     }

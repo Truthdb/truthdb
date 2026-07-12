@@ -36,6 +36,8 @@ pub enum TokenKind {
     /// Numeric/decimal literal text (kept exact; typed at bind time).
     Number(String),
     String(String),
+    /// A `@@`-prefixed global variable name (without the `@@`), lowercased.
+    GlobalVar(String),
     // Operators / punctuation.
     Comma,
     Semicolon,
@@ -253,6 +255,20 @@ impl<'a> Lexer<'a> {
             b'\'' => self.lex_string(start),
             b'[' => self.lex_bracket_ident(start),
             b'"' => self.lex_quoted_ident(start),
+            b'@' if self.peek2() == Some(b'@') => {
+                // `@@name` — a global/session variable (e.g. @@TRANCOUNT).
+                self.pos += 2;
+                let name_start = self.pos;
+                while self.peek().is_some_and(is_ident_cont) {
+                    self.pos += 1;
+                }
+                let name =
+                    String::from_utf8_lossy(&self.src[name_start..self.pos]).to_ascii_lowercase();
+                Ok(Token {
+                    kind: TokenKind::GlobalVar(name),
+                    span: Span::new(start, self.pos),
+                })
+            }
             b'@' => Err(
                 SqlError::message_only(102, "Variables are not supported yet.")
                     .at(Span::new(start, start + 1)),

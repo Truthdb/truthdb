@@ -3,6 +3,7 @@ pub mod client_listener;
 mod direct_io;
 pub mod dispatcher;
 pub mod engine;
+pub mod lock;
 pub mod rel;
 pub mod relstore;
 pub mod session;

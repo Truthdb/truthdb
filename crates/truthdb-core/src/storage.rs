@@ -313,16 +313,17 @@ impl Storage {
     }
 
     pub fn rel_insert(&mut self, name: &str, values: Vec<Datum>) -> Result<(), StorageError> {
-        self.rel_insert_many(name, vec![values])
+        self.rel_insert_many(name, vec![values], &mut TxnScope::Auto)
     }
 
     /// Inserts many rows as ONE atomic statement: all rows land or none do
     /// (a later row's constraint failure rolls back the whole statement,
     /// matching T-SQL multi-row `INSERT ... VALUES` semantics).
-    pub fn rel_insert_many(
+    pub(crate) fn rel_insert_many(
         &mut self,
         name: &str,
         rows: Vec<Vec<Datum>>,
+        scope: &mut TxnScope,
     ) -> Result<(), StorageError> {
         self.file.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(name)?;
@@ -345,7 +346,7 @@ impl Storage {
                 object_id: def.object_id,
                 root: def.root_page,
             };
-            self.file.rel_statement(move |ctx, txn| {
+            self.file.rel_statement_scoped(scope, move |ctx, txn| {
                 for (key, row) in &encoded {
                     let key = key.as_ref().expect("tree row has a key");
                     match tree.insert_unique(ctx, &mut OpMode::Txn(txn), key, row)? {
@@ -364,7 +365,7 @@ impl Storage {
                 object_id: def.object_id,
                 first_page: def.root_page,
             };
-            self.file.rel_statement(move |ctx, txn| {
+            self.file.rel_statement_scoped(scope, move |ctx, txn| {
                 for (_, row) in &encoded {
                     heap.insert(ctx, txn, row)?;
                 }
@@ -635,6 +636,7 @@ impl Storage {
         &mut self,
         name: &str,
         locators: Vec<RowLocator>,
+        scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
         self.file.ensure_rel_usable()?;
         let (def, _schema) = self.rel_def(name)?;
@@ -647,7 +649,7 @@ impl Storage {
                 object_id: def.object_id,
                 root: def.root_page,
             };
-            self.file.rel_statement(move |ctx, txn| {
+            self.file.rel_statement_scoped(scope, move |ctx, txn| {
                 for loc in &locators {
                     if let RowLocator::Key(key) = loc {
                         tree.delete(ctx, &mut OpMode::Txn(txn), key)?;
@@ -660,7 +662,7 @@ impl Storage {
                 object_id: def.object_id,
                 first_page: def.root_page,
             };
-            self.file.rel_statement(move |ctx, txn| {
+            self.file.rel_statement_scoped(scope, move |ctx, txn| {
                 for loc in &locators {
                     if let RowLocator::Rid(rid) = loc {
                         heap.delete(ctx, txn, *rid)?;
@@ -680,6 +682,7 @@ impl Storage {
         &mut self,
         name: &str,
         updates: Vec<(RowLocator, Vec<Datum>)>,
+        scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
         self.file.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(name)?;
@@ -710,7 +713,7 @@ impl Storage {
                     rekey.push((old_key, new_key, row));
                 }
             }
-            self.file.rel_statement(move |ctx, txn| {
+            self.file.rel_statement_scoped(scope, move |ctx, txn| {
                 // Delete all re-keyed olds first so a new key may reuse one.
                 for (old_key, _, _) in &rekey {
                     tree.delete(ctx, &mut OpMode::Txn(txn), old_key)?;
@@ -745,7 +748,7 @@ impl Storage {
                 validate_not_null(&schema, &values)?;
                 encoded.push((rid, encode_row(&schema, &values)?));
             }
-            self.file.rel_statement(move |ctx, txn| {
+            self.file.rel_statement_scoped(scope, move |ctx, txn| {
                 for (rid, row) in &encoded {
                     heap.update(ctx, txn, *rid, row)?;
                 }
@@ -753,6 +756,30 @@ impl Storage {
             })?;
         }
         Ok(count)
+    }
+
+    /// Opens a multi-statement transaction (`BEGIN TRAN`).
+    pub(crate) fn rel_begin(&mut self) -> Result<StorageTxn, StorageError> {
+        self.file.ensure_rel_usable()?;
+        self.file.begin_txn()
+    }
+
+    /// Commits a caller-held transaction.
+    pub(crate) fn rel_commit(&mut self, txn: StorageTxn) -> Result<(), StorageError> {
+        self.file.ensure_rel_usable()?;
+        self.file.commit_txn(txn)
+    }
+
+    /// Rolls back a caller-held transaction.
+    pub(crate) fn rel_rollback(&mut self, txn: StorageTxn) -> Result<(), StorageError> {
+        self.file.ensure_rel_usable()?;
+        self.file.rollback_txn(txn)
+    }
+
+    /// Whether any explicit transaction is open. Checkpoints must be skipped
+    /// while this holds — see [`StorageFile::has_active_transactions`].
+    pub(crate) fn has_active_transactions(&self) -> bool {
+        self.file.has_active_transactions()
     }
 
     /// Reserves `count` identity values for a table's IDENTITY column,
@@ -899,6 +926,24 @@ fn validate_not_null(schema: &Schema, values: &[Datum]) -> Result<(), StorageErr
 pub(crate) enum RowLocator {
     Key(Vec<u8>),
     Rid(Rid),
+}
+
+/// A caller-held (multi-statement) relational transaction: the WAL/undo chain
+/// plus the tree-root snapshot taken at BEGIN (used to re-descend trees during
+/// rollback).
+pub(crate) struct StorageTxn {
+    txn: TxnLink,
+    roots: std::collections::HashMap<u32, u64>,
+}
+
+/// The transaction a statement runs under.
+pub(crate) enum TxnScope<'a> {
+    /// Autocommit: begin + commit around the single statement.
+    Auto,
+    /// A caller-held transaction; the statement's ops are appended and NOT
+    /// committed. A statement error leaves its partial ops in place — the
+    /// caller dooms the transaction and a later ROLLBACK undoes everything.
+    Explicit(&'a mut StorageTxn),
 }
 
 pub struct SnapshotData {
@@ -1256,6 +1301,75 @@ impl StorageFile {
             self.rel.wedged = true;
         }
         result
+    }
+
+    /// Runs one statement under `scope`: autocommit (begin+commit) or appended
+    /// to a caller-held transaction (no commit; partial ops survive an error).
+    fn rel_statement_scoped<T>(
+        &mut self,
+        scope: &mut TxnScope,
+        f: impl FnOnce(&mut RelCtx<'_>, &mut TxnLink) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        match scope {
+            TxnScope::Auto => self.rel_statement(f),
+            TxnScope::Explicit(stx) => {
+                let mut ctx = self.rel_ctx();
+                f(&mut ctx, &mut stx.txn)
+            }
+        }
+    }
+
+    /// Opens a multi-statement transaction (BEGIN TRAN), snapshotting tree roots
+    /// for a later rollback.
+    fn begin_txn(&mut self) -> Result<StorageTxn, StorageError> {
+        let txn_id = self.rel.next_txn_id;
+        self.rel.next_txn_id += 1;
+        let roots = self.rel.tree_roots();
+        let mut ctx = self.rel_ctx();
+        let txn = ctx.begin(txn_id)?;
+        // The transaction is now open (its undo records must survive until it
+        // commits or rolls back, which gates checkpoints — see `active_txns`).
+        self.rel.active_txns += 1;
+        Ok(StorageTxn { txn, roots })
+    }
+
+    /// Commits a caller-held transaction (forces the log). A failure wedges the
+    /// store, as for autocommit commits.
+    fn commit_txn(&mut self, stx: StorageTxn) -> Result<(), StorageError> {
+        // The transaction is ending (the `StorageTxn` is consumed either way).
+        self.rel.active_txns = self.rel.active_txns.saturating_sub(1);
+        let mut ctx = self.rel_ctx();
+        match ctx.commit(stx.txn) {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                self.rel.wedged = true;
+                Err(err)
+            }
+        }
+    }
+
+    /// Rolls back a caller-held transaction via its in-memory undo log (CLRs).
+    fn rollback_txn(&mut self, stx: StorageTxn) -> Result<(), StorageError> {
+        self.rel.active_txns = self.rel.active_txns.saturating_sub(1);
+        let roots = stx.roots;
+        let mut ctx = self.rel_ctx();
+        match rel_recovery::rollback(&mut ctx, stx.txn, &roots) {
+            Ok(()) => {
+                let _ = ctx.io.wal.sync_all();
+                Ok(())
+            }
+            Err(err) => {
+                self.rel.wedged = true;
+                Err(err)
+            }
+        }
+    }
+
+    /// Whether any explicit transaction is open. A checkpoint must be skipped
+    /// while this is true (its WAL truncation would discard undo records still
+    /// needed to roll the open transaction back after a crash).
+    fn has_active_transactions(&self) -> bool {
+        self.rel.active_txns > 0
     }
 
     fn ensure_rel_usable(&self) -> Result<(), StorageError> {

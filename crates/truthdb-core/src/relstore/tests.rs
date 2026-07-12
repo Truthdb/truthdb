@@ -153,6 +153,39 @@ fn committed_statements_survive_crash_without_checkpoint() {
 }
 
 #[test]
+fn active_transaction_count_gates_checkpoints() {
+    // The checkpoint gate (Engine::maybe_checkpoint) reads
+    // `has_active_transactions`; verify it tracks explicit transactions across
+    // both the commit and rollback paths so a checkpoint can never run while
+    // an explicit transaction is open (which would truncate its undo records).
+    let path = unique_temp_path("active-txn-gate");
+    let mut storage = create_storage(&path);
+    assert!(!storage.has_active_transactions());
+
+    let txn = storage.rel_begin().expect("begin");
+    assert!(
+        storage.has_active_transactions(),
+        "open transaction is active"
+    );
+    storage.rel_commit(txn).expect("commit");
+    assert!(
+        !storage.has_active_transactions(),
+        "commit clears the active transaction"
+    );
+
+    let txn = storage.rel_begin().expect("begin");
+    assert!(storage.has_active_transactions());
+    storage.rel_rollback(txn).expect("rollback");
+    assert!(
+        !storage.has_active_transactions(),
+        "rollback clears the active transaction"
+    );
+
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
 fn uncommitted_statement_is_undone_and_recovery_rerun_is_clean() {
     let path = unique_temp_path("loser-undo");
     let mut storage = create_storage(&path);

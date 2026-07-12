@@ -130,6 +130,29 @@ def main() -> int:
         print(f"FAIL: UNIQUEIDENTIFIER round-trip: {g!r}")
         return 1
 
+    # Stage 6 transactions via the TDS Transaction Manager. DDL runs while
+    # autocommit is on (it is disallowed inside an explicit transaction); DML
+    # transactions then commit/rollback through TM_COMMIT/ROLLBACK requests.
+    cur.execute("CREATE TABLE tx_py (id INT NOT NULL PRIMARY KEY, v INT)")
+
+    conn.autocommit = False
+    cur.execute("INSERT INTO tx_py VALUES (1, 100)")
+    conn.commit()
+    conn.autocommit = True
+    cur.execute("SELECT v FROM tx_py WHERE id = 1")
+    if cur.fetchone()[0] != 100:
+        print("FAIL: committed transaction row missing")
+        return 1
+
+    conn.autocommit = False
+    cur.execute("INSERT INTO tx_py VALUES (2, 200)")
+    conn.rollback()
+    conn.autocommit = True
+    cur.execute("SELECT id FROM tx_py ORDER BY id")
+    if cur.fetchall() != [(1,)]:
+        print("FAIL: rolled-back transaction row was not discarded")
+        return 1
+
     conn.close()
     print("tds conformance: OK")
     return 0

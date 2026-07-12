@@ -11,17 +11,76 @@ pub mod collation;
 mod value;
 
 use truthdb_sql::ast::{
-    ColumnDef, CreateTable, DataType, Delete, DropTable, Expr, ExprKind, Insert, Name, OrderItem,
-    Select, SelectItem, Statement, Update,
+    ColumnDef, CreateTable, DataType, Delete, DropTable, Expr, ExprKind, Insert, IsolationLevel,
+    Name, OrderItem, Select, SelectItem, SetStatement, Statement, Update,
 };
 use truthdb_sql::error::SqlError;
+use truthdb_sql::eval::EvalContext;
 use truthdb_sql::value::{SqlValue, order_key_cmp};
 use truthdb_sql::{ast, eval};
 
+use crate::lock::{LockMode, Resource};
 use crate::relstore::catalog::{self, TableDef};
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
-use crate::storage::{Storage, StorageError};
+use crate::storage::{Storage, StorageError, StorageTxn, TxnScope};
+
+/// Per-session transaction state carried across statements/batches. Lives in
+/// the session (engine thread); autocommit statements use `Default`.
+#[derive(Default)]
+pub struct TxnContext {
+    txn: Option<StorageTxn>,
+    /// `@@TRANCOUNT` — nested BEGINs increment; only the outermost COMMIT
+    /// actually commits.
+    trancount: u32,
+    /// Set when a statement failed inside the transaction (SQL Server
+    /// XACT_ABORT-style): only ROLLBACK is then allowed.
+    doomed: bool,
+    xact_abort: bool,
+    isolation: Isolation,
+}
+
+/// Session isolation level (defaults to READ COMMITTED, like SQL Server).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Isolation {
+    ReadUncommitted,
+    #[default]
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
+}
+
+impl TxnContext {
+    fn in_txn(&self) -> bool {
+        self.txn.is_some()
+    }
+
+    fn eval_context(&self) -> EvalContext {
+        EvalContext {
+            trancount: self.trancount as i32,
+        }
+    }
+
+    /// True if a transaction is open (used by the session to decide whether a
+    /// disconnect must roll back).
+    pub fn has_open_transaction(&self) -> bool {
+        self.txn.is_some()
+    }
+
+    /// The session's current isolation level (drives which locks reads take).
+    pub fn isolation(&self) -> Isolation {
+        self.isolation
+    }
+
+    /// Rolls back and discards any open transaction (connection teardown).
+    pub fn abort(&mut self, storage: &mut Storage) {
+        if let Some(txn) = self.txn.take() {
+            let _ = storage.rel_rollback(txn);
+        }
+        self.trancount = 0;
+        self.doomed = false;
+    }
+}
 
 /// Result of one executed statement.
 #[derive(Debug, Clone, PartialEq)]
@@ -58,7 +117,7 @@ pub struct BatchOutcome {
 
 /// Parses and executes a SQL batch. A parse error yields an empty batch with
 /// the error; a runtime error stops the batch but keeps earlier results.
-pub fn execute_batch(storage: &mut Storage, sql: &str) -> BatchOutcome {
+pub fn execute_batch(storage: &mut Storage, sql: &str, txn_ctx: &mut TxnContext) -> BatchOutcome {
     let statements = match truthdb_sql::parse(sql) {
         Ok(statements) => statements,
         Err(error) => {
@@ -70,9 +129,14 @@ pub fn execute_batch(storage: &mut Storage, sql: &str) -> BatchOutcome {
     };
     let mut results = Vec::with_capacity(statements.len());
     for statement in &statements {
-        match exec_statement(storage, statement) {
+        match exec_statement(storage, statement, txn_ctx) {
             Ok(result) => results.push(result),
             Err(error) => {
+                // A statement failure inside an explicit transaction dooms it
+                // (XACT_ABORT-style): only ROLLBACK is then permitted.
+                if txn_ctx.in_txn() {
+                    txn_ctx.doomed = true;
+                }
                 return BatchOutcome {
                     results,
                     error: Some(error),
@@ -86,30 +150,238 @@ pub fn execute_batch(storage: &mut Storage, sql: &str) -> BatchOutcome {
     }
 }
 
+/// The table/database locks a batch needs, from its statements and the
+/// session isolation level, deduped to the strongest mode per resource. The
+/// engine acquires these up front (before running any statement) so a
+/// conflicting batch can be parked and restarted cleanly.
+///
+/// A parse error yields no locks — execution re-parses and surfaces it.
+/// `sys.*` views and unresolved tables take no lock (catalog reads are
+/// unlocked; missing tables error at execution).
+pub fn analyze_locks(
+    storage: &Storage,
+    sql: &str,
+    isolation: Isolation,
+) -> Vec<(Resource, LockMode)> {
+    let Ok(statements) = truthdb_sql::parse(sql) else {
+        return Vec::new();
+    };
+    // Reads take shared locks except under READ UNCOMMITTED, which takes none.
+    // A batch that raises the isolation level (e.g. `SET ISOLATION LEVEL
+    // SERIALIZABLE; SELECT ...`) must lock its reads even if the session was
+    // READ UNCOMMITTED on entry — otherwise the post-SET read would run
+    // unlocked. We therefore take read locks unless the whole batch is READ
+    // UNCOMMITTED: the session is RU and no SET raises it above RU.
+    let escalates_reads = statements.iter().any(|s| {
+        matches!(
+            s,
+            Statement::Set(SetStatement::IsolationLevel(level))
+                if !matches!(level, IsolationLevel::ReadUncommitted)
+        )
+    });
+    let reads_lock = !matches!(isolation, Isolation::ReadUncommitted) || escalates_reads;
+    let mut needs: std::collections::HashMap<Resource, LockMode> = std::collections::HashMap::new();
+    let mut add = |resource: Resource, mode: LockMode| {
+        needs
+            .entry(resource)
+            .and_modify(|m| *m = m.combine(mode))
+            .or_insert(mode);
+    };
+    for statement in &statements {
+        match statement {
+            Statement::Select(select) => {
+                if !reads_lock {
+                    continue;
+                }
+                if let Some(from) = &select.from {
+                    let lower = from.value.to_ascii_lowercase();
+                    if lower.starts_with("sys.") {
+                        continue; // catalog view: unlocked
+                    }
+                    if let Some(def) = resolve_table(storage, &from.value) {
+                        add(Resource::Database, LockMode::IntentShared);
+                        add(Resource::Table(def.object_id), LockMode::Shared);
+                    }
+                }
+            }
+            Statement::Insert(Insert { table, .. })
+            | Statement::Update(Update { table, .. })
+            | Statement::Delete(Delete { table, .. }) => {
+                if let Some(def) = resolve_table(storage, &table.value) {
+                    add(Resource::Database, LockMode::IntentExclusive);
+                    add(Resource::Table(def.object_id), LockMode::Exclusive);
+                }
+            }
+            // DDL serializes against every active transaction via a
+            // database-exclusive lock (it is disallowed inside a txn anyway).
+            Statement::CreateTable(_) | Statement::DropTable(_) => {
+                add(Resource::Database, LockMode::Exclusive);
+            }
+            // Transaction control and SET take no data locks.
+            Statement::BeginTransaction { .. }
+            | Statement::Commit { .. }
+            | Statement::Rollback { .. }
+            | Statement::Set(_) => {}
+        }
+    }
+    needs.into_iter().collect()
+}
+
 /// Parses and executes a SQL batch, returning one result per statement, or
 /// the first error (discarding earlier results). Kept for tests; the server
 /// uses [`execute_batch`].
 #[cfg(test)]
 pub fn execute(storage: &mut Storage, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
-    let outcome = execute_batch(storage, sql);
+    let mut txn_ctx = TxnContext::default();
+    let outcome = execute_batch(storage, sql, &mut txn_ctx);
     match outcome.error {
         Some(error) => Err(error),
         None => Ok(outcome.results),
     }
 }
 
+impl TxnContext {
+    fn scope(&mut self) -> TxnScope<'_> {
+        match &mut self.txn {
+            Some(txn) => TxnScope::Explicit(txn),
+            None => TxnScope::Auto,
+        }
+    }
+}
+
 fn exec_statement(
     storage: &mut Storage,
     statement: &Statement,
+    txn_ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
-    match statement {
-        Statement::CreateTable(create) => exec_create_table(storage, create),
-        Statement::DropTable(drop) => exec_drop_table(storage, drop),
-        Statement::Insert(insert) => exec_insert(storage, insert),
-        Statement::Update(update) => exec_update(storage, update),
-        Statement::Delete(delete) => exec_delete(storage, delete),
-        Statement::Select(select) => Ok(StatementResult::Rows(exec_select(storage, select)?)),
+    // A doomed transaction rejects everything but ROLLBACK.
+    if txn_ctx.doomed && !matches!(statement, Statement::Rollback { .. }) {
+        return Err(SqlError::new(
+            3930,
+            16,
+            1,
+            "The current transaction cannot be committed and cannot support operations that write to the log file. Roll back the transaction.",
+        ));
     }
+    match statement {
+        Statement::BeginTransaction { .. } => exec_begin(storage, txn_ctx),
+        Statement::Commit { .. } => exec_commit(storage, txn_ctx),
+        Statement::Rollback { .. } => exec_rollback(storage, txn_ctx),
+        Statement::Set(set) => exec_set(txn_ctx, set),
+        Statement::CreateTable(create) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_table(storage, create)
+        }
+        Statement::DropTable(drop) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_table(storage, drop)
+        }
+        Statement::Insert(insert) => {
+            let eval_ctx = txn_ctx.eval_context();
+            let mut scope = txn_ctx.scope();
+            exec_insert(storage, insert, &mut scope, &eval_ctx)
+        }
+        Statement::Update(update) => {
+            let eval_ctx = txn_ctx.eval_context();
+            let mut scope = txn_ctx.scope();
+            exec_update(storage, update, &mut scope, &eval_ctx)
+        }
+        Statement::Delete(delete) => {
+            let eval_ctx = txn_ctx.eval_context();
+            let mut scope = txn_ctx.scope();
+            exec_delete(storage, delete, &mut scope, &eval_ctx)
+        }
+        Statement::Select(select) => {
+            let eval_ctx = txn_ctx.eval_context();
+            Ok(StatementResult::Rows(exec_select(
+                storage, select, &eval_ctx,
+            )?))
+        }
+    }
+}
+
+fn ddl_in_txn_err() -> SqlError {
+    SqlError::new(
+        226,
+        16,
+        1,
+        "DDL statements are not allowed inside an explicit transaction in this version.",
+    )
+}
+
+// ---- transaction control -----------------------------------------------
+
+fn exec_begin(storage: &mut Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
+    if ctx.txn.is_none() {
+        ctx.txn = Some(storage.rel_begin().map_err(|e| map_storage_err(e, ""))?);
+    }
+    // Nested BEGIN only bumps the count (SQL Server semantics).
+    ctx.trancount += 1;
+    Ok(StatementResult::Done)
+}
+
+fn exec_commit(storage: &mut Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
+    if ctx.trancount == 0 {
+        return Err(SqlError::new(
+            3902,
+            16,
+            1,
+            "The COMMIT TRANSACTION request has no corresponding BEGIN TRANSACTION.",
+        ));
+    }
+    ctx.trancount -= 1;
+    // Only the outermost COMMIT actually commits.
+    if ctx.trancount == 0
+        && let Some(txn) = ctx.txn.take()
+    {
+        storage
+            .rel_commit(txn)
+            .map_err(|e| map_storage_err(e, ""))?;
+    }
+    Ok(StatementResult::Done)
+}
+
+fn exec_rollback(storage: &mut Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
+    if ctx.trancount == 0 {
+        return Err(SqlError::new(
+            3903,
+            16,
+            1,
+            "The ROLLBACK TRANSACTION request has no corresponding BEGIN TRANSACTION.",
+        ));
+    }
+    // ROLLBACK always unwinds the whole transaction, regardless of nesting.
+    // Reset the session's transaction counters even if the storage rollback
+    // fails (which wedges the store): the transaction is over either way, so
+    // leaving @@TRANCOUNT / doomed set would desync the session.
+    let result = match ctx.txn.take() {
+        Some(txn) => storage
+            .rel_rollback(txn)
+            .map_err(|e| map_storage_err(e, "")),
+        None => Ok(()),
+    };
+    ctx.trancount = 0;
+    ctx.doomed = false;
+    result.map(|()| StatementResult::Done)
+}
+
+fn exec_set(ctx: &mut TxnContext, set: &SetStatement) -> Result<StatementResult, SqlError> {
+    match set {
+        SetStatement::XactAbort(on) => ctx.xact_abort = *on,
+        SetStatement::IsolationLevel(level) => {
+            ctx.isolation = match level {
+                IsolationLevel::ReadUncommitted => Isolation::ReadUncommitted,
+                IsolationLevel::ReadCommitted => Isolation::ReadCommitted,
+                IsolationLevel::RepeatableRead => Isolation::RepeatableRead,
+                IsolationLevel::Serializable => Isolation::Serializable,
+            }
+        }
+    }
+    Ok(StatementResult::Done)
 }
 
 // ---- CREATE TABLE -------------------------------------------------------
@@ -341,7 +613,12 @@ fn exec_drop_table(storage: &mut Storage, drop: &DropTable) -> Result<StatementR
 
 // ---- INSERT -------------------------------------------------------------
 
-fn exec_insert(storage: &mut Storage, insert: &Insert) -> Result<StatementResult, SqlError> {
+fn exec_insert(
+    storage: &mut Storage,
+    insert: &Insert,
+    scope: &mut TxnScope,
+    eval_ctx: &EvalContext,
+) -> Result<StatementResult, SqlError> {
     let def = resolve_table(storage, &insert.table.value)
         .ok_or_else(|| SqlError::invalid_object(&insert.table.value).at(insert.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
@@ -414,7 +691,7 @@ fn exec_insert(storage: &mut Storage, insert: &Insert) -> Result<StatementResult
         let mut values = vec![Datum::Null; ncols];
         for (position, expr) in target.iter().zip(row_exprs) {
             let column = &schema.columns[*position];
-            let sql_value = eval_constant(expr)?;
+            let sql_value = eval_constant(expr, eval_ctx)?;
             if sql_value.is_null() && !column.nullable {
                 return Err(SqlError::null_into_not_null(
                     &column.name,
@@ -434,7 +711,7 @@ fn exec_insert(storage: &mut Storage, insert: &Insert) -> Result<StatementResult
                 continue;
             }
             if let Some(text) = def.default_for(index) {
-                let sql_value = eval_default(text)?;
+                let sql_value = eval_default(text, eval_ctx)?;
                 values[index] = value::sql_to_datum(&sql_value, &column.column_type, &column.name)?;
             }
         }
@@ -452,15 +729,15 @@ fn exec_insert(storage: &mut Storage, insert: &Insert) -> Result<StatementResult
 
     let inserted = rows.len() as u64;
     storage
-        .rel_insert_many(&def.name, rows)
+        .rel_insert_many(&def.name, rows, scope)
         .map_err(|err| map_storage_err(err, &def.name))?;
     Ok(StatementResult::RowsAffected(inserted))
 }
 
 /// Evaluates a column DEFAULT (re-parsed from its stored source text).
-fn eval_default(text: &str) -> Result<SqlValue, SqlError> {
+fn eval_default(text: &str, eval_ctx: &EvalContext) -> Result<SqlValue, SqlError> {
     let expr = truthdb_sql::parse_expr(text)?;
-    eval_constant(&expr)
+    eval_constant(&expr, eval_ctx)
 }
 
 /// Coerces a generated identity value to its column's integer type, erroring
@@ -491,7 +768,12 @@ fn identity_datum(column_type: &ColumnType, v: i64) -> Result<Datum, SqlError> {
 
 // ---- UPDATE / DELETE ----------------------------------------------------
 
-fn exec_update(storage: &mut Storage, update: &Update) -> Result<StatementResult, SqlError> {
+fn exec_update(
+    storage: &mut Storage,
+    update: &Update,
+    scope: &mut TxnScope,
+    eval_ctx: &EvalContext,
+) -> Result<StatementResult, SqlError> {
     let def = resolve_table(storage, &update.table.value)
         .ok_or_else(|| SqlError::invalid_object(&update.table.value).at(update.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
@@ -539,7 +821,7 @@ fn exec_update(storage: &mut Storage, update: &Update) -> Result<StatementResult
     let types = schema_types(&schema);
     let mut updates = Vec::new();
     for (locator, row) in located {
-        if !predicate_true(&update.where_clause, &row, &types, &resolver)? {
+        if !predicate_true(&update.where_clause, &row, &types, &resolver, eval_ctx)? {
             continue;
         }
         // Every SET expression sees the pre-update row.
@@ -547,7 +829,7 @@ fn exec_update(storage: &mut Storage, update: &Update) -> Result<StatementResult
         let mut new_row = row;
         for (index, expr) in &assignments {
             let column = &schema.columns[*index];
-            let sql_value = eval::eval(expr, &old_scope, &resolver)?;
+            let sql_value = eval::eval(expr, &old_scope, &resolver, eval_ctx)?;
             if sql_value.is_null() && !column.nullable {
                 return Err(SqlError::null_into_not_null(
                     &column.name,
@@ -559,12 +841,17 @@ fn exec_update(storage: &mut Storage, update: &Update) -> Result<StatementResult
         updates.push((locator, new_row));
     }
     let count = storage
-        .rel_update_located(&def.name, updates)
+        .rel_update_located(&def.name, updates, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
     Ok(StatementResult::RowsAffected(count as u64))
 }
 
-fn exec_delete(storage: &mut Storage, delete: &Delete) -> Result<StatementResult, SqlError> {
+fn exec_delete(
+    storage: &mut Storage,
+    delete: &Delete,
+    scope: &mut TxnScope,
+    eval_ctx: &EvalContext,
+) -> Result<StatementResult, SqlError> {
     let def = resolve_table(storage, &delete.table.value)
         .ok_or_else(|| SqlError::invalid_object(&delete.table.value).at(delete.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
@@ -576,12 +863,12 @@ fn exec_delete(storage: &mut Storage, delete: &Delete) -> Result<StatementResult
         .map_err(|e| map_storage_err(e, &def.name))?;
     let mut targets = Vec::new();
     for (locator, row) in located {
-        if predicate_true(&delete.where_clause, &row, &types, &resolver)? {
+        if predicate_true(&delete.where_clause, &row, &types, &resolver, eval_ctx)? {
             targets.push(locator);
         }
     }
     let count = storage
-        .rel_delete_located(&def.name, targets)
+        .rel_delete_located(&def.name, targets, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
     Ok(StatementResult::RowsAffected(count as u64))
 }
@@ -602,11 +889,12 @@ fn predicate_true(
     row: &[Datum],
     types: &[ColumnType],
     resolver: &Vec<String>,
+    eval_ctx: &EvalContext,
 ) -> Result<bool, SqlError> {
     let Some(predicate) = where_clause else {
         return Ok(true);
     };
-    match eval::eval(predicate, &row_values(row, types), resolver)? {
+    match eval::eval(predicate, &row_values(row, types), resolver, eval_ctx)? {
         SqlValue::Bool(b) => Ok(b),
         SqlValue::Null => Ok(false),
         _ => Err(SqlError::new(
@@ -649,7 +937,11 @@ fn row_values(row: &[Datum], types: &[ColumnType]) -> Vec<SqlValue> {
         .collect()
 }
 
-fn exec_select(storage: &mut Storage, select: &Select) -> Result<RowSet, SqlError> {
+fn exec_select(
+    storage: &mut Storage,
+    select: &Select,
+    eval_ctx: &EvalContext,
+) -> Result<RowSet, SqlError> {
     let source = build_source(storage, select.from.as_ref())?;
     let resolver = source.names();
     let types = source.types();
@@ -661,7 +953,7 @@ fn exec_select(storage: &mut Storage, select: &Select) -> Result<RowSet, SqlErro
         let keep = match &select.where_clause {
             None => true,
             Some(predicate) => {
-                let value = eval::eval(predicate, &row_values(&row, &types), &resolver)?;
+                let value = eval::eval(predicate, &row_values(&row, &types), &resolver, eval_ctx)?;
                 match value {
                     SqlValue::Bool(b) => b,
                     SqlValue::Null => false,
@@ -691,6 +983,7 @@ fn exec_select(storage: &mut Storage, select: &Select) -> Result<RowSet, SqlErro
             &types,
             &source.collations,
             &resolver,
+            eval_ctx,
         )?;
     }
 
@@ -699,7 +992,14 @@ fn exec_select(storage: &mut Storage, select: &Select) -> Result<RowSet, SqlErro
         rows.truncate(top as usize);
     }
 
-    project(&select.items, &source.columns, &rows, &types, &resolver)
+    project(
+        &select.items,
+        &source.columns,
+        &rows,
+        &types,
+        &resolver,
+        eval_ctx,
+    )
 }
 
 fn order_rows(
@@ -708,6 +1008,7 @@ fn order_rows(
     types: &[ColumnType],
     collations: &[Option<String>],
     resolver: &Vec<String>,
+    eval_ctx: &EvalContext,
 ) -> Result<(), SqlError> {
     use std::cmp::Ordering;
     // A bare character column is ordered by its collation (its COLLATE clause,
@@ -739,7 +1040,7 @@ fn order_rows(
         let values = row_values(row, types);
         let mut key = Vec::with_capacity(order_by.len());
         for item in order_by {
-            key.push(eval::eval(&item.expr, &values, resolver)?);
+            key.push(eval::eval(&item.expr, &values, resolver, eval_ctx)?);
         }
         keyed.push((key, index));
     }
@@ -772,6 +1073,7 @@ fn project(
     rows: &[Vec<Datum>],
     types: &[ColumnType],
     resolver: &Vec<String>,
+    eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
     // Output column plan: a source column (typed, pass-through) or a
     // computed expression (evaluated then typed by inference).
@@ -827,7 +1129,7 @@ fn project(
                 // Evaluate the column for every row, then infer one type.
                 let mut values = Vec::with_capacity(rows.len());
                 for row in &row_sql {
-                    values.push(eval::eval(expr, row, resolver)?);
+                    values.push(eval::eval(expr, row, resolver, eval_ctx)?);
                 }
                 let column_type = value::infer_type(&values);
                 for (out, value) in out_rows.iter_mut().zip(&values) {
@@ -975,9 +1277,9 @@ fn sys_columns(storage: &Storage) -> Source {
 // ---- helpers ------------------------------------------------------------
 
 /// Evaluates a constant expression (INSERT VALUES): no columns in scope.
-fn eval_constant(expr: &Expr) -> Result<SqlValue, SqlError> {
+fn eval_constant(expr: &Expr, eval_ctx: &EvalContext) -> Result<SqlValue, SqlError> {
     let empty: Vec<String> = Vec::new();
-    eval::eval(expr, &[], &empty)
+    eval::eval(expr, &[], &empty, eval_ctx)
 }
 
 fn column_index(schema: &Schema, name: &str) -> Option<usize> {

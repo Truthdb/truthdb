@@ -18,12 +18,16 @@ const TOKEN_DONE: u8 = 0xfd;
 const DONE_FINAL: u16 = 0x0000;
 const DONE_MORE: u16 = 0x0001;
 const DONE_ERROR: u16 = 0x0002;
+const DONE_INXACT: u16 = 0x0004;
 const DONE_COUNT: u16 = 0x0010;
 const DONE_ATTN: u16 = 0x0020;
 
 // ENVCHANGE types.
 const ENV_DATABASE: u8 = 1;
 const ENV_PACKET_SIZE: u8 = 4;
+const ENV_BEGIN_TRAN: u8 = 8;
+const ENV_COMMIT_TRAN: u8 = 9;
+const ENV_ROLLBACK_TRAN: u8 = 10;
 
 /// UCS-2LE code units of `s`, truncated to at most `max` units. Truncating
 /// keeps the emitted body consistent with a length prefix that can only count
@@ -90,6 +94,46 @@ pub fn envchange_packet_size(out: &mut Vec<u8>, new_size: usize, old_size: usize
     out.extend_from_slice(&body);
 }
 
+/// A transaction descriptor as a B_VARBYTE (1-byte length + 8 LE bytes).
+fn push_b_varbyte_descriptor(out: &mut Vec<u8>, descriptor: u64) {
+    out.push(8);
+    out.extend_from_slice(&descriptor.to_le_bytes());
+}
+
+/// ENVCHANGE type 8 (Begin Transaction): NewValue = the new descriptor,
+/// OldValue empty. Drives `db.BeginTx()` on the client.
+pub fn envchange_begin_tran(out: &mut Vec<u8>, descriptor: u64) {
+    let mut body = Vec::new();
+    body.push(ENV_BEGIN_TRAN);
+    push_b_varbyte_descriptor(&mut body, descriptor); // new value
+    body.push(0); // old value: empty
+    out.push(TOKEN_ENVCHANGE);
+    out.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    out.extend_from_slice(&body);
+}
+
+/// ENVCHANGE type 9 (Commit Transaction): NewValue empty, OldValue = the
+/// descriptor that just committed.
+pub fn envchange_commit_tran(out: &mut Vec<u8>, descriptor: u64) {
+    envchange_end_tran(out, ENV_COMMIT_TRAN, descriptor);
+}
+
+/// ENVCHANGE type 10 (Rollback Transaction): NewValue empty, OldValue = the
+/// descriptor that just rolled back.
+pub fn envchange_rollback_tran(out: &mut Vec<u8>, descriptor: u64) {
+    envchange_end_tran(out, ENV_ROLLBACK_TRAN, descriptor);
+}
+
+fn envchange_end_tran(out: &mut Vec<u8>, env_type: u8, descriptor: u64) {
+    let mut body = Vec::new();
+    body.push(env_type);
+    body.push(0); // new value: empty
+    push_b_varbyte_descriptor(&mut body, descriptor); // old value
+    out.push(TOKEN_ENVCHANGE);
+    out.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    out.extend_from_slice(&body);
+}
+
 /// INFO token (informational message, same shape as ERROR).
 pub fn info(out: &mut Vec<u8>, number: i32, state: u8, class: u8, message: &str) {
     message_token(out, TOKEN_INFO, number, state, class, message);
@@ -144,11 +188,15 @@ pub fn row(out: &mut Vec<u8>, values: &[Datum], columns: &[ResultColumn]) {
 }
 
 /// DONE token. `more` sets DONE_MORE (another result follows); `count`
-/// carries a row count (DONE_COUNT); `error` sets DONE_ERROR.
-pub fn done(out: &mut Vec<u8>, more: bool, error: bool, count: Option<u64>) {
+/// carries a row count (DONE_COUNT); `error` sets DONE_ERROR; `in_xact` sets
+/// DONE_INXACT (a transaction is still active for the connection).
+pub fn done(out: &mut Vec<u8>, more: bool, error: bool, in_xact: bool, count: Option<u64>) {
     let mut status = if more { DONE_MORE } else { DONE_FINAL };
     if error {
         status |= DONE_ERROR;
+    }
+    if in_xact {
+        status |= DONE_INXACT;
     }
     if count.is_some() {
         status |= DONE_COUNT;
@@ -215,12 +263,45 @@ mod tests {
     #[test]
     fn done_status_bits() {
         let mut out = Vec::new();
-        done(&mut out, false, false, Some(3));
+        done(&mut out, false, false, false, Some(3));
         assert_eq!(out[0], TOKEN_DONE);
         let status = u16::from_le_bytes([out[1], out[2]]);
         assert_eq!(status, DONE_COUNT);
         let count = u64::from_le_bytes(out[5..13].try_into().unwrap());
         assert_eq!(count, 3);
+    }
+
+    #[test]
+    fn done_sets_inxact_flag() {
+        let mut out = Vec::new();
+        done(&mut out, false, false, true, None);
+        let status = u16::from_le_bytes([out[1], out[2]]);
+        assert_eq!(status & DONE_INXACT, DONE_INXACT);
+    }
+
+    #[test]
+    fn envchange_begin_tran_carries_descriptor() {
+        let mut out = Vec::new();
+        envchange_begin_tran(&mut out, 0x1122334455667788);
+        assert_eq!(out[0], TOKEN_ENVCHANGE);
+        let len = u16::from_le_bytes([out[1], out[2]]) as usize;
+        assert_eq!(out.len(), 3 + len);
+        assert_eq!(out[3], ENV_BEGIN_TRAN);
+        assert_eq!(out[4], 8); // new value length
+        let desc = u64::from_le_bytes(out[5..13].try_into().unwrap());
+        assert_eq!(desc, 0x1122334455667788);
+        assert_eq!(out[13], 0); // old value length
+    }
+
+    #[test]
+    fn envchange_commit_tran_carries_old_descriptor() {
+        let mut out = Vec::new();
+        envchange_commit_tran(&mut out, 0x42);
+        assert_eq!(out[3], ENV_COMMIT_TRAN);
+        assert_eq!(out[4], 0); // new value length
+        assert_eq!(out[5], 8); // old value length
+        let desc = u64::from_le_bytes(out[6..14].try_into().unwrap());
+        assert_eq!(desc, 0x42);
     }
 
     #[test]

@@ -11,6 +11,35 @@ pub enum Statement {
     Update(Update),
     Delete(Delete),
     Select(Select),
+    /// `BEGIN TRAN[SACTION] [name]`.
+    BeginTransaction {
+        name: Option<Name>,
+        span: Span,
+    },
+    /// `COMMIT [TRAN[SACTION]] [name]`.
+    Commit {
+        span: Span,
+    },
+    /// `ROLLBACK [TRAN[SACTION]] [name]`.
+    Rollback {
+        span: Span,
+    },
+    /// `SET` session option (XACT_ABORT / TRANSACTION ISOLATION LEVEL).
+    Set(SetStatement),
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum SetStatement {
+    XactAbort(bool),
+    IsolationLevel(IsolationLevel),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IsolationLevel {
+    ReadUncommitted,
+    ReadCommitted,
+    RepeatableRead,
+    Serializable,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -214,6 +243,9 @@ pub enum ExprKind {
         name: String,
         args: Vec<Expr>,
     },
+    /// A `@@`-prefixed global/session variable (e.g. `@@TRANCOUNT`), evaluated
+    /// from the session's [`EvalContext`](crate::eval::EvalContext).
+    GlobalVar(String),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -111,6 +111,152 @@ impl Parser {
             Some("UPDATE") => self.parse_update(),
             Some("DELETE") => self.parse_delete(),
             Some("SELECT") => Ok(Statement::Select(self.parse_select()?)),
+            Some("BEGIN") => self.parse_begin(),
+            Some("COMMIT") => self.parse_commit(),
+            Some("ROLLBACK") => self.parse_rollback(),
+            Some("SET") => self.parse_set(),
+            _ => {
+                let token = self.peek().clone();
+                Err(SqlError::syntax(self.token_text(&token), token.span))
+            }
+        }
+    }
+
+    // ---- transaction control --------------------------------------------
+
+    fn parse_begin(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("BEGIN")?;
+        // Stage 6 has no BEGIN...END blocks; BEGIN must open a transaction.
+        let mut end = match self.peek_keyword().as_deref() {
+            Some("TRAN") | Some("TRANSACTION") => self.bump().span,
+            _ => {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+        };
+        let name = self.parse_optional_txn_name();
+        if let Some(n) = &name {
+            end = n.span;
+        }
+        Ok(Statement::BeginTransaction {
+            name,
+            span: start.to(end),
+        })
+    }
+
+    fn parse_commit(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("COMMIT")?;
+        let end = self.eat_optional_tran_and_name(start);
+        Ok(Statement::Commit {
+            span: start.to(end),
+        })
+    }
+
+    fn parse_rollback(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("ROLLBACK")?;
+        let end = self.eat_optional_tran_and_name(start);
+        Ok(Statement::Rollback {
+            span: start.to(end),
+        })
+    }
+
+    /// Consumes an optional `TRAN`/`TRANSACTION`/`WORK` keyword and transaction
+    /// name after COMMIT/ROLLBACK; returns the end span.
+    fn eat_optional_tran_and_name(&mut self, start: Span) -> Span {
+        let mut end = start;
+        if matches!(
+            self.peek_keyword().as_deref(),
+            Some("TRAN") | Some("TRANSACTION") | Some("WORK")
+        ) {
+            end = self.bump().span;
+        }
+        if let Some(n) = self.parse_optional_txn_name() {
+            end = n.span;
+        }
+        end
+    }
+
+    fn parse_optional_txn_name(&mut self) -> Option<Name> {
+        // A bare (non-clause) identifier following is the transaction name.
+        if matches!(self.peek().kind, TokenKind::Word { quoted: true, .. }) {
+            return self.parse_name().ok();
+        }
+        if let Some(kw) = self.peek_keyword() {
+            if is_reserved(&kw) {
+                return None;
+            }
+            return self.parse_name().ok();
+        }
+        None
+    }
+
+    fn parse_set(&mut self) -> SqlResult<Statement> {
+        self.expect_keyword("SET")?;
+        match self.peek_keyword().as_deref() {
+            Some("XACT_ABORT") => {
+                self.bump();
+                let on = self.parse_on_off()?;
+                Ok(Statement::Set(SetStatement::XactAbort(on)))
+            }
+            Some("TRANSACTION") => {
+                self.bump();
+                self.expect_keyword("ISOLATION")?;
+                self.expect_keyword("LEVEL")?;
+                let level = self.parse_isolation_level()?;
+                Ok(Statement::Set(SetStatement::IsolationLevel(level)))
+            }
+            _ => {
+                let token = self.peek().clone();
+                Err(SqlError::syntax(self.token_text(&token), token.span))
+            }
+        }
+    }
+
+    fn parse_on_off(&mut self) -> SqlResult<bool> {
+        match self.peek_keyword().as_deref() {
+            Some("ON") => {
+                self.bump();
+                Ok(true)
+            }
+            Some("OFF") => {
+                self.bump();
+                Ok(false)
+            }
+            _ => {
+                let token = self.peek().clone();
+                Err(SqlError::syntax(self.token_text(&token), token.span))
+            }
+        }
+    }
+
+    fn parse_isolation_level(&mut self) -> SqlResult<IsolationLevel> {
+        match self.peek_keyword().as_deref() {
+            Some("READ") => {
+                self.bump();
+                match self.peek_keyword().as_deref() {
+                    Some("UNCOMMITTED") => {
+                        self.bump();
+                        Ok(IsolationLevel::ReadUncommitted)
+                    }
+                    Some("COMMITTED") => {
+                        self.bump();
+                        Ok(IsolationLevel::ReadCommitted)
+                    }
+                    _ => {
+                        let token = self.peek().clone();
+                        Err(SqlError::syntax(self.token_text(&token), token.span))
+                    }
+                }
+            }
+            Some("REPEATABLE") => {
+                self.bump();
+                self.expect_keyword("READ")?;
+                Ok(IsolationLevel::RepeatableRead)
+            }
+            Some("SERIALIZABLE") => {
+                self.bump();
+                Ok(IsolationLevel::Serializable)
+            }
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -913,6 +1059,13 @@ impl Parser {
                 self.bump();
                 Ok(Expr {
                     kind: ExprKind::Str(s.clone()),
+                    span: token.span,
+                })
+            }
+            TokenKind::GlobalVar(name) => {
+                self.bump();
+                Ok(Expr {
+                    kind: ExprKind::GlobalVar(name.clone()),
                     span: token.span,
                 })
             }
