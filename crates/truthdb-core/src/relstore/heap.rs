@@ -329,6 +329,35 @@ impl Heap {
         Ok(())
     }
 
+    /// Reads the row at a home RID, following a forwarding stub to its moved
+    /// copy. Returns the raw row bytes, or None if the slot is empty. Used by
+    /// index key lookups (the index stores home RIDs).
+    pub fn read_row(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        rid: Rid,
+    ) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(cell) = self.read_cell(ctx, rid)? else {
+            return Ok(None);
+        };
+        match cell[0] {
+            TAG_ROW => Ok(Some(cell[1..].to_vec())),
+            TAG_MOVED => Ok(Some(cell[11..].to_vec())),
+            TAG_STUB => {
+                let target = parse_rid(&cell[1..]);
+                match self.read_cell(ctx, target)? {
+                    Some(target_cell) if target_cell[0] == TAG_MOVED => {
+                        Ok(Some(target_cell[11..].to_vec()))
+                    }
+                    _ => Ok(None),
+                }
+            }
+            other => Err(StorageError::InvalidFile(format!(
+                "unknown heap cell tag {other}"
+            ))),
+        }
+    }
+
     /// Scans all rows: (home RID, row bytes). Moved rows report their home
     /// RID; stubs and tombstones are skipped.
     pub fn scan(&self, ctx: &mut RelCtx<'_>) -> Result<Vec<(Rid, Vec<u8>)>, StorageError> {

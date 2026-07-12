@@ -105,8 +105,8 @@ impl Parser {
 
     fn parse_statement(&mut self) -> SqlResult<Statement> {
         match self.peek_keyword().as_deref() {
-            Some("CREATE") => self.parse_create_table(),
-            Some("DROP") => self.parse_drop_table(),
+            Some("CREATE") => self.parse_create(),
+            Some("DROP") => self.parse_drop(),
             Some("INSERT") => self.parse_insert(),
             Some("UPDATE") => self.parse_update(),
             Some("DELETE") => self.parse_delete(),
@@ -205,6 +205,11 @@ impl Parser {
                 let level = self.parse_isolation_level()?;
                 Ok(Statement::Set(SetStatement::IsolationLevel(level)))
             }
+            Some("SHOWPLAN_TEXT") => {
+                self.bump();
+                let on = self.parse_on_off()?;
+                Ok(Statement::Set(SetStatement::ShowplanText(on)))
+            }
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -266,8 +271,62 @@ impl Parser {
 
     // ---- CREATE TABLE ---------------------------------------------------
 
-    fn parse_create_table(&mut self) -> SqlResult<Statement> {
+    /// Dispatches `CREATE TABLE` vs `CREATE [UNIQUE] INDEX`.
+    fn parse_create(&mut self) -> SqlResult<Statement> {
         let start = self.expect_keyword("CREATE")?;
+        let unique = self.peek_keyword().as_deref() == Some("UNIQUE");
+        if unique {
+            self.bump();
+        }
+        match self.peek_keyword().as_deref() {
+            Some("INDEX") => self.parse_create_index(start, unique),
+            Some("TABLE") if !unique => self.parse_create_table(start),
+            _ => {
+                let token = self.peek().clone();
+                Err(SqlError::syntax(self.token_text(&token), token.span))
+            }
+        }
+    }
+
+    fn parse_create_index(&mut self, start: Span, unique: bool) -> SqlResult<Statement> {
+        self.expect_keyword("INDEX")?;
+        let name = self.parse_name()?;
+        self.expect_keyword("ON")?;
+        let table = self.parse_name()?;
+        self.expect(&TokenKind::LParen)?;
+        let mut columns = Vec::new();
+        loop {
+            let col_name = self.parse_name()?;
+            let ascending = match self.peek_keyword().as_deref() {
+                Some("ASC") => {
+                    self.bump();
+                    true
+                }
+                Some("DESC") => {
+                    self.bump();
+                    false
+                }
+                _ => true,
+            };
+            columns.push(IndexColumn {
+                name: col_name,
+                ascending,
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(&TokenKind::RParen)?;
+        Ok(Statement::CreateIndex(CreateIndex {
+            name,
+            table,
+            unique,
+            columns,
+            span: start.to(end),
+        }))
+    }
+
+    fn parse_create_table(&mut self, start: Span) -> SqlResult<Statement> {
         self.expect_keyword("TABLE")?;
         let table = self.parse_name()?;
         self.expect(&TokenKind::LParen)?;
@@ -483,8 +542,32 @@ impl Parser {
 
     // ---- DROP TABLE -----------------------------------------------------
 
-    fn parse_drop_table(&mut self) -> SqlResult<Statement> {
+    /// Dispatches `DROP TABLE` vs `DROP INDEX`.
+    fn parse_drop(&mut self) -> SqlResult<Statement> {
         let start = self.expect_keyword("DROP")?;
+        match self.peek_keyword().as_deref() {
+            Some("INDEX") => self.parse_drop_index(start),
+            Some("TABLE") => self.parse_drop_table(start),
+            _ => {
+                let token = self.peek().clone();
+                Err(SqlError::syntax(self.token_text(&token), token.span))
+            }
+        }
+    }
+
+    fn parse_drop_index(&mut self, start: Span) -> SqlResult<Statement> {
+        self.expect_keyword("INDEX")?;
+        let name = self.parse_name()?;
+        self.expect_keyword("ON")?;
+        let table = self.parse_name()?;
+        Ok(Statement::DropIndex(DropIndex {
+            span: start.to(table.span),
+            name,
+            table,
+        }))
+    }
+
+    fn parse_drop_table(&mut self, start: Span) -> SqlResult<Statement> {
         self.expect_keyword("TABLE")?;
         let if_exists = if self.peek_keyword().as_deref() == Some("IF") {
             self.bump();

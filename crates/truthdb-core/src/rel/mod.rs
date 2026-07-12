@@ -8,11 +8,12 @@
 //! error numbers.
 
 pub mod collation;
+mod plan;
 mod value;
 
 use truthdb_sql::ast::{
-    ColumnDef, CreateTable, DataType, Delete, DropTable, Expr, ExprKind, Insert, IsolationLevel,
-    Name, OrderItem, Select, SelectItem, SetStatement, Statement, Update,
+    ColumnDef, CreateIndex, CreateTable, DataType, Delete, DropIndex, DropTable, Expr, ExprKind,
+    Insert, IsolationLevel, Name, OrderItem, Select, SelectItem, SetStatement, Statement, Update,
 };
 use truthdb_sql::error::SqlError;
 use truthdb_sql::eval::EvalContext;
@@ -38,6 +39,8 @@ pub struct TxnContext {
     doomed: bool,
     xact_abort: bool,
     isolation: Isolation,
+    /// `SET SHOWPLAN_TEXT ON` — a SELECT returns its plan text, not results.
+    showplan_text: bool,
 }
 
 /// Session isolation level (defaults to READ COMMITTED, like SQL Server).
@@ -214,7 +217,10 @@ pub fn analyze_locks(
             }
             // DDL serializes against every active transaction via a
             // database-exclusive lock (it is disallowed inside a txn anyway).
-            Statement::CreateTable(_) | Statement::DropTable(_) => {
+            Statement::CreateTable(_)
+            | Statement::DropTable(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_) => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // Transaction control and SET take no data locks.
@@ -280,6 +286,18 @@ fn exec_statement(
             }
             exec_drop_table(storage, drop)
         }
+        Statement::CreateIndex(create) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_index(storage, create)
+        }
+        Statement::DropIndex(drop) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_index(storage, drop)
+        }
         Statement::Insert(insert) => {
             let eval_ctx = txn_ctx.eval_context();
             let mut scope = txn_ctx.scope();
@@ -297,11 +315,50 @@ fn exec_statement(
         }
         Statement::Select(select) => {
             let eval_ctx = txn_ctx.eval_context();
-            Ok(StatementResult::Rows(exec_select(
-                storage, select, &eval_ctx,
-            )?))
+            if txn_ctx.showplan_text {
+                Ok(StatementResult::Rows(showplan_rows(
+                    storage, select, &eval_ctx,
+                )?))
+            } else {
+                Ok(StatementResult::Rows(exec_select(
+                    storage, select, &eval_ctx,
+                )?))
+            }
         }
     }
+}
+
+/// Builds a one-column `SHOWPLAN_TEXT` rowset describing a SELECT's access
+/// path, without executing it.
+fn showplan_rows(
+    storage: &mut Storage,
+    select: &Select,
+    eval_ctx: &EvalContext,
+) -> Result<RowSet, SqlError> {
+    let lines = match select.from.as_ref() {
+        Some(from) if !from.value.to_ascii_lowercase().starts_with("sys.") => {
+            match resolve_table(storage, &from.value) {
+                Some(def) => {
+                    let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
+                    let path = plan::choose(&def, &schema, &select.where_clause, eval_ctx);
+                    plan::plan_text(&path, &def.name)
+                }
+                None => vec![format!("Table Scan({})", from.value)],
+            }
+        }
+        Some(from) => vec![format!("Table Scan({})", from.value)],
+        None => vec!["Constant Scan".to_string()],
+    };
+    Ok(RowSet {
+        columns: vec![ResultColumn {
+            name: "StmtText".to_string(),
+            column_type: ColumnType::NVarChar { max_len: 4000 },
+        }],
+        rows: lines
+            .into_iter()
+            .map(|line| vec![Datum::NVarChar(line)])
+            .collect(),
+    })
 }
 
 fn ddl_in_txn_err() -> SqlError {
@@ -380,6 +437,7 @@ fn exec_set(ctx: &mut TxnContext, set: &SetStatement) -> Result<StatementResult,
                 IsolationLevel::Serializable => Isolation::Serializable,
             }
         }
+        SetStatement::ShowplanText(on) => ctx.showplan_text = *on,
     }
     Ok(StatementResult::Done)
 }
@@ -611,6 +669,52 @@ fn exec_drop_table(storage: &mut Storage, drop: &DropTable) -> Result<StatementR
     }
 }
 
+// ---- CREATE / DROP INDEX ------------------------------------------------
+
+fn exec_create_index(
+    storage: &mut Storage,
+    create: &CreateIndex,
+) -> Result<StatementResult, SqlError> {
+    let def = resolve_table(storage, &create.table.value)
+        .ok_or_else(|| SqlError::invalid_object(&create.table.value).at(create.table.span))?;
+    let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
+    let mut columns = Vec::with_capacity(create.columns.len());
+    for col in &create.columns {
+        let index = schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&col.name.value))
+            .ok_or_else(|| SqlError::invalid_column(&col.name.value).at(col.name.span))?;
+        columns.push((index, col.ascending));
+    }
+    storage
+        .rel_create_index(&def.name, create.name.value.clone(), columns, create.unique)
+        .map_err(|e| map_storage_err(e, &def.name))?;
+    Ok(StatementResult::Done)
+}
+
+fn exec_drop_index(storage: &mut Storage, drop: &DropIndex) -> Result<StatementResult, SqlError> {
+    // Resolve the table so the index lookup is scoped to it (index names are
+    // per-table; two tables may share an index name).
+    let table = resolve_table(storage, &drop.table.value)
+        .ok_or_else(|| SqlError::invalid_object(&drop.table.value).at(drop.table.span))?;
+    let existed = storage
+        .rel_drop_index(&table.name, &drop.name.value)
+        .map_err(|e| map_storage_err(e, &drop.name.value))?;
+    if !existed {
+        return Err(SqlError::new(
+            3701,
+            11,
+            5,
+            format!(
+                "Cannot drop the index '{}', because it does not exist or you do not have permission.",
+                drop.name.value
+            ),
+        ));
+    }
+    Ok(StatementResult::Done)
+}
+
 // ---- INSERT -------------------------------------------------------------
 
 fn exec_insert(
@@ -824,7 +928,9 @@ fn exec_update(
         if !predicate_true(&update.where_clause, &row, &types, &resolver, eval_ctx)? {
             continue;
         }
-        // Every SET expression sees the pre-update row.
+        // Every SET expression sees the pre-update row; keep the old values
+        // for secondary-index maintenance.
+        let old_values = row.clone();
         let old_scope = row_values(&row, &types);
         let mut new_row = row;
         for (index, expr) in &assignments {
@@ -838,7 +944,7 @@ fn exec_update(
             }
             new_row[*index] = value::sql_to_datum(&sql_value, &column.column_type, &column.name)?;
         }
-        updates.push((locator, new_row));
+        updates.push((locator, old_values, new_row));
     }
     let count = storage
         .rel_update_located(&def.name, updates, scope)
@@ -864,7 +970,8 @@ fn exec_delete(
     let mut targets = Vec::new();
     for (locator, row) in located {
         if predicate_true(&delete.where_clause, &row, &types, &resolver, eval_ctx)? {
-            targets.push(locator);
+            // Keep the row values for secondary-index maintenance.
+            targets.push((locator, row));
         }
     }
     let count = storage
@@ -942,7 +1049,12 @@ fn exec_select(
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
-    let source = build_source(storage, select.from.as_ref())?;
+    let source = build_source(
+        storage,
+        select.from.as_ref(),
+        &select.where_clause,
+        eval_ctx,
+    )?;
     let resolver = source.names();
     let types = source.types();
 
@@ -1166,7 +1278,12 @@ fn bare_column_index(expr: &Expr, columns: &[String]) -> Option<usize> {
     }
 }
 
-fn build_source(storage: &mut Storage, from: Option<&Name>) -> Result<Source, SqlError> {
+fn build_source(
+    storage: &mut Storage,
+    from: Option<&Name>,
+    where_clause: &Option<Expr>,
+    eval_ctx: &EvalContext,
+) -> Result<Source, SqlError> {
     let Some(from) = from else {
         // No FROM: one row, no columns (constant SELECT).
         return Ok(Source {
@@ -1178,13 +1295,26 @@ fn build_source(storage: &mut Storage, from: Option<&Name>) -> Result<Source, Sq
     match from.value.to_ascii_lowercase().as_str() {
         "sys.tables" => Ok(sys_tables(storage)),
         "sys.columns" => Ok(sys_columns(storage)),
+        "sys.indexes" => Ok(sys_indexes(storage)),
         _ => {
             let def = resolve_table(storage, &from.value)
                 .ok_or_else(|| SqlError::invalid_object(&from.value).at(from.span))?;
             let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
-            let rows = storage
-                .rel_scan(&def.name)
-                .map_err(|err| map_storage_err(err, &def.name))?;
+            // Access-path selection: an index seek narrows the candidate set;
+            // the WHERE filter above re-checks, so results match a full scan.
+            let rows = match plan::choose(&def, &schema, where_clause, eval_ctx) {
+                plan::AccessPath::TableScan => storage
+                    .rel_scan(&def.name)
+                    .map_err(|err| map_storage_err(err, &def.name))?,
+                plan::AccessPath::IndexSeek {
+                    index_object_id,
+                    lower,
+                    upper,
+                    ..
+                } => storage
+                    .rel_index_scan(&def.name, index_object_id, lower, upper)
+                    .map_err(|err| map_storage_err(err, &def.name))?,
+            };
             let columns = schema
                 .columns
                 .iter()
@@ -1274,6 +1404,35 @@ fn sys_columns(storage: &Storage) -> Source {
     }
 }
 
+fn sys_indexes(storage: &Storage) -> Source {
+    let columns = vec![
+        int_col("object_id"),
+        int_col("index_id"),
+        nvarchar("name", 128),
+        ResultColumn {
+            name: "is_unique".to_string(),
+            column_type: ColumnType::Bit,
+        },
+    ];
+    let mut rows = Vec::new();
+    for def in storage.rel_tables() {
+        for index in &def.indexes {
+            rows.push(vec![
+                Datum::Int(def.object_id as i32),
+                Datum::Int(index.object_id as i32),
+                Datum::NVarChar(index.name.clone()),
+                Datum::Bit(index.unique),
+            ]);
+        }
+    }
+    let collations = vec![None; columns.len()];
+    Source {
+        columns,
+        collations,
+        rows,
+    }
+}
+
 // ---- helpers ------------------------------------------------------------
 
 /// Evaluates a constant expression (INSERT VALUES): no columns in scope.
@@ -1317,6 +1476,14 @@ fn map_storage_err(err: StorageError, table: &str) -> SqlError {
     match err {
         StorageError::Constraint(msg) if msg.contains("duplicate primary key") => {
             SqlError::pk_violation(table)
+        }
+        StorageError::Constraint(msg) if msg.contains("duplicate unique index") => {
+            // 2601: cannot insert a duplicate key row in a unique index.
+            SqlError::new(2601, 14, 1, msg)
+        }
+        StorageError::Constraint(msg) if msg.contains("already exists") => {
+            // 1913: an index with that name already exists on the table.
+            SqlError::new(1913, 16, 1, msg)
         }
         StorageError::Constraint(msg) if msg.contains("does not allow NULL") => {
             SqlError::new(515, 16, 2, msg)

@@ -15,7 +15,7 @@
 //! performed in memory, then logged as full-page images of every touched
 //! page (redo is idempotent by page LSN), never undone.
 
-use crate::relstore::ctx::{OpMode, RelCtx};
+use crate::relstore::ctx::{LogMode, OpMode, RelCtx};
 use crate::relstore::page::PAGE_TYPE_TREE;
 use crate::relstore::slotted::{NO_PAGE, SlottedPage, SlottedRead};
 use crate::storage::StorageError;
@@ -211,6 +211,54 @@ impl BTree {
         }
     }
 
+    /// Inserts a unique key logged as a system image (redo-only, no undo).
+    /// Used to backfill a freshly-created index tree: the tree is not yet in
+    /// the statement's undo roots, so per-insert undo could not re-descend it.
+    /// A failed build simply leaves the whole tree an unreferenced orphan (the
+    /// catalog entry that would name it is undone), matching the accepted
+    /// DDL-rollback page-leak trade-off.
+    pub fn insert_unique_bulk(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        key: &[u8],
+        row: &[u8],
+    ) -> Result<TreeInsert, StorageError> {
+        let cell = leaf_cell(key, row);
+        if cell.len() > TREE_MAX_CELL {
+            return Err(StorageError::InvalidConfig(format!(
+                "tree row of {} bytes exceeds the per-cell cap of {TREE_MAX_CELL}",
+                cell.len()
+            )));
+        }
+        loop {
+            let path = self.descend(ctx, key)?;
+            let leaf = path.last().expect("leaf").page;
+            let frame = ctx.fetch(leaf)?;
+            let page = SlottedRead::new(ctx.pool.page(frame));
+            let position = match leaf_search(&page, key) {
+                Ok(_) => {
+                    ctx.pool.unpin(frame);
+                    return Ok(TreeInsert::DuplicateKey);
+                }
+                Err(position) => position,
+            };
+            let fits = page.total_free() >= cell.len() + 4;
+            ctx.pool.unpin(frame);
+            if fits {
+                ctx.apply_op(
+                    LogMode::System,
+                    PageOpRedo::InsertAt {
+                        page: leaf,
+                        index: position as u16,
+                        bytes: cell.clone(),
+                    },
+                )?;
+                return Ok(TreeInsert::Inserted);
+            }
+            self.split_one(ctx, &path)?;
+        }
+    }
+
     /// Deletes `key`, returning the removed row. No rebalancing (deletes
     /// leave pages sparse, SQL Server-style).
     pub fn delete(
@@ -346,6 +394,70 @@ impl BTree {
             page_no = next;
         }
         Ok(out)
+    }
+
+    /// Range scan in key order: `(key, row)` pairs with `lower <= key <= upper`
+    /// (either bound `None` = unbounded on that side). Descends to `lower`'s
+    /// leaf, then walks the leaf chain, stopping past `upper`.
+    pub fn scan_range(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+    ) -> Result<Vec<KeyRow>, StorageError> {
+        // Leaf and start index for the lower bound.
+        let (mut page_no, mut start) = match lower {
+            Some(key) => {
+                let path = self.descend(ctx, key)?;
+                let leaf = path.last().expect("leaf").page;
+                let frame = ctx.fetch(leaf)?;
+                let page = SlottedRead::new(ctx.pool.page(frame));
+                let index = match leaf_search(&page, key) {
+                    Ok(i) => i,
+                    Err(i) => i,
+                };
+                ctx.pool.unpin(frame);
+                (leaf, index)
+            }
+            None => (self.leftmost_leaf(ctx)?, 0),
+        };
+        let mut out = Vec::new();
+        while page_no != NO_PAGE {
+            let frame = ctx.fetch(page_no)?;
+            let page = SlottedRead::new(ctx.pool.page(frame));
+            for index in start..page.slot_count() {
+                let cell = page.get(index).expect("tree pages have no tombstones");
+                let key = cell_key(cell);
+                if let Some(upper) = upper
+                    && key > upper
+                {
+                    ctx.pool.unpin(frame);
+                    return Ok(out);
+                }
+                out.push((key.to_vec(), leaf_cell_row(cell).to_vec()));
+            }
+            let next = page.next_page();
+            ctx.pool.unpin(frame);
+            page_no = next;
+            start = 0;
+        }
+        Ok(out)
+    }
+
+    /// The leftmost leaf page (start of the leaf chain).
+    fn leftmost_leaf(&self, ctx: &mut RelCtx<'_>) -> Result<u64, StorageError> {
+        let mut page_no = self.root;
+        loop {
+            let frame = ctx.fetch(page_no)?;
+            let page = SlottedRead::new(ctx.pool.page(frame));
+            if page.level() == 0 {
+                ctx.pool.unpin(frame);
+                return Ok(page_no);
+            }
+            let child = internal_cell_child(page.get(0).expect("sentinel entry"));
+            ctx.pool.unpin(frame);
+            page_no = child;
+        }
     }
 
     /// Splits exactly one node: the deepest node on `path` whose parent can

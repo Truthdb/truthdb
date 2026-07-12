@@ -9,6 +9,7 @@ pub mod buffer_pool;
 pub mod catalog;
 pub(crate) mod ctx;
 pub mod heap;
+pub mod index;
 pub mod key;
 pub mod page;
 pub mod recovery;
@@ -60,7 +61,8 @@ impl RelState {
     }
 
     /// Stable root pages by object id (for logical tree undos), including
-    /// the catalog tree itself.
+    /// the catalog tree itself and every secondary index (index trees are
+    /// undone the same way as clustered tables).
     pub fn tree_roots(&self) -> HashMap<u32, u64> {
         let mut roots = HashMap::new();
         if let Some(root) = self.catalog_root {
@@ -69,6 +71,9 @@ impl RelState {
         for def in self.tables.values() {
             if def.is_tree() {
                 roots.insert(def.object_id, def.root_page);
+            }
+            for index in &def.indexes {
+                roots.insert(index.object_id, index.root_page);
             }
         }
         roots

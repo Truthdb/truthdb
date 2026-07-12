@@ -2245,6 +2245,382 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    // ---- secondary indexes + planner (Stage 7) -------------------------
+
+    /// Plan text lines for a SELECT under SHOWPLAN_TEXT (one batch so the SET
+    /// persists to the SELECT).
+    fn plan_lines(engine: &mut Engine, select: &str) -> Vec<String> {
+        let env = sql(engine, &format!("SET SHOWPLAN_TEXT ON; {select}"));
+        let results = env["results"].as_array().expect("results array");
+        let rows = results
+            .iter()
+            .find(|r| r["type"] == "rows")
+            .unwrap_or_else(|| panic!("no plan rows in {env}"));
+        rows["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r[0].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn sql_index_ab_harness_identical_results() {
+        let path = unique_temp_path("sql-index-ab");
+        let mut engine = new_engine(&path);
+        // Two identical tables; an index only on one.
+        for t in ["noidx", "idx"] {
+            engine
+                .execute(&format!(
+                    "CREATE TABLE {t} (id INT NOT NULL PRIMARY KEY, a INT, name NVARCHAR(20))"
+                ))
+                .expect("create");
+            engine
+                .execute(&format!(
+                    "INSERT INTO {t} VALUES (1,10,'a'),(2,20,'b'),(3,20,'c'),(4,30,NULL),(5,10,'e')"
+                ))
+                .expect("insert");
+        }
+        engine
+            .execute("CREATE INDEX ix_a ON idx (a)")
+            .expect("create index");
+
+        // Every query returns identical rows whether it scans or seeks.
+        for pred in [
+            "a = 20",
+            "a > 15",
+            "a >= 20",
+            "a < 25",
+            "a = 10 AND id > 1",
+            "a <> 20",
+        ] {
+            let q = |t: &str| format!("SELECT id, a FROM {t} WHERE {pred} ORDER BY id");
+            let (_, base) = sql_rows(&mut engine, &q("noidx"));
+            let (_, with_index) = sql_rows(&mut engine, &q("idx"));
+            assert_eq!(base, with_index, "mismatch for predicate `{pred}`");
+        }
+
+        // The equality predicate actually uses the index.
+        let plan = plan_lines(&mut engine, "SELECT id FROM idx WHERE a = 20");
+        assert!(
+            plan.iter()
+                .any(|l| l.contains("Index Seek") && l.contains("ix_a")),
+            "expected an index seek, got {plan:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_unique_index_rejects_duplicate_2601() {
+        let path = unique_temp_path("sql-unique-index");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, email NVARCHAR(50))")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 'a@x'), (2, 'b@x')")
+            .expect("insert");
+        engine
+            .execute("CREATE UNIQUE INDEX ux_email ON t (email)")
+            .expect("create unique index");
+        // A duplicate email now violates the unique index (2601, not 2627).
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO t VALUES (3, 'a@x')"),
+            2601
+        );
+        // Updating to a duplicate also violates it.
+        assert_eq!(
+            sql_error_number(&mut engine, "UPDATE t SET email = 'a@x' WHERE id = 2"),
+            2601
+        );
+        // A distinct value is fine.
+        engine
+            .execute("INSERT INTO t VALUES (3, 'c@x')")
+            .expect("distinct insert");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_unique_index_build_rejects_existing_duplicates() {
+        let path = unique_temp_path("sql-unique-build");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 5), (2, 5)")
+            .expect("insert");
+        // Building a unique index over duplicate data fails.
+        assert_eq!(
+            sql_error_number(&mut engine, "CREATE UNIQUE INDEX ux_a ON t (a)"),
+            2601
+        );
+        // ...and the failed build left no index behind (still scannable).
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t ORDER BY id");
+        assert_eq!(rows.len(), 2);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_index_maintained_across_update_and_delete() {
+        let path = unique_temp_path("sql-index-maint");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1,10),(2,20),(3,30)")
+            .expect("insert");
+        engine.execute("CREATE INDEX ix_a ON t (a)").expect("index");
+
+        // Update moves a row from a=20 to a=25; delete removes a=30.
+        engine
+            .execute("UPDATE t SET a = 25 WHERE id = 2")
+            .expect("update");
+        engine
+            .execute("DELETE FROM t WHERE a = 30")
+            .expect("delete");
+
+        // Index seeks reflect the mutations.
+        let (_, at20) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 20");
+        assert!(at20.is_empty(), "a=20 gone after update");
+        let (_, at25) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 25");
+        assert_eq!(at25, vec![vec![Some("2".into())]]);
+        let (_, at30) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 30");
+        assert!(at30.is_empty(), "a=30 gone after delete");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_showplan_text_reports_seek_versus_scan() {
+        let path = unique_temp_path("sql-showplan");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
+            .expect("create");
+        engine.execute("CREATE INDEX ix_a ON t (a)").expect("index");
+
+        let seek = plan_lines(&mut engine, "SELECT id FROM t WHERE a = 7");
+        assert_eq!(seek[0], "Index Seek(t.ix_a), SEEK: a = 7");
+        assert_eq!(seek[1], "Key Lookup(t)");
+
+        // No sargable predicate → a scan.
+        let scan = plan_lines(&mut engine, "SELECT id FROM t WHERE a + 1 = 8");
+        assert_eq!(scan, vec!["Table Scan(t)".to_string()]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_index_survives_restart() {
+        let path = unique_temp_path("sql-index-restart");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1,10),(2,20)")
+            .expect("insert");
+        engine.execute("CREATE INDEX ix_a ON t (a)").expect("index");
+
+        drop(engine);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("replay");
+        // The index is still usable after recovery.
+        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE a = 20");
+        assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 20");
+        assert_eq!(rows, vec![vec![Some("2".into())]]);
+        // Maintenance still works post-restart.
+        engine
+            .execute("INSERT INTO t VALUES (3, 20)")
+            .expect("insert after restart");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 20 ORDER BY id");
+        assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_composite_and_descending_index_seek() {
+        let path = unique_temp_path("sql-composite-index");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT, b INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1,1,100),(2,1,200),(3,2,100),(4,2,200)")
+            .expect("insert");
+        engine
+            .execute("CREATE INDEX ix_ab ON t (a, b DESC)")
+            .expect("create composite index");
+
+        // Equality on the leading column + range on the second seeks the index.
+        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE a = 2 AND b = 200");
+        assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 2 AND b = 200");
+        assert_eq!(rows, vec![vec![Some("4".into())]]);
+        // Leading-column-only seek returns both a=1 rows.
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 1 ORDER BY id");
+        assert_eq!(rows, vec![vec![Some("1".into())], vec![Some("2".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_index_on_heap_table_uses_rid_locator() {
+        let path = unique_temp_path("sql-heap-index");
+        let mut engine = new_engine(&path);
+        // No PRIMARY KEY → heap table.
+        engine
+            .execute("CREATE TABLE h (a INT, name NVARCHAR(20))")
+            .expect("create heap");
+        engine
+            .execute("INSERT INTO h VALUES (10,'x'),(20,'y'),(10,'z')")
+            .expect("insert");
+        engine.execute("CREATE INDEX ix_a ON h (a)").expect("index");
+
+        let plan = plan_lines(&mut engine, "SELECT name FROM h WHERE a = 10");
+        assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");
+        let (_, mut rows) = sql_rows(&mut engine, "SELECT name FROM h WHERE a = 10");
+        rows.sort();
+        assert_eq!(rows, vec![vec![Some("x".into())], vec![Some("z".into())]]);
+        // Update through a heap row keeps the index consistent.
+        engine
+            .execute("UPDATE h SET a = 99 WHERE name = 'x'")
+            .expect("update");
+        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM h WHERE a = 10");
+        assert_eq!(rows, vec![vec![Some("z".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_drop_index_and_sys_indexes() {
+        let path = unique_temp_path("sql-drop-index");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
+            .expect("create");
+        engine.execute("CREATE INDEX ix_a ON t (a)").expect("index");
+
+        // sys.indexes lists it.
+        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM sys.indexes");
+        assert_eq!(rows, vec![vec![Some("ix_a".into())]]);
+
+        engine.execute("DROP INDEX ix_a ON t").expect("drop index");
+        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM sys.indexes");
+        assert!(rows.is_empty(), "index gone from catalog");
+        // Queries now scan.
+        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE a = 1");
+        assert_eq!(plan, vec!["Table Scan(t)".to_string()]);
+        // Dropping a missing index errors 3701.
+        assert_eq!(sql_error_number(&mut engine, "DROP INDEX nope ON t"), 3701);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_nvarchar_equality_seeks_but_range_scans() {
+        let path = unique_temp_path("sql-index-nvarchar");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 'abc'), (2, 'ABC'), (3, 'xyz')")
+            .expect("insert");
+        engine
+            .execute("CREATE INDEX ix_name ON t (name)")
+            .expect("index");
+
+        // Equality is an exact byte match, so it seeks; the filter compares by
+        // code point, so it is case-sensitive.
+        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE name = 'abc'");
+        assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");
+        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE name = 'abc'");
+        assert_eq!(rows, vec![vec![Some("1".into())]], "'ABC' is not 'abc'");
+
+        // A range on NVARCHAR must NOT seek (UTF-16BE key order can diverge
+        // from code-point order at astral characters); it scans and stays
+        // correct.
+        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE name > 'a'");
+        assert_eq!(plan, vec!["Table Scan(t)".to_string()]);
+        let (_, mut rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE name > 'a'");
+        rows.sort();
+        // 'ABC' (0x41..) < 'a' (0x61) by code point; 'abc','xyz' > 'a'.
+        assert_eq!(rows, vec![vec![Some("1".into())], vec![Some("3".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_varchar_range_can_index_seek() {
+        let path = unique_temp_path("sql-index-varchar");
+        let mut engine = new_engine(&path);
+        // VARCHAR keys are UTF-8 bytes, whose order equals code-point order, so
+        // a range seek is correct.
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, code VARCHAR(20))")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1,'aaa'),(2,'mmm'),(3,'zzz')")
+            .expect("insert");
+        engine
+            .execute("CREATE INDEX ix_code ON t (code)")
+            .expect("index");
+
+        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE code > 'b'");
+        assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");
+        let (_, mut rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE code > 'b'");
+        rows.sort();
+        assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_drop_index_is_table_scoped() {
+        let path = unique_temp_path("sql-drop-scoped");
+        let mut engine = new_engine(&path);
+        // Two tables with same-named indexes; DROP INDEX must only touch the
+        // named table's index.
+        for t in ["t1", "t2"] {
+            engine
+                .execute(&format!(
+                    "CREATE TABLE {t} (id INT NOT NULL PRIMARY KEY, a INT)"
+                ))
+                .expect("create");
+            engine
+                .execute(&format!("CREATE INDEX ix ON {t} (a)"))
+                .expect("index");
+        }
+        engine.execute("DROP INDEX ix ON t1").expect("drop t1.ix");
+
+        // t2's index survives; t1's is gone.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT object_id FROM sys.indexes ORDER BY object_id",
+        );
+        assert_eq!(rows.len(), 1, "only t2's index remains");
+        let plan = plan_lines(&mut engine, "SELECT id FROM t2 WHERE a = 1");
+        assert!(
+            plan.iter().any(|l| l.contains("Index Seek")),
+            "t2 still seeks"
+        );
+        let plan = plan_lines(&mut engine, "SELECT id FROM t1 WHERE a = 1");
+        assert_eq!(plan, vec!["Table Scan(t1)".to_string()], "t1 index dropped");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_create_index_inside_transaction_is_rejected() {
+        let path = unique_temp_path("sql-index-in-txn");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
+            .expect("create");
+        // DDL (incl. CREATE INDEX) is disallowed inside an explicit transaction.
+        assert_eq!(
+            sql_error_number(&mut engine, "BEGIN TRAN; CREATE INDEX ix_a ON t (a);"),
+            226
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn sql_non_boolean_where_is_rejected_4145() {
         let path = unique_temp_path("sql-where-4145");
