@@ -123,7 +123,12 @@ impl Engine {
     /// along with any error in one envelope, transported as a normal
     /// response (TDS-like) rather than failing the connection.
     fn execute_sql(&mut self, input: &str) -> Result<String, EngineError> {
-        let outcome = crate::rel::execute_batch(&mut self.storage, input);
+        // The native (session-less) path has nowhere to carry an open
+        // transaction across calls, so it uses a transient context and rolls
+        // back anything an unbalanced BEGIN leaves dangling.
+        let mut txn_ctx = crate::rel::TxnContext::default();
+        let outcome = crate::rel::execute_batch(&mut self.storage, input, &mut txn_ctx);
+        txn_ctx.abort(&mut self.storage);
         self.maybe_checkpoint()?;
         Ok(render_sql_outcome(&outcome))
     }
@@ -131,11 +136,34 @@ impl Engine {
     /// Runs a SQL batch and returns the typed outcome (result sets +
     /// optional error). The TDS gateway uses this to emit COLMETADATA / ROW
     /// / DONE / ERROR token streams; a TDS client only ever speaks SQL, so
-    /// there is no ES routing here.
-    pub fn sql_batch(&mut self, input: &str) -> Result<crate::rel::BatchOutcome, EngineError> {
-        let outcome = crate::rel::execute_batch(&mut self.storage, input);
+    /// there is no ES routing here. The `txn_ctx` carries transaction state
+    /// (open transaction, `@@TRANCOUNT`, isolation) across batches within a
+    /// session.
+    pub fn sql_batch(
+        &mut self,
+        input: &str,
+        txn_ctx: &mut crate::rel::TxnContext,
+    ) -> Result<crate::rel::BatchOutcome, EngineError> {
+        let outcome = crate::rel::execute_batch(&mut self.storage, input, txn_ctx);
         self.maybe_checkpoint()?;
         Ok(outcome)
+    }
+
+    /// Rolls back and discards a session's open transaction (connection
+    /// teardown). No-op when the session has no transaction.
+    pub fn abort_session_txn(&mut self, txn_ctx: &mut crate::rel::TxnContext) {
+        txn_ctx.abort(&mut self.storage);
+    }
+
+    /// The table/database locks a SQL batch needs at the given isolation
+    /// level (see [`crate::rel::analyze_locks`]). The session loop acquires
+    /// these before running the batch.
+    pub fn analyze_locks(
+        &self,
+        input: &str,
+        isolation: crate::rel::Isolation,
+    ) -> Vec<(crate::lock::Resource, crate::lock::LockMode)> {
+        crate::rel::analyze_locks(&self.storage, input, isolation)
     }
 
     pub fn checkpoint(&mut self) -> Result<(), EngineError> {
@@ -155,6 +183,14 @@ impl Engine {
     }
 
     fn maybe_checkpoint(&mut self) -> Result<(), EngineError> {
+        // A checkpoint flushes dirty pages and truncates the WAL head. While an
+        // explicit transaction is open its uncommitted pages would be made
+        // durable and its undo records discarded, so a crash could not roll it
+        // back. Defer the checkpoint until every transaction has closed; the
+        // WAL keeps growing until then (bounded, non-corrupting).
+        if self.storage.has_active_transactions() {
+            return Ok(());
+        }
         if self.wal_usage_ratio() >= WAL_CHECKPOINT_THRESHOLD {
             self.checkpoint()?;
         }
@@ -575,6 +611,9 @@ pub enum EngineError {
 
     #[error("{0}")]
     Replay(String),
+
+    #[error("engine is shutting down")]
+    Unavailable,
 }
 
 #[derive(Debug, Error)]
@@ -1941,6 +1980,268 @@ mod tests {
         // The first row is durably present.
         let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t");
         assert_eq!(rows, vec![vec![Some("1".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ---- explicit transactions (Stage 6, M2) ---------------------------
+
+    use crate::rel::{BatchOutcome, StatementResult, TxnContext};
+    use crate::relstore::types::Datum;
+
+    /// Runs a SQL batch through the session path with a persistent transaction
+    /// context (as a TDS connection would), returning the typed outcome.
+    fn batch(engine: &mut Engine, ctx: &mut TxnContext, sql: &str) -> BatchOutcome {
+        engine.sql_batch(sql, ctx).expect("sql_batch")
+    }
+
+    /// The integer `id` column (column 0) of the first rowset in an outcome.
+    fn ids(outcome: &BatchOutcome) -> Vec<i32> {
+        for result in &outcome.results {
+            if let StatementResult::Rows(rowset) = result {
+                return rowset
+                    .rows
+                    .iter()
+                    .map(|row| match row[0] {
+                        Datum::TinyInt(v) => v as i32,
+                        Datum::SmallInt(v) => v as i32,
+                        Datum::Int(v) => v,
+                        Datum::BigInt(v) => v as i32,
+                        ref other => panic!("expected integer id, got {other:?}"),
+                    })
+                    .collect();
+            }
+        }
+        panic!("no rowset in outcome: {:?}", outcome.results);
+    }
+
+    #[test]
+    fn txn_commit_is_durable_across_restart() {
+        let path = unique_temp_path("txn-commit-durable");
+        let mut engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+
+        batch(
+            &mut engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let out = batch(
+            &mut engine,
+            &mut ctx,
+            "BEGIN TRANSACTION; INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT TRANSACTION;",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(
+            !ctx.has_open_transaction(),
+            "COMMIT must close the transaction"
+        );
+
+        // Reopen: the committed rows must survive ARIES recovery.
+        drop(engine);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("replay");
+        let mut ctx = TxnContext::default();
+        let out = batch(&mut engine, &mut ctx, "SELECT id FROM t ORDER BY id");
+        assert_eq!(ids(&out), vec![1, 2]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn txn_rollback_discards_all_writes() {
+        let path = unique_temp_path("txn-rollback");
+        let mut engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+
+        batch(
+            &mut engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&mut engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        let out = batch(
+            &mut engine,
+            &mut ctx,
+            "BEGIN TRANSACTION; INSERT INTO t VALUES (2); INSERT INTO t VALUES (3); ROLLBACK TRANSACTION;",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(!ctx.has_open_transaction());
+
+        // Only the pre-transaction row 1 remains.
+        let out = batch(&mut engine, &mut ctx, "SELECT id FROM t ORDER BY id");
+        assert_eq!(ids(&out), vec![1]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn txn_trancount_reflects_nesting() {
+        let path = unique_temp_path("txn-trancount");
+        let mut engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+
+        // Outside any transaction, @@TRANCOUNT is 0.
+        let out = batch(&mut engine, &mut ctx, "SELECT @@TRANCOUNT AS n");
+        assert_eq!(ids(&out), vec![0]);
+
+        // Nested BEGINs bump the count; only the outermost COMMIT commits.
+        let out = batch(
+            &mut engine,
+            &mut ctx,
+            "BEGIN TRAN; BEGIN TRAN; SELECT @@TRANCOUNT AS n;",
+        );
+        assert_eq!(ids(&out), vec![2]);
+        assert!(ctx.has_open_transaction());
+
+        let out = batch(&mut engine, &mut ctx, "COMMIT; SELECT @@TRANCOUNT AS n;");
+        assert_eq!(ids(&out), vec![1], "inner COMMIT only decrements");
+        assert!(
+            ctx.has_open_transaction(),
+            "transaction still open at count 1"
+        );
+
+        batch(&mut engine, &mut ctx, "COMMIT");
+        assert!(!ctx.has_open_transaction());
+        let out = batch(&mut engine, &mut ctx, "SELECT @@TRANCOUNT AS n");
+        assert_eq!(ids(&out), vec![0]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn txn_error_dooms_transaction_until_rollback() {
+        let path = unique_temp_path("txn-doomed");
+        let mut engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+
+        batch(
+            &mut engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        // A duplicate-PK failure inside the transaction dooms it.
+        let out = batch(
+            &mut engine,
+            &mut ctx,
+            "BEGIN TRAN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (1);",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(2627));
+
+        // A doomed transaction rejects further work with 3930...
+        let out = batch(&mut engine, &mut ctx, "SELECT 1 AS n");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(3930));
+
+        // ...but ROLLBACK is allowed and clears the doom.
+        let out = batch(&mut engine, &mut ctx, "ROLLBACK");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(!ctx.has_open_transaction());
+
+        // The table is usable again and holds nothing (the txn rolled back).
+        let out = batch(&mut engine, &mut ctx, "SELECT id FROM t");
+        assert_eq!(ids(&out), Vec::<i32>::new());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn txn_ddl_inside_transaction_is_rejected() {
+        let path = unique_temp_path("txn-ddl");
+        let mut engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+
+        let out = batch(
+            &mut engine,
+            &mut ctx,
+            "BEGIN TRAN; CREATE TABLE t (id INT NOT NULL PRIMARY KEY);",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(226));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn txn_bare_commit_and_rollback_error() {
+        let path = unique_temp_path("txn-bare");
+        let mut engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+
+        let out = batch(&mut engine, &mut ctx, "COMMIT TRANSACTION");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(3902));
+
+        let out = batch(&mut engine, &mut ctx, "ROLLBACK TRANSACTION");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(3903));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn txn_abort_on_disconnect_rolls_back() {
+        let path = unique_temp_path("txn-disconnect");
+        let mut engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+
+        batch(
+            &mut engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(
+            &mut engine,
+            &mut ctx,
+            "BEGIN TRAN; INSERT INTO t VALUES (7);",
+        );
+        assert!(ctx.has_open_transaction());
+
+        // Simulate the session teardown that CloseSession performs.
+        engine.abort_session_txn(&mut ctx);
+        assert!(!ctx.has_open_transaction());
+
+        let mut ctx2 = TxnContext::default();
+        let out = batch(&mut engine, &mut ctx2, "SELECT id FROM t");
+        assert_eq!(
+            ids(&out),
+            Vec::<i32>::new(),
+            "uncommitted insert was rolled back"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn txn_uncommitted_explicit_txn_is_undone_after_crash() {
+        let path = unique_temp_path("txn-crash-undo");
+        let mut engine = new_engine(&path);
+        batch(
+            &mut engine,
+            &mut TxnContext::default(),
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+
+        // Session A opens a transaction and inserts 99 but never commits.
+        let mut ctx_a = TxnContext::default();
+        batch(
+            &mut engine,
+            &mut ctx_a,
+            "BEGIN TRAN; INSERT INTO t VALUES (99);",
+        );
+        assert!(ctx_a.has_open_transaction());
+
+        // An autocommit insert commits, forcing the WAL to disk — including
+        // A's (earlier, still-uncommitted) log records.
+        batch(
+            &mut engine,
+            &mut TxnContext::default(),
+            "INSERT INTO t VALUES (1)",
+        );
+
+        // Crash: drop the engine and A's context without a graceful rollback
+        // (StorageTxn has no Drop, so nothing is committed on the way out).
+        drop(ctx_a);
+        drop(engine);
+
+        // Recovery on reopen redoes history then undoes the loser (A): row 99
+        // is gone, the committed row 1 survives.
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("replay");
+        let out = batch(
+            &mut engine,
+            &mut TxnContext::default(),
+            "SELECT id FROM t ORDER BY id",
+        );
+        assert_eq!(ids(&out), vec![1]);
         let _ = std::fs::remove_file(path);
     }
 

@@ -17,6 +17,7 @@ pub const PKT_SQL_BATCH: u8 = 0x01;
 pub const PKT_RPC: u8 = 0x03;
 pub const PKT_TABULAR_RESULT: u8 = 0x04;
 pub const PKT_ATTENTION: u8 = 0x06;
+pub const PKT_TRANSACTION_MANAGER: u8 = 0x0e;
 pub const PKT_LOGIN7: u8 = 0x10;
 pub const PKT_PRELOGIN: u8 = 0x12;
 

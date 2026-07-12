@@ -37,15 +37,29 @@ impl ColumnResolver for Vec<String> {
 /// kept small (heavy arms delegate to out-of-line helpers) so this is safe.
 const MAX_EVAL_DEPTH: usize = 500;
 
+/// Session context available to expression evaluation: `@@`-variables (and,
+/// in later stages, the current time / SCOPE_IDENTITY). `Default` is a
+/// no-transaction context, used where no session is in scope.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EvalContext {
+    pub trancount: i32,
+}
+
 /// Evaluates `expr` against `row`, resolving columns via `resolver`.
-pub fn eval(expr: &Expr, row: &[SqlValue], resolver: &impl ColumnResolver) -> SqlResult<SqlValue> {
-    eval_at(expr, row, resolver, 0)
+pub fn eval(
+    expr: &Expr,
+    row: &[SqlValue],
+    resolver: &impl ColumnResolver,
+    ctx: &EvalContext,
+) -> SqlResult<SqlValue> {
+    eval_at(expr, row, resolver, ctx, 0)
 }
 
 fn eval_at(
     expr: &Expr,
     row: &[SqlValue],
     resolver: &impl ColumnResolver,
+    ctx: &EvalContext,
     depth: usize,
 ) -> SqlResult<SqlValue> {
     if depth > MAX_EVAL_DEPTH {
@@ -61,20 +75,21 @@ fn eval_at(
         ExprKind::Str(s) => Ok(SqlValue::Str(s.clone())),
         ExprKind::Bool(b) => Ok(SqlValue::Bool(*b)),
         ExprKind::Column(name) => eval_column(name, row, resolver),
+        ExprKind::GlobalVar(name) => eval_global_var(name, ctx),
         ExprKind::Unary { op, expr: inner } => {
-            let value = eval_at(inner, row, resolver, depth + 1)?;
+            let value = eval_at(inner, row, resolver, ctx, depth + 1)?;
             eval_unary(*op, value)
         }
         ExprKind::IsNull {
             expr: inner,
             negated,
         } => {
-            let value = eval_at(inner, row, resolver, depth + 1)?;
+            let value = eval_at(inner, row, resolver, ctx, depth + 1)?;
             Ok(SqlValue::Bool(value.is_null() != *negated))
         }
         ExprKind::Binary { op, left, right } => {
-            let l = eval_at(left, row, resolver, depth + 1)?;
-            let r = eval_at(right, row, resolver, depth + 1)?;
+            let l = eval_at(left, row, resolver, ctx, depth + 1)?;
+            let r = eval_at(right, row, resolver, ctx, depth + 1)?;
             eval_binary(*op, l, r)
         }
         ExprKind::Like {
@@ -82,18 +97,18 @@ fn eval_at(
             pattern,
             escape,
             negated,
-        } => eval_like_expr(expr, pattern, *escape, *negated, row, resolver, depth),
+        } => eval_like_expr(expr, pattern, *escape, *negated, row, resolver, ctx, depth),
         ExprKind::InList {
             expr,
             list,
             negated,
-        } => eval_in_expr(expr, list, *negated, row, resolver, depth),
+        } => eval_in_expr(expr, list, *negated, row, resolver, ctx, depth),
         ExprKind::Between {
             expr,
             low,
             high,
             negated,
-        } => eval_between_expr(expr, low, high, *negated, row, resolver, depth),
+        } => eval_between_expr(expr, low, high, *negated, row, resolver, ctx, depth),
         ExprKind::Case {
             operand,
             branches,
@@ -104,13 +119,14 @@ fn eval_at(
             else_result.as_deref(),
             row,
             resolver,
+            ctx,
             depth,
         ),
         ExprKind::Cast { expr, target } => {
-            let v = eval_at(expr, row, resolver, depth + 1)?;
+            let v = eval_at(expr, row, resolver, ctx, depth + 1)?;
             cast_value(v, target)
         }
-        ExprKind::Function { name, args } => eval_call(name, args, row, resolver, depth),
+        ExprKind::Function { name, args } => eval_call(name, args, row, resolver, ctx, depth),
     }
 }
 
@@ -124,6 +140,20 @@ fn eval_column(
         .resolve(&name.value)
         .ok_or_else(|| SqlError::invalid_column(&name.value).at(name.span))?;
     Ok(row[index].clone())
+}
+
+#[inline(never)]
+fn eval_global_var(name: &str, ctx: &EvalContext) -> SqlResult<SqlValue> {
+    match name {
+        "trancount" => Ok(SqlValue::Int(ctx.trancount as i64)),
+        "spid" => Ok(SqlValue::Int(0)),
+        "version" => Ok(SqlValue::Str("TruthDB".to_string())),
+        "error" | "rowcount" | "identity" => Ok(SqlValue::Int(0)),
+        other => Err(SqlError::message_only(
+            102,
+            format!("Incorrect syntax near '@@{other}'."),
+        )),
+    }
 }
 
 #[inline(never)]
@@ -151,6 +181,7 @@ fn eval_unary(op: UnaryOp, value: SqlValue) -> SqlResult<SqlValue> {
 // one that recurses down a long operator chain — stays small.
 
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn eval_like_expr<R: ColumnResolver>(
     expr: &Expr,
     pattern: &Expr,
@@ -158,10 +189,11 @@ fn eval_like_expr<R: ColumnResolver>(
     negated: bool,
     row: &[SqlValue],
     resolver: &R,
+    ctx: &EvalContext,
     depth: usize,
 ) -> SqlResult<SqlValue> {
-    let value = eval_at(expr, row, resolver, depth + 1)?;
-    let pat = eval_at(pattern, row, resolver, depth + 1)?;
+    let value = eval_at(expr, row, resolver, ctx, depth + 1)?;
+    let pat = eval_at(pattern, row, resolver, ctx, depth + 1)?;
     if value.is_null() || pat.is_null() {
         return Ok(SqlValue::Null);
     }
@@ -181,16 +213,17 @@ fn eval_in_expr<R: ColumnResolver>(
     negated: bool,
     row: &[SqlValue],
     resolver: &R,
+    ctx: &EvalContext,
     depth: usize,
 ) -> SqlResult<SqlValue> {
-    let value = eval_at(expr, row, resolver, depth + 1)?;
+    let value = eval_at(expr, row, resolver, ctx, depth + 1)?;
     if value.is_null() {
         return Ok(SqlValue::Null);
     }
     // `x IN (list)` is `x=a OR x=b OR ...` under three-valued logic.
     let mut any_unknown = false;
     for item in list {
-        let candidate = eval_at(item, row, resolver, depth + 1)?;
+        let candidate = eval_at(item, row, resolver, ctx, depth + 1)?;
         match value.compare(&candidate)? {
             Some(std::cmp::Ordering::Equal) => return Ok(SqlValue::Bool(!negated)),
             None => any_unknown = true,
@@ -205,6 +238,7 @@ fn eval_in_expr<R: ColumnResolver>(
 }
 
 #[inline(never)]
+#[allow(clippy::too_many_arguments)]
 fn eval_between_expr<R: ColumnResolver>(
     expr: &Expr,
     low: &Expr,
@@ -212,11 +246,12 @@ fn eval_between_expr<R: ColumnResolver>(
     negated: bool,
     row: &[SqlValue],
     resolver: &R,
+    ctx: &EvalContext,
     depth: usize,
 ) -> SqlResult<SqlValue> {
-    let value = eval_at(expr, row, resolver, depth + 1)?;
-    let lo = eval_at(low, row, resolver, depth + 1)?;
-    let hi = eval_at(high, row, resolver, depth + 1)?;
+    let value = eval_at(expr, row, resolver, ctx, depth + 1)?;
+    let lo = eval_at(low, row, resolver, ctx, depth + 1)?;
+    let hi = eval_at(high, row, resolver, ctx, depth + 1)?;
     // `x BETWEEN a AND b` is `x>=a AND x<=b` (three-valued).
     let ge = value.compare(&lo)?.map(|o| o != Ordering::Less);
     let le = value.compare(&hi)?.map(|o| o != Ordering::Greater);
@@ -235,31 +270,32 @@ fn eval_case_expr<R: ColumnResolver>(
     else_result: Option<&Expr>,
     row: &[SqlValue],
     resolver: &R,
+    ctx: &EvalContext,
     depth: usize,
 ) -> SqlResult<SqlValue> {
     let operand_value = match operand {
-        Some(o) => Some(eval_at(o, row, resolver, depth + 1)?),
+        Some(o) => Some(eval_at(o, row, resolver, ctx, depth + 1)?),
         None => None,
     };
     for (cond, result) in branches {
         let matched = match &operand_value {
             // Simple CASE: operand = WHEN value (NULL never matches).
             Some(ov) => {
-                let cv = eval_at(cond, row, resolver, depth + 1)?;
+                let cv = eval_at(cond, row, resolver, ctx, depth + 1)?;
                 matches!(ov.compare(&cv)?, Some(Ordering::Equal))
             }
             // Searched CASE: WHEN is a boolean predicate.
             None => matches!(
-                eval_at(cond, row, resolver, depth + 1)?,
+                eval_at(cond, row, resolver, ctx, depth + 1)?,
                 SqlValue::Bool(true)
             ),
         };
         if matched {
-            return eval_at(result, row, resolver, depth + 1);
+            return eval_at(result, row, resolver, ctx, depth + 1);
         }
     }
     match else_result {
-        Some(e) => eval_at(e, row, resolver, depth + 1),
+        Some(e) => eval_at(e, row, resolver, ctx, depth + 1),
         None => Ok(SqlValue::Null),
     }
 }
@@ -270,11 +306,12 @@ fn eval_call<R: ColumnResolver>(
     args: &[Expr],
     row: &[SqlValue],
     resolver: &R,
+    ctx: &EvalContext,
     depth: usize,
 ) -> SqlResult<SqlValue> {
     let mut values = Vec::with_capacity(args.len());
     for arg in args {
-        values.push(eval_at(arg, row, resolver, depth + 1)?);
+        values.push(eval_at(arg, row, resolver, ctx, depth + 1)?);
     }
     functions::eval_function(name, values)
 }
@@ -668,7 +705,7 @@ mod tests {
             _ => panic!("expected expr"),
         };
         let names: Vec<String> = columns.iter().map(|c| c.to_string()).collect();
-        eval(expr, row, &names).expect("eval")
+        eval(expr, row, &names, &EvalContext::default()).expect("eval")
     }
 
     #[test]
@@ -695,7 +732,12 @@ mod tests {
             panic!()
         };
         let empty: Vec<String> = Vec::new();
-        assert_eq!(eval(expr, &[], &empty).unwrap_err().number, 8134);
+        assert_eq!(
+            eval(expr, &[], &empty, &EvalContext::default())
+                .unwrap_err()
+                .number,
+            8134
+        );
     }
 
     #[test]
@@ -763,7 +805,12 @@ mod tests {
             panic!()
         };
         let empty: Vec<String> = Vec::new();
-        assert_eq!(eval(expr, &[], &empty).unwrap_err().number, 191);
+        assert_eq!(
+            eval(expr, &[], &empty, &EvalContext::default())
+                .unwrap_err()
+                .number,
+            191
+        );
     }
 
     #[test]

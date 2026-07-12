@@ -1,4 +1,3 @@
-use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use truthdb_proto::{
@@ -6,18 +5,18 @@ use truthdb_proto::{
     PROTOCOL_VERSION, ProtoError, decode_message, encode_message,
 };
 
-use crate::engine::Engine;
+use crate::session::EngineHandle;
 
 pub struct Dispatcher {
-    engine: Arc<Mutex<Engine>>,
+    engine: EngineHandle,
 }
 
 impl Dispatcher {
-    pub fn new(engine: Arc<Mutex<Engine>>) -> Self {
+    pub fn new(engine: EngineHandle) -> Self {
         Dispatcher { engine }
     }
 
-    pub fn dispatch(&self, frame: Frame) -> Result<Option<Frame>, ProtoError> {
+    pub async fn dispatch(&self, frame: Frame) -> Result<Option<Frame>, ProtoError> {
         match frame.msg_type {
             MsgType::HelloReq => {
                 let _req: HelloReq = decode_message(&frame.payload)?;
@@ -54,23 +53,16 @@ impl Dispatcher {
             }
             MsgType::CommandReq => {
                 let req: CommandReq = decode_message(&frame.payload)?;
-                let resp = match self.engine.lock() {
-                    Ok(mut engine) => match engine.execute(&req.command) {
-                        Ok(message) => CommandResp {
-                            id: req.id,
-                            ok: true,
-                            message,
-                        },
-                        Err(err) => CommandResp {
-                            id: req.id,
-                            ok: false,
-                            message: err.to_string(),
-                        },
+                let resp = match self.engine.run_native(req.command).await {
+                    Ok(message) => CommandResp {
+                        id: req.id,
+                        ok: true,
+                        message,
                     },
-                    Err(_) => CommandResp {
+                    Err(err) => CommandResp {
                         id: req.id,
                         ok: false,
-                        message: "engine lock poisoned".to_string(),
+                        message: err.to_string(),
                     },
                 };
 

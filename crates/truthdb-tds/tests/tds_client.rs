@@ -5,15 +5,17 @@
 //! DONE, ERROR) without needing an external SQL Server driver.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use truthdb_core::engine::Engine;
+use truthdb_core::session::{EngineHandle, spawn_engine};
 use truthdb_core::storage::{Storage, StorageOptions};
 use truthdb_tds::server::{TdsConfig, serve_connection};
 
 // Packet types.
 const PKT_SQL_BATCH: u8 = 0x01;
+const PKT_TRANSACTION_MANAGER: u8 = 0x0e;
 const PKT_LOGIN7: u8 = 0x10;
 const PKT_PRELOGIN: u8 = 0x12;
 
@@ -27,7 +29,7 @@ fn temp_path(label: &str) -> std::path::PathBuf {
     path
 }
 
-fn engine(path: &std::path::Path) -> Arc<Mutex<Engine>> {
+fn engine(path: &std::path::Path) -> EngineHandle {
     let opts = StorageOptions {
         size_gib: 1,
         wal_ratio: 0.05,
@@ -37,7 +39,9 @@ fn engine(path: &std::path::Path) -> Arc<Mutex<Engine>> {
         reserved_ratio: 0.17,
     };
     let storage = Storage::create(path.to_path_buf(), opts).expect("storage");
-    Arc::new(Mutex::new(Engine::new(storage).expect("engine")))
+    // The JoinHandle is dropped; the engine thread exits when the last
+    // EngineHandle drops at end of test.
+    spawn_engine(Engine::new(storage).expect("engine")).0
 }
 
 fn config() -> TdsConfig {
@@ -125,6 +129,24 @@ impl Client {
         let (_, response) = self.read_message().await;
         parse_tokens(&response)
     }
+
+    /// Sends a Transaction Manager request (request type + optional isolation
+    /// byte for BEGIN) and returns the decoded response tokens.
+    async fn tm_request(&mut self, request_type: u16, isolation: u8) -> Vec<Token> {
+        let mut payload = Vec::new();
+        let headers = all_headers();
+        let total = 4 + headers.len();
+        payload.extend_from_slice(&(total as u32).to_le_bytes());
+        payload.extend_from_slice(&headers);
+        payload.extend_from_slice(&request_type.to_le_bytes());
+        if request_type == 5 {
+            payload.push(isolation); // IsolationLevel
+            payload.push(0); // name length (B_VARCHAR, empty)
+        }
+        self.write_packet(PKT_TRANSACTION_MANAGER, &payload).await;
+        let (_, response) = self.read_message().await;
+        parse_tokens(&response)
+    }
 }
 
 /// A minimal ALL_HEADERS with a transaction-descriptor header (type 2).
@@ -169,7 +191,8 @@ enum Token {
     ColMetadata(Vec<ColType>),
     Row(Vec<Cell>),
     Error { number: i32 },
-    Done { count: Option<u64> },
+    EnvChange { kind: u8 },
+    Done { count: Option<u64>, in_xact: bool },
     Other(u8),
 }
 
@@ -214,6 +237,8 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
                 if token == 0xaa {
                     let number = i32::from_le_bytes(body[0..4].try_into().unwrap());
                     tokens.push(Token::Error { number });
+                } else if token == 0xe3 {
+                    tokens.push(Token::EnvChange { kind: body[0] });
                 }
                 i += 2 + len;
             }
@@ -233,9 +258,11 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
                 let status = u16::from_le_bytes([payload[i], payload[i + 1]]);
                 let count = u64::from_le_bytes(payload[i + 4..i + 12].try_into().unwrap());
                 let has_count = status & 0x0010 != 0;
+                let in_xact = status & 0x0004 != 0;
                 i += 12;
                 tokens.push(Token::Done {
                     count: has_count.then_some(count),
+                    in_xact,
                 });
             }
             other => {
@@ -371,7 +398,7 @@ fn parse_row(bytes: &[u8], meta: &[ColType]) -> (Vec<Cell>, usize) {
     (cells, i)
 }
 
-async fn connect(engine: Arc<Mutex<Engine>>) -> Client {
+async fn connect(engine: EngineHandle) -> Client {
     let (client_half, server_half) = tokio::io::duplex(64 * 1024);
     let cfg = Arc::new(config());
     tokio::spawn(async move {
@@ -386,7 +413,7 @@ async fn connect(engine: Arc<Mutex<Engine>>) -> Client {
 async fn full_handshake_query_and_error() {
     let path = temp_path("e2e");
     let engine = engine(&path);
-    let mut client = connect(Arc::clone(&engine)).await;
+    let mut client = connect(engine.clone()).await;
 
     client.prelogin().await;
     let login = client.login("sa", "secret").await;
@@ -403,7 +430,7 @@ async fn full_handshake_query_and_error() {
     assert!(
         insert
             .iter()
-            .any(|t| matches!(t, Token::Done { count: Some(3) })),
+            .any(|t| matches!(t, Token::Done { count: Some(3), .. })),
         "insert tokens: {insert:?}"
     );
 
@@ -479,5 +506,102 @@ async fn computed_columns_and_constant_select() {
         .collect();
     assert_eq!(*rows[0], vec![Cell::Int(10), Cell::Int(20)]);
     assert_eq!(*rows[1], vec![Cell::Int(20), Cell::Int(40)]);
+    let _ = std::fs::remove_file(path);
+}
+
+// Transaction Manager request types (MS-TDS 2.2.6.9).
+const TM_BEGIN_XACT: u16 = 5;
+const TM_COMMIT_XACT: u16 = 7;
+const TM_ROLLBACK_XACT: u16 = 8;
+
+fn has_envchange(tokens: &[Token], kind: u8) -> bool {
+    tokens
+        .iter()
+        .any(|t| matches!(t, Token::EnvChange { kind: k } if *k == kind))
+}
+
+fn row_ints(tokens: &[Token]) -> Vec<i64> {
+    tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::Row(cells) => match cells.first() {
+                Some(Cell::Int(v)) => Some(*v),
+                _ => None,
+            },
+            _ => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn tm_begin_commit_persists_and_emits_envchanges() {
+    let path = temp_path("tm-commit");
+    let engine = engine(&path);
+    let mut client = connect(engine).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .await;
+
+    // db.BeginTx(): a TM begin request → ENVCHANGE(8) + DONE(INXACT).
+    let begin = client.tm_request(TM_BEGIN_XACT, 0).await;
+    assert!(has_envchange(&begin, 8), "begin tokens: {begin:?}");
+    assert!(
+        begin
+            .iter()
+            .any(|t| matches!(t, Token::Done { in_xact: true, .. })),
+        "begin DONE must set INXACT: {begin:?}"
+    );
+
+    // A statement inside the transaction reports it is still in a transaction.
+    let insert = client.batch("INSERT INTO t VALUES (1)").await;
+    assert!(
+        insert
+            .iter()
+            .any(|t| matches!(t, Token::Done { in_xact: true, .. })),
+        "in-txn statement DONE must set INXACT: {insert:?}"
+    );
+
+    // Commit → ENVCHANGE(9) + DONE without INXACT.
+    let commit = client.tm_request(TM_COMMIT_XACT, 0).await;
+    assert!(has_envchange(&commit, 9), "commit tokens: {commit:?}");
+    assert!(
+        commit
+            .iter()
+            .any(|t| matches!(t, Token::Done { in_xact: false, .. })),
+        "commit DONE must clear INXACT: {commit:?}"
+    );
+
+    // The committed row is durable and visible after the transaction.
+    let select = client.batch("SELECT id FROM t").await;
+    assert_eq!(row_ints(&select), vec![1]);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn tm_begin_rollback_discards_writes() {
+    let path = temp_path("tm-rollback");
+    let engine = engine(&path);
+    let mut client = connect(engine).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .await;
+    client.batch("INSERT INTO t VALUES (1)").await;
+
+    client.tm_request(TM_BEGIN_XACT, 0).await;
+    client.batch("INSERT INTO t VALUES (2)").await;
+
+    // Rollback → ENVCHANGE(10); the second insert is discarded.
+    let rollback = client.tm_request(TM_ROLLBACK_XACT, 0).await;
+    assert!(
+        has_envchange(&rollback, 10),
+        "rollback tokens: {rollback:?}"
+    );
+
+    let select = client.batch("SELECT id FROM t ORDER BY id").await;
+    assert_eq!(row_ints(&select), vec![1], "only the pre-txn row survives");
     let _ = std::fs::remove_file(path);
 }

@@ -9,11 +9,13 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"errors"
 	"fmt"
 	"os"
 	"strings"
+	"time"
 
 	mssql "github.com/microsoft/go-mssqldb"
 )
@@ -175,7 +177,116 @@ func main() {
 		fail("large multi-packet value: len %d != 3000", len(large))
 	}
 
+	// 11-13: transactions via the TDS Transaction Manager (db.BeginTx sends
+	// TM_BEGIN_XACT, tx.Commit/Rollback send TM_COMMIT/ROLLBACK_XACT).
+	transactionMatrix(db)
+	blockingDemo(db, host, port, user, pass)
+
 	fmt.Println("tds conformance (go-mssqldb): OK")
+}
+
+// transactionMatrix exercises db.BeginTx + Commit/Rollback (the TM request
+// path) and verifies commit durability and rollback discard.
+func transactionMatrix(db *sql.DB) {
+	ctx := context.Background()
+	mustExec(db, "CREATE TABLE tx_go (id INT NOT NULL PRIMARY KEY, v INT)")
+
+	// 11. BeginTx + Insert + Commit → the row persists.
+	tx, err := db.BeginTx(ctx, &sql.TxOptions{Isolation: sql.LevelReadCommitted})
+	if err != nil {
+		fail("BeginTx (commit case): %v", err)
+	}
+	if _, err := tx.Exec("INSERT INTO tx_go VALUES (1, 100)"); err != nil {
+		fail("tx insert: %v", err)
+	}
+	if err := tx.Commit(); err != nil {
+		fail("tx commit: %v", err)
+	}
+	var v int64
+	if err := db.QueryRow("SELECT v FROM tx_go WHERE id = 1").Scan(&v); err != nil {
+		fail("committed row missing: %v", err)
+	}
+	if v != 100 {
+		fail("committed value wrong: %d", v)
+	}
+
+	// 12. BeginTx + Insert + Rollback → the row is discarded.
+	tx2, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		fail("BeginTx (rollback case): %v", err)
+	}
+	if _, err := tx2.Exec("INSERT INTO tx_go VALUES (2, 200)"); err != nil {
+		fail("tx2 insert: %v", err)
+	}
+	if err := tx2.Rollback(); err != nil {
+		fail("tx2 rollback: %v", err)
+	}
+	rows := scanNullInts(db, "SELECT id FROM tx_go ORDER BY id")
+	if len(rows) != 1 || rows[0].Int64 != 1 {
+		fail("rollback did not discard row 2: %v", rows)
+	}
+}
+
+// blockingDemo shows a two-connection blocking interaction: an uncommitted
+// writer blocks a reader on the same table until it commits (READ COMMITTED,
+// no dirty read). The reader runs in a goroutine and must stay blocked until
+// the writer commits, then observe the committed value.
+func blockingDemo(db *sql.DB, host, port, user, pass string) {
+	mustExec(db, "CREATE TABLE block_go (id INT NOT NULL PRIMARY KEY, v INT)")
+	mustExec(db, "INSERT INTO block_go VALUES (1, 1)")
+
+	// A second, independent connection for the writer.
+	writerDB, err := sql.Open("sqlserver", dsn(host, port, user, pass))
+	if err != nil {
+		fail("open writer db: %v", err)
+	}
+	defer writerDB.Close()
+
+	writerTx, err := writerDB.BeginTx(context.Background(), nil)
+	if err != nil {
+		fail("writer BeginTx: %v", err)
+	}
+	if _, err := writerTx.Exec("UPDATE block_go SET v = 2 WHERE id = 1"); err != nil {
+		fail("writer update: %v", err)
+	}
+
+	// The reader (independent connection) blocks on the writer's X lock.
+	value := make(chan int64, 1)
+	readErr := make(chan error, 1)
+	go func() {
+		var v int64
+		if err := db.QueryRow("SELECT v FROM block_go WHERE id = 1").Scan(&v); err != nil {
+			readErr <- err
+			return
+		}
+		value <- v
+	}()
+
+	// While the writer's transaction is open, the reader must not return.
+	select {
+	case <-value:
+		fail("reader was not blocked by the uncommitted writer (dirty read?)")
+	case err := <-readErr:
+		fail("reader errored while blocked: %v", err)
+	case <-time.After(400 * time.Millisecond):
+		// Still blocked, as expected.
+	}
+
+	// Committing the writer releases the lock; the reader unblocks and sees
+	// the committed value (2), never the original (1).
+	if err := writerTx.Commit(); err != nil {
+		fail("writer commit: %v", err)
+	}
+	select {
+	case v := <-value:
+		if v != 2 {
+			fail("reader saw %d, expected the committed value 2", v)
+		}
+	case err := <-readErr:
+		fail("reader errored after commit: %v", err)
+	case <-time.After(5 * time.Second):
+		fail("reader did not unblock after the writer committed")
+	}
 }
 
 func scanNullStrings(db *sql.DB, query string) []sql.NullString {
