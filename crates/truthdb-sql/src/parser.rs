@@ -630,6 +630,21 @@ impl Parser {
                 },
             });
         }
+        // [NOT] LIKE / IN / BETWEEN (the trailing-NOT predicate form).
+        let negated = self.peek_keyword().as_deref() == Some("NOT")
+            && matches!(
+                self.peek_keyword_at(1).as_deref(),
+                Some("LIKE") | Some("IN") | Some("BETWEEN")
+            );
+        if negated {
+            self.bump();
+        }
+        match self.peek_keyword().as_deref() {
+            Some("LIKE") => return self.parse_like(left, negated),
+            Some("IN") => return self.parse_in(left, negated),
+            Some("BETWEEN") => return self.parse_between(left, negated),
+            _ => {}
+        }
         let op = match self.peek().kind {
             TokenKind::Eq => BinaryOp::Eq,
             TokenKind::Ne => BinaryOp::Ne,
@@ -643,6 +658,173 @@ impl Parser {
         let right = self.parse_additive()?;
         self.node()?;
         Ok(binary(op, left, right))
+    }
+
+    fn parse_like(&mut self, left: Expr, negated: bool) -> SqlResult<Expr> {
+        self.bump(); // LIKE
+        let pattern = self.parse_additive()?;
+        let mut end = pattern.span;
+        let escape = if self.peek_keyword().as_deref() == Some("ESCAPE") {
+            self.bump();
+            let token = self.bump();
+            end = token.span;
+            match &token.kind {
+                TokenKind::String(s) if s.chars().count() == 1 => s.chars().next(),
+                _ => return Err(SqlError::syntax(self.token_text(&token), token.span)),
+            }
+        } else {
+            None
+        };
+        self.node()?;
+        Ok(Expr {
+            span: left.span.to(end),
+            kind: ExprKind::Like {
+                expr: Box::new(left),
+                pattern: Box::new(pattern),
+                escape,
+                negated,
+            },
+        })
+    }
+
+    fn parse_in(&mut self, left: Expr, negated: bool) -> SqlResult<Expr> {
+        self.bump(); // IN
+        self.expect(&TokenKind::LParen)?;
+        let mut list = Vec::new();
+        loop {
+            list.push(self.parse_expr()?);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        let end = self.expect(&TokenKind::RParen)?;
+        self.node()?;
+        Ok(Expr {
+            span: left.span.to(end),
+            kind: ExprKind::InList {
+                expr: Box::new(left),
+                list,
+                negated,
+            },
+        })
+    }
+
+    fn parse_between(&mut self, left: Expr, negated: bool) -> SqlResult<Expr> {
+        self.bump(); // BETWEEN
+        // `low`/`high` parse at additive precedence so BETWEEN's `AND` is not
+        // swallowed as a boolean connective.
+        let low = self.parse_additive()?;
+        self.expect_keyword("AND")?;
+        let high = self.parse_additive()?;
+        self.node()?;
+        Ok(Expr {
+            span: left.span.to(high.span),
+            kind: ExprKind::Between {
+                expr: Box::new(left),
+                low: Box::new(low),
+                high: Box::new(high),
+                negated,
+            },
+        })
+    }
+
+    fn parse_function(&mut self, name: Name) -> SqlResult<Expr> {
+        self.expect(&TokenKind::LParen)?;
+        let mut args = Vec::new();
+        if !self.check(&TokenKind::RParen) {
+            loop {
+                args.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let end = self.expect(&TokenKind::RParen)?;
+        self.node()?;
+        Ok(Expr {
+            span: name.span.to(end),
+            kind: ExprKind::Function {
+                name: name.value,
+                args,
+            },
+        })
+    }
+
+    fn parse_case(&mut self) -> SqlResult<Expr> {
+        let start = self.bump().span; // CASE
+        // A simple CASE has an operand before the first WHEN.
+        let operand = if self.peek_keyword().as_deref() == Some("WHEN") {
+            None
+        } else {
+            Some(Box::new(self.parse_expr()?))
+        };
+        let mut branches = Vec::new();
+        while self.peek_keyword().as_deref() == Some("WHEN") {
+            self.bump();
+            let cond = self.parse_expr()?;
+            self.expect_keyword("THEN")?;
+            let result = self.parse_expr()?;
+            self.node()?;
+            branches.push((cond, result));
+        }
+        if branches.is_empty() {
+            let token = self.peek().clone();
+            return Err(SqlError::syntax(self.token_text(&token), token.span));
+        }
+        let else_result = if self.peek_keyword().as_deref() == Some("ELSE") {
+            self.bump();
+            Some(Box::new(self.parse_expr()?))
+        } else {
+            None
+        };
+        let end = self.expect_keyword("END")?;
+        self.node()?;
+        Ok(Expr {
+            span: start.to(end),
+            kind: ExprKind::Case {
+                operand,
+                branches,
+                else_result,
+            },
+        })
+    }
+
+    fn parse_cast(&mut self) -> SqlResult<Expr> {
+        let start = self.bump().span; // CAST
+        self.expect(&TokenKind::LParen)?;
+        let expr = self.parse_expr()?;
+        self.expect_keyword("AS")?;
+        let (target, _) = self.parse_data_type()?;
+        let end = self.expect(&TokenKind::RParen)?;
+        self.node()?;
+        Ok(Expr {
+            span: start.to(end),
+            kind: ExprKind::Cast {
+                expr: Box::new(expr),
+                target,
+            },
+        })
+    }
+
+    fn parse_convert(&mut self) -> SqlResult<Expr> {
+        let start = self.bump().span; // CONVERT
+        self.expect(&TokenKind::LParen)?;
+        let (target, _) = self.parse_data_type()?;
+        self.expect(&TokenKind::Comma)?;
+        let expr = self.parse_expr()?;
+        // An optional style argument is accepted and ignored for now.
+        if self.eat(&TokenKind::Comma) {
+            let _ = self.parse_expr()?;
+        }
+        let end = self.expect(&TokenKind::RParen)?;
+        self.node()?;
+        Ok(Expr {
+            span: start.to(end),
+            kind: ExprKind::Cast {
+                expr: Box::new(expr),
+                target,
+            },
+        })
     }
 
     fn parse_additive(&mut self) -> SqlResult<Expr> {
@@ -764,15 +946,23 @@ impl Parser {
                             span: token.span,
                         })
                     }
+                    Some("CASE") if !quoted => self.parse_case(),
+                    Some("CAST") if !quoted => self.parse_cast(),
+                    Some("CONVERT") if !quoted => self.parse_convert(),
                     Some(kw) if !quoted && is_reserved(kw) => {
                         Err(SqlError::syntax(self.token_text(&token), token.span))
                     }
                     _ => {
                         let name = self.parse_name()?;
-                        Ok(Expr {
-                            span: name.span,
-                            kind: ExprKind::Column(name),
-                        })
+                        // A single identifier followed by `(` is a function call.
+                        if !name.value.contains('.') && self.check(&TokenKind::LParen) {
+                            self.parse_function(name)
+                        } else {
+                            Ok(Expr {
+                                span: name.span,
+                                kind: ExprKind::Column(name),
+                            })
+                        }
                     }
                 }
             }
@@ -859,6 +1049,14 @@ impl Parser {
 
     fn peek_keyword(&self) -> Option<String> {
         self.peek().keyword()
+    }
+
+    /// The keyword `offset` tokens ahead of the cursor (for two-token lookahead
+    /// like `NOT LIKE`).
+    fn peek_keyword_at(&self, offset: usize) -> Option<String> {
+        self.tokens
+            .get((self.pos + offset).min(self.tokens.len() - 1))
+            .and_then(|t| t.keyword())
     }
 
     fn bump(&mut self) -> Token {

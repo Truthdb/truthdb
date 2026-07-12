@@ -176,6 +176,44 @@ pub enum ExprKind {
         expr: Box<Expr>,
         negated: bool,
     },
+    /// `expr [NOT] LIKE pattern [ESCAPE 'c']`.
+    Like {
+        expr: Box<Expr>,
+        pattern: Box<Expr>,
+        escape: Option<char>,
+        negated: bool,
+    },
+    /// `expr [NOT] IN (v1, v2, ...)`.
+    InList {
+        expr: Box<Expr>,
+        list: Vec<Expr>,
+        negated: bool,
+    },
+    /// `expr [NOT] BETWEEN low AND high`.
+    Between {
+        expr: Box<Expr>,
+        low: Box<Expr>,
+        high: Box<Expr>,
+        negated: bool,
+    },
+    /// `CASE [operand] WHEN cond THEN result ... [ELSE result] END`. When
+    /// `operand` is set it is a simple CASE (compared to each WHEN value).
+    Case {
+        operand: Option<Box<Expr>>,
+        branches: Vec<(Expr, Expr)>,
+        else_result: Option<Box<Expr>>,
+    },
+    /// `CAST(expr AS type)` / `CONVERT(type, expr)`.
+    Cast {
+        expr: Box<Expr>,
+        target: DataType,
+    },
+    /// A scalar function call: `name(arg, ...)` (incl. ISNULL/COALESCE/IIF and
+    /// niladic functions like GETDATE()).
+    Function {
+        name: String,
+        args: Vec<Expr>,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -31,6 +31,10 @@ fn pow10(n: u8) -> i128 {
     p
 }
 
+// The arithmetic methods (add/sub/mul/div) intentionally mirror the operator
+// names but return `Result` with SQL Server's derived result type, so they
+// cannot be the std ops traits.
+#[allow(clippy::should_implement_trait)]
 impl Decimal {
     pub fn new(value: i128, precision: u8, scale: u8) -> Self {
         Decimal {

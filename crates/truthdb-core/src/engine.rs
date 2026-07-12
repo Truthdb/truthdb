@@ -1581,6 +1581,55 @@ mod tests {
     }
 
     #[test]
+    fn sql_expression_operators() {
+        let path = unique_temp_path("sql-expr-ops");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20), score INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1, 'Alice', 90), (2, 'Bob', NULL), (3, 'Carol', 70)")
+            .expect("insert");
+
+        // LIKE + IN + BETWEEN combine in a WHERE.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM t WHERE name LIKE 'A%' OR id IN (3) OR score BETWEEN 85 AND 95 ORDER BY id",
+        );
+        assert_eq!(rows, vec![vec![Some("1".into())], vec![Some("3".into())]]);
+
+        // CASE (searched) + ISNULL + a scalar function.
+        let (cols, rows) = sql_rows(
+            &mut engine,
+            "SELECT UPPER(name) AS u, ISNULL(score, 0) AS s, \
+             CASE WHEN score >= 85 THEN 'hi' WHEN score IS NULL THEN 'none' ELSE 'lo' END AS grade \
+             FROM t ORDER BY id",
+        );
+        assert_eq!(cols, vec!["u", "s", "grade"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("ALICE".into()), Some("90".into()), Some("hi".into())],
+                vec![Some("BOB".into()), Some("0".into()), Some("none".into())],
+                vec![Some("CAROL".into()), Some("70".into()), Some("lo".into())],
+            ]
+        );
+
+        // CAST and NOT LIKE.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT CAST(score AS NVARCHAR(10)) FROM t WHERE id = 1",
+        );
+        assert_eq!(rows, vec![vec![Some("90".into())]]);
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM t WHERE name NOT LIKE '%o%' ORDER BY id",
+        );
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_duplicate_pk_reports_error_2627() {
         let path = unique_temp_path("sql-pk-dup");
         let mut engine = new_engine(&path);
