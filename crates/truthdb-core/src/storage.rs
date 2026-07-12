@@ -5,6 +5,16 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::allocator::{EXTENT_PAGES, PageAllocator};
 use crate::direct_io::{AlignedPageBuf, DirectFile};
+use crate::relstore::RelState;
+use crate::relstore::btree::{BTree, TreeInsert};
+use crate::relstore::buffer_pool::DEFAULT_CAPACITY_BYTES;
+use crate::relstore::catalog::{self, FIRST_USER_OBJECT_ID, TableDef};
+use crate::relstore::ctx::{OpMode, PoolIo, RelCtx, TxnLink};
+use crate::relstore::heap::Heap;
+use crate::relstore::key::encode_key;
+use crate::relstore::recovery as rel_recovery;
+use crate::relstore::row::{Column, Schema, decode_row, encode_row};
+use crate::relstore::types::{Datum, TypeError};
 use crate::storage_layout::{
     FileHeader, PAGE_SIZE, SNAPSHOT_DESCRIPTOR_SIZE, SUPERBLOCK_ACTIVE_A, SUPERBLOCK_ACTIVE_B,
     SnapshotDescriptor, Superblock, WAL_ENTRY_TYPE_REL, WAL_MAX_BYTES, WAL_MIN_BYTES, align_down,
@@ -14,6 +24,12 @@ use crate::wal::records::{REL_KIND_ALLOC_EXTENT, REL_KIND_FREE_EXTENT, RelRecord
 use crate::wal::{WalWriter, scan_ring};
 
 pub use crate::wal::WalRecord;
+
+impl From<TypeError> for StorageError {
+    fn from(err: TypeError) -> Self {
+        StorageError::InvalidConfig(err.0)
+    }
+}
 
 /// Version stamped in REL wal entries (entry-level, distinct from the record
 /// kinds inside).
@@ -86,6 +102,9 @@ pub enum StorageError {
 
     #[error("wal ring full: {0}")]
     WalFull(String),
+
+    #[error("constraint violation: {0}")]
+    Constraint(String),
 }
 
 pub struct Storage {
@@ -178,6 +197,437 @@ impl Storage {
     pub fn is_page_allocated(&self, page: u64) -> bool {
         self.file.allocator.is_allocated(page)
     }
+
+    // ---- relational store (Stage 2 surface; SQL replaces this in Stage 3) --
+
+    /// Creates a table: with `key_names` it becomes a clustered B+ tree on
+    /// those columns, without it a heap.
+    pub fn rel_create_table(
+        &mut self,
+        name: &str,
+        columns: Vec<Column>,
+        key_names: &[String],
+    ) -> Result<(), StorageError> {
+        self.file.ensure_rel_usable()?;
+        if self.file.rel.tables.contains_key(name) {
+            return Err(StorageError::Constraint(format!(
+                "table '{name}' already exists"
+            )));
+        }
+        if columns.is_empty() {
+            return Err(StorageError::InvalidConfig(
+                "a table needs at least one column".to_string(),
+            ));
+        }
+        let mut key_columns = Vec::new();
+        for key_name in key_names {
+            let index = columns
+                .iter()
+                .position(|c| &c.name == key_name)
+                .ok_or_else(|| {
+                    StorageError::InvalidConfig(format!("unknown key column '{key_name}'"))
+                })?;
+            if columns[index].nullable {
+                return Err(StorageError::InvalidConfig(format!(
+                    "primary key column '{key_name}' must be NOT NULL"
+                )));
+            }
+            key_columns.push(index);
+        }
+
+        // The catalog tree itself is created outside the statement (system
+        // records, not undoable) so a rolled-back CREATE TABLE still leaves
+        // a valid catalog.
+        if self.file.rel.catalog_root.is_none() {
+            let root = {
+                let mut ctx = self.file.rel_ctx();
+                catalog::create_catalog(&mut ctx)?
+            };
+            self.file.rel.catalog_root = Some(root);
+        }
+        let catalog_root = self.file.rel.catalog_root.expect("catalog exists");
+        let object_id = self.file.rel.next_object_id;
+        let def_columns: Vec<(String, String, bool)> = columns
+            .iter()
+            .map(|c| (c.name.clone(), c.column_type.name(), c.nullable))
+            .collect();
+        let table_name = name.to_string();
+        let is_tree = !key_columns.is_empty();
+
+        let def = self.file.rel_statement(move |ctx, txn| {
+            let root_page = if is_tree {
+                BTree::create(ctx, object_id)?.root
+            } else {
+                Heap::create(ctx, object_id)?.first_page
+            };
+            let def = TableDef {
+                object_id,
+                name: table_name,
+                columns: def_columns,
+                key_columns,
+                root_page,
+            };
+            catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
+            Ok(def)
+        })?;
+        self.file.rel.next_object_id += 1;
+        self.file.rel.tables.insert(name.to_string(), def);
+        Ok(())
+    }
+
+    /// The table's definition (schema and layout), if it exists.
+    pub fn rel_table(&self, name: &str) -> Option<TableDef> {
+        self.file.rel.tables.get(name).cloned()
+    }
+
+    pub fn rel_insert(&mut self, name: &str, values: Vec<Datum>) -> Result<(), StorageError> {
+        self.file.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(name)?;
+        validate_not_null(&schema, &values)?;
+        let row = encode_row(&schema, &values)?;
+        if def.is_tree() {
+            let key = encode_key(&schema, &def.key_columns, &values)?;
+            let tree = BTree {
+                object_id: def.object_id,
+                root: def.root_page,
+            };
+            self.file.rel_statement(move |ctx, txn| {
+                match tree.insert_unique(ctx, &mut OpMode::Txn(txn), &key, &row)? {
+                    TreeInsert::Inserted => Ok(()),
+                    TreeInsert::DuplicateKey => Err(StorageError::Constraint(
+                        "duplicate primary key".to_string(),
+                    )),
+                }
+            })
+        } else {
+            let heap = Heap {
+                object_id: def.object_id,
+                first_page: def.root_page,
+            };
+            self.file.rel_statement(move |ctx, txn| {
+                heap.insert(ctx, txn, &row)?;
+                Ok(())
+            })
+        }
+    }
+
+    /// Point lookup by primary key (clustered tables only).
+    pub fn rel_get(
+        &mut self,
+        name: &str,
+        key_values: &[Datum],
+    ) -> Result<Option<Vec<Datum>>, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(name)?;
+        if !def.is_tree() {
+            return Err(StorageError::InvalidConfig(format!(
+                "table '{name}' has no primary key"
+            )));
+        }
+        if key_values.len() != def.key_columns.len() {
+            return Err(StorageError::InvalidConfig(
+                "wrong number of key values".to_string(),
+            ));
+        }
+        let mut key = Vec::new();
+        for value in key_values {
+            crate::relstore::key::encode_datum(value, &mut key)?;
+        }
+        let tree = BTree {
+            object_id: def.object_id,
+            root: def.root_page,
+        };
+        let mut ctx = self.file.rel_ctx();
+        match tree.get(&mut ctx, &key)? {
+            Some(row) => Ok(Some(decode_row(&schema, &row)?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Full scan: rows as typed datums (key order for trees, chain order
+    /// for heaps).
+    pub fn rel_scan(&mut self, name: &str) -> Result<Vec<Vec<Datum>>, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(name)?;
+        let mut ctx = self.file.rel_ctx();
+        let raw: Vec<Vec<u8>> = if def.is_tree() {
+            let tree = BTree {
+                object_id: def.object_id,
+                root: def.root_page,
+            };
+            tree.scan(&mut ctx)?
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect()
+        } else {
+            let heap = Heap {
+                object_id: def.object_id,
+                first_page: def.root_page,
+            };
+            heap.scan(&mut ctx)?
+                .into_iter()
+                .map(|(_, row)| row)
+                .collect()
+        };
+        raw.into_iter()
+            .map(|row| decode_row(&schema, &row).map_err(StorageError::from))
+            .collect()
+    }
+
+    /// Deletes every row where `column = value`; returns the count. Targets
+    /// are materialized before any mutation (Halloween avoidance).
+    pub fn rel_delete_where(
+        &mut self,
+        name: &str,
+        column: &str,
+        value: &Datum,
+    ) -> Result<usize, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(name)?;
+        let column_index = column_index(&schema, column)?;
+        if def.is_tree() {
+            let tree = BTree {
+                object_id: def.object_id,
+                root: def.root_page,
+            };
+            let keys = {
+                let mut ctx = self.file.rel_ctx();
+                let mut keys = Vec::new();
+                for (key, row) in tree.scan(&mut ctx)? {
+                    if decode_row(&schema, &row)?[column_index] == *value {
+                        keys.push(key);
+                    }
+                }
+                keys
+            };
+            let count = keys.len();
+            if count > 0 {
+                self.file.rel_statement(move |ctx, txn| {
+                    for key in &keys {
+                        tree.delete(ctx, &mut OpMode::Txn(txn), key)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(count)
+        } else {
+            let heap = Heap {
+                object_id: def.object_id,
+                first_page: def.root_page,
+            };
+            let rids = {
+                let mut ctx = self.file.rel_ctx();
+                let mut rids = Vec::new();
+                for (rid, row) in heap.scan(&mut ctx)? {
+                    if decode_row(&schema, &row)?[column_index] == *value {
+                        rids.push(rid);
+                    }
+                }
+                rids
+            };
+            let count = rids.len();
+            if count > 0 {
+                self.file.rel_statement(move |ctx, txn| {
+                    for rid in &rids {
+                        heap.delete(ctx, txn, *rid)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(count)
+        }
+    }
+
+    /// Updates every row where `column = value` with the given column
+    /// assignments; returns the count. Key columns of clustered tables are
+    /// immutable here (delete + insert to change a key).
+    pub fn rel_update_where(
+        &mut self,
+        name: &str,
+        column: &str,
+        value: &Datum,
+        assignments: &[(String, Datum)],
+    ) -> Result<usize, StorageError> {
+        self.file.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(name)?;
+        let column_index = column_index(&schema, column)?;
+        let mut set: Vec<(usize, Datum)> = Vec::new();
+        for (set_name, set_value) in assignments {
+            let index = column_index_by(&schema, set_name)?;
+            if def.key_columns.contains(&index) {
+                return Err(StorageError::InvalidConfig(format!(
+                    "cannot update primary key column '{set_name}'"
+                )));
+            }
+            set.push((index, set_value.clone()));
+        }
+
+        let apply_set = |mut values: Vec<Datum>| -> Vec<Datum> {
+            for (index, new_value) in &set {
+                values[*index] = new_value.clone();
+            }
+            values
+        };
+
+        if def.is_tree() {
+            let tree = BTree {
+                object_id: def.object_id,
+                root: def.root_page,
+            };
+            let targets = {
+                let mut ctx = self.file.rel_ctx();
+                let mut targets = Vec::new();
+                for (key, row) in tree.scan(&mut ctx)? {
+                    let values = decode_row(&schema, &row)?;
+                    if values[column_index] == *value {
+                        targets.push((key, values));
+                    }
+                }
+                targets
+            };
+            let count = targets.len();
+            let mut encoded = Vec::with_capacity(count);
+            for (key, values) in targets {
+                let new_values = apply_set(values);
+                validate_not_null(&schema, &new_values)?;
+                encoded.push((key, encode_row(&schema, &new_values)?));
+            }
+            if count > 0 {
+                self.file.rel_statement(move |ctx, txn| {
+                    for (key, row) in &encoded {
+                        tree.update(ctx, &mut OpMode::Txn(txn), key, row)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(count)
+        } else {
+            let heap = Heap {
+                object_id: def.object_id,
+                first_page: def.root_page,
+            };
+            let targets = {
+                let mut ctx = self.file.rel_ctx();
+                let mut targets = Vec::new();
+                for (rid, row) in heap.scan(&mut ctx)? {
+                    let values = decode_row(&schema, &row)?;
+                    if values[column_index] == *value {
+                        targets.push((rid, values));
+                    }
+                }
+                targets
+            };
+            let count = targets.len();
+            let mut encoded = Vec::with_capacity(count);
+            for (rid, values) in targets {
+                let new_values = apply_set(values);
+                validate_not_null(&schema, &new_values)?;
+                encoded.push((rid, encode_row(&schema, &new_values)?));
+            }
+            if count > 0 {
+                self.file.rel_statement(move |ctx, txn| {
+                    for (rid, row) in &encoded {
+                        heap.update(ctx, txn, *rid, row)?;
+                    }
+                    Ok(())
+                })?;
+            }
+            Ok(count)
+        }
+    }
+
+    /// Test hook: run an insert's ops durably but never commit — the state a
+    /// crash mid-statement leaves behind (loser transaction for recovery).
+    #[cfg(test)]
+    pub(crate) fn rel_insert_without_commit(
+        &mut self,
+        name: &str,
+        values: Vec<Datum>,
+    ) -> Result<(), StorageError> {
+        let (def, schema) = self.rel_def(name)?;
+        let row = encode_row(&schema, &values)?;
+        let txn_id = self.file.rel.next_txn_id;
+        self.file.rel.next_txn_id += 1;
+        let mut ctx = self.file.rel_ctx();
+        let mut txn = ctx.begin(txn_id)?;
+        if def.is_tree() {
+            let key = encode_key(&schema, &def.key_columns, &values)?;
+            let tree = BTree {
+                object_id: def.object_id,
+                root: def.root_page,
+            };
+            tree.insert_unique(&mut ctx, &mut OpMode::Txn(&mut txn), &key, &row)?;
+        } else {
+            let heap = Heap {
+                object_id: def.object_id,
+                first_page: def.root_page,
+            };
+            heap.insert(&mut ctx, &mut txn, &row)?;
+        }
+        // Durable ops, no commit record: exactly the crash window.
+        ctx.io.wal.sync_all()?;
+        Ok(())
+    }
+
+    /// Test hook: flush dirty relational pages to disk WITHOUT advancing the
+    /// WAL head (the mid-checkpoint crash window where torn pages are
+    /// possible but their FPIs are still in the log).
+    #[cfg(test)]
+    pub(crate) fn rel_flush_pool_only(&mut self) -> Result<(), StorageError> {
+        self.file.wal.sync_all()?;
+        let RelState { pool, .. } = &mut self.file.rel;
+        let mut io = PoolIo {
+            file: &mut self.file.file,
+            wal: &mut self.file.wal,
+            data_offset: self.file.layout.data_offset,
+            data_pages: self.file.layout.data_size / PAGE_SIZE as u64,
+        };
+        pool.flush_all(&mut io)?;
+        self.file.file.sync_data()?;
+        Ok(())
+    }
+
+    /// Test hook: the absolute file offset of a data-region page.
+    #[cfg(test)]
+    pub(crate) fn data_page_offset(&self, page: u64) -> u64 {
+        self.file.layout.data_offset + page * PAGE_SIZE as u64
+    }
+
+    fn rel_def(&self, name: &str) -> Result<(TableDef, Schema), StorageError> {
+        let def = self
+            .file
+            .rel
+            .tables
+            .get(name)
+            .cloned()
+            .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{name}'")))?;
+        let schema = def.schema()?;
+        Ok((def, schema))
+    }
+}
+
+fn column_index(schema: &Schema, name: &str) -> Result<usize, StorageError> {
+    column_index_by(schema, name)
+}
+
+fn column_index_by(schema: &Schema, name: &str) -> Result<usize, StorageError> {
+    schema
+        .columns
+        .iter()
+        .position(|c| c.name == name)
+        .ok_or_else(|| StorageError::InvalidConfig(format!("unknown column '{name}'")))
+}
+
+fn validate_not_null(schema: &Schema, values: &[Datum]) -> Result<(), StorageError> {
+    for (column, value) in schema.columns.iter().zip(values) {
+        if !column.nullable && value.is_null() {
+            return Err(StorageError::Constraint(format!(
+                "column '{}' does not allow NULL",
+                column.name
+            )));
+        }
+    }
+    Ok(())
 }
 
 pub struct SnapshotData {
@@ -199,6 +649,8 @@ struct StorageFile {
     superblock_b: Superblock,
     active_superblock: ActiveSuperblock,
     allocator: PageAllocator,
+    /// Relational store state (buffer pool, dirty-page table, catalog cache).
+    rel: RelState,
     /// WAL records recovered at open, waiting for the engine to replay them.
     replay_cache: Vec<WalRecord>,
 }
@@ -306,6 +758,20 @@ impl StorageFile {
         )?;
         let recorded_tail = active_sb.wal_tail;
 
+        // The catalog root is stored as an absolute file offset (0 = none).
+        let mut rel = RelState::new(DEFAULT_CAPACITY_BYTES);
+        if active_sb.metadata_root != 0 {
+            if active_sb.metadata_root < layout.data_offset
+                || active_sb.metadata_root >= layout.data_offset + layout.data_size
+            {
+                return Err(StorageError::InvalidFile(
+                    "catalog root outside the data region".to_string(),
+                ));
+            }
+            rel.catalog_root =
+                Some((active_sb.metadata_root - layout.data_offset) / PAGE_SIZE as u64);
+        }
+
         let mut storage = StorageFile {
             path,
             file,
@@ -315,6 +781,7 @@ impl StorageFile {
             superblock_b,
             active_superblock,
             allocator: PageAllocator::new(layout.data_size),
+            rel,
             replay_cache: scan.records,
         };
         storage.recover_allocator()?;
@@ -335,6 +802,10 @@ impl StorageFile {
             storage.write_active_superblock(last_seq)?;
             storage.file.sync_data()?;
         }
+
+        // ARIES restart for the relational store: analysis + redo, catalog
+        // reload, undo of losers with compensation logging.
+        storage.recover_rel()?;
         Ok(storage)
     }
 
@@ -393,8 +864,137 @@ impl StorageFile {
             superblock_b,
             active_superblock: ActiveSuperblock::A,
             allocator: PageAllocator::new(layout.data_size),
+            rel: RelState::new(DEFAULT_CAPACITY_BYTES),
             replay_cache: Vec::new(),
         })
+    }
+
+    /// Builds the relational execution context over this file's parts.
+    fn rel_ctx(&mut self) -> RelCtx<'_> {
+        RelCtx {
+            pool: &mut self.rel.pool,
+            io: PoolIo {
+                file: &mut self.file,
+                wal: &mut self.wal,
+                data_offset: self.layout.data_offset,
+                data_pages: self.layout.data_size / PAGE_SIZE as u64,
+            },
+            allocator: &mut self.allocator,
+            dpt: &mut self.rel.dpt,
+            use_reserve: false,
+        }
+    }
+
+    /// Decodes the relational records (with their LSNs) from the recovery
+    /// scan.
+    fn rel_records(&self) -> Result<Vec<(u64, RelRecord)>, StorageError> {
+        self.replay_cache
+            .iter()
+            .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
+            .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
+            .collect()
+    }
+
+    /// ARIES restart: analysis + redo (repeating history), then undo of
+    /// loser transactions with CLRs. The catalog is loaded between redo and
+    /// undo (undo needs tree roots) and reloaded after (undo may have
+    /// removed catalog rows).
+    fn recover_rel(&mut self) -> Result<(), StorageError> {
+        let records = self.rel_records()?;
+        if records.is_empty() && self.rel.catalog_root.is_none() {
+            return Ok(());
+        }
+
+        let outcome = {
+            let mut ctx = self.rel_ctx();
+            rel_recovery::analyze_and_redo(&mut ctx, &records)?
+        };
+        if let Some(root) = outcome.catalog_root {
+            self.rel.catalog_root = Some(root);
+        }
+        self.rel.next_txn_id = outcome.max_txn_id + 1;
+
+        self.reload_catalog()?;
+        if !outcome.losers.is_empty() {
+            let roots = self.rel.tree_roots();
+            let mut ctx = self.rel_ctx();
+            rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &roots)?;
+            self.reload_catalog()?;
+        }
+        self.rel.next_object_id = self
+            .rel
+            .tables
+            .values()
+            .map(|def| def.object_id + 1)
+            .max()
+            .unwrap_or(FIRST_USER_OBJECT_ID)
+            .max(FIRST_USER_OBJECT_ID);
+        self.wal.sync_all()?;
+        Ok(())
+    }
+
+    fn reload_catalog(&mut self) -> Result<(), StorageError> {
+        let Some(root) = self.rel.catalog_root else {
+            self.rel.tables.clear();
+            return Ok(());
+        };
+        let defs = {
+            let mut ctx = self.rel_ctx();
+            catalog::load_tables(&mut ctx, root)?
+        };
+        self.rel.tables = defs
+            .into_iter()
+            .map(|def| (def.name.clone(), def))
+            .collect();
+        Ok(())
+    }
+
+    /// Runs one autocommit relational statement: begin, ops, commit (force
+    /// log); statement failure rolls back through the in-memory undo log.
+    fn rel_statement<T>(
+        &mut self,
+        f: impl FnOnce(&mut RelCtx<'_>, &mut TxnLink) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let txn_id = self.rel.next_txn_id;
+        self.rel.next_txn_id += 1;
+        let roots = self.rel.tree_roots();
+        let mut ctx = self.rel_ctx();
+        let mut txn = ctx.begin(txn_id)?;
+        let (result, wedged) = match f(&mut ctx, &mut txn) {
+            Ok(value) => match ctx.commit(txn) {
+                Ok(()) => (Ok(value), false),
+                // The commit record may or may not have reached the disk;
+                // writing CLRs now could undo a durable commit. Wedge and
+                // let restart recovery decide (commit durable -> winner,
+                // else -> loser undone).
+                Err(err) => (Err(err), true),
+            },
+            Err(err) => match rel_recovery::rollback(&mut ctx, txn, &roots) {
+                Ok(()) => {
+                    let _ = ctx.io.wal.sync_all();
+                    (Err(err), false)
+                }
+                // Half-rolled-back state in the pool that the WAL cannot
+                // explain: nothing relational may proceed (a checkpoint
+                // would make it permanent).
+                Err(rollback_err) => (Err(rollback_err), true),
+            },
+        };
+        let _ = ctx;
+        if wedged {
+            self.rel.wedged = true;
+        }
+        result
+    }
+
+    fn ensure_rel_usable(&self) -> Result<(), StorageError> {
+        if self.rel.wedged {
+            return Err(StorageError::InvalidFile(
+                "relational store wedged after a failed commit/rollback; restart to recover from the log"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     /// Rebuilds the live allocator: persisted bitmap, then reconciliation
@@ -440,11 +1040,9 @@ impl StorageFile {
                     let (start, pages) = record.decode_extent_redo()?;
                     self.allocator.free(start, pages);
                 }
-                other => {
-                    return Err(StorageError::InvalidFile(format!(
-                        "unknown rel wal record kind {other}"
-                    )));
-                }
+                // Transaction/page records are ARIES recovery's business
+                // (recover_rel); the allocator only replays extent state.
+                _ => {}
             }
         }
 
@@ -563,6 +1161,7 @@ impl StorageFile {
         next_seq_no: u64,
         next_doc_id: u64,
     ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
         if data.is_empty() {
             // An empty snapshot would produce a descriptor that
             // SnapshotDescriptor::is_valid rejects while the WAL head still
@@ -688,6 +1287,25 @@ impl StorageFile {
         desc_offset: u64,
         data_write_offset: u64,
     ) -> Result<(), StorageError> {
+        // Flush every dirty relational page (WAL-before-data enforced per
+        // page by the pool) and reset the dirty-page table: the next change
+        // to any page starts a fresh FPI epoch. With the engine single-
+        // threaded, no relational transaction can span a checkpoint, so the
+        // WAL head may advance to the tail below (a future concurrent engine
+        // must clamp it to the oldest active transaction's begin LSN).
+        self.wal.sync_all()?;
+        {
+            let RelState { pool, dpt, .. } = &mut self.rel;
+            let mut io = PoolIo {
+                file: &mut self.file,
+                wal: &mut self.wal,
+                data_offset: self.layout.data_offset,
+                data_pages: self.layout.data_size / PAGE_SIZE as u64,
+            };
+            pool.flush_all(&mut io)?;
+            dpt.clear();
+        }
+
         // Free the previous snapshot's extent now that the new one is
         //    durable, and persist the allocator bitmap (temp extents
         //    excluded). The bitmap must be durable before the WAL head
@@ -717,6 +1335,12 @@ impl StorageFile {
         self.active_superblock = new_active;
 
         let (head, tail) = (self.wal.head(), self.wal.tail());
+        // Catalog root as an absolute file offset (0 = none).
+        let metadata_root = self
+            .rel
+            .catalog_root
+            .map(|page| self.layout.data_offset + page * PAGE_SIZE as u64)
+            .unwrap_or(0);
         let new_sb = |active_flag: u8| -> Superblock {
             let mut sb = Superblock::default();
             sb.generation = generation;
@@ -726,6 +1350,7 @@ impl StorageFile {
             sb.last_committed_seq = checkpoint_seq;
             sb.snapshot_root = desc_offset;
             sb.data_root = data_write_offset;
+            sb.metadata_root = metadata_root;
             sb.checksum = sb.compute_checksum();
             sb
         };

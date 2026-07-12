@@ -4,6 +4,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use thiserror::Error;
 
+use crate::relstore::row::{Column, Schema};
+use crate::relstore::types::{ColumnType, Datum};
 use crate::storage::{Storage, StorageError};
 
 const ENGINE_WAL_ENTRY_VERSION: u16 = 1;
@@ -106,7 +108,68 @@ impl Engine {
                     }
                 }))
             }
+            Command::Table(table_command) => self.execute_table(table_command),
         }
+    }
+
+    /// Temporary Stage 2 debug surface over the relational store; replaced
+    /// by SQL in Stage 3.
+    fn execute_table(&mut self, command: TableCommand) -> Result<String, EngineError> {
+        match command {
+            TableCommand::Create { name, body } => {
+                let (columns, key_names) = parse_table_create_body(&body)?;
+                self.storage.rel_create_table(&name, columns, &key_names)?;
+                self.maybe_checkpoint()?;
+                render_json(&json!({ "acknowledged": true, "table": name }))
+            }
+            TableCommand::Insert { name, body } => {
+                let schema = self.table_schema(&name)?;
+                let values = parse_row_values(&schema, &body)?;
+                self.storage.rel_insert(&name, values)?;
+                self.maybe_checkpoint()?;
+                render_json(&json!({ "rows_affected": 1 }))
+            }
+            TableCommand::Scan { name } => {
+                let schema = self.table_schema(&name)?;
+                let rows = self.storage.rel_scan(&name)?;
+                let rendered: Vec<Value> = rows
+                    .iter()
+                    .map(|row| {
+                        let mut object = Map::new();
+                        for (column, value) in schema.columns.iter().zip(row) {
+                            object.insert(column.name.clone(), value.to_json(&column.column_type));
+                        }
+                        Value::Object(object)
+                    })
+                    .collect();
+                render_json(&json!({ "count": rendered.len(), "rows": rendered }))
+            }
+            TableCommand::Update { name, body } => {
+                let schema = self.table_schema(&name)?;
+                let (column, value) = parse_where(&schema, &body)?;
+                let assignments = parse_set(&schema, &body)?;
+                let count = self
+                    .storage
+                    .rel_update_where(&name, &column, &value, &assignments)?;
+                self.maybe_checkpoint()?;
+                render_json(&json!({ "rows_affected": count }))
+            }
+            TableCommand::Delete { name, body } => {
+                let schema = self.table_schema(&name)?;
+                let (column, value) = parse_where(&schema, &body)?;
+                let count = self.storage.rel_delete_where(&name, &column, &value)?;
+                self.maybe_checkpoint()?;
+                render_json(&json!({ "rows_affected": count }))
+            }
+        }
+    }
+
+    fn table_schema(&self, name: &str) -> Result<Schema, EngineError> {
+        let def = self
+            .storage
+            .rel_table(name)
+            .ok_or_else(|| CommandError::InvalidCommand(format!("unknown table '{name}'")))?;
+        Ok(def.schema()?)
     }
 
     pub fn checkpoint(&mut self) -> Result<(), EngineError> {
@@ -447,6 +510,17 @@ enum Command {
         index: String,
         query: SearchQuery,
     },
+    Table(TableCommand),
+}
+
+/// Temporary Stage 2 debug commands over the relational store.
+#[derive(Debug, Clone)]
+enum TableCommand {
+    Create { name: String, body: Document },
+    Insert { name: String, body: Document },
+    Scan { name: String },
+    Update { name: String, body: Document },
+    Delete { name: String, body: Document },
 }
 
 #[derive(Debug, Clone)]
@@ -599,8 +673,39 @@ fn parse_command(input: &str) -> Result<Command, CommandError> {
         return Ok(Command::Search { index, query });
     }
 
+    if let Some((header, body)) = split_command(trimmed, "table create")? {
+        let name = parse_single_name(header, "table create")?;
+        let body = parse_document_body(body)?;
+        return Ok(Command::Table(TableCommand::Create { name, body }));
+    }
+    if let Some((header, body)) = split_command(trimmed, "table insert")? {
+        let name = parse_single_name(header, "table insert")?;
+        let body = parse_document_body(body)?;
+        return Ok(Command::Table(TableCommand::Insert { name, body }));
+    }
+    if let Some((header, body)) = split_command(trimmed, "table update")? {
+        let name = parse_single_name(header, "table update")?;
+        let body = parse_document_body(body)?;
+        return Ok(Command::Table(TableCommand::Update { name, body }));
+    }
+    if let Some((header, body)) = split_command(trimmed, "table delete")? {
+        let name = parse_single_name(header, "table delete")?;
+        let body = parse_document_body(body)?;
+        return Ok(Command::Table(TableCommand::Delete { name, body }));
+    }
+    if let Some((header, _body)) = split_command(trimmed, "table scan")? {
+        let name = parse_single_name(header, "table scan")?;
+        return Ok(Command::Table(TableCommand::Scan { name }));
+    }
+    // `table scan` takes no body, so also accept the bodyless form (every
+    // other route requires a `{`, which split_command enforces).
+    if trimmed.to_ascii_lowercase().starts_with("table scan") {
+        let name = parse_single_name(trimmed, "table scan")?;
+        return Ok(Command::Table(TableCommand::Scan { name }));
+    }
+
     Err(CommandError::InvalidCommand(
-        "expected one of: create index, insert document, search".to_string(),
+        "expected one of: create index, insert document, search, table create/insert/scan/update/delete".to_string(),
     ))
 }
 
@@ -678,6 +783,120 @@ fn parse_document_body(body: &str) -> Result<Document, CommandError> {
     let value = parse_json(body)?;
     let object = as_object(&value, "document body")?;
     Ok(object.clone())
+}
+
+/// Parses `{"columns": [{"name","type","nullable"?}...], "primary_key": [..]?}`.
+fn parse_table_create_body(body: &Document) -> Result<(Vec<Column>, Vec<String>), EngineError> {
+    let bad = |msg: &str| EngineError::Command(CommandError::InvalidCommand(msg.to_string()));
+    let columns_value = body
+        .get("columns")
+        .and_then(Value::as_array)
+        .ok_or_else(|| bad("table create requires a 'columns' array"))?;
+    let mut columns = Vec::with_capacity(columns_value.len());
+    for column_value in columns_value {
+        let object = column_value
+            .as_object()
+            .ok_or_else(|| bad("each column must be an object"))?;
+        let name = object
+            .get("name")
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad("column missing 'name'"))?;
+        let type_spec = object
+            .get("type")
+            .and_then(Value::as_str)
+            .ok_or_else(|| bad("column missing 'type'"))?;
+        let nullable = object
+            .get("nullable")
+            .map(|v| v.as_bool().ok_or_else(|| bad("'nullable' must be a bool")))
+            .transpose()?
+            .unwrap_or(true);
+        let column_type = ColumnType::parse(type_spec)
+            .map_err(|err| EngineError::Command(CommandError::InvalidCommand(err.0)))?;
+        columns.push(Column {
+            name: name.to_string(),
+            column_type,
+            nullable,
+        });
+    }
+    let key_names = match body.get("primary_key") {
+        None => Vec::new(),
+        Some(value) => value
+            .as_array()
+            .ok_or_else(|| bad("'primary_key' must be an array"))?
+            .iter()
+            .map(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .ok_or_else(|| bad("'primary_key' entries must be strings"))
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+    };
+    Ok((columns, key_names))
+}
+
+/// Converts an insert body (column -> JSON value) into a full row in schema
+/// order; absent columns become NULL.
+fn parse_row_values(schema: &Schema, body: &Document) -> Result<Vec<Datum>, EngineError> {
+    for field in body.keys() {
+        if !schema.columns.iter().any(|c| &c.name == field) {
+            return Err(CommandError::InvalidCommand(format!("unknown column '{field}'")).into());
+        }
+    }
+    schema
+        .columns
+        .iter()
+        .map(|column| {
+            let value = body.get(&column.name).unwrap_or(&Value::Null);
+            Datum::from_json(&column.column_type, value)
+                .map_err(|err| CommandError::InvalidCommand(err.0).into())
+        })
+        .collect()
+}
+
+/// Parses `{"where": {"col": value}}` into a typed equality predicate.
+fn parse_where(schema: &Schema, body: &Document) -> Result<(String, Datum), EngineError> {
+    let bad = |msg: &str| EngineError::Command(CommandError::InvalidCommand(msg.to_string()));
+    let object = body
+        .get("where")
+        .and_then(Value::as_object)
+        .ok_or_else(|| bad("expected a 'where' object with exactly one column"))?;
+    if object.len() != 1 {
+        return Err(bad("'where' must contain exactly one column"));
+    }
+    let (name, value) = object.iter().next().expect("one entry");
+    let column = schema
+        .columns
+        .iter()
+        .find(|c| &c.name == name)
+        .ok_or_else(|| bad(&format!("unknown column '{name}'")))?;
+    let datum = Datum::from_json(&column.column_type, value)
+        .map_err(|err| EngineError::Command(CommandError::InvalidCommand(err.0)))?;
+    Ok((name.clone(), datum))
+}
+
+/// Parses `{"set": {"col": value, ...}}` into typed assignments.
+fn parse_set(schema: &Schema, body: &Document) -> Result<Vec<(String, Datum)>, EngineError> {
+    let bad = |msg: &str| EngineError::Command(CommandError::InvalidCommand(msg.to_string()));
+    let object = body
+        .get("set")
+        .and_then(Value::as_object)
+        .ok_or_else(|| bad("expected a 'set' object"))?;
+    if object.is_empty() {
+        return Err(bad("'set' must assign at least one column"));
+    }
+    object
+        .iter()
+        .map(|(name, value)| {
+            let column = schema
+                .columns
+                .iter()
+                .find(|c| &c.name == name)
+                .ok_or_else(|| bad(&format!("unknown column '{name}'")))?;
+            let datum = Datum::from_json(&column.column_type, value)
+                .map_err(|err| EngineError::Command(CommandError::InvalidCommand(err.0)))?;
+            Ok((name.clone(), datum))
+        })
+        .collect()
 }
 
 fn parse_search_body(body: &str) -> Result<SearchQuery, CommandError> {
@@ -1084,6 +1303,95 @@ mod tests {
             .expect("search");
         let response: Value = serde_json::from_str(&response).expect("valid json");
         assert_eq!(response["hits"]["total"].as_u64(), Some(1));
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Stage 2 exit criterion: search events and relational records share
+    /// one WAL ring; a crash must recover both, each through its own
+    /// mechanism, regardless of interleaving.
+    #[test]
+    fn mixed_search_and_relational_wal_replays_in_order() {
+        let path = unique_temp_path("mixed-wal");
+        let storage =
+            Storage::create(path.clone(), test_storage_options()).expect("storage create");
+        let mut engine = Engine::new(storage).expect("engine create");
+
+        engine
+            .execute(
+                r#"create index docs { "mappings": { "properties": { "body": { "type": "text" } } } }"#,
+            )
+            .expect("create index");
+        engine
+            .execute(
+                r#"table create items { "columns": [ {"name":"id","type":"int","nullable":false}, {"name":"label","type":"nvarchar(50)"} ], "primary_key": ["id"] }"#,
+            )
+            .expect("create table");
+        // Interleave the two subsystems in one ring.
+        for i in 0..10 {
+            engine
+                .execute(&format!(
+                    r#"insert document docs {{ "body": "search event {i}" }}"#
+                ))
+                .expect("insert doc");
+            engine
+                .execute(&format!(
+                    r#"table insert items {{ "id": {i}, "label": "row {i}" }}"#
+                ))
+                .expect("insert row");
+        }
+        engine
+            .execute(r#"table delete items { "where": { "id": 3 } }"#)
+            .expect("delete row");
+        drop(engine); // crash: everything lives in the shared WAL only
+
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("recover both subsystems");
+
+        let response = engine
+            .execute(r#"search docs { "query": { "match": { "body": "search" } } }"#)
+            .expect("search");
+        let response: Value = serde_json::from_str(&response).expect("json");
+        assert_eq!(response["hits"]["total"].as_u64(), Some(10));
+
+        let response = engine.execute(r#"table scan items {}"#).expect("scan");
+        let response: Value = serde_json::from_str(&response).expect("json");
+        assert_eq!(response["count"].as_u64(), Some(9));
+        let ids: Vec<i64> = response["rows"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["id"].as_i64().unwrap())
+            .collect();
+        assert_eq!(ids, vec![0, 1, 2, 4, 5, 6, 7, 8, 9], "key order, id 3 gone");
+
+        // Both surfaces stay writable after recovery.
+        engine
+            .execute(
+                r#"table update items { "where": { "id": 4 }, "set": { "label": "updated" } }"#,
+            )
+            .expect("update after recovery");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn table_scan_accepts_bodyless_form() {
+        let path = unique_temp_path("scan-bodyless");
+        let storage =
+            Storage::create(path.clone(), test_storage_options()).expect("storage create");
+        let mut engine = Engine::new(storage).expect("engine create");
+        engine
+            .execute(
+                r#"table create t { "columns": [ {"name":"id","type":"int","nullable":false} ], "primary_key": ["id"] }"#,
+            )
+            .expect("create table");
+        engine
+            .execute(r#"table insert t { "id": 1 }"#)
+            .expect("insert");
+        for command in ["table scan t", "table scan t {}"] {
+            let response = engine.execute(command).expect("scan");
+            let response: Value = serde_json::from_str(&response).expect("json");
+            assert_eq!(response["count"].as_u64(), Some(1), "for '{command}'");
+        }
         let _ = std::fs::remove_file(path);
     }
 

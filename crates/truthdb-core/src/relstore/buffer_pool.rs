@@ -237,14 +237,16 @@ impl BufferPool {
     }
 
     /// WAL-before-data write-back: flush the WAL to the page's LSN, stamp
-    /// the page checksum, write the page.
+    /// the page checksum, write the page. The flushed watermark counts
+    /// covered bytes, so a record STARTING at the watermark is not durable
+    /// yet — hence `>=`.
     fn write_back(
         &mut self,
         index: usize,
         backend: &mut impl PoolBackend,
     ) -> Result<(), StorageError> {
         let lsn = page::page_lsn(self.frames[index].buf.as_slice());
-        if lsn > backend.flushed_lsn() {
+        if lsn >= backend.flushed_lsn() && lsn > 0 {
             backend.flush_wal_to(lsn)?;
         }
         page::stamp_checksum(self.frames[index].buf.as_mut_slice());
