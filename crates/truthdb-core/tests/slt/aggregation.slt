@@ -1,0 +1,52 @@
+# Aggregation, GROUP BY, HAVING (Stage 8)
+
+statement ok
+CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, dept NVARCHAR(10), amount INT)
+
+statement ok
+INSERT INTO sales VALUES (1,'a',10),(2,'a',20),(3,'b',30),(4,'b',NULL),(5,'a',20)
+
+# COUNT(*) counts rows; COUNT(col) skips NULLs.
+query II
+SELECT COUNT(*), COUNT(amount) FROM sales
+----
+5 4
+
+# SUM/MIN/MAX over the whole table (NULLs skipped).
+query III
+SELECT SUM(amount), MIN(amount), MAX(amount) FROM sales
+----
+80 10 30
+
+# Integer AVG truncates (dept 'a': 10,20,20 -> 50/3 = 16).
+query I
+SELECT AVG(amount) FROM sales WHERE dept = 'a'
+----
+16
+
+# GROUP BY with a per-group count and sum.
+query TII
+SELECT dept, COUNT(*), SUM(amount) FROM sales GROUP BY dept ORDER BY dept
+----
+a 3 50
+b 2 30
+
+# HAVING filters groups after aggregation.
+query TI
+SELECT dept, SUM(amount) FROM sales GROUP BY dept HAVING SUM(amount) > 40
+----
+a 50
+
+# COUNT(DISTINCT) over non-null values.
+query I
+SELECT COUNT(DISTINCT amount) FROM sales
+----
+3
+
+# A non-grouped, non-aggregated column is rejected.
+statement error
+SELECT id, dept FROM sales GROUP BY dept
+
+# An aggregate may not appear in WHERE.
+statement error
+SELECT dept FROM sales WHERE COUNT(*) > 1

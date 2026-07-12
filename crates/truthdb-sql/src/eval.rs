@@ -127,6 +127,13 @@ fn eval_at(
             cast_value(v, target)
         }
         ExprKind::Function { name, args } => eval_call(name, args, row, resolver, ctx, depth),
+        // Aggregates are resolved by the grouping executor, never per row. One
+        // reaching scalar eval means it appeared where aggregates are not
+        // allowed (e.g. WHERE) — SQL Server error 147.
+        ExprKind::Aggregate { .. } => Err(SqlError::message_only(
+            147,
+            "An aggregate may not appear in the WHERE clause or a non-grouped context.",
+        )),
     }
 }
 
@@ -546,6 +553,12 @@ fn compare_matches(op: BinaryOp, ord: std::cmp::Ordering) -> bool {
         BinaryOp::Ge => ord != Less,
         _ => unreachable!("not a comparison op"),
     }
+}
+
+/// Arithmetic on two values with SQL Server numeric promotion (NULL-
+/// propagating). Exposed for aggregate folding (SUM/AVG) in the executor.
+pub fn arith(op: BinaryOp, left: SqlValue, right: SqlValue) -> SqlResult<SqlValue> {
+    arithmetic(op, left, right)
 }
 
 fn arithmetic(op: BinaryOp, l: SqlValue, r: SqlValue) -> SqlResult<SqlValue> {

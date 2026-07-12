@@ -2621,6 +2621,159 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    // ---- aggregation, GROUP BY, DISTINCT (Stage 8) ---------------------
+
+    fn agg_setup(label: &str) -> (Engine, PathBuf) {
+        let path = unique_temp_path(label);
+        let mut engine = new_engine(&path);
+        engine
+            .execute(
+                "CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, dept NVARCHAR(10), amount INT)",
+            )
+            .expect("create");
+        engine
+            .execute(
+                "INSERT INTO sales VALUES \
+                 (1,'a',10),(2,'a',20),(3,'b',30),(4,'b',NULL),(5,'a',20)",
+            )
+            .expect("insert");
+        (engine, path)
+    }
+
+    #[test]
+    fn sql_aggregates_over_whole_table() {
+        let (mut engine, path) = agg_setup("agg-whole");
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT COUNT(*), COUNT(amount), SUM(amount), MIN(amount), MAX(amount) FROM sales",
+        );
+        // COUNT(*)=5, COUNT(amount)=4 (skips NULL), SUM=80, MIN=10, MAX=30.
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("5".into()),
+                Some("4".into()),
+                Some("80".into()),
+                Some("10".into()),
+                Some("30".into()),
+            ]]
+        );
+    }
+
+    #[test]
+    fn sql_avg_integer_truncates() {
+        let (mut engine, path) = agg_setup("agg-avg");
+        // AVG(amount) = 80/4 = 20 exactly here; use a truncating case too.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT AVG(amount) FROM sales WHERE dept = 'a'",
+        );
+        // dept 'a': 10,20,20 -> sum 50 / 3 = 16 (integer truncation).
+        assert_eq!(rows, vec![vec![Some("16".into())]]);
+    }
+
+    #[test]
+    fn sql_group_by_with_aggregates() {
+        let (mut engine, path) = agg_setup("agg-group");
+        let (cols, rows) = sql_rows(
+            &mut engine,
+            "SELECT dept, COUNT(*), SUM(amount) FROM sales GROUP BY dept ORDER BY dept",
+        );
+        assert_eq!(cols[0], "dept");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("a".into()), Some("3".into()), Some("50".into())],
+                vec![Some("b".into()), Some("2".into()), Some("30".into())],
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_having_filters_groups() {
+        let (mut engine, path) = agg_setup("agg-having");
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT dept, SUM(amount) FROM sales GROUP BY dept HAVING SUM(amount) > 40 ORDER BY dept",
+        );
+        assert_eq!(rows, vec![vec![Some("a".into()), Some("50".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_count_distinct() {
+        let (mut engine, path) = agg_setup("agg-distinct");
+        // amounts: 10,20,30,NULL,20 -> distinct non-null = {10,20,30} = 3.
+        let (_, rows) = sql_rows(&mut engine, "SELECT COUNT(DISTINCT amount) FROM sales");
+        assert_eq!(rows, vec![vec![Some("3".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_select_distinct() {
+        let (mut engine, path) = agg_setup("agg-select-distinct");
+        let (_, mut rows) = sql_rows(&mut engine, "SELECT DISTINCT dept FROM sales");
+        rows.sort();
+        assert_eq!(rows, vec![vec![Some("a".into())], vec![Some("b".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_order_by_ordinal_and_aggregate() {
+        let (mut engine, path) = agg_setup("agg-order");
+        // ORDER BY 2 DESC = order by SUM(amount) descending.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT dept, SUM(amount) FROM sales GROUP BY dept ORDER BY 2 DESC",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("a".into()), Some("50".into())],
+                vec![Some("b".into()), Some("30".into())],
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_count_star_over_empty_is_zero_but_group_by_is_empty_set() {
+        let path = unique_temp_path("agg-empty");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        // No rows: COUNT(*) with no GROUP BY = one row (0); SUM = NULL.
+        let (_, rows) = sql_rows(&mut engine, "SELECT COUNT(*), SUM(v) FROM t");
+        assert_eq!(rows, vec![vec![Some("0".into()), None]]);
+        // With GROUP BY, no rows = zero groups.
+        let (_, rows) = sql_rows(&mut engine, "SELECT v, COUNT(*) FROM t GROUP BY v");
+        assert!(rows.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_non_grouped_column_is_error_8120() {
+        let (mut engine, path) = agg_setup("agg-8120");
+        // `id` is neither grouped nor aggregated.
+        assert_eq!(
+            sql_error_number(&mut engine, "SELECT id, dept FROM sales GROUP BY dept"),
+            8120
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_aggregate_in_where_is_error_147() {
+        let (mut engine, path) = agg_setup("agg-147");
+        assert_eq!(
+            sql_error_number(&mut engine, "SELECT dept FROM sales WHERE COUNT(*) > 1"),
+            147
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn sql_non_boolean_where_is_rejected_4145() {
         let path = unique_temp_path("sql-where-4145");

@@ -2,6 +2,7 @@
     Select(
         Select {
             top: None,
+            distinct: false,
             items: [
                 Expr {
                     expr: Expr {
@@ -234,6 +235,8 @@
                 },
             ),
             where_clause: None,
+            group_by: [],
+            having: None,
             order_by: [],
             span: Span {
                 start: 0,
