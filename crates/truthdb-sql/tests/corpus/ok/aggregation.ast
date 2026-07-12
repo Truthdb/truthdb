@@ -1,0 +1,218 @@
+[
+    Select(
+        Select {
+            top: None,
+            distinct: true,
+            items: [
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "dept",
+                                quoted: false,
+                                span: Span {
+                                    start: 16,
+                                    end: 20,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 16,
+                            end: 20,
+                        },
+                    },
+                    alias: None,
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Aggregate {
+                            func: Count,
+                            distinct: false,
+                            arg: None,
+                        },
+                        span: Span {
+                            start: 22,
+                            end: 30,
+                        },
+                    },
+                    alias: None,
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Aggregate {
+                            func: Sum,
+                            distinct: false,
+                            arg: Some(
+                                Expr {
+                                    kind: Column(
+                                        Name {
+                                            value: "amount",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 36,
+                                                end: 42,
+                                            },
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 36,
+                                        end: 42,
+                                    },
+                                },
+                            ),
+                        },
+                        span: Span {
+                            start: 32,
+                            end: 43,
+                        },
+                    },
+                    alias: None,
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Aggregate {
+                            func: Avg,
+                            distinct: true,
+                            arg: Some(
+                                Expr {
+                                    kind: Column(
+                                        Name {
+                                            value: "amount",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 58,
+                                                end: 64,
+                                            },
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 58,
+                                        end: 64,
+                                    },
+                                },
+                            ),
+                        },
+                        span: Span {
+                            start: 45,
+                            end: 65,
+                        },
+                    },
+                    alias: None,
+                },
+            ],
+            from: Some(
+                Name {
+                    value: "sales",
+                    quoted: false,
+                    span: Span {
+                        start: 71,
+                        end: 76,
+                    },
+                },
+            ),
+            where_clause: Some(
+                Expr {
+                    kind: Binary {
+                        op: Gt,
+                        left: Expr {
+                            kind: Column(
+                                Name {
+                                    value: "amount",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 83,
+                                        end: 89,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 83,
+                                end: 89,
+                            },
+                        },
+                        right: Expr {
+                            kind: Int(
+                                0,
+                            ),
+                            span: Span {
+                                start: 92,
+                                end: 93,
+                            },
+                        },
+                    },
+                    span: Span {
+                        start: 83,
+                        end: 93,
+                    },
+                },
+            ),
+            group_by: [
+                Expr {
+                    kind: Column(
+                        Name {
+                            value: "dept",
+                            quoted: false,
+                            span: Span {
+                                start: 103,
+                                end: 107,
+                            },
+                        },
+                    ),
+                    span: Span {
+                        start: 103,
+                        end: 107,
+                    },
+                },
+            ],
+            having: Some(
+                Expr {
+                    kind: Binary {
+                        op: Gt,
+                        left: Expr {
+                            kind: Aggregate {
+                                func: Count,
+                                distinct: false,
+                                arg: None,
+                            },
+                            span: Span {
+                                start: 115,
+                                end: 123,
+                            },
+                        },
+                        right: Expr {
+                            kind: Int(
+                                1,
+                            ),
+                            span: Span {
+                                start: 126,
+                                end: 127,
+                            },
+                        },
+                    },
+                    span: Span {
+                        start: 115,
+                        end: 127,
+                    },
+                },
+            ),
+            order_by: [
+                OrderItem {
+                    expr: Expr {
+                        kind: Int(
+                            2,
+                        ),
+                        span: Span {
+                            start: 137,
+                            end: 138,
+                        },
+                    },
+                    descending: true,
+                },
+            ],
+            span: Span {
+                start: 0,
+                end: 143,
+            },
+        },
+    ),
+]

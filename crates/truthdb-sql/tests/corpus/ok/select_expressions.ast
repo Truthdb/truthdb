@@ -2,6 +2,7 @@
     Select(
         Select {
             top: None,
+            distinct: false,
             items: [
                 Expr {
                     expr: Expr {
@@ -461,6 +462,8 @@
                     },
                 },
             ),
+            group_by: [],
+            having: None,
             order_by: [
                 OrderItem {
                     expr: Expr {

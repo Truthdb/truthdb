@@ -1,0 +1,6 @@
+SELECT DISTINCT dept, COUNT(*), SUM(amount), AVG(DISTINCT amount)
+FROM sales
+WHERE amount > 0
+GROUP BY dept
+HAVING COUNT(*) > 1
+ORDER BY 2 DESC

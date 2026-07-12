@@ -165,9 +165,15 @@ pub struct Delete {
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
     pub top: Option<u64>,
+    /// `SELECT DISTINCT` — deduplicate the projected rows.
+    pub distinct: bool,
     pub items: Vec<SelectItem>,
     pub from: Option<Name>,
     pub where_clause: Option<Expr>,
+    /// `GROUP BY <expr>, ...` (empty = no grouping).
+    pub group_by: Vec<Expr>,
+    /// `HAVING <predicate>` — filters groups after aggregation.
+    pub having: Option<Expr>,
     pub order_by: Vec<OrderItem>,
     pub span: Span,
 }
@@ -273,9 +279,27 @@ pub enum ExprKind {
         name: String,
         args: Vec<Expr>,
     },
+    /// An aggregate: `COUNT(*)` (arg `None`), `COUNT(x)`, `SUM(DISTINCT x)`,
+    /// etc. Resolved by the grouping executor, never by scalar eval.
+    Aggregate {
+        func: AggFunc,
+        distinct: bool,
+        /// The argument expression; `None` only for `COUNT(*)`.
+        arg: Option<Box<Expr>>,
+    },
     /// A `@@`-prefixed global/session variable (e.g. `@@TRANCOUNT`), evaluated
     /// from the session's [`EvalContext`](crate::eval::EvalContext).
     GlobalVar(String),
+}
+
+/// The five standard aggregate functions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AggFunc {
+    Count,
+    Sum,
+    Avg,
+    Min,
+    Max,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

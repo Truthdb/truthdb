@@ -693,6 +693,18 @@ impl Parser {
 
     fn parse_select(&mut self) -> SqlResult<Select> {
         let start = self.expect_keyword("SELECT")?;
+        // Optional set quantifier: `SELECT [ALL | DISTINCT]`.
+        let distinct = match self.peek_keyword().as_deref() {
+            Some("DISTINCT") => {
+                self.bump();
+                true
+            }
+            Some("ALL") => {
+                self.bump();
+                false
+            }
+            _ => false,
+        };
         let top = if self.peek_keyword().as_deref() == Some("TOP") {
             self.bump();
             Some(self.parse_u64_literal()?)
@@ -729,6 +741,27 @@ impl Parser {
             None
         };
 
+        // GROUP BY <expr>, ...
+        let mut group_by = Vec::new();
+        if self.peek_keyword().as_deref() == Some("GROUP") {
+            self.bump();
+            self.expect_keyword("BY")?;
+            loop {
+                group_by.push(self.parse_expr()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+
+        // HAVING <predicate>
+        let having = if self.peek_keyword().as_deref() == Some("HAVING") {
+            self.bump();
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+
         let mut order_by = Vec::new();
         if self.peek_keyword().as_deref() == Some("ORDER") {
             self.bump();
@@ -755,9 +788,12 @@ impl Parser {
 
         Ok(Select {
             top,
+            distinct,
             items,
             from,
             where_clause,
+            group_by,
+            having,
             order_by,
             span: start.to(self.prev_span()),
         })
@@ -959,6 +995,9 @@ impl Parser {
 
     fn parse_function(&mut self, name: Name) -> SqlResult<Expr> {
         self.expect(&TokenKind::LParen)?;
+        if let Some(func) = agg_func(&name.value) {
+            return self.parse_aggregate(name, func);
+        }
         let mut args = Vec::new();
         if !self.check(&TokenKind::RParen) {
             loop {
@@ -975,6 +1014,47 @@ impl Parser {
             kind: ExprKind::Function {
                 name: name.value,
                 args,
+            },
+        })
+    }
+
+    /// Parses an aggregate call body (the opening `(` is already consumed):
+    /// `COUNT(*)`, `COUNT([DISTINCT|ALL] expr)`, `SUM/AVG/MIN/MAX(...)`.
+    fn parse_aggregate(&mut self, name: Name, func: AggFunc) -> SqlResult<Expr> {
+        // COUNT(*) — the only aggregate that takes a star.
+        if func == AggFunc::Count && self.check(&TokenKind::Star) {
+            self.bump();
+            let end = self.expect(&TokenKind::RParen)?;
+            self.node()?;
+            return Ok(Expr {
+                span: name.span.to(end),
+                kind: ExprKind::Aggregate {
+                    func,
+                    distinct: false,
+                    arg: None,
+                },
+            });
+        }
+        let distinct = match self.peek_keyword().as_deref() {
+            Some("DISTINCT") => {
+                self.bump();
+                true
+            }
+            Some("ALL") => {
+                self.bump();
+                false
+            }
+            _ => false,
+        };
+        let arg = self.parse_expr()?;
+        let end = self.expect(&TokenKind::RParen)?;
+        self.node()?;
+        Ok(Expr {
+            span: name.span.to(end),
+            kind: ExprKind::Aggregate {
+                func,
+                distinct,
+                arg: Some(Box::new(arg)),
             },
         })
     }
@@ -1372,6 +1452,18 @@ fn is_clause_keyword(keyword: &str) -> bool {
         keyword,
         "FROM" | "WHERE" | "ORDER" | "GROUP" | "HAVING" | "AS"
     )
+}
+
+/// The aggregate function for a name, if it is one (case-insensitive).
+fn agg_func(name: &str) -> Option<AggFunc> {
+    match name.to_ascii_uppercase().as_str() {
+        "COUNT" => Some(AggFunc::Count),
+        "SUM" => Some(AggFunc::Sum),
+        "AVG" => Some(AggFunc::Avg),
+        "MIN" => Some(AggFunc::Min),
+        "MAX" => Some(AggFunc::Max),
+        _ => None,
+    }
 }
 
 /// Reserved words that may not be used as bare identifiers.

@@ -2,6 +2,7 @@
     Select(
         Select {
             top: None,
+            distinct: false,
             items: [
                 Wildcard,
             ],
@@ -51,6 +52,8 @@
                     },
                 },
             ),
+            group_by: [],
+            having: None,
             order_by: [],
             span: Span {
                 start: 18,

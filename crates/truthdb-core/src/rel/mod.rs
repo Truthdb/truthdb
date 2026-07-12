@@ -7,6 +7,7 @@
 //! sources built from the catalog. Storage errors are mapped to SQL Server
 //! error numbers.
 
+mod aggregate;
 pub mod collation;
 mod plan;
 mod value;
@@ -1086,6 +1087,32 @@ fn exec_select(
         }
     }
 
+    // A grouped/aggregated or DISTINCT query projects first (its ORDER BY
+    // references the output), while a plain query orders the source rows so it
+    // can order by columns that are not in the SELECT list.
+    if aggregate::is_aggregated(select) || select.distinct {
+        let mut out = if aggregate::is_aggregated(select) {
+            aggregate::execute(select, &rows, &types, &resolver, eval_ctx)?
+        } else {
+            project(
+                &select.items,
+                &source.columns,
+                &rows,
+                &types,
+                &resolver,
+                eval_ctx,
+            )?
+        };
+        if select.distinct {
+            dedup_rows(&mut out);
+        }
+        order_output(&mut out, &select.order_by, eval_ctx)?;
+        if let Some(top) = select.top {
+            out.rows.truncate(top as usize);
+        }
+        return Ok(out);
+    }
+
     // ORDER BY (evaluated against the source row; stable so equal keys keep
     // input order).
     if !select.order_by.is_empty() {
@@ -1112,6 +1139,76 @@ fn exec_select(
         &resolver,
         eval_ctx,
     )
+}
+
+/// Removes duplicate output rows (SELECT DISTINCT), keeping first occurrence.
+/// NULLs are equal to each other (`Datum` equality), matching SQL Server.
+fn dedup_rows(rowset: &mut RowSet) {
+    let mut seen: Vec<Vec<Datum>> = Vec::new();
+    rowset.rows.retain(|row| {
+        if seen.iter().any(|s| s == row) {
+            false
+        } else {
+            seen.push(row.clone());
+            true
+        }
+    });
+}
+
+/// Orders an output RowSet by ORDER BY items referencing the output: a bare
+/// integer is a 1-based output-column ordinal; any other expression is
+/// evaluated against the output row (its columns are the resolver). Uses
+/// code-point ordering (NULLs first), stable.
+fn order_output(
+    rowset: &mut RowSet,
+    order_by: &[OrderItem],
+    eval_ctx: &EvalContext,
+) -> Result<(), SqlError> {
+    if order_by.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = rowset.columns.iter().map(|c| c.name.clone()).collect();
+    let types: Vec<ColumnType> = rowset.columns.iter().map(|c| c.column_type).collect();
+    let mut keyed: Vec<(Vec<SqlValue>, usize)> = Vec::with_capacity(rowset.rows.len());
+    for (index, row) in rowset.rows.iter().enumerate() {
+        let sql_row = row_values(row, &types);
+        let mut key = Vec::with_capacity(order_by.len());
+        for item in order_by {
+            let value = if let ExprKind::Int(n) = &item.expr.kind {
+                let ordinal = usize::try_from(*n)
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .filter(|&i| i < sql_row.len())
+                    .ok_or_else(|| {
+                        SqlError::new(
+                            108,
+                            16,
+                            1,
+                            format!("The ORDER BY position number {n} is out of range."),
+                        )
+                    })?;
+                sql_row[ordinal].clone()
+            } else {
+                eval::eval(&item.expr, &sql_row, &names, eval_ctx)?
+            };
+            key.push(value);
+        }
+        keyed.push((key, index));
+    }
+    keyed.sort_by(|(ka, ia), (kb, ib)| {
+        for (index, item) in order_by.iter().enumerate() {
+            let mut ord = order_key_cmp(&ka[index], &kb[index]);
+            if item.descending {
+                ord = ord.reverse();
+            }
+            if ord != std::cmp::Ordering::Equal {
+                return ord;
+            }
+        }
+        ia.cmp(ib)
+    });
+    rowset.rows = keyed.iter().map(|(_, i)| rowset.rows[*i].clone()).collect();
+    Ok(())
 }
 
 fn order_rows(
