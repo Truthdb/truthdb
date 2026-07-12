@@ -141,7 +141,7 @@ pub fn execute(
         out_rows.push(row);
     }
 
-    Ok(build_rowset(out_names, out_rows))
+    build_rowset(out_names, out_rows)
 }
 
 /// Groups the rows by the GROUP BY key expressions. With no GROUP BY the whole
@@ -246,6 +246,24 @@ fn fold(func: AggFunc, values: Vec<SqlValue>) -> Result<SqlValue, SqlError> {
             let count = values.len() as i64;
             let mut sum: Option<SqlValue> = None;
             for value in values {
+                // SUM/AVG accept only numeric types — a character/date operand
+                // is error 8117, never string concatenation (which `arith`
+                // would otherwise do for `Str + Str`).
+                if !matches!(
+                    value,
+                    SqlValue::Int(_) | SqlValue::Decimal(_) | SqlValue::Float(_)
+                ) {
+                    let op = if func == AggFunc::Sum { "sum" } else { "avg" };
+                    return Err(SqlError::new(
+                        8117,
+                        16,
+                        1,
+                        format!(
+                            "Operand data type {} is invalid for the {op} operator.",
+                            value.type_name()
+                        ),
+                    ));
+                }
                 sum = Some(match sum {
                     None => value,
                     Some(acc) => eval::arith(BinaryOp::Add, acc, value)?,
@@ -435,6 +453,112 @@ fn same_expr(a: &Expr, b: &Expr) -> bool {
                 && ax.len() == ay.len()
                 && ax.iter().zip(ay).all(|(x, y)| same_expr(x, y))
         }
+        (
+            ExprKind::Cast {
+                expr: ex,
+                target: tx,
+            },
+            ExprKind::Cast {
+                expr: ey,
+                target: ty,
+            },
+        ) => tx == ty && same_expr(ex, ey),
+        (
+            ExprKind::IsNull {
+                expr: ex,
+                negated: nx,
+            },
+            ExprKind::IsNull {
+                expr: ey,
+                negated: ny,
+            },
+        ) => nx == ny && same_expr(ex, ey),
+        (
+            ExprKind::Like {
+                expr: ex,
+                pattern: px,
+                escape: cx,
+                negated: nx,
+            },
+            ExprKind::Like {
+                expr: ey,
+                pattern: py,
+                escape: cy,
+                negated: ny,
+            },
+        ) => cx == cy && nx == ny && same_expr(ex, ey) && same_expr(px, py),
+        (
+            ExprKind::InList {
+                expr: ex,
+                list: lx,
+                negated: nx,
+            },
+            ExprKind::InList {
+                expr: ey,
+                list: ly,
+                negated: ny,
+            },
+        ) => {
+            nx == ny
+                && same_expr(ex, ey)
+                && lx.len() == ly.len()
+                && lx.iter().zip(ly).all(|(a, b)| same_expr(a, b))
+        }
+        (
+            ExprKind::Between {
+                expr: ex,
+                low: lox,
+                high: hix,
+                negated: nx,
+            },
+            ExprKind::Between {
+                expr: ey,
+                low: loy,
+                high: hiy,
+                negated: ny,
+            },
+        ) => nx == ny && same_expr(ex, ey) && same_expr(lox, loy) && same_expr(hix, hiy),
+        (
+            ExprKind::Case {
+                operand: ox,
+                branches: bx,
+                else_result: elx,
+            },
+            ExprKind::Case {
+                operand: oy,
+                branches: by,
+                else_result: ely,
+            },
+        ) => {
+            same_opt(ox, oy)
+                && bx.len() == by.len()
+                && bx
+                    .iter()
+                    .zip(by)
+                    .all(|((wx, rx), (wy, ry))| same_expr(wx, wy) && same_expr(rx, ry))
+                && same_opt(elx, ely)
+        }
+        (ExprKind::GlobalVar(x), ExprKind::GlobalVar(y)) => x.eq_ignore_ascii_case(y),
+        (
+            ExprKind::Aggregate {
+                func: fx,
+                distinct: dx,
+                arg: ax,
+            },
+            ExprKind::Aggregate {
+                func: fy,
+                distinct: dy,
+                arg: ay,
+            },
+        ) => fx == fy && dx == dy && same_opt(ax, ay),
+        _ => false,
+    }
+}
+
+fn same_opt(a: &Option<Box<Expr>>, b: &Option<Box<Expr>>) -> bool {
+    match (a, b) {
+        (Some(x), Some(y)) => same_expr(x, y),
+        (None, None) => true,
         _ => false,
     }
 }
@@ -452,8 +576,10 @@ fn output_name(expr: &Expr, alias: Option<&Name>) -> String {
 }
 
 /// Builds a typed RowSet from evaluated output rows: each column's type is
-/// inferred from its values, then every value is coerced to it.
-fn build_rowset(names: Vec<String>, rows: Vec<Vec<SqlValue>>) -> RowSet {
+/// inferred from its values, then every value is coerced to it. A coercion
+/// failure (overflow/truncation) is propagated — matching the plain projection
+/// path — rather than masked as NULL.
+fn build_rowset(names: Vec<String>, rows: Vec<Vec<SqlValue>>) -> Result<RowSet, SqlError> {
     let width = names.len();
     let mut columns = Vec::with_capacity(width);
     for (index, name) in names.into_iter().enumerate() {
@@ -461,20 +587,20 @@ fn build_rowset(names: Vec<String>, rows: Vec<Vec<SqlValue>>) -> RowSet {
         let column_type = value::infer_type(&column_values);
         columns.push(ResultColumn { name, column_type });
     }
-    let out_rows = rows
-        .into_iter()
-        .map(|row| {
-            row.into_iter()
-                .enumerate()
-                .map(|(index, v)| {
-                    value::sql_to_datum(&v, &columns[index].column_type, &columns[index].name)
-                        .unwrap_or(Datum::Null)
-                })
-                .collect()
-        })
-        .collect();
-    RowSet {
+    let mut out_rows = Vec::with_capacity(rows.len());
+    for row in rows {
+        let mut out = Vec::with_capacity(width);
+        for (index, v) in row.into_iter().enumerate() {
+            out.push(value::sql_to_datum(
+                &v,
+                &columns[index].column_type,
+                &columns[index].name,
+            )?);
+        }
+        out_rows.push(out);
+    }
+    Ok(RowSet {
         columns,
         rows: out_rows,
-    }
+    })
 }

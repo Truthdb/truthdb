@@ -2775,6 +2775,73 @@ mod tests {
     }
 
     #[test]
+    fn sql_group_by_cast_expression_key() {
+        let path = unique_temp_path("agg-cast-key");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1,10),(2,10),(3,20)")
+            .expect("insert");
+        // A CAST group key must match the identical SELECT expression (not
+        // wrongly trigger 8120 by recursing into the inner column).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT CAST(v AS BIGINT), COUNT(*) FROM t GROUP BY CAST(v AS BIGINT) ORDER BY 1",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("10".into()), Some("2".into())],
+                vec![Some("20".into()), Some("1".into())],
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_sum_of_character_column_is_error_8117() {
+        let path = unique_temp_path("agg-sum-char");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, s VARCHAR(10))")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1,'1'),(2,'2'),(3,'3')")
+            .expect("insert");
+        // SUM/AVG of character data errors (never string-concatenates).
+        assert_eq!(sql_error_number(&mut engine, "SELECT SUM(s) FROM t"), 8117);
+        assert_eq!(sql_error_number(&mut engine, "SELECT AVG(s) FROM t"), 8117);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_grouped_coercion_error_is_not_swallowed() {
+        let path = unique_temp_path("agg-coerce");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, g INT)")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1,1),(2,123456)")
+            .expect("insert");
+        // A heterogeneous grouped output (short string in one group, a large
+        // integer in another) must raise the truncation error, not mask it as
+        // NULL — matching the plain-projection path.
+        let plain = sql_error_number(
+            &mut engine,
+            "SELECT CASE WHEN g = 1 THEN 'x' ELSE g END FROM t",
+        );
+        let grouped = sql_error_number(
+            &mut engine,
+            "SELECT CASE WHEN g = 1 THEN 'x' ELSE g END FROM t GROUP BY g",
+        );
+        assert_eq!(plain, grouped, "grouped path must raise the same error");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_non_boolean_where_is_rejected_4145() {
         let path = unique_temp_path("sql-where-4145");
         let mut engine = new_engine(&path);
