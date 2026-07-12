@@ -3,14 +3,21 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 use xxhash_rust::xxh64::xxh64;
 
-use crate::allocator::PageAllocator;
-use crate::direct_io::DirectFile;
+use crate::allocator::{EXTENT_PAGES, PageAllocator};
+use crate::direct_io::{AlignedPageBuf, DirectFile};
 use crate::storage_layout::{
     FileHeader, PAGE_SIZE, SNAPSHOT_DESCRIPTOR_SIZE, SUPERBLOCK_ACTIVE_A, SUPERBLOCK_ACTIVE_B,
-    SnapshotDescriptor, Superblock, WAL_ENTRY_FOOTER_SIZE, WAL_ENTRY_HEADER_SIZE,
-    WAL_ENTRY_TYPE_COMMIT, WAL_ENTRY_TYPE_RECORD, WAL_MAX_BYTES, WAL_MIN_BYTES, WalEntryFooter,
-    WalEntryHeader, align_down, assert_layout_invariants, wal_entry_padded_len, wal_payload_crc,
+    SnapshotDescriptor, Superblock, WAL_ENTRY_TYPE_REL, WAL_MAX_BYTES, WAL_MIN_BYTES, align_down,
+    assert_layout_invariants,
 };
+use crate::wal::records::{REL_KIND_ALLOC_EXTENT, REL_KIND_FREE_EXTENT, RelRecord};
+use crate::wal::{WalWriter, scan_ring};
+
+pub use crate::wal::WalRecord;
+
+/// Version stamped in REL wal entries (entry-level, distinct from the record
+/// kinds inside).
+const REL_WAL_ENTRY_VERSION: u16 = 1;
 
 #[derive(Debug, Clone, Copy)]
 pub struct StorageOptions {
@@ -93,9 +100,20 @@ impl Storage {
     }
 
     pub fn create(path: PathBuf, opts: StorageOptions) -> Result<Self, StorageError> {
+        Self::create_with_wal_bounds(path, opts, WAL_MIN_BYTES, WAL_MAX_BYTES)
+    }
+
+    /// Test hook: create with custom WAL ring bounds so ring-wrap paths can
+    /// be exercised without writing hundreds of MiB.
+    pub(crate) fn create_with_wal_bounds(
+        path: PathBuf,
+        opts: StorageOptions,
+        wal_min_bytes: u64,
+        wal_max_bytes: u64,
+    ) -> Result<Self, StorageError> {
         assert_layout_invariants();
         opts.validate()?;
-        let file = StorageFile::create_new(path, opts)?;
+        let file = StorageFile::create_new(path, opts, wal_min_bytes, wal_max_bytes)?;
         Ok(Storage { file })
     }
 
@@ -103,28 +121,24 @@ impl Storage {
         &self.file.path
     }
 
+    /// Appends one WAL entry, durably, and returns its LSN (unwrapped log
+    /// position). The entry's `logical_ts` is stamped with the LSN by the
+    /// writer.
     pub fn append_wal_entry(
         &mut self,
         entry_type: u16,
         entry_version: u16,
         seq_no: u64,
-        logical_ts: u64,
         payload: &[u8],
     ) -> Result<u64, StorageError> {
         self.file
-            .append_wal_entry(entry_type, entry_version, seq_no, logical_ts, payload)
+            .append_wal_entry(entry_type, entry_version, seq_no, payload)
     }
 
-    pub fn verify_wal_entry_at(&mut self, position: u64) -> Result<bool, StorageError> {
-        self.file.verify_wal_entry_at(position)
-    }
-
-    pub fn recover_wal(&mut self) -> Result<RecoveryState, StorageError> {
-        self.file.recover_wal()
-    }
-
+    /// Returns the WAL records recovered at open (head..tail order). Drains
+    /// the recovery cache; subsequent calls return an empty vec.
     pub fn replay_wal_entries(&mut self) -> Result<Vec<WalRecord>, StorageError> {
-        self.file.replay_wal_entries()
+        Ok(std::mem::take(&mut self.file.replay_cache))
     }
 
     pub fn write_checkpoint(
@@ -143,7 +157,26 @@ impl Storage {
     }
 
     pub fn wal_usage_ratio(&self) -> f64 {
-        self.file.wal_usage_ratio()
+        self.file.wal.usage_ratio()
+    }
+
+    /// Allocates one 64-page extent in the data region and returns its first
+    /// page number. Durable extents are WAL-logged (replayed on recovery);
+    /// temporary extents are not logged and vanish on restart.
+    pub fn allocate_extent(&mut self, temp: bool) -> Result<u64, StorageError> {
+        self.file.allocate_extent(temp)
+    }
+
+    /// Frees a 64-page extent previously returned by
+    /// [`Storage::allocate_extent`]. WAL-logged.
+    pub fn free_extent(&mut self, start_page: u64) -> Result<(), StorageError> {
+        self.file.free_extent(start_page)
+    }
+
+    /// Whether a data-region page is currently allocated (test/diagnostic
+    /// hook).
+    pub fn is_page_allocated(&self, page: u64) -> bool {
+        self.file.allocator.is_allocated(page)
     }
 }
 
@@ -156,13 +189,18 @@ pub struct SnapshotData {
 
 struct StorageFile {
     path: PathBuf,
+    /// Handle for data-region, superblock and descriptor I/O.
     file: DirectFile,
+    /// WAL writer with its own dedicated file handle, so log writes do not
+    /// serialize behind page flushes.
+    wal: WalWriter,
     layout: StorageLayout,
-    header: FileHeader,
     superblock_a: Superblock,
     superblock_b: Superblock,
     active_superblock: ActiveSuperblock,
-    wal_state: WalRingState,
+    allocator: PageAllocator,
+    /// WAL records recovered at open, waiting for the engine to replay them.
+    replay_cache: Vec<WalRecord>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -194,31 +232,32 @@ impl StorageFile {
         let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
         file.read_exact_at(0, &mut header_bytes)?;
         let header = FileHeader::from_le_bytes(&header_bytes);
-        let expected_header_checksum = header.compute_checksum();
 
         if header.magic != crate::storage_layout::FILE_MAGIC {
             return Err(StorageError::InvalidFile("bad magic".to_string()));
         }
-        if header.version != crate::storage_layout::FILE_VERSION {
-            return Err(StorageError::InvalidFile("unsupported version".to_string()));
-        }
         if header.page_size as usize != crate::storage_layout::PAGE_SIZE {
             return Err(StorageError::InvalidFile("page size mismatch".to_string()));
         }
-        if header.header_checksum != expected_header_checksum {
+        if header.header_checksum != header.compute_checksum() {
             return Err(StorageError::InvalidFile(
                 "header checksum mismatch".to_string(),
             ));
         }
+        // Validate the layout before any destructive step (the v1 upgrade
+        // mutates the file; a file we cannot operate must be rejected while
+        // it is still untouched v1).
+        let layout = layout_from_header(&header, file.len());
+        validate_allocator_region(&layout)?;
 
         let mut sb_a_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
         file.read_exact_at(header.superblock_a_offset, &mut sb_a_bytes)?;
-        let superblock_a = Superblock::from_le_bytes(&sb_a_bytes);
+        let mut superblock_a = Superblock::from_le_bytes(&sb_a_bytes);
         let sb_a_valid = superblock_a.checksum == superblock_a.compute_checksum();
 
         let mut sb_b_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
         file.read_exact_at(header.superblock_b_offset, &mut sb_b_bytes)?;
-        let superblock_b = Superblock::from_le_bytes(&sb_b_bytes);
+        let mut superblock_b = Superblock::from_le_bytes(&sb_b_bytes);
         let sb_b_valid = superblock_b.checksum == superblock_b.compute_checksum();
 
         if !sb_a_valid && !sb_b_valid {
@@ -227,59 +266,86 @@ impl StorageFile {
             ));
         }
 
-        let active_superblock = ActiveSuperblock::from_superblocks(
+        let mut active_superblock = ActiveSuperblock::from_superblocks(
             &superblock_a,
             &superblock_b,
             sb_a_valid,
             sb_b_valid,
         );
 
-        let layout = StorageLayout {
-            total_size: file.len(),
-            header_offset: 0,
-            superblock_a_offset: header.superblock_a_offset,
-            superblock_b_offset: header.superblock_b_offset,
-            wal_offset: header.wal_offset,
-            wal_size: header.wal_size,
-            data_offset: header.data_offset,
-            data_size: header.data_size,
-            metadata_offset: header.metadata_offset,
-            metadata_size: header.metadata_size,
-            allocator_offset: header.allocator_offset,
-            allocator_size: header.allocator_size,
-            snapshot_offset: header.snapshot_offset,
-            snapshot_size: header.snapshot_size,
-            reserved_offset: header.reserved_offset,
-            reserved_size: header.reserved_size,
-        };
-
+        if header.version == crate::storage_layout::FILE_VERSION_V1 {
+            let active_sb = match active_superblock {
+                ActiveSuperblock::A => superblock_a,
+                ActiveSuperblock::B => superblock_b,
+            };
+            (superblock_a, superblock_b) =
+                upgrade_v1_to_v2(&mut file, header, &layout, &active_sb)?;
+            active_superblock = ActiveSuperblock::A;
+        }
         let active_sb = match active_superblock {
             ActiveSuperblock::A => &superblock_a,
             ActiveSuperblock::B => &superblock_b,
         };
-        let wal_state = WalRingState {
-            head: active_sb.wal_head,
-            tail: active_sb.wal_tail,
-            offset: header.wal_offset,
-            size: header.wal_size,
-        };
 
-        let file = StorageFile {
+        // Recover the true WAL tail: trust the superblock's tail as a lower
+        // bound and scan forward (CRC + LSN self-identity) past it.
+        let mut log_file = DirectFile::open_existing(path.clone())?;
+        let scan = scan_ring(
+            &mut log_file,
+            layout.wal_offset,
+            layout.wal_size,
+            active_sb.wal_head,
+            active_sb.wal_tail,
+        )?;
+        let wal = WalWriter::open(
+            log_file,
+            layout.wal_offset,
+            layout.wal_size,
+            active_sb.wal_head,
+            scan.tail,
+        )?;
+        let recorded_tail = active_sb.wal_tail;
+
+        let mut storage = StorageFile {
             path,
             file,
+            wal,
             layout,
-            header,
             superblock_a,
             superblock_b,
             active_superblock,
-            wal_state,
+            allocator: PageAllocator::new(layout.data_size),
+            replay_cache: scan.records,
         };
-        file.touch();
-        Ok(file)
+        storage.recover_allocator()?;
+
+        // A tail below the superblock's recorded one means part of the
+        // trusted region was lost (media corruption, or a v1 file whose
+        // superblock ran ahead of durability). Persist the corrected tail
+        // now: otherwise entries appended at it could crash-recover with the
+        // old superblock and stale entries beyond them would be replayed as
+        // trusted.
+        if scan.tail < recorded_tail {
+            let last_seq = storage
+                .replay_cache
+                .iter()
+                .map(|r| r.seq_no)
+                .max()
+                .unwrap_or(0);
+            storage.write_active_superblock(last_seq)?;
+            storage.file.sync_data()?;
+        }
+        Ok(storage)
     }
 
-    fn create_new(path: PathBuf, opts: StorageOptions) -> Result<Self, StorageError> {
-        let layout = compute_layout(opts)?;
+    fn create_new(
+        path: PathBuf,
+        opts: StorageOptions,
+        wal_min_bytes: u64,
+        wal_max_bytes: u64,
+    ) -> Result<Self, StorageError> {
+        let layout = compute_layout(opts, wal_min_bytes, wal_max_bytes)?;
+        validate_allocator_region(&layout)?;
         let mut header = FileHeader::default();
         header.superblock_a_offset = layout.superblock_a_offset;
         header.superblock_b_offset = layout.superblock_b_offset;
@@ -300,11 +366,10 @@ impl StorageFile {
         let mut superblock_a = Superblock::default();
         superblock_a.checksum = superblock_a.compute_checksum();
         let mut superblock_b = Superblock::default();
-        superblock_b.active = crate::storage_layout::SUPERBLOCK_ACTIVE_B;
+        superblock_b.active = SUPERBLOCK_ACTIVE_B;
         superblock_b.checksum = superblock_b.compute_checksum();
 
         let mut file = DirectFile::create_new(path.clone(), layout.total_size)?;
-
         file.write_all_at(layout.header_offset, &header.to_le_bytes_with_checksum())?;
         file.write_all_at(
             layout.superblock_a_offset,
@@ -316,32 +381,94 @@ impl StorageFile {
         )?;
         file.sync_data()?;
 
-        let wal_state = WalRingState {
-            head: superblock_a.wal_head,
-            tail: superblock_a.wal_tail,
-            offset: layout.wal_offset,
-            size: layout.wal_size,
-        };
+        let log_file = DirectFile::open_existing(path.clone())?;
+        let wal = WalWriter::open(log_file, layout.wal_offset, layout.wal_size, 0, 0)?;
 
-        let file = StorageFile {
+        Ok(StorageFile {
             path,
             file,
+            wal,
             layout,
-            header,
             superblock_a,
             superblock_b,
             active_superblock: ActiveSuperblock::A,
-            wal_state,
-        };
-        file.touch();
-        Ok(file)
+            allocator: PageAllocator::new(layout.data_size),
+            replay_cache: Vec::new(),
+        })
     }
 
-    fn touch(&self) {
-        let _ = self.layout.total_size;
-        let _ = self.header.magic;
-        let _ = self.superblock_a.generation;
-        let _ = self.superblock_b.generation;
+    /// Rebuilds the live allocator: persisted bitmap, then reconciliation
+    /// with the snapshot descriptors and the WAL.
+    ///
+    /// Order matters:
+    /// 1. free the stale snapshot descriptor's extent — logically this free
+    ///    belongs to the checkpoint that superseded it, which precedes every
+    ///    replayed WAL record;
+    /// 2. replay logged alloc/free extents (all idempotent bit operations);
+    /// 3. mark the live snapshot's extent allocated last, healing the crash
+    ///    window where the descriptor was written but the bitmap was not.
+    fn recover_allocator(&mut self) -> Result<(), StorageError> {
+        let bitmap_len = (self.layout.data_size / PAGE_SIZE as u64).div_ceil(8) as usize;
+        let mut bitmap = vec![0u8; bitmap_len];
+        self.file
+            .read_exact_at(self.layout.allocator_offset, &mut bitmap)?;
+        self.allocator = PageAllocator::from_bitmap(bitmap, self.layout.data_size);
+
+        let descriptors = self.read_snapshot_descriptors()?;
+        let live_slot = live_descriptor_slot(&descriptors);
+        for (slot, desc) in descriptors.iter().enumerate() {
+            let Some(desc) = desc else { continue };
+            if Some(slot) != live_slot {
+                let (start, pages) = self.descriptor_page_range(desc)?;
+                self.allocator.free(start, pages);
+            }
+        }
+
+        let rel_records: Vec<RelRecord> = self
+            .replay_cache
+            .iter()
+            .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
+            .map(|record| RelRecord::decode(&record.payload))
+            .collect::<Result<_, _>>()?;
+        for record in rel_records {
+            match record.kind {
+                REL_KIND_ALLOC_EXTENT => {
+                    let (start, pages) = record.decode_extent_redo()?;
+                    self.allocator.mark_used(start, pages);
+                }
+                REL_KIND_FREE_EXTENT => {
+                    let (start, pages) = record.decode_extent_redo()?;
+                    self.allocator.free(start, pages);
+                }
+                other => {
+                    return Err(StorageError::InvalidFile(format!(
+                        "unknown rel wal record kind {other}"
+                    )));
+                }
+            }
+        }
+
+        if let Some(live) = live_slot.and_then(|slot| descriptors[slot]) {
+            let (start, pages) = self.descriptor_page_range(&live)?;
+            self.allocator.mark_used(start, pages);
+        }
+        Ok(())
+    }
+
+    /// Converts a snapshot descriptor's byte extent into data-region pages.
+    fn descriptor_page_range(&self, desc: &SnapshotDescriptor) -> Result<(u64, u64), StorageError> {
+        let page = PAGE_SIZE as u64;
+        if desc.data_offset < self.layout.data_offset
+            || !desc.data_offset.is_multiple_of(page)
+            || desc.data_offset + desc.data_len > self.layout.data_offset + self.layout.data_size
+        {
+            return Err(StorageError::InvalidFile(
+                "snapshot descriptor extent outside data region".to_string(),
+            ));
+        }
+        let start = (desc.data_offset - self.layout.data_offset) / page;
+        let pages = desc.data_len.div_ceil(page);
+        Ok((start, pages))
     }
 
     fn append_wal_entry(
@@ -349,298 +476,83 @@ impl StorageFile {
         entry_type: u16,
         entry_version: u16,
         seq_no: u64,
-        logical_ts: u64,
         payload: &[u8],
     ) -> Result<u64, StorageError> {
-        if self.wal_state.size == 0 {
-            return Err(StorageError::InvalidFile(
-                "wal region size is zero".to_string(),
-            ));
+        let lsn = self
+            .wal
+            .append_entry(entry_type, entry_version, seq_no, payload)?;
+        if self.wal.take_superblock_due() {
+            // Best-effort hint: the entry is already durable, so a failed
+            // superblock rewrite must not fail the append (callers would
+            // roll back state whose WAL record is durable). Recovery only
+            // scans a little further.
+            let _ = self.write_active_superblock(seq_no);
         }
-        let payload_len = payload.len();
-        let entry_len = wal_entry_padded_len(payload_len);
-        if entry_len as u64 > self.wal_state.size {
-            return Err(StorageError::WalFull(
-                "entry larger than wal ring".to_string(),
-            ));
-        }
-
-        let used = self.wal_state.tail.saturating_sub(self.wal_state.head);
-        let free = self.wal_state.size.saturating_sub(used);
-
-        let tail_offset = (self.wal_state.tail % self.wal_state.size) as usize;
-        let bytes_to_end = self.wal_state.size as usize - tail_offset;
-        let needs_wrap = entry_len > bytes_to_end;
-        let required = if needs_wrap {
-            bytes_to_end + entry_len
-        } else {
-            entry_len
-        };
-
-        if required as u64 > free {
-            return Err(StorageError::WalFull("wal ring full".to_string()));
-        }
-
-        if needs_wrap && bytes_to_end > 0 {
-            let write_pos = self.wal_state.offset + tail_offset as u64;
-            let zeroes = vec![0u8; bytes_to_end];
-            self.file.write_all_at(write_pos, &zeroes)?;
-            self.wal_state.tail = self.wal_state.tail.saturating_add(bytes_to_end as u64);
-        }
-
-        let write_pos = self.wal_state.offset + (self.wal_state.tail % self.wal_state.size);
-
-        let payload_crc = wal_payload_crc(payload);
-        let header = WalEntryHeader::new(
-            entry_type,
-            entry_version,
-            payload_len as u32,
-            seq_no,
-            logical_ts,
-            payload_crc,
-        );
-
-        let footer = WalEntryFooter {
-            payload_len: payload_len as u32,
-            payload_crc,
-        };
-        let mut entry_bytes = Vec::with_capacity(entry_len);
-        entry_bytes.extend_from_slice(&header.to_le_bytes());
-        entry_bytes.extend_from_slice(payload);
-        entry_bytes.extend_from_slice(&footer.to_le_bytes());
-        entry_bytes.resize(entry_len, 0);
-
-        self.file.write_all_at(write_pos, &entry_bytes)?;
-
-        self.wal_state.tail = self.wal_state.tail.saturating_add(entry_len as u64);
-        self.sync_active_superblock(seq_no)?;
-        self.file.sync_data()?;
-
-        debug_assert!(self.verify_wal_entry_at(write_pos).unwrap_or(false));
-
-        Ok(write_pos)
+        Ok(lsn)
     }
 
-    fn verify_wal_entry_at(&mut self, position: u64) -> Result<bool, StorageError> {
-        let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
-        self.file.read_exact_at(position, &mut header_bytes)?;
-        let header = WalEntryHeader::from_le_bytes(&header_bytes);
-        if !header.verify_header_crc() {
-            return Ok(false);
-        }
-
-        let payload_len = header.payload_len as usize;
-        let mut payload = vec![0u8; payload_len];
-        self.file
-            .read_exact_at(position + WAL_ENTRY_HEADER_SIZE as u64, &mut payload)?;
-        let payload_crc = wal_payload_crc(&payload);
-        if payload_crc != header.payload_crc {
-            return Ok(false);
-        }
-
-        let mut footer_bytes = [0u8; WAL_ENTRY_FOOTER_SIZE];
-        self.file.read_exact_at(
-            position + WAL_ENTRY_HEADER_SIZE as u64 + payload_len as u64,
-            &mut footer_bytes,
-        )?;
-        let footer = WalEntryFooter::from_le_bytes(&footer_bytes);
-        if footer.payload_len != header.payload_len || footer.payload_crc != header.payload_crc {
-            return Ok(false);
-        }
-
-        Ok(true)
-    }
-
-    fn recover_wal(&mut self) -> Result<RecoveryState, StorageError> {
-        let wal_offset = self.layout.wal_offset;
-        let wal_size = self.layout.wal_size;
-        let mut cursor = self.wal_state.head;
-        let tail = self.wal_state.tail;
-
-        if wal_size == 0 || tail <= cursor {
-            return Ok(RecoveryState::default());
-        }
-
-        let mut last_valid_seq = None;
-        let mut last_committed_seq = None;
-        let mut bytes_scanned = 0u64;
-        let _ = WAL_ENTRY_TYPE_RECORD;
-
-        while cursor < tail {
-            let ring_pos = cursor % wal_size;
-            let bytes_to_end = wal_size - ring_pos;
-
-            if bytes_to_end < WAL_ENTRY_HEADER_SIZE as u64 {
-                cursor = cursor.saturating_add(bytes_to_end);
-                bytes_scanned = bytes_scanned.saturating_add(bytes_to_end);
-                continue;
-            }
-
-            let file_pos = wal_offset + ring_pos;
-
-            let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
-            self.file.read_exact_at(file_pos, &mut header_bytes)?;
-            if header_bytes.iter().all(|b| *b == 0) {
-                cursor = cursor.saturating_add(bytes_to_end);
-                bytes_scanned = bytes_scanned.saturating_add(bytes_to_end);
-                continue;
-            }
-
-            let header = WalEntryHeader::from_le_bytes(&header_bytes);
-            if !header.verify_header_crc() {
-                break;
-            }
-
-            let payload_len = header.payload_len as usize;
-            let entry_len = wal_entry_padded_len(payload_len) as u64;
-            if entry_len > wal_size {
-                break;
-            }
-
-            let total_len = (WAL_ENTRY_HEADER_SIZE + payload_len + WAL_ENTRY_FOOTER_SIZE) as u64;
-            if total_len > bytes_to_end {
-                break;
-            }
-
-            let mut payload = vec![0u8; payload_len];
-            self.file
-                .read_exact_at(file_pos + WAL_ENTRY_HEADER_SIZE as u64, &mut payload)?;
-            let payload_crc = wal_payload_crc(&payload);
-            if payload_crc != header.payload_crc {
-                break;
-            }
-
-            let mut footer_bytes = [0u8; WAL_ENTRY_FOOTER_SIZE];
-            self.file.read_exact_at(
-                file_pos + WAL_ENTRY_HEADER_SIZE as u64 + payload_len as u64,
-                &mut footer_bytes,
-            )?;
-            let footer = WalEntryFooter::from_le_bytes(&footer_bytes);
-            if footer.payload_len != header.payload_len || footer.payload_crc != header.payload_crc
-            {
-                break;
-            }
-
-            if header.entry_type == WAL_ENTRY_TYPE_COMMIT && payload_len >= 18 {
-                let commit_seq = u64::from_le_bytes(payload[8..16].try_into().unwrap());
-                last_committed_seq = Some(commit_seq);
-            }
-
-            last_valid_seq = Some(header.seq_no);
-
-            cursor = cursor.saturating_add(entry_len);
-            bytes_scanned = bytes_scanned.saturating_add(entry_len);
-        }
-
-        Ok(RecoveryState {
-            last_valid_seq,
-            last_committed_seq,
-            bytes_scanned,
-        })
-    }
-
-    fn replay_wal_entries(&mut self) -> Result<Vec<WalRecord>, StorageError> {
-        let wal_offset = self.layout.wal_offset;
-        let wal_size = self.layout.wal_size;
-        let mut cursor = self.wal_state.head;
-        let tail = self.wal_state.tail;
-        let mut entries = Vec::new();
-
-        if wal_size == 0 || tail <= cursor {
-            return Ok(entries);
-        }
-
-        while cursor < tail {
-            let ring_pos = cursor % wal_size;
-            let bytes_to_end = wal_size - ring_pos;
-
-            if bytes_to_end < WAL_ENTRY_HEADER_SIZE as u64 {
-                cursor = cursor.saturating_add(bytes_to_end);
-                continue;
-            }
-
-            let file_pos = wal_offset + ring_pos;
-
-            let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
-            self.file.read_exact_at(file_pos, &mut header_bytes)?;
-            if header_bytes.iter().all(|b| *b == 0) {
-                cursor = cursor.saturating_add(bytes_to_end);
-                continue;
-            }
-
-            let header = WalEntryHeader::from_le_bytes(&header_bytes);
-            if !header.verify_header_crc() {
-                break;
-            }
-
-            let payload_len = header.payload_len as usize;
-            let entry_len = wal_entry_padded_len(payload_len) as u64;
-            if entry_len > wal_size {
-                break;
-            }
-
-            let total_len = (WAL_ENTRY_HEADER_SIZE + payload_len + WAL_ENTRY_FOOTER_SIZE) as u64;
-            if total_len > bytes_to_end {
-                break;
-            }
-
-            let mut payload = vec![0u8; payload_len];
-            self.file
-                .read_exact_at(file_pos + WAL_ENTRY_HEADER_SIZE as u64, &mut payload)?;
-            let payload_crc = wal_payload_crc(&payload);
-            if payload_crc != header.payload_crc {
-                break;
-            }
-
-            let mut footer_bytes = [0u8; WAL_ENTRY_FOOTER_SIZE];
-            self.file.read_exact_at(
-                file_pos + WAL_ENTRY_HEADER_SIZE as u64 + payload_len as u64,
-                &mut footer_bytes,
-            )?;
-            let footer = WalEntryFooter::from_le_bytes(&footer_bytes);
-            if footer.payload_len != header.payload_len || footer.payload_crc != header.payload_crc
-            {
-                break;
-            }
-
-            entries.push(WalRecord {
-                entry_type: header.entry_type,
-                entry_version: header.entry_version,
-                seq_no: header.seq_no,
-                logical_ts: header.logical_ts,
-                payload,
+    fn allocate_extent(&mut self, temp: bool) -> Result<u64, StorageError> {
+        if temp {
+            return self.allocator.allocate_temp_extent().ok_or_else(|| {
+                StorageError::InvalidConfig("data region full: cannot allocate extent".to_string())
             });
-
-            cursor = cursor.saturating_add(entry_len);
         }
-
-        Ok(entries)
+        let start = self.allocator.allocate_extent().ok_or_else(|| {
+            StorageError::InvalidConfig("data region full: cannot allocate extent".to_string())
+        })?;
+        let record = RelRecord::alloc_extent(start, EXTENT_PAGES);
+        if let Err(err) = self.append_wal_entry(
+            WAL_ENTRY_TYPE_REL,
+            REL_WAL_ENTRY_VERSION,
+            0,
+            &record.encode(),
+        ) {
+            self.allocator.free(start, EXTENT_PAGES);
+            return Err(err);
+        }
+        Ok(start)
     }
 
-    fn sync_active_superblock(&mut self, last_committed_seq: u64) -> Result<(), StorageError> {
+    fn free_extent(&mut self, start_page: u64) -> Result<(), StorageError> {
+        // Log first, then mutate: a free whose record never became durable
+        // must not leave the pages reusable in memory.
+        let record = RelRecord::free_extent(start_page, EXTENT_PAGES);
+        self.append_wal_entry(
+            WAL_ENTRY_TYPE_REL,
+            REL_WAL_ENTRY_VERSION,
+            0,
+            &record.encode(),
+        )?;
+        self.allocator.free(start_page, EXTENT_PAGES);
+        Ok(())
+    }
+
+    /// Lazily rewrites the active superblock in place (no fsync: it is a
+    /// recovery-scan optimization, not a durability point; a torn write
+    /// falls back to the other superblock).
+    fn write_active_superblock(&mut self, last_committed_seq: u64) -> Result<(), StorageError> {
         let generation = self
             .superblock_a
             .generation
             .max(self.superblock_b.generation)
             .saturating_add(1);
 
+        let (head, tail) = (self.wal.head(), self.wal.tail());
         let (sb, offset) = match self.active_superblock {
             ActiveSuperblock::A => (&mut self.superblock_a, self.layout.superblock_a_offset),
             ActiveSuperblock::B => (&mut self.superblock_b, self.layout.superblock_b_offset),
         };
-
         sb.generation = generation;
         sb.active = match self.active_superblock {
             ActiveSuperblock::A => SUPERBLOCK_ACTIVE_A,
             ActiveSuperblock::B => SUPERBLOCK_ACTIVE_B,
         };
-        sb.wal_head = self.wal_state.head;
-        sb.wal_tail = self.wal_state.tail;
+        sb.wal_head = head;
+        sb.wal_tail = tail;
         sb.last_committed_seq = last_committed_seq;
         sb.checksum = sb.compute_checksum();
-
-        self.file
-            .write_all_at(offset, &sb.to_le_bytes_with_checksum())?;
+        let bytes = sb.to_le_bytes_with_checksum();
+        self.wal.file_mut().write_all_at(offset, &bytes)?;
         Ok(())
     }
 
@@ -651,125 +563,192 @@ impl StorageFile {
         next_seq_no: u64,
         next_doc_id: u64,
     ) -> Result<(), StorageError> {
-        let page_size = PAGE_SIZE as u64;
-        let num_pages = (data.len() as u64).div_ceil(page_size);
-        let padded_len = num_pages * page_size;
-
-        if padded_len > self.layout.data_size {
+        if data.is_empty() {
+            // An empty snapshot would produce a descriptor that
+            // SnapshotDescriptor::is_valid rejects while the WAL head still
+            // advances — silently reviving the previous snapshot on reopen.
             return Err(StorageError::InvalidConfig(
-                "checkpoint data exceeds data region size".to_string(),
+                "checkpoint data must not be empty".to_string(),
             ));
         }
+        let page = PAGE_SIZE as u64;
+        let num_pages = (data.len() as u64).div_ceil(page);
 
-        let mut allocator = self.load_allocator()?;
-
-        let current_snapshot = self.load_active_snapshot_descriptor()?;
-        let target_slot: u8 = if let Some(ref desc) = current_snapshot {
-            if desc.slot == 0 { 1 } else { 0 }
-        } else {
-            0
-        };
-
-        // Two-slot A/B strategy: slot 0 = first half of data region, slot 1 = second half.
-        let half_pages = self.layout.data_size / page_size / 2;
-        let slot_start_page = if target_slot == 0 { 0 } else { half_pages };
-
-        if num_pages > half_pages {
-            return Err(StorageError::InvalidConfig(
-                "checkpoint data exceeds half of data region (slot capacity)".to_string(),
-            ));
-        }
-
-        // Free the target slot region and reallocate
-        allocator.free(slot_start_page, half_pages);
-        let alloc_start = allocator.allocate(num_pages).ok_or_else(|| {
-            StorageError::InvalidConfig("cannot allocate pages for checkpoint".to_string())
-        })?;
-
-        let data_write_offset = self.layout.data_offset + alloc_start * page_size;
-
-        // Write the data (padded to page alignment)
-        let mut padded_data = data.to_vec();
-        padded_data.resize(padded_len as usize, 0);
-        self.file.write_all_at(data_write_offset, &padded_data)?;
-        self.file.sync_data()?;
-
-        // Write allocator bitmap
-        self.save_allocator(&allocator)?;
-        self.file.sync_data()?;
-
-        // Write snapshot descriptor
-        let data_checksum = xxh64(data, 0);
+        // Mint the generation above everything durable: both superblocks AND
+        // both descriptors. A crash between descriptor fsync and superblock
+        // publish leaves a descriptor generation ahead of the superblocks;
+        // minting from superblocks alone could then duplicate a live
+        // descriptor generation.
+        let descriptors = self.read_snapshot_descriptors()?;
+        let previous = live_descriptor_slot(&descriptors).and_then(|slot| descriptors[slot]);
         let generation = self
             .superblock_a
             .generation
             .max(self.superblock_b.generation)
+            .max(
+                descriptors
+                    .iter()
+                    .flatten()
+                    .map(|d| d.generation)
+                    .max()
+                    .unwrap_or(0),
+            )
             .saturating_add(1);
 
+        // The snapshot is an ordinary allocator extent now; the old snapshot
+        // stays allocated (and readable) until the new one is durable.
+        let alloc_start = self.allocator.allocate(num_pages).ok_or_else(|| {
+            StorageError::InvalidConfig(
+                "cannot allocate contiguous pages for checkpoint".to_string(),
+            )
+        })?;
+        let data_write_offset = self.layout.data_offset + alloc_start * page;
+
+        // Phase 1a — snapshot pages + fsync. A failure here may roll the
+        // allocation back: nothing references the extent yet.
+        let write_data = self
+            .write_data_pages(data_write_offset, data)
+            .and_then(|()| self.file.sync_data().map_err(StorageError::from));
+        if let Err(err) = write_data {
+            self.allocator.free(alloc_start, num_pages);
+            return Err(err);
+        }
+
+        // Phase 1b — descriptor write + fsync. From the moment the write is
+        // *issued* the descriptor may be durable regardless of any error we
+        // observe, so from here on there is no rollback: a failure leaves the
+        // extent allocated (worst case a leak until the next successful
+        // checkpoint) and recovery reconciles from whichever descriptor won.
+        let desc_offset = self.write_snapshot_descriptor(
+            data,
+            data_write_offset,
+            &previous,
+            generation,
+            checkpoint_seq,
+            next_seq_no,
+            next_doc_id,
+        )?;
+
+        // Phase 2 — the new snapshot is authoritative from here on. A crash
+        // or error leaves state that `recover_allocator` reconciles on the
+        // next open.
+        self.finish_checkpoint(
+            previous,
+            generation,
+            checkpoint_seq,
+            desc_offset,
+            data_write_offset,
+        )
+    }
+
+    /// Writes the new snapshot descriptor into the slot not currently live
+    /// and fsyncs it. Once durable, its higher generation makes the new
+    /// snapshot authoritative.
+    #[allow(clippy::too_many_arguments)]
+    fn write_snapshot_descriptor(
+        &mut self,
+        data: &[u8],
+        data_write_offset: u64,
+        previous: &Option<SnapshotDescriptor>,
+        generation: u64,
+        checkpoint_seq: u64,
+        next_seq_no: u64,
+        next_doc_id: u64,
+    ) -> Result<u64, StorageError> {
+        let target_slot: u8 = match previous {
+            Some(desc) if desc.slot == 0 => 1,
+            Some(_) => 0,
+            None => 0,
+        };
         let mut desc = SnapshotDescriptor::default();
         desc.generation = generation;
         desc.slot = target_slot;
         desc.checkpoint_seq = checkpoint_seq;
         desc.data_offset = data_write_offset;
         desc.data_len = data.len() as u64;
-        desc.data_checksum = data_checksum;
+        desc.data_checksum = xxh64(data, 0);
         desc.next_seq_no = next_seq_no;
         desc.next_doc_id = next_doc_id;
         desc.checksum = desc.compute_checksum();
-
         let desc_offset =
             self.layout.snapshot_offset + (target_slot as u64) * SNAPSHOT_DESCRIPTOR_SIZE as u64;
         self.file
             .write_all_at(desc_offset, &desc.to_le_bytes_with_checksum())?;
         self.file.sync_data()?;
+        Ok(desc_offset)
+    }
 
-        // Advance wal_head to reclaim entries covered by this checkpoint
-        self.wal_state.head = self.wal_state.tail;
+    /// Checkpoint phase 2: reclaim the previous snapshot, persist the
+    /// allocator bitmap, advance the WAL head and publish both superblocks.
+    fn finish_checkpoint(
+        &mut self,
+        previous: Option<SnapshotDescriptor>,
+        generation: u64,
+        checkpoint_seq: u64,
+        desc_offset: u64,
+        data_write_offset: u64,
+    ) -> Result<(), StorageError> {
+        // Free the previous snapshot's extent now that the new one is
+        //    durable, and persist the allocator bitmap (temp extents
+        //    excluded). The bitmap must be durable before the WAL head
+        //    advances, otherwise logged alloc/free records could be
+        //    reclaimed before their effects are persisted anywhere.
+        if let Some(prev) = &previous {
+            let (start, pages) = self.descriptor_page_range(prev)?;
+            self.allocator.free(start, pages);
+        }
+        let bitmap = self.allocator.persistable_bitmap();
+        if bitmap.len() as u64 > self.layout.allocator_size {
+            return Err(StorageError::InvalidFile(
+                "allocator bitmap exceeds allocator region".to_string(),
+            ));
+        }
+        self.file
+            .write_all_at(self.layout.allocator_offset, &bitmap)?;
+        self.file.sync_data()?;
 
-        // Flip to the inactive superblock and write it with the new state
+        // 4. Advance the WAL head and publish both superblocks (new active
+        //    first).
+        self.wal.set_head(self.wal.tail());
         let new_active = match self.active_superblock {
             ActiveSuperblock::A => ActiveSuperblock::B,
             ActiveSuperblock::B => ActiveSuperblock::A,
         };
         self.active_superblock = new_active;
 
-        // Build the new superblock state for both
+        let (head, tail) = (self.wal.head(), self.wal.tail());
         let new_sb = |active_flag: u8| -> Superblock {
             let mut sb = Superblock::default();
             sb.generation = generation;
             sb.active = active_flag;
-            sb.wal_head = self.wal_state.head;
-            sb.wal_tail = self.wal_state.tail;
+            sb.wal_head = head;
+            sb.wal_tail = tail;
             sb.last_committed_seq = checkpoint_seq;
             sb.snapshot_root = desc_offset;
             sb.data_root = data_write_offset;
             sb.checksum = sb.compute_checksum();
             sb
         };
-
         self.superblock_a = new_sb(SUPERBLOCK_ACTIVE_A);
         self.superblock_b = new_sb(SUPERBLOCK_ACTIVE_B);
 
-        // Write primary (new active) first, then backup
         let (primary_offset, primary_sb, backup_offset, backup_sb) = match new_active {
             ActiveSuperblock::A => (
                 self.layout.superblock_a_offset,
-                &self.superblock_a,
+                self.superblock_a,
                 self.layout.superblock_b_offset,
-                &self.superblock_b,
+                self.superblock_b,
             ),
             ActiveSuperblock::B => (
                 self.layout.superblock_b_offset,
-                &self.superblock_b,
+                self.superblock_b,
                 self.layout.superblock_a_offset,
-                &self.superblock_a,
+                self.superblock_a,
             ),
         };
-
         self.file
             .write_all_at(primary_offset, &primary_sb.to_le_bytes_with_checksum())?;
         self.file.sync_data()?;
-
         self.file
             .write_all_at(backup_offset, &backup_sb.to_le_bytes_with_checksum())?;
         self.file.sync_data()?;
@@ -777,15 +756,41 @@ impl StorageFile {
         Ok(())
     }
 
-    fn load_active_snapshot_descriptor(
-        &mut self,
-    ) -> Result<Option<SnapshotDescriptor>, StorageError> {
-        // Try slot 0 and slot 1, return the one with higher generation
-        let mut best: Option<SnapshotDescriptor> = None;
+    /// Writes `data` (zero-padded to whole pages) at a page-aligned offset
+    /// using batched page writes.
+    fn write_data_pages(&mut self, offset: u64, data: &[u8]) -> Result<(), StorageError> {
+        const BATCH_FRAMES: usize = 64;
+        let mut frames: Vec<AlignedPageBuf> = Vec::with_capacity(BATCH_FRAMES);
+        let mut batch_start = offset;
+        let mut cursor = 0usize;
+        let total_pages = data.len().div_ceil(PAGE_SIZE);
+        for _ in 0..total_pages {
+            let mut frame = AlignedPageBuf::new();
+            let len = (data.len() - cursor).min(PAGE_SIZE);
+            frame.as_mut_slice()[..len].copy_from_slice(&data[cursor..cursor + len]);
+            cursor += len;
+            frames.push(frame);
+            if frames.len() == BATCH_FRAMES {
+                let refs: Vec<&AlignedPageBuf> = frames.iter().collect();
+                self.file.write_pages_from(batch_start, &refs)?;
+                batch_start += (BATCH_FRAMES * PAGE_SIZE) as u64;
+                frames.clear();
+            }
+        }
+        if !frames.is_empty() {
+            let refs: Vec<&AlignedPageBuf> = frames.iter().collect();
+            self.file.write_pages_from(batch_start, &refs)?;
+        }
+        Ok(())
+    }
 
-        for slot in 0..2u8 {
+    fn read_snapshot_descriptors(
+        &mut self,
+    ) -> Result<[Option<SnapshotDescriptor>; 2], StorageError> {
+        let mut out = [None, None];
+        for (slot, entry) in out.iter_mut().enumerate() {
             let desc_offset =
-                self.layout.snapshot_offset + (slot as u64) * SNAPSHOT_DESCRIPTOR_SIZE as u64;
+                self.layout.snapshot_offset + slot as u64 * SNAPSHOT_DESCRIPTOR_SIZE as u64;
             if desc_offset + SNAPSHOT_DESCRIPTOR_SIZE as u64
                 > self.layout.snapshot_offset + self.layout.snapshot_size
             {
@@ -794,12 +799,18 @@ impl StorageFile {
             let mut desc_bytes = [0u8; SNAPSHOT_DESCRIPTOR_SIZE];
             self.file.read_exact_at(desc_offset, &mut desc_bytes)?;
             let desc = SnapshotDescriptor::from_le_bytes(&desc_bytes);
-            if desc.is_valid() && best.as_ref().is_none_or(|b| desc.generation > b.generation) {
-                best = Some(desc);
+            if desc.is_valid() {
+                *entry = Some(desc);
             }
         }
+        Ok(out)
+    }
 
-        Ok(best)
+    fn load_active_snapshot_descriptor(
+        &mut self,
+    ) -> Result<Option<SnapshotDescriptor>, StorageError> {
+        let descriptors = self.read_snapshot_descriptors()?;
+        Ok(live_descriptor_slot(&descriptors).and_then(|slot| descriptors[slot]))
     }
 
     fn load_snapshot(&mut self) -> Result<Option<SnapshotData>, StorageError> {
@@ -825,61 +836,122 @@ impl StorageFile {
             next_doc_id: desc.next_doc_id,
         }))
     }
+}
 
-    fn load_allocator(&mut self) -> Result<PageAllocator, StorageError> {
-        if self.layout.allocator_size == 0 {
-            return Ok(PageAllocator::new(self.layout.data_size));
+/// In-place v1 -> v2 upgrade:
+/// 1. zero the allocator bitmap (v1's half-slot bookkeeping is meaningless
+///    in v2 — `recover_allocator` re-marks the live snapshot extent);
+/// 2. rewrite BOTH superblocks from the active one — v1's backup superblock
+///    may be arbitrarily stale, and any later fallback to it would silently
+///    drop fsync-acknowledged v1 WAL entries (v1 entries beyond a stale tail
+///    cannot pass the v2 forward scan);
+/// 3. stamp the new version.
+///
+/// Each step is fsync-fenced; a crash before step 3 leaves a v1 file and the
+/// upgrade re-runs idempotently.
+fn upgrade_v1_to_v2(
+    file: &mut DirectFile,
+    mut header: FileHeader,
+    layout: &StorageLayout,
+    active_sb: &Superblock,
+) -> Result<(Superblock, Superblock), StorageError> {
+    let zero_page = AlignedPageBuf::new();
+    let mut offset = header.allocator_offset;
+    let end = header.allocator_offset + header.allocator_size;
+    while offset < end {
+        file.write_page_from(offset, &zero_page)?;
+        offset += PAGE_SIZE as u64;
+    }
+    file.sync_data()?;
+
+    let generation = active_sb.generation.saturating_add(1);
+    let new_sb = |active_flag: u8| -> Superblock {
+        let mut sb = *active_sb;
+        sb.generation = generation;
+        sb.active = active_flag;
+        sb.checksum = sb.compute_checksum();
+        sb
+    };
+    let superblock_a = new_sb(SUPERBLOCK_ACTIVE_A);
+    let superblock_b = new_sb(SUPERBLOCK_ACTIVE_B);
+    file.write_all_at(
+        layout.superblock_a_offset,
+        &superblock_a.to_le_bytes_with_checksum(),
+    )?;
+    file.sync_data()?;
+    file.write_all_at(
+        layout.superblock_b_offset,
+        &superblock_b.to_le_bytes_with_checksum(),
+    )?;
+    file.sync_data()?;
+
+    header.version = crate::storage_layout::FILE_VERSION;
+    header.header_checksum = header.compute_checksum();
+    file.write_all_at(0, &header.to_le_bytes_with_checksum())?;
+    file.sync_data()?;
+    Ok((superblock_a, superblock_b))
+}
+
+/// Picks the live snapshot descriptor slot by the highest
+/// `(generation, slot index)` — one total order shared by every consumer
+/// (allocator recovery and snapshot loading), so they can never disagree on
+/// which descriptor is authoritative, even in the face of legacy duplicate
+/// generations.
+fn live_descriptor_slot(descriptors: &[Option<SnapshotDescriptor>; 2]) -> Option<usize> {
+    let mut best: Option<usize> = None;
+    for (slot, desc) in descriptors.iter().enumerate() {
+        let Some(desc) = desc else { continue };
+        let better = match best {
+            None => true,
+            Some(b) => {
+                let current = descriptors[b].as_ref().expect("best slot is valid");
+                (desc.generation, slot) > (current.generation, b)
+            }
+        };
+        if better {
+            best = Some(slot);
         }
-        let bitmap_len = (self.layout.data_size / PAGE_SIZE as u64).div_ceil(8) as usize;
-        let read_len = bitmap_len.min(self.layout.allocator_size as usize);
-        let mut bitmap = vec![0u8; bitmap_len];
-        self.file
-            .read_exact_at(self.layout.allocator_offset, &mut bitmap[..read_len])?;
-        Ok(PageAllocator::from_bitmap(bitmap, self.layout.data_size))
     }
+    best
+}
 
-    fn save_allocator(&mut self, allocator: &PageAllocator) -> Result<(), StorageError> {
-        let bitmap = allocator.bitmap();
-        let write_len = bitmap.len().min(self.layout.allocator_size as usize);
-        self.file
-            .write_all_at(self.layout.allocator_offset, &bitmap[..write_len])?;
-        Ok(())
+fn layout_from_header(header: &FileHeader, total_size: u64) -> StorageLayout {
+    StorageLayout {
+        total_size,
+        header_offset: 0,
+        superblock_a_offset: header.superblock_a_offset,
+        superblock_b_offset: header.superblock_b_offset,
+        wal_offset: header.wal_offset,
+        wal_size: header.wal_size,
+        data_offset: header.data_offset,
+        data_size: header.data_size,
+        metadata_offset: header.metadata_offset,
+        metadata_size: header.metadata_size,
+        allocator_offset: header.allocator_offset,
+        allocator_size: header.allocator_size,
+        snapshot_offset: header.snapshot_offset,
+        snapshot_size: header.snapshot_size,
+        reserved_offset: header.reserved_offset,
+        reserved_size: header.reserved_size,
     }
+}
 
-    fn wal_usage_ratio(&self) -> f64 {
-        if self.wal_state.size == 0 {
-            return 1.0;
-        }
-        let used = self.wal_state.tail.saturating_sub(self.wal_state.head);
-        used as f64 / self.wal_state.size as f64
+fn validate_allocator_region(layout: &StorageLayout) -> Result<(), StorageError> {
+    let bitmap_len = (layout.data_size / PAGE_SIZE as u64).div_ceil(8);
+    if bitmap_len > layout.allocator_size {
+        return Err(StorageError::InvalidConfig(format!(
+            "allocator region ({} bytes) too small for data-region bitmap ({bitmap_len} bytes)",
+            layout.allocator_size
+        )));
     }
+    Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
-struct WalRingState {
-    head: u64,
-    tail: u64,
-    offset: u64,
-    size: u64,
-}
-
-#[derive(Debug, Default, Clone, Copy)]
-pub struct RecoveryState {
-    pub last_valid_seq: Option<u64>,
-    pub last_committed_seq: Option<u64>,
-    pub bytes_scanned: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct WalRecord {
-    pub entry_type: u16,
-    pub entry_version: u16,
-    pub seq_no: u64,
-    pub logical_ts: u64,
-    pub payload: Vec<u8>,
-}
-
-fn compute_layout(opts: StorageOptions) -> Result<StorageLayout, StorageError> {
+fn compute_layout(
+    opts: StorageOptions,
+    wal_min_bytes: u64,
+    wal_max_bytes: u64,
+) -> Result<StorageLayout, StorageError> {
     let total_size = opts
         .size_gib
         .checked_mul(crate::storage_layout::GIB)
@@ -894,7 +966,7 @@ fn compute_layout(opts: StorageOptions) -> Result<StorageLayout, StorageError> {
     }
 
     let wal_raw = (total_size as f64 * opts.wal_ratio) as u64;
-    let wal_clamped = wal_raw.clamp(WAL_MIN_BYTES, WAL_MAX_BYTES);
+    let wal_clamped = wal_raw.clamp(wal_min_bytes, wal_max_bytes);
     let wal_size = align_down(wal_clamped, page);
 
     let metadata_size = align_down((total_size as f64 * opts.metadata_ratio) as u64, page);
@@ -954,4 +1026,814 @@ fn compute_layout(opts: StorageOptions) -> Result<StorageLayout, StorageError> {
         reserved_offset,
         reserved_size,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Seek, SeekFrom, Write};
+    use std::path::{Path, PathBuf};
+
+    use super::*;
+    use crate::storage_layout::{
+        FILE_HEADER_SIZE, FILE_VERSION, FILE_VERSION_V1, SUPERBLOCK_SIZE, WAL_ENTRY_TYPE_RECORD,
+        WalEntryFooter, WalEntryHeader, wal_entry_padded_len, wal_payload_crc,
+    };
+
+    /// Small ring so wrap/full paths are cheap to reach.
+    const TEST_WAL_BYTES: u64 = 64 * 1024;
+
+    fn test_storage_options() -> StorageOptions {
+        StorageOptions {
+            size_gib: 1,
+            wal_ratio: 0.05,
+            metadata_ratio: 0.08,
+            snapshot_ratio: 0.02,
+            allocator_ratio: 0.02,
+            reserved_ratio: 0.17,
+        }
+    }
+
+    fn unique_temp_path(label: &str) -> PathBuf {
+        let mut path = std::env::temp_dir();
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time before unix epoch")
+            .as_nanos();
+        path.push(format!("truthdb-storage-{label}-{nanos}.db"));
+        path
+    }
+
+    fn create_small(path: &Path) -> Storage {
+        Storage::create_with_wal_bounds(
+            path.to_path_buf(),
+            test_storage_options(),
+            TEST_WAL_BYTES,
+            TEST_WAL_BYTES,
+        )
+        .expect("create storage")
+    }
+
+    /// Buffered write into the file (test-side corruption / fixtures). The
+    /// sync makes it visible to subsequent O_DIRECT reads.
+    fn overwrite_bytes(path: &Path, offset: u64, bytes: &[u8]) {
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open for corruption");
+        file.seek(SeekFrom::Start(offset)).expect("seek");
+        file.write_all(bytes).expect("write");
+        file.sync_all().expect("sync");
+    }
+
+    fn read_bytes(path: &Path, offset: u64, len: usize) -> Vec<u8> {
+        let mut file = std::fs::File::open(path).expect("open for read");
+        file.seek(SeekFrom::Start(offset)).expect("seek");
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf).expect("read");
+        buf
+    }
+
+    fn append_search_entry(storage: &mut Storage, seq_no: u64, payload: &[u8]) -> u64 {
+        storage
+            .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, seq_no, payload)
+            .expect("append wal entry")
+    }
+
+    /// Reads both superblocks from disk and returns the active (highest
+    /// valid generation) one.
+    fn read_active_superblock(path: &Path, layout: &StorageLayout) -> Superblock {
+        let read_sb = |offset: u64| -> Option<Superblock> {
+            let bytes = read_bytes(path, offset, SUPERBLOCK_SIZE);
+            let sb = Superblock::from_le_bytes(bytes.as_slice().try_into().unwrap());
+            (sb.checksum == sb.compute_checksum()).then_some(sb)
+        };
+        let a = read_sb(layout.superblock_a_offset);
+        let b = read_sb(layout.superblock_b_offset);
+        match (a, b) {
+            (Some(a), Some(b)) => {
+                if b.generation > a.generation {
+                    b
+                } else {
+                    a
+                }
+            }
+            (Some(a), None) => a,
+            (None, Some(b)) => b,
+            (None, None) => panic!("no valid superblock"),
+        }
+    }
+
+    fn test_layout() -> StorageLayout {
+        compute_layout(test_storage_options(), TEST_WAL_BYTES, TEST_WAL_BYTES).expect("layout")
+    }
+
+    /// Writes a v1-format file: v1 header, superblocks, optional snapshot in
+    /// half-slot 0, WAL entries with v1 stamping (`logical_ts = seq_no`) and
+    /// garbage in the allocator bitmap (v1 half-slot bookkeeping the upgrade
+    /// must discard).
+    fn write_v1_fixture(
+        path: &Path,
+        wal_events: &[(u64, Vec<u8>)],
+        snapshot: Option<(&[u8], u64, u64, u64)>,
+    ) -> StorageLayout {
+        let layout = test_layout();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .expect("create fixture");
+        file.set_len(layout.total_size).expect("set_len");
+        drop(file);
+
+        let mut header = FileHeader::default();
+        header.version = FILE_VERSION_V1;
+        header.superblock_a_offset = layout.superblock_a_offset;
+        header.superblock_b_offset = layout.superblock_b_offset;
+        header.wal_offset = layout.wal_offset;
+        header.wal_size = layout.wal_size;
+        header.data_offset = layout.data_offset;
+        header.data_size = layout.data_size;
+        header.metadata_offset = layout.metadata_offset;
+        header.metadata_size = layout.metadata_size;
+        header.allocator_offset = layout.allocator_offset;
+        header.allocator_size = layout.allocator_size;
+        header.snapshot_offset = layout.snapshot_offset;
+        header.snapshot_size = layout.snapshot_size;
+        header.reserved_offset = layout.reserved_offset;
+        header.reserved_size = layout.reserved_size;
+        header.header_checksum = header.compute_checksum();
+        overwrite_bytes(path, 0, &header.to_le_bytes_with_checksum());
+
+        // WAL entries, sequentially from ring position 0, v1 stamping.
+        let mut tail = 0u64;
+        let mut last_seq = 0u64;
+        for (seq_no, payload) in wal_events {
+            let padded = wal_entry_padded_len(payload.len());
+            let crc = wal_payload_crc(payload);
+            let entry_header = WalEntryHeader::new(
+                WAL_ENTRY_TYPE_RECORD,
+                1,
+                payload.len() as u32,
+                *seq_no,
+                *seq_no, // v1: logical_ts carried the engine seq
+                crc,
+            );
+            let footer = WalEntryFooter {
+                payload_len: payload.len() as u32,
+                payload_crc: crc,
+            };
+            let mut bytes = Vec::with_capacity(padded);
+            bytes.extend_from_slice(&entry_header.to_le_bytes());
+            bytes.extend_from_slice(payload);
+            bytes.extend_from_slice(&footer.to_le_bytes());
+            bytes.resize(padded, 0);
+            overwrite_bytes(path, layout.wal_offset + tail, &bytes);
+            tail += padded as u64;
+            last_seq = *seq_no;
+        }
+
+        // Snapshot in v1 half-slot 0 (start of the data region).
+        if let Some((data, checkpoint_seq, next_seq_no, next_doc_id)) = snapshot {
+            overwrite_bytes(path, layout.data_offset, data);
+            let mut desc = SnapshotDescriptor::default();
+            desc.generation = 1;
+            desc.slot = 0;
+            desc.checkpoint_seq = checkpoint_seq;
+            desc.data_offset = layout.data_offset;
+            desc.data_len = data.len() as u64;
+            desc.data_checksum = xxh64(data, 0);
+            desc.next_seq_no = next_seq_no;
+            desc.next_doc_id = next_doc_id;
+            desc.checksum = desc.compute_checksum();
+            overwrite_bytes(
+                path,
+                layout.snapshot_offset,
+                &desc.to_le_bytes_with_checksum(),
+            );
+        }
+
+        // v1 half-slot allocator garbage the upgrade must wipe.
+        overwrite_bytes(path, layout.allocator_offset, &[0xFF; 512]);
+
+        let mut sb_a = Superblock::default();
+        sb_a.generation = 2;
+        sb_a.active = SUPERBLOCK_ACTIVE_A;
+        sb_a.wal_tail = tail;
+        sb_a.last_committed_seq = last_seq;
+        sb_a.checksum = sb_a.compute_checksum();
+        overwrite_bytes(
+            path,
+            layout.superblock_a_offset,
+            &sb_a.to_le_bytes_with_checksum(),
+        );
+        let mut sb_b = Superblock::default();
+        sb_b.active = SUPERBLOCK_ACTIVE_B;
+        sb_b.checksum = sb_b.compute_checksum();
+        overwrite_bytes(
+            path,
+            layout.superblock_b_offset,
+            &sb_b.to_le_bytes_with_checksum(),
+        );
+        layout
+    }
+
+    #[test]
+    fn v1_fixture_upgrades_in_place_and_preserves_state() {
+        let path = unique_temp_path("v1-upgrade");
+        let snapshot_data = b"v1-snapshot-payload".as_slice();
+        let events = vec![(6u64, vec![1u8; 100]), (7u64, vec![2u8; 50])];
+        write_v1_fixture(&path, &events, Some((snapshot_data, 5, 8, 3)));
+
+        let mut storage = Storage::open(path.clone()).expect("open v1 file");
+
+        // Snapshot survives the upgrade.
+        let snapshot = storage
+            .load_snapshot()
+            .expect("load snapshot")
+            .expect("snapshot present");
+        assert_eq!(snapshot.data, snapshot_data);
+        assert_eq!(snapshot.checkpoint_seq, 5);
+        assert_eq!(snapshot.next_seq_no, 8);
+        assert_eq!(snapshot.next_doc_id, 3);
+
+        // WAL entries survive and replay in order.
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].seq_no, 6);
+        assert_eq!(records[0].payload, vec![1u8; 100]);
+        assert_eq!(records[1].seq_no, 7);
+        assert_eq!(records[1].payload, vec![2u8; 50]);
+
+        // The allocator was rebuilt: only the live snapshot extent is
+        // allocated; the v1 half-slot garbage is gone.
+        assert!(storage.is_page_allocated(0), "snapshot extent must be live");
+        assert!(
+            !storage.is_page_allocated(1),
+            "pages past the snapshot extent must be free"
+        );
+        assert!(
+            !storage.is_page_allocated(100),
+            "v1 bitmap garbage must have been wiped"
+        );
+
+        // New work post-upgrade: append + checkpoint + reopen.
+        append_search_entry(&mut storage, 8, b"post-upgrade");
+        storage
+            .write_checkpoint(b"v2-snapshot", 8, 9, 4)
+            .expect("checkpoint");
+        drop(storage);
+
+        // On-disk version is now v2; upgraded file opens cleanly.
+        let header_bytes = read_bytes(&path, 0, FILE_HEADER_SIZE);
+        let header = FileHeader::from_le_bytes(header_bytes.as_slice().try_into().unwrap());
+        assert_eq!(header.version, FILE_VERSION);
+        assert_eq!(header.header_checksum, header.compute_checksum());
+
+        let mut storage = Storage::open(path.clone()).expect("reopen upgraded");
+        let snapshot = storage
+            .load_snapshot()
+            .expect("load")
+            .expect("second snapshot");
+        assert_eq!(snapshot.data, b"v2-snapshot");
+        assert!(
+            storage.replay_wal_entries().expect("replay").is_empty(),
+            "checkpoint reclaimed the wal"
+        );
+        // The upgraded snapshot's extent was freed once the v2 one became
+        // durable; page 0 belonged to the v1 snapshot.
+        assert!(!storage.is_page_allocated(0));
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn torn_tail_is_stopped_at_and_healed_by_whole_page_flush() {
+        let path = unique_temp_path("torn-tail");
+        let layout = test_layout();
+        let mut storage = create_small(&path);
+        let payload_a = vec![0xAAu8; 100];
+        append_search_entry(&mut storage, 1, &payload_a);
+        drop(storage); // crash: superblock still says tail = 0
+
+        // Simulate a torn write of a follow-up entry: garbage on the tail
+        // page right after entry A.
+        let entry_a_len = wal_entry_padded_len(payload_a.len()) as u64;
+        overwrite_bytes(&path, layout.wal_offset + entry_a_len, &[0x5Au8; 200]);
+
+        // Recovery must stop at the garbage and keep A.
+        let mut storage = Storage::open(path.clone()).expect("reopen after tear");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 1, "only entry A must survive the torn tail");
+        assert_eq!(records[0].payload, payload_a);
+
+        // The next append rewrites the whole tail page from memory, healing
+        // the torn bytes: B lands exactly where the garbage was.
+        let payload_b = vec![0xBBu8; 60];
+        append_search_entry(&mut storage, 2, &payload_b);
+        drop(storage);
+
+        let mut storage = Storage::open(path.clone()).expect("reopen after heal");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].payload, payload_a);
+        assert_eq!(records[1].payload, payload_b);
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn superblock_is_lazy_and_forward_scan_recovers_past_it() {
+        let path = unique_temp_path("lazy-superblock");
+        let layout = test_layout();
+        let mut storage = create_small(&path);
+        storage.file.wal.set_superblock_interval(400);
+
+        // 152 bytes per entry: the cadence write fires once, on entry 3
+        // (456 bytes appended), and entry 4 stays past the recorded tail.
+        let payloads: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i + 1; 100]).collect();
+        let mut lsns = Vec::new();
+        for (i, payload) in payloads.iter().enumerate() {
+            lsns.push(append_search_entry(&mut storage, i as u64 + 1, payload));
+        }
+        drop(storage); // crash without checkpoint
+
+        // The on-disk superblock lags the true tail (laziness) but is not 0
+        // (the cadence rewrite fired).
+        let sb = read_active_superblock(&path, &layout);
+        let true_tail = lsns[3] + wal_entry_padded_len(payloads[3].len()) as u64;
+        assert!(sb.wal_tail > 0, "cadence superblock write must have fired");
+        assert!(
+            sb.wal_tail < true_tail,
+            "superblock tail {} must lag the true tail {true_tail}",
+            sb.wal_tail
+        );
+
+        // Recovery scans forward past the stale superblock tail and finds
+        // every entry.
+        let mut storage = Storage::open(path.clone()).expect("reopen");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 4, "forward scan must recover all entries");
+        for (record, payload) in records.iter().zip(&payloads) {
+            assert_eq!(&record.payload, payload);
+        }
+        // LSN self-identity stamping.
+        for (record, lsn) in records.iter().zip(&lsns) {
+            assert_eq!(record.logical_ts, *lsn);
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_wraps_after_checkpoint_and_recovers_across_the_lap() {
+        let path = unique_temp_path("wal-wrap");
+        let mut storage = create_small(&path);
+
+        // Fill ~60% of the 64 KiB ring, then reclaim it via checkpoint.
+        for seq in 1..=5u64 {
+            append_search_entry(&mut storage, seq, &vec![seq as u8; 8000]);
+        }
+        storage
+            .write_checkpoint(b"state-at-5", 5, 6, 1)
+            .expect("checkpoint");
+
+        // These cross the lap boundary (one entry forces a wrap gap).
+        let post: Vec<Vec<u8>> = (6..=9u64).map(|seq| vec![seq as u8; 8000]).collect();
+        for (i, payload) in post.iter().enumerate() {
+            append_search_entry(&mut storage, 6 + i as u64, payload);
+        }
+        drop(storage); // crash
+
+        let mut storage = Storage::open(path.clone()).expect("reopen");
+        let snapshot = storage
+            .load_snapshot()
+            .expect("load")
+            .expect("snapshot present");
+        assert_eq!(snapshot.data, b"state-at-5");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(
+            records.len(),
+            4,
+            "exactly the post-checkpoint entries replay"
+        );
+        for (record, payload) in records.iter().zip(&post) {
+            assert_eq!(&record.payload, payload);
+        }
+        // The ring stays usable after recovery on the wrapped lap.
+        append_search_entry(&mut storage, 10, b"after-recovery");
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn wal_full_errors_and_checkpoint_reclaims() {
+        let path = unique_temp_path("wal-full");
+        let mut storage = create_small(&path);
+        let payload = vec![7u8; 8000];
+        let mut appended = 0;
+        let err = loop {
+            match storage.append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, appended + 1, &payload) {
+                Ok(_) => appended += 1,
+                Err(err) => break err,
+            }
+            assert!(appended < 100, "ring must fill up");
+        };
+        assert!(matches!(err, StorageError::WalFull(_)), "got: {err}");
+
+        storage
+            .write_checkpoint(b"reclaim", appended, appended + 1, 1)
+            .expect("checkpoint");
+        append_search_entry(&mut storage, appended + 1, &payload);
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn extent_alloc_free_replays_from_wal() {
+        let path = unique_temp_path("extent-replay");
+        let mut storage = create_small(&path);
+        let durable = storage.allocate_extent(false).expect("durable extent");
+        let temp = storage.allocate_extent(true).expect("temp extent");
+        assert_ne!(durable, temp);
+        drop(storage); // crash: bitmap never persisted, only the WAL knows
+
+        let mut storage = Storage::open(path.clone()).expect("reopen");
+        assert!(
+            storage.is_page_allocated(durable),
+            "logged alloc must replay"
+        );
+        assert!(
+            !storage.is_page_allocated(temp),
+            "temp extents must vanish on restart"
+        );
+
+        storage.free_extent(durable).expect("free extent");
+        drop(storage); // crash again
+
+        let mut storage = Storage::open(path.clone()).expect("reopen after free");
+        assert!(
+            !storage.is_page_allocated(durable),
+            "logged free must replay"
+        );
+
+        // Alloc + checkpoint: the bitmap carries the state once the WAL is
+        // reclaimed.
+        let kept = storage.allocate_extent(false).expect("extent");
+        storage
+            .write_checkpoint(b"with-extent", 1, 2, 1)
+            .expect("checkpoint");
+        drop(storage);
+
+        let mut storage = Storage::open(path.clone()).expect("reopen after checkpoint");
+        assert!(
+            storage.replay_wal_entries().expect("replay").is_empty(),
+            "wal reclaimed"
+        );
+        assert!(
+            storage.is_page_allocated(kept),
+            "bitmap must carry extents across checkpoints"
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression (review finding): the whole-tail-page flush must never
+    /// let the page's zero suffix alias onto live entries at the head. With
+    /// a mid-page head and a nearly-full ring, the append that would have
+    /// clobbered the head must instead report WalFull, and every previously
+    /// acknowledged entry must survive a crash.
+    #[test]
+    fn tail_page_flush_never_overwrites_live_head_entries() {
+        let path = unique_temp_path("tail-page-alias");
+        let mut storage = create_small(&path);
+
+        // Head becomes mid-page: one 5056-byte entry, then checkpoint.
+        append_search_entry(&mut storage, 1, &vec![1u8; 5000]);
+        storage
+            .write_checkpoint(b"cp", 1, 2, 1)
+            .expect("checkpoint");
+
+        // Fill the ring almost entirely (the 15th entry wraps).
+        let mut acked = Vec::new();
+        for i in 0..15u64 {
+            let payload = vec![(i + 2) as u8; 4000];
+            append_search_entry(&mut storage, i + 2, &payload);
+            acked.push(payload);
+        }
+
+        // This append fits the naive byte count but its tail-page zero
+        // suffix would overwrite the oldest live entries; it must be
+        // rejected.
+        let err = storage
+            .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, 17, &vec![9u8; 900])
+            .expect_err("append aliasing the head must fail");
+        assert!(matches!(err, StorageError::WalFull(_)), "got: {err}");
+        drop(storage); // crash
+
+        let mut storage = Storage::open(path.clone()).expect("reopen");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 15, "every acked entry must survive");
+        for (record, payload) in records.iter().zip(&acked) {
+            assert_eq!(&record.payload, payload);
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression (review finding): a crash between descriptor fsync and
+    /// superblock publish leaves descriptor generations ahead of the
+    /// superblocks. The next checkpoint must mint a strictly higher
+    /// generation (no duplicates), and later opens must agree on the live
+    /// snapshot.
+    #[test]
+    fn checkpoint_after_superblock_publish_crash_mints_higher_generation() {
+        let path = unique_temp_path("gen-minting");
+        let layout = test_layout();
+        let mut storage = create_small(&path);
+        storage.write_checkpoint(b"one", 1, 2, 1).expect("cp 1");
+        drop(storage);
+
+        // Save the checkpoint-1-era superblocks.
+        let sb_a = read_bytes(&path, layout.superblock_a_offset, SUPERBLOCK_SIZE);
+        let sb_b = read_bytes(&path, layout.superblock_b_offset, SUPERBLOCK_SIZE);
+
+        let mut storage = Storage::open(path.clone()).expect("reopen");
+        storage.write_checkpoint(b"two", 2, 3, 1).expect("cp 2");
+        drop(storage);
+
+        // Simulate the crash window: descriptor of checkpoint 2 durable,
+        // superblocks rolled back to checkpoint 1.
+        overwrite_bytes(&path, layout.superblock_a_offset, &sb_a);
+        overwrite_bytes(&path, layout.superblock_b_offset, &sb_b);
+
+        let mut storage = Storage::open(path.clone()).expect("reopen in crash window");
+        let snapshot = storage.load_snapshot().expect("load").expect("snapshot");
+        assert_eq!(snapshot.data, b"two", "newest descriptor must win");
+
+        // The next checkpoint must not duplicate checkpoint 2's generation.
+        storage.write_checkpoint(b"three", 3, 4, 1).expect("cp 3");
+        drop(storage);
+
+        let mut storage = Storage::open(path.clone()).expect("final reopen");
+        let snapshot = storage.load_snapshot().expect("load").expect("snapshot");
+        assert_eq!(snapshot.data, b"three");
+        // Allocator agrees with the snapshot choice: the live extent is
+        // allocated and loadable, and further checkpoints keep working.
+        storage.write_checkpoint(b"four", 4, 5, 1).expect("cp 4");
+        let snapshot = storage.load_snapshot().expect("load").expect("snapshot");
+        assert_eq!(snapshot.data, b"four");
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Review finding: a durable wrap gap whose next-lap entry never made it
+    /// to disk must rewind the recovered tail to the gap start.
+    #[test]
+    fn wrap_gap_without_next_lap_entry_rewinds_tail() {
+        let path = unique_temp_path("gap-rewind");
+        let layout = test_layout();
+        let mut storage = create_small(&path);
+        for seq in 1..=5u64 {
+            append_search_entry(&mut storage, seq, &vec![seq as u8; 8000]);
+        }
+        storage
+            .write_checkpoint(b"cp", 5, 6, 1)
+            .expect("checkpoint");
+        let post: Vec<Vec<u8>> = (6..=9u64).map(|seq| vec![seq as u8; 8000]).collect();
+        for (i, payload) in post.iter().enumerate() {
+            append_search_entry(&mut storage, 6 + i as u64, payload);
+        }
+        drop(storage);
+
+        // Entry 9 wrapped to the ring start. Erase its lap-2 pages as if the
+        // gap reached disk but the entry itself never did.
+        let entry_len = wal_entry_padded_len(8000);
+        overwrite_bytes(&path, layout.wal_offset, &vec![0u8; entry_len]);
+
+        let mut storage = Storage::open(path.clone()).expect("reopen");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 3, "the lost wrap entry must not replay");
+        for (record, payload) in records.iter().zip(&post[..3]) {
+            assert_eq!(&record.payload, payload);
+        }
+
+        // The rewound tail must be usable: a new append re-wraps and
+        // survives another crash.
+        append_search_entry(&mut storage, 9, b"after-rewind");
+        drop(storage);
+        let mut storage = Storage::open(path.clone()).expect("second reopen");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 4);
+        assert_eq!(records[3].payload, b"after-rewind");
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Review finding: the in-place lazy superblock rewrite stakes its
+    /// safety on falling back to the other superblock plus the forward
+    /// scan. Exercise exactly that: corrupt the active superblock and
+    /// recover everything through the stale one.
+    #[test]
+    fn torn_active_superblock_falls_back_and_forward_scan_recovers() {
+        let path = unique_temp_path("torn-superblock");
+        let layout = test_layout();
+        let mut storage = create_small(&path);
+        storage.file.wal.set_superblock_interval(400);
+        let payloads: Vec<Vec<u8>> = (0..4u8).map(|i| vec![i + 1; 100]).collect();
+        for (i, payload) in payloads.iter().enumerate() {
+            append_search_entry(&mut storage, i as u64 + 1, payload);
+        }
+        drop(storage);
+
+        // The lazy writes all went to the active superblock (A). Tear it.
+        overwrite_bytes(
+            &path,
+            layout.superblock_a_offset,
+            &[0xEEu8; SUPERBLOCK_SIZE],
+        );
+
+        let mut storage = Storage::open(path.clone()).expect("reopen on backup superblock");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 4, "forward scan from the stale superblock");
+        for (record, payload) in records.iter().zip(&payloads) {
+            assert_eq!(&record.payload, payload);
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Corruption inside the trusted region truncates the log there; the
+    /// corrected tail must be persisted at open so stale entries beyond it
+    /// can never re-enter a future trusted region.
+    #[test]
+    fn trusted_region_corruption_truncates_and_persists_corrected_tail() {
+        let path = unique_temp_path("trusted-corruption");
+        let layout = test_layout();
+        let mut storage = create_small(&path);
+        storage.file.wal.set_superblock_interval(400);
+        for seq in 1..=4u64 {
+            append_search_entry(&mut storage, seq, &vec![seq as u8; 100]);
+        }
+        drop(storage);
+        let entry_len = wal_entry_padded_len(100) as u64;
+
+        // Corrupt entry 2, inside the superblock-trusted region.
+        overwrite_bytes(&path, layout.wal_offset + entry_len + 8, &[0xDDu8; 32]);
+
+        let mut storage = Storage::open(path.clone()).expect("reopen after corruption");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 1, "log truncates at the corrupt entry");
+        assert_eq!(records[0].payload, vec![1u8; 100]);
+        drop(storage);
+
+        // The corrected (smaller) tail must now be on disk.
+        let sb = read_active_superblock(&path, &layout);
+        assert_eq!(
+            sb.wal_tail, entry_len,
+            "open must persist the corrected tail"
+        );
+
+        // New history: append a differently-sized entry and crash. Recovery
+        // must see [entry 1, new entry] and never resurrect old entries 3/4.
+        let mut storage = Storage::open(path.clone()).expect("reopen");
+        storage.replay_wal_entries().expect("drain");
+        append_search_entry(&mut storage, 2, &vec![9u8; 60]);
+        drop(storage);
+        let mut storage = Storage::open(path.clone()).expect("final reopen");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 2);
+        assert_eq!(records[0].payload, vec![1u8; 100]);
+        assert_eq!(records[1].payload, vec![9u8; 60]);
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Review finding: allocate_extent's rollback when the WAL append fails
+    /// must leave the allocator exactly as before.
+    #[test]
+    fn allocate_extent_rolls_back_when_wal_is_full() {
+        let path = unique_temp_path("extent-rollback");
+        let mut storage = create_small(&path);
+        // Fill the ring for large and small entries alike.
+        let mut seq = 1u64;
+        for payload_len in [8000usize, 1000, 100, 8] {
+            loop {
+                match storage.append_wal_entry(
+                    WAL_ENTRY_TYPE_RECORD,
+                    1,
+                    seq,
+                    &vec![7u8; payload_len],
+                ) {
+                    Ok(_) => seq += 1,
+                    Err(_) => break,
+                }
+                assert!(seq < 1000, "ring must fill up");
+            }
+        }
+
+        let err = storage
+            .allocate_extent(false)
+            .expect_err("extent alloc must fail when its record cannot be logged");
+        assert!(matches!(err, StorageError::WalFull(_)), "got: {err}");
+        for page in 0..EXTENT_PAGES {
+            assert!(
+                !storage.is_page_allocated(page),
+                "rolled-back extent must leave page {page} free"
+            );
+        }
+
+        // After reclaiming the ring, extent allocation works again and the
+        // rolled-back range stays free (the next-fit cursor moved past it,
+        // so it is not the range reused here).
+        storage
+            .write_checkpoint(b"reclaim", seq, seq + 1, 1)
+            .expect("checkpoint");
+        let start = storage.allocate_extent(false).expect("extent");
+        for page in 0..EXTENT_PAGES {
+            assert!(!storage.is_page_allocated(page));
+        }
+        assert!(storage.is_page_allocated(start));
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn empty_checkpoint_data_is_rejected() {
+        let path = unique_temp_path("empty-checkpoint");
+        let mut storage = create_small(&path);
+        storage.write_checkpoint(b"valid", 1, 2, 1).expect("cp");
+        let err = storage
+            .write_checkpoint(b"", 2, 3, 1)
+            .expect_err("empty checkpoint must be rejected");
+        assert!(matches!(err, StorageError::InvalidConfig(_)), "got: {err}");
+        // The previous snapshot is untouched.
+        let snapshot = storage.load_snapshot().expect("load").expect("snapshot");
+        assert_eq!(snapshot.data, b"valid");
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Review finding: the v1 upgrade must refresh BOTH superblocks — a v1
+    /// backup superblock is arbitrarily stale, and a later fallback to it
+    /// would lose every v1 WAL entry (they cannot pass the v2 forward scan).
+    #[test]
+    fn upgraded_v1_file_survives_active_superblock_loss() {
+        let path = unique_temp_path("v1-superblock-refresh");
+        let events = vec![(1u64, vec![5u8; 80]), (2u64, vec![6u8; 40])];
+        let layout = write_v1_fixture(&path, &events, None);
+
+        // First open performs the upgrade.
+        let mut storage = Storage::open(path.clone()).expect("upgrade open");
+        assert_eq!(storage.replay_wal_entries().expect("replay").len(), 2);
+        drop(storage);
+
+        // Lose the active superblock; the refreshed backup must carry the
+        // v1 tail so the trusted scan still finds the v1-stamped entries.
+        overwrite_bytes(
+            &path,
+            layout.superblock_a_offset,
+            &[0xEEu8; SUPERBLOCK_SIZE],
+        );
+        let mut storage = Storage::open(path.clone()).expect("reopen on backup");
+        let records = storage.replay_wal_entries().expect("replay");
+        assert_eq!(records.len(), 2, "v1 entries must survive the fallback");
+        assert_eq!(records[0].payload, vec![5u8; 80]);
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn successive_checkpoints_recycle_snapshot_extents() {
+        let path = unique_temp_path("snapshot-recycle");
+        let mut storage = create_small(&path);
+        storage.write_checkpoint(b"first", 1, 2, 1).expect("cp 1");
+        let first_desc = storage
+            .file
+            .load_active_snapshot_descriptor()
+            .expect("desc")
+            .expect("present");
+        let (first_start, first_pages) = storage
+            .file
+            .descriptor_page_range(&first_desc)
+            .expect("range");
+        assert!(storage.is_page_allocated(first_start));
+
+        storage
+            .write_checkpoint(b"second-snapshot", 2, 3, 1)
+            .expect("cp 2");
+        for page in first_start..first_start + first_pages {
+            assert!(
+                !storage.is_page_allocated(page),
+                "first snapshot extent must be freed after the second checkpoint"
+            );
+        }
+        drop(storage);
+
+        let mut storage = Storage::open(path.clone()).expect("reopen");
+        let snapshot = storage.load_snapshot().expect("load").expect("snapshot");
+        assert_eq!(snapshot.data, b"second-snapshot");
+        assert!(!storage.is_page_allocated(first_start));
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
 }

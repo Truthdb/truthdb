@@ -3,7 +3,8 @@ use xxhash_rust::xxh64::xxh64;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const FILE_MAGIC: [u8; 8] = *b"TRUTHDB\0";
-pub const FILE_VERSION: u32 = 1;
+pub const FILE_VERSION_V1: u32 = 1;
+pub const FILE_VERSION: u32 = 2;
 
 pub const FILE_HEADER_SIZE: usize = PAGE_SIZE;
 pub const SUPERBLOCK_SIZE: usize = PAGE_SIZE;
@@ -19,6 +20,7 @@ pub const WAL_ENTRY_HEADER_SIZE: usize = 40;
 pub const WAL_ENTRY_FOOTER_SIZE: usize = 12;
 pub const WAL_ENTRY_TYPE_RECORD: u16 = 1;
 pub const WAL_ENTRY_TYPE_COMMIT: u16 = 2;
+pub const WAL_ENTRY_TYPE_REL: u16 = 3;
 
 pub const SUPERBLOCK_ACTIVE_A: u8 = 0;
 pub const SUPERBLOCK_ACTIVE_B: u8 = 1;
@@ -540,10 +542,14 @@ pub(crate) fn assert_layout_invariants() {
     use core::mem::size_of;
 
     debug_assert_eq!(FILE_MAGIC, *b"TRUTHDB\0");
-    debug_assert_eq!(FILE_VERSION, 1);
+    debug_assert_eq!(FILE_VERSION_V1, 1);
+    debug_assert_eq!(FILE_VERSION, 2);
     debug_assert_eq!(PAGE_SIZE, 4096);
     debug_assert_eq!(WAL_ENTRY_ALIGNMENT, 8);
     debug_assert_eq!(WAL_ENTRY_FOOTER_SIZE, 12);
+    debug_assert_eq!(WAL_ENTRY_TYPE_RECORD, 1);
+    debug_assert_eq!(WAL_ENTRY_TYPE_COMMIT, 2);
+    debug_assert_eq!(WAL_ENTRY_TYPE_REL, 3);
     debug_assert_eq!(SUPERBLOCK_ACTIVE_A, 0);
     debug_assert_eq!(SUPERBLOCK_ACTIVE_B, 1);
 
