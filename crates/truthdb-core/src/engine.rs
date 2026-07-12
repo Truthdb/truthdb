@@ -2816,6 +2816,155 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    // ---- joins (Stage 8 part 2) ----------------------------------------
+
+    fn join_setup(label: &str) -> (Engine, PathBuf) {
+        let path = unique_temp_path(label);
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE cust (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))")
+            .expect("create cust");
+        engine
+            .execute("CREATE TABLE ord (id INT NOT NULL PRIMARY KEY, cust_id INT, amount INT)")
+            .expect("create ord");
+        engine
+            .execute("INSERT INTO cust VALUES (1,'alice'),(2,'bob'),(3,'carol')")
+            .expect("insert cust");
+        // carol(3) has no orders; order 13 references a missing customer (99).
+        engine
+            .execute("INSERT INTO ord VALUES (10,1,100),(11,1,200),(12,2,50),(13,99,7)")
+            .expect("insert ord");
+        (engine, path)
+    }
+
+    fn row_count(engine: &mut Engine, sql: &str) -> usize {
+        sql_rows(engine, sql).1.len()
+    }
+
+    #[test]
+    fn sql_inner_join() {
+        let (mut engine, path) = join_setup("join-inner");
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT c.name, o.amount FROM cust c JOIN ord o ON c.id = o.cust_id ORDER BY o.id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("alice".into()), Some("100".into())],
+                vec![Some("alice".into()), Some("200".into())],
+                vec![Some("bob".into()), Some("50".into())],
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_left_join_keeps_unmatched_left() {
+        let (mut engine, path) = join_setup("join-left");
+        // carol has no orders → one row with NULL amount.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT c.name, o.amount FROM cust c LEFT JOIN ord o ON c.id = o.cust_id \
+             ORDER BY c.id, o.id",
+        );
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3], vec![Some("carol".into()), None]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_right_join_keeps_unmatched_right() {
+        let (mut engine, path) = join_setup("join-right");
+        // order 13 (cust 99) has no customer → NULL name.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT c.name, o.id FROM cust c RIGHT JOIN ord o ON c.id = o.cust_id ORDER BY o.id",
+        );
+        assert_eq!(rows.len(), 4);
+        assert_eq!(rows[3], vec![None, Some("13".into())]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_full_join_keeps_both_unmatched() {
+        let (mut engine, path) = join_setup("join-full");
+        // 3 matched + carol (left-only) + order 13 (right-only) = 5 rows.
+        assert_eq!(
+            row_count(
+                &mut engine,
+                "SELECT c.name, o.id FROM cust c FULL JOIN ord o ON c.id = o.cust_id",
+            ),
+            5
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_cross_join_and_comma() {
+        let (mut engine, path) = join_setup("join-cross");
+        // 3 customers x 4 orders = 12.
+        assert_eq!(
+            row_count(
+                &mut engine,
+                "SELECT c.id, o.id FROM cust c CROSS JOIN ord o"
+            ),
+            12
+        );
+        assert_eq!(
+            row_count(&mut engine, "SELECT c.id, o.id FROM cust c, ord o"),
+            12
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_join_with_where_and_qualified_wildcard() {
+        let (mut engine, path) = join_setup("join-where");
+        let (cols, rows) = sql_rows(
+            &mut engine,
+            "SELECT c.* FROM cust c JOIN ord o ON c.id = o.cust_id WHERE o.amount > 100 ORDER BY o.id",
+        );
+        // c.* expands to cust columns; only order 11 (amount 200, alice).
+        assert_eq!(cols, vec!["id", "name"]);
+        assert_eq!(rows, vec![vec![Some("1".into()), Some("alice".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_aggregate_over_join() {
+        let (mut engine, path) = join_setup("join-agg");
+        // Total amount per customer (inner join).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT c.name, SUM(o.amount) FROM cust c JOIN ord o ON c.id = o.cust_id \
+             GROUP BY c.name ORDER BY c.name",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("alice".into()), Some("300".into())],
+                vec![Some("bob".into()), Some("50".into())],
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_ambiguous_column_errors() {
+        let (mut engine, path) = join_setup("join-ambig");
+        // `id` exists in both cust and ord → unresolvable.
+        let err = sql_error_number(
+            &mut engine,
+            "SELECT id FROM cust c JOIN ord o ON c.id = o.cust_id",
+        );
+        assert!(
+            err == 209 || err == 207,
+            "ambiguous column error, got {err}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn sql_grouped_coercion_error_is_not_swallowed() {
         let path = unique_temp_path("agg-coerce");

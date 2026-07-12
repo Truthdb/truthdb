@@ -1,0 +1,290 @@
+[
+    Select(
+        Select {
+            top: None,
+            distinct: false,
+            items: [
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "c.name",
+                                quoted: false,
+                                span: Span {
+                                    start: 7,
+                                    end: 13,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 7,
+                            end: 13,
+                        },
+                    },
+                    alias: None,
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "o.amount",
+                                quoted: false,
+                                span: Span {
+                                    start: 15,
+                                    end: 23,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 15,
+                            end: 23,
+                        },
+                    },
+                    alias: None,
+                },
+                QualifiedWildcard(
+                    Name {
+                        value: "s",
+                        quoted: false,
+                        span: Span {
+                            start: 25,
+                            end: 26,
+                        },
+                    },
+                ),
+            ],
+            from: Some(
+                Join {
+                    left: Join {
+                        left: Join {
+                            left: Table {
+                                name: Name {
+                                    value: "cust",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 34,
+                                        end: 38,
+                                    },
+                                },
+                                alias: Some(
+                                    Name {
+                                        value: "c",
+                                        quoted: false,
+                                        span: Span {
+                                            start: 42,
+                                            end: 43,
+                                        },
+                                    },
+                                ),
+                            },
+                            right: Table {
+                                name: Name {
+                                    value: "ord",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 55,
+                                        end: 58,
+                                    },
+                                },
+                                alias: Some(
+                                    Name {
+                                        value: "o",
+                                        quoted: false,
+                                        span: Span {
+                                            start: 59,
+                                            end: 60,
+                                        },
+                                    },
+                                ),
+                            },
+                            kind: Inner,
+                            on: Some(
+                                Expr {
+                                    kind: Binary {
+                                        op: Eq,
+                                        left: Expr {
+                                            kind: Column(
+                                                Name {
+                                                    value: "c.id",
+                                                    quoted: false,
+                                                    span: Span {
+                                                        start: 64,
+                                                        end: 68,
+                                                    },
+                                                },
+                                            ),
+                                            span: Span {
+                                                start: 64,
+                                                end: 68,
+                                            },
+                                        },
+                                        right: Expr {
+                                            kind: Column(
+                                                Name {
+                                                    value: "o.cust_id",
+                                                    quoted: false,
+                                                    span: Span {
+                                                        start: 71,
+                                                        end: 80,
+                                                    },
+                                                },
+                                            ),
+                                            span: Span {
+                                                start: 71,
+                                                end: 80,
+                                            },
+                                        },
+                                    },
+                                    span: Span {
+                                        start: 64,
+                                        end: 80,
+                                    },
+                                },
+                            ),
+                        },
+                        right: Table {
+                            name: Name {
+                                value: "ship",
+                                quoted: false,
+                                span: Span {
+                                    start: 97,
+                                    end: 101,
+                                },
+                            },
+                            alias: Some(
+                                Name {
+                                    value: "s",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 102,
+                                        end: 103,
+                                    },
+                                },
+                            ),
+                        },
+                        kind: Left,
+                        on: Some(
+                            Expr {
+                                kind: Binary {
+                                    op: Eq,
+                                    left: Expr {
+                                        kind: Column(
+                                            Name {
+                                                value: "o.id",
+                                                quoted: false,
+                                                span: Span {
+                                                    start: 107,
+                                                    end: 111,
+                                                },
+                                            },
+                                        ),
+                                        span: Span {
+                                            start: 107,
+                                            end: 111,
+                                        },
+                                    },
+                                    right: Expr {
+                                        kind: Column(
+                                            Name {
+                                                value: "s.ord_id",
+                                                quoted: false,
+                                                span: Span {
+                                                    start: 114,
+                                                    end: 122,
+                                                },
+                                            },
+                                        ),
+                                        span: Span {
+                                            start: 114,
+                                            end: 122,
+                                        },
+                                    },
+                                },
+                                span: Span {
+                                    start: 107,
+                                    end: 122,
+                                },
+                            },
+                        ),
+                    },
+                    right: Table {
+                        name: Name {
+                            value: "region",
+                            quoted: false,
+                            span: Span {
+                                start: 134,
+                                end: 140,
+                            },
+                        },
+                        alias: None,
+                    },
+                    kind: Cross,
+                    on: None,
+                },
+            ),
+            where_clause: Some(
+                Expr {
+                    kind: Binary {
+                        op: Gt,
+                        left: Expr {
+                            kind: Column(
+                                Name {
+                                    value: "o.amount",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 147,
+                                        end: 155,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 147,
+                                end: 155,
+                            },
+                        },
+                        right: Expr {
+                            kind: Int(
+                                100,
+                            ),
+                            span: Span {
+                                start: 158,
+                                end: 161,
+                            },
+                        },
+                    },
+                    span: Span {
+                        start: 147,
+                        end: 161,
+                    },
+                },
+            ),
+            group_by: [],
+            having: None,
+            order_by: [
+                OrderItem {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "c.name",
+                                quoted: false,
+                                span: Span {
+                                    start: 171,
+                                    end: 177,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 171,
+                            end: 177,
+                        },
+                    },
+                    descending: false,
+                },
+            ],
+            span: Span {
+                start: 0,
+                end: 177,
+            },
+        },
+    ),
+]

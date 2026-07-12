@@ -92,13 +92,16 @@
                 },
             ],
             from: Some(
-                Name {
-                    value: "products",
-                    quoted: false,
-                    span: Span {
-                        start: 49,
-                        end: 57,
+                Table {
+                    name: Name {
+                        value: "products",
+                        quoted: false,
+                        span: Span {
+                            start: 49,
+                            end: 57,
+                        },
                     },
+                    alias: None,
                 },
             ),
             where_clause: Some(

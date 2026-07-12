@@ -14,7 +14,8 @@ mod value;
 
 use truthdb_sql::ast::{
     ColumnDef, CreateIndex, CreateTable, DataType, Delete, DropIndex, DropTable, Expr, ExprKind,
-    Insert, IsolationLevel, Name, OrderItem, Select, SelectItem, SetStatement, Statement, Update,
+    Insert, IsolationLevel, JoinKind, Name, OrderItem, Select, SelectItem, SetStatement, Statement,
+    TableRef, Update,
 };
 use truthdb_sql::error::SqlError;
 use truthdb_sql::eval::EvalContext;
@@ -198,13 +199,16 @@ pub fn analyze_locks(
                     continue;
                 }
                 if let Some(from) = &select.from {
-                    let lower = from.value.to_ascii_lowercase();
-                    if lower.starts_with("sys.") {
-                        continue; // catalog view: unlocked
-                    }
-                    if let Some(def) = resolve_table(storage, &from.value) {
-                        add(Resource::Database, LockMode::IntentShared);
-                        add(Resource::Table(def.object_id), LockMode::Shared);
+                    let mut tables = Vec::new();
+                    collect_table_names(from, &mut tables);
+                    for name in tables {
+                        if name.value.to_ascii_lowercase().starts_with("sys.") {
+                            continue; // catalog view: unlocked
+                        }
+                        if let Some(def) = resolve_table(storage, &name.value) {
+                            add(Resource::Database, LockMode::IntentShared);
+                            add(Resource::Table(def.object_id), LockMode::Shared);
+                        }
                     }
                 }
             }
@@ -337,18 +341,30 @@ fn showplan_rows(
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
     let lines = match select.from.as_ref() {
-        Some(from) if !from.value.to_ascii_lowercase().starts_with("sys.") => {
-            match resolve_table(storage, &from.value) {
+        None => vec!["Constant Scan".to_string()],
+        Some(TableRef::Table { name, .. })
+            if !name.value.to_ascii_lowercase().starts_with("sys.") =>
+        {
+            match resolve_table(storage, &name.value) {
                 Some(def) => {
                     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
                     let path = plan::choose(&def, &schema, &select.where_clause, eval_ctx);
                     plan::plan_text(&path, &def.name)
                 }
-                None => vec![format!("Table Scan({})", from.value)],
+                None => vec![format!("Table Scan({})", name.value)],
             }
         }
-        Some(from) => vec![format!("Table Scan({})", from.value)],
-        None => vec!["Constant Scan".to_string()],
+        Some(TableRef::Table { name, .. }) => vec![format!("Table Scan({})", name.value)],
+        Some(join) => {
+            // Multi-table: a nested-loop join over full scans (Stage 8).
+            let mut tables = Vec::new();
+            collect_table_names(join, &mut tables);
+            let mut lines = vec!["Nested Loops (join)".to_string()];
+            for table in tables {
+                lines.push(format!("  Table Scan({})", strip_schema(&table.value)));
+            }
+            lines
+        }
     };
     Ok(RowSet {
         columns: vec![ResultColumn {
@@ -1019,6 +1035,9 @@ fn predicate_true(
 
 struct Source {
     columns: Vec<ResultColumn>,
+    /// Per-column table qualifier (alias or table name; `None` = virtual/
+    /// constant source), parallel to `columns`. Drives multi-table resolution.
+    qualifiers: Vec<Option<String>>,
     /// Per-column collation names (parallel to `columns`; `None` = database
     /// default). Used by ORDER BY on character columns.
     collations: Vec<Option<String>>,
@@ -1027,12 +1046,80 @@ struct Source {
 }
 
 impl Source {
-    fn names(&self) -> Vec<String> {
-        self.columns.iter().map(|c| c.name.clone()).collect()
-    }
-
     fn types(&self) -> Vec<ColumnType> {
         self.columns.iter().map(|c| c.column_type).collect()
+    }
+
+    fn scope(&self) -> JoinScope {
+        JoinScope {
+            columns: self
+                .qualifiers
+                .iter()
+                .zip(&self.columns)
+                .map(|(qualifier, column)| (qualifier.clone(), column.name.clone()))
+                .collect(),
+        }
+    }
+}
+
+/// Resolves column references against a (possibly multi-table) row source. A
+/// dotted `t.col` matches by qualifier + name; a bare `col` matches a unique
+/// column (ambiguous or unknown → `None`, surfaced by eval as an invalid-
+/// column error).
+pub(super) struct JoinScope {
+    /// (qualifier, bare column name) per source column.
+    columns: Vec<(Option<String>, String)>,
+}
+
+/// Resolver over an output RowSet's columns. Output columns are unqualified,
+/// so a qualified `t.col` reference (e.g. in a grouped query's ORDER BY)
+/// resolves by its bare name.
+struct OutputScope {
+    names: Vec<String>,
+}
+
+impl truthdb_sql::eval::ColumnResolver for OutputScope {
+    fn resolve(&self, name: &str) -> Option<usize> {
+        let bare = name.rsplit('.').next().unwrap_or(name);
+        self.names.iter().position(|n| n.eq_ignore_ascii_case(bare))
+    }
+}
+
+impl JoinScope {
+    /// Source-column indices belonging to a table qualifier (for `t.*`).
+    fn indices_for_qualifier(&self, qualifier: &str) -> Vec<usize> {
+        self.columns
+            .iter()
+            .enumerate()
+            .filter(|(_, (q, _))| {
+                q.as_deref()
+                    .is_some_and(|q| q.eq_ignore_ascii_case(qualifier))
+            })
+            .map(|(index, _)| index)
+            .collect()
+    }
+}
+
+impl truthdb_sql::eval::ColumnResolver for JoinScope {
+    fn resolve(&self, name: &str) -> Option<usize> {
+        if let Some((qualifier, column)) = name.rsplit_once('.') {
+            self.columns.iter().position(|(q, c)| {
+                q.as_deref()
+                    .is_some_and(|q| q.eq_ignore_ascii_case(qualifier))
+                    && c.eq_ignore_ascii_case(column)
+            })
+        } else {
+            let mut found = None;
+            for (index, (_, column)) in self.columns.iter().enumerate() {
+                if column.eq_ignore_ascii_case(name) {
+                    if found.is_some() {
+                        return None; // ambiguous
+                    }
+                    found = Some(index);
+                }
+            }
+            found
+        }
     }
 }
 
@@ -1056,7 +1143,7 @@ fn exec_select(
         &select.where_clause,
         eval_ctx,
     )?;
-    let resolver = source.names();
+    let resolver = source.scope();
     let types = source.types();
 
     // WHERE. The predicate must be boolean-typed (SQL Server 4145): a bare
@@ -1168,6 +1255,7 @@ fn order_output(
         return Ok(());
     }
     let names: Vec<String> = rowset.columns.iter().map(|c| c.name.clone()).collect();
+    let scope = OutputScope { names };
     let types: Vec<ColumnType> = rowset.columns.iter().map(|c| c.column_type).collect();
     let mut keyed: Vec<(Vec<SqlValue>, usize)> = Vec::with_capacity(rowset.rows.len());
     for (index, row) in rowset.rows.iter().enumerate() {
@@ -1189,7 +1277,7 @@ fn order_output(
                     })?;
                 sql_row[ordinal].clone()
             } else {
-                eval::eval(&item.expr, &sql_row, &names, eval_ctx)?
+                eval::eval(&item.expr, &sql_row, &scope, eval_ctx)?
             };
             key.push(value);
         }
@@ -1216,7 +1304,7 @@ fn order_rows(
     order_by: &[OrderItem],
     types: &[ColumnType],
     collations: &[Option<String>],
-    resolver: &Vec<String>,
+    resolver: &JoinScope,
     eval_ctx: &EvalContext,
 ) -> Result<(), SqlError> {
     use std::cmp::Ordering;
@@ -1281,7 +1369,7 @@ fn project(
     source_columns: &[ResultColumn],
     rows: &[Vec<Datum>],
     types: &[ColumnType],
-    resolver: &Vec<String>,
+    resolver: &JoinScope,
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
     // Output column plan: a source column (typed, pass-through) or a
@@ -1290,7 +1378,6 @@ fn project(
         SourceColumn { index: usize, name: String },
         Expr { name: String, expr: &'a Expr },
     }
-    let source_names: Vec<String> = source_columns.iter().map(|c| c.name.clone()).collect();
     let mut projs = Vec::new();
     for item in items {
         match item {
@@ -1302,13 +1389,34 @@ fn project(
                     });
                 }
             }
+            SelectItem::QualifiedWildcard(qualifier) => {
+                let indices = resolver.indices_for_qualifier(&qualifier.value);
+                if indices.is_empty() {
+                    return Err(SqlError::new(
+                        4104,
+                        16,
+                        1,
+                        format!(
+                            "The multi-part identifier \"{}.*\" could not be bound.",
+                            qualifier.value
+                        ),
+                    )
+                    .at(qualifier.span));
+                }
+                for index in indices {
+                    projs.push(Proj::SourceColumn {
+                        index,
+                        name: source_columns[index].name.clone(),
+                    });
+                }
+            }
             SelectItem::Expr { expr, alias } => {
                 let name = alias
                     .as_ref()
                     .map(|a| a.value.clone())
                     .or_else(|| bare_column_name(expr))
                     .unwrap_or_default();
-                match bare_column_index(expr, &source_names) {
+                match bare_column_index(expr, resolver) {
                     // A bare column still carries its resolved output name so an
                     // `AS alias` (or the referenced name's casing) is preserved.
                     Some(index) => projs.push(Proj::SourceColumn { index, name }),
@@ -1361,44 +1469,76 @@ fn project(
 
 fn bare_column_name(expr: &Expr) -> Option<String> {
     match &expr.kind {
-        ExprKind::Column(name) => Some(name.value.clone()),
+        // A qualified `t.col` reference outputs the bare column name.
+        ExprKind::Column(name) => Some(name.value.rsplit('.').next().unwrap_or("").to_string()),
         _ => None,
     }
 }
 
-fn bare_column_index(expr: &Expr, columns: &[String]) -> Option<usize> {
+fn bare_column_index(expr: &Expr, scope: &JoinScope) -> Option<usize> {
+    use truthdb_sql::eval::ColumnResolver;
     match &expr.kind {
-        ExprKind::Column(name) => columns
-            .iter()
-            .position(|c| c.eq_ignore_ascii_case(&name.value)),
+        ExprKind::Column(name) => scope.resolve(&name.value),
         _ => None,
+    }
+}
+
+/// Collects every base-table name referenced in a FROM join tree.
+fn collect_table_names<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
+    match tref {
+        TableRef::Table { name, .. } => out.push(name),
+        TableRef::Join { left, right, .. } => {
+            collect_table_names(left, out);
+            collect_table_names(right, out);
+        }
     }
 }
 
 fn build_source(
     storage: &mut Storage,
-    from: Option<&Name>,
+    from: Option<&TableRef>,
     where_clause: &Option<Expr>,
     eval_ctx: &EvalContext,
 ) -> Result<Source, SqlError> {
-    let Some(from) = from else {
-        // No FROM: one row, no columns (constant SELECT).
-        return Ok(Source {
+    match from {
+        None => Ok(Source {
+            // No FROM: one row, no columns (constant SELECT).
             columns: Vec::new(),
+            qualifiers: Vec::new(),
             collations: Vec::new(),
             rows: vec![Vec::new()],
-        });
-    };
-    match from.value.to_ascii_lowercase().as_str() {
-        "sys.tables" => Ok(sys_tables(storage)),
-        "sys.columns" => Ok(sys_columns(storage)),
-        "sys.indexes" => Ok(sys_indexes(storage)),
+        }),
+        // A single top-level table may use the WHERE for an index seek; base
+        // tables inside a join scan fully (join-order planning is later).
+        Some(TableRef::Table { name, alias }) => {
+            build_table_source(storage, name, alias.as_ref(), where_clause, eval_ctx)
+        }
+        Some(join) => build_join(storage, join, eval_ctx),
+    }
+}
+
+/// Builds the row source for one base table (or `sys.*` view), stamping every
+/// column with the table's qualifier (its alias, else its name).
+fn build_table_source(
+    storage: &mut Storage,
+    name: &Name,
+    alias: Option<&Name>,
+    where_clause: &Option<Expr>,
+    eval_ctx: &EvalContext,
+) -> Result<Source, SqlError> {
+    let qualifier = alias
+        .map(|a| a.value.clone())
+        .unwrap_or_else(|| strip_schema(&name.value).to_string());
+    let base = match name.value.to_ascii_lowercase().as_str() {
+        "sys.tables" => sys_tables(storage),
+        "sys.columns" => sys_columns(storage),
+        "sys.indexes" => sys_indexes(storage),
         _ => {
-            let def = resolve_table(storage, &from.value)
-                .ok_or_else(|| SqlError::invalid_object(&from.value).at(from.span))?;
+            let def = resolve_table(storage, &name.value)
+                .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
             let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
-            // Access-path selection: an index seek narrows the candidate set;
-            // the WHERE filter above re-checks, so results match a full scan.
+            // An index seek narrows the candidate set; the WHERE filter later
+            // re-checks, so results match a full scan.
             let rows = match plan::choose(&def, &schema, where_clause, eval_ctx) {
                 plan::AccessPath::TableScan => storage
                     .rel_scan(&def.name)
@@ -1421,13 +1561,160 @@ fn build_source(
                 })
                 .collect();
             let collations = schema.columns.iter().map(|c| c.collation.clone()).collect();
-            Ok(Source {
+            Source {
                 columns,
+                qualifiers: Vec::new(),
                 collations,
                 rows,
-            })
+            }
+        }
+    };
+    let count = base.columns.len();
+    Ok(Source {
+        qualifiers: vec![Some(qualifier); count],
+        ..base
+    })
+}
+
+/// Recursively builds a join tree's combined row source (base tables scan
+/// fully).
+fn build_join(
+    storage: &mut Storage,
+    tref: &TableRef,
+    eval_ctx: &EvalContext,
+) -> Result<Source, SqlError> {
+    match tref {
+        TableRef::Table { name, alias } => {
+            build_table_source(storage, name, alias.as_ref(), &None, eval_ctx)
+        }
+        TableRef::Join {
+            left,
+            right,
+            kind,
+            on,
+        } => {
+            let left = build_join(storage, left, eval_ctx)?;
+            let right = build_join(storage, right, eval_ctx)?;
+            join_sources(left, right, *kind, on.as_ref(), eval_ctx)
         }
     }
+}
+
+/// Nested-loop join of two materialized sources. The ON predicate (absent for
+/// CROSS) is evaluated against the concatenated row; outer joins emit NULL-
+/// extended rows for unmatched sides.
+fn join_sources(
+    left: Source,
+    right: Source,
+    kind: JoinKind,
+    on: Option<&Expr>,
+    eval_ctx: &EvalContext,
+) -> Result<Source, SqlError> {
+    let mut columns = left.columns.clone();
+    columns.extend(right.columns.clone());
+    let mut qualifiers = left.qualifiers.clone();
+    qualifiers.extend(right.qualifiers.clone());
+    let mut collations = left.collations.clone();
+    collations.extend(right.collations.clone());
+    let types: Vec<ColumnType> = columns.iter().map(|c| c.column_type).collect();
+    let scope = JoinScope {
+        columns: qualifiers
+            .iter()
+            .zip(&columns)
+            .map(|(q, c)| (q.clone(), c.name.clone()))
+            .collect(),
+    };
+    let left_nulls = vec![Datum::Null; left.columns.len()];
+    let right_nulls = vec![Datum::Null; right.columns.len()];
+
+    let concat = |l: &[Datum], r: &[Datum]| -> Vec<Datum> { l.iter().chain(r).cloned().collect() };
+    let matches = |l: &[Datum], r: &[Datum]| -> Result<bool, SqlError> {
+        match on {
+            None => Ok(true),
+            Some(pred) => {
+                let row = concat(l, r);
+                match eval::eval(pred, &row_values(&row, &types), &scope, eval_ctx)? {
+                    SqlValue::Bool(b) => Ok(b),
+                    SqlValue::Null => Ok(false),
+                    _ => Err(SqlError::new(
+                        4145,
+                        15,
+                        1,
+                        "An expression of non-boolean type specified in a context where a condition is expected, near 'ON'.",
+                    )
+                    .at(pred.span)),
+                }
+            }
+        }
+    };
+
+    let mut rows = Vec::new();
+    match kind {
+        JoinKind::Cross | JoinKind::Inner => {
+            for l in &left.rows {
+                for r in &right.rows {
+                    if matches(l, r)? {
+                        rows.push(concat(l, r));
+                    }
+                }
+            }
+        }
+        JoinKind::Left => {
+            for l in &left.rows {
+                let mut matched = false;
+                for r in &right.rows {
+                    if matches(l, r)? {
+                        rows.push(concat(l, r));
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    rows.push(concat(l, &right_nulls));
+                }
+            }
+        }
+        JoinKind::Right => {
+            for r in &right.rows {
+                let mut matched = false;
+                for l in &left.rows {
+                    if matches(l, r)? {
+                        rows.push(concat(l, r));
+                        matched = true;
+                    }
+                }
+                if !matched {
+                    rows.push(concat(&left_nulls, r));
+                }
+            }
+        }
+        JoinKind::Full => {
+            let mut right_matched = vec![false; right.rows.len()];
+            for l in &left.rows {
+                let mut matched = false;
+                for (index, r) in right.rows.iter().enumerate() {
+                    if matches(l, r)? {
+                        rows.push(concat(l, r));
+                        matched = true;
+                        right_matched[index] = true;
+                    }
+                }
+                if !matched {
+                    rows.push(concat(l, &right_nulls));
+                }
+            }
+            for (index, r) in right.rows.iter().enumerate() {
+                if !right_matched[index] {
+                    rows.push(concat(&left_nulls, r));
+                }
+            }
+        }
+    }
+    Ok(Source {
+        columns,
+        qualifiers,
+        collations,
+        rows,
+    })
 }
 
 // ---- sys.* virtual sources ---------------------------------------------
@@ -1454,8 +1741,10 @@ fn sys_tables(storage: &Storage) -> Source {
         .map(|def| vec![Datum::Int(def.object_id as i32), Datum::NVarChar(def.name)])
         .collect();
     let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
     Source {
         columns,
+        qualifiers,
         collations,
         rows,
     }
@@ -1494,8 +1783,10 @@ fn sys_columns(storage: &Storage) -> Source {
         }
     }
     let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
     Source {
         columns,
+        qualifiers,
         collations,
         rows,
     }
@@ -1523,8 +1814,10 @@ fn sys_indexes(storage: &Storage) -> Source {
         }
     }
     let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
     Source {
         columns,
+        qualifiers,
         collations,
         rows,
     }

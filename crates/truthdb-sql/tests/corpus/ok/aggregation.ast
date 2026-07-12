@@ -101,13 +101,16 @@
                 },
             ],
             from: Some(
-                Name {
-                    value: "sales",
-                    quoted: false,
-                    span: Span {
-                        start: 71,
-                        end: 76,
+                Table {
+                    name: Name {
+                        value: "sales",
+                        quoted: false,
+                        span: Span {
+                            start: 71,
+                            end: 76,
+                        },
                     },
+                    alias: None,
                 },
             ),
             where_clause: Some(

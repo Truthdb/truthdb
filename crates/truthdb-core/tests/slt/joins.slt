@@ -1,0 +1,47 @@
+# Joins (Stage 8 part 2)
+
+statement ok
+CREATE TABLE cust (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))
+
+statement ok
+CREATE TABLE ord (id INT NOT NULL PRIMARY KEY, cust_id INT, amount INT)
+
+statement ok
+INSERT INTO cust VALUES (1,'alice'),(2,'bob'),(3,'carol')
+
+statement ok
+INSERT INTO ord VALUES (10,1,100),(11,1,200),(12,2,50),(13,99,7)
+
+# INNER JOIN
+query TI
+SELECT c.name, o.amount FROM cust c JOIN ord o ON c.id = o.cust_id ORDER BY o.id
+----
+alice 100
+alice 200
+bob 50
+
+# LEFT JOIN keeps carol with a NULL amount.
+query TI
+SELECT c.name, o.amount FROM cust c LEFT JOIN ord o ON c.id = o.cust_id ORDER BY c.id, o.id
+----
+alice 100
+alice 200
+bob 50
+carol NULL
+
+# CROSS JOIN cardinality.
+query I
+SELECT COUNT(*) FROM cust CROSS JOIN ord
+----
+12
+
+# Aggregate over a join, grouped.
+query TI
+SELECT c.name, SUM(o.amount) FROM cust c JOIN ord o ON c.id = o.cust_id GROUP BY c.name ORDER BY c.name
+----
+alice 300
+bob 50
+
+# Ambiguous unqualified column is rejected.
+statement error
+SELECT id FROM cust c JOIN ord o ON c.id = o.cust_id

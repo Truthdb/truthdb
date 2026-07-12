@@ -168,7 +168,8 @@ pub struct Select {
     /// `SELECT DISTINCT` — deduplicate the projected rows.
     pub distinct: bool,
     pub items: Vec<SelectItem>,
-    pub from: Option<Name>,
+    /// The FROM clause: a table or a join tree (absent for a constant SELECT).
+    pub from: Option<TableRef>,
     pub where_clause: Option<Expr>,
     /// `GROUP BY <expr>, ...` (empty = no grouping).
     pub group_by: Vec<Expr>,
@@ -178,10 +179,38 @@ pub struct Select {
     pub span: Span,
 }
 
+/// A FROM clause: a base table (with optional alias) or a join of two table
+/// references. Comma-separated tables desugar to `CROSS JOIN`.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TableRef {
+    Table {
+        name: Name,
+        alias: Option<Name>,
+    },
+    Join {
+        left: Box<TableRef>,
+        right: Box<TableRef>,
+        kind: JoinKind,
+        /// The `ON` predicate (absent for `CROSS JOIN`).
+        on: Option<Expr>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    Inner,
+    Left,
+    Right,
+    Full,
+    Cross,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum SelectItem {
     /// `*`
     Wildcard,
+    /// `table.*`
+    QualifiedWildcard(Name),
     Expr {
         expr: Expr,
         alias: Option<Name>,

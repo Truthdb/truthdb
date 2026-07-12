@@ -717,6 +717,12 @@ impl Parser {
             if self.check(&TokenKind::Star) {
                 self.bump();
                 items.push(SelectItem::Wildcard);
+            } else if self.is_qualified_wildcard() {
+                // `table.*`
+                let name = self.parse_ident()?;
+                self.expect(&TokenKind::Dot)?;
+                self.expect(&TokenKind::Star)?;
+                items.push(SelectItem::QualifiedWildcard(name));
             } else {
                 let expr = self.parse_expr()?;
                 let alias = self.parse_optional_alias()?;
@@ -729,7 +735,7 @@ impl Parser {
 
         let from = if self.peek_keyword().as_deref() == Some("FROM") {
             self.bump();
-            Some(self.parse_name()?)
+            Some(self.parse_from()?)
         } else {
             None
         };
@@ -815,6 +821,126 @@ impl Parser {
             return Ok(Some(self.parse_name()?));
         }
         Ok(None)
+    }
+
+    /// True if the next three tokens are `<word> . *` (a qualified wildcard).
+    fn is_qualified_wildcard(&self) -> bool {
+        let is_word = matches!(
+            self.tokens.get(self.pos).map(|t| &t.kind),
+            Some(TokenKind::Word { .. })
+        );
+        let is_dot = matches!(
+            self.tokens.get(self.pos + 1).map(|t| &t.kind),
+            Some(TokenKind::Dot)
+        );
+        let is_star = matches!(
+            self.tokens.get(self.pos + 2).map(|t| &t.kind),
+            Some(TokenKind::Star)
+        );
+        is_word && is_dot && is_star
+    }
+
+    // ---- FROM / joins ---------------------------------------------------
+
+    /// Parses a FROM clause: a table primary followed by zero or more joins
+    /// (comma = CROSS JOIN). Joins are left-associative.
+    fn parse_from(&mut self) -> SqlResult<TableRef> {
+        let mut left = self.parse_table_primary()?;
+        loop {
+            if self.eat(&TokenKind::Comma) {
+                let right = self.parse_table_primary()?;
+                left = TableRef::Join {
+                    left: Box::new(left),
+                    right: Box::new(right),
+                    kind: JoinKind::Cross,
+                    on: None,
+                };
+                continue;
+            }
+            let kind = match self.peek_keyword().as_deref() {
+                Some("INNER") => {
+                    self.bump();
+                    self.expect_keyword("JOIN")?;
+                    JoinKind::Inner
+                }
+                Some("JOIN") => {
+                    self.bump();
+                    JoinKind::Inner
+                }
+                Some("LEFT") => {
+                    self.bump();
+                    let _ = self.eat_keyword("OUTER");
+                    self.expect_keyword("JOIN")?;
+                    JoinKind::Left
+                }
+                Some("RIGHT") => {
+                    self.bump();
+                    let _ = self.eat_keyword("OUTER");
+                    self.expect_keyword("JOIN")?;
+                    JoinKind::Right
+                }
+                Some("FULL") => {
+                    self.bump();
+                    let _ = self.eat_keyword("OUTER");
+                    self.expect_keyword("JOIN")?;
+                    JoinKind::Full
+                }
+                Some("CROSS") => {
+                    self.bump();
+                    self.expect_keyword("JOIN")?;
+                    JoinKind::Cross
+                }
+                _ => break,
+            };
+            let right = self.parse_table_primary()?;
+            let on = if kind == JoinKind::Cross {
+                None
+            } else {
+                self.expect_keyword("ON")?;
+                Some(self.parse_expr()?)
+            };
+            left = TableRef::Join {
+                left: Box::new(left),
+                right: Box::new(right),
+                kind,
+                on,
+            };
+        }
+        Ok(left)
+    }
+
+    fn parse_table_primary(&mut self) -> SqlResult<TableRef> {
+        // Derived tables (subqueries) arrive in Stage 11.
+        let name = self.parse_name()?;
+        let alias = self.parse_optional_table_alias()?;
+        Ok(TableRef::Table { name, alias })
+    }
+
+    fn parse_optional_table_alias(&mut self) -> SqlResult<Option<Name>> {
+        if self.peek_keyword().as_deref() == Some("AS") {
+            self.bump();
+            return Ok(Some(self.parse_name()?));
+        }
+        if let Some(keyword) = self.peek_keyword() {
+            if is_clause_keyword(&keyword) || is_join_keyword(&keyword) {
+                return Ok(None);
+            }
+            return Ok(Some(self.parse_name()?));
+        }
+        if matches!(self.peek().kind, TokenKind::Word { quoted: true, .. }) {
+            return Ok(Some(self.parse_name()?));
+        }
+        Ok(None)
+    }
+
+    /// Consumes `keyword` if it is next; returns whether it did.
+    fn eat_keyword(&mut self, keyword: &str) -> bool {
+        if self.peek_keyword().as_deref() == Some(keyword) {
+            self.bump();
+            true
+        } else {
+            false
+        }
     }
 
     // ---- expressions (precedence climbing) ------------------------------
@@ -1451,6 +1577,14 @@ fn is_clause_keyword(keyword: &str) -> bool {
     matches!(
         keyword,
         "FROM" | "WHERE" | "ORDER" | "GROUP" | "HAVING" | "AS"
+    )
+}
+
+/// Keywords that introduce a join (so they are not read as a table alias).
+fn is_join_keyword(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "JOIN" | "INNER" | "LEFT" | "RIGHT" | "FULL" | "CROSS" | "ON" | "OUTER"
     )
 }
 

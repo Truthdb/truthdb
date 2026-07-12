@@ -15,7 +15,7 @@ use truthdb_sql::value::{SqlValue, order_key_cmp};
 use crate::relstore::types::{ColumnType, Datum};
 
 use super::value;
-use super::{ResultColumn, RowSet, row_values};
+use super::{JoinScope, ResultColumn, RowSet, row_values};
 
 /// True if the query aggregates: it has a GROUP BY, a HAVING, or any aggregate
 /// in its SELECT list.
@@ -24,7 +24,7 @@ pub fn is_aggregated(select: &Select) -> bool {
         || select.having.is_some()
         || select.items.iter().any(|item| match item {
             SelectItem::Expr { expr, .. } => contains_aggregate(expr),
-            SelectItem::Wildcard => false,
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
         })
 }
 
@@ -76,7 +76,7 @@ pub fn execute(
     select: &Select,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
-    resolver: &[String],
+    resolver: &JoinScope,
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
     // Rewrite SELECT items + HAVING against the group row, collecting aggregates.
@@ -85,7 +85,7 @@ pub fn execute(
     let mut out_exprs: Vec<Expr> = Vec::new();
     for item in &select.items {
         match item {
-            SelectItem::Wildcard => {
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {
                 return Err(SqlError::new(
                     8120,
                     16,
@@ -152,7 +152,7 @@ fn group_rows(
     select: &Select,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
-    resolver: &[String],
+    resolver: &JoinScope,
     eval_ctx: &EvalContext,
 ) -> Result<Vec<(Vec<SqlValue>, Vec<usize>)>, SqlError> {
     if select.group_by.is_empty() {
@@ -165,7 +165,7 @@ fn group_rows(
         let key = select
             .group_by
             .iter()
-            .map(|expr| eval::eval(expr, &sql_row, &resolver.to_vec(), eval_ctx))
+            .map(|expr| eval::eval(expr, &sql_row, resolver, eval_ctx))
             .collect::<Result<Vec<_>, _>>()?;
         keyed.push((key, index));
     }
@@ -191,7 +191,7 @@ fn compute_aggregate(
     spec: &AggSpec,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
-    resolver: &[String],
+    resolver: &JoinScope,
     members: &[usize],
     eval_ctx: &EvalContext,
 ) -> Result<SqlValue, SqlError> {
@@ -199,11 +199,10 @@ fn compute_aggregate(
     let Some(arg) = &spec.arg else {
         return Ok(SqlValue::Int(members.len() as i64));
     };
-    let resolver = resolver.to_vec();
     let mut values: Vec<SqlValue> = Vec::new();
     for &index in members {
         let sql_row = row_values(&rows[index], types);
-        let value = eval::eval(arg, &sql_row, &resolver, eval_ctx)?;
+        let value = eval::eval(arg, &sql_row, resolver, eval_ctx)?;
         if !value.is_null() {
             values.push(value);
         }
