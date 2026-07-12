@@ -30,9 +30,7 @@ impl Engine {
 
         // Try to load a snapshot first
         if let Some(snapshot) = engine.storage.load_snapshot()? {
-            let state: EngineState = bincode::deserialize(&snapshot.data)
-                .map_err(|err| EngineError::Replay(format!("failed to decode snapshot: {err}")))?;
-            engine.state = state;
+            engine.state = decode_snapshot(&snapshot.data)?;
             engine.next_seq_no = snapshot.next_seq_no;
             engine.next_doc_id = snapshot.next_doc_id;
             // Rebuild postings (not serialized)
@@ -41,9 +39,18 @@ impl Engine {
             }
         }
 
-        // Replay any WAL entries after the snapshot
+        // Replay any WAL entries after the snapshot. The ring is shared with
+        // other subsystems (relational records use different entry types);
+        // only search events are ours to apply. Records the snapshot already
+        // covers (seq_no below its next_seq_no) are skipped: a crash between
+        // the snapshot descriptor becoming durable and the WAL head
+        // advancing legitimately leaves them in the ring, and re-applying
+        // them would fail (duplicate index/document errors).
         let records = engine.storage.replay_wal_entries()?;
         for record in records {
+            if record.entry_type != ENGINE_WAL_ENTRY_TYPE || record.seq_no < engine.next_seq_no {
+                continue;
+            }
             let event: WalEvent = serde_json::from_slice(&record.payload)
                 .map_err(|err| EngineError::Replay(format!("failed to decode wal event: {err}")))?;
             engine.apply_event(&event)?;
@@ -103,7 +110,10 @@ impl Engine {
     }
 
     pub fn checkpoint(&mut self) -> Result<(), EngineError> {
-        let data = bincode::serialize(&self.state)
+        // JSON, not bincode: documents hold serde_json::Value, which bincode
+        // can serialize but never deserialize (`deserialize_any`), so bincode
+        // snapshots with documents could not be loaded back.
+        let data = serde_json::to_vec(&self.state)
             .map_err(|err| EngineError::Replay(format!("failed to serialize state: {err}")))?;
         let checkpoint_seq = self.next_seq_no.saturating_sub(1);
         self.storage
@@ -129,7 +139,6 @@ impl Engine {
         self.storage.append_wal_entry(
             ENGINE_WAL_ENTRY_TYPE,
             ENGINE_WAL_ENTRY_VERSION,
-            seq_no,
             seq_no,
             &payload,
         )?;
@@ -819,6 +828,21 @@ fn render_json(value: &Value) -> Result<String, EngineError> {
         .map_err(|err| EngineError::Replay(format!("failed to render json response: {err}")))
 }
 
+/// Decodes a snapshot payload: JSON (current format), falling back to
+/// bincode for snapshots written by older versions. Legacy bincode snapshots
+/// can only have been document-free (bincode cannot deserialize
+/// `serde_json::Value`, so document-bearing ones were never loadable).
+fn decode_snapshot(data: &[u8]) -> Result<EngineState, EngineError> {
+    match serde_json::from_slice(data) {
+        Ok(state) => Ok(state),
+        Err(json_err) => bincode::deserialize(data).map_err(|bincode_err| {
+            EngineError::Replay(format!(
+                "failed to decode snapshot: as json: {json_err}; as legacy bincode: {bincode_err}"
+            ))
+        }),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
@@ -950,6 +974,150 @@ mod tests {
             response["hits"]["hits"][0]["_source"]["name"].as_str(),
             Some("Red Running Shoes")
         );
+
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression (review finding, pre-existing): snapshots holding
+    /// documents could never be decoded again (bincode cannot deserialize
+    /// serde_json::Value). Round-trip a checkpoint with real documents plus
+    /// a post-checkpoint WAL event.
+    #[test]
+    fn checkpoint_with_documents_survives_restart() {
+        let path = unique_temp_path("checkpoint-roundtrip");
+        let storage =
+            Storage::create(path.clone(), test_storage_options()).expect("storage create");
+        let mut engine = Engine::new(storage).expect("engine create");
+        engine
+            .execute(
+                r#"
+                create index notes {
+                  "mappings": { "properties": { "body": { "type": "text" } } }
+                }
+                "#,
+            )
+            .expect("create index");
+        engine
+            .execute(r#"insert document notes { "body": "first snapshot doc" }"#)
+            .expect("insert 1");
+        engine
+            .execute(r#"insert document notes { "body": "second snapshot doc" }"#)
+            .expect("insert 2");
+        engine.checkpoint().expect("checkpoint with documents");
+        engine
+            .execute(r#"insert document notes { "body": "post checkpoint doc" }"#)
+            .expect("insert 3");
+        drop(engine);
+
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("engine restart after checkpoint");
+        let response = engine
+            .execute(r#"search notes { "query": { "match": { "body": "doc" } } }"#)
+            .expect("search");
+        let response: Value = serde_json::from_str(&response).expect("valid json");
+        assert_eq!(
+            response["hits"]["total"].as_u64(),
+            Some(3),
+            "snapshot docs and post-checkpoint doc must all survive"
+        );
+        // Doc-id continuity: the next insert must not collide.
+        engine
+            .execute(r#"insert document notes { "body": "post restart doc" }"#)
+            .expect("insert after restart");
+        let _ = std::fs::remove_file(path);
+    }
+
+    /// Regression (review finding): a crash between the snapshot descriptor
+    /// becoming durable and the WAL head advancing leaves snapshot-covered
+    /// events in the ring; replay must skip them instead of failing on
+    /// duplicate applies.
+    #[test]
+    fn replay_skips_events_already_covered_by_snapshot() {
+        let path = unique_temp_path("covered-replay");
+        let mut storage =
+            Storage::create(path.clone(), test_storage_options()).expect("storage create");
+
+        // Snapshot state: index "notes" with one document, next_seq_no = 3.
+        let mut mappings = BTreeMap::new();
+        mappings.insert("body".to_string(), FieldType::Text);
+        let create_event = WalEvent::CreateIndex {
+            name: "notes".to_string(),
+            mappings: mappings.clone(),
+        };
+        let mut doc = Document::new();
+        doc.insert("body".to_string(), Value::String("covered".to_string()));
+        let insert_event = WalEvent::InsertDocument {
+            index: "notes".to_string(),
+            id: "1".to_string(),
+            document: doc,
+        };
+        let mut state = EngineState::default();
+        let mut index = IndexState::new(mappings);
+        if let WalEvent::InsertDocument { id, document, .. } = &insert_event {
+            index.insert_document(id, document).expect("apply insert");
+        }
+        state.indices.insert("notes".to_string(), index);
+        let snapshot = serde_json::to_vec(&state).expect("encode state");
+        storage
+            .write_checkpoint(&snapshot, 2, 3, 2)
+            .expect("checkpoint");
+
+        // The crash window: events 1 and 2 (already in the snapshot) sit in
+        // the ring after the checkpoint.
+        for (seq, event) in [(1u64, &create_event), (2u64, &insert_event)] {
+            let payload = serde_json::to_vec(event).expect("encode event");
+            storage
+                .append_wal_entry(
+                    ENGINE_WAL_ENTRY_TYPE,
+                    ENGINE_WAL_ENTRY_VERSION,
+                    seq,
+                    &payload,
+                )
+                .expect("append covered event");
+        }
+        drop(storage);
+
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("open must skip covered events");
+        let response = engine
+            .execute(r#"search notes { "query": { "match": { "body": "covered" } } }"#)
+            .expect("search");
+        let response: Value = serde_json::from_str(&response).expect("valid json");
+        assert_eq!(response["hits"]["total"].as_u64(), Some(1));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn engine_replay_ignores_relational_wal_records() {
+        let path = unique_temp_path("rel-coexistence");
+        let mut storage =
+            Storage::create(path.clone(), test_storage_options()).expect("storage create");
+        // Relational records land in the same ring before and between search
+        // events; search replay must skip them.
+        let extent = storage.allocate_extent(false).expect("extent");
+        let mut engine = Engine::new(storage).expect("engine create");
+        engine
+            .execute(
+                r#"
+                create index notes {
+                  "mappings": { "properties": { "body": { "type": "text" } } }
+                }
+                "#,
+            )
+            .expect("create index");
+        engine
+            .execute(r#"insert document notes { "body": "relational coexistence" }"#)
+            .expect("insert");
+        drop(engine);
+
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("engine replay with rel records");
+        let response = engine
+            .execute(r#"search notes { "query": { "match": { "body": "coexistence" } } }"#)
+            .expect("search after replay");
+        let response: Value = serde_json::from_str(&response).expect("valid json");
+        assert_eq!(response["hits"]["total"].as_u64(), Some(1));
+        let _ = extent;
 
         let _ = std::fs::remove_file(path);
     }

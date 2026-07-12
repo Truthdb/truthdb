@@ -1,3 +1,66 @@
+use crate::storage_layout::PAGE_SIZE;
+
+/// A page-sized, page-aligned, heap-allocated buffer suitable for O_DIRECT I/O.
+///
+/// Callers own these frames (buffer pool frames, WAL tail-page images) and pass
+/// them to [`DirectFile::read_page_into`] / [`DirectFile::write_page_from`].
+pub struct AlignedPageBuf {
+    ptr: std::ptr::NonNull<u8>,
+}
+
+impl AlignedPageBuf {
+    pub fn new() -> Self {
+        let layout = std::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
+            .expect("page layout is valid");
+        // SAFETY: layout has non-zero size.
+        let ptr = unsafe { std::alloc::alloc_zeroed(layout) };
+        let Some(ptr) = std::ptr::NonNull::new(ptr) else {
+            std::alloc::handle_alloc_error(layout);
+        };
+        AlignedPageBuf { ptr }
+    }
+
+    pub fn as_slice(&self) -> &[u8] {
+        // SAFETY: ptr is valid for PAGE_SIZE bytes for the lifetime of self.
+        unsafe { std::slice::from_raw_parts(self.ptr.as_ptr(), PAGE_SIZE) }
+    }
+
+    pub fn as_mut_slice(&mut self) -> &mut [u8] {
+        // SAFETY: ptr is valid for PAGE_SIZE bytes and uniquely borrowed.
+        unsafe { std::slice::from_raw_parts_mut(self.ptr.as_ptr(), PAGE_SIZE) }
+    }
+
+    pub fn zero(&mut self) {
+        self.as_mut_slice().fill(0);
+    }
+}
+
+impl Default for AlignedPageBuf {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Clone for AlignedPageBuf {
+    fn clone(&self) -> Self {
+        let mut copy = AlignedPageBuf::new();
+        copy.as_mut_slice().copy_from_slice(self.as_slice());
+        copy
+    }
+}
+
+impl Drop for AlignedPageBuf {
+    fn drop(&mut self) {
+        let layout = std::alloc::Layout::from_size_align(PAGE_SIZE, PAGE_SIZE)
+            .expect("page layout is valid");
+        // SAFETY: ptr was allocated with this exact layout.
+        unsafe { std::alloc::dealloc(self.ptr.as_ptr(), layout) };
+    }
+}
+
+// SAFETY: AlignedPageBuf uniquely owns its allocation.
+unsafe impl Send for AlignedPageBuf {}
+
 #[cfg(target_os = "linux")]
 mod imp {
     use std::fs::{File, OpenOptions};
@@ -72,6 +135,11 @@ mod imp {
         buffers: Vec<AlignedBuffer>,
         next_user_data: u64,
         len: u64,
+        /// Set when the ring state is no longer trustworthy (submission or
+        /// wait failed with operations possibly in flight). All further
+        /// operations fail fast: consuming stale completions would let a
+        /// later fsync acknowledge a write that never happened.
+        poisoned: bool,
     }
 
     impl DirectFile {
@@ -120,6 +188,7 @@ mod imp {
                 buffers,
                 next_user_data: 1,
                 len,
+                poisoned: false,
             })
         }
 
@@ -205,6 +274,72 @@ mod imp {
             Ok(())
         }
 
+        pub fn read_page_into(
+            &mut self,
+            page_offset: u64,
+            frame: &mut super::AlignedPageBuf,
+        ) -> io::Result<()> {
+            ensure_page_aligned(page_offset)?;
+            let entry = opcode::Read::new(
+                types::Fixed(FIXED_FILE_INDEX),
+                frame.as_mut_slice().as_mut_ptr(),
+                PAGE_SIZE as u32,
+            )
+            .offset(page_offset)
+            .build()
+            .user_data(self.next_user_data());
+
+            let read = self.submit(entry)?;
+            if read != PAGE_SIZE {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    format!("short direct read: expected {PAGE_SIZE}, got {read}"),
+                ));
+            }
+            Ok(())
+        }
+
+        pub fn write_page_from(
+            &mut self,
+            page_offset: u64,
+            frame: &super::AlignedPageBuf,
+        ) -> io::Result<()> {
+            self.write_pages_from(page_offset, &[frame])
+        }
+
+        /// Writes `frames` as consecutive pages starting at `page_offset`,
+        /// batching submissions through the ring.
+        pub fn write_pages_from(
+            &mut self,
+            page_offset: u64,
+            frames: &[&super::AlignedPageBuf],
+        ) -> io::Result<()> {
+            self.check_usable()?;
+            ensure_page_aligned(page_offset)?;
+            for (chunk_index, chunk) in frames.chunks(IO_URING_ENTRIES as usize).enumerate() {
+                let chunk_offset =
+                    page_offset + (chunk_index * IO_URING_ENTRIES as usize * PAGE_SIZE) as u64;
+                for (i, frame) in chunk.iter().enumerate() {
+                    let entry = opcode::Write::new(
+                        types::Fixed(FIXED_FILE_INDEX),
+                        frame.as_slice().as_ptr(),
+                        PAGE_SIZE as u32,
+                    )
+                    .offset(chunk_offset + (i * PAGE_SIZE) as u64)
+                    .build()
+                    .user_data(self.next_user_data());
+                    // SAFETY: the frame borrows outlive this call, and every
+                    // queued entry is either fully submitted-and-reaped below
+                    // or the handle is poisoned so the ring is never touched
+                    // again.
+                    unsafe { self.push_entry(&entry)? };
+                }
+                self.submit_and_wait_all(chunk.len())?;
+                self.drain_completions(chunk.len(), PAGE_SIZE)?;
+            }
+            Ok(())
+        }
+
         fn read_page(&mut self, page_offset: u64) -> io::Result<()> {
             let user_data = self.next_user_data();
             let buf_ptr = {
@@ -264,26 +399,106 @@ mod imp {
         }
 
         fn submit(&mut self, entry: io_uring::squeue::Entry) -> io::Result<usize> {
-            {
-                let mut submission = self.ring.submission();
-                unsafe {
-                    submission
-                        .push(&entry)
-                        .map_err(|_| io::Error::other("io_uring submission queue full"))?;
-                }
-            }
+            self.check_usable()?;
+            // SAFETY: the entry's buffer is either an internal scratch buffer
+            // owned by self or a caller frame that outlives the call; the
+            // entry is submitted and reaped (or the handle poisoned) below.
+            unsafe { self.push_entry(&entry)? };
+            self.submit_and_wait_all(1)?;
 
-            self.ring
-                .submit_and_wait(1)
-                .map_err(annotate_io_uring_error)?;
-            let mut completion = self.ring.completion();
-            let cqe = completion
-                .next()
-                .ok_or_else(|| io::Error::other("io_uring completion queue empty"))?;
+            let cqe = match self.ring.completion().next() {
+                Some(cqe) => cqe,
+                None => {
+                    self.poisoned = true;
+                    return Err(io::Error::other("io_uring completion queue empty"));
+                }
+            };
             if cqe.result() < 0 {
                 return Err(io::Error::from_raw_os_error(-cqe.result()));
             }
             Ok(cqe.result() as usize)
+        }
+
+        fn check_usable(&self) -> io::Result<()> {
+            if self.poisoned {
+                return Err(io::Error::other(
+                    "direct file disabled after an io_uring failure (operations may still be in flight); refusing to acknowledge further I/O",
+                ));
+            }
+            Ok(())
+        }
+
+        /// Queues one SQE. On failure the handle is poisoned: earlier entries
+        /// of the same batch may already sit unsubmitted in the queue, and
+        /// they must never reach the kernel once their buffers are gone.
+        ///
+        /// # Safety
+        /// The buffers referenced by `entry` must stay live until the
+        /// matching completion is reaped, or the handle is poisoned.
+        unsafe fn push_entry(&mut self, entry: &io_uring::squeue::Entry) -> io::Result<()> {
+            let pushed = unsafe { self.ring.submission().push(entry) };
+            if pushed.is_err() {
+                self.poisoned = true;
+                return Err(io::Error::other("io_uring submission queue full"));
+            }
+            Ok(())
+        }
+
+        /// Submits queued SQEs and waits for `want` completions, retrying
+        /// interrupted waits. Any other failure poisons the handle:
+        /// operations may be in flight against buffers we no longer control.
+        fn submit_and_wait_all(&mut self, want: usize) -> io::Result<()> {
+            loop {
+                match self.ring.submit_and_wait(want) {
+                    Ok(_) => return Ok(()),
+                    Err(err) if err.kind() == io::ErrorKind::Interrupted => continue,
+                    Err(err) => {
+                        self.poisoned = true;
+                        return Err(annotate_io_uring_error(err));
+                    }
+                }
+            }
+        }
+
+        /// Reaps exactly `count` completions, even after one reports an
+        /// error — an unreaped CQE would be mis-attributed to a later
+        /// operation (e.g. an fsync acknowledging a failed write). Returns
+        /// the first error encountered.
+        fn drain_completions(&mut self, count: usize, expected_len: usize) -> io::Result<()> {
+            let mut first_error: Option<io::Error> = None;
+            let mut missing = false;
+            {
+                let mut completion = self.ring.completion();
+                for _ in 0..count {
+                    let Some(cqe) = completion.next() else {
+                        missing = true;
+                        break;
+                    };
+                    if cqe.result() < 0 {
+                        first_error
+                            .get_or_insert_with(|| io::Error::from_raw_os_error(-cqe.result()));
+                    } else if cqe.result() as usize != expected_len {
+                        first_error.get_or_insert_with(|| {
+                            io::Error::new(
+                                io::ErrorKind::WriteZero,
+                                format!(
+                                    "short direct write: expected {expected_len}, got {}",
+                                    cqe.result()
+                                ),
+                            )
+                        });
+                    }
+                }
+            }
+            if missing {
+                self.poisoned = true;
+                return Err(first_error
+                    .unwrap_or_else(|| io::Error::other("io_uring completion queue empty")));
+            }
+            match first_error {
+                Some(err) => Err(err),
+                None => Ok(()),
+            }
         }
 
         fn next_user_data(&mut self) -> u64 {
@@ -294,6 +509,16 @@ mod imp {
     }
 
     unsafe impl Send for DirectFile {}
+
+    fn ensure_page_aligned(offset: u64) -> io::Result<()> {
+        if !offset.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("offset {offset} is not page-aligned"),
+            ));
+        }
+        Ok(())
+    }
 
     fn annotate_io_uring_error(err: io::Error) -> io::Error {
         match err.raw_os_error() {
@@ -344,6 +569,30 @@ mod imp {
         }
 
         pub fn sync_data(&mut self) -> io::Result<()> {
+            Err(io::Error::other("truthdb storage requires Linux io_uring"))
+        }
+
+        pub fn read_page_into(
+            &mut self,
+            _page_offset: u64,
+            _frame: &mut super::AlignedPageBuf,
+        ) -> io::Result<()> {
+            Err(io::Error::other("truthdb storage requires Linux io_uring"))
+        }
+
+        pub fn write_page_from(
+            &mut self,
+            _page_offset: u64,
+            _frame: &super::AlignedPageBuf,
+        ) -> io::Result<()> {
+            Err(io::Error::other("truthdb storage requires Linux io_uring"))
+        }
+
+        pub fn write_pages_from(
+            &mut self,
+            _page_offset: u64,
+            _frames: &[&super::AlignedPageBuf],
+        ) -> io::Result<()> {
             Err(io::Error::other("truthdb storage requires Linux io_uring"))
         }
     }
