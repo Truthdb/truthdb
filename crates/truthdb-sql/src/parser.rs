@@ -1107,7 +1107,43 @@ impl Parser {
     }
 
     fn parse_table_primary(&mut self) -> SqlResult<TableRef> {
-        // Derived tables (subqueries) arrive in Stage 11.
+        // A derived table or a parenthesized group re-enters parse_select /
+        // parse_from, so bound the FROM nesting the same way expressions are
+        // bounded — otherwise a deeply nested `((( ... )))` overflows the stack
+        // and aborts the process. Shares the expression depth budget.
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            return Err(Self::too_deep());
+        }
+        let tref = self.parse_table_primary_body()?;
+        self.depth -= 1;
+        Ok(tref)
+    }
+
+    fn parse_table_primary_body(&mut self) -> SqlResult<TableRef> {
+        if self.check(&TokenKind::LParen) {
+            // `(SELECT ...)` is a derived table (required alias); any other
+            // parenthesized form is a grouped table reference / join.
+            if self.peek_keyword_at(1).as_deref() == Some("SELECT") {
+                self.bump(); // (
+                let subquery = self.parse_select()?;
+                self.expect(&TokenKind::RParen)?;
+                let alias = self.parse_optional_table_alias()?.ok_or_else(|| {
+                    SqlError::message_only(
+                        102,
+                        "Incorrect syntax: a derived table must have an alias.",
+                    )
+                })?;
+                return Ok(TableRef::Derived {
+                    subquery: Box::new(subquery),
+                    alias,
+                });
+            }
+            self.bump(); // (
+            let inner = self.parse_from()?;
+            self.expect(&TokenKind::RParen)?;
+            return Ok(inner);
+        }
         let name = self.parse_name()?;
         let alias = self.parse_optional_table_alias()?;
         Ok(TableRef::Table { name, alias })
@@ -1834,6 +1870,20 @@ mod tests {
         let sql = format!("SELECT {}1{}", "(".repeat(5000), ")".repeat(5000));
         let err = Parser::parse_str(&sql).expect_err("must reject, not overflow");
         assert_eq!(err.number, 191);
+    }
+
+    #[test]
+    fn deeply_nested_from_error_not_overflow() {
+        // Nested parenthesized-group FROM: must reject cleanly, not overflow.
+        let group = format!("SELECT 1 FROM {}t{}", "(".repeat(5000), ")".repeat(5000));
+        assert_eq!(Parser::parse_str(&group).unwrap_err().number, 191);
+        // Nested derived tables likewise.
+        let derived = format!(
+            "SELECT * FROM {}SELECT * FROM t{} x",
+            "(SELECT * FROM ".repeat(2000),
+            ") y".repeat(2000),
+        );
+        assert_eq!(Parser::parse_str(&derived).unwrap_err().number, 191);
     }
 
     #[test]

@@ -2487,13 +2487,19 @@ fn bare_column_index(expr: &Expr, scope: &JoinScope) -> Option<usize> {
     }
 }
 
-/// Collects every base-table name referenced in a FROM join tree.
+/// Collects every base-table name referenced in a FROM join tree, recursing
+/// into derived-table subqueries so their tables are locked too.
 fn collect_table_names<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
     match tref {
         TableRef::Table { name, .. } => out.push(name),
         TableRef::Join { left, right, .. } => {
             collect_table_names(left, out);
             collect_table_names(right, out);
+        }
+        TableRef::Derived { subquery, .. } => {
+            if let Some(from) = &subquery.from {
+                collect_table_names(from, out);
+            }
         }
     }
 }
@@ -2505,7 +2511,9 @@ fn exposed_name(name: &Name, alias: Option<&Name>) -> String {
         .unwrap_or_else(|| strip_schema(&name.value).to_string())
 }
 
-/// Collects the exposed names of every table in a FROM tree.
+/// Collects the exposed names of every table in a FROM tree. A derived table's
+/// exposed name is its alias (its inner tables are not exposed to the outer
+/// query).
 fn collect_exposed_names(tref: &TableRef, out: &mut Vec<String>) {
     match tref {
         TableRef::Table { name, alias } => out.push(exposed_name(name, alias.as_ref())),
@@ -2513,6 +2521,7 @@ fn collect_exposed_names(tref: &TableRef, out: &mut Vec<String>) {
             collect_exposed_names(left, out);
             collect_exposed_names(right, out);
         }
+        TableRef::Derived { alias, .. } => out.push(alias.value.clone()),
     }
 }
 
@@ -2657,7 +2666,62 @@ fn build_join(
             let right = build_join(storage, right, eval_ctx)?;
             join_sources(left, right, *kind, on.as_ref(), eval_ctx)
         }
+        TableRef::Derived { subquery, alias } => {
+            build_derived_source(storage, subquery, alias, eval_ctx)
+        }
     }
+}
+
+/// Builds a derived table's row source by executing its subquery and stamping
+/// every output column with the derived-table alias. Every column must be named
+/// (8155) and names must be unique within the derived table (8156).
+fn build_derived_source(
+    storage: &mut Storage,
+    subquery: &Select,
+    alias: &Name,
+    eval_ctx: &EvalContext,
+) -> Result<Source, SqlError> {
+    let rowset = exec_select(storage, subquery, eval_ctx)?;
+    for (index, column) in rowset.columns.iter().enumerate() {
+        if column.name.is_empty() {
+            return Err(SqlError::new(
+                8155,
+                16,
+                2,
+                format!(
+                    "No column name was specified for column {} of '{}'.",
+                    index + 1,
+                    alias.value
+                ),
+            ));
+        }
+        if rowset.columns[..index]
+            .iter()
+            .any(|c| c.name.eq_ignore_ascii_case(&column.name))
+        {
+            return Err(SqlError::new(
+                8156,
+                16,
+                1,
+                format!(
+                    "The column '{}' was specified multiple times for '{}'.",
+                    column.name, alias.value
+                ),
+            ));
+        }
+    }
+    let count = rowset.columns.len();
+    Ok(Source {
+        columns: rowset.columns,
+        qualifiers: vec![Some(alias.value.clone()); count],
+        // KNOWN LIMITATION: a RowSet carries no per-column collation, so a
+        // derived character column loses its source collation and an outer
+        // ORDER BY sorts it under the database default rather than the base
+        // column's COLLATE. Fixing this needs collation threaded through the
+        // project/RowSet boundary; deferred (narrow, non-default-collation only).
+        collations: vec![None; count],
+        rows: rowset.rows,
+    })
 }
 
 /// Nested-loop join of two materialized sources. The ON predicate (absent for

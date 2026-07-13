@@ -1,0 +1,485 @@
+[
+    Select(
+        Select {
+            top: None,
+            distinct: false,
+            items: [
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "s.id",
+                                quoted: false,
+                                span: Span {
+                                    start: 7,
+                                    end: 11,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 7,
+                            end: 11,
+                        },
+                    },
+                    alias: None,
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "s.total",
+                                quoted: false,
+                                span: Span {
+                                    start: 13,
+                                    end: 20,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 13,
+                            end: 20,
+                        },
+                    },
+                    alias: None,
+                },
+            ],
+            from: Some(
+                Derived {
+                    subquery: Select {
+                        top: None,
+                        distinct: false,
+                        items: [
+                            Expr {
+                                expr: Expr {
+                                    kind: Column(
+                                        Name {
+                                            value: "id",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 34,
+                                                end: 36,
+                                            },
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 34,
+                                        end: 36,
+                                    },
+                                },
+                                alias: None,
+                            },
+                            Expr {
+                                expr: Expr {
+                                    kind: Binary {
+                                        op: Add,
+                                        left: Expr {
+                                            kind: Column(
+                                                Name {
+                                                    value: "amount",
+                                                    quoted: false,
+                                                    span: Span {
+                                                        start: 38,
+                                                        end: 44,
+                                                    },
+                                                },
+                                            ),
+                                            span: Span {
+                                                start: 38,
+                                                end: 44,
+                                            },
+                                        },
+                                        right: Expr {
+                                            kind: Int(
+                                                1,
+                                            ),
+                                            span: Span {
+                                                start: 47,
+                                                end: 48,
+                                            },
+                                        },
+                                    },
+                                    span: Span {
+                                        start: 38,
+                                        end: 48,
+                                    },
+                                },
+                                alias: Some(
+                                    Name {
+                                        value: "total",
+                                        quoted: false,
+                                        span: Span {
+                                            start: 52,
+                                            end: 57,
+                                        },
+                                    },
+                                ),
+                            },
+                        ],
+                        from: Some(
+                            Table {
+                                name: Name {
+                                    value: "sales",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 63,
+                                        end: 68,
+                                    },
+                                },
+                                alias: None,
+                            },
+                        ),
+                        where_clause: Some(
+                            Expr {
+                                kind: Binary {
+                                    op: Gt,
+                                    left: Expr {
+                                        kind: Column(
+                                            Name {
+                                                value: "amount",
+                                                quoted: false,
+                                                span: Span {
+                                                    start: 75,
+                                                    end: 81,
+                                                },
+                                            },
+                                        ),
+                                        span: Span {
+                                            start: 75,
+                                            end: 81,
+                                        },
+                                    },
+                                    right: Expr {
+                                        kind: Int(
+                                            0,
+                                        ),
+                                        span: Span {
+                                            start: 84,
+                                            end: 85,
+                                        },
+                                    },
+                                },
+                                span: Span {
+                                    start: 75,
+                                    end: 85,
+                                },
+                            },
+                        ),
+                        group_by: [],
+                        having: None,
+                        order_by: [],
+                        span: Span {
+                            start: 27,
+                            end: 85,
+                        },
+                    },
+                    alias: Name {
+                        value: "s",
+                        quoted: false,
+                        span: Span {
+                            start: 87,
+                            end: 88,
+                        },
+                    },
+                },
+            ),
+            where_clause: Some(
+                Expr {
+                    kind: Binary {
+                        op: Lt,
+                        left: Expr {
+                            kind: Column(
+                                Name {
+                                    value: "s.id",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 95,
+                                        end: 99,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 95,
+                                end: 99,
+                            },
+                        },
+                        right: Expr {
+                            kind: Int(
+                                10,
+                            ),
+                            span: Span {
+                                start: 102,
+                                end: 104,
+                            },
+                        },
+                    },
+                    span: Span {
+                        start: 95,
+                        end: 104,
+                    },
+                },
+            ),
+            group_by: [],
+            having: None,
+            order_by: [
+                OrderItem {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "s.id",
+                                quoted: false,
+                                span: Span {
+                                    start: 114,
+                                    end: 118,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 114,
+                            end: 118,
+                        },
+                    },
+                    descending: false,
+                },
+            ],
+            span: Span {
+                start: 0,
+                end: 118,
+            },
+        },
+    ),
+    Select(
+        Select {
+            top: None,
+            distinct: false,
+            items: [
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "t.dept",
+                                quoted: false,
+                                span: Span {
+                                    start: 127,
+                                    end: 133,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 127,
+                            end: 133,
+                        },
+                    },
+                    alias: None,
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "d.total",
+                                quoted: false,
+                                span: Span {
+                                    start: 135,
+                                    end: 142,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 135,
+                            end: 142,
+                        },
+                    },
+                    alias: None,
+                },
+            ],
+            from: Some(
+                Join {
+                    left: Table {
+                        name: Name {
+                            value: "sales",
+                            quoted: false,
+                            span: Span {
+                                start: 148,
+                                end: 153,
+                            },
+                        },
+                        alias: Some(
+                            Name {
+                                value: "t",
+                                quoted: false,
+                                span: Span {
+                                    start: 154,
+                                    end: 155,
+                                },
+                            },
+                        ),
+                    },
+                    right: Derived {
+                        subquery: Select {
+                            top: None,
+                            distinct: false,
+                            items: [
+                                Expr {
+                                    expr: Expr {
+                                        kind: Column(
+                                            Name {
+                                                value: "dept",
+                                                quoted: false,
+                                                span: Span {
+                                                    start: 169,
+                                                    end: 173,
+                                                },
+                                            },
+                                        ),
+                                        span: Span {
+                                            start: 169,
+                                            end: 173,
+                                        },
+                                    },
+                                    alias: None,
+                                },
+                                Expr {
+                                    expr: Expr {
+                                        kind: Aggregate {
+                                            func: Sum,
+                                            distinct: false,
+                                            arg: Some(
+                                                Expr {
+                                                    kind: Column(
+                                                        Name {
+                                                            value: "amount",
+                                                            quoted: false,
+                                                            span: Span {
+                                                                start: 179,
+                                                                end: 185,
+                                                            },
+                                                        },
+                                                    ),
+                                                    span: Span {
+                                                        start: 179,
+                                                        end: 185,
+                                                    },
+                                                },
+                                            ),
+                                        },
+                                        span: Span {
+                                            start: 175,
+                                            end: 186,
+                                        },
+                                    },
+                                    alias: Some(
+                                        Name {
+                                            value: "total",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 190,
+                                                end: 195,
+                                            },
+                                        },
+                                    ),
+                                },
+                            ],
+                            from: Some(
+                                Table {
+                                    name: Name {
+                                        value: "sales",
+                                        quoted: false,
+                                        span: Span {
+                                            start: 201,
+                                            end: 206,
+                                        },
+                                    },
+                                    alias: None,
+                                },
+                            ),
+                            where_clause: None,
+                            group_by: [
+                                Expr {
+                                    kind: Column(
+                                        Name {
+                                            value: "dept",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 216,
+                                                end: 220,
+                                            },
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 216,
+                                        end: 220,
+                                    },
+                                },
+                            ],
+                            having: None,
+                            order_by: [],
+                            span: Span {
+                                start: 162,
+                                end: 220,
+                            },
+                        },
+                        alias: Name {
+                            value: "d",
+                            quoted: false,
+                            span: Span {
+                                start: 222,
+                                end: 223,
+                            },
+                        },
+                    },
+                    kind: Inner,
+                    on: Some(
+                        Expr {
+                            kind: Binary {
+                                op: Eq,
+                                left: Expr {
+                                    kind: Column(
+                                        Name {
+                                            value: "t.dept",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 227,
+                                                end: 233,
+                                            },
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 227,
+                                        end: 233,
+                                    },
+                                },
+                                right: Expr {
+                                    kind: Column(
+                                        Name {
+                                            value: "d.dept",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 236,
+                                                end: 242,
+                                            },
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 236,
+                                        end: 242,
+                                    },
+                                },
+                            },
+                            span: Span {
+                                start: 227,
+                                end: 242,
+                            },
+                        },
+                    ),
+                },
+            ),
+            where_clause: None,
+            group_by: [],
+            having: None,
+            order_by: [],
+            span: Span {
+                start: 120,
+                end: 242,
+            },
+        },
+    ),
+]
