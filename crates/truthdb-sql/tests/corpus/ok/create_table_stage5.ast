@@ -33,6 +33,7 @@
                     ),
                     collation: None,
                     checks: [],
+                    foreign_keys: [],
                     span: Span {
                         start: 25,
                         end: 67,
@@ -58,6 +59,7 @@
                         "Finnish_Swedish_CI_AS",
                     ),
                     checks: [],
+                    foreign_keys: [],
                     span: Span {
                         start: 73,
                         end: 119,
@@ -84,6 +86,7 @@
                     identity: None,
                     collation: None,
                     checks: [],
+                    foreign_keys: [],
                     span: Span {
                         start: 125,
                         end: 155,
@@ -105,6 +108,7 @@
                     identity: None,
                     collation: None,
                     checks: [],
+                    foreign_keys: [],
                     span: Span {
                         start: 161,
                         end: 178,
@@ -126,6 +130,7 @@
                     identity: None,
                     collation: None,
                     checks: [],
+                    foreign_keys: [],
                     span: Span {
                         start: 184,
                         end: 204,
@@ -143,6 +148,7 @@
                 },
             ],
             check_constraints: [],
+            foreign_keys: [],
             span: Span {
                 start: 0,
                 end: 206,

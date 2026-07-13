@@ -1,0 +1,323 @@
+[
+    CreateTable(
+        CreateTable {
+            table: Name {
+                value: "orders",
+                quoted: false,
+                span: Span {
+                    start: 13,
+                    end: 19,
+                },
+            },
+            columns: [
+                ColumnDef {
+                    name: Name {
+                        value: "id",
+                        quoted: false,
+                        span: Span {
+                            start: 26,
+                            end: 28,
+                        },
+                    },
+                    data_type: Int,
+                    nullable: Some(
+                        false,
+                    ),
+                    primary_key: true,
+                    default: None,
+                    identity: None,
+                    collation: None,
+                    checks: [],
+                    foreign_keys: [],
+                    span: Span {
+                        start: 26,
+                        end: 53,
+                    },
+                },
+                ColumnDef {
+                    name: Name {
+                        value: "cust_id",
+                        quoted: false,
+                        span: Span {
+                            start: 59,
+                            end: 66,
+                        },
+                    },
+                    data_type: Int,
+                    nullable: None,
+                    primary_key: false,
+                    default: None,
+                    identity: None,
+                    collation: None,
+                    checks: [],
+                    foreign_keys: [
+                        ForeignKey {
+                            name: None,
+                            columns: [
+                                Name {
+                                    value: "cust_id",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 59,
+                                        end: 66,
+                                    },
+                                },
+                            ],
+                            parent: Name {
+                                value: "customers",
+                                quoted: false,
+                                span: Span {
+                                    start: 82,
+                                    end: 91,
+                                },
+                            },
+                            parent_columns: [],
+                            span: Span {
+                                start: 71,
+                                end: 91,
+                            },
+                        },
+                    ],
+                    span: Span {
+                        start: 59,
+                        end: 91,
+                    },
+                },
+                ColumnDef {
+                    name: Name {
+                        value: "prod_id",
+                        quoted: false,
+                        span: Span {
+                            start: 97,
+                            end: 104,
+                        },
+                    },
+                    data_type: Int,
+                    nullable: None,
+                    primary_key: false,
+                    default: None,
+                    identity: None,
+                    collation: None,
+                    checks: [],
+                    foreign_keys: [
+                        ForeignKey {
+                            name: Some(
+                                Name {
+                                    value: "fk_prod",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 120,
+                                        end: 127,
+                                    },
+                                },
+                            ),
+                            columns: [
+                                Name {
+                                    value: "prod_id",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 97,
+                                        end: 104,
+                                    },
+                                },
+                            ],
+                            parent: Name {
+                                value: "products",
+                                quoted: false,
+                                span: Span {
+                                    start: 139,
+                                    end: 147,
+                                },
+                            },
+                            parent_columns: [
+                                Name {
+                                    value: "id",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 149,
+                                        end: 151,
+                                    },
+                                },
+                            ],
+                            span: Span {
+                                start: 128,
+                                end: 151,
+                            },
+                        },
+                    ],
+                    span: Span {
+                        start: 97,
+                        end: 151,
+                    },
+                },
+            ],
+            primary_key: [
+                Name {
+                    value: "id",
+                    quoted: false,
+                    span: Span {
+                        start: 26,
+                        end: 28,
+                    },
+                },
+            ],
+            check_constraints: [],
+            foreign_keys: [
+                ForeignKey {
+                    name: Some(
+                        Name {
+                            value: "fk_cust",
+                            quoted: false,
+                            span: Span {
+                                start: 169,
+                                end: 176,
+                            },
+                        },
+                    ),
+                    columns: [
+                        Name {
+                            value: "cust_id",
+                            quoted: false,
+                            span: Span {
+                                start: 190,
+                                end: 197,
+                            },
+                        },
+                    ],
+                    parent: Name {
+                        value: "customers",
+                        quoted: false,
+                        span: Span {
+                            start: 210,
+                            end: 219,
+                        },
+                    },
+                    parent_columns: [
+                        Name {
+                            value: "id",
+                            quoted: false,
+                            span: Span {
+                                start: 221,
+                                end: 223,
+                            },
+                        },
+                    ],
+                    span: Span {
+                        start: 177,
+                        end: 223,
+                    },
+                },
+            ],
+            span: Span {
+                start: 0,
+                end: 226,
+            },
+        },
+    ),
+    AlterTable(
+        AlterTable {
+            table: Name {
+                value: "orders",
+                quoted: false,
+                span: Span {
+                    start: 240,
+                    end: 246,
+                },
+            },
+            action: AddForeignKey(
+                ForeignKey {
+                    name: Some(
+                        Name {
+                            value: "fk2",
+                            quoted: false,
+                            span: Span {
+                                start: 262,
+                                end: 265,
+                            },
+                        },
+                    ),
+                    columns: [
+                        Name {
+                            value: "prod_id",
+                            quoted: false,
+                            span: Span {
+                                start: 279,
+                                end: 286,
+                            },
+                        },
+                    ],
+                    parent: Name {
+                        value: "products",
+                        quoted: false,
+                        span: Span {
+                            start: 299,
+                            end: 307,
+                        },
+                    },
+                    parent_columns: [
+                        Name {
+                            value: "id",
+                            quoted: false,
+                            span: Span {
+                                start: 309,
+                                end: 311,
+                            },
+                        },
+                    ],
+                    span: Span {
+                        start: 266,
+                        end: 311,
+                    },
+                },
+            ),
+            span: Span {
+                start: 228,
+                end: 311,
+            },
+        },
+    ),
+    AlterTable(
+        AlterTable {
+            table: Name {
+                value: "orders",
+                quoted: false,
+                span: Span {
+                    start: 326,
+                    end: 332,
+                },
+            },
+            action: AddForeignKey(
+                ForeignKey {
+                    name: None,
+                    columns: [
+                        Name {
+                            value: "cust_id",
+                            quoted: false,
+                            span: Span {
+                                start: 350,
+                                end: 357,
+                            },
+                        },
+                    ],
+                    parent: Name {
+                        value: "customers",
+                        quoted: false,
+                        span: Span {
+                            start: 370,
+                            end: 379,
+                        },
+                    },
+                    parent_columns: [],
+                    span: Span {
+                        start: 337,
+                        end: 379,
+                    },
+                },
+            ),
+            span: Span {
+                start: 314,
+                end: 379,
+            },
+        },
+    ),
+]

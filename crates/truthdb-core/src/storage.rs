@@ -203,6 +203,7 @@ impl Storage {
 
     /// Creates a table: with `key_names` it becomes a clustered B+ tree on
     /// those columns, without it a heap.
+    #[allow(clippy::too_many_arguments)]
     pub fn rel_create_table(
         &mut self,
         name: &str,
@@ -211,6 +212,7 @@ impl Storage {
         defaults: Vec<Option<String>>,
         identity: Option<catalog::IdentitySpec>,
         check_constraints: Vec<catalog::CheckDef>,
+        foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
         self.file.ensure_rel_usable()?;
         if self.file.rel.tables.contains_key(name) {
@@ -276,6 +278,7 @@ impl Storage {
                 identity,
                 indexes: Vec::new(),
                 check_constraints,
+                foreign_keys,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
@@ -1043,6 +1046,35 @@ impl Storage {
             .cloned()
             .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{name}'")))?;
         def.check_constraints = check_constraints;
+        let catalog_root = self
+            .file
+            .rel
+            .catalog_root
+            .ok_or_else(|| StorageError::InvalidConfig("catalog root missing".to_string()))?;
+        let persisted = def.clone();
+        self.file.rel_statement(move |ctx, txn| {
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &persisted)
+        })?;
+        self.file.rel.tables.insert(name.to_string(), def);
+        Ok(())
+    }
+
+    /// Replaces a table's FOREIGN KEY constraints (ALTER TABLE ADD/DROP
+    /// CONSTRAINT) and persists the mutated catalog row.
+    pub(crate) fn rel_set_foreign_keys(
+        &mut self,
+        name: &str,
+        foreign_keys: Vec<catalog::ForeignKeyDef>,
+    ) -> Result<(), StorageError> {
+        self.file.ensure_rel_usable()?;
+        let mut def = self
+            .file
+            .rel
+            .tables
+            .get(name)
+            .cloned()
+            .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{name}'")))?;
+        def.foreign_keys = foreign_keys;
         let catalog_root = self
             .file
             .rel

@@ -81,6 +81,7 @@ fn create_tree_table(storage: &mut Storage, name: &str) {
             Vec::new(),
             None,
             Vec::new(),
+            Vec::new(),
         )
         .expect("create tree table");
 }
@@ -93,6 +94,7 @@ fn create_heap_table(storage: &mut Storage, name: &str) {
             &[],
             Vec::new(),
             None,
+            Vec::new(),
             Vec::new(),
         )
         .expect("create heap table");
@@ -619,6 +621,7 @@ fn heap_update_on_stub_starved_page_fails_cleanly() {
             &[],
             Vec::new(),
             None,
+            Vec::new(),
             Vec::new(),
         )
         .expect("create heap");

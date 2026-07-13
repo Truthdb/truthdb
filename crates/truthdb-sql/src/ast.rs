@@ -44,6 +44,8 @@ pub struct AlterTable {
 pub enum AlterAction {
     /// `ADD [CONSTRAINT name] CHECK (expr)`.
     AddCheck(CheckConstraint),
+    /// `ADD [CONSTRAINT name] FOREIGN KEY (...) REFERENCES ...`.
+    AddForeignKey(ForeignKey),
     /// `DROP CONSTRAINT <name>`.
     DropConstraint(Name),
 }
@@ -99,6 +101,8 @@ pub struct CreateTable {
     pub primary_key: Vec<Name>,
     /// Table-level `[CONSTRAINT name] CHECK (expr)` constraints.
     pub check_constraints: Vec<CheckConstraint>,
+    /// Table-level `[CONSTRAINT name] FOREIGN KEY (...) REFERENCES ...`.
+    pub foreign_keys: Vec<ForeignKey>,
     pub span: Span,
 }
 
@@ -109,6 +113,19 @@ pub struct CreateTable {
 pub struct CheckConstraint {
     pub name: Option<Name>,
     pub predicate: String,
+    pub span: Span,
+}
+
+/// A `[CONSTRAINT name] FOREIGN KEY (cols) REFERENCES parent [(pcols)]`
+/// constraint. A column-level `col ... REFERENCES parent [(pcol)]` desugars to
+/// a single-column foreign key. `parent_columns` empty means "the parent's
+/// primary key".
+#[derive(Debug, Clone, PartialEq)]
+pub struct ForeignKey {
+    pub name: Option<Name>,
+    pub columns: Vec<Name>,
+    pub parent: Name,
+    pub parent_columns: Vec<Name>,
     pub span: Span,
 }
 
@@ -127,6 +144,8 @@ pub struct ColumnDef {
     pub collation: Option<String>,
     /// Column-level `[CONSTRAINT name] CHECK (expr)` constraints.
     pub checks: Vec<CheckConstraint>,
+    /// Column-level `[CONSTRAINT name] REFERENCES parent [(pcol)]` foreign keys.
+    pub foreign_keys: Vec<ForeignKey>,
     pub span: Span,
 }
 
