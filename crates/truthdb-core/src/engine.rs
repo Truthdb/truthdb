@@ -1885,6 +1885,306 @@ mod tests {
     }
 
     #[test]
+    fn sql_foreign_key_child_and_parent_enforcement() {
+        let path = unique_temp_path("sql-fk");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE parent (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))")
+            .expect("parent");
+        engine
+            .execute(
+                "CREATE TABLE child (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES parent (id))",
+            )
+            .expect("child");
+        engine
+            .execute("INSERT INTO parent VALUES (1, 'a'), (2, 'b')")
+            .expect("seed parent");
+
+        // Child side: a referenced parent must exist; NULL skips enforcement.
+        engine
+            .execute("INSERT INTO child VALUES (10, 1)")
+            .expect("child -> parent 1");
+        engine
+            .execute("INSERT INTO child VALUES (11, NULL)")
+            .expect("NULL fk allowed");
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO child VALUES (12, 99)"),
+            547
+        );
+
+        // Parent side (DELETE, NO ACTION): a referenced parent cannot be deleted.
+        assert_eq!(
+            sql_error_number(&mut engine, "DELETE FROM parent WHERE id = 1"),
+            547
+        );
+        engine
+            .execute("DELETE FROM parent WHERE id = 2")
+            .expect("unreferenced parent deletes");
+
+        // Parent side (UPDATE of the PK): cannot vacate a referenced key; a
+        // non-key update is fine.
+        assert_eq!(
+            sql_error_number(&mut engine, "UPDATE parent SET id = 5 WHERE id = 1"),
+            547
+        );
+        engine
+            .execute("UPDATE parent SET name = 'z' WHERE id = 1")
+            .expect("non-key parent update");
+
+        // Child UPDATE re-checks the new value.
+        assert_eq!(
+            sql_error_number(&mut engine, "UPDATE child SET pid = 42 WHERE id = 10"),
+            547
+        );
+        engine
+            .execute("UPDATE child SET pid = NULL WHERE id = 10")
+            .expect("child update to NULL");
+        // With no child referencing parent 1, it can now be deleted.
+        engine
+            .execute("DELETE FROM parent WHERE id = 1")
+            .expect("now-unreferenced parent deletes");
+
+        // The constraint is enforced again after a restart.
+        drop(engine);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("engine");
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO child VALUES (20, 7)"),
+            547
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_foreign_key_self_reference() {
+        let path = unique_temp_path("sql-fk-self");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE emp (id INT NOT NULL PRIMARY KEY, mgr INT REFERENCES emp (id))")
+            .expect("emp");
+        // A root has a NULL manager; a subordinate references an existing row.
+        engine
+            .execute("INSERT INTO emp VALUES (1, NULL)")
+            .expect("root");
+        engine
+            .execute("INSERT INTO emp VALUES (2, 1)")
+            .expect("sub");
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO emp VALUES (3, 99)"),
+            547
+        );
+        // A batch may reference a sibling row inserted in the same statement
+        // (row 4 references 5, which is created alongside it).
+        engine
+            .execute("INSERT INTO emp VALUES (4, 5), (5, 1)")
+            .expect("self-ref batch");
+        // A referenced row cannot be deleted while a subordinate remains.
+        assert_eq!(
+            sql_error_number(&mut engine, "DELETE FROM emp WHERE id = 1"),
+            547
+        );
+
+        // A primary-key change that would orphan a self-reference is rejected
+        // (row 4 references row 5, so changing id 5 dangles mgr=5). This must be
+        // validated against the post-update state, not the stale pre-update row.
+        assert_eq!(
+            sql_error_number(&mut engine, "UPDATE emp SET id = 50 WHERE id = 5"),
+            547
+        );
+        // A primary-key change with no dependents is allowed (nothing points at
+        // row 2, and its own mgr=1 still exists).
+        engine
+            .execute("UPDATE emp SET id = 6 WHERE id = 2")
+            .expect("unreferenced self-ref pk change");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_constraint_name_unique_across_kinds() {
+        let path = unique_temp_path("sql-constraint-names");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
+            .expect("p");
+        // A CHECK and a FOREIGN KEY cannot share a name within one CREATE.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "CREATE TABLE c (x INT, CONSTRAINT dup CHECK (x > 0), \
+                   CONSTRAINT dup FOREIGN KEY (x) REFERENCES p (id))",
+            ),
+            2714
+        );
+        // Nor across ALTER, in either order.
+        engine.execute("CREATE TABLE c (x INT)").expect("c");
+        engine
+            .execute("ALTER TABLE c ADD CONSTRAINT dup CHECK (x > 0)")
+            .expect("add check");
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "ALTER TABLE c ADD CONSTRAINT dup FOREIGN KEY (x) REFERENCES p (id)",
+            ),
+            2714
+        );
+        engine
+            .execute("ALTER TABLE c ADD CONSTRAINT fk1 FOREIGN KEY (x) REFERENCES p (id)")
+            .expect("add fk");
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "ALTER TABLE c ADD CONSTRAINT fk1 CHECK (x < 100)"
+            ),
+            2714
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_foreign_key_alter_drop_and_catalog() {
+        let path = unique_temp_path("sql-fk-alter");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
+            .expect("p");
+        engine
+            .execute("CREATE TABLE c (id INT NOT NULL PRIMARY KEY, pid INT)")
+            .expect("c");
+        engine.execute("INSERT INTO p VALUES (1)").expect("seed p");
+        // Row 11 references a missing parent (no FK yet, so it is allowed).
+        engine
+            .execute("INSERT INTO c VALUES (10, 1), (11, 99)")
+            .expect("seed c");
+
+        // ADD FOREIGN KEY validates existing rows: row 11 orphans -> 547.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p (id)",
+            ),
+            547
+        );
+        // Fix the orphan, then the constraint is added and enforced.
+        engine
+            .execute("UPDATE c SET pid = 1 WHERE id = 11")
+            .expect("fix orphan");
+        engine
+            .execute("ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p (id)")
+            .expect("add fk");
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO c VALUES (12, 77)"),
+            547
+        );
+
+        // sys.foreign_keys lists it, referencing p.
+        let p_oid = table_object_id(&mut engine, "p");
+        let (cols, rows) = sql_rows(
+            &mut engine,
+            "SELECT name, referenced_object_id FROM sys.foreign_keys",
+        );
+        assert_eq!(cols, vec!["name", "referenced_object_id"]);
+        assert_eq!(rows, vec![vec![Some("fk".into()), Some(p_oid.to_string())]]);
+
+        // A referenced parent cannot be dropped.
+        assert_eq!(sql_error_number(&mut engine, "DROP TABLE p"), 3726);
+
+        // DROP CONSTRAINT removes enforcement; the FK survives a restart until
+        // then. Confirm durability first.
+        drop(engine);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("engine");
+        assert_eq!(
+            sql_error_number(&mut engine, "INSERT INTO c VALUES (13, 55)"),
+            547
+        );
+        engine
+            .execute("ALTER TABLE c DROP CONSTRAINT fk")
+            .expect("drop fk");
+        engine
+            .execute("INSERT INTO c VALUES (14, 55)")
+            .expect("insert allowed after drop");
+        // Now p can be dropped.
+        engine.execute("DROP TABLE p").expect("drop unref parent");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_foreign_key_validation_errors() {
+        let path = unique_temp_path("sql-fk-invalid");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY, other INT)")
+            .expect("p");
+        engine
+            .execute("CREATE TABLE bignum (id BIGINT NOT NULL PRIMARY KEY)")
+            .expect("bignum");
+        // Referencing a non-primary-key column of the parent.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "CREATE TABLE r1 (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES p (other))",
+            ),
+            1776
+        );
+        // Type mismatch between child (INT) and parent PK (BIGINT).
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "CREATE TABLE r2 (id INT NOT NULL PRIMARY KEY, bid INT REFERENCES bignum (id))",
+            ),
+            1778
+        );
+        // Referencing a table that does not exist.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "CREATE TABLE r3 (id INT NOT NULL PRIMARY KEY, x INT REFERENCES nope (id))",
+            ),
+            208
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn foreign_key_insert_locks_parent_shared() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("fk-locks");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
+            .expect("p");
+        engine
+            .execute("CREATE TABLE c (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES p (id))")
+            .expect("c");
+        let p = table_object_id(&mut engine, "p");
+        let c = table_object_id(&mut engine, "c");
+
+        // INSERT into the child reads the parent, so it must take a Shared lock
+        // on the parent (else it could read an uncommitted parent row).
+        let locks = engine.analyze_locks("INSERT INTO c VALUES (1, 1)", Isolation::ReadCommitted);
+        assert!(
+            locks.contains(&(Resource::Table(c), LockMode::Exclusive)),
+            "child Exclusive: {locks:?}"
+        );
+        assert!(
+            locks.contains(&(Resource::Table(p), LockMode::Shared)),
+            "parent Shared: {locks:?}"
+        );
+        // DELETE of the parent reads the child (NO ACTION check) -> child Shared.
+        let del = engine.analyze_locks("DELETE FROM p WHERE id = 1", Isolation::ReadCommitted);
+        assert!(
+            del.contains(&(Resource::Table(p), LockMode::Exclusive)),
+            "parent Exclusive: {del:?}"
+        );
+        assert!(
+            del.contains(&(Resource::Table(c), LockMode::Shared)),
+            "child Shared: {del:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_decimal_arithmetic_and_rendering() {
         let path = unique_temp_path("sql-decimal");
         let mut engine = new_engine(&path);

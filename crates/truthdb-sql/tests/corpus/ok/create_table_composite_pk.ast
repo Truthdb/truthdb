@@ -28,6 +28,7 @@
                     identity: None,
                     collation: None,
                     checks: [],
+                    foreign_keys: [],
                     span: Span {
                         start: 31,
                         end: 52,
@@ -51,6 +52,7 @@
                     identity: None,
                     collation: None,
                     checks: [],
+                    foreign_keys: [],
                     span: Span {
                         start: 58,
                         end: 83,
@@ -72,6 +74,7 @@
                     identity: None,
                     collation: None,
                     checks: [],
+                    foreign_keys: [],
                     span: Span {
                         start: 89,
                         end: 96,
@@ -97,6 +100,7 @@
                 },
             ],
             check_constraints: [],
+            foreign_keys: [],
             span: Span {
                 start: 0,
                 end: 135,

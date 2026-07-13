@@ -56,6 +56,19 @@ pub struct CheckDef {
     pub predicate: String,
 }
 
+/// A `FOREIGN KEY` constraint (NO ACTION). Referenced columns are always the
+/// parent's primary key, so only the child columns are stored — ordered to
+/// match the parent's primary-key column order, so a child row's key can be
+/// probed against the parent directly.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForeignKeyDef {
+    pub name: String,
+    /// Child column indices, in parent primary-key order.
+    pub columns: Vec<usize>,
+    /// Referenced parent table (bare name).
+    pub parent: String,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TableDef {
     pub object_id: u32,
@@ -81,6 +94,9 @@ pub struct TableDef {
     /// `CHECK` constraints enforced on INSERT/UPDATE.
     #[serde(default)]
     pub check_constraints: Vec<CheckDef>,
+    /// `FOREIGN KEY` constraints (this table is the referencing child).
+    #[serde(default)]
+    pub foreign_keys: Vec<ForeignKeyDef>,
 }
 
 impl TableDef {

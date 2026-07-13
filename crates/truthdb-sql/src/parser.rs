@@ -335,6 +335,7 @@ impl Parser {
         let mut columns = Vec::new();
         let mut primary_key: Vec<Name> = Vec::new();
         let mut check_constraints: Vec<CheckConstraint> = Vec::new();
+        let mut foreign_keys: Vec<ForeignKey> = Vec::new();
         loop {
             // A leading `CONSTRAINT name` introduces a named table constraint.
             let constraint_name = self.parse_optional_constraint_name()?;
@@ -359,6 +360,9 @@ impl Parser {
                 }
                 Some("CHECK") => {
                     check_constraints.push(self.parse_check_constraint(constraint_name)?);
+                }
+                Some("FOREIGN") => {
+                    foreign_keys.push(self.parse_foreign_key(constraint_name)?);
                 }
                 _ if constraint_name.is_some() => {
                     // `CONSTRAINT name` must be followed by a table constraint.
@@ -389,6 +393,7 @@ impl Parser {
             columns,
             primary_key,
             check_constraints,
+            foreign_keys,
             span: start.to(end),
         }))
     }
@@ -425,6 +430,69 @@ impl Parser {
         })
     }
 
+    /// Parses `FOREIGN KEY (cols) REFERENCES parent [(pcols)]` (the
+    /// `CONSTRAINT name` prefix, if any, is already consumed).
+    fn parse_foreign_key(&mut self, name: Option<Name>) -> SqlResult<ForeignKey> {
+        let start = self.expect_keyword("FOREIGN")?;
+        self.expect_keyword("KEY")?;
+        let columns = self.parse_name_list()?;
+        self.expect_keyword("REFERENCES")?;
+        let parent = self.parse_name()?;
+        let (parent_columns, end) = self.parse_optional_reference_columns(parent.span)?;
+        Ok(ForeignKey {
+            name,
+            columns,
+            parent,
+            parent_columns,
+            span: start.to(end),
+        })
+    }
+
+    /// Parses a column-level `REFERENCES parent [(pcol)]` into a single-column
+    /// foreign key over `column`.
+    fn parse_column_reference(
+        &mut self,
+        name: Option<Name>,
+        column: &Name,
+    ) -> SqlResult<ForeignKey> {
+        let start = self.expect_keyword("REFERENCES")?;
+        let parent = self.parse_name()?;
+        let (parent_columns, end) = self.parse_optional_reference_columns(parent.span)?;
+        Ok(ForeignKey {
+            name,
+            columns: vec![column.clone()],
+            parent,
+            parent_columns,
+            span: start.to(end),
+        })
+    }
+
+    /// Parses a parenthesized comma-separated name list.
+    fn parse_name_list(&mut self) -> SqlResult<Vec<Name>> {
+        self.expect(&TokenKind::LParen)?;
+        let mut names = Vec::new();
+        loop {
+            names.push(self.parse_name()?);
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok(names)
+    }
+
+    /// Parses an optional `(cols)` after `REFERENCES parent`; absent means the
+    /// parent's primary key. Returns the columns and the end span.
+    fn parse_optional_reference_columns(&mut self, fallback: Span) -> SqlResult<(Vec<Name>, Span)> {
+        if self.check(&TokenKind::LParen) {
+            let cols = self.parse_name_list()?;
+            let end = cols.last().map(|n| n.span).unwrap_or(fallback);
+            Ok((cols, end))
+        } else {
+            Ok((Vec::new(), fallback))
+        }
+    }
+
     fn parse_column_def(&mut self) -> SqlResult<ColumnDef> {
         let name = self.parse_name()?;
         let (data_type, type_span) = self.parse_data_type()?;
@@ -434,6 +502,7 @@ impl Parser {
         let mut identity = None;
         let mut collation = None;
         let mut checks = Vec::new();
+        let mut foreign_keys = Vec::new();
         let mut end = type_span;
         loop {
             match self.peek_keyword().as_deref() {
@@ -442,11 +511,23 @@ impl Parser {
                     end = check.span;
                     checks.push(check);
                 }
+                Some("REFERENCES") => {
+                    let fk = self.parse_column_reference(None, &name)?;
+                    end = fk.span;
+                    foreign_keys.push(fk);
+                }
                 Some("CONSTRAINT") => {
                     let constraint_name = self.parse_optional_constraint_name()?;
-                    let check = self.parse_check_constraint(constraint_name)?;
-                    end = check.span;
-                    checks.push(check);
+                    // A named column constraint is CHECK or REFERENCES.
+                    if self.peek_keyword().as_deref() == Some("REFERENCES") {
+                        let fk = self.parse_column_reference(constraint_name, &name)?;
+                        end = fk.span;
+                        foreign_keys.push(fk);
+                    } else {
+                        let check = self.parse_check_constraint(constraint_name)?;
+                        end = check.span;
+                        checks.push(check);
+                    }
                 }
                 Some("NOT") => {
                     self.bump();
@@ -497,6 +578,7 @@ impl Parser {
             identity,
             collation,
             checks,
+            foreign_keys,
         })
     }
 
@@ -610,12 +692,18 @@ impl Parser {
         let (action, end) = match self.peek_keyword().as_deref() {
             Some("ADD") => {
                 self.bump();
-                // Stage 10 part 2: only `ADD [CONSTRAINT name] CHECK (expr)`.
-                // ADD column arrives in a later part.
+                // `ADD [CONSTRAINT name] (CHECK | FOREIGN KEY ...)`. ADD column
+                // arrives in a later part.
                 let name = self.parse_optional_constraint_name()?;
-                let check = self.parse_check_constraint(name)?;
-                let end = check.span;
-                (AlterAction::AddCheck(check), end)
+                if self.peek_keyword().as_deref() == Some("FOREIGN") {
+                    let fk = self.parse_foreign_key(name)?;
+                    let end = fk.span;
+                    (AlterAction::AddForeignKey(fk), end)
+                } else {
+                    let check = self.parse_check_constraint(name)?;
+                    let end = check.span;
+                    (AlterAction::AddCheck(check), end)
+                }
             }
             Some("DROP") => {
                 self.bump();

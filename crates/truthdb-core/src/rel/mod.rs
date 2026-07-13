@@ -14,8 +14,8 @@ mod value;
 
 use truthdb_sql::ast::{
     AlterAction, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable, DataType,
-    Delete, DropIndex, DropTable, Expr, ExprKind, Insert, InsertSource, IsolationLevel, JoinKind,
-    Name, OrderItem, Select, SelectItem, SetStatement, Statement, TableRef, Update,
+    Delete, DropIndex, DropTable, Expr, ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel,
+    JoinKind, Name, OrderItem, Select, SelectItem, SetStatement, Statement, TableRef, Update,
 };
 use truthdb_sql::error::SqlError;
 use truthdb_sql::eval::EvalContext;
@@ -163,6 +163,28 @@ pub fn execute_batch(storage: &mut Storage, sql: &str, txn_ctx: &mut TxnContext)
 /// A parse error yields no locks — execution re-parses and surfaces it.
 /// `sys.*` views and unresolved tables take no lock (catalog reads are
 /// unlocked; missing tables error at execution).
+/// Object ids of the parent tables a table's foreign keys reference.
+fn fk_parent_object_ids(storage: &Storage, def: &TableDef) -> Vec<u32> {
+    def.foreign_keys
+        .iter()
+        .filter_map(|fk| resolve_table(storage, &fk.parent).map(|p| p.object_id))
+        .collect()
+}
+
+/// Object ids of the tables whose foreign keys reference `parent_name`.
+fn fk_child_object_ids(storage: &Storage, parent_name: &str) -> Vec<u32> {
+    storage
+        .rel_tables()
+        .into_iter()
+        .filter(|t| {
+            t.foreign_keys
+                .iter()
+                .any(|fk| fk.parent.eq_ignore_ascii_case(parent_name))
+        })
+        .map(|t| t.object_id)
+        .collect()
+}
+
 pub fn analyze_locks(
     storage: &Storage,
     sql: &str,
@@ -216,6 +238,11 @@ pub fn analyze_locks(
                 if let Some(def) = resolve_table(storage, &insert.table.value) {
                     add(Resource::Database, LockMode::IntentExclusive);
                     add(Resource::Table(def.object_id), LockMode::Exclusive);
+                    // A child INSERT reads its FK parents (integrity read).
+                    for oid in fk_parent_object_ids(storage, &def) {
+                        add(Resource::Database, LockMode::IntentShared);
+                        add(Resource::Table(oid), LockMode::Shared);
+                    }
                 }
                 // INSERT ... SELECT also reads its source tables; lock them
                 // like a SELECT so it cannot read another txn's uncommitted
@@ -237,10 +264,31 @@ pub fn analyze_locks(
                     }
                 }
             }
-            Statement::Update(Update { table, .. }) | Statement::Delete(Delete { table, .. }) => {
+            Statement::Update(Update { table, .. }) => {
                 if let Some(def) = resolve_table(storage, &table.value) {
                     add(Resource::Database, LockMode::IntentExclusive);
                     add(Resource::Table(def.object_id), LockMode::Exclusive);
+                    // UPDATE reads FK parents (new values) and referencing
+                    // children (a changed PK must not orphan them).
+                    for oid in fk_parent_object_ids(storage, &def) {
+                        add(Resource::Database, LockMode::IntentShared);
+                        add(Resource::Table(oid), LockMode::Shared);
+                    }
+                    for oid in fk_child_object_ids(storage, &def.name) {
+                        add(Resource::Database, LockMode::IntentShared);
+                        add(Resource::Table(oid), LockMode::Shared);
+                    }
+                }
+            }
+            Statement::Delete(Delete { table, .. }) => {
+                if let Some(def) = resolve_table(storage, &table.value) {
+                    add(Resource::Database, LockMode::IntentExclusive);
+                    add(Resource::Table(def.object_id), LockMode::Exclusive);
+                    // DELETE reads referencing children (NO ACTION check).
+                    for oid in fk_child_object_ids(storage, &def.name) {
+                        add(Resource::Database, LockMode::IntentShared);
+                        add(Resource::Table(oid), LockMode::Shared);
+                    }
                 }
             }
             // DDL serializes against every active transaction via a
@@ -620,6 +668,11 @@ fn exec_create_table(
     // CHECK constraints (column-level + table-level): validate, name, and
     // fold into the catalog. Validation needs the bound columns.
     let check_constraints = build_check_defs(create, &columns, table_name)?;
+    // FOREIGN KEY constraints: validate against the (possibly self-)referenced
+    // table's primary key and order each child column to the parent's PK.
+    // Constraint names are unique across kinds, so seed with the check names.
+    let check_names: Vec<String> = check_constraints.iter().map(|c| c.name.clone()).collect();
+    let foreign_keys = build_foreign_key_defs(storage, create, &columns, table_name, &check_names)?;
 
     storage
         .rel_create_table(
@@ -629,9 +682,200 @@ fn exec_create_table(
             defaults,
             identity,
             check_constraints,
+            foreign_keys,
         )
         .map_err(|err| map_storage_err(err, table_name))?;
     Ok(StatementResult::Done)
+}
+
+/// Collects and validates a table's FOREIGN KEY constraints (column-level, then
+/// table-level), assigning a name to unnamed ones. `check_names` are the names
+/// already taken by the table's CHECK constraints so a FK cannot reuse one
+/// (constraint names are unique across kinds).
+fn build_foreign_key_defs(
+    storage: &Storage,
+    create: &CreateTable,
+    columns: &[Column],
+    table_name: &str,
+    check_names: &[String],
+) -> Result<Vec<catalog::ForeignKeyDef>, SqlError> {
+    let raw = create
+        .columns
+        .iter()
+        .flat_map(|c| c.foreign_keys.iter())
+        .chain(create.foreign_keys.iter());
+
+    // The parent's primary key (name, type) per PK column, in PK order. A
+    // self-reference reads it from this CREATE; otherwise from the catalog.
+    let self_pk = || -> Result<Vec<(String, ColumnType)>, SqlError> {
+        create
+            .primary_key
+            .iter()
+            .map(|k| {
+                let col = columns
+                    .iter()
+                    .find(|c| c.name.eq_ignore_ascii_case(&k.value))
+                    .expect("primary key column bound");
+                Ok((col.name.clone(), col.column_type))
+            })
+            .collect()
+    };
+
+    let mut names: Vec<String> = check_names.to_vec();
+    let mut defs = Vec::new();
+    for fk in raw {
+        let parent_bare = strip_schema(&fk.parent.value);
+        let is_self = parent_bare.eq_ignore_ascii_case(table_name);
+        // Parent primary key: (column name, type) in PK order.
+        let parent_pk: Vec<(String, ColumnType)> = if is_self {
+            self_pk()?
+        } else {
+            let parent = resolve_table(storage, &fk.parent.value)
+                .ok_or_else(|| SqlError::invalid_object(&fk.parent.value).at(fk.parent.span))?;
+            let schema = parent
+                .schema()
+                .map_err(|e| map_storage_err(e, &parent.name))?;
+            parent
+                .key_columns
+                .iter()
+                .map(|&i| {
+                    (
+                        schema.columns[i].name.clone(),
+                        schema.columns[i].column_type,
+                    )
+                })
+                .collect()
+        };
+        let def = bind_foreign_key(fk, columns, table_name, &parent_pk, parent_bare, &names)?;
+        names.push(def.name.clone());
+        defs.push(def);
+    }
+    Ok(defs)
+}
+
+/// Validates one FOREIGN KEY against the parent's primary key and produces a
+/// [`catalog::ForeignKeyDef`] whose child column indices are ordered to match
+/// the parent's PK. Referenced columns must be exactly the parent PK (SQL
+/// Server requires a unique/PK target); child and parent column types and
+/// counts must match.
+fn bind_foreign_key(
+    fk: &ForeignKey,
+    columns: &[Column],
+    table_name: &str,
+    parent_pk: &[(String, ColumnType)],
+    parent_bare: &str,
+    existing_names: &[String],
+) -> Result<catalog::ForeignKeyDef, SqlError> {
+    let no_key = || {
+        SqlError::new(
+            1776,
+            16,
+            0,
+            format!(
+                "There are no primary or candidate keys in the referenced table '{parent_bare}' that match the referencing column list in the foreign key."
+            ),
+        )
+        .at(fk.parent.span)
+    };
+    if parent_pk.is_empty() {
+        return Err(no_key());
+    }
+    // Referenced parent columns (defaulting to the whole PK) paired with the
+    // child columns positionally.
+    let parent_cols: Vec<String> = if fk.parent_columns.is_empty() {
+        parent_pk.iter().map(|(n, _)| n.clone()).collect()
+    } else {
+        fk.parent_columns.iter().map(|n| n.value.clone()).collect()
+    };
+    if fk.columns.len() != parent_cols.len() {
+        return Err(SqlError::new(
+            1776,
+            16,
+            0,
+            "The number of referencing columns differs from the number of referenced columns.",
+        )
+        .at(fk.span));
+    }
+    // The referenced set must be exactly the parent PK (order-independent).
+    if parent_cols.len() != parent_pk.len()
+        || !parent_pk
+            .iter()
+            .all(|(pk, _)| parent_cols.iter().any(|c| c.eq_ignore_ascii_case(pk)))
+    {
+        return Err(no_key());
+    }
+
+    // Resolve child column indices and check each child/parent type matches.
+    let child_index = |name: &Name| -> Result<usize, SqlError> {
+        columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&name.value))
+            .ok_or_else(|| SqlError::invalid_column(&name.value).at(name.span))
+    };
+    // For each parent PK column (in PK order), find the child column mapped to
+    // it and record its index — so the stored order matches the parent PK.
+    let mut ordered = Vec::with_capacity(parent_pk.len());
+    for (pk_name, pk_type) in parent_pk {
+        // Which referenced position names this PK column?
+        let pos = parent_cols
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(pk_name))
+            .ok_or_else(no_key)?;
+        let child_col = &fk.columns[pos];
+        let idx = child_index(child_col)?;
+        if columns[idx].column_type != *pk_type {
+            return Err(SqlError::new(
+                1778,
+                16,
+                0,
+                format!(
+                    "Column '{table_name}.{}' is not the same data type as referencing column '{parent_bare}.{pk_name}' in the foreign key.",
+                    columns[idx].name
+                ),
+            )
+            .at(child_col.span));
+        }
+        ordered.push(idx);
+    }
+
+    let name = match &fk.name {
+        Some(n) => {
+            if existing_names
+                .iter()
+                .any(|e| e.eq_ignore_ascii_case(&n.value))
+            {
+                return Err(SqlError::new(
+                    2714,
+                    16,
+                    5,
+                    format!(
+                        "There is already an object named '{}' in the database.",
+                        n.value
+                    ),
+                )
+                .at(n.span));
+            }
+            n.value.clone()
+        }
+        None => {
+            let mut seq = 0u32;
+            loop {
+                seq += 1;
+                let candidate = format!("FK__{table_name}__{parent_bare}__{seq}");
+                if !existing_names
+                    .iter()
+                    .any(|e| e.eq_ignore_ascii_case(&candidate))
+                {
+                    break candidate;
+                }
+            }
+        }
+    };
+    Ok(catalog::ForeignKeyDef {
+        name,
+        columns: ordered,
+        parent: parent_bare.to_string(),
+    })
 }
 
 /// Collects a table's CHECK constraints (column-level, then table-level) and
@@ -842,6 +1086,154 @@ fn enforce_checks(
     Ok(())
 }
 
+/// A child row's referencing key for one foreign key (the FK columns in parent
+/// primary-key order). `None` if any FK column is NULL — MATCH SIMPLE, which
+/// skips enforcement (the NULL-FK trap).
+fn fk_key(fk: &catalog::ForeignKeyDef, row: &[Datum]) -> Option<Vec<Datum>> {
+    let key: Vec<Datum> = fk.columns.iter().map(|&i| row[i].clone()).collect();
+    if key.iter().any(|d| matches!(d, Datum::Null)) {
+        None
+    } else {
+        Some(key)
+    }
+}
+
+/// Whether a referencing `key` (parent PK order) exists in the parent — either
+/// a committed parent row, or, for a self-reference, a sibling row in `batch`
+/// (whose PK columns are `child.key_columns`).
+fn fk_parent_exists(
+    storage: &mut Storage,
+    fk: &catalog::ForeignKeyDef,
+    key: &[Datum],
+    child: &TableDef,
+    batch: &[Vec<Datum>],
+) -> Result<bool, SqlError> {
+    if storage
+        .rel_get(&fk.parent, key)
+        .map_err(|e| map_storage_err(e, &fk.parent))?
+        .is_some()
+    {
+        return Ok(true);
+    }
+    if fk.parent.eq_ignore_ascii_case(&child.name) && child.key_columns.len() == key.len() {
+        return Ok(batch
+            .iter()
+            .any(|r| child.key_columns.iter().zip(key).all(|(&i, k)| &r[i] == k)));
+    }
+    Ok(false)
+}
+
+fn fk_child_violation(name: &str, verb: &str, parent: &str) -> SqlError {
+    SqlError::new(
+        547,
+        16,
+        0,
+        format!(
+            "The {verb} statement conflicted with the FOREIGN KEY constraint \"{name}\". The conflict occurred in database \"truthdb\", table \"dbo.{parent}\".",
+        ),
+    )
+}
+
+/// Enforces this table's FOREIGN KEY constraints against a built child row:
+/// each non-NULL referencing key must exist in the parent's primary key. For a
+/// self-reference, a sibling row in the same statement (`batch`) also satisfies
+/// it. A missing parent is error 547. `check_self_ref` skips self-referencing
+/// foreign keys (an UPDATE validates those against its post-update snapshot,
+/// since a pre-mutation probe would see stale rows).
+fn enforce_child_fks(
+    storage: &mut Storage,
+    def: &TableDef,
+    row: &[Datum],
+    batch: &[Vec<Datum>],
+    verb: &str,
+    check_self_ref: bool,
+) -> Result<(), SqlError> {
+    for fk in &def.foreign_keys {
+        if !check_self_ref && fk.parent.eq_ignore_ascii_case(&def.name) {
+            continue;
+        }
+        let Some(key) = fk_key(fk, row) else {
+            continue; // NULL referencing column: not enforced
+        };
+        if !fk_parent_exists(storage, fk, &key, def, batch)? {
+            return Err(fk_child_violation(&fk.name, verb, &fk.parent));
+        }
+    }
+    Ok(())
+}
+
+/// Enforces NO ACTION on the parent side: no surviving child row may reference
+/// any of `removed_keys` (parent primary-key values being deleted or vacated by
+/// an UPDATE). A referencing child is error 547. Referencing children are found
+/// by scanning every table's foreign keys (FK-index optimization deferred).
+fn enforce_parent_fks(
+    storage: &mut Storage,
+    parent: &TableDef,
+    removed_keys: &[Vec<Datum>],
+    verb: &str,
+    check_self_ref: bool,
+) -> Result<(), SqlError> {
+    if removed_keys.is_empty() {
+        return Ok(());
+    }
+    let children: Vec<TableDef> = storage
+        .rel_tables()
+        .into_iter()
+        .filter(|t| {
+            t.foreign_keys
+                .iter()
+                .any(|fk| fk.parent.eq_ignore_ascii_case(&parent.name))
+        })
+        .collect();
+    for child in &children {
+        let self_ref = child.name.eq_ignore_ascii_case(&parent.name);
+        // A self-referencing table's own FKs are validated against the
+        // post-update snapshot, not the pre-mutation child scan.
+        if self_ref && !check_self_ref {
+            continue;
+        }
+        let child_rows = storage
+            .rel_scan(&child.name)
+            .map_err(|e| map_storage_err(e, &child.name))?;
+        for fk in &child.foreign_keys {
+            if !fk.parent.eq_ignore_ascii_case(&parent.name) {
+                continue;
+            }
+            for row in &child_rows {
+                // A self-referencing row that is itself being removed does not
+                // count as a surviving reference.
+                if self_ref {
+                    let pk: Vec<Datum> =
+                        parent.key_columns.iter().map(|&i| row[i].clone()).collect();
+                    if removed_keys.contains(&pk) {
+                        continue;
+                    }
+                }
+                let Some(key) = fk_key(fk, row) else {
+                    continue;
+                };
+                if removed_keys.contains(&key) {
+                    return Err(SqlError::new(
+                        547,
+                        16,
+                        0,
+                        format!(
+                            "The {verb} statement conflicted with the REFERENCE constraint \"{}\". The conflict occurred in database \"truthdb\", table \"dbo.{}\".",
+                            fk.name, child.name
+                        ),
+                    ));
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The primary-key values of a row (in key-column order).
+fn pk_of(def: &TableDef, row: &[Datum]) -> Vec<Datum> {
+    def.key_columns.iter().map(|&i| row[i].clone()).collect()
+}
+
 fn bind_column(column: &ColumnDef) -> Result<Column, SqlError> {
     let column_type = match &column.data_type {
         DataType::TinyInt => ColumnType::TinyInt,
@@ -918,6 +1310,29 @@ fn exec_drop_table(storage: &mut Storage, drop: &DropTable) -> Result<StatementR
     let name = resolve_table(storage, &drop.table.value).map(|d| d.name);
     match name {
         Some(name) => {
+            // A table still referenced by another table's foreign key cannot be
+            // dropped (SQL Server 3726) — it would leave a dangling reference.
+            if let Some(child) = storage.rel_tables().into_iter().find(|t| {
+                !t.name.eq_ignore_ascii_case(&name)
+                    && t.foreign_keys
+                        .iter()
+                        .any(|fk| fk.parent.eq_ignore_ascii_case(&name))
+            }) {
+                let referencing = child
+                    .foreign_keys
+                    .iter()
+                    .find(|fk| fk.parent.eq_ignore_ascii_case(&name))
+                    .map(|fk| fk.name.clone())
+                    .unwrap_or_default();
+                return Err(SqlError::new(
+                    3726,
+                    16,
+                    1,
+                    format!(
+                        "Could not drop object '{name}' because it is referenced by a FOREIGN KEY constraint '{referencing}'."
+                    ),
+                ));
+            }
             storage
                 .rel_drop_table(&name)
                 .map_err(|err| map_storage_err(err, &drop.table.value))?;
@@ -993,8 +1408,86 @@ fn exec_alter_table(
         .ok_or_else(|| SqlError::invalid_object(&alter.table.value).at(alter.table.span))?;
     match &alter.action {
         AlterAction::AddCheck(check) => alter_add_check(storage, &def, check, eval_ctx),
+        AlterAction::AddForeignKey(fk) => alter_add_foreign_key(storage, &def, fk),
         AlterAction::DropConstraint(name) => alter_drop_constraint(storage, &def, name),
     }
+}
+
+/// `ALTER TABLE ... ADD [CONSTRAINT name] FOREIGN KEY (...) REFERENCES ...`.
+/// Validates the constraint and every existing row (WITH CHECK): a child row
+/// referencing a missing parent is 547 and the constraint is not added.
+fn alter_add_foreign_key(
+    storage: &mut Storage,
+    def: &TableDef,
+    fk: &ForeignKey,
+) -> Result<StatementResult, SqlError> {
+    let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
+    let parent_bare = strip_schema(&fk.parent.value);
+    let parent_pk: Vec<(String, ColumnType)> = if parent_bare.eq_ignore_ascii_case(&def.name) {
+        def.key_columns
+            .iter()
+            .map(|&i| {
+                (
+                    schema.columns[i].name.clone(),
+                    schema.columns[i].column_type,
+                )
+            })
+            .collect()
+    } else {
+        let parent = resolve_table(storage, &fk.parent.value)
+            .ok_or_else(|| SqlError::invalid_object(&fk.parent.value).at(fk.parent.span))?;
+        let pschema = parent
+            .schema()
+            .map_err(|e| map_storage_err(e, &parent.name))?;
+        parent
+            .key_columns
+            .iter()
+            .map(|&i| {
+                (
+                    pschema.columns[i].name.clone(),
+                    pschema.columns[i].column_type,
+                )
+            })
+            .collect()
+    };
+    let existing_names: Vec<String> = def
+        .check_constraints
+        .iter()
+        .map(|c| c.name.clone())
+        .chain(def.foreign_keys.iter().map(|f| f.name.clone()))
+        .collect();
+    let new_def = bind_foreign_key(
+        fk,
+        &schema.columns,
+        &def.name,
+        &parent_pk,
+        parent_bare,
+        &existing_names,
+    )?;
+
+    // WITH CHECK: every existing child row must satisfy the new foreign key
+    // (its sibling rows count for a self-reference).
+    let rows = storage
+        .rel_scan(&def.name)
+        .map_err(|e| map_storage_err(e, &def.name))?;
+    for row in &rows {
+        if let Some(key) = fk_key(&new_def, row)
+            && !fk_parent_exists(storage, &new_def, &key, def, &rows)?
+        {
+            return Err(fk_child_violation(
+                &new_def.name,
+                "ALTER TABLE",
+                &new_def.parent,
+            ));
+        }
+    }
+
+    let mut fks = def.foreign_keys.clone();
+    fks.push(new_def);
+    storage
+        .rel_set_foreign_keys(&def.name, fks)
+        .map_err(|e| map_storage_err(e, &def.name))?;
+    Ok(StatementResult::Done)
 }
 
 /// `ALTER TABLE ... ADD [CONSTRAINT name] CHECK (expr)`. Validates the new
@@ -1007,10 +1500,12 @@ fn alter_add_check(
     eval_ctx: &EvalContext,
 ) -> Result<StatementResult, SqlError> {
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
+    // Constraint names are unique across kinds (CHECK and FOREIGN KEY).
     let existing: Vec<String> = def
         .check_constraints
         .iter()
         .map(|c| c.name.clone())
+        .chain(def.foreign_keys.iter().map(|f| f.name.clone()))
         .collect();
     let new_def = bind_check(check, &schema.columns, &def.name, &existing)?;
 
@@ -1044,32 +1539,52 @@ fn alter_add_check(
     Ok(StatementResult::Done)
 }
 
-/// `ALTER TABLE ... DROP CONSTRAINT name`. Removes a CHECK constraint by name
-/// (case-insensitive); an unknown name is error 3728.
+/// `ALTER TABLE ... DROP CONSTRAINT name`. Removes a CHECK or FOREIGN KEY
+/// constraint by name (case-insensitive); an unknown name is error 3728.
 fn alter_drop_constraint(
     storage: &mut Storage,
     def: &TableDef,
     name: &Name,
 ) -> Result<StatementResult, SqlError> {
-    let checks: Vec<catalog::CheckDef> = def
+    if def
         .check_constraints
         .iter()
-        .filter(|c| !c.name.eq_ignore_ascii_case(&name.value))
-        .cloned()
-        .collect();
-    if checks.len() == def.check_constraints.len() {
-        return Err(SqlError::new(
-            3728,
-            16,
-            1,
-            format!("'{}' is not a constraint.", name.value),
-        )
-        .at(name.span));
+        .any(|c| c.name.eq_ignore_ascii_case(&name.value))
+    {
+        let checks: Vec<catalog::CheckDef> = def
+            .check_constraints
+            .iter()
+            .filter(|c| !c.name.eq_ignore_ascii_case(&name.value))
+            .cloned()
+            .collect();
+        storage
+            .rel_set_check_constraints(&def.name, checks)
+            .map_err(|e| map_storage_err(e, &def.name))?;
+        return Ok(StatementResult::Done);
     }
-    storage
-        .rel_set_check_constraints(&def.name, checks)
-        .map_err(|e| map_storage_err(e, &def.name))?;
-    Ok(StatementResult::Done)
+    if def
+        .foreign_keys
+        .iter()
+        .any(|f| f.name.eq_ignore_ascii_case(&name.value))
+    {
+        let fks: Vec<catalog::ForeignKeyDef> = def
+            .foreign_keys
+            .iter()
+            .filter(|f| !f.name.eq_ignore_ascii_case(&name.value))
+            .cloned()
+            .collect();
+        storage
+            .rel_set_foreign_keys(&def.name, fks)
+            .map_err(|e| map_storage_err(e, &def.name))?;
+        return Ok(StatementResult::Done);
+    }
+    Err(SqlError::new(
+        3728,
+        16,
+        1,
+        format!("'{}' is not a constraint.", name.value),
+    )
+    .at(name.span))
 }
 
 // ---- INSERT -------------------------------------------------------------
@@ -1198,6 +1713,14 @@ fn exec_insert(
             )?;
         }
         rows.push(values);
+    }
+
+    // FOREIGN KEY (child side): each new row must reference an existing parent
+    // (a sibling row in this batch counts for a self-reference).
+    if !def.foreign_keys.is_empty() {
+        for row in &rows {
+            enforce_child_fks(storage, &def, row, &rows, "INSERT", true)?;
+        }
     }
 
     let inserted = rows.len() as u64;
@@ -1377,6 +1900,61 @@ fn exec_update(
         }
         updates.push((locator, old_values, new_row));
     }
+
+    // FOREIGN KEY (child side): each updated row must still reference a valid
+    // parent. Self-referencing FKs are validated separately below.
+    if !def.foreign_keys.is_empty() {
+        for (_, _, new_row) in &updates {
+            enforce_child_fks(storage, &def, new_row, &[], "UPDATE", false)?;
+        }
+    }
+    // FOREIGN KEY (parent side, other tables): a row whose primary key changes
+    // vacates its old key; no surviving child in ANOTHER table may still
+    // reference it (NO ACTION). Self-references are handled by the snapshot.
+    if def.is_tree() {
+        let removed: Vec<Vec<Datum>> = updates
+            .iter()
+            .filter_map(|(_, old, new)| {
+                let old_pk = pk_of(&def, old);
+                (old_pk != pk_of(&def, new)).then_some(old_pk)
+            })
+            .collect();
+        enforce_parent_fks(storage, &def, &removed, "UPDATE", false)?;
+    }
+    // FOREIGN KEY (self-reference): a self-referencing table's own foreign keys
+    // must hold against the state the UPDATE produces — a pre-mutation probe
+    // sees stale rows. Every surviving row's non-NULL self-FK key must match a
+    // surviving primary key.
+    if def.is_tree()
+        && def
+            .foreign_keys
+            .iter()
+            .any(|fk| fk.parent.eq_ignore_ascii_case(&def.name))
+    {
+        let old_pks: Vec<Vec<Datum>> = updates.iter().map(|(_, old, _)| pk_of(&def, old)).collect();
+        let mut post_rows: Vec<Vec<Datum>> = storage
+            .rel_scan(&def.name)
+            .map_err(|e| map_storage_err(e, &def.name))?
+            .into_iter()
+            .filter(|r| !old_pks.contains(&pk_of(&def, r)))
+            .collect();
+        post_rows.extend(updates.iter().map(|(_, _, new)| new.clone()));
+        let post_pks: Vec<Vec<Datum>> = post_rows.iter().map(|r| pk_of(&def, r)).collect();
+        for r in &post_rows {
+            for fk in def
+                .foreign_keys
+                .iter()
+                .filter(|fk| fk.parent.eq_ignore_ascii_case(&def.name))
+            {
+                if let Some(key) = fk_key(fk, r)
+                    && !post_pks.contains(&key)
+                {
+                    return Err(fk_child_violation(&fk.name, "UPDATE", &fk.parent));
+                }
+            }
+        }
+    }
+
     let count = storage
         .rel_update_located(&def.name, updates, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
@@ -1405,6 +1983,14 @@ fn exec_delete(
             targets.push((locator, row));
         }
     }
+
+    // FOREIGN KEY (parent side): no surviving child may reference a deleted row
+    // (a self-referencing row that is itself deleted does not count).
+    if def.is_tree() {
+        let removed: Vec<Vec<Datum>> = targets.iter().map(|(_, row)| pk_of(&def, row)).collect();
+        enforce_parent_fks(storage, &def, &removed, "DELETE", true)?;
+    }
+
     let count = storage
         .rel_delete_located(&def.name, targets, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
@@ -2005,6 +2591,7 @@ fn build_table_source(
         "sys.columns" => sys_columns(storage),
         "sys.indexes" => sys_indexes(storage),
         "sys.check_constraints" => sys_check_constraints(storage),
+        "sys.foreign_keys" => sys_foreign_keys(storage),
         _ => {
             let def = resolve_table(storage, &name.value)
                 .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
@@ -2308,6 +2895,42 @@ fn sys_check_constraints(storage: &Storage) -> Source {
                 Datum::NVarChar(check.name.clone()),
                 Datum::Int(def.object_id as i32),
                 Datum::NVarChar(format!("({})", check.predicate)),
+            ]);
+        }
+    }
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows,
+    }
+}
+
+fn sys_foreign_keys(storage: &Storage) -> Source {
+    let columns = vec![
+        nvarchar("name", 128),
+        int_col("parent_object_id"),
+        int_col("referenced_object_id"),
+    ];
+    // Resolve parent (referenced) table names to object ids.
+    let tables = storage.rel_tables();
+    let oid_of = |name: &str| {
+        tables
+            .iter()
+            .find(|t| t.name.eq_ignore_ascii_case(name))
+            .map(|t| t.object_id)
+    };
+    let mut rows = Vec::new();
+    for def in &tables {
+        for fk in &def.foreign_keys {
+            rows.push(vec![
+                Datum::NVarChar(fk.name.clone()),
+                Datum::Int(def.object_id as i32),
+                oid_of(&fk.parent)
+                    .map(|o| Datum::Int(o as i32))
+                    .unwrap_or(Datum::Null),
             ]);
         }
     }

@@ -1,0 +1,61 @@
+# FOREIGN KEY constraints (Stage 10 part 3)
+
+statement ok
+CREATE TABLE parent (id INT NOT NULL PRIMARY KEY, label NVARCHAR(20))
+
+statement ok
+CREATE TABLE child (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES parent (id))
+
+statement ok
+INSERT INTO parent VALUES (1, 'a'), (2, 'b')
+
+# Child referencing an existing parent.
+statement ok
+INSERT INTO child VALUES (10, 1)
+
+# NULL-FK trap: a NULL referencing column skips enforcement (no parent needed).
+statement ok
+INSERT INTO child VALUES (11, NULL)
+
+# Referencing a missing parent is rejected.
+statement error
+INSERT INTO child VALUES (12, 99)
+
+# A referenced parent cannot be deleted (NO ACTION).
+statement error
+DELETE FROM parent WHERE id = 1
+
+# An unreferenced parent deletes fine.
+statement ok
+DELETE FROM parent WHERE id = 2
+
+# Changing a referenced parent's primary key is rejected.
+statement error
+UPDATE parent SET id = 5 WHERE id = 1
+
+# Composite foreign key.
+statement ok
+CREATE TABLE region (country NVARCHAR(2) NOT NULL, code INT NOT NULL, PRIMARY KEY (country, code))
+
+statement ok
+CREATE TABLE city (id INT NOT NULL PRIMARY KEY, country NVARCHAR(2), code INT, CONSTRAINT fk_region FOREIGN KEY (country, code) REFERENCES region (country, code))
+
+statement ok
+INSERT INTO region VALUES ('US', 1), ('CA', 2)
+
+statement ok
+INSERT INTO city VALUES (1, 'US', 1)
+
+statement error
+INSERT INTO city VALUES (2, 'US', 9)
+
+# A partially-NULL composite key skips enforcement.
+statement ok
+INSERT INTO city VALUES (3, 'US', NULL)
+
+# sys.foreign_keys lists both foreign keys.
+query T
+SELECT name FROM sys.foreign_keys ORDER BY name
+----
+FK__child__parent__1
+fk_region
