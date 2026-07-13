@@ -17,6 +17,9 @@ use truthdb_core::relstore::types::{ColumnType, Datum};
 
 // Data type tokens (MS-TDS 2.2.5.4) — the variable/nullable forms drivers send
 // for parameters, plus DATE/DATETIME2/GUID/DECIMAL.
+/// A typeless NULL: no metadata, no value body (go-mssqldb sends a bare `nil`
+/// parameter this way).
+const NULLTYPE: u8 = 0x1f;
 const INTN: u8 = 0x26;
 const BITN: u8 = 0x68;
 const FLTN: u8 = 0x6d;
@@ -122,6 +125,9 @@ pub fn split_sp_executesql(mut params: Vec<RpcParam>) -> io::Result<(String, Vec
 fn decode_param(c: &mut Cursor) -> io::Result<(ColumnType, Datum)> {
     let token = c.u8()?;
     match token {
+        // A typeless NULL carries no metadata and no value. The stored column
+        // type is unused (the value coerces to NULL wherever it is read).
+        NULLTYPE => Ok((ColumnType::Int, Datum::Null)),
         INTN => {
             let max_len = c.u8()?;
             let column_type = int_type(max_len)?;
@@ -531,6 +537,34 @@ mod tests {
         assert!(matches!(&values[0].value, Datum::NVarChar(s) if s == "café"));
         assert!(matches!(values[1].value, Datum::BigInt(5_000_000_000)));
         assert!(matches!(values[2].value, Datum::Null));
+    }
+
+    #[test]
+    fn decodes_bare_nulltype_param() {
+        // go-mssqldb sends a `nil` parameter as a typeless NULL (0x1F): the
+        // token alone, with no metadata and no value body.
+        let mut b = Vec::new();
+        b.extend_from_slice(&PROCID_SENTINEL.to_le_bytes());
+        b.extend_from_slice(&SP_EXECUTESQL_PROCID.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        push_nvarchar_param(&mut b, "", "stmt");
+        push_nvarchar_param(&mut b, "@params", "decl");
+        push_name(&mut b, "@p1");
+        b.push(0x00); // status
+        b.push(NULLTYPE); // token, nothing follows
+        // A second param after it must still parse (no over-read of NULLTYPE).
+        push_name(&mut b, "@p2");
+        b.push(0x00);
+        b.push(INTN);
+        b.push(4);
+        b.push(4);
+        b.extend_from_slice(&7i32.to_le_bytes());
+
+        let req = parse_rpc_request(&b).expect("parse");
+        let (_sql, values) = split_sp_executesql(req.params).expect("split");
+        assert_eq!(values.len(), 2);
+        assert!(matches!(values[0].value, Datum::Null));
+        assert!(matches!(values[1].value, Datum::Int(7)));
     }
 
     #[test]
