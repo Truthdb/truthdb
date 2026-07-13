@@ -252,6 +252,11 @@ pub enum TableRef {
         /// The `ON` predicate (absent for `CROSS JOIN`).
         on: Option<Expr>,
     },
+    /// A derived table: `(SELECT ...) AS alias`. The alias is required.
+    Derived {
+        subquery: Box<Select>,
+        alias: Name,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

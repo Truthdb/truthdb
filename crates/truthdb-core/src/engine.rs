@@ -2185,6 +2185,76 @@ mod tests {
     }
 
     #[test]
+    fn sql_derived_tables() {
+        let path = unique_temp_path("sql-derived");
+        let mut engine = new_engine(&path);
+        engine
+            .execute(
+                "CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, dept NVARCHAR(4), amount INT)",
+            )
+            .expect("create");
+        engine
+            .execute("INSERT INTO sales VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',50)")
+            .expect("seed");
+
+        // A derived table filtered further by the outer query; columns resolve
+        // by the derived alias.
+        let (cols, rows) = sql_rows(
+            &mut engine,
+            "SELECT s.id, s.amount FROM (SELECT id, amount FROM sales WHERE amount >= 10) s \
+               WHERE s.id < 3 ORDER BY s.id",
+        );
+        assert_eq!(cols, vec!["id", "amount"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("1".into()), Some("10".into())],
+                vec![Some("2".into()), Some("20".into())],
+            ]
+        );
+
+        // A derived table may aggregate; the outer query filters on the alias.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT d.dept, d.total FROM (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) d \
+               WHERE d.total > 30 ORDER BY d.dept",
+        );
+        assert_eq!(rows, vec![vec![Some("b".into()), Some("55".into())]]);
+
+        // A derived table joined to a base table.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT t.dept, d.total FROM sales t \
+               JOIN (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) d ON t.dept = d.dept \
+               WHERE t.id = 1",
+        );
+        assert_eq!(rows, vec![vec![Some("a".into()), Some("30".into())]]);
+
+        // A derived table must have an alias.
+        assert_eq!(
+            sql_error_number(&mut engine, "SELECT * FROM (SELECT id FROM sales)"),
+            102
+        );
+        // Every derived column must be named.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "SELECT * FROM (SELECT amount + 1 FROM sales) x"
+            ),
+            8155
+        );
+        // Duplicate derived column names are rejected.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "SELECT * FROM (SELECT id, amount AS id FROM sales) x",
+            ),
+            8156
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_sys_default_constraints() {
         let path = unique_temp_path("sql-default-constraints");
         let mut engine = new_engine(&path);

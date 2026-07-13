@@ -1,0 +1,37 @@
+# Derived tables (Stage 11 part 1)
+
+statement ok
+CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, dept NVARCHAR(4), amount INT)
+
+statement ok
+INSERT INTO sales VALUES (1, 'a', 10), (2, 'a', 20), (3, 'b', 5), (4, 'b', 50)
+
+# A derived table filtered further by the outer query.
+query II
+SELECT s.id, s.amount FROM (SELECT id, amount FROM sales WHERE amount >= 10) s WHERE s.id < 3 ORDER BY s.id
+----
+1 10
+2 20
+
+# A derived table that aggregates; the outer query filters on the alias.
+query TI
+SELECT d.dept, d.total FROM (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) d WHERE d.total > 30 ORDER BY d.dept
+----
+b 55
+
+# A derived table joined to a base table.
+query TI
+SELECT t.dept, d.total FROM sales t JOIN (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) d ON t.dept = d.dept ORDER BY t.id
+----
+a 30
+a 30
+b 55
+b 55
+
+# A derived table must have an alias.
+statement error
+SELECT * FROM (SELECT id FROM sales)
+
+# Every derived column must be named.
+statement error
+SELECT * FROM (SELECT amount + 1 FROM sales) x
