@@ -2185,6 +2185,40 @@ mod tests {
     }
 
     #[test]
+    fn sql_sys_default_constraints() {
+        let path = unique_temp_path("sql-default-constraints");
+        let mut engine = new_engine(&path);
+        engine
+            .execute(
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, \
+                   qty INT DEFAULT 0, note NVARCHAR(10) DEFAULT 'n/a', plain INT)",
+            )
+            .expect("create");
+        // One row per column that carries a DEFAULT (plain has none).
+        let (cols, rows) = sql_rows(
+            &mut engine,
+            "SELECT name, parent_column_id, definition FROM sys.default_constraints ORDER BY parent_column_id",
+        );
+        assert_eq!(cols, vec!["name", "parent_column_id", "definition"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![
+                    Some("DF__t__qty".into()),
+                    Some("2".into()),
+                    Some("(0)".into())
+                ],
+                vec![
+                    Some("DF__t__note".into()),
+                    Some("3".into()),
+                    Some("('n/a')".into()),
+                ],
+            ]
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_decimal_arithmetic_and_rendering() {
         let path = unique_temp_path("sql-decimal");
         let mut engine = new_engine(&path);
