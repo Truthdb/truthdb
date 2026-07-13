@@ -37,12 +37,17 @@ impl ColumnResolver for Vec<String> {
 /// kept small (heavy arms delegate to out-of-line helpers) so this is safe.
 const MAX_EVAL_DEPTH: usize = 500;
 
-/// Session context available to expression evaluation: `@@`-variables (and,
-/// in later stages, the current time / SCOPE_IDENTITY). `Default` is a
-/// no-transaction context, used where no session is in scope.
-#[derive(Debug, Clone, Copy, Default)]
+/// Session context available to expression evaluation: `@@`-variables, the
+/// batch's `@`-variables, and (in later stages) the current time /
+/// SCOPE_IDENTITY. `Default` is a no-transaction, no-variable context, used
+/// where no session is in scope.
+#[derive(Debug, Clone, Default)]
 pub struct EvalContext {
     pub trancount: i32,
+    /// Declared batch variables (name without `@`, lowercased) to their current
+    /// value. Present but NULL for a declared-but-unset variable; absent means
+    /// undeclared.
+    pub variables: std::collections::HashMap<String, SqlValue>,
 }
 
 /// Evaluates `expr` against `row`, resolving columns via `resolver`.
@@ -84,6 +89,12 @@ fn eval_at(
         ),
         ExprKind::Column(name) => eval_column(name, row, resolver),
         ExprKind::GlobalVar(name) => eval_global_var(name, ctx),
+        ExprKind::LocalVar(name) => ctx.variables.get(name).cloned().ok_or_else(|| {
+            SqlError::message_only(
+                137,
+                format!("Must declare the scalar variable \"@{name}\"."),
+            )
+        }),
         ExprKind::Unary { op, expr: inner } => {
             let value = eval_at(inner, row, resolver, ctx, depth + 1)?;
             eval_unary(*op, value)

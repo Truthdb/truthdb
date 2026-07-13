@@ -116,6 +116,7 @@ impl Parser {
             Some("COMMIT") => self.parse_commit(),
             Some("ROLLBACK") => self.parse_rollback(),
             Some("SET") => self.parse_set(),
+            Some("DECLARE") => self.parse_declare(),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -191,8 +192,49 @@ impl Parser {
         None
     }
 
+    /// `DECLARE @a TYPE [= expr], @b TYPE ...`.
+    fn parse_declare(&mut self) -> SqlResult<Statement> {
+        self.expect_keyword("DECLARE")?;
+        let mut decls = Vec::new();
+        loop {
+            let token = self.peek().clone();
+            let TokenKind::LocalVar(name) = &token.kind else {
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            };
+            let name = name.clone();
+            self.bump();
+            let _ = self.eat_keyword("AS"); // `DECLARE @v AS INT` — AS optional
+            let (data_type, type_span) = self.parse_data_type()?;
+            let (initializer, end) = if self.eat(&TokenKind::Eq) {
+                let expr = self.parse_expr()?;
+                let end = expr.span;
+                (Some(expr), end)
+            } else {
+                (None, type_span)
+            };
+            decls.push(Declaration {
+                name,
+                data_type,
+                initializer,
+                span: token.span.to(end),
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(Statement::Declare(decls))
+    }
+
     fn parse_set(&mut self) -> SqlResult<Statement> {
         self.expect_keyword("SET")?;
+        // `SET @v = expr` — a variable assignment.
+        if let TokenKind::LocalVar(name) = &self.peek().kind {
+            let name = name.clone();
+            self.bump();
+            self.expect(&TokenKind::Eq)?;
+            let value = self.parse_expr()?;
+            return Ok(Statement::Set(SetStatement::Variable { name, value }));
+        }
         match self.peek_keyword().as_deref() {
             Some("XACT_ABORT") => {
                 self.bump();
@@ -1602,6 +1644,13 @@ impl Parser {
                 self.bump();
                 Ok(Expr {
                     kind: ExprKind::GlobalVar(name.clone()),
+                    span: token.span,
+                })
+            }
+            TokenKind::LocalVar(name) => {
+                self.bump();
+                Ok(Expr {
+                    kind: ExprKind::LocalVar(name.clone()),
                     span: token.span,
                 })
             }

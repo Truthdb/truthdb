@@ -320,7 +320,8 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggs: &mut Vec<AggSpec>) -> Result<Ex
         | ExprKind::Str(_)
         | ExprKind::Bool(_)
         | ExprKind::Literal(_)
-        | ExprKind::GlobalVar(_) => expr.kind.clone(),
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_) => expr.kind.clone(),
         // Subqueries are rewritten to literals before aggregation runs; clone
         // defensively (evaluation would reject any that slipped through).
         ExprKind::Subquery(_) | ExprKind::Exists(_) | ExprKind::InSubquery { .. } => {
