@@ -134,11 +134,42 @@ pub struct BatchOutcome {
     pub error: Option<SqlError>,
 }
 
+/// One `sp_executesql` parameter: its `@name` (as it appears in the RPC
+/// stream), declared type, and decoded value. Passed by the TDS layer to
+/// [`execute_batch_with_params`], which seeds them as batch variables the
+/// statement text can read by name.
+#[derive(Debug, Clone)]
+pub struct RpcParam {
+    pub name: String,
+    pub column_type: ColumnType,
+    pub value: Datum,
+}
+
 /// Parses and executes a SQL batch. A parse error yields an empty batch with
 /// the error; a runtime error stops the batch but keeps earlier results.
 pub fn execute_batch(storage: &mut Storage, sql: &str, txn_ctx: &mut TxnContext) -> BatchOutcome {
+    execute_batch_with_params(storage, sql, txn_ctx, &[])
+}
+
+/// Like [`execute_batch`], but seeds `params` as batch variables before running
+/// the statement text — the `sp_executesql` path. Parameters are injected as
+/// already-typed values, never re-rendered into the SQL text, so a parameter
+/// value can never alter the statement's structure (no injection surface).
+pub fn execute_batch_with_params(
+    storage: &mut Storage,
+    sql: &str,
+    txn_ctx: &mut TxnContext,
+    params: &[RpcParam],
+) -> BatchOutcome {
     // Variables are batch-scoped: each batch starts with none.
     txn_ctx.clear_variables();
+    for param in params {
+        // The lexer keys `@p1` as `p1` (leading `@` stripped, lowercased); the
+        // RPC name arrives as `@p1`, so normalise it the same way to match.
+        let key = param.name.trim_start_matches('@').to_ascii_lowercase();
+        let value = value::datum_to_sql(&param.value, &param.column_type);
+        txn_ctx.variables.insert(key, (param.column_type, value));
+    }
     let statements = match truthdb_sql::parse(sql) {
         Ok(statements) => statements,
         Err(error) => {

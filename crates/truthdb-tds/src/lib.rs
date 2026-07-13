@@ -3,11 +3,13 @@
 //! A SQL Server-protocol front end so real drivers (pymssql, go-mssqldb) can
 //! connect to TruthDB. Covers the packet layer, PRELOGIN, optional TLS (the
 //! tunneled handshake of MS-TDS 2.2.6.5; see [`tls`]), LOGIN7 with config-file
-//! auth, and SQLBatch → token-stream execution over the engine's typed SQL
-//! results. RPC/prepared statements arrive later in Stage 9.
+//! auth, SQLBatch → token-stream execution over the engine's typed SQL results,
+//! and RPC `sp_executesql` for parameterized queries (see [`rpc`]). Handle-based
+//! prepared statements (`sp_prepare`/`sp_execute`) arrive later in Stage 9.
 
 pub mod login;
 pub mod packet;
+pub mod rpc;
 pub mod server;
 pub mod tls;
 pub mod token;

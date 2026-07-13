@@ -144,7 +144,19 @@ impl Engine {
         input: &str,
         txn_ctx: &mut crate::rel::TxnContext,
     ) -> Result<crate::rel::BatchOutcome, EngineError> {
-        let outcome = crate::rel::execute_batch(&mut self.storage, input, txn_ctx);
+        self.sql_batch_with_params(input, txn_ctx, &[])
+    }
+
+    /// Runs a SQL batch with `sp_executesql` parameters seeded as batch
+    /// variables (see [`crate::rel::execute_batch_with_params`]).
+    pub fn sql_batch_with_params(
+        &mut self,
+        input: &str,
+        txn_ctx: &mut crate::rel::TxnContext,
+        params: &[crate::rel::RpcParam],
+    ) -> Result<crate::rel::BatchOutcome, EngineError> {
+        let outcome =
+            crate::rel::execute_batch_with_params(&mut self.storage, input, txn_ctx, params);
         self.maybe_checkpoint()?;
         Ok(outcome)
     }
