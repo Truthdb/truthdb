@@ -76,10 +76,14 @@ impl SessionManager {
         }
     }
 
-    fn open(&mut self) -> SessionId {
+    fn open(&mut self, database: String, login: String) -> SessionId {
         let id = SessionId(self.next_id);
         self.next_id += 1;
-        self.sessions.insert(id, Session::default());
+        let mut session = Session::default();
+        session
+            .txn_ctx
+            .set_session_identity(database, login, id.0 as i32);
+        self.sessions.insert(id, session);
         id
     }
 
@@ -100,6 +104,8 @@ impl SessionManager {
 /// async caller awaits.
 enum EngineCall {
     OpenSession {
+        database: String,
+        login: String,
         reply: oneshot::Sender<SessionId>,
     },
     /// A SQL batch on behalf of a session (TDS path): typed results. `params`
@@ -129,10 +135,20 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Opens a session; returns its id (or a placeholder if the engine is gone).
-    pub async fn open_session(&self) -> SessionId {
+    /// Opens a session for a connection, recording its database and login for
+    /// session intrinsics. Returns its id (or a placeholder if the engine is
+    /// gone).
+    pub async fn open_session(&self, database: String, login: String) -> SessionId {
         let (reply, rx) = oneshot::channel();
-        if self.tx.send(EngineCall::OpenSession { reply }).is_err() {
+        if self
+            .tx
+            .send(EngineCall::OpenSession {
+                database,
+                login,
+                reply,
+            })
+            .is_err()
+        {
             return SessionId(0);
         }
         rx.await.unwrap_or(SessionId(0))
@@ -266,8 +282,12 @@ impl EngineLoop {
             };
             self.reap_expired();
             match call {
-                Some(EngineCall::OpenSession { reply }) => {
-                    let _ = reply.send(self.sessions.open());
+                Some(EngineCall::OpenSession {
+                    database,
+                    login,
+                    reply,
+                }) => {
+                    let _ = reply.send(self.sessions.open(database, login));
                 }
                 Some(EngineCall::RunBatch {
                     session,
@@ -577,8 +597,8 @@ mod tests {
     #[tokio::test]
     async fn writer_blocks_reader_until_commit() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session().await;
-        let b = h.handle.open_session().await;
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
 
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
@@ -616,8 +636,8 @@ mod tests {
     #[tokio::test]
     async fn read_uncommitted_sees_uncommitted_rows_without_blocking() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session().await;
-        let b = h.handle.open_session().await;
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
 
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
@@ -648,8 +668,8 @@ mod tests {
     #[tokio::test]
     async fn disconnect_releases_locks_and_wakes_waiter() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session().await;
-        let b = h.handle.open_session().await;
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
 
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
@@ -684,8 +704,8 @@ mod tests {
     async fn deadlock_is_broken_by_timeout_with_1205() {
         // Short timeout so the reaper fires quickly.
         let h = start(Duration::from_millis(300));
-        let a = h.handle.open_session().await;
-        let b = h.handle.open_session().await;
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
 
         for stmt in [
             "CREATE TABLE a (id INT NOT NULL PRIMARY KEY)",
@@ -736,8 +756,8 @@ mod tests {
     #[tokio::test]
     async fn repeatable_read_holds_shared_lock_and_blocks_a_writer() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session().await;
-        let b = h.handle.open_session().await;
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -782,8 +802,8 @@ mod tests {
     #[tokio::test]
     async fn read_committed_releases_shared_lock_so_a_writer_proceeds() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session().await;
-        let b = h.handle.open_session().await;
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -816,8 +836,8 @@ mod tests {
     #[tokio::test]
     async fn isolation_escalation_within_a_batch_locks_the_read() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session().await;
-        let b = h.handle.open_session().await;
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -866,8 +886,8 @@ mod tests {
     #[tokio::test]
     async fn holder_is_not_blocked_by_a_waiter_on_its_own_lock() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session().await;
-        let b = h.handle.open_session().await;
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -914,8 +934,8 @@ mod tests {
     #[tokio::test]
     async fn autocommit_reads_run_concurrently() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session().await;
-        let b = h.handle.open_session().await;
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
