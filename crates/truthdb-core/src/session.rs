@@ -1,29 +1,45 @@
-//! The engine actor: a dedicated OS thread owns the [`Engine`] and a
-//! [`SessionManager`], and serves [`EngineCall`]s over a channel. This replaces
-//! the shared `Arc<Mutex<Engine>>` — it serializes engine access (as the mutex
-//! did), carries per-connection sessions (transaction/isolation state) and
-//! moves the engine's synchronous io_uring work off the async reactor onto its
-//! own thread.
+//! The engine worker pool: a bank of OS threads shares an `Arc<Engine>` and a
+//! [`Scheduler`] (sessions + lock table + parked queue behind one mutex) and
+//! serves [`EngineCall`]s off a channel. Workers hold the scheduler mutex only
+//! to make lock decisions (acquire / park / release / wake); a batch's actual
+//! execution runs with the mutex *released*, so non-conflicting batches run
+//! concurrently. Per-connection session state (transaction / isolation) lives
+//! in the [`SessionManager`], and the synchronous io_uring work runs off the
+//! async reactor on these threads.
 //!
-//! ## Locking without blocking the actor
+//! ## Locking without blocking a worker
 //!
-//! The actor runs one call at a time, so it must never block in place waiting
-//! for a lock — the lock's holder could only release by having its own call
-//! processed, which the blocked thread would prevent (self-deadlock). Instead
-//! a batch acquires *all* the table/database locks it needs up front (see
-//! [`crate::rel::analyze_locks`]) before running any statement. If one
-//! conflicts, the whole [`EngineCall::RunBatch`] is *parked* — its reply
-//! deferred — and the actor moves on. Releasing locks (commit / rollback /
-//! disconnect) wakes parked batches in FIFO order and re-attempts them; since
-//! a parked batch never ran, restarting it is exact.
+//! A worker must never block in place waiting for a lock — the lock's holder
+//! could only release by having its own work processed, and while workers exist
+//! to do that, a batch that parked mid-execution could not be restarted
+//! cleanly. Instead a batch acquires *all* the table/database locks it needs up
+//! front (see [`crate::rel::analyze_locks`]) before running any statement, so a
+//! running batch never blocks on a lock. If a lock conflicts, the whole
+//! [`EngineCall::RunBatch`] is *parked* — its reply deferred — and the worker
+//! moves on. Releasing locks (commit / rollback / disconnect) makes parked
+//! batches grantable; the releasing worker drains them in FIFO order, running
+//! each. Since a parked batch never ran, restarting it is exact.
 //!
-//! A deadlock is broken by a waits-for-graph cycle detector that runs the
-//! instant a parking batch closes a cycle: the youngest transaction in the
-//! cycle is rolled back as the victim (error 1205). A 5 s per-wait deadline
-//! remains as a backstop for any stall the graph does not model.
+//! Because a running batch never waits on a lock, only *parked* batches can
+//! form a lock-wait cycle. A deadlock is broken by a waits-for-graph cycle
+//! detector that runs the instant a parking batch closes a cycle: the youngest
+//! transaction in the cycle is rolled back as the victim (error 1205). A 5 s
+//! per-wait deadline remains as a backstop for any stall the graph does not
+//! model.
+//!
+//! ## Thread-safety of shared state
+//!
+//! Two locks, always taken in this order (never the reverse), so they cannot
+//! deadlock: the **scheduler** mutex (lock decisions) may briefly take the
+//! **storage** mutex under it (catalog lookup in `analyze_locks`, rollback in
+//! `abort`); batch execution takes only storage (and the engine's execution
+//! gate), never the scheduler. See [`Engine`] for the execution gate that keeps
+//! the native path from observing a relational batch's torn writes.
 
 use std::collections::{HashMap, VecDeque};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -132,10 +148,14 @@ enum EngineCall {
     Shutdown,
 }
 
-/// A cloneable handle to the engine thread. Cheap to clone (shares the sender).
+/// A cloneable handle to the engine's worker pool. Cheap to clone (shares the
+/// sender).
 #[derive(Clone)]
 pub struct EngineHandle {
     tx: mpsc::Sender<EngineCall>,
+    /// Number of worker threads, so [`Self::shutdown`] can send one poison
+    /// pill per worker.
+    workers: usize,
 }
 
 impl EngineHandle {
@@ -202,36 +222,275 @@ impl EngineHandle {
         let _ = self.tx.send(EngineCall::CloseSession { session });
     }
 
-    /// Asks the engine thread to stop after draining queued calls.
+    /// Asks the worker pool to stop. One poison pill per worker wakes every
+    /// thread (even those blocked on `recv`); each consumes one and exits.
     pub fn shutdown(&self) {
-        let _ = self.tx.send(EngineCall::Shutdown);
+        for _ in 0..self.workers {
+            let _ = self.tx.send(EngineCall::Shutdown);
+        }
     }
 }
 
-/// Spawns the engine thread and returns a handle plus its join handle.
+/// Worker-thread count for the pool: one per core (minus a couple reserved for
+/// the async listeners), at least two so reads can genuinely overlap.
+fn worker_count() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get().saturating_sub(2))
+        .unwrap_or(2)
+        .max(2)
+}
+
+/// Spawns the engine worker pool and returns a handle plus a join handle for a
+/// supervisor thread that outlives every worker.
 pub fn spawn_engine(engine: Engine) -> (EngineHandle, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel();
-    let join = std::thread::Builder::new()
-        .name("truthdb-engine".to_string())
-        .spawn(move || EngineLoop::new(engine).run(rx))
-        .expect("spawn engine thread");
-    (EngineHandle { tx }, join)
+    spawn_engine_pool(engine, LOCK_WAIT_TIMEOUT, worker_count())
 }
 
 /// Like [`spawn_engine`] but with a custom lock-wait timeout, so tests can
 /// exercise the deadlock reaper without a real 5 s wait.
 #[cfg(test)]
 fn spawn_engine_with_timeout(engine: Engine, timeout: Duration) -> (EngineHandle, JoinHandle<()>) {
+    spawn_engine_pool(engine, timeout, worker_count())
+}
+
+fn spawn_engine_pool(
+    engine: Engine,
+    timeout: Duration,
+    workers: usize,
+) -> (EngineHandle, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
+    let shared = Arc::new(Shared {
+        engine: Arc::new(engine),
+        scheduler: Mutex::new(Scheduler::new(timeout)),
+        rx: Mutex::new(rx),
+        stop: AtomicBool::new(false),
+    });
+    // A supervisor thread spawns the workers and joins them; its handle is what
+    // callers join at shutdown. When all workers have exited, any batch still
+    // parked is failed so its caller unblocks.
+    let supervisor = Arc::clone(&shared);
     let join = std::thread::Builder::new()
-        .name("truthdb-engine-test".to_string())
+        .name("truthdb-engine".to_string())
         .spawn(move || {
-            let mut engine_loop = EngineLoop::new(engine);
-            engine_loop.lock_wait_timeout = timeout;
-            engine_loop.run(rx);
+            let handles: Vec<_> = (0..workers)
+                .map(|i| {
+                    let shared = Arc::clone(&supervisor);
+                    std::thread::Builder::new()
+                        .name(format!("truthdb-worker-{i}"))
+                        .spawn(move || worker_loop(&shared))
+                        .expect("spawn worker thread")
+                })
+                .collect();
+            for handle in handles {
+                let _ = handle.join();
+            }
+            let mut sched = supervisor.scheduler.lock().expect("scheduler poisoned");
+            for parked in sched.parked.drain(..) {
+                let _ = parked.reply.send(Err(EngineError::Unavailable));
+            }
         })
-        .expect("spawn engine thread");
-    (EngineHandle { tx }, join)
+        .expect("spawn engine supervisor");
+    (EngineHandle { tx, workers }, join)
+}
+
+/// State shared by every worker thread.
+struct Shared {
+    /// The database engine. `&self` throughout, so the pool shares one `Arc`.
+    engine: Arc<Engine>,
+    /// Sessions + lock table + parked queue. Held only for lock decisions.
+    scheduler: Mutex<Scheduler>,
+    /// Inbound calls. Behind a mutex because `mpsc::Receiver` has a single
+    /// consumer: a worker locks it only for the brief `recv`, then releases it
+    /// so a sibling can take the next call while this one runs its batch.
+    rx: Mutex<mpsc::Receiver<EngineCall>>,
+    /// Set when a `Shutdown` is seen, so a worker between calls exits promptly
+    /// rather than picking up more work.
+    stop: AtomicBool,
+}
+
+// The pool shares `Arc<Engine>` across worker threads, so the engine — and thus
+// the whole shared state — must be Send + Sync. Assert it here rather than
+// discovering it via a distant `thread::spawn` error.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<Shared>();
+};
+
+/// A parked batch that has become grantable: its locks are already held and its
+/// session's transaction context has been taken out for the worker to run with.
+struct Runnable {
+    session: SessionId,
+    sql: String,
+    params: Vec<crate::rel::RpcParam>,
+    reply: oneshot::Sender<Result<BatchReply, EngineError>>,
+    txn_ctx: TxnContext,
+}
+
+/// One worker thread: pull a call, dispatch it, repeat until shutdown.
+fn worker_loop(shared: &Arc<Shared>) {
+    while !shared.stop.load(Ordering::Acquire) {
+        // Block for the next call, waking at the earliest parked deadline so a
+        // stalled waiter is reaped even if no new call arrives. The rx mutex has
+        // a single consumer, so only one worker is in `recv` at a time; the
+        // deadline snapshot is taken before contending for it and can go stale
+        // (another worker may park a batch while we wait for the mutex). To keep
+        // the reaper live we NEVER block indefinitely: with nothing parked we
+        // still cap the wait at `lock_wait_timeout` and re-evaluate. Since a
+        // parked batch's own deadline is exactly that far out, this cap
+        // guarantees a worker re-reads the queue no later than the first
+        // deadline, so it is reaped on time. (Only the brief `recv` holds rx.)
+        let (deadline, cap) = {
+            let sched = shared.scheduler.lock().expect("scheduler poisoned");
+            (sched.earliest_deadline(), sched.lock_wait_timeout)
+        };
+        let wait = match deadline {
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            None => cap,
+        };
+        let call = {
+            let rx = shared.rx.lock().expect("rx mutex poisoned");
+            match rx.recv_timeout(wait) {
+                Ok(call) => Some(call),
+                Err(mpsc::RecvTimeoutError::Timeout) => None,
+                Err(mpsc::RecvTimeoutError::Disconnected) => break,
+            }
+        };
+        // Reap any expired waiter (a deadlock backstop). A reap releases the
+        // victim's locks, which may unblock its parked partner, so drain before
+        // handling the call — otherwise, if the system then goes quiet, that
+        // partner could sit grantable until its own deadline and be reaped as a
+        // false victim. (dispatch_batch / close_session drain again after their
+        // own releases.)
+        {
+            let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
+            sched.reap_expired(&shared.engine);
+        }
+        drain_ready(shared);
+        match call {
+            None => {}
+            Some(EngineCall::OpenSession {
+                database,
+                login,
+                reply,
+            }) => {
+                let id = shared
+                    .scheduler
+                    .lock()
+                    .expect("scheduler poisoned")
+                    .sessions
+                    .open(database, login);
+                let _ = reply.send(id);
+            }
+            Some(EngineCall::RunBatch {
+                session,
+                sql,
+                params,
+                reply,
+            }) => dispatch_batch(shared, session, sql, params, reply),
+            Some(EngineCall::RunNative { command, reply }) => {
+                let _ = reply.send(shared.engine.execute(&command));
+            }
+            Some(EngineCall::CloseSession { session }) => {
+                shared
+                    .scheduler
+                    .lock()
+                    .expect("scheduler poisoned")
+                    .close_session(&shared.engine, session);
+                drain_ready(shared);
+            }
+            Some(EngineCall::Shutdown) => {
+                shared.stop.store(true, Ordering::Release);
+                break;
+            }
+        }
+    }
+}
+
+/// Acquires a batch's locks and runs it, or parks it behind a conflict. Either
+/// way, drains anything the batch's completion (or a deadlock abort) unblocked.
+fn dispatch_batch(
+    shared: &Arc<Shared>,
+    session: SessionId,
+    sql: String,
+    params: Vec<crate::rel::RpcParam>,
+    reply: oneshot::Sender<Result<BatchReply, EngineError>>,
+) {
+    let runnable = {
+        let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
+        let isolation = sched.isolation(session);
+        // Parameters are values, not statements, so they never change which
+        // locks the batch needs — analyse the statement text as usual.
+        let needs = shared.engine.analyze_locks(&sql, isolation);
+        if sched.try_acquire(session.raw(), &needs, true) {
+            let txn_ctx = sched.take_ctx(session);
+            Some(Runnable {
+                session,
+                sql,
+                params,
+                reply,
+                txn_ctx,
+            })
+        } else {
+            let deadline = Instant::now() + sched.lock_wait_timeout;
+            sched.parked.push_back(Parked {
+                session,
+                sql,
+                params,
+                reply,
+                needs,
+                deadline,
+            });
+            // The new waiter may have closed a lock-wait cycle; break it now
+            // rather than waiting for the deadline backstop.
+            sched.detect_deadlock(&shared.engine);
+            None
+        }
+    };
+    if let Some(work) = runnable {
+        run_and_finish(shared, work);
+    }
+    drain_ready(shared);
+}
+
+/// Runs a batch whose locks are already held (execution holds no scheduler
+/// lock, so batches run concurrently), then re-locks the scheduler to return
+/// the session's transaction context and release the locks that do not outlive
+/// the batch.
+fn run_and_finish(shared: &Arc<Shared>, work: Runnable) {
+    let Runnable {
+        session,
+        sql,
+        params,
+        reply,
+        mut txn_ctx,
+    } = work;
+    let outcome = shared
+        .engine
+        .sql_batch_with_params(&sql, &mut txn_ctx, &params);
+    let in_transaction = {
+        let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
+        sched.finish(&shared.engine, session, txn_ctx)
+    };
+    let _ = reply.send(outcome.map(|outcome| BatchReply {
+        outcome,
+        in_transaction,
+    }));
+}
+
+/// Runs every parked batch whose locks are now grantable, in FIFO order, until
+/// none remain. Each finished batch may release locks that unblock the next, so
+/// this re-checks after every one.
+fn drain_ready(shared: &Arc<Shared>) {
+    loop {
+        let work = {
+            let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
+            sched.next_grantable()
+        };
+        match work {
+            Some(work) => run_and_finish(shared, work),
+            None => break,
+        }
+    }
 }
 
 /// A SQL batch waiting for locks: its request, the locks it needs, and the
@@ -245,71 +504,23 @@ struct Parked {
     deadline: Instant,
 }
 
-/// The engine actor's mutable world: the engine, its sessions, the lock
-/// manager, and the FIFO queue of batches parked on locks.
-struct EngineLoop {
-    engine: Engine,
+/// The scheduler's mutable world: the sessions, the lock manager, and the FIFO
+/// queue of batches parked on locks. One [`Mutex`] guards all three; a worker
+/// holds it only to make lock decisions, never while running a batch.
+struct Scheduler {
     sessions: SessionManager,
     locks: LockManager,
     parked: VecDeque<Parked>,
     lock_wait_timeout: Duration,
 }
 
-impl EngineLoop {
-    fn new(engine: Engine) -> Self {
-        EngineLoop {
-            engine,
+impl Scheduler {
+    fn new(lock_wait_timeout: Duration) -> Self {
+        Scheduler {
             sessions: SessionManager::new(),
             locks: LockManager::new(),
             parked: VecDeque::new(),
-            lock_wait_timeout: LOCK_WAIT_TIMEOUT,
-        }
-    }
-
-    fn run(mut self, rx: mpsc::Receiver<EngineCall>) {
-        loop {
-            // Wake at the earliest parked deadline so deadlocked waiters are
-            // reaped even if no new call arrives.
-            let call = match self.earliest_deadline() {
-                Some(deadline) => {
-                    let wait = deadline.saturating_duration_since(Instant::now());
-                    match rx.recv_timeout(wait) {
-                        Ok(call) => Some(call),
-                        Err(mpsc::RecvTimeoutError::Timeout) => None,
-                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
-                    }
-                }
-                None => match rx.recv() {
-                    Ok(call) => Some(call),
-                    Err(_) => break,
-                },
-            };
-            self.reap_expired();
-            match call {
-                Some(EngineCall::OpenSession {
-                    database,
-                    login,
-                    reply,
-                }) => {
-                    let _ = reply.send(self.sessions.open(database, login));
-                }
-                Some(EngineCall::RunBatch {
-                    session,
-                    sql,
-                    params,
-                    reply,
-                }) => self.dispatch_batch(session, sql, params, reply),
-                Some(EngineCall::RunNative { command, reply }) => {
-                    let _ = reply.send(self.engine.execute(&command));
-                }
-                Some(EngineCall::CloseSession { session }) => self.close_session(session),
-                Some(EngineCall::Shutdown) => break,
-                None => {}
-            }
-        }
-        // Draining: fail any batches still parked so their callers unblock.
-        for parked in self.parked.drain(..) {
-            let _ = parked.reply.send(Err(EngineError::Unavailable));
+            lock_wait_timeout,
         }
     }
 
@@ -317,38 +528,24 @@ impl EngineLoop {
         self.parked.iter().map(|p| p.deadline).min()
     }
 
-    /// Acquires a batch's locks and runs it, or parks it behind a conflict.
-    fn dispatch_batch(
-        &mut self,
-        session: SessionId,
-        sql: String,
-        params: Vec<crate::rel::RpcParam>,
-        reply: oneshot::Sender<Result<BatchReply, EngineError>>,
-    ) {
-        let isolation = self
-            .sessions
+    /// A session's current isolation level (default if the session is unknown).
+    fn isolation(&self, session: SessionId) -> Isolation {
+        self.sessions
             .get(session)
             .map(|s| s.txn_ctx.isolation())
-            .unwrap_or_default();
-        // Parameters are values, not statements, so they never change which
-        // locks the batch needs — analyse the statement text as usual.
-        let needs = self.engine.analyze_locks(&sql, isolation);
-        if self.try_acquire(session.raw(), &needs, true) {
-            self.run_and_reply(session, &sql, &params, reply);
-            self.wake_parked();
-        } else {
-            self.parked.push_back(Parked {
-                session,
-                sql,
-                params,
-                reply,
-                needs,
-                deadline: Instant::now() + self.lock_wait_timeout,
-            });
-            // The new waiter may have closed a lock-wait cycle; break it now
-            // rather than waiting for the deadline backstop.
-            self.detect_deadlock();
-        }
+            .unwrap_or_default()
+    }
+
+    /// Takes a session's transaction context out for a worker to run a batch
+    /// with (a `Default` placeholder is left behind; [`Self::finish`] returns
+    /// the real one). A session has at most one in-flight batch and no close
+    /// races it — the connection is request/response — so the placeholder is
+    /// never observed. Unknown session: a transient context, rolled back after.
+    fn take_ctx(&mut self, session: SessionId) -> TxnContext {
+        self.sessions
+            .get_mut(session)
+            .map(|state| std::mem::take(&mut state.txn_ctx))
+            .unwrap_or_default()
     }
 
     /// Tries to grant every lock in `needs` to `owner` atomically. When
@@ -382,100 +579,93 @@ impl EngineLoop {
         true
     }
 
-    /// Runs a batch whose locks are already held, replies, then releases the
-    /// locks that do not outlive it (all of them once the transaction closes;
-    /// read locks after each statement under READ COMMITTED).
-    fn run_and_reply(
-        &mut self,
-        session: SessionId,
-        sql: &str,
-        params: &[crate::rel::RpcParam],
-        reply: oneshot::Sender<Result<BatchReply, EngineError>>,
-    ) {
+    /// Returns a finished batch's transaction context to its session and
+    /// releases the locks that do not outlive it: all of them once the
+    /// transaction closes; read locks after each statement under READ
+    /// COMMITTED. Returns whether the connection is still in a transaction.
+    /// (Execution ran in [`run_and_finish`], with the scheduler lock released.)
+    fn finish(&mut self, engine: &Engine, session: SessionId, txn_ctx: TxnContext) -> bool {
         let owner = session.raw();
-        let outcome = match self.sessions.get_mut(session) {
-            Some(state) => self
-                .engine
-                .sql_batch_with_params(sql, &mut state.txn_ctx, params),
-            None => {
-                // Unknown session: one-shot autocommit, hold no locks after.
-                let mut txn_ctx = TxnContext::default();
-                let out = self.engine.sql_batch_with_params(sql, &mut txn_ctx, params);
-                self.engine.abort_session_txn(&mut txn_ctx);
-                out
-            }
-        };
-        let in_transaction = match self.sessions.get(session) {
-            Some(state) if state.txn_ctx.has_open_transaction() => {
-                // Transaction still open: keep write locks. Under READ
-                // COMMITTED shared locks do not survive the statement.
-                if matches!(state.txn_ctx.isolation(), Isolation::ReadCommitted) {
-                    self.locks.release_read_locks(owner);
+        match self.sessions.get_mut(session) {
+            Some(state) => {
+                state.txn_ctx = txn_ctx;
+                let open = state.txn_ctx.has_open_transaction();
+                let is_read_committed =
+                    matches!(state.txn_ctx.isolation(), Isolation::ReadCommitted);
+                if open {
+                    // Transaction still open: keep write locks. Under READ
+                    // COMMITTED shared locks do not survive the statement.
+                    if is_read_committed {
+                        self.locks.release_read_locks(owner);
+                    }
+                    true
+                } else {
+                    // Transaction closed (autocommit or COMMIT/ROLLBACK): drop
+                    // every lock the batch acquired.
+                    self.locks.release_all(owner);
+                    false
                 }
-                true
             }
-            // Transaction closed (autocommit or COMMIT/ROLLBACK) or unknown
-            // session: drop every lock the batch acquired.
-            _ => {
+            None => {
+                // Session closed while the batch ran, or unknown: roll back the
+                // taken context and hold no locks.
+                let mut txn_ctx = txn_ctx;
+                engine.abort_session_txn(&mut txn_ctx);
                 self.locks.release_all(owner);
                 false
-            }
-        };
-        let _ = reply.send(outcome.map(|outcome| BatchReply {
-            outcome,
-            in_transaction,
-        }));
-    }
-
-    /// Re-attempts parked batches in FIFO order until none can proceed. A
-    /// woken batch may itself release locks (autocommit / commit), so this
-    /// re-scans from the front after each grant.
-    fn wake_parked(&mut self) {
-        loop {
-            let mut ran = false;
-            let mut i = 0;
-            while i < self.parked.len() {
-                let owner = self.parked[i].session.raw();
-                // Only waiters ahead in the queue have priority (FIFO); a
-                // waiter never yields to itself or to those behind it.
-                let ahead: Vec<(Resource, LockMode)> = self
-                    .parked
-                    .iter()
-                    .take(i)
-                    .filter(|p| p.session.raw() != owner)
-                    .flat_map(|p| p.needs.iter().copied())
-                    .collect();
-                let grantable = self.parked[i].needs.iter().all(|(resource, mode)| {
-                    // A resource the waiter already holds is exempt from the
-                    // FIFO yield (it is not jumping the queue for it), matching
-                    // try_acquire.
-                    (self.locks.holds(owner, *resource)
-                        || !ahead.iter().any(|(r, _)| r == resource))
-                        && self.locks.conflict(owner, *resource, *mode).is_none()
-                });
-                if grantable {
-                    let parked = self.parked.remove(i).expect("index in bounds");
-                    for (resource, mode) in &parked.needs {
-                        self.locks.grant(owner, *resource, *mode);
-                    }
-                    self.run_and_reply(parked.session, &parked.sql, &parked.params, parked.reply);
-                    ran = true;
-                    break; // re-scan from the front (locks may have changed)
-                }
-                i += 1;
-            }
-            if !ran {
-                break;
             }
         }
     }
 
+    /// Removes and returns the first parked batch (FIFO) whose locks are now
+    /// grantable, having granted them and taken its session's transaction
+    /// context out to run with. `None` if none can proceed. The caller runs it
+    /// with the scheduler lock released, then calls again.
+    fn next_grantable(&mut self) -> Option<Runnable> {
+        let mut i = 0;
+        while i < self.parked.len() {
+            let owner = self.parked[i].session.raw();
+            // Only waiters ahead in the queue have priority (FIFO); a waiter
+            // never yields to itself or to those behind it.
+            let ahead: Vec<(Resource, LockMode)> = self
+                .parked
+                .iter()
+                .take(i)
+                .filter(|p| p.session.raw() != owner)
+                .flat_map(|p| p.needs.iter().copied())
+                .collect();
+            let grantable = self.parked[i].needs.iter().all(|(resource, mode)| {
+                // A resource the waiter already holds is exempt from the FIFO
+                // yield (it is not jumping the queue for it), matching
+                // try_acquire.
+                (self.locks.holds(owner, *resource) || !ahead.iter().any(|(r, _)| r == resource))
+                    && self.locks.conflict(owner, *resource, *mode).is_none()
+            });
+            if grantable {
+                let parked = self.parked.remove(i).expect("index in bounds");
+                for (resource, mode) in &parked.needs {
+                    self.locks.grant(owner, *resource, *mode);
+                }
+                let txn_ctx = self.take_ctx(parked.session);
+                return Some(Runnable {
+                    session: parked.session,
+                    sql: parked.sql,
+                    params: parked.params,
+                    reply: parked.reply,
+                    txn_ctx,
+                });
+            }
+            i += 1;
+        }
+        None
+    }
+
     /// Rolls back the single earliest-deadline batch whose wait has expired
-    /// (the deadlock victim), then wakes anyone its released locks unblock —
-    /// which typically rescues its deadlock partner before that partner is
-    /// itself reaped. Any further expired waiters are handled on the next
-    /// loop iteration.
-    fn reap_expired(&mut self) {
+    /// (the deadlock backstop victim). The caller then drains anyone its
+    /// released locks unblock — typically rescuing its deadlock partner before
+    /// that partner is itself reaped. Any further expired waiters are handled on
+    /// the next loop iteration.
+    fn reap_expired(&mut self, engine: &Engine) {
         let now = Instant::now();
         let victim_idx = self
             .parked
@@ -485,21 +675,20 @@ impl EngineLoop {
             .min_by_key(|(_, p)| p.deadline)
             .map(|(i, _)| i);
         if let Some(idx) = victim_idx {
-            self.abort_parked_victim(idx);
+            self.abort_parked_victim(engine, idx);
         }
     }
 
     /// Aborts the parked batch at `idx` as a deadlock victim: rolls back its
-    /// transaction, releases its locks, replies with error 1205, and wakes any
-    /// batches its released locks unblock.
-    fn abort_parked_victim(&mut self, idx: usize) {
+    /// transaction, releases its locks, and replies with error 1205. The caller
+    /// drains any batches the released locks unblock.
+    fn abort_parked_victim(&mut self, engine: &Engine, idx: usize) {
         let victim = self.parked.remove(idx).expect("index in bounds");
         if let Some(state) = self.sessions.get_mut(victim.session) {
-            self.engine.abort_session_txn(&mut state.txn_ctx);
+            engine.abort_session_txn(&mut state.txn_ctx);
         }
         self.locks.release_all(victim.session.raw());
         let _ = victim.reply.send(Ok(deadlock_victim_reply()));
-        self.wake_parked();
     }
 
     /// Detects lock-wait *cycles* among the parked batches — a waits-for graph
@@ -507,9 +696,9 @@ impl EngineLoop {
     /// (error 1205). A cycle can only form when a batch parks, so this runs the
     /// instant one does, breaking the deadlock immediately rather than after the
     /// wait-timeout backstop. Aborts victims until the graph is acyclic.
-    fn detect_deadlock(&mut self) {
+    fn detect_deadlock(&mut self, engine: &Engine) {
         while let Some(idx) = self.find_deadlock_victim() {
-            self.abort_parked_victim(idx);
+            self.abort_parked_victim(engine, idx);
         }
     }
 
@@ -556,16 +745,15 @@ impl EngineLoop {
             .map(|(i, _)| i)
     }
 
-    /// Handles a disconnect: roll back any open transaction, release the
-    /// session's locks, and wake anyone that was waiting on them.
-    fn close_session(&mut self, session: SessionId) {
+    /// Handles a disconnect: roll back any open transaction and release the
+    /// session's locks. The caller drains anyone that was waiting on them.
+    fn close_session(&mut self, engine: &Engine, session: SessionId) {
         if let Some(mut state) = self.sessions.close(session)
             && state.txn_ctx.has_open_transaction()
         {
-            self.engine.abort_session_txn(&mut state.txn_ctx);
+            engine.abort_session_txn(&mut state.txn_ctx);
         }
         self.locks.release_all(session.raw());
-        self.wake_parked();
     }
 }
 
@@ -1219,5 +1407,247 @@ mod tests {
         .unwrap();
         assert_eq!(ids(&out_a), vec![1]);
         assert_eq!(ids(&out_b), vec![1]);
+    }
+
+    /// The worker pool's core correctness stress test: many sessions run money
+    /// transfers concurrently, some rolled back at random, and the total across
+    /// all accounts must be exactly conserved — no lost updates, no torn
+    /// transactions, no money created or destroyed by the concurrent plumbing
+    /// (take/return of session context, parking, waking, draining).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_transfers_conserve_the_total() {
+        const ACCOUNTS: i64 = 8;
+        const TASKS: usize = 16;
+        const TRANSFERS: usize = 25;
+        const INITIAL: i64 = 1000;
+
+        let h = start(Duration::from_secs(30));
+        let setup = h.handle.open_session(String::new(), String::new()).await;
+        h.handle
+            .run_batch(
+                setup,
+                "CREATE TABLE accounts (id INT NOT NULL PRIMARY KEY, balance INT NOT NULL)".into(),
+            )
+            .await
+            .unwrap();
+        for id in 1..=ACCOUNTS {
+            h.handle
+                .run_batch(
+                    setup,
+                    format!("INSERT INTO accounts VALUES ({id}, {INITIAL})"),
+                )
+                .await
+                .unwrap();
+        }
+
+        let mut tasks = Vec::new();
+        for t in 0..TASKS {
+            let handle = h.handle.clone();
+            tasks.push(tokio::spawn(async move {
+                let session = handle.open_session(String::new(), String::new()).await;
+                // A deterministic per-task PRNG (an LCG) — reproducible, no dep.
+                let mut rng: u64 =
+                    0x9E37_79B9_7F4A_7C15 ^ (t as u64).wrapping_mul(0x2545_F491_4F6C_DD1D);
+                let mut next = move || {
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    rng >> 33
+                };
+                for _ in 0..TRANSFERS {
+                    let a = (next() % ACCOUNTS as u64) as i64 + 1;
+                    // Force a distinct counterparty: (a % N) + 1 is never a.
+                    let b = (a % ACCOUNTS) + 1;
+                    let amount = (next() % 50) as i64 + 1;
+                    // One in ten transactions rolls back; conservation must hold
+                    // either way.
+                    let close = if next() % 10 == 0 {
+                        "ROLLBACK"
+                    } else {
+                        "COMMIT"
+                    };
+                    let sql = format!(
+                        "BEGIN TRAN; \
+                         UPDATE accounts SET balance = balance - {amount} WHERE id = {a}; \
+                         UPDATE accounts SET balance = balance + {amount} WHERE id = {b}; \
+                         {close};"
+                    );
+                    // A deadlock victim (1205) rolls back cleanly; just retry it.
+                    loop {
+                        let reply = handle.run_batch(session, sql.clone()).await.unwrap();
+                        match error_number(&reply) {
+                            Some(1205) => continue,
+                            Some(other) => panic!("unexpected error {other} on transfer"),
+                            None => break,
+                        }
+                    }
+                }
+                handle.close_session(session);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let reply = h
+            .handle
+            .run_batch(setup, "SELECT balance FROM accounts".into())
+            .await
+            .unwrap();
+        let total: i64 = ids(&reply).iter().sum();
+        assert_eq!(
+            total,
+            ACCOUNTS * INITIAL,
+            "money was created or destroyed under concurrency"
+        );
+    }
+
+    /// Like the conservation test, but each transfer is a *multi-batch*
+    /// transaction across two tables, so locks are taken incrementally and two
+    /// transfers in opposite table order can genuinely deadlock. A 1205 victim
+    /// rolls back and retries. Exercises cross-batch lock holding, the deadlock
+    /// detector, and victim retry all under concurrent load — the total must
+    /// still be conserved.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_multi_table_transfers_survive_deadlocks() {
+        const ACCOUNTS: i64 = 3;
+        const TASKS: usize = 10;
+        const TRANSFERS: usize = 12;
+        const INITIAL: i64 = 1000;
+        const TABLES: [&str; 2] = ["checking", "savings"];
+
+        let h = start(Duration::from_secs(30));
+        let setup = h.handle.open_session(String::new(), String::new()).await;
+        for table in TABLES {
+            h.handle
+                .run_batch(
+                    setup,
+                    format!(
+                        "CREATE TABLE {table} (id INT NOT NULL PRIMARY KEY, balance INT NOT NULL)"
+                    ),
+                )
+                .await
+                .unwrap();
+            for id in 1..=ACCOUNTS {
+                h.handle
+                    .run_batch(
+                        setup,
+                        format!("INSERT INTO {table} VALUES ({id}, {INITIAL})"),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        let mut tasks = Vec::new();
+        for t in 0..TASKS {
+            let handle = h.handle.clone();
+            tasks.push(tokio::spawn(async move {
+                let session = handle.open_session(String::new(), String::new()).await;
+                let mut rng: u64 =
+                    0xDEAD_BEEF_0000_0001 ^ (t as u64).wrapping_mul(0x2545_F491_4F6C_DD1D);
+                let mut next = move || {
+                    rng = rng
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    rng >> 33
+                };
+                for _ in 0..TRANSFERS {
+                    let src = TABLES[(next() % 2) as usize];
+                    let dst = TABLES[(next() % 2) as usize];
+                    let a = (next() % ACCOUNTS as u64) as i64 + 1;
+                    let b = (next() % ACCOUNTS as u64) as i64 + 1;
+                    let amount = (next() % 40) as i64 + 1;
+                    let close = if next() % 8 == 0 {
+                        "ROLLBACK"
+                    } else {
+                        "COMMIT"
+                    };
+                    // Deadlock victims only ever land on the two UPDATEs; BEGIN
+                    // and COMMIT/ROLLBACK take no new locks. Retry the whole
+                    // transaction (already rolled back) from the top.
+                    'attempt: loop {
+                        let steps = [
+                            "BEGIN TRAN".to_string(),
+                            format!("UPDATE {src} SET balance = balance - {amount} WHERE id = {a}"),
+                            format!("UPDATE {dst} SET balance = balance + {amount} WHERE id = {b}"),
+                            close.to_string(),
+                        ];
+                        for step in steps {
+                            let reply = handle.run_batch(session, step).await.unwrap();
+                            match error_number(&reply) {
+                                Some(1205) => continue 'attempt,
+                                Some(other) => panic!("unexpected error {other}"),
+                                None => {}
+                            }
+                        }
+                        break;
+                    }
+                }
+                handle.close_session(session);
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap();
+        }
+
+        let mut total = 0i64;
+        for table in TABLES {
+            let reply = h
+                .handle
+                .run_batch(setup, format!("SELECT balance FROM {table}"))
+                .await
+                .unwrap();
+            total += ids(&reply).iter().sum::<i64>();
+        }
+        assert_eq!(
+            total,
+            2 * ACCOUNTS * INITIAL,
+            "money not conserved across tables under deadlock retries"
+        );
+    }
+
+    /// A single waiter blocked on a legitimately-held lock (no cycle, so the
+    /// graph detector finds nothing) must still be freed by the lock-wait
+    /// timeout even when the pool then goes completely quiet — no further call
+    /// arrives to wake a worker. Regression: a stale `earliest_deadline`
+    /// snapshot used to let a worker block in an untimed `recv` holding the
+    /// single-consumer rx mutex, disabling the reaper during quiescence and
+    /// hanging the waiter indefinitely instead of timing it out.
+    #[tokio::test]
+    async fn lone_waiter_is_reaped_by_timeout_when_pool_goes_idle() {
+        let h = start(Duration::from_millis(300));
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
+
+        h.handle
+            .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
+            .await
+            .unwrap();
+        h.handle
+            .run_batch(a, "INSERT INTO t VALUES (1)".into())
+            .await
+            .unwrap();
+        // A holds X on t and stays idle inside its transaction (never commits).
+        h.handle
+            .run_batch(a, "BEGIN TRAN; UPDATE t SET id = id".into())
+            .await
+            .unwrap();
+
+        // B's read conflicts with A's uncommitted write and parks. There is no
+        // cycle (A waits on nothing), so only the timeout backstop can free it,
+        // and no further calls arrive to wake a worker.
+        let out = tokio::time::timeout(
+            Duration::from_secs(5),
+            h.handle.run_batch(b, "SELECT id FROM t".into()),
+        )
+        .await
+        .expect("lone waiter must be reaped by the timeout, not hang forever")
+        .unwrap();
+        assert_eq!(
+            error_number(&out),
+            Some(1205),
+            "the lone waiter should time out as a 1205 victim"
+        );
     }
 }

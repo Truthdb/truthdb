@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::sync::RwLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -12,29 +13,47 @@ const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
 
 type Document = Map<String, Value>;
 
-pub struct Engine {
-    storage: Storage,
+/// The engine's search-subsystem state, mutated only on the native path
+/// ([`Engine::execute`]) and read by the checkpointer. Guarded by
+/// [`Engine::meta`], a `RwLock` that doubles as the execution gate that keeps
+/// the two paths from observing each other's torn state (see [`Engine`]).
+struct EngineMeta {
     state: EngineState,
     next_seq_no: u64,
     next_doc_id: u64,
 }
 
+/// The database engine, shared across the worker pool as `Arc<Engine>`.
+///
+/// All methods take `&self`: [`Storage`] is internally synchronized, and the
+/// search-subsystem state lives behind `meta`. `meta` also serves as the
+/// **execution gate** decoupling the two execution paths, which do not share a
+/// lock manager: a relational batch ([`Self::sql_batch_with_params`]) holds
+/// `meta.read()` for its whole run (many run concurrently), while a native
+/// command ([`Self::execute`], which bypasses table locks) takes `meta.write()`
+/// and so runs exclusively. Without this, a concurrent native batch could read
+/// a relational batch's half-applied writes — which the old single-threaded
+/// actor prevented for free.
+pub struct Engine {
+    storage: Storage,
+    meta: RwLock<EngineMeta>,
+}
+
 impl Engine {
     pub fn new(storage: Storage) -> Result<Self, EngineError> {
-        let mut engine = Engine {
-            storage,
+        let mut meta = EngineMeta {
             state: EngineState::default(),
             next_seq_no: 1,
             next_doc_id: 1,
         };
 
         // Try to load a snapshot first
-        if let Some(snapshot) = engine.storage.load_snapshot()? {
-            engine.state = decode_snapshot(&snapshot.data)?;
-            engine.next_seq_no = snapshot.next_seq_no;
-            engine.next_doc_id = snapshot.next_doc_id;
+        if let Some(snapshot) = storage.load_snapshot()? {
+            meta.state = decode_snapshot(&snapshot.data)?;
+            meta.next_seq_no = snapshot.next_seq_no;
+            meta.next_doc_id = snapshot.next_doc_id;
             // Rebuild postings (not serialized)
-            for index_state in engine.state.indices.values_mut() {
+            for index_state in meta.state.indices.values_mut() {
                 index_state.rebuild_postings()?;
             }
         }
@@ -46,56 +65,62 @@ impl Engine {
         // the snapshot descriptor becoming durable and the WAL head
         // advancing legitimately leaves them in the ring, and re-applying
         // them would fail (duplicate index/document errors).
-        let records = engine.storage.replay_wal_entries()?;
+        let records = storage.replay_wal_entries()?;
         for record in records {
-            if record.entry_type != ENGINE_WAL_ENTRY_TYPE || record.seq_no < engine.next_seq_no {
+            if record.entry_type != ENGINE_WAL_ENTRY_TYPE || record.seq_no < meta.next_seq_no {
                 continue;
             }
             let event: WalEvent = serde_json::from_slice(&record.payload)
                 .map_err(|err| EngineError::Replay(format!("failed to decode wal event: {err}")))?;
-            engine.apply_event(&event)?;
-            engine.next_seq_no = record.seq_no.saturating_add(1);
+            meta.apply_event(&event)?;
+            meta.next_seq_no = record.seq_no.saturating_add(1);
         }
 
-        Ok(engine)
+        Ok(Engine {
+            storage,
+            meta: RwLock::new(meta),
+        })
     }
 
-    pub fn execute(&mut self, input: &str) -> Result<String, EngineError> {
+    pub fn execute(&self, input: &str) -> Result<String, EngineError> {
+        // Native path: exclusive on the execution gate (see [`Engine`]), which
+        // also gives the search state the `&mut` it needs.
+        let mut meta = self.meta.write().expect("engine meta poisoned");
         // Routing: the legacy ES commands all carry a `{` JSON body; that
         // shape routes to the frozen search path. Everything else is SQL.
         match parse_command(input)? {
-            Some(command) => self.execute_es(command),
-            None => self.execute_sql(input),
+            Some(command) => self.execute_es(&mut meta, command),
+            None => self.execute_sql(&mut meta, input),
         }
     }
 
-    fn execute_es(&mut self, command: Command) -> Result<String, EngineError> {
+    fn execute_es(&self, meta: &mut EngineMeta, command: Command) -> Result<String, EngineError> {
         match command {
             Command::CreateIndex { name, mappings } => {
-                self.validate_create_index(&name, &mappings)?;
+                meta.validate_create_index(&name, &mappings)?;
                 let event = WalEvent::CreateIndex {
                     name: name.clone(),
                     mappings: mappings.clone(),
                 };
-                self.persist_event(&event)?;
-                self.apply_event(&event)?;
-                self.maybe_checkpoint()?;
+                self.persist_event(meta, &event)?;
+                meta.apply_event(&event)?;
+                self.maybe_checkpoint(meta)?;
                 render_json(&json!({
                     "acknowledged": true,
                     "index": name,
                 }))
             }
             Command::InsertDocument { index, document } => {
-                self.validate_insert_document(&index, &document)?;
-                let doc_id = self.next_doc_id.to_string();
+                meta.validate_insert_document(&index, &document)?;
+                let doc_id = meta.next_doc_id.to_string();
                 let event = WalEvent::InsertDocument {
                     index: index.clone(),
                     id: doc_id.clone(),
                     document: document.clone(),
                 };
-                self.persist_event(&event)?;
-                self.apply_event(&event)?;
-                self.maybe_checkpoint()?;
+                self.persist_event(meta, &event)?;
+                meta.apply_event(&event)?;
+                self.maybe_checkpoint(meta)?;
                 render_json(&json!({
                     "_id": doc_id,
                     "_index": index,
@@ -103,7 +128,7 @@ impl Engine {
                 }))
             }
             Command::Search { index, query } => {
-                let index_state = self.state.indices.get(&index).ok_or_else(|| {
+                let index_state = meta.state.indices.get(&index).ok_or_else(|| {
                     EngineError::Command(CommandError::UnknownIndex(index.clone()))
                 })?;
                 let hits = index_state.search(&query)?;
@@ -122,14 +147,14 @@ impl Engine {
     /// committed (each is autocommit in Stage 3), so their results ride
     /// along with any error in one envelope, transported as a normal
     /// response (TDS-like) rather than failing the connection.
-    fn execute_sql(&mut self, input: &str) -> Result<String, EngineError> {
+    fn execute_sql(&self, meta: &mut EngineMeta, input: &str) -> Result<String, EngineError> {
         // The native (session-less) path has nowhere to carry an open
         // transaction across calls, so it uses a transient context and rolls
         // back anything an unbalanced BEGIN leaves dangling.
         let mut txn_ctx = crate::rel::TxnContext::default();
         let outcome = crate::rel::execute_batch(&self.storage, input, &mut txn_ctx);
         txn_ctx.abort(&self.storage);
-        self.maybe_checkpoint()?;
+        self.maybe_checkpoint(meta)?;
         Ok(render_sql_outcome(&outcome))
     }
 
@@ -140,7 +165,7 @@ impl Engine {
     /// (open transaction, `@@TRANCOUNT`, isolation) across batches within a
     /// session.
     pub fn sql_batch(
-        &mut self,
+        &self,
         input: &str,
         txn_ctx: &mut crate::rel::TxnContext,
     ) -> Result<crate::rel::BatchOutcome, EngineError> {
@@ -150,19 +175,23 @@ impl Engine {
     /// Runs a SQL batch with `sp_executesql` parameters seeded as batch
     /// variables (see [`crate::rel::execute_batch_with_params`]).
     pub fn sql_batch_with_params(
-        &mut self,
+        &self,
         input: &str,
         txn_ctx: &mut crate::rel::TxnContext,
         params: &[crate::rel::RpcParam],
     ) -> Result<crate::rel::BatchOutcome, EngineError> {
+        // Hold the execution gate shared for the whole batch: concurrent
+        // relational batches run together, but a native writer is excluded (see
+        // [`Engine`]). The guard also gives the checkpointer its `meta` read.
+        let meta = self.meta.read().expect("engine meta poisoned");
         let outcome = crate::rel::execute_batch_with_params(&self.storage, input, txn_ctx, params);
-        self.maybe_checkpoint()?;
+        self.maybe_checkpoint(&meta)?;
         Ok(outcome)
     }
 
     /// Rolls back and discards a session's open transaction (connection
     /// teardown). No-op when the session has no transaction.
-    pub fn abort_session_txn(&mut self, txn_ctx: &mut crate::rel::TxnContext) {
+    pub fn abort_session_txn(&self, txn_ctx: &mut crate::rel::TxnContext) {
         txn_ctx.abort(&self.storage);
     }
 
@@ -177,15 +206,20 @@ impl Engine {
         crate::rel::analyze_locks(&self.storage, input, isolation)
     }
 
-    pub fn checkpoint(&mut self) -> Result<(), EngineError> {
+    pub fn checkpoint(&self) -> Result<(), EngineError> {
+        let meta = self.meta.read().expect("engine meta poisoned");
+        self.checkpoint_locked(&meta)
+    }
+
+    fn checkpoint_locked(&self, meta: &EngineMeta) -> Result<(), EngineError> {
         // JSON, not bincode: documents hold serde_json::Value, which bincode
         // can serialize but never deserialize (`deserialize_any`), so bincode
         // snapshots with documents could not be loaded back.
-        let data = serde_json::to_vec(&self.state)
+        let data = serde_json::to_vec(&meta.state)
             .map_err(|err| EngineError::Replay(format!("failed to serialize state: {err}")))?;
-        let checkpoint_seq = self.next_seq_no.saturating_sub(1);
+        let checkpoint_seq = meta.next_seq_no.saturating_sub(1);
         self.storage
-            .write_checkpoint(&data, checkpoint_seq, self.next_seq_no, self.next_doc_id)?;
+            .write_checkpoint(&data, checkpoint_seq, meta.next_seq_no, meta.next_doc_id)?;
         Ok(())
     }
 
@@ -193,35 +227,49 @@ impl Engine {
         self.storage.wal_usage_ratio()
     }
 
-    fn maybe_checkpoint(&mut self) -> Result<(), EngineError> {
-        // A checkpoint flushes dirty pages and truncates the WAL head. While an
-        // explicit transaction is open its uncommitted pages would be made
-        // durable and its undo records discarded, so a crash could not roll it
-        // back. Defer the checkpoint until every transaction has closed; the
-        // WAL keeps growing until then (bounded, non-corrupting).
-        if self.storage.has_active_transactions() {
+    fn maybe_checkpoint(&self, meta: &EngineMeta) -> Result<(), EngineError> {
+        // A checkpoint flushes dirty pages and truncates the WAL head. While a
+        // transaction is open its uncommitted pages would be made durable and
+        // its undo records discarded, so a crash could not roll it back. The
+        // check-and-write must be atomic: with a concurrent worker pool a
+        // transaction can begin between a bare check and the truncation, so the
+        // decision is re-made under the storage lock in `checkpoint_if_quiescent`
+        // (which no transaction can `begin` across). The bare pre-check here
+        // just avoids serializing state on every batch in the common case.
+        if self.storage.has_active_transactions()
+            || self.wal_usage_ratio() < WAL_CHECKPOINT_THRESHOLD
+        {
             return Ok(());
         }
-        if self.wal_usage_ratio() >= WAL_CHECKPOINT_THRESHOLD {
-            self.checkpoint()?;
-        }
+        let data = serde_json::to_vec(&meta.state)
+            .map_err(|err| EngineError::Replay(format!("failed to serialize state: {err}")))?;
+        let checkpoint_seq = meta.next_seq_no.saturating_sub(1);
+        self.storage.checkpoint_if_quiescent(
+            &data,
+            checkpoint_seq,
+            meta.next_seq_no,
+            meta.next_doc_id,
+            WAL_CHECKPOINT_THRESHOLD,
+        )?;
         Ok(())
     }
 
-    fn persist_event(&mut self, event: &WalEvent) -> Result<(), EngineError> {
+    fn persist_event(&self, meta: &mut EngineMeta, event: &WalEvent) -> Result<(), EngineError> {
         let payload = serde_json::to_vec(event)
             .map_err(|err| EngineError::Replay(format!("failed to encode wal event: {err}")))?;
-        let seq_no = self.next_seq_no;
+        let seq_no = meta.next_seq_no;
         self.storage.append_wal_entry(
             ENGINE_WAL_ENTRY_TYPE,
             ENGINE_WAL_ENTRY_VERSION,
             seq_no,
             &payload,
         )?;
-        self.next_seq_no = self.next_seq_no.saturating_add(1);
+        meta.next_seq_no = meta.next_seq_no.saturating_add(1);
         Ok(())
     }
+}
 
+impl EngineMeta {
     fn apply_event(&mut self, event: &WalEvent) -> Result<(), EngineError> {
         match event {
             WalEvent::CreateIndex { name, mappings } => {
@@ -1012,7 +1060,7 @@ mod tests {
         let path = unique_temp_path("basic-search");
         let storage =
             Storage::create(path.clone(), test_storage_options()).expect("storage create");
-        let mut engine = Engine::new(storage).expect("engine create");
+        let engine = Engine::new(storage).expect("engine create");
 
         engine
             .execute(
@@ -1080,7 +1128,7 @@ mod tests {
         drop(engine);
 
         let storage = Storage::open(path.clone()).expect("storage reopen");
-        let mut engine = Engine::new(storage).expect("engine replay");
+        let engine = Engine::new(storage).expect("engine replay");
         let response = engine
             .execute(
                 r#"
@@ -1118,7 +1166,7 @@ mod tests {
         let path = unique_temp_path("checkpoint-roundtrip");
         let storage =
             Storage::create(path.clone(), test_storage_options()).expect("storage create");
-        let mut engine = Engine::new(storage).expect("engine create");
+        let engine = Engine::new(storage).expect("engine create");
         engine
             .execute(
                 r#"
@@ -1141,7 +1189,7 @@ mod tests {
         drop(engine);
 
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("engine restart after checkpoint");
+        let engine = Engine::new(storage).expect("engine restart after checkpoint");
         let response = engine
             .execute(r#"search notes { "query": { "match": { "body": "doc" } } }"#)
             .expect("search");
@@ -1209,7 +1257,7 @@ mod tests {
         drop(storage);
 
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("open must skip covered events");
+        let engine = Engine::new(storage).expect("open must skip covered events");
         let response = engine
             .execute(r#"search notes { "query": { "match": { "body": "covered" } } }"#)
             .expect("search");
@@ -1226,7 +1274,7 @@ mod tests {
         let path = unique_temp_path("mixed-wal");
         let storage =
             Storage::create(path.clone(), test_storage_options()).expect("storage create");
-        let mut engine = Engine::new(storage).expect("engine create");
+        let engine = Engine::new(storage).expect("engine create");
 
         engine
             .execute(
@@ -1250,7 +1298,7 @@ mod tests {
         drop(engine); // crash: everything lives in the shared WAL only
 
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("recover both subsystems");
+        let engine = Engine::new(storage).expect("recover both subsystems");
 
         let response = engine
             .execute(r#"search docs { "query": { "match": { "body": "search" } } }"#)
@@ -1258,7 +1306,7 @@ mod tests {
         let response: Value = serde_json::from_str(&response).expect("json");
         assert_eq!(response["hits"]["total"].as_u64(), Some(10));
 
-        let ids = sql_column_i64(&mut engine, "SELECT id FROM items ORDER BY id", 0);
+        let ids = sql_column_i64(&engine, "SELECT id FROM items ORDER BY id", 0);
         assert_eq!(
             ids,
             (0..10).collect::<Vec<_>>(),
@@ -1269,17 +1317,13 @@ mod tests {
         engine
             .execute("INSERT INTO items VALUES (10, 'after recovery')")
             .expect("insert after recovery");
-        let ids = sql_column_i64(
-            &mut engine,
-            "SELECT id FROM items WHERE id > 8 ORDER BY id",
-            0,
-        );
+        let ids = sql_column_i64(&engine, "SELECT id FROM items WHERE id > 8 ORDER BY id", 0);
         assert_eq!(ids, vec![9, 10]);
         let _ = std::fs::remove_file(path);
     }
 
     /// Extracts one integer column from a SELECT via the SQL envelope.
-    fn sql_column_i64(engine: &mut Engine, sql: &str, column: usize) -> Vec<i64> {
+    fn sql_column_i64(engine: &Engine, sql: &str, column: usize) -> Vec<i64> {
         let response = engine.execute(sql).expect("sql");
         let response: Value = serde_json::from_str(&response).expect("json");
         assert_eq!(
@@ -1302,7 +1346,7 @@ mod tests {
         // Relational records land in the same ring before and between search
         // events; search replay must skip them.
         let extent = storage.allocate_extent(false).expect("extent");
-        let mut engine = Engine::new(storage).expect("engine create");
+        let engine = Engine::new(storage).expect("engine create");
         engine
             .execute(
                 r#"
@@ -1318,7 +1362,7 @@ mod tests {
         drop(engine);
 
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("engine replay with rel records");
+        let engine = Engine::new(storage).expect("engine replay with rel records");
         let response = engine
             .execute(r#"search notes { "query": { "match": { "body": "coexistence" } } }"#)
             .expect("search after replay");
@@ -1330,14 +1374,14 @@ mod tests {
     }
 
     /// Runs SQL and returns the parsed envelope.
-    fn sql(engine: &mut Engine, text: &str) -> Value {
+    fn sql(engine: &Engine, text: &str) -> Value {
         let response = engine.execute(text).expect("execute");
         serde_json::from_str(&response).expect("json envelope")
     }
 
     /// Runs SQL expected to error and returns the SQL error number from the
     /// envelope's trailing `error`.
-    fn sql_error_number(engine: &mut Engine, text: &str) -> i64 {
+    fn sql_error_number(engine: &Engine, text: &str) -> i64 {
         let env = sql(engine, text);
         env["error"]["number"]
             .as_i64()
@@ -1346,7 +1390,7 @@ mod tests {
 
     /// Runs a single-statement SELECT and returns its (columns, rows) where
     /// each cell is `Option<String>` (None = NULL).
-    fn sql_rows(engine: &mut Engine, text: &str) -> (Vec<String>, Vec<Vec<Option<String>>>) {
+    fn sql_rows(engine: &Engine, text: &str) -> (Vec<String>, Vec<Vec<Option<String>>>) {
         let env = sql(engine, text);
         assert_eq!(env["kind"], "sql", "expected rows, got {env}");
         let result = &env["results"][0];
@@ -1378,7 +1422,7 @@ mod tests {
     }
 
     /// A table's catalog object id (via `sys.tables`).
-    fn table_object_id(engine: &mut Engine, name: &str) -> u32 {
+    fn table_object_id(engine: &Engine, name: &str) -> u32 {
         let (_, rows) = sql_rows(
             engine,
             &format!("SELECT object_id FROM sys.tables WHERE name = '{name}'"),
@@ -1393,7 +1437,7 @@ mod tests {
     #[test]
     fn sql_create_insert_select_survive_restart() {
         let path = unique_temp_path("sql-roundtrip");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
 
         engine
             .execute(
@@ -1404,7 +1448,7 @@ mod tests {
             .execute("INSERT INTO products VALUES (1, 'Skor', 79.99), (2, 'Kangor', 129.5), (3, 'Sockar', NULL)")
             .expect("insert");
 
-        let (columns, rows) = sql_rows(&mut engine, "SELECT id, name FROM products ORDER BY id");
+        let (columns, rows) = sql_rows(&engine, "SELECT id, name FROM products ORDER BY id");
         assert_eq!(columns, vec!["id", "name"]);
         assert_eq!(
             rows,
@@ -1418,8 +1462,8 @@ mod tests {
 
         // Restart: schema + rows recovered.
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("engine");
-        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM products WHERE price IS NULL");
+        let engine = Engine::new(storage).expect("engine");
+        let (_, rows) = sql_rows(&engine, "SELECT name FROM products WHERE price IS NULL");
         assert_eq!(rows, vec![vec![Some("Sockar".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -1427,7 +1471,7 @@ mod tests {
     #[test]
     fn sql_update_and_delete_with_where() {
         let path = unique_temp_path("sql-update-delete");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT, label NVARCHAR(20))")
             .expect("create");
@@ -1439,14 +1483,14 @@ mod tests {
         engine
             .execute("UPDATE t SET n = n + 5, label = 'x' WHERE id = 2")
             .expect("update");
-        let (_, rows) = sql_rows(&mut engine, "SELECT n, label FROM t WHERE id = 2");
+        let (_, rows) = sql_rows(&engine, "SELECT n, label FROM t WHERE id = 2");
         assert_eq!(rows, vec![vec![Some("25".into()), Some("x".into())]]);
 
         // DELETE a subset.
         engine
             .execute("DELETE FROM t WHERE n < 20")
             .expect("delete");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t ORDER BY id");
         assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -1454,7 +1498,7 @@ mod tests {
     #[test]
     fn sql_update_primary_key_rekeys() {
         let path = unique_temp_path("sql-update-pk");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
             .expect("create");
@@ -1465,7 +1509,7 @@ mod tests {
         engine
             .execute("UPDATE t SET id = 5 WHERE id = 1")
             .expect("update");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id, v FROM t ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id, v FROM t ORDER BY id");
         assert_eq!(
             rows,
             vec![
@@ -1475,7 +1519,7 @@ mod tests {
         );
         // Re-keying onto an existing key collides (2627).
         assert_eq!(
-            sql_error_number(&mut engine, "UPDATE t SET id = 2 WHERE id = 5"),
+            sql_error_number(&engine, "UPDATE t SET id = 2 WHERE id = 5"),
             2627
         );
         let _ = std::fs::remove_file(path);
@@ -1484,7 +1528,7 @@ mod tests {
     #[test]
     fn sql_delete_all_and_update_null_violation() {
         let path = unique_temp_path("sql-del-all");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, n INT NOT NULL)")
             .expect("create");
@@ -1493,12 +1537,12 @@ mod tests {
             .expect("insert");
         // Updating a NOT NULL column to NULL is 515.
         assert_eq!(
-            sql_error_number(&mut engine, "UPDATE t SET n = NULL WHERE id = 1"),
+            sql_error_number(&engine, "UPDATE t SET n = NULL WHERE id = 1"),
             515
         );
         // DELETE with no WHERE clears the table.
         engine.execute("DELETE FROM t").expect("delete all");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t");
         assert!(rows.is_empty());
         let _ = std::fs::remove_file(path);
     }
@@ -1506,7 +1550,7 @@ mod tests {
     #[test]
     fn sql_default_values_applied() {
         let path = unique_temp_path("sql-default");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute(
                 "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, \
@@ -1521,7 +1565,7 @@ mod tests {
         engine
             .execute("INSERT INTO t (id, label) VALUES (2, NULL)")
             .expect("insert2");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id, n, label FROM t ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id, n, label FROM t ORDER BY id");
         assert_eq!(
             rows,
             vec![
@@ -1535,7 +1579,7 @@ mod tests {
     #[test]
     fn sql_identity_assigns_and_survives_restart() {
         let path = unique_temp_path("sql-identity");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute(
                 "CREATE TABLE t (id INT NOT NULL PRIMARY KEY IDENTITY(1,1), name NVARCHAR(10))",
@@ -1552,7 +1596,7 @@ mod tests {
         engine
             .execute("INSERT INTO t (name) VALUES ('d')")
             .expect("i3");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id, name FROM t ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id, name FROM t ORDER BY id");
         assert_eq!(
             rows,
             vec![
@@ -1563,29 +1607,29 @@ mod tests {
         );
         // Providing an explicit value for an identity column is rejected.
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO t (id, name) VALUES (9, 'z')"),
+            sql_error_number(&engine, "INSERT INTO t (id, name) VALUES (9, 'z')"),
             8101
         );
         // Identity cannot be updated.
         assert_eq!(
-            sql_error_number(&mut engine, "UPDATE t SET id = 100 WHERE id = 1"),
+            sql_error_number(&engine, "UPDATE t SET id = 100 WHERE id = 1"),
             8102
         );
         drop(engine);
 
         // Restart: the counter continues from 5, never reusing 3.
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("engine");
+        let engine = Engine::new(storage).expect("engine");
         engine
             .execute("INSERT INTO t (name) VALUES ('e')")
             .expect("i4");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE name = 'e'");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE name = 'e'");
         assert_eq!(rows, vec![vec![Some("5".into())]]);
         let _ = std::fs::remove_file(path);
     }
 
     /// Runs SQL expected to error and returns the SQL error message.
-    fn sql_error_message(engine: &mut Engine, text: &str) -> String {
+    fn sql_error_message(engine: &Engine, text: &str) -> String {
         let env = sql(engine, text);
         env["error"]["message"]
             .as_str()
@@ -1596,7 +1640,7 @@ mod tests {
     #[test]
     fn sql_check_constraints_enforced_on_insert_and_update() {
         let path = unique_temp_path("sql-check");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute(
                 "CREATE TABLE items (\
@@ -1614,11 +1658,11 @@ mod tests {
 
         // Column check violation (qty < 0) → 547.
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO items VALUES (2, -1, 10)"),
+            sql_error_number(&engine, "INSERT INTO items VALUES (2, -1, 10)"),
             547
         );
         // Named table check violation (price <= qty) → 547, name in message.
-        let msg = sql_error_message(&mut engine, "INSERT INTO items VALUES (3, 5, 5)");
+        let msg = sql_error_message(&engine, "INSERT INTO items VALUES (3, 5, 5)");
         assert!(
             msg.contains("ck_price"),
             "message should name the constraint: {msg}"
@@ -1631,27 +1675,27 @@ mod tests {
 
         // UPDATE is checked against the new row.
         assert_eq!(
-            sql_error_number(&mut engine, "UPDATE items SET qty = -3 WHERE id = 1"),
+            sql_error_number(&engine, "UPDATE items SET qty = -3 WHERE id = 1"),
             547
         );
         engine
             .execute("UPDATE items SET qty = 2 WHERE id = 1")
             .expect("update ok");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM items ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM items ORDER BY id");
         assert_eq!(rows, vec![vec![Some("1".into())], vec![Some("4".into())],]);
 
         // The constraint survives a restart and still fires.
         drop(engine);
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("engine");
+        let engine = Engine::new(storage).expect("engine");
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO items VALUES (5, -9, 10)"),
+            sql_error_number(&engine, "INSERT INTO items VALUES (5, -9, 10)"),
             547
         );
         // sys.check_constraints lists both (the auto-named column check and the
         // explicitly named table check).
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT name FROM sys.check_constraints ORDER BY name",
         );
         assert_eq!(
@@ -1667,11 +1711,11 @@ mod tests {
     #[test]
     fn sql_check_constraint_rejects_unknown_column_and_duplicate_name() {
         let path = unique_temp_path("sql-check-invalid");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         // A CHECK referencing a non-existent column is rejected at CREATE (207).
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, CHECK (missing > 0))",
             ),
             207
@@ -1679,7 +1723,7 @@ mod tests {
         // Two constraints with the same explicit name collide (2714).
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, \
                    CONSTRAINT c CHECK (id > 0), CONSTRAINT c CHECK (id < 100))",
             ),
@@ -1688,7 +1732,7 @@ mod tests {
         // A multi-part (qualified) identifier in a CHECK is rejected at CREATE
         // (4104) rather than producing a table that rejects every INSERT.
         assert_eq!(
-            sql_error_number(&mut engine, "CREATE TABLE t (col INT, CHECK (t.col > 0))",),
+            sql_error_number(&engine, "CREATE TABLE t (col INT, CHECK (t.col > 0))",),
             4104
         );
         let _ = std::fs::remove_file(path);
@@ -1697,7 +1741,7 @@ mod tests {
     #[test]
     fn sql_insert_select_copies_rows() {
         let path = unique_temp_path("sql-insert-select");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE src (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20), keep BIT)")
             .expect("create src");
@@ -1717,10 +1761,7 @@ mod tests {
                 "INSERT INTO dst (id, label) SELECT id, name FROM src WHERE keep = 1 ORDER BY id",
             )
             .expect("insert select");
-        let (_, rows) = sql_rows(
-            &mut engine,
-            "SELECT rid, id, label, note FROM dst ORDER BY rid",
-        );
+        let (_, rows) = sql_rows(&engine, "SELECT rid, id, label, note FROM dst ORDER BY rid");
         assert_eq!(
             rows,
             vec![
@@ -1741,14 +1782,11 @@ mod tests {
 
         // Column-count mismatch between SELECT list and insert list.
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO dst (id) SELECT id, name FROM src"),
+            sql_error_number(&engine, "INSERT INTO dst (id) SELECT id, name FROM src"),
             121
         );
         assert_eq!(
-            sql_error_number(
-                &mut engine,
-                "INSERT INTO dst (id, label) SELECT id FROM src"
-            ),
+            sql_error_number(&engine, "INSERT INTO dst (id, label) SELECT id FROM src"),
             120
         );
 
@@ -1757,7 +1795,7 @@ mod tests {
         engine
             .execute("INSERT INTO dst (id, label) SELECT id, label FROM dst")
             .expect("self insert select");
-        let (_, rows) = sql_rows(&mut engine, "SELECT COUNT(*) FROM dst");
+        let (_, rows) = sql_rows(&engine, "SELECT COUNT(*) FROM dst");
         assert_eq!(rows, vec![vec![Some("4".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -1767,15 +1805,15 @@ mod tests {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;
         let path = unique_temp_path("insert-select-locks");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)")
             .expect("t1");
         engine
             .execute("CREATE TABLE t2 (v INT NOT NULL)")
             .expect("t2");
-        let t1 = table_object_id(&mut engine, "t1");
-        let t2 = table_object_id(&mut engine, "t2");
+        let t1 = table_object_id(&engine, "t1");
+        let t2 = table_object_id(&engine, "t2");
 
         // The SELECT's source table must be read-locked (Shared) and the target
         // write-locked (Exclusive); without the Shared lock this INSERT could
@@ -1824,7 +1862,7 @@ mod tests {
     #[test]
     fn sql_alter_table_add_drop_check() {
         let path = unique_temp_path("sql-alter-check");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, qty INT)")
             .expect("create");
@@ -1838,7 +1876,7 @@ mod tests {
             .execute("ALTER TABLE t ADD CONSTRAINT ck_qty CHECK (qty >= 0)")
             .expect("add check");
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO t VALUES (3, -1)"),
+            sql_error_number(&engine, "INSERT INTO t VALUES (3, -1)"),
             547
         );
 
@@ -1846,7 +1884,7 @@ mod tests {
         // not persisted (a later insert violating it still succeeds after DROP).
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "ALTER TABLE t ADD CONSTRAINT ck_big CHECK (qty > 8)"
             ),
             547
@@ -1866,19 +1904,19 @@ mod tests {
 
         // Dropping an unknown constraint errors.
         assert_eq!(
-            sql_error_number(&mut engine, "ALTER TABLE t DROP CONSTRAINT nope"),
+            sql_error_number(&engine, "ALTER TABLE t DROP CONSTRAINT nope"),
             3728
         );
         // ALTER TABLE is DDL and is not allowed inside an explicit transaction
         // (needs a persistent txn context, so run it as one batch).
         let mut ctx = TxnContext::default();
         let out = batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "BEGIN TRANSACTION; ALTER TABLE t ADD CHECK (qty < 100)",
         );
         assert_eq!(out.error.as_ref().map(|e| e.number), Some(226));
-        batch(&mut engine, &mut ctx, "ROLLBACK");
+        batch(&engine, &mut ctx, "ROLLBACK");
 
         // A constraint added via ALTER survives a restart.
         engine
@@ -1886,9 +1924,9 @@ mod tests {
             .expect("add ck_id");
         drop(engine);
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("engine");
+        let engine = Engine::new(storage).expect("engine");
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT name FROM sys.check_constraints ORDER BY name",
         );
         assert_eq!(rows, vec![vec![Some("ck_id".into())]]);
@@ -1898,7 +1936,7 @@ mod tests {
     #[test]
     fn sql_foreign_key_child_and_parent_enforcement() {
         let path = unique_temp_path("sql-fk");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE parent (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))")
             .expect("parent");
@@ -1919,13 +1957,13 @@ mod tests {
             .execute("INSERT INTO child VALUES (11, NULL)")
             .expect("NULL fk allowed");
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO child VALUES (12, 99)"),
+            sql_error_number(&engine, "INSERT INTO child VALUES (12, 99)"),
             547
         );
 
         // Parent side (DELETE, NO ACTION): a referenced parent cannot be deleted.
         assert_eq!(
-            sql_error_number(&mut engine, "DELETE FROM parent WHERE id = 1"),
+            sql_error_number(&engine, "DELETE FROM parent WHERE id = 1"),
             547
         );
         engine
@@ -1935,7 +1973,7 @@ mod tests {
         // Parent side (UPDATE of the PK): cannot vacate a referenced key; a
         // non-key update is fine.
         assert_eq!(
-            sql_error_number(&mut engine, "UPDATE parent SET id = 5 WHERE id = 1"),
+            sql_error_number(&engine, "UPDATE parent SET id = 5 WHERE id = 1"),
             547
         );
         engine
@@ -1944,7 +1982,7 @@ mod tests {
 
         // Child UPDATE re-checks the new value.
         assert_eq!(
-            sql_error_number(&mut engine, "UPDATE child SET pid = 42 WHERE id = 10"),
+            sql_error_number(&engine, "UPDATE child SET pid = 42 WHERE id = 10"),
             547
         );
         engine
@@ -1958,9 +1996,9 @@ mod tests {
         // The constraint is enforced again after a restart.
         drop(engine);
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("engine");
+        let engine = Engine::new(storage).expect("engine");
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO child VALUES (20, 7)"),
+            sql_error_number(&engine, "INSERT INTO child VALUES (20, 7)"),
             547
         );
         let _ = std::fs::remove_file(path);
@@ -1969,7 +2007,7 @@ mod tests {
     #[test]
     fn sql_foreign_key_self_reference() {
         let path = unique_temp_path("sql-fk-self");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE emp (id INT NOT NULL PRIMARY KEY, mgr INT REFERENCES emp (id))")
             .expect("emp");
@@ -1981,7 +2019,7 @@ mod tests {
             .execute("INSERT INTO emp VALUES (2, 1)")
             .expect("sub");
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO emp VALUES (3, 99)"),
+            sql_error_number(&engine, "INSERT INTO emp VALUES (3, 99)"),
             547
         );
         // A batch may reference a sibling row inserted in the same statement
@@ -1991,7 +2029,7 @@ mod tests {
             .expect("self-ref batch");
         // A referenced row cannot be deleted while a subordinate remains.
         assert_eq!(
-            sql_error_number(&mut engine, "DELETE FROM emp WHERE id = 1"),
+            sql_error_number(&engine, "DELETE FROM emp WHERE id = 1"),
             547
         );
 
@@ -1999,7 +2037,7 @@ mod tests {
         // (row 4 references row 5, so changing id 5 dangles mgr=5). This must be
         // validated against the post-update state, not the stale pre-update row.
         assert_eq!(
-            sql_error_number(&mut engine, "UPDATE emp SET id = 50 WHERE id = 5"),
+            sql_error_number(&engine, "UPDATE emp SET id = 50 WHERE id = 5"),
             547
         );
         // A primary-key change with no dependents is allowed (nothing points at
@@ -2013,14 +2051,14 @@ mod tests {
     #[test]
     fn sql_constraint_name_unique_across_kinds() {
         let path = unique_temp_path("sql-constraint-names");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
             .expect("p");
         // A CHECK and a FOREIGN KEY cannot share a name within one CREATE.
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "CREATE TABLE c (x INT, CONSTRAINT dup CHECK (x > 0), \
                    CONSTRAINT dup FOREIGN KEY (x) REFERENCES p (id))",
             ),
@@ -2033,7 +2071,7 @@ mod tests {
             .expect("add check");
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "ALTER TABLE c ADD CONSTRAINT dup FOREIGN KEY (x) REFERENCES p (id)",
             ),
             2714
@@ -2042,10 +2080,7 @@ mod tests {
             .execute("ALTER TABLE c ADD CONSTRAINT fk1 FOREIGN KEY (x) REFERENCES p (id)")
             .expect("add fk");
         assert_eq!(
-            sql_error_number(
-                &mut engine,
-                "ALTER TABLE c ADD CONSTRAINT fk1 CHECK (x < 100)"
-            ),
+            sql_error_number(&engine, "ALTER TABLE c ADD CONSTRAINT fk1 CHECK (x < 100)"),
             2714
         );
         let _ = std::fs::remove_file(path);
@@ -2054,7 +2089,7 @@ mod tests {
     #[test]
     fn sql_foreign_key_alter_drop_and_catalog() {
         let path = unique_temp_path("sql-fk-alter");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
             .expect("p");
@@ -2070,7 +2105,7 @@ mod tests {
         // ADD FOREIGN KEY validates existing rows: row 11 orphans -> 547.
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p (id)",
             ),
             547
@@ -2083,29 +2118,29 @@ mod tests {
             .execute("ALTER TABLE c ADD CONSTRAINT fk FOREIGN KEY (pid) REFERENCES p (id)")
             .expect("add fk");
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO c VALUES (12, 77)"),
+            sql_error_number(&engine, "INSERT INTO c VALUES (12, 77)"),
             547
         );
 
         // sys.foreign_keys lists it, referencing p.
-        let p_oid = table_object_id(&mut engine, "p");
+        let p_oid = table_object_id(&engine, "p");
         let (cols, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT name, referenced_object_id FROM sys.foreign_keys",
         );
         assert_eq!(cols, vec!["name", "referenced_object_id"]);
         assert_eq!(rows, vec![vec![Some("fk".into()), Some(p_oid.to_string())]]);
 
         // A referenced parent cannot be dropped.
-        assert_eq!(sql_error_number(&mut engine, "DROP TABLE p"), 3726);
+        assert_eq!(sql_error_number(&engine, "DROP TABLE p"), 3726);
 
         // DROP CONSTRAINT removes enforcement; the FK survives a restart until
         // then. Confirm durability first.
         drop(engine);
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("engine");
+        let engine = Engine::new(storage).expect("engine");
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO c VALUES (13, 55)"),
+            sql_error_number(&engine, "INSERT INTO c VALUES (13, 55)"),
             547
         );
         engine
@@ -2122,7 +2157,7 @@ mod tests {
     #[test]
     fn sql_foreign_key_validation_errors() {
         let path = unique_temp_path("sql-fk-invalid");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY, other INT)")
             .expect("p");
@@ -2132,7 +2167,7 @@ mod tests {
         // Referencing a non-primary-key column of the parent.
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "CREATE TABLE r1 (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES p (other))",
             ),
             1776
@@ -2140,7 +2175,7 @@ mod tests {
         // Type mismatch between child (INT) and parent PK (BIGINT).
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "CREATE TABLE r2 (id INT NOT NULL PRIMARY KEY, bid INT REFERENCES bignum (id))",
             ),
             1778
@@ -2148,7 +2183,7 @@ mod tests {
         // Referencing a table that does not exist.
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "CREATE TABLE r3 (id INT NOT NULL PRIMARY KEY, x INT REFERENCES nope (id))",
             ),
             208
@@ -2164,11 +2199,11 @@ mod tests {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;
         let path = unique_temp_path("nested-cte-locks");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE secret (z INT NOT NULL PRIMARY KEY)")
             .expect("secret");
-        let secret = table_object_id(&mut engine, "secret");
+        let secret = table_object_id(&engine, "secret");
 
         // Plain query with a nested CTE.
         let direct = engine.analyze_locks(
@@ -2202,14 +2237,14 @@ mod tests {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;
         let path = unique_temp_path("view-locks");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE base (x INT NOT NULL PRIMARY KEY)")
             .expect("base");
         engine
             .execute("CREATE VIEW v AS WITH c AS (SELECT x FROM base) SELECT x FROM c")
             .expect("view");
-        let base = table_object_id(&mut engine, "base");
+        let base = table_object_id(&engine, "base");
 
         let locks = engine.analyze_locks("SELECT x FROM v", Isolation::ReadCommitted);
         assert!(
@@ -2228,7 +2263,7 @@ mod tests {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;
         let path = unique_temp_path("view-exists-cte-locks");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE base (x INT NOT NULL PRIMARY KEY)")
             .expect("base");
@@ -2238,8 +2273,8 @@ mod tests {
         engine
             .execute("CREATE VIEW v AS SELECT x FROM base WHERE EXISTS (WITH d AS (SELECT z FROM secret) SELECT z FROM d)")
             .expect("view");
-        let base = table_object_id(&mut engine, "base");
-        let secret = table_object_id(&mut engine, "secret");
+        let base = table_object_id(&engine, "base");
+        let secret = table_object_id(&engine, "secret");
 
         let locks = engine.analyze_locks("SELECT x FROM v", Isolation::ReadCommitted);
         assert!(
@@ -2260,7 +2295,7 @@ mod tests {
         let path = unique_temp_path("view-persist");
         let storage =
             Storage::create(path.clone(), test_storage_options()).expect("storage create");
-        let mut engine = Engine::new(storage).expect("engine create");
+        let engine = Engine::new(storage).expect("engine create");
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
             .expect("table");
@@ -2273,7 +2308,7 @@ mod tests {
         drop(engine);
 
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("engine restart");
+        let engine = Engine::new(storage).expect("engine restart");
         let out = engine.execute("SELECT id FROM hi").expect("query view");
         assert!(out.contains('2'), "view query after restart: {out}");
         let listed = engine
@@ -2291,11 +2326,11 @@ mod tests {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;
         let path = unique_temp_path("assign-cte-locks");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE secret (x INT NOT NULL PRIMARY KEY)")
             .expect("secret");
-        let secret = table_object_id(&mut engine, "secret");
+        let secret = table_object_id(&engine, "secret");
 
         let locks = engine.analyze_locks(
             "DECLARE @v INT; WITH c AS (SELECT x FROM secret) SELECT @v = (SELECT MAX(x) FROM c)",
@@ -2313,15 +2348,15 @@ mod tests {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;
         let path = unique_temp_path("fk-locks");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE p (id INT NOT NULL PRIMARY KEY)")
             .expect("p");
         engine
             .execute("CREATE TABLE c (id INT NOT NULL PRIMARY KEY, pid INT REFERENCES p (id))")
             .expect("c");
-        let p = table_object_id(&mut engine, "p");
-        let c = table_object_id(&mut engine, "c");
+        let p = table_object_id(&engine, "p");
+        let c = table_object_id(&engine, "c");
 
         // INSERT into the child reads the parent, so it must take a Shared lock
         // on the parent (else it could read an uncommitted parent row).
@@ -2350,21 +2385,17 @@ mod tests {
     #[test]
     fn sql_batch_variables() {
         let path = unique_temp_path("sql-vars");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
 
         // DECLARE, SET, and read a variable within one batch.
-        let out = batch(
-            &mut engine,
-            &mut ctx,
-            "DECLARE @n INT; SET @n = 42; SELECT @n",
-        );
+        let out = batch(&engine, &mut ctx, "DECLARE @n INT; SET @n = 42; SELECT @n");
         assert!(out.error.is_none(), "{:?}", out.error);
         assert_eq!(ids(&out), vec![42]);
 
         // An initializer may reference an earlier variable in the same DECLARE.
         let out = batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "DECLARE @a INT = 5, @b INT = @a + 1; SELECT @b",
         );
@@ -2373,17 +2404,17 @@ mod tests {
 
         // A variable used in a WHERE clause.
         batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
         );
         batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "INSERT INTO t VALUES (1,10),(2,20),(3,30)",
         );
         let out = batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "DECLARE @min INT; SET @min = 20; SELECT id FROM t WHERE v >= @min ORDER BY id",
         );
@@ -2391,14 +2422,14 @@ mod tests {
 
         // Using an undeclared variable is error 137 (SET and read).
         assert_eq!(
-            batch(&mut engine, &mut ctx, "SET @nope = 1")
+            batch(&engine, &mut ctx, "SET @nope = 1")
                 .error
                 .as_ref()
                 .map(|e| e.number),
             Some(137)
         );
         assert_eq!(
-            batch(&mut engine, &mut ctx, "SELECT @nope")
+            batch(&engine, &mut ctx, "SELECT @nope")
                 .error
                 .as_ref()
                 .map(|e| e.number),
@@ -2407,7 +2438,7 @@ mod tests {
 
         // Redeclaring within the same batch is error 134.
         assert_eq!(
-            batch(&mut engine, &mut ctx, "DECLARE @d INT; DECLARE @d INT")
+            batch(&engine, &mut ctx, "DECLARE @d INT; DECLARE @d INT")
                 .error
                 .as_ref()
                 .map(|e| e.number),
@@ -2415,9 +2446,9 @@ mod tests {
         );
 
         // Variables are batch-scoped: one declared in a prior batch is gone.
-        batch(&mut engine, &mut ctx, "DECLARE @scoped INT");
+        batch(&engine, &mut ctx, "DECLARE @scoped INT");
         assert_eq!(
-            batch(&mut engine, &mut ctx, "SELECT @scoped")
+            batch(&engine, &mut ctx, "SELECT @scoped")
                 .error
                 .as_ref()
                 .map(|e| e.number),
@@ -2429,7 +2460,7 @@ mod tests {
     #[test]
     fn sql_scalar_in_exists_subqueries() {
         let path = unique_temp_path("sql-subquery");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE nums (id INT NOT NULL PRIMARY KEY, v INT)")
             .expect("nums");
@@ -2445,14 +2476,14 @@ mod tests {
 
         // Scalar subquery in WHERE.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id FROM nums WHERE v = (SELECT MAX(v) FROM nums)",
         );
         assert_eq!(rows, vec![vec![Some("3".into())]]);
 
         // Scalar subquery in the SELECT list (evaluated once).
         let (cols, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id, (SELECT COUNT(*) FROM picks) AS pc FROM nums ORDER BY id",
         );
         assert_eq!(cols, vec!["id", "pc"]);
@@ -2467,19 +2498,19 @@ mod tests {
 
         // IN (SELECT) and NOT IN (SELECT).
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id FROM nums WHERE id IN (SELECT target FROM picks) ORDER BY id",
         );
         assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id FROM nums WHERE id NOT IN (SELECT target FROM picks)",
         );
         assert_eq!(rows, vec![vec![Some("1".into())]]);
 
         // EXISTS / NOT EXISTS (uncorrelated).
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id FROM nums WHERE EXISTS (SELECT 1 FROM picks WHERE target = 3) ORDER BY id",
         );
         assert_eq!(
@@ -2491,14 +2522,14 @@ mod tests {
             ]
         );
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id FROM nums WHERE NOT EXISTS (SELECT 1 FROM picks WHERE target = 99)",
         );
         assert_eq!(rows.len(), 3);
 
         // A scalar subquery with no rows is NULL (so the `=` is unknown).
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id FROM nums WHERE v = (SELECT v FROM nums WHERE id = 99)",
         );
         assert!(rows.is_empty());
@@ -2507,14 +2538,14 @@ mod tests {
         // is 116.
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "SELECT id FROM nums WHERE v = (SELECT v FROM nums)"
             ),
             512
         );
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "SELECT id FROM nums WHERE v = (SELECT id, v FROM nums WHERE id = 1)",
             ),
             116
@@ -2523,7 +2554,7 @@ mod tests {
         // supported; it errors as an invalid column rather than mis-resolving.
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "SELECT id FROM nums WHERE v = (SELECT target FROM picks WHERE picks.target = nums.id)",
             ),
             207
@@ -2535,7 +2566,7 @@ mod tests {
             .execute("INSERT INTO nums VALUES (4, NULL)")
             .expect("null row");
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id FROM nums WHERE v NOT IN (SELECT target FROM picks WHERE target > 1000) ORDER BY id",
         );
         assert_eq!(
@@ -2549,7 +2580,7 @@ mod tests {
         );
         // `IN (empty subquery)` is FALSE for every row (no rows returned).
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id FROM nums WHERE v IN (SELECT target FROM picks WHERE target > 1000)",
         );
         assert!(rows.is_empty());
@@ -2561,15 +2592,15 @@ mod tests {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;
         let path = unique_temp_path("subquery-locks");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE a (id INT NOT NULL PRIMARY KEY)")
             .expect("a");
         engine
             .execute("CREATE TABLE b (id INT NOT NULL PRIMARY KEY)")
             .expect("b");
-        let a = table_object_id(&mut engine, "a");
-        let b = table_object_id(&mut engine, "b");
+        let a = table_object_id(&engine, "a");
+        let b = table_object_id(&engine, "b");
         // A subquery over `b` inside `a`'s WHERE reads `b`, so it must take a
         // Shared lock on `b` (else it could read `b`'s uncommitted rows).
         let locks = engine.analyze_locks(
@@ -2590,7 +2621,7 @@ mod tests {
     #[test]
     fn sql_common_table_expressions() {
         let path = unique_temp_path("sql-cte");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute(
                 "CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, dept NVARCHAR(4), amount INT)",
@@ -2602,7 +2633,7 @@ mod tests {
 
         // A basic CTE referenced in FROM.
         let (cols, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "WITH big AS (SELECT id, amount FROM sales WHERE amount >= 20) SELECT id FROM big ORDER BY id",
         );
         assert_eq!(cols, vec!["id"]);
@@ -2610,7 +2641,7 @@ mod tests {
 
         // A CTE that aggregates, filtered by the outer query.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "WITH s AS (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) \
                SELECT dept FROM s WHERE total > 30 ORDER BY dept",
         );
@@ -2618,7 +2649,7 @@ mod tests {
 
         // A later CTE references an earlier one.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "WITH a AS (SELECT id, amount FROM sales WHERE amount >= 10), \
                   b AS (SELECT id FROM a WHERE amount >= 20) \
                SELECT id FROM b ORDER BY id",
@@ -2627,7 +2658,7 @@ mod tests {
 
         // A CTE joined to a base table.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "WITH s AS (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) \
                SELECT t.id, s.total FROM sales t JOIN s ON t.dept = s.dept WHERE t.id = 3",
         );
@@ -2636,20 +2667,20 @@ mod tests {
         // The optional column-rename list is not supported yet.
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "WITH c(x) AS (SELECT id FROM sales) SELECT x FROM c",
             ),
             102
         );
         // A recursive / self-reference resolves as a (non-existent) base table.
         assert_eq!(
-            sql_error_number(&mut engine, "WITH r AS (SELECT id FROM r) SELECT id FROM r"),
+            sql_error_number(&engine, "WITH r AS (SELECT id FROM r) SELECT id FROM r"),
             208
         );
 
         // A CTE is visible to a subquery in the WHERE clause, not just the FROM.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "WITH s AS (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) \
                SELECT id FROM sales WHERE dept IN (SELECT dept FROM s WHERE total > 30) ORDER BY id",
         );
@@ -2658,7 +2689,7 @@ mod tests {
         // Duplicate CTE names are rejected.
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "WITH a AS (SELECT 1 AS x), a AS (SELECT 2 AS x) SELECT x FROM a",
             ),
             460
@@ -2666,7 +2697,7 @@ mod tests {
         // A schema-qualified reference does not match a CTE (dbo.s is a base
         // table name, which here does not exist).
         assert_eq!(
-            sql_error_number(&mut engine, "WITH s AS (SELECT 1 AS v) SELECT v FROM dbo.s"),
+            sql_error_number(&engine, "WITH s AS (SELECT 1 AS v) SELECT v FROM dbo.s"),
             208
         );
         let _ = std::fs::remove_file(path);
@@ -2675,7 +2706,7 @@ mod tests {
     #[test]
     fn sql_derived_tables() {
         let path = unique_temp_path("sql-derived");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute(
                 "CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, dept NVARCHAR(4), amount INT)",
@@ -2688,7 +2719,7 @@ mod tests {
         // A derived table filtered further by the outer query; columns resolve
         // by the derived alias.
         let (cols, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT s.id, s.amount FROM (SELECT id, amount FROM sales WHERE amount >= 10) s \
                WHERE s.id < 3 ORDER BY s.id",
         );
@@ -2703,7 +2734,7 @@ mod tests {
 
         // A derived table may aggregate; the outer query filters on the alias.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT d.dept, d.total FROM (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) d \
                WHERE d.total > 30 ORDER BY d.dept",
         );
@@ -2711,7 +2742,7 @@ mod tests {
 
         // A derived table joined to a base table.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT t.dept, d.total FROM sales t \
                JOIN (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) d ON t.dept = d.dept \
                WHERE t.id = 1",
@@ -2720,21 +2751,18 @@ mod tests {
 
         // A derived table must have an alias.
         assert_eq!(
-            sql_error_number(&mut engine, "SELECT * FROM (SELECT id FROM sales)"),
+            sql_error_number(&engine, "SELECT * FROM (SELECT id FROM sales)"),
             102
         );
         // Every derived column must be named.
         assert_eq!(
-            sql_error_number(
-                &mut engine,
-                "SELECT * FROM (SELECT amount + 1 FROM sales) x"
-            ),
+            sql_error_number(&engine, "SELECT * FROM (SELECT amount + 1 FROM sales) x"),
             8155
         );
         // Duplicate derived column names are rejected.
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "SELECT * FROM (SELECT id, amount AS id FROM sales) x",
             ),
             8156
@@ -2745,7 +2773,7 @@ mod tests {
     #[test]
     fn sql_sys_default_constraints() {
         let path = unique_temp_path("sql-default-constraints");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute(
                 "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, \
@@ -2754,7 +2782,7 @@ mod tests {
             .expect("create");
         // One row per column that carries a DEFAULT (plain has none).
         let (cols, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT name, parent_column_id, definition FROM sys.default_constraints ORDER BY parent_column_id",
         );
         assert_eq!(cols, vec!["name", "parent_column_id", "definition"]);
@@ -2779,7 +2807,7 @@ mod tests {
     #[test]
     fn sql_decimal_arithmetic_and_rendering() {
         let path = unique_temp_path("sql-decimal");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, price DECIMAL(10,2))")
             .expect("create");
@@ -2787,7 +2815,7 @@ mod tests {
             .execute("INSERT INTO t VALUES (1, 12.50), (2, 3.30)")
             .expect("insert");
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT price, price * 2 AS dbl, price + 0.05 AS bump FROM t ORDER BY id",
         );
         assert_eq!(
@@ -2806,7 +2834,7 @@ mod tests {
             ]
         );
         // Division derives scale = max(6, ...) per SQL Server.
-        let (_, rows) = sql_rows(&mut engine, "SELECT price / 3 FROM t WHERE id = 1");
+        let (_, rows) = sql_rows(&engine, "SELECT price / 3 FROM t WHERE id = 1");
         assert_eq!(rows, vec![vec![Some("4.166667".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -2814,14 +2842,14 @@ mod tests {
     #[test]
     fn sql_temporal_types_round_trip() {
         let path = unique_temp_path("sql-temporal");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, d DATE, dt DATETIME2)")
             .expect("create");
         engine
             .execute("INSERT INTO t VALUES (1, '2020-06-15', '2020-06-15 13:45:30.5')")
             .expect("insert");
-        let (_, rows) = sql_rows(&mut engine, "SELECT d, dt FROM t");
+        let (_, rows) = sql_rows(&engine, "SELECT d, dt FROM t");
         assert_eq!(
             rows,
             vec![vec![
@@ -2830,7 +2858,7 @@ mod tests {
             ]]
         );
         // A character literal implicitly converts to DATE for the comparison.
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE d = '2020-06-15'");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE d = '2020-06-15'");
         assert_eq!(rows, vec![vec![Some("1".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -2838,7 +2866,7 @@ mod tests {
     #[test]
     fn sql_expression_operators() {
         let path = unique_temp_path("sql-expr-ops");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20), score INT)")
             .expect("create");
@@ -2848,14 +2876,14 @@ mod tests {
 
         // LIKE + IN + BETWEEN combine in a WHERE.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id FROM t WHERE name LIKE 'A%' OR id IN (3) OR score BETWEEN 85 AND 95 ORDER BY id",
         );
         assert_eq!(rows, vec![vec![Some("1".into())], vec![Some("3".into())]]);
 
         // CASE (searched) + ISNULL + a scalar function.
         let (cols, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT UPPER(name) AS u, ISNULL(score, 0) AS s, \
              CASE WHEN score >= 85 THEN 'hi' WHEN score IS NULL THEN 'none' ELSE 'lo' END AS grade \
              FROM t ORDER BY id",
@@ -2872,12 +2900,12 @@ mod tests {
 
         // CAST and NOT LIKE.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT CAST(score AS NVARCHAR(10)) FROM t WHERE id = 1",
         );
         assert_eq!(rows, vec![vec![Some("90".into())]]);
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT id FROM t WHERE name NOT LIKE '%o%' ORDER BY id",
         );
         assert_eq!(rows, vec![vec![Some("1".into())]]);
@@ -2887,7 +2915,7 @@ mod tests {
     #[test]
     fn sql_swedish_collation_order_by() {
         let path = unique_temp_path("sql-collation");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute(
                 "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, \
@@ -2901,12 +2929,12 @@ mod tests {
             )
             .expect("insert");
         // Swedish sorts å, ä, ö after z: apa, björn, zebra, åre, ängel, öl.
-        let (_, rows) = sql_rows(&mut engine, "SELECT w FROM t ORDER BY w");
+        let (_, rows) = sql_rows(&engine, "SELECT w FROM t ORDER BY w");
         let order: Vec<String> = rows.into_iter().map(|r| r[0].clone().unwrap()).collect();
         assert_eq!(order, vec!["apa", "björn", "zebra", "åre", "ängel", "öl"]);
         // The collation is surfaced in sys.columns.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT collation_name FROM sys.columns WHERE name = 'w'",
         );
         assert_eq!(rows, vec![vec![Some("Finnish_Swedish_CI_AS".into())]]);
@@ -2916,10 +2944,10 @@ mod tests {
     #[test]
     fn sql_stage5_review_fixes() {
         let path = unique_temp_path("sql-review-fixes");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         // CAST decimal/float to int truncates toward zero (not rounds).
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT CAST(10.6496 AS INT), CAST(2.9 AS INT), CAST(-10.6496 AS INT)",
         );
         assert_eq!(
@@ -2932,7 +2960,7 @@ mod tests {
         );
         // REPLICATE with a huge count is bounded (no panic / mutex-poison DoS).
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT LEN(REPLICATE('abc', 9223372036854775807)) AS n",
         );
         assert_eq!(rows, vec![vec![Some("999999".into())]]);
@@ -2944,7 +2972,7 @@ mod tests {
             .execute("INSERT INTO t VALUES (1), (2)")
             .expect("insert");
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT CASE WHEN id = 1 THEN 100000 ELSE 0.5 END AS v FROM t ORDER BY id",
         );
         assert_eq!(
@@ -2953,7 +2981,7 @@ mod tests {
         );
         // UPDATE with a duplicated SET column is rejected (264).
         assert_eq!(
-            sql_error_number(&mut engine, "UPDATE t SET id = 3, id = 4 WHERE id = 1"),
+            sql_error_number(&engine, "UPDATE t SET id = 3, id = 4 WHERE id = 1"),
             264
         );
         let _ = std::fs::remove_file(path);
@@ -2962,22 +2990,19 @@ mod tests {
     #[test]
     fn sql_duplicate_pk_reports_error_2627() {
         let path = unique_temp_path("sql-pk-dup");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT PRIMARY KEY)")
             .expect("create");
         engine.execute("INSERT INTO t VALUES (1)").expect("insert");
-        assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO t VALUES (1)"),
-            2627
-        );
+        assert_eq!(sql_error_number(&engine, "INSERT INTO t VALUES (1)"), 2627);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn sql_where_order_top_projection() {
         let path = unique_temp_path("sql-select");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE nums (n INT NOT NULL PRIMARY KEY, label NVARCHAR(10))")
             .expect("create");
@@ -2988,7 +3013,7 @@ mod tests {
         }
         // WHERE + ORDER DESC + TOP + computed projection.
         let (columns, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT TOP 3 n, n * 10 AS ten FROM nums WHERE n > 4 ORDER BY n DESC",
         );
         assert_eq!(columns, vec!["n", "ten"]);
@@ -3006,7 +3031,7 @@ mod tests {
     #[test]
     fn sql_bare_column_alias_is_preserved() {
         let path = unique_temp_path("sql-alias");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE nums (n INT NOT NULL PRIMARY KEY)")
             .expect("create");
@@ -3015,7 +3040,7 @@ mod tests {
             .expect("insert");
         // A bare column with an alias must report the alias, not the source
         // column name (regression guard for the typed-projection refactor).
-        let (columns, rows) = sql_rows(&mut engine, "SELECT n AS foo FROM nums");
+        let (columns, rows) = sql_rows(&engine, "SELECT n AS foo FROM nums");
         assert_eq!(columns, vec!["foo"]);
         assert_eq!(rows, vec![vec![Some("1".into())]]);
         let _ = std::fs::remove_file(path);
@@ -3024,7 +3049,7 @@ mod tests {
     #[test]
     fn sql_three_valued_where_keeps_only_true_rows() {
         let path = unique_temp_path("sql-3vl");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
             .expect("create");
@@ -3032,10 +3057,10 @@ mod tests {
             .execute("INSERT INTO t VALUES (1, 10), (2, NULL), (3, 30)")
             .expect("insert");
         // v <> 10 is UNKNOWN for the NULL row, which is filtered out.
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE v <> 10 ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE v <> 10 ORDER BY id");
         assert_eq!(rows, vec![vec![Some("3".into())]]);
         // IS NULL is two-valued.
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE v IS NULL");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE v IS NULL");
         assert_eq!(rows, vec![vec![Some("2".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -3043,21 +3068,21 @@ mod tests {
     #[test]
     fn sql_sys_catalog_is_queryable() {
         let path = unique_temp_path("sql-syscat");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE alpha (id INT PRIMARY KEY, name NVARCHAR(20))")
             .expect("create alpha");
         engine
             .execute("CREATE TABLE beta (x BIGINT NOT NULL)")
             .expect("create beta");
-        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM sys.tables ORDER BY name");
+        let (_, rows) = sql_rows(&engine, "SELECT name FROM sys.tables ORDER BY name");
         assert_eq!(
             rows,
             vec![vec![Some("alpha".into())], vec![Some("beta".into())]]
         );
         // sys.columns: alpha has two columns.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT name, type FROM sys.columns WHERE object_id = 2 ORDER BY column_id",
         );
         assert_eq!(
@@ -3073,44 +3098,38 @@ mod tests {
     #[test]
     fn sql_drop_table_and_errors() {
         let path = unique_temp_path("sql-drop");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT PRIMARY KEY)")
             .expect("create");
         // Selecting a missing table -> 208.
-        assert_eq!(sql_error_number(&mut engine, "SELECT * FROM nope"), 208);
+        assert_eq!(sql_error_number(&engine, "SELECT * FROM nope"), 208);
         // Duplicate CREATE -> 2714.
-        assert_eq!(
-            sql_error_number(&mut engine, "CREATE TABLE t (id INT)"),
-            2714
-        );
+        assert_eq!(sql_error_number(&engine, "CREATE TABLE t (id INT)"), 2714);
         // DROP then it's gone; DROP IF EXISTS is a no-op; bare DROP -> 3701.
         engine.execute("DROP TABLE t").expect("drop");
-        assert_eq!(sql_error_number(&mut engine, "SELECT * FROM t"), 208);
+        assert_eq!(sql_error_number(&engine, "SELECT * FROM t"), 208);
         engine
             .execute("DROP TABLE IF EXISTS t")
             .expect("drop if exists");
-        assert_eq!(sql_error_number(&mut engine, "DROP TABLE t"), 3701);
+        assert_eq!(sql_error_number(&engine, "DROP TABLE t"), 3701);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn sql_not_null_violation_reports_515() {
         let path = unique_temp_path("sql-notnull");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(10) NOT NULL)")
             .expect("create");
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO t (id) VALUES (1)"),
+            sql_error_number(&engine, "INSERT INTO t (id) VALUES (1)"),
             515
         );
         // String too long -> 8152.
         assert_eq!(
-            sql_error_number(
-                &mut engine,
-                "INSERT INTO t VALUES (1, 'this is far too long')"
-            ),
+            sql_error_number(&engine, "INSERT INTO t VALUES (1, 'this is far too long')"),
             8152
         );
         let _ = std::fs::remove_file(path);
@@ -3120,7 +3139,7 @@ mod tests {
     fn sql_and_search_share_the_engine() {
         // The SQL front door must not disturb the frozen ES surface.
         let path = unique_temp_path("sql-es-coexist");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute(r#"create index docs { "mappings": { "properties": { "body": { "type": "text" } } } }"#)
             .expect("create index");
@@ -3135,11 +3154,11 @@ mod tests {
             .expect("insert row");
 
         let search = sql(
-            &mut engine,
+            &engine,
             r#"search docs { "query": { "match": { "body": "hello" } } }"#,
         );
         assert_eq!(search["hits"]["total"], 1);
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t");
         assert_eq!(rows, vec![vec![Some("42".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -3147,7 +3166,7 @@ mod tests {
     #[test]
     fn sql_bit_column_compares_to_integer_literal() {
         let path = unique_temp_path("sql-bit-cmp");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, active BIT)")
             .expect("create");
@@ -3155,7 +3174,7 @@ mod tests {
             .execute("INSERT INTO t VALUES (1, 1), (2, 0), (3, NULL)")
             .expect("insert");
         // `active = 1` (BIT vs int) must work, not clash.
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE active = 1 ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE active = 1 ORDER BY id");
         assert_eq!(rows, vec![vec![Some("1".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -3163,7 +3182,7 @@ mod tests {
     #[test]
     fn sql_multi_row_insert_is_atomic() {
         let path = unique_temp_path("sql-insert-atomic");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
             .expect("create");
@@ -3171,10 +3190,10 @@ mod tests {
         // The 3rd row duplicates PK 5: the whole INSERT must roll back, so
         // rows 10 and 11 must NOT be present.
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO t VALUES (10), (11), (5)"),
+            sql_error_number(&engine, "INSERT INTO t VALUES (10), (11), (5)"),
             2627
         );
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t ORDER BY id");
         assert_eq!(rows, vec![vec![Some("5".into())]], "no partial rows");
         let _ = std::fs::remove_file(path);
     }
@@ -3182,10 +3201,10 @@ mod tests {
     #[test]
     fn sql_batch_keeps_earlier_results_before_an_error() {
         let path = unique_temp_path("sql-batch-partial");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         // One batch: a good CREATE + INSERT, then a failing INSERT.
         let env = sql(
-            &mut engine,
+            &engine,
             "CREATE TABLE t (id INT PRIMARY KEY); INSERT INTO t VALUES (1); INSERT INTO t VALUES (1);",
         );
         assert_eq!(env["kind"], "sql");
@@ -3194,7 +3213,7 @@ mod tests {
         assert_eq!(env["results"][1]["rows_affected"], 1);
         assert_eq!(env["error"]["number"], 2627);
         // The first row is durably present.
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t");
         assert_eq!(rows, vec![vec![Some("1".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -3206,7 +3225,7 @@ mod tests {
 
     /// Runs a SQL batch through the session path with a persistent transaction
     /// context (as a TDS connection would), returning the typed outcome.
-    fn batch(engine: &mut Engine, ctx: &mut TxnContext, sql: &str) -> BatchOutcome {
+    fn batch(engine: &Engine, ctx: &mut TxnContext, sql: &str) -> BatchOutcome {
         engine.sql_batch(sql, ctx).expect("sql_batch")
     }
 
@@ -3233,16 +3252,16 @@ mod tests {
     #[test]
     fn txn_commit_is_durable_across_restart() {
         let path = unique_temp_path("txn-commit-durable");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
 
         batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
         );
         let out = batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "BEGIN TRANSACTION; INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT TRANSACTION;",
         );
@@ -3255,9 +3274,9 @@ mod tests {
         // Reopen: the committed rows must survive ARIES recovery.
         drop(engine);
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("replay");
+        let engine = Engine::new(storage).expect("replay");
         let mut ctx = TxnContext::default();
-        let out = batch(&mut engine, &mut ctx, "SELECT id FROM t ORDER BY id");
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t ORDER BY id");
         assert_eq!(ids(&out), vec![1, 2]);
         let _ = std::fs::remove_file(path);
     }
@@ -3265,17 +3284,17 @@ mod tests {
     #[test]
     fn txn_rollback_discards_all_writes() {
         let path = unique_temp_path("txn-rollback");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
 
         batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
         );
-        batch(&mut engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
         let out = batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "BEGIN TRANSACTION; INSERT INTO t VALUES (2); INSERT INTO t VALUES (3); ROLLBACK TRANSACTION;",
         );
@@ -3283,7 +3302,7 @@ mod tests {
         assert!(!ctx.has_open_transaction());
 
         // Only the pre-transaction row 1 remains.
-        let out = batch(&mut engine, &mut ctx, "SELECT id FROM t ORDER BY id");
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t ORDER BY id");
         assert_eq!(ids(&out), vec![1]);
         let _ = std::fs::remove_file(path);
     }
@@ -3291,32 +3310,32 @@ mod tests {
     #[test]
     fn txn_trancount_reflects_nesting() {
         let path = unique_temp_path("txn-trancount");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
 
         // Outside any transaction, @@TRANCOUNT is 0.
-        let out = batch(&mut engine, &mut ctx, "SELECT @@TRANCOUNT AS n");
+        let out = batch(&engine, &mut ctx, "SELECT @@TRANCOUNT AS n");
         assert_eq!(ids(&out), vec![0]);
 
         // Nested BEGINs bump the count; only the outermost COMMIT commits.
         let out = batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "BEGIN TRAN; BEGIN TRAN; SELECT @@TRANCOUNT AS n;",
         );
         assert_eq!(ids(&out), vec![2]);
         assert!(ctx.has_open_transaction());
 
-        let out = batch(&mut engine, &mut ctx, "COMMIT; SELECT @@TRANCOUNT AS n;");
+        let out = batch(&engine, &mut ctx, "COMMIT; SELECT @@TRANCOUNT AS n;");
         assert_eq!(ids(&out), vec![1], "inner COMMIT only decrements");
         assert!(
             ctx.has_open_transaction(),
             "transaction still open at count 1"
         );
 
-        batch(&mut engine, &mut ctx, "COMMIT");
+        batch(&engine, &mut ctx, "COMMIT");
         assert!(!ctx.has_open_transaction());
-        let out = batch(&mut engine, &mut ctx, "SELECT @@TRANCOUNT AS n");
+        let out = batch(&engine, &mut ctx, "SELECT @@TRANCOUNT AS n");
         assert_eq!(ids(&out), vec![0]);
         let _ = std::fs::remove_file(path);
     }
@@ -3324,33 +3343,33 @@ mod tests {
     #[test]
     fn txn_error_dooms_transaction_until_rollback() {
         let path = unique_temp_path("txn-doomed");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
 
         batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
         );
         // A duplicate-PK failure inside the transaction dooms it.
         let out = batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "BEGIN TRAN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (1);",
         );
         assert_eq!(out.error.as_ref().map(|e| e.number), Some(2627));
 
         // A doomed transaction rejects further work with 3930...
-        let out = batch(&mut engine, &mut ctx, "SELECT 1 AS n");
+        let out = batch(&engine, &mut ctx, "SELECT 1 AS n");
         assert_eq!(out.error.as_ref().map(|e| e.number), Some(3930));
 
         // ...but ROLLBACK is allowed and clears the doom.
-        let out = batch(&mut engine, &mut ctx, "ROLLBACK");
+        let out = batch(&engine, &mut ctx, "ROLLBACK");
         assert!(out.error.is_none(), "{:?}", out.error);
         assert!(!ctx.has_open_transaction());
 
         // The table is usable again and holds nothing (the txn rolled back).
-        let out = batch(&mut engine, &mut ctx, "SELECT id FROM t");
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t");
         assert_eq!(ids(&out), Vec::<i32>::new());
         let _ = std::fs::remove_file(path);
     }
@@ -3358,11 +3377,11 @@ mod tests {
     #[test]
     fn txn_ddl_inside_transaction_is_rejected() {
         let path = unique_temp_path("txn-ddl");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
 
         let out = batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "BEGIN TRAN; CREATE TABLE t (id INT NOT NULL PRIMARY KEY);",
         );
@@ -3373,13 +3392,13 @@ mod tests {
     #[test]
     fn txn_bare_commit_and_rollback_error() {
         let path = unique_temp_path("txn-bare");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
 
-        let out = batch(&mut engine, &mut ctx, "COMMIT TRANSACTION");
+        let out = batch(&engine, &mut ctx, "COMMIT TRANSACTION");
         assert_eq!(out.error.as_ref().map(|e| e.number), Some(3902));
 
-        let out = batch(&mut engine, &mut ctx, "ROLLBACK TRANSACTION");
+        let out = batch(&engine, &mut ctx, "ROLLBACK TRANSACTION");
         assert_eq!(out.error.as_ref().map(|e| e.number), Some(3903));
         let _ = std::fs::remove_file(path);
     }
@@ -3387,19 +3406,15 @@ mod tests {
     #[test]
     fn txn_abort_on_disconnect_rolls_back() {
         let path = unique_temp_path("txn-disconnect");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
 
         batch(
-            &mut engine,
+            &engine,
             &mut ctx,
             "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
         );
-        batch(
-            &mut engine,
-            &mut ctx,
-            "BEGIN TRAN; INSERT INTO t VALUES (7);",
-        );
+        batch(&engine, &mut ctx, "BEGIN TRAN; INSERT INTO t VALUES (7);");
         assert!(ctx.has_open_transaction());
 
         // Simulate the session teardown that CloseSession performs.
@@ -3407,7 +3422,7 @@ mod tests {
         assert!(!ctx.has_open_transaction());
 
         let mut ctx2 = TxnContext::default();
-        let out = batch(&mut engine, &mut ctx2, "SELECT id FROM t");
+        let out = batch(&engine, &mut ctx2, "SELECT id FROM t");
         assert_eq!(
             ids(&out),
             Vec::<i32>::new(),
@@ -3419,9 +3434,9 @@ mod tests {
     #[test]
     fn txn_uncommitted_explicit_txn_is_undone_after_crash() {
         let path = unique_temp_path("txn-crash-undo");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         batch(
-            &mut engine,
+            &engine,
             &mut TxnContext::default(),
             "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
         );
@@ -3429,7 +3444,7 @@ mod tests {
         // Session A opens a transaction and inserts 99 but never commits.
         let mut ctx_a = TxnContext::default();
         batch(
-            &mut engine,
+            &engine,
             &mut ctx_a,
             "BEGIN TRAN; INSERT INTO t VALUES (99);",
         );
@@ -3438,7 +3453,7 @@ mod tests {
         // An autocommit insert commits, forcing the WAL to disk — including
         // A's (earlier, still-uncommitted) log records.
         batch(
-            &mut engine,
+            &engine,
             &mut TxnContext::default(),
             "INSERT INTO t VALUES (1)",
         );
@@ -3451,9 +3466,9 @@ mod tests {
         // Recovery on reopen redoes history then undoes the loser (A): row 99
         // is gone, the committed row 1 survives.
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("replay");
+        let engine = Engine::new(storage).expect("replay");
         let out = batch(
-            &mut engine,
+            &engine,
             &mut TxnContext::default(),
             "SELECT id FROM t ORDER BY id",
         );
@@ -3465,7 +3480,7 @@ mod tests {
 
     /// Plan text lines for a SELECT under SHOWPLAN_TEXT (one batch so the SET
     /// persists to the SELECT).
-    fn plan_lines(engine: &mut Engine, select: &str) -> Vec<String> {
+    fn plan_lines(engine: &Engine, select: &str) -> Vec<String> {
         let env = sql(engine, &format!("SET SHOWPLAN_TEXT ON; {select}"));
         let results = env["results"].as_array().expect("results array");
         let rows = results
@@ -3483,7 +3498,7 @@ mod tests {
     #[test]
     fn sql_index_ab_harness_identical_results() {
         let path = unique_temp_path("sql-index-ab");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         // Two identical tables; an index only on one.
         for t in ["noidx", "idx"] {
             engine
@@ -3511,13 +3526,13 @@ mod tests {
             "a <> 20",
         ] {
             let q = |t: &str| format!("SELECT id, a FROM {t} WHERE {pred} ORDER BY id");
-            let (_, base) = sql_rows(&mut engine, &q("noidx"));
-            let (_, with_index) = sql_rows(&mut engine, &q("idx"));
+            let (_, base) = sql_rows(&engine, &q("noidx"));
+            let (_, with_index) = sql_rows(&engine, &q("idx"));
             assert_eq!(base, with_index, "mismatch for predicate `{pred}`");
         }
 
         // The equality predicate actually uses the index.
-        let plan = plan_lines(&mut engine, "SELECT id FROM idx WHERE a = 20");
+        let plan = plan_lines(&engine, "SELECT id FROM idx WHERE a = 20");
         assert!(
             plan.iter()
                 .any(|l| l.contains("Index Seek") && l.contains("ix_a")),
@@ -3529,7 +3544,7 @@ mod tests {
     #[test]
     fn sql_unique_index_rejects_duplicate_2601() {
         let path = unique_temp_path("sql-unique-index");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, email NVARCHAR(50))")
             .expect("create");
@@ -3541,12 +3556,12 @@ mod tests {
             .expect("create unique index");
         // A duplicate email now violates the unique index (2601, not 2627).
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO t VALUES (3, 'a@x')"),
+            sql_error_number(&engine, "INSERT INTO t VALUES (3, 'a@x')"),
             2601
         );
         // Updating to a duplicate also violates it.
         assert_eq!(
-            sql_error_number(&mut engine, "UPDATE t SET email = 'a@x' WHERE id = 2"),
+            sql_error_number(&engine, "UPDATE t SET email = 'a@x' WHERE id = 2"),
             2601
         );
         // A distinct value is fine.
@@ -3559,7 +3574,7 @@ mod tests {
     #[test]
     fn sql_unique_index_build_rejects_existing_duplicates() {
         let path = unique_temp_path("sql-unique-build");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
             .expect("create");
@@ -3568,11 +3583,11 @@ mod tests {
             .expect("insert");
         // Building a unique index over duplicate data fails.
         assert_eq!(
-            sql_error_number(&mut engine, "CREATE UNIQUE INDEX ux_a ON t (a)"),
+            sql_error_number(&engine, "CREATE UNIQUE INDEX ux_a ON t (a)"),
             2601
         );
         // ...and the failed build left no index behind (still scannable).
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t ORDER BY id");
         assert_eq!(rows.len(), 2);
         let _ = std::fs::remove_file(path);
     }
@@ -3580,7 +3595,7 @@ mod tests {
     #[test]
     fn sql_index_maintained_across_update_and_delete() {
         let path = unique_temp_path("sql-index-maint");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
             .expect("create");
@@ -3598,11 +3613,11 @@ mod tests {
             .expect("delete");
 
         // Index seeks reflect the mutations.
-        let (_, at20) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 20");
+        let (_, at20) = sql_rows(&engine, "SELECT id FROM t WHERE a = 20");
         assert!(at20.is_empty(), "a=20 gone after update");
-        let (_, at25) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 25");
+        let (_, at25) = sql_rows(&engine, "SELECT id FROM t WHERE a = 25");
         assert_eq!(at25, vec![vec![Some("2".into())]]);
-        let (_, at30) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 30");
+        let (_, at30) = sql_rows(&engine, "SELECT id FROM t WHERE a = 30");
         assert!(at30.is_empty(), "a=30 gone after delete");
         let _ = std::fs::remove_file(path);
     }
@@ -3610,18 +3625,18 @@ mod tests {
     #[test]
     fn sql_showplan_text_reports_seek_versus_scan() {
         let path = unique_temp_path("sql-showplan");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
             .expect("create");
         engine.execute("CREATE INDEX ix_a ON t (a)").expect("index");
 
-        let seek = plan_lines(&mut engine, "SELECT id FROM t WHERE a = 7");
+        let seek = plan_lines(&engine, "SELECT id FROM t WHERE a = 7");
         assert_eq!(seek[0], "Index Seek(t.ix_a), SEEK: a = 7");
         assert_eq!(seek[1], "Key Lookup(t)");
 
         // No sargable predicate → a scan.
-        let scan = plan_lines(&mut engine, "SELECT id FROM t WHERE a + 1 = 8");
+        let scan = plan_lines(&engine, "SELECT id FROM t WHERE a + 1 = 8");
         assert_eq!(scan, vec!["Table Scan(t)".to_string()]);
         let _ = std::fs::remove_file(path);
     }
@@ -3629,7 +3644,7 @@ mod tests {
     #[test]
     fn sql_index_survives_restart() {
         let path = unique_temp_path("sql-index-restart");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
             .expect("create");
@@ -3640,17 +3655,17 @@ mod tests {
 
         drop(engine);
         let storage = Storage::open(path.clone()).expect("reopen");
-        let mut engine = Engine::new(storage).expect("replay");
+        let engine = Engine::new(storage).expect("replay");
         // The index is still usable after recovery.
-        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE a = 20");
+        let plan = plan_lines(&engine, "SELECT id FROM t WHERE a = 20");
         assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 20");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE a = 20");
         assert_eq!(rows, vec![vec![Some("2".into())]]);
         // Maintenance still works post-restart.
         engine
             .execute("INSERT INTO t VALUES (3, 20)")
             .expect("insert after restart");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 20 ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE a = 20 ORDER BY id");
         assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -3658,7 +3673,7 @@ mod tests {
     #[test]
     fn sql_composite_and_descending_index_seek() {
         let path = unique_temp_path("sql-composite-index");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT, b INT)")
             .expect("create");
@@ -3670,12 +3685,12 @@ mod tests {
             .expect("create composite index");
 
         // Equality on the leading column + range on the second seeks the index.
-        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE a = 2 AND b = 200");
+        let plan = plan_lines(&engine, "SELECT id FROM t WHERE a = 2 AND b = 200");
         assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 2 AND b = 200");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE a = 2 AND b = 200");
         assert_eq!(rows, vec![vec![Some("4".into())]]);
         // Leading-column-only seek returns both a=1 rows.
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE a = 1 ORDER BY id");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE a = 1 ORDER BY id");
         assert_eq!(rows, vec![vec![Some("1".into())], vec![Some("2".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -3683,7 +3698,7 @@ mod tests {
     #[test]
     fn sql_index_on_heap_table_uses_rid_locator() {
         let path = unique_temp_path("sql-heap-index");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         // No PRIMARY KEY → heap table.
         engine
             .execute("CREATE TABLE h (a INT, name NVARCHAR(20))")
@@ -3693,16 +3708,16 @@ mod tests {
             .expect("insert");
         engine.execute("CREATE INDEX ix_a ON h (a)").expect("index");
 
-        let plan = plan_lines(&mut engine, "SELECT name FROM h WHERE a = 10");
+        let plan = plan_lines(&engine, "SELECT name FROM h WHERE a = 10");
         assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");
-        let (_, mut rows) = sql_rows(&mut engine, "SELECT name FROM h WHERE a = 10");
+        let (_, mut rows) = sql_rows(&engine, "SELECT name FROM h WHERE a = 10");
         rows.sort();
         assert_eq!(rows, vec![vec![Some("x".into())], vec![Some("z".into())]]);
         // Update through a heap row keeps the index consistent.
         engine
             .execute("UPDATE h SET a = 99 WHERE name = 'x'")
             .expect("update");
-        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM h WHERE a = 10");
+        let (_, rows) = sql_rows(&engine, "SELECT name FROM h WHERE a = 10");
         assert_eq!(rows, vec![vec![Some("z".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -3710,31 +3725,31 @@ mod tests {
     #[test]
     fn sql_drop_index_and_sys_indexes() {
         let path = unique_temp_path("sql-drop-index");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
             .expect("create");
         engine.execute("CREATE INDEX ix_a ON t (a)").expect("index");
 
         // sys.indexes lists it.
-        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM sys.indexes");
+        let (_, rows) = sql_rows(&engine, "SELECT name FROM sys.indexes");
         assert_eq!(rows, vec![vec![Some("ix_a".into())]]);
 
         engine.execute("DROP INDEX ix_a ON t").expect("drop index");
-        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM sys.indexes");
+        let (_, rows) = sql_rows(&engine, "SELECT name FROM sys.indexes");
         assert!(rows.is_empty(), "index gone from catalog");
         // Queries now scan.
-        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE a = 1");
+        let plan = plan_lines(&engine, "SELECT id FROM t WHERE a = 1");
         assert_eq!(plan, vec!["Table Scan(t)".to_string()]);
         // Dropping a missing index errors 3701.
-        assert_eq!(sql_error_number(&mut engine, "DROP INDEX nope ON t"), 3701);
+        assert_eq!(sql_error_number(&engine, "DROP INDEX nope ON t"), 3701);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn sql_nvarchar_equality_seeks_but_range_scans() {
         let path = unique_temp_path("sql-index-nvarchar");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))")
             .expect("create");
@@ -3747,17 +3762,17 @@ mod tests {
 
         // Equality is an exact byte match, so it seeks; the filter compares by
         // code point, so it is case-sensitive.
-        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE name = 'abc'");
+        let plan = plan_lines(&engine, "SELECT id FROM t WHERE name = 'abc'");
         assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE name = 'abc'");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE name = 'abc'");
         assert_eq!(rows, vec![vec![Some("1".into())]], "'ABC' is not 'abc'");
 
         // A range on NVARCHAR must NOT seek (UTF-16BE key order can diverge
         // from code-point order at astral characters); it scans and stays
         // correct.
-        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE name > 'a'");
+        let plan = plan_lines(&engine, "SELECT id FROM t WHERE name > 'a'");
         assert_eq!(plan, vec!["Table Scan(t)".to_string()]);
-        let (_, mut rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE name > 'a'");
+        let (_, mut rows) = sql_rows(&engine, "SELECT id FROM t WHERE name > 'a'");
         rows.sort();
         // 'ABC' (0x41..) < 'a' (0x61) by code point; 'abc','xyz' > 'a'.
         assert_eq!(rows, vec![vec![Some("1".into())], vec![Some("3".into())]]);
@@ -3767,7 +3782,7 @@ mod tests {
     #[test]
     fn sql_varchar_range_can_index_seek() {
         let path = unique_temp_path("sql-index-varchar");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         // VARCHAR keys are UTF-8 bytes, whose order equals code-point order, so
         // a range seek is correct.
         engine
@@ -3780,9 +3795,9 @@ mod tests {
             .execute("CREATE INDEX ix_code ON t (code)")
             .expect("index");
 
-        let plan = plan_lines(&mut engine, "SELECT id FROM t WHERE code > 'b'");
+        let plan = plan_lines(&engine, "SELECT id FROM t WHERE code > 'b'");
         assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");
-        let (_, mut rows) = sql_rows(&mut engine, "SELECT id FROM t WHERE code > 'b'");
+        let (_, mut rows) = sql_rows(&engine, "SELECT id FROM t WHERE code > 'b'");
         rows.sort();
         assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
         let _ = std::fs::remove_file(path);
@@ -3791,7 +3806,7 @@ mod tests {
     #[test]
     fn sql_drop_index_is_table_scoped() {
         let path = unique_temp_path("sql-drop-scoped");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         // Two tables with same-named indexes; DROP INDEX must only touch the
         // named table's index.
         for t in ["t1", "t2"] {
@@ -3808,16 +3823,16 @@ mod tests {
 
         // t2's index survives; t1's is gone.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT object_id FROM sys.indexes ORDER BY object_id",
         );
         assert_eq!(rows.len(), 1, "only t2's index remains");
-        let plan = plan_lines(&mut engine, "SELECT id FROM t2 WHERE a = 1");
+        let plan = plan_lines(&engine, "SELECT id FROM t2 WHERE a = 1");
         assert!(
             plan.iter().any(|l| l.contains("Index Seek")),
             "t2 still seeks"
         );
-        let plan = plan_lines(&mut engine, "SELECT id FROM t1 WHERE a = 1");
+        let plan = plan_lines(&engine, "SELECT id FROM t1 WHERE a = 1");
         assert_eq!(plan, vec!["Table Scan(t1)".to_string()], "t1 index dropped");
         let _ = std::fs::remove_file(path);
     }
@@ -3825,13 +3840,13 @@ mod tests {
     #[test]
     fn sql_create_index_inside_transaction_is_rejected() {
         let path = unique_temp_path("sql-index-in-txn");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
             .expect("create");
         // DDL (incl. CREATE INDEX) is disallowed inside an explicit transaction.
         assert_eq!(
-            sql_error_number(&mut engine, "BEGIN TRAN; CREATE INDEX ix_a ON t (a);"),
+            sql_error_number(&engine, "BEGIN TRAN; CREATE INDEX ix_a ON t (a);"),
             226
         );
         let _ = std::fs::remove_file(path);
@@ -3841,7 +3856,7 @@ mod tests {
 
     fn agg_setup(label: &str) -> (Engine, PathBuf) {
         let path = unique_temp_path(label);
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute(
                 "CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, dept NVARCHAR(10), amount INT)",
@@ -3858,9 +3873,9 @@ mod tests {
 
     #[test]
     fn sql_aggregates_over_whole_table() {
-        let (mut engine, path) = agg_setup("agg-whole");
+        let (engine, path) = agg_setup("agg-whole");
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT COUNT(*), COUNT(amount), SUM(amount), MIN(amount), MAX(amount) FROM sales",
         );
         // COUNT(*)=5, COUNT(amount)=4 (skips NULL), SUM=80, MIN=10, MAX=30.
@@ -3878,21 +3893,18 @@ mod tests {
 
     #[test]
     fn sql_avg_integer_truncates() {
-        let (mut engine, path) = agg_setup("agg-avg");
+        let (engine, path) = agg_setup("agg-avg");
         // AVG(amount) = 80/4 = 20 exactly here; use a truncating case too.
-        let (_, rows) = sql_rows(
-            &mut engine,
-            "SELECT AVG(amount) FROM sales WHERE dept = 'a'",
-        );
+        let (_, rows) = sql_rows(&engine, "SELECT AVG(amount) FROM sales WHERE dept = 'a'");
         // dept 'a': 10,20,20 -> sum 50 / 3 = 16 (integer truncation).
         assert_eq!(rows, vec![vec![Some("16".into())]]);
     }
 
     #[test]
     fn sql_group_by_with_aggregates() {
-        let (mut engine, path) = agg_setup("agg-group");
+        let (engine, path) = agg_setup("agg-group");
         let (cols, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT dept, COUNT(*), SUM(amount) FROM sales GROUP BY dept ORDER BY dept",
         );
         assert_eq!(cols[0], "dept");
@@ -3908,9 +3920,9 @@ mod tests {
 
     #[test]
     fn sql_having_filters_groups() {
-        let (mut engine, path) = agg_setup("agg-having");
+        let (engine, path) = agg_setup("agg-having");
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT dept, SUM(amount) FROM sales GROUP BY dept HAVING SUM(amount) > 40 ORDER BY dept",
         );
         assert_eq!(rows, vec![vec![Some("a".into()), Some("50".into())]]);
@@ -3919,17 +3931,17 @@ mod tests {
 
     #[test]
     fn sql_count_distinct() {
-        let (mut engine, path) = agg_setup("agg-distinct");
+        let (engine, path) = agg_setup("agg-distinct");
         // amounts: 10,20,30,NULL,20 -> distinct non-null = {10,20,30} = 3.
-        let (_, rows) = sql_rows(&mut engine, "SELECT COUNT(DISTINCT amount) FROM sales");
+        let (_, rows) = sql_rows(&engine, "SELECT COUNT(DISTINCT amount) FROM sales");
         assert_eq!(rows, vec![vec![Some("3".into())]]);
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn sql_select_distinct() {
-        let (mut engine, path) = agg_setup("agg-select-distinct");
-        let (_, mut rows) = sql_rows(&mut engine, "SELECT DISTINCT dept FROM sales");
+        let (engine, path) = agg_setup("agg-select-distinct");
+        let (_, mut rows) = sql_rows(&engine, "SELECT DISTINCT dept FROM sales");
         rows.sort();
         assert_eq!(rows, vec![vec![Some("a".into())], vec![Some("b".into())]]);
         let _ = std::fs::remove_file(path);
@@ -3937,10 +3949,10 @@ mod tests {
 
     #[test]
     fn sql_order_by_ordinal_and_aggregate() {
-        let (mut engine, path) = agg_setup("agg-order");
+        let (engine, path) = agg_setup("agg-order");
         // ORDER BY 2 DESC = order by SUM(amount) descending.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT dept, SUM(amount) FROM sales GROUP BY dept ORDER BY 2 DESC",
         );
         assert_eq!(
@@ -3956,25 +3968,25 @@ mod tests {
     #[test]
     fn sql_count_star_over_empty_is_zero_but_group_by_is_empty_set() {
         let path = unique_temp_path("agg-empty");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
             .expect("create");
         // No rows: COUNT(*) with no GROUP BY = one row (0); SUM = NULL.
-        let (_, rows) = sql_rows(&mut engine, "SELECT COUNT(*), SUM(v) FROM t");
+        let (_, rows) = sql_rows(&engine, "SELECT COUNT(*), SUM(v) FROM t");
         assert_eq!(rows, vec![vec![Some("0".into()), None]]);
         // With GROUP BY, no rows = zero groups.
-        let (_, rows) = sql_rows(&mut engine, "SELECT v, COUNT(*) FROM t GROUP BY v");
+        let (_, rows) = sql_rows(&engine, "SELECT v, COUNT(*) FROM t GROUP BY v");
         assert!(rows.is_empty());
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
     fn sql_non_grouped_column_is_error_8120() {
-        let (mut engine, path) = agg_setup("agg-8120");
+        let (engine, path) = agg_setup("agg-8120");
         // `id` is neither grouped nor aggregated.
         assert_eq!(
-            sql_error_number(&mut engine, "SELECT id, dept FROM sales GROUP BY dept"),
+            sql_error_number(&engine, "SELECT id, dept FROM sales GROUP BY dept"),
             8120
         );
         let _ = std::fs::remove_file(path);
@@ -3982,9 +3994,9 @@ mod tests {
 
     #[test]
     fn sql_aggregate_in_where_is_error_147() {
-        let (mut engine, path) = agg_setup("agg-147");
+        let (engine, path) = agg_setup("agg-147");
         assert_eq!(
-            sql_error_number(&mut engine, "SELECT dept FROM sales WHERE COUNT(*) > 1"),
+            sql_error_number(&engine, "SELECT dept FROM sales WHERE COUNT(*) > 1"),
             147
         );
         let _ = std::fs::remove_file(path);
@@ -3993,7 +4005,7 @@ mod tests {
     #[test]
     fn sql_group_by_cast_expression_key() {
         let path = unique_temp_path("agg-cast-key");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
             .expect("create");
@@ -4003,7 +4015,7 @@ mod tests {
         // A CAST group key must match the identical SELECT expression (not
         // wrongly trigger 8120 by recursing into the inner column).
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT CAST(v AS BIGINT), COUNT(*) FROM t GROUP BY CAST(v AS BIGINT) ORDER BY 1",
         );
         assert_eq!(
@@ -4019,7 +4031,7 @@ mod tests {
     #[test]
     fn sql_sum_of_character_column_is_error_8117() {
         let path = unique_temp_path("agg-sum-char");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, s VARCHAR(10))")
             .expect("create");
@@ -4027,8 +4039,8 @@ mod tests {
             .execute("INSERT INTO t VALUES (1,'1'),(2,'2'),(3,'3')")
             .expect("insert");
         // SUM/AVG of character data errors (never string-concatenates).
-        assert_eq!(sql_error_number(&mut engine, "SELECT SUM(s) FROM t"), 8117);
-        assert_eq!(sql_error_number(&mut engine, "SELECT AVG(s) FROM t"), 8117);
+        assert_eq!(sql_error_number(&engine, "SELECT SUM(s) FROM t"), 8117);
+        assert_eq!(sql_error_number(&engine, "SELECT AVG(s) FROM t"), 8117);
         let _ = std::fs::remove_file(path);
     }
 
@@ -4036,7 +4048,7 @@ mod tests {
 
     fn join_setup(label: &str) -> (Engine, PathBuf) {
         let path = unique_temp_path(label);
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE cust (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))")
             .expect("create cust");
@@ -4053,15 +4065,15 @@ mod tests {
         (engine, path)
     }
 
-    fn row_count(engine: &mut Engine, sql: &str) -> usize {
+    fn row_count(engine: &Engine, sql: &str) -> usize {
         sql_rows(engine, sql).1.len()
     }
 
     #[test]
     fn sql_inner_join() {
-        let (mut engine, path) = join_setup("join-inner");
+        let (engine, path) = join_setup("join-inner");
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT c.name, o.amount FROM cust c JOIN ord o ON c.id = o.cust_id ORDER BY o.id",
         );
         assert_eq!(
@@ -4077,10 +4089,10 @@ mod tests {
 
     #[test]
     fn sql_left_join_keeps_unmatched_left() {
-        let (mut engine, path) = join_setup("join-left");
+        let (engine, path) = join_setup("join-left");
         // carol has no orders → one row with NULL amount.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT c.name, o.amount FROM cust c LEFT JOIN ord o ON c.id = o.cust_id \
              ORDER BY c.id, o.id",
         );
@@ -4091,10 +4103,10 @@ mod tests {
 
     #[test]
     fn sql_right_join_keeps_unmatched_right() {
-        let (mut engine, path) = join_setup("join-right");
+        let (engine, path) = join_setup("join-right");
         // order 13 (cust 99) has no customer → NULL name.
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT c.name, o.id FROM cust c RIGHT JOIN ord o ON c.id = o.cust_id ORDER BY o.id",
         );
         assert_eq!(rows.len(), 4);
@@ -4104,11 +4116,11 @@ mod tests {
 
     #[test]
     fn sql_full_join_keeps_both_unmatched() {
-        let (mut engine, path) = join_setup("join-full");
+        let (engine, path) = join_setup("join-full");
         // 3 matched + carol (left-only) + order 13 (right-only) = 5 rows.
         assert_eq!(
             row_count(
-                &mut engine,
+                &engine,
                 "SELECT c.name, o.id FROM cust c FULL JOIN ord o ON c.id = o.cust_id",
             ),
             5
@@ -4118,17 +4130,14 @@ mod tests {
 
     #[test]
     fn sql_cross_join_and_comma() {
-        let (mut engine, path) = join_setup("join-cross");
+        let (engine, path) = join_setup("join-cross");
         // 3 customers x 4 orders = 12.
         assert_eq!(
-            row_count(
-                &mut engine,
-                "SELECT c.id, o.id FROM cust c CROSS JOIN ord o"
-            ),
+            row_count(&engine, "SELECT c.id, o.id FROM cust c CROSS JOIN ord o"),
             12
         );
         assert_eq!(
-            row_count(&mut engine, "SELECT c.id, o.id FROM cust c, ord o"),
+            row_count(&engine, "SELECT c.id, o.id FROM cust c, ord o"),
             12
         );
         let _ = std::fs::remove_file(path);
@@ -4136,9 +4145,9 @@ mod tests {
 
     #[test]
     fn sql_join_with_where_and_qualified_wildcard() {
-        let (mut engine, path) = join_setup("join-where");
+        let (engine, path) = join_setup("join-where");
         let (cols, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT c.* FROM cust c JOIN ord o ON c.id = o.cust_id WHERE o.amount > 100 ORDER BY o.id",
         );
         // c.* expands to cust columns; only order 11 (amount 200, alice).
@@ -4149,10 +4158,10 @@ mod tests {
 
     #[test]
     fn sql_aggregate_over_join() {
-        let (mut engine, path) = join_setup("join-agg");
+        let (engine, path) = join_setup("join-agg");
         // Total amount per customer (inner join).
         let (_, rows) = sql_rows(
-            &mut engine,
+            &engine,
             "SELECT c.name, SUM(o.amount) FROM cust c JOIN ord o ON c.id = o.cust_id \
              GROUP BY c.name ORDER BY c.name",
         );
@@ -4168,10 +4177,10 @@ mod tests {
 
     #[test]
     fn sql_ambiguous_column_errors() {
-        let (mut engine, path) = join_setup("join-ambig");
+        let (engine, path) = join_setup("join-ambig");
         // `id` exists in both cust and ord → unresolvable.
         let err = sql_error_number(
-            &mut engine,
+            &engine,
             "SELECT id FROM cust c JOIN ord o ON c.id = o.cust_id",
         );
         assert!(
@@ -4184,7 +4193,7 @@ mod tests {
     #[test]
     fn sql_grouped_coercion_error_is_not_swallowed() {
         let path = unique_temp_path("agg-coerce");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, g INT)")
             .expect("create");
@@ -4194,12 +4203,9 @@ mod tests {
         // A heterogeneous grouped output (short string in one group, a large
         // integer in another) must raise the truncation error, not mask it as
         // NULL — matching the plain-projection path.
-        let plain = sql_error_number(
-            &mut engine,
-            "SELECT CASE WHEN g = 1 THEN 'x' ELSE g END FROM t",
-        );
+        let plain = sql_error_number(&engine, "SELECT CASE WHEN g = 1 THEN 'x' ELSE g END FROM t");
         let grouped = sql_error_number(
-            &mut engine,
+            &engine,
             "SELECT CASE WHEN g = 1 THEN 'x' ELSE g END FROM t GROUP BY g",
         );
         assert_eq!(plain, grouped, "grouped path must raise the same error");
@@ -4209,14 +4215,14 @@ mod tests {
     #[test]
     fn sql_non_boolean_where_is_rejected_4145() {
         let path = unique_temp_path("sql-where-4145");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
             .expect("create");
         engine.execute("INSERT INTO t VALUES (1)").expect("insert");
         // `WHERE id + 1` is numeric, not boolean.
         assert_eq!(
-            sql_error_number(&mut engine, "SELECT id FROM t WHERE id + 1"),
+            sql_error_number(&engine, "SELECT id FROM t WHERE id + 1"),
             4145
         );
         let _ = std::fs::remove_file(path);
@@ -4225,7 +4231,7 @@ mod tests {
     #[test]
     fn sql_schema_qualified_names_resolve() {
         let path = unique_temp_path("sql-dbo");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE dbo.products (id INT NOT NULL PRIMARY KEY)")
             .expect("create dbo.");
@@ -4233,9 +4239,9 @@ mod tests {
             .execute("INSERT INTO dbo.products VALUES (1)")
             .expect("insert dbo.");
         // Reachable by both qualified and bare names.
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM products");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM products");
         assert_eq!(rows, vec![vec![Some("1".into())]]);
-        let (_, rows) = sql_rows(&mut engine, "SELECT id FROM dbo.products");
+        let (_, rows) = sql_rows(&engine, "SELECT id FROM dbo.products");
         assert_eq!(rows, vec![vec![Some("1".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -4243,14 +4249,14 @@ mod tests {
     #[test]
     fn sql_unicode_round_trips_through_insert_and_select() {
         let path = unique_temp_path("sql-unicode");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(50))")
             .expect("create");
         engine
             .execute("INSERT INTO t VALUES (1, 'café åäö 😀')")
             .expect("insert");
-        let (_, rows) = sql_rows(&mut engine, "SELECT name FROM t");
+        let (_, rows) = sql_rows(&engine, "SELECT name FROM t");
         assert_eq!(rows, vec![vec![Some("café åäö 😀".into())]]);
         let _ = std::fs::remove_file(path);
     }
@@ -4258,14 +4264,14 @@ mod tests {
     #[test]
     fn sql_bigint_overflow_literal_errors_not_saturates() {
         let path = unique_temp_path("sql-bigint-of");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, big BIGINT)")
             .expect("create");
         // 1e30 overflows i64; must error, not silently saturate.
         assert_eq!(
             sql_error_number(
-                &mut engine,
+                &engine,
                 "INSERT INTO t VALUES (1, 1000000000000000000000000000000)"
             ),
             220
@@ -4276,7 +4282,7 @@ mod tests {
     #[test]
     fn sql_table_level_pk_column_is_not_null() {
         let path = unique_temp_path("sql-tablepk");
-        let mut engine = new_engine(&path);
+        let engine = new_engine(&path);
         // A table-level PK on a column with no explicit nullability succeeds
         // (the column is promoted to NOT NULL).
         engine
@@ -4284,7 +4290,7 @@ mod tests {
             .expect("create");
         // Inserting NULL into the PK column is then a NOT NULL violation.
         assert_eq!(
-            sql_error_number(&mut engine, "INSERT INTO t (v) VALUES ('x')"),
+            sql_error_number(&engine, "INSERT INTO t (v) VALUES ('x')"),
             515
         );
         let _ = std::fs::remove_file(path);

@@ -191,6 +191,29 @@ impl Storage {
             .write_checkpoint(data, checkpoint_seq, next_seq_no, next_doc_id)
     }
 
+    /// Writes a checkpoint only if no transaction is active and the WAL is at
+    /// least `threshold` full — decided and written under a single lock hold, so
+    /// a transaction cannot `begin` (which also takes this lock) in the window
+    /// between the check and the WAL truncation. Without that atomicity a
+    /// concurrent worker could open a transaction just after the check, and the
+    /// checkpoint would flush its uncommitted pages and discard its undo,
+    /// resurrecting uncommitted data after a crash. Returns whether it wrote.
+    pub fn checkpoint_if_quiescent(
+        &self,
+        data: &[u8],
+        checkpoint_seq: u64,
+        next_seq_no: u64,
+        next_doc_id: u64,
+        threshold: f64,
+    ) -> Result<bool, StorageError> {
+        let mut file = self.lock();
+        if file.has_active_transactions() || file.wal_usage_ratio() < threshold {
+            return Ok(false);
+        }
+        file.write_checkpoint(data, checkpoint_seq, next_seq_no, next_doc_id)?;
+        Ok(true)
+    }
+
     pub fn load_snapshot(&self) -> Result<Option<SnapshotData>, StorageError> {
         self.lock().load_snapshot()
     }
