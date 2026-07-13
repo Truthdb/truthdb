@@ -108,7 +108,7 @@ impl TxnContext {
     }
 
     /// Rolls back and discards any open transaction (connection teardown).
-    pub fn abort(&mut self, storage: &mut Storage) {
+    pub fn abort(&mut self, storage: &Storage) {
         if let Some(txn) = self.txn.take() {
             let _ = storage.rel_rollback(txn);
         }
@@ -163,7 +163,7 @@ pub struct RpcParam {
 
 /// Parses and executes a SQL batch. A parse error yields an empty batch with
 /// the error; a runtime error stops the batch but keeps earlier results.
-pub fn execute_batch(storage: &mut Storage, sql: &str, txn_ctx: &mut TxnContext) -> BatchOutcome {
+pub fn execute_batch(storage: &Storage, sql: &str, txn_ctx: &mut TxnContext) -> BatchOutcome {
     execute_batch_with_params(storage, sql, txn_ctx, &[])
 }
 
@@ -172,7 +172,7 @@ pub fn execute_batch(storage: &mut Storage, sql: &str, txn_ctx: &mut TxnContext)
 /// already-typed values, never re-rendered into the SQL text, so a parameter
 /// value can never alter the statement's structure (no injection surface).
 pub fn execute_batch_with_params(
-    storage: &mut Storage,
+    storage: &Storage,
     sql: &str,
     txn_ctx: &mut TxnContext,
     params: &[RpcParam],
@@ -375,7 +375,7 @@ pub fn analyze_locks(
 /// the first error (discarding earlier results). Kept for tests; the server
 /// uses [`execute_batch`].
 #[cfg(test)]
-pub fn execute(storage: &mut Storage, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
+pub fn execute(storage: &Storage, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
     let mut txn_ctx = TxnContext::default();
     let outcome = execute_batch(storage, sql, &mut txn_ctx);
     match outcome.error {
@@ -394,7 +394,7 @@ impl TxnContext {
 }
 
 fn exec_statement(
-    storage: &mut Storage,
+    storage: &Storage,
     statement: &Statement,
     txn_ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
@@ -496,7 +496,7 @@ fn exec_statement(
 /// Builds a one-column `SHOWPLAN_TEXT` rowset describing a SELECT's access
 /// path, without executing it.
 fn showplan_rows(
-    storage: &mut Storage,
+    storage: &Storage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
@@ -549,7 +549,7 @@ fn ddl_in_txn_err() -> SqlError {
 
 // ---- transaction control -----------------------------------------------
 
-fn exec_begin(storage: &mut Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
+fn exec_begin(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
     if ctx.txn.is_none() {
         ctx.txn = Some(storage.rel_begin().map_err(|e| map_storage_err(e, ""))?);
     }
@@ -558,7 +558,7 @@ fn exec_begin(storage: &mut Storage, ctx: &mut TxnContext) -> Result<StatementRe
     Ok(StatementResult::Done)
 }
 
-fn exec_commit(storage: &mut Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
+fn exec_commit(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
     if ctx.trancount == 0 {
         return Err(SqlError::new(
             3902,
@@ -579,7 +579,7 @@ fn exec_commit(storage: &mut Storage, ctx: &mut TxnContext) -> Result<StatementR
     Ok(StatementResult::Done)
 }
 
-fn exec_rollback(storage: &mut Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
+fn exec_rollback(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
     if ctx.trancount == 0 {
         return Err(SqlError::new(
             3903,
@@ -684,10 +684,7 @@ fn coerce_variable(
 
 // ---- CREATE TABLE -------------------------------------------------------
 
-fn exec_create_table(
-    storage: &mut Storage,
-    create: &CreateTable,
-) -> Result<StatementResult, SqlError> {
+fn exec_create_table(storage: &Storage, create: &CreateTable) -> Result<StatementResult, SqlError> {
     // Strip an optional `dbo.` schema prefix so the table is stored (and
     // later resolved) under its bare name.
     let table_name = strip_schema(&create.table.value);
@@ -1257,7 +1254,7 @@ fn fk_key(fk: &catalog::ForeignKeyDef, row: &[Datum]) -> Option<Vec<Datum>> {
 /// a committed parent row, or, for a self-reference, a sibling row in `batch`
 /// (whose PK columns are `child.key_columns`).
 fn fk_parent_exists(
-    storage: &mut Storage,
+    storage: &Storage,
     fk: &catalog::ForeignKeyDef,
     key: &[Datum],
     child: &TableDef,
@@ -1296,7 +1293,7 @@ fn fk_child_violation(name: &str, verb: &str, parent: &str) -> SqlError {
 /// foreign keys (an UPDATE validates those against its post-update snapshot,
 /// since a pre-mutation probe would see stale rows).
 fn enforce_child_fks(
-    storage: &mut Storage,
+    storage: &Storage,
     def: &TableDef,
     row: &[Datum],
     batch: &[Vec<Datum>],
@@ -1322,7 +1319,7 @@ fn enforce_child_fks(
 /// an UPDATE). A referencing child is error 547. Referencing children are found
 /// by scanning every table's foreign keys (FK-index optimization deferred).
 fn enforce_parent_fks(
-    storage: &mut Storage,
+    storage: &Storage,
     parent: &TableDef,
     removed_keys: &[Vec<Datum>],
     verb: &str,
@@ -1464,7 +1461,7 @@ fn length(n: u32, name: &str) -> Result<u16, SqlError> {
 
 // ---- DROP TABLE ---------------------------------------------------------
 
-fn exec_drop_table(storage: &mut Storage, drop: &DropTable) -> Result<StatementResult, SqlError> {
+fn exec_drop_table(storage: &Storage, drop: &DropTable) -> Result<StatementResult, SqlError> {
     // DROP TABLE does not drop a view (use DROP VIEW). The object exists but is
     // the wrong type, so error even under IF EXISTS rather than silently no-op.
     if resolve_table(storage, &drop.table.value).is_some_and(|d| d.is_view()) {
@@ -1536,10 +1533,7 @@ fn parse_view_query(text: &str, view_name: &str) -> Result<Select, SqlError> {
     }
 }
 
-fn exec_create_view(
-    storage: &mut Storage,
-    create: &CreateView,
-) -> Result<StatementResult, SqlError> {
+fn exec_create_view(storage: &Storage, create: &CreateView) -> Result<StatementResult, SqlError> {
     let bare = strip_schema(&create.name.value);
     if resolve_table(storage, &create.name.value).is_some() {
         return Err(SqlError::new(
@@ -1559,7 +1553,7 @@ fn exec_create_view(
     Ok(StatementResult::Done)
 }
 
-fn exec_drop_view(storage: &mut Storage, drop: &DropView) -> Result<StatementResult, SqlError> {
+fn exec_drop_view(storage: &Storage, drop: &DropView) -> Result<StatementResult, SqlError> {
     match resolve_table(storage, &drop.name.value) {
         Some(def) if def.is_view() => {
             storage
@@ -1592,10 +1586,7 @@ fn exec_drop_view(storage: &mut Storage, drop: &DropView) -> Result<StatementRes
 
 // ---- CREATE / DROP INDEX ------------------------------------------------
 
-fn exec_create_index(
-    storage: &mut Storage,
-    create: &CreateIndex,
-) -> Result<StatementResult, SqlError> {
+fn exec_create_index(storage: &Storage, create: &CreateIndex) -> Result<StatementResult, SqlError> {
     let def = resolve_table(storage, &create.table.value)
         .ok_or_else(|| SqlError::invalid_object(&create.table.value).at(create.table.span))?;
     reject_view_as_table(&def)?;
@@ -1615,7 +1606,7 @@ fn exec_create_index(
     Ok(StatementResult::Done)
 }
 
-fn exec_drop_index(storage: &mut Storage, drop: &DropIndex) -> Result<StatementResult, SqlError> {
+fn exec_drop_index(storage: &Storage, drop: &DropIndex) -> Result<StatementResult, SqlError> {
     // Resolve the table so the index lookup is scoped to it (index names are
     // per-table; two tables may share an index name).
     let table = resolve_table(storage, &drop.table.value)
@@ -1640,7 +1631,7 @@ fn exec_drop_index(storage: &mut Storage, drop: &DropIndex) -> Result<StatementR
 // ---- ALTER TABLE --------------------------------------------------------
 
 fn exec_alter_table(
-    storage: &mut Storage,
+    storage: &Storage,
     alter: &AlterTable,
     eval_ctx: &EvalContext,
 ) -> Result<StatementResult, SqlError> {
@@ -1658,7 +1649,7 @@ fn exec_alter_table(
 /// Validates the constraint and every existing row (WITH CHECK): a child row
 /// referencing a missing parent is 547 and the constraint is not added.
 fn alter_add_foreign_key(
-    storage: &mut Storage,
+    storage: &Storage,
     def: &TableDef,
     fk: &ForeignKey,
 ) -> Result<StatementResult, SqlError> {
@@ -1735,7 +1726,7 @@ fn alter_add_foreign_key(
 /// constraint against every existing row (SQL Server's default WITH CHECK); a
 /// violating row is error 547 and the constraint is not added.
 fn alter_add_check(
-    storage: &mut Storage,
+    storage: &Storage,
     def: &TableDef,
     check: &CheckConstraint,
     eval_ctx: &EvalContext,
@@ -1783,7 +1774,7 @@ fn alter_add_check(
 /// `ALTER TABLE ... DROP CONSTRAINT name`. Removes a CHECK or FOREIGN KEY
 /// constraint by name (case-insensitive); an unknown name is error 3728.
 fn alter_drop_constraint(
-    storage: &mut Storage,
+    storage: &Storage,
     def: &TableDef,
     name: &Name,
 ) -> Result<StatementResult, SqlError> {
@@ -1831,7 +1822,7 @@ fn alter_drop_constraint(
 // ---- INSERT -------------------------------------------------------------
 
 fn exec_insert(
-    storage: &mut Storage,
+    storage: &Storage,
     insert: &Insert,
     scope: &mut TxnScope,
     eval_ctx: &EvalContext,
@@ -1977,7 +1968,7 @@ fn exec_insert(
 /// `SELECT` is executed and its rows converted. Rejects an arity mismatch
 /// against the target column count (110 for VALUES, 120/121 for SELECT).
 fn insert_input_rows(
-    storage: &mut Storage,
+    storage: &Storage,
     source: &InsertSource,
     target_len: usize,
     eval_ctx: &EvalContext,
@@ -2064,7 +2055,7 @@ fn identity_datum(column_type: &ColumnType, v: i64) -> Result<Datum, SqlError> {
 // ---- UPDATE / DELETE ----------------------------------------------------
 
 fn exec_update(
-    storage: &mut Storage,
+    storage: &Storage,
     update: &Update,
     scope: &mut TxnScope,
     eval_ctx: &EvalContext,
@@ -2205,7 +2196,7 @@ fn exec_update(
 }
 
 fn exec_delete(
-    storage: &mut Storage,
+    storage: &Storage,
     delete: &Delete,
     scope: &mut TxnScope,
     eval_ctx: &EvalContext,
@@ -2604,7 +2595,7 @@ fn expand_expr_ctes(expr: &Expr, resolved: &CteMap) -> Expr {
 /// are supported; a correlated one references an outer column and fails to
 /// resolve when executed independently.
 fn rewrite_select_subqueries(
-    storage: &mut Storage,
+    storage: &Storage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<Select, SqlError> {
@@ -2619,7 +2610,7 @@ fn rewrite_select_subqueries(
             other => Ok(other.clone()),
         })
         .collect::<Result<Vec<_>, SqlError>>()?;
-    let rewrite_opt = |storage: &mut Storage, e: &Option<Expr>| -> Result<Option<Expr>, SqlError> {
+    let rewrite_opt = |storage: &Storage, e: &Option<Expr>| -> Result<Option<Expr>, SqlError> {
         e.as_ref()
             .map(|e| rewrite_subqueries(storage, e, eval_ctx))
             .transpose()
@@ -2659,16 +2650,16 @@ fn rewrite_select_subqueries(
 /// result: a scalar `(SELECT ...)` -> a literal, `EXISTS (...)` -> a boolean,
 /// `expr IN (SELECT ...)` -> an `InList` of the subquery's values.
 fn rewrite_subqueries(
-    storage: &mut Storage,
+    storage: &Storage,
     expr: &Expr,
     eval_ctx: &EvalContext,
 ) -> Result<Expr, SqlError> {
-    let recur = |storage: &mut Storage, e: &Expr| rewrite_subqueries(storage, e, eval_ctx);
-    let recur_box = |storage: &mut Storage, e: &Expr| -> Result<Box<Expr>, SqlError> {
+    let recur = |storage: &Storage, e: &Expr| rewrite_subqueries(storage, e, eval_ctx);
+    let recur_box = |storage: &Storage, e: &Expr| -> Result<Box<Expr>, SqlError> {
         Ok(Box::new(recur(storage, e)?))
     };
     let recur_opt =
-        |storage: &mut Storage, e: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, SqlError> {
+        |storage: &Storage, e: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, SqlError> {
             e.as_ref().map(|e| recur_box(storage, e)).transpose()
         };
     let kind = match &expr.kind {
@@ -2797,7 +2788,7 @@ fn rewrite_subqueries(
 /// for 1 row, error 512 for more than 1 row; error 116 if it is not exactly one
 /// column wide.
 fn eval_scalar_subquery(
-    storage: &mut Storage,
+    storage: &Storage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<SqlValue, SqlError> {
@@ -2823,7 +2814,7 @@ fn eval_scalar_subquery(
 /// Evaluates an `IN (SELECT ...)` subquery to its list of values (one column,
 /// else error 116).
 fn eval_in_subquery(
-    storage: &mut Storage,
+    storage: &Storage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<Vec<SqlValue>, SqlError> {
@@ -2849,7 +2840,7 @@ fn scalar_subquery_shape_err() -> SqlError {
 }
 
 fn exec_select(
-    storage: &mut Storage,
+    storage: &Storage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
@@ -2978,7 +2969,7 @@ fn exec_select(
 /// rather than evaluated against the pre-statement snapshot, which would give a
 /// result that silently differs from SQL Server's per-row assignment.
 fn exec_select_assign(
-    storage: &mut Storage,
+    storage: &Storage,
     select: &Select,
     txn_ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
@@ -3564,7 +3555,7 @@ fn check_exposed_names(from: &TableRef) -> Result<(), SqlError> {
 }
 
 fn build_source(
-    storage: &mut Storage,
+    storage: &Storage,
     from: Option<&TableRef>,
     where_clause: &Option<Expr>,
     eval_ctx: &EvalContext,
@@ -3576,7 +3567,7 @@ fn build_source(
 }
 
 fn build_source_inner(
-    storage: &mut Storage,
+    storage: &Storage,
     from: Option<&TableRef>,
     where_clause: &Option<Expr>,
     eval_ctx: &EvalContext,
@@ -3601,7 +3592,7 @@ fn build_source_inner(
 /// Builds the row source for one base table (or `sys.*` view), stamping every
 /// column with the table's qualifier (its alias, else its name).
 fn build_table_source(
-    storage: &mut Storage,
+    storage: &Storage,
     name: &Name,
     alias: Option<&Name>,
     where_clause: &Option<Expr>,
@@ -3693,7 +3684,7 @@ fn build_table_source(
 /// Recursively builds a join tree's combined row source (base tables scan
 /// fully).
 fn build_join(
-    storage: &mut Storage,
+    storage: &Storage,
     tref: &TableRef,
     eval_ctx: &EvalContext,
 ) -> Result<Source, SqlError> {
@@ -3721,7 +3712,7 @@ fn build_join(
 /// every output column with the derived-table alias. Every column must be named
 /// (8155) and names must be unique within the derived table (8156).
 fn build_derived_source(
-    storage: &mut Storage,
+    storage: &Storage,
     subquery: &Select,
     alias: &Name,
     eval_ctx: &EvalContext,

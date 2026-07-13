@@ -127,8 +127,8 @@ impl Engine {
         // transaction across calls, so it uses a transient context and rolls
         // back anything an unbalanced BEGIN leaves dangling.
         let mut txn_ctx = crate::rel::TxnContext::default();
-        let outcome = crate::rel::execute_batch(&mut self.storage, input, &mut txn_ctx);
-        txn_ctx.abort(&mut self.storage);
+        let outcome = crate::rel::execute_batch(&self.storage, input, &mut txn_ctx);
+        txn_ctx.abort(&self.storage);
         self.maybe_checkpoint()?;
         Ok(render_sql_outcome(&outcome))
     }
@@ -155,8 +155,7 @@ impl Engine {
         txn_ctx: &mut crate::rel::TxnContext,
         params: &[crate::rel::RpcParam],
     ) -> Result<crate::rel::BatchOutcome, EngineError> {
-        let outcome =
-            crate::rel::execute_batch_with_params(&mut self.storage, input, txn_ctx, params);
+        let outcome = crate::rel::execute_batch_with_params(&self.storage, input, txn_ctx, params);
         self.maybe_checkpoint()?;
         Ok(outcome)
     }
@@ -164,7 +163,7 @@ impl Engine {
     /// Rolls back and discards a session's open transaction (connection
     /// teardown). No-op when the session has no transaction.
     pub fn abort_session_txn(&mut self, txn_ctx: &mut crate::rel::TxnContext) {
-        txn_ctx.abort(&mut self.storage);
+        txn_ctx.abort(&self.storage);
     }
 
     /// The table/database locks a SQL batch needs at the given isolation
