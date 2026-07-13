@@ -180,9 +180,83 @@ func main() {
 	// 11-13: transactions via the TDS Transaction Manager (db.BeginTx sends
 	// TM_BEGIN_XACT, tx.Commit/Rollback send TM_COMMIT/ROLLBACK_XACT).
 	transactionMatrix(db)
+	parameterizedQueries(db)
 	blockingDemo(db, host, port, user, pass)
 
 	fmt.Println("tds conformance (go-mssqldb): OK")
+}
+
+// parameterizedQueries exercises the sp_executesql RPC path: go-mssqldb sends
+// query arguments as typed RPC parameters (packet type 0x03), never spliced
+// into the SQL text.
+func parameterizedQueries(db *sql.DB) {
+	mustExec(db, "CREATE TABLE param_go (id INT NOT NULL PRIMARY KEY, name NVARCHAR(40), n INT)")
+
+	// Parameterized INSERTs with int, unicode string, and NULL parameters.
+	if _, err := db.Exec("INSERT INTO param_go (id, name, n) VALUES (@p1, @p2, @p3)",
+		sql.Named("p1", 1), sql.Named("p2", "café"), sql.Named("p3", 7)); err != nil {
+		fail("param insert: %v", err)
+	}
+	if _, err := db.Exec("INSERT INTO param_go (id, name, n) VALUES (@p1, @p2, @p3)",
+		sql.Named("p1", 2), sql.Named("p2", "Zürich"), sql.Named("p3", nil)); err != nil {
+		fail("param insert (null): %v", err)
+	}
+
+	// Parameterized SELECT: the predicate value arrives as a typed parameter.
+	var name string
+	var n sql.NullInt64
+	if err := db.QueryRow("SELECT name, n FROM param_go WHERE id = @p1", sql.Named("p1", 1)).
+		Scan(&name, &n); err != nil {
+		fail("param select: %v", err)
+	}
+	if name != "café" || !n.Valid || n.Int64 != 7 {
+		fail("param select mismatch: name=%q n=%v", name, n)
+	}
+
+	// A NULL parameter round-trips as a NULL column.
+	var n2 sql.NullInt64
+	if err := db.QueryRow("SELECT n FROM param_go WHERE id = @p1", sql.Named("p1", 2)).
+		Scan(&n2); err != nil {
+		fail("param select (null): %v", err)
+	}
+	if n2.Valid {
+		fail("NULL parameter did not round-trip: %v", n2)
+	}
+
+	// A long string (> 4000 chars) is sent NVARCHAR(MAX)/PLP-chunked. Measure
+	// its decoded length — echoing a >4000-char NVARCHAR result is a separate,
+	// not-yet-supported MAX case.
+	long := strings.Repeat("λ", 5000)
+	var plen int64
+	if err := db.QueryRow("SELECT LEN(@p1)", sql.Named("p1", long)).Scan(&plen); err != nil {
+		fail("PLP param select: %v", err)
+	}
+	if plen != 5000 {
+		fail("long (PLP) parameter not fully decoded: LEN=%d", plen)
+	}
+
+	// Injection safety: a payload passed as a parameter is stored literally,
+	// not executed — the table must survive.
+	evil := "'); DROP TABLE param_go; --"
+	if _, err := db.Exec("INSERT INTO param_go (id, name) VALUES (@p1, @p2)",
+		sql.Named("p1", 3), sql.Named("p2", evil)); err != nil {
+		fail("param insert (payload): %v", err)
+	}
+	var stored string
+	if err := db.QueryRow("SELECT name FROM param_go WHERE id = @p1", sql.Named("p1", 3)).
+		Scan(&stored); err != nil {
+		fail("payload select: %v", err)
+	}
+	if stored != evil {
+		fail("parameter not stored literally: %q", stored)
+	}
+	var count int64
+	if err := db.QueryRow("SELECT COUNT(*) FROM param_go").Scan(&count); err != nil {
+		fail("count: %v", err)
+	}
+	if count != 3 {
+		fail("table did not survive injection payload: count=%d", count)
+	}
 }
 
 // transactionMatrix exercises db.BeginTx + Commit/Rollback (the TM request

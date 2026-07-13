@@ -217,6 +217,9 @@ jobs:
       - name: Conformance — pytds (Python)
         run: python3 scripts/tds_conformance.py 127.0.0.1 1433 sa secret
 
+      - name: Conformance — pytds parameterized (sp_executesql RPC)
+        run: python3 scripts/tds_conformance_rpc.py 127.0.0.1 1433 sa secret
+
       - name: Conformance — pytds over TLS (tunneled handshake)
         run: python3 scripts/tds_conformance_tls.py 127.0.0.1 1433 sa secret /etc/truthdb/tls.crt
 

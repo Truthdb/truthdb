@@ -102,10 +102,13 @@ enum EngineCall {
     OpenSession {
         reply: oneshot::Sender<SessionId>,
     },
-    /// A SQL batch on behalf of a session (TDS path): typed results.
+    /// A SQL batch on behalf of a session (TDS path): typed results. `params`
+    /// is empty for a plain batch, or the `sp_executesql` parameters seeded as
+    /// batch variables before the statement runs (RPC path).
     RunBatch {
         session: SessionId,
         sql: String,
+        params: Vec<crate::rel::RpcParam>,
         reply: oneshot::Sender<Result<BatchReply, EngineError>>,
     },
     /// A native-protocol command (ES or SQL): rendered text.
@@ -142,11 +145,23 @@ impl EngineHandle {
         session: SessionId,
         sql: String,
     ) -> Result<BatchReply, EngineError> {
+        self.run_rpc(session, sql, Vec::new()).await
+    }
+
+    /// Runs an `sp_executesql` statement with decoded parameters seeded as
+    /// batch variables. Same lock/parking path as [`Self::run_batch`].
+    pub async fn run_rpc(
+        &self,
+        session: SessionId,
+        sql: String,
+        params: Vec<crate::rel::RpcParam>,
+    ) -> Result<BatchReply, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(EngineCall::RunBatch {
                 session,
                 sql,
+                params,
                 reply,
             })
             .map_err(|_| EngineError::Unavailable)?;
@@ -204,6 +219,7 @@ fn spawn_engine_with_timeout(engine: Engine, timeout: Duration) -> (EngineHandle
 struct Parked {
     session: SessionId,
     sql: String,
+    params: Vec<crate::rel::RpcParam>,
     reply: oneshot::Sender<Result<BatchReply, EngineError>>,
     needs: Vec<(Resource, LockMode)>,
     deadline: Instant,
@@ -256,8 +272,9 @@ impl EngineLoop {
                 Some(EngineCall::RunBatch {
                     session,
                     sql,
+                    params,
                     reply,
-                }) => self.dispatch_batch(session, sql, reply),
+                }) => self.dispatch_batch(session, sql, params, reply),
                 Some(EngineCall::RunNative { command, reply }) => {
                     let _ = reply.send(self.engine.execute(&command));
                 }
@@ -281,6 +298,7 @@ impl EngineLoop {
         &mut self,
         session: SessionId,
         sql: String,
+        params: Vec<crate::rel::RpcParam>,
         reply: oneshot::Sender<Result<BatchReply, EngineError>>,
     ) {
         let isolation = self
@@ -288,14 +306,17 @@ impl EngineLoop {
             .get(session)
             .map(|s| s.txn_ctx.isolation())
             .unwrap_or_default();
+        // Parameters are values, not statements, so they never change which
+        // locks the batch needs — analyse the statement text as usual.
         let needs = self.engine.analyze_locks(&sql, isolation);
         if self.try_acquire(session.raw(), &needs, true) {
-            self.run_and_reply(session, &sql, reply);
+            self.run_and_reply(session, &sql, &params, reply);
             self.wake_parked();
         } else {
             self.parked.push_back(Parked {
                 session,
                 sql,
+                params,
                 reply,
                 needs,
                 deadline: Instant::now() + self.lock_wait_timeout,
@@ -341,15 +362,18 @@ impl EngineLoop {
         &mut self,
         session: SessionId,
         sql: &str,
+        params: &[crate::rel::RpcParam],
         reply: oneshot::Sender<Result<BatchReply, EngineError>>,
     ) {
         let owner = session.raw();
         let outcome = match self.sessions.get_mut(session) {
-            Some(state) => self.engine.sql_batch(sql, &mut state.txn_ctx),
+            Some(state) => self
+                .engine
+                .sql_batch_with_params(sql, &mut state.txn_ctx, params),
             None => {
                 // Unknown session: one-shot autocommit, hold no locks after.
                 let mut txn_ctx = TxnContext::default();
-                let out = self.engine.sql_batch(sql, &mut txn_ctx);
+                let out = self.engine.sql_batch_with_params(sql, &mut txn_ctx, params);
                 self.engine.abort_session_txn(&mut txn_ctx);
                 out
             }
@@ -407,7 +431,7 @@ impl EngineLoop {
                     for (resource, mode) in &parked.needs {
                         self.locks.grant(owner, *resource, *mode);
                     }
-                    self.run_and_reply(parked.session, &parked.sql, parked.reply);
+                    self.run_and_reply(parked.session, &parked.sql, &parked.params, parked.reply);
                     ran = true;
                     break; // re-scan from the front (locks may have changed)
                 }

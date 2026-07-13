@@ -9,9 +9,10 @@ use truthdb_core::session::{EngineHandle, SessionId};
 
 use crate::login::{self, parse_login7};
 use crate::packet::{
-    self, DEFAULT_PACKET_SIZE, Message, PKT_ATTENTION, PKT_LOGIN7, PKT_PRELOGIN, PKT_SQL_BATCH,
-    PKT_TABULAR_RESULT, PKT_TRANSACTION_MANAGER, read_message, write_message,
+    self, DEFAULT_PACKET_SIZE, Message, PKT_ATTENTION, PKT_LOGIN7, PKT_PRELOGIN, PKT_RPC,
+    PKT_SQL_BATCH, PKT_TABULAR_RESULT, PKT_TRANSACTION_MANAGER, read_message, write_message,
 };
+use crate::rpc::{self, RpcProc};
 use crate::token;
 
 // Transaction Manager request types (MS-TDS 2.2.6.9).
@@ -153,6 +154,10 @@ where
             PKT_SQL_BATCH => {
                 let sql = batch_sql(&message.payload)?;
                 let response = run_batch(engine, session, &sql).await;
+                write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?;
+            }
+            PKT_RPC => {
+                let response = run_rpc(engine, session, &message.payload).await;
                 write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?;
             }
             PKT_TRANSACTION_MANAGER => {
@@ -301,6 +306,44 @@ async fn run_batch(engine: &EngineHandle, session: SessionId, sql: &str) -> Vec<
             out
         }
     }
+}
+
+/// Handles an RPC request. Supports `sp_executesql` — decode its statement and
+/// typed parameters, run them, and return the same token stream a batch would.
+/// Any other procedure, or a malformed request, is answered with an error token
+/// plus a final DONE so the connection stays usable.
+async fn run_rpc(engine: &EngineHandle, session: SessionId, payload: &[u8]) -> Vec<u8> {
+    let request = match rpc::parse_rpc_request(skip_all_headers(payload)) {
+        Ok(request) => request,
+        Err(err) => return rpc_error(&format!("malformed RPC request: {err}")),
+    };
+    match request.proc {
+        RpcProc::SpExecuteSql => {
+            let (sql, params) = match rpc::split_sp_executesql(request.params) {
+                Ok(split) => split,
+                Err(err) => return rpc_error(&err.to_string()),
+            };
+            match engine.run_rpc(session, sql, params).await {
+                Ok(reply) => build_batch_tokens(&reply.outcome, reply.in_transaction),
+                Err(err) => rpc_error(&err.to_string()),
+            }
+        }
+        // Error 2812 is SQL Server's "Could not find stored procedure".
+        RpcProc::Other(name) => {
+            rpc_error_num(2812, &format!("Could not find stored procedure '{name}'."))
+        }
+    }
+}
+
+fn rpc_error(message: &str) -> Vec<u8> {
+    rpc_error_num(50000, message)
+}
+
+fn rpc_error_num(number: i32, message: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    token::error(&mut out, number, 1, 16, message);
+    token::done(&mut out, false, true, false, None);
+    out
 }
 
 /// Builds the COLMETADATA/ROW/DONE/ERROR token stream for a batch outcome.
