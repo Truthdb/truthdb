@@ -75,6 +75,10 @@ pub enum SetStatement {
         name: String,
         value: Expr,
     },
+    /// A recognized session option that TruthDB accepts but ignores (client
+    /// compatibility: `SET QUOTED_IDENTIFIER ON`, `SET NOCOUNT ON`,
+    /// `SET TEXTSIZE 2147483647`, ...).
+    Ignored,
 }
 
 /// `CREATE [UNIQUE] INDEX <name> ON <table> (<col> [ASC|DESC], ...)`.

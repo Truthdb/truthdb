@@ -1,0 +1,62 @@
+# Client-compatibility session options (Stage 9): SET options that TruthDB
+# accepts but ignores, plus the @@VERSION intrinsic. Drivers and tools (SSMS,
+# sqlcmd) emit these at connection time.
+
+statement ok
+SET QUOTED_IDENTIFIER ON
+
+statement ok
+SET ANSI_NULLS ON
+
+statement ok
+SET NOCOUNT ON
+
+statement ok
+SET ANSI_PADDING OFF
+
+statement ok
+SET TEXTSIZE 2147483647
+
+statement ok
+SET LOCK_TIMEOUT 5000
+
+# A signed numeric argument is accepted.
+statement ok
+SET DEADLOCK_PRIORITY -5
+
+statement ok
+SET DATEFORMAT mdy
+
+# Options whose OFF would change results are rejected, not silently ignored.
+statement error
+SET ANSI_NULLS OFF
+
+statement error
+SET CONCAT_NULL_YIELDS_NULL OFF
+
+# Options that change what/how much runs are rejected, not silently dropped.
+statement error
+SET ROWCOUNT 100
+
+# The no-op options do not disturb a following statement.
+statement ok
+CREATE TABLE opt_probe (id INT NOT NULL PRIMARY KEY)
+
+statement ok
+INSERT INTO opt_probe VALUES (1), (2)
+
+query I
+SELECT id FROM opt_probe ORDER BY id
+----
+1
+2
+
+# @@VERSION leads with TruthDB's identity so tools can display it.
+query T
+SELECT LEFT(@@VERSION, 7)
+----
+TruthDB
+
+# An unrecognized SET option is still a syntax error.
+statement error
+SET WHATSIT ON
