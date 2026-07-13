@@ -196,7 +196,17 @@ pub fn execute_batch_with_params(
         }
     };
     let mut results = Vec::with_capacity(statements.len());
+    // Whether any statement may have made a durable commit: group commit defers
+    // the WAL fsync to one call at the end of the batch (see
+    // [`finalize_durability`]).
+    let mut committed = false;
     for statement in &statements {
+        // Flag durability by statement kind, before matching the result: a
+        // write/DDL/COMMIT can commit even when it then errors — an autocommit
+        // statement, an identity reservation (its own mini-commit, made even
+        // inside an open transaction and even if the row insert later fails),
+        // or the outermost COMMIT.
+        committed |= statement_may_commit(statement);
         match exec_statement(storage, statement, txn_ctx) {
             Ok(result) => results.push(result),
             Err(error) => {
@@ -205,16 +215,57 @@ pub fn execute_batch_with_params(
                 if txn_ctx.in_txn() {
                     txn_ctx.doomed = true;
                 }
-                return BatchOutcome {
-                    results,
-                    error: Some(error),
-                };
+                let error = finalize_durability(storage, committed, Some(error));
+                return BatchOutcome { results, error };
             }
         }
     }
-    BatchOutcome {
-        results,
-        error: None,
+    let error = finalize_durability(storage, committed, None);
+    BatchOutcome { results, error }
+}
+
+/// Whether a statement can make a durable commit that the batch must fsync: any
+/// write/DDL (its own autocommit, or an identity reservation's mini-commit even
+/// inside a transaction) or a `COMMIT`. Conservative by design — it flags by
+/// kind, not by transaction state, so a hidden mini-commit (e.g. identity) is
+/// never missed. Reads, `BEGIN`, `ROLLBACK`, `SET` and `DECLARE` never commit.
+fn statement_may_commit(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Insert(_)
+            | Statement::Update(_)
+            | Statement::Delete(_)
+            | Statement::CreateTable(_)
+            | Statement::DropTable(_)
+            | Statement::CreateView(_)
+            | Statement::DropView(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
+            | Statement::AlterTable(_)
+            | Statement::Commit { .. }
+    )
+}
+
+/// Blocks until the batch's commit records are fsync-durable (group commit),
+/// when the batch may have committed anything. A durability (fsync) failure
+/// wedges the store — the in-memory state is now ahead of the log, so no
+/// further op may serve it — and is reported unless the batch already carries a
+/// statement error (which the client asked about and takes precedence; the
+/// wedge then surfaces on the next operation).
+fn finalize_durability(
+    storage: &Storage,
+    committed: bool,
+    prior: Option<SqlError>,
+) -> Option<SqlError> {
+    if !committed {
+        return prior;
+    }
+    match storage.ensure_durable(storage.wal_tail()) {
+        Ok(()) => prior,
+        Err(err) => {
+            storage.wedge();
+            Some(prior.unwrap_or_else(|| map_storage_err(err, "")))
+        }
     }
 }
 

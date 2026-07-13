@@ -274,6 +274,15 @@ mod imp {
             Ok(())
         }
 
+        /// Duplicates the underlying file descriptor as a plain [`std::fs::File`]
+        /// (same open file description). The clone shares the file, so an
+        /// `fdatasync` on it flushes every write made through this handle — used
+        /// by the group-commit log-writer to fsync the WAL off the storage lock,
+        /// without touching this handle's io_uring ring.
+        pub fn try_clone_std(&self) -> io::Result<std::fs::File> {
+            self.file.try_clone()
+        }
+
         pub fn read_page_into(
             &mut self,
             page_offset: u64,
@@ -569,6 +578,10 @@ mod imp {
         }
 
         pub fn sync_data(&mut self) -> io::Result<()> {
+            Err(io::Error::other("truthdb storage requires Linux io_uring"))
+        }
+
+        pub fn try_clone_std(&self) -> io::Result<std::fs::File> {
             Err(io::Error::other("truthdb storage requires Linux io_uring"))
         }
 

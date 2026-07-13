@@ -184,7 +184,12 @@ impl RelCtx<'_> {
     /// end record is an ATT-cleanup optimization (analysis already treats
     /// COMMIT as terminal), so its failure must not fail a durable commit.
     pub fn commit(&mut self, txn: TxnLink) -> Result<(), StorageError> {
-        let commit_lsn = self.append(&RelRecord::txn_commit(txn.txn_id, txn.last_lsn), true)?;
+        // The commit record is written but NOT fsynced here: group commit makes
+        // it durable via the log-writer once the executor calls
+        // `Storage::ensure_durable` at the end of the batch, so one fsync serves
+        // every commit in the window. The record must reach the disk before the
+        // batch is acknowledged; nothing before that ack depends on it.
+        let commit_lsn = self.append(&RelRecord::txn_commit(txn.txn_id, txn.last_lsn), false)?;
         let _ = self.append(&RelRecord::txn_end(txn.txn_id, commit_lsn), false);
         Ok(())
     }
