@@ -1,0 +1,209 @@
+[
+    Declare(
+        [
+            Declaration {
+                name: "a",
+                data_type: Int,
+                initializer: None,
+                span: Span {
+                    start: 8,
+                    end: 14,
+                },
+            },
+            Declaration {
+                name: "b",
+                data_type: NVarChar(
+                    10,
+                ),
+                initializer: Some(
+                    Expr {
+                        kind: Str(
+                            "hi",
+                        ),
+                        span: Span {
+                            start: 34,
+                            end: 38,
+                        },
+                    },
+                ),
+                span: Span {
+                    start: 16,
+                    end: 38,
+                },
+            },
+            Declaration {
+                name: "c",
+                data_type: Int,
+                initializer: Some(
+                    Expr {
+                        kind: Binary {
+                            op: Add,
+                            left: Expr {
+                                kind: LocalVar(
+                                    "a",
+                                ),
+                                span: Span {
+                                    start: 49,
+                                    end: 51,
+                                },
+                            },
+                            right: Expr {
+                                kind: Int(
+                                    1,
+                                ),
+                                span: Span {
+                                    start: 54,
+                                    end: 55,
+                                },
+                            },
+                        },
+                        span: Span {
+                            start: 49,
+                            end: 55,
+                        },
+                    },
+                ),
+                span: Span {
+                    start: 40,
+                    end: 55,
+                },
+            },
+        ],
+    ),
+    Set(
+        Variable {
+            name: "a",
+            value: Expr {
+                kind: Binary {
+                    op: Mul,
+                    left: Expr {
+                        kind: Int(
+                            5,
+                        ),
+                        span: Span {
+                            start: 66,
+                            end: 67,
+                        },
+                    },
+                    right: Expr {
+                        kind: Int(
+                            2,
+                        ),
+                        span: Span {
+                            start: 70,
+                            end: 71,
+                        },
+                    },
+                },
+                span: Span {
+                    start: 66,
+                    end: 71,
+                },
+            },
+        },
+    ),
+    Select(
+        Select {
+            top: None,
+            distinct: false,
+            items: [
+                Expr {
+                    expr: Expr {
+                        kind: LocalVar(
+                            "a",
+                        ),
+                        span: Span {
+                            start: 80,
+                            end: 82,
+                        },
+                    },
+                    alias: Some(
+                        Name {
+                            value: "doubled",
+                            quoted: false,
+                            span: Span {
+                                start: 86,
+                                end: 93,
+                            },
+                        },
+                    ),
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "id",
+                                quoted: false,
+                                span: Span {
+                                    start: 95,
+                                    end: 97,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 95,
+                            end: 97,
+                        },
+                    },
+                    alias: None,
+                },
+            ],
+            from: Some(
+                Table {
+                    name: Name {
+                        value: "t",
+                        quoted: false,
+                        span: Span {
+                            start: 103,
+                            end: 104,
+                        },
+                    },
+                    alias: None,
+                },
+            ),
+            where_clause: Some(
+                Expr {
+                    kind: Binary {
+                        op: Ge,
+                        left: Expr {
+                            kind: Column(
+                                Name {
+                                    value: "v",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 111,
+                                        end: 112,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 111,
+                                end: 112,
+                            },
+                        },
+                        right: Expr {
+                            kind: LocalVar(
+                                "a",
+                            ),
+                            span: Span {
+                                start: 116,
+                                end: 118,
+                            },
+                        },
+                    },
+                    span: Span {
+                        start: 111,
+                        end: 118,
+                    },
+                },
+            ),
+            group_by: [],
+            having: None,
+            order_by: [],
+            span: Span {
+                start: 73,
+                end: 118,
+            },
+        },
+    ),
+]

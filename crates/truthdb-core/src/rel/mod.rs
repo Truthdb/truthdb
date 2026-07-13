@@ -14,8 +14,9 @@ mod value;
 
 use truthdb_sql::ast::{
     AlterAction, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable, DataType,
-    Delete, DropIndex, DropTable, Expr, ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel,
-    JoinKind, Name, OrderItem, Select, SelectItem, SetStatement, Statement, TableRef, Update,
+    Declaration, Delete, DropIndex, DropTable, Expr, ExprKind, ForeignKey, Insert, InsertSource,
+    IsolationLevel, JoinKind, Name, OrderItem, Select, SelectItem, SetStatement, Statement,
+    TableRef, Update,
 };
 use truthdb_sql::error::SqlError;
 use truthdb_sql::eval::EvalContext;
@@ -43,6 +44,9 @@ pub struct TxnContext {
     isolation: Isolation,
     /// `SET SHOWPLAN_TEXT ON` — a SELECT returns its plan text, not results.
     showplan_text: bool,
+    /// Declared batch variables (name without `@`, lowercased) to their type
+    /// and current value. Cleared at the start of each batch.
+    variables: std::collections::HashMap<String, (ColumnType, SqlValue)>,
 }
 
 /// Session isolation level (defaults to READ COMMITTED, like SQL Server).
@@ -63,7 +67,17 @@ impl TxnContext {
     fn eval_context(&self) -> EvalContext {
         EvalContext {
             trancount: self.trancount as i32,
+            variables: self
+                .variables
+                .iter()
+                .map(|(name, (_, value))| (name.clone(), value.clone()))
+                .collect(),
         }
+    }
+
+    /// Clears batch-scoped variables (called at the start of each batch).
+    pub fn clear_variables(&mut self) {
+        self.variables.clear();
     }
 
     /// True if a transaction is open (used by the session to decide whether a
@@ -123,6 +137,8 @@ pub struct BatchOutcome {
 /// Parses and executes a SQL batch. A parse error yields an empty batch with
 /// the error; a runtime error stops the batch but keeps earlier results.
 pub fn execute_batch(storage: &mut Storage, sql: &str, txn_ctx: &mut TxnContext) -> BatchOutcome {
+    // Variables are batch-scoped: each batch starts with none.
+    txn_ctx.clear_variables();
     let statements = match truthdb_sql::parse(sql) {
         Ok(statements) => statements,
         Err(error) => {
@@ -298,11 +314,12 @@ pub fn analyze_locks(
             | Statement::AlterTable(_) => {
                 add(Resource::Database, LockMode::Exclusive);
             }
-            // Transaction control and SET take no data locks.
+            // Transaction control, SET, and DECLARE take no data locks.
             Statement::BeginTransaction { .. }
             | Statement::Commit { .. }
             | Statement::Rollback { .. }
-            | Statement::Set(_) => {}
+            | Statement::Set(_)
+            | Statement::Declare(_) => {}
         }
     }
     needs.into_iter().collect()
@@ -349,6 +366,7 @@ fn exec_statement(
         Statement::Commit { .. } => exec_commit(storage, txn_ctx),
         Statement::Rollback { .. } => exec_rollback(storage, txn_ctx),
         Statement::Set(set) => exec_set(txn_ctx, set),
+        Statement::Declare(decls) => exec_declare(txn_ctx, decls),
         Statement::CreateTable(create) => {
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
@@ -532,8 +550,70 @@ fn exec_set(ctx: &mut TxnContext, set: &SetStatement) -> Result<StatementResult,
             }
         }
         SetStatement::ShowplanText(on) => ctx.showplan_text = *on,
+        SetStatement::Variable { name, value } => {
+            let column_type = ctx
+                .variables
+                .get(name)
+                .map(|(t, _)| *t)
+                .ok_or_else(|| undeclared_variable_err(name))?;
+            let eval_ctx = ctx.eval_context();
+            let coerced = coerce_variable(value, &column_type, name, &eval_ctx)?;
+            ctx.variables.insert(name.clone(), (column_type, coerced));
+        }
     }
     Ok(StatementResult::Done)
+}
+
+/// `DECLARE @a TYPE [= expr], ...`. Each variable is added to the batch (error
+/// 134 if already declared); an initializer (which may reference an earlier
+/// variable) is coerced to the declared type, else the value starts NULL.
+fn exec_declare(ctx: &mut TxnContext, decls: &[Declaration]) -> Result<StatementResult, SqlError> {
+    for decl in decls {
+        if ctx.variables.contains_key(&decl.name) {
+            return Err(SqlError::new(
+                134,
+                15,
+                2,
+                format!(
+                    "The variable name '@{}' has already been declared. Variable names must be unique within a query batch.",
+                    decl.name
+                ),
+            ));
+        }
+        let column_type = data_type_to_column_type(&decl.data_type, &decl.name)?;
+        let value = match &decl.initializer {
+            Some(expr) => {
+                let eval_ctx = ctx.eval_context();
+                coerce_variable(expr, &column_type, &decl.name, &eval_ctx)?
+            }
+            None => SqlValue::Null,
+        };
+        ctx.variables
+            .insert(decl.name.clone(), (column_type, value));
+    }
+    Ok(StatementResult::Done)
+}
+
+fn undeclared_variable_err(name: &str) -> SqlError {
+    SqlError::new(
+        137,
+        15,
+        2,
+        format!("Must declare the scalar variable \"@{name}\"."),
+    )
+}
+
+/// Evaluates a variable initializer/assignment (a constant expression that may
+/// reference already-declared variables) and coerces it to the declared type.
+fn coerce_variable(
+    expr: &Expr,
+    column_type: &ColumnType,
+    name: &str,
+    eval_ctx: &EvalContext,
+) -> Result<SqlValue, SqlError> {
+    let sql_value = eval_constant(expr, eval_ctx)?;
+    let datum = value::sql_to_datum(&sql_value, column_type, name)?;
+    Ok(value::datum_to_sql(&datum, column_type))
 }
 
 // ---- CREATE TABLE -------------------------------------------------------
@@ -1034,7 +1114,8 @@ fn validate_check_columns(expr: &Expr, columns: &[Column]) -> Result<(), SqlErro
         | ExprKind::Str(_)
         | ExprKind::Bool(_)
         | ExprKind::Literal(_)
-        | ExprKind::GlobalVar(_) => Ok(()),
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_) => Ok(()),
         // Subqueries are not allowed in a CHECK constraint (SQL Server 1046).
         ExprKind::Subquery(_) | ExprKind::Exists(_) | ExprKind::InSubquery { .. } => {
             Err(SqlError::new(
@@ -1242,8 +1323,10 @@ fn pk_of(def: &TableDef, row: &[Datum]) -> Vec<Datum> {
     def.key_columns.iter().map(|&i| row[i].clone()).collect()
 }
 
-fn bind_column(column: &ColumnDef) -> Result<Column, SqlError> {
-    let column_type = match &column.data_type {
+/// Maps a parsed [`DataType`] to a storage [`ColumnType`], validating length
+/// bounds. `name` is only used for the length-overflow error message.
+fn data_type_to_column_type(data_type: &DataType, name: &str) -> Result<ColumnType, SqlError> {
+    Ok(match data_type {
         DataType::TinyInt => ColumnType::TinyInt,
         DataType::SmallInt => ColumnType::SmallInt,
         DataType::Int => ColumnType::Int,
@@ -1260,15 +1343,19 @@ fn bind_column(column: &ColumnDef) -> Result<Column, SqlError> {
         DataType::DateTime2 => ColumnType::DateTime2,
         DataType::UniqueIdentifier => ColumnType::UniqueIdentifier,
         DataType::VarChar(n) => ColumnType::VarChar {
-            max_len: length(*n, column)?,
+            max_len: length(*n, name)?,
         },
         DataType::NVarChar(n) => ColumnType::NVarChar {
-            max_len: length(*n, column)?,
+            max_len: length(*n, name)?,
         },
         DataType::VarBinary(n) => ColumnType::VarBinary {
-            max_len: length(*n, column)?,
+            max_len: length(*n, name)?,
         },
-    };
+    })
+}
+
+fn bind_column(column: &ColumnDef) -> Result<Column, SqlError> {
+    let column_type = data_type_to_column_type(&column.data_type, &column.name.value)?;
     // A COLLATE clause is only meaningful on character columns.
     if column.collation.is_some()
         && !matches!(
@@ -1298,16 +1385,13 @@ fn bind_column(column: &ColumnDef) -> Result<Column, SqlError> {
     })
 }
 
-fn length(n: u32, column: &ColumnDef) -> Result<u16, SqlError> {
+fn length(n: u32, name: &str) -> Result<u16, SqlError> {
     u16::try_from(n).map_err(|_| {
         SqlError::new(
             131,
             15,
             2,
-            format!(
-                "The size for column '{}' exceeds the maximum.",
-                column.name.value
-            ),
+            format!("The size for column '{name}' exceeds the maximum."),
         )
     })
 }
@@ -2332,7 +2416,8 @@ fn rewrite_subqueries(
         | ExprKind::Bool(_)
         | ExprKind::Literal(_)
         | ExprKind::Column(_)
-        | ExprKind::GlobalVar(_) => expr.kind.clone(),
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_) => expr.kind.clone(),
     };
     Ok(Expr {
         kind,
@@ -2870,7 +2955,8 @@ fn collect_expr_tables<'a>(expr: &'a Expr, out: &mut Vec<&'a Name>) {
         | ExprKind::Bool(_)
         | ExprKind::Literal(_)
         | ExprKind::Column(_)
-        | ExprKind::GlobalVar(_) => {}
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_) => {}
     }
 }
 

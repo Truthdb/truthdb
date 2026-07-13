@@ -26,10 +26,23 @@ pub enum Statement {
     Rollback {
         span: Span,
     },
-    /// `SET` session option (XACT_ABORT / TRANSACTION ISOLATION LEVEL).
+    /// `SET` session option (XACT_ABORT / TRANSACTION ISOLATION LEVEL) or a
+    /// `SET @v = expr` variable assignment.
     Set(SetStatement),
     /// `ALTER TABLE ...`.
     AlterTable(AlterTable),
+    /// `DECLARE @a TYPE [= expr], ...` — batch variable declarations.
+    Declare(Vec<Declaration>),
+}
+
+/// One `@name TYPE [= initializer]` in a `DECLARE`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Declaration {
+    /// Variable name without the `@`, lowercased.
+    pub name: String,
+    pub data_type: DataType,
+    pub initializer: Option<Expr>,
+    pub span: Span,
 }
 
 /// `ALTER TABLE <table> <action>`.
@@ -57,6 +70,11 @@ pub enum SetStatement {
     /// `SET SHOWPLAN_TEXT ON|OFF` — when on, statements return their plan text
     /// instead of executing.
     ShowplanText(bool),
+    /// `SET @v = expr` — assigns a batch variable.
+    Variable {
+        name: String,
+        value: Expr,
+    },
 }
 
 /// `CREATE [UNIQUE] INDEX <name> ON <table> (<col> [ASC|DESC], ...)`.
@@ -382,6 +400,9 @@ pub enum ExprKind {
     /// A `@@`-prefixed global/session variable (e.g. `@@TRANCOUNT`), evaluated
     /// from the session's [`EvalContext`](crate::eval::EvalContext).
     GlobalVar(String),
+    /// A `@`-prefixed local/batch variable (name without the `@`, lowercased),
+    /// resolved from the batch's declared variables.
+    LocalVar(String),
     /// A precomputed value. Not produced by the parser — the executor rewrites
     /// each evaluated subquery to a `Literal` so scalar evaluation stays free of
     /// storage access.

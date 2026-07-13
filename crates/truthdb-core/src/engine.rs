@@ -2185,6 +2185,85 @@ mod tests {
     }
 
     #[test]
+    fn sql_batch_variables() {
+        let path = unique_temp_path("sql-vars");
+        let mut engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+
+        // DECLARE, SET, and read a variable within one batch.
+        let out = batch(
+            &mut engine,
+            &mut ctx,
+            "DECLARE @n INT; SET @n = 42; SELECT @n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![42]);
+
+        // An initializer may reference an earlier variable in the same DECLARE.
+        let out = batch(
+            &mut engine,
+            &mut ctx,
+            "DECLARE @a INT = 5, @b INT = @a + 1; SELECT @b",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![6]);
+
+        // A variable used in a WHERE clause.
+        batch(
+            &mut engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+        );
+        batch(
+            &mut engine,
+            &mut ctx,
+            "INSERT INTO t VALUES (1,10),(2,20),(3,30)",
+        );
+        let out = batch(
+            &mut engine,
+            &mut ctx,
+            "DECLARE @min INT; SET @min = 20; SELECT id FROM t WHERE v >= @min ORDER BY id",
+        );
+        assert_eq!(ids(&out), vec![2, 3]);
+
+        // Using an undeclared variable is error 137 (SET and read).
+        assert_eq!(
+            batch(&mut engine, &mut ctx, "SET @nope = 1")
+                .error
+                .as_ref()
+                .map(|e| e.number),
+            Some(137)
+        );
+        assert_eq!(
+            batch(&mut engine, &mut ctx, "SELECT @nope")
+                .error
+                .as_ref()
+                .map(|e| e.number),
+            Some(137)
+        );
+
+        // Redeclaring within the same batch is error 134.
+        assert_eq!(
+            batch(&mut engine, &mut ctx, "DECLARE @d INT; DECLARE @d INT")
+                .error
+                .as_ref()
+                .map(|e| e.number),
+            Some(134)
+        );
+
+        // Variables are batch-scoped: one declared in a prior batch is gone.
+        batch(&mut engine, &mut ctx, "DECLARE @scoped INT");
+        assert_eq!(
+            batch(&mut engine, &mut ctx, "SELECT @scoped")
+                .error
+                .as_ref()
+                .map(|e| e.number),
+            Some(137)
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_scalar_in_exists_subqueries() {
         let path = unique_temp_path("sql-subquery");
         let mut engine = new_engine(&path);

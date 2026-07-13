@@ -38,6 +38,8 @@ pub enum TokenKind {
     String(String),
     /// A `@@`-prefixed global variable name (without the `@@`), lowercased.
     GlobalVar(String),
+    /// A `@`-prefixed local/batch variable name (without the `@`), lowercased.
+    LocalVar(String),
     // Operators / punctuation.
     Comma,
     Semicolon,
@@ -269,10 +271,23 @@ impl<'a> Lexer<'a> {
                     span: Span::new(start, self.pos),
                 })
             }
-            b'@' => Err(
-                SqlError::message_only(102, "Variables are not supported yet.")
-                    .at(Span::new(start, start + 1)),
-            ),
+            b'@' => {
+                // `@name` — a local/batch variable.
+                self.pos += 1;
+                let name_start = self.pos;
+                while self.peek().is_some_and(is_ident_cont) {
+                    self.pos += 1;
+                }
+                if self.pos == name_start {
+                    return Err(SqlError::syntax('@', Span::new(start, start + 1)));
+                }
+                let name =
+                    String::from_utf8_lossy(&self.src[name_start..self.pos]).to_ascii_lowercase();
+                Ok(Token {
+                    kind: TokenKind::LocalVar(name),
+                    span: Span::new(start, self.pos),
+                })
+            }
             _ if b.is_ascii_digit() => self.lex_number(start),
             _ if is_ident_start(b) => self.lex_word(start),
             _ => {
