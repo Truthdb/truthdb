@@ -2592,6 +2592,7 @@ fn build_table_source(
         "sys.indexes" => sys_indexes(storage),
         "sys.check_constraints" => sys_check_constraints(storage),
         "sys.foreign_keys" => sys_foreign_keys(storage),
+        "sys.default_constraints" => sys_default_constraints(storage),
         _ => {
             let def = resolve_table(storage, &name.value)
                 .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
@@ -2931,6 +2932,38 @@ fn sys_foreign_keys(storage: &Storage) -> Source {
                 oid_of(&fk.parent)
                     .map(|o| Datum::Int(o as i32))
                     .unwrap_or(Datum::Null),
+            ]);
+        }
+    }
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows,
+    }
+}
+
+fn sys_default_constraints(storage: &Storage) -> Source {
+    let columns = vec![
+        nvarchar("name", 128),
+        int_col("parent_object_id"),
+        int_col("parent_column_id"),
+        nvarchar("definition", 4000),
+    ];
+    // Inline column DEFAULTs are unnamed; SQL Server auto-names them
+    // `DF__<table>__<column>__...`. We synthesize a stable `DF__<table>__<col>`.
+    let mut rows = Vec::new();
+    for def in storage.rel_tables() {
+        for (index, text) in def.defaults.iter().enumerate() {
+            let Some(text) = text else { continue };
+            let column = &def.columns[index].0;
+            rows.push(vec![
+                Datum::NVarChar(format!("DF__{}__{}", def.name, column)),
+                Datum::Int(def.object_id as i32),
+                Datum::Int(index as i32 + 1),
+                Datum::NVarChar(format!("({text})")),
             ]);
         }
     }
