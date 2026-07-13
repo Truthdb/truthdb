@@ -13,10 +13,10 @@ mod plan;
 mod value;
 
 use truthdb_sql::ast::{
-    AlterAction, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable, DataType,
-    Declaration, Delete, DropIndex, DropTable, Expr, ExprKind, ForeignKey, Insert, InsertSource,
-    IsolationLevel, JoinKind, Name, OrderItem, Select, SelectItem, SetStatement, Statement,
-    TableRef, Update,
+    AlterAction, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable, CreateView,
+    DataType, Declaration, Delete, DropIndex, DropTable, DropView, Expr, ExprKind, ForeignKey,
+    Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem, Select, SelectItem,
+    SetStatement, Statement, TableRef, Update,
 };
 use truthdb_sql::error::SqlError;
 use truthdb_sql::eval::EvalContext;
@@ -290,12 +290,9 @@ pub fn analyze_locks(
                 let mut tables = Vec::new();
                 collect_locked_tables(&expanded, &mut tables);
                 for name in tables {
-                    if name.value.to_ascii_lowercase().starts_with("sys.") {
-                        continue; // catalog view: unlocked
-                    }
-                    if let Some(def) = resolve_table(storage, &name.value) {
+                    for oid in read_lock_object_ids(storage, &name.value) {
                         add(Resource::Database, LockMode::IntentShared);
-                        add(Resource::Table(def.object_id), LockMode::Shared);
+                        add(Resource::Table(oid), LockMode::Shared);
                     }
                 }
             }
@@ -318,12 +315,9 @@ pub fn analyze_locks(
                     let mut tables = Vec::new();
                     collect_locked_tables(&expanded, &mut tables);
                     for name in tables {
-                        if name.value.to_ascii_lowercase().starts_with("sys.") {
-                            continue;
-                        }
-                        if let Some(def) = resolve_table(storage, &name.value) {
+                        for oid in read_lock_object_ids(storage, &name.value) {
                             add(Resource::Database, LockMode::IntentShared);
-                            add(Resource::Table(def.object_id), LockMode::Shared);
+                            add(Resource::Table(oid), LockMode::Shared);
                         }
                     }
                 }
@@ -359,6 +353,8 @@ pub fn analyze_locks(
             // database-exclusive lock (it is disallowed inside a txn anyway).
             Statement::CreateTable(_)
             | Statement::DropTable(_)
+            | Statement::CreateView(_)
+            | Statement::DropView(_)
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
             | Statement::AlterTable(_) => {
@@ -428,6 +424,18 @@ fn exec_statement(
                 return Err(ddl_in_txn_err());
             }
             exec_drop_table(storage, drop)
+        }
+        Statement::CreateView(create) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_view(storage, create)
+        }
+        Statement::DropView(drop) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_view(storage, drop)
         }
         Statement::CreateIndex(create) => {
             if txn_ctx.in_txn() {
@@ -1457,6 +1465,19 @@ fn length(n: u32, name: &str) -> Result<u16, SqlError> {
 // ---- DROP TABLE ---------------------------------------------------------
 
 fn exec_drop_table(storage: &mut Storage, drop: &DropTable) -> Result<StatementResult, SqlError> {
+    // DROP TABLE does not drop a view (use DROP VIEW). The object exists but is
+    // the wrong type, so error even under IF EXISTS rather than silently no-op.
+    if resolve_table(storage, &drop.table.value).is_some_and(|d| d.is_view()) {
+        return Err(SqlError::new(
+            3701,
+            11,
+            5,
+            format!(
+                "Cannot drop the table '{}', because it does not exist or you do not have permission.",
+                drop.table.value
+            ),
+        ));
+    }
     let name = resolve_table(storage, &drop.table.value).map(|d| d.name);
     match name {
         Some(name) => {
@@ -1501,6 +1522,74 @@ fn exec_drop_table(storage: &mut Storage, drop: &DropTable) -> Result<StatementR
     }
 }
 
+// ---- CREATE / DROP VIEW -------------------------------------------------
+
+/// Parses a stored view definition back into its `SELECT`. The text was
+/// validated at CREATE, so this only fails on catalog corruption.
+fn parse_view_query(text: &str, view_name: &str) -> Result<Select, SqlError> {
+    match truthdb_sql::parse(text)?.into_iter().next() {
+        Some(Statement::Select(select)) => Ok(select),
+        _ => Err(SqlError::message_only(
+            208,
+            format!("The definition of view '{view_name}' is not a SELECT."),
+        )),
+    }
+}
+
+fn exec_create_view(
+    storage: &mut Storage,
+    create: &CreateView,
+) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&create.name.value);
+    if resolve_table(storage, &create.name.value).is_some() {
+        return Err(SqlError::new(
+            2714,
+            16,
+            6,
+            format!("There is already an object named '{bare}' in the database."),
+        ));
+    }
+    // Validate the definition parses as a SELECT now; base-table and column
+    // resolution is deferred to query time (SQL Server-style deferred name
+    // resolution — a view over a not-yet-created table is allowed).
+    parse_view_query(&create.query_text, bare)?;
+    storage
+        .rel_create_view(bare, &create.query_text)
+        .map_err(|e| map_storage_err(e, &create.name.value))?;
+    Ok(StatementResult::Done)
+}
+
+fn exec_drop_view(storage: &mut Storage, drop: &DropView) -> Result<StatementResult, SqlError> {
+    match resolve_table(storage, &drop.name.value) {
+        Some(def) if def.is_view() => {
+            storage
+                .rel_drop_table(&def.name)
+                .map_err(|e| map_storage_err(e, &def.name))?;
+            Ok(StatementResult::Done)
+        }
+        // The object exists but is a base table, not a view.
+        Some(_) => Err(SqlError::new(
+            3701,
+            11,
+            5,
+            format!(
+                "Cannot drop the view '{}', because it does not exist or you do not have permission.",
+                drop.name.value
+            ),
+        )),
+        None if drop.if_exists => Ok(StatementResult::Done),
+        None => Err(SqlError::new(
+            3701,
+            11,
+            5,
+            format!(
+                "Cannot drop the view '{}', because it does not exist or you do not have permission.",
+                drop.name.value
+            ),
+        )),
+    }
+}
+
 // ---- CREATE / DROP INDEX ------------------------------------------------
 
 fn exec_create_index(
@@ -1509,6 +1598,7 @@ fn exec_create_index(
 ) -> Result<StatementResult, SqlError> {
     let def = resolve_table(storage, &create.table.value)
         .ok_or_else(|| SqlError::invalid_object(&create.table.value).at(create.table.span))?;
+    reject_view_as_table(&def)?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let mut columns = Vec::with_capacity(create.columns.len());
     for col in &create.columns {
@@ -1556,6 +1646,7 @@ fn exec_alter_table(
 ) -> Result<StatementResult, SqlError> {
     let def = resolve_table(storage, &alter.table.value)
         .ok_or_else(|| SqlError::invalid_object(&alter.table.value).at(alter.table.span))?;
+    reject_view_as_table(&def)?;
     match &alter.action {
         AlterAction::AddCheck(check) => alter_add_check(storage, &def, check, eval_ctx),
         AlterAction::AddForeignKey(fk) => alter_add_foreign_key(storage, &def, fk),
@@ -1747,6 +1838,7 @@ fn exec_insert(
 ) -> Result<StatementResult, SqlError> {
     let def = resolve_table(storage, &insert.table.value)
         .ok_or_else(|| SqlError::invalid_object(&insert.table.value).at(insert.table.span))?;
+    reject_dml_on_view(&def)?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let ncols = schema.columns.len();
     let identity_col = def.identity.map(|s| s.column);
@@ -1979,6 +2071,7 @@ fn exec_update(
 ) -> Result<StatementResult, SqlError> {
     let def = resolve_table(storage, &update.table.value)
         .ok_or_else(|| SqlError::invalid_object(&update.table.value).at(update.table.span))?;
+    reject_dml_on_view(&def)?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let resolver = schema_names(&schema);
     let identity_col = def.identity.map(|s| s.column);
@@ -2119,6 +2212,7 @@ fn exec_delete(
 ) -> Result<StatementResult, SqlError> {
     let def = resolve_table(storage, &delete.table.value)
         .ok_or_else(|| SqlError::invalid_object(&delete.table.value).at(delete.table.span))?;
+    reject_dml_on_view(&def)?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let resolver = schema_names(&schema);
 
@@ -2296,25 +2390,24 @@ fn row_values(row: &[Datum], types: &[ColumnType]) -> Vec<SqlValue> {
 type CteMap = std::collections::HashMap<String, Select>;
 
 fn expand_ctes(select: &Select) -> Select {
-    if select.ctes.is_empty() {
-        return select.clone();
-    }
-    let mut resolved: CteMap = std::collections::HashMap::new();
+    expand_select_ctes(select, &CteMap::new())
+}
+
+/// A copy of `select` with every CTE reference — at this level and nested inside
+/// its subqueries — replaced by a derived table. `outer` is the enclosing CTE
+/// scope; this select's own `WITH` layers on top of it (so a nested `WITH` sees
+/// enclosing CTEs and is itself inlined). The result carries no `ctes` at any
+/// level, so lock analysis, which walks the expanded tree without re-expanding,
+/// still sees every base table the executor reads.
+fn expand_select_ctes(select: &Select, outer: &CteMap) -> Select {
+    let mut resolved = outer.clone();
     for cte in &select.ctes {
         let body = expand_select_ctes(&cte.query, &resolved);
         resolved.insert(cte.name.value.to_ascii_lowercase(), body);
     }
-    let mut out = expand_select_ctes(select, &resolved);
-    out.ctes = Vec::new();
-    out
-}
-
-/// A copy of `select` with its FROM references and its embedded subqueries'
-/// references to `resolved` CTEs replaced by derived tables. (The CTE is visible
-/// to the whole statement, not just the top-level FROM.) The select's own `ctes`
-/// field is left intact — a nested `WITH` keeps its own scope.
-fn expand_select_ctes(select: &Select, resolved: &CteMap) -> Select {
+    let resolved = &resolved;
     let mut out = select.clone();
+    out.ctes = Vec::new();
     out.from = out
         .from
         .as_ref()
@@ -3519,6 +3612,7 @@ fn build_table_source(
         .unwrap_or_else(|| strip_schema(&name.value).to_string());
     let base = match name.value.to_ascii_lowercase().as_str() {
         "sys.tables" => sys_tables(storage),
+        "sys.views" => sys_views(storage),
         "sys.columns" => sys_columns(storage),
         "sys.indexes" => sys_indexes(storage),
         "sys.check_constraints" => sys_check_constraints(storage),
@@ -3527,6 +3621,35 @@ fn build_table_source(
         _ => {
             let def = resolve_table(storage, &name.value)
                 .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
+            // A view: run its stored SELECT as a derived table under the view's
+            // qualifier. First cut: a view over another view is rejected here
+            // rather than expanded, which keeps this non-recursive.
+            if let Some(query_text) = &def.view_query {
+                let body = parse_view_query(query_text, &def.name)?;
+                // Inline the body's own CTEs before checking for referenced
+                // views, so a view reached only through a CTE is still caught.
+                let expanded_body = expand_ctes(&body);
+                let mut refs = Vec::new();
+                collect_locked_tables(&expanded_body, &mut refs);
+                if refs
+                    .iter()
+                    .any(|n| resolve_table(storage, &n.value).is_some_and(|d| d.is_view()))
+                {
+                    return Err(SqlError::message_only(
+                        4506,
+                        format!(
+                            "View '{}' references another view, which is not supported yet.",
+                            def.name
+                        ),
+                    ));
+                }
+                let qual = Name {
+                    value: qualifier,
+                    quoted: false,
+                    span: name.span,
+                };
+                return build_derived_source(storage, &body, &qual, eval_ctx);
+            }
             let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
             // An index seek narrows the candidate set; the WHERE filter later
             // re-checks, so results match a full scan.
@@ -3784,7 +3907,38 @@ fn sys_tables(storage: &Storage) -> Source {
     let rows = storage
         .rel_tables()
         .into_iter()
+        .filter(|def| !def.is_view())
         .map(|def| vec![Datum::Int(def.object_id as i32), Datum::NVarChar(def.name)])
+        .collect();
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows,
+    }
+}
+
+/// `sys.views` — one row per view, with its stored definition text.
+fn sys_views(storage: &Storage) -> Source {
+    let columns = vec![
+        int_col("object_id"),
+        nvarchar("name", 128),
+        nvarchar("definition", 4000),
+    ];
+    let rows = storage
+        .rel_tables()
+        .into_iter()
+        .filter_map(|def| {
+            def.view_query.map(|q| {
+                vec![
+                    Datum::Int(def.object_id as i32),
+                    Datum::NVarChar(def.name),
+                    Datum::NVarChar(q),
+                ]
+            })
+        })
         .collect();
     let collations = vec![None; columns.len()];
     let qualifiers = vec![None; columns.len()];
@@ -3989,6 +4143,72 @@ fn strip_schema(name: &str) -> &str {
 
 /// Case-insensitive table resolution (single `dbo` schema in Stage 3). An
 /// optional `dbo.` schema prefix is accepted and stripped.
+/// The base-table object ids that a read of `name` must Shared-lock: the table
+/// itself, or — for a view — the base tables its definition reads. `sys.*`
+/// views take no lock. Nested views (a view over a view) are not expanded here
+/// (they error at query time), so they contribute no locks; view expansion is
+/// one level deep, matching the executor.
+fn read_lock_object_ids(storage: &Storage, name: &str) -> Vec<u32> {
+    if name.to_ascii_lowercase().starts_with("sys.") {
+        return Vec::new();
+    }
+    let Some(def) = resolve_table(storage, name) else {
+        return Vec::new();
+    };
+    let Some(text) = &def.view_query else {
+        return vec![def.object_id];
+    };
+    let Ok(body) = parse_view_query(text, &def.name) else {
+        return Vec::new();
+    };
+    // Inline the body's own CTEs so a base table reached only through a CTE is
+    // still locked (matching what the executor reads).
+    let expanded = expand_ctes(&body);
+    let mut names = Vec::new();
+    collect_locked_tables(&expanded, &mut names);
+    names
+        .into_iter()
+        .filter(|n| !n.value.to_ascii_lowercase().starts_with("sys."))
+        .filter_map(|n| resolve_table(storage, &n.value))
+        .filter(|d| !d.is_view())
+        .map(|d| d.object_id)
+        .collect()
+}
+
+/// Views are read-only here; INSERT/UPDATE/DELETE against one is rejected.
+fn reject_dml_on_view(def: &TableDef) -> Result<(), SqlError> {
+    if def.is_view() {
+        return Err(SqlError::new(
+            4406,
+            16,
+            1,
+            format!(
+                "Update or insert of view '{}' is not supported (the view is read-only).",
+                def.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
+/// Table-only DDL (ALTER TABLE, CREATE INDEX) rejects a view. Without this a
+/// view's `root_page = 0` would be heap-scanned — and page 0 is the catalog
+/// root, so a bare `ALTER TABLE view ADD CHECK (1=1)` could corrupt the catalog.
+fn reject_view_as_table(def: &TableDef) -> Result<(), SqlError> {
+    if def.is_view() {
+        return Err(SqlError::new(
+            4928,
+            16,
+            1,
+            format!(
+                "Cannot perform this operation on '{}' because it is a view, not a table.",
+                def.name
+            ),
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_table(storage: &Storage, name: &str) -> Option<TableDef> {
     let bare = strip_schema(name);
     if let Some(def) = storage.rel_table(bare) {

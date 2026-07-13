@@ -279,6 +279,52 @@ impl Storage {
                 indexes: Vec::new(),
                 check_constraints,
                 foreign_keys,
+                view_query: None,
+            };
+            catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
+            Ok(def)
+        })?;
+        self.file.rel.next_object_id += 1;
+        self.file.rel.tables.insert(name.to_string(), def);
+        Ok(())
+    }
+
+    /// Creates a VIEW: a catalog entry that stores its `SELECT` source text and
+    /// owns no data pages. The name shares the table namespace (a view and a
+    /// table cannot share a name).
+    pub fn rel_create_view(&mut self, name: &str, query_text: &str) -> Result<(), StorageError> {
+        self.file.ensure_rel_usable()?;
+        if self.file.rel.tables.contains_key(name) {
+            return Err(StorageError::Constraint(format!(
+                "object '{name}' already exists"
+            )));
+        }
+        if self.file.rel.catalog_root.is_none() {
+            let root = {
+                let mut ctx = self.file.rel_ctx();
+                catalog::create_catalog(&mut ctx)?
+            };
+            self.file.rel.catalog_root = Some(root);
+        }
+        let catalog_root = self.file.rel.catalog_root.expect("catalog exists");
+        let object_id = self.file.rel.next_object_id;
+        let view_name = name.to_string();
+        let query = query_text.to_string();
+
+        let def = self.file.rel_statement(move |ctx, txn| {
+            let def = TableDef {
+                object_id,
+                name: view_name,
+                columns: Vec::new(),
+                key_columns: Vec::new(),
+                root_page: 0,
+                defaults: Vec::new(),
+                collations: Vec::new(),
+                identity: None,
+                indexes: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                view_query: Some(query),
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)

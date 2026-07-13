@@ -97,6 +97,18 @@ pub struct TableDef {
     /// `FOREIGN KEY` constraints (this table is the referencing child).
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// For a VIEW: the source text of its `SELECT`, re-parsed and inlined (as a
+    /// derived table) wherever the view is referenced. `None` for a base table.
+    /// A view carries no data pages, columns, or key.
+    #[serde(default)]
+    pub view_query: Option<String>,
+}
+
+impl TableDef {
+    /// True if this catalog entry is a view rather than a base table.
+    pub fn is_view(&self) -> bool {
+        self.view_query.is_some()
+    }
 }
 
 impl TableDef {

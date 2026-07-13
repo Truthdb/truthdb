@@ -7,6 +7,8 @@ use crate::lexer::Span;
 pub enum Statement {
     CreateTable(CreateTable),
     DropTable(DropTable),
+    CreateView(CreateView),
+    DropView(DropView),
     CreateIndex(CreateIndex),
     DropIndex(DropIndex),
     Insert(Insert),
@@ -200,6 +202,23 @@ pub enum DataType {
 #[derive(Debug, Clone, PartialEq)]
 pub struct DropTable {
     pub table: Name,
+    pub if_exists: bool,
+    pub span: Span,
+}
+
+/// `CREATE VIEW name AS SELECT ...`. Only the source text of the query is kept;
+/// it is re-parsed and inlined wherever the view is referenced.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateView {
+    pub name: Name,
+    pub query_text: String,
+    pub span: Span,
+}
+
+/// `DROP VIEW [IF EXISTS] name`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DropView {
+    pub name: Name,
     pub if_exists: bool,
     pub span: Span,
 }
