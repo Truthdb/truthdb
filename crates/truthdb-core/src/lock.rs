@@ -107,6 +107,20 @@ impl LockManager {
             .map(|g| g.owner)
     }
 
+    /// Every other owner whose held lock on `resource` conflicts with `mode` —
+    /// i.e. all the owners a would-be acquirer must wait for. Used to build the
+    /// waits-for graph for deadlock detection.
+    pub fn conflicting_holders(&self, owner: u64, resource: Resource, mode: LockMode) -> Vec<u64> {
+        let Some(grants) = self.grants.get(&resource) else {
+            return Vec::new();
+        };
+        grants
+            .iter()
+            .filter(|g| g.owner != owner && !g.mode.compatible_with(mode))
+            .map(|g| g.owner)
+            .collect()
+    }
+
     /// Whether `owner` already holds any lock on `resource`. Used to exempt a
     /// re-acquisition or upgrade from FIFO anti-barging: an owner that already
     /// holds a resource is not jumping the queue for it.

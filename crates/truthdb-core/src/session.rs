@@ -15,8 +15,12 @@
 //! conflicts, the whole [`EngineCall::RunBatch`] is *parked* — its reply
 //! deferred — and the actor moves on. Releasing locks (commit / rollback /
 //! disconnect) wakes parked batches in FIFO order and re-attempts them; since
-//! a parked batch never ran, restarting it is exact. A 5 s deadline reaps a
-//! batch stuck behind a deadlock, rolling it back as the victim (error 1205).
+//! a parked batch never ran, restarting it is exact.
+//!
+//! A deadlock is broken by a waits-for-graph cycle detector that runs the
+//! instant a parking batch closes a cycle: the youngest transaction in the
+//! cycle is rolled back as the victim (error 1205). A 5 s per-wait deadline
+//! remains as a backstop for any stall the graph does not model.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::mpsc;
@@ -341,6 +345,9 @@ impl EngineLoop {
                 needs,
                 deadline: Instant::now() + self.lock_wait_timeout,
             });
+            // The new waiter may have closed a lock-wait cycle; break it now
+            // rather than waiting for the deadline backstop.
+            self.detect_deadlock();
         }
     }
 
@@ -477,9 +484,15 @@ impl EngineLoop {
             .filter(|(_, p)| p.deadline <= now)
             .min_by_key(|(_, p)| p.deadline)
             .map(|(i, _)| i);
-        let Some(idx) = victim_idx else {
-            return;
-        };
+        if let Some(idx) = victim_idx {
+            self.abort_parked_victim(idx);
+        }
+    }
+
+    /// Aborts the parked batch at `idx` as a deadlock victim: rolls back its
+    /// transaction, releases its locks, replies with error 1205, and wakes any
+    /// batches its released locks unblock.
+    fn abort_parked_victim(&mut self, idx: usize) {
         let victim = self.parked.remove(idx).expect("index in bounds");
         if let Some(state) = self.sessions.get_mut(victim.session) {
             self.engine.abort_session_txn(&mut state.txn_ctx);
@@ -487,6 +500,60 @@ impl EngineLoop {
         self.locks.release_all(victim.session.raw());
         let _ = victim.reply.send(Ok(deadlock_victim_reply()));
         self.wake_parked();
+    }
+
+    /// Detects lock-wait *cycles* among the parked batches — a waits-for graph
+    /// over the lock manager — and aborts the youngest transaction in each cycle
+    /// (error 1205). A cycle can only form when a batch parks, so this runs the
+    /// instant one does, breaking the deadlock immediately rather than after the
+    /// wait-timeout backstop. Aborts victims until the graph is acyclic.
+    fn detect_deadlock(&mut self) {
+        while let Some(idx) = self.find_deadlock_victim() {
+            self.abort_parked_victim(idx);
+        }
+    }
+
+    /// The parked-queue index of a deadlock victim, or `None` if no cycle exists.
+    /// Edge O -> H: a parked owner O waits for every current holder H of a
+    /// resource O needs but cannot acquire. The victim is the cycle member that
+    /// parked most recently (the youngest wait — the least work to roll back).
+    fn find_deadlock_victim(&self) -> Option<usize> {
+        use std::collections::{HashMap, HashSet};
+        // Assumes at most one parked batch per session (a session is
+        // request/response, so it has at most one in-flight batch). If pipelining
+        // is ever added, the per-owner edge merge and single-index abort below
+        // must be revisited.
+        let mut waits_for: HashMap<u64, HashSet<u64>> = HashMap::new();
+        for (index, parked) in self.parked.iter().enumerate() {
+            let owner = parked.session.raw();
+            let edges = waits_for.entry(owner).or_default();
+            for (resource, mode) in &parked.needs {
+                // Held-conflict edges: owners holding a conflicting lock.
+                for holder in self.locks.conflicting_holders(owner, *resource, *mode) {
+                    edges.insert(holder);
+                }
+                // FIFO anti-barging edges: a batch yields a free resource to any
+                // waiter parked ahead of it that needs the same resource (the
+                // `wake_parked` grant rule), unless it already holds it. Without
+                // these a deadlock routed through a queue yield would be missed.
+                if !self.locks.holds(owner, *resource) {
+                    for ahead in self.parked.iter().take(index) {
+                        if ahead.session.raw() != owner
+                            && ahead.needs.iter().any(|(r, _)| r == resource)
+                        {
+                            edges.insert(ahead.session.raw());
+                        }
+                    }
+                }
+            }
+        }
+        let cycle = find_cycle(&waits_for)?;
+        self.parked
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| cycle.contains(&p.session.raw()))
+            .max_by_key(|(_, p)| p.deadline)
+            .map(|(i, _)| i)
     }
 
     /// Handles a disconnect: roll back any open transaction, release the
@@ -504,6 +571,61 @@ impl EngineLoop {
 
 /// The reply delivered to a deadlock victim: no results, error 1205, and the
 /// transaction is over (it was rolled back).
+/// Finds one cycle in a waits-for graph (owner -> owners it waits for), or
+/// `None` if acyclic. Iterative colored DFS (white/gray/black); a back-edge to a
+/// gray node on the current path is a cycle, returned as the owners composing
+/// it. Nodes with no outgoing edges (a lock holder that is not itself waiting)
+/// are dead ends and cannot close a cycle.
+fn find_cycle(
+    graph: &std::collections::HashMap<u64, std::collections::HashSet<u64>>,
+) -> Option<Vec<u64>> {
+    const WHITE: u8 = 0;
+    const GRAY: u8 = 1;
+    const BLACK: u8 = 2;
+    // Pre-seed every graph node WHITE. A neighbor absent from this map is a lock
+    // holder that is not itself waiting (no outgoing edges) — a dead end, so it
+    // defaults to BLACK below and cannot extend a path.
+    let mut color: std::collections::HashMap<u64, u8> = graph.keys().map(|&k| (k, WHITE)).collect();
+    for &root in graph.keys() {
+        if color.get(&root).copied().unwrap_or(WHITE) != WHITE {
+            continue;
+        }
+        let mut path: Vec<u64> = vec![root];
+        let neighbors = |n: u64| -> std::vec::IntoIter<u64> {
+            graph
+                .get(&n)
+                .map(|s| s.iter().copied().collect::<Vec<_>>())
+                .unwrap_or_default()
+                .into_iter()
+        };
+        let mut iters: Vec<std::vec::IntoIter<u64>> = vec![neighbors(root)];
+        color.insert(root, GRAY);
+        while !iters.is_empty() {
+            let next = iters.last_mut().expect("non-empty").next();
+            match next {
+                Some(next) => match color.get(&next).copied().unwrap_or(BLACK) {
+                    WHITE => {
+                        color.insert(next, GRAY);
+                        path.push(next);
+                        iters.push(neighbors(next));
+                    }
+                    GRAY => {
+                        let start = path.iter().position(|&x| x == next).expect("gray on path");
+                        return Some(path[start..].to_vec());
+                    }
+                    _ => {}
+                },
+                None => {
+                    let done = path.pop().expect("path non-empty");
+                    color.insert(done, BLACK);
+                    iters.pop();
+                }
+            }
+        }
+    }
+    None
+}
+
 fn deadlock_victim_reply() -> BatchReply {
     BatchReply {
         outcome: BatchOutcome {
@@ -526,7 +648,37 @@ mod tests {
     use crate::rel::StatementResult;
     use crate::relstore::types::Datum;
     use crate::storage::{Storage, StorageOptions};
+    use std::collections::{HashMap, HashSet};
     use std::path::PathBuf;
+
+    fn graph(edges: &[(u64, &[u64])]) -> HashMap<u64, HashSet<u64>> {
+        edges
+            .iter()
+            .map(|(from, to)| (*from, to.iter().copied().collect()))
+            .collect()
+    }
+
+    #[test]
+    fn find_cycle_detects_and_ignores_cycles() {
+        // No edges / acyclic chain / DAG -> None.
+        assert!(find_cycle(&graph(&[])).is_none());
+        assert!(find_cycle(&graph(&[(1, &[2]), (2, &[3]), (3, &[])])).is_none());
+        assert!(find_cycle(&graph(&[(1, &[2, 3]), (2, &[3]), (3, &[])])).is_none());
+
+        // A 2-cycle where the second node is reached as a neighbor before it is
+        // colored — the case that regressed when unvisited nodes defaulted to
+        // "done" instead of "unvisited".
+        let c2 = find_cycle(&graph(&[(1, &[2]), (2, &[1])])).expect("2-cycle");
+        assert_eq!(c2.iter().copied().collect::<HashSet<_>>(), [1, 2].into());
+
+        // A 3-cycle with a dead-end branch (4 holds a lock but is not waiting).
+        let c3 = find_cycle(&graph(&[(1, &[2, 4]), (2, &[3]), (3, &[1])])).expect("3-cycle");
+        assert_eq!(c3.iter().copied().collect::<HashSet<_>>(), [1, 2, 3].into());
+
+        // A self-loop (a transaction waiting on itself should never happen, but
+        // the detector must not miss it).
+        assert!(find_cycle(&graph(&[(1, &[1])])).is_some());
+    }
 
     fn test_storage_options() -> StorageOptions {
         StorageOptions {
@@ -747,6 +899,113 @@ mod tests {
 
         // Exactly one is the deadlock victim (1205); the other succeeds.
         let victims = [&a_out, &b_out]
+            .iter()
+            .filter(|o| error_number(o) == Some(1205))
+            .count();
+        assert_eq!(victims, 1, "exactly one transaction is the deadlock victim");
+    }
+
+    #[tokio::test]
+    async fn deadlock_is_broken_by_the_waits_for_graph_not_the_timeout() {
+        // A 30 s wait timeout: if the deadlock were only broken by the timeout
+        // backstop this would not resolve for 30 s. The waits-for-graph detector
+        // must break it the instant the cycle closes, so the whole thing
+        // finishes well under the timeout.
+        let h = start(Duration::from_secs(30));
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
+        for stmt in [
+            "CREATE TABLE a (id INT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE b (id INT NOT NULL PRIMARY KEY)",
+            "INSERT INTO a VALUES (1)",
+            "INSERT INTO b VALUES (1)",
+        ] {
+            h.handle.run_batch(a, stmt.into()).await.unwrap();
+        }
+        h.handle
+            .run_batch(a, "BEGIN TRAN; UPDATE a SET id = id".into())
+            .await
+            .unwrap();
+        h.handle
+            .run_batch(b, "BEGIN TRAN; UPDATE b SET id = id".into())
+            .await
+            .unwrap();
+
+        let ha = h.handle.clone();
+        let a_waits =
+            tokio::spawn(async move { ha.run_batch(a, "UPDATE b SET id = id".into()).await });
+        let hb = h.handle.clone();
+        let b_waits =
+            tokio::spawn(async move { hb.run_batch(b, "UPDATE a SET id = id".into()).await });
+
+        // Both resolve far sooner than the 30 s timeout — proving graph detection.
+        let a_out = tokio::time::timeout(Duration::from_secs(3), a_waits)
+            .await
+            .expect("graph must break the deadlock well under the timeout")
+            .unwrap()
+            .unwrap();
+        let b_out = tokio::time::timeout(Duration::from_secs(3), b_waits)
+            .await
+            .expect("graph must break the deadlock well under the timeout")
+            .unwrap()
+            .unwrap();
+
+        let victims = [&a_out, &b_out]
+            .iter()
+            .filter(|o| error_number(o) == Some(1205))
+            .count();
+        assert_eq!(victims, 1, "exactly one transaction is the deadlock victim");
+    }
+
+    #[tokio::test]
+    async fn deadlock_through_a_fifo_yield_is_detected_by_the_graph() {
+        // A deadlock whose cycle passes through a FIFO anti-barging yield (not a
+        // held-lock conflict): A holds t1; C parks wanting t1+t2; A then wants
+        // the *free* t2 but yields to C, which is queued ahead for it. The graph
+        // must model that yield edge and break the cycle under the 30 s timeout.
+        let h = start(Duration::from_secs(30));
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let c = h.handle.open_session(String::new(), String::new()).await;
+        for stmt in [
+            "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY)",
+            "CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY)",
+            "INSERT INTO t1 VALUES (1)",
+            "INSERT INTO t2 VALUES (1)",
+        ] {
+            h.handle.run_batch(a, stmt.into()).await.unwrap();
+        }
+        // A holds X(t1).
+        h.handle
+            .run_batch(a, "BEGIN TRAN; UPDATE t1 SET id = id".into())
+            .await
+            .unwrap();
+        // C wants t2 then t1 (held by A) → parks, now queued ahead for t2.
+        let hc = h.handle.clone();
+        let c_waits = tokio::spawn(async move {
+            hc.run_batch(
+                c,
+                "BEGIN TRAN; UPDATE t2 SET id = id; UPDATE t1 SET id = id".into(),
+            )
+            .await
+        });
+        // Ensure C is parked before A asks for t2, so A queues behind it.
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        // A wants the free t2 but yields to C (ahead) → parks → FIFO cycle.
+        let ha = h.handle.clone();
+        let a_waits =
+            tokio::spawn(async move { ha.run_batch(a, "UPDATE t2 SET id = id".into()).await });
+
+        let a_out = tokio::time::timeout(Duration::from_secs(3), a_waits)
+            .await
+            .expect("graph must break the FIFO deadlock well under the timeout")
+            .unwrap()
+            .unwrap();
+        let c_out = tokio::time::timeout(Duration::from_secs(3), c_waits)
+            .await
+            .expect("graph must break the FIFO deadlock well under the timeout")
+            .unwrap()
+            .unwrap();
+        let victims = [&a_out, &c_out]
             .iter()
             .filter(|o| error_number(o) == Some(1205))
             .count();
