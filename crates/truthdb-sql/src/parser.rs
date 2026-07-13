@@ -394,11 +394,43 @@ impl Parser {
         match self.peek_keyword().as_deref() {
             Some("INDEX") => self.parse_create_index(start, unique),
             Some("TABLE") if !unique => self.parse_create_table(start),
+            Some("VIEW") if !unique => self.parse_create_view(start),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
             }
         }
+    }
+
+    fn parse_create_view(&mut self, start: Span) -> SqlResult<Statement> {
+        self.expect_keyword("VIEW")?;
+        let name = self.parse_name()?;
+        // A view column list (`CREATE VIEW v (a, b) AS ...`) renames the output
+        // columns; not supported yet.
+        if self.check(&TokenKind::LParen) {
+            let token = self.peek().clone();
+            return Err(SqlError::message_only(
+                102,
+                format!(
+                    "A column list on CREATE VIEW is not supported yet, near '{}'.",
+                    self.token_text(&token)
+                ),
+            ));
+        }
+        self.expect_keyword("AS")?;
+        // Capture text from the current token so a leading `WITH` (whose CTEs
+        // precede the SELECT keyword the query span starts at) is included.
+        let query_start = self.peek().span.start;
+        let query = self.parse_select()?;
+        let query_text = self
+            .slice(Span::new(query_start, query.span.end))
+            .trim()
+            .to_string();
+        Ok(Statement::CreateView(CreateView {
+            span: start.to(query.span),
+            name,
+            query_text,
+        }))
     }
 
     fn parse_create_index(&mut self, start: Span, unique: bool) -> SqlResult<Statement> {
@@ -844,11 +876,29 @@ impl Parser {
         match self.peek_keyword().as_deref() {
             Some("INDEX") => self.parse_drop_index(start),
             Some("TABLE") => self.parse_drop_table(start),
+            Some("VIEW") => self.parse_drop_view(start),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
             }
         }
+    }
+
+    fn parse_drop_view(&mut self, start: Span) -> SqlResult<Statement> {
+        self.expect_keyword("VIEW")?;
+        let if_exists = if self.peek_keyword().as_deref() == Some("IF") {
+            self.bump();
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_name()?;
+        Ok(Statement::DropView(DropView {
+            span: start.to(name.span),
+            name,
+            if_exists,
+        }))
     }
 
     fn parse_drop_index(&mut self, start: Span) -> SqlResult<Statement> {

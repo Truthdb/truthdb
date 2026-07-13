@@ -1,0 +1,129 @@
+# CREATE / DROP VIEW (Stage 11). A view stores its SELECT text and is inlined
+# (as a derived table) wherever it is referenced.
+
+statement ok
+CREATE TABLE emp (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20), dept NVARCHAR(4), salary INT)
+
+statement ok
+INSERT INTO emp VALUES (1,'Ada','eng',100),(2,'Bo','eng',90),(3,'Cy','ops',70),(4,'Di','ops',80)
+
+statement ok
+CREATE VIEW eng AS SELECT id, name, salary FROM emp WHERE dept = 'eng'
+
+# Select from a view.
+query IT
+SELECT id, name FROM eng ORDER BY id
+----
+1 Ada
+2 Bo
+
+# A view with aggregation.
+statement ok
+CREATE VIEW dept_pay AS SELECT dept, SUM(salary) AS total FROM emp GROUP BY dept
+
+query TI
+SELECT dept, total FROM dept_pay ORDER BY dept
+----
+eng 190
+ops 150
+
+# A view referenced in a WHERE against the outer query, and joined to a table.
+query TI
+SELECT e.name, d.total FROM eng e JOIN dept_pay d ON d.dept = 'eng' ORDER BY e.id
+----
+Ada 190
+Bo 190
+
+# A view can be filtered and aliased by the outer query.
+query I
+SELECT COUNT(*) FROM eng WHERE salary >= 95
+----
+1
+
+# A view whose body uses a CTE reads the CTE's base table correctly.
+statement ok
+CREATE VIEW top_paid AS WITH ranked AS (SELECT name, salary FROM emp WHERE salary >= 90) SELECT name FROM ranked
+
+query T
+SELECT name FROM top_paid ORDER BY name
+----
+Ada
+Bo
+
+# sys.views lists the view; sys.tables does not.
+query T
+SELECT name FROM sys.views WHERE name = 'eng'
+----
+eng
+
+query I
+SELECT COUNT(*) FROM sys.tables WHERE name IN ('eng', 'dept_pay')
+----
+0
+
+# The base table is still listed by sys.tables.
+query T
+SELECT name FROM sys.tables WHERE name = 'emp'
+----
+emp
+
+# DML against a view is rejected (read-only).
+statement error
+INSERT INTO eng VALUES (9, 'X', 999)
+
+statement error
+UPDATE eng SET salary = 1 WHERE id = 1
+
+statement error
+DELETE FROM eng WHERE id = 1
+
+# Table-only DDL against a view is rejected (a bare ALTER ... ADD CHECK (1=1)
+# would otherwise heap-scan the view's root_page 0 — the catalog root).
+statement error
+ALTER TABLE eng ADD CHECK (1 = 1)
+
+statement error
+CREATE INDEX ix_eng ON eng (id)
+
+# DROP TABLE does not drop a view, even with IF EXISTS (wrong object type).
+statement error
+DROP TABLE IF EXISTS eng
+
+# A view over another view is not supported (rejected at query time).
+statement ok
+CREATE VIEW eng2 AS SELECT id FROM eng
+
+statement error
+SELECT id FROM eng2
+
+# Deferred name resolution: a view over a missing table is created, but querying
+# it fails.
+statement ok
+CREATE VIEW ghost AS SELECT * FROM does_not_exist
+
+statement error
+SELECT * FROM ghost
+
+# Creating an object whose name is taken errors (2714).
+statement error
+CREATE VIEW emp AS SELECT id FROM emp
+
+# DROP TABLE does not drop a view, and DROP VIEW does not drop a table.
+statement error
+DROP TABLE eng
+
+statement error
+DROP VIEW emp
+
+# DROP VIEW removes it; a second drop errors unless IF EXISTS.
+statement ok
+DROP VIEW eng
+
+statement error
+SELECT * FROM eng
+
+statement error
+DROP VIEW eng
+
+statement ok
+DROP VIEW IF EXISTS eng

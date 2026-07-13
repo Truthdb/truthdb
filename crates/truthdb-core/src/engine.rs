@@ -2158,6 +2158,133 @@ mod tests {
     }
 
     #[test]
+    fn nested_cte_locks_its_base_table() {
+        // A CTE whose body itself declares a CTE (`WITH c AS (WITH d AS ...)`)
+        // must still Shared-lock the base table the inner CTE reads — directly
+        // and through a view — or it dirty-reads under READ COMMITTED.
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("nested-cte-locks");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE secret (z INT NOT NULL PRIMARY KEY)")
+            .expect("secret");
+        let secret = table_object_id(&mut engine, "secret");
+
+        // Plain query with a nested CTE.
+        let direct = engine.analyze_locks(
+            "WITH c AS (WITH d AS (SELECT z FROM secret) SELECT z FROM d) SELECT z FROM c",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            direct.contains(&(Resource::Table(secret), LockMode::Shared)),
+            "nested-CTE query must lock secret: {direct:?}"
+        );
+
+        // Same through a view.
+        engine
+            .execute(
+                "CREATE VIEW v AS WITH c AS (WITH d AS (SELECT z FROM secret) SELECT z FROM d) SELECT z FROM c",
+            )
+            .expect("view");
+        let via_view = engine.analyze_locks("SELECT z FROM v", Isolation::ReadCommitted);
+        assert!(
+            via_view.contains(&(Resource::Table(secret), LockMode::Shared)),
+            "view over a nested-CTE body must lock secret: {via_view:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn selecting_a_view_locks_its_base_tables() {
+        // A read through a view must Shared-lock the view's base tables (else a
+        // dirty read under READ COMMITTED), including a base table the view body
+        // reaches only through its own CTE.
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("view-locks");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE base (x INT NOT NULL PRIMARY KEY)")
+            .expect("base");
+        engine
+            .execute("CREATE VIEW v AS WITH c AS (SELECT x FROM base) SELECT x FROM c")
+            .expect("view");
+        let base = table_object_id(&mut engine, "base");
+
+        let locks = engine.analyze_locks("SELECT x FROM v", Isolation::ReadCommitted);
+        assert!(
+            locks.contains(&(Resource::Table(base), LockMode::Shared)),
+            "a view's base table (via its CTE) must be Shared-locked: {locks:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn view_with_nested_cte_in_exists_locks_both_tables() {
+        // A view whose body has `WHERE EXISTS (WITH d AS (SELECT ... FROM secret)
+        // ...)` reads both `base` and `secret`; both must be Shared-locked.
+        // EXISTS is the only expression position the parser lets a subquery start
+        // with WITH, so it is the nested-CTE-in-expression case for locks.
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("view-exists-cte-locks");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE base (x INT NOT NULL PRIMARY KEY)")
+            .expect("base");
+        engine
+            .execute("CREATE TABLE secret (z INT NOT NULL PRIMARY KEY)")
+            .expect("secret");
+        engine
+            .execute("CREATE VIEW v AS SELECT x FROM base WHERE EXISTS (WITH d AS (SELECT z FROM secret) SELECT z FROM d)")
+            .expect("view");
+        let base = table_object_id(&mut engine, "base");
+        let secret = table_object_id(&mut engine, "secret");
+
+        let locks = engine.analyze_locks("SELECT x FROM v", Isolation::ReadCommitted);
+        assert!(
+            locks.contains(&(Resource::Table(base), LockMode::Shared)),
+            "base must be locked: {locks:?}"
+        );
+        assert!(
+            locks.contains(&(Resource::Table(secret), LockMode::Shared)),
+            "secret (behind the EXISTS nested CTE) must be locked: {locks:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn view_definition_survives_restart() {
+        // A view lives in the persisted catalog, so it must be queryable after
+        // the engine is reopened.
+        let path = unique_temp_path("view-persist");
+        let storage =
+            Storage::create(path.clone(), test_storage_options()).expect("storage create");
+        let mut engine = Engine::new(storage).expect("engine create");
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("table");
+        engine
+            .execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+            .expect("insert");
+        engine
+            .execute("CREATE VIEW hi AS SELECT id FROM t WHERE v >= 20")
+            .expect("view");
+        drop(engine);
+
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut engine = Engine::new(storage).expect("engine restart");
+        let out = engine.execute("SELECT id FROM hi").expect("query view");
+        assert!(out.contains('2'), "view query after restart: {out}");
+        let listed = engine
+            .execute("SELECT name FROM sys.views")
+            .expect("sys.views");
+        assert!(listed.contains("hi"), "sys.views after restart: {listed}");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn assignment_select_locks_base_table_behind_a_cte_value() {
         // A CTE referenced only inside an assignment SELECT's value subquery
         // must still lock the real base table, or the read could dirty-read a
