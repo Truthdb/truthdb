@@ -1,6 +1,7 @@
 [
     Select(
         Select {
+            ctes: [],
             top: None,
             distinct: true,
             items: [

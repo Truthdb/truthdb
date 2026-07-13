@@ -1,6 +1,7 @@
 [
     Select(
         Select {
+            ctes: [],
             top: None,
             distinct: false,
             items: [
@@ -60,6 +61,7 @@
                         right: Expr {
                             kind: Subquery(
                                 Select {
+                                    ctes: [],
                                     top: None,
                                     distinct: false,
                                     items: [
@@ -141,6 +143,7 @@
     ),
     Select(
         Select {
+            ctes: [],
             top: None,
             distinct: false,
             items: [
@@ -167,6 +170,7 @@
                     expr: Expr {
                         kind: Subquery(
                             Select {
+                                ctes: [],
                                 top: None,
                                 distinct: false,
                                 items: [
@@ -261,6 +265,7 @@
                                     },
                                 },
                                 subquery: Select {
+                                    ctes: [],
                                     top: None,
                                     distinct: false,
                                     items: [
@@ -316,6 +321,7 @@
                         right: Expr {
                             kind: Exists(
                                 Select {
+                                    ctes: [],
                                     top: None,
                                     distinct: false,
                                     items: [
@@ -378,6 +384,7 @@
     ),
     Select(
         Select {
+            ctes: [],
             top: None,
             distinct: false,
             items: [
@@ -434,6 +441,7 @@
                             },
                         },
                         subquery: Select {
+                            ctes: [],
                             top: None,
                             distinct: false,
                             items: [

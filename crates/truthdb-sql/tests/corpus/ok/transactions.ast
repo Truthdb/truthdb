@@ -106,6 +106,7 @@
     ),
     Select(
         Select {
+            ctes: [],
             top: None,
             distinct: false,
             items: [

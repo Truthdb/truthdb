@@ -2425,6 +2425,91 @@ mod tests {
     }
 
     #[test]
+    fn sql_common_table_expressions() {
+        let path = unique_temp_path("sql-cte");
+        let mut engine = new_engine(&path);
+        engine
+            .execute(
+                "CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, dept NVARCHAR(4), amount INT)",
+            )
+            .expect("create");
+        engine
+            .execute("INSERT INTO sales VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',50)")
+            .expect("seed");
+
+        // A basic CTE referenced in FROM.
+        let (cols, rows) = sql_rows(
+            &mut engine,
+            "WITH big AS (SELECT id, amount FROM sales WHERE amount >= 20) SELECT id FROM big ORDER BY id",
+        );
+        assert_eq!(cols, vec!["id"]);
+        assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("4".into())]]);
+
+        // A CTE that aggregates, filtered by the outer query.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "WITH s AS (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) \
+               SELECT dept FROM s WHERE total > 30 ORDER BY dept",
+        );
+        assert_eq!(rows, vec![vec![Some("b".into())]]);
+
+        // A later CTE references an earlier one.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "WITH a AS (SELECT id, amount FROM sales WHERE amount >= 10), \
+                  b AS (SELECT id FROM a WHERE amount >= 20) \
+               SELECT id FROM b ORDER BY id",
+        );
+        assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("4".into())]]);
+
+        // A CTE joined to a base table.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "WITH s AS (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) \
+               SELECT t.id, s.total FROM sales t JOIN s ON t.dept = s.dept WHERE t.id = 3",
+        );
+        assert_eq!(rows, vec![vec![Some("3".into()), Some("55".into())]]);
+
+        // The optional column-rename list is not supported yet.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "WITH c(x) AS (SELECT id FROM sales) SELECT x FROM c",
+            ),
+            102
+        );
+        // A recursive / self-reference resolves as a (non-existent) base table.
+        assert_eq!(
+            sql_error_number(&mut engine, "WITH r AS (SELECT id FROM r) SELECT id FROM r"),
+            208
+        );
+
+        // A CTE is visible to a subquery in the WHERE clause, not just the FROM.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "WITH s AS (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) \
+               SELECT id FROM sales WHERE dept IN (SELECT dept FROM s WHERE total > 30) ORDER BY id",
+        );
+        assert_eq!(rows, vec![vec![Some("3".into())], vec![Some("4".into())]]);
+
+        // Duplicate CTE names are rejected.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "WITH a AS (SELECT 1 AS x), a AS (SELECT 2 AS x) SELECT x FROM a",
+            ),
+            460
+        );
+        // A schema-qualified reference does not match a CTE (dbo.s is a base
+        // table name, which here does not exist).
+        assert_eq!(
+            sql_error_number(&mut engine, "WITH s AS (SELECT 1 AS v) SELECT v FROM dbo.s"),
+            208
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_derived_tables() {
         let path = unique_temp_path("sql-derived");
         let mut engine = new_engine(&path);

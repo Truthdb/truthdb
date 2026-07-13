@@ -1,0 +1,40 @@
+# Common table expressions (Stage 11 part 4, non-recursive)
+
+statement ok
+CREATE TABLE sales (id INT NOT NULL PRIMARY KEY, dept NVARCHAR(4), amount INT)
+
+statement ok
+INSERT INTO sales VALUES (1,'a',10),(2,'a',20),(3,'b',5),(4,'b',50)
+
+# A CTE referenced in FROM.
+query I
+WITH big AS (SELECT id, amount FROM sales WHERE amount >= 20) SELECT id FROM big ORDER BY id
+----
+2
+4
+
+# A CTE that aggregates, filtered by the outer query.
+query TI
+WITH s AS (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) SELECT dept, total FROM s WHERE total > 30 ORDER BY dept
+----
+b 55
+
+# A later CTE references an earlier one.
+query I
+WITH a AS (SELECT id, amount FROM sales WHERE amount >= 10), b AS (SELECT id FROM a WHERE amount >= 20) SELECT id FROM b ORDER BY id
+----
+2
+4
+
+# A CTE joined to a base table.
+query II
+WITH s AS (SELECT dept, SUM(amount) AS total FROM sales GROUP BY dept) SELECT t.id, s.total FROM sales t JOIN s ON t.dept = s.dept ORDER BY t.id
+----
+1 30
+2 30
+3 55
+4 55
+
+# A CTE column-rename list is not supported yet.
+statement error
+WITH c(x) AS (SELECT id FROM sales) SELECT x FROM c

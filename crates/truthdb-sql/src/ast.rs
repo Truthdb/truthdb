@@ -240,6 +240,9 @@ pub struct Delete {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct Select {
+    /// `WITH name AS (SELECT ...), ...` common table expressions (empty = none).
+    /// Non-recursive; expanded inline (as derived tables) before execution.
+    pub ctes: Vec<Cte>,
     pub top: Option<u64>,
     /// `SELECT DISTINCT` — deduplicate the projected rows.
     pub distinct: bool,
@@ -253,6 +256,14 @@ pub struct Select {
     pub having: Option<Expr>,
     pub order_by: Vec<OrderItem>,
     pub span: Span,
+}
+
+/// A `WITH` common table expression: `name AS (SELECT ...)`. The optional
+/// column-rename list is not yet supported.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Cte {
+    pub name: Name,
+    pub query: Box<Select>,
 }
 
 /// A FROM clause: a base table (with optional alias) or a join of two table
