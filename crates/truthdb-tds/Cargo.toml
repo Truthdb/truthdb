@@ -9,5 +9,8 @@ license = "MIT"
 tokio = { workspace = true }
 tracing = { workspace = true }
 truthdb-core = { path = "../truthdb-core", version = "0.1.0" }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]

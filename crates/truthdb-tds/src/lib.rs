@@ -1,14 +1,15 @@
 //! TDS (Tabular Data Stream) gateway for TruthDB.
 //!
-//! A plaintext SQL Server-protocol front end so real drivers (pymssql,
-//! go-mssqldb with `encrypt=disable`) can connect to TruthDB. Stage 4 covers
-//! the packet layer, PRELOGIN (encryption not supported), LOGIN7 with
-//! config-file auth, and SQLBatch → token-stream execution over the engine's
-//! typed SQL results. TLS and RPC/prepared statements arrive in Stage 9.
+//! A SQL Server-protocol front end so real drivers (pymssql, go-mssqldb) can
+//! connect to TruthDB. Covers the packet layer, PRELOGIN, optional TLS (the
+//! tunneled handshake of MS-TDS 2.2.6.5; see [`tls`]), LOGIN7 with config-file
+//! auth, and SQLBatch → token-stream execution over the engine's typed SQL
+//! results. RPC/prepared statements arrive later in Stage 9.
 
 pub mod login;
 pub mod packet;
 pub mod server;
+pub mod tls;
 pub mod token;
 pub mod typeinfo;
 

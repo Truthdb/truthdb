@@ -114,9 +114,27 @@ async fn main() {
 
     // Optional TDS (SQL Server protocol) gateway.
     let tds_task = if config.tds.enabled {
+        let tls = match (&config.tds.tls_cert, &config.tds.tls_key) {
+            (Some(cert_path), Some(key_path)) => match load_tds_tls(cert_path, key_path) {
+                Ok(tls) => {
+                    info!("TDS TLS enabled (cert {cert_path})");
+                    Some(tls)
+                }
+                Err(err) => {
+                    eprintln!("Failed to load TDS TLS certificate/key: {err}");
+                    return;
+                }
+            },
+            (None, None) => None,
+            _ => {
+                eprintln!("TDS TLS needs both tls_cert and tls_key");
+                return;
+            }
+        };
         let tds_config = truthdb_tds::TdsConfig {
             users: config.tds.auth.clone(),
             database: config.tds.database.clone(),
+            tls,
         };
         match truthdb_tds::TdsListener::bind(
             &config.tds.addr,
@@ -162,4 +180,11 @@ async fn main() {
     engine.shutdown();
     let _ = tokio::task::spawn_blocking(move || engine_join.join()).await;
     info!("TruthDB exiting");
+}
+
+/// Loads a PEM certificate chain and private key into a TDS TLS config.
+fn load_tds_tls(cert_path: &str, key_path: &str) -> std::io::Result<truthdb_tds::tls::TlsConfig> {
+    let cert = std::fs::read(cert_path)?;
+    let key = std::fs::read(key_path)?;
+    truthdb_tds::tls::TlsConfig::from_pem(&cert, &key)
 }

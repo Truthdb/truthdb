@@ -50,6 +50,7 @@ fn config() -> TdsConfig {
     TdsConfig {
         users,
         database: "truthdb".to_string(),
+        tls: None,
     }
 }
 

@@ -35,6 +35,14 @@ pub struct TdsConfig {
 
     #[serde(default)]
     pub auth: HashMap<String, String>,
+
+    /// PEM certificate chain path — enables TLS when set (with `tls_key`).
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+
+    /// PEM private key path (paired with `tls_cert`).
+    #[serde(default)]
+    pub tls_key: Option<String>,
 }
 
 impl Default for TdsConfig {
@@ -45,6 +53,8 @@ impl Default for TdsConfig {
             port: default_tds_port(),
             database: default_tds_database(),
             auth: HashMap::new(),
+            tls_cert: None,
+            tls_key: None,
         }
     }
 }
@@ -300,6 +310,8 @@ struct TdsConfigOverride {
     port: Option<u16>,
     database: Option<String>,
     auth: Option<HashMap<String, String>>,
+    tls_cert: Option<String>,
+    tls_key: Option<String>,
 }
 
 fn apply_tds_override(target: &mut TdsConfig, source: TdsConfigOverride) {
@@ -317,6 +329,12 @@ fn apply_tds_override(target: &mut TdsConfig, source: TdsConfigOverride) {
     }
     if let Some(auth) = source.auth {
         target.auth = auth;
+    }
+    if source.tls_cert.is_some() {
+        target.tls_cert = source.tls_cert;
+    }
+    if source.tls_key.is_some() {
+        target.tls_key = source.tls_key;
     }
 }
 
