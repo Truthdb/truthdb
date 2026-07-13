@@ -563,6 +563,7 @@ fn exec_set(ctx: &mut TxnContext, set: &SetStatement) -> Result<StatementResult,
             let coerced = coerce_variable(value, &column_type, name, &eval_ctx)?;
             ctx.variables.insert(name.clone(), (column_type, coerced));
         }
+        SetStatement::Ignored => {}
     }
     Ok(StatementResult::Done)
 }

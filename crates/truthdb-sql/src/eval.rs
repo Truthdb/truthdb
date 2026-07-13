@@ -173,7 +173,12 @@ fn eval_global_var(name: &str, ctx: &EvalContext) -> SqlResult<SqlValue> {
     match name {
         "trancount" => Ok(SqlValue::Int(ctx.trancount as i64)),
         "spid" => Ok(SqlValue::Int(0)),
-        "version" => Ok(SqlValue::Str("TruthDB".to_string())),
+        // Lead with TruthDB's own identity, then a SQL-Server-shaped version
+        // token so tooling that scrapes @@VERSION for a version number keeps
+        // working.
+        "version" => Ok(SqlValue::Str(
+            "TruthDB - 16.0.1000.6\n\tMicrosoft SQL Server 2022 compatible edition".to_string(),
+        )),
         "error" | "rowcount" | "identity" => Ok(SqlValue::Int(0)),
         other => Err(SqlError::message_only(
             102,

@@ -253,11 +253,81 @@ impl Parser {
                 let on = self.parse_on_off()?;
                 Ok(Statement::Set(SetStatement::ShowplanText(on)))
             }
+            Some(kw) if Self::set_option_requires_on(kw) => {
+                // The SQL Server default for these is ON, and TruthDB's engine
+                // is hardwired to that ON behaviour. Accept ON as a no-op, but
+                // reject OFF: silently ignoring it would return results that
+                // differ from what the client asked for (e.g. `ANSI_NULLS OFF`
+                // making `col = NULL` match NULL rows).
+                self.bump();
+                if self.parse_on_off()? {
+                    Ok(Statement::Set(SetStatement::Ignored))
+                } else {
+                    Err(SqlError::message_only(
+                        102,
+                        format!("SET {kw} OFF is not supported."),
+                    ))
+                }
+            }
+            Some(kw) if Self::set_option_ignorable(kw) => {
+                // Cosmetic or advisory options that do not change query results
+                // at TruthDB's feature level. Accept any argument as a no-op.
+                // Each takes a single argument (`ON`/`OFF`, a bare word, or a
+                // number that may carry a leading sign), so consume the option
+                // name, an optional sign, and one argument token.
+                self.bump();
+                let _ = self.eat(&TokenKind::Minus) || self.eat(&TokenKind::Plus);
+                if !matches!(self.peek().kind, TokenKind::Semicolon | TokenKind::Eof) {
+                    self.bump();
+                }
+                Ok(Statement::Set(SetStatement::Ignored))
+            }
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
             }
         }
+    }
+
+    /// Options whose SQL Server ON default matches TruthDB's fixed behaviour.
+    /// Accepting ON is a faithful no-op; OFF must be rejected because TruthDB
+    /// cannot honour it and silently ignoring it would corrupt results.
+    fn set_option_requires_on(kw: &str) -> bool {
+        matches!(
+            kw,
+            "QUOTED_IDENTIFIER" | "ANSI_NULLS" | "CONCAT_NULL_YIELDS_NULL" | "ANSI_DEFAULTS"
+        )
+    }
+
+    /// Cosmetic or advisory session options that clients (SSMS, sqlcmd,
+    /// drivers) set at connection time. TruthDB does not model these, but
+    /// ignoring them does not change query results, so accepting them as
+    /// no-ops keeps those clients working.
+    ///
+    /// Options that change *what* or *how much* runs — `ROWCOUNT`, `NOEXEC`,
+    /// `PARSEONLY`, `FMTONLY`, `IMPLICIT_TRANSACTIONS` — are deliberately absent:
+    /// silently ignoring them would run statements the client meant to limit or
+    /// skip. They stay hard errors until implemented.
+    fn set_option_ignorable(kw: &str) -> bool {
+        matches!(
+            kw,
+            "ANSI_PADDING"
+                | "ANSI_WARNINGS"
+                | "ANSI_NULL_DFLT_ON"
+                | "ANSI_NULL_DFLT_OFF"
+                | "ARITHABORT"
+                | "ARITHIGNORE"
+                | "NUMERIC_ROUNDABORT"
+                | "NOCOUNT"
+                | "CURSOR_CLOSE_ON_COMMIT"
+                | "FORCEPLAN"
+                | "TEXTSIZE"
+                | "LOCK_TIMEOUT"
+                | "DEADLOCK_PRIORITY"
+                | "DATEFIRST"
+                | "DATEFORMAT"
+                | "LANGUAGE"
+        )
     }
 
     fn parse_on_off(&mut self) -> SqlResult<bool> {
@@ -2047,6 +2117,58 @@ mod tests {
         assert!(Parser::parse_str(&sql).is_ok());
         let chain = format!("SELECT 1{}", " + 1".repeat(100));
         assert!(Parser::parse_str(&chain).is_ok());
+    }
+
+    #[test]
+    fn ignorable_set_options_parse_as_noops() {
+        // Cosmetic/advisory options clients send at connection time: ON/OFF
+        // flags, value forms, a signed value, and a required-ON option at ON.
+        let sql = "SET QUOTED_IDENTIFIER ON; SET NOCOUNT ON; SET ANSI_WARNINGS OFF; \
+                   SET TEXTSIZE 2147483647; SET DATEFORMAT mdy; SET LOCK_TIMEOUT -1";
+        let stmts = Parser::parse_str(sql).expect("all recognized as no-ops");
+        assert_eq!(stmts.len(), 6);
+        assert!(
+            stmts
+                .iter()
+                .all(|s| matches!(s, Statement::Set(SetStatement::Ignored))),
+            "every option should parse to SetStatement::Ignored: {stmts:?}",
+        );
+        // An unknown option is still a syntax error, not silently ignored.
+        assert_eq!(Parser::parse_str("SET WHATSIT ON").unwrap_err().number, 102);
+    }
+
+    #[test]
+    fn result_changing_set_options_are_not_silently_ignored() {
+        // OFF for an option TruthDB hardwires to ON must be rejected, never
+        // silently accepted (it would change query results).
+        assert_eq!(
+            Parser::parse_str("SET ANSI_NULLS OFF").unwrap_err().number,
+            102,
+        );
+        assert_eq!(
+            Parser::parse_str("SET CONCAT_NULL_YIELDS_NULL OFF")
+                .unwrap_err()
+                .number,
+            102,
+        );
+        // ...but the matching ON is a faithful no-op.
+        assert!(matches!(
+            Parser::parse_str("SET ANSI_NULLS ON").as_deref(),
+            Ok([Statement::Set(SetStatement::Ignored)]),
+        ));
+        // Options that change what/how much runs stay hard errors, not no-ops,
+        // so we never silently drop a client's row cap or skip flag.
+        for sql in [
+            "SET ROWCOUNT 100",
+            "SET NOEXEC ON",
+            "SET IMPLICIT_TRANSACTIONS ON",
+        ] {
+            assert_eq!(
+                Parser::parse_str(sql).unwrap_err().number,
+                102,
+                "{sql} must not be a silent no-op",
+            );
+        }
     }
 
     #[test]
