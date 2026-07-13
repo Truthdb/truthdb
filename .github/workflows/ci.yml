@@ -164,7 +164,8 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends python3 python3-pip
-          pip install --break-system-packages python-tds==1.17.1
+          # pyOpenSSL is required for pytds's TLS (encrypted) connections.
+          pip install --break-system-packages python-tds==1.17.1 pyOpenSSL
 
       - name: Install Go
         run: |
