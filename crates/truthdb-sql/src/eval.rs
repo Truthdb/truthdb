@@ -74,6 +74,14 @@ fn eval_at(
         ExprKind::Number(text) => eval_number_literal(text),
         ExprKind::Str(s) => Ok(SqlValue::Str(s.clone())),
         ExprKind::Bool(b) => Ok(SqlValue::Bool(*b)),
+        // A precomputed value (a rewritten subquery).
+        ExprKind::Literal(value) => Ok(value.clone()),
+        // Subqueries must be rewritten to literals by the executor before
+        // evaluation; reaching here means one appeared in an unsupported
+        // context (e.g. a join ON clause).
+        ExprKind::Subquery(_) | ExprKind::Exists(_) | ExprKind::InSubquery { .. } => Err(
+            SqlError::message_only(1015, "A subquery is not supported in this context."),
+        ),
         ExprKind::Column(name) => eval_column(name, row, resolver),
         ExprKind::GlobalVar(name) => eval_global_var(name, ctx),
         ExprKind::Unary { op, expr: inner } => {
@@ -223,6 +231,13 @@ fn eval_in_expr<R: ColumnResolver>(
     ctx: &EvalContext,
     depth: usize,
 ) -> SqlResult<SqlValue> {
+    // An empty list is definite regardless of the operand: `x IN ()` is FALSE
+    // and `x NOT IN ()` is TRUE, even when `x` is NULL (the comparison set is
+    // empty, so there is nothing unknown). Only reachable via an IN-subquery
+    // that returned no rows — a written value list always has at least one item.
+    if list.is_empty() {
+        return Ok(SqlValue::Bool(negated));
+    }
     let value = eval_at(expr, row, resolver, ctx, depth + 1)?;
     if value.is_null() {
         return Ok(SqlValue::Null);

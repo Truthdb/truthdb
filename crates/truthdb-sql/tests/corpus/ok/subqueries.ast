@@ -1,0 +1,534 @@
+[
+    Select(
+        Select {
+            top: None,
+            distinct: false,
+            items: [
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "id",
+                                quoted: false,
+                                span: Span {
+                                    start: 7,
+                                    end: 9,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 7,
+                            end: 9,
+                        },
+                    },
+                    alias: None,
+                },
+            ],
+            from: Some(
+                Table {
+                    name: Name {
+                        value: "nums",
+                        quoted: false,
+                        span: Span {
+                            start: 15,
+                            end: 19,
+                        },
+                    },
+                    alias: None,
+                },
+            ),
+            where_clause: Some(
+                Expr {
+                    kind: Binary {
+                        op: Eq,
+                        left: Expr {
+                            kind: Column(
+                                Name {
+                                    value: "v",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 26,
+                                        end: 27,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 26,
+                                end: 27,
+                            },
+                        },
+                        right: Expr {
+                            kind: Subquery(
+                                Select {
+                                    top: None,
+                                    distinct: false,
+                                    items: [
+                                        Expr {
+                                            expr: Expr {
+                                                kind: Aggregate {
+                                                    func: Max,
+                                                    distinct: false,
+                                                    arg: Some(
+                                                        Expr {
+                                                            kind: Column(
+                                                                Name {
+                                                                    value: "v",
+                                                                    quoted: false,
+                                                                    span: Span {
+                                                                        start: 42,
+                                                                        end: 43,
+                                                                    },
+                                                                },
+                                                            ),
+                                                            span: Span {
+                                                                start: 42,
+                                                                end: 43,
+                                                            },
+                                                        },
+                                                    ),
+                                                },
+                                                span: Span {
+                                                    start: 38,
+                                                    end: 44,
+                                                },
+                                            },
+                                            alias: None,
+                                        },
+                                    ],
+                                    from: Some(
+                                        Table {
+                                            name: Name {
+                                                value: "nums",
+                                                quoted: false,
+                                                span: Span {
+                                                    start: 50,
+                                                    end: 54,
+                                                },
+                                            },
+                                            alias: None,
+                                        },
+                                    ),
+                                    where_clause: None,
+                                    group_by: [],
+                                    having: None,
+                                    order_by: [],
+                                    span: Span {
+                                        start: 31,
+                                        end: 54,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 30,
+                                end: 55,
+                            },
+                        },
+                    },
+                    span: Span {
+                        start: 26,
+                        end: 55,
+                    },
+                },
+            ),
+            group_by: [],
+            having: None,
+            order_by: [],
+            span: Span {
+                start: 0,
+                end: 55,
+            },
+        },
+    ),
+    Select(
+        Select {
+            top: None,
+            distinct: false,
+            items: [
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "id",
+                                quoted: false,
+                                span: Span {
+                                    start: 64,
+                                    end: 66,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 64,
+                            end: 66,
+                        },
+                    },
+                    alias: None,
+                },
+                Expr {
+                    expr: Expr {
+                        kind: Subquery(
+                            Select {
+                                top: None,
+                                distinct: false,
+                                items: [
+                                    Expr {
+                                        expr: Expr {
+                                            kind: Aggregate {
+                                                func: Count,
+                                                distinct: false,
+                                                arg: None,
+                                            },
+                                            span: Span {
+                                                start: 76,
+                                                end: 84,
+                                            },
+                                        },
+                                        alias: None,
+                                    },
+                                ],
+                                from: Some(
+                                    Table {
+                                        name: Name {
+                                            value: "picks",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 90,
+                                                end: 95,
+                                            },
+                                        },
+                                        alias: None,
+                                    },
+                                ),
+                                where_clause: None,
+                                group_by: [],
+                                having: None,
+                                order_by: [],
+                                span: Span {
+                                    start: 69,
+                                    end: 95,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 68,
+                            end: 96,
+                        },
+                    },
+                    alias: Some(
+                        Name {
+                            value: "pc",
+                            quoted: false,
+                            span: Span {
+                                start: 100,
+                                end: 102,
+                            },
+                        },
+                    ),
+                },
+            ],
+            from: Some(
+                Table {
+                    name: Name {
+                        value: "nums",
+                        quoted: false,
+                        span: Span {
+                            start: 108,
+                            end: 112,
+                        },
+                    },
+                    alias: None,
+                },
+            ),
+            where_clause: Some(
+                Expr {
+                    kind: Binary {
+                        op: And,
+                        left: Expr {
+                            kind: InSubquery {
+                                expr: Expr {
+                                    kind: Column(
+                                        Name {
+                                            value: "id",
+                                            quoted: false,
+                                            span: Span {
+                                                start: 119,
+                                                end: 121,
+                                            },
+                                        },
+                                    ),
+                                    span: Span {
+                                        start: 119,
+                                        end: 121,
+                                    },
+                                },
+                                subquery: Select {
+                                    top: None,
+                                    distinct: false,
+                                    items: [
+                                        Expr {
+                                            expr: Expr {
+                                                kind: Column(
+                                                    Name {
+                                                        value: "target",
+                                                        quoted: false,
+                                                        span: Span {
+                                                            start: 133,
+                                                            end: 139,
+                                                        },
+                                                    },
+                                                ),
+                                                span: Span {
+                                                    start: 133,
+                                                    end: 139,
+                                                },
+                                            },
+                                            alias: None,
+                                        },
+                                    ],
+                                    from: Some(
+                                        Table {
+                                            name: Name {
+                                                value: "picks",
+                                                quoted: false,
+                                                span: Span {
+                                                    start: 145,
+                                                    end: 150,
+                                                },
+                                            },
+                                            alias: None,
+                                        },
+                                    ),
+                                    where_clause: None,
+                                    group_by: [],
+                                    having: None,
+                                    order_by: [],
+                                    span: Span {
+                                        start: 126,
+                                        end: 150,
+                                    },
+                                },
+                                negated: false,
+                            },
+                            span: Span {
+                                start: 119,
+                                end: 151,
+                            },
+                        },
+                        right: Expr {
+                            kind: Exists(
+                                Select {
+                                    top: None,
+                                    distinct: false,
+                                    items: [
+                                        Expr {
+                                            expr: Expr {
+                                                kind: Int(
+                                                    1,
+                                                ),
+                                                span: Span {
+                                                    start: 171,
+                                                    end: 172,
+                                                },
+                                            },
+                                            alias: None,
+                                        },
+                                    ],
+                                    from: Some(
+                                        Table {
+                                            name: Name {
+                                                value: "picks",
+                                                quoted: false,
+                                                span: Span {
+                                                    start: 178,
+                                                    end: 183,
+                                                },
+                                            },
+                                            alias: None,
+                                        },
+                                    ),
+                                    where_clause: None,
+                                    group_by: [],
+                                    having: None,
+                                    order_by: [],
+                                    span: Span {
+                                        start: 164,
+                                        end: 183,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 156,
+                                end: 184,
+                            },
+                        },
+                    },
+                    span: Span {
+                        start: 119,
+                        end: 184,
+                    },
+                },
+            ),
+            group_by: [],
+            having: None,
+            order_by: [],
+            span: Span {
+                start: 57,
+                end: 184,
+            },
+        },
+    ),
+    Select(
+        Select {
+            top: None,
+            distinct: false,
+            items: [
+                Expr {
+                    expr: Expr {
+                        kind: Column(
+                            Name {
+                                value: "id",
+                                quoted: false,
+                                span: Span {
+                                    start: 193,
+                                    end: 195,
+                                },
+                            },
+                        ),
+                        span: Span {
+                            start: 193,
+                            end: 195,
+                        },
+                    },
+                    alias: None,
+                },
+            ],
+            from: Some(
+                Table {
+                    name: Name {
+                        value: "nums",
+                        quoted: false,
+                        span: Span {
+                            start: 201,
+                            end: 205,
+                        },
+                    },
+                    alias: None,
+                },
+            ),
+            where_clause: Some(
+                Expr {
+                    kind: InSubquery {
+                        expr: Expr {
+                            kind: Column(
+                                Name {
+                                    value: "id",
+                                    quoted: false,
+                                    span: Span {
+                                        start: 212,
+                                        end: 214,
+                                    },
+                                },
+                            ),
+                            span: Span {
+                                start: 212,
+                                end: 214,
+                            },
+                        },
+                        subquery: Select {
+                            top: None,
+                            distinct: false,
+                            items: [
+                                Expr {
+                                    expr: Expr {
+                                        kind: Column(
+                                            Name {
+                                                value: "target",
+                                                quoted: false,
+                                                span: Span {
+                                                    start: 230,
+                                                    end: 236,
+                                                },
+                                            },
+                                        ),
+                                        span: Span {
+                                            start: 230,
+                                            end: 236,
+                                        },
+                                    },
+                                    alias: None,
+                                },
+                            ],
+                            from: Some(
+                                Table {
+                                    name: Name {
+                                        value: "picks",
+                                        quoted: false,
+                                        span: Span {
+                                            start: 242,
+                                            end: 247,
+                                        },
+                                    },
+                                    alias: None,
+                                },
+                            ),
+                            where_clause: Some(
+                                Expr {
+                                    kind: Binary {
+                                        op: Gt,
+                                        left: Expr {
+                                            kind: Column(
+                                                Name {
+                                                    value: "target",
+                                                    quoted: false,
+                                                    span: Span {
+                                                        start: 254,
+                                                        end: 260,
+                                                    },
+                                                },
+                                            ),
+                                            span: Span {
+                                                start: 254,
+                                                end: 260,
+                                            },
+                                        },
+                                        right: Expr {
+                                            kind: Int(
+                                                0,
+                                            ),
+                                            span: Span {
+                                                start: 263,
+                                                end: 264,
+                                            },
+                                        },
+                                    },
+                                    span: Span {
+                                        start: 254,
+                                        end: 264,
+                                    },
+                                },
+                            ),
+                            group_by: [],
+                            having: None,
+                            order_by: [],
+                            span: Span {
+                                start: 223,
+                                end: 264,
+                            },
+                        },
+                        negated: true,
+                    },
+                    span: Span {
+                        start: 212,
+                        end: 265,
+                    },
+                },
+            ),
+            group_by: [],
+            having: None,
+            order_by: [],
+            span: Span {
+                start: 186,
+                end: 265,
+            },
+        },
+    ),
+]

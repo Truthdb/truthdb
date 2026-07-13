@@ -1314,6 +1314,20 @@ impl Parser {
     fn parse_in(&mut self, left: Expr, negated: bool) -> SqlResult<Expr> {
         self.bump(); // IN
         self.expect(&TokenKind::LParen)?;
+        // `expr IN (SELECT ...)` is a subquery; otherwise a value list.
+        if self.peek_keyword().as_deref() == Some("SELECT") {
+            let subquery = self.parse_select()?;
+            let end = self.expect(&TokenKind::RParen)?;
+            self.node()?;
+            return Ok(Expr {
+                span: left.span.to(end),
+                kind: ExprKind::InSubquery {
+                    expr: Box::new(left),
+                    subquery: Box::new(subquery),
+                    negated,
+                },
+            });
+        }
         let mut list = Vec::new();
         loop {
             list.push(self.parse_expr()?);
@@ -1592,10 +1606,21 @@ impl Parser {
                 })
             }
             TokenKind::LParen => {
-                self.bump();
-                let inner = self.parse_expr()?;
-                self.expect(&TokenKind::RParen)?;
-                Ok(inner)
+                // `(SELECT ...)` is a scalar subquery; otherwise a grouping paren.
+                if self.peek_keyword_at(1).as_deref() == Some("SELECT") {
+                    let start = self.bump().span; // (
+                    let subquery = self.parse_select()?;
+                    let end = self.expect(&TokenKind::RParen)?;
+                    Ok(Expr {
+                        kind: ExprKind::Subquery(Box::new(subquery)),
+                        span: start.to(end),
+                    })
+                } else {
+                    self.bump();
+                    let inner = self.parse_expr()?;
+                    self.expect(&TokenKind::RParen)?;
+                    Ok(inner)
+                }
             }
             TokenKind::Word { quoted, .. } => {
                 let keyword = token.keyword();
@@ -1624,6 +1649,17 @@ impl Parser {
                     Some("CASE") if !quoted => self.parse_case(),
                     Some("CAST") if !quoted => self.parse_cast(),
                     Some("CONVERT") if !quoted => self.parse_convert(),
+                    Some("EXISTS") if !quoted => {
+                        // `EXISTS (SELECT ...)`; `NOT EXISTS` is parse_not over this.
+                        let start = self.bump().span;
+                        self.expect(&TokenKind::LParen)?;
+                        let subquery = self.parse_select()?;
+                        let end = self.expect(&TokenKind::RParen)?;
+                        Ok(Expr {
+                            kind: ExprKind::Exists(Box::new(subquery)),
+                            span: start.to(end),
+                        })
+                    }
                     Some(kw) if !quoted && is_reserved(kw) => {
                         Err(SqlError::syntax(self.token_text(&token), token.span))
                     }

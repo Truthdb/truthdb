@@ -382,6 +382,22 @@ pub enum ExprKind {
     /// A `@@`-prefixed global/session variable (e.g. `@@TRANCOUNT`), evaluated
     /// from the session's [`EvalContext`](crate::eval::EvalContext).
     GlobalVar(String),
+    /// A precomputed value. Not produced by the parser — the executor rewrites
+    /// each evaluated subquery to a `Literal` so scalar evaluation stays free of
+    /// storage access.
+    Literal(crate::value::SqlValue),
+    /// A scalar subquery `(SELECT ...)`. Rewritten to a [`Literal`] (its single
+    /// value; 512 if it returns more than one row) before evaluation.
+    Subquery(Box<Select>),
+    /// `EXISTS (SELECT ...)`. Rewritten to a boolean before evaluation.
+    Exists(Box<Select>),
+    /// `expr [NOT] IN (SELECT ...)`. Rewritten to an [`InList`] of the
+    /// subquery's values before evaluation.
+    InSubquery {
+        expr: Box<Expr>,
+        subquery: Box<Select>,
+        negated: bool,
+    },
 }
 
 /// The five standard aggregate functions.

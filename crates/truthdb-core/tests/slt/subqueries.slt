@@ -1,0 +1,52 @@
+# Scalar / IN / EXISTS subqueries (Stage 11 part 2, uncorrelated)
+
+statement ok
+CREATE TABLE nums (id INT NOT NULL PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO nums VALUES (1, 10), (2, 20), (3, 30)
+
+statement ok
+CREATE TABLE picks (id INT NOT NULL PRIMARY KEY, target INT)
+
+statement ok
+INSERT INTO picks VALUES (1, 2), (2, 3)
+
+# Scalar subquery in WHERE.
+query I
+SELECT id FROM nums WHERE v = (SELECT MAX(v) FROM nums)
+----
+3
+
+# Scalar subquery in the SELECT list (evaluated once, same for every row).
+query II
+SELECT id, (SELECT COUNT(*) FROM picks) AS pc FROM nums ORDER BY id
+----
+1 2
+2 2
+3 2
+
+# IN (SELECT).
+query I
+SELECT id FROM nums WHERE id IN (SELECT target FROM picks) ORDER BY id
+----
+2
+3
+
+# NOT IN (SELECT).
+query I
+SELECT id FROM nums WHERE id NOT IN (SELECT target FROM picks)
+----
+1
+
+# EXISTS (uncorrelated true) keeps all rows.
+query I
+SELECT id FROM nums WHERE EXISTS (SELECT 1 FROM picks WHERE target = 3) ORDER BY id
+----
+1
+2
+3
+
+# A scalar subquery returning more than one row is an error.
+statement error
+SELECT id FROM nums WHERE v = (SELECT v FROM nums)

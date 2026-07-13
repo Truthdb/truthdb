@@ -2185,6 +2185,167 @@ mod tests {
     }
 
     #[test]
+    fn sql_scalar_in_exists_subqueries() {
+        let path = unique_temp_path("sql-subquery");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE nums (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("nums");
+        engine
+            .execute("INSERT INTO nums VALUES (1, 10), (2, 20), (3, 30)")
+            .expect("seed");
+        engine
+            .execute("CREATE TABLE picks (id INT NOT NULL PRIMARY KEY, target INT)")
+            .expect("picks");
+        engine
+            .execute("INSERT INTO picks VALUES (1, 2), (2, 3)")
+            .expect("seed2");
+
+        // Scalar subquery in WHERE.
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM nums WHERE v = (SELECT MAX(v) FROM nums)",
+        );
+        assert_eq!(rows, vec![vec![Some("3".into())]]);
+
+        // Scalar subquery in the SELECT list (evaluated once).
+        let (cols, rows) = sql_rows(
+            &mut engine,
+            "SELECT id, (SELECT COUNT(*) FROM picks) AS pc FROM nums ORDER BY id",
+        );
+        assert_eq!(cols, vec!["id", "pc"]);
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("1".into()), Some("2".into())],
+                vec![Some("2".into()), Some("2".into())],
+                vec![Some("3".into()), Some("2".into())],
+            ]
+        );
+
+        // IN (SELECT) and NOT IN (SELECT).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM nums WHERE id IN (SELECT target FROM picks) ORDER BY id",
+        );
+        assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM nums WHERE id NOT IN (SELECT target FROM picks)",
+        );
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
+
+        // EXISTS / NOT EXISTS (uncorrelated).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM nums WHERE EXISTS (SELECT 1 FROM picks WHERE target = 3) ORDER BY id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("1".into())],
+                vec![Some("2".into())],
+                vec![Some("3".into())],
+            ]
+        );
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM nums WHERE NOT EXISTS (SELECT 1 FROM picks WHERE target = 99)",
+        );
+        assert_eq!(rows.len(), 3);
+
+        // A scalar subquery with no rows is NULL (so the `=` is unknown).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM nums WHERE v = (SELECT v FROM nums WHERE id = 99)",
+        );
+        assert!(rows.is_empty());
+
+        // More than one row from a scalar subquery is 512; more than one column
+        // is 116.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "SELECT id FROM nums WHERE v = (SELECT v FROM nums)"
+            ),
+            512
+        );
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "SELECT id FROM nums WHERE v = (SELECT id, v FROM nums WHERE id = 1)",
+            ),
+            116
+        );
+        // A correlated subquery (references an outer column) is not yet
+        // supported; it errors as an invalid column rather than mis-resolving.
+        assert_eq!(
+            sql_error_number(
+                &mut engine,
+                "SELECT id FROM nums WHERE v = (SELECT target FROM picks WHERE picks.target = nums.id)",
+            ),
+            207
+        );
+
+        // `NOT IN (empty subquery)` is TRUE for every row, including a NULL
+        // outer value — the comparison set is empty, so nothing is unknown.
+        engine
+            .execute("INSERT INTO nums VALUES (4, NULL)")
+            .expect("null row");
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM nums WHERE v NOT IN (SELECT target FROM picks WHERE target > 1000) ORDER BY id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("1".into())],
+                vec![Some("2".into())],
+                vec![Some("3".into())],
+                vec![Some("4".into())],
+            ]
+        );
+        // `IN (empty subquery)` is FALSE for every row (no rows returned).
+        let (_, rows) = sql_rows(
+            &mut engine,
+            "SELECT id FROM nums WHERE v IN (SELECT target FROM picks WHERE target > 1000)",
+        );
+        assert!(rows.is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn subquery_locks_referenced_tables_shared() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("subquery-locks");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE a (id INT NOT NULL PRIMARY KEY)")
+            .expect("a");
+        engine
+            .execute("CREATE TABLE b (id INT NOT NULL PRIMARY KEY)")
+            .expect("b");
+        let a = table_object_id(&mut engine, "a");
+        let b = table_object_id(&mut engine, "b");
+        // A subquery over `b` inside `a`'s WHERE reads `b`, so it must take a
+        // Shared lock on `b` (else it could read `b`'s uncommitted rows).
+        let locks = engine.analyze_locks(
+            "SELECT id FROM a WHERE id IN (SELECT id FROM b)",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            locks.contains(&(Resource::Table(a), LockMode::Shared)),
+            "a Shared: {locks:?}"
+        );
+        assert!(
+            locks.contains(&(Resource::Table(b), LockMode::Shared)),
+            "b Shared (subquery): {locks:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn sql_derived_tables() {
         let path = unique_temp_path("sql-derived");
         let mut engine = new_engine(&path);
