@@ -1,16 +1,22 @@
 //! PRELOGIN response and LOGIN7 parsing (MS-TDS 2.2.6.5, 2.2.6.4).
 
-/// Builds a PRELOGIN response: version, ENCRYPTION = NOT_SUP (plaintext
-/// only), MARS off. The option table is a list of
-/// `token u8 | offset u16 (BE) | length u16 (BE)` entries ended by `0xFF`,
-/// followed by the option data.
-pub fn prelogin_response() -> Vec<u8> {
+// PRELOGIN ENCRYPTION option values (MS-TDS 2.2.6.5).
+pub const ENCRYPT_OFF: u8 = 0x00;
+pub const ENCRYPT_ON: u8 = 0x01;
+pub const ENCRYPT_NOT_SUP: u8 = 0x02;
+pub const ENCRYPT_REQ: u8 = 0x03;
+
+const TOKEN_ENCRYPTION: u8 = 0x01;
+
+/// Builds a PRELOGIN response: version, an ENCRYPTION option, MARS off. When
+/// `offer_tls` is set the server advertises `ENCRYPT_ON` (the whole session is
+/// encrypted after a tunneled TLS handshake); otherwise `ENCRYPT_NOT_SUP`
+/// (plaintext). The option table is a list of `token u8 | offset u16 (BE) |
+/// length u16 (BE)` entries ended by `0xFF`, followed by the option data.
+pub fn prelogin_response(offer_tls: bool) -> Vec<u8> {
     const TOKEN_VERSION: u8 = 0x00;
-    const TOKEN_ENCRYPTION: u8 = 0x01;
     const TOKEN_MARS: u8 = 0x04;
     const TERMINATOR: u8 = 0xff;
-    /// ENCRYPT_NOT_SUP: this server does not support TLS (Stage 4 plaintext).
-    const ENCRYPT_NOT_SUP: u8 = 0x02;
 
     // Three options + terminator: table is 3*5 + 1 = 16 bytes; data follows.
     let table_len = 3 * 5 + 1;
@@ -32,9 +38,32 @@ pub fn prelogin_response() -> Vec<u8> {
     out.push(TERMINATOR);
 
     out.extend_from_slice(&version);
-    out.push(ENCRYPT_NOT_SUP);
+    out.push(if offer_tls {
+        ENCRYPT_ON
+    } else {
+        ENCRYPT_NOT_SUP
+    });
     out.push(0x00); // MARS off
     out
+}
+
+/// Extracts the client's ENCRYPTION option value from a PRELOGIN request
+/// payload; returns `ENCRYPT_NOT_SUP` if the option is absent or malformed.
+pub fn prelogin_client_encryption(payload: &[u8]) -> u8 {
+    let mut i = 0;
+    while i + 5 <= payload.len() {
+        let token = payload[i];
+        if token == 0xff {
+            break;
+        }
+        let offset = u16::from_be_bytes([payload[i + 1], payload[i + 2]]) as usize;
+        let len = u16::from_be_bytes([payload[i + 3], payload[i + 4]]) as usize;
+        if token == TOKEN_ENCRYPTION && len >= 1 && offset < payload.len() {
+            return payload[offset];
+        }
+        i += 5;
+    }
+    ENCRYPT_NOT_SUP
 }
 
 /// The fields a LOGIN7 request carries that Stage 4 uses.
@@ -180,7 +209,7 @@ mod tests {
 
     #[test]
     fn prelogin_response_is_well_formed() {
-        let resp = prelogin_response();
+        let resp = prelogin_response(false);
         // First option token is VERSION with a sane offset.
         assert_eq!(resp[0], 0x00);
         let version_off = u16::from_be_bytes([resp[1], resp[2]]) as usize;
@@ -192,5 +221,30 @@ mod tests {
     #[test]
     fn short_login7_errors() {
         assert!(parse_login7(&[0u8; 10]).is_err());
+    }
+
+    #[test]
+    fn prelogin_response_advertises_encryption() {
+        // The ENCRYPTION option value is the last byte before the MARS byte.
+        let off = prelogin_response(false);
+        assert_eq!(off[off.len() - 2], ENCRYPT_NOT_SUP);
+        let on = prelogin_response(true);
+        assert_eq!(on[on.len() - 2], ENCRYPT_ON);
+    }
+
+    #[test]
+    fn prelogin_client_encryption_parses_option() {
+        // Round-trip: a response built with ENCRYPT_ON is read back as ON.
+        assert_eq!(
+            prelogin_client_encryption(&prelogin_response(true)),
+            ENCRYPT_ON
+        );
+        assert_eq!(
+            prelogin_client_encryption(&prelogin_response(false)),
+            ENCRYPT_NOT_SUP
+        );
+        // A payload without an ENCRYPTION option defaults to NOT_SUP.
+        assert_eq!(prelogin_client_encryption(&[0xff]), ENCRYPT_NOT_SUP);
+        assert_eq!(prelogin_client_encryption(&[]), ENCRYPT_NOT_SUP);
     }
 }

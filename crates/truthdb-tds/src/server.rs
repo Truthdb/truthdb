@@ -19,13 +19,18 @@ const TM_BEGIN_XACT: u16 = 5;
 const TM_COMMIT_XACT: u16 = 7;
 const TM_ROLLBACK_XACT: u16 = 8;
 
-/// Server-side TDS configuration: the login users and the reported database.
+/// Server-side TDS configuration: the login users, the reported database, and
+/// optional TLS.
 #[derive(Debug, Clone)]
 pub struct TdsConfig {
     /// username -> password (plaintext config auth for Stage 4).
     pub users: HashMap<String, String>,
     /// The single database name reported to clients.
     pub database: String,
+    /// TLS certificate/key. When present, the server offers encryption to
+    /// clients that request it (a tunneled TLS handshake, then an encrypted
+    /// session).
+    pub tls: Option<crate::tls::TlsConfig>,
 }
 
 /// Handles one TDS connection to completion (or disconnect).
@@ -44,15 +49,29 @@ where
     if prelogin.kind != PKT_PRELOGIN {
         return Err(protocol_err("expected PRELOGIN"));
     }
+    // Offer TLS only when configured AND the client asks to encrypt (ENCRYPT_ON
+    // /REQ). We encrypt the whole session, not the login-only mode.
+    let client_enc = login::prelogin_client_encryption(&prelogin.payload);
+    let offer_tls =
+        config.tls.is_some() && matches!(client_enc, login::ENCRYPT_ON | login::ENCRYPT_REQ);
     // The PRELOGIN *response* is sent as a REPLY (Tabular Result) packet;
     // clients (pytds/go-mssqldb) expect type 0x04 here, not 0x12.
     write_message(
         &mut stream,
         PKT_TABULAR_RESULT,
-        &login::prelogin_response(),
+        &login::prelogin_response(offer_tls),
         packet_size,
     )
     .await?;
+
+    // If encryption was negotiated, complete the tunneled TLS handshake and run
+    // the rest of the session over the encrypted stream.
+    let mut stream = if offer_tls {
+        let tls = config.tls.as_ref().expect("tls configured");
+        crate::tls::MaybeTlsStream::Tls(Box::new(tls.accept(stream).await?))
+    } else {
+        crate::tls::MaybeTlsStream::Plain(stream)
+    };
 
     // --- LOGIN7 ---
     let login_msg = read_message(&mut stream).await?;

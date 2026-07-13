@@ -164,12 +164,20 @@ jobs:
         run: |
           apt-get update
           apt-get install -y --no-install-recommends python3 python3-pip
-          pip install --break-system-packages python-tds==1.17.1
+          # pyOpenSSL is required for pytds's TLS (encrypted) connections.
+          pip install --break-system-packages python-tds==1.17.1 pyOpenSSL
 
       - name: Install Go
         run: |
           curl -fsSL https://go.dev/dl/go1.22.4.linux-amd64.tar.gz | tar -C /usr/local -xz
           echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+
+      - name: Generate a self-signed TLS certificate
+        run: |
+          mkdir -p /etc/truthdb
+          openssl req -x509 -newkey rsa:2048 -nodes -days 1 \
+            -keyout /etc/truthdb/tls.key -out /etc/truthdb/tls.crt \
+            -subj "/CN=localhost"
 
       - name: Configure and start server
         run: |
@@ -183,6 +191,8 @@ jobs:
           addr = "127.0.0.1"
           port = 1433
           database = "truthdb"
+          tls_cert = "/etc/truthdb/tls.crt"
+          tls_key = "/etc/truthdb/tls.key"
 
           [tds.auth]
           sa = "secret"
@@ -206,6 +216,9 @@ jobs:
 
       - name: Conformance — pytds (Python)
         run: python3 scripts/tds_conformance.py 127.0.0.1 1433 sa secret
+
+      - name: Conformance — pytds over TLS (tunneled handshake)
+        run: python3 scripts/tds_conformance_tls.py 127.0.0.1 1433 sa secret /etc/truthdb/tls.crt
 
       - name: Conformance — go-mssqldb (Go)
         run: |
