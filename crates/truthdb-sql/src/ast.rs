@@ -311,6 +311,13 @@ pub enum SelectItem {
         expr: Expr,
         alias: Option<Name>,
     },
+    /// `@var = expr` — an assignment SELECT. All items must be assignments (a
+    /// query cannot mix assignments with result columns). `target` is the
+    /// variable name without its leading `@`, lowercased (as the lexer emits it).
+    Assign {
+        target: String,
+        value: Expr,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]

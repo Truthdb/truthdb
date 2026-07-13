@@ -1,0 +1,79 @@
+# Assignment SELECT: `SELECT @v = expr [, ...] [FROM ...]` (Stage 11).
+# Variables are batch-scoped, so each check declares, assigns, and reads in one
+# batch; only the trailing SELECT produces rows for the runner to compare.
+
+statement ok
+CREATE TABLE nums (id INT NOT NULL PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO nums VALUES (1, 10), (2, 20), (3, 30)
+
+# Scalar assignment with no FROM.
+query I
+DECLARE @a INT; SELECT @a = 5 + 2; SELECT @a
+----
+7
+
+# Aggregate into a variable.
+query I
+DECLARE @c INT; SELECT @c = COUNT(*) FROM nums; SELECT @c
+----
+3
+
+# Single-row lookup by key.
+query I
+DECLARE @x INT; SELECT @x = v FROM nums WHERE id = 2; SELECT @x
+----
+20
+
+# Many rows: the variable holds the last row's value (ORDER BY makes it stable).
+query I
+DECLARE @x INT; SELECT @x = v FROM nums ORDER BY id; SELECT @x
+----
+30
+
+# Zero rows: the variable keeps its prior value.
+query I
+DECLARE @x INT; SET @x = 99; SELECT @x = v FROM nums WHERE id = 999; SELECT @x
+----
+99
+
+# Multiple assignments in one SELECT.
+query II
+DECLARE @lo INT, @hi INT; SELECT @lo = MIN(v), @hi = MAX(v) FROM nums; SELECT @lo, @hi
+----
+10 30
+
+# A value type is coerced to the variable's declared type.
+query I
+DECLARE @s NVARCHAR(10); SELECT @s = 42; SELECT @s
+----
+42
+
+# Mixing an assignment with a result column is rejected (141).
+statement error
+SELECT @a = 1, v FROM nums
+
+# Assigning to an undeclared variable is rejected (137).
+statement error
+SELECT @undeclared = 1
+
+# A value that reads a variable being assigned is rejected, not silently wrong:
+# self-referential running aggregation (use SET or a set-based aggregate)...
+statement error
+DECLARE @s INT; SET @s = 0; SELECT @s = @s + v FROM nums
+
+# ...and cross-referencing another target in the same SELECT.
+statement error
+DECLARE @a INT, @b INT; SELECT @a = 10, @b = @a
+
+# A value subquery reading a base table only through a CTE still runs (and, at
+# the lock layer, locks that base table).
+query I
+DECLARE @m INT; WITH c AS (SELECT v FROM nums) SELECT @m = (SELECT MAX(v) FROM c); SELECT @m
+----
+30
+
+# An assignment SELECT cannot be nested as a derived table.
+statement error
+SELECT * FROM (SELECT @a = 1) t

@@ -24,6 +24,7 @@ pub fn is_aggregated(select: &Select) -> bool {
         || select.having.is_some()
         || select.items.iter().any(|item| match item {
             SelectItem::Expr { expr, .. } => contains_aggregate(expr),
+            SelectItem::Assign { value, .. } => contains_aggregate(value),
             SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
         })
 }
@@ -96,6 +97,10 @@ pub fn execute(
             SelectItem::Expr { expr, alias } => {
                 out_names.push(output_name(expr, alias.as_ref()));
                 out_exprs.push(rewrite(expr, &select.group_by, &mut aggs)?);
+            }
+            // Assignment SELECTs are rewritten to Expr items before execution.
+            SelectItem::Assign { .. } => {
+                unreachable!("assignment SELECT handled before aggregation")
             }
         }
     }

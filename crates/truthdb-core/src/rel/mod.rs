@@ -464,6 +464,13 @@ fn exec_statement(
             exec_delete(storage, delete, &mut scope, &eval_ctx)
         }
         Statement::Select(select) => {
+            if select
+                .items
+                .iter()
+                .any(|i| matches!(i, SelectItem::Assign { .. }))
+            {
+                return exec_select_assign(storage, select, txn_ctx);
+            }
             let eval_ctx = txn_ctx.eval_context();
             if txn_ctx.showplan_text {
                 Ok(StatementResult::Rows(showplan_rows(
@@ -2320,6 +2327,13 @@ fn expand_select_ctes(select: &Select, resolved: &CteMap) -> Select {
                 expr: expand_expr_ctes(expr, resolved),
                 alias: alias.clone(),
             },
+            // Inline CTE references inside an assignment value too, so lock
+            // analysis (which expands the original assignment SELECT) sees the
+            // real base tables behind a CTE used only in the value expression.
+            SelectItem::Assign { target, value } => SelectItem::Assign {
+                target: target.clone(),
+                value: expand_expr_ctes(value, resolved),
+            },
             other => other.clone(),
         })
         .collect();
@@ -2746,6 +2760,18 @@ fn exec_select(
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
+    // A top-level assignment SELECT is routed to exec_select_assign; one reaching
+    // here has been nested in a subquery / derived table / CTE, which is invalid.
+    if select
+        .items
+        .iter()
+        .any(|i| matches!(i, SelectItem::Assign { .. }))
+    {
+        return Err(SqlError::message_only(
+            141,
+            "A SELECT that assigns to a variable cannot be used inside a query expression.",
+        ));
+    }
     // Inline any WITH common table expressions (as derived tables) first.
     let expanded;
     let select = if select.ctes.is_empty() {
@@ -2848,6 +2874,87 @@ fn exec_select(
         &resolver,
         eval_ctx,
     )
+}
+
+/// `SELECT @a = expr, @b = expr2 [FROM ...]` — an assignment SELECT. The value
+/// expressions are projected as an ordinary result set; each variable then
+/// takes the value from the *last* row the query produces (SQL Server's
+/// documented behaviour for the final value). Zero rows leave the variables
+/// unchanged. A value that reads a variable being assigned in the same
+/// statement (running aggregation, cross-referencing targets) is rejected
+/// rather than evaluated against the pre-statement snapshot, which would give a
+/// result that silently differs from SQL Server's per-row assignment.
+fn exec_select_assign(
+    storage: &mut Storage,
+    select: &Select,
+    txn_ctx: &mut TxnContext,
+) -> Result<StatementResult, SqlError> {
+    // Every target must be a declared variable; capture their declared types.
+    let mut targets: Vec<(String, ColumnType)> = Vec::with_capacity(select.items.len());
+    for item in &select.items {
+        let SelectItem::Assign { target, .. } = item else {
+            // The dispatcher only routes here when every item is an assignment.
+            unreachable!("assignment SELECT has a non-assignment item");
+        };
+        let column_type = txn_ctx
+            .variables
+            .get(target)
+            .map(|(t, _)| *t)
+            .ok_or_else(|| undeclared_variable_err(target))?;
+        targets.push((target.clone(), column_type));
+    }
+
+    // Every value is evaluated against the variables' pre-statement values, so a
+    // value that references a variable being assigned here would silently
+    // diverge from SQL Server's per-row / left-to-right assignment (running
+    // aggregation, cross-referencing targets). Reject those rather than compute
+    // a wrong result; the caller can use SET or a set-based aggregate instead.
+    let target_names: std::collections::HashSet<&str> =
+        targets.iter().map(|(name, _)| name.as_str()).collect();
+    for item in &select.items {
+        let SelectItem::Assign { value, .. } = item else {
+            unreachable!()
+        };
+        if expr_uses_local_var(value, &target_names) {
+            return Err(SqlError::message_only(
+                141,
+                "An assignment SELECT cannot reference a variable it is assigning in the same statement; use SET or a set-based aggregate.",
+            ));
+        }
+    }
+
+    // Project the value expressions as an ordinary result set.
+    let projected = Select {
+        items: select
+            .items
+            .iter()
+            .map(|item| {
+                let SelectItem::Assign { value, .. } = item else {
+                    unreachable!()
+                };
+                SelectItem::Expr {
+                    expr: value.clone(),
+                    alias: None,
+                }
+            })
+            .collect(),
+        ..select.clone()
+    };
+    let rowset = exec_select(storage, &projected, &txn_ctx.eval_context())?;
+
+    // Assign the last row's values (SQL Server: the variable holds the value
+    // from the final row). No rows -> variables keep their current values.
+    if let Some(last) = rowset.rows.last() {
+        for (index, (name, column_type)) in targets.iter().enumerate() {
+            let produced = value::datum_to_sql(&last[index], &rowset.columns[index].column_type);
+            let datum = value::sql_to_datum(&produced, column_type, name)?;
+            let coerced = value::datum_to_sql(&datum, column_type);
+            txn_ctx
+                .variables
+                .insert(name.clone(), (*column_type, coerced));
+        }
+    }
+    Ok(StatementResult::Done)
 }
 
 /// Removes duplicate output rows (SELECT DISTINCT), keeping first occurrence.
@@ -3045,6 +3152,10 @@ fn project(
                     None => projs.push(Proj::Expr { name, expr }),
                 }
             }
+            // Assignment SELECTs are rewritten to Expr items before projection.
+            SelectItem::Assign { .. } => {
+                unreachable!("assignment SELECT handled before projection")
+            }
         }
     }
 
@@ -3132,8 +3243,11 @@ fn collect_locked_tables<'a>(select: &'a Select, out: &mut Vec<&'a Name>) {
         collect_from_tables(from, out);
     }
     for item in &select.items {
-        if let SelectItem::Expr { expr, .. } = item {
-            collect_expr_tables(expr, out);
+        match item {
+            SelectItem::Expr { expr, .. } | SelectItem::Assign { value: expr, .. } => {
+                collect_expr_tables(expr, out)
+            }
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {}
         }
     }
     for expr in select.where_clause.iter().chain(select.having.iter()) {
@@ -3166,6 +3280,89 @@ fn collect_from_tables<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
 }
 
 /// Collects base tables from every subquery embedded in an expression.
+/// True if `expr` references any of the named local variables (`@name`, given
+/// without the leading `@`), descending into subqueries. Used to reject an
+/// assignment SELECT whose value reads a variable it is assigning.
+fn expr_uses_local_var(expr: &Expr, names: &std::collections::HashSet<&str>) -> bool {
+    match &expr.kind {
+        ExprKind::LocalVar(name) => names.contains(name.as_str()),
+        ExprKind::Subquery(select) | ExprKind::Exists(select) => {
+            select_uses_local_var(select, names)
+        }
+        ExprKind::InSubquery { expr, subquery, .. } => {
+            expr_uses_local_var(expr, names) || select_uses_local_var(subquery, names)
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::Cast { expr, .. } => expr_uses_local_var(expr, names),
+        ExprKind::Binary { left, right, .. } => {
+            expr_uses_local_var(left, names) || expr_uses_local_var(right, names)
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            expr_uses_local_var(expr, names) || expr_uses_local_var(pattern, names)
+        }
+        ExprKind::InList { expr, list, .. } => {
+            expr_uses_local_var(expr, names) || list.iter().any(|e| expr_uses_local_var(e, names))
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            expr_uses_local_var(expr, names)
+                || expr_uses_local_var(low, names)
+                || expr_uses_local_var(high, names)
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            operand
+                .as_ref()
+                .is_some_and(|o| expr_uses_local_var(o, names))
+                || branches
+                    .iter()
+                    .any(|(w, t)| expr_uses_local_var(w, names) || expr_uses_local_var(t, names))
+                || else_result
+                    .as_ref()
+                    .is_some_and(|e| expr_uses_local_var(e, names))
+        }
+        ExprKind::Function { args, .. } => args.iter().any(|a| expr_uses_local_var(a, names)),
+        ExprKind::Aggregate { arg, .. } => {
+            arg.as_ref().is_some_and(|a| expr_uses_local_var(a, names))
+        }
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
+        | ExprKind::Column(_)
+        | ExprKind::GlobalVar(_) => false,
+    }
+}
+
+/// True if any expression in `select` references one of the named local
+/// variables (descends the SELECT list, WHERE/HAVING, GROUP BY, and ORDER BY).
+fn select_uses_local_var(select: &Select, names: &std::collections::HashSet<&str>) -> bool {
+    let item_uses = select.items.iter().any(|item| match item {
+        SelectItem::Expr { expr, .. } | SelectItem::Assign { value: expr, .. } => {
+            expr_uses_local_var(expr, names)
+        }
+        SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => false,
+    });
+    item_uses
+        || select
+            .where_clause
+            .iter()
+            .chain(select.having.iter())
+            .chain(select.group_by.iter())
+            .any(|e| expr_uses_local_var(e, names))
+        || select
+            .order_by
+            .iter()
+            .any(|o| expr_uses_local_var(&o.expr, names))
+}
+
 fn collect_expr_tables<'a>(expr: &'a Expr, out: &mut Vec<&'a Name>) {
     match &expr.kind {
         ExprKind::Subquery(select) | ExprKind::Exists(select) => collect_locked_tables(select, out),
