@@ -123,8 +123,11 @@ where
     write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
 
     // Each connection gets an engine-side session; it is closed (rolling back
-    // any open transaction) whenever the connection ends, cleanly or not.
-    let session = engine.open_session().await;
+    // any open transaction) whenever the connection ends, cleanly or not. The
+    // database and login are recorded for session intrinsics (DB_NAME() etc.).
+    let session = engine
+        .open_session(database.clone(), login.username.clone())
+        .await;
     let result = request_loop(&mut stream, &engine, session, packet_size).await;
     engine.close_session(session);
     result

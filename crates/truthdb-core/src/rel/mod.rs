@@ -47,6 +47,11 @@ pub struct TxnContext {
     /// Declared batch variables (name without `@`, lowercased) to their type
     /// and current value. Cleared at the start of each batch.
     variables: std::collections::HashMap<String, (ColumnType, SqlValue)>,
+    /// Connection identity for session intrinsics (`DB_NAME()`,
+    /// `SUSER_SNAME()`, `@@SPID`), set once when the session opens.
+    database: String,
+    login: String,
+    spid: i32,
 }
 
 /// Session isolation level (defaults to READ COMMITTED, like SQL Server).
@@ -72,7 +77,18 @@ impl TxnContext {
                 .iter()
                 .map(|(name, (_, value))| (name.clone(), value.clone()))
                 .collect(),
+            database: self.database.clone(),
+            login: self.login.clone(),
+            spid: self.spid,
         }
+    }
+
+    /// Records the connection identity used by session intrinsics. Called once
+    /// when the session opens.
+    pub fn set_session_identity(&mut self, database: String, login: String, spid: i32) {
+        self.database = database;
+        self.login = login;
+        self.spid = spid;
     }
 
     /// Clears batch-scoped variables (called at the start of each batch).

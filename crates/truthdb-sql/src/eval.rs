@@ -48,6 +48,12 @@ pub struct EvalContext {
     /// value. Present but NULL for a declared-but-unset variable; absent means
     /// undeclared.
     pub variables: std::collections::HashMap<String, SqlValue>,
+    /// The connection's current database name — `DB_NAME()`.
+    pub database: String,
+    /// The authenticated login name — `SUSER_SNAME()`.
+    pub login: String,
+    /// The session process id — `@@SPID`.
+    pub spid: i32,
 }
 
 /// Evaluates `expr` against `row`, resolving columns via `resolver`.
@@ -172,7 +178,7 @@ fn eval_column(
 fn eval_global_var(name: &str, ctx: &EvalContext) -> SqlResult<SqlValue> {
     match name {
         "trancount" => Ok(SqlValue::Int(ctx.trancount as i64)),
-        "spid" => Ok(SqlValue::Int(0)),
+        "spid" => Ok(SqlValue::Int(ctx.spid as i64)),
         // Lead with TruthDB's own identity, then a SQL-Server-shaped version
         // token so tooling that scrapes @@VERSION for a version number keeps
         // working.
@@ -347,11 +353,30 @@ fn eval_call<R: ColumnResolver>(
     ctx: &EvalContext,
     depth: usize,
 ) -> SqlResult<SqlValue> {
+    // Session-context functions read the EvalContext, which the pure
+    // functions::eval_function does not receive.
+    if let Some(value) = eval_session_function(name, args) {
+        return Ok(value(ctx));
+    }
     let mut values = Vec::with_capacity(args.len());
     for arg in args {
         values.push(eval_at(arg, row, resolver, ctx, depth + 1)?);
     }
     functions::eval_function(name, values)
+}
+
+/// Session-identity intrinsics that resolve against the [`EvalContext`] rather
+/// than their arguments. Returns a closure so the (cheap) context read happens
+/// only when the name matches. With a single database, `DB_NAME()` and
+/// `DB_NAME(id)` both report the current database.
+fn eval_session_function(name: &str, args: &[Expr]) -> Option<fn(&EvalContext) -> SqlValue> {
+    match name.to_ascii_uppercase().as_str() {
+        "DB_NAME" if args.len() <= 1 => Some(|ctx| SqlValue::Str(ctx.database.clone())),
+        "SUSER_SNAME" | "SUSER_NAME" if args.is_empty() => {
+            Some(|ctx| SqlValue::Str(ctx.login.clone()))
+        }
+        _ => None,
+    }
 }
 
 /// CAST/CONVERT: converts a value to a target [`DataType`], producing a value
@@ -764,6 +789,32 @@ mod tests {
     #[test]
     fn null_arithmetic_is_null() {
         assert_eq!(eval_predicate("1 + NULL", &[], &[]), SqlValue::Null);
+    }
+
+    #[test]
+    fn session_identity_intrinsics() {
+        let ctx = EvalContext {
+            database: "truthdb".to_string(),
+            login: "sa".to_string(),
+            spid: 53,
+            ..EvalContext::default()
+        };
+        let eval_ctx = |sql: &str| {
+            let statements = Parser::parse_str(&format!("SELECT {sql}")).expect("parse");
+            let crate::ast::Statement::Select(select) = &statements[0] else {
+                panic!("expected select")
+            };
+            let crate::ast::SelectItem::Expr { expr, .. } = &select.items[0] else {
+                panic!("expected expr")
+            };
+            let no_columns: Vec<String> = Vec::new();
+            eval(expr, &[], &no_columns, &ctx).expect("eval")
+        };
+        assert_eq!(eval_ctx("DB_NAME()"), SqlValue::Str("truthdb".to_string()));
+        assert_eq!(eval_ctx("DB_NAME(1)"), SqlValue::Str("truthdb".to_string()));
+        assert_eq!(eval_ctx("SUSER_SNAME()"), SqlValue::Str("sa".to_string()));
+        assert_eq!(eval_ctx("SUSER_NAME()"), SqlValue::Str("sa".to_string()));
+        assert_eq!(eval_ctx("@@SPID"), SqlValue::Int(53));
     }
 
     #[test]

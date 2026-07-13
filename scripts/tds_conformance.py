@@ -153,6 +153,13 @@ def main() -> int:
         print("FAIL: rolled-back transaction row was not discarded")
         return 1
 
+    # Session-identity intrinsics reflect the connection's database and login.
+    cur.execute("SELECT DB_NAME(), SUSER_SNAME(), @@SPID")
+    db, login, spid = cur.fetchone()
+    if db != "truthdb" or login != "sa" or not (isinstance(spid, int) and spid > 0):
+        print(f"FAIL: session intrinsics: db={db!r} login={login!r} spid={spid!r}")
+        return 1
+
     conn.close()
     print("tds conformance: OK")
     return 0
