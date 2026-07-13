@@ -220,17 +220,17 @@ pub fn analyze_locks(
                 if !reads_lock {
                     continue;
                 }
-                if let Some(from) = &select.from {
-                    let mut tables = Vec::new();
-                    collect_table_names(from, &mut tables);
-                    for name in tables {
-                        if name.value.to_ascii_lowercase().starts_with("sys.") {
-                            continue; // catalog view: unlocked
-                        }
-                        if let Some(def) = resolve_table(storage, &name.value) {
-                            add(Resource::Database, LockMode::IntentShared);
-                            add(Resource::Table(def.object_id), LockMode::Shared);
-                        }
+                // Lock every base table the query reads — the FROM clause AND
+                // any subqueries in its expressions (WHERE/SELECT/HAVING/...).
+                let mut tables = Vec::new();
+                collect_locked_tables(select, &mut tables);
+                for name in tables {
+                    if name.value.to_ascii_lowercase().starts_with("sys.") {
+                        continue; // catalog view: unlocked
+                    }
+                    if let Some(def) = resolve_table(storage, &name.value) {
+                        add(Resource::Database, LockMode::IntentShared);
+                        add(Resource::Table(def.object_id), LockMode::Shared);
                     }
                 }
             }
@@ -244,15 +244,13 @@ pub fn analyze_locks(
                         add(Resource::Table(oid), LockMode::Shared);
                     }
                 }
-                // INSERT ... SELECT also reads its source tables; lock them
-                // like a SELECT so it cannot read another txn's uncommitted
-                // rows (they combine to SIX on the target if it is a source).
-                if reads_lock
-                    && let InsertSource::Select(select) = &insert.source
-                    && let Some(from) = &select.from
-                {
+                // INSERT ... SELECT also reads its source tables (and any
+                // subqueries in the SELECT); lock them like a SELECT so it
+                // cannot read another txn's uncommitted rows (they combine to
+                // SIX on the target if it is a source).
+                if reads_lock && let InsertSource::Select(select) = &insert.source {
                     let mut tables = Vec::new();
-                    collect_table_names(from, &mut tables);
+                    collect_locked_tables(select, &mut tables);
                     for name in tables {
                         if name.value.to_ascii_lowercase().starts_with("sys.") {
                             continue;
@@ -1035,7 +1033,17 @@ fn validate_check_columns(expr: &Expr, columns: &[Column]) -> Result<(), SqlErro
         | ExprKind::Number(_)
         | ExprKind::Str(_)
         | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
         | ExprKind::GlobalVar(_) => Ok(()),
+        // Subqueries are not allowed in a CHECK constraint (SQL Server 1046).
+        ExprKind::Subquery(_) | ExprKind::Exists(_) | ExprKind::InSubquery { .. } => {
+            Err(SqlError::new(
+                1046,
+                15,
+                1,
+                "Subqueries are not allowed in this context. Only scalar expressions are allowed.",
+            ))
+        }
     }
 }
 
@@ -2136,11 +2144,267 @@ fn row_values(row: &[Datum], types: &[ColumnType]) -> Vec<SqlValue> {
         .collect()
 }
 
+// ---- subquery resolution ------------------------------------------------
+
+/// Returns a copy of a SELECT with every subquery in its expressions
+/// (WHERE/HAVING/SELECT list/GROUP BY/ORDER BY) evaluated and replaced by a
+/// precomputed literal. Subqueries in a FROM-clause join `ON` are not rewritten
+/// here (they are rare and error at evaluation). Only uncorrelated subqueries
+/// are supported; a correlated one references an outer column and fails to
+/// resolve when executed independently.
+fn rewrite_select_subqueries(
+    storage: &mut Storage,
+    select: &Select,
+    eval_ctx: &EvalContext,
+) -> Result<Select, SqlError> {
+    let items = select
+        .items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Expr { expr, alias } => Ok(SelectItem::Expr {
+                expr: rewrite_subqueries(storage, expr, eval_ctx)?,
+                alias: alias.clone(),
+            }),
+            other => Ok(other.clone()),
+        })
+        .collect::<Result<Vec<_>, SqlError>>()?;
+    let rewrite_opt = |storage: &mut Storage, e: &Option<Expr>| -> Result<Option<Expr>, SqlError> {
+        e.as_ref()
+            .map(|e| rewrite_subqueries(storage, e, eval_ctx))
+            .transpose()
+    };
+    let where_clause = rewrite_opt(storage, &select.where_clause)?;
+    let having = rewrite_opt(storage, &select.having)?;
+    let group_by = select
+        .group_by
+        .iter()
+        .map(|e| rewrite_subqueries(storage, e, eval_ctx))
+        .collect::<Result<Vec<_>, SqlError>>()?;
+    let order_by = select
+        .order_by
+        .iter()
+        .map(|o| {
+            Ok(OrderItem {
+                expr: rewrite_subqueries(storage, &o.expr, eval_ctx)?,
+                descending: o.descending,
+            })
+        })
+        .collect::<Result<Vec<_>, SqlError>>()?;
+    Ok(Select {
+        top: select.top,
+        distinct: select.distinct,
+        items,
+        from: select.from.clone(),
+        where_clause,
+        group_by,
+        having,
+        order_by,
+        span: select.span,
+    })
+}
+
+/// Recursively replaces each subquery node in an expression with its evaluated
+/// result: a scalar `(SELECT ...)` -> a literal, `EXISTS (...)` -> a boolean,
+/// `expr IN (SELECT ...)` -> an `InList` of the subquery's values.
+fn rewrite_subqueries(
+    storage: &mut Storage,
+    expr: &Expr,
+    eval_ctx: &EvalContext,
+) -> Result<Expr, SqlError> {
+    let recur = |storage: &mut Storage, e: &Expr| rewrite_subqueries(storage, e, eval_ctx);
+    let recur_box = |storage: &mut Storage, e: &Expr| -> Result<Box<Expr>, SqlError> {
+        Ok(Box::new(recur(storage, e)?))
+    };
+    let recur_opt =
+        |storage: &mut Storage, e: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, SqlError> {
+            e.as_ref().map(|e| recur_box(storage, e)).transpose()
+        };
+    let kind = match &expr.kind {
+        ExprKind::Subquery(select) => {
+            ExprKind::Literal(eval_scalar_subquery(storage, select, eval_ctx)?)
+        }
+        ExprKind::Exists(select) => {
+            let rowset = exec_select(storage, select, eval_ctx)?;
+            ExprKind::Bool(!rowset.rows.is_empty())
+        }
+        ExprKind::InSubquery {
+            expr: lhs,
+            subquery,
+            negated,
+        } => {
+            let lhs = recur_box(storage, lhs)?;
+            let list = eval_in_subquery(storage, subquery, eval_ctx)?
+                .into_iter()
+                .map(|v| Expr {
+                    kind: ExprKind::Literal(v),
+                    span: expr.span,
+                })
+                .collect();
+            ExprKind::InList {
+                expr: lhs,
+                list,
+                negated: *negated,
+            }
+        }
+        ExprKind::Unary { op, expr: e } => ExprKind::Unary {
+            op: *op,
+            expr: recur_box(storage, e)?,
+        },
+        ExprKind::Binary { op, left, right } => ExprKind::Binary {
+            op: *op,
+            left: recur_box(storage, left)?,
+            right: recur_box(storage, right)?,
+        },
+        ExprKind::IsNull { expr: e, negated } => ExprKind::IsNull {
+            expr: recur_box(storage, e)?,
+            negated: *negated,
+        },
+        ExprKind::Like {
+            expr: e,
+            pattern,
+            escape,
+            negated,
+        } => ExprKind::Like {
+            expr: recur_box(storage, e)?,
+            pattern: recur_box(storage, pattern)?,
+            escape: *escape,
+            negated: *negated,
+        },
+        ExprKind::InList {
+            expr: e,
+            list,
+            negated,
+        } => ExprKind::InList {
+            expr: recur_box(storage, e)?,
+            list: list
+                .iter()
+                .map(|x| recur(storage, x))
+                .collect::<Result<_, _>>()?,
+            negated: *negated,
+        },
+        ExprKind::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => ExprKind::Between {
+            expr: recur_box(storage, e)?,
+            low: recur_box(storage, low)?,
+            high: recur_box(storage, high)?,
+            negated: *negated,
+        },
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => ExprKind::Case {
+            operand: recur_opt(storage, operand)?,
+            branches: branches
+                .iter()
+                .map(|(w, r)| Ok((recur(storage, w)?, recur(storage, r)?)))
+                .collect::<Result<_, SqlError>>()?,
+            else_result: recur_opt(storage, else_result)?,
+        },
+        ExprKind::Cast { expr: e, target } => ExprKind::Cast {
+            expr: recur_box(storage, e)?,
+            target: target.clone(),
+        },
+        ExprKind::Function { name, args } => ExprKind::Function {
+            name: name.clone(),
+            args: args
+                .iter()
+                .map(|a| recur(storage, a))
+                .collect::<Result<_, _>>()?,
+        },
+        ExprKind::Aggregate {
+            func,
+            distinct,
+            arg,
+        } => ExprKind::Aggregate {
+            func: *func,
+            distinct: *distinct,
+            arg: recur_opt(storage, arg)?,
+        },
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
+        | ExprKind::Column(_)
+        | ExprKind::GlobalVar(_) => expr.kind.clone(),
+    };
+    Ok(Expr {
+        kind,
+        span: expr.span,
+    })
+}
+
+/// Evaluates a scalar subquery to a single value: NULL for 0 rows, the value
+/// for 1 row, error 512 for more than 1 row; error 116 if it is not exactly one
+/// column wide.
+fn eval_scalar_subquery(
+    storage: &mut Storage,
+    select: &Select,
+    eval_ctx: &EvalContext,
+) -> Result<SqlValue, SqlError> {
+    let rowset = exec_select(storage, select, eval_ctx)?;
+    if rowset.columns.len() != 1 {
+        return Err(scalar_subquery_shape_err());
+    }
+    match rowset.rows.len() {
+        0 => Ok(SqlValue::Null),
+        1 => Ok(value::datum_to_sql(
+            &rowset.rows[0][0],
+            &rowset.columns[0].column_type,
+        )),
+        _ => Err(SqlError::new(
+            512,
+            16,
+            1,
+            "Subquery returned more than 1 value. This is not permitted when the subquery follows =, !=, <, <=, >, >= or when the subquery is used as an expression.",
+        )),
+    }
+}
+
+/// Evaluates an `IN (SELECT ...)` subquery to its list of values (one column,
+/// else error 116).
+fn eval_in_subquery(
+    storage: &mut Storage,
+    select: &Select,
+    eval_ctx: &EvalContext,
+) -> Result<Vec<SqlValue>, SqlError> {
+    let rowset = exec_select(storage, select, eval_ctx)?;
+    if rowset.columns.len() != 1 {
+        return Err(scalar_subquery_shape_err());
+    }
+    let column_type = rowset.columns[0].column_type;
+    Ok(rowset
+        .rows
+        .iter()
+        .map(|r| value::datum_to_sql(&r[0], &column_type))
+        .collect())
+}
+
+fn scalar_subquery_shape_err() -> SqlError {
+    SqlError::new(
+        116,
+        16,
+        1,
+        "Only one expression can be specified in the select list when the subquery is not introduced with EXISTS.",
+    )
+}
+
 fn exec_select(
     storage: &mut Storage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
+    // Resolve each (uncorrelated) subquery once, up front, replacing it with a
+    // literal / boolean / value-list so the rest of execution is subquery-free.
+    let rewritten = rewrite_select_subqueries(storage, select, eval_ctx)?;
+    let select = &rewritten;
+
     let source = build_source(
         storage,
         select.from.as_ref(),
@@ -2488,7 +2752,8 @@ fn bare_column_index(expr: &Expr, scope: &JoinScope) -> Option<usize> {
 }
 
 /// Collects every base-table name referenced in a FROM join tree, recursing
-/// into derived-table subqueries so their tables are locked too.
+/// into derived-table subqueries so their tables are locked too. (Used for the
+/// SHOWPLAN table list; [`collect_locked_tables`] is the lock-set collector.)
 fn collect_table_names<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
     match tref {
         TableRef::Table { name, .. } => out.push(name),
@@ -2501,6 +2766,111 @@ fn collect_table_names<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
                 collect_table_names(from, out);
             }
         }
+    }
+}
+
+/// Collects every base table a SELECT reads for the lock set: its FROM tree
+/// (including derived-table subqueries and join `ON` clauses) plus every
+/// subquery embedded in its expressions (WHERE/SELECT list/HAVING/GROUP BY/
+/// ORDER BY). Recurses through nested subqueries.
+fn collect_locked_tables<'a>(select: &'a Select, out: &mut Vec<&'a Name>) {
+    if let Some(from) = &select.from {
+        collect_from_tables(from, out);
+    }
+    for item in &select.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            collect_expr_tables(expr, out);
+        }
+    }
+    for expr in select.where_clause.iter().chain(select.having.iter()) {
+        collect_expr_tables(expr, out);
+    }
+    for expr in &select.group_by {
+        collect_expr_tables(expr, out);
+    }
+    for item in &select.order_by {
+        collect_expr_tables(&item.expr, out);
+    }
+}
+
+/// Collects base tables from a FROM tree, recursing into derived subqueries and
+/// join `ON` predicates (which may contain their own subqueries).
+fn collect_from_tables<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
+    match tref {
+        TableRef::Table { name, .. } => out.push(name),
+        TableRef::Join {
+            left, right, on, ..
+        } => {
+            collect_from_tables(left, out);
+            collect_from_tables(right, out);
+            if let Some(on) = on {
+                collect_expr_tables(on, out);
+            }
+        }
+        TableRef::Derived { subquery, .. } => collect_locked_tables(subquery, out),
+    }
+}
+
+/// Collects base tables from every subquery embedded in an expression.
+fn collect_expr_tables<'a>(expr: &'a Expr, out: &mut Vec<&'a Name>) {
+    match &expr.kind {
+        ExprKind::Subquery(select) | ExprKind::Exists(select) => collect_locked_tables(select, out),
+        ExprKind::InSubquery { expr, subquery, .. } => {
+            collect_expr_tables(expr, out);
+            collect_locked_tables(subquery, out);
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::Cast { expr, .. } => collect_expr_tables(expr, out),
+        ExprKind::Binary { left, right, .. } => {
+            collect_expr_tables(left, out);
+            collect_expr_tables(right, out);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_expr_tables(expr, out);
+            collect_expr_tables(pattern, out);
+        }
+        ExprKind::InList { expr, list, .. } => {
+            collect_expr_tables(expr, out);
+            list.iter().for_each(|e| collect_expr_tables(e, out));
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_tables(expr, out);
+            collect_expr_tables(low, out);
+            collect_expr_tables(high, out);
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_expr_tables(o, out);
+            }
+            for (when, then) in branches {
+                collect_expr_tables(when, out);
+                collect_expr_tables(then, out);
+            }
+            if let Some(e) = else_result {
+                collect_expr_tables(e, out);
+            }
+        }
+        ExprKind::Function { args, .. } => args.iter().for_each(|a| collect_expr_tables(a, out)),
+        ExprKind::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                collect_expr_tables(a, out);
+            }
+        }
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
+        | ExprKind::Column(_)
+        | ExprKind::GlobalVar(_) => {}
     }
 }
 

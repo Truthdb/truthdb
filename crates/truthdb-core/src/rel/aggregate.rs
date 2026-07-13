@@ -319,7 +319,13 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggs: &mut Vec<AggSpec>) -> Result<Ex
         | ExprKind::Number(_)
         | ExprKind::Str(_)
         | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
         | ExprKind::GlobalVar(_) => expr.kind.clone(),
+        // Subqueries are rewritten to literals before aggregation runs; clone
+        // defensively (evaluation would reject any that slipped through).
+        ExprKind::Subquery(_) | ExprKind::Exists(_) | ExprKind::InSubquery { .. } => {
+            expr.kind.clone()
+        }
         ExprKind::Unary { op, expr: inner } => ExprKind::Unary {
             op: *op,
             expr: Box::new(rewrite(inner, group_by, aggs)?),
