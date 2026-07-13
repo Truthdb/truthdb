@@ -111,7 +111,7 @@ impl Parser {
             Some("INSERT") => self.parse_insert(),
             Some("UPDATE") => self.parse_update(),
             Some("DELETE") => self.parse_delete(),
-            Some("SELECT") => Ok(Statement::Select(self.parse_select()?)),
+            Some("SELECT") | Some("WITH") => Ok(Statement::Select(self.parse_select()?)),
             Some("BEGIN") => self.parse_begin(),
             Some("COMMIT") => self.parse_commit(),
             Some("ROLLBACK") => self.parse_rollback(),
@@ -922,7 +922,60 @@ impl Parser {
 
     // ---- SELECT ---------------------------------------------------------
 
+    /// `WITH name AS (SELECT ...), ... ` — a common-table-expression prefix.
+    fn parse_ctes(&mut self) -> SqlResult<Vec<Cte>> {
+        // Bound WITH-in-WITH nesting like other recursive parse paths.
+        self.depth += 1;
+        if self.depth > MAX_EXPR_DEPTH {
+            return Err(Self::too_deep());
+        }
+        self.expect_keyword("WITH")?;
+        let mut ctes: Vec<Cte> = Vec::new();
+        loop {
+            let name = self.parse_name()?;
+            if self.check(&TokenKind::LParen) {
+                return Err(SqlError::message_only(
+                    102,
+                    "A column list on a common table expression is not supported yet.",
+                ));
+            }
+            if ctes
+                .iter()
+                .any(|c| c.name.value.eq_ignore_ascii_case(&name.value))
+            {
+                return Err(SqlError::new(
+                    460,
+                    15,
+                    1,
+                    format!(
+                        "Duplicate common table expression name '{}' was specified.",
+                        name.value
+                    ),
+                )
+                .at(name.span));
+            }
+            self.expect_keyword("AS")?;
+            self.expect(&TokenKind::LParen)?;
+            let query = self.parse_select()?;
+            self.expect(&TokenKind::RParen)?;
+            ctes.push(Cte {
+                name,
+                query: Box::new(query),
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.depth -= 1;
+        Ok(ctes)
+    }
+
     fn parse_select(&mut self) -> SqlResult<Select> {
+        let ctes = if self.peek_keyword().as_deref() == Some("WITH") {
+            self.parse_ctes()?
+        } else {
+            Vec::new()
+        };
         let start = self.expect_keyword("SELECT")?;
         // Optional set quantifier: `SELECT [ALL | DISTINCT]`.
         let distinct = match self.peek_keyword().as_deref() {
@@ -1024,6 +1077,7 @@ impl Parser {
         }
 
         Ok(Select {
+            ctes,
             top,
             distinct,
             items,

@@ -1,6 +1,7 @@
 [
     Select(
         Select {
+            ctes: [],
             top: None,
             distinct: false,
             items: [
@@ -46,6 +47,7 @@
             from: Some(
                 Derived {
                     subquery: Select {
+                        ctes: [],
                         top: None,
                         distinct: false,
                         items: [
@@ -249,6 +251,7 @@
     ),
     Select(
         Select {
+            ctes: [],
             top: None,
             distinct: false,
             items: [
@@ -315,6 +318,7 @@
                     },
                     right: Derived {
                         subquery: Select {
+                            ctes: [],
                             top: None,
                             distinct: false,
                             items: [

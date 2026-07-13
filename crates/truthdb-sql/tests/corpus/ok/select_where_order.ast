@@ -1,6 +1,7 @@
 [
     Select(
         Select {
+            ctes: [],
             top: Some(
                 5,
             ),
