@@ -2158,6 +2158,31 @@ mod tests {
     }
 
     #[test]
+    fn assignment_select_locks_base_table_behind_a_cte_value() {
+        // A CTE referenced only inside an assignment SELECT's value subquery
+        // must still lock the real base table, or the read could dirty-read a
+        // concurrent uncommitted write under READ COMMITTED.
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("assign-cte-locks");
+        let mut engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE secret (x INT NOT NULL PRIMARY KEY)")
+            .expect("secret");
+        let secret = table_object_id(&mut engine, "secret");
+
+        let locks = engine.analyze_locks(
+            "DECLARE @v INT; WITH c AS (SELECT x FROM secret) SELECT @v = (SELECT MAX(x) FROM c)",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            locks.contains(&(Resource::Table(secret), LockMode::Shared)),
+            "base table behind the CTE-in-value must be Shared-locked: {locks:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn foreign_key_insert_locks_parent_shared() {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;

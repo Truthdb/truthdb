@@ -1077,6 +1077,13 @@ impl Parser {
                 self.expect(&TokenKind::Dot)?;
                 self.expect(&TokenKind::Star)?;
                 items.push(SelectItem::QualifiedWildcard(name));
+            } else if let Some(target) = self.assignment_target() {
+                // `@var = expr` — an assignment SELECT (not the `@var = expr`
+                // comparison a WHERE clause would parse).
+                self.bump(); // @var
+                self.bump(); // =
+                let value = self.parse_expr()?;
+                items.push(SelectItem::Assign { target, value });
             } else {
                 let expr = self.parse_expr()?;
                 let alias = self.parse_optional_alias()?;
@@ -1085,6 +1092,18 @@ impl Parser {
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
+        }
+
+        // A SELECT cannot mix variable assignments with result columns (141).
+        let assigns = items
+            .iter()
+            .filter(|i| matches!(i, SelectItem::Assign { .. }))
+            .count();
+        if assigns != 0 && assigns != items.len() {
+            return Err(SqlError::message_only(
+                141,
+                "A SELECT statement that assigns a value to a variable must not be combined with data-retrieval operations.",
+            ));
         }
 
         let from = if self.peek_keyword().as_deref() == Some("FROM") {
@@ -1176,6 +1195,19 @@ impl Parser {
             return Ok(Some(self.parse_name()?));
         }
         Ok(None)
+    }
+
+    /// If the next two tokens are `@var =`, returns the variable name (the
+    /// start of an assignment SELECT item). Peeks only — does not consume.
+    fn assignment_target(&self) -> Option<String> {
+        let name = match self.tokens.get(self.pos).map(|t| &t.kind) {
+            Some(TokenKind::LocalVar(name)) => name.clone(),
+            _ => return None,
+        };
+        match self.tokens.get(self.pos + 1).map(|t| &t.kind) {
+            Some(TokenKind::Eq) => Some(name),
+            _ => None,
+        }
     }
 
     /// True if the next three tokens are `<word> . *` (a qualified wildcard).
@@ -2117,6 +2149,34 @@ mod tests {
         assert!(Parser::parse_str(&sql).is_ok());
         let chain = format!("SELECT 1{}", " + 1".repeat(100));
         assert!(Parser::parse_str(&chain).is_ok());
+    }
+
+    #[test]
+    fn assignment_select_parses_as_assign_item() {
+        // `SELECT @v = expr` is an assignment item, not a boolean comparison.
+        let stmts = Parser::parse_str("SELECT @v = 1 + 2").expect("parse");
+        let Statement::Select(select) = &stmts[0] else {
+            panic!("expected select")
+        };
+        assert!(
+            matches!(&select.items[0], SelectItem::Assign { target, .. } if target == "v"),
+            "expected an assignment item: {:?}",
+            select.items[0]
+        );
+
+        // `@v = x` inside a WHERE stays a comparison (only the item list assigns).
+        let stmts = Parser::parse_str("SELECT 1 WHERE @v = 5").expect("parse");
+        let Statement::Select(select) = &stmts[0] else {
+            panic!("expected select")
+        };
+        assert!(matches!(&select.items[0], SelectItem::Expr { .. }));
+        assert!(select.where_clause.is_some());
+
+        // Mixing an assignment with a result column is a syntax-level error 141.
+        assert_eq!(
+            Parser::parse_str("SELECT @v = 1, 2").unwrap_err().number,
+            141,
+        );
     }
 
     #[test]
