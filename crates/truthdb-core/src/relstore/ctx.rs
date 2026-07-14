@@ -74,6 +74,25 @@ pub(crate) struct TxnLink {
     pub undo_log: Vec<(u64, PageOpUndo)>,
 }
 
+/// A marker in a live transaction's log to which a later partial rollback can
+/// return, undoing only the work done since (statement-level atomicity). Captures
+/// the undo-log length and the WAL chain tail at capture time.
+#[derive(Clone, Copy)]
+pub(crate) struct Savepoint {
+    pub undo_len: usize,
+    pub last_lsn: u64,
+}
+
+impl TxnLink {
+    /// Captures a savepoint at the current point in this transaction.
+    pub fn savepoint(&self) -> Savepoint {
+        Savepoint {
+            undo_len: self.undo_log.len(),
+            last_lsn: self.last_lsn,
+        }
+    }
+}
+
 /// How an access-method operation logs its user-visible page op: as a
 /// forward transaction record (with undo) or as a compensation record
 /// during rollback/recovery-undo. Structural changes (splits, new pages)

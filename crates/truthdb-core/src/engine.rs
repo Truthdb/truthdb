@@ -3787,21 +3787,86 @@ mod tests {
     }
 
     #[test]
-    fn txn_error_dooms_transaction_until_rollback() {
-        let path = unique_temp_path("txn-doomed");
+    fn txn_statement_error_rolls_back_statement_not_transaction() {
+        // SQL Server default (XACT_ABORT OFF): a non-fatal statement error rolls
+        // back only that statement; the transaction stays open and the batch
+        // continues past it.
+        let path = unique_temp_path("txn-stmt-atomic");
         let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
-
         batch(
             &engine,
             &mut ctx,
             "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
         );
-        // A duplicate-PK failure inside the transaction dooms it.
+        // The middle INSERT is a duplicate PK (2627, severity 14): it rolls back
+        // only itself; the surrounding inserts still apply and COMMIT persists them.
         let out = batch(
             &engine,
             &mut ctx,
-            "BEGIN TRAN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (1);",
+            "BEGIN TRAN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT",
+        );
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(2627),
+            "the duplicate is reported"
+        );
+        assert!(
+            !ctx.has_open_transaction(),
+            "COMMIT ran — the transaction was not doomed"
+        );
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t");
+        assert_eq!(
+            ids(&out),
+            vec![1, 2],
+            "the dup rolled back; 1 and 2 committed"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn txn_partial_multirow_insert_is_atomic() {
+        // A multi-row INSERT that fails partway undoes ALL its rows (statement
+        // atomicity), leaving no partial write in the surviving transaction.
+        let path = unique_temp_path("txn-multirow-atomic");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (5)");
+        batch(&engine, &mut ctx, "BEGIN TRAN");
+        // (6) inserts, then (5) is a duplicate — the whole statement rolls back.
+        let out = batch(&engine, &mut ctx, "INSERT INTO t VALUES (6), (5)");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(2627));
+        batch(&engine, &mut ctx, "COMMIT");
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t");
+        assert_eq!(
+            ids(&out),
+            vec![5],
+            "the partial (6) was undone with the statement"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn txn_error_dooms_transaction_when_xact_abort_on() {
+        // SET XACT_ABORT ON: a statement error dooms the whole transaction — only
+        // ROLLBACK is then accepted (error 3930).
+        let path = unique_temp_path("txn-doomed");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "SET XACT_ABORT ON; BEGIN TRAN; INSERT INTO t VALUES (1); INSERT INTO t VALUES (1);",
         );
         assert_eq!(out.error.as_ref().map(|e| e.number), Some(2627));
 
@@ -3919,6 +3984,74 @@ mod tests {
             "SELECT id FROM t ORDER BY id",
         );
         assert_eq!(ids(&out), vec![1]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn txn_statement_rollback_then_crash_recovers_cleanly() {
+        // A statement rolled back to a savepoint writes CLRs; if the transaction
+        // then crashes uncommitted, recovery must undo the surviving ops and SKIP
+        // the already-compensated statement (follow the CLR chain — never
+        // double-undo). This exercises the ARIES correctness of `rollback_to`.
+        let path = unique_temp_path("txn-stmt-rollback-crash");
+        let engine = new_engine(&path);
+        batch(
+            &engine,
+            &mut TxnContext::default(),
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+
+        // Session A: open a transaction, insert 10, hit a duplicate-PK (rolled back
+        // to a savepoint under XACT_ABORT OFF), then insert 11 — all uncommitted.
+        let mut ctx_a = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx_a,
+            "BEGIN TRAN; INSERT INTO t VALUES (10); INSERT INTO t VALUES (10); INSERT INTO t VALUES (11)",
+        );
+        assert!(
+            ctx_a.has_open_transaction(),
+            "the transaction survived the statement error (XACT_ABORT OFF)"
+        );
+
+        // An autocommit insert forces A's WAL records — including the compensation
+        // CLRs from the rolled-back statement — to disk.
+        batch(
+            &engine,
+            &mut TxnContext::default(),
+            "INSERT INTO t VALUES (1)",
+        );
+
+        // Crash before A commits.
+        drop(ctx_a);
+        drop(engine);
+
+        // Recovery undoes A entirely (10 and 11 gone); the compensated duplicate is
+        // skipped via its CLR chain (no double-undo / corruption); row 1 survives.
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let engine = Engine::new(storage).expect("replay");
+        let out = batch(
+            &engine,
+            &mut TxnContext::default(),
+            "SELECT id FROM t ORDER BY id",
+        );
+        assert_eq!(
+            ids(&out),
+            vec![1],
+            "A fully undone; only the committed row survives"
+        );
+        // The table is writable and 10/11 are free again (fully rolled back).
+        batch(
+            &engine,
+            &mut TxnContext::default(),
+            "INSERT INTO t VALUES (10), (11)",
+        );
+        let out = batch(
+            &engine,
+            &mut TxnContext::default(),
+            "SELECT id FROM t ORDER BY id",
+        );
+        assert_eq!(ids(&out), vec![1, 10, 11]);
         let _ = std::fs::remove_file(path);
     }
 

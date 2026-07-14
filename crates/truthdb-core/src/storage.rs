@@ -2027,7 +2027,12 @@ impl StorageFile {
     }
 
     /// Runs one statement under `scope`: autocommit (begin+commit) or appended
-    /// to a caller-held transaction (no commit; partial ops survive an error).
+    /// to a caller-held transaction. In both cases the statement is *atomic* — an
+    /// error undoes its own partial writes. For the explicit transaction, the
+    /// undo is a partial rollback to a savepoint taken before the statement; the
+    /// transaction stays open (the SQL layer decides, per `SET XACT_ABORT`,
+    /// whether to continue or doom it), so a failed statement never leaves partial
+    /// rows behind.
     fn rel_statement_scoped<T>(
         &mut self,
         scope: &mut TxnScope,
@@ -2036,8 +2041,26 @@ impl StorageFile {
         match scope {
             TxnScope::Auto => self.rel_statement(f),
             TxnScope::Explicit(stx) => {
+                let roots = self.rel.tree_roots();
                 let mut ctx = self.rel_ctx();
-                f(&mut ctx, &mut stx.txn)
+                let savepoint = stx.txn.savepoint();
+                let (result, wedged) = match f(&mut ctx, &mut stx.txn) {
+                    Ok(value) => (Ok(value), false),
+                    Err(err) => {
+                        match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &roots) {
+                            Ok(()) => (Err(err), false),
+                            // A half-undone statement the WAL cannot explain:
+                            // wedge the engine (a checkpoint would make it
+                            // permanent), mirroring the autocommit path.
+                            Err(rollback_err) => (Err(rollback_err), true),
+                        }
+                    }
+                };
+                let _ = ctx;
+                if wedged {
+                    self.rel.wedged = true;
+                }
+                result
             }
         }
     }
