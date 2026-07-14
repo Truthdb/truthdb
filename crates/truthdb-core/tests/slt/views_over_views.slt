@@ -1,0 +1,60 @@
+# View-over-view recursive expansion + cycle capping + sys.sql_modules (Stage 11).
+
+statement ok
+CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO t VALUES (1,10),(2,20),(3,30),(4,40)
+
+# A three-level view chain: v3 -> v2 -> v1 -> t.
+statement ok
+CREATE VIEW v1 AS SELECT id, v FROM t WHERE v >= 20
+
+statement ok
+CREATE VIEW v2 AS SELECT id, v FROM v1 WHERE v <= 30
+
+statement ok
+CREATE VIEW v3 AS SELECT id FROM v2
+
+query I
+SELECT id FROM v3 ORDER BY id
+----
+2
+3
+
+# The outer query can still filter and aggregate over the nested view.
+query I
+SELECT COUNT(*) FROM v2 WHERE v = 20
+----
+1
+
+# A view over a view, joined to a base table.
+query II
+SELECT v2.id, t.v FROM v2 JOIN t ON t.id = v2.id ORDER BY v2.id
+----
+2 20
+3 30
+
+# sys.sql_modules exposes each view's definition text.
+query T
+SELECT m.definition FROM sys.sql_modules m JOIN sys.views sv ON sv.object_id = m.object_id
+WHERE sv.name = 'v3'
+----
+SELECT id FROM v2
+
+# A view cycle (self-reference) is capped instead of overflowing the stack.
+statement ok
+CREATE VIEW cyc AS SELECT id FROM cyc
+
+statement error
+SELECT id FROM cyc
+
+# A two-view mutual cycle is likewise capped.
+statement ok
+CREATE VIEW ping AS SELECT id FROM pong
+
+statement ok
+CREATE VIEW pong AS SELECT id FROM ping
+
+statement error
+SELECT id FROM ping
