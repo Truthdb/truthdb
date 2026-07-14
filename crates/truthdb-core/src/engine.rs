@@ -4359,15 +4359,18 @@ mod tests {
     #[test]
     fn sql_ambiguous_column_errors() {
         let (engine, path) = join_setup("join-ambig");
-        // `id` exists in both cust and ord → unresolvable.
+        // `id` exists in both cust and ord → ambiguous (SQL Server 209).
         let err = sql_error_number(
             &engine,
             "SELECT id FROM cust c JOIN ord o ON c.id = o.cust_id",
         );
-        assert!(
-            err == 209 || err == 207,
-            "ambiguous column error, got {err}"
+        assert_eq!(err, 209, "ambiguous column should be 209");
+        // A genuinely missing column is still 207 (invalid), not 209.
+        let missing = sql_error_number(
+            &engine,
+            "SELECT nope FROM cust c JOIN ord o ON c.id = o.cust_id",
         );
+        assert_eq!(missing, 207, "unknown column should be 207");
         let _ = std::fs::remove_file(path);
     }
 
