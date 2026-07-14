@@ -1722,10 +1722,40 @@ fn enforce_child_fks(
     Ok(())
 }
 
+/// A child index whose leading key columns are exactly the FK's child columns,
+/// usable to probe for referencing rows by seeking the removed parent key
+/// instead of scanning the whole child.
+fn fk_probe_index<'a>(
+    child: &'a TableDef,
+    fk: &catalog::ForeignKeyDef,
+) -> Option<&'a catalog::IndexDef> {
+    child.indexes.iter().find(|index| {
+        index.columns.len() >= fk.columns.len()
+            && index
+                .columns
+                .iter()
+                .zip(&fk.columns)
+                .all(|((col, _asc), &fk_col)| *col == fk_col)
+    })
+}
+
+/// The error raised when a surviving child row references a removed parent key.
+fn reference_conflict(verb: &str, fk_name: &str, child_name: &str) -> SqlError {
+    SqlError::new(
+        547,
+        16,
+        0,
+        format!(
+            "The {verb} statement conflicted with the REFERENCE constraint \"{fk_name}\". The conflict occurred in database \"truthdb\", table \"dbo.{child_name}\"."
+        ),
+    )
+}
+
 /// Enforces NO ACTION on the parent side: no surviving child row may reference
 /// any of `removed_keys` (parent primary-key values being deleted or vacated by
-/// an UPDATE). A referencing child is error 547. Referencing children are found
-/// by scanning every table's foreign keys (FK-index optimization deferred).
+/// an UPDATE). A referencing child is error 547. When the child has an index on
+/// the FK columns, each removed key is probed by an index seek; otherwise the
+/// child is scanned.
 fn enforce_parent_fks(
     storage: &Storage,
     parent: &TableDef,
@@ -1752,13 +1782,42 @@ fn enforce_parent_fks(
         if self_ref && !check_self_ref {
             continue;
         }
-        let child_rows = storage
-            .rel_scan(&child.name)
-            .map_err(|e| map_storage_err(e, &child.name))?;
         for fk in &child.foreign_keys {
             if !fk.parent.eq_ignore_ascii_case(&parent.name) {
                 continue;
             }
+            // Fast path: an index on the FK columns lets us seek each removed
+            // parent key instead of scanning the child. Not used for a
+            // self-reference (whose own being-removed rows must be excluded). If
+            // a key fails to encode (unexpected type mismatch), fall back to the
+            // scan rather than risk missing a reference.
+            if !self_ref && let Some(index) = fk_probe_index(child, fk) {
+                let mut handled = true;
+                for key in removed_keys {
+                    match crate::relstore::index::encode_index_prefix(key, &index.columns) {
+                        Ok(lower) => {
+                            let upper = crate::relstore::index::prefix_upper_bound(&lower);
+                            let matches = storage
+                                .rel_index_scan(&child.name, index.object_id, Some(lower), upper)
+                                .map_err(|e| map_storage_err(e, &child.name))?;
+                            if !matches.is_empty() {
+                                return Err(reference_conflict(verb, &fk.name, &child.name));
+                            }
+                        }
+                        Err(_) => {
+                            handled = false;
+                            break;
+                        }
+                    }
+                }
+                if handled {
+                    continue;
+                }
+            }
+            // Fallback: scan the child and compare each row's FK key.
+            let child_rows = storage
+                .rel_scan(&child.name)
+                .map_err(|e| map_storage_err(e, &child.name))?;
             for row in &child_rows {
                 // A self-referencing row that is itself being removed does not
                 // count as a surviving reference.
@@ -1773,15 +1832,7 @@ fn enforce_parent_fks(
                     continue;
                 };
                 if removed_keys.contains(&key) {
-                    return Err(SqlError::new(
-                        547,
-                        16,
-                        0,
-                        format!(
-                            "The {verb} statement conflicted with the REFERENCE constraint \"{}\". The conflict occurred in database \"truthdb\", table \"dbo.{}\".",
-                            fk.name, child.name
-                        ),
-                    ));
+                    return Err(reference_conflict(verb, &fk.name, &child.name));
                 }
             }
         }

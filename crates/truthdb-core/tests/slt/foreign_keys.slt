@@ -59,3 +59,51 @@ SELECT name FROM sys.foreign_keys ORDER BY name
 ----
 FK__child__parent__1
 fk_region
+
+# --- FK parent-side probe uses a child index when present (Stage 10) ---
+# The child has an index on its FK column, so a parent DELETE/UPDATE seeks it
+# rather than scanning the whole child. Results are identical to the scan path.
+statement ok
+CREATE TABLE par (id INT NOT NULL PRIMARY KEY, label NVARCHAR(10))
+
+statement ok
+CREATE TABLE chld (id INT NOT NULL PRIMARY KEY, par_id INT REFERENCES par (id))
+
+statement ok
+CREATE INDEX ix_chld_par ON chld (par_id)
+
+statement ok
+INSERT INTO par VALUES (1, 'a'), (2, 'b'), (3, 'c')
+
+statement ok
+INSERT INTO chld VALUES (100, 1), (101, 1), (102, 2)
+
+# Deleting a referenced parent is blocked (found via the index).
+statement error
+DELETE FROM par WHERE id = 1
+
+# Deleting an unreferenced parent succeeds.
+statement ok
+DELETE FROM par WHERE id = 3
+
+# Changing a referenced parent's key is also blocked.
+statement error
+UPDATE par SET id = 9 WHERE id = 2
+
+# After the referencing children are gone, the parent can be deleted.
+statement ok
+DELETE FROM chld WHERE par_id = 1
+
+statement ok
+DELETE FROM par WHERE id = 1
+
+# A child row with a NULL FK does not reference any parent (index seek skips it):
+# once the real reference to par 2 is gone, only a NULL-FK child remains.
+statement ok
+DELETE FROM chld WHERE par_id = 2
+
+statement ok
+INSERT INTO chld VALUES (200, NULL)
+
+statement ok
+DELETE FROM par WHERE id = 2
