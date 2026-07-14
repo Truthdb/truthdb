@@ -60,6 +60,10 @@ pub struct TxnContext {
     /// surfaced as `SCOPE_IDENTITY()`. Persists across statements until the next
     /// identity INSERT; unaffected by non-identity inserts.
     scope_identity: Option<i64>,
+    /// Named savepoints in the current transaction (`SAVE TRANSACTION <name>`,
+    /// lowercased) → the point to which `ROLLBACK TRANSACTION <name>` returns.
+    /// Cleared when the transaction ends.
+    savepoints: std::collections::HashMap<String, crate::relstore::ctx::Savepoint>,
 }
 
 /// Session isolation level (defaults to READ COMMITTED, like SQL Server).
@@ -764,6 +768,7 @@ pub fn analyze_locks(
             Statement::BeginTransaction { .. }
             | Statement::Commit { .. }
             | Statement::Rollback { .. }
+            | Statement::SaveTransaction { .. }
             | Statement::Set(_)
             | Statement::Declare(_) => {}
         }
@@ -829,7 +834,9 @@ fn exec_statement(
     txn_ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
     // A doomed transaction rejects everything but ROLLBACK.
-    if txn_ctx.doomed && !matches!(statement, Statement::Rollback { .. }) {
+    // A doomed transaction accepts only a full ROLLBACK (no savepoint name); a
+    // partial rollback or a new savepoint on a doomed transaction is rejected.
+    if txn_ctx.doomed && !matches!(statement, Statement::Rollback { name: None, .. }) {
         return Err(SqlError::new(
             3930,
             16,
@@ -840,7 +847,8 @@ fn exec_statement(
     match statement {
         Statement::BeginTransaction { .. } => exec_begin(storage, txn_ctx),
         Statement::Commit { .. } => exec_commit(storage, txn_ctx),
-        Statement::Rollback { .. } => exec_rollback(storage, txn_ctx),
+        Statement::Rollback { name, .. } => exec_rollback(storage, txn_ctx, name.as_ref()),
+        Statement::SaveTransaction { name, .. } => exec_save(storage, txn_ctx, name),
         Statement::Set(set) => exec_set(txn_ctx, set),
         Statement::Declare(decls) => exec_declare(txn_ctx, decls),
         Statement::CreateTable(create) => {
@@ -1010,6 +1018,7 @@ fn exec_commit(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementResul
     if ctx.trancount == 0
         && let Some(txn) = ctx.txn.take()
     {
+        ctx.savepoints.clear();
         storage
             .rel_commit(txn)
             .map_err(|e| map_storage_err(e, ""))?;
@@ -1017,7 +1026,11 @@ fn exec_commit(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementResul
     Ok(StatementResult::Done)
 }
 
-fn exec_rollback(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
+fn exec_rollback(
+    storage: &Storage,
+    ctx: &mut TxnContext,
+    name: Option<&Name>,
+) -> Result<StatementResult, SqlError> {
     if ctx.trancount == 0 {
         return Err(SqlError::new(
             3903,
@@ -1026,10 +1039,39 @@ fn exec_rollback(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementRes
             "The ROLLBACK TRANSACTION request has no corresponding BEGIN TRANSACTION.",
         ));
     }
-    // ROLLBACK always unwinds the whole transaction, regardless of nesting.
-    // Reset the session's transaction counters even if the storage rollback
-    // fails (which wedges the store): the transaction is over either way, so
-    // leaving @@TRANCOUNT / doomed set would desync the session.
+    // ROLLBACK <savepoint>: partial rollback — the transaction stays open and
+    // @@TRANCOUNT is unchanged; only the work done since the savepoint is undone.
+    if let Some(name) = name {
+        let Some(savepoint) = ctx
+            .savepoints
+            .get(&name.value.to_ascii_lowercase())
+            .copied()
+        else {
+            return Err(SqlError::new(
+                3908,
+                16,
+                1,
+                format!(
+                    "Cannot roll back {}. No transaction or savepoint of that name was found.",
+                    name.value
+                ),
+            ));
+        };
+        if let Some(txn) = ctx.txn.as_mut() {
+            storage
+                .rel_rollback_to(txn, savepoint)
+                .map_err(|e| map_storage_err(e, ""))?;
+        }
+        // Savepoints taken after this one are invalidated — their undo-log suffix
+        // was just discarded (the target savepoint itself remains re-usable).
+        ctx.savepoints
+            .retain(|_, sp| sp.undo_len <= savepoint.undo_len);
+        return Ok(StatementResult::Done);
+    }
+    // ROLLBACK (whole transaction), regardless of nesting. Reset the session's
+    // transaction counters even if the storage rollback fails (which wedges the
+    // store): the transaction is over either way, so leaving @@TRANCOUNT /
+    // doomed set would desync the session.
     let result = match ctx.txn.take() {
         Some(txn) => storage
             .rel_rollback(txn)
@@ -1038,7 +1080,25 @@ fn exec_rollback(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementRes
     };
     ctx.trancount = 0;
     ctx.doomed = false;
+    ctx.savepoints.clear();
     result.map(|()| StatementResult::Done)
+}
+
+/// `SAVE TRANSACTION <name>`: record a savepoint the transaction can later roll
+/// back to. Requires an active transaction (in autocommit there is nothing to
+/// save, so it is a no-op). Re-saving an existing name overwrites it, as in
+/// SQL Server.
+fn exec_save(
+    storage: &Storage,
+    ctx: &mut TxnContext,
+    name: &Name,
+) -> Result<StatementResult, SqlError> {
+    if let Some(txn) = ctx.txn.as_ref() {
+        let savepoint = storage.rel_savepoint(txn);
+        ctx.savepoints
+            .insert(name.value.to_ascii_lowercase(), savepoint);
+    }
+    Ok(StatementResult::Done)
 }
 
 fn exec_set(ctx: &mut TxnContext, set: &SetStatement) -> Result<StatementResult, SqlError> {
