@@ -974,6 +974,79 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn point_writers_to_different_rows_run_concurrently() {
+        // The Stage 12 row-lock win: two transactions updating *different* rows
+        // of one table no longer serialize (Table IX + distinct Row X locks).
+        let h = start(Duration::from_secs(30));
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
+        h.handle
+            .run_batch(
+                a,
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT); INSERT INTO t VALUES (1,0),(2,0);".into(),
+            )
+            .await
+            .unwrap();
+
+        // A holds Row X on id = 1 inside an open transaction.
+        h.handle
+            .run_batch(a, "BEGIN TRAN; UPDATE t SET v = 10 WHERE id = 1;".into())
+            .await
+            .unwrap();
+
+        // B updates id = 2 — a different row — and must complete without waiting
+        // for A's commit.
+        let out = tokio::time::timeout(
+            Duration::from_secs(3),
+            h.handle
+                .run_batch(b, "UPDATE t SET v = 20 WHERE id = 2".into()),
+        )
+        .await
+        .expect("a point write to a different row must not block")
+        .unwrap();
+        assert!(error_number(&out).is_none(), "{:?}", out.outcome.error);
+
+        h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn point_writers_to_the_same_row_serialize() {
+        let h = start(Duration::from_secs(30));
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
+        h.handle
+            .run_batch(
+                a,
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT); INSERT INTO t VALUES (1,0);"
+                    .into(),
+            )
+            .await
+            .unwrap();
+        h.handle
+            .run_batch(a, "BEGIN TRAN; UPDATE t SET v = 10 WHERE id = 1;".into())
+            .await
+            .unwrap();
+
+        // B updates the *same* row (id = 1): it must block on A's Row X.
+        let handle_b = h.handle.clone();
+        let write = tokio::spawn(async move {
+            handle_b
+                .run_batch(b, "UPDATE t SET v = 20 WHERE id = 1".into())
+                .await
+                .unwrap()
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        assert!(!write.is_finished(), "same-row writer must block");
+
+        h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
+        let out = tokio::time::timeout(Duration::from_secs(5), write)
+            .await
+            .expect("writer unblocks after commit")
+            .unwrap();
+        assert!(error_number(&out).is_none(), "{:?}", out.outcome.error);
+    }
+
+    #[tokio::test]
     async fn read_uncommitted_sees_uncommitted_rows_without_blocking() {
         let h = start(Duration::from_secs(30));
         let a = h.handle.open_session(String::new(), String::new()).await;

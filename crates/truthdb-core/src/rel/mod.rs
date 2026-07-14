@@ -24,6 +24,8 @@ use truthdb_sql::eval::EvalContext;
 use truthdb_sql::value::{SqlValue, order_key_cmp};
 use truthdb_sql::{ast, eval};
 
+use xxhash_rust::xxh64::xxh64;
+
 use crate::lock::{LockMode, Resource};
 use crate::relstore::catalog::{self, TableDef};
 use crate::relstore::row::{Column, Schema};
@@ -300,6 +302,209 @@ fn fk_child_object_ids(storage: &Storage, parent_name: &str) -> Vec<u32> {
         .collect()
 }
 
+/// True if any table has a foreign key referencing `name` — i.e. `name` is an
+/// FK parent. Such a table keeps table-granular write locks so an FK
+/// existence-read (Table IS on the parent) still serializes against a
+/// concurrent change to the referenced row.
+fn is_fk_parent(storage: &Storage, name: &str) -> bool {
+    !fk_child_object_ids(storage, name).is_empty()
+}
+
+/// Above this many row-lock keys for one statement, `analyze_locks` escalates to
+/// a single table lock (SQL Server-style lock escalation) rather than flooding
+/// the lock table.
+const ROW_LOCK_ESCALATION_THRESHOLD: usize = 1000;
+
+/// A key hash for the [`Resource::Row`] lock, from the row's clustered-key bytes.
+fn row_key_hash(schema: &Schema, key_columns: &[usize], key_values: &[Datum]) -> Option<u64> {
+    let bytes = crate::relstore::key::encode_key(schema, key_columns, key_values).ok()?;
+    Some(xxh64(&bytes, 0))
+}
+
+/// Evaluates a constant literal expression (`5`, `'x'`, `-3`, NULL, …) to a
+/// value. Returns `None` for anything that is not a self-contained literal —
+/// a column reference, variable, function call, or subquery — so the caller
+/// falls back to a coarser (table) lock rather than a wrong row key.
+fn eval_literal_const(expr: &Expr) -> Option<SqlValue> {
+    if !is_literal_const(expr) {
+        return None;
+    }
+    let empty: Vec<String> = Vec::new();
+    eval::eval(expr, &[], &empty, &EvalContext::default()).ok()
+}
+
+/// True if `expr` is a self-contained literal (no columns/vars/functions/
+/// subqueries): a literal, or a unary +/- over one.
+fn is_literal_const(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Null
+        | ExprKind::Literal(_) => true,
+        ExprKind::Unary { expr: inner, .. } => is_literal_const(inner),
+        _ => false,
+    }
+}
+
+/// True if `expr` contains any subquery node (scalar, EXISTS, or IN (SELECT)).
+fn expr_has_subquery(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Subquery(_) | ExprKind::Exists(_) | ExprKind::InSubquery { .. } => true,
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
+        | ExprKind::Column(_)
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_) => false,
+        ExprKind::Unary { expr: e, .. }
+        | ExprKind::IsNull { expr: e, .. }
+        | ExprKind::Cast { expr: e, .. } => expr_has_subquery(e),
+        ExprKind::Binary { left, right, .. } => expr_has_subquery(left) || expr_has_subquery(right),
+        ExprKind::Like {
+            expr: e, pattern, ..
+        } => expr_has_subquery(e) || expr_has_subquery(pattern),
+        ExprKind::InList { expr: e, list, .. } => {
+            expr_has_subquery(e) || list.iter().any(expr_has_subquery)
+        }
+        ExprKind::Between {
+            expr: e, low, high, ..
+        } => expr_has_subquery(e) || expr_has_subquery(low) || expr_has_subquery(high),
+        ExprKind::Function { args, .. } => args.iter().any(expr_has_subquery),
+        ExprKind::Aggregate { arg, .. } => arg.as_deref().is_some_and(expr_has_subquery),
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(expr_has_subquery)
+                || branches
+                    .iter()
+                    .any(|(w, r)| expr_has_subquery(w) || expr_has_subquery(r))
+                || else_result.as_deref().is_some_and(expr_has_subquery)
+        }
+    }
+}
+
+/// The row-lock keys for an INSERT: `Some(hashes)` when the target is a
+/// clustered table and every row supplies all key columns as constant literals
+/// (so two concurrent inserters of *different* keys need not serialize).
+/// `None` — fall back to a table lock — for a heap, an IDENTITY/defaulted key
+/// (value is server-generated, unknown here), `INSERT ... SELECT`, a
+/// non-constant key expression, or more keys than the escalation threshold.
+fn insert_row_key_hashes(def: &TableDef, insert: &Insert) -> Option<Vec<u64>> {
+    if def.key_columns.is_empty() {
+        return None;
+    }
+    let InsertSource::Values(value_rows) = &insert.source else {
+        return None;
+    };
+    let schema = def.schema().ok()?;
+    let ncols = schema.columns.len();
+    let identity_col = def.identity.map(|s| s.column);
+    // Column index for each value position (explicit list, else all non-identity
+    // columns in order — matching `exec_insert`).
+    let target: Vec<usize> = match &insert.columns {
+        Some(names) => names
+            .iter()
+            .map(|n| column_index(&schema, &n.value))
+            .collect::<Option<Vec<_>>>()?,
+        None => (0..ncols).filter(|i| Some(*i) != identity_col).collect(),
+    };
+    let mut hashes = Vec::with_capacity(value_rows.len());
+    for row in value_rows {
+        if row.len() != target.len() {
+            return None; // arity mismatch — executor will error; table-lock it
+        }
+        let mut key_values = vec![Datum::Null; ncols];
+        for &kc in &def.key_columns {
+            if Some(kc) == identity_col {
+                return None; // server-generated key value
+            }
+            let pos = target.iter().position(|&t| t == kc)?; // key not supplied
+            let value = eval_literal_const(&row[pos])?;
+            let column = &schema.columns[kc];
+            key_values[kc] = value::sql_to_datum(&value, &column.column_type, &column.name).ok()?;
+        }
+        hashes.push(row_key_hash(&schema, &def.key_columns, &key_values)?);
+        if hashes.len() > ROW_LOCK_ESCALATION_THRESHOLD {
+            return None;
+        }
+    }
+    Some(hashes)
+}
+
+/// The single row-lock key for a point UPDATE/DELETE: `Some(hash)` when the
+/// WHERE clause is a subquery-free conjunction that pins *every* clustered-key
+/// column to a constant literal. `None` — fall back to a table lock — otherwise
+/// (heap, partial/absent key predicate, range/OR/subquery predicate).
+fn where_point_key_hash(def: &TableDef, where_clause: &Option<Expr>) -> Option<u64> {
+    if def.key_columns.is_empty() {
+        return None;
+    }
+    let where_clause = where_clause.as_ref()?;
+    if expr_has_subquery(where_clause) {
+        return None;
+    }
+    let schema = def.schema().ok()?;
+    let mut conjuncts = Vec::new();
+    flatten_and(where_clause, &mut conjuncts);
+    let mut key_values = vec![Datum::Null; schema.columns.len()];
+    let mut bound: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    for conjunct in conjuncts {
+        let ExprKind::Binary {
+            op: ast::BinaryOp::Eq,
+            left,
+            right,
+        } = &conjunct.kind
+        else {
+            continue;
+        };
+        let (name, value_expr) = match (&left.kind, &right.kind) {
+            (ExprKind::Column(n), _) => (n, right.as_ref()),
+            (_, ExprKind::Column(n)) => (n, left.as_ref()),
+            _ => continue,
+        };
+        let Some(ci) = column_index(&schema, &name.value) else {
+            continue;
+        };
+        if !def.key_columns.contains(&ci) {
+            continue;
+        }
+        let Some(value) = eval_literal_const(value_expr) else {
+            continue;
+        };
+        let column = &schema.columns[ci];
+        if let Ok(datum) = value::sql_to_datum(&value, &column.column_type, &column.name) {
+            key_values[ci] = datum;
+            bound.insert(ci);
+        }
+    }
+    if def.key_columns.iter().any(|kc| !bound.contains(kc)) {
+        return None; // not every key column pinned
+    }
+    row_key_hash(&schema, &def.key_columns, &key_values)
+}
+
+/// The row-lock key for a point UPDATE: as [`where_point_key_hash`], but only
+/// when no assignment targets a key column (a key change moves the row, touching
+/// two keys) and no assignment value contains a subquery (which would read rows
+/// the single row lock does not cover).
+fn update_row_key_hash(def: &TableDef, update: &Update) -> Option<u64> {
+    let schema = def.schema().ok()?;
+    for assignment in &update.assignments {
+        let ci = column_index(&schema, &assignment.column.value)?;
+        if def.key_columns.contains(&ci) || expr_has_subquery(&assignment.value) {
+            return None;
+        }
+    }
+    where_point_key_hash(def, &update.where_clause)
+}
+
 pub fn analyze_locks(
     storage: &Storage,
     sql: &str,
@@ -350,8 +555,29 @@ pub fn analyze_locks(
             }
             Statement::Insert(insert) => {
                 if let Some(def) = resolve_table(storage, &insert.table.value) {
-                    add(Resource::Database, LockMode::IntentExclusive);
-                    add(Resource::Table(def.object_id), LockMode::Exclusive);
+                    // Row X locks on each inserted key (two inserters of
+                    // different keys then run concurrently under Table IX); a
+                    // heap / IDENTITY / non-literal key falls back to Table X.
+                    // A table referenced as an FK parent keeps Table X so an FK
+                    // existence-read (Table IS) still serializes against it.
+                    let hashes = if is_fk_parent(storage, &def.name) {
+                        None
+                    } else {
+                        insert_row_key_hashes(&def, insert)
+                    };
+                    match hashes {
+                        Some(hashes) => {
+                            add(Resource::Database, LockMode::IntentExclusive);
+                            add(Resource::Table(def.object_id), LockMode::IntentExclusive);
+                            for hash in hashes {
+                                add(Resource::Row(def.object_id, hash), LockMode::Exclusive);
+                            }
+                        }
+                        None => {
+                            add(Resource::Database, LockMode::IntentExclusive);
+                            add(Resource::Table(def.object_id), LockMode::Exclusive);
+                        }
+                    }
                     // A child INSERT reads its FK parents (integrity read).
                     for oid in fk_parent_object_ids(storage, &def) {
                         add(Resource::Database, LockMode::IntentShared);
@@ -374,10 +600,27 @@ pub fn analyze_locks(
                     }
                 }
             }
-            Statement::Update(Update { table, .. }) => {
-                if let Some(def) = resolve_table(storage, &table.value) {
-                    add(Resource::Database, LockMode::IntentExclusive);
-                    add(Resource::Table(def.object_id), LockMode::Exclusive);
+            Statement::Update(update) => {
+                if let Some(def) = resolve_table(storage, &update.table.value) {
+                    // A point UPDATE (WHERE pins the whole key, no key-column
+                    // write, no subquery) takes Table IX + a single Row X. A
+                    // table referenced as an FK parent keeps Table X (see INSERT).
+                    let hash = if is_fk_parent(storage, &def.name) {
+                        None
+                    } else {
+                        update_row_key_hash(&def, update)
+                    };
+                    match hash {
+                        Some(hash) => {
+                            add(Resource::Database, LockMode::IntentExclusive);
+                            add(Resource::Table(def.object_id), LockMode::IntentExclusive);
+                            add(Resource::Row(def.object_id, hash), LockMode::Exclusive);
+                        }
+                        None => {
+                            add(Resource::Database, LockMode::IntentExclusive);
+                            add(Resource::Table(def.object_id), LockMode::Exclusive);
+                        }
+                    }
                     // UPDATE reads FK parents (new values) and referencing
                     // children (a changed PK must not orphan them).
                     for oid in fk_parent_object_ids(storage, &def) {
@@ -390,10 +633,27 @@ pub fn analyze_locks(
                     }
                 }
             }
-            Statement::Delete(Delete { table, .. }) => {
-                if let Some(def) = resolve_table(storage, &table.value) {
-                    add(Resource::Database, LockMode::IntentExclusive);
-                    add(Resource::Table(def.object_id), LockMode::Exclusive);
+            Statement::Delete(delete) => {
+                if let Some(def) = resolve_table(storage, &delete.table.value) {
+                    // A point DELETE (WHERE pins the whole key, no subquery)
+                    // takes Table IX + a single Row X. A table referenced as an
+                    // FK parent keeps Table X (see INSERT).
+                    let hash = if is_fk_parent(storage, &def.name) {
+                        None
+                    } else {
+                        where_point_key_hash(&def, &delete.where_clause)
+                    };
+                    match hash {
+                        Some(hash) => {
+                            add(Resource::Database, LockMode::IntentExclusive);
+                            add(Resource::Table(def.object_id), LockMode::IntentExclusive);
+                            add(Resource::Row(def.object_id, hash), LockMode::Exclusive);
+                        }
+                        None => {
+                            add(Resource::Database, LockMode::IntentExclusive);
+                            add(Resource::Table(def.object_id), LockMode::Exclusive);
+                        }
+                    }
                     // DELETE reads referencing children (NO ACTION check).
                     for oid in fk_child_object_ids(storage, &def.name) {
                         add(Resource::Database, LockMode::IntentShared);

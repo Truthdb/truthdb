@@ -1,21 +1,28 @@
-//! Table/database lock manager (Stage 6): coarse, table-granular two-phase
-//! locking that serializes conflicting transactions across sessions.
+//! Database/table/row lock manager (Stage 6, row locks added in Stage 12):
+//! two-phase locking that serializes conflicting transactions across sessions.
 //!
-//! The engine is a single actor thread, so it never blocks in place on a
-//! lock — the [`session`](crate::session) loop acquires a batch's locks up
-//! front and *parks* the whole request when one conflicts (see that module).
-//! This type is the pure bookkeeping underneath: which owner holds what, and
-//! whether a requested mode conflicts. Row-level keys arrive in Stage 12; for
-//! now the finest resource is a table.
+//! Worker threads never block in place on a lock — the
+//! [`session`](crate::session) scheduler acquires a batch's locks up front and
+//! *parks* the whole request when one conflicts (see that module). This type is
+//! the pure bookkeeping underneath: which owner holds what, and whether a
+//! requested mode conflicts. Point INSERT/UPDATE/DELETE take a [`Resource::Row`]
+//! lock so writers to different rows of one table need not serialize; scans and
+//! non-point predicates stay table-granular.
 
 use std::collections::HashMap;
 
-/// A lockable resource. `Database` is the hierarchy root (intent locks);
-/// `Table` is keyed by catalog object id.
+/// A lockable resource, forming a `Database` → `Table` → `Row` hierarchy.
+/// `Database` is the intent-lock root; `Table` is keyed by catalog object id;
+/// `Row` is keyed by `(table object id, key hash)` — the xxh64 of the row's
+/// clustered-key bytes (Stage 12). A row lock keeps [`Resource`] `Copy` by
+/// hashing the key rather than carrying its bytes; a hash collision only ever
+/// makes two unrelated rows share a lock queue (a rare, harmless over-serialize)
+/// — it can never let two distinct keys skip a real conflict.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Resource {
     Database,
     Table(u32),
+    Row(u32, u64),
 }
 
 /// Lock modes, weakest to strongest by [`LockMode::rank`]. Intent modes
@@ -238,6 +245,26 @@ mod tests {
         lm.grant(A, T, LockMode::Exclusive);
         // Now B is excluded.
         assert_eq!(lm.conflict(B, T, LockMode::Shared), Some(A));
+    }
+
+    #[test]
+    fn row_locks_on_distinct_keys_do_not_conflict() {
+        let mut lm = LockManager::new();
+        let r5 = Resource::Row(10, 5);
+        let r6 = Resource::Row(10, 6);
+        // Both writers take IX on the table (compatible) + X on their own row.
+        lm.grant(A, Resource::Table(10), LockMode::IntentExclusive);
+        lm.grant(A, r5, LockMode::Exclusive);
+        // B's IX on the table coexists with A's IX.
+        assert!(
+            lm.conflict(B, Resource::Table(10), LockMode::IntentExclusive)
+                .is_none()
+        );
+        lm.grant(B, Resource::Table(10), LockMode::IntentExclusive);
+        // B's X on a different row does not conflict with A's.
+        assert!(lm.conflict(B, r6, LockMode::Exclusive).is_none());
+        // But B's X on the *same* row does.
+        assert_eq!(lm.conflict(B, r5, LockMode::Exclusive), Some(A));
     }
 
     #[test]

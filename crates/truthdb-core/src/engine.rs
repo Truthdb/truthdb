@@ -2344,6 +2344,94 @@ mod tests {
     }
 
     #[test]
+    fn row_locks_for_point_operations() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("row-locks");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("t");
+        let t = table_object_id(&engine, "t");
+        let rc = Isolation::ReadCommitted;
+
+        let has_table_x = |locks: &[(Resource, LockMode)]| {
+            locks.contains(&(Resource::Table(t), LockMode::Exclusive))
+        };
+        let row_x = |locks: &[(Resource, LockMode)]| -> Option<u64> {
+            locks.iter().find_map(|(r, m)| match r {
+                Resource::Row(oid, h) if *oid == t && *m == LockMode::Exclusive => Some(*h),
+                _ => None,
+            })
+        };
+
+        // Point UPDATE: Table IX + a single Row X, no Table X.
+        let up = engine.analyze_locks("UPDATE t SET v = 9 WHERE id = 5", rc);
+        assert!(up.contains(&(Resource::Table(t), LockMode::IntentExclusive)));
+        assert!(
+            !has_table_x(&up),
+            "point UPDATE must not take Table X: {up:?}"
+        );
+        let k5 = row_x(&up).expect("point UPDATE row lock");
+
+        // Point DELETE: same row key as the UPDATE of id = 5.
+        let del = engine.analyze_locks("DELETE FROM t WHERE id = 5", rc);
+        assert_eq!(row_x(&del), Some(k5), "DELETE id=5 must lock the same row");
+
+        // A different key → a different row resource (so the two run concurrently).
+        let up6 = engine.analyze_locks("UPDATE t SET v = 1 WHERE id = 6", rc);
+        assert_ne!(row_x(&up6), Some(k5));
+
+        // Point INSERT (literal key) row-locks; INSERT ... SELECT does not.
+        let ins = engine.analyze_locks("INSERT INTO t VALUES (7, 1)", rc);
+        assert!(row_x(&ins).is_some() && !has_table_x(&ins));
+        let ins_sel = engine.analyze_locks("INSERT INTO t SELECT id, v FROM t", rc);
+        assert!(has_table_x(&ins_sel) && row_x(&ins_sel).is_none());
+
+        // Range / OR / partial predicates fall back to Table X.
+        for sql in [
+            "UPDATE t SET v = 1 WHERE id > 5",
+            "DELETE FROM t WHERE id = 5 OR id = 6",
+            "UPDATE t SET v = 1",
+            "UPDATE t SET id = 2 WHERE id = 5", // key change moves the row
+            "DELETE FROM t WHERE id = (SELECT MAX(id) FROM t)",
+        ] {
+            let locks = engine.analyze_locks(sql, rc);
+            assert!(
+                has_table_x(&locks) && row_x(&locks).is_none(),
+                "table lock for `{sql}`: {locks:?}"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn row_locks_require_full_composite_key() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("row-locks-composite");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (a INT NOT NULL, b INT NOT NULL, v INT, PRIMARY KEY (a, b))")
+            .expect("t");
+        let t = table_object_id(&engine, "t");
+        let rc = Isolation::ReadCommitted;
+        let row_x = |locks: &[(Resource, LockMode)]| {
+            locks.iter().any(|(r, m)| {
+                matches!(r, Resource::Row(oid, _) if *oid == t) && *m == LockMode::Exclusive
+            })
+        };
+        // Both key columns pinned → row lock.
+        assert!(row_x(
+            &engine.analyze_locks("UPDATE t SET v = 1 WHERE a = 1 AND b = 2", rc)
+        ));
+        // Only one pinned → table lock.
+        let partial = engine.analyze_locks("UPDATE t SET v = 1 WHERE a = 1", rc);
+        assert!(!row_x(&partial) && partial.contains(&(Resource::Table(t), LockMode::Exclusive)));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn foreign_key_insert_locks_parent_shared() {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;
@@ -2359,11 +2447,20 @@ mod tests {
         let c = table_object_id(&engine, "c");
 
         // INSERT into the child reads the parent, so it must take a Shared lock
-        // on the parent (else it could read an uncommitted parent row).
+        // on the parent (else it could read an uncommitted parent row). The
+        // child is not itself an FK parent, so its point INSERT row-locks:
+        // Table IntentExclusive + a Row Exclusive on the inserted key.
         let locks = engine.analyze_locks("INSERT INTO c VALUES (1, 1)", Isolation::ReadCommitted);
         assert!(
-            locks.contains(&(Resource::Table(c), LockMode::Exclusive)),
-            "child Exclusive: {locks:?}"
+            locks.contains(&(Resource::Table(c), LockMode::IntentExclusive)),
+            "child IntentExclusive: {locks:?}"
+        );
+        assert!(
+            locks
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Row(t, _) if *t == c)
+                    && *m == LockMode::Exclusive),
+            "child Row Exclusive: {locks:?}"
         );
         assert!(
             locks.contains(&(Resource::Table(p), LockMode::Shared)),
