@@ -127,6 +127,18 @@ pub struct CreateTable {
     pub check_constraints: Vec<CheckConstraint>,
     /// Table-level `[CONSTRAINT name] FOREIGN KEY (...) REFERENCES ...`.
     pub foreign_keys: Vec<ForeignKey>,
+    /// `[CONSTRAINT name] UNIQUE (...)` constraints (table-level, or desugared
+    /// from an inline column `UNIQUE`). Each becomes a unique index.
+    pub unique_constraints: Vec<UniqueConstraint>,
+    pub span: Span,
+}
+
+/// A `[CONSTRAINT name] UNIQUE (cols)` constraint. A column-level `col ... UNIQUE`
+/// desugars to a single-column one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UniqueConstraint {
+    pub name: Option<Name>,
+    pub columns: Vec<Name>,
     pub span: Span,
 }
 
@@ -159,6 +171,8 @@ pub struct ColumnDef {
     pub data_type: DataType,
     pub nullable: Option<bool>,
     pub primary_key: bool,
+    /// Column-level `UNIQUE` — desugars to a single-column unique constraint.
+    pub unique: bool,
     /// `DEFAULT <expr>` source text — re-parsed and evaluated at INSERT so a
     /// non-constant default (e.g. a niladic function) is applied per row.
     pub default: Option<String>,

@@ -24,6 +24,7 @@
                         false,
                     ),
                     primary_key: true,
+                    unique: false,
                     default: None,
                     identity: Some(
                         Identity {
@@ -53,6 +54,7 @@
                     ),
                     nullable: None,
                     primary_key: false,
+                    unique: false,
                     default: None,
                     identity: None,
                     collation: Some(
@@ -80,6 +82,7 @@
                     },
                     nullable: None,
                     primary_key: false,
+                    unique: false,
                     default: Some(
                         "0",
                     ),
@@ -104,6 +107,7 @@
                     data_type: DateTime2,
                     nullable: None,
                     primary_key: false,
+                    unique: false,
                     default: None,
                     identity: None,
                     collation: None,
@@ -126,6 +130,7 @@
                     data_type: UniqueIdentifier,
                     nullable: None,
                     primary_key: false,
+                    unique: false,
                     default: None,
                     identity: None,
                     collation: None,
@@ -149,6 +154,7 @@
             ],
             check_constraints: [],
             foreign_keys: [],
+            unique_constraints: [],
             span: Span {
                 start: 0,
                 end: 206,

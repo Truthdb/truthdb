@@ -480,10 +480,28 @@ impl Parser {
         let mut primary_key: Vec<Name> = Vec::new();
         let mut check_constraints: Vec<CheckConstraint> = Vec::new();
         let mut foreign_keys: Vec<ForeignKey> = Vec::new();
+        let mut unique_constraints: Vec<UniqueConstraint> = Vec::new();
         loop {
             // A leading `CONSTRAINT name` introduces a named table constraint.
             let constraint_name = self.parse_optional_constraint_name()?;
             match self.peek_keyword().as_deref() {
+                Some("UNIQUE") => {
+                    let start = self.bump().span;
+                    self.expect(&TokenKind::LParen)?;
+                    let mut cols = Vec::new();
+                    loop {
+                        cols.push(self.parse_name()?);
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                    let end = self.expect(&TokenKind::RParen)?;
+                    unique_constraints.push(UniqueConstraint {
+                        name: constraint_name,
+                        columns: cols,
+                        span: start.to(end),
+                    });
+                }
                 Some("PRIMARY") => {
                     if !primary_key.is_empty() {
                         return Err(SqlError::message_only(
@@ -524,6 +542,14 @@ impl Parser {
                         }
                         primary_key.push(column.name.clone());
                     }
+                    // A column-level `UNIQUE` is a single-column unique constraint.
+                    if column.unique {
+                        unique_constraints.push(UniqueConstraint {
+                            name: None,
+                            columns: vec![column.name.clone()],
+                            span: column.span,
+                        });
+                    }
                     columns.push(column);
                 }
             }
@@ -538,6 +564,7 @@ impl Parser {
             primary_key,
             check_constraints,
             foreign_keys,
+            unique_constraints,
             span: start.to(end),
         }))
     }
@@ -647,9 +674,14 @@ impl Parser {
         let mut collation = None;
         let mut checks = Vec::new();
         let mut foreign_keys = Vec::new();
+        let mut unique = false;
         let mut end = type_span;
         loop {
             match self.peek_keyword().as_deref() {
+                Some("UNIQUE") => {
+                    end = self.bump().span;
+                    unique = true;
+                }
                 Some("CHECK") => {
                     let check = self.parse_check_constraint(None)?;
                     end = check.span;
@@ -718,6 +750,7 @@ impl Parser {
             data_type,
             nullable,
             primary_key,
+            unique,
             default,
             identity,
             collation,
