@@ -2251,6 +2251,16 @@ mod tests {
             locks.contains(&(Resource::Table(base), LockMode::Shared)),
             "a view's base table (via its CTE) must be Shared-locked: {locks:?}"
         );
+
+        // A view over the view must reach the base table through both levels.
+        engine
+            .execute("CREATE VIEW v2 AS SELECT x FROM v")
+            .expect("v2");
+        let nested = engine.analyze_locks("SELECT x FROM v2", Isolation::ReadCommitted);
+        assert!(
+            nested.contains(&(Resource::Table(base), LockMode::Shared)),
+            "a nested view must Shared-lock the base table through both views: {nested:?}"
+        );
         let _ = std::fs::remove_file(path);
     }
 

@@ -4534,6 +4534,42 @@ fn build_source_inner(
     }
 }
 
+/// SQL Server caps view/function nesting at 32 levels; a deeper chain (or a view
+/// cycle) errors here rather than overflowing the stack.
+const MAX_VIEW_NESTING: u32 = 32;
+
+thread_local! {
+    /// Current view-expansion depth on this worker thread (each batch runs on
+    /// one thread, so a thread-local is per-request).
+    static VIEW_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard that increments the view-nesting depth on `enter` and restores it
+/// on drop (including the error/`?` paths), erroring past [`MAX_VIEW_NESTING`].
+struct ViewDepthGuard;
+
+impl ViewDepthGuard {
+    fn enter(view_name: &str) -> Result<Self, SqlError> {
+        let depth = VIEW_DEPTH.with(|d| d.get());
+        if depth >= MAX_VIEW_NESTING {
+            return Err(SqlError::message_only(
+                436,
+                format!(
+                    "View '{view_name}' exceeds the maximum view nesting level of {MAX_VIEW_NESTING} (possibly a view cycle)."
+                ),
+            ));
+        }
+        VIEW_DEPTH.with(|d| d.set(depth + 1));
+        Ok(ViewDepthGuard)
+    }
+}
+
+impl Drop for ViewDepthGuard {
+    fn drop(&mut self) {
+        VIEW_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
 /// Builds the row source for one base table (or `sys.*` view), stamping every
 /// column with the table's qualifier (its alias, else its name).
 fn build_table_source(
@@ -4549,6 +4585,7 @@ fn build_table_source(
     let base = match name.value.to_ascii_lowercase().as_str() {
         "sys.tables" => sys_tables(storage),
         "sys.views" => sys_views(storage),
+        "sys.sql_modules" => sys_sql_modules(storage),
         "sys.columns" => sys_columns(storage),
         "sys.indexes" => sys_indexes(storage),
         "sys.check_constraints" => sys_check_constraints(storage),
@@ -4558,27 +4595,14 @@ fn build_table_source(
             let def = resolve_table(storage, &name.value)
                 .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
             // A view: run its stored SELECT as a derived table under the view's
-            // qualifier. First cut: a view over another view is rejected here
-            // rather than expanded, which keeps this non-recursive.
+            // qualifier. A view over another view expands recursively — building
+            // the derived source re-enters `build_table_source` for the inner
+            // view — bounded by a nesting-depth guard that turns a view cycle
+            // (self- or mutually-referential views) into a clean error instead
+            // of a stack overflow.
             if let Some(query_text) = &def.view_query {
+                let _guard = ViewDepthGuard::enter(&def.name)?;
                 let body = parse_view_query(query_text, &def.name)?;
-                // Inline the body's own CTEs before checking for referenced
-                // views, so a view reached only through a CTE is still caught.
-                let expanded_body = expand_ctes(&body);
-                let mut refs = Vec::new();
-                collect_locked_tables(&expanded_body, &mut refs);
-                if refs
-                    .iter()
-                    .any(|n| resolve_table(storage, &n.value).is_some_and(|d| d.is_view()))
-                {
-                    return Err(SqlError::message_only(
-                        4506,
-                        format!(
-                            "View '{}' references another view, which is not supported yet.",
-                            def.name
-                        ),
-                    ));
-                }
                 let qual = Name {
                     value: qualifier,
                     quoted: false,
@@ -5110,6 +5134,29 @@ fn sys_views(storage: &Storage) -> Source {
     }
 }
 
+/// `sys.sql_modules`: the SQL definition of each module (currently views), keyed
+/// by `object_id`. SQL Server surfaces view/procedure/trigger text here; today
+/// only views carry a definition.
+fn sys_sql_modules(storage: &Storage) -> Source {
+    let columns = vec![int_col("object_id"), nvarchar("definition", 4000)];
+    let rows = storage
+        .rel_tables()
+        .into_iter()
+        .filter_map(|def| {
+            def.view_query
+                .map(|q| vec![Datum::Int(def.object_id as i32), Datum::NVarChar(q)])
+        })
+        .collect();
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows,
+    }
+}
+
 fn sys_columns(storage: &Storage) -> Source {
     let columns = vec![
         int_col("object_id"),
@@ -5309,30 +5356,39 @@ fn strip_schema(name: &str) -> &str {
 /// (they error at query time), so they contribute no locks; view expansion is
 /// one level deep, matching the executor.
 fn read_lock_object_ids(storage: &Storage, name: &str) -> Vec<u32> {
-    if name.to_ascii_lowercase().starts_with("sys.") {
-        return Vec::new();
+    let mut out = Vec::new();
+    collect_read_lock_ids(storage, name, 0, &mut out);
+    out
+}
+
+/// Resolves `name` to the base-table object ids the executor will read,
+/// recursing through nested views (so a view over a view locks the inner view's
+/// base tables). Bounded by [`MAX_VIEW_NESTING`] so a view cycle terminates.
+fn collect_read_lock_ids(storage: &Storage, name: &str, depth: u32, out: &mut Vec<u32>) {
+    if depth > MAX_VIEW_NESTING || name.to_ascii_lowercase().starts_with("sys.") {
+        return;
     }
     let Some(def) = resolve_table(storage, name) else {
-        return Vec::new();
+        return;
     };
     let Some(text) = &def.view_query else {
-        return vec![def.object_id];
+        // A base table.
+        if !out.contains(&def.object_id) {
+            out.push(def.object_id);
+        }
+        return;
     };
+    // A view: recurse into every table its body references. Inline the body's
+    // own CTEs so a base table reached only through a CTE is still locked.
     let Ok(body) = parse_view_query(text, &def.name) else {
-        return Vec::new();
+        return;
     };
-    // Inline the body's own CTEs so a base table reached only through a CTE is
-    // still locked (matching what the executor reads).
     let expanded = expand_ctes(&body);
     let mut names = Vec::new();
     collect_locked_tables(&expanded, &mut names);
-    names
-        .into_iter()
-        .filter(|n| !n.value.to_ascii_lowercase().starts_with("sys."))
-        .filter_map(|n| resolve_table(storage, &n.value))
-        .filter(|d| !d.is_view())
-        .map(|d| d.object_id)
-        .collect()
+    for referenced in names {
+        collect_read_lock_ids(storage, &referenced.value, depth + 1, out);
+    }
 }
 
 /// Views are read-only here; INSERT/UPDATE/DELETE against one is rejected.

@@ -89,12 +89,15 @@ CREATE INDEX ix_eng ON eng (id)
 statement error
 DROP TABLE IF EXISTS eng
 
-# A view over another view is not supported (rejected at query time).
+# A view over another view expands recursively.
 statement ok
 CREATE VIEW eng2 AS SELECT id FROM eng
 
-statement error
-SELECT id FROM eng2
+query I
+SELECT id FROM eng2 ORDER BY id
+----
+1
+2
 
 # Deferred name resolution: a view over a missing table is created, but querying
 # it fails.
