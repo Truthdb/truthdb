@@ -3943,7 +3943,7 @@ fn exec_select(
             )?
         };
         if select.distinct {
-            dedup_rows(&mut out);
+            dedup_rows(storage, &mut out)?;
         }
         order_output(&mut out, &select.order_by, eval_ctx)?;
         if let Some(top) = select.top {
@@ -4064,18 +4064,62 @@ fn exec_select_assign(
 
 /// Removes duplicate output rows (SELECT DISTINCT), keeping first occurrence.
 /// NULLs are equal to each other (`Datum` equality), matching SQL Server.
-fn dedup_rows(rowset: &mut RowSet) {
-    // Hash-based DISTINCT — O(n) instead of the old O(n²) linear scan, keeping
-    // first-appearance order. Each output column is single-typed (projection
-    // coerced it), so `HashKey`'s `order_key_cmp` equality agrees with the
-    // former `Vec<Datum>` equality for every realistic input. (Edge: two `float`
-    // NaN rows now collapse to one — `order_key_cmp` treats NaN as equal, like
-    // GROUP BY already did — where the old raw `Datum` `==` kept them distinct.)
+fn dedup_rows(storage: &Storage, rowset: &mut RowSet) -> Result<(), SqlError> {
+    // Hash-based DISTINCT — O(n) instead of the old O(n²) linear scan. Each
+    // output column is single-typed (projection coerced it), so `HashKey`'s
+    // `order_key_cmp` equality agrees with the former `Vec<Datum>` equality for
+    // every realistic input. (Edge: two `float` NaN rows now collapse to one —
+    // `order_key_cmp` treats NaN as equal, like GROUP BY already did — where the
+    // old raw `Datum` `==` kept them distinct.)
     let types: Vec<ColumnType> = rowset.columns.iter().map(|c| c.column_type).collect();
-    let mut seen: std::collections::HashSet<hash::HashKey> = std::collections::HashSet::new();
-    rowset
-        .rows
-        .retain(|row| seen.insert(hash::HashKey(row_values(row, &types))));
+    let approx: usize = rowset.rows.iter().map(|r| approx_row_bytes(r)).sum();
+    if approx <= sort_budget() {
+        // In-memory: keep first-appearance order (DISTINCT without ORDER BY has
+        // no guaranteed order, but this is the least-surprising small-set result).
+        let mut seen: std::collections::HashSet<hash::HashKey> = std::collections::HashSet::new();
+        rowset
+            .rows
+            .retain(|row| seen.insert(hash::HashKey(row_values(row, &types))));
+        return Ok(());
+    }
+
+    // Grace-hash DISTINCT: partition rows by key hash into temp extents (equal
+    // rows share a partition), then dedup each partition in memory. The per-
+    // partition dedup set is bounded to ~one partition instead of the whole
+    // input. Output is by partition (immaterial — a spilling DISTINCT is not
+    // order-sensitive; any ORDER BY runs afterward).
+    let partitions = (approx / sort_budget() + 1).max(2);
+    let partition_of = |key: &[SqlValue]| -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        hash::HashKey(key.to_vec()).hash(&mut hasher);
+        (hasher.finish() % partitions as u64) as usize
+    };
+    let spill_err = |e| map_storage_err(e, "<distinct spill>");
+    let mut parts: Vec<_> = (0..partitions)
+        .map(|_| crate::relstore::spill::RowSpool::new(storage))
+        .collect();
+    for row in &rowset.rows {
+        let key = row_values(row, &types);
+        parts[partition_of(&key)]
+            .write_row(row)
+            .map_err(spill_err)?;
+    }
+    for part in parts.iter_mut() {
+        part.finish_writing().map_err(spill_err)?;
+    }
+    let mut out: Vec<Vec<Datum>> = Vec::new();
+    for part in parts.iter_mut() {
+        let mut seen: std::collections::HashSet<hash::HashKey> = std::collections::HashSet::new();
+        let mut reader = part.reader();
+        while let Some(row) = reader.next_row().map_err(spill_err)? {
+            if seen.insert(hash::HashKey(row_values(&row, &types))) {
+                out.push(row);
+            }
+        }
+    }
+    rowset.rows = out;
+    Ok(())
 }
 
 /// Orders an output RowSet by ORDER BY items referencing the output: a bare
@@ -5234,26 +5278,77 @@ fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
-/// Grace-hash INNER join: partition both inputs by join-key hash into temp
-/// extents (matching rows share a partition, since equal keys hash equally),
-/// then join each partition pair in memory — bounding the build hash table to
-/// one partition instead of the whole right input. NULL keys never match, so
-/// they are dropped. Output order is by partition (an INNER join is unordered).
+/// Grace-hash join for any kind: partition both inputs by join-key hash into
+/// temp extents (matching rows share a partition, since equal keys hash equally,
+/// so per-partition matched/unmatched equals globally matched/unmatched), then
+/// join each partition pair in memory — the build hash table is bounded to one
+/// partition. Each partition materializes only the build side and streams the
+/// probe side. NULL-keyed rows never match: the outer side's are null-extended
+/// directly, the inner side's are dropped. Output order is by partition
+/// (immaterial — a spilling join is not order-sensitive).
 #[allow(clippy::too_many_arguments)]
-fn grace_hash_inner_join(
+fn grace_hash_join(
     storage: &Storage,
     left: &Source,
     right: &Source,
+    kind: JoinKind,
     left_key: &impl Fn(&[Datum]) -> Vec<SqlValue>,
     right_key: &impl Fn(&[Datum]) -> Vec<SqlValue>,
     matches: &impl Fn(&[Datum], &[Datum]) -> Result<bool, SqlError>,
     concat: &impl Fn(&[Datum], &[Datum]) -> Vec<Datum>,
+    left_nulls: &[Datum],
+    right_nulls: &[Datum],
     rows: &mut Vec<Vec<Datum>>,
 ) -> Result<(), SqlError> {
     use hash::{HashKey, key_has_null};
     use std::collections::HashMap;
 
-    let build_bytes: usize = right.rows.iter().map(|r| approx_row_bytes(r)).sum();
+    // The build side is the one NOT driving output: left for RIGHT, else right.
+    let build_left = matches!(kind, JoinKind::Right);
+    let preserve_probe = !matches!(kind, JoinKind::Inner); // LEFT/RIGHT/FULL keep the probe side
+    let preserve_build = matches!(kind, JoinKind::Full); // FULL also keeps the build side
+
+    // Orientation helpers so output is always [left columns .. right columns].
+    let emit_match = |probe: &[Datum], build: &[Datum]| -> Vec<Datum> {
+        if build_left {
+            concat(build, probe)
+        } else {
+            concat(probe, build)
+        }
+    };
+    let emit_probe_only = |probe: &[Datum]| -> Vec<Datum> {
+        if build_left {
+            concat(left_nulls, probe)
+        } else {
+            concat(probe, right_nulls)
+        }
+    };
+    let emit_build_only = |build: &[Datum]| -> Vec<Datum> {
+        if build_left {
+            concat(build, right_nulls)
+        } else {
+            concat(left_nulls, build)
+        }
+    };
+    // build side = left for RIGHT (build_left), else right; probe is the other.
+    let build_rows_all = if build_left { &left.rows } else { &right.rows };
+    let probe_rows = if build_left { &right.rows } else { &left.rows };
+    let build_key = |r: &[Datum]| {
+        if build_left {
+            left_key(r)
+        } else {
+            right_key(r)
+        }
+    };
+    let probe_key = |r: &[Datum]| {
+        if build_left {
+            right_key(r)
+        } else {
+            left_key(r)
+        }
+    };
+
+    let build_bytes: usize = build_rows_all.iter().map(|r| approx_row_bytes(r)).sum();
     let partitions = (build_bytes / sort_budget() + 1).max(2);
     let partition_of = |key: &[SqlValue]| -> usize {
         use std::hash::{Hash, Hasher};
@@ -5263,60 +5358,95 @@ fn grace_hash_inner_join(
     };
     let spill_err = |e| map_storage_err(e, "<join spill>");
 
-    let mut left_parts: Vec<_> = (0..partitions)
+    let mut probe_parts: Vec<_> = (0..partitions)
         .map(|_| crate::relstore::spill::RowSpool::new(storage))
         .collect();
-    let mut right_parts: Vec<_> = (0..partitions)
+    let mut build_parts: Vec<_> = (0..partitions)
         .map(|_| crate::relstore::spill::RowSpool::new(storage))
         .collect();
-    for l in &left.rows {
-        let key = left_key(l);
+    // Partition non-null-key rows; null-key rows can't match, so emit the outer
+    // side's now and drop the rest.
+    for p in probe_rows {
+        let key = probe_key(p);
         if key_has_null(&key) {
+            if preserve_probe {
+                rows.push(emit_probe_only(p));
+            }
             continue;
         }
-        left_parts[partition_of(&key)]
-            .write_row(l)
+        probe_parts[partition_of(&key)]
+            .write_row(p)
             .map_err(spill_err)?;
     }
-    for r in &right.rows {
-        let key = right_key(r);
+    for b in build_rows_all {
+        let key = build_key(b);
         if key_has_null(&key) {
+            if preserve_build {
+                rows.push(emit_build_only(b));
+            }
             continue;
         }
-        right_parts[partition_of(&key)]
-            .write_row(r)
+        build_parts[partition_of(&key)]
+            .write_row(b)
             .map_err(spill_err)?;
     }
-    for part in left_parts.iter_mut().chain(right_parts.iter_mut()) {
+    for part in probe_parts.iter_mut().chain(build_parts.iter_mut()) {
         part.finish_writing().map_err(spill_err)?;
     }
 
     for part in 0..partitions {
-        // Build a hash table over the right partition.
-        let mut r_rows: Vec<Vec<Datum>> =
-            Vec::with_capacity(right_parts[part].row_count() as usize);
-        let mut r_reader = right_parts[part].reader();
-        while let Some(row) = r_reader.next_row().map_err(spill_err)? {
-            r_rows.push(row);
+        let mut b_rows: Vec<Vec<Datum>> =
+            Vec::with_capacity(build_parts[part].row_count() as usize);
+        let mut b_reader = build_parts[part].reader();
+        while let Some(row) = b_reader.next_row().map_err(spill_err)? {
+            b_rows.push(row);
         }
         let mut table: HashMap<HashKey, Vec<usize>> = HashMap::new();
-        for (ri, r) in r_rows.iter().enumerate() {
-            table.entry(HashKey(right_key(r))).or_default().push(ri);
+        for (bi, b) in b_rows.iter().enumerate() {
+            table.entry(HashKey(build_key(b))).or_default().push(bi);
         }
-        // Probe with the left partition (streamed) and re-check the full ON.
-        let mut l_reader = left_parts[part].reader();
-        while let Some(l) = l_reader.next_row().map_err(spill_err)? {
-            if let Some(cands) = table.get(&HashKey(left_key(&l))) {
-                for &ri in cands {
-                    let r = &r_rows[ri];
-                    if matches(&l, r)? {
-                        rows.push(concat(&l, r));
+        let mut build_matched = vec![false; b_rows.len()];
+        let mut p_reader = probe_parts[part].reader();
+        while let Some(p) = p_reader.next_row().map_err(spill_err)? {
+            let mut matched = false;
+            if let Some(cands) = table.get(&HashKey(probe_key(&p))) {
+                for &bi in cands {
+                    let b = &b_rows[bi];
+                    if matches_oriented(&p, b, build_left, matches)? {
+                        rows.push(emit_match(&p, b));
+                        matched = true;
+                        build_matched[bi] = true;
                     }
+                }
+            }
+            if preserve_probe && !matched {
+                rows.push(emit_probe_only(&p));
+            }
+        }
+        if preserve_build {
+            for (bi, b) in b_rows.iter().enumerate() {
+                if !build_matched[bi] {
+                    rows.push(emit_build_only(b));
                 }
             }
         }
     }
     Ok(())
+}
+
+/// Evaluates the ON predicate for a probe/build pair in the caller's left/right
+/// orientation (`matches` always takes `(left, right)`).
+fn matches_oriented(
+    probe: &[Datum],
+    build: &[Datum],
+    build_left: bool,
+    matches: &impl Fn(&[Datum], &[Datum]) -> Result<bool, SqlError>,
+) -> Result<bool, SqlError> {
+    if build_left {
+        matches(build, probe)
+    } else {
+        matches(probe, build)
+    }
 }
 
 /// Hash join over two materialized sources on the given equi-key columns. The
@@ -5355,15 +5485,28 @@ fn hash_join(
             .collect()
     };
 
-    // Grace-hash spill for a large INNER join: partition both sides by join-key
-    // hash so each partition's build table fits in the memory budget. (INNER
-    // only — outer joins keep the in-memory build, whose unmatched null-extension
-    // is left for a follow-up.)
-    if kind == JoinKind::Inner {
-        let build_bytes: usize = right.rows.iter().map(|r| approx_row_bytes(r)).sum();
+    // Grace-hash spill for a large join (any kind): partition both sides by
+    // join-key hash so each partition's build table fits in the memory budget.
+    {
+        let build_rows = if matches!(kind, JoinKind::Right) {
+            &left.rows
+        } else {
+            &right.rows
+        };
+        let build_bytes: usize = build_rows.iter().map(|r| approx_row_bytes(r)).sum();
         if build_bytes > sort_budget() {
-            return grace_hash_inner_join(
-                storage, left, right, &left_key, &right_key, matches, concat, rows,
+            return grace_hash_join(
+                storage,
+                left,
+                right,
+                kind,
+                &left_key,
+                &right_key,
+                matches,
+                concat,
+                left_nulls,
+                right_nulls,
+                rows,
             );
         }
     }
