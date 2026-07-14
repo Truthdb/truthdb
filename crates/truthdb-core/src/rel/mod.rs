@@ -321,6 +321,43 @@ fn row_key_hash(schema: &Schema, key_columns: &[usize], key_values: &[Datum]) ->
     Some(xxh64(&bytes, 0))
 }
 
+/// True if the clustered key can be safely hashed for a row lock: no key column
+/// is a floating type. REAL/FLOAT keys are excluded because `-0.0 == 0.0` (and
+/// NaN) compare equal in evaluation but encode to distinct key bytes, so two
+/// writers to one physical row could get distinct hashes and not serialize.
+fn key_columns_row_lockable(schema: &Schema, key_columns: &[usize]) -> bool {
+    key_columns.iter().all(|&i| {
+        !matches!(
+            schema.columns[i].column_type,
+            ColumnType::Real | ColumnType::Float
+        )
+    })
+}
+
+/// True if a literal may pin a key column for a row lock: the executor's
+/// equality must be a direct same-domain match so the lock key equals the stored
+/// row's key. The hazard is a **character** key compared to a non-string literal:
+/// the executor coerces the stored string to the literal's number (many strings
+/// → one number: `'05' = 5`), while the lock key coerces the number to one
+/// canonical string — opposite directions that disagree. So a character key
+/// column requires a string literal; other domains coerce unambiguously (or
+/// `sql_to_datum` errors and the caller falls back).
+fn literal_pins_key(value: &SqlValue, column_type: &ColumnType) -> bool {
+    match column_type {
+        ColumnType::VarChar { .. } | ColumnType::NVarChar { .. } => {
+            matches!(value, SqlValue::Str(_))
+        }
+        _ => true,
+    }
+}
+
+/// True if the table has a secondary UNIQUE index. Such a table keeps
+/// table-granular locks for INSERT/UPDATE: a Row X on the clustered key alone
+/// would not serialize two writers colliding on the *unique index* key.
+fn has_secondary_unique_index(def: &TableDef) -> bool {
+    def.indexes.iter().any(|ix| ix.unique)
+}
+
 /// Evaluates a constant literal expression (`5`, `'x'`, `-3`, NULL, …) to a
 /// value. Returns `None` for anything that is not a self-contained literal —
 /// a column reference, variable, function call, or subquery — so the caller
@@ -404,6 +441,9 @@ fn insert_row_key_hashes(def: &TableDef, insert: &Insert) -> Option<Vec<u64>> {
         return None;
     };
     let schema = def.schema().ok()?;
+    if !key_columns_row_lockable(&schema, &def.key_columns) {
+        return None;
+    }
     let ncols = schema.columns.len();
     let identity_col = def.identity.map(|s| s.column);
     // Column index for each value position (explicit list, else all non-identity
@@ -428,6 +468,9 @@ fn insert_row_key_hashes(def: &TableDef, insert: &Insert) -> Option<Vec<u64>> {
             let pos = target.iter().position(|&t| t == kc)?; // key not supplied
             let value = eval_literal_const(&row[pos])?;
             let column = &schema.columns[kc];
+            if !literal_pins_key(&value, &column.column_type) {
+                return None;
+            }
             key_values[kc] = value::sql_to_datum(&value, &column.column_type, &column.name).ok()?;
         }
         hashes.push(row_key_hash(&schema, &def.key_columns, &key_values)?);
@@ -451,6 +494,9 @@ fn where_point_key_hash(def: &TableDef, where_clause: &Option<Expr>) -> Option<u
         return None;
     }
     let schema = def.schema().ok()?;
+    if !key_columns_row_lockable(&schema, &def.key_columns) {
+        return None;
+    }
     let mut conjuncts = Vec::new();
     flatten_and(where_clause, &mut conjuncts);
     let mut key_values = vec![Datum::Null; schema.columns.len()];
@@ -479,6 +525,9 @@ fn where_point_key_hash(def: &TableDef, where_clause: &Option<Expr>) -> Option<u
             continue;
         };
         let column = &schema.columns[ci];
+        if !literal_pins_key(&value, &column.column_type) {
+            continue;
+        }
         if let Ok(datum) = value::sql_to_datum(&value, &column.column_type, &column.name) {
             key_values[ci] = datum;
             bound.insert(ci);
@@ -559,12 +608,15 @@ pub fn analyze_locks(
                     // different keys then run concurrently under Table IX); a
                     // heap / IDENTITY / non-literal key falls back to Table X.
                     // A table referenced as an FK parent keeps Table X so an FK
-                    // existence-read (Table IS) still serializes against it.
-                    let hashes = if is_fk_parent(storage, &def.name) {
-                        None
-                    } else {
-                        insert_row_key_hashes(&def, insert)
-                    };
+                    // existence-read (Table IS) still serializes against it; a
+                    // secondary UNIQUE index likewise needs table-granular
+                    // serialization (the PK Row X does not cover its key).
+                    let hashes =
+                        if is_fk_parent(storage, &def.name) || has_secondary_unique_index(&def) {
+                            None
+                        } else {
+                            insert_row_key_hashes(&def, insert)
+                        };
                     match hashes {
                         Some(hashes) => {
                             add(Resource::Database, LockMode::IntentExclusive);
@@ -603,13 +655,14 @@ pub fn analyze_locks(
             Statement::Update(update) => {
                 if let Some(def) = resolve_table(storage, &update.table.value) {
                     // A point UPDATE (WHERE pins the whole key, no key-column
-                    // write, no subquery) takes Table IX + a single Row X. A
-                    // table referenced as an FK parent keeps Table X (see INSERT).
-                    let hash = if is_fk_parent(storage, &def.name) {
-                        None
-                    } else {
-                        update_row_key_hash(&def, update)
-                    };
+                    // write, no subquery) takes Table IX + a single Row X. An FK
+                    // parent or a secondary UNIQUE index keeps Table X (see INSERT).
+                    let hash =
+                        if is_fk_parent(storage, &def.name) || has_secondary_unique_index(&def) {
+                            None
+                        } else {
+                            update_row_key_hash(&def, update)
+                        };
                     match hash {
                         Some(hash) => {
                             add(Resource::Database, LockMode::IntentExclusive);
@@ -678,6 +731,36 @@ pub fn analyze_locks(
             | Statement::Rollback { .. }
             | Statement::Set(_)
             | Statement::Declare(_) => {}
+        }
+    }
+    // Batch-level lock escalation: if a table accumulated more than the
+    // threshold of row locks across the whole batch (many literal-key INSERTs,
+    // a loop, or several point statements), replace them all with one Table X.
+    // Bounds the lock set a batch can request regardless of per-statement caps.
+    let mut row_counts: std::collections::HashMap<u32, usize> = std::collections::HashMap::new();
+    for resource in needs.keys() {
+        if let Resource::Row(oid, _) = resource {
+            *row_counts.entry(*oid).or_default() += 1;
+        }
+    }
+    let escalate: std::collections::HashSet<u32> = row_counts
+        .into_iter()
+        .filter(|(_, count)| *count > ROW_LOCK_ESCALATION_THRESHOLD)
+        .map(|(oid, _)| oid)
+        .collect();
+    if !escalate.is_empty() {
+        needs.retain(
+            |resource, _| !matches!(resource, Resource::Row(oid, _) if escalate.contains(oid)),
+        );
+        for oid in escalate {
+            needs
+                .entry(Resource::Table(oid))
+                .and_modify(|m| *m = m.combine(LockMode::Exclusive))
+                .or_insert(LockMode::Exclusive);
+            needs
+                .entry(Resource::Database)
+                .and_modify(|m| *m = m.combine(LockMode::IntentExclusive))
+                .or_insert(LockMode::IntentExclusive);
         }
     }
     needs.into_iter().collect()

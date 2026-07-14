@@ -37,9 +37,7 @@ pub enum LockMode {
 }
 
 impl LockMode {
-    /// Rank for upgrade/combine. Stage 6 only ever combines within the intent
-    /// pair `{IS,IX}` (on `Database`) or the base pair `{S,X}` (on a table),
-    /// so a plain max-by-rank is exact — no SIX lock is ever needed.
+    /// Rank in the lock lattice, for [`LockMode::combine`].
     fn rank(self) -> u8 {
         match self {
             LockMode::IntentShared => 0,
@@ -49,12 +47,19 @@ impl LockMode {
         }
     }
 
-    /// The stronger of two modes an owner needs on one resource.
+    /// The least mode an owner needs to cover both `self` and `other` on one
+    /// resource (the lattice join). `S` and `IX` are incomparable — their true
+    /// join is `SIX`, which this engine has no mode for, so it uses the stronger
+    /// `X`. This case is real since Stage 12: a batch that point-writes a row
+    /// (Table `IX`) *and* reads the same table (Table `S`) must end up with an
+    /// exclusive table lock, not `S` — otherwise max-by-rank would silently drop
+    /// the write intent and expose the uncommitted row to table-level readers.
     pub fn combine(self, other: LockMode) -> LockMode {
-        if self.rank() >= other.rank() {
-            self
-        } else {
-            other
+        use LockMode::*;
+        match (self, other) {
+            (Shared, IntentExclusive) | (IntentExclusive, Shared) => Exclusive,
+            _ if self.rank() >= other.rank() => self,
+            _ => other,
         }
     }
 
@@ -245,6 +250,20 @@ mod tests {
         lm.grant(A, T, LockMode::Exclusive);
         // Now B is excluded.
         assert_eq!(lm.conflict(B, T, LockMode::Shared), Some(A));
+    }
+
+    #[test]
+    fn combine_shared_and_intent_exclusive_escalates_to_exclusive() {
+        use LockMode::*;
+        // A batch that point-writes a row (Table IX) and reads the same table
+        // (Table S) must combine to X — not S, which would drop the write intent.
+        assert_eq!(Shared.combine(IntentExclusive), Exclusive);
+        assert_eq!(IntentExclusive.combine(Shared), Exclusive);
+        // The other pairs are plain max-by-rank.
+        assert_eq!(IntentShared.combine(IntentExclusive), IntentExclusive);
+        assert_eq!(IntentShared.combine(Shared), Shared);
+        assert_eq!(Shared.combine(Exclusive), Exclusive);
+        assert_eq!(IntentExclusive.combine(Exclusive), Exclusive);
     }
 
     #[test]

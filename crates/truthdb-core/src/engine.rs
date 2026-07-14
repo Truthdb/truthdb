@@ -2406,6 +2406,73 @@ mod tests {
     }
 
     #[test]
+    fn row_lock_safety_guards() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("row-lock-guards");
+        let engine = new_engine(&path);
+        // Character PK, a table with a secondary UNIQUE index, and a FLOAT PK.
+        engine
+            .execute("CREATE TABLE cs (id VARCHAR(10) NOT NULL PRIMARY KEY, v INT)")
+            .expect("cs");
+        engine
+            .execute("CREATE TABLE u (id INT NOT NULL PRIMARY KEY, email VARCHAR(50))")
+            .expect("u");
+        engine
+            .execute("CREATE UNIQUE INDEX ux ON u (email)")
+            .expect("ux");
+        engine
+            .execute("CREATE TABLE f (k FLOAT NOT NULL PRIMARY KEY, v INT)")
+            .expect("f");
+        let cs = table_object_id(&engine, "cs");
+        let u = table_object_id(&engine, "u");
+        let f = table_object_id(&engine, "f");
+        let rc = Isolation::ReadCommitted;
+        let table_x = |locks: &[(Resource, LockMode)], t: u32| {
+            locks.contains(&(Resource::Table(t), LockMode::Exclusive))
+        };
+        let has_row = |locks: &[(Resource, LockMode)], t: u32| {
+            locks
+                .iter()
+                .any(|(r, _)| matches!(r, Resource::Row(o, _) if *o == t))
+        };
+
+        // Character PK vs a *string* literal row-locks; vs a *numeric* literal it
+        // does not (the executor's string->number match is many-to-one).
+        let str_lit = engine.analyze_locks("UPDATE cs SET v = 1 WHERE id = '05'", rc);
+        assert!(has_row(&str_lit, cs));
+        let num_lit = engine.analyze_locks("UPDATE cs SET v = 1 WHERE id = 5", rc);
+        assert!(table_x(&num_lit, cs) && !has_row(&num_lit, cs));
+
+        // A table with a secondary UNIQUE index: INSERT/UPDATE keep Table X;
+        // DELETE may still row-lock (a delete cannot create a duplicate).
+        let ins = engine.analyze_locks("INSERT INTO u VALUES (1, 'a@b.com')", rc);
+        assert!(table_x(&ins, u) && !has_row(&ins, u));
+        let upd = engine.analyze_locks("UPDATE u SET email = 'x' WHERE id = 1", rc);
+        assert!(table_x(&upd, u) && !has_row(&upd, u));
+        let del = engine.analyze_locks("DELETE FROM u WHERE id = 1", rc);
+        assert!(has_row(&del, u) && !table_x(&del, u));
+
+        // FLOAT PK is never row-locked (signed zero / NaN encode ambiguity).
+        let fl = engine.analyze_locks("UPDATE f SET v = 1 WHERE k = 1.0", rc);
+        assert!(table_x(&fl, f) && !has_row(&fl, f));
+
+        // A batch that point-writes AND reads the same table must end up with an
+        // exclusive table lock (the IX+S -> X combine fix), not a Shared lock.
+        let batch =
+            engine.analyze_locks("UPDATE cs SET v = 1 WHERE id = '05'; SELECT * FROM cs", rc);
+        assert!(
+            table_x(&batch, cs),
+            "point-write + same-table read must hold Table X: {batch:?}"
+        );
+        assert!(
+            !batch.contains(&(Resource::Table(cs), LockMode::Shared)),
+            "must not downgrade to Shared: {batch:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn row_locks_require_full_composite_key() {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;
