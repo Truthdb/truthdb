@@ -2714,15 +2714,32 @@ mod tests {
             ),
             116
         );
-        // A correlated subquery (references an outer column) is not yet
-        // supported; it errors as an invalid column rather than mis-resolving.
-        assert_eq!(
-            sql_error_number(
-                &engine,
-                "SELECT id FROM nums WHERE v = (SELECT target FROM picks WHERE picks.target = nums.id)",
-            ),
-            207
+        // Correlated subqueries: the inner query references an outer column and
+        // is re-run per outer row (Stage 11).
+        // EXISTS: nums with a pick whose target equals the num id -> 2, 3.
+        let (_, rows) = sql_rows(
+            &engine,
+            "SELECT id FROM nums WHERE EXISTS (SELECT 1 FROM picks WHERE picks.target = nums.id) ORDER BY id",
         );
+        assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
+        // NOT EXISTS is the complement.
+        let (_, rows) = sql_rows(
+            &engine,
+            "SELECT id FROM nums WHERE NOT EXISTS (SELECT 1 FROM picks WHERE picks.target = nums.id) ORDER BY id",
+        );
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
+        // Correlated scalar subquery: the pick sharing the num's id has target 2.
+        let (_, rows) = sql_rows(
+            &engine,
+            "SELECT id FROM nums WHERE (SELECT target FROM picks WHERE picks.id = nums.id) = 2",
+        );
+        assert_eq!(rows, vec![vec![Some("1".into())]]);
+        // Correlated IN: num id is among the targets of picks sharing that id.
+        let (_, rows) = sql_rows(
+            &engine,
+            "SELECT id FROM nums WHERE id IN (SELECT target FROM picks WHERE picks.id = nums.id - 1) ORDER BY id",
+        );
+        assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
 
         // `NOT IN (empty subquery)` is TRUE for every row, including a NULL
         // outer value — the comparison set is empty, so nothing is unknown.
