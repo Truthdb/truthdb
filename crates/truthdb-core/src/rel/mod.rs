@@ -9,6 +9,7 @@
 
 mod aggregate;
 pub mod collation;
+mod hash;
 mod plan;
 mod value;
 
@@ -3095,15 +3096,17 @@ fn exec_select_assign(
 /// Removes duplicate output rows (SELECT DISTINCT), keeping first occurrence.
 /// NULLs are equal to each other (`Datum` equality), matching SQL Server.
 fn dedup_rows(rowset: &mut RowSet) {
-    let mut seen: Vec<Vec<Datum>> = Vec::new();
-    rowset.rows.retain(|row| {
-        if seen.iter().any(|s| s == row) {
-            false
-        } else {
-            seen.push(row.clone());
-            true
-        }
-    });
+    // Hash-based DISTINCT — O(n) instead of the old O(n²) linear scan, keeping
+    // first-appearance order. Each output column is single-typed (projection
+    // coerced it), so `HashKey`'s `order_key_cmp` equality agrees with the
+    // former `Vec<Datum>` equality for every realistic input. (Edge: two `float`
+    // NaN rows now collapse to one — `order_key_cmp` treats NaN as equal, like
+    // GROUP BY already did — where the old raw `Datum` `==` kept them distinct.)
+    let types: Vec<ColumnType> = rowset.columns.iter().map(|c| c.column_type).collect();
+    let mut seen: std::collections::HashSet<hash::HashKey> = std::collections::HashSet::new();
+    rowset
+        .rows
+        .retain(|row| seen.insert(hash::HashKey(row_values(row, &types))));
 }
 
 /// Orders an output RowSet by ORDER BY items referencing the output: a bare
@@ -3859,63 +3862,91 @@ fn join_sources(
         }
     };
 
+    // Equijoin key columns (bare `left_col = right_col` conjuncts of a
+    // hash-compatible type). When present on an INNER/LEFT/RIGHT/FULL join, a
+    // hash join replaces the O(n·m) nested loop; the full ON predicate is still
+    // re-checked on each hash candidate, so the result set and its order are
+    // identical to the nested loop. (Like a real optimizer, the hash join
+    // evaluates the ON predicate only on candidate pairs sharing a key, so a
+    // side-effecting error in a residual conjunct — e.g. `1/b.z` — may be raised
+    // on fewer rows than the loop would; the SQL result set is unaffected.)
+    // CROSS and equi-key-less joins keep the loop.
+    let equi = match on {
+        Some(pred) => extract_equi_keys(pred, &left, &right),
+        None => Vec::new(),
+    };
+
     let mut rows = Vec::new();
-    match kind {
-        JoinKind::Cross | JoinKind::Inner => {
-            for l in &left.rows {
-                for r in &right.rows {
-                    if matches(l, r)? {
-                        rows.push(concat(l, r));
-                    }
-                }
-            }
-        }
-        JoinKind::Left => {
-            for l in &left.rows {
-                let mut matched = false;
-                for r in &right.rows {
-                    if matches(l, r)? {
-                        rows.push(concat(l, r));
-                        matched = true;
-                    }
-                }
-                if !matched {
-                    rows.push(concat(l, &right_nulls));
-                }
-            }
-        }
-        JoinKind::Right => {
-            for r in &right.rows {
-                let mut matched = false;
+    if !equi.is_empty() && !matches!(kind, JoinKind::Cross) {
+        hash_join(
+            &left,
+            &right,
+            kind,
+            &equi,
+            &matches,
+            &concat,
+            &left_nulls,
+            &right_nulls,
+            &mut rows,
+        )?;
+    } else {
+        match kind {
+            JoinKind::Cross | JoinKind::Inner => {
                 for l in &left.rows {
-                    if matches(l, r)? {
-                        rows.push(concat(l, r));
-                        matched = true;
+                    for r in &right.rows {
+                        if matches(l, r)? {
+                            rows.push(concat(l, r));
+                        }
                     }
                 }
-                if !matched {
-                    rows.push(concat(&left_nulls, r));
+            }
+            JoinKind::Left => {
+                for l in &left.rows {
+                    let mut matched = false;
+                    for r in &right.rows {
+                        if matches(l, r)? {
+                            rows.push(concat(l, r));
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        rows.push(concat(l, &right_nulls));
+                    }
                 }
             }
-        }
-        JoinKind::Full => {
-            let mut right_matched = vec![false; right.rows.len()];
-            for l in &left.rows {
-                let mut matched = false;
+            JoinKind::Right => {
+                for r in &right.rows {
+                    let mut matched = false;
+                    for l in &left.rows {
+                        if matches(l, r)? {
+                            rows.push(concat(l, r));
+                            matched = true;
+                        }
+                    }
+                    if !matched {
+                        rows.push(concat(&left_nulls, r));
+                    }
+                }
+            }
+            JoinKind::Full => {
+                let mut right_matched = vec![false; right.rows.len()];
+                for l in &left.rows {
+                    let mut matched = false;
+                    for (index, r) in right.rows.iter().enumerate() {
+                        if matches(l, r)? {
+                            rows.push(concat(l, r));
+                            matched = true;
+                            right_matched[index] = true;
+                        }
+                    }
+                    if !matched {
+                        rows.push(concat(l, &right_nulls));
+                    }
+                }
                 for (index, r) in right.rows.iter().enumerate() {
-                    if matches(l, r)? {
-                        rows.push(concat(l, r));
-                        matched = true;
-                        right_matched[index] = true;
+                    if !right_matched[index] {
+                        rows.push(concat(&left_nulls, r));
                     }
-                }
-                if !matched {
-                    rows.push(concat(l, &right_nulls));
-                }
-            }
-            for (index, r) in right.rows.iter().enumerate() {
-                if !right_matched[index] {
-                    rows.push(concat(&left_nulls, r));
                 }
             }
         }
@@ -3926,6 +3957,203 @@ fn join_sources(
         collations,
         rows,
     })
+}
+
+/// An equijoin key pair: `(left column index, right column index)` for a
+/// `left_col = right_col` conjunct of the ON predicate.
+type EquiKey = (usize, usize);
+
+/// Extracts the equijoin key pairs usable for a hash join from an ON predicate:
+/// the top-level `AND` conjuncts that are `col = col` with one bare column
+/// resolving uniquely to the left source, the other uniquely to the right, and
+/// matching hash classes. A predicate with no such conjunct (a range/disjunction
+/// join, an expression key, or a type-mismatched equality) yields an empty list
+/// and the caller keeps the nested-loop join. Non-equi conjuncts are left for
+/// the full-ON re-check on each hash candidate, so results are unchanged.
+fn extract_equi_keys(pred: &Expr, left: &Source, right: &Source) -> Vec<EquiKey> {
+    let left_scope = left.scope();
+    let right_scope = right.scope();
+    // `Some(true)` = resolves uniquely to the left source, `Some(false)` = right,
+    // `None` = neither, both, or not a bare column.
+    let side_of = |expr: &Expr| -> Option<(bool, usize)> {
+        let ExprKind::Column(name) = &expr.kind else {
+            return None;
+        };
+        use truthdb_sql::eval::ColumnResolver;
+        match (
+            left_scope.resolve(&name.value),
+            right_scope.resolve(&name.value),
+        ) {
+            (Some(i), None) => Some((true, i)),
+            (None, Some(j)) => Some((false, j)),
+            _ => None,
+        }
+    };
+    let mut conjuncts = Vec::new();
+    flatten_and(pred, &mut conjuncts);
+    let mut keys = Vec::new();
+    for conjunct in conjuncts {
+        let ExprKind::Binary {
+            op: ast::BinaryOp::Eq,
+            left: le,
+            right: re,
+        } = &conjunct.kind
+        else {
+            continue;
+        };
+        let pair = match (side_of(le), side_of(re)) {
+            (Some((true, i)), Some((false, j))) => (i, j),
+            (Some((false, j)), Some((true, i))) => (i, j),
+            _ => continue,
+        };
+        if hash::hash_class(left.columns[pair.0].column_type)
+            == hash::hash_class(right.columns[pair.1].column_type)
+        {
+            keys.push(pair);
+        }
+    }
+    keys
+}
+
+/// Collects the top-level `AND` conjuncts of an expression (flattening nested
+/// `AND`s); any other expression is one conjunct.
+fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
+    if let ExprKind::Binary {
+        op: ast::BinaryOp::And,
+        left,
+        right,
+    } = &expr.kind
+    {
+        flatten_and(left, out);
+        flatten_and(right, out);
+    } else {
+        out.push(expr);
+    }
+}
+
+/// Hash join over two materialized sources on the given equi-key columns. The
+/// build side is hashed by its key tuple; the probe side drives output so row
+/// order matches the nested loop exactly (INNER/LEFT drive from the left,
+/// RIGHT from the right, FULL from the left with a right-side matched bitmap).
+/// NULL key components never match (`x = NULL` is UNKNOWN), so NULL-keyed rows
+/// are excluded from the table and treated as unmatched. The full ON predicate
+/// is re-evaluated on every candidate, so residual (non-equi) conjuncts and the
+/// 3VL of the equality are honored identically to the nested loop.
+#[allow(clippy::too_many_arguments)]
+fn hash_join(
+    left: &Source,
+    right: &Source,
+    kind: JoinKind,
+    equi: &[EquiKey],
+    matches: &impl Fn(&[Datum], &[Datum]) -> Result<bool, SqlError>,
+    concat: &impl Fn(&[Datum], &[Datum]) -> Vec<Datum>,
+    left_nulls: &[Datum],
+    right_nulls: &[Datum],
+    rows: &mut Vec<Vec<Datum>>,
+) -> Result<(), SqlError> {
+    use hash::{HashKey, key_has_null};
+    use std::collections::HashMap;
+
+    let left_key = |l: &[Datum]| -> Vec<SqlValue> {
+        equi.iter()
+            .map(|&(i, _)| value::datum_to_sql(&l[i], &left.columns[i].column_type))
+            .collect()
+    };
+    let right_key = |r: &[Datum]| -> Vec<SqlValue> {
+        equi.iter()
+            .map(|&(_, j)| value::datum_to_sql(&r[j], &right.columns[j].column_type))
+            .collect()
+    };
+
+    // The build side is the one NOT driving output: right for INNER/LEFT/FULL,
+    // left for RIGHT.
+    let build_left = matches!(kind, JoinKind::Right);
+    let mut table: HashMap<HashKey, Vec<usize>> = HashMap::new();
+    let build_rows = if build_left { &left.rows } else { &right.rows };
+    for (index, row) in build_rows.iter().enumerate() {
+        let key = if build_left {
+            left_key(row)
+        } else {
+            right_key(row)
+        };
+        if key_has_null(&key) {
+            continue;
+        }
+        table.entry(HashKey(key)).or_default().push(index);
+    }
+
+    match kind {
+        JoinKind::Inner | JoinKind::Left => {
+            for l in &left.rows {
+                let key = left_key(l);
+                let mut matched = false;
+                if !key_has_null(&key)
+                    && let Some(cands) = table.get(&HashKey(key))
+                {
+                    for &ri in cands {
+                        let r = &right.rows[ri];
+                        if matches(l, r)? {
+                            rows.push(concat(l, r));
+                            matched = true;
+                        }
+                    }
+                }
+                if kind == JoinKind::Left && !matched {
+                    rows.push(concat(l, right_nulls));
+                }
+            }
+        }
+        JoinKind::Right => {
+            for r in &right.rows {
+                let key = right_key(r);
+                let mut matched = false;
+                if !key_has_null(&key)
+                    && let Some(cands) = table.get(&HashKey(key))
+                {
+                    for &li in cands {
+                        let l = &left.rows[li];
+                        if matches(l, r)? {
+                            rows.push(concat(l, r));
+                            matched = true;
+                        }
+                    }
+                }
+                if !matched {
+                    rows.push(concat(left_nulls, r));
+                }
+            }
+        }
+        JoinKind::Full => {
+            let mut right_matched = vec![false; right.rows.len()];
+            for l in &left.rows {
+                let key = left_key(l);
+                let mut matched = false;
+                if !key_has_null(&key)
+                    && let Some(cands) = table.get(&HashKey(key))
+                {
+                    for &ri in cands {
+                        let r = &right.rows[ri];
+                        if matches(l, r)? {
+                            rows.push(concat(l, r));
+                            matched = true;
+                            right_matched[ri] = true;
+                        }
+                    }
+                }
+                if !matched {
+                    rows.push(concat(l, right_nulls));
+                }
+            }
+            for (index, r) in right.rows.iter().enumerate() {
+                if !right_matched[index] {
+                    rows.push(concat(left_nulls, r));
+                }
+            }
+        }
+        // CROSS never reaches here (the caller keeps the nested loop for it).
+        JoinKind::Cross => unreachable!("cross join has no equi keys"),
+    }
+    Ok(())
 }
 
 // ---- sys.* virtual sources ---------------------------------------------

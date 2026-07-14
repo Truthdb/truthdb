@@ -1,0 +1,196 @@
+# Hash join / hash aggregate / hash distinct (Stage 8 in-memory hash operators).
+# Exercises the tricky paths: duplicate join keys (many-to-many), NULL keys
+# (which never equi-match), residual non-equi ON conjuncts, all four outer-join
+# kinds and their row order, multi-column equi keys, the nested-loop fallback
+# for a non-equi (range) join, and hash grouping/DISTINCT over many groups.
+
+statement ok
+CREATE TABLE l (k INT, v NVARCHAR(20))
+
+statement ok
+CREATE TABLE r (k INT, w NVARCHAR(20))
+
+statement ok
+INSERT INTO l VALUES (1,'l1a'),(1,'l1b'),(2,'l2'),(NULL,'lnull'),(3,'l3')
+
+statement ok
+INSERT INTO r VALUES (1,'r1a'),(1,'r1b'),(2,'r2'),(NULL,'rnull'),(4,'r4')
+
+# INNER JOIN: many-to-many on k=1, single on k=2, NULL never matches, k=3/k=4
+# unmatched.
+query TT
+SELECT l.v, r.w FROM l JOIN r ON l.k = r.k ORDER BY l.v, r.w
+----
+l1a r1a
+l1a r1b
+l1b r1a
+l1b r1b
+l2 r2
+
+# LEFT JOIN: unmatched left rows (l3, lnull) NULL-extend.
+query TT
+SELECT l.v, r.w FROM l LEFT JOIN r ON l.k = r.k ORDER BY l.v, r.w
+----
+l1a r1a
+l1a r1b
+l1b r1a
+l1b r1b
+l2 r2
+l3 NULL
+lnull NULL
+
+# RIGHT JOIN: unmatched right rows (r4, rnull) NULL-extend.
+query TT
+SELECT l.v, r.w FROM l RIGHT JOIN r ON l.k = r.k ORDER BY r.w, l.v
+----
+l1a r1a
+l1b r1a
+l1a r1b
+l1b r1b
+l2 r2
+NULL r4
+NULL rnull
+
+# FULL JOIN: unmatched from both sides.
+query TT
+SELECT l.v, r.w FROM l FULL JOIN r ON l.k = r.k ORDER BY l.v, r.w
+----
+NULL r4
+NULL rnull
+l1a r1a
+l1a r1b
+l1b r1a
+l1b r1b
+l2 r2
+l3 NULL
+lnull NULL
+
+# Residual (non-equi) ON conjunct is honored on hash candidates.
+query TT
+SELECT l.v, r.w FROM l JOIN r ON l.k = r.k AND r.w <> 'r1a' ORDER BY l.v, r.w
+----
+l1a r1b
+l1b r1b
+l2 r2
+
+# A NULL-keyed row is unmatched even against another NULL key (x = NULL is
+# UNKNOWN): the INNER join over the NULL keys yields nothing.
+query I
+SELECT COUNT(*) FROM l JOIN r ON l.k = r.k
+----
+5
+
+# Non-equi (range) join falls back to the nested loop; still correct.
+query I
+SELECT COUNT(*) FROM l JOIN r ON l.k < r.k
+----
+6
+
+# Multi-column equi key.
+statement ok
+CREATE TABLE lp (a INT, b INT, tag NVARCHAR(10))
+
+statement ok
+CREATE TABLE rp (a INT, b INT, tag NVARCHAR(10))
+
+statement ok
+INSERT INTO lp VALUES (1,1,'x'),(1,2,'y'),(2,1,'z')
+
+statement ok
+INSERT INTO rp VALUES (1,1,'p'),(1,2,'q'),(9,9,'n')
+
+query TT
+SELECT lp.tag, rp.tag FROM lp JOIN rp ON lp.a = rp.a AND lp.b = rp.b ORDER BY lp.tag
+----
+x p
+y q
+
+# Cross-type numeric equi-join must find exact matches even above 2^53, where an
+# f64 hash would double-round the DECIMAL and drop the row. 9007199254740993 is
+# the smallest odd integer not exactly representable as f64.
+statement ok
+CREATE TABLE bigk (k BIGINT)
+
+statement ok
+CREATE TABLE deck (k DECIMAL(20,1))
+
+statement ok
+INSERT INTO bigk VALUES (9007199254740993), (9007199254740995)
+
+statement ok
+INSERT INTO deck VALUES (9007199254740993.0)
+
+query I
+SELECT bigk.k FROM bigk JOIN deck ON bigk.k = deck.k
+----
+9007199254740993
+
+# Cross-scale DECIMAL = DECIMAL of the same large value must still match.
+statement ok
+CREATE TABLE d0 (k DECIMAL(38,0))
+
+statement ok
+CREATE TABLE d2 (k DECIMAL(38,2))
+
+statement ok
+INSERT INTO d0 VALUES (9007199254740993)
+
+statement ok
+INSERT INTO d2 VALUES (9007199254740993.00)
+
+query I
+SELECT COUNT(*) FROM d0 JOIN d2 ON d0.k = d2.k
+----
+1
+
+# --- hash aggregate over many groups, incl. a NULL group and HAVING ---
+statement ok
+CREATE TABLE g (grp INT, amt INT)
+
+statement ok
+INSERT INTO g VALUES (1,10),(1,20),(2,5),(2,5),(3,100),(NULL,7),(NULL,3)
+
+query II
+SELECT grp, SUM(amt) FROM g GROUP BY grp ORDER BY grp
+----
+NULL 10
+1 30
+2 10
+3 100
+
+# HAVING filters groups.
+query II
+SELECT grp, COUNT(*) FROM g GROUP BY grp HAVING COUNT(*) > 1 ORDER BY grp
+----
+NULL 2
+1 2
+2 2
+
+# COUNT(DISTINCT) within groups.
+query II
+SELECT grp, COUNT(DISTINCT amt) FROM g GROUP BY grp ORDER BY grp
+----
+NULL 2
+1 2
+2 1
+3 1
+
+# --- hash DISTINCT ---
+query I
+SELECT DISTINCT grp FROM g ORDER BY grp
+----
+NULL
+1
+2
+3
+
+# DISTINCT over multiple columns keeps distinct combinations.
+query II
+SELECT DISTINCT grp, amt FROM g ORDER BY grp, amt
+----
+NULL 3
+NULL 7
+1 10
+1 20
+2 5
+3 100
