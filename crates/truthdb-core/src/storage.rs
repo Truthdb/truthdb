@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::thread::JoinHandle;
 
 use thiserror::Error;
 use xxhash_rust::xxh64::xxh64;
 
 use crate::allocator::{EXTENT_PAGES, PageAllocator};
 use crate::direct_io::{AlignedPageBuf, DirectFile};
+use crate::group_commit::GroupCommit;
 use crate::relstore::RelState;
 use crate::relstore::btree::{BTree, TreeInsert};
 use crate::relstore::buffer_pool::DEFAULT_CAPACITY_BYTES;
@@ -117,6 +120,11 @@ pub enum StorageError {
 pub struct Storage {
     path: PathBuf,
     inner: std::sync::Mutex<StorageFile>,
+    /// Group-commit coordinator: commits register their WAL tail here and wait
+    /// for the log-writer to fsync past it. Shared with the log-writer thread.
+    gc: Arc<GroupCommit>,
+    /// The log-writer thread's join handle, taken in `Drop` after signalling it.
+    log_writer: Option<JoinHandle<()>>,
 }
 
 // The point of the mutex: `Storage` is shareable across worker threads. Assert
@@ -126,18 +134,39 @@ const _: fn() = || {
     assert_send_sync::<Storage>();
 };
 
+impl Drop for Storage {
+    fn drop(&mut self) {
+        // Stop the log-writer and wait for it to exit before the WAL file (and
+        // its duplicated fd) go away.
+        self.gc.shutdown();
+        if let Some(writer) = self.log_writer.take() {
+            let _ = writer.join();
+        }
+    }
+}
+
 impl Storage {
     fn lock(&self) -> std::sync::MutexGuard<'_, StorageFile> {
         self.inner.lock().expect("storage mutex poisoned")
     }
 
-    pub fn open(path: PathBuf) -> Result<Self, StorageError> {
-        assert_layout_invariants();
-        let file = StorageFile::open_existing(path.clone())?;
+    /// Wraps an opened/created [`StorageFile`] in a `Storage`, spawning the
+    /// group-commit log-writer over a duplicated WAL fd.
+    fn with_log_writer(path: PathBuf, file: StorageFile) -> Result<Self, StorageError> {
+        let wal_fd = file.try_clone_wal_fd()?;
+        let (gc, log_writer) = GroupCommit::start(wal_fd);
         Ok(Storage {
             path,
             inner: std::sync::Mutex::new(file),
+            gc,
+            log_writer: Some(log_writer),
         })
+    }
+
+    pub fn open(path: PathBuf) -> Result<Self, StorageError> {
+        assert_layout_invariants();
+        let file = StorageFile::open_existing(path.clone())?;
+        Self::with_log_writer(path, file)
     }
 
     pub fn create(path: PathBuf, opts: StorageOptions) -> Result<Self, StorageError> {
@@ -155,14 +184,34 @@ impl Storage {
         assert_layout_invariants();
         opts.validate()?;
         let file = StorageFile::create_new(path.clone(), opts, wal_min_bytes, wal_max_bytes)?;
-        Ok(Storage {
-            path,
-            inner: std::sync::Mutex::new(file),
-        })
+        Self::with_log_writer(path, file)
     }
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    /// Blocks until the WAL is fsync-durable up to `target` — the tail past a
+    /// committed record. The executor calls this once per batch that committed,
+    /// so one log-writer fsync makes many concurrent commits durable.
+    pub(crate) fn ensure_durable(&self, target: u64) -> Result<(), StorageError> {
+        self.gc.ensure_durable(target)
+    }
+
+    /// The current WAL tail — the durability target for a batch that committed.
+    pub(crate) fn wal_tail(&self) -> u64 {
+        self.lock().wal_tail()
+    }
+
+    /// Wedges the relational store after a durability (fsync) failure so no
+    /// further op serves state the log does not back. See `ensure_rel_usable`.
+    pub(crate) fn wedge(&self) {
+        self.lock().wedge();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn group_commit_fsyncs(&self) -> u64 {
+        self.gc.fsync_count()
     }
 
     pub fn append_wal_entry(
@@ -207,7 +256,10 @@ impl Storage {
         threshold: f64,
     ) -> Result<bool, StorageError> {
         let mut file = self.lock();
-        if file.has_active_transactions() || file.wal_usage_ratio() < threshold {
+        // A wedged store's in-memory state is ahead of the durable log after a
+        // failed fsync; checkpointing would flush and re-fsync exactly the data
+        // whose durability failed (and was reported to the client as failed).
+        if file.rel.wedged || file.has_active_transactions() || file.wal_usage_ratio() < threshold {
             return Ok(false);
         }
         file.write_checkpoint(data, checkpoint_seq, next_seq_no, next_doc_id)?;
@@ -611,6 +663,16 @@ impl StorageFile {
 
     pub fn wal_usage_ratio(&self) -> f64 {
         self.wal.usage_ratio()
+    }
+
+    /// The current WAL tail (append position).
+    fn wal_tail(&self) -> u64 {
+        self.wal.tail()
+    }
+
+    /// Duplicates the WAL file descriptor for the group-commit log-writer.
+    fn try_clone_wal_fd(&self) -> Result<std::fs::File, StorageError> {
+        Ok(self.wal.try_clone_file()?)
     }
 
     /// Whether a data-region page is currently allocated (test/diagnostic
@@ -1997,6 +2059,15 @@ impl StorageFile {
         Ok(())
     }
 
+    /// Wedges the relational store: every subsequent relational op (reads too)
+    /// fails until restart recovery. Reached from a group-commit fsync failure,
+    /// where the commit record was already appended (so the commit-time wedge in
+    /// `rel_statement`/`commit_txn` never fired) but never became durable — the
+    /// in-memory state is now ahead of the log and must not be served.
+    fn wedge(&mut self) {
+        self.rel.wedged = true;
+    }
+
     /// Rebuilds the live allocator: persisted bitmap, then reconciliation
     /// with the snapshot descriptors and the WAL.
     ///
@@ -2696,6 +2767,105 @@ mod tests {
             TEST_WAL_BYTES,
         )
         .expect("create storage")
+    }
+
+    /// Group commit: many transactions whose commit records are already in the
+    /// WAL, all waiting for durability up to the same point, are made durable by
+    /// a single log-writer fsync. Deterministic (independent of fsync latency):
+    /// the commit records are appended WITHOUT fsyncing first — `rel_insert`
+    /// appends its commit record but does not force the log — then every
+    /// committer waits on the same tail, so exactly one fsync serves them all.
+    #[test]
+    fn group_commit_coalesces_many_commits_into_one_fsync() {
+        use crate::rel::{TxnContext, execute_batch};
+        use std::sync::Arc;
+
+        const THREADS: usize = 16;
+
+        let path = unique_temp_path("group-commit");
+        let storage =
+            Arc::new(Storage::create(path.clone(), test_storage_options()).expect("create"));
+
+        let mut setup = TxnContext::default();
+        let create = execute_batch(&storage, "CREATE TABLE t (v INT NOT NULL)", &mut setup);
+        assert!(create.error.is_none(), "create table: {:?}", create.error);
+        let baseline = storage.group_commit_fsyncs();
+
+        // Raw autocommit inserts append a commit record each with `sync=false`
+        // and never call `ensure_durable`, so the WAL tail advances while
+        // `flushed` stays put — nothing fsyncs.
+        for i in 0..THREADS {
+            storage
+                .rel_insert("t", vec![Datum::Int(i as i32)])
+                .expect("insert");
+        }
+        let target = storage.wal_tail();
+        assert_eq!(
+            storage.group_commit_fsyncs(),
+            baseline,
+            "appending commit records must not fsync"
+        );
+
+        // Every committer waits for durability up to the same tail; one fsync
+        // covers them all.
+        let mut handles = Vec::new();
+        for _ in 0..THREADS {
+            let storage = Arc::clone(&storage);
+            handles.push(std::thread::spawn(move || {
+                storage.ensure_durable(target).expect("durable")
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("thread panicked");
+        }
+
+        let fsyncs = storage.group_commit_fsyncs() - baseline;
+        assert!(
+            (1..=2).contains(&fsyncs),
+            "{THREADS} commits should coalesce into a single fsync, got {fsyncs}"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// An identity value is consumed permanently (SQL Server semantics), so its
+    /// reservation — a mini-commit made even inside an open transaction — must be
+    /// fsynced. Regression: group commit skipped `ensure_durable` for a batch
+    /// whose only durable effect was the identity reservation (an INSERT inside
+    /// a still-open transaction), so a crash would revert and reuse the value.
+    #[test]
+    fn identity_reservation_is_made_durable_even_inside_a_transaction() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("identity-durable");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+
+        let mut ctx = TxnContext::default();
+        let create = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY IDENTITY(1,1), v INT NOT NULL)",
+            &mut ctx,
+        );
+        assert!(create.error.is_none(), "create: {:?}", create.error);
+
+        let before = storage.group_commit_fsyncs();
+        // INSERT inside an open transaction: no row commits (the COMMIT is a
+        // later batch), but the identity reservation does and must be fsynced.
+        let out = execute_batch(
+            &storage,
+            "BEGIN TRAN; INSERT INTO t (v) VALUES (1)",
+            &mut ctx,
+        );
+        assert!(out.error.is_none(), "insert: {:?}", out.error);
+        assert!(
+            storage.group_commit_fsyncs() > before,
+            "identity reservation inside a transaction must be made durable"
+        );
+
+        let _ = execute_batch(&storage, "ROLLBACK", &mut ctx);
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// Buffered write into the file (test-side corruption / fixtures). The
