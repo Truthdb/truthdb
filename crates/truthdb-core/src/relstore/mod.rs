@@ -15,6 +15,7 @@ pub mod page;
 pub mod recovery;
 pub mod row;
 pub mod slotted;
+pub mod spill;
 #[cfg(test)]
 mod tests;
 pub mod types;

@@ -282,6 +282,18 @@ impl Storage {
         self.lock().free_extent(start_page)
     }
 
+    /// Writes one raw page (`PAGE_SIZE` bytes) to a data-region page — used by
+    /// the spill spool over temp extents. Bypasses the buffer pool and the WAL
+    /// (spill pages are query-scratch, never recovered).
+    pub(crate) fn spill_write_page(&self, page: u64, data: &[u8]) -> Result<(), StorageError> {
+        self.lock().spill_write_page(page, data)
+    }
+
+    /// Reads one raw data-region page (`PAGE_SIZE` bytes) into `out`.
+    pub(crate) fn spill_read_page(&self, page: u64, out: &mut [u8]) -> Result<(), StorageError> {
+        self.lock().spill_read_page(page, out)
+    }
+
     pub fn is_page_allocated(&self, page: u64) -> bool {
         self.lock().is_page_allocated(page)
     }
@@ -2193,6 +2205,24 @@ impl StorageFile {
             &record.encode(),
         )?;
         self.allocator.free(start_page, EXTENT_PAGES);
+        Ok(())
+    }
+
+    fn spill_write_page(&mut self, page: u64, data: &[u8]) -> Result<(), StorageError> {
+        debug_assert_eq!(data.len(), PAGE_SIZE);
+        let mut frame = crate::direct_io::AlignedPageBuf::new();
+        frame.as_mut_slice().copy_from_slice(data);
+        let offset = self.layout.data_offset + page * PAGE_SIZE as u64;
+        self.file.write_page_from(offset, &frame)?;
+        Ok(())
+    }
+
+    fn spill_read_page(&mut self, page: u64, out: &mut [u8]) -> Result<(), StorageError> {
+        debug_assert_eq!(out.len(), PAGE_SIZE);
+        let mut frame = crate::direct_io::AlignedPageBuf::new();
+        let offset = self.layout.data_offset + page * PAGE_SIZE as u64;
+        self.file.read_page_into(offset, &mut frame)?;
+        out.copy_from_slice(frame.as_slice());
         Ok(())
     }
 
