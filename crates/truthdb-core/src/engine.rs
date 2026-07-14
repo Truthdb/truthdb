@@ -2444,6 +2444,86 @@ mod tests {
     }
 
     #[test]
+    fn outer_joins_grace_hash_spill_and_match_in_memory() {
+        // A tiny budget forces the grace-hash join for LEFT/RIGHT/FULL. Each must
+        // match its in-memory result, including probe-side unmatched rows,
+        // build-side unmatched rows (FULL), and NULL-keyed rows on both sides
+        // (never match; the outer side's are null-extended, the inner's dropped).
+        let path = unique_temp_path("outer-join-spill");
+        let engine = new_engine(&path);
+        engine.execute("CREATE TABLE l (k INT, v INT)").expect("l");
+        engine.execute("CREATE TABLE r (k INT, w INT)").expect("r");
+        for i in 0..300 {
+            // Disjoint-ish key ranges so both sides have unmatched rows.
+            let lk = if i % 41 == 0 {
+                "NULL".into()
+            } else {
+                (i % 30).to_string()
+            };
+            engine
+                .execute(&format!("INSERT INTO l VALUES ({lk}, {i})"))
+                .expect("l ins");
+            let rk = if i % 43 == 0 {
+                "NULL".into()
+            } else {
+                (i % 25 + 10).to_string()
+            };
+            engine
+                .execute(&format!("INSERT INTO r VALUES ({rk}, {i})"))
+                .expect("r ins");
+        }
+        for kind in ["LEFT", "RIGHT", "FULL"] {
+            let query =
+                format!("SELECT l.v, r.w FROM l {kind} JOIN r ON l.k = r.k ORDER BY l.v, r.w");
+            let (_, reference) = sql_rows(&engine, &query);
+            crate::rel::set_test_sort_budget(Some(500));
+            let (_, spilled) = sql_rows(&engine, &query);
+            crate::rel::set_test_sort_budget(None);
+            assert!(!reference.is_empty(), "{kind}: reference empty");
+            assert_eq!(
+                spilled, reference,
+                "grace-hash {kind} join must match in-memory"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn distinct_grace_hash_spills_and_matches_in_memory() {
+        // A tiny budget forces grace-hash DISTINCT (partition rows by key hash to
+        // temp extents, dedup each partition). Results must match the in-memory
+        // hash DISTINCT — many duplicates, NULLs, and a multi-column key.
+        let path = unique_temp_path("distinct-spill");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT, b INT)")
+            .expect("t");
+        for i in 0..900 {
+            let a = if i % 53 == 0 {
+                "NULL".to_string()
+            } else {
+                (i % 20).to_string()
+            };
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {a}, {})", i % 15))
+                .expect("insert");
+        }
+        let query = "SELECT DISTINCT a, b FROM t ORDER BY a, b";
+
+        let (_, reference) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(Some(400));
+        let (_, spilled) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(None);
+
+        assert!(!reference.is_empty());
+        assert_eq!(
+            spilled, reference,
+            "grace-hash DISTINCT must match in-memory"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn group_by_grace_hash_spills_and_matches_in_memory() {
         // A tiny budget forces grace-hash aggregation (partition rows by
         // group-key hash to temp extents, aggregate each partition). Results
