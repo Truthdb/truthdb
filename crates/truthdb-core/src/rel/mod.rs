@@ -19,6 +19,7 @@ use truthdb_sql::ast::{
     Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem, Select, SelectItem,
     SetStatement, Statement, TableRef, Update,
 };
+use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
 use truthdb_sql::eval::{ColumnResolver, EvalContext};
 use truthdb_sql::value::{SqlValue, order_key_cmp};
@@ -330,6 +331,11 @@ fn row_key_hash(schema: &Schema, key_columns: &[usize], key_values: &[Datum]) ->
 /// is a floating type. REAL/FLOAT keys are excluded because `-0.0 == 0.0` (and
 /// NaN) compare equal in evaluation but encode to distinct key bytes, so two
 /// writers to one physical row could get distinct hashes and not serialize.
+///
+/// Character keys are safe even under a case-insensitive collation: the row-lock
+/// hash is taken over the *folded* key (`encode_key` folds character keys by
+/// collation, Stage 5), so `WHERE key = 'ABC'` and a concurrent write of `'abc'`
+/// hash to the same row resource and serialize.
 fn key_columns_row_lockable(schema: &Schema, key_columns: &[usize]) -> bool {
     key_columns.iter().all(|&i| {
         !matches!(
@@ -1638,7 +1644,7 @@ fn parse_checks(def: &TableDef) -> Result<Vec<(String, Expr)>, SqlError> {
 fn enforce_checks(
     checks: &[(String, Expr)],
     row: &[SqlValue],
-    resolver: &Vec<String>,
+    resolver: &impl ColumnResolver,
     eval_ctx: &EvalContext,
     verb: &str,
     table: &str,
@@ -1701,9 +1707,20 @@ fn fk_parent_exists(
         return Ok(true);
     }
     if fk.parent.eq_ignore_ascii_case(&child.name) && child.key_columns.len() == key.len() {
-        return Ok(batch
+        // Fold both the referencing key and each sibling's PK by the parent PK
+        // collation, so a case-insensitive self-reference matches a case-variant
+        // sibling in the same statement — consistent with the folded `rel_get`
+        // above (which handles the committed-row case).
+        let key_coll: Vec<Option<String>> = child
+            .key_columns
             .iter()
-            .any(|r| child.key_columns.iter().zip(key).all(|(&i, k)| &r[i] == k)));
+            .map(|&i| child.collations.get(i).cloned().flatten())
+            .collect();
+        let folded_key = fold_datum_key(key, &key_coll);
+        return Ok(batch.iter().any(|r| {
+            let sibling: Vec<Datum> = child.key_columns.iter().map(|&i| r[i].clone()).collect();
+            fold_datum_key(&sibling, &key_coll) == folded_key
+        }));
     }
     Ok(false)
 }
@@ -1764,6 +1781,23 @@ fn fk_probe_index<'a>(
     })
 }
 
+/// Whether the child FK columns and the referenced parent PK columns have the
+/// same case sensitivity. The FK index fast path folds the probe key by the
+/// *child* column collation (to match the child index's folded keys), while the
+/// insert-time check (`rel_get`) and the scan fallback fold by the *parent* PK
+/// collation; when they disagree (a mixed-collation FK) the fast path can miss a
+/// reference, so it is only used when the collations match — otherwise the scan
+/// fallback (parent collation, consistent with insert) handles it.
+fn fk_collations_match(child: &TableDef, fk: &catalog::ForeignKeyDef, parent: &TableDef) -> bool {
+    fk.columns.len() == parent.key_columns.len()
+        && fk.columns.iter().zip(&parent.key_columns).all(|(&c, &p)| {
+            CollationSensitivity::from_optional(child.collations.get(c).and_then(|x| x.as_deref()))
+                == CollationSensitivity::from_optional(
+                    parent.collations.get(p).and_then(|x| x.as_deref()),
+                )
+        })
+}
+
 /// The error raised when a surviving child row references a removed parent key.
 fn reference_conflict(verb: &str, fk_name: &str, child_name: &str) -> SqlError {
     SqlError::new(
@@ -1791,6 +1825,18 @@ fn enforce_parent_fks(
     if removed_keys.is_empty() {
         return Ok(());
     }
+    // Fold the removed parent keys by the parent PK collation so the scan
+    // fallback matches child references case-insensitively — the same folding the
+    // index fast path gets from the child index's key encoding.
+    let parent_key_coll: Vec<Option<String>> = parent
+        .key_columns
+        .iter()
+        .map(|&i| parent.collations.get(i).cloned().flatten())
+        .collect();
+    let removed_folded: Vec<Vec<Datum>> = removed_keys
+        .iter()
+        .map(|k| fold_datum_key(k, &parent_key_coll))
+        .collect();
     let children: Vec<TableDef> = storage
         .rel_tables()
         .into_iter()
@@ -1816,10 +1862,17 @@ fn enforce_parent_fks(
             // self-reference (whose own being-removed rows must be excluded). If
             // a key fails to encode (unexpected type mismatch), fall back to the
             // scan rather than risk missing a reference.
-            if !self_ref && let Some(index) = fk_probe_index(child, fk) {
+            if !self_ref
+                && fk_collations_match(child, fk, parent)
+                && let Some(index) = fk_probe_index(child, fk)
+            {
                 let mut handled = true;
                 for key in removed_keys {
-                    match crate::relstore::index::encode_index_prefix(key, &index.columns) {
+                    match crate::relstore::index::encode_index_prefix(
+                        key,
+                        &index.columns,
+                        &child.collations,
+                    ) {
                         Ok(lower) => {
                             let upper = crate::relstore::index::prefix_upper_bound(&lower);
                             let matches = storage
@@ -1849,14 +1902,14 @@ fn enforce_parent_fks(
                 if self_ref {
                     let pk: Vec<Datum> =
                         parent.key_columns.iter().map(|&i| row[i].clone()).collect();
-                    if removed_keys.contains(&pk) {
+                    if removed_folded.contains(&fold_datum_key(&pk, &parent_key_coll)) {
                         continue;
                     }
                 }
                 let Some(key) = fk_key(fk, row) else {
                     continue;
                 };
-                if removed_keys.contains(&key) {
+                if removed_folded.contains(&fold_datum_key(&key, &parent_key_coll)) {
                     return Err(reference_conflict(verb, &fk.name, &child.name));
                 }
             }
@@ -1868,6 +1921,23 @@ fn enforce_parent_fks(
 /// The primary-key values of a row (in key-column order).
 fn pk_of(def: &TableDef, row: &[Datum]) -> Vec<Datum> {
     def.key_columns.iter().map(|&i| row[i].clone()).collect()
+}
+
+/// Folds a key's character values to their collation-canonical form (`collations`
+/// parallel to `values`), so value-level key comparisons (e.g. the FK scan
+/// fallback) match case-insensitively, consistent with the folded key bytes.
+fn fold_datum_key(values: &[Datum], collations: &[Option<String>]) -> Vec<Datum> {
+    values
+        .iter()
+        .enumerate()
+        .map(|(i, value)| {
+            crate::relstore::key::fold_key_datum(
+                value,
+                collations.get(i).and_then(|c| c.as_deref()),
+            )
+            .into_owned()
+        })
+        .collect()
 }
 
 /// Maps a parsed [`DataType`] to a storage [`ColumnType`], validating length
@@ -2230,7 +2300,7 @@ fn alter_add_check(
         new_def.name.clone(),
         truthdb_sql::parse_expr(&new_def.predicate)?,
     )];
-    let resolver = schema_names(&schema);
+    let resolver = SchemaScope { schema: &schema };
     let types = schema_types(&schema);
     let rows = storage
         .rel_scan(&def.name)
@@ -2321,7 +2391,7 @@ fn exec_insert(
 
     // CHECK constraints are parsed once and evaluated against each built row.
     let checks = parse_checks(&def)?;
-    let check_resolver = schema_names(&schema);
+    let check_resolver = SchemaScope { schema: &schema };
     let check_types = schema_types(&schema);
 
     // Target column indices. An explicit list may not name the identity column
@@ -2557,7 +2627,7 @@ fn exec_update(
         .ok_or_else(|| SqlError::invalid_object(&update.table.value).at(update.table.span))?;
     reject_dml_on_view(&def)?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
-    let resolver = schema_names(&schema);
+    let resolver = SchemaScope { schema: &schema };
     let identity_col = def.identity.map(|s| s.column);
     let checks = parse_checks(&def)?;
 
@@ -2666,7 +2736,19 @@ fn exec_update(
             .filter(|r| !old_pks.contains(&pk_of(&def, r)))
             .collect();
         post_rows.extend(updates.iter().map(|(_, _, new)| new.clone()));
-        let post_pks: Vec<Vec<Datum>> = post_rows.iter().map(|r| pk_of(&def, r)).collect();
+        // Fold the surviving PKs and each FK reference by the (self-referenced)
+        // PK collation, so a case-insensitive self-reference matches a case-
+        // variant sibling — consistent with the INSERT batch path
+        // (`fk_parent_exists`) and the DELETE path (`enforce_parent_fks`).
+        let key_coll: Vec<Option<String>> = def
+            .key_columns
+            .iter()
+            .map(|&i| def.collations.get(i).cloned().flatten())
+            .collect();
+        let post_pks: Vec<Vec<Datum>> = post_rows
+            .iter()
+            .map(|r| fold_datum_key(&pk_of(&def, r), &key_coll))
+            .collect();
         for r in &post_rows {
             for fk in def
                 .foreign_keys
@@ -2674,7 +2756,7 @@ fn exec_update(
                 .filter(|fk| fk.parent.eq_ignore_ascii_case(&def.name))
             {
                 if let Some(key) = fk_key(fk, r)
-                    && !post_pks.contains(&key)
+                    && !post_pks.contains(&fold_datum_key(&key, &key_coll))
                 {
                     return Err(fk_child_violation(&fk.name, "UPDATE", &fk.parent));
                 }
@@ -2698,7 +2780,7 @@ fn exec_delete(
         .ok_or_else(|| SqlError::invalid_object(&delete.table.value).at(delete.table.span))?;
     reject_dml_on_view(&def)?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
-    let resolver = schema_names(&schema);
+    let resolver = SchemaScope { schema: &schema };
 
     let types = schema_types(&schema);
     let located = storage
@@ -2725,8 +2807,32 @@ fn exec_delete(
     Ok(StatementResult::RowsAffected(count as u64))
 }
 
-fn schema_names(schema: &Schema) -> Vec<String> {
-    schema.columns.iter().map(|c| c.name.clone()).collect()
+/// Resolver over a single table's schema columns, carrying per-column collation.
+/// UPDATE/DELETE/CHECK predicate evaluation must go through this (not a bare
+/// `Vec<String>`, whose `ColumnResolver::collation` reports the case-insensitive
+/// default for *every* column) so an explicit `_CS`/`_BIN` column compares
+/// case-sensitively — otherwise a `DELETE ... WHERE cs_col = 'abc'` would fold
+/// case and remove case-variant rows it must keep.
+struct SchemaScope<'a> {
+    schema: &'a Schema,
+}
+
+impl truthdb_sql::eval::ColumnResolver for SchemaScope<'_> {
+    fn resolve(&self, name: &str) -> Option<usize> {
+        self.schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(name))
+    }
+
+    fn collation(&self, index: usize) -> CollationSensitivity {
+        CollationSensitivity::from_optional(
+            self.schema
+                .columns
+                .get(index)
+                .and_then(|c| c.collation.as_deref()),
+        )
+    }
 }
 
 fn schema_types(schema: &Schema) -> Vec<ColumnType> {
@@ -2740,7 +2846,7 @@ fn predicate_true(
     where_clause: &Option<Expr>,
     row: &[Datum],
     types: &[ColumnType],
-    resolver: &Vec<String>,
+    resolver: &impl ColumnResolver,
     eval_ctx: &EvalContext,
 ) -> Result<bool, SqlError> {
     let Some(predicate) = where_clause else {
@@ -2786,6 +2892,7 @@ impl Source {
                 .zip(&self.columns)
                 .map(|(qualifier, column)| (qualifier.clone(), column.name.clone()))
                 .collect(),
+            collations: self.collations.clone(),
         }
     }
 }
@@ -2797,11 +2904,23 @@ impl Source {
 pub(super) struct JoinScope {
     /// (qualifier, bare column name) per source column.
     columns: Vec<(Option<String>, String)>,
+    /// Per-column collation names, parallel to `columns` (`None` = database
+    /// default). Empty for correlation-only scopes that never drive comparison.
+    collations: Vec<Option<String>>,
 }
 
 /// Resolver over an output RowSet's columns. Output columns are unqualified,
 /// so a qualified `t.col` reference (e.g. in a grouped query's ORDER BY)
 /// resolves by its bare name.
+///
+/// It does not carry per-column collation, so an *embedded equality* in an
+/// ORDER BY expression over a `_CS`/`_BIN` output column (e.g.
+/// `ORDER BY CASE WHEN code = 'ABC' THEN 0 ELSE 1 END`) folds case
+/// (case-insensitive default). The sort key itself is collation-correct — the
+/// non-aggregated path orders via `sort_collators` (real per-column collation)
+/// and the aggregated/DISTINCT path via `order_key_cmp` — so this only affects a
+/// nested `=` inside an ORDER BY expression on a case-sensitive column: a narrow,
+/// documented limitation.
 struct OutputScope {
     names: Vec<String>,
 }
@@ -2879,6 +2998,12 @@ impl truthdb_sql::eval::ColumnResolver for JoinScope {
             Some(index) => Resolution::Found(index),
             None => Resolution::NotFound,
         }
+    }
+
+    fn collation(&self, index: usize) -> truthdb_sql::collation::CollationSensitivity {
+        truthdb_sql::collation::CollationSensitivity::from_optional(
+            self.collations.get(index).and_then(|c| c.as_deref()),
+        )
     }
 }
 
@@ -3127,7 +3252,10 @@ fn rewrite_select_subqueries(
         .from
         .as_ref()
         .and_then(|from| from_column_names(storage, from))
-        .map(|columns| JoinScope { columns });
+        .map(|columns| JoinScope {
+            collations: Vec::new(),
+            columns,
+        });
     let items = select
         .items
         .iter()
@@ -3431,7 +3559,10 @@ fn subquery_inner_scope(storage: &Storage, subquery: &Select) -> Option<JoinScop
         Some(from) => from_column_names(storage, from)?,
         None => Vec::new(),
     };
-    Some(JoinScope { columns })
+    Some(JoinScope {
+        collations: Vec::new(),
+        columns,
+    })
 }
 
 /// True if `subquery` references a column that resolves in the enclosing `outer`
@@ -3943,7 +4074,21 @@ fn exec_select(
             )?
         };
         if select.distinct {
-            dedup_rows(storage, &mut out)?;
+            // Each output column's collation (resolved back to its source column;
+            // a computed/aliased column has no source column → the case-
+            // insensitive default), so DISTINCT honours an explicit `_CS`/`_BIN`
+            // column exactly like GROUP BY / COUNT(DISTINCT) do.
+            let out_sens: Vec<CollationSensitivity> = out
+                .columns
+                .iter()
+                .map(|c| {
+                    resolver
+                        .resolve(&c.name)
+                        .map(|i| resolver.collation(i))
+                        .unwrap_or(CollationSensitivity::DEFAULT)
+                })
+                .collect();
+            dedup_rows(storage, &mut out, &out_sens)?;
         }
         order_output(&mut out, &select.order_by, eval_ctx)?;
         if let Some(top) = select.top {
@@ -4064,7 +4209,11 @@ fn exec_select_assign(
 
 /// Removes duplicate output rows (SELECT DISTINCT), keeping first occurrence.
 /// NULLs are equal to each other (`Datum` equality), matching SQL Server.
-fn dedup_rows(storage: &Storage, rowset: &mut RowSet) -> Result<(), SqlError> {
+fn dedup_rows(
+    storage: &Storage,
+    rowset: &mut RowSet,
+    sensitivities: &[CollationSensitivity],
+) -> Result<(), SqlError> {
     // Hash-based DISTINCT — O(n) instead of the old O(n²) linear scan. Each
     // output column is single-typed (projection coerced it), so `HashKey`'s
     // `order_key_cmp` equality agrees with the former `Vec<Datum>` equality for
@@ -4072,6 +4221,11 @@ fn dedup_rows(storage: &Storage, rowset: &mut RowSet) -> Result<(), SqlError> {
     // `order_key_cmp` treats NaN as equal, like GROUP BY already did — where the
     // old raw `Datum` `==` kept them distinct.)
     let types: Vec<ColumnType> = rowset.columns.iter().map(|c| c.column_type).collect();
+    // DISTINCT folds string columns by each output column's collation
+    // (`sensitivities`, parallel to the columns), so a `_CI` column folds case
+    // and a `_CS`/`_BIN` column stays exact — consistent with GROUP BY and
+    // COUNT(DISTINCT). `dedup_key` keeps the original row for output.
+    let dedup_key = |row: &[Datum]| hash::fold_hash_key(&row_values(row, &types), sensitivities);
     let approx: usize = rowset.rows.iter().map(|r| approx_row_bytes(r)).sum();
     if approx <= sort_budget() {
         // In-memory: keep first-appearance order (DISTINCT without ORDER BY has
@@ -4079,7 +4233,7 @@ fn dedup_rows(storage: &Storage, rowset: &mut RowSet) -> Result<(), SqlError> {
         let mut seen: std::collections::HashSet<hash::HashKey> = std::collections::HashSet::new();
         rowset
             .rows
-            .retain(|row| seen.insert(hash::HashKey(row_values(row, &types))));
+            .retain(|row| seen.insert(hash::HashKey(dedup_key(row))));
         return Ok(());
     }
 
@@ -4100,7 +4254,10 @@ fn dedup_rows(storage: &Storage, rowset: &mut RowSet) -> Result<(), SqlError> {
         .map(|_| crate::relstore::spill::RowSpool::new(storage))
         .collect();
     for row in &rowset.rows {
-        let key = row_values(row, &types);
+        // Partition by the *folded* key so case-insensitive-equal rows land in
+        // the same partition (else a cross-partition duplicate is missed); the
+        // stored row stays original for output.
+        let key = dedup_key(row);
         parts[partition_of(&key)]
             .write_row(row)
             .map_err(spill_err)?;
@@ -4113,7 +4270,7 @@ fn dedup_rows(storage: &Storage, rowset: &mut RowSet) -> Result<(), SqlError> {
         let mut seen: std::collections::HashSet<hash::HashKey> = std::collections::HashSet::new();
         let mut reader = part.reader();
         while let Some(row) = reader.next_row().map_err(spill_err)? {
-            if seen.insert(hash::HashKey(row_values(&row, &types))) {
+            if seen.insert(hash::HashKey(dedup_key(&row))) {
                 out.push(row);
             }
         }
@@ -5084,6 +5241,7 @@ fn join_sources(
             .zip(&columns)
             .map(|(q, c)| (q.clone(), c.name.clone()))
             .collect(),
+        collations: collations.clone(),
     };
     let left_nulls = vec![Datum::Null; left.columns.len()];
     let right_nulls = vec![Datum::Null; right.columns.len()];
@@ -5474,14 +5632,36 @@ fn hash_join(
     use hash::{HashKey, key_has_null};
     use std::collections::HashMap;
 
+    // The case sensitivity governing each equi-key pair — the combined collation
+    // of its two columns. The hash key is only a *pre-filter*: the full ON
+    // predicate (collation-aware `matches`) re-checks each candidate, so the
+    // buckets must be a superset of true matches. Folding both sides' key strings
+    // by this sensitivity ensures case-insensitive-equal keys share a bucket (an
+    // unfolded, case-sensitive hash would put `'abc'` and `'ABC'` in different
+    // buckets, and the CI `matches` would never be consulted → a lost match).
+    let key_sens: Vec<CollationSensitivity> = equi
+        .iter()
+        .map(|&(i, j)| {
+            CollationSensitivity::from_optional(left.collations.get(i).and_then(|c| c.as_deref()))
+                .combine(CollationSensitivity::from_optional(
+                    right.collations.get(j).and_then(|c| c.as_deref()),
+                ))
+        })
+        .collect();
     let left_key = |l: &[Datum]| -> Vec<SqlValue> {
         equi.iter()
-            .map(|&(i, _)| value::datum_to_sql(&l[i], &left.columns[i].column_type))
+            .zip(&key_sens)
+            .map(|(&(i, _), &sens)| {
+                sens.fold_value(value::datum_to_sql(&l[i], &left.columns[i].column_type))
+            })
             .collect()
     };
     let right_key = |r: &[Datum]| -> Vec<SqlValue> {
         equi.iter()
-            .map(|&(_, j)| value::datum_to_sql(&r[j], &right.columns[j].column_type))
+            .zip(&key_sens)
+            .map(|(&(_, j), &sens)| {
+                sens.fold_value(value::datum_to_sql(&r[j], &right.columns[j].column_type))
+            })
             .collect()
     };
 

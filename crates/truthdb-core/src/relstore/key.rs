@@ -15,11 +15,41 @@
 //! Keys are compared, never decoded: B+ tree leaves carry the full row, so
 //! values are always recoverable without reversing this encoding.
 
+use std::borrow::Cow;
+
+use truthdb_sql::collation::CollationSensitivity;
+
 use crate::relstore::row::Schema;
 use crate::relstore::types::{Datum, TypeError};
 
 const NULL_MARKER: u8 = 0x00;
 const VALUE_MARKER: u8 = 0x01;
+
+/// Folds a character key value to its collation-canonical form so keys under a
+/// case-insensitive collation compare, seek, and enforce uniqueness case-
+/// insensitively (`'ABC'` and `'abc'` map to one key). Non-character values and
+/// case-sensitive / binary collations pass through unchanged. Only the *key*
+/// folds — the stored row keeps the original value, so output is unaffected. Both
+/// the stored key and a seek/probe literal fold identically (same column
+/// collation), so `seek(fold('abc'))` finds the row stored as `'ABC'`.
+///
+/// (Case folding, not a full linguistic sort key: `_CI` case-insensitivity is
+/// exact, but locale ordering and accent-insensitivity in *index order* still
+/// need icu sort keys — see [`CollationSensitivity`]'s note.)
+pub fn fold_key_datum<'a>(value: &'a Datum, collation: Option<&str>) -> Cow<'a, Datum> {
+    if CollationSensitivity::from_optional(collation) != CollationSensitivity::CaseInsensitive {
+        return Cow::Borrowed(value);
+    }
+    match value {
+        Datum::VarChar(s) => Cow::Owned(Datum::VarChar(fold_ci(s))),
+        Datum::NVarChar(s) => Cow::Owned(Datum::NVarChar(fold_ci(s))),
+        _ => Cow::Borrowed(value),
+    }
+}
+
+fn fold_ci(s: &str) -> String {
+    CollationSensitivity::CaseInsensitive.fold(s).into_owned()
+}
 
 /// SQL Server's uniqueidentifier comparison evaluates bytes in this
 /// significance order (most significant first).
@@ -40,8 +70,12 @@ pub fn encode_key(
         let value = values
             .get(index)
             .ok_or_else(|| TypeError(format!("row has no value for key column {index}")))?;
-        let _ = column;
-        encode_datum(value, &mut out)?;
+        // Fold character keys by the column's collation so a case-insensitive
+        // clustered/PK key seeks and enforces uniqueness case-insensitively.
+        encode_datum(
+            &fold_key_datum(value, column.collation.as_deref()),
+            &mut out,
+        )?;
     }
     Ok(out)
 }

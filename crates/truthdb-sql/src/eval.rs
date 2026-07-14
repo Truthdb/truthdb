@@ -8,6 +8,7 @@
 use std::cmp::Ordering;
 
 use crate::ast::{BinaryOp, DataType, Expr, ExprKind, Name, UnaryOp};
+use crate::collation::CollationSensitivity;
 use crate::decimal::Decimal;
 use crate::error::{SqlError, SqlResult};
 use crate::functions;
@@ -34,6 +35,15 @@ pub trait ColumnResolver {
             Some(index) => Resolution::Found(index),
             None => Resolution::NotFound,
         }
+    }
+
+    /// The case sensitivity of the column at `index` — its collation. Drives
+    /// case-insensitive string equality. The default (case-insensitive, the
+    /// database default) is used by resolvers with no per-column collation; a
+    /// resolver over base-table columns overrides it to honour explicit
+    /// `_CS`/`_BIN` columns.
+    fn collation(&self, _index: usize) -> CollationSensitivity {
+        CollationSensitivity::DEFAULT
     }
 }
 
@@ -137,7 +147,8 @@ fn eval_at(
         ExprKind::Binary { op, left, right } => {
             let l = eval_at(left, row, resolver, ctx, depth + 1)?;
             let r = eval_at(right, row, resolver, ctx, depth + 1)?;
-            eval_binary(*op, l, r)
+            let sensitivity = comparison_sensitivity(left, right, resolver);
+            eval_binary(*op, l, r, sensitivity)
         }
         ExprKind::Like {
             expr,
@@ -262,7 +273,12 @@ fn eval_like_expr<R: ColumnResolver>(
             "LIKE requires character-string operands".to_string(),
         ));
     };
-    let matched = crate::like::like_match(text, pattern, escape);
+    // Under a case-insensitive collation, fold both sides before matching (LIKE
+    // wildcards are ASCII and survive lowercasing); the LHS column's collation
+    // governs. `_CS`/`_BIN` columns match exactly.
+    let sensitivity = operand_sensitivity(expr, resolver).unwrap_or(CollationSensitivity::DEFAULT);
+    let matched =
+        crate::like::like_match(&sensitivity.fold(text), &sensitivity.fold(pattern), escape);
     Ok(SqlValue::Bool(matched != negated))
 }
 
@@ -287,11 +303,14 @@ fn eval_in_expr<R: ColumnResolver>(
     if value.is_null() {
         return Ok(SqlValue::Null);
     }
+    // The operand's column collation governs the string equality; a list of
+    // literals contributes nothing.
+    let sensitivity = operand_sensitivity(expr, resolver).unwrap_or(CollationSensitivity::DEFAULT);
     // `x IN (list)` is `x=a OR x=b OR ...` under three-valued logic.
     let mut any_unknown = false;
     for item in list {
         let candidate = eval_at(item, row, resolver, ctx, depth + 1)?;
-        match value.compare(&candidate)? {
+        match value.compare_collated(&candidate, sensitivity)? {
             Some(std::cmp::Ordering::Equal) => return Ok(SqlValue::Bool(!negated)),
             None => any_unknown = true,
             _ => {}
@@ -319,9 +338,15 @@ fn eval_between_expr<R: ColumnResolver>(
     let value = eval_at(expr, row, resolver, ctx, depth + 1)?;
     let lo = eval_at(low, row, resolver, ctx, depth + 1)?;
     let hi = eval_at(high, row, resolver, ctx, depth + 1)?;
-    // `x BETWEEN a AND b` is `x>=a AND x<=b` (three-valued).
-    let ge = value.compare(&lo)?.map(|o| o != Ordering::Less);
-    let le = value.compare(&hi)?.map(|o| o != Ordering::Greater);
+    // `x BETWEEN a AND b` is `x>=a AND x<=b` (three-valued); the operand's column
+    // collation governs the string comparison.
+    let sensitivity = operand_sensitivity(expr, resolver).unwrap_or(CollationSensitivity::DEFAULT);
+    let ge = value
+        .compare_collated(&lo, sensitivity)?
+        .map(|o| o != Ordering::Less);
+    let le = value
+        .compare_collated(&hi, sensitivity)?
+        .map(|o| o != Ordering::Greater);
     let within = value::and(ge, le);
     Ok(three_valued(if negated {
         value::not(within)
@@ -614,17 +639,64 @@ fn eval_number_literal(text: &str) -> SqlResult<SqlValue> {
 }
 
 #[inline(never)]
-fn eval_binary(op: BinaryOp, l: SqlValue, r: SqlValue) -> SqlResult<SqlValue> {
+fn eval_binary(
+    op: BinaryOp,
+    l: SqlValue,
+    r: SqlValue,
+    sensitivity: CollationSensitivity,
+) -> SqlResult<SqlValue> {
     use BinaryOp::*;
     match op {
         And => Ok(three_valued(value::and(l.as_predicate(), r.as_predicate()))),
         Or => Ok(three_valued(value::or(l.as_predicate(), r.as_predicate()))),
         Eq | Ne | Lt | Le | Gt | Ge => {
-            let ordering = l.compare(&r)?;
+            let ordering = l.compare_collated(&r, sensitivity)?;
             Ok(three_valued(ordering.map(|ord| compare_matches(op, ord))))
         }
         Add | Sub | Mul | Div | Mod => arithmetic(op, l, r),
     }
+}
+
+/// The case sensitivity governing a comparison of `left` and `right`. A column
+/// operand contributes its column collation (implicit precedence); a literal or
+/// computed expression contributes nothing (coercible-default, which yields). If
+/// any participating column is case-sensitive the comparison is case-sensitive;
+/// otherwise it is case-insensitive (the database default). Ignored for
+/// non-string operands.
+fn comparison_sensitivity(
+    left: &Expr,
+    right: &Expr,
+    resolver: &impl ColumnResolver,
+) -> CollationSensitivity {
+    match (
+        operand_sensitivity(left, resolver),
+        operand_sensitivity(right, resolver),
+    ) {
+        (Some(a), Some(b)) => a.combine(b),
+        (Some(a), None) | (None, Some(a)) => a,
+        (None, None) => CollationSensitivity::DEFAULT,
+    }
+}
+
+/// The implicit collation of `expr` if it is a resolvable column reference, else
+/// `None` (a literal or computed expression is coercible-default and yields to a
+/// column's collation).
+fn operand_sensitivity(
+    expr: &Expr,
+    resolver: &impl ColumnResolver,
+) -> Option<CollationSensitivity> {
+    if let ExprKind::Column(name) = &expr.kind {
+        return resolver.resolve(&name.value).map(|i| resolver.collation(i));
+    }
+    None
+}
+
+/// The collation governing `expr` when it is used as a grouping / join / DISTINCT
+/// key column: its column collation if it is a column reference, else the
+/// database default (case-insensitive). Used by the hash operators to fold key
+/// strings so case-insensitive-equal keys share a bucket.
+pub fn key_collation(expr: &Expr, resolver: &impl ColumnResolver) -> CollationSensitivity {
+    operand_sensitivity(expr, resolver).unwrap_or(CollationSensitivity::DEFAULT)
 }
 
 fn compare_matches(op: BinaryOp, ord: std::cmp::Ordering) -> bool {

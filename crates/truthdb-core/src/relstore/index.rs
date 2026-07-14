@@ -15,8 +15,14 @@
 //! is likewise unique (NULL encodes to one byte), as in SQL Server.
 
 use crate::relstore::heap::Rid;
-use crate::relstore::key::encode_datum;
+use crate::relstore::key::{encode_datum, fold_key_datum};
 use crate::relstore::types::{Datum, TypeError};
+
+/// The collation of the schema column at `index` (empty/short slice → the
+/// case-insensitive database default), for folding character index keys.
+fn column_collation(collations: &[Option<String>], index: usize) -> Option<&str> {
+    collations.get(index).and_then(|c| c.as_deref())
+}
 
 /// How to fetch a base-table row from an index entry: by clustered PK key
 /// bytes, or by heap home RID.
@@ -30,21 +36,25 @@ const LOCATOR_KEY: u8 = 0;
 const LOCATOR_RID: u8 = 1;
 
 /// Encodes an index's key columns from a row's values, applying per-column
-/// ASC/DESC direction. `columns` is `(schema index, ascending)` in key order.
+/// ASC/DESC direction. `columns` is `(schema index, ascending)` in key order;
+/// `collations` is the table's per-column collation (by schema index), so a
+/// case-insensitive character index key folds the same way as the clustered key.
 pub fn encode_index_columns(
     values: &[Datum],
     columns: &[(usize, bool)],
+    collations: &[Option<String>],
 ) -> Result<Vec<u8>, TypeError> {
     let mut out = Vec::new();
     for &(index, ascending) in columns {
         let value = values
             .get(index)
             .ok_or_else(|| TypeError(format!("index column {index} out of range")))?;
+        let folded = fold_key_datum(value, column_collation(collations, index));
         if ascending {
-            encode_datum(value, &mut out)?;
+            encode_datum(&folded, &mut out)?;
         } else {
             let start = out.len();
-            encode_datum(value, &mut out)?;
+            encode_datum(&folded, &mut out)?;
             // DESC: invert this column's bytes so ordering reverses.
             for b in &mut out[start..] {
                 *b = !*b;
@@ -56,19 +66,23 @@ pub fn encode_index_columns(
 
 /// Encodes a leading prefix of an index's columns directly from seek values
 /// (`values[i]` is the value for `columns[i]`), applying ASC/DESC. Used to
-/// build index-seek bounds.
+/// build index-seek bounds. Folds the same way as [`encode_index_columns`], so a
+/// seek literal matches the stored (folded) key under a case-insensitive
+/// collation.
 pub fn encode_index_prefix(
     values: &[Datum],
     columns: &[(usize, bool)],
+    collations: &[Option<String>],
 ) -> Result<Vec<u8>, TypeError> {
     let mut out = Vec::new();
     for (i, value) in values.iter().enumerate() {
-        let (_, ascending) = columns[i];
+        let (index, ascending) = columns[i];
+        let folded = fold_key_datum(value, column_collation(collations, index));
         if ascending {
-            encode_datum(value, &mut out)?;
+            encode_datum(&folded, &mut out)?;
         } else {
             let start = out.len();
-            encode_datum(value, &mut out)?;
+            encode_datum(&folded, &mut out)?;
             for b in &mut out[start..] {
                 *b = !*b;
             }
@@ -143,7 +157,10 @@ mod tests {
     use std::cmp::Ordering;
 
     fn key(values: &[Datum], columns: &[(usize, bool)]) -> Vec<u8> {
-        encode_index_columns(values, columns).expect("encode")
+        // Case-sensitive collation everywhere, so these order/DESC tests exercise
+        // the raw byte layout directly (no case-folding of string keys).
+        let cs = vec![Some("Latin1_General_CS_AS".to_string()); 8];
+        encode_index_columns(values, columns, &cs).expect("encode")
     }
 
     #[test]
