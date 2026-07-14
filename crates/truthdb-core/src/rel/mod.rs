@@ -1223,6 +1223,26 @@ fn exec_create_table(storage: &Storage, create: &CreateTable) -> Result<Statemen
     let check_names: Vec<String> = check_constraints.iter().map(|c| c.name.clone()).collect();
     let foreign_keys = build_foreign_key_defs(storage, create, &columns, table_name, &check_names)?;
 
+    // UNIQUE constraints become unique indexes. Resolve their columns now (while
+    // `columns` is in hand) so an invalid column errors before the table exists.
+    let mut unique_indexes: Vec<(String, Vec<(usize, bool)>)> = Vec::new();
+    for (i, uc) in create.unique_constraints.iter().enumerate() {
+        let mut cols = Vec::with_capacity(uc.columns.len());
+        for col in &uc.columns {
+            let index = columns
+                .iter()
+                .position(|c| c.name.eq_ignore_ascii_case(&col.value))
+                .ok_or_else(|| SqlError::invalid_column(&col.value).at(col.span))?;
+            cols.push((index, true));
+        }
+        let name = uc
+            .name
+            .as_ref()
+            .map(|n| n.value.clone())
+            .unwrap_or_else(|| format!("UQ_{table_name}_{}", i + 1));
+        unique_indexes.push((name, cols));
+    }
+
     storage
         .rel_create_table(
             table_name,
@@ -1234,6 +1254,11 @@ fn exec_create_table(storage: &Storage, create: &CreateTable) -> Result<Statemen
             foreign_keys,
         )
         .map_err(|err| map_storage_err(err, table_name))?;
+    for (name, cols) in unique_indexes {
+        storage
+            .rel_create_index(table_name, name, cols, true)
+            .map_err(|err| map_storage_err(err, table_name))?;
+    }
     Ok(StatementResult::Done)
 }
 

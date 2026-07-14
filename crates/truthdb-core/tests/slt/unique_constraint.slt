@@ -1,0 +1,41 @@
+# Inline UNIQUE constraints (Stage 7): a column-level or table-level UNIQUE
+# becomes a unique index, enforced with error 2601.
+
+statement ok
+CREATE TABLE users (id INT NOT NULL PRIMARY KEY, email VARCHAR(50) UNIQUE, code INT, CONSTRAINT uq_code UNIQUE (code))
+
+statement ok
+INSERT INTO users VALUES (1, 'a@x.com', 100)
+
+# A duplicate email violates the column-level UNIQUE.
+statement error
+INSERT INTO users VALUES (2, 'a@x.com', 200)
+
+# A duplicate code violates the named table-level UNIQUE.
+statement error
+INSERT INTO users VALUES (3, 'b@x.com', 100)
+
+# Distinct values are fine.
+statement ok
+INSERT INTO users VALUES (4, 'b@x.com', 200)
+
+# The unique index appears in sys.indexes.
+query T
+SELECT name FROM sys.indexes WHERE name = 'uq_code'
+----
+uq_code
+
+# A composite table-level UNIQUE over two columns.
+statement ok
+CREATE TABLE pairs (a INT, b INT, UNIQUE (a, b))
+
+statement ok
+INSERT INTO pairs VALUES (1, 1), (1, 2), (2, 1)
+
+# The full (a,b) pair must be unique; a repeat is rejected.
+statement error
+INSERT INTO pairs VALUES (1, 1)
+
+# A partial overlap is allowed (only the whole tuple is unique).
+statement ok
+INSERT INTO pairs VALUES (2, 2)
