@@ -163,8 +163,13 @@ fn group_rows(
     if select.group_by.is_empty() {
         return Ok(vec![(Vec::new(), (0..rows.len()).collect())]);
     }
-    // Key each row, then bucket by key (order_key_cmp equality).
-    let mut keyed: Vec<(Vec<SqlValue>, usize)> = Vec::with_capacity(rows.len());
+    // Key each row and bucket by key in a hash table — O(n) instead of the old
+    // O(n·groups) linear probe. `HashKey`'s equality matches the previous
+    // `order_key_cmp`-based `keys_equal`, so groups are identical; a side `Vec`
+    // preserves first-appearance order (the order the old scan produced).
+    use super::hash::HashKey;
+    let mut index_of: std::collections::HashMap<HashKey, usize> = std::collections::HashMap::new();
+    let mut groups: Vec<(Vec<SqlValue>, Vec<usize>)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
         let sql_row = row_values(row, types);
         let key = select
@@ -172,24 +177,15 @@ fn group_rows(
             .iter()
             .map(|expr| eval::eval(expr, &sql_row, resolver, eval_ctx))
             .collect::<Result<Vec<_>, _>>()?;
-        keyed.push((key, index));
-    }
-    let mut groups: Vec<(Vec<SqlValue>, Vec<usize>)> = Vec::new();
-    for (key, index) in keyed {
-        if let Some((_, members)) = groups.iter_mut().find(|(k, _)| keys_equal(k, &key)) {
-            members.push(index);
-        } else {
-            groups.push((key, vec![index]));
+        match index_of.get(&HashKey(key.clone())) {
+            Some(&pos) => groups[pos].1.push(index),
+            None => {
+                index_of.insert(HashKey(key.clone()), groups.len());
+                groups.push((key, vec![index]));
+            }
         }
     }
     Ok(groups)
-}
-
-fn keys_equal(a: &[SqlValue], b: &[SqlValue]) -> bool {
-    a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| order_key_cmp(x, y) == std::cmp::Ordering::Equal)
 }
 
 fn compute_aggregate(
