@@ -65,6 +65,15 @@ ORDER BY name
 ----
 alice
 
+# An inner column that is AMBIGUOUS within the subquery's own join is NOT
+# rebound to a same-named outer column — it stays an (erroring) inner reference,
+# not a silent correlation. Here `id` is ambiguous across ord a / ord b and also
+# exists in the outer cust, so a naive correlation check would wrongly bind it to
+# cust.id; instead the statement errors.
+statement error
+SELECT name FROM cust
+WHERE EXISTS (SELECT 1 FROM ord a JOIN ord b ON a.cust_id = b.cust_id WHERE id = 5)
+
 # Correlated subquery whose outer row has a NULL correlation value never matches
 # (NULL = anything is UNKNOWN).
 statement ok

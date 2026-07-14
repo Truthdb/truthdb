@@ -2716,6 +2716,24 @@ impl truthdb_sql::eval::ColumnResolver for OutputScope {
 }
 
 impl JoinScope {
+    /// True if any column matches `name` — even ambiguously (>1 match), where
+    /// [`ColumnResolver::resolve`] returns `None`. Correlation analysis uses this
+    /// to tell "the inner scope has this name (bind/error here)" from "the name
+    /// is absent (it is an outer reference)": an ambiguous inner column must NOT
+    /// be rebound to a same-named outer column.
+    fn matches_any(&self, name: &str) -> bool {
+        self.columns.iter().any(|(qualifier, column)| {
+            if let Some((q, c)) = name.rsplit_once('.') {
+                qualifier
+                    .as_deref()
+                    .is_some_and(|qq| qq.eq_ignore_ascii_case(q))
+                    && column.eq_ignore_ascii_case(c)
+            } else {
+                column.eq_ignore_ascii_case(name)
+            }
+        })
+    }
+
     /// Source-column indices belonging to a table qualifier (for `t.*`).
     fn indices_for_qualifier(&self, qualifier: &str) -> Vec<usize> {
         self.columns
@@ -3317,7 +3335,9 @@ fn is_correlated(storage: &Storage, subquery: &Select, outer: &JoinScope) -> boo
     };
     let mut correlated = false;
     select_column_refs(subquery, &mut |name| {
-        if inner.resolve(&name.value).is_none() && outer.resolve(&name.value).is_some() {
+        // `matches_any` (not `resolve`) so an *ambiguous* inner column is treated
+        // as inner (it errors in the subquery) rather than rebound to the outer.
+        if !inner.matches_any(&name.value) && outer.resolve(&name.value).is_some() {
             correlated = true;
         }
     });
@@ -3534,8 +3554,8 @@ fn substitute_subquery_outer_refs(
 ) -> Option<Select> {
     let inner = subquery_inner_scope(storage, subquery)?;
     let substitute = |name: &Name| -> Option<Expr> {
-        if inner.resolve(&name.value).is_some() {
-            return None; // the subquery's own column wins
+        if inner.matches_any(&name.value) {
+            return None; // the subquery's own column wins (even if ambiguous)
         }
         let index = outer.resolve(&name.value)?;
         Some(Expr {
