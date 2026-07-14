@@ -2401,6 +2401,49 @@ mod tests {
     }
 
     #[test]
+    fn inner_join_grace_hash_spills_and_matches_in_memory() {
+        // A tiny budget forces the grace-hash INNER join (partition both sides by
+        // key hash to temp extents, join per partition). Results must match the
+        // in-memory hash join — many-to-many keys, NULL keys (never match), and a
+        // residual ON predicate.
+        let path = unique_temp_path("join-spill");
+        let engine = new_engine(&path);
+        engine.execute("CREATE TABLE l (k INT, v INT)").expect("l");
+        engine.execute("CREATE TABLE r (k INT, w INT)").expect("r");
+        for i in 0..300 {
+            let lk = if i % 41 == 0 {
+                "NULL".into()
+            } else {
+                (i % 25).to_string()
+            };
+            engine
+                .execute(&format!("INSERT INTO l VALUES ({lk}, {i})"))
+                .expect("l ins");
+            let rk = if i % 43 == 0 {
+                "NULL".into()
+            } else {
+                (i % 25).to_string()
+            };
+            engine
+                .execute(&format!("INSERT INTO r VALUES ({rk}, {i})"))
+                .expect("r ins");
+        }
+        let query = "SELECT l.v, r.w FROM l JOIN r ON l.k = r.k AND r.w > 100 ORDER BY l.v, r.w";
+
+        let (_, reference) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(Some(500));
+        let (_, spilled) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(None);
+
+        assert!(!reference.is_empty());
+        assert_eq!(
+            spilled, reference,
+            "grace-hash INNER join must match in-memory"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn group_by_grace_hash_spills_and_matches_in_memory() {
         // A tiny budget forces grace-hash aggregation (partition rows by
         // group-key hash to temp extents, aggregate each partition). Results
