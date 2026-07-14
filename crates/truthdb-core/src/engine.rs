@@ -228,23 +228,18 @@ impl Engine {
     }
 
     fn maybe_checkpoint(&self, meta: &EngineMeta) -> Result<(), EngineError> {
-        // A checkpoint flushes dirty pages and truncates the WAL head. While a
-        // transaction is open its uncommitted pages would be made durable and
-        // its undo records discarded, so a crash could not roll it back. The
-        // check-and-write must be atomic: with a concurrent worker pool a
-        // transaction can begin between a bare check and the truncation, so the
-        // decision is re-made under the storage lock in `checkpoint_if_quiescent`
-        // (which no transaction can `begin` across). The bare pre-check here
-        // just avoids serializing state on every batch in the common case.
-        if self.storage.has_active_transactions()
-            || self.wal_usage_ratio() < WAL_CHECKPOINT_THRESHOLD
-        {
+        // A (fuzzy) checkpoint flushes dirty pages and truncates the WAL head to
+        // the oldest open transaction's begin LSN, so it may run with open
+        // transactions (their undo survives). The decision is (re-)made under the
+        // storage lock in `checkpoint_if_wal_full`; this bare pre-check just
+        // avoids serializing state on every batch below the WAL threshold.
+        if self.wal_usage_ratio() < WAL_CHECKPOINT_THRESHOLD {
             return Ok(());
         }
         let data = serde_json::to_vec(&meta.state)
             .map_err(|err| EngineError::Replay(format!("failed to serialize state: {err}")))?;
         let checkpoint_seq = meta.next_seq_no.saturating_sub(1);
-        self.storage.checkpoint_if_quiescent(
+        self.storage.checkpoint_if_wal_full(
             &data,
             checkpoint_seq,
             meta.next_seq_no,

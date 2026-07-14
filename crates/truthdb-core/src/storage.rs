@@ -240,14 +240,14 @@ impl Storage {
             .write_checkpoint(data, checkpoint_seq, next_seq_no, next_doc_id)
     }
 
-    /// Writes a checkpoint only if no transaction is active and the WAL is at
-    /// least `threshold` full — decided and written under a single lock hold, so
-    /// a transaction cannot `begin` (which also takes this lock) in the window
-    /// between the check and the WAL truncation. Without that atomicity a
-    /// concurrent worker could open a transaction just after the check, and the
-    /// checkpoint would flush its uncommitted pages and discard its undo,
-    /// resurrecting uncommitted data after a crash. Returns whether it wrote.
-    pub fn checkpoint_if_quiescent(
+    /// Writes a checkpoint if the WAL is at least `threshold` full. This is a
+    /// *fuzzy* checkpoint: it may run with open explicit transactions — it
+    /// flushes their (uncommitted) pages under the steal policy and clamps the
+    /// WAL head to the oldest open transaction's begin LSN, so their undo records
+    /// survive a crash. Decided and written under one lock hold (a transaction
+    /// cannot `begin`, changing the oldest begin LSN, in the window between the
+    /// clamp computation and the truncation). Returns whether it wrote.
+    pub fn checkpoint_if_wal_full(
         &self,
         data: &[u8],
         checkpoint_seq: u64,
@@ -259,7 +259,7 @@ impl Storage {
         // A wedged store's in-memory state is ahead of the durable log after a
         // failed fsync; checkpointing would flush and re-fsync exactly the data
         // whose durability failed (and was reported to the client as failed).
-        if file.rel.wedged || file.has_active_transactions() || file.wal_usage_ratio() < threshold {
+        if file.rel.wedged || file.wal_usage_ratio() < threshold {
             return Ok(false);
         }
         file.write_checkpoint(data, checkpoint_seq, next_seq_no, next_doc_id)?;
@@ -464,6 +464,7 @@ impl Storage {
         self.lock().rollback_txn_to(txn, savepoint)
     }
 
+    #[cfg(test)]
     pub(crate) fn has_active_transactions(&self) -> bool {
         self.lock().has_active_transactions()
     }
@@ -2089,9 +2090,10 @@ impl StorageFile {
         let roots = self.rel.tree_roots();
         let mut ctx = self.rel_ctx();
         let txn = ctx.begin(txn_id)?;
-        // The transaction is now open (its undo records must survive until it
-        // commits or rolls back, which gates checkpoints — see `active_txns`).
-        self.rel.active_txns += 1;
+        // Track the transaction's BEGIN LSN so a checkpoint clamps the WAL head
+        // to the oldest open transaction, preserving its undo records for crash
+        // rollback (its uncommitted pages may still be flushed under steal).
+        self.rel.active_txn_begins.insert(txn.txn_id, txn.last_lsn);
         Ok(StorageTxn { txn, roots })
     }
 
@@ -2099,7 +2101,7 @@ impl StorageFile {
     /// store, as for autocommit commits.
     fn commit_txn(&mut self, stx: StorageTxn) -> Result<(), StorageError> {
         // The transaction is ending (the `StorageTxn` is consumed either way).
-        self.rel.active_txns = self.rel.active_txns.saturating_sub(1);
+        self.rel.active_txn_begins.remove(&stx.txn.txn_id);
         let mut ctx = self.rel_ctx();
         match ctx.commit(stx.txn) {
             Ok(()) => Ok(()),
@@ -2112,7 +2114,7 @@ impl StorageFile {
 
     /// Rolls back a caller-held transaction via its in-memory undo log (CLRs).
     fn rollback_txn(&mut self, stx: StorageTxn) -> Result<(), StorageError> {
-        self.rel.active_txns = self.rel.active_txns.saturating_sub(1);
+        self.rel.active_txn_begins.remove(&stx.txn.txn_id);
         let roots = stx.roots;
         let mut ctx = self.rel_ctx();
         match rel_recovery::rollback(&mut ctx, stx.txn, &roots) {
@@ -2150,11 +2152,21 @@ impl StorageFile {
         }
     }
 
-    /// Whether any explicit transaction is open. A checkpoint must be skipped
-    /// while this is true (its WAL truncation would discard undo records still
-    /// needed to roll the open transaction back after a crash).
+    /// Whether any explicit transaction is open.
+    #[cfg(test)]
     fn has_active_transactions(&self) -> bool {
-        self.rel.active_txns > 0
+        !self.rel.active_txn_begins.is_empty()
+    }
+
+    /// The WAL LSN a checkpoint may truncate up to: the oldest open transaction's
+    /// BEGIN LSN (so its undo records survive), or the WAL tail if none is open.
+    fn checkpoint_wal_head(&self) -> u64 {
+        self.rel
+            .active_txn_begins
+            .values()
+            .min()
+            .copied()
+            .map_or(self.wal.tail(), |oldest| oldest.min(self.wal.tail()))
     }
 
     fn ensure_rel_usable(&self) -> Result<(), StorageError> {
@@ -2484,12 +2496,11 @@ impl StorageFile {
         desc_offset: u64,
         data_write_offset: u64,
     ) -> Result<(), StorageError> {
-        // Flush every dirty relational page (WAL-before-data enforced per
-        // page by the pool) and reset the dirty-page table: the next change
-        // to any page starts a fresh FPI epoch. With the engine single-
-        // threaded, no relational transaction can span a checkpoint, so the
-        // WAL head may advance to the tail below (a future concurrent engine
-        // must clamp it to the oldest active transaction's begin LSN).
+        // Flush every dirty relational page (WAL-before-data enforced per page
+        // by the pool) and reset the dirty-page table: the next change to any
+        // page starts a fresh FPI epoch. Flushing an *uncommitted* page is safe
+        // (ARIES steal) because the WAL head is clamped below to the oldest open
+        // transaction's begin LSN, so its undo records survive to roll it back.
         self.wal.sync_all()?;
         {
             let RelState { pool, dpt, .. } = &mut self.rel;
@@ -2522,9 +2533,10 @@ impl StorageFile {
             .write_all_at(self.layout.allocator_offset, &bitmap)?;
         self.file.sync_data()?;
 
-        // 4. Advance the WAL head and publish both superblocks (new active
-        //    first).
-        self.wal.set_head(self.wal.tail());
+        // 4. Advance the WAL head — to the tail, or clamped to the oldest open
+        //    transaction's begin LSN so its undo survives (fuzzy checkpoint) —
+        //    and publish both superblocks (new active first).
+        self.wal.set_head(self.checkpoint_wal_head());
         let new_active = match self.active_superblock {
             ActiveSuperblock::A => ActiveSuperblock::B,
             ActiveSuperblock::B => ActiveSuperblock::A,

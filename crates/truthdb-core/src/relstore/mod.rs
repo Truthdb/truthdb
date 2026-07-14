@@ -40,11 +40,12 @@ pub(crate) struct RelState {
     pub tables: HashMap<String, TableDef>,
     pub next_txn_id: u64,
     pub next_object_id: u32,
-    /// Open explicit (multi-statement) transactions. A checkpoint must not run
-    /// while any is open: it would flush their uncommitted pages and truncate
-    /// the WAL past their undo records, making uncommitted writes permanent on
-    /// crash. Autocommit statements never leave one open across calls.
-    pub active_txns: u32,
+    /// Open explicit (multi-statement) transactions: txn id → its `BEGIN` LSN.
+    /// A (fuzzy) checkpoint may run while these are open — it flushes their
+    /// (uncommitted) pages under the steal policy — but must clamp the WAL head
+    /// to the *oldest* begin LSN here so their undo records survive for crash
+    /// rollback. Autocommit statements never leave one open across calls.
+    pub active_txn_begins: std::collections::BTreeMap<u64, u64>,
 }
 
 impl RelState {
@@ -57,7 +58,7 @@ impl RelState {
             tables: HashMap::new(),
             next_txn_id: 1,
             next_object_id: FIRST_USER_OBJECT_ID,
-            active_txns: 0,
+            active_txn_begins: std::collections::BTreeMap::new(),
         }
     }
 
