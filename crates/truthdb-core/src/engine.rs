@@ -2401,6 +2401,42 @@ mod tests {
     }
 
     #[test]
+    fn group_by_grace_hash_spills_and_matches_in_memory() {
+        // A tiny budget forces grace-hash aggregation (partition rows by
+        // group-key hash to temp extents, aggregate each partition). Results
+        // must match the in-memory hash aggregate — group keys, SUM, COUNT, and
+        // COUNT(DISTINCT), including a NULL group and HAVING.
+        let path = unique_temp_path("agg-spill");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, grp INT, amt INT)")
+            .expect("t");
+        for i in 0..800 {
+            let grp = if i % 37 == 0 {
+                "NULL".to_string()
+            } else {
+                (i % 60).to_string()
+            };
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {grp}, {})", i % 10))
+                .expect("insert");
+        }
+        let query = "SELECT grp, SUM(amt), COUNT(*), COUNT(DISTINCT amt) FROM t GROUP BY grp HAVING COUNT(*) > 2 ORDER BY grp";
+
+        let (_, reference) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(Some(400));
+        let (_, spilled) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(None);
+
+        assert!(!reference.is_empty());
+        assert_eq!(
+            spilled, reference,
+            "grace-hash aggregate must match in-memory"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn order_by_spills_wide_join_rows() {
         // A join's source row is the concatenation of both tables' columns. Each
         // per-table row fits (< the ~2020 B clustered cell cap), but the joined

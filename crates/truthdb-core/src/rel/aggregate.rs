@@ -74,6 +74,7 @@ struct AggSpec {
 /// Runs the grouped query over the (already WHERE-filtered) source rows and
 /// returns the projected output rows (before DISTINCT/ORDER BY/TOP).
 pub fn execute(
+    storage: &crate::storage::Storage,
     select: &Select,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
@@ -115,18 +116,62 @@ pub fn execute(
         .chain((0..aggs.len()).map(|j| format!("$agg{j}")))
         .collect();
 
-    let groups = group_rows(select, rows, types, resolver, eval_ctx)?;
+    // A GROUP BY over an input larger than the operator memory budget spills:
+    // partition the rows by group-key hash (so every member of a group lands in
+    // one partition) to temp extents, then aggregate each partition in bounded
+    // memory. Without GROUP BY (one group) or within budget, aggregate directly.
+    let budget = super::sort_budget();
+    let input_bytes: usize = rows.iter().map(|r| super::approx_row_bytes(r)).sum();
+    let out_rows = if select.group_by.is_empty() || input_bytes <= budget {
+        aggregate_partition(
+            select, rows, types, resolver, eval_ctx, &aggs, &having, &out_exprs, &synth,
+        )?
+    } else {
+        grace_hash_aggregate(
+            storage,
+            select,
+            rows,
+            types,
+            resolver,
+            eval_ctx,
+            &aggs,
+            &having,
+            &out_exprs,
+            &synth,
+            input_bytes,
+            budget,
+        )?
+    };
 
+    build_rowset(out_names, out_rows)
+}
+
+/// Groups `rows`, computes each aggregate and HAVING, and projects the output
+/// SQL-value rows. This is the in-memory aggregation used both directly and per
+/// grace-hash partition.
+#[allow(clippy::too_many_arguments, clippy::ptr_arg)]
+fn aggregate_partition(
+    select: &Select,
+    rows: &[Vec<Datum>],
+    types: &[ColumnType],
+    resolver: &JoinScope,
+    eval_ctx: &EvalContext,
+    aggs: &[AggSpec],
+    having: &Option<Expr>,
+    out_exprs: &[Expr],
+    synth: &Vec<String>,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    let groups = group_rows(select, rows, types, resolver, eval_ctx)?;
     let mut out_rows: Vec<Vec<SqlValue>> = Vec::new();
     for (keys, members) in &groups {
         let mut group_row = keys.clone();
-        for spec in &aggs {
+        for spec in aggs {
             group_row.push(compute_aggregate(
                 spec, rows, types, resolver, members, eval_ctx,
             )?);
         }
-        if let Some(having) = &having {
-            match eval::eval(having, &group_row, &synth, eval_ctx)? {
+        if let Some(having) = having {
+            match eval::eval(having, &group_row, synth, eval_ctx)? {
                 SqlValue::Bool(true) => {}
                 SqlValue::Bool(false) | SqlValue::Null => continue,
                 _ => {
@@ -140,13 +185,89 @@ pub fn execute(
             }
         }
         let mut row = Vec::with_capacity(out_exprs.len());
-        for expr in &out_exprs {
-            row.push(eval::eval(expr, &group_row, &synth, eval_ctx)?);
+        for expr in out_exprs {
+            row.push(eval::eval(expr, &group_row, synth, eval_ctx)?);
         }
         out_rows.push(row);
     }
+    Ok(out_rows)
+}
 
-    build_rowset(out_names, out_rows)
+/// Grace-hash aggregation: partition rows by group-key hash into temp-extent
+/// spools, then aggregate each partition independently and concatenate.
+/// (Extreme group skew — one partition far larger than the budget — is not
+/// re-partitioned; a first cut, documented.)
+#[allow(clippy::too_many_arguments, clippy::ptr_arg)]
+fn grace_hash_aggregate(
+    storage: &crate::storage::Storage,
+    select: &Select,
+    rows: &[Vec<Datum>],
+    types: &[ColumnType],
+    resolver: &JoinScope,
+    eval_ctx: &EvalContext,
+    aggs: &[AggSpec],
+    having: &Option<Expr>,
+    out_exprs: &[Expr],
+    synth: &Vec<String>,
+    input_bytes: usize,
+    budget: usize,
+) -> Result<Vec<Vec<SqlValue>>, SqlError> {
+    let partitions = (input_bytes / budget + 1).max(2);
+    let mut spools: Vec<crate::relstore::spill::RowSpool> = (0..partitions)
+        .map(|_| crate::relstore::spill::RowSpool::new(storage))
+        .collect();
+    for row in rows {
+        let key = group_key(select, row, types, resolver, eval_ctx)?;
+        let index = partition_index(&key, partitions);
+        spools[index]
+            .write_row(row)
+            .map_err(|e| super::map_storage_err(e, "<agg spill>"))?;
+    }
+    let mut out_rows: Vec<Vec<SqlValue>> = Vec::new();
+    for spool in &mut spools {
+        spool
+            .finish_writing()
+            .map_err(|e| super::map_storage_err(e, "<agg spill>"))?;
+    }
+    for spool in &spools {
+        let mut part_rows: Vec<Vec<Datum>> = Vec::with_capacity(spool.row_count() as usize);
+        let mut reader = spool.reader();
+        while let Some(row) = reader
+            .next_row()
+            .map_err(|e| super::map_storage_err(e, "<agg spill>"))?
+        {
+            part_rows.push(row);
+        }
+        out_rows.extend(aggregate_partition(
+            select, &part_rows, types, resolver, eval_ctx, aggs, having, out_exprs, synth,
+        )?);
+    }
+    Ok(out_rows)
+}
+
+/// The GROUP BY key of one row (used to route it to a grace-hash partition).
+fn group_key(
+    select: &Select,
+    row: &[Datum],
+    types: &[ColumnType],
+    resolver: &JoinScope,
+    eval_ctx: &EvalContext,
+) -> Result<Vec<SqlValue>, SqlError> {
+    let sql_row = row_values(row, types);
+    select
+        .group_by
+        .iter()
+        .map(|expr| eval::eval(expr, &sql_row, resolver, eval_ctx))
+        .collect()
+}
+
+/// The partition a group key routes to. Uses the same `HashKey` hashing as the
+/// in-memory grouping, so equal group keys always share a partition.
+fn partition_index(key: &[SqlValue], partitions: usize) -> usize {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    super::hash::HashKey(key.to_vec()).hash(&mut hasher);
+    (hasher.finish() % partitions as u64) as usize
 }
 
 /// Groups the rows by the GROUP BY key expressions. With no GROUP BY the whole

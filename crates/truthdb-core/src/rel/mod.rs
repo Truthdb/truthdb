@@ -3931,7 +3931,7 @@ fn exec_select(
     // can order by columns that are not in the SELECT list.
     if aggregate::is_aggregated(select) || select.distinct {
         let mut out = if aggregate::is_aggregated(select) {
-            aggregate::execute(select, &rows, &types, &resolver, eval_ctx)?
+            aggregate::execute(storage, select, &rows, &types, &resolver, eval_ctx)?
         } else {
             project(
                 &select.items,
