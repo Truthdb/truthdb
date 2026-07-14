@@ -2354,6 +2354,102 @@ mod tests {
     }
 
     #[test]
+    fn order_by_spills_and_matches_in_memory_sort() {
+        // A tiny sort budget forces the external merge sort (spill sorted runs
+        // to temp extents + k-way merge); its output must be byte-identical to
+        // the in-memory sort, ties included.
+        let path = unique_temp_path("sort-spill");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, grp INT, tag NVARCHAR(20))")
+            .expect("t");
+        // 600 rows with many tied `grp` values (exercises stable cross-run ties).
+        for i in 0..600 {
+            engine
+                .execute(&format!(
+                    "INSERT INTO t VALUES ({i}, {}, 'tag-{}')",
+                    (i * 7) % 50,
+                    i % 13
+                ))
+                .expect("insert");
+        }
+        let query = "SELECT id, grp, tag FROM t ORDER BY grp, tag, id";
+
+        // Reference: default (in-memory) budget.
+        let (_, reference) = sql_rows(&engine, query);
+
+        // Forced spill: a 300-byte budget makes almost every row its own run.
+        crate::rel::set_test_sort_budget(Some(300));
+        let (_, spilled) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(None);
+
+        assert_eq!(reference.len(), 600);
+        assert_eq!(
+            spilled, reference,
+            "spilled sort must match the in-memory sort"
+        );
+        // Sanity: the result really is ordered by (grp, tag, id).
+        let key = |r: &Vec<Option<String>>| {
+            (
+                r[1].clone().unwrap().parse::<i64>().unwrap(),
+                r[2].clone().unwrap(),
+                r[0].clone().unwrap().parse::<i64>().unwrap(),
+            )
+        };
+        assert!(spilled.windows(2).all(|w| key(&w[0]) <= key(&w[1])));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn order_by_spills_wide_join_rows() {
+        // A join's source row is the concatenation of both tables' columns. Each
+        // per-table row fits (< the ~2020 B clustered cell cap), but the joined
+        // source row (two ~1950 B strings) exceeds the 3900 B in-row table cap —
+        // sorting it (pre-projection) must still spill: the spill codec is
+        // cap-free, whereas reusing the table codec would error 1701.
+        let path = unique_temp_path("sort-spill-wide");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE a (k INT NOT NULL PRIMARY KEY, s VARCHAR(2000))")
+            .expect("a");
+        engine
+            .execute("CREATE TABLE b (k INT NOT NULL PRIMARY KEY, s VARCHAR(2000))")
+            .expect("b");
+        for i in 0..40 {
+            engine
+                .execute(&format!(
+                    "INSERT INTO a VALUES ({i}, '{}')",
+                    "x".repeat(1950)
+                ))
+                .expect("a ins");
+            engine
+                .execute(&format!(
+                    "INSERT INTO b VALUES ({i}, '{}')",
+                    "y".repeat(1950)
+                ))
+                .expect("b ins");
+        }
+        let query = "SELECT a.k FROM a JOIN b ON a.k = b.k ORDER BY a.k DESC";
+        let (_, reference) = sql_rows(&engine, query);
+        assert_eq!(
+            reference.len(),
+            40,
+            "join+sort should return 40 rows in memory"
+        );
+        // Each joined source row is ~3.9 KB (> 3900) — forced to spill.
+        crate::rel::set_test_sort_budget(Some(300));
+        let (_, rows) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(None);
+        assert_eq!(
+            rows, reference,
+            "spilled wide-join sort must match in-memory"
+        );
+        assert_eq!(rows[0][0].as_deref(), Some("39"));
+        assert_eq!(rows[39][0].as_deref(), Some("0"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn row_locks_for_point_operations() {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;

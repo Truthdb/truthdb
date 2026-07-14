@@ -3953,10 +3953,11 @@ fn exec_select(
     }
 
     // ORDER BY (evaluated against the source row; stable so equal keys keep
-    // input order).
+    // input order). Spills to temp extents when the input exceeds the budget.
     if !select.order_by.is_empty() {
-        order_rows(
-            &mut rows,
+        rows = order_rows(
+            storage,
+            rows,
             &select.order_by,
             &types,
             &source.collations,
@@ -4134,18 +4135,70 @@ fn order_output(
     Ok(())
 }
 
-fn order_rows(
-    rows: &mut [Vec<Datum>],
+/// Per-query sort memory budget: a sort whose rows exceed this spills to temp
+/// extents (external merge sort) rather than growing without bound.
+const SORT_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+
+/// A row paired with its evaluated ORDER BY key, as carried through the sort.
+type KeyedRow = (Vec<SqlValue>, Vec<Datum>);
+
+#[cfg(test)]
+thread_local! {
+    /// Test-only override that forces the external-sort spill path on small
+    /// inputs (execution runs on the calling thread in tests).
+    static TEST_SORT_BUDGET: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+/// The active sort memory budget (overridable in tests).
+fn sort_budget() -> usize {
+    #[cfg(test)]
+    if let Some(budget) = TEST_SORT_BUDGET.with(std::cell::Cell::get) {
+        return budget;
+    }
+    SORT_MEMORY_BUDGET
+}
+
+/// Forces (or clears) the sort spill budget for the current test thread.
+#[cfg(test)]
+pub(crate) fn set_test_sort_budget(budget: Option<usize>) {
+    TEST_SORT_BUDGET.with(|cell| cell.set(budget));
+}
+
+/// The ORDER BY comparator for one pair of pre-evaluated key tuples: per item,
+/// collation-aware for a character column, else value order (NULLs first);
+/// `descending` reverses. No tie-break here — the caller adds stability.
+fn compare_sort_keys(
+    a: &[SqlValue],
+    b: &[SqlValue],
+    order_by: &[OrderItem],
+    collators: &[Option<collation::Collation>],
+) -> std::cmp::Ordering {
+    use std::cmp::Ordering;
+    for (col, item) in order_by.iter().enumerate() {
+        let ord = match (&collators[col], &a[col], &b[col]) {
+            (Some(coll), SqlValue::Str(x), SqlValue::Str(y)) => coll.compare(x, y),
+            (Some(_), SqlValue::Null, SqlValue::Null) => Ordering::Equal,
+            (Some(_), SqlValue::Null, _) => Ordering::Less,
+            (Some(_), _, SqlValue::Null) => Ordering::Greater,
+            _ => order_key_cmp(&a[col], &b[col]),
+        };
+        let ord = if item.descending { ord.reverse() } else { ord };
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
+/// Builds the per-item collators (only a bare character column is collation-
+/// ordered; everything else uses value order).
+fn sort_collators(
     order_by: &[OrderItem],
     types: &[ColumnType],
     collations: &[Option<String>],
     resolver: &JoinScope,
-    eval_ctx: &EvalContext,
-) -> Result<(), SqlError> {
-    use std::cmp::Ordering;
-    // A bare character column is ordered by its collation (its COLLATE clause,
-    // else the database default); anything else uses value ordering.
-    let collators: Vec<Option<collation::Collation>> = order_by
+) -> Vec<Option<collation::Collation>> {
+    order_by
         .iter()
         .map(|item| {
             let index = bare_column_index(&item.expr, resolver)?;
@@ -4163,40 +4216,198 @@ fn order_rows(
                 .unwrap_or_else(|| collation::DEFAULT_COLLATION.to_string());
             Some(collation::Collation::from_name(&name))
         })
-        .collect();
+        .collect()
+}
 
-    // Precompute sort keys to keep comparisons cheap and to surface eval
-    // errors before sorting.
-    let mut keyed: Vec<(Vec<SqlValue>, usize)> = Vec::with_capacity(rows.len());
-    for (index, row) in rows.iter().enumerate() {
-        let values = row_values(row, types);
-        let mut key = Vec::with_capacity(order_by.len());
-        for item in order_by {
-            key.push(eval::eval(&item.expr, &values, resolver, eval_ctx)?);
+/// The ORDER BY key of one row.
+fn sort_key(
+    row: &[Datum],
+    order_by: &[OrderItem],
+    types: &[ColumnType],
+    resolver: &JoinScope,
+    eval_ctx: &EvalContext,
+) -> Result<Vec<SqlValue>, SqlError> {
+    let values = row_values(row, types);
+    order_by
+        .iter()
+        .map(|item| eval::eval(&item.expr, &values, resolver, eval_ctx))
+        .collect()
+}
+
+/// A rough in-memory byte estimate for a row, for the sort budget.
+fn approx_row_bytes(row: &[Datum]) -> usize {
+    let payload: usize = row
+        .iter()
+        .map(|d| match d {
+            Datum::VarChar(s) | Datum::NVarChar(s) => s.len() + 16,
+            Datum::VarBinary(b) => b.len() + 16,
+            _ => 16,
+        })
+        .sum();
+    payload + 24
+}
+
+/// Sorts the (already WHERE-filtered) source rows by ORDER BY. Fits-in-budget
+/// inputs sort in memory (Rust's stable `sort_by`); a larger input spills
+/// sorted runs to temp extents and k-way merges them (external merge sort),
+/// bounding the sort's working memory instead of erroring or doubling memory.
+fn order_rows(
+    storage: &Storage,
+    rows: Vec<Vec<Datum>>,
+    order_by: &[OrderItem],
+    types: &[ColumnType],
+    collations: &[Option<String>],
+    resolver: &JoinScope,
+    eval_ctx: &EvalContext,
+) -> Result<Vec<Vec<Datum>>, SqlError> {
+    order_rows_budgeted(
+        storage,
+        rows,
+        order_by,
+        types,
+        collations,
+        resolver,
+        eval_ctx,
+        sort_budget(),
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn order_rows_budgeted<'a>(
+    storage: &'a Storage,
+    rows: Vec<Vec<Datum>>,
+    order_by: &[OrderItem],
+    types: &[ColumnType],
+    collations: &[Option<String>],
+    resolver: &JoinScope,
+    eval_ctx: &EvalContext,
+    budget: usize,
+) -> Result<Vec<Vec<Datum>>, SqlError> {
+    let collators = sort_collators(order_by, types, collations, resolver);
+    let cmp = |a: &Vec<SqlValue>, b: &Vec<SqlValue>| compare_sort_keys(a, b, order_by, &collators);
+
+    // Generate sorted runs, spilling a run to a `RowSpool` each time the
+    // accumulated rows reach the budget. The final (in-memory) run is kept.
+    let mut runs: Vec<crate::relstore::spill::RowSpool<'a>> = Vec::new();
+    let mut current: Vec<KeyedRow> = Vec::new();
+    let mut current_bytes = 0usize;
+    for row in rows {
+        let key = sort_key(&row, order_by, types, resolver, eval_ctx)?;
+        current_bytes += approx_row_bytes(&row);
+        current.push((key, row));
+        if current_bytes >= budget {
+            runs.push(sort_and_spill(storage, &mut current, &cmp)?);
+            current_bytes = 0;
         }
-        keyed.push((key, index));
     }
-    keyed.sort_by(|(a, ai), (b, bi)| {
-        for (col, item) in order_by.iter().enumerate() {
-            let ord = match (&collators[col], &a[col], &b[col]) {
-                (Some(coll), SqlValue::Str(x), SqlValue::Str(y)) => coll.compare(x, y),
-                // NULL still sorts first even under a collation.
-                (Some(_), SqlValue::Null, SqlValue::Null) => Ordering::Equal,
-                (Some(_), SqlValue::Null, _) => Ordering::Less,
-                (Some(_), _, SqlValue::Null) => Ordering::Greater,
-                _ => order_key_cmp(&a[col], &b[col]),
-            };
-            let ord = if item.descending { ord.reverse() } else { ord };
-            if ord != Ordering::Equal {
-                return ord;
+    // No spill: a plain stable in-memory sort.
+    if runs.is_empty() {
+        current.sort_by(|(a, _), (b, _)| cmp(a, b));
+        return Ok(current.into_iter().map(|(_, row)| row).collect());
+    }
+    // Sort the final partial run and merge every run.
+    current.sort_by(|(a, _), (b, _)| cmp(a, b));
+    merge_runs(
+        &runs, current, order_by, types, resolver, eval_ctx, &collators,
+    )
+}
+
+/// Stably sorts `run` in place and writes its rows (in sorted order) to a fresh
+/// `RowSpool`, clearing `run`.
+fn sort_and_spill<'a>(
+    storage: &'a Storage,
+    run: &mut Vec<KeyedRow>,
+    cmp: &impl Fn(&Vec<SqlValue>, &Vec<SqlValue>) -> std::cmp::Ordering,
+) -> Result<crate::relstore::spill::RowSpool<'a>, SqlError> {
+    run.sort_by(|(a, _), (b, _)| cmp(a, b));
+    let mut spool = crate::relstore::spill::RowSpool::new(storage);
+    for (_, row) in run.drain(..) {
+        spool
+            .write_row(&row)
+            .map_err(|e| map_storage_err(e, "<sort spill>"))?;
+    }
+    spool
+        .finish_writing()
+        .map_err(|e| map_storage_err(e, "<sort spill>"))?;
+    Ok(spool)
+}
+
+/// K-way merges the sorted spilled `runs` and the sorted in-memory `tail` run
+/// into one sorted row vector. Keys are recomputed per row on read (cheap for
+/// column refs); ties prefer the earlier run so the merge is globally stable
+/// (spilled runs hold earlier input rows than the in-memory tail).
+#[allow(clippy::too_many_arguments)]
+fn merge_runs(
+    runs: &[crate::relstore::spill::RowSpool<'_>],
+    tail: Vec<KeyedRow>,
+    order_by: &[OrderItem],
+    types: &[ColumnType],
+    resolver: &JoinScope,
+    eval_ctx: &EvalContext,
+    collators: &[Option<collation::Collation>],
+) -> Result<Vec<Vec<Datum>>, SqlError> {
+    // One cursor per source: spilled-run readers first, then the in-memory tail.
+    let mut readers: Vec<_> = runs.iter().map(|r| r.reader()).collect();
+    let mut tail_iter = tail.into_iter();
+
+    // Current head (key + row) of each source, in the same order.
+    let source_count = readers.len() + 1;
+    let mut heads: Vec<Option<(Vec<SqlValue>, Vec<Datum>)>> = Vec::with_capacity(source_count);
+    for reader in &mut readers {
+        heads.push(read_head(reader, order_by, types, resolver, eval_ctx)?);
+    }
+    heads.push(tail_iter.next());
+
+    let total: usize = runs.iter().map(|r| r.row_count() as usize).sum::<usize>() + heads.len();
+    let mut out: Vec<Vec<Datum>> = Vec::with_capacity(total);
+    loop {
+        // Pick the smallest head; on a key tie, the earliest source (lowest
+        // index) wins, which preserves input order across runs.
+        let mut best: Option<usize> = None;
+        for (i, head) in heads.iter().enumerate() {
+            let Some((key, _)) = head else { continue };
+            match best {
+                None => best = Some(i),
+                Some(b) => {
+                    let (bkey, _) = heads[b].as_ref().unwrap();
+                    if compare_sort_keys(key, bkey, order_by, collators) == std::cmp::Ordering::Less
+                    {
+                        best = Some(i);
+                    }
+                }
             }
         }
-        ai.cmp(bi) // stable tie-break
-    });
-    let order: Vec<usize> = keyed.into_iter().map(|(_, i)| i).collect();
-    let reordered: Vec<Vec<Datum>> = order.iter().map(|&i| rows[i].clone()).collect();
-    rows.clone_from_slice(&reordered);
-    Ok(())
+        let Some(i) = best else { break };
+        let (_, row) = heads[i].take().unwrap();
+        out.push(row);
+        // Advance the chosen source.
+        heads[i] = if i < readers.len() {
+            read_head(&mut readers[i], order_by, types, resolver, eval_ctx)?
+        } else {
+            tail_iter.next()
+        };
+    }
+    Ok(out)
+}
+
+/// Reads the next row from a spool reader and pairs it with its ORDER BY key.
+fn read_head(
+    reader: &mut crate::relstore::spill::RowSpoolReader,
+    order_by: &[OrderItem],
+    types: &[ColumnType],
+    resolver: &JoinScope,
+    eval_ctx: &EvalContext,
+) -> Result<Option<KeyedRow>, SqlError> {
+    match reader
+        .next_row()
+        .map_err(|e| map_storage_err(e, "<sort spill>"))?
+    {
+        Some(row) => {
+            let key = sort_key(&row, order_by, types, resolver, eval_ctx)?;
+            Ok(Some((key, row)))
+        }
+        None => Ok(None),
+    }
 }
 
 fn project(
