@@ -115,6 +115,7 @@ impl Parser {
             Some("BEGIN") => self.parse_begin(),
             Some("COMMIT") => self.parse_commit(),
             Some("ROLLBACK") => self.parse_rollback(),
+            Some("SAVE") => self.parse_save(),
             Some("SET") => self.parse_set(),
             Some("DECLARE") => self.parse_declare(),
             _ => {
@@ -156,10 +157,39 @@ impl Parser {
 
     fn parse_rollback(&mut self) -> SqlResult<Statement> {
         let start = self.expect_keyword("ROLLBACK")?;
-        let end = self.eat_optional_tran_and_name(start);
+        let mut end = start;
+        if matches!(
+            self.peek_keyword().as_deref(),
+            Some("TRAN") | Some("TRANSACTION") | Some("WORK")
+        ) {
+            end = self.bump().span;
+        }
+        // A name after ROLLBACK [TRAN] targets a savepoint (partial rollback).
+        let name = self.parse_optional_txn_name();
+        if let Some(n) = &name {
+            end = n.span;
+        }
         Ok(Statement::Rollback {
+            name,
             span: start.to(end),
         })
+    }
+
+    fn parse_save(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("SAVE")?;
+        // SAVE TRAN[SACTION] <name> — both the keyword and the name are required.
+        match self.peek_keyword().as_deref() {
+            Some("TRAN") | Some("TRANSACTION") => {
+                self.bump();
+            }
+            _ => {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+        }
+        let name = self.parse_name()?;
+        let span = start.to(name.span);
+        Ok(Statement::SaveTransaction { name, span })
     }
 
     /// Consumes an optional `TRAN`/`TRANSACTION`/`WORK` keyword and transaction

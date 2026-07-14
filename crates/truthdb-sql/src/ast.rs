@@ -24,8 +24,15 @@ pub enum Statement {
     Commit {
         span: Span,
     },
-    /// `ROLLBACK [TRAN[SACTION]] [name]`.
+    /// `ROLLBACK [TRAN[SACTION]] [name]`. A `name` rolls back to that savepoint
+    /// (the transaction stays open); no name rolls back the whole transaction.
     Rollback {
+        name: Option<Name>,
+        span: Span,
+    },
+    /// `SAVE TRAN[SACTION] name` — a named savepoint within a transaction.
+    SaveTransaction {
+        name: Name,
         span: Span,
     },
     /// `SET` session option (XACT_ABORT / TRANSACTION ISOLATION LEVEL) or a

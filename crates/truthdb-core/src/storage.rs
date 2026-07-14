@@ -448,6 +448,22 @@ impl Storage {
         self.lock().rel_rollback(txn)
     }
 
+    /// Captures a savepoint in a caller-held transaction (`SAVE TRANSACTION`).
+    pub(crate) fn rel_savepoint(&self, txn: &StorageTxn) -> crate::relstore::ctx::Savepoint {
+        txn.txn.savepoint()
+    }
+
+    /// Rolls a caller-held transaction back to a savepoint (`ROLLBACK
+    /// TRANSACTION <name>`), undoing only the work done since; the transaction
+    /// stays open.
+    pub(crate) fn rel_rollback_to(
+        &self,
+        txn: &mut StorageTxn,
+        savepoint: crate::relstore::ctx::Savepoint,
+    ) -> Result<(), StorageError> {
+        self.lock().rollback_txn_to(txn, savepoint)
+    }
+
     pub(crate) fn has_active_transactions(&self) -> bool {
         self.lock().has_active_transactions()
     }
@@ -2100,6 +2116,29 @@ impl StorageFile {
         let roots = stx.roots;
         let mut ctx = self.rel_ctx();
         match rel_recovery::rollback(&mut ctx, stx.txn, &roots) {
+            Ok(()) => {
+                let _ = ctx.io.wal.sync_all();
+                Ok(())
+            }
+            Err(err) => {
+                self.rel.wedged = true;
+                Err(err)
+            }
+        }
+    }
+
+    /// Rolls a still-open transaction back to a savepoint (partial rollback,
+    /// `ROLLBACK TRANSACTION <name>`). The transaction remains active — its count
+    /// is untouched — so only the work done since the savepoint is undone.
+    fn rollback_txn_to(
+        &mut self,
+        stx: &mut StorageTxn,
+        savepoint: crate::relstore::ctx::Savepoint,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        let roots = stx.roots.clone();
+        let mut ctx = self.rel_ctx();
+        match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &roots) {
             Ok(()) => {
                 let _ = ctx.io.wal.sync_all();
                 Ok(())

@@ -4055,6 +4055,101 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn save_transaction_partial_rollback_keeps_earlier_work() {
+        // SAVE TRANSACTION + ROLLBACK TRANSACTION <name> undoes only the work done
+        // since the savepoint; the transaction stays open and commits the rest.
+        let path = unique_temp_path("save-tran");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRAN; INSERT INTO t VALUES (1); SAVE TRANSACTION sp; INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)",
+        );
+        // Roll back to the savepoint: 2 and 3 are undone, 1 remains, txn open.
+        let out = batch(&engine, &mut ctx, "ROLLBACK TRANSACTION sp");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(ctx.has_open_transaction(), "the transaction stays open");
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t ORDER BY id");
+        assert_eq!(ids(&out), vec![1], "2 and 3 rolled back; 1 remains");
+        // The transaction is still usable and commits the survivors.
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (4); COMMIT");
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t ORDER BY id");
+        assert_eq!(ids(&out), vec![1, 4]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn rollback_to_unknown_savepoint_errors_3908() {
+        let path = unique_temp_path("save-tran-missing");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "BEGIN TRAN; INSERT INTO t VALUES (1)");
+        let out = batch(&engine, &mut ctx, "ROLLBACK TRANSACTION nope");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(3908),
+            "rolling back to an unknown savepoint errors 3908"
+        );
+        // The transaction is untouched — a full ROLLBACK still works.
+        batch(&engine, &mut ctx, "ROLLBACK");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_transaction_rollback_then_crash_recovers_cleanly() {
+        // A ROLLBACK TO savepoint writes CLRs; if the transaction then crashes
+        // uncommitted, recovery must undo it all without double-undoing the
+        // savepoint-compensated work.
+        let path = unique_temp_path("save-tran-crash");
+        let engine = new_engine(&path);
+        batch(
+            &engine,
+            &mut TxnContext::default(),
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let mut ctx_a = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx_a,
+            "BEGIN TRAN; INSERT INTO t VALUES (10); SAVE TRANSACTION sp; INSERT INTO t VALUES (11); ROLLBACK TRANSACTION sp; INSERT INTO t VALUES (12)",
+        );
+        assert!(ctx_a.has_open_transaction());
+        // Force A's WAL (incl. the savepoint-rollback CLRs) to disk.
+        batch(
+            &engine,
+            &mut TxnContext::default(),
+            "INSERT INTO t VALUES (1)",
+        );
+        drop(ctx_a);
+        drop(engine);
+
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let engine = Engine::new(storage).expect("replay");
+        let out = batch(
+            &engine,
+            &mut TxnContext::default(),
+            "SELECT id FROM t ORDER BY id",
+        );
+        assert_eq!(
+            ids(&out),
+            vec![1],
+            "A (10/12) fully undone; committed row 1 survives"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     // ---- secondary indexes + planner (Stage 7) -------------------------
 
     /// Plan text lines for a SELECT under SHOWPLAN_TEXT (one batch so the SET
