@@ -2401,6 +2401,55 @@ mod tests {
     }
 
     #[test]
+    fn order_by_spills_wide_join_rows() {
+        // A join's source row is the concatenation of both tables' columns. Each
+        // per-table row fits (< the ~2020 B clustered cell cap), but the joined
+        // source row (two ~1950 B strings) exceeds the 3900 B in-row table cap —
+        // sorting it (pre-projection) must still spill: the spill codec is
+        // cap-free, whereas reusing the table codec would error 1701.
+        let path = unique_temp_path("sort-spill-wide");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE a (k INT NOT NULL PRIMARY KEY, s VARCHAR(2000))")
+            .expect("a");
+        engine
+            .execute("CREATE TABLE b (k INT NOT NULL PRIMARY KEY, s VARCHAR(2000))")
+            .expect("b");
+        for i in 0..40 {
+            engine
+                .execute(&format!(
+                    "INSERT INTO a VALUES ({i}, '{}')",
+                    "x".repeat(1950)
+                ))
+                .expect("a ins");
+            engine
+                .execute(&format!(
+                    "INSERT INTO b VALUES ({i}, '{}')",
+                    "y".repeat(1950)
+                ))
+                .expect("b ins");
+        }
+        let query = "SELECT a.k FROM a JOIN b ON a.k = b.k ORDER BY a.k DESC";
+        let (_, reference) = sql_rows(&engine, query);
+        assert_eq!(
+            reference.len(),
+            40,
+            "join+sort should return 40 rows in memory"
+        );
+        // Each joined source row is ~3.9 KB (> 3900) — forced to spill.
+        crate::rel::set_test_sort_budget(Some(300));
+        let (_, rows) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(None);
+        assert_eq!(
+            rows, reference,
+            "spilled wide-join sort must match in-memory"
+        );
+        assert_eq!(rows[0][0].as_deref(), Some("39"));
+        assert_eq!(rows[39][0].as_deref(), Some("0"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn row_locks_for_point_operations() {
         use crate::lock::{LockMode, Resource};
         use crate::rel::Isolation;

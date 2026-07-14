@@ -4288,7 +4288,6 @@ fn order_rows_budgeted<'a>(
 
     // Generate sorted runs, spilling a run to a `RowSpool` each time the
     // accumulated rows reach the budget. The final (in-memory) run is kept.
-    let schema = sort_spill_schema(types);
     let mut runs: Vec<crate::relstore::spill::RowSpool<'a>> = Vec::new();
     let mut current: Vec<KeyedRow> = Vec::new();
     let mut current_bytes = 0usize;
@@ -4297,7 +4296,7 @@ fn order_rows_budgeted<'a>(
         current_bytes += approx_row_bytes(&row);
         current.push((key, row));
         if current_bytes >= budget {
-            runs.push(sort_and_spill(storage, &schema, &mut current, &cmp)?);
+            runs.push(sort_and_spill(storage, &mut current, &cmp)?);
             current_bytes = 0;
         }
     }
@@ -4313,32 +4312,15 @@ fn order_rows_budgeted<'a>(
     )
 }
 
-/// A minimal schema (types only) for the sort spill codec.
-fn sort_spill_schema(types: &[ColumnType]) -> crate::relstore::row::Schema {
-    crate::relstore::row::Schema {
-        columns: types
-            .iter()
-            .enumerate()
-            .map(|(i, ty)| crate::relstore::row::Column {
-                name: format!("c{i}"),
-                column_type: *ty,
-                nullable: true,
-                collation: None,
-            })
-            .collect(),
-    }
-}
-
 /// Stably sorts `run` in place and writes its rows (in sorted order) to a fresh
 /// `RowSpool`, clearing `run`.
 fn sort_and_spill<'a>(
     storage: &'a Storage,
-    schema: &crate::relstore::row::Schema,
     run: &mut Vec<KeyedRow>,
     cmp: &impl Fn(&Vec<SqlValue>, &Vec<SqlValue>) -> std::cmp::Ordering,
 ) -> Result<crate::relstore::spill::RowSpool<'a>, SqlError> {
     run.sort_by(|(a, _), (b, _)| cmp(a, b));
-    let mut spool = crate::relstore::spill::RowSpool::new(storage, schema.clone());
+    let mut spool = crate::relstore::spill::RowSpool::new(storage);
     for (_, row) in run.drain(..) {
         spool
             .write_row(&row)
