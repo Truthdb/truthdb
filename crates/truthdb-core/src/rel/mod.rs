@@ -3099,7 +3099,9 @@ fn dedup_rows(rowset: &mut RowSet) {
     // Hash-based DISTINCT — O(n) instead of the old O(n²) linear scan, keeping
     // first-appearance order. Each output column is single-typed (projection
     // coerced it), so `HashKey`'s `order_key_cmp` equality agrees with the
-    // former `Vec<Datum>` equality for every realistic input.
+    // former `Vec<Datum>` equality for every realistic input. (Edge: two `float`
+    // NaN rows now collapse to one — `order_key_cmp` treats NaN as equal, like
+    // GROUP BY already did — where the old raw `Datum` `==` kept them distinct.)
     let types: Vec<ColumnType> = rowset.columns.iter().map(|c| c.column_type).collect();
     let mut seen: std::collections::HashSet<hash::HashKey> = std::collections::HashSet::new();
     rowset
@@ -3863,8 +3865,12 @@ fn join_sources(
     // Equijoin key columns (bare `left_col = right_col` conjuncts of a
     // hash-compatible type). When present on an INNER/LEFT/RIGHT/FULL join, a
     // hash join replaces the O(n·m) nested loop; the full ON predicate is still
-    // re-checked on each hash candidate, so results (and their order) are
-    // identical to the nested loop. CROSS and equi-key-less joins keep the loop.
+    // re-checked on each hash candidate, so the result set and its order are
+    // identical to the nested loop. (Like a real optimizer, the hash join
+    // evaluates the ON predicate only on candidate pairs sharing a key, so a
+    // side-effecting error in a residual conjunct — e.g. `1/b.z` — may be raised
+    // on fewer rows than the loop would; the SQL result set is unaffected.)
+    // CROSS and equi-key-less joins keep the loop.
     let equi = match on {
         Some(pred) => extract_equi_keys(pred, &left, &right),
         None => Vec::new(),
@@ -3974,7 +3980,10 @@ fn extract_equi_keys(pred: &Expr, left: &Source, right: &Source) -> Vec<EquiKey>
             return None;
         };
         use truthdb_sql::eval::ColumnResolver;
-        match (left_scope.resolve(&name.value), right_scope.resolve(&name.value)) {
+        match (
+            left_scope.resolve(&name.value),
+            right_scope.resolve(&name.value),
+        ) {
             (Some(i), None) => Some((true, i)),
             (None, Some(j)) => Some((false, j)),
             _ => None,
@@ -4062,7 +4071,11 @@ fn hash_join(
     let mut table: HashMap<HashKey, Vec<usize>> = HashMap::new();
     let build_rows = if build_left { &left.rows } else { &right.rows };
     for (index, row) in build_rows.iter().enumerate() {
-        let key = if build_left { left_key(row) } else { right_key(row) };
+        let key = if build_left {
+            left_key(row)
+        } else {
+            right_key(row)
+        };
         if key_has_null(&key) {
             continue;
         }

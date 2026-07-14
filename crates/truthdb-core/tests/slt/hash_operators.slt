@@ -105,6 +105,44 @@ SELECT lp.tag, rp.tag FROM lp JOIN rp ON lp.a = rp.a AND lp.b = rp.b ORDER BY lp
 x p
 y q
 
+# Cross-type numeric equi-join must find exact matches even above 2^53, where an
+# f64 hash would double-round the DECIMAL and drop the row. 9007199254740993 is
+# the smallest odd integer not exactly representable as f64.
+statement ok
+CREATE TABLE bigk (k BIGINT)
+
+statement ok
+CREATE TABLE deck (k DECIMAL(20,1))
+
+statement ok
+INSERT INTO bigk VALUES (9007199254740993), (9007199254740995)
+
+statement ok
+INSERT INTO deck VALUES (9007199254740993.0)
+
+query I
+SELECT bigk.k FROM bigk JOIN deck ON bigk.k = deck.k
+----
+9007199254740993
+
+# Cross-scale DECIMAL = DECIMAL of the same large value must still match.
+statement ok
+CREATE TABLE d0 (k DECIMAL(38,0))
+
+statement ok
+CREATE TABLE d2 (k DECIMAL(38,2))
+
+statement ok
+INSERT INTO d0 VALUES (9007199254740993)
+
+statement ok
+INSERT INTO d2 VALUES (9007199254740993.00)
+
+query I
+SELECT COUNT(*) FROM d0 JOIN d2 ON d0.k = d2.k
+----
+1
+
 # --- hash aggregate over many groups, incl. a NULL group and HAVING ---
 statement ok
 CREATE TABLE g (grp INT, amt INT)
