@@ -503,11 +503,12 @@ fn index_insert_row(
     ctx: &mut RelCtx<'_>,
     txn: &mut TxnLink,
     indexes: &[IndexDef],
+    collations: &[Option<String>],
     values: &[Datum],
     locator: &Locator,
 ) -> Result<(), StorageError> {
     for index in indexes {
-        let index_key = index::encode_index_columns(values, &index.columns)
+        let index_key = index::encode_index_columns(values, &index.columns, collations)
             .map_err(|err| StorageError::InvalidConfig(err.0))?;
         let (key, value) = index::leaf_entry(&index_key, locator, index.unique);
         let tree = BTree {
@@ -534,16 +535,17 @@ fn apply_index_updates(
     ctx: &mut RelCtx<'_>,
     txn: &mut TxnLink,
     indexes: &[IndexDef],
+    collations: &[Option<String>],
     ops: &[(Vec<Datum>, Locator, Vec<Datum>, Locator)],
 ) -> Result<(), StorageError> {
     if indexes.is_empty() {
         return Ok(());
     }
     for (old_values, old_locator, _, _) in ops {
-        index_delete_row(ctx, txn, indexes, old_values, old_locator)?;
+        index_delete_row(ctx, txn, indexes, collations, old_values, old_locator)?;
     }
     for (_, _, new_values, new_locator) in ops {
-        index_insert_row(ctx, txn, indexes, new_values, new_locator)?;
+        index_insert_row(ctx, txn, indexes, collations, new_values, new_locator)?;
     }
     Ok(())
 }
@@ -553,11 +555,12 @@ fn index_delete_row(
     ctx: &mut RelCtx<'_>,
     txn: &mut TxnLink,
     indexes: &[IndexDef],
+    collations: &[Option<String>],
     values: &[Datum],
     locator: &Locator,
 ) -> Result<(), StorageError> {
     for index in indexes {
-        let index_key = index::encode_index_columns(values, &index.columns)
+        let index_key = index::encode_index_columns(values, &index.columns, collations)
             .map_err(|err| StorageError::InvalidConfig(err.0))?;
         let (key, _) = index::leaf_entry(&index_key, locator, index.unique);
         let tree = BTree {
@@ -899,7 +902,7 @@ impl StorageFile {
                     RowLocator::Key(key) => Locator::Key(key.clone()),
                     RowLocator::Rid(rid) => Locator::Rid(*rid),
                 };
-                let index_key = index::encode_index_columns(values, &columns)
+                let index_key = index::encode_index_columns(values, &columns, &def.collations)
                     .map_err(|err| StorageError::InvalidConfig(err.0))?;
                 let (key, value) = index::leaf_entry(&index_key, &locator, unique);
                 // Backfill is system-logged: the fresh tree is not in the
@@ -1052,6 +1055,7 @@ impl StorageFile {
         }
 
         let indexes = def.indexes.clone();
+        let collations = def.collations.clone();
         if def.is_tree() {
             let tree = BTree {
                 object_id: def.object_id,
@@ -1069,7 +1073,14 @@ impl StorageFile {
                         }
                     }
                     // Clustered rows locate by PK key.
-                    index_insert_row(ctx, txn, &indexes, values, &Locator::Key(key.clone()))?;
+                    index_insert_row(
+                        ctx,
+                        txn,
+                        &indexes,
+                        &collations,
+                        values,
+                        &Locator::Key(key.clone()),
+                    )?;
                 }
                 Ok(())
             })
@@ -1082,7 +1093,7 @@ impl StorageFile {
                 for ((_, row), values) in encoded.iter().zip(rows.iter()) {
                     // Heap rows locate by their home RID.
                     let rid = heap.insert(ctx, txn, row)?;
-                    index_insert_row(ctx, txn, &indexes, values, &Locator::Rid(rid))?;
+                    index_insert_row(ctx, txn, &indexes, &collations, values, &Locator::Rid(rid))?;
                 }
                 Ok(())
             })
@@ -1107,9 +1118,16 @@ impl StorageFile {
                 "wrong number of key values".to_string(),
             ));
         }
+        // Fold each key column so a case-insensitive character PK lookup matches
+        // the stored (folded) key — the seek literal must fold exactly as the
+        // stored key did.
         let mut key = Vec::new();
-        for value in key_values {
-            crate::relstore::key::encode_datum(value, &mut key)?;
+        for (value, &col) in key_values.iter().zip(&def.key_columns) {
+            let folded = crate::relstore::key::fold_key_datum(
+                value,
+                schema.columns[col].collation.as_deref(),
+            );
+            crate::relstore::key::encode_datum(&folded, &mut key)?;
         }
         let tree = BTree {
             object_id: def.object_id,
@@ -1361,6 +1379,7 @@ impl StorageFile {
             return Ok(0);
         }
         let indexes = def.indexes.clone();
+        let collations = def.collations.clone();
         if def.is_tree() {
             let tree = BTree {
                 object_id: def.object_id,
@@ -1370,7 +1389,14 @@ impl StorageFile {
                 for (loc, values) in &targets {
                     if let RowLocator::Key(key) = loc {
                         tree.delete(ctx, &mut OpMode::Txn(txn), key)?;
-                        index_delete_row(ctx, txn, &indexes, values, &Locator::Key(key.clone()))?;
+                        index_delete_row(
+                            ctx,
+                            txn,
+                            &indexes,
+                            &collations,
+                            values,
+                            &Locator::Key(key.clone()),
+                        )?;
                     }
                 }
                 Ok(())
@@ -1384,7 +1410,14 @@ impl StorageFile {
                 for (loc, values) in &targets {
                     if let RowLocator::Rid(rid) = loc {
                         heap.delete(ctx, txn, *rid)?;
-                        index_delete_row(ctx, txn, &indexes, values, &Locator::Rid(*rid))?;
+                        index_delete_row(
+                            ctx,
+                            txn,
+                            &indexes,
+                            &collations,
+                            values,
+                            &Locator::Rid(*rid),
+                        )?;
                     }
                 }
                 Ok(())
@@ -1413,6 +1446,7 @@ impl StorageFile {
             return Ok(0);
         }
         let indexes = def.indexes.clone();
+        let collations = def.collations.clone();
         // (old values, old locator, new values, new locator) for index upkeep.
         let mut idx_ops: Vec<(Vec<Datum>, Locator, Vec<Datum>, Locator)> = Vec::new();
         if def.is_tree() {
@@ -1464,7 +1498,7 @@ impl StorageFile {
                 for (key, row) in &in_place {
                     tree.update(ctx, &mut OpMode::Txn(txn), key, row)?;
                 }
-                apply_index_updates(ctx, txn, &indexes, &idx_ops)?;
+                apply_index_updates(ctx, txn, &indexes, &collations, &idx_ops)?;
                 Ok(())
             })?;
         } else {
@@ -1490,7 +1524,7 @@ impl StorageFile {
                 for (rid, row) in &encoded {
                     heap.update(ctx, txn, *rid, row)?;
                 }
-                apply_index_updates(ctx, txn, &indexes, &idx_ops)?;
+                apply_index_updates(ctx, txn, &indexes, &collations, &idx_ops)?;
                 Ok(())
             })?;
         }

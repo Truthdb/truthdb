@@ -9,6 +9,7 @@
 
 use std::cmp::Ordering;
 
+use crate::collation::CollationSensitivity;
 use crate::decimal::Decimal;
 use crate::error::{SqlError, SqlResult};
 use crate::temporal;
@@ -85,6 +86,26 @@ impl SqlValue {
     pub fn compare(&self, other: &SqlValue) -> SqlResult<Option<Ordering>> {
         if self.is_null() || other.is_null() {
             return Ok(None);
+        }
+        self.compare_non_null(other).map(Some)
+    }
+
+    /// Three-valued comparison under a collation's case sensitivity: like
+    /// [`SqlValue::compare`], but two `Str` operands are compared case-folded
+    /// when `sensitivity` is case-insensitive (the database default). Every
+    /// non-string comparison is identical to `compare`. This is the entry point
+    /// for SQL-visible string equality (`WHERE =`, joins, `IN`, `BETWEEN`);
+    /// binary/internal comparisons keep using `compare`.
+    pub fn compare_collated(
+        &self,
+        other: &SqlValue,
+        sensitivity: CollationSensitivity,
+    ) -> SqlResult<Option<Ordering>> {
+        if self.is_null() || other.is_null() {
+            return Ok(None);
+        }
+        if let (SqlValue::Str(a), SqlValue::Str(b)) = (self, other) {
+            return Ok(Some(sensitivity.compare_str(a, b)));
         }
         self.compare_non_null(other).map(Some)
     }

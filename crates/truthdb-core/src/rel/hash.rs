@@ -45,9 +45,29 @@
 
 use std::hash::{Hash, Hasher};
 
+use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::value::{SqlValue, order_key_cmp};
 
 use crate::relstore::types::ColumnType;
+
+/// Folds the string components of a group/DISTINCT key to their collation-
+/// canonical form (`sensitivities[i]` governs `key[i]`; a missing entry defaults
+/// to the case-insensitive database default), so case-insensitive-equal keys
+/// share a bucket and compare `Eq`. The caller keeps the original key for output
+/// — this produces only the bucketing/equality key. (Non-string values and
+/// case-sensitive columns pass through unchanged.)
+pub fn fold_hash_key(key: &[SqlValue], sensitivities: &[CollationSensitivity]) -> Vec<SqlValue> {
+    key.iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let sens = sensitivities
+                .get(index)
+                .copied()
+                .unwrap_or(CollationSensitivity::DEFAULT);
+            sens.fold_value(value.clone())
+        })
+        .collect()
+}
 
 /// The hashing family of a column type. Two columns can be joined by the hash
 /// path only if their classes match, which guarantees their key values hash the

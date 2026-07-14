@@ -7,6 +7,7 @@
 //! Server-compatible numbers (see [`error`]).
 
 pub mod ast;
+pub mod collation;
 pub mod decimal;
 pub mod error;
 pub mod eval;

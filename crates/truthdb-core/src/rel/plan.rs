@@ -170,18 +170,20 @@ fn as_sarg(
     None
 }
 
-/// Whether a column may back an index *range* seek. An index seek is correct
-/// only when the index's key byte order matches the WHERE filter's compare
-/// order for that column. The filter compares strings by Rust `str` order
-/// (Unicode code point; collation-insensitive for now). Numbers/dates/GUIDs
-/// and VARCHAR (UTF-8 bytes) already match. NVARCHAR index keys are UTF-16BE,
-/// whose byte order diverges from code-point order at supplementary-plane
-/// characters (surrogate pairs) — so an NVARCHAR *range* bound could exclude a
-/// matching row the filter keeps. Equality seeks are exact byte matches and
-/// stay correct for every type, so only NVARCHAR ranges are excluded here.
+/// Whether a column may back an index *range* seek. A seek is correct only when
+/// the index's key byte order matches the WHERE filter's compare order for that
+/// column. The filter now compares strings by the column's collation (Stage 5)
+/// and the index key is folded the same way (`fold_key_datum`), so VARCHAR keys
+/// (UTF-8 bytes of the folded string) match the filter order — equality seeks
+/// (folded literal vs folded key) and VARCHAR ranges stay correct, including
+/// case-insensitively. NVARCHAR index keys are UTF-16BE, whose byte order
+/// diverges from the filter's order at supplementary-plane characters (surrogate
+/// pairs) regardless of folding — so an NVARCHAR *range* bound could exclude a
+/// matching row the filter keeps, and only NVARCHAR ranges are excluded here.
+/// (Equality seeks stay correct for NVARCHAR: they are exact folded-key matches.)
 ///
-/// (When a later stage makes WHERE collation-aware, index keys must switch to
-/// collation sort keys or this gate must widen to non-binary collations too.)
+/// Locale-specific ordering (Swedish å-after-z) would still need collation sort
+/// keys; case-folding alone gives correct *equality*, not linguistic order.
 fn range_seekable_column(column: &Column) -> bool {
     !matches!(column.column_type, ColumnType::NVarChar { .. })
 }
@@ -269,7 +271,7 @@ fn try_index(index: &IndexDef, schema: &Schema, sargs: &[Sarg]) -> Option<(u32, 
     if eq_values.is_empty() && lower_extra.is_none() && upper_extra.is_none() {
         return None;
     }
-    let (lower, upper) = build_bounds(index, &eq_values, &lower_extra, &upper_extra)?;
+    let (lower, upper) = build_bounds(index, schema, &eq_values, &lower_extra, &upper_extra)?;
     let unique_full = index.unique && eq_values.len() == index.columns.len();
     let score = (eq_values.len() as u32) * 10
         + if unique_full { 1000 } else { 0 }
@@ -289,11 +291,16 @@ fn try_index(index: &IndexDef, schema: &Schema, sargs: &[Sarg]) -> Option<(u32, 
 
 fn build_bounds(
     index: &IndexDef,
+    schema: &Schema,
     eq_values: &[Datum],
     lower_extra: &Option<Datum>,
     upper_extra: &Option<Datum>,
 ) -> Option<Bounds> {
     let cols = &index.columns;
+    // Per-column collations (by schema index) so a seek literal folds exactly as
+    // the stored index key did — a case-insensitive character seek matches.
+    let collations: Vec<Option<String>> =
+        schema.columns.iter().map(|c| c.collation.clone()).collect();
     let mut lower_vals = eq_values.to_vec();
     if let Some(value) = lower_extra {
         lower_vals.push(value.clone());
@@ -301,15 +308,15 @@ fn build_bounds(
     let lower = if lower_vals.is_empty() {
         None
     } else {
-        Some(index::encode_index_prefix(&lower_vals, cols).ok()?)
+        Some(index::encode_index_prefix(&lower_vals, cols, &collations).ok()?)
     };
     let upper = if let Some(value) = upper_extra {
         let mut upper_vals = eq_values.to_vec();
         upper_vals.push(value.clone());
-        let encoded = index::encode_index_prefix(&upper_vals, cols).ok()?;
+        let encoded = index::encode_index_prefix(&upper_vals, cols, &collations).ok()?;
         index::prefix_upper_bound(&encoded)
     } else if !eq_values.is_empty() {
-        let encoded = index::encode_index_prefix(eq_values, cols).ok()?;
+        let encoded = index::encode_index_prefix(eq_values, cols, &collations).ok()?;
         index::prefix_upper_bound(&encoded)
     } else {
         None

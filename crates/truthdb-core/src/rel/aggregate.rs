@@ -8,6 +8,7 @@
 //! inside an aggregate is rejected with error 8120.
 
 use truthdb_sql::ast::{AggFunc, BinaryOp, Expr, ExprKind, Name, Select, SelectItem};
+use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
 use truthdb_sql::eval::{self, EvalContext};
 use truthdb_sql::value::{SqlValue, order_key_cmp};
@@ -63,6 +64,28 @@ fn contains_aggregate(expr: &Expr) -> bool {
     }
 }
 
+/// Resolver over the synthetic group row `[group keys..., aggregate results...]`.
+/// Carries each grouping column's collation (aggregate-result slots default to
+/// the case-insensitive database default) so HAVING / projection comparisons on
+/// a `_CS`/`_BIN` grouping column stay case-sensitive.
+struct SynthScope {
+    names: Vec<String>,
+    collations: Vec<CollationSensitivity>,
+}
+
+impl truthdb_sql::eval::ColumnResolver for SynthScope {
+    fn resolve(&self, name: &str) -> Option<usize> {
+        self.names.iter().position(|n| n.eq_ignore_ascii_case(name))
+    }
+
+    fn collation(&self, index: usize) -> CollationSensitivity {
+        self.collations
+            .get(index)
+            .copied()
+            .unwrap_or(CollationSensitivity::DEFAULT)
+    }
+}
+
 /// One aggregate to compute over each group.
 struct AggSpec {
     func: AggFunc,
@@ -110,11 +133,22 @@ pub fn execute(
         None => None,
     };
 
-    // The synthetic resolver over [group keys..., aggregate results...].
-    let synth: Vec<String> = (0..select.group_by.len())
+    // The synthetic resolver over [group keys..., aggregate results...], carrying
+    // each grouping column's collation so HAVING / projection comparisons on a
+    // `_CS`/`_BIN` grouping column stay case-sensitive (a bare name list would
+    // report the case-insensitive default and re-merge groups `group_rows` kept
+    // apart). Aggregate-result slots take the database default.
+    let names: Vec<String> = (0..select.group_by.len())
         .map(|i| format!("$gk{i}"))
         .chain((0..aggs.len()).map(|j| format!("$agg{j}")))
         .collect();
+    let collations: Vec<CollationSensitivity> = select
+        .group_by
+        .iter()
+        .map(|expr| eval::key_collation(expr, resolver))
+        .chain((0..aggs.len()).map(|_| CollationSensitivity::DEFAULT))
+        .collect();
+    let synth = SynthScope { names, collations };
 
     // A GROUP BY over an input larger than the operator memory budget spills:
     // partition the rows by group-key hash (so every member of a group lands in
@@ -149,7 +183,7 @@ pub fn execute(
 /// Groups `rows`, computes each aggregate and HAVING, and projects the output
 /// SQL-value rows. This is the in-memory aggregation used both directly and per
 /// grace-hash partition.
-#[allow(clippy::too_many_arguments, clippy::ptr_arg)]
+#[allow(clippy::too_many_arguments)]
 fn aggregate_partition(
     select: &Select,
     rows: &[Vec<Datum>],
@@ -159,7 +193,7 @@ fn aggregate_partition(
     aggs: &[AggSpec],
     having: &Option<Expr>,
     out_exprs: &[Expr],
-    synth: &Vec<String>,
+    synth: &SynthScope,
 ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
     let groups = group_rows(select, rows, types, resolver, eval_ctx)?;
     let mut out_rows: Vec<Vec<SqlValue>> = Vec::new();
@@ -197,7 +231,7 @@ fn aggregate_partition(
 /// spools, then aggregate each partition independently and concatenate.
 /// (Extreme group skew — one partition far larger than the budget — is not
 /// re-partitioned; a first cut, documented.)
-#[allow(clippy::too_many_arguments, clippy::ptr_arg)]
+#[allow(clippy::too_many_arguments)]
 fn grace_hash_aggregate(
     storage: &crate::storage::Storage,
     select: &Select,
@@ -208,7 +242,7 @@ fn grace_hash_aggregate(
     aggs: &[AggSpec],
     having: &Option<Expr>,
     out_exprs: &[Expr],
-    synth: &Vec<String>,
+    synth: &SynthScope,
     input_bytes: usize,
     budget: usize,
 ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
@@ -246,6 +280,9 @@ fn grace_hash_aggregate(
 }
 
 /// The GROUP BY key of one row (used to route it to a grace-hash partition).
+/// The key is *folded* by each grouping column's collation — identically to the
+/// in-memory `group_rows` — so case-insensitive-equal keys route to the same
+/// partition and are not split across partitions on a spilling GROUP BY.
 fn group_key(
     select: &Select,
     row: &[Datum],
@@ -254,11 +291,17 @@ fn group_key(
     eval_ctx: &EvalContext,
 ) -> Result<Vec<SqlValue>, SqlError> {
     let sql_row = row_values(row, types);
-    select
+    let key_sens: Vec<CollationSensitivity> = select
+        .group_by
+        .iter()
+        .map(|expr| eval::key_collation(expr, resolver))
+        .collect();
+    let raw = select
         .group_by
         .iter()
         .map(|expr| eval::eval(expr, &sql_row, resolver, eval_ctx))
-        .collect()
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(super::hash::fold_hash_key(&raw, &key_sens))
 }
 
 /// The partition a group key routes to. Uses the same `HashKey` hashing as the
@@ -288,7 +331,17 @@ fn group_rows(
     // O(n·groups) linear probe. `HashKey`'s equality matches the previous
     // `order_key_cmp`-based `keys_equal`, so groups are identical; a side `Vec`
     // preserves first-appearance order (the order the old scan produced).
-    use super::hash::HashKey;
+    use super::hash::{HashKey, fold_hash_key};
+    // The collation of each grouping column (a bare column keeps its collation;
+    // any other expression takes the database default). Groups are bucketed by
+    // the *folded* key so case-insensitive-equal keys collapse into one group,
+    // while the stored key keeps the first row's original value for output —
+    // `GROUP BY name` over `'ABC'`,`'abc'` returns one group labelled `'ABC'`.
+    let key_sens: Vec<truthdb_sql::collation::CollationSensitivity> = select
+        .group_by
+        .iter()
+        .map(|expr| eval::key_collation(expr, resolver))
+        .collect();
     let mut index_of: std::collections::HashMap<HashKey, usize> = std::collections::HashMap::new();
     let mut groups: Vec<(Vec<SqlValue>, Vec<usize>)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
@@ -298,10 +351,11 @@ fn group_rows(
             .iter()
             .map(|expr| eval::eval(expr, &sql_row, resolver, eval_ctx))
             .collect::<Result<Vec<_>, _>>()?;
-        match index_of.get(&HashKey(key.clone())) {
+        let folded = fold_hash_key(&key, &key_sens);
+        match index_of.get(&HashKey(folded.clone())) {
             Some(&pos) => groups[pos].1.push(index),
             None => {
-                index_of.insert(HashKey(key.clone()), groups.len());
+                index_of.insert(HashKey(folded), groups.len());
                 groups.push((key, vec![index]));
             }
         }
@@ -321,6 +375,10 @@ fn compute_aggregate(
     let Some(arg) = &spec.arg else {
         return Ok(SqlValue::Int(members.len() as i64));
     };
+    // The argument column's collation governs DISTINCT deduplication and MIN/MAX
+    // for character values (case-insensitive by default), consistent with GROUP
+    // BY and WHERE.
+    let sensitivity = eval::key_collation(arg, resolver);
     let mut values: Vec<SqlValue> = Vec::new();
     for &index in members {
         let sql_row = row_values(&rows[index], types);
@@ -330,13 +388,34 @@ fn compute_aggregate(
         }
     }
     if spec.distinct {
-        values.sort_by(order_key_cmp);
-        values.dedup_by(|a, b| order_key_cmp(a, b) == std::cmp::Ordering::Equal);
+        // Dedup case-insensitively under a `_CI` collation: `COUNT(DISTINCT name)`
+        // counts `'ABC'` and `'abc'` once. Strings compare by the collation;
+        // everything else keeps `order_key_cmp`.
+        let cmp = |a: &SqlValue, b: &SqlValue| collated_cmp(a, b, sensitivity);
+        values.sort_by(&cmp);
+        values.dedup_by(|a, b| cmp(a, b) == std::cmp::Ordering::Equal);
     }
-    fold(spec.func, values)
+    fold(spec.func, values, sensitivity)
 }
 
-fn fold(func: AggFunc, values: Vec<SqlValue>) -> Result<SqlValue, SqlError> {
+/// Compares two aggregate values under a collation: character operands fold by
+/// case sensitivity, all others fall back to `order_key_cmp`.
+fn collated_cmp(
+    a: &SqlValue,
+    b: &SqlValue,
+    sensitivity: CollationSensitivity,
+) -> std::cmp::Ordering {
+    match (a, b) {
+        (SqlValue::Str(x), SqlValue::Str(y)) => sensitivity.compare_str(x, y),
+        _ => order_key_cmp(a, b),
+    }
+}
+
+fn fold(
+    func: AggFunc,
+    values: Vec<SqlValue>,
+    sensitivity: CollationSensitivity,
+) -> Result<SqlValue, SqlError> {
     match func {
         AggFunc::Count => Ok(SqlValue::Int(values.len() as i64)),
         AggFunc::Min | AggFunc::Max => {
@@ -346,9 +425,7 @@ fn fold(func: AggFunc, values: Vec<SqlValue>) -> Result<SqlValue, SqlError> {
                 best = Some(match best {
                     None => value,
                     Some(current) => {
-                        let ord = current
-                            .compare(&value)?
-                            .unwrap_or(std::cmp::Ordering::Equal);
+                        let ord = collated_cmp(&current, &value, sensitivity);
                         let take_new = if want_max {
                             ord == std::cmp::Ordering::Less
                         } else {
