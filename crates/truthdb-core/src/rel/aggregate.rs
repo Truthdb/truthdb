@@ -345,6 +345,7 @@ fn group_rows(
     let mut index_of: std::collections::HashMap<HashKey, usize> = std::collections::HashMap::new();
     let mut groups: Vec<(Vec<SqlValue>, Vec<usize>)> = Vec::new();
     for (index, row) in rows.iter().enumerate() {
+        super::check_cancelled()?;
         let sql_row = row_values(row, types);
         let key = select
             .group_by

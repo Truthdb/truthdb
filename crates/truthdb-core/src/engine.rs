@@ -4051,6 +4051,37 @@ mod tests {
     }
 
     #[test]
+    fn attention_cancel_aborts_a_batch() {
+        // A TDS Attention sets the batch's cancel flag; the executor polls it and
+        // aborts, returning the internal cancel marker (3617) instead of results.
+        // The transaction is not doomed.
+        let path = unique_temp_path("attn-cancel");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        for i in 0..10 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("ins");
+        }
+        // Simulate an Attention arriving: raise the cancel flag for this thread.
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        crate::rel::set_test_cancel(flag);
+        let env = sql(&engine, "SELECT id FROM t");
+        // Clear before asserting so a panic can't leak the flag to another test.
+        crate::rel::clear_test_cancel();
+        assert_eq!(
+            env["error"]["number"], 3617,
+            "a cancelled batch aborts instead of returning rows: {env}"
+        );
+        // The engine is still usable afterwards.
+        let (_, rows) = sql_rows(&engine, "SELECT COUNT(*) FROM t");
+        assert_eq!(rows, vec![vec![Some("10".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn save_transaction_partial_rollback_keeps_earlier_work() {
         // SAVE TRANSACTION + ROLLBACK TRANSACTION <name> undoes only the work done
         // since the savepoint; the transaction stays open and commits the rest.

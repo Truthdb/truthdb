@@ -135,6 +135,8 @@ enum EngineCall {
         session: SessionId,
         sql: String,
         params: Vec<crate::rel::RpcParam>,
+        /// Set by the connection on a TDS Attention to abort the batch mid-flight.
+        cancel: Arc<AtomicBool>,
         reply: oneshot::Sender<Result<BatchReply, EngineError>>,
     },
     /// A native-protocol command (ES or SQL): rendered text.
@@ -196,12 +198,39 @@ impl EngineHandle {
         sql: String,
         params: Vec<crate::rel::RpcParam>,
     ) -> Result<BatchReply, EngineError> {
+        self.run_rpc_cancellable(session, sql, params, Arc::new(AtomicBool::new(false)))
+            .await
+    }
+
+    /// Like [`Self::run_batch`] but the caller holds `cancel`: setting it (on a
+    /// TDS Attention) aborts the running statement mid-flight (the executor polls
+    /// it). Pass a shared clone to the connection's Attention handler.
+    pub async fn run_batch_cancellable(
+        &self,
+        session: SessionId,
+        sql: String,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<BatchReply, EngineError> {
+        self.run_rpc_cancellable(session, sql, Vec::new(), cancel)
+            .await
+    }
+
+    /// Like [`Self::run_rpc`] but cancellable via `cancel` (see
+    /// [`Self::run_batch_cancellable`]).
+    pub async fn run_rpc_cancellable(
+        &self,
+        session: SessionId,
+        sql: String,
+        params: Vec<crate::rel::RpcParam>,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<BatchReply, EngineError> {
         let (reply, rx) = oneshot::channel();
         self.tx
             .send(EngineCall::RunBatch {
                 session,
                 sql,
                 params,
+                cancel,
                 reply,
             })
             .map_err(|_| EngineError::Unavailable)?;
@@ -322,6 +351,7 @@ struct Runnable {
     session: SessionId,
     sql: String,
     params: Vec<crate::rel::RpcParam>,
+    cancel: Arc<AtomicBool>,
     reply: oneshot::Sender<Result<BatchReply, EngineError>>,
     txn_ctx: TxnContext,
 }
@@ -385,8 +415,9 @@ fn worker_loop(shared: &Arc<Shared>) {
                 session,
                 sql,
                 params,
+                cancel,
                 reply,
-            }) => dispatch_batch(shared, session, sql, params, reply),
+            }) => dispatch_batch(shared, session, sql, params, cancel, reply),
             Some(EngineCall::RunNative { command, reply }) => {
                 let _ = reply.send(shared.engine.execute(&command));
             }
@@ -413,6 +444,7 @@ fn dispatch_batch(
     session: SessionId,
     sql: String,
     params: Vec<crate::rel::RpcParam>,
+    cancel: Arc<AtomicBool>,
     reply: oneshot::Sender<Result<BatchReply, EngineError>>,
 ) {
     let runnable = {
@@ -427,6 +459,7 @@ fn dispatch_batch(
                 session,
                 sql,
                 params,
+                cancel,
                 reply,
                 txn_ctx,
             })
@@ -436,6 +469,7 @@ fn dispatch_batch(
                 session,
                 sql,
                 params,
+                cancel,
                 reply,
                 needs,
                 deadline,
@@ -461,9 +495,13 @@ fn run_and_finish(shared: &Arc<Shared>, work: Runnable) {
         session,
         sql,
         params,
+        cancel,
         reply,
         mut txn_ctx,
     } = work;
+    // Bind the cancel flag to this worker thread for the batch, so the executor's
+    // `check_cancelled` polls see a TDS Attention; the guard clears it on return.
+    let _cancel_guard = crate::rel::CancelScope::enter(cancel);
     let outcome = shared
         .engine
         .sql_batch_with_params(&sql, &mut txn_ctx, &params);
@@ -499,6 +537,7 @@ struct Parked {
     session: SessionId,
     sql: String,
     params: Vec<crate::rel::RpcParam>,
+    cancel: Arc<AtomicBool>,
     reply: oneshot::Sender<Result<BatchReply, EngineError>>,
     needs: Vec<(Resource, LockMode)>,
     deadline: Instant,
@@ -651,6 +690,7 @@ impl Scheduler {
                     session: parked.session,
                     sql: parked.sql,
                     params: parked.params,
+                    cancel: parked.cancel,
                     reply: parked.reply,
                     txn_ctx,
                 });

@@ -21,7 +21,7 @@ pub const PKT_TRANSACTION_MANAGER: u8 = 0x0e;
 pub const PKT_LOGIN7: u8 = 0x10;
 pub const PKT_PRELOGIN: u8 = 0x12;
 
-const HEADER_LEN: usize = 8;
+pub const HEADER_LEN: usize = 8;
 const STATUS_EOM: u8 = 0x01;
 
 /// Upper bound on a fully reassembled message. A peer controls the EOM bit, so
