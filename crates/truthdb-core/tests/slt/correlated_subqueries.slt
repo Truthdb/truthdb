@@ -1,0 +1,89 @@
+# Correlated subqueries (Stage 11): the inner query references an outer column
+# and is re-evaluated per outer row (per-row apply). Covers correlated EXISTS /
+# NOT EXISTS / scalar / IN in the WHERE clause, over base tables and joins,
+# including NULL handling and a correlated reference combined with an inner
+# predicate.
+
+statement ok
+CREATE TABLE cust (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))
+
+statement ok
+CREATE TABLE ord (id INT NOT NULL PRIMARY KEY, cust_id INT, amount INT)
+
+statement ok
+INSERT INTO cust VALUES (1,'alice'),(2,'bob'),(3,'carol')
+
+statement ok
+INSERT INTO ord VALUES (10,1,100),(11,1,250),(12,2,50)
+
+# Correlated EXISTS: customers that have at least one order.
+query T
+SELECT name FROM cust WHERE EXISTS (SELECT 1 FROM ord WHERE ord.cust_id = cust.id) ORDER BY name
+----
+alice
+bob
+
+# Correlated NOT EXISTS: customers without orders.
+query T
+SELECT name FROM cust WHERE NOT EXISTS (SELECT 1 FROM ord WHERE ord.cust_id = cust.id) ORDER BY name
+----
+carol
+
+# Correlated scalar: the customer whose single order is 50.
+query T
+SELECT name FROM cust
+WHERE (SELECT MAX(amount) FROM ord WHERE ord.cust_id = cust.id) = 50
+ORDER BY name
+----
+bob
+
+# Correlated with an extra inner predicate: customers with an order over 200.
+query T
+SELECT name FROM cust
+WHERE EXISTS (SELECT 1 FROM ord WHERE ord.cust_id = cust.id AND ord.amount > 200)
+ORDER BY name
+----
+alice
+
+# Correlated IN: the customer's id is among the cust_ids of its high-value
+# orders (the amount threshold scales with the outer id). Only alice (id 1) has
+# an order whose cust_id (1) is >= 1*100 and equals her id.
+query T
+SELECT name FROM cust
+WHERE cust.id IN (SELECT cust_id FROM ord WHERE ord.amount >= cust.id * 100)
+ORDER BY name
+----
+alice
+
+# An inner column shadows an outer column of the same bare name: the inner one
+# wins (SQL scoping). `amount` exists only inside; `id` exists in both, and the
+# unqualified `id` in the subquery binds to ord.id (inner), not cust.id.
+query T
+SELECT name FROM cust
+WHERE EXISTS (SELECT 1 FROM ord WHERE ord.cust_id = cust.id AND id = 10)
+ORDER BY name
+----
+alice
+
+# An inner column that is AMBIGUOUS within the subquery's own join is NOT
+# rebound to a same-named outer column — it stays an (erroring) inner reference,
+# not a silent correlation. Here `id` is ambiguous across ord a / ord b and also
+# exists in the outer cust, so a naive correlation check would wrongly bind it to
+# cust.id; instead the statement errors.
+statement error
+SELECT name FROM cust
+WHERE EXISTS (SELECT 1 FROM ord a JOIN ord b ON a.cust_id = b.cust_id WHERE id = 5)
+
+# Correlated subquery whose outer row has a NULL correlation value never matches
+# (NULL = anything is UNKNOWN).
+statement ok
+INSERT INTO cust VALUES (4, 'dave')
+
+statement ok
+INSERT INTO ord VALUES (13, NULL, 5)
+
+query T
+SELECT name FROM cust WHERE EXISTS (SELECT 1 FROM ord WHERE ord.cust_id = cust.id) ORDER BY name
+----
+alice
+bob

@@ -20,7 +20,7 @@ use truthdb_sql::ast::{
     SetStatement, Statement, TableRef, Update,
 };
 use truthdb_sql::error::SqlError;
-use truthdb_sql::eval::EvalContext;
+use truthdb_sql::eval::{ColumnResolver, EvalContext};
 use truthdb_sql::value::{SqlValue, order_key_cmp};
 use truthdb_sql::{ast, eval};
 
@@ -2716,6 +2716,24 @@ impl truthdb_sql::eval::ColumnResolver for OutputScope {
 }
 
 impl JoinScope {
+    /// True if any column matches `name` — even ambiguously (>1 match), where
+    /// [`ColumnResolver::resolve`] returns `None`. Correlation analysis uses this
+    /// to tell "the inner scope has this name (bind/error here)" from "the name
+    /// is absent (it is an outer reference)": an ambiguous inner column must NOT
+    /// be rebound to a same-named outer column.
+    fn matches_any(&self, name: &str) -> bool {
+        self.columns.iter().any(|(qualifier, column)| {
+            if let Some((q, c)) = name.rsplit_once('.') {
+                qualifier
+                    .as_deref()
+                    .is_some_and(|qq| qq.eq_ignore_ascii_case(q))
+                    && column.eq_ignore_ascii_case(c)
+            } else {
+                column.eq_ignore_ascii_case(name)
+            }
+        })
+    }
+
     /// Source-column indices belonging to a table qualifier (for `t.*`).
     fn indices_for_qualifier(&self, qualifier: &str) -> Vec<usize> {
         self.columns
@@ -2994,35 +3012,47 @@ fn rewrite_select_subqueries(
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<Select, SqlError> {
+    // The columns this query exposes to a correlated subquery in its WHERE. A
+    // correlated WHERE subquery is left un-evaluated here (the per-row loop runs
+    // it with the outer row bound); other positions (SELECT list, HAVING, GROUP
+    // BY, ORDER BY) do not support correlation and evaluate as before.
+    let self_scope = select
+        .from
+        .as_ref()
+        .and_then(|from| from_column_names(storage, from))
+        .map(|columns| JoinScope { columns });
     let items = select
         .items
         .iter()
         .map(|item| match item {
             SelectItem::Expr { expr, alias } => Ok(SelectItem::Expr {
-                expr: rewrite_subqueries(storage, expr, eval_ctx)?,
+                expr: rewrite_subqueries(storage, expr, eval_ctx, None)?,
                 alias: alias.clone(),
             }),
             other => Ok(other.clone()),
         })
         .collect::<Result<Vec<_>, SqlError>>()?;
-    let rewrite_opt = |storage: &Storage, e: &Option<Expr>| -> Result<Option<Expr>, SqlError> {
-        e.as_ref()
-            .map(|e| rewrite_subqueries(storage, e, eval_ctx))
-            .transpose()
-    };
-    let where_clause = rewrite_opt(storage, &select.where_clause)?;
-    let having = rewrite_opt(storage, &select.having)?;
+    let where_clause = select
+        .where_clause
+        .as_ref()
+        .map(|e| rewrite_subqueries(storage, e, eval_ctx, self_scope.as_ref()))
+        .transpose()?;
+    let having = select
+        .having
+        .as_ref()
+        .map(|e| rewrite_subqueries(storage, e, eval_ctx, None))
+        .transpose()?;
     let group_by = select
         .group_by
         .iter()
-        .map(|e| rewrite_subqueries(storage, e, eval_ctx))
+        .map(|e| rewrite_subqueries(storage, e, eval_ctx, None))
         .collect::<Result<Vec<_>, SqlError>>()?;
     let order_by = select
         .order_by
         .iter()
         .map(|o| {
             Ok(OrderItem {
-                expr: rewrite_subqueries(storage, &o.expr, eval_ctx)?,
+                expr: rewrite_subqueries(storage, &o.expr, eval_ctx, None)?,
                 descending: o.descending,
             })
         })
@@ -3048,8 +3078,10 @@ fn rewrite_subqueries(
     storage: &Storage,
     expr: &Expr,
     eval_ctx: &EvalContext,
+    correlated_scope: Option<&JoinScope>,
 ) -> Result<Expr, SqlError> {
-    let recur = |storage: &Storage, e: &Expr| rewrite_subqueries(storage, e, eval_ctx);
+    let recur =
+        |storage: &Storage, e: &Expr| rewrite_subqueries(storage, e, eval_ctx, correlated_scope);
     let recur_box = |storage: &Storage, e: &Expr| -> Result<Box<Expr>, SqlError> {
         Ok(Box::new(recur(storage, e)?))
     };
@@ -3057,7 +3089,16 @@ fn rewrite_subqueries(
         |storage: &Storage, e: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, SqlError> {
             e.as_ref().map(|e| recur_box(storage, e)).transpose()
         };
+    // A subquery correlated with the enclosing query (`correlated_scope`) is left
+    // in place — the per-row WHERE loop substitutes its outer references and runs
+    // it once per outer row (`substitute_correlated_in_expr`).
+    let leave_correlated = |select: &Select| {
+        correlated_scope.is_some_and(|scope| is_correlated(storage, select, scope))
+    };
     let kind = match &expr.kind {
+        ExprKind::Subquery(select) if leave_correlated(select) => expr.kind.clone(),
+        ExprKind::Exists(select) if leave_correlated(select) => expr.kind.clone(),
+        ExprKind::InSubquery { subquery, .. } if leave_correlated(subquery) => expr.kind.clone(),
         ExprKind::Subquery(select) => {
             ExprKind::Literal(eval_scalar_subquery(storage, select, eval_ctx)?)
         }
@@ -3234,6 +3275,470 @@ fn scalar_subquery_shape_err() -> SqlError {
     )
 }
 
+// ---- correlated subquery support ----------------------------------------
+//
+// A subquery that references an enclosing query's column is *correlated*. It is
+// left un-evaluated by `rewrite_select_subqueries` (which only folds away
+// uncorrelated subqueries) and instead re-run once per outer row: the per-row
+// WHERE loop calls `substitute_correlated_in_expr`, which binds the outer row's
+// values into the subquery (`substitute_subquery_outer_refs`) and evaluates it.
+// This is the "correct, slow, honest" per-row apply. Supported for correlated
+// subqueries in the WHERE clause over base-table / join subqueries; a correlated
+// reference inside a derived-table / view subquery (whose inner scope cannot be
+// read from the catalog) falls back to the prior behavior (invalid-column 207).
+
+/// The `(qualifier, bare column name)` columns a FROM clause exposes, read from
+/// the catalog WITHOUT materializing rows. `None` if the FROM has a derived
+/// table or a view, whose output columns need binding to determine.
+fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<String>, String)>> {
+    match from {
+        TableRef::Table { name, alias } => {
+            let def = resolve_table(storage, &name.value)?;
+            if def.is_view() {
+                return None;
+            }
+            let qualifier = alias
+                .as_ref()
+                .map(|a| a.value.clone())
+                .unwrap_or_else(|| strip_schema(&name.value).to_string());
+            Some(
+                def.columns
+                    .iter()
+                    .map(|(cname, _, _)| (Some(qualifier.clone()), cname.clone()))
+                    .collect(),
+            )
+        }
+        TableRef::Join { left, right, .. } => {
+            let mut cols = from_column_names(storage, left)?;
+            cols.extend(from_column_names(storage, right)?);
+            Some(cols)
+        }
+        TableRef::Derived { .. } => None,
+    }
+}
+
+/// The inner scope of a subquery (its own FROM columns), or `None` if it cannot
+/// be determined from the catalog alone.
+fn subquery_inner_scope(storage: &Storage, subquery: &Select) -> Option<JoinScope> {
+    let columns = match &subquery.from {
+        Some(from) => from_column_names(storage, from)?,
+        None => Vec::new(),
+    };
+    Some(JoinScope { columns })
+}
+
+/// True if `subquery` references a column that resolves in the enclosing `outer`
+/// scope but not in its own FROM — i.e. it is correlated.
+fn is_correlated(storage: &Storage, subquery: &Select, outer: &JoinScope) -> bool {
+    let Some(inner) = subquery_inner_scope(storage, subquery) else {
+        return false;
+    };
+    let mut correlated = false;
+    select_column_refs(subquery, &mut |name| {
+        // `matches_any` (not `resolve`) so an *ambiguous* inner column is treated
+        // as inner (it errors in the subquery) rather than rebound to the outer.
+        if !inner.matches_any(&name.value) && outer.resolve(&name.value).is_some() {
+            correlated = true;
+        }
+    });
+    correlated
+}
+
+/// Calls `f` on every column reference in a select's own clauses (WHERE, SELECT
+/// items, HAVING, GROUP BY, ORDER BY), not descending into nested subqueries
+/// (which resolve in their own scope).
+fn select_column_refs(select: &Select, f: &mut impl FnMut(&Name)) {
+    if let Some(w) = &select.where_clause {
+        expr_column_refs(w, f);
+    }
+    for item in &select.items {
+        match item {
+            SelectItem::Expr { expr, .. } => expr_column_refs(expr, f),
+            SelectItem::Assign { value, .. } => expr_column_refs(value, f),
+            SelectItem::Wildcard | SelectItem::QualifiedWildcard(_) => {}
+        }
+    }
+    if let Some(h) = &select.having {
+        expr_column_refs(h, f);
+    }
+    for e in &select.group_by {
+        expr_column_refs(e, f);
+    }
+    for o in &select.order_by {
+        expr_column_refs(&o.expr, f);
+    }
+}
+
+/// Calls `f` on every column reference in an expression, not descending into
+/// nested subquery bodies.
+fn expr_column_refs(expr: &Expr, f: &mut impl FnMut(&Name)) {
+    match &expr.kind {
+        ExprKind::Column(name) => f(name),
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_)
+        | ExprKind::Subquery(_)
+        | ExprKind::Exists(_) => {}
+        // The IN operand is at this scope; the subquery body is not.
+        ExprKind::InSubquery { expr: e, .. } => expr_column_refs(e, f),
+        ExprKind::Unary { expr: e, .. }
+        | ExprKind::IsNull { expr: e, .. }
+        | ExprKind::Cast { expr: e, .. } => expr_column_refs(e, f),
+        ExprKind::Binary { left, right, .. } => {
+            expr_column_refs(left, f);
+            expr_column_refs(right, f);
+        }
+        ExprKind::Like {
+            expr: e, pattern, ..
+        } => {
+            expr_column_refs(e, f);
+            expr_column_refs(pattern, f);
+        }
+        ExprKind::InList { expr: e, list, .. } => {
+            expr_column_refs(e, f);
+            list.iter().for_each(|x| expr_column_refs(x, f));
+        }
+        ExprKind::Between {
+            expr: e, low, high, ..
+        } => {
+            expr_column_refs(e, f);
+            expr_column_refs(low, f);
+            expr_column_refs(high, f);
+        }
+        ExprKind::Function { args, .. } => args.iter().for_each(|a| expr_column_refs(a, f)),
+        ExprKind::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                expr_column_refs(a, f);
+            }
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                expr_column_refs(o, f);
+            }
+            for (w, r) in branches {
+                expr_column_refs(w, f);
+                expr_column_refs(r, f);
+            }
+            if let Some(e) = else_result {
+                expr_column_refs(e, f);
+            }
+        }
+    }
+}
+
+/// Replaces every column reference in an expression via `f` (a replacement, or
+/// `None` to keep), not descending into nested subquery bodies (but mapping an
+/// `IN (SELECT)` operand, which is at this scope).
+fn map_expr_columns(expr: &Expr, f: &impl Fn(&Name) -> Option<Expr>) -> Expr {
+    let map = |e: &Expr| map_expr_columns(e, f);
+    let map_box = |e: &Expr| Box::new(map_expr_columns(e, f));
+    let kind = match &expr.kind {
+        ExprKind::Column(name) => match f(name) {
+            Some(replacement) => return replacement,
+            None => expr.kind.clone(),
+        },
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_)
+        | ExprKind::Subquery(_)
+        | ExprKind::Exists(_) => expr.kind.clone(),
+        ExprKind::InSubquery {
+            expr: e,
+            subquery,
+            negated,
+        } => ExprKind::InSubquery {
+            expr: map_box(e),
+            subquery: subquery.clone(),
+            negated: *negated,
+        },
+        ExprKind::Unary { op, expr: e } => ExprKind::Unary {
+            op: *op,
+            expr: map_box(e),
+        },
+        ExprKind::IsNull { expr: e, negated } => ExprKind::IsNull {
+            expr: map_box(e),
+            negated: *negated,
+        },
+        ExprKind::Cast { expr: e, target } => ExprKind::Cast {
+            expr: map_box(e),
+            target: target.clone(),
+        },
+        ExprKind::Binary { op, left, right } => ExprKind::Binary {
+            op: *op,
+            left: map_box(left),
+            right: map_box(right),
+        },
+        ExprKind::Like {
+            expr: e,
+            pattern,
+            escape,
+            negated,
+        } => ExprKind::Like {
+            expr: map_box(e),
+            pattern: map_box(pattern),
+            escape: *escape,
+            negated: *negated,
+        },
+        ExprKind::InList {
+            expr: e,
+            list,
+            negated,
+        } => ExprKind::InList {
+            expr: map_box(e),
+            list: list.iter().map(map).collect(),
+            negated: *negated,
+        },
+        ExprKind::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => ExprKind::Between {
+            expr: map_box(e),
+            low: map_box(low),
+            high: map_box(high),
+            negated: *negated,
+        },
+        ExprKind::Function { name, args } => ExprKind::Function {
+            name: name.clone(),
+            args: args.iter().map(map).collect(),
+        },
+        ExprKind::Aggregate {
+            func,
+            distinct,
+            arg,
+        } => ExprKind::Aggregate {
+            func: *func,
+            distinct: *distinct,
+            arg: arg.as_ref().map(|a| map_box(a)),
+        },
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => ExprKind::Case {
+            operand: operand.as_ref().map(|o| map_box(o)),
+            branches: branches.iter().map(|(w, r)| (map(w), map(r))).collect(),
+            else_result: else_result.as_ref().map(|e| map_box(e)),
+        },
+    };
+    Expr {
+        kind,
+        span: expr.span,
+    }
+}
+
+/// A copy of `subquery` with references to the enclosing query's columns (per
+/// `outer`) replaced by the current outer row's literal values — making a
+/// correlated subquery uncorrelated for that row. `None` if the inner scope
+/// cannot be determined; the caller then runs the subquery unchanged.
+fn substitute_subquery_outer_refs(
+    storage: &Storage,
+    subquery: &Select,
+    outer: &JoinScope,
+    outer_row: &[SqlValue],
+) -> Option<Select> {
+    let inner = subquery_inner_scope(storage, subquery)?;
+    let substitute = |name: &Name| -> Option<Expr> {
+        if inner.matches_any(&name.value) {
+            return None; // the subquery's own column wins (even if ambiguous)
+        }
+        let index = outer.resolve(&name.value)?;
+        Some(Expr {
+            kind: ExprKind::Literal(outer_row.get(index)?.clone()),
+            span: name.span,
+        })
+    };
+    let mut out = subquery.clone();
+    out.where_clause = out
+        .where_clause
+        .as_ref()
+        .map(|e| map_expr_columns(e, &substitute));
+    out.items = out
+        .items
+        .iter()
+        .map(|item| match item {
+            SelectItem::Expr { expr, alias } => SelectItem::Expr {
+                expr: map_expr_columns(expr, &substitute),
+                alias: alias.clone(),
+            },
+            other => other.clone(),
+        })
+        .collect();
+    out.having = out
+        .having
+        .as_ref()
+        .map(|e| map_expr_columns(e, &substitute));
+    out.group_by = out
+        .group_by
+        .iter()
+        .map(|e| map_expr_columns(e, &substitute))
+        .collect();
+    out.order_by = out
+        .order_by
+        .iter()
+        .map(|o| OrderItem {
+            expr: map_expr_columns(&o.expr, &substitute),
+            descending: o.descending,
+        })
+        .collect();
+    Some(out)
+}
+
+/// Evaluates each correlated subquery in `expr` against `outer_row` (binding the
+/// enclosing query's columns per `outer`) and replaces it with a literal —
+/// producing a subquery-free predicate for that outer row.
+fn substitute_correlated_in_expr(
+    storage: &Storage,
+    expr: &Expr,
+    outer: &JoinScope,
+    outer_row: &[SqlValue],
+    eval_ctx: &EvalContext,
+) -> Result<Expr, SqlError> {
+    let recur = |e: &Expr| substitute_correlated_in_expr(storage, e, outer, outer_row, eval_ctx);
+    let recur_box = |e: &Expr| -> Result<Box<Expr>, SqlError> { Ok(Box::new(recur(e)?)) };
+    let bind = |sq: &Select| -> Select {
+        substitute_subquery_outer_refs(storage, sq, outer, outer_row).unwrap_or_else(|| sq.clone())
+    };
+    let kind = match &expr.kind {
+        ExprKind::Subquery(sq) => {
+            ExprKind::Literal(eval_scalar_subquery(storage, &bind(sq), eval_ctx)?)
+        }
+        ExprKind::Exists(sq) => {
+            let rowset = exec_select(storage, &bind(sq), eval_ctx)?;
+            ExprKind::Bool(!rowset.rows.is_empty())
+        }
+        ExprKind::InSubquery {
+            expr: lhs,
+            subquery,
+            negated,
+        } => {
+            let lhs = recur_box(lhs)?;
+            let list = eval_in_subquery(storage, &bind(subquery), eval_ctx)?
+                .into_iter()
+                .map(|v| Expr {
+                    kind: ExprKind::Literal(v),
+                    span: expr.span,
+                })
+                .collect();
+            ExprKind::InList {
+                expr: lhs,
+                list,
+                negated: *negated,
+            }
+        }
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
+        | ExprKind::Column(_)
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_) => expr.kind.clone(),
+        ExprKind::Unary { op, expr: e } => ExprKind::Unary {
+            op: *op,
+            expr: recur_box(e)?,
+        },
+        ExprKind::IsNull { expr: e, negated } => ExprKind::IsNull {
+            expr: recur_box(e)?,
+            negated: *negated,
+        },
+        ExprKind::Cast { expr: e, target } => ExprKind::Cast {
+            expr: recur_box(e)?,
+            target: target.clone(),
+        },
+        ExprKind::Binary { op, left, right } => ExprKind::Binary {
+            op: *op,
+            left: recur_box(left)?,
+            right: recur_box(right)?,
+        },
+        ExprKind::Like {
+            expr: e,
+            pattern,
+            escape,
+            negated,
+        } => ExprKind::Like {
+            expr: recur_box(e)?,
+            pattern: recur_box(pattern)?,
+            escape: *escape,
+            negated: *negated,
+        },
+        ExprKind::InList {
+            expr: e,
+            list,
+            negated,
+        } => ExprKind::InList {
+            expr: recur_box(e)?,
+            list: list.iter().map(&recur).collect::<Result<_, _>>()?,
+            negated: *negated,
+        },
+        ExprKind::Between {
+            expr: e,
+            low,
+            high,
+            negated,
+        } => ExprKind::Between {
+            expr: recur_box(e)?,
+            low: recur_box(low)?,
+            high: recur_box(high)?,
+            negated: *negated,
+        },
+        ExprKind::Function { name, args } => ExprKind::Function {
+            name: name.clone(),
+            args: args.iter().map(&recur).collect::<Result<_, _>>()?,
+        },
+        ExprKind::Aggregate {
+            func,
+            distinct,
+            arg,
+        } => ExprKind::Aggregate {
+            func: *func,
+            distinct: *distinct,
+            arg: match arg {
+                Some(a) => Some(recur_box(a)?),
+                None => None,
+            },
+        },
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => ExprKind::Case {
+            operand: match operand {
+                Some(o) => Some(recur_box(o)?),
+                None => None,
+            },
+            branches: branches
+                .iter()
+                .map(|(w, r)| Ok((recur(w)?, recur(r)?)))
+                .collect::<Result<_, SqlError>>()?,
+            else_result: match else_result {
+                Some(e) => Some(recur_box(e)?),
+                None => None,
+            },
+        },
+    };
+    Ok(Expr {
+        kind,
+        span: expr.span,
+    })
+}
+
 fn exec_select(
     storage: &Storage,
     select: &Select,
@@ -3274,13 +3779,26 @@ fn exec_select(
     let types = source.types();
 
     // WHERE. The predicate must be boolean-typed (SQL Server 4145): a bare
-    // numeric/string expression is rejected rather than silently coerced.
+    // numeric/string expression is rejected rather than silently coerced. Any
+    // subquery left in the (already-rewritten) predicate is correlated: bind the
+    // outer row into it and evaluate per row.
+    let where_correlated = select.where_clause.as_ref().is_some_and(expr_has_subquery);
     let mut rows: Vec<Vec<Datum>> = Vec::new();
     for row in source.rows {
+        let sql_row = row_values(&row, &types);
         let keep = match &select.where_clause {
             None => true,
             Some(predicate) => {
-                let value = eval::eval(predicate, &row_values(&row, &types), &resolver, eval_ctx)?;
+                let bound;
+                let predicate = if where_correlated {
+                    bound = substitute_correlated_in_expr(
+                        storage, predicate, &resolver, &sql_row, eval_ctx,
+                    )?;
+                    &bound
+                } else {
+                    predicate
+                };
+                let value = eval::eval(predicate, &sql_row, &resolver, eval_ctx)?;
                 match value {
                     SqlValue::Bool(b) => b,
                     SqlValue::Null => false,
@@ -3690,7 +4208,6 @@ fn bare_column_name(expr: &Expr) -> Option<String> {
 }
 
 fn bare_column_index(expr: &Expr, scope: &JoinScope) -> Option<usize> {
-    use truthdb_sql::eval::ColumnResolver;
     match &expr.kind {
         ExprKind::Column(name) => scope.resolve(&name.value),
         _ => None,
@@ -4322,7 +4839,6 @@ fn extract_equi_keys(pred: &Expr, left: &Source, right: &Source) -> Vec<EquiKey>
         let ExprKind::Column(name) = &expr.kind else {
             return None;
         };
-        use truthdb_sql::eval::ColumnResolver;
         match (
             left_scope.resolve(&name.value),
             right_scope.resolve(&name.value),
