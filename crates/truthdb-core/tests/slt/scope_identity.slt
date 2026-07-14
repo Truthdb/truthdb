@@ -1,0 +1,40 @@
+# SCOPE_IDENTITY() (Stage 5): the last identity value generated in the session.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL PRIMARY KEY IDENTITY(10, 5), name NVARCHAR(10))
+
+statement ok
+CREATE TABLE plain (id INT NOT NULL PRIMARY KEY, name NVARCHAR(10))
+
+# Before any identity insert, SCOPE_IDENTITY() is NULL.
+query I
+SELECT CAST(SCOPE_IDENTITY() AS BIGINT)
+----
+NULL
+
+# A single identity insert: seed 10.
+statement ok
+INSERT INTO t (name) VALUES ('a')
+
+query I
+SELECT CAST(SCOPE_IDENTITY() AS BIGINT)
+----
+10
+
+# A multi-row insert: the LAST value (10, 15, 20 -> 20).
+statement ok
+INSERT INTO t (name) VALUES ('b'), ('c')
+
+query I
+SELECT CAST(SCOPE_IDENTITY() AS BIGINT)
+----
+20
+
+# An insert into a table WITHOUT an identity column does not change it.
+statement ok
+INSERT INTO plain VALUES (99, 'x')
+
+query I
+SELECT CAST(SCOPE_IDENTITY() AS BIGINT)
+----
+20

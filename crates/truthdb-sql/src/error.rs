@@ -63,6 +63,11 @@ impl SqlError {
         SqlError::new(207, 16, 1, format!("Invalid column name '{name}'."))
     }
 
+    /// 209: ambiguous column name (matches more than one source column).
+    pub fn ambiguous_column(name: &str) -> Self {
+        SqlError::new(209, 16, 1, format!("Ambiguous column name '{name}'."))
+    }
+
     /// 2627: primary key / unique constraint violation.
     pub fn pk_violation(table: &str) -> Self {
         SqlError::new(

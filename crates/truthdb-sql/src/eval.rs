@@ -13,9 +13,28 @@ use crate::error::{SqlError, SqlResult};
 use crate::functions;
 use crate::value::{self, Numeric, SqlValue};
 
+/// The outcome of resolving a column name, distinguishing a missing column from
+/// one that is ambiguous (matches more than one source column) so each maps to
+/// the correct SQL Server error (208-family 207 vs 209).
+pub enum Resolution {
+    Found(usize),
+    NotFound,
+    Ambiguous,
+}
+
 /// Resolves a column name to its position in the row, case-insensitively.
 pub trait ColumnResolver {
     fn resolve(&self, name: &str) -> Option<usize>;
+
+    /// Like [`ColumnResolver::resolve`] but distinguishes not-found from
+    /// ambiguous. The default cannot detect ambiguity (a `None` from `resolve`
+    /// is reported as not-found); a multi-source resolver overrides it.
+    fn resolve_detail(&self, name: &str) -> Resolution {
+        match self.resolve(name) {
+            Some(index) => Resolution::Found(index),
+            None => Resolution::NotFound,
+        }
+    }
 }
 
 impl ColumnResolver for [String] {
@@ -54,6 +73,9 @@ pub struct EvalContext {
     pub login: String,
     /// The session process id — `@@SPID`.
     pub spid: i32,
+    /// The last identity value inserted in this scope — `SCOPE_IDENTITY()`.
+    /// `None` until an identity INSERT runs.
+    pub scope_identity: Option<i64>,
 }
 
 /// Evaluates `expr` against `row`, resolving columns via `resolver`.
@@ -168,10 +190,11 @@ fn eval_column(
     row: &[SqlValue],
     resolver: &impl ColumnResolver,
 ) -> SqlResult<SqlValue> {
-    let index = resolver
-        .resolve(&name.value)
-        .ok_or_else(|| SqlError::invalid_column(&name.value).at(name.span))?;
-    Ok(row[index].clone())
+    match resolver.resolve_detail(&name.value) {
+        Resolution::Found(index) => Ok(row[index].clone()),
+        Resolution::Ambiguous => Err(SqlError::ambiguous_column(&name.value).at(name.span)),
+        Resolution::NotFound => Err(SqlError::invalid_column(&name.value).at(name.span)),
+    }
 }
 
 #[inline(never)]
@@ -375,6 +398,12 @@ fn eval_session_function(name: &str, args: &[Expr]) -> Option<fn(&EvalContext) -
         "SUSER_SNAME" | "SUSER_NAME" if args.is_empty() => {
             Some(|ctx| SqlValue::Str(ctx.login.clone()))
         }
+        // SQL Server returns NUMERIC(38,0); NULL when no identity has been
+        // generated in the scope yet.
+        "SCOPE_IDENTITY" if args.is_empty() => Some(|ctx| match ctx.scope_identity {
+            Some(value) => SqlValue::Decimal(Box::new(Decimal::new(value as i128, 38, 0))),
+            None => SqlValue::Null,
+        }),
         _ => None,
     }
 }

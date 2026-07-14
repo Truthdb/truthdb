@@ -55,6 +55,10 @@ pub struct TxnContext {
     database: String,
     login: String,
     spid: i32,
+    /// The last identity value inserted in this session (SQL Server scope),
+    /// surfaced as `SCOPE_IDENTITY()`. Persists across statements until the next
+    /// identity INSERT; unaffected by non-identity inserts.
+    scope_identity: Option<i64>,
 }
 
 /// Session isolation level (defaults to READ COMMITTED, like SQL Server).
@@ -83,6 +87,7 @@ impl TxnContext {
             database: self.database.clone(),
             login: self.login.clone(),
             spid: self.spid,
+            scope_identity: self.scope_identity,
         }
     }
 
@@ -853,8 +858,16 @@ fn exec_statement(
         }
         Statement::Insert(insert) => {
             let eval_ctx = txn_ctx.eval_context();
-            let mut scope = txn_ctx.scope();
-            exec_insert(storage, insert, &mut scope, &eval_ctx)
+            let (result, identity) = {
+                let mut scope = txn_ctx.scope();
+                exec_insert(storage, insert, &mut scope, &eval_ctx)?
+            };
+            // An identity INSERT updates SCOPE_IDENTITY(); a non-identity one
+            // (identity == None) leaves it unchanged.
+            if let Some(value) = identity {
+                txn_ctx.scope_identity = Some(value);
+            }
+            Ok(result)
         }
         Statement::Update(update) => {
             let eval_ctx = txn_ctx.eval_context();
@@ -2221,7 +2234,7 @@ fn exec_insert(
     insert: &Insert,
     scope: &mut TxnScope,
     eval_ctx: &EvalContext,
-) -> Result<StatementResult, SqlError> {
+) -> Result<(StatementResult, Option<i64>), SqlError> {
     let def = resolve_table(storage, &insert.table.value)
         .ok_or_else(|| SqlError::invalid_object(&insert.table.value).at(insert.table.span))?;
     reject_dml_on_view(&def)?;
@@ -2355,7 +2368,16 @@ fn exec_insert(
     storage
         .rel_insert_many(&def.name, rows, scope)
         .map_err(|err| map_storage_err(err, &def.name))?;
-    Ok(StatementResult::RowsAffected(inserted))
+    // The last identity value generated (for SCOPE_IDENTITY()): the reserved
+    // first value plus the increment for each subsequent row. `None` when the
+    // table has no identity column or no rows were inserted.
+    let last_identity = match (identity_col, identity_first) {
+        (Some(_), Some(first)) if inserted > 0 => {
+            Some(first.saturating_add((inserted as i64 - 1).saturating_mul(increment)))
+        }
+        _ => None,
+    };
+    Ok((StatementResult::RowsAffected(inserted), last_identity))
 }
 
 /// Produces the input rows an INSERT supplies, each already in target-column
@@ -2750,10 +2772,15 @@ impl JoinScope {
 
 impl truthdb_sql::eval::ColumnResolver for JoinScope {
     fn resolve(&self, name: &str) -> Option<usize> {
-        // Both branches reject an ambiguous match (more than one column) by
-        // returning None, so eval raises an invalid-column error rather than
-        // silently picking the first.
-        let mut found = None;
+        match self.resolve_detail(name) {
+            truthdb_sql::eval::Resolution::Found(index) => Some(index),
+            // Ambiguous and not-found both fail to bind a single column.
+            _ => None,
+        }
+    }
+
+    fn resolve_detail(&self, name: &str) -> truthdb_sql::eval::Resolution {
+        use truthdb_sql::eval::Resolution;
         let matches = |q: &Option<String>, c: &str| -> bool {
             if let Some((qualifier, column)) = name.rsplit_once('.') {
                 q.as_deref()
@@ -2763,15 +2790,19 @@ impl truthdb_sql::eval::ColumnResolver for JoinScope {
                 c.eq_ignore_ascii_case(name)
             }
         };
+        let mut found = None;
         for (index, (qualifier, column)) in self.columns.iter().enumerate() {
             if matches(qualifier, column) {
                 if found.is_some() {
-                    return None; // ambiguous
+                    return Resolution::Ambiguous; // more than one match
                 }
                 found = Some(index);
             }
         }
-        found
+        match found {
+            Some(index) => Resolution::Found(index),
+            None => Resolution::NotFound,
+        }
     }
 }
 
