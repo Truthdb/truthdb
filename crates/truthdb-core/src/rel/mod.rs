@@ -4956,7 +4956,7 @@ fn build_join(
         } => {
             let left = build_join(storage, left, eval_ctx)?;
             let right = build_join(storage, right, eval_ctx)?;
-            join_sources(left, right, *kind, on.as_ref(), eval_ctx)
+            join_sources(storage, left, right, *kind, on.as_ref(), eval_ctx)
         }
         TableRef::Derived { subquery, alias } => {
             build_derived_source(storage, subquery, alias, eval_ctx)
@@ -5020,6 +5020,7 @@ fn build_derived_source(
 /// CROSS) is evaluated against the concatenated row; outer joins emit NULL-
 /// extended rows for unmatched sides.
 fn join_sources(
+    storage: &Storage,
     left: Source,
     right: Source,
     kind: JoinKind,
@@ -5081,6 +5082,7 @@ fn join_sources(
     let mut rows = Vec::new();
     if !equi.is_empty() && !matches!(kind, JoinKind::Cross) {
         hash_join(
+            storage,
             &left,
             &right,
             kind,
@@ -5232,6 +5234,91 @@ fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
     }
 }
 
+/// Grace-hash INNER join: partition both inputs by join-key hash into temp
+/// extents (matching rows share a partition, since equal keys hash equally),
+/// then join each partition pair in memory — bounding the build hash table to
+/// one partition instead of the whole right input. NULL keys never match, so
+/// they are dropped. Output order is by partition (an INNER join is unordered).
+#[allow(clippy::too_many_arguments)]
+fn grace_hash_inner_join(
+    storage: &Storage,
+    left: &Source,
+    right: &Source,
+    left_key: &impl Fn(&[Datum]) -> Vec<SqlValue>,
+    right_key: &impl Fn(&[Datum]) -> Vec<SqlValue>,
+    matches: &impl Fn(&[Datum], &[Datum]) -> Result<bool, SqlError>,
+    concat: &impl Fn(&[Datum], &[Datum]) -> Vec<Datum>,
+    rows: &mut Vec<Vec<Datum>>,
+) -> Result<(), SqlError> {
+    use hash::{HashKey, key_has_null};
+    use std::collections::HashMap;
+
+    let build_bytes: usize = right.rows.iter().map(|r| approx_row_bytes(r)).sum();
+    let partitions = (build_bytes / sort_budget() + 1).max(2);
+    let partition_of = |key: &[SqlValue]| -> usize {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        HashKey(key.to_vec()).hash(&mut hasher);
+        (hasher.finish() % partitions as u64) as usize
+    };
+    let spill_err = |e| map_storage_err(e, "<join spill>");
+
+    let mut left_parts: Vec<_> = (0..partitions)
+        .map(|_| crate::relstore::spill::RowSpool::new(storage))
+        .collect();
+    let mut right_parts: Vec<_> = (0..partitions)
+        .map(|_| crate::relstore::spill::RowSpool::new(storage))
+        .collect();
+    for l in &left.rows {
+        let key = left_key(l);
+        if key_has_null(&key) {
+            continue;
+        }
+        left_parts[partition_of(&key)]
+            .write_row(l)
+            .map_err(spill_err)?;
+    }
+    for r in &right.rows {
+        let key = right_key(r);
+        if key_has_null(&key) {
+            continue;
+        }
+        right_parts[partition_of(&key)]
+            .write_row(r)
+            .map_err(spill_err)?;
+    }
+    for part in left_parts.iter_mut().chain(right_parts.iter_mut()) {
+        part.finish_writing().map_err(spill_err)?;
+    }
+
+    for part in 0..partitions {
+        // Build a hash table over the right partition.
+        let mut r_rows: Vec<Vec<Datum>> =
+            Vec::with_capacity(right_parts[part].row_count() as usize);
+        let mut r_reader = right_parts[part].reader();
+        while let Some(row) = r_reader.next_row().map_err(spill_err)? {
+            r_rows.push(row);
+        }
+        let mut table: HashMap<HashKey, Vec<usize>> = HashMap::new();
+        for (ri, r) in r_rows.iter().enumerate() {
+            table.entry(HashKey(right_key(r))).or_default().push(ri);
+        }
+        // Probe with the left partition (streamed) and re-check the full ON.
+        let mut l_reader = left_parts[part].reader();
+        while let Some(l) = l_reader.next_row().map_err(spill_err)? {
+            if let Some(cands) = table.get(&HashKey(left_key(&l))) {
+                for &ri in cands {
+                    let r = &r_rows[ri];
+                    if matches(&l, r)? {
+                        rows.push(concat(&l, r));
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Hash join over two materialized sources on the given equi-key columns. The
 /// build side is hashed by its key tuple; the probe side drives output so row
 /// order matches the nested loop exactly (INNER/LEFT drive from the left,
@@ -5239,9 +5326,11 @@ fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 /// NULL key components never match (`x = NULL` is UNKNOWN), so NULL-keyed rows
 /// are excluded from the table and treated as unmatched. The full ON predicate
 /// is re-evaluated on every candidate, so residual (non-equi) conjuncts and the
-/// 3VL of the equality are honored identically to the nested loop.
+/// 3VL of the equality are honored identically to the nested loop. A large INNER
+/// join spills via [`grace_hash_inner_join`].
 #[allow(clippy::too_many_arguments)]
 fn hash_join(
+    storage: &Storage,
     left: &Source,
     right: &Source,
     kind: JoinKind,
@@ -5265,6 +5354,19 @@ fn hash_join(
             .map(|&(_, j)| value::datum_to_sql(&r[j], &right.columns[j].column_type))
             .collect()
     };
+
+    // Grace-hash spill for a large INNER join: partition both sides by join-key
+    // hash so each partition's build table fits in the memory budget. (INNER
+    // only — outer joins keep the in-memory build, whose unmatched null-extension
+    // is left for a follow-up.)
+    if kind == JoinKind::Inner {
+        let build_bytes: usize = right.rows.iter().map(|r| approx_row_bytes(r)).sum();
+        if build_bytes > sort_budget() {
+            return grace_hash_inner_join(
+                storage, left, right, &left_key, &right_key, matches, concat, rows,
+            );
+        }
+    }
 
     // The build side is the one NOT driving output: right for INNER/LEFT/FULL,
     // left for RIGHT.
