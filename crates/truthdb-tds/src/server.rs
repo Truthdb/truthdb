@@ -2,15 +2,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
-use tokio::io::{self, AsyncRead, AsyncWrite};
+use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 use truthdb_core::rel::{BatchOutcome, StatementResult};
 use truthdb_core::session::{EngineHandle, SessionId};
 
 use crate::login::{self, parse_login7};
 use crate::packet::{
-    self, DEFAULT_PACKET_SIZE, Message, PKT_ATTENTION, PKT_LOGIN7, PKT_PRELOGIN, PKT_RPC,
-    PKT_SQL_BATCH, PKT_TABULAR_RESULT, PKT_TRANSACTION_MANAGER, read_message, write_message,
+    self, DEFAULT_PACKET_SIZE, HEADER_LEN, Message, PKT_ATTENTION, PKT_LOGIN7, PKT_PRELOGIN,
+    PKT_RPC, PKT_SQL_BATCH, PKT_TABULAR_RESULT, PKT_TRANSACTION_MANAGER, read_message,
+    write_message,
 };
 use crate::rpc::{self, RpcProc};
 use crate::token;
@@ -156,12 +158,24 @@ where
         match message.kind {
             PKT_SQL_BATCH => {
                 let sql = batch_sql(&message.payload)?;
-                let response = run_batch(engine, session, &sql).await;
-                write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?;
+                let cancel = Arc::new(AtomicBool::new(false));
+                let work = run_batch(engine, session, &sql, cancel.clone());
+                match run_watching_attention(stream, cancel, work).await? {
+                    Some(response) => {
+                        write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?
+                    }
+                    None => return Ok(()),
+                }
             }
             PKT_RPC => {
-                let response = run_rpc(engine, session, &message.payload).await;
-                write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?;
+                let cancel = Arc::new(AtomicBool::new(false));
+                let work = run_rpc(engine, session, &message.payload, cancel.clone());
+                match run_watching_attention(stream, cancel, work).await? {
+                    Some(response) => {
+                        write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?
+                    }
+                    None => return Ok(()),
+                }
             }
             PKT_TRANSACTION_MANAGER => {
                 let response = handle_tm_request(
@@ -175,9 +189,9 @@ where
                 write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?;
             }
             PKT_ATTENTION => {
-                // Acknowledge cancel with a DONE(attention). True mid-batch
-                // interruption arrives in a later stage; batches here run to
-                // completion.
+                // An Attention arriving with no batch in flight (the batch it
+                // targeted already finished): just acknowledge it. Mid-batch
+                // Attentions are handled by `run_watching_attention` above.
                 let mut out = Vec::new();
                 token::done_attention(&mut out);
                 write_message(stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
@@ -297,9 +311,93 @@ fn authenticate(config: &TdsConfig, username: &str, password: &str) -> bool {
         .is_some_and(|expected| expected == password)
 }
 
-/// Runs a SQL batch through the engine actor and builds its token stream.
-async fn run_batch(engine: &EngineHandle, session: SessionId, sql: &str) -> Vec<u8> {
-    match engine.run_batch(session, sql.to_string()).await {
+/// Runs `work` (a batch/RPC that respects `cancel`) while concurrently watching
+/// the connection for a TDS Attention. If one arrives, `cancel` is set so the
+/// executor aborts the statement, and the client is answered with a
+/// `DONE(attention)` instead of the (partial) result. Returns `Ok(None)` if the
+/// client disconnected mid-batch.
+///
+/// `AsyncReadExt::read` is cancellation-safe, so bytes read into `hdr` survive a
+/// `select!` iteration that resolves to the batch instead; any partial header
+/// left when the batch wins is completed afterwards so packet framing is intact.
+async fn run_watching_attention<S, F>(
+    stream: &mut S,
+    cancel: Arc<AtomicBool>,
+    work: F,
+) -> io::Result<Option<Vec<u8>>>
+where
+    S: AsyncRead + AsyncWrite + Unpin,
+    F: std::future::Future<Output = Vec<u8>>,
+{
+    let mut work = std::pin::pin!(work);
+    let mut hdr = [0u8; HEADER_LEN];
+    let mut got = 0usize;
+    let mut attention = false;
+    let result = loop {
+        tokio::select! {
+            resp = &mut work => break resp,
+            read = stream.read(&mut hdr[got..]) => match read? {
+                0 => {
+                    // Client disconnected mid-batch: abort and drain, then drop.
+                    cancel.store(true, Ordering::Relaxed);
+                    let _ = (&mut work).await;
+                    return Ok(None);
+                }
+                n => {
+                    got += n;
+                    if got == HEADER_LEN {
+                        // Only an Attention (a header-only packet) is legal during
+                        // a running batch — TDS is request/response with no MARS.
+                        if hdr[0] == PKT_ATTENTION {
+                            attention = true;
+                            cancel.store(true, Ordering::Relaxed);
+                            got = 0;
+                        } else {
+                            // A pipelined non-Attention packet: fail loud rather
+                            // than silently ignore its (undrained) body and misframe
+                            // the next read. Abort the batch, then error out.
+                            cancel.store(true, Ordering::Relaxed);
+                            let _ = (&mut work).await;
+                            return Err(protocol_err(
+                                "unexpected TDS packet during a running batch",
+                            ));
+                        }
+                    }
+                }
+            },
+        }
+    };
+    // The batch finished before a header fully arrived: complete it so the next
+    // read stays framed (and still honour a late Attention).
+    if got > 0 {
+        stream.read_exact(&mut hdr[got..]).await?;
+        if hdr[0] == PKT_ATTENTION {
+            attention = true;
+        } else {
+            return Err(protocol_err("unexpected TDS packet during a running batch"));
+        }
+    }
+    if attention {
+        let mut out = Vec::new();
+        token::done_attention(&mut out);
+        Ok(Some(out))
+    } else {
+        Ok(Some(result))
+    }
+}
+
+/// Runs a SQL batch through the engine actor and builds its token stream. The
+/// batch is cancellable: setting `cancel` (on a TDS Attention) aborts it.
+async fn run_batch(
+    engine: &EngineHandle,
+    session: SessionId,
+    sql: &str,
+    cancel: Arc<AtomicBool>,
+) -> Vec<u8> {
+    match engine
+        .run_batch_cancellable(session, sql.to_string(), cancel)
+        .await
+    {
         Ok(reply) => build_batch_tokens(&reply.outcome, reply.in_transaction),
         Err(err) => {
             // A genuine engine/storage failure (not a SQL-level error).
@@ -315,7 +413,12 @@ async fn run_batch(engine: &EngineHandle, session: SessionId, sql: &str) -> Vec<
 /// typed parameters, run them, and return the same token stream a batch would.
 /// Any other procedure, or a malformed request, is answered with an error token
 /// plus a final DONE so the connection stays usable.
-async fn run_rpc(engine: &EngineHandle, session: SessionId, payload: &[u8]) -> Vec<u8> {
+async fn run_rpc(
+    engine: &EngineHandle,
+    session: SessionId,
+    payload: &[u8],
+    cancel: Arc<AtomicBool>,
+) -> Vec<u8> {
     let request = match rpc::parse_rpc_request(skip_all_headers(payload)) {
         Ok(request) => request,
         Err(err) => return rpc_error(&format!("malformed RPC request: {err}")),
@@ -326,7 +429,10 @@ async fn run_rpc(engine: &EngineHandle, session: SessionId, payload: &[u8]) -> V
                 Ok(split) => split,
                 Err(err) => return rpc_error(&err.to_string()),
             };
-            match engine.run_rpc(session, sql, params).await {
+            match engine
+                .run_rpc_cancellable(session, sql, params, cancel)
+                .await
+            {
                 Ok(reply) => build_batch_tokens(&reply.outcome, reply.in_transaction),
                 Err(err) => rpc_error(&err.to_string()),
             }
@@ -438,4 +544,55 @@ fn protocol_err(message: &str) -> io::Error {
 #[doc(hidden)]
 pub async fn read_raw_message<R: AsyncRead + Unpin>(reader: &mut R) -> io::Result<Message> {
     read_message(reader).await
+}
+
+#[cfg(test)]
+mod attention_tests {
+    use super::*;
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn attention_during_batch_cancels_and_acks() {
+        let (mut client, mut server) = tokio::io::duplex(64);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let cwork = cancel.clone();
+        // A "batch" that runs until its cancel flag is set (like the executor
+        // polling `check_cancelled`), then would return a normal result.
+        let work = async move {
+            loop {
+                if cwork.load(Ordering::Relaxed) {
+                    return b"RESULT".to_vec();
+                }
+                tokio::task::yield_now().await;
+            }
+        };
+        // The client sends an Attention (header-only packet) during the batch.
+        let attn = [PKT_ATTENTION, 0x01, 0x00, 0x08, 0, 0, 0, 0];
+        client.write_all(&attn).await.expect("send attention");
+        let out = run_watching_attention(&mut server, cancel.clone(), work)
+            .await
+            .expect("io ok")
+            .expect("not disconnected");
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the Attention set the cancel flag"
+        );
+        let mut expected = Vec::new();
+        token::done_attention(&mut expected);
+        assert_eq!(out, expected, "response is DONE(attention), not the result");
+    }
+
+    #[tokio::test]
+    async fn no_attention_returns_the_batch_result() {
+        let (_client, mut server) = tokio::io::duplex(64);
+        let cancel = Arc::new(AtomicBool::new(false));
+        // The batch completes on its own; no Attention is ever sent.
+        let work = async move { b"RESULT".to_vec() };
+        let out = run_watching_attention(&mut server, cancel.clone(), work)
+            .await
+            .expect("io ok")
+            .expect("not disconnected");
+        assert!(!cancel.load(Ordering::Relaxed));
+        assert_eq!(out, b"RESULT".to_vec(), "no attention -> the real result");
+    }
 }

@@ -225,6 +225,11 @@ pub fn execute_batch_with_params(
     // results rather than terminating the batch.
     let mut last_error: Option<SqlError> = None;
     for statement in &statements {
+        // A TDS Attention (cancel) aborts the batch before the next statement.
+        if let Err(cancel) = check_cancelled() {
+            let error = finalize_durability(storage, committed, Some(cancel));
+            return BatchOutcome { results, error };
+        }
         // Flag durability by statement kind, before matching the result: a
         // write/DDL/COMMIT can commit even when it then errors — an autocommit
         // statement, an identity reservation (its own mini-commit, made even
@@ -234,6 +239,16 @@ pub fn execute_batch_with_params(
         match exec_statement(storage, statement, txn_ctx) {
             Ok(result) => results.push(result),
             Err(error) => {
+                // A cancelled statement (whose `check_cancelled` fired inside an
+                // operator) aborts the batch immediately — the transaction stays
+                // open (its partial write was already undone to a savepoint), not
+                // doomed. Key on the cancel marker, not the flag: an Attention
+                // landing concurrently with an *unrelated* failure must not
+                // suppress that failure's XACT_ABORT/severity dooming.
+                if error.number == CANCEL_ERROR {
+                    let error = finalize_durability(storage, committed, Some(error));
+                    return BatchOutcome { results, error };
+                }
                 // Inside an explicit transaction the statement's partial writes
                 // were already undone to a savepoint (`rel_statement_scoped`), so
                 // the transaction is consistent either way. `SET XACT_ABORT` (and
@@ -2536,6 +2551,7 @@ fn exec_insert(
     // Build every row up front; insert them as one atomic statement.
     let mut rows = Vec::with_capacity(input_rows.len());
     for (row_no, input) in input_rows.iter().enumerate() {
+        check_cancelled()?;
         // Full row in schema order: unspecified columns start NULL.
         let mut values = vec![Datum::Null; ncols];
         for (position, sql_value) in target.iter().zip(input) {
@@ -2756,6 +2772,7 @@ fn exec_update(
     let types = schema_types(&schema);
     let mut updates = Vec::new();
     for (locator, row) in located {
+        check_cancelled()?;
         if !predicate_true(&update.where_clause, &row, &types, &resolver, eval_ctx)? {
             continue;
         }
@@ -2872,6 +2889,7 @@ fn exec_delete(
         .map_err(|e| map_storage_err(e, &def.name))?;
     let mut targets = Vec::new();
     for (locator, row) in located {
+        check_cancelled()?;
         if predicate_true(&delete.where_clause, &row, &types, &resolver, eval_ctx)? {
             // Keep the row values for secondary-index maintenance.
             targets.push((locator, row));
@@ -4107,6 +4125,7 @@ fn exec_select(
     let where_correlated = select.where_clause.as_ref().is_some_and(expr_has_subquery);
     let mut rows: Vec<Vec<Datum>> = Vec::new();
     for row in source.rows {
+        check_cancelled()?;
         let sql_row = row_values(&row, &types);
         let keep = match &select.where_clause {
             None => true,
@@ -4449,6 +4468,74 @@ pub(crate) fn set_test_sort_budget(budget: Option<usize>) {
     TEST_SORT_BUDGET.with(|cell| cell.set(budget));
 }
 
+thread_local! {
+    /// The cancellation flag for the batch running on this worker thread — set by
+    /// the connection task when a TDS Attention (cancel) arrives. Executor loops
+    /// poll it via [`check_cancelled`] so a running statement can be aborted.
+    static CANCEL_FLAG: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Binds a cancellation flag to the current thread for one batch, clearing it on
+/// drop so a later batch on the same pooled worker never sees a stale flag.
+pub struct CancelScope;
+
+impl CancelScope {
+    pub fn enter(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> CancelScope {
+        CANCEL_FLAG.with(|c| *c.borrow_mut() = Some(flag));
+        CancelScope
+    }
+}
+
+impl Drop for CancelScope {
+    fn drop(&mut self) {
+        CANCEL_FLAG.with(|c| *c.borrow_mut() = None);
+    }
+}
+
+/// True if the batch on this thread has been asked to cancel (Attention).
+fn is_cancelled() -> bool {
+    CANCEL_FLAG.with(|c| {
+        c.borrow()
+            .as_ref()
+            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
+    })
+}
+
+/// Errors if the current batch has been cancelled (TDS Attention). Executor
+/// loops call this periodically so a long statement aborts mid-flight. The
+/// client is answered with a `DONE(attention)`, not this error — it is an
+/// internal marker the batch driver recognises to stop without dooming the txn.
+pub fn check_cancelled() -> Result<(), SqlError> {
+    if is_cancelled() {
+        Err(SqlError::message_only(
+            CANCEL_ERROR,
+            "The query was canceled.",
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+/// The error number [`check_cancelled`] raises. The batch driver keys on this
+/// (not the raw cancel flag) so a concurrent Attention can't suppress the
+/// `XACT_ABORT`/severity dooming of an *unrelated* statement failure.
+const CANCEL_ERROR: i32 = 3617;
+
+/// Sets the current thread's cancel flag (test helper — execution runs on the
+/// calling thread in tests, so this simulates an Attention).
+#[cfg(test)]
+pub(crate) fn set_test_cancel(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    CANCEL_FLAG.with(|c| *c.borrow_mut() = Some(flag));
+}
+
+/// Clears the current thread's cancel flag (test helper — reset before other
+/// tests reuse the thread).
+#[cfg(test)]
+pub(crate) fn clear_test_cancel() {
+    CANCEL_FLAG.with(|c| *c.borrow_mut() = None);
+}
+
 /// The ORDER BY comparator for one pair of pre-evaluated key tuples: per item,
 /// collation-aware for a character column, else value order (NULLs first);
 /// `descending` reverses. No tie-break here — the caller adds stability.
@@ -4577,6 +4664,7 @@ fn order_rows_budgeted<'a>(
     let mut current: Vec<KeyedRow> = Vec::new();
     let mut current_bytes = 0usize;
     for row in rows {
+        check_cancelled()?;
         let key = sort_key(&row, order_by, types, resolver, eval_ctx)?;
         current_bytes += approx_row_bytes(&row);
         current.push((key, row));
@@ -5383,6 +5471,7 @@ fn join_sources(
         match kind {
             JoinKind::Cross | JoinKind::Inner => {
                 for l in &left.rows {
+                    check_cancelled()?;
                     for r in &right.rows {
                         if matches(l, r)? {
                             rows.push(concat(l, r));
@@ -5392,6 +5481,7 @@ fn join_sources(
             }
             JoinKind::Left => {
                 for l in &left.rows {
+                    check_cancelled()?;
                     let mut matched = false;
                     for r in &right.rows {
                         if matches(l, r)? {
@@ -5406,6 +5496,7 @@ fn join_sources(
             }
             JoinKind::Right => {
                 for r in &right.rows {
+                    check_cancelled()?;
                     let mut matched = false;
                     for l in &left.rows {
                         if matches(l, r)? {
@@ -5421,6 +5512,7 @@ fn join_sources(
             JoinKind::Full => {
                 let mut right_matched = vec![false; right.rows.len()];
                 for l in &left.rows {
+                    check_cancelled()?;
                     let mut matched = false;
                     for (index, r) in right.rows.iter().enumerate() {
                         if matches(l, r)? {
@@ -5609,6 +5701,7 @@ fn grace_hash_join(
     // Partition non-null-key rows; null-key rows can't match, so emit the outer
     // side's now and drop the rest.
     for p in probe_rows {
+        check_cancelled()?;
         let key = probe_key(p);
         if key_has_null(&key) {
             if preserve_probe {
@@ -5621,6 +5714,7 @@ fn grace_hash_join(
             .map_err(spill_err)?;
     }
     for b in build_rows_all {
+        check_cancelled()?;
         let key = build_key(b);
         if key_has_null(&key) {
             if preserve_build {
@@ -5781,6 +5875,7 @@ fn hash_join(
     let mut table: HashMap<HashKey, Vec<usize>> = HashMap::new();
     let build_rows = if build_left { &left.rows } else { &right.rows };
     for (index, row) in build_rows.iter().enumerate() {
+        check_cancelled()?;
         let key = if build_left {
             left_key(row)
         } else {
@@ -5795,6 +5890,7 @@ fn hash_join(
     match kind {
         JoinKind::Inner | JoinKind::Left => {
             for l in &left.rows {
+                check_cancelled()?;
                 let key = left_key(l);
                 let mut matched = false;
                 if !key_has_null(&key)
@@ -5815,6 +5911,7 @@ fn hash_join(
         }
         JoinKind::Right => {
             for r in &right.rows {
+                check_cancelled()?;
                 let key = right_key(r);
                 let mut matched = false;
                 if !key_has_null(&key)
@@ -5836,6 +5933,7 @@ fn hash_join(
         JoinKind::Full => {
             let mut right_matched = vec![false; right.rows.len()];
             for l in &left.rows {
+                check_cancelled()?;
                 let key = left_key(l);
                 let mut matched = false;
                 if !key_has_null(&key)
