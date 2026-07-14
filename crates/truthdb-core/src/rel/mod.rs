@@ -150,6 +150,13 @@ pub struct RowSet {
     pub rows: Vec<Vec<Datum>>,
 }
 
+/// Error severity at or above which a statement failure dooms the whole
+/// transaction even under `SET XACT_ABORT OFF` (SQL Server treats severity ≥ 17
+/// as resource/batch-level, versus 11–16 statement-level). Constraint violations
+/// (2627/2601/515/547, severity 14–16) stay below it, so they roll back only the
+/// failing statement and the transaction survives.
+const XACT_ABORT_SEVERITY: u8 = 17;
+
 /// A batch's outcome: the results of the statements that ran, plus the error
 /// that stopped the batch (if any). Statements before an error have already
 /// committed (each statement is autocommit in Stage 3), so their results are
@@ -209,6 +216,10 @@ pub fn execute_batch_with_params(
     // the WAL fsync to one call at the end of the batch (see
     // [`finalize_durability`]).
     let mut committed = false;
+    // The last non-dooming statement error under `SET XACT_ABORT OFF` — the batch
+    // continues past it (SQL Server default), so it is reported alongside the
+    // results rather than terminating the batch.
+    let mut last_error: Option<SqlError> = None;
     for statement in &statements {
         // Flag durability by statement kind, before matching the result: a
         // write/DDL/COMMIT can commit even when it then errors — an autocommit
@@ -219,8 +230,18 @@ pub fn execute_batch_with_params(
         match exec_statement(storage, statement, txn_ctx) {
             Ok(result) => results.push(result),
             Err(error) => {
-                // A statement failure inside an explicit transaction dooms it
-                // (XACT_ABORT-style): only ROLLBACK is then permitted.
+                // Inside an explicit transaction the statement's partial writes
+                // were already undone to a savepoint (`rel_statement_scoped`), so
+                // the transaction is consistent either way. `SET XACT_ABORT` (and
+                // error severity) then decides its fate: OFF (the default) with a
+                // non-fatal error rolls back only the statement and the batch
+                // continues; ON — or a high-severity error — dooms the whole
+                // transaction (only ROLLBACK is then accepted, error 3930).
+                let dooms = txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY;
+                if txn_ctx.in_txn() && !dooms {
+                    last_error = Some(error);
+                    continue;
+                }
                 if txn_ctx.in_txn() {
                     txn_ctx.doomed = true;
                 }
@@ -229,7 +250,7 @@ pub fn execute_batch_with_params(
             }
         }
     }
-    let error = finalize_durability(storage, committed, None);
+    let error = finalize_durability(storage, committed, last_error);
     BatchOutcome { results, error }
 }
 
@@ -257,10 +278,13 @@ fn statement_may_commit(statement: &Statement) -> bool {
 
 /// Blocks until the batch's commit records are fsync-durable (group commit),
 /// when the batch may have committed anything. A durability (fsync) failure
-/// wedges the store — the in-memory state is now ahead of the log, so no
-/// further op may serve it — and is reported unless the batch already carries a
-/// statement error (which the client asked about and takes precedence; the
-/// wedge then surfaces on the next operation).
+/// wedges the store — the in-memory state is now ahead of the log, so no further
+/// op may serve it — and *takes precedence over any `prior` statement error*: a
+/// lost commit is more severe than a statement error the client asked about, and
+/// a benign, continued error (e.g. a duplicate-key under `XACT_ABORT OFF` that
+/// the batch ran past before a real `COMMIT`) must not mask it — otherwise the
+/// client would be told the transaction committed while its data is silently
+/// undone as a loser on restart.
 fn finalize_durability(
     storage: &Storage,
     committed: bool,
@@ -273,7 +297,7 @@ fn finalize_durability(
         Ok(()) => prior,
         Err(err) => {
             storage.wedge();
-            Some(prior.unwrap_or_else(|| map_storage_err(err, "")))
+            Some(map_storage_err(err, ""))
         }
     }
 }

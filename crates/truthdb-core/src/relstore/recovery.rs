@@ -296,6 +296,35 @@ pub(crate) fn undo_one(
     Ok(())
 }
 
+/// Rolls a live transaction back to a [`Savepoint`], undoing only the work done
+/// since it was taken (statement-level atomicity) while the transaction stays
+/// open. Undoes the undo-log suffix in reverse with the same CLR discipline as a
+/// full rollback, so a crash before the eventual commit/rollback recovers
+/// correctly: each compensation CLR's `undo_next` points before the undone op, so
+/// recovery's undo skips it (never double-undoing). The undo-log suffix is
+/// dropped, so a later full rollback unwinds only the surviving prefix.
+pub(crate) fn rollback_to(
+    ctx: &mut RelCtx<'_>,
+    txn: &mut TxnLink,
+    savepoint: crate::relstore::ctx::Savepoint,
+    tree_roots: &HashMap<u32, u64>,
+) -> Result<(), StorageError> {
+    ctx.use_reserve = true;
+    // Detach the suffix (work done after the savepoint) and undo it tail-first.
+    let suffix: Vec<(u64, PageOpUndo)> = txn.undo_log.split_off(savepoint.undo_len);
+    for (index, (lsn, undo)) in suffix.iter().enumerate().rev() {
+        // The predecessor of the first undone op is the savepoint's chain tail,
+        // so its sealing CLR moves the undo cursor back to the savepoint.
+        let prev = if index == 0 {
+            savepoint.last_lsn
+        } else {
+            suffix[index - 1].0
+        };
+        undo_one(ctx, txn, undo, *lsn, prev, tree_roots)?;
+    }
+    Ok(())
+}
+
 /// Rolls back a live transaction (statement failure) using its in-memory
 /// undo log; same CLR discipline as recovery undo.
 pub(crate) fn rollback(
