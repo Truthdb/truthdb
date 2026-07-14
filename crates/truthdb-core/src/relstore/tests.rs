@@ -157,11 +157,10 @@ fn committed_statements_survive_crash_without_checkpoint() {
 }
 
 #[test]
-fn active_transaction_count_gates_checkpoints() {
-    // The checkpoint gate (Engine::maybe_checkpoint) reads
-    // `has_active_transactions`; verify it tracks explicit transactions across
-    // both the commit and rollback paths so a checkpoint can never run while
-    // an explicit transaction is open (which would truncate its undo records).
+fn active_transaction_count_tracks_open_transactions() {
+    // The active-transaction set (which a fuzzy checkpoint clamps the WAL head
+    // to) must track explicit transactions across both the commit and rollback
+    // paths, so `has_active_transactions` flips on begin and off on end.
     let path = unique_temp_path("active-txn-gate");
     let mut storage = create_storage(&path);
     assert!(!storage.has_active_transactions());
@@ -185,6 +184,90 @@ fn active_transaction_count_gates_checkpoints() {
         "rollback clears the active transaction"
     );
 
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn fuzzy_checkpoint_with_open_txn_then_crash_undoes_it() {
+    // A checkpoint may now run WHILE an explicit transaction is open. It flushes
+    // the txn's uncommitted page but clamps the WAL head to the txn's begin LSN,
+    // so its undo survives. On crash the open txn is rolled back; a row committed
+    // before the checkpoint survives.
+    use crate::storage::TxnScope;
+    let path = unique_temp_path("fuzzy-ckpt-crash");
+    let mut storage = create_storage(&path);
+    create_tree_table(&mut storage, "t");
+    storage
+        .rel_insert("t", row(1, "committed"))
+        .expect("insert 1");
+
+    let mut txn = storage.rel_begin().expect("begin");
+    storage
+        .rel_insert_many(
+            "t",
+            vec![row(99, "uncommitted")],
+            &mut TxnScope::Explicit(&mut txn),
+        )
+        .expect("insert 99 under txn");
+    assert!(storage.has_active_transactions());
+
+    // Fuzzy checkpoint with the transaction still open (previously refused).
+    storage
+        .write_checkpoint(b"fuzzy", 1, 2, 1)
+        .expect("checkpoint runs with an open transaction");
+
+    drop(txn); // crash before commit
+    drop(storage);
+
+    let mut storage = Storage::open(path.clone()).expect("reopen");
+    assert_eq!(
+        scan_ids(&mut storage, "t"),
+        vec![1],
+        "open txn rolled back after the fuzzy checkpoint; committed row survives"
+    );
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn fuzzy_checkpoint_then_commit_survives_crash() {
+    // Work done both before AND after a fuzzy checkpoint, then committed, must
+    // survive a crash — the checkpoint clamped the WAL head to the txn's begin,
+    // so redo replays everything the commit made durable.
+    use crate::storage::TxnScope;
+    let path = unique_temp_path("fuzzy-ckpt-commit");
+    let mut storage = create_storage(&path);
+    create_tree_table(&mut storage, "t");
+
+    let mut txn = storage.rel_begin().expect("begin");
+    storage
+        .rel_insert_many(
+            "t",
+            vec![row(50, "before-ckpt")],
+            &mut TxnScope::Explicit(&mut txn),
+        )
+        .expect("insert 50");
+    storage
+        .write_checkpoint(b"fuzzy", 1, 2, 1)
+        .expect("checkpoint with open txn");
+    storage
+        .rel_insert_many(
+            "t",
+            vec![row(51, "after-ckpt")],
+            &mut TxnScope::Explicit(&mut txn),
+        )
+        .expect("insert 51");
+    storage.rel_commit(txn).expect("commit forces the log");
+
+    drop(storage); // crash after commit
+
+    let mut storage = Storage::open(path.clone()).expect("reopen");
+    assert_eq!(
+        scan_ids(&mut storage, "t"),
+        vec![50, 51],
+        "both pre- and post-checkpoint rows of the committed txn survive"
+    );
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
