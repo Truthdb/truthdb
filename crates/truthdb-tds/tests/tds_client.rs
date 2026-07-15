@@ -180,7 +180,14 @@ impl Client {
     /// byte for BEGIN) and returns the decoded response tokens.
     async fn tm_request(&mut self, request_type: u16, isolation: u8) -> Vec<Token> {
         let mut payload = Vec::new();
-        let headers = all_headers(self.tran_descriptor);
+        // Mirror go-mssqldb: a BEGIN carries a placeholder 0 descriptor (it
+        // names no transaction yet), while COMMIT/ROLLBACK carry the live one.
+        let descriptor = if request_type == TM_BEGIN_XACT {
+            0
+        } else {
+            self.tran_descriptor
+        };
+        let headers = all_headers(descriptor);
         let total = 4 + headers.len();
         payload.extend_from_slice(&(total as u32).to_le_bytes());
         payload.extend_from_slice(&headers);
@@ -721,6 +728,92 @@ async fn transaction_descriptor_round_trips_through_envchange() {
 
     client.tm_request(TM_COMMIT_XACT, 0).await;
     assert_eq!(client.tran_descriptor, 0, "commit clears the descriptor");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn begin_after_a_batch_commit_is_accepted_with_a_placeholder_descriptor() {
+    // Regression: go-mssqldb hardcodes descriptor 0 on TM begin while using the
+    // live descriptor everywhere else. Committing via a SQL batch leaves the
+    // server's descriptor non-zero (the batch path emits no ENVCHANGE), so a
+    // following begin arrives claiming 0 against a non-zero descriptor.
+    // Validating a begin would kill this correct client's connection.
+    let path = temp_path("begin-placeholder");
+    let engine = engine(&path);
+    let mut client = connect(engine).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .await;
+
+    // Begin via TM, then commit via a SQL batch: the server's descriptor stays
+    // non-zero because only TM requests move it.
+    client.tm_request(TM_BEGIN_XACT, 0).await;
+    assert_ne!(client.tran_descriptor, 0, "begin minted a descriptor");
+    client.batch("INSERT INTO t VALUES (1)").await;
+    client.batch("COMMIT TRANSACTION").await;
+
+    // A second begin, carrying go-mssqldb's placeholder 0, must be accepted.
+    let begin = client.tm_request(TM_BEGIN_XACT, 0).await;
+    assert!(
+        has_envchange(&begin, 8),
+        "a begin with a placeholder descriptor must be accepted: {begin:?}"
+    );
+    let rows = client.batch("SELECT id FROM t").await;
+    assert!(
+        rows.iter().any(|t| matches!(t, Token::Row(_))),
+        "the connection is still usable: {rows:?}"
+    );
+    client.tm_request(TM_ROLLBACK_XACT, 0).await;
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn nested_tm_commit_keeps_the_transaction_and_its_descriptor() {
+    // A nested COMMIT (@@TRANCOUNT 2 -> 1) does not end the transaction, so it
+    // must not announce one ending: emitting ENVCHANGE 9 here would contradict
+    // the same reply's DONE(INXACT) and zero a descriptor the client is still
+    // meant to send.
+    let path = temp_path("nested-tm-commit");
+    let engine = engine(&path);
+    let mut client = connect(engine).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .await;
+
+    client.tm_request(TM_BEGIN_XACT, 0).await;
+    let descriptor = client.tran_descriptor;
+    assert_ne!(descriptor, 0);
+    // Nest a second transaction via SQL: @@TRANCOUNT is now 2.
+    client.batch("BEGIN TRANSACTION").await;
+
+    // The inner commit only decrements @@TRANCOUNT: still in a transaction.
+    let commit = client.tm_request(TM_COMMIT_XACT, 0).await;
+    assert!(
+        !has_envchange(&commit, 9),
+        "a nested commit must not announce the transaction ending: {commit:?}"
+    );
+    assert!(
+        commit
+            .iter()
+            .any(|t| matches!(t, Token::Done { in_xact: true, .. })),
+        "still in a transaction: {commit:?}"
+    );
+    assert_eq!(
+        client.tran_descriptor, descriptor,
+        "the descriptor survives a nested commit"
+    );
+
+    // The outer commit ends it: now the ENVCHANGE fires and clears it.
+    let commit = client.tm_request(TM_COMMIT_XACT, 0).await;
+    assert!(
+        has_envchange(&commit, 9),
+        "outer commit ends it: {commit:?}"
+    );
+    assert_eq!(client.tran_descriptor, 0);
     let _ = std::fs::remove_file(path);
 }
 

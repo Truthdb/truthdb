@@ -158,7 +158,7 @@ where
         match message.kind {
             PKT_SQL_BATCH => {
                 let headers = parse_all_headers(&message.payload)?;
-                check_transaction_descriptor(&headers, tran_descriptor)?;
+                check_transaction_descriptor(headers.transaction_descriptor, tran_descriptor)?;
                 let sql = batch_sql(headers.body)?;
                 let cancel = Arc::new(AtomicBool::new(false));
                 let work = run_batch(engine, session, &sql, cancel.clone());
@@ -171,7 +171,7 @@ where
             }
             PKT_RPC => {
                 let headers = parse_all_headers(&message.payload)?;
-                check_transaction_descriptor(&headers, tran_descriptor)?;
+                check_transaction_descriptor(headers.transaction_descriptor, tran_descriptor)?;
                 let cancel = Arc::new(AtomicBool::new(false));
                 let work = run_rpc(engine, session, headers.body, cancel.clone());
                 match run_watching_attention(stream, cancel, work).await? {
@@ -183,11 +183,11 @@ where
             }
             PKT_TRANSACTION_MANAGER => {
                 let headers = parse_all_headers(&message.payload)?;
-                check_transaction_descriptor(&headers, tran_descriptor)?;
                 let response = handle_tm_request(
                     engine,
                     session,
                     headers.body,
+                    headers.transaction_descriptor,
                     &mut tran_descriptor,
                     &mut next_descriptor,
                 )
@@ -215,10 +215,20 @@ async fn handle_tm_request(
     engine: &EngineHandle,
     session: SessionId,
     body: &[u8],
+    claimed_descriptor: Option<u64>,
     tran_descriptor: &mut u64,
     next_descriptor: &mut u64,
 ) -> io::Result<Vec<u8>> {
     let (request_type, isolation) = parse_tm_request(body)?;
+    // Only COMMIT/ROLLBACK are validated: they name the transaction they end,
+    // so a mismatch means the client is ending a transaction it is not in. A
+    // BEGIN's descriptor references no transaction yet — it is a placeholder,
+    // and real drivers treat it as one: go-mssqldb hardcodes 0 on BEGIN while
+    // using the live descriptor everywhere else. Validating it would kill the
+    // connection of a perfectly correct client.
+    if request_type != TM_BEGIN_XACT {
+        check_transaction_descriptor(claimed_descriptor, *tran_descriptor)?;
+    }
     let sql = match request_type {
         TM_BEGIN_XACT => match isolation_set_clause(isolation) {
             Some(set) => format!("{set}; BEGIN TRANSACTION"),
@@ -265,13 +275,22 @@ async fn handle_tm_request(
             *tran_descriptor = descriptor;
             token::envchange_begin_tran(&mut out, descriptor);
         }
+        // A nested COMMIT (@@TRANCOUNT 2 -> 1) does not end the transaction, so
+        // it emits no terminating ENVCHANGE and keeps the descriptor: the
+        // transaction the client is in has not changed. Announcing the end of a
+        // still-open transaction would contradict this reply's own DONE(INXACT)
+        // and, now that the descriptor is validated, desynchronise the client.
         TM_COMMIT_XACT => {
-            token::envchange_commit_tran(&mut out, *tran_descriptor);
-            *tran_descriptor = 0;
+            if !reply.in_transaction {
+                token::envchange_commit_tran(&mut out, *tran_descriptor);
+                *tran_descriptor = 0;
+            }
         }
         TM_ROLLBACK_XACT => {
-            token::envchange_rollback_tran(&mut out, *tran_descriptor);
-            *tran_descriptor = 0;
+            if !reply.in_transaction {
+                token::envchange_rollback_tran(&mut out, *tran_descriptor);
+                *tran_descriptor = 0;
+            }
         }
         _ => unreachable!("request type validated above"),
     }
@@ -577,8 +596,10 @@ fn parse_all_headers(payload: &[u8]) -> io::Result<AllHeaders<'_>> {
 /// meaningful when present, and refusing requests without one would break
 /// clients that omit it (MS-TDS mandates it, but tolerating absence costs
 /// nothing here — a client that never sends one never desynchronises).
-fn check_transaction_descriptor(headers: &AllHeaders<'_>, current: u64) -> io::Result<()> {
-    match headers.transaction_descriptor {
+///
+/// Nor is a `TM_BEGIN_XACT` checked — see [`handle_tm_request`].
+fn check_transaction_descriptor(claimed: Option<u64>, current: u64) -> io::Result<()> {
+    match claimed {
         Some(descriptor) if descriptor != current => Err(protocol_err(&format!(
             "transaction descriptor {descriptor} does not match this connection's transaction {current}"
         ))),
