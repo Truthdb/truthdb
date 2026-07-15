@@ -16,6 +16,11 @@ group_sync_ms = 5
 backpressure_timeout_ms = 50
 snapshot_min_interval_ms = 1000
 snapshot_wal_threshold = 0.7
+# The database's default collation: what a character column declared without an
+# explicit COLLATE gets. Applied when the database file is created and stamped
+# into it — an existing file keeps the collation it was created with, since its
+# index keys are already encoded under it. Default: SQL_Latin1_General_CP1_CI_AS.
+# default_collation = "Finnish_Swedish_CI_AS"
 
 # TDS (SQL Server protocol) gateway. Disabled by default. When enabled, real
 # SQL Server drivers (pytds, go-mssqldb with encrypt=disable) can connect.

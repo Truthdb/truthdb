@@ -36,6 +36,7 @@ fn new_engine(path: &Path) -> Engine {
         snapshot_ratio: 0.02,
         allocator_ratio: 0.02,
         reserved_ratio: 0.17,
+        default_collation: None,
     };
     let storage = Storage::create(path.to_path_buf(), opts).expect("create storage");
     Engine::new(storage).expect("engine")

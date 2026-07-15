@@ -39,7 +39,7 @@ impl From<TypeError> for StorageError {
 /// kinds inside).
 const REL_WAL_ENTRY_VERSION: u16 = 1;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct StorageOptions {
     pub size_gib: u64,
     pub wal_ratio: f64,
@@ -47,6 +47,14 @@ pub struct StorageOptions {
     pub snapshot_ratio: f64,
     pub allocator_ratio: f64,
     pub reserved_ratio: f64,
+    /// The database's default collation: what a character column declared
+    /// without an explicit `COLLATE` gets. `None` uses the built-in default.
+    ///
+    /// It is stamped into the file at creation and read back on open, never
+    /// taken from the running config, because it decides the sort-key bytes of
+    /// every column that inherited it — changing it under existing data would
+    /// silently invalidate their keys.
+    pub default_collation: Option<String>,
 }
 
 impl StorageOptions {
@@ -326,6 +334,15 @@ impl Storage {
 
     pub fn rel_table(&self, name: &str) -> Option<TableDef> {
         self.lock().rel_table(name)
+    }
+
+    /// The database's default collation, as stamped into the file at creation.
+    /// `None` means the built-in default. A character column declared without an
+    /// explicit `COLLATE` is resolved to this at CREATE TABLE and stored with
+    /// it, so a column keeps the collation it was created under even if a later
+    /// database is created with a different default.
+    pub fn default_collation(&self) -> Option<String> {
+        self.lock().default_collation.clone()
     }
 
     pub fn rel_tables(&self) -> Vec<TableDef> {
@@ -689,6 +706,11 @@ struct StorageFile {
     rel: RelState,
     /// WAL records recovered at open, waiting for the engine to replay them.
     replay_cache: Vec<WalRecord>,
+    /// The database's default collation, read from the file header at open. A
+    /// character column declared without an explicit `COLLATE` is resolved to
+    /// this at CREATE TABLE and stored with it, so the column keeps the
+    /// collation it was created under even if the default later changes.
+    default_collation: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -747,7 +769,7 @@ impl StorageFile {
     pub fn rel_create_table(
         &mut self,
         name: &str,
-        columns: Vec<Column>,
+        mut columns: Vec<Column>,
         key_names: &[String],
         defaults: Vec<Option<String>>,
         identity: Option<catalog::IdentitySpec>,
@@ -755,6 +777,25 @@ impl StorageFile {
         foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        // A character column declared without an explicit COLLATE inherits the
+        // database default *by name*, recorded now rather than resolved on each
+        // read: the column's key bytes are that collation's sort keys, so it has
+        // to keep the collation it was created under. Resolved here, at the one
+        // point every CREATE TABLE passes through, so the SQL path and the
+        // native path cannot disagree.
+        if let Some(default) = self.default_collation.clone() {
+            for column in &mut columns {
+                if column.collation.is_none()
+                    && matches!(
+                        column.column_type,
+                        crate::relstore::types::ColumnType::VarChar { .. }
+                            | crate::relstore::types::ColumnType::NVarChar { .. }
+                    )
+                {
+                    column.collation = Some(default.clone());
+                }
+            }
+        }
         if self.rel.tables.contains_key(name) {
             return Err(StorageError::Constraint(format!(
                 "table '{name}' already exists"
@@ -1853,6 +1894,7 @@ impl StorageFile {
         }
 
         let mut storage = StorageFile {
+            default_collation: header.default_collation(),
             file,
             wal,
             layout,
@@ -1894,9 +1936,17 @@ impl StorageFile {
         wal_min_bytes: u64,
         wal_max_bytes: u64,
     ) -> Result<Self, StorageError> {
-        let layout = compute_layout(opts, wal_min_bytes, wal_max_bytes)?;
+        let layout = compute_layout(opts.clone(), wal_min_bytes, wal_max_bytes)?;
         validate_allocator_region(&layout)?;
         let mut header = FileHeader::default();
+        // Stamp the database's default collation into the file. Every character
+        // column declared without an explicit COLLATE is keyed under it, so it
+        // belongs to the data, not to whatever the config says at the next boot.
+        if let Some(name) = opts.default_collation.as_deref() {
+            header
+                .set_default_collation(name)
+                .map_err(StorageError::InvalidConfig)?;
+        }
         header.superblock_a_offset = layout.superblock_a_offset;
         header.superblock_b_offset = layout.superblock_b_offset;
         header.wal_offset = layout.wal_offset;
@@ -1935,6 +1985,7 @@ impl StorageFile {
         let wal = WalWriter::open(log_file, layout.wal_offset, layout.wal_size, 0, 0)?;
 
         Ok(StorageFile {
+            default_collation: header.default_collation(),
             file,
             wal,
             layout,
@@ -2912,6 +2963,7 @@ mod tests {
             snapshot_ratio: 0.02,
             allocator_ratio: 0.02,
             reserved_ratio: 0.17,
+            default_collation: None,
         }
     }
 

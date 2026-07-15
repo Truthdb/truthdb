@@ -2264,6 +2264,9 @@ fn data_type_to_column_type(data_type: &DataType, name: &str) -> Result<ColumnTy
     })
 }
 
+/// Binds a declared column. A character column left without an explicit
+/// `COLLATE` keeps `None` here and is resolved to the database default by
+/// `rel_create_table`, the one point every CREATE TABLE passes through.
 fn bind_column(column: &ColumnDef) -> Result<Column, SqlError> {
     let column_type = data_type_to_column_type(&column.data_type, &column.name.value)?;
     // A COLLATE clause is only meaningful on character columns.

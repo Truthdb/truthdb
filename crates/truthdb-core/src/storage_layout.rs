@@ -168,6 +168,42 @@ impl FileHeader {
         header
     }
 
+    /// The database's default collation, from the reserved area: a `u16` length
+    /// then UTF-8 bytes. Empty (a fresh zeroed header, or a file created before
+    /// this was recorded) means the built-in default.
+    ///
+    /// It lives in the file because it decides the sort-key bytes of every
+    /// character column declared without an explicit `COLLATE`. Changing it
+    /// under existing data would silently invalidate their keys, so a database
+    /// is stamped with one at creation and reads it back on open rather than
+    /// taking it from whatever the current config happens to say.
+    pub fn default_collation(&self) -> Option<String> {
+        let len = u16::from_le_bytes(self.reserved[0..2].try_into().unwrap()) as usize;
+        if len == 0 || len > self.reserved.len() - 2 {
+            return None;
+        }
+        std::str::from_utf8(&self.reserved[2..2 + len])
+            .ok()
+            .map(str::to_string)
+    }
+
+    /// Stamps the database's default collation into the reserved area. Fails if
+    /// the name cannot fit, rather than storing a truncated one that would key
+    /// columns under a collation nobody asked for.
+    pub fn set_default_collation(&mut self, name: &str) -> Result<(), String> {
+        let bytes = name.as_bytes();
+        if bytes.len() + 2 > self.reserved.len() {
+            return Err(format!(
+                "collation name is too long for the file header: {} bytes, room for {}",
+                bytes.len(),
+                self.reserved.len() - 2
+            ));
+        }
+        self.reserved[0..2].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
+        self.reserved[2..2 + bytes.len()].copy_from_slice(bytes);
+        Ok(())
+    }
+
     pub fn compute_checksum(self) -> u64 {
         let mut out = self.to_le_bytes_with_checksum();
         out[64..72].copy_from_slice(&0u64.to_le_bytes());
