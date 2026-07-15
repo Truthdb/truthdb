@@ -133,6 +133,17 @@ pub struct Storage {
     gc: Arc<GroupCommit>,
     /// The log-writer thread's join handle, taken in `Drop` after signalling it.
     log_writer: Option<JoinHandle<()>>,
+    /// Scan slices read, so a test can prove a scan stopped early rather than
+    /// reading the table and discarding the rest. On the instance and not in a
+    /// `static`: the suite runs in parallel in one binary, so a static would
+    /// count every other test's scans as well as this one's.
+    #[cfg(test)]
+    scan_slices: std::sync::atomic::AtomicUsize,
+    /// Times a SELECT took the row-at-a-time path, so a test comparing it with
+    /// the collecting path can prove it actually ran — an A/B whose two sides
+    /// are the same code agrees with itself. Per-instance for the same reason.
+    #[cfg(test)]
+    scan_selects: std::sync::atomic::AtomicUsize,
 }
 
 // The point of the mutex: `Storage` is shareable across worker threads. Assert
@@ -168,7 +179,30 @@ impl Storage {
             inner: std::sync::Mutex::new(file),
             gc,
             log_writer: Some(log_writer),
+            #[cfg(test)]
+            scan_slices: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            scan_selects: std::sync::atomic::AtomicUsize::new(0),
         })
+    }
+
+    /// Scan slices this store has read.
+    #[cfg(test)]
+    pub(crate) fn scan_slices(&self) -> usize {
+        self.scan_slices.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// SELECTs this store has answered on the row-at-a-time path.
+    #[cfg(test)]
+    pub(crate) fn scan_selects(&self) -> usize {
+        self.scan_selects.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Counts one row-at-a-time SELECT (called by `rel::scan_select`).
+    #[cfg(test)]
+    pub(crate) fn count_scan_select(&self) {
+        self.scan_selects
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     pub fn open(path: PathBuf) -> Result<Self, StorageError> {
@@ -429,9 +463,32 @@ impl Storage {
         let mut out = Vec::new();
         let mut cursor = ScanCursor::start();
         while !cursor.done() {
-            cursor = self.lock().rel_scan_slice(name, cursor, budget, &mut out)?;
+            cursor = self.rel_scan_slice(name, cursor, budget, &mut out)?;
         }
         Ok(out)
+    }
+
+    /// One slice of a scan: reads up to `budget` rows from `cursor`, appends
+    /// them to `out`, and returns where to resume (`done()` once the table is
+    /// exhausted).
+    ///
+    /// The storage lock is taken for this call alone, so a caller that loops
+    /// lets other sessions in between slices. That is [`Self::rel_scan_sliced`]
+    /// with the loop handed to the caller — for a reader that consumes rows as
+    /// it goes rather than wanting them all at once — and it carries the same
+    /// contract: only for readers holding the table's lock, since nothing pins
+    /// a page between slices.
+    pub(crate) fn rel_scan_slice(
+        &self,
+        name: &str,
+        cursor: ScanCursor,
+        budget: usize,
+        out: &mut Vec<Vec<Datum>>,
+    ) -> Result<ScanCursor, StorageError> {
+        #[cfg(test)]
+        self.scan_slices
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.lock().rel_scan_slice(name, cursor, budget, out)
     }
 
     /// Test hook: a table's definition + schema, for driving a batched scan.
