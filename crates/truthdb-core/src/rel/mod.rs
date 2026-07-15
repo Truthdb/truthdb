@@ -29,6 +29,7 @@ use truthdb_sql::{ast, eval};
 use xxhash_rust::xxh64::xxh64;
 
 use crate::lock::{LockMode, Resource};
+use crate::relstore::btree::ScanCursor;
 use crate::relstore::catalog::{self, TableDef};
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
@@ -4393,6 +4394,28 @@ fn substitute_correlated_in_expr(
     })
 }
 
+/// Whether a WHERE/ON predicate keeps a row. The predicate must be
+/// boolean-typed (SQL Server 4145): a bare numeric/string expression is
+/// rejected rather than silently coerced, and UNKNOWN drops the row (3VL).
+fn where_keeps(
+    predicate: &Expr,
+    row: &[SqlValue],
+    resolver: &JoinScope,
+    eval_ctx: &EvalContext,
+) -> Result<bool, SqlError> {
+    match eval::eval(predicate, row, resolver, eval_ctx)? {
+        SqlValue::Bool(b) => Ok(b),
+        SqlValue::Null => Ok(false),
+        _ => Err(SqlError::new(
+            4145,
+            15,
+            1,
+            "An expression of non-boolean type specified in a context where a condition is expected, near 'WHERE'.",
+        )
+        .at(predicate.span)),
+    }
+}
+
 fn exec_select(
     storage: &Storage,
     select: &Select,
@@ -4410,6 +4433,15 @@ fn exec_select(
             "A SELECT that assigns to a variable cannot be used inside a query expression.",
         ));
     }
+    // A single-table scan whose every output column comes from the schema needs
+    // no stage that waits for the whole input, so it runs row by row instead.
+    // The gate goes before the CTE expansion and the subquery rewrite because it
+    // excludes both — and the rewrite would otherwise clone the whole statement
+    // and run any subquery eagerly.
+    if let Some(plan) = scan_plan(storage, select, eval_ctx) {
+        return scan_select(storage, &plan, select, eval_ctx);
+    }
+
     // Inline any WITH common table expressions (as derived tables) first.
     let expanded;
     let select = if select.ctes.is_empty() {
@@ -4453,20 +4485,7 @@ fn exec_select(
                 } else {
                     predicate
                 };
-                let value = eval::eval(predicate, &sql_row, &resolver, eval_ctx)?;
-                match value {
-                    SqlValue::Bool(b) => b,
-                    SqlValue::Null => false,
-                    _ => {
-                        return Err(SqlError::new(
-                            4145,
-                            15,
-                            1,
-                            "An expression of non-boolean type specified in a context where a condition is expected, near 'WHERE'.",
-                        )
-                        .at(predicate.span));
-                    }
-                }
+                where_keeps(predicate, &sql_row, &resolver, eval_ctx)?
             }
         };
         if keep {
@@ -4542,6 +4561,314 @@ fn exec_select(
         &resolver,
         eval_ctx,
     )
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook: makes [`scan_plan`] decline everything, so a test can run one
+    /// query down both paths and compare. Thread-local, not a `static`: a batch
+    /// runs on one thread, and the suite runs its tests in parallel in a single
+    /// binary — a global would force every other test's queries onto the
+    /// collecting path for as long as this one was set.
+    static FORCE_COLLECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+#[cfg(test)]
+fn force_collecting() -> bool {
+    FORCE_COLLECTING.with(|c| c.get())
+}
+
+/// Runs `f` with [`scan_select`]'s path disabled, so `f`'s queries take the
+/// collecting path. Restores on drop, so a panicking `f` cannot leave the flag
+/// set for the next test to run on this thread.
+#[cfg(test)]
+pub(crate) fn without_scan_path<R>(f: impl FnOnce() -> R) -> R {
+    struct Restore;
+    impl Drop for Restore {
+        fn drop(&mut self) {
+            FORCE_COLLECTING.with(|c| c.set(false));
+        }
+    }
+    FORCE_COLLECTING.with(|c| c.set(true));
+    let _restore = Restore;
+    f()
+}
+
+/// A `SELECT` that can be answered a row at a time: one base table, scanned,
+/// filtered and projected without any stage that must see the whole input
+/// first. Produced by [`scan_plan`], consumed by [`scan_select`].
+struct ScanPlan {
+    /// The base table's catalog name — what the scan reads.
+    table: String,
+    /// How to read it: the planner's choice, made once (see [`scan_plan`]).
+    access: plan::AccessPath,
+    /// Source column metadata, in table order.
+    source: Vec<ResultColumn>,
+    /// Resolves the WHERE clause's column references against the source.
+    resolver: JoinScope,
+    /// Output columns. Every type here is the schema's, which is what makes the
+    /// shape work: a computed column's type comes from `infer_type` over every
+    /// value in it, so it cannot be known until the last row has been seen.
+    columns: Vec<ResultColumn>,
+    /// The source column each output column reads.
+    picks: Vec<usize>,
+}
+
+/// Recognises the shape [`scan_select`] can run, or `None` for everything else
+/// — which then takes the collecting path unchanged.
+///
+/// Every rejection here is a stage that cannot answer until it has the whole
+/// input: `ORDER BY` sorts it, `DISTINCT` dedups it, an aggregate folds it, a
+/// computed column types it, and a join/derived table/CTE/view is another query
+/// underneath. An `IndexSeek` is excluded for the opposite reason — it reads
+/// *less* than a scan, and reading the whole table to filter it down would
+/// trade the planner's work for this one's.
+fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Option<ScanPlan> {
+    #[cfg(test)]
+    if force_collecting() {
+        return None;
+    }
+    if !select.ctes.is_empty()
+        || select.distinct
+        || !select.order_by.is_empty()
+        || aggregate::is_aggregated(select)
+    {
+        return None;
+    }
+    // `TOP 0` wants no rows, so this path would never evaluate the WHERE — and
+    // the engine reports an unresolvable column (207) or a non-boolean predicate
+    // (4145) from that evaluation, having no separate binding pass. Reading a
+    // table to discard all of it is not worth answering an invalid query with an
+    // empty result set, so the degenerate case stays on the collecting path.
+    if select.top == Some(0) {
+        return None;
+    }
+    // An uncorrelated subquery is executed by the rewrite this path skips; a
+    // correlated one runs a query per row. (A subquery in the SELECT list is
+    // already excluded: it is not a bare column.)
+    if select.where_clause.as_ref().is_some_and(expr_has_subquery) {
+        return None;
+    }
+    // Whether every output column *could* be a source column, which is a
+    // property of the syntax alone. Deciding it before the catalog is read keeps
+    // `SELECT id + 1 FROM t` from paying for a table definition, a schema and a
+    // resolver it is only going to discard.
+    if !select.items.iter().all(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard
+                | SelectItem::QualifiedWildcard(_)
+                | SelectItem::Expr {
+                    expr: Expr {
+                        kind: ExprKind::Column(_),
+                        ..
+                    },
+                    ..
+                }
+        )
+    }) {
+        return None;
+    }
+    let Some(TableRef::Table { name, alias }) = select.from.as_ref() else {
+        return None;
+    };
+    // The `sys.*` virtual tables build their rows in Rust and have no cursor to
+    // scan. They are matched by their full name *before* catalog resolution, so
+    // this check has to come first for the same reason: `resolve_table` strips a
+    // schema prefix, so it would answer `sys.tables` with a user table called
+    // `tables`.
+    if is_sys_view(&name.value) {
+        return None;
+    }
+    let def = resolve_table(storage, &name.value)?;
+    // A view is its own SELECT, expanded as a derived table — and its TableDef
+    // has no columns and a `root_page` of 0, so a wildcard over it would project
+    // nothing and the scan would read the catalog root instead of the view.
+    if def.view_query.is_some() {
+        return None;
+    }
+    let schema = def.schema().ok()?;
+    // The same access path `build_table_source` would take. Taking it here too,
+    // rather than declining a seek, is what keeps this gate free for the queries
+    // it rejects: a decline would have thrown away the definition, the schema
+    // and this choice, and `build_table_source` would compute all three again.
+    let access = plan::choose(&def, &schema, &select.where_clause, eval_ctx);
+
+    let qualifier = alias
+        .as_ref()
+        .map(|a| a.value.clone())
+        .unwrap_or_else(|| strip_schema(&name.value).to_string());
+    let source: Vec<ResultColumn> = schema
+        .columns
+        .iter()
+        .map(|c| ResultColumn {
+            name: c.name.clone(),
+            column_type: c.column_type,
+        })
+        .collect();
+    let collations: Vec<Option<String>> =
+        schema.columns.iter().map(|c| c.collation.clone()).collect();
+    let resolver = JoinScope {
+        columns: source
+            .iter()
+            .map(|c| (Some(qualifier.clone()), c.name.clone()))
+            .collect(),
+        collations,
+    };
+
+    // The projection plan, mirroring `project`'s: every item must resolve to a
+    // source column, so the output's types are the schema's.
+    let mut columns = Vec::new();
+    let mut picks = Vec::new();
+    for item in &select.items {
+        match item {
+            SelectItem::Wildcard => {
+                for (index, column) in source.iter().enumerate() {
+                    picks.push(index);
+                    columns.push(column.clone());
+                }
+            }
+            SelectItem::QualifiedWildcard(q) => {
+                let indices = resolver.indices_for_qualifier(&q.value);
+                // Unbound (4104): leave the error to the collecting path.
+                if indices.is_empty() {
+                    return None;
+                }
+                for index in indices {
+                    picks.push(index);
+                    columns.push(source[index].clone());
+                }
+            }
+            SelectItem::Expr { expr, alias } => {
+                let index = bare_column_index(expr, &resolver)?;
+                let name = alias
+                    .as_ref()
+                    .map(|a| a.value.clone())
+                    .or_else(|| bare_column_name(expr))
+                    .unwrap_or_default();
+                picks.push(index);
+                columns.push(ResultColumn {
+                    name,
+                    column_type: source[index].column_type,
+                });
+            }
+            // Rejected before projection on both paths.
+            SelectItem::Assign { .. } => return None,
+        }
+    }
+
+    Some(ScanPlan {
+        table: def.name,
+        access,
+        source,
+        resolver,
+        columns,
+        picks,
+    })
+}
+
+/// The `sys.*` catalog views, which [`build_table_source`] answers by name
+/// ahead of any catalog lookup.
+fn is_sys_view(name: &str) -> bool {
+    matches!(
+        name.to_ascii_lowercase().as_str(),
+        "sys.tables"
+            | "sys.views"
+            | "sys.sql_modules"
+            | "sys.columns"
+            | "sys.indexes"
+            | "sys.check_constraints"
+            | "sys.foreign_keys"
+            | "sys.default_constraints"
+    )
+}
+
+/// Scans, filters and projects one base table a row at a time.
+///
+/// The collecting path builds the whole table into `Source.rows`, filters that
+/// into a second vector, converts *every* row to `SqlValue` in `project`, and
+/// projects into a third — four copies of the input alive at once, before TOP
+/// has discarded any of them. Here a slice is the only input in hand, each row
+/// is projected or dropped as it is read, and `TOP n` stops the scan rather
+/// than truncating afterwards.
+///
+/// The result is still collected; what this drops is the *input's*
+/// materialization, which is the part that has no upper bound. An index seek
+/// keeps its input materialized — `rel_index_scan` has no cursor — so it gains
+/// the per-row savings but not that one; a seek's candidate set is bounded by
+/// the seek.
+///
+/// `TOP n` therefore stops the scan without evaluating the predicate on rows
+/// past the nth kept one, where the collecting path evaluated every source row
+/// before truncating. A predicate that errors on one of those rows (a divide by
+/// zero, an overflow) now goes unraised — which is SQL Server's behaviour, whose
+/// Top operator likewise stops asking its child for rows.
+fn scan_select(
+    storage: &Storage,
+    plan: &ScanPlan,
+    select: &Select,
+    eval_ctx: &EvalContext,
+) -> Result<RowSet, SqlError> {
+    #[cfg(test)]
+    storage.count_scan_select();
+    let types: Vec<ColumnType> = plan.source.iter().map(|c| c.column_type).collect();
+    let mut out = RowSet {
+        columns: plan.columns.clone(),
+        rows: Vec::new(),
+    };
+    // TOP counts rows *kept*, matching the collecting path's truncation of the
+    // filtered rows. `TOP 0` never reaches here (the gate declines it).
+    let enough = |out: &RowSet| select.top.is_some_and(|top| out.rows.len() as u64 >= top);
+
+    // One row: filter it, and project it or drop it. `Ok(false)` once TOP is
+    // satisfied and the caller should stop reading.
+    let take = |row: Vec<Datum>, out: &mut RowSet| -> Result<bool, SqlError> {
+        check_cancelled()?;
+        if let Some(predicate) = &select.where_clause {
+            let sql_row = row_values(&row, &types);
+            if !where_keeps(predicate, &sql_row, &plan.resolver, eval_ctx)? {
+                return Ok(true);
+            }
+        }
+        out.rows
+            .push(plan.picks.iter().map(|i| row[*i].clone()).collect());
+        Ok(!enough(out))
+    };
+
+    match &plan.access {
+        plan::AccessPath::TableScan => {
+            let mut cursor = ScanCursor::start();
+            let mut slice: Vec<Vec<Datum>> = Vec::new();
+            'scan: while !cursor.done() {
+                cursor = storage
+                    .rel_scan_slice(&plan.table, cursor, SCAN_SLICE_ROWS, &mut slice)
+                    .map_err(|err| map_storage_err(err, &plan.table))?;
+                for row in slice.drain(..) {
+                    if !take(row, &mut out)? {
+                        break 'scan;
+                    }
+                }
+            }
+        }
+        plan::AccessPath::IndexSeek {
+            index_object_id,
+            lower,
+            upper,
+            ..
+        } => {
+            // The seek narrows the candidates; the predicate still re-checks
+            // each one, so the result matches a full scan.
+            let rows = storage
+                .rel_index_scan(&plan.table, *index_object_id, lower.clone(), upper.clone())
+                .map_err(|err| map_storage_err(err, &plan.table))?;
+            for row in rows {
+                if !take(row, &mut out)? {
+                    break;
+                }
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// `SELECT @a = expr, @b = expr2 [FROM ...]` — an assignment SELECT. The value
