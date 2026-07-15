@@ -12,7 +12,10 @@
 //! identical keys — so an index over them matches insensitively with no
 //! separate folding step.
 
+use std::cell::RefCell;
 use std::cmp::Ordering;
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
 
 use icu_collator::options::{CollatorOptions, Strength};
 use icu_collator::{CollationKeySink, CollatorBorrowed, CollatorPreferences};
@@ -50,6 +53,44 @@ impl CollationKeySink for KeyBuf {
     fn finish(&mut self, _state: KeyState) -> Result<Self::Output, Self::Error> {
         Ok(())
     }
+}
+
+/// Returns the shared [`Collation`] for a collation name (`None` = the database
+/// default).
+///
+/// Building one loads icu data, and key encoding runs on every insert, seek and
+/// probe, so each name is built once and shared. Lookups go through a
+/// thread-local cache so the hot path takes no lock; the first use of a name on
+/// any thread interns it under a global lock. Interned collations are leaked:
+/// the set of names a database uses is small and fixed, and a `&'static` keeps
+/// the hot path free of reference counting.
+pub fn cached(name: Option<&str>) -> &'static Collation {
+    thread_local! {
+        static LOCAL: RefCell<HashMap<String, &'static Collation>> = RefCell::new(HashMap::new());
+    }
+    let name = name.unwrap_or(DEFAULT_COLLATION);
+    LOCAL.with(|local| {
+        if let Some(found) = local.borrow().get(name) {
+            return *found;
+        }
+        let interned = intern(name);
+        local.borrow_mut().insert(name.to_string(), interned);
+        interned
+    })
+}
+
+fn intern(name: &str) -> &'static Collation {
+    static GLOBAL: OnceLock<Mutex<HashMap<String, &'static Collation>>> = OnceLock::new();
+    let mut map = GLOBAL
+        .get_or_init(|| Mutex::new(HashMap::new()))
+        .lock()
+        .expect("collation cache poisoned");
+    if let Some(found) = map.get(name) {
+        return found;
+    }
+    let leaked: &'static Collation = Box::leak(Box::new(Collation::from_name(name)));
+    map.insert(name.to_string(), leaked);
+    leaked
 }
 
 impl Collation {

@@ -2005,10 +2005,10 @@ fn fk_parent_exists(
             .iter()
             .map(|&i| child.collations.get(i).cloned().flatten())
             .collect();
-        let folded_key = fold_datum_key(key, &key_coll);
+        let folded_key = collated_key(key, &key_coll);
         return Ok(batch.iter().any(|r| {
             let sibling: Vec<Datum> = child.key_columns.iter().map(|&i| r[i].clone()).collect();
-            fold_datum_key(&sibling, &key_coll) == folded_key
+            collated_key(&sibling, &key_coll) == folded_key
         }));
     }
     Ok(false)
@@ -2122,9 +2122,9 @@ fn enforce_parent_fks(
         .iter()
         .map(|&i| parent.collations.get(i).cloned().flatten())
         .collect();
-    let removed_folded: Vec<Vec<Datum>> = removed_keys
+    let removed_folded: Vec<Vec<u8>> = removed_keys
         .iter()
-        .map(|k| fold_datum_key(k, &parent_key_coll))
+        .map(|k| collated_key(k, &parent_key_coll))
         .collect();
     let children: Vec<TableDef> = storage
         .rel_tables()
@@ -2191,14 +2191,14 @@ fn enforce_parent_fks(
                 if self_ref {
                     let pk: Vec<Datum> =
                         parent.key_columns.iter().map(|&i| row[i].clone()).collect();
-                    if removed_folded.contains(&fold_datum_key(&pk, &parent_key_coll)) {
+                    if removed_folded.contains(&collated_key(&pk, &parent_key_coll)) {
                         continue;
                     }
                 }
                 let Some(key) = fk_key(fk, row) else {
                     continue;
                 };
-                if removed_folded.contains(&fold_datum_key(&key, &parent_key_coll)) {
+                if removed_folded.contains(&collated_key(&key, &parent_key_coll)) {
                     return Err(reference_conflict(verb, &fk.name, &child.name));
                 }
             }
@@ -2212,21 +2212,25 @@ fn pk_of(def: &TableDef, row: &[Datum]) -> Vec<Datum> {
     def.key_columns.iter().map(|&i| row[i].clone()).collect()
 }
 
-/// Folds a key's character values to their collation-canonical form (`collations`
-/// parallel to `values`), so value-level key comparisons (e.g. the FK scan
-/// fallback) match case-insensitively, consistent with the folded key bytes.
-fn fold_datum_key(values: &[Datum], collations: &[Option<String>]) -> Vec<Datum> {
-    values
-        .iter()
-        .enumerate()
-        .map(|(i, value)| {
-            crate::relstore::key::fold_key_datum(
-                value,
-                collations.get(i).and_then(|c| c.as_deref()),
-            )
-            .into_owned()
-        })
-        .collect()
+/// A key's collation-canonical bytes (`collations` parallel to `values`), for
+/// comparing keys by value — the FK scan fallback and the self-reference checks.
+///
+/// This encodes exactly as the index key does, so "equal" here means what it
+/// means to a seek: two keys match when the collation says they do, including
+/// case- and accent-insensitively. Comparing the encoded bytes rather than the
+/// values is what keeps the two definitions from drifting apart.
+fn collated_key(values: &[Datum], collations: &[Option<String>]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for (i, value) in values.iter().enumerate() {
+        // A key column always encodes; a type error here would mean the row did
+        // not come from this table.
+        let _ = crate::relstore::key::encode_datum_collated(
+            value,
+            collations.get(i).and_then(|c| c.as_deref()),
+            &mut out,
+        );
+    }
+    out
 }
 
 /// Maps a parsed [`DataType`] to a storage [`ColumnType`], validating length
@@ -3036,9 +3040,9 @@ fn exec_update(
             .iter()
             .map(|&i| def.collations.get(i).cloned().flatten())
             .collect();
-        let post_pks: Vec<Vec<Datum>> = post_rows
+        let post_pks: Vec<Vec<u8>> = post_rows
             .iter()
-            .map(|r| fold_datum_key(&pk_of(&def, r), &key_coll))
+            .map(|r| collated_key(&pk_of(&def, r), &key_coll))
             .collect();
         for r in &post_rows {
             for fk in def
@@ -3047,7 +3051,7 @@ fn exec_update(
                 .filter(|fk| fk.parent.eq_ignore_ascii_case(&def.name))
             {
                 if let Some(key) = fk_key(fk, r)
-                    && !post_pks.contains(&fold_datum_key(&key, &key_coll))
+                    && !post_pks.contains(&collated_key(&key, &key_coll))
                 {
                     return Err(fk_child_violation(&fk.name, "UPDATE", &fk.parent));
                 }

@@ -1,0 +1,134 @@
+# Index keys carry the column collation's sort key (Stage 5), so index order is
+# the collation's linguistic order and accent-insensitivity works. Case-folded
+# key bytes could do neither: they order by code point, where 'å' (U+00E5) lands
+# after 'z' by accident of encoding rather than by Swedish rule, and they have no
+# answer for accents at all.
+
+# --- locale ordering through a clustered (PK) index ---
+
+statement ok
+CREATE TABLE sv (w VARCHAR(20) COLLATE Finnish_Swedish_CI_AS NOT NULL PRIMARY KEY)
+
+statement ok
+INSERT INTO sv VALUES ('ö'), ('a'), ('z'), ('å'), ('b'), ('ä')
+
+# Swedish: å, ä, ö collate AFTER z.
+query T
+SELECT w FROM sv ORDER BY w
+----
+a
+b
+z
+å
+ä
+ö
+
+# The root collation disagrees: accents sort near their base letter, before z.
+statement ok
+CREATE TABLE root (w VARCHAR(20) COLLATE SQL_Latin1_General_CP1_CI_AS NOT NULL PRIMARY KEY)
+
+statement ok
+INSERT INTO root VALUES ('ö'), ('a'), ('z'), ('å'), ('b'), ('ä')
+
+query T
+SELECT w FROM root ORDER BY w
+----
+a
+å
+ä
+b
+ö
+z
+
+# --- accent-insensitive (_AI) equality, seeks and uniqueness ---
+
+statement ok
+CREATE TABLE ai (w VARCHAR(30) COLLATE Latin1_General_CI_AI NOT NULL PRIMARY KEY)
+
+statement ok
+INSERT INTO ai VALUES ('resume')
+
+# 'Résumé' is the same key under _AI, so it is a duplicate.
+statement error
+INSERT INTO ai VALUES ('Résumé')
+
+# ...and a seek for the accented form finds the stored plain one.
+query T
+SELECT w FROM ai WHERE w = 'Résumé'
+----
+resume
+
+query T
+SELECT w FROM ai WHERE w = 'RESUME'
+----
+resume
+
+# --- accent-sensitive (_AS) keeps them distinct ---
+
+statement ok
+CREATE TABLE as_t (w VARCHAR(30) COLLATE Latin1_General_CI_AS NOT NULL PRIMARY KEY)
+
+statement ok
+INSERT INTO as_t VALUES ('resume'), ('résumé')
+
+query I
+SELECT COUNT(*) FROM as_t
+----
+2
+
+# Case-insensitive still holds under _AS: only the accent distinguishes them.
+statement error
+INSERT INTO as_t VALUES ('RESUME')
+
+query T
+SELECT w FROM as_t WHERE w = 'RÉSUMÉ'
+----
+résumé
+
+# --- a secondary index carries the collation too ---
+
+statement ok
+CREATE TABLE idx (id INT NOT NULL PRIMARY KEY, w VARCHAR(20) COLLATE Finnish_Swedish_CI_AS)
+
+statement ok
+CREATE INDEX ix_w ON idx (w)
+
+statement ok
+INSERT INTO idx VALUES (1, 'ö'), (2, 'a'), (3, 'z'), (4, 'å')
+
+query T
+SELECT w FROM idx ORDER BY w
+----
+a
+z
+å
+ö
+
+# A seek through the index matches case-insensitively.
+query I
+SELECT id FROM idx WHERE w = 'Ö'
+----
+1
+
+# --- binary collation stays code-point ordered ---
+
+statement ok
+CREATE TABLE bin (w VARCHAR(20) COLLATE Latin1_General_BIN2 NOT NULL PRIMARY KEY)
+
+statement ok
+INSERT INTO bin VALUES ('a'), ('A'), ('z'), ('B')
+
+# Code points: 'A'(65) < 'B'(66) < 'a'(97) < 'z'(122).
+query T
+SELECT w FROM bin ORDER BY w
+----
+A
+B
+a
+z
+
+# Binary is case-sensitive, so 'A' and 'a' coexist and a seek is exact.
+query T
+SELECT w FROM bin WHERE w = 'a'
+----
+a

@@ -7,17 +7,16 @@
 //! - floats: IEEE-754 total-order transform, big-endian
 //! - date/time/datetime2: their tick counts, big-endian (date-major)
 //! - uniqueidentifier: bytes permuted into SQL Server comparison order
-//! - strings/binary: raw bytes with `0x00 -> 0x00 0xFF` escaping and a
-//!   `0x00 0x00` terminator so composite keys stay order-preserving
-//!   (NVARCHAR uses UTF-16BE code units — binary collation until Stage 5;
-//!   collation sort keys replace these payloads then).
+//! - strings: the column collation's **sort key** bytes, escaped as below, so
+//!   index order is the collation's linguistic order and case/accent
+//!   insensitivity falls out of the key itself
+//! - binary (and `*_BIN*` collations): raw bytes, escaped as below
+//!
+//! String and binary payloads use `0x00 -> 0x00 0xFF` escaping and a `0x00 0x00`
+//! terminator so composite keys stay order-preserving.
 //!
 //! Keys are compared, never decoded: B+ tree leaves carry the full row, so
 //! values are always recoverable without reversing this encoding.
-
-use std::borrow::Cow;
-
-use truthdb_sql::collation::CollationSensitivity;
 
 use crate::relstore::row::Schema;
 use crate::relstore::types::{Datum, TypeError};
@@ -25,30 +24,38 @@ use crate::relstore::types::{Datum, TypeError};
 const NULL_MARKER: u8 = 0x00;
 const VALUE_MARKER: u8 = 0x01;
 
-/// Folds a character key value to its collation-canonical form so keys under a
-/// case-insensitive collation compare, seek, and enforce uniqueness case-
-/// insensitively (`'ABC'` and `'abc'` map to one key). Non-character values and
-/// case-sensitive / binary collations pass through unchanged. Only the *key*
-/// folds — the stored row keeps the original value, so output is unaffected. Both
-/// the stored key and a seek/probe literal fold identically (same column
-/// collation), so `seek(fold('abc'))` finds the row stored as `'ABC'`.
+/// Encodes one key value under a column's collation.
 ///
-/// (Case folding, not a full linguistic sort key: `_CI` case-insensitivity is
-/// exact, but locale ordering and accent-insensitivity in *index order* still
-/// need icu sort keys — see [`CollationSensitivity`]'s note.)
-pub fn fold_key_datum<'a>(value: &'a Datum, collation: Option<&str>) -> Cow<'a, Datum> {
-    if CollationSensitivity::from_optional(collation) != CollationSensitivity::CaseInsensitive {
-        return Cow::Borrowed(value);
-    }
-    match value {
-        Datum::VarChar(s) => Cow::Owned(Datum::VarChar(fold_ci(s))),
-        Datum::NVarChar(s) => Cow::Owned(Datum::NVarChar(fold_ci(s))),
-        _ => Cow::Borrowed(value),
-    }
-}
-
-fn fold_ci(s: &str) -> String {
-    CollationSensitivity::CaseInsensitive.fold(s).into_owned()
+/// A character value contributes its collation's **sort key** rather than its
+/// own bytes, which is what puts the collation's order into the index: sort keys
+/// compare bytewise exactly as the collator compares strings, so a B+ tree keyed
+/// on them is in linguistic order (Swedish `å` after `z`, not at its code
+/// point). Case- and accent-insensitivity come from the same bytes — at the
+/// strength a `_CI`/`_AI` collation implies, `'ABC'` and `'abc'`, or `'é'` and
+/// `'e'`, produce one identical key — so equal-under-the-collation values map to
+/// one key, and seeks, uniqueness and FK probes match accordingly.
+///
+/// Only the *key* is transformed; the stored row keeps the original value, so
+/// output is unaffected. A stored key and a seek/probe literal encode through
+/// the same column collation, so `seek('abc')` finds the row stored as `'ABC'`.
+///
+/// Non-character values, and `*_BIN*` collations (whose order is code-point
+/// order), encode exactly as [`encode_datum`] does.
+pub fn encode_datum_collated(
+    value: &Datum,
+    collation: Option<&str>,
+    out: &mut Vec<u8>,
+) -> Result<(), TypeError> {
+    let text = match value {
+        Datum::VarChar(s) | Datum::NVarChar(s) => s,
+        _ => return encode_datum(value, out),
+    };
+    out.push(VALUE_MARKER);
+    encode_escaped(
+        &crate::rel::collation::cached(collation).sort_key(text),
+        out,
+    );
+    Ok(())
 }
 
 /// SQL Server's uniqueidentifier comparison evaluates bytes in this
@@ -70,12 +77,10 @@ pub fn encode_key(
         let value = values
             .get(index)
             .ok_or_else(|| TypeError(format!("row has no value for key column {index}")))?;
-        // Fold character keys by the column's collation so a case-insensitive
-        // clustered/PK key seeks and enforces uniqueness case-insensitively.
-        encode_datum(
-            &fold_key_datum(value, column.collation.as_deref()),
-            &mut out,
-        )?;
+        // Character keys carry their collation's sort key, so the clustered/PK
+        // key is ordered linguistically and matches case/accent-insensitively
+        // exactly as the collation says.
+        encode_datum_collated(value, column.collation.as_deref(), &mut out)?;
     }
     Ok(out)
 }
