@@ -38,7 +38,6 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -188,17 +187,126 @@ enum EngineCall {
     CloseSession {
         session: SessionId,
     },
-    Shutdown,
+}
+
+/// What a worker took off the [`Inbox`].
+enum Work {
+    /// A call to dispatch.
+    Call(EngineCall),
+    /// No call — parked work may have become grantable, so drain.
+    Drain,
+}
+
+/// The pool's inbound queue: calls waiting for a worker, and a nudge saying
+/// parked work may now be grantable.
+///
+/// Not an `mpsc`, because a worker has to wait for *either* of those and a
+/// channel receiver can only wait for a call. That was what pinned the deadlock
+/// backstop to the worker threads: whoever reaps a victim releases locks that
+/// rescue the waiters behind it, and nothing could reach a worker parked in
+/// `recv` to say so — so the reaping had to happen on a worker, between
+/// batches, which is to say only as often as the pool was free.
+struct Inbox {
+    state: Mutex<InboxState>,
+    /// Signalled on a new call, a drain nudge, and on close.
+    ready: Condvar,
+}
+
+struct InboxState {
+    calls: VecDeque<EngineCall>,
+    /// A pending drain. One flag rather than a count: draining is idempotent
+    /// and runs everything grantable, so two nudges are one drain.
+    drain: bool,
+    /// No more calls will come — every handle is gone, or `shutdown` was
+    /// called. Workers finish what is queued and exit.
+    closed: bool,
+}
+
+impl Inbox {
+    fn new() -> Self {
+        Inbox {
+            state: Mutex::new(InboxState {
+                calls: VecDeque::new(),
+                drain: false,
+                closed: false,
+            }),
+            ready: Condvar::new(),
+        }
+    }
+
+    /// Queues a call. Dropped on the floor once closed — the pool is going away
+    /// and the caller's reply channel dies with it, which is how a caller finds
+    /// out.
+    fn send(&self, call: EngineCall) {
+        let mut state = self.state.lock().expect("inbox poisoned");
+        if state.closed {
+            return;
+        }
+        state.calls.push_back(call);
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    /// Asks some worker to look at the parked queue: locks were released and
+    /// whatever they unblock still needs a thread to run it.
+    fn nudge(&self) {
+        let mut state = self.state.lock().expect("inbox poisoned");
+        if state.closed {
+            return;
+        }
+        state.drain = true;
+        drop(state);
+        self.ready.notify_one();
+    }
+
+    /// Closes the inbox and wakes every worker.
+    fn close(&self) {
+        let mut state = self.state.lock().expect("inbox poisoned");
+        state.closed = true;
+        drop(state);
+        self.ready.notify_all();
+    }
+
+    /// Blocks until there is something to do. `None` once the inbox is closed
+    /// and drained, which is a worker's signal to exit.
+    fn next(&self) -> Option<Work> {
+        let mut state = self.state.lock().expect("inbox poisoned");
+        loop {
+            if let Some(call) = state.calls.pop_front() {
+                return Some(Work::Call(call));
+            }
+            if std::mem::take(&mut state.drain) {
+                return Some(Work::Drain);
+            }
+            if state.closed {
+                return None;
+            }
+            state = self.ready.wait(state).expect("inbox poisoned");
+        }
+    }
+}
+
+/// Closes the [`Inbox`] when the last [`EngineHandle`] goes.
+///
+/// The pool's usual shutdown is the handle being dropped — nothing calls
+/// [`EngineHandle::shutdown`] — and an `Arc<Inbox>` the workers also hold could
+/// never reach zero to signal it. This token is held only by handles, so its
+/// count reaching zero means exactly "no more calls will ever arrive".
+struct HandleToken(Arc<Inbox>);
+
+impl Drop for HandleToken {
+    fn drop(&mut self) {
+        self.0.close();
+    }
 }
 
 /// A cloneable handle to the engine's worker pool. Cheap to clone (shares the
 /// sender).
 #[derive(Clone)]
 pub struct EngineHandle {
-    tx: mpsc::Sender<EngineCall>,
-    /// Number of worker threads, so [`Self::shutdown`] can send one poison
-    /// pill per worker.
-    workers: usize,
+    inbox: Arc<Inbox>,
+    /// Dropped with the last handle, which closes the inbox.
+    _token: Arc<HandleToken>,
 }
 
 impl EngineHandle {
@@ -207,17 +315,11 @@ impl EngineHandle {
     /// gone).
     pub async fn open_session(&self, database: String, login: String) -> SessionId {
         let (reply, rx) = oneshot::channel();
-        if self
-            .tx
-            .send(EngineCall::OpenSession {
-                database,
-                login,
-                reply,
-            })
-            .is_err()
-        {
-            return SessionId(0);
-        }
+        self.inbox.send(EngineCall::OpenSession {
+            database,
+            login,
+            reply,
+        });
         rx.await.unwrap_or(SessionId(0))
     }
 
@@ -266,38 +368,35 @@ impl EngineHandle {
         cancel: Arc<AtomicBool>,
     ) -> Result<BatchReply, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(EngineCall::RunBatch {
-                session,
-                sql,
-                params,
-                cancel,
-                reply,
-            })
-            .map_err(|_| EngineError::Unavailable)?;
+        self.inbox.send(EngineCall::RunBatch {
+            session,
+            sql,
+            params,
+            cancel,
+            reply,
+        });
+        // A closed inbox drops the call, so the reply channel dies unsent —
+        // which is the same "engine is gone" the caller would otherwise be told.
         rx.await.map_err(|_| EngineError::Unavailable)?
     }
 
     /// Runs a native-protocol command (ES or SQL) and returns rendered text.
     pub async fn run_native(&self, command: String) -> Result<String, EngineError> {
         let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(EngineCall::RunNative { command, reply })
-            .map_err(|_| EngineError::Unavailable)?;
+        self.inbox.send(EngineCall::RunNative { command, reply });
         rx.await.map_err(|_| EngineError::Unavailable)?
     }
 
     /// Closes a session (rolling back any open transaction — later milestone).
     pub fn close_session(&self, session: SessionId) {
-        let _ = self.tx.send(EngineCall::CloseSession { session });
+        self.inbox.send(EngineCall::CloseSession { session });
     }
 
-    /// Asks the worker pool to stop. One poison pill per worker wakes every
-    /// thread (even those blocked on `recv`); each consumes one and exits.
+    /// Asks the worker pool to stop: the inbox closes and every worker wakes,
+    /// finishes what is queued, and exits. Dropping the last handle does the
+    /// same thing.
     pub fn shutdown(&self) {
-        for _ in 0..self.workers {
-            let _ = self.tx.send(EngineCall::Shutdown);
-        }
+        self.inbox.close();
     }
 }
 
@@ -344,11 +443,11 @@ fn spawn_engine_pool(
     idle_txn_timeout: Option<Duration>,
     workers: usize,
 ) -> (EngineHandle, JoinHandle<()>) {
-    let (tx, rx) = mpsc::channel();
+    let inbox = Arc::new(Inbox::new());
     let shared = Arc::new(Shared {
         engine: Arc::new(engine),
         scheduler: Mutex::new(Scheduler::new(timeout, idle_txn_timeout)),
-        rx: Mutex::new(rx),
+        inbox: Arc::clone(&inbox),
         stop: AtomicBool::new(false),
         idle: Mutex::new(()),
         wake: Condvar::new(),
@@ -394,7 +493,13 @@ fn spawn_engine_pool(
             }
         })
         .expect("spawn engine supervisor");
-    (EngineHandle { tx, workers }, join)
+    (
+        EngineHandle {
+            _token: Arc::new(HandleToken(Arc::clone(&inbox))),
+            inbox,
+        },
+        join,
+    )
 }
 
 /// State shared by every worker thread.
@@ -403,10 +508,9 @@ struct Shared {
     engine: Arc<Engine>,
     /// Sessions + lock table + parked queue. Held only for lock decisions.
     scheduler: Mutex<Scheduler>,
-    /// Inbound calls. Behind a mutex because `mpsc::Receiver` has a single
-    /// consumer: a worker locks it only for the brief `recv`, then releases it
-    /// so a sibling can take the next call while this one runs its batch.
-    rx: Mutex<mpsc::Receiver<EngineCall>>,
+    /// Inbound calls, plus the drain nudge a releaser uses to hand parked work
+    /// to whichever worker is free.
+    inbox: Arc<Inbox>,
     /// Set when a `Shutdown` is seen, so a worker between calls exits promptly
     /// rather than picking up more work.
     stop: AtomicBool,
@@ -448,37 +552,36 @@ static MAINTENANCE_STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::A
 #[cfg(test)]
 static MAINTENANCE_SWEEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The idle-transaction reaper, on a thread that never runs a batch.
+/// The engine's housekeeping, on a thread that never runs a batch: the deadlock
+/// backstop and the idle-transaction reaper.
 ///
-/// It used to run only on the workers, between calls, which made it exactly as
-/// punctual as the pool was free — and the pool is `cores-2` threads, two on a
-/// four-core box. A few long scans deferred it for as long as they ran, which
-/// is backwards: it exists to release the locks of a client that has stopped
-/// responding, and a loaded engine is when that matters most. Nothing a client
-/// does can delay this thread, because it never executes anything on anyone's
-/// behalf.
+/// Both used to run only on the workers, between calls, which made them exactly
+/// as punctual as the pool was free — and the pool is `cores-2` threads, two on
+/// a four-core box. A few long scans deferred them for as long as they ran,
+/// which is backwards: the idle reaper exists to release the locks of a client
+/// that has stopped responding, and a loaded engine is when that matters most.
+/// Nothing a client does can delay this thread, because it never executes
+/// anything on anyone's behalf.
 ///
-/// **Only the idle reaper lives here.** The deadlock backstop
-/// ([`Scheduler::reap_expired`]) stays on the workers, because it is coupled to
-/// draining: reaping a victim releases locks that rescue the waiters behind it,
-/// and its contract is that the same pass then runs them. A sweeper that reaps
-/// without draining is worse than none — it re-reaps the waiters a drain would
-/// have rescued, and (since a waiter it must *not* reap keeps a deadline in the
-/// past) it spins doing so. The idle reaper has no such coupling: it is purely
-/// a function of `last_activity`, and the locks it frees are drained by
-/// whichever worker gets there, exactly as before.
-///
-/// Its cadence therefore never depends on the parked queue — see
-/// [`Scheduler::sweep_interval`].
+/// It only *releases* locks. Running what that unblocks still needs a worker,
+/// so it nudges the [`Inbox`] rather than doing it here — the pairing the old
+/// worker sweep got for free by simply calling `drain_ready` next.
 fn maintenance_loop(shared: &Arc<Shared>) {
     #[cfg(test)]
     MAINTENANCE_STARTS.fetch_add(1, Ordering::Relaxed);
     while !shared.stop.load(Ordering::Acquire) {
-        let wait = shared
-            .scheduler
-            .lock()
-            .expect("scheduler poisoned")
-            .sweep_interval();
+        // Sleep until the nearest deadline the reaper could act on, capped by
+        // the idle sweep's interval and floored so no arrangement of parked
+        // work or tuning knobs can turn this loop into a spin.
+        let wait = {
+            let sched = shared.scheduler.lock().expect("scheduler poisoned");
+            let cap = sched.sweep_interval();
+            match sched.earliest_reapable_deadline() {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(cap),
+                None => cap,
+            }
+            .max(MIN_SWEEP_INTERVAL)
+        };
         {
             // `stop` is read and written under this mutex, so a shutdown that
             // lands between the check and the wait cannot be missed — it would
@@ -495,66 +598,49 @@ fn maintenance_loop(shared: &Arc<Shared>) {
         }
         #[cfg(test)]
         MAINTENANCE_SWEEPS.fetch_add(1, Ordering::Relaxed);
-        let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
-        sched.reap_idle_txns(&shared.engine);
+        {
+            let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
+            // One victim per sweep, and the floor on the sleep means a worker
+            // has a chance to run what that release rescued before the next
+            // one. The ordering matters: reaping a victim makes the waiter
+            // behind it grantable, and sweeping again without letting that
+            // happen would take a second victim where one would do.
+            sched.reap_expired(&shared.engine);
+            sched.reap_idle_txns(&shared.engine);
+        }
+        // Unconditionally, not just when something was released. Workers now
+        // block indefinitely on the inbox, so a nudge that should have been
+        // sent and was not is a batch parked forever rather than a batch
+        // started late — this periodic one is the backstop the workers' old
+        // `recv_timeout(wake_cap)` used to be, at the same cost: one wakeup per
+        // interval on an idle engine, which finds nothing and sleeps again.
+        shared.inbox.nudge();
     }
 }
 
 /// One worker thread: pull a call, dispatch it, repeat until shutdown.
 fn worker_loop(shared: &Arc<Shared>) {
     while !shared.stop.load(Ordering::Acquire) {
-        // Block for the next call, waking at the earliest parked deadline so a
-        // stalled waiter is reaped even if no new call arrives. The rx mutex has
-        // a single consumer, so only one worker is in `recv` at a time; the
-        // deadline snapshot is taken before contending for it and can go stale
-        // (another worker may park a batch while we wait for the mutex). To keep
-        // the reaper live we NEVER block indefinitely: with nothing parked we
-        // still cap the wait at `lock_wait_timeout` and re-evaluate. Since a
-        // parked batch's own deadline is exactly that far out, this cap
-        // guarantees a worker re-reads the queue no later than the first
-        // deadline, so it is reaped on time. (Only the brief `recv` holds rx.)
-        let (deadline, cap) = {
-            let sched = shared.scheduler.lock().expect("scheduler poisoned");
-            (sched.earliest_deadline(), sched.wake_cap())
+        // Block until there is a call to run, or a releaser nudged us to look
+        // at the parked queue. `None` means the inbox is closed and drained.
+        let work = match shared.inbox.next() {
+            Some(work) => work,
+            None => break,
         };
-        let wait = match deadline {
-            // Never sleep past the periodic cap, even when the nearest parked
-            // deadline is further out: the idle sweep still has to run.
-            Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(cap),
-            None => cap,
-        };
-        let call = {
-            let rx = shared.rx.lock().expect("rx mutex poisoned");
-            match rx.recv_timeout(wait) {
-                Ok(call) => Some(call),
-                Err(mpsc::RecvTimeoutError::Timeout) => None,
-                Err(mpsc::RecvTimeoutError::Disconnected) => break,
-            }
-        };
-        // Reap any expired waiter (a deadlock backstop). A reap releases the
-        // victim's locks, which may unblock its parked partner, so drain before
-        // handling the call — otherwise, if the system then goes quiet, that
-        // partner could sit grantable until its own deadline and be reaped as a
-        // false victim. (dispatch_batch / close_session drain again after their
-        // own releases.)
         {
-            let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
             // A call we just dequeued proves its session is not idle. Stamp it
-            // before sweeping: the sweep runs in this same iteration, *before*
-            // the call below is dispatched, and would otherwise reap the
-            // transaction of a session whose next batch is already in hand.
-            if let Some(EngineCall::RunBatch { session, .. }) = &call {
+            // before anything else looks: the maintenance thread sweeps at
+            // arbitrary times and would otherwise reap the transaction of a
+            // session whose next batch is already in hand.
+            let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
+            if let Work::Call(EngineCall::RunBatch { session, .. }) = &work {
                 sched.sessions.touch(*session);
             }
-            sched.reap_expired(&shared.engine);
-            // The loop above never blocks longer than `wake_cap`, so this sweep
-            // runs regularly even on a completely idle server.
-            sched.reap_idle_txns(&shared.engine);
         }
         drain_ready(shared);
-        match call {
-            None => {}
-            Some(EngineCall::OpenSession {
+        match work {
+            Work::Drain => {}
+            Work::Call(EngineCall::OpenSession {
                 database,
                 login,
                 reply,
@@ -567,27 +653,23 @@ fn worker_loop(shared: &Arc<Shared>) {
                     .open(database, login);
                 let _ = reply.send(id);
             }
-            Some(EngineCall::RunBatch {
+            Work::Call(EngineCall::RunBatch {
                 session,
                 sql,
                 params,
                 cancel,
                 reply,
             }) => dispatch_batch(shared, session, sql, params, cancel, reply),
-            Some(EngineCall::RunNative { command, reply }) => {
+            Work::Call(EngineCall::RunNative { command, reply }) => {
                 let _ = reply.send(shared.engine.execute(&command));
             }
-            Some(EngineCall::CloseSession { session }) => {
+            Work::Call(EngineCall::CloseSession { session }) => {
                 shared
                     .scheduler
                     .lock()
                     .expect("scheduler poisoned")
                     .close_session(&shared.engine, session);
                 drain_ready(shared);
-            }
-            Some(EngineCall::Shutdown) => {
-                shared.stop.store(true, Ordering::Release);
-                break;
             }
         }
     }
@@ -725,28 +807,24 @@ impl Scheduler {
         }
     }
 
-    fn earliest_deadline(&self) -> Option<Instant> {
-        self.parked.iter().map(|p| p.deadline).min()
+    /// The earliest deadline the reaper could actually act on.
+    ///
+    /// A waiter that is grantable is skipped, and that is load-bearing rather
+    /// than an optimisation: [`Self::reap_expired`] refuses to reap one (it is
+    /// queued for a worker, not blocked), so its deadline stays in the past for
+    /// as long as it sits there. Letting that drive the sleep computes zero and
+    /// spins a core against the scheduler mutex — and only while every worker
+    /// is busy, since a free one drains the waiter away in microseconds.
+    fn earliest_reapable_deadline(&self) -> Option<Instant> {
+        (0..self.parked.len())
+            .filter(|i| !self.grantable(*i))
+            .map(|i| self.parked[i].deadline)
+            .min()
     }
 
-    /// The longest a worker may block before re-evaluating. A worker has two
-    /// periodic duties — reaping a parked batch at its deadline and reaping a
-    /// transaction left idle — so it must wake for whichever comes first. With
-    /// the default timeouts the lock-wait bound (5 s) dominates the idle one
-    /// (10 min) and this is unchanged; a deployment (or test) that sets a short
-    /// idle timeout gets a correspondingly shorter cap instead of a reaper that
-    /// silently runs late.
-    /// How long the maintenance thread sleeps between idle sweeps.
-    ///
-    /// Deliberately a function of the timeouts alone, never of the parked
-    /// queue: a deadline in the past — which [`Self::reap_expired`] leaves
-    /// there on purpose, for a waiter that is grantable and so must not be
-    /// reaped — would drive the wait to zero and spin a core against the
-    /// scheduler mutex. The idle reaper has no business with parked deadlines
-    /// anyway.
-    ///
-    /// Floored, because `idle_txn_timeout` is a tuning knob and tests already
-    /// pass `Duration::ZERO`; without it, that setting alone would peg a core.
+    /// The longest the maintenance thread may sleep: often enough to notice an
+    /// idle transaction, and floored so no setting of a tuning knob can turn
+    /// its loop into a spin (a test already passes `Duration::ZERO`).
     fn sweep_interval(&self) -> Duration {
         match self.idle_txn_timeout {
             Some(idle) => idle.min(self.lock_wait_timeout),
@@ -754,13 +832,6 @@ impl Scheduler {
             None => self.lock_wait_timeout,
         }
         .max(MIN_SWEEP_INTERVAL)
-    }
-
-    fn wake_cap(&self) -> Duration {
-        match self.idle_txn_timeout {
-            Some(idle) => self.lock_wait_timeout.min(idle),
-            None => self.lock_wait_timeout,
-        }
     }
 
     /// A session's current isolation level (default if the session is unknown).
@@ -1525,6 +1596,36 @@ mod tests {
         drop(h);
     }
 
+    #[tokio::test]
+    async fn a_batch_the_idle_reaper_unblocks_is_handed_to_a_worker() {
+        // The reaper runs off-worker now, so releasing a lock and running what
+        // that unblocks happen on different threads. Workers block on the inbox
+        // indefinitely — there is no timeout to fall back on — so a reap that
+        // did not nudge would leave this batch parked forever rather than late.
+        let h = start_with_idle(Some(Duration::from_millis(150)));
+        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let b = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        h.handle
+            .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
+            .await
+            .unwrap();
+        // A abandons a write lock; B parks behind it and can only be rescued by
+        // the maintenance thread reaping A and then nudging a worker.
+        h.handle
+            .run_batch(a, "BEGIN TRAN; INSERT INTO t VALUES (1);".into())
+            .await
+            .unwrap();
+        let reply = tokio::time::timeout(
+            Duration::from_secs(10),
+            h.handle.run_batch(b, "SELECT id FROM t".into()),
+        )
+        .await
+        .expect("the rescued batch was handed to a worker, not left parked")
+        .unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        assert_eq!(ids(&reply), Vec::<i64>::new(), "the reaped write is undone");
+    }
+
     #[test]
     fn the_maintenance_thread_sleeps_between_sweeps_whatever_is_parked() {
         // An expired waiter that `reap_expired` must NOT reap (its locks are
@@ -1546,11 +1647,10 @@ mod tests {
             needs: vec![(Resource::Table(1), LockMode::Shared)],
             deadline: Instant::now() - Duration::from_secs(60),
         });
-        let (_tx, rx) = mpsc::channel();
         let shared = Arc::new(Shared {
             engine: Arc::new(engine),
             scheduler: Mutex::new(sched),
-            rx: Mutex::new(rx),
+            inbox: Arc::new(Inbox::new()),
             stop: AtomicBool::new(false),
             idle: Mutex::new(()),
             wake: Condvar::new(),
@@ -1608,12 +1708,10 @@ mod tests {
                 "the session starts with an open txn"
             );
         }
-        // Keep the sender alive so the (worker-less) channel stays open.
-        let (_tx, rx) = mpsc::channel();
         let shared = Arc::new(Shared {
             engine: Arc::new(engine),
             scheduler: Mutex::new(sched),
-            rx: Mutex::new(rx),
+            inbox: Arc::new(Inbox::new()),
             stop: AtomicBool::new(false),
             idle: Mutex::new(()),
             wake: Condvar::new(),
