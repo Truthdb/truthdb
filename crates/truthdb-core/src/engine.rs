@@ -195,6 +195,13 @@ impl Engine {
         txn_ctx.abort(&self.storage);
     }
 
+    /// Rolls back a transaction the idle reaper is reclaiming. Unlike
+    /// [`Self::abort_session_txn`] the session lives on, so the rollback is
+    /// recorded and reported to its next batch.
+    pub fn abort_idle_session_txn(&self, txn_ctx: &mut crate::rel::TxnContext) {
+        txn_ctx.abort_idle(&self.storage);
+    }
+
     /// The table/database locks a SQL batch needs at the given isolation
     /// level (see [`crate::rel::analyze_locks`]). The session loop acquires
     /// these before running the batch.

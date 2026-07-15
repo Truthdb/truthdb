@@ -68,6 +68,13 @@ pub struct TxnContext {
     /// nested `TRY`/`CATCH` restore the outer error on exit). `ERROR_*()` read
     /// the top; empty outside any `CATCH` block.
     error_stack: Vec<truthdb_sql::eval::ErrorInfo>,
+    /// Set when the idle reaper rolled this session's transaction back. The
+    /// session's next batch fails with 1205 and clears it, so a client that
+    /// comes back believing it is still in a transaction is told the
+    /// transaction is gone — rather than silently autocommitting statements it
+    /// means to be transactional, and only discovering it at a COMMIT that
+    /// errors 3902 long after the writes became durable.
+    reaped: bool,
 }
 
 /// Session isolation level (defaults to READ COMMITTED, like SQL Server).
@@ -154,13 +161,35 @@ impl TxnContext {
         self.isolation
     }
 
-    /// Rolls back and discards any open transaction (connection teardown).
+    /// Rolls back and discards any open transaction, resetting every piece of
+    /// transaction-scoped state.
+    ///
+    /// `savepoints` must be cleared here, not merely on the paths that discard
+    /// the context afterwards: a savepoint holds the *undo-log offset* of the
+    /// transaction that recorded it, so one surviving into the session's next
+    /// transaction would let `ROLLBACK TRANSACTION <name>` find a stale entry
+    /// instead of erroring 3908 — and hand a dead transaction's offset to
+    /// `rel_rollback_to`, which either truncates the new transaction's undo log
+    /// (silently discarding committed work) or panics on `split_off`.
     pub fn abort(&mut self, storage: &Storage) {
         if let Some(txn) = self.txn.take() {
             let _ = storage.rel_rollback(txn);
         }
         self.trancount = 0;
         self.doomed = false;
+        self.savepoints.clear();
+    }
+
+    /// Rolls back this session's transaction because it sat idle too long, and
+    /// records that it happened so the session's next batch can say so.
+    pub fn abort_idle(&mut self, storage: &Storage) {
+        self.abort(storage);
+        self.reaped = true;
+    }
+
+    /// Takes the "your transaction was reaped" flag, if set.
+    fn take_reaped(&mut self) -> bool {
+        std::mem::take(&mut self.reaped)
     }
 }
 
@@ -231,6 +260,22 @@ pub fn execute_batch_with_params(
     txn_ctx: &mut TxnContext,
     params: &[RpcParam],
 ) -> BatchOutcome {
+    // A transaction reaped for idleness is reported to the session's next batch
+    // (once). 1205 is the code this engine already uses for a server-initiated
+    // transaction abort (the parked deadlock victim), and every driver treats it
+    // as "the transaction is gone, retry it" — which is exactly the right
+    // recovery here.
+    if txn_ctx.take_reaped() {
+        return BatchOutcome {
+            results: Vec::new(),
+            error: Some(SqlError::new(
+                1205,
+                13,
+                51,
+                "The transaction was rolled back because the session was idle for too long. Rerun the transaction.",
+            )),
+        };
+    }
     // Variables are batch-scoped: each batch starts with none.
     txn_ctx.clear_variables();
     for param in params {
