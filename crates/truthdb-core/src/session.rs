@@ -433,6 +433,12 @@ struct Runnable {
     txn_ctx: TxnContext,
 }
 
+/// Counts maintenance threads that have started, so a test can prove the pool
+/// actually spawns one — the reaping itself is pinned against a hand-built
+/// `Shared`, which would not notice the supervisor forgetting to wire it up.
+#[cfg(test)]
+static MAINTENANCE_STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
 /// The engine's housekeeping, on a thread that never runs a batch: the
 /// deadlock backstop (reap a lock wait past its deadline) and the idle-
 /// transaction reaper.
@@ -450,6 +456,8 @@ struct Runnable {
 /// It only *releases* locks; running whatever that unblocks still needs a
 /// worker, and always did.
 fn maintenance_loop(shared: &Arc<Shared>) {
+    #[cfg(test)]
+    MAINTENANCE_STARTS.fetch_add(1, Ordering::Relaxed);
     while !shared.stop.load(Ordering::Acquire) {
         // Sleep until the nearest parked deadline, but never past the sweep
         // cap: an idle transaction has no deadline in the parked queue, so with
@@ -1465,6 +1473,26 @@ mod tests {
             "with nothing parked, the idle transaction is reaped"
         );
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn the_pool_actually_spawns_a_maintenance_thread() {
+        // `housekeeping_runs_with_no_worker_free_to_do_it` builds `Shared` by
+        // hand and starts the thread itself, so it would pass just as happily
+        // if the supervisor never spawned one. This covers the wiring: run the
+        // real `spawn_engine` path and wait for a maintenance thread to report
+        // in. (A sibling test's pool satisfying this is fine — it is the same
+        // supervisor code either way; what fails is nobody spawning one at all.)
+        let h = start_with_idle(Some(Duration::from_millis(150)));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while MAINTENANCE_STARTS.load(Ordering::Relaxed) == 0 && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            MAINTENANCE_STARTS.load(Ordering::Relaxed) > 0,
+            "the pool spawns a maintenance thread"
+        );
+        drop(h);
     }
 
     #[test]
