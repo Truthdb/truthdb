@@ -49,7 +49,8 @@ use truthdb_sql::error::SqlError;
 
 use crate::engine::{Engine, EngineError};
 use crate::lock::{LockManager, LockMode, Resource};
-use crate::rel::{BatchOutcome, Isolation, TxnContext};
+use crate::rel::{BatchOutcome, Isolation, ResultColumn, RowSet, StatementResult, TxnContext};
+use crate::relstore::types::Datum;
 
 /// How long a batch may wait on a lock before it is treated as a deadlock
 /// victim and rolled back (SQL Server-style, plan: "5 s wait timeout →
@@ -74,6 +75,122 @@ const IDLE_TXN_TIMEOUT: Duration = Duration::from_secs(600);
 pub struct BatchReply {
     pub outcome: BatchOutcome,
     pub in_transaction: bool,
+}
+
+/// How many rows one [`BatchEvent::Rows`] carries. With [`REPLY_CHANNEL_DEPTH`]
+/// this bounds how many rows sit between the worker and the connection.
+const EVENT_ROWS: usize = 256;
+
+/// How many events may be in flight before the worker blocks. Deep enough that
+/// a connection doing a socket write does not stall the worker for every chunk,
+/// shallow enough that the queue is a buffer rather than a copy of the result.
+const REPLY_CHANNEL_DEPTH: usize = 4;
+
+/// One event in a batch's streamed reply.
+///
+/// A batch emits, per statement, either `Columns` followed by zero or more
+/// `Rows` chunks and then `StatementDone`, or a bare `StatementDone` (DDL, a
+/// row count). A batch-stopping `Error` may follow the statements that ran.
+/// Every stream ends with exactly one terminal event — `Complete` or `Failed` —
+/// unless the receiver is dropped first.
+pub enum BatchEvent {
+    /// Starts a result set: its column metadata.
+    Columns(Vec<ResultColumn>),
+    /// A chunk of rows for the result set the last `Columns` opened.
+    Rows(Vec<Vec<Datum>>),
+    /// Ends one statement. `count` is its row count / rows-affected, or `None`
+    /// for a statement that reports neither (DDL).
+    StatementDone {
+        count: Option<u64>,
+        /// The transaction state to stamp on this statement's DONE
+        /// (`DONE_INXACT`).
+        in_transaction: bool,
+    },
+    /// A SQL error that stopped the batch. The statements before it kept their
+    /// results, which were already streamed.
+    Error(SqlError),
+    /// Terminal: the batch ended.
+    Complete { in_transaction: bool },
+    /// Terminal: the engine could not run the batch at all.
+    Failed(EngineError),
+}
+
+/// The reply channel for one batch: a bounded queue of [`BatchEvent`]s.
+///
+/// Bounded is the point. An unbounded reply lets a result set exist in full
+/// between the worker and the socket, which is the memory the streaming path
+/// exists to not spend; here a worker that outruns the connection blocks in
+/// [`Self::send`] until the connection drains. The cost of that backpressure is
+/// that a client which stops reading mid-result holds its worker (and its
+/// locks) until it resumes or disconnects — the same trade SQL Server makes,
+/// where the wait shows up as `ASYNC_NETWORK_IO`.
+pub struct BatchSink {
+    tx: tokio::sync::mpsc::Sender<BatchEvent>,
+}
+
+impl BatchSink {
+    /// Sends one event, blocking this worker while the connection is behind.
+    ///
+    /// Returns `false` once the receiver is gone (the client disconnected, or
+    /// its connection task was dropped), which is the producer's signal to stop
+    /// early rather than render rows nobody will read.
+    ///
+    /// Only ever called from a worker thread. `blocking_send` panics inside an
+    /// async runtime, and workers are plain OS threads with no reactor on them.
+    fn send(&self, event: BatchEvent) -> bool {
+        self.tx.blocking_send(event).is_ok()
+    }
+
+    /// Streams a finished outcome as events.
+    ///
+    /// The executor still materializes each statement's rows before this runs,
+    /// so `in_transaction` is the batch's final state for every DONE — exactly
+    /// what the non-streaming path stamped. Once statements emit rows as they
+    /// produce them, the state will be each statement's own.
+    fn send_outcome(&self, outcome: BatchOutcome, in_transaction: bool) {
+        for result in outcome.results {
+            let sent = match result {
+                StatementResult::Rows(rowset) => self.send_rowset(rowset, in_transaction),
+                StatementResult::RowsAffected(n) => self.send(BatchEvent::StatementDone {
+                    count: Some(n),
+                    in_transaction,
+                }),
+                StatementResult::Done => self.send(BatchEvent::StatementDone {
+                    count: None,
+                    in_transaction,
+                }),
+            };
+            if !sent {
+                return;
+            }
+        }
+        if let Some(error) = outcome.error
+            && !self.send(BatchEvent::Error(error))
+        {
+            return;
+        }
+        self.send(BatchEvent::Complete { in_transaction });
+    }
+
+    /// Streams one result set: metadata, then rows in [`EVENT_ROWS`] chunks.
+    fn send_rowset(&self, rowset: RowSet, in_transaction: bool) -> bool {
+        let count = rowset.rows.len() as u64;
+        if !self.send(BatchEvent::Columns(rowset.columns)) {
+            return false;
+        }
+        let mut rows = rowset.rows;
+        while !rows.is_empty() {
+            let rest = rows.split_off(rows.len().min(EVENT_ROWS));
+            if !self.send(BatchEvent::Rows(rows)) {
+                return false;
+            }
+            rows = rest;
+        }
+        self.send(BatchEvent::StatementDone {
+            count: Some(count),
+            in_transaction,
+        })
+    }
 }
 
 /// Identifies a connection's session on the engine thread.
@@ -174,7 +291,7 @@ enum EngineCall {
         params: Vec<crate::rel::RpcParam>,
         /// Set by the connection on a TDS Attention to abort the batch mid-flight.
         cancel: Arc<AtomicBool>,
-        reply: oneshot::Sender<Result<BatchReply, EngineError>>,
+        reply: BatchSink,
     },
     /// A native-protocol command (ES or SQL): rendered text.
     RunNative {
@@ -254,6 +371,10 @@ impl EngineHandle {
 
     /// Like [`Self::run_rpc`] but cancellable via `cancel` (see
     /// [`Self::run_batch_cancellable`]).
+    ///
+    /// Collects the whole reply, so it costs the memory the result set needs.
+    /// A caller that writes the rows straight out — the TDS gateway — should
+    /// use [`Self::stream_rpc`] instead.
     pub async fn run_rpc_cancellable(
         &self,
         session: SessionId,
@@ -261,17 +382,55 @@ impl EngineHandle {
         params: Vec<crate::rel::RpcParam>,
         cancel: Arc<AtomicBool>,
     ) -> Result<BatchReply, EngineError> {
-        let (reply, rx) = oneshot::channel();
-        self.tx
-            .send(EngineCall::RunBatch {
+        let mut events = self.stream_rpc(session, sql, params, cancel);
+        collect_reply(&mut events).await
+    }
+
+    /// Runs a SQL batch and returns its reply as a stream (see
+    /// [`Self::stream_rpc`]).
+    pub fn stream_batch(
+        &self,
+        session: SessionId,
+        sql: String,
+        cancel: Arc<AtomicBool>,
+    ) -> tokio::sync::mpsc::Receiver<BatchEvent> {
+        self.stream_rpc(session, sql, Vec::new(), cancel)
+    }
+
+    /// Runs a batch and returns its reply as a stream of [`BatchEvent`]s, so
+    /// the caller can write each chunk of rows out as it arrives instead of
+    /// holding the whole result.
+    ///
+    /// The receiver must be drained until a terminal event, or dropped: the
+    /// worker blocks once [`REPLY_CHANNEL_DEPTH`] events are outstanding.
+    /// Dropping it tells the worker to stop producing.
+    ///
+    /// An engine that is already gone is reported as a `Failed` event rather
+    /// than a separate error return, so a caller has one shape to render.
+    pub fn stream_rpc(
+        &self,
+        session: SessionId,
+        sql: String,
+        params: Vec<crate::rel::RpcParam>,
+        cancel: Arc<AtomicBool>,
+    ) -> tokio::sync::mpsc::Receiver<BatchEvent> {
+        let (tx, rx) = tokio::sync::mpsc::channel(REPLY_CHANNEL_DEPTH);
+        if let Err(mpsc::SendError(EngineCall::RunBatch { reply, .. })) =
+            self.tx.send(EngineCall::RunBatch {
                 session,
                 sql,
                 params,
                 cancel,
-                reply,
+                reply: BatchSink { tx },
             })
-            .map_err(|_| EngineError::Unavailable)?;
-        rx.await.map_err(|_| EngineError::Unavailable)?
+        {
+            // The channel is empty and its depth is at least one, so this
+            // cannot block or fail.
+            let _ = reply
+                .tx
+                .try_send(BatchEvent::Failed(EngineError::Unavailable));
+        }
+        rx
     }
 
     /// Runs a native-protocol command (ES or SQL) and returns rendered text.
@@ -295,6 +454,51 @@ impl EngineHandle {
             let _ = self.tx.send(EngineCall::Shutdown);
         }
     }
+}
+
+/// Reassembles an event stream into a whole [`BatchReply`] — the shape callers
+/// that want the entire result in memory (the slt runner, the transaction
+/// manager path, tests) still ask for. Draining as the worker produces is what
+/// keeps it from blocking on the bounded channel.
+async fn collect_reply(
+    events: &mut tokio::sync::mpsc::Receiver<BatchEvent>,
+) -> Result<BatchReply, EngineError> {
+    let mut results: Vec<StatementResult> = Vec::new();
+    let mut error = None;
+    // The rows of the statement currently streaming, if it opened a result set.
+    let mut open: Option<RowSet> = None;
+    while let Some(event) = events.recv().await {
+        match event {
+            BatchEvent::Columns(columns) => {
+                open = Some(RowSet {
+                    columns,
+                    rows: Vec::new(),
+                });
+            }
+            BatchEvent::Rows(mut rows) => {
+                if let Some(rowset) = open.as_mut() {
+                    rowset.rows.append(&mut rows);
+                }
+            }
+            BatchEvent::StatementDone { count, .. } => results.push(match open.take() {
+                Some(rowset) => StatementResult::Rows(rowset),
+                None => match count {
+                    Some(n) => StatementResult::RowsAffected(n),
+                    None => StatementResult::Done,
+                },
+            }),
+            BatchEvent::Error(err) => error = Some(err),
+            BatchEvent::Complete { in_transaction } => {
+                return Ok(BatchReply {
+                    outcome: BatchOutcome { results, error },
+                    in_transaction,
+                });
+            }
+            BatchEvent::Failed(err) => return Err(err),
+        }
+    }
+    // The stream ended without a terminal event: the worker pool is gone.
+    Err(EngineError::Unavailable)
 }
 
 /// Worker-thread count for the pool: one per core (minus a couple reserved for
@@ -368,7 +572,9 @@ fn spawn_engine_pool(
             }
             let mut sched = supervisor.scheduler.lock().expect("scheduler poisoned");
             for parked in sched.parked.drain(..) {
-                let _ = parked.reply.send(Err(EngineError::Unavailable));
+                parked
+                    .reply
+                    .send(BatchEvent::Failed(EngineError::Unavailable));
             }
         })
         .expect("spawn engine supervisor");
@@ -405,7 +611,7 @@ struct Runnable {
     sql: String,
     params: Vec<crate::rel::RpcParam>,
     cancel: Arc<AtomicBool>,
-    reply: oneshot::Sender<Result<BatchReply, EngineError>>,
+    reply: BatchSink,
     txn_ctx: TxnContext,
 }
 
@@ -510,7 +716,7 @@ fn dispatch_batch(
     sql: String,
     params: Vec<crate::rel::RpcParam>,
     cancel: Arc<AtomicBool>,
-    reply: oneshot::Sender<Result<BatchReply, EngineError>>,
+    reply: BatchSink,
 ) {
     let runnable = {
         let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
@@ -575,10 +781,14 @@ fn run_and_finish(shared: &Arc<Shared>, work: Runnable) {
         let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
         sched.finish(&shared.engine, session, txn_ctx)
     };
-    let _ = reply.send(outcome.map(|outcome| BatchReply {
-        outcome,
-        in_transaction,
-    }));
+    // Streaming the reply happens after the batch's locks are settled, so a
+    // client that reads slowly stalls only this worker, never the lock it held.
+    match outcome {
+        Ok(outcome) => reply.send_outcome(outcome, in_transaction),
+        Err(err) => {
+            reply.send(BatchEvent::Failed(err));
+        }
+    }
 }
 
 /// Runs every parked batch whose locks are now grantable, in FIFO order, until
@@ -604,7 +814,7 @@ struct Parked {
     sql: String,
     params: Vec<crate::rel::RpcParam>,
     cancel: Arc<AtomicBool>,
-    reply: oneshot::Sender<Result<BatchReply, EngineError>>,
+    reply: BatchSink,
     needs: Vec<(Resource, LockMode)>,
     deadline: Instant,
 }
@@ -744,6 +954,27 @@ impl Scheduler {
         }
     }
 
+    /// Whether the parked batch at `i` could take every lock it needs right
+    /// now — i.e. it is waiting for a worker to pick it up, not for a lock.
+    fn grantable(&self, i: usize) -> bool {
+        let owner = self.parked[i].session.raw();
+        // Only waiters ahead in the queue have priority (FIFO); a waiter never
+        // yields to itself or to those behind it.
+        let ahead: Vec<(Resource, LockMode)> = self
+            .parked
+            .iter()
+            .take(i)
+            .filter(|p| p.session.raw() != owner)
+            .flat_map(|p| p.needs.iter().copied())
+            .collect();
+        self.parked[i].needs.iter().all(|(resource, mode)| {
+            // A resource the waiter already holds is exempt from the FIFO yield
+            // (it is not jumping the queue for it), matching try_acquire.
+            (self.locks.holds(owner, *resource) || !ahead.iter().any(|(r, _)| r == resource))
+                && self.locks.conflict(owner, *resource, *mode).is_none()
+        })
+    }
+
     /// Removes and returns the first parked batch (FIFO) whose locks are now
     /// grantable, having granted them and taken its session's transaction
     /// context out to run with. `None` if none can proceed. The caller runs it
@@ -752,23 +983,7 @@ impl Scheduler {
         let mut i = 0;
         while i < self.parked.len() {
             let owner = self.parked[i].session.raw();
-            // Only waiters ahead in the queue have priority (FIFO); a waiter
-            // never yields to itself or to those behind it.
-            let ahead: Vec<(Resource, LockMode)> = self
-                .parked
-                .iter()
-                .take(i)
-                .filter(|p| p.session.raw() != owner)
-                .flat_map(|p| p.needs.iter().copied())
-                .collect();
-            let grantable = self.parked[i].needs.iter().all(|(resource, mode)| {
-                // A resource the waiter already holds is exempt from the FIFO
-                // yield (it is not jumping the queue for it), matching
-                // try_acquire.
-                (self.locks.holds(owner, *resource) || !ahead.iter().any(|(r, _)| r == resource))
-                    && self.locks.conflict(owner, *resource, *mode).is_none()
-            });
-            if grantable {
+            if self.grantable(i) {
                 let parked = self.parked.remove(i).expect("index in bounds");
                 for (resource, mode) in &parked.needs {
                     self.locks.grant(owner, *resource, *mode);
@@ -793,13 +1008,20 @@ impl Scheduler {
     /// released locks unblock — typically rescuing its deadlock partner before
     /// that partner is itself reaped. Any further expired waiters are handled on
     /// the next loop iteration.
+    ///
+    /// A waiter whose locks are already grantable is never a victim, however
+    /// long it has sat there: it is not blocked on anyone, it is waiting for a
+    /// worker to run it, and killing it would report a lock conflict (1205)
+    /// that does not exist. That gap used to be too narrow to hit — the worker
+    /// that released the locks granted them microseconds later — but a worker
+    /// streaming a reply can now block on a slow client between the two.
     fn reap_expired(&mut self, engine: &Engine) {
         let now = Instant::now();
         let victim_idx = self
             .parked
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.deadline <= now)
+            .filter(|(i, p)| p.deadline <= now && !self.grantable(*i))
             .min_by_key(|(_, p)| p.deadline)
             .map(|(i, _)| i);
         if let Some(idx) = victim_idx {
@@ -860,7 +1082,9 @@ impl Scheduler {
             engine.abort_session_txn(&mut state.txn_ctx);
         }
         self.locks.release_all(victim.session.raw());
-        let _ = victim.reply.send(Ok(deadlock_victim_reply()));
+        // Safe to send under the scheduler mutex: a parked batch never ran, so
+        // its channel is empty and these two events cannot fill it.
+        victim.reply.send_outcome(deadlock_victim_reply(), false);
     }
 
     /// Detects lock-wait *cycles* among the parked batches — a waits-for graph
@@ -986,18 +1210,15 @@ fn find_cycle(
     None
 }
 
-fn deadlock_victim_reply() -> BatchReply {
-    BatchReply {
-        outcome: BatchOutcome {
-            results: Vec::new(),
-            error: Some(SqlError::new(
-                1205,
-                13,
-                51,
-                "Transaction was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.",
-            )),
-        },
-        in_transaction: false,
+fn deadlock_victim_reply() -> BatchOutcome {
+    BatchOutcome {
+        results: Vec::new(),
+        error: Some(SqlError::new(
+            1205,
+            13,
+            51,
+            "Transaction was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.",
+        )),
     }
 }
 
@@ -1352,13 +1573,13 @@ mod tests {
                 .sql_batch("BEGIN TRAN; INSERT INTO t VALUES (1);", ctx)
                 .expect("begin");
         }
-        let (reply, _rx) = oneshot::channel();
+        let (tx, _rx) = tokio::sync::mpsc::channel(REPLY_CHANNEL_DEPTH);
         sched.parked.push_back(Parked {
             session: id,
             sql: "SELECT id FROM t".into(),
             params: Vec::new(),
             cancel: Arc::new(AtomicBool::new(false)),
-            reply,
+            reply: BatchSink { tx },
             needs: Vec::new(),
             deadline: Instant::now() + Duration::from_secs(5),
         });
@@ -1373,6 +1594,48 @@ mod tests {
         assert!(
             sched.reap_idle_txns(&engine),
             "with nothing parked, the idle transaction is reaped"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_parked_batch_whose_locks_are_free_is_never_reaped_as_a_victim() {
+        // A waiter whose locks are grantable is not blocked on anybody — it is
+        // waiting for a worker to pick it up — so killing it would report a
+        // lock conflict (1205) that does not exist. The window used to be
+        // microseconds wide (the worker that released the locks granted them
+        // immediately after), but a worker streaming a reply now blocks until
+        // its client reads, which can leave a grantable batch parked well past
+        // its deadline.
+        let (engine, mut sched, path) = bare("reap-grantable", None);
+        let id = sched.sessions.open("truthdb".into(), "sa".into());
+        let (tx, _rx) = tokio::sync::mpsc::channel(REPLY_CHANNEL_DEPTH);
+        // Parked, deadline long gone, and nothing holds the lock it wants.
+        sched.parked.push_back(Parked {
+            session: id,
+            sql: "SELECT 1".into(),
+            params: Vec::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            reply: BatchSink { tx },
+            needs: vec![(Resource::Table(1), LockMode::Shared)],
+            deadline: Instant::now() - Duration::from_secs(60),
+        });
+        sched.reap_expired(&engine);
+        assert_eq!(
+            sched.parked.len(),
+            1,
+            "an expired waiter whose locks are free is not a deadlock victim"
+        );
+
+        // The same waiter, once something actually blocks it, is reaped — so it
+        // is grantability doing the work above, not a dead reaper.
+        sched
+            .locks
+            .grant(999, Resource::Table(1), LockMode::Exclusive);
+        sched.reap_expired(&engine);
+        assert!(
+            sched.parked.is_empty(),
+            "an expired waiter that is genuinely blocked is the victim"
         );
         let _ = std::fs::remove_file(path);
     }
