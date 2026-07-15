@@ -88,3 +88,50 @@ SELECT v * 10 AS big FROM a WHERE v > 10 ORDER BY big DESC
 ----
 300
 200
+
+# --- ORDER BY <ordinal> on the plain path ---
+# A bare integer is a 1-based output-column ordinal, not a constant. It used to
+# evaluate as a constant, so every sort key was equal and the rows came back in
+# insertion order — silently unsorted.
+
+query I
+SELECT v FROM a ORDER BY 1
+----
+10
+20
+30
+
+# The ordinal points at the output column, so it follows the alias's expression.
+query I
+SELECT v * 2 AS dbl FROM a ORDER BY 1
+----
+20
+40
+60
+
+query I
+SELECT v FROM a ORDER BY 1 DESC
+----
+30
+20
+10
+
+# Ordinals over a wildcard resolve to the source columns, in order.
+query IIT
+SELECT * FROM a ORDER BY 2
+----
+2 10 y
+3 20 x
+1 30 x
+
+# Mixed: an ordinal and a named column together.
+query TI
+SELECT g, v FROM a ORDER BY 1, 2
+----
+x 20
+x 30
+y 10
+
+# Out of range is 108, not a panic or a silent no-op.
+statement error
+SELECT v FROM a ORDER BY 7
