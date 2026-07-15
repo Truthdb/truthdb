@@ -9,7 +9,7 @@ use crate::allocator::{EXTENT_PAGES, PageAllocator};
 use crate::direct_io::{AlignedPageBuf, DirectFile};
 use crate::group_commit::GroupCommit;
 use crate::relstore::RelState;
-use crate::relstore::btree::{BTree, TreeInsert};
+use crate::relstore::btree::{BTree, ScanCursor, TreeInsert};
 use crate::relstore::buffer_pool::DEFAULT_CAPACITY_BYTES;
 use crate::relstore::catalog::{self, FIRST_USER_OBJECT_ID, IndexDef, TableDef};
 use crate::relstore::ctx::{OpMode, PoolIo, RelCtx, TxnLink};
@@ -406,6 +406,32 @@ impl Storage {
 
     pub fn rel_scan(&self, name: &str) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.lock().rel_scan(name)
+    }
+
+    /// Scans a table in bounded slices, dropping the storage lock between them,
+    /// so one large read stops blocking every other session for its whole
+    /// duration.
+    ///
+    /// Only for readers that hold the table's lock — which a SELECT does at
+    /// every isolation level except READ UNCOMMITTED, whose whole contract is
+    /// that it sees in-flight change. Nothing pins a page between slices, so a
+    /// concurrent writer could restructure the tree; the cursor checks each
+    /// resumed page still belongs to the table and stops rather than read
+    /// another object's rows. The integrity checks (FK probes, WITH CHECK) keep
+    /// using [`Self::rel_scan`], whose single lock hold makes them atomic — a
+    /// validation that missed a row because a page split mid-walk would admit a
+    /// violating row.
+    pub fn rel_scan_sliced(
+        &self,
+        name: &str,
+        budget: usize,
+    ) -> Result<Vec<Vec<Datum>>, StorageError> {
+        let mut out = Vec::new();
+        let mut cursor = ScanCursor::start();
+        while !cursor.done() {
+            cursor = self.lock().rel_scan_slice(name, cursor, budget, &mut out)?;
+        }
+        Ok(out)
     }
 
     /// Test hook: a table's definition + schema, for driving a batched scan.
@@ -1228,6 +1254,45 @@ impl StorageFile {
 
     /// Full scan: rows as typed datums (key order for trees, chain order
     /// for heaps).
+    /// One slice of a scan: appends at most `budget` rows from `cursor` and
+    /// returns where to resume. The caller loops, so the storage lock is taken
+    /// once per slice instead of once for the whole table.
+    pub(crate) fn rel_scan_slice(
+        &mut self,
+        name: &str,
+        cursor: ScanCursor,
+        budget: usize,
+        out: &mut Vec<Vec<Datum>>,
+    ) -> Result<ScanCursor, StorageError> {
+        self.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(name)?;
+        let mut ctx = self.rel_ctx();
+        let mut raw: Vec<Vec<u8>> = Vec::new();
+        let next = if def.is_tree() {
+            let tree = BTree {
+                object_id: def.object_id,
+                root: def.root_page,
+            };
+            let mut keyed = Vec::new();
+            let next = tree.scan_from(&mut ctx, cursor, budget, &mut keyed)?;
+            raw.extend(keyed.into_iter().map(|(_, row)| row));
+            next
+        } else {
+            let heap = Heap {
+                object_id: def.object_id,
+                first_page: def.root_page,
+            };
+            let mut located = Vec::new();
+            let next = heap.scan_from(&mut ctx, cursor, budget, &mut located)?;
+            raw.extend(located.into_iter().map(|(_, row)| row));
+            next
+        };
+        for row in raw {
+            out.push(decode_row(&schema, &row)?);
+        }
+        Ok(next)
+    }
+
     pub fn rel_scan(&mut self, name: &str) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(name)?;

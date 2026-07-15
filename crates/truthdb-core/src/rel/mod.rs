@@ -3166,6 +3166,12 @@ fn predicate_true(
 
 // ---- SELECT -------------------------------------------------------------
 
+/// Rows a table scan reads per slice before dropping the storage lock and
+/// letting another session in. Large enough that the per-slice overhead (a lock
+/// acquisition and a catalog lookup) is noise against decoding the rows, small
+/// enough that a big scan yields often.
+const SCAN_SLICE_ROWS: usize = 1024;
+
 struct Source {
     columns: Vec<ResultColumn>,
     /// Per-column table qualifier (alias or table name; `None` = virtual/
@@ -5583,8 +5589,11 @@ fn build_table_source(
             // An index seek narrows the candidate set; the WHERE filter later
             // re-checks, so results match a full scan.
             let rows = match plan::choose(&def, &schema, where_clause, eval_ctx) {
+                // Sliced: a read holds the table's lock, so it need not also
+                // hold the storage lock for the whole table and block every
+                // other session while it walks.
                 plan::AccessPath::TableScan => storage
-                    .rel_scan(&def.name)
+                    .rel_scan_sliced(&def.name, SCAN_SLICE_ROWS)
                     .map_err(|err| map_storage_err(err, &def.name))?,
                 plan::AccessPath::IndexSeek {
                     index_object_id,

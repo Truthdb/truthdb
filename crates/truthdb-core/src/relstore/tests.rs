@@ -964,3 +964,91 @@ fn a_collation_name_too_long_for_the_header_is_refused() {
     }
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn a_sliced_scan_reads_the_same_rows_as_a_whole_one() {
+    // The SELECT path reads through rel_scan_sliced; it must agree with the
+    // atomic rel_scan the integrity checks still use, at any slice size.
+    let path = unique_temp_path("scan-sliced");
+    let mut storage = create_storage(&path);
+    create_tree_table(&mut storage, "t");
+    create_heap_table(&mut storage, "h");
+    for i in 0..300 {
+        storage
+            .rel_insert("t", row(i, &"x".repeat(150)))
+            .expect("insert t");
+        storage
+            .rel_insert("h", row(i, &"x".repeat(150)))
+            .expect("insert h");
+    }
+    for table in ["t", "h"] {
+        let whole = scan_ids(&mut storage, table);
+        assert_eq!(whole.len(), 300, "{table}: precondition");
+        for budget in [1, 3, 64, 299, 300, 301, 4096] {
+            let sliced: Vec<i32> = storage
+                .rel_scan_sliced(table, budget)
+                .expect("sliced scan")
+                .iter()
+                .map(|r| match r[0] {
+                    Datum::Int(v) => v,
+                    ref other => panic!("expected int id, got {other:?}"),
+                })
+                .collect();
+            assert_eq!(sliced, whole, "{table}: slice budget {budget}");
+        }
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_sliced_scan_lets_another_thread_take_the_storage_lock_mid_scan() {
+    // The point of slicing: one large read must stop blocking every other
+    // session for its whole duration. With a single lock hold, the probe below
+    // cannot run until the scan finishes.
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    let path = unique_temp_path("scan-sliced-lock");
+    let mut storage = Storage::create_with_wal_bounds(
+        path.clone(),
+        storage_options(),
+        64 * 1024 * 1024,
+        64 * 1024 * 1024,
+    )
+    .expect("create");
+    create_tree_table(&mut storage, "t");
+    for i in 0..1500 {
+        storage
+            .rel_insert("t", row(i, &"x".repeat(400)))
+            .expect("insert");
+    }
+    let storage = Arc::new(storage);
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let probes = Arc::new(AtomicUsize::new(0));
+    let probe = {
+        let storage = Arc::clone(&storage);
+        let stop = Arc::clone(&stop);
+        let probes = Arc::clone(&probes);
+        std::thread::spawn(move || {
+            // Each rel_get takes the storage lock briefly. If the scan held it
+            // throughout, none of these could complete while it ran.
+            while !stop.load(Ordering::Relaxed) {
+                let _ = storage.rel_get("t", &[Datum::Int(0)]);
+                probes.fetch_add(1, Ordering::Relaxed);
+            }
+        })
+    };
+
+    let rows = storage.rel_scan_sliced("t", 8).expect("sliced scan");
+    let during = probes.load(Ordering::Relaxed);
+    stop.store(true, Ordering::Relaxed);
+    probe.join().expect("probe thread");
+
+    assert_eq!(rows.len(), 1500, "the scan still reads everything");
+    assert!(
+        during > 0,
+        "another thread must get the storage lock while a sliced scan runs"
+    );
+    let _ = std::fs::remove_file(path);
+}
