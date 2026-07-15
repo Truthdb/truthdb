@@ -16,7 +16,7 @@
 //! page (redo is idempotent by page LSN), never undone.
 
 use crate::relstore::ctx::{LogMode, OpMode, RelCtx};
-use crate::relstore::page::PAGE_TYPE_TREE;
+use crate::relstore::page::{self, PAGE_TYPE_TREE};
 use crate::relstore::slotted::{NO_PAGE, SlottedPage, SlottedRead};
 use crate::storage::StorageError;
 use crate::storage_layout::PAGE_SIZE;
@@ -29,6 +29,49 @@ pub const TREE_MAX_CELL: usize = (PAGE_SIZE - crate::relstore::slotted::STRUCT_H
 
 /// A `(key bytes, row bytes)` pair from a scan.
 pub type KeyRow = (Vec<u8>, Vec<u8>);
+
+/// Where a batched scan resumes: the page to read next and the slot within it.
+/// `page: None` means "not started"; `done()` means the chain is exhausted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ScanCursor {
+    page: Option<u64>,
+    slot: usize,
+}
+
+impl ScanCursor {
+    pub fn start() -> Self {
+        ScanCursor {
+            page: None,
+            slot: 0,
+        }
+    }
+
+    pub fn done(&self) -> bool {
+        self.page == Some(NO_PAGE)
+    }
+
+    pub(crate) fn at(page: u64, slot: usize) -> Self {
+        ScanCursor {
+            page: Some(page),
+            slot,
+        }
+    }
+
+    pub(crate) fn finished() -> Self {
+        ScanCursor {
+            page: Some(NO_PAGE),
+            slot: 0,
+        }
+    }
+
+    pub(crate) fn page(&self) -> Option<u64> {
+        self.page
+    }
+
+    pub(crate) fn slot(&self) -> usize {
+        self.slot
+    }
+}
 
 pub(crate) struct BTree {
     pub object_id: u32,
@@ -368,32 +411,60 @@ impl BTree {
 
     /// Full scan in key order via the leaf chain: (key, row) pairs.
     pub fn scan(&self, ctx: &mut RelCtx<'_>) -> Result<Vec<KeyRow>, StorageError> {
-        // Find the leftmost leaf.
-        let mut page_no = self.root;
-        loop {
-            let frame = ctx.fetch(page_no)?;
-            let page = SlottedRead::new(ctx.pool.page(frame));
-            if page.level() == 0 {
-                ctx.pool.unpin(frame);
-                break;
-            }
-            let child = internal_cell_child(page.get(0).expect("sentinel entry"));
-            ctx.pool.unpin(frame);
-            page_no = child;
-        }
         let mut out = Vec::new();
+        let mut cursor = ScanCursor::start();
+        while !cursor.done() {
+            cursor = self.scan_from(ctx, cursor, usize::MAX, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Appends at most `budget` rows from `cursor` onward, returning where to
+    /// resume. Lets a caller walk a large table in bounded slices instead of
+    /// materializing it, so the storage mutex can be dropped between slices.
+    ///
+    /// A resumed page is checked against this tree's `object_id` before it is
+    /// read: nothing holds the page between calls, so a page freed and recycled
+    /// to another object in the meantime would otherwise be read as if it were
+    /// still ours. On a mismatch the scan stops rather than return another
+    /// object's rows. (Callers holding a table lock cannot see that happen; a
+    /// READ UNCOMMITTED scan takes no lock and can.)
+    pub fn scan_from(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        cursor: ScanCursor,
+        budget: usize,
+        out: &mut Vec<KeyRow>,
+    ) -> Result<ScanCursor, StorageError> {
+        let mut page_no = match cursor.page {
+            Some(page) => page,
+            None => self.leftmost_leaf(ctx)?,
+        };
+        let mut slot = cursor.slot;
+        let mut taken = 0;
         while page_no != NO_PAGE {
             let frame = ctx.fetch(page_no)?;
+            if page::read_header(ctx.pool.page(frame)).object_id != self.object_id {
+                ctx.pool.unpin(frame);
+                return Ok(ScanCursor::finished());
+            }
             let page = SlottedRead::new(ctx.pool.page(frame));
-            for index in 0..page.slot_count() {
-                let cell = page.get(index).expect("tree pages have no tombstones");
+            while slot < page.slot_count() {
+                if taken == budget {
+                    ctx.pool.unpin(frame);
+                    return Ok(ScanCursor::at(page_no, slot));
+                }
+                let cell = page.get(slot).expect("tree pages have no tombstones");
                 out.push((cell_key(cell).to_vec(), leaf_cell_row(cell).to_vec()));
+                slot += 1;
+                taken += 1;
             }
             let next = page.next_page();
             ctx.pool.unpin(frame);
             page_no = next;
+            slot = 0;
         }
-        Ok(out)
+        Ok(ScanCursor::finished())
     }
 
     /// Range scan in key order: `(key, row)` pairs with `lower <= key <= upper`

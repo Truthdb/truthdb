@@ -391,6 +391,34 @@ impl Storage {
         self.lock().rel_scan(name)
     }
 
+    /// Test hook: a table's definition + schema, for driving a batched scan.
+    #[cfg(test)]
+    pub(crate) fn rel_def_for_test(
+        &self,
+        name: &str,
+    ) -> Result<
+        (
+            crate::relstore::catalog::TableDef,
+            crate::relstore::row::Schema,
+        ),
+        StorageError,
+    > {
+        self.lock().rel_def(name)
+    }
+
+    /// Test hook: runs `f` against a page context, taking the storage lock for
+    /// that call only — the shape a batched scan uses, one acquisition per
+    /// slice rather than one across the whole table.
+    #[cfg(test)]
+    pub(crate) fn with_rel_ctx_for_test<R>(
+        &self,
+        f: impl FnOnce(&mut crate::relstore::ctx::RelCtx<'_>) -> R,
+    ) -> R {
+        let mut guard = self.lock();
+        let mut ctx = guard.rel_ctx();
+        f(&mut ctx)
+    }
+
     pub fn rel_delete_where(
         &self,
         name: &str,
