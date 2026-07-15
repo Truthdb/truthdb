@@ -756,6 +756,291 @@ pub async fn read_raw_message<R: AsyncRead + Unpin>(reader: &mut R) -> io::Resul
     read_message(reader).await
 }
 
+/// Pins the streaming renderer against the buffered one it replaced.
+///
+/// The whole compatibility claim of streaming is that a driver cannot tell the
+/// difference, so the oracle here is the old `build_batch_tokens` — kept
+/// verbatim, independent of the code under test — and every batch shape must
+/// render to the same bytes through it and through [`BatchRender`]. The
+/// DONE_MORE deferral is what this is really for: the old code knew the last
+/// statement by its index, the new one has to wait for the next event to learn
+/// there is not one.
+#[cfg(test)]
+mod render_tests {
+    use super::*;
+    use crate::packet::{MAX_PACKET_SIZE, read_message};
+    use truthdb_core::rel::{BatchOutcome, RowSet, StatementResult};
+    use truthdb_core::relstore::types::{ColumnType, Datum};
+    use truthdb_sql::error::SqlError;
+
+    /// The pre-streaming renderer, verbatim. Do not "fix" this to agree with
+    /// the new code: it is the oracle, and its job is to disagree.
+    fn build_batch_tokens(outcome: &BatchOutcome, in_transaction: bool) -> Vec<u8> {
+        let mut out = Vec::new();
+        let has_error = outcome.error.is_some();
+        let last_index = outcome.results.len().saturating_sub(1);
+        for (index, result) in outcome.results.iter().enumerate() {
+            let more = index != last_index || has_error;
+            match result {
+                StatementResult::Rows(rowset) => {
+                    token::colmetadata(&mut out, &rowset.columns);
+                    for row in &rowset.rows {
+                        token::row(&mut out, row, &rowset.columns);
+                    }
+                    token::done(
+                        &mut out,
+                        more,
+                        false,
+                        in_transaction,
+                        Some(rowset.rows.len() as u64),
+                    );
+                }
+                StatementResult::RowsAffected(n) => {
+                    token::done(&mut out, more, false, in_transaction, Some(*n));
+                }
+                StatementResult::Done => {
+                    token::done(&mut out, more, false, in_transaction, None);
+                }
+            }
+        }
+        if let Some(error) = &outcome.error {
+            token::error(
+                &mut out,
+                error.number,
+                error.state,
+                error.level,
+                &error.message,
+            );
+            token::done(&mut out, false, true, in_transaction, None);
+        } else if outcome.results.is_empty() {
+            token::done(&mut out, false, false, in_transaction, None);
+        }
+        out
+    }
+
+    /// Renders `events` and returns the reassembled message payload.
+    async fn render(events: Vec<BatchEvent>) -> Vec<u8> {
+        let mut buf = Vec::new();
+        let mut out = MessageWriter::new(&mut buf, PKT_TABULAR_RESULT, MAX_PACKET_SIZE);
+        let mut render = BatchRender::default();
+        for event in events {
+            render.event(&mut out, event).await.expect("render");
+        }
+        out.finish().await.expect("finish");
+        let mut cursor = std::io::Cursor::new(buf);
+        read_message(&mut cursor).await.expect("message").payload
+    }
+
+    fn columns() -> Vec<ResultColumn> {
+        vec![ResultColumn {
+            name: "id".into(),
+            column_type: ColumnType::Int,
+        }]
+    }
+
+    fn rowset(n: i32) -> RowSet {
+        RowSet {
+            columns: columns(),
+            rows: (0..n).map(|i| vec![Datum::Int(i)]).collect(),
+        }
+    }
+
+    fn err() -> SqlError {
+        SqlError::new(2627, 14, 1, "Violation of PRIMARY KEY constraint.")
+    }
+
+    /// The events a rowset streams as: metadata, its rows, then its DONE.
+    fn rowset_events(set: &RowSet, in_transaction: bool) -> Vec<BatchEvent> {
+        vec![
+            BatchEvent::Columns(set.columns.clone()),
+            BatchEvent::Rows(set.rows.clone()),
+            BatchEvent::StatementDone {
+                count: Some(set.rows.len() as u64),
+                in_transaction,
+            },
+        ]
+    }
+
+    async fn assert_same(
+        events: Vec<BatchEvent>,
+        outcome: BatchOutcome,
+        in_xact: bool,
+        case: &str,
+    ) {
+        assert_eq!(
+            render(events).await,
+            build_batch_tokens(&outcome, in_xact),
+            "{case} (in_transaction={in_xact})"
+        );
+    }
+
+    #[tokio::test]
+    async fn every_batch_shape_renders_exactly_as_the_buffered_path_did() {
+        for in_xact in [false, true] {
+            // A batch with no statements at all: one final DONE.
+            assert_same(
+                vec![BatchEvent::Complete {
+                    in_transaction: in_xact,
+                }],
+                BatchOutcome {
+                    results: Vec::new(),
+                    error: None,
+                },
+                in_xact,
+                "empty batch",
+            )
+            .await;
+
+            // One rowset — including the zero-row case, whose DONE still
+            // carries a count of 0.
+            for n in [0i32, 3] {
+                let set = rowset(n);
+                let mut events = rowset_events(&set, in_xact);
+                events.push(BatchEvent::Complete {
+                    in_transaction: in_xact,
+                });
+                assert_same(
+                    events,
+                    BatchOutcome {
+                        results: vec![StatementResult::Rows(set)],
+                        error: None,
+                    },
+                    in_xact,
+                    &format!("single rowset of {n}"),
+                )
+                .await;
+            }
+
+            // A row count (DML) and a bare DONE (DDL).
+            assert_same(
+                vec![
+                    BatchEvent::StatementDone {
+                        count: Some(5),
+                        in_transaction: in_xact,
+                    },
+                    BatchEvent::Complete {
+                        in_transaction: in_xact,
+                    },
+                ],
+                BatchOutcome {
+                    results: vec![StatementResult::RowsAffected(5)],
+                    error: None,
+                },
+                in_xact,
+                "rows affected",
+            )
+            .await;
+            assert_same(
+                vec![
+                    BatchEvent::StatementDone {
+                        count: None,
+                        in_transaction: in_xact,
+                    },
+                    BatchEvent::Complete {
+                        in_transaction: in_xact,
+                    },
+                ],
+                BatchOutcome {
+                    results: vec![StatementResult::Done],
+                    error: None,
+                },
+                in_xact,
+                "ddl",
+            )
+            .await;
+
+            // Several statements: every DONE but the last says MORE.
+            let (a, b) = (rowset(2), rowset(1));
+            let mut events = rowset_events(&a, in_xact);
+            events.extend(rowset_events(&b, in_xact));
+            events.push(BatchEvent::StatementDone {
+                count: Some(9),
+                in_transaction: in_xact,
+            });
+            events.push(BatchEvent::Complete {
+                in_transaction: in_xact,
+            });
+            assert_same(
+                events,
+                BatchOutcome {
+                    results: vec![
+                        StatementResult::Rows(a.clone()),
+                        StatementResult::Rows(b),
+                        StatementResult::RowsAffected(9),
+                    ],
+                    error: None,
+                },
+                in_xact,
+                "three statements",
+            )
+            .await;
+
+            // An error after results: the last statement's DONE now says MORE,
+            // because the error's DONE is the final one.
+            let mut events = rowset_events(&a, in_xact);
+            events.push(BatchEvent::Error(err()));
+            events.push(BatchEvent::Complete {
+                in_transaction: in_xact,
+            });
+            assert_same(
+                events,
+                BatchOutcome {
+                    results: vec![StatementResult::Rows(a)],
+                    error: Some(err()),
+                },
+                in_xact,
+                "results then error",
+            )
+            .await;
+
+            // An error alone.
+            assert_same(
+                vec![
+                    BatchEvent::Error(err()),
+                    BatchEvent::Complete {
+                        in_transaction: in_xact,
+                    },
+                ],
+                BatchOutcome {
+                    results: Vec::new(),
+                    error: Some(err()),
+                },
+                in_xact,
+                "error only",
+            )
+            .await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_rowset_renders_the_same_however_its_rows_are_chunked() {
+        // The worker splits a result into EVENT_ROWS-sized events; where those
+        // splits fall must not be visible on the wire.
+        let set = rowset(10);
+        let whole = build_batch_tokens(
+            &BatchOutcome {
+                results: vec![StatementResult::Rows(set.clone())],
+                error: None,
+            },
+            false,
+        );
+        for chunk in [1usize, 3, 10, 64] {
+            let mut events = vec![BatchEvent::Columns(set.columns.clone())];
+            for part in set.rows.chunks(chunk) {
+                events.push(BatchEvent::Rows(part.to_vec()));
+            }
+            events.push(BatchEvent::StatementDone {
+                count: Some(set.rows.len() as u64),
+                in_transaction: false,
+            });
+            events.push(BatchEvent::Complete {
+                in_transaction: false,
+            });
+            assert_eq!(render(events).await, whole, "{chunk} rows per event");
+        }
+    }
+}
+
 #[cfg(test)]
 mod attention_tests {
     use super::*;
