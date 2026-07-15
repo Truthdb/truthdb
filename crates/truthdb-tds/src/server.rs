@@ -5,9 +5,10 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
+use tokio::sync::mpsc;
 use truthdb_core::engine::EngineError;
-use truthdb_core::rel::{BatchOutcome, StatementResult};
-use truthdb_core::session::{BatchReply, EngineHandle, SessionId};
+use truthdb_core::rel::ResultColumn;
+use truthdb_core::session::{BatchEvent, EngineHandle, SessionId};
 
 use crate::login::{self, parse_login7};
 use crate::packet::{
@@ -200,22 +201,26 @@ where
                 check_transaction_descriptor(headers.transaction_descriptor, tran_descriptor)?;
                 let sql = batch_sql(headers.body)?;
                 let cancel = Arc::new(AtomicBool::new(false));
-                let work = run_batch(engine, session, sql, cancel.clone());
-                match run_watching_attention(stream, cancel, work).await? {
-                    Watched::Finished(reply) => write_reply(stream, reply, packet_size).await?,
-                    Watched::Attention => write_attention_ack(stream, packet_size).await?,
-                    Watched::Disconnected => return Ok(()),
+                let events = engine.stream_batch(session, sql, cancel.clone());
+                if !stream_reply(stream, events, cancel, packet_size).await? {
+                    return Ok(());
                 }
             }
             PKT_RPC => {
                 let headers = parse_all_headers(&message.payload)?;
                 check_transaction_descriptor(headers.transaction_descriptor, tran_descriptor)?;
                 let cancel = Arc::new(AtomicBool::new(false));
-                let work = run_rpc(engine, session, headers.body, cancel.clone());
-                match run_watching_attention(stream, cancel, work).await? {
-                    Watched::Finished(reply) => write_reply(stream, reply, packet_size).await?,
-                    Watched::Attention => write_attention_ack(stream, packet_size).await?,
-                    Watched::Disconnected => return Ok(()),
+                match start_rpc(engine, session, headers.body, cancel.clone()) {
+                    Ok(events) => {
+                        if !stream_reply(stream, events, cancel, packet_size).await? {
+                            return Ok(());
+                        }
+                    }
+                    // A malformed or unsupported request never reached the
+                    // engine, so there is no stream — just the error tokens.
+                    Err(tokens) => {
+                        write_message(stream, PKT_TABULAR_RESULT, &tokens, packet_size).await?
+                    }
                 }
             }
             PKT_TRANSACTION_MANAGER => {
@@ -234,7 +239,7 @@ where
             PKT_ATTENTION => {
                 // An Attention arriving with no batch in flight (the batch it
                 // targeted already finished): just acknowledge it. Mid-batch
-                // Attentions are handled by `run_watching_attention` above.
+                // Attentions are handled by `stream_reply` above.
                 write_attention_ack(stream, packet_size).await?;
             }
             _ => return Err(protocol_err("unexpected TDS message type")),
@@ -370,36 +375,106 @@ fn authenticate(config: &TdsConfig, username: &str, password: &str) -> bool {
         .is_some_and(|expected| expected == password)
 }
 
-/// Runs `work` (a batch/RPC that respects `cancel`) while concurrently watching
-/// the connection for a TDS Attention. If one arrives, `cancel` is set so the
-/// executor aborts the statement, and the caller answers with `DONE(attention)`
-/// instead of the (discarded) result.
+/// Waits for a cancelled batch to finish, discarding the rest of its reply.
+///
+/// Every path that leaves `stream_reply` early ends the connection, and
+/// `serve_connection` closes the session on its way out — `close_session`
+/// releases *the session's* locks, and a batch that is still running still holds
+/// them and may still be writing. Releasing them under it would let the next
+/// session read rows mid-statement. So the batch is cancelled and then waited
+/// for, exactly as the buffered path this replaces did with its
+/// `let _ = (&mut work).await`.
+///
+/// The wait is bounded by the batch, not by the client: `check_cancelled` stops
+/// it at its next row, and the worker never blocks on this channel.
+async fn drain_to_end(events: &mut mpsc::UnboundedReceiver<BatchEvent>) {
+    while events.recv().await.is_some() {}
+}
+
+/// Acknowledges an Attention that arrived with no batch in flight:
+/// `DONE(attention)` and nothing else.
+async fn write_attention_ack<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    packet_size: usize,
+) -> io::Result<()> {
+    let mut out = Vec::new();
+    token::done_attention(&mut out);
+    write_message(stream, PKT_TABULAR_RESULT, &out, packet_size).await
+}
+
+/// Streams a batch's reply to the client — writing packets as rows arrive —
+/// while concurrently watching the connection for a TDS Attention. `Ok(false)`
+/// if the client disconnected mid-batch.
+///
+/// Reading and writing at once needs both halves of the stream, so it is split;
+/// nothing else touches it for the batch's duration, so the split's internal
+/// lock is never contended.
+///
+/// An Attention sets `cancel` (the executor's `check_cancelled` polls see it)
+/// and the rest of the reply is dropped rather than rendered: the client is
+/// answered with `DONE(attention)`, which per MS-TDS terminates the response.
+/// Rows already written stay written — unlike the buffered path this replaces,
+/// which discarded the whole result. Streaming means some of it has already
+/// left, and drivers discard a cancelled response's rows on seeing the
+/// attention DONE.
 ///
 /// `AsyncReadExt::read` is cancellation-safe, so bytes read into `hdr` survive a
-/// `select!` iteration that resolves to the batch instead; any partial header
-/// left when the batch wins is completed afterwards so packet framing is intact.
-async fn run_watching_attention<S, F, T>(
+/// `select!` iteration that resolves to an event instead; any partial header
+/// left when the batch ends is completed afterwards so packet framing is intact.
+async fn stream_reply<S>(
     stream: &mut S,
+    mut events: mpsc::UnboundedReceiver<BatchEvent>,
     cancel: Arc<AtomicBool>,
-    work: F,
-) -> io::Result<Watched<T>>
+    packet_size: usize,
+) -> io::Result<bool>
 where
     S: AsyncRead + AsyncWrite + Unpin,
-    F: std::future::Future<Output = T>,
 {
-    let mut work = std::pin::pin!(work);
+    let (mut rd, mut wr) = tokio::io::split(stream);
+    let mut out = MessageWriter::new(&mut wr, PKT_TABULAR_RESULT, packet_size);
+    let mut render = BatchRender::default();
     let mut hdr = [0u8; HEADER_LEN];
     let mut got = 0usize;
     let mut attention = false;
-    let result = loop {
+    loop {
         tokio::select! {
-            resp = &mut work => break resp,
-            read = stream.read(&mut hdr[got..]) => match read? {
+            event = events.recv() => match event {
+                // Render until the terminal event. After an Attention the
+                // remaining events are drained without rendering: they would
+                // otherwise put the executor's internal "query was canceled"
+                // error on the wire, which the buffered path never showed.
+                Some(event) => {
+                    if attention {
+                        continue;
+                    }
+                    if render.event(&mut out, event).await? {
+                        break;
+                    }
+                }
+                // The stream ended without a terminal event: the worker panicked,
+                // or the pool dropped the call at shutdown. Falling through here
+                // would emit a message with no DONE at all — an empty EOM packet
+                // that leaves the client waiting for a result that never
+                // terminates. The buffered path turned a dead reply channel into
+                // a clean 50000, so render exactly that, flushing any DONE still
+                // held back on the way (a stream that died between
+                // `StatementDone` and `Complete` would otherwise leave its result
+                // set unterminated).
+                None => {
+                    if !attention {
+                        render
+                            .event(&mut out, BatchEvent::Failed(EngineError::Unavailable))
+                            .await?;
+                    }
+                    break;
+                }
+            },
+            read = rd.read(&mut hdr[got..]) => match read? {
                 0 => {
-                    // Client disconnected mid-batch: abort and drain, then drop.
+                    // Client disconnected mid-batch.
                     cancel.store(true, Ordering::Relaxed);
-                    let _ = (&mut work).await;
-                    return Ok(Watched::Disconnected);
+                    drain_to_end(&mut events).await;
+                    return Ok(false);
                 }
                 n => {
                     got += n;
@@ -415,7 +490,7 @@ where
                             // than silently ignore its (undrained) body and misframe
                             // the next read. Abort the batch, then error out.
                             cancel.store(true, Ordering::Relaxed);
-                            let _ = (&mut work).await;
+                            drain_to_end(&mut events).await;
                             return Err(protocol_err(
                                 "unexpected TDS packet during a running batch",
                             ));
@@ -424,182 +499,201 @@ where
                 }
             },
         }
-    };
+    }
     // The batch finished before a header fully arrived: complete it so the next
     // read stays framed (and still honour a late Attention).
+    let mut late_attention = false;
     if got > 0 {
-        stream.read_exact(&mut hdr[got..]).await?;
+        rd.read_exact(&mut hdr[got..]).await?;
         if hdr[0] == PKT_ATTENTION {
-            attention = true;
+            late_attention = true;
         } else {
             return Err(protocol_err("unexpected TDS packet during a running batch"));
         }
     }
     if attention {
-        Ok(Watched::Attention)
-    } else {
-        Ok(Watched::Finished(result))
+        // Mid-batch: everything after the Attention was drained unrendered, so
+        // this is the message's only final DONE.
+        let mut done = Vec::new();
+        token::done_attention(&mut done);
+        out.write(&done).await?;
     }
+    out.finish().await?;
+    if late_attention && !attention {
+        // The Attention landed after the batch had already rendered its own
+        // final DONE, so the acknowledgement cannot go in that message: a client
+        // stops reading at the first DONE with DONE_MORE clear and never parses
+        // a second one behind it — go-mssqldb's `processSingleResponse` returns
+        // there, `readCancelConfirmation` then reports no ack, and it blocks
+        // forever in `io.ReadFull` waiting for one, with no connection timeout
+        // by default. Its own source comment describes this race and expects a
+        // *separate* response.
+        //
+        // So the ack gets its own message, which is what this file already does
+        // for an Attention that arrives with no batch in flight, and what the
+        // buffered path achieved by discarding the result and sending the ack
+        // alone. Streaming cannot take the result back, but it can still put the
+        // ack where the client is looking for it.
+        write_attention_ack(&mut wr, packet_size).await?;
+    }
+    Ok(true)
 }
 
-/// How a batch ended, from the connection's point of view.
-enum Watched<T> {
-    /// It ran to completion; nothing interrupted it.
-    Finished(T),
-    /// A TDS Attention arrived: it was cancelled and its result discarded.
-    Attention,
-    /// The client disconnected mid-batch.
-    Disconnected,
-}
-
-/// Acknowledges a cancelled batch: `DONE(attention)` and nothing else.
-async fn write_attention_ack<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    packet_size: usize,
-) -> io::Result<()> {
-    let mut out = Vec::new();
-    token::done_attention(&mut out);
-    write_message(stream, PKT_TABULAR_RESULT, &out, packet_size).await
-}
-
-/// A reply ready to go to the client: a batch's outcome, or ready-made tokens
-/// for a request that never reached the engine (a malformed or unsupported
-/// RPC), which carry error numbers an `EngineError` cannot express.
-enum Reply {
-    Batch(Result<BatchReply, EngineError>),
-    Tokens(Vec<u8>),
-}
-
-/// Writes a reply as one TDS message, rendering tokens straight into packets as
-/// they are produced.
+/// Starts an RPC request on the engine, returning its reply stream.
 ///
-/// The reply is still a whole `BatchOutcome` — the executor materializes it —
-/// but rendering no longer doubles that: rather than encoding every token into
-/// one `Vec<u8>` and chunking it afterwards, each packet goes to the socket as
-/// it fills, so rendering costs one packet's worth of bytes however many rows
-/// the result carries.
-async fn write_reply<S: AsyncWrite + Unpin>(
-    stream: &mut S,
-    reply: Reply,
-    packet_size: usize,
-) -> io::Result<()> {
-    let mut out = MessageWriter::new(stream, PKT_TABULAR_RESULT, packet_size);
-    let mut buf = Vec::new();
-    match reply {
-        Reply::Batch(Ok(reply)) => {
-            write_batch_tokens(&mut out, &mut buf, &reply.outcome, reply.in_transaction).await?
-        }
-        Reply::Batch(Err(err)) => {
-            // A genuine engine/storage failure (not a SQL-level error).
-            token::error(&mut buf, 50000, 1, 16, &err.to_string());
-            token::done(&mut buf, false, true, false, None);
-            out.write(&buf).await?;
-        }
-        Reply::Tokens(tokens) => out.write(&tokens).await?,
-    }
-    out.finish().await
-}
-
-/// Writes the COLMETADATA/ROW/DONE/ERROR token stream for a batch outcome.
-/// `in_transaction` sets `DONE_INXACT` so the client knows the connection is
-/// still inside a transaction.
-///
-/// `buf` is scratch each token is encoded into before being appended to the
-/// message. It is handed over and cleared once a packet's worth has built up,
-/// so a million-row result never assembles into one buffer.
-async fn write_batch_tokens<W: AsyncWrite + Unpin>(
-    out: &mut MessageWriter<'_, W>,
-    buf: &mut Vec<u8>,
-    outcome: &BatchOutcome,
-    in_transaction: bool,
-) -> io::Result<()> {
-    let has_error = outcome.error.is_some();
-    let last_index = outcome.results.len().saturating_sub(1);
-    for (index, result) in outcome.results.iter().enumerate() {
-        // A DONE is final only when it is the last token group of the whole
-        // response (no more results and no trailing error).
-        let more = index != last_index || has_error;
-        buf.clear();
-        match result {
-            StatementResult::Rows(rowset) => {
-                token::colmetadata(buf, &rowset.columns);
-                for row in &rowset.rows {
-                    token::row(buf, row, &rowset.columns);
-                    if buf.len() >= ROW_FLUSH_BYTES {
-                        out.write(buf).await?;
-                        buf.clear();
-                    }
-                }
-                token::done(
-                    buf,
-                    more,
-                    false,
-                    in_transaction,
-                    Some(rowset.rows.len() as u64),
-                );
-            }
-            StatementResult::RowsAffected(n) => {
-                token::done(buf, more, false, in_transaction, Some(*n));
-            }
-            StatementResult::Done => {
-                token::done(buf, more, false, in_transaction, None);
-            }
-        }
-        out.write(buf).await?;
-    }
-    buf.clear();
-    if let Some(error) = &outcome.error {
-        token::error(buf, error.number, error.state, error.level, &error.message);
-        token::done(buf, false, true, in_transaction, None);
-    } else if outcome.results.is_empty() {
-        // Empty batch (e.g. only comments): a single final DONE.
-        token::done(buf, false, false, in_transaction, None);
-    }
-    out.write(buf).await
-}
-
-/// Runs a SQL batch through the engine actor. The batch is cancellable: setting
-/// `cancel` (on a TDS Attention) aborts it.
-async fn run_batch(
-    engine: &EngineHandle,
-    session: SessionId,
-    sql: String,
-    cancel: Arc<AtomicBool>,
-) -> Reply {
-    Reply::Batch(engine.run_batch_cancellable(session, sql, cancel).await)
-}
-
-/// Handles an RPC request. Supports `sp_executesql` — decode its statement and
-/// typed parameters, run them, and reply exactly as a batch would. Any other
-/// procedure, or a malformed request, is answered with an error token plus a
-/// final DONE so the connection stays usable.
-async fn run_rpc(
+/// Supports `sp_executesql` — decode its statement and typed parameters and run
+/// them, streaming exactly what a batch would. Any other procedure, or a
+/// malformed request, never reaches the engine and comes back as ready-made
+/// error tokens (`Err`) plus a final DONE, so the connection stays usable.
+fn start_rpc(
     engine: &EngineHandle,
     session: SessionId,
     body: &[u8],
     cancel: Arc<AtomicBool>,
-) -> Reply {
-    let request = match rpc::parse_rpc_request(body) {
-        Ok(request) => request,
-        Err(err) => return Reply::Tokens(rpc_error(&format!("malformed RPC request: {err}"))),
-    };
+) -> Result<mpsc::UnboundedReceiver<BatchEvent>, Vec<u8>> {
+    let request = rpc::parse_rpc_request(body)
+        .map_err(|err| rpc_error(&format!("malformed RPC request: {err}")))?;
     match request.proc {
         RpcProc::SpExecuteSql => {
-            let (sql, params) = match rpc::split_sp_executesql(request.params) {
-                Ok(split) => split,
-                Err(err) => return Reply::Tokens(rpc_error(&err.to_string())),
-            };
-            Reply::Batch(
-                engine
-                    .run_rpc_cancellable(session, sql, params, cancel)
-                    .await,
-            )
+            let (sql, params) = rpc::split_sp_executesql(request.params)
+                .map_err(|err| rpc_error(&err.to_string()))?;
+            Ok(engine.stream_rpc(session, sql, params, cancel))
         }
         // Error 2812 is SQL Server's "Could not find stored procedure".
-        RpcProc::Other(name) => Reply::Tokens(rpc_error_num(
+        RpcProc::Other(name) => Err(rpc_error_num(
             2812,
             &format!("Could not find stored procedure '{name}'."),
         )),
+    }
+}
+
+/// Renders a batch's [`BatchEvent`]s into a TDS token stream as they arrive.
+///
+/// The only state it carries is the current result set's column metadata (ROW
+/// encoding needs it) and one deferred DONE, so a response of any size renders
+/// in constant memory.
+#[derive(Default)]
+struct BatchRender {
+    /// Columns of the result set the last COLMETADATA opened.
+    columns: Vec<ResultColumn>,
+    /// A finished statement's DONE, held back until the next event says whether
+    /// anything follows it: `DONE_MORE` means "not the last token group of this
+    /// response", which the statement itself cannot know. The buffered renderer
+    /// knew the last statement by its index; a stream has to wait and see.
+    pending: Option<PendingDone>,
+    /// Set once a batch-stopping ERROR has been written, so the final DONE
+    /// carries `DONE_ERROR`.
+    errored: bool,
+    /// Scratch for encoding tokens, reused so a row costs no allocation here.
+    buf: Vec<u8>,
+}
+
+/// A statement's DONE, minus the `more` bit that only the next event settles.
+struct PendingDone {
+    count: Option<u64>,
+    in_transaction: bool,
+}
+
+impl BatchRender {
+    /// Renders one event. Returns whether it was the batch's terminal event.
+    async fn event<W: AsyncWrite + Unpin>(
+        &mut self,
+        out: &mut MessageWriter<'_, W>,
+        event: BatchEvent,
+    ) -> io::Result<bool> {
+        match event {
+            BatchEvent::Columns(columns) => {
+                self.flush_pending(out, true).await?;
+                self.columns = columns;
+                self.buf.clear();
+                token::colmetadata(&mut self.buf, &self.columns);
+                out.write(&self.buf).await?;
+            }
+            BatchEvent::Rows(rows) => {
+                self.buf.clear();
+                for row in &rows {
+                    token::row(&mut self.buf, row, &self.columns);
+                    if self.buf.len() >= ROW_FLUSH_BYTES {
+                        out.write(&self.buf).await?;
+                        self.buf.clear();
+                    }
+                }
+                out.write(&self.buf).await?;
+            }
+            BatchEvent::StatementDone {
+                count,
+                in_transaction,
+            } => {
+                self.flush_pending(out, true).await?;
+                self.pending = Some(PendingDone {
+                    count,
+                    in_transaction,
+                });
+            }
+            BatchEvent::Error(error) => {
+                self.flush_pending(out, true).await?;
+                self.buf.clear();
+                token::error(
+                    &mut self.buf,
+                    error.number,
+                    error.state,
+                    error.level,
+                    &error.message,
+                );
+                out.write(&self.buf).await?;
+                self.errored = true;
+            }
+            BatchEvent::Complete { in_transaction } => {
+                if self.errored {
+                    // The error's own final DONE, after the last statement's.
+                    self.flush_pending(out, true).await?;
+                    self.done(out, false, true, in_transaction, None).await?;
+                } else if self.pending.is_some() {
+                    self.flush_pending(out, false).await?;
+                } else {
+                    // A batch with no statements at all (e.g. only comments):
+                    // one final DONE.
+                    self.done(out, false, false, in_transaction, None).await?;
+                }
+                return Ok(true);
+            }
+            BatchEvent::Failed(err) => {
+                // A genuine engine/storage failure, not a SQL-level error.
+                self.flush_pending(out, true).await?;
+                self.buf.clear();
+                token::error(&mut self.buf, 50000, 1, 16, &err.to_string());
+                out.write(&self.buf).await?;
+                self.done(out, false, true, false, None).await?;
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
+    /// Writes the deferred DONE, if any, now that `more` is known.
+    async fn flush_pending<W: AsyncWrite + Unpin>(
+        &mut self,
+        out: &mut MessageWriter<'_, W>,
+        more: bool,
+    ) -> io::Result<()> {
+        if let Some(done) = self.pending.take() {
+            self.done(out, more, false, done.in_transaction, done.count)
+                .await?;
+        }
+        Ok(())
+    }
+
+    async fn done<W: AsyncWrite + Unpin>(
+        &mut self,
+        out: &mut MessageWriter<'_, W>,
+        more: bool,
+        error: bool,
+        in_transaction: bool,
+        count: Option<u64>,
+    ) -> io::Result<()> {
+        self.buf.clear();
+        token::done(&mut self.buf, more, error, in_transaction, count);
+        out.write(&self.buf).await
     }
 }
 
@@ -747,7 +841,7 @@ pub async fn read_raw_message<R: AsyncRead + Unpin>(reader: &mut R) -> io::Resul
 mod render_tests {
     use super::*;
     use crate::packet::{MIN_PACKET_SIZE, read_message};
-    use truthdb_core::rel::{ResultColumn, RowSet};
+    use truthdb_core::rel::{BatchOutcome, ResultColumn, RowSet, StatementResult};
     use truthdb_core::relstore::types::{ColumnType, Datum};
     use truthdb_sql::error::SqlError;
 
@@ -797,23 +891,116 @@ mod render_tests {
     }
 
     /// Renders through the real write path and reassembles the message.
+    /// Renders `outcome` through the real path: as the event stream a worker
+    /// would produce, drained by `stream_reply` exactly as a connection drains
+    /// it. Nothing is short-circuited — the events go through a real channel and
+    /// the deferred DONE has to settle `DONE_MORE` by lookahead, which is the
+    /// part most likely to disagree with the oracle.
     async fn rendered(outcome: &BatchOutcome, in_xact: bool, packet_size: usize) -> Vec<u8> {
-        let mut wire = Vec::new();
-        write_reply(
+        let events = events_for(outcome, in_xact);
+        let mut wire = Duplex {
+            read: std::io::Cursor::new(Vec::new()),
+            written: Vec::new(),
+        };
+        let kept = stream_reply(
             &mut wire,
-            Reply::Batch(Ok(BatchReply {
-                outcome: BatchOutcome {
-                    results: outcome.results.clone(),
-                    error: outcome.error.clone(),
-                },
-                in_transaction: in_xact,
-            })),
+            events,
+            Arc::new(AtomicBool::new(false)),
             packet_size,
         )
         .await
-        .expect("write");
-        let mut cursor = std::io::Cursor::new(wire);
+        .expect("stream");
+        assert!(kept, "the client did not disconnect");
+        let mut cursor = std::io::Cursor::new(wire.written);
         read_message(&mut cursor).await.expect("message").payload
+    }
+
+    /// The events a worker's `send_outcome` would produce for `outcome`, in a
+    /// closed channel ready to drain.
+    fn events_for(outcome: &BatchOutcome, in_xact: bool) -> mpsc::UnboundedReceiver<BatchEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for result in &outcome.results {
+            match result {
+                StatementResult::Rows(rowset) => {
+                    tx.send(BatchEvent::Columns(rowset.columns.clone()))
+                        .unwrap();
+                    // Chunked exactly as the sink chunks, so a boundary landing
+                    // mid-result is exercised here too.
+                    for chunk in rowset.rows.chunks(256) {
+                        tx.send(BatchEvent::Rows(chunk.to_vec())).unwrap();
+                    }
+                    tx.send(BatchEvent::StatementDone {
+                        count: Some(rowset.rows.len() as u64),
+                        in_transaction: in_xact,
+                    })
+                    .unwrap();
+                }
+                StatementResult::RowsAffected(n) => tx
+                    .send(BatchEvent::StatementDone {
+                        count: Some(*n),
+                        in_transaction: in_xact,
+                    })
+                    .unwrap(),
+                StatementResult::Done => tx
+                    .send(BatchEvent::StatementDone {
+                        count: None,
+                        in_transaction: in_xact,
+                    })
+                    .unwrap(),
+            }
+        }
+        if let Some(error) = &outcome.error {
+            tx.send(BatchEvent::Error(error.clone())).unwrap();
+        }
+        tx.send(BatchEvent::Complete {
+            in_transaction: in_xact,
+        })
+        .unwrap();
+        rx
+    }
+
+    /// A stream whose read half never yields (no Attention ever arrives) and
+    /// whose write half collects the bytes. `stream_reply` splits it, so it
+    /// needs both halves on one object.
+    struct Duplex {
+        read: std::io::Cursor<Vec<u8>>,
+        written: Vec<u8>,
+    }
+
+    impl AsyncRead for Duplex {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            // Never ready: a client that sends nothing during its batch. Not
+            // `Ok(())` with zero bytes, which `stream_reply` reads as a
+            // disconnect.
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for Duplex {
+        fn poll_write(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            self.written.extend_from_slice(buf);
+            std::task::Poll::Ready(Ok(buf.len()))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
     }
 
     fn columns() -> Vec<ResultColumn> {
@@ -904,17 +1091,20 @@ mod render_tests {
         // than accumulating into one buffer. A 5000-row result at the minimum
         // packet size is hundreds of packets and exactly one EOM.
         let batch = outcome(vec![StatementResult::Rows(rowset(5000))], None);
-        let mut wire = Vec::new();
-        write_reply(
-            &mut wire,
-            Reply::Batch(Ok(BatchReply {
-                outcome: batch,
-                in_transaction: false,
-            })),
+        let events = events_for(&batch, false);
+        let mut duplex = Duplex {
+            read: std::io::Cursor::new(Vec::new()),
+            written: Vec::new(),
+        };
+        stream_reply(
+            &mut duplex,
+            events,
+            Arc::new(AtomicBool::new(false)),
             MIN_PACKET_SIZE,
         )
         .await
-        .expect("write");
+        .expect("stream");
+        let wire = duplex.written;
         let mut packets = 0;
         let mut eom = 0;
         let mut offset = 0;
@@ -942,77 +1132,243 @@ mod render_tests {
 mod attention_tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+    use truthdb_core::rel::ResultColumn;
+    use truthdb_core::relstore::types::{ColumnType, Datum};
 
     /// An Attention header-only packet.
     const ATTN: [u8; 8] = [PKT_ATTENTION, 0x01, 0x00, 0x08, 0, 0, 0, 0];
 
-    #[tokio::test]
-    async fn attention_during_batch_cancels_and_acks() {
-        let (mut client, mut server) = tokio::io::duplex(64);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let cwork = cancel.clone();
-        // A "batch" that runs until its cancel flag is set (like the executor
-        // polling `check_cancelled`), then would return a normal result.
-        let work = async move {
-            loop {
-                if cwork.load(Ordering::Relaxed) {
-                    return b"RESULT".to_vec();
-                }
+    fn columns() -> Vec<ResultColumn> {
+        vec![ResultColumn {
+            name: "id".to_string(),
+            column_type: ColumnType::Int,
+        }]
+    }
+
+    /// A batch that produces nothing until its cancel flag is set — the
+    /// executor polling `check_cancelled` before its first row. Emitting
+    /// nothing up front is what makes the test deterministic: `select!` picks
+    /// randomly among ready branches, so a batch with rows waiting would
+    /// sometimes render them before the Attention and sometimes not.
+    fn cancellable_batch(cancel: Arc<AtomicBool>) -> mpsc::UnboundedReceiver<BatchEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            while !cancel.load(Ordering::Relaxed) {
                 tokio::task::yield_now().await;
             }
-        };
+            // A cancelled batch reports the executor's internal cancel error,
+            // which the renderer must not put on the wire.
+            tx.send(BatchEvent::Error(
+                truthdb_sql::error::SqlError::message_only(3617, "The query was canceled."),
+            ))
+            .ok();
+            tx.send(BatchEvent::Complete {
+                in_transaction: false,
+            })
+            .ok();
+        });
+        rx
+    }
+
+    #[tokio::test]
+    async fn attention_during_batch_cancels_and_acks() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut server = server;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let events = cancellable_batch(cancel.clone());
         // The client sends an Attention (header-only packet) during the batch.
         client.write_all(&ATTN).await.expect("send attention");
-        let watched = run_watching_attention(&mut server, cancel.clone(), work)
+        let kept = stream_reply(&mut server, events, cancel.clone(), 4096)
             .await
             .expect("io ok");
+        assert!(kept, "the client is still connected");
         assert!(
             cancel.load(Ordering::Relaxed),
             "the Attention set the cancel flag"
         );
-        assert!(
-            matches!(watched, Watched::Attention),
-            "the result is discarded for a DONE(attention)"
-        );
+
+        let mut cursor = std::io::Cursor::new(read_client_bytes(&mut client).await);
+        let payload = crate::packet::read_message(&mut cursor)
+            .await
+            .expect("message")
+            .payload;
+        // DONE(attention) and nothing else. The executor's internal 3617 is
+        // never rendered — the buffered path did not show it, and a client must
+        // not see it either — even though the batch reported it.
+        let mut expected = Vec::new();
+        token::done_attention(&mut expected);
+        assert_eq!(payload, expected);
     }
 
     #[tokio::test]
-    async fn no_attention_returns_the_batch_result() {
-        let (_client, mut server) = tokio::io::duplex(64);
+    async fn no_attention_renders_the_batch_normally() {
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut server = server;
         let cancel = Arc::new(AtomicBool::new(false));
-        // The batch completes on its own; no Attention is ever sent.
-        let work = async move { b"RESULT".to_vec() };
-        let watched = run_watching_attention(&mut server, cancel.clone(), work)
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(BatchEvent::Columns(columns())).unwrap();
+        tx.send(BatchEvent::Rows(vec![vec![Datum::Int(1)]]))
+            .unwrap();
+        tx.send(BatchEvent::StatementDone {
+            count: Some(1),
+            in_transaction: false,
+        })
+        .unwrap();
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        let kept = stream_reply(&mut server, rx, cancel.clone(), 4096)
             .await
             .expect("io ok");
+        assert!(kept);
         assert!(!cancel.load(Ordering::Relaxed));
-        match watched {
-            Watched::Finished(out) => assert_eq!(out, b"RESULT".to_vec()),
-            _ => panic!("no attention -> the real result"),
-        }
+        let mut cursor = std::io::Cursor::new(read_client_bytes(&mut client).await);
+        let payload = crate::packet::read_message(&mut cursor)
+            .await
+            .expect("message")
+            .payload;
+        // One final DONE carrying the row count, and no attention bit.
+        let mut expected = Vec::new();
+        token::colmetadata(&mut expected, &columns());
+        token::row(&mut expected, &[Datum::Int(1)], &columns());
+        token::done(&mut expected, false, false, false, Some(1));
+        assert_eq!(payload, expected);
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_ends_without_a_terminal_event_is_a_clean_error() {
+        // The worker panicked, or the pool dropped the call at shutdown. Falling
+        // through here would emit a message with NO DONE at all, leaving the
+        // client waiting on a result that never terminates. The buffered path
+        // turned a dead reply channel into a clean 50000.
+        let (mut client, server) = tokio::io::duplex(4096);
+        let mut server = server;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(BatchEvent::Columns(columns())).unwrap();
+        tx.send(BatchEvent::Rows(vec![vec![Datum::Int(1)]]))
+            .unwrap();
+        // A DONE is still deferred here — it must not be lost either.
+        tx.send(BatchEvent::StatementDone {
+            count: Some(1),
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        let kept = stream_reply(&mut server, rx, Arc::new(AtomicBool::new(false)), 4096)
+            .await
+            .expect("io ok");
+        assert!(kept);
+        let mut cursor = std::io::Cursor::new(read_client_bytes(&mut client).await);
+        let payload = crate::packet::read_message(&mut cursor)
+            .await
+            .expect("message")
+            .payload;
+        // The deferred DONE is flushed with DONE_MORE (something does follow
+        // it), then the error and its final DONE_ERROR. Without the fix this
+        // message has no DONE at all.
+        let mut expected = Vec::new();
+        token::colmetadata(&mut expected, &columns());
+        token::row(&mut expected, &[Datum::Int(1)], &columns());
+        token::done(&mut expected, true, false, false, Some(1));
+        token::error(
+            &mut expected,
+            50000,
+            1,
+            16,
+            &EngineError::Unavailable.to_string(),
+        );
+        token::done(&mut expected, false, true, false, None);
+        assert_eq!(payload, expected);
+    }
+
+    #[tokio::test]
+    async fn an_early_exit_waits_for_the_batch_it_cancelled_to_finish() {
+        // `serve_connection` closes the session the moment this returns, and
+        // `close_session` releases *the session's* locks. A batch that is still
+        // running still holds them and may still be writing, so returning early
+        // hands its locks to the next session mid-statement — a dirty read the
+        // engine has no defence against, since nothing can abort a running
+        // batch. The buffered path awaited the batch here for this reason.
+        let (client, server) = tokio::io::duplex(4096);
+        let mut server = server;
+        drop(client);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let batch_cancel = cancel.clone();
+        let batch_finished = finished.clone();
+        tokio::spawn(async move {
+            // The batch notices its cancel flag, then still has work to do
+            // before it returns and its locks are released.
+            while !batch_cancel.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            batch_finished.store(true, Ordering::Relaxed);
+            tx.send(BatchEvent::Complete {
+                in_transaction: false,
+            })
+            .ok();
+            // `tx` drops here: the sink dying is what says the batch is over.
+        });
+
+        let kept = stream_reply(&mut server, rx, cancel.clone(), 4096)
+            .await
+            .expect("io ok");
+        assert!(!kept, "the client disconnected");
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "a vanished client cancels the batch it left running"
+        );
+        assert!(
+            finished.load(Ordering::Relaxed),
+            "returned while the batch was still running: the caller would now \
+             release its locks out from under it"
+        );
     }
 
     #[tokio::test]
     async fn a_disconnect_mid_batch_is_reported_as_such() {
-        let (client, mut server) = tokio::io::duplex(64);
+        let (client, server) = tokio::io::duplex(4096);
+        let mut server = server;
         drop(client);
         let cancel = Arc::new(AtomicBool::new(false));
-        let cwork = cancel.clone();
-        let work = async move {
-            loop {
-                if cwork.load(Ordering::Relaxed) {
-                    return b"RESULT".to_vec();
-                }
-                tokio::task::yield_now().await;
-            }
-        };
-        let watched = run_watching_attention(&mut server, cancel.clone(), work)
+        let events = cancellable_batch(cancel.clone());
+        let kept = stream_reply(&mut server, events, cancel.clone(), 4096)
             .await
             .expect("io ok");
-        assert!(matches!(watched, Watched::Disconnected));
+        assert!(!kept, "the client disconnected");
         assert!(
             cancel.load(Ordering::Relaxed),
             "a vanished client still cancels the batch it left running"
         );
+    }
+
+    /// Everything the server has written so far.
+    async fn read_client_bytes(client: &mut tokio::io::DuplexStream) -> Vec<u8> {
+        use tokio::io::AsyncReadExt;
+        let mut buf = Vec::new();
+        // The server half is still open, so read what is buffered and stop.
+        loop {
+            let mut chunk = [0u8; 4096];
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                client.read(&mut chunk),
+            )
+            .await
+            {
+                Ok(Ok(0)) | Err(_) => break,
+                Ok(Ok(n)) => buf.extend_from_slice(&chunk[..n]),
+                Ok(Err(_)) => break,
+            }
+        }
+        buf
     }
 }
