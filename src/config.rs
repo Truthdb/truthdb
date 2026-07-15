@@ -43,6 +43,22 @@ pub struct TdsConfig {
     /// PEM private key path (paired with `tls_cert`).
     #[serde(default)]
     pub tls_key: Option<String>,
+
+    /// Encryption policy: `off` never encrypts, `optional` (the default)
+    /// encrypts when the client asks, `required` refuses clients that will not
+    /// encrypt. `required` needs `tls_cert`/`tls_key`.
+    #[serde(default)]
+    pub encryption: Encryption,
+}
+
+/// `[tds] encryption = "off" | "optional" | "required"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Encryption {
+    Off,
+    #[default]
+    Optional,
+    Required,
 }
 
 impl Default for TdsConfig {
@@ -55,6 +71,7 @@ impl Default for TdsConfig {
             auth: HashMap::new(),
             tls_cert: None,
             tls_key: None,
+            encryption: Encryption::default(),
         }
     }
 }

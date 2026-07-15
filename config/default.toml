@@ -25,5 +25,13 @@ snapshot_wal_threshold = 0.7
 # port = 1433
 # database = "truthdb"
 #
-# [tds.auth]           # username = password (plaintext; TLS arrives in Stage 9)
+#
+# encryption: "off" never encrypts; "optional" (default) encrypts when the
+# client asks; "required" refuses clients that will not encrypt, and needs
+# tls_cert/tls_key.
+# encryption = "optional"
+# tls_cert = "/etc/truthdb/tls.crt"
+# tls_key = "/etc/truthdb/tls.key"
+#
+# [tds.auth]           # username = password (send it over TLS: see encryption)
 # sa = "change-me"
