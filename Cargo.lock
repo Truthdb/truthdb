@@ -1240,6 +1240,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "truthdb-core",
+ "truthdb-sql",
 ]
 
 [[package]]
