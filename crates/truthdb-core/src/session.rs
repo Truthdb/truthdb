@@ -181,13 +181,18 @@ impl BatchSink {
         if !self.send(BatchEvent::Columns(rowset.columns)) {
             return false;
         }
-        let mut rows = rowset.rows;
-        while !rows.is_empty() {
-            let rest = rows.split_off(rows.len().min(EVENT_ROWS));
-            if !self.send(BatchEvent::Rows(rows)) {
+        // Taken from the front through the iterator, not `split_off`: splitting
+        // hands back the *remainder* each time, so every chunk memmoves what is
+        // left and a large result costs O(n²). This moves each row once.
+        let mut rows = rowset.rows.into_iter();
+        loop {
+            let chunk: Vec<Vec<Datum>> = rows.by_ref().take(EVENT_ROWS).collect();
+            if chunk.is_empty() {
+                break;
+            }
+            if !self.send(BatchEvent::Rows(chunk)) {
                 return false;
             }
-            rows = rest;
         }
         self.send(BatchEvent::StatementDone {
             count: Some(count),

@@ -375,6 +375,22 @@ fn authenticate(config: &TdsConfig, username: &str, password: &str) -> bool {
         .is_some_and(|expected| expected == password)
 }
 
+/// Waits for a cancelled batch to finish, discarding the rest of its reply.
+///
+/// Every path that leaves `stream_reply` early ends the connection, and
+/// `serve_connection` closes the session on its way out — `close_session`
+/// releases *the session's* locks, and a batch that is still running still holds
+/// them and may still be writing. Releasing them under it would let the next
+/// session read rows mid-statement. So the batch is cancelled and then waited
+/// for, exactly as the buffered path this replaces did with its
+/// `let _ = (&mut work).await`.
+///
+/// The wait is bounded by the batch, not by the client: `check_cancelled` stops
+/// it at its next row, and the worker never blocks on this channel.
+async fn drain_to_end(events: &mut mpsc::UnboundedReceiver<BatchEvent>) {
+    while events.recv().await.is_some() {}
+}
+
 /// Acknowledges an Attention that arrived with no batch in flight:
 /// `DONE(attention)` and nothing else.
 async fn write_attention_ack<S: AsyncWrite + Unpin>(
@@ -455,10 +471,9 @@ where
             },
             read = rd.read(&mut hdr[got..]) => match read? {
                 0 => {
-                    // Client disconnected mid-batch: abort, then drop the reply.
-                    // Dropping the receiver also stops the worker producing rows
-                    // nobody will read.
+                    // Client disconnected mid-batch.
                     cancel.store(true, Ordering::Relaxed);
+                    drain_to_end(&mut events).await;
                     return Ok(false);
                 }
                 n => {
@@ -475,6 +490,7 @@ where
                             // than silently ignore its (undrained) body and misframe
                             // the next read. Abort the batch, then error out.
                             cancel.store(true, Ordering::Relaxed);
+                            drain_to_end(&mut events).await;
                             return Err(protocol_err(
                                 "unexpected TDS packet during a running batch",
                             ));
@@ -486,27 +502,40 @@ where
     }
     // The batch finished before a header fully arrived: complete it so the next
     // read stays framed (and still honour a late Attention).
+    let mut late_attention = false;
     if got > 0 {
         rd.read_exact(&mut hdr[got..]).await?;
         if hdr[0] == PKT_ATTENTION {
-            attention = true;
+            late_attention = true;
         } else {
             return Err(protocol_err("unexpected TDS packet during a running batch"));
         }
     }
     if attention {
-        // An Attention that lands after the batch has already rendered its final
-        // DONE leaves this message with two: the batch's, and this
-        // acknowledgement. That is deliberate, and it is the only option left.
-        // The client will not proceed until it is acknowledged (MS-TDS 2.2.1.6),
-        // and the response it is being acknowledged for is already on the wire —
-        // streaming cannot take it back the way the buffered path did, which
-        // discarded the result and sent this alone.
+        // Mid-batch: everything after the Attention was drained unrendered, so
+        // this is the message's only final DONE.
         let mut done = Vec::new();
         token::done_attention(&mut done);
         out.write(&done).await?;
     }
     out.finish().await?;
+    if late_attention && !attention {
+        // The Attention landed after the batch had already rendered its own
+        // final DONE, so the acknowledgement cannot go in that message: a client
+        // stops reading at the first DONE with DONE_MORE clear and never parses
+        // a second one behind it — go-mssqldb's `processSingleResponse` returns
+        // there, `readCancelConfirmation` then reports no ack, and it blocks
+        // forever in `io.ReadFull` waiting for one, with no connection timeout
+        // by default. Its own source comment describes this race and expects a
+        // *separate* response.
+        //
+        // So the ack gets its own message, which is what this file already does
+        // for an Attention that arrives with no batch in flight, and what the
+        // buffered path achieved by discarding the result and sending the ack
+        // alone. Streaming cannot take the result back, but it can still put the
+        // ack where the client is looking for it.
+        write_attention_ack(&mut wr, packet_size).await?;
+    }
     Ok(true)
 }
 
@@ -1254,6 +1283,55 @@ mod attention_tests {
         );
         token::done(&mut expected, false, true, false, None);
         assert_eq!(payload, expected);
+    }
+
+    #[tokio::test]
+    async fn an_early_exit_waits_for_the_batch_it_cancelled_to_finish() {
+        // `serve_connection` closes the session the moment this returns, and
+        // `close_session` releases *the session's* locks. A batch that is still
+        // running still holds them and may still be writing, so returning early
+        // hands its locks to the next session mid-statement — a dirty read the
+        // engine has no defence against, since nothing can abort a running
+        // batch. The buffered path awaited the batch here for this reason.
+        let (client, server) = tokio::io::duplex(4096);
+        let mut server = server;
+        drop(client);
+        let cancel = Arc::new(AtomicBool::new(false));
+        let finished = Arc::new(AtomicBool::new(false));
+
+        let (tx, rx) = mpsc::unbounded_channel();
+        let batch_cancel = cancel.clone();
+        let batch_finished = finished.clone();
+        tokio::spawn(async move {
+            // The batch notices its cancel flag, then still has work to do
+            // before it returns and its locks are released.
+            while !batch_cancel.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+            for _ in 0..50 {
+                tokio::task::yield_now().await;
+            }
+            batch_finished.store(true, Ordering::Relaxed);
+            tx.send(BatchEvent::Complete {
+                in_transaction: false,
+            })
+            .ok();
+            // `tx` drops here: the sink dying is what says the batch is over.
+        });
+
+        let kept = stream_reply(&mut server, rx, cancel.clone(), 4096)
+            .await
+            .expect("io ok");
+        assert!(!kept, "the client disconnected");
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "a vanished client cancels the batch it left running"
+        );
+        assert!(
+            finished.load(Ordering::Relaxed),
+            "returned while the batch was still running: the caller would now \
+             release its locks out from under it"
+        );
     }
 
     #[tokio::test]
