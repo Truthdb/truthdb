@@ -61,6 +61,10 @@ fn ucs2le(s: &str) -> Vec<u8> {
 /// A minimal client that speaks just enough TDS to test the server.
 struct Client {
     stream: DuplexStream,
+    /// The connection's current transaction descriptor, learned from ENVCHANGE
+    /// 8 (begin) and cleared by 9/10 (commit/rollback). Real drivers echo this
+    /// in every request's ALL_HEADERS, and the server validates it.
+    tran_descriptor: u64,
 }
 
 impl Client {
@@ -79,6 +83,31 @@ impl Client {
         self.stream.write_all(&header).await.unwrap();
         self.stream.write_all(payload).await.unwrap();
         self.stream.flush().await.unwrap();
+    }
+
+    /// Reads a message, or None if the server closed the connection (which is
+    /// how a protocol error surfaces to the client).
+    async fn try_read_message(&mut self) -> Option<(u8, Vec<u8>)> {
+        let mut header = [0u8; 8];
+        self.stream.read_exact(&mut header).await.ok()?;
+        let kind = header[0];
+        let mut payload = self.read_body(&header).await;
+        let mut status = header[1];
+        while status & 0x01 == 0 {
+            self.stream.read_exact(&mut header).await.ok()?;
+            status = header[1];
+            payload.extend(self.read_body(&header).await);
+        }
+        Some((kind, payload))
+    }
+
+    /// Sends a SQLBatch with a caller-supplied ALL_HEADERS block (to exercise
+    /// malformed / mismatched headers the normal `batch` path cannot produce).
+    async fn raw_batch(&mut self, headers_block: &[u8], sql: &str) {
+        let mut payload = Vec::new();
+        payload.extend_from_slice(headers_block);
+        payload.extend(ucs2le(sql));
+        self.write_packet(PKT_SQL_BATCH, &payload).await;
     }
 
     /// Reads a full message (packets until EOM) -> (kind, payload).
@@ -121,21 +150,37 @@ impl Client {
         let mut payload = Vec::new();
         // ALL_HEADERS: TotalLength includes itself (the 4-byte field) plus
         // the header block; the SQL text starts right after.
-        let headers = all_headers();
+        let headers = all_headers(self.tran_descriptor);
         let total = 4 + headers.len();
         payload.extend_from_slice(&(total as u32).to_le_bytes());
         payload.extend_from_slice(&headers);
         payload.extend(ucs2le(sql));
         self.write_packet(PKT_SQL_BATCH, &payload).await;
         let (_, response) = self.read_message().await;
-        parse_tokens(&response)
+        let tokens = parse_tokens(&response);
+        self.track_descriptor(&tokens);
+        tokens
+    }
+
+    /// Applies any transaction ENVCHANGE in a response to the tracked
+    /// descriptor, exactly as a real driver would.
+    fn track_descriptor(&mut self, tokens: &[Token]) {
+        for token in tokens {
+            if let Token::EnvChange { kind, descriptor } = token {
+                match kind {
+                    8 => self.tran_descriptor = *descriptor,
+                    9 | 10 => self.tran_descriptor = 0,
+                    _ => {}
+                }
+            }
+        }
     }
 
     /// Sends a Transaction Manager request (request type + optional isolation
     /// byte for BEGIN) and returns the decoded response tokens.
     async fn tm_request(&mut self, request_type: u16, isolation: u8) -> Vec<Token> {
         let mut payload = Vec::new();
-        let headers = all_headers();
+        let headers = all_headers(self.tran_descriptor);
         let total = 4 + headers.len();
         payload.extend_from_slice(&(total as u32).to_le_bytes());
         payload.extend_from_slice(&headers);
@@ -146,18 +191,43 @@ impl Client {
         }
         self.write_packet(PKT_TRANSACTION_MANAGER, &payload).await;
         let (_, response) = self.read_message().await;
-        parse_tokens(&response)
+        let tokens = parse_tokens(&response);
+        self.track_descriptor(&tokens);
+        tokens
     }
 }
 
-/// A minimal ALL_HEADERS with a transaction-descriptor header (type 2).
-fn all_headers() -> Vec<u8> {
+/// The transaction descriptor carried by an ENVCHANGE body, or 0 if there is
+/// none. Body = `type u8 | NewValue B_VARBYTE | OldValue B_VARBYTE`; type 8
+/// (begin) puts the new descriptor in NewValue, types 9/10 (commit/rollback)
+/// leave NewValue empty and put the ending descriptor in OldValue.
+fn envchange_descriptor(body: &[u8]) -> u64 {
+    let read_varbyte = |at: usize| -> Option<(u64, usize)> {
+        let len = *body.get(at)? as usize;
+        if len == 8 && body.len() >= at + 1 + 8 {
+            let bytes: [u8; 8] = body[at + 1..at + 9].try_into().ok()?;
+            Some((u64::from_le_bytes(bytes), at + 1 + len))
+        } else {
+            Some((0, at + 1 + len))
+        }
+    };
+    // NewValue first; if it was empty, fall through to OldValue.
+    match read_varbyte(1) {
+        Some((value, _)) if value != 0 => value,
+        Some((_, next)) => read_varbyte(next).map(|(v, _)| v).unwrap_or(0),
+        None => 0,
+    }
+}
+
+/// A minimal ALL_HEADERS with a transaction-descriptor header (type 2),
+/// carrying the connection's current descriptor (0 = no transaction).
+fn all_headers(descriptor: u64) -> Vec<u8> {
     // Header: length u32 | type u16 | transaction descriptor u64 | request count u32
     let mut header = Vec::new();
     let body_len = 4 + 2 + 8 + 4;
     header.extend_from_slice(&(body_len as u32).to_le_bytes());
     header.extend_from_slice(&2u16.to_le_bytes()); // transaction descriptor
-    header.extend_from_slice(&0u64.to_le_bytes());
+    header.extend_from_slice(&descriptor.to_le_bytes());
     header.extend_from_slice(&1u32.to_le_bytes());
     header
 }
@@ -192,7 +262,7 @@ enum Token {
     ColMetadata(Vec<ColType>),
     Row(Vec<Cell>),
     Error { number: i32 },
-    EnvChange { kind: u8 },
+    EnvChange { kind: u8, descriptor: u64 },
     Done { count: Option<u64>, in_xact: bool },
     Other(u8),
 }
@@ -239,7 +309,13 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
                     let number = i32::from_le_bytes(body[0..4].try_into().unwrap());
                     tokens.push(Token::Error { number });
                 } else if token == 0xe3 {
-                    tokens.push(Token::EnvChange { kind: body[0] });
+                    // Transaction ENVCHANGEs carry the descriptor as a
+                    // B_VARBYTE: type 8 (begin) in NewValue, types 9/10
+                    // (commit/rollback) in OldValue (NewValue empty).
+                    tokens.push(Token::EnvChange {
+                        kind: body[0],
+                        descriptor: envchange_descriptor(body),
+                    });
                 }
                 i += 2 + len;
             }
@@ -407,6 +483,7 @@ async fn connect(engine: EngineHandle) -> Client {
     });
     Client {
         stream: client_half,
+        tran_descriptor: 0,
     }
 }
 
@@ -518,7 +595,7 @@ const TM_ROLLBACK_XACT: u16 = 8;
 fn has_envchange(tokens: &[Token], kind: u8) -> bool {
     tokens
         .iter()
-        .any(|t| matches!(t, Token::EnvChange { kind: k } if *k == kind))
+        .any(|t| matches!(t, Token::EnvChange { kind: k, .. } if *k == kind))
 }
 
 fn row_ints(tokens: &[Token]) -> Vec<i64> {
@@ -532,6 +609,119 @@ fn row_ints(tokens: &[Token]) -> Vec<i64> {
             _ => None,
         })
         .collect()
+}
+
+/// Wraps a header block with its ALL_HEADERS TotalLength (which includes itself).
+fn headers_block(headers: &[u8]) -> Vec<u8> {
+    let mut out = Vec::new();
+    out.extend_from_slice(&((4 + headers.len()) as u32).to_le_bytes());
+    out.extend_from_slice(headers);
+    out
+}
+
+#[tokio::test]
+async fn malformed_all_headers_is_rejected() {
+    // A TotalLength that runs past the payload must be a protocol error. It was
+    // previously treated as "no headers", handing the header bytes to the SQL
+    // decoder as if they were the query.
+    for bad in [
+        // TotalLength beyond the payload.
+        {
+            let mut p = 9999u32.to_le_bytes().to_vec();
+            p.extend(ucs2le("SELECT 1"));
+            p
+        },
+        // TotalLength smaller than the field itself.
+        {
+            let mut p = 2u32.to_le_bytes().to_vec();
+            p.extend(ucs2le("SELECT 1"));
+            p
+        },
+        // A header whose HeaderLength is 0 (would stall the walk).
+        {
+            let mut h = 0u32.to_le_bytes().to_vec();
+            h.extend_from_slice(&2u16.to_le_bytes());
+            headers_block(&h)
+        },
+        // A header whose HeaderLength overruns the block.
+        {
+            let mut h = 999u32.to_le_bytes().to_vec();
+            h.extend_from_slice(&2u16.to_le_bytes());
+            headers_block(&h)
+        },
+        // A transaction-descriptor header with truncated data.
+        {
+            let mut h = (4u32 + 2 + 3).to_le_bytes().to_vec();
+            h.extend_from_slice(&2u16.to_le_bytes());
+            h.extend_from_slice(&[0, 0, 0]);
+            headers_block(&h)
+        },
+    ] {
+        let path = temp_path("bad-headers");
+        let engine = engine(&path);
+        let mut client = connect(engine).await;
+        client.prelogin().await;
+        client.login("sa", "secret").await;
+        client.write_packet(PKT_SQL_BATCH, &bad).await;
+        assert!(
+            client.try_read_message().await.is_none(),
+            "malformed ALL_HEADERS must close the connection, not answer"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[tokio::test]
+async fn mismatched_transaction_descriptor_is_rejected() {
+    // A descriptor the server never handed out means the client's transaction
+    // view has desynchronised: the request must not run.
+    let path = temp_path("bad-descriptor");
+    let engine = engine(&path);
+    let mut client = connect(engine).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+
+    // No transaction is open, so the connection's descriptor is 0; claim 42.
+    client
+        .raw_batch(&headers_block(&all_headers(42)), "SELECT 1")
+        .await;
+    assert!(
+        client.try_read_message().await.is_none(),
+        "a mismatched transaction descriptor must close the connection"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn transaction_descriptor_round_trips_through_envchange() {
+    // The server mints a descriptor on TM begin, the client echoes it on the
+    // next request, and it returns to 0 after commit. This is what the
+    // validation above enforces, so pin the values rather than only the flow.
+    let path = temp_path("descriptor-roundtrip");
+    let engine = engine(&path);
+    let mut client = connect(engine).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    assert_eq!(client.tran_descriptor, 0, "no transaction at login");
+
+    client.tm_request(TM_BEGIN_XACT, 0).await;
+    let in_txn = client.tran_descriptor;
+    assert_ne!(in_txn, 0, "begin must mint a non-zero descriptor");
+
+    // The next request echoes it and is accepted (the server validates it).
+    let rows = client.batch("SELECT 1").await;
+    assert!(
+        rows.iter().any(|t| matches!(t, Token::Row(_))),
+        "echoing the descriptor must be accepted: {rows:?}"
+    );
+    assert_eq!(
+        client.tran_descriptor, in_txn,
+        "descriptor is stable in-txn"
+    );
+
+    client.tm_request(TM_COMMIT_XACT, 0).await;
+    assert_eq!(client.tran_descriptor, 0, "commit clears the descriptor");
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]

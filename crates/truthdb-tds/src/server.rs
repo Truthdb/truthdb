@@ -157,7 +157,9 @@ where
         };
         match message.kind {
             PKT_SQL_BATCH => {
-                let sql = batch_sql(&message.payload)?;
+                let headers = parse_all_headers(&message.payload)?;
+                check_transaction_descriptor(&headers, tran_descriptor)?;
+                let sql = batch_sql(headers.body)?;
                 let cancel = Arc::new(AtomicBool::new(false));
                 let work = run_batch(engine, session, &sql, cancel.clone());
                 match run_watching_attention(stream, cancel, work).await? {
@@ -168,8 +170,10 @@ where
                 }
             }
             PKT_RPC => {
+                let headers = parse_all_headers(&message.payload)?;
+                check_transaction_descriptor(&headers, tran_descriptor)?;
                 let cancel = Arc::new(AtomicBool::new(false));
-                let work = run_rpc(engine, session, &message.payload, cancel.clone());
+                let work = run_rpc(engine, session, headers.body, cancel.clone());
                 match run_watching_attention(stream, cancel, work).await? {
                     Some(response) => {
                         write_message(stream, PKT_TABULAR_RESULT, &response, packet_size).await?
@@ -178,10 +182,12 @@ where
                 }
             }
             PKT_TRANSACTION_MANAGER => {
+                let headers = parse_all_headers(&message.payload)?;
+                check_transaction_descriptor(&headers, tran_descriptor)?;
                 let response = handle_tm_request(
                     engine,
                     session,
-                    &message.payload,
+                    headers.body,
                     &mut tran_descriptor,
                     &mut next_descriptor,
                 )
@@ -208,11 +214,11 @@ where
 async fn handle_tm_request(
     engine: &EngineHandle,
     session: SessionId,
-    payload: &[u8],
+    body: &[u8],
     tran_descriptor: &mut u64,
     next_descriptor: &mut u64,
 ) -> io::Result<Vec<u8>> {
-    let (request_type, isolation) = parse_tm_request(payload)?;
+    let (request_type, isolation) = parse_tm_request(body)?;
     let sql = match request_type {
         TM_BEGIN_XACT => match isolation_set_clause(isolation) {
             Some(set) => format!("{set}; BEGIN TRANSACTION"),
@@ -273,11 +279,10 @@ async fn handle_tm_request(
     Ok(out)
 }
 
-/// Parses a Transaction Manager request payload: an ALL_HEADERS block, then a
+/// Parses a Transaction Manager request body (the bytes *after* ALL_HEADERS): a
 /// `RequestType` (u16 LE), then for `TM_BEGIN_XACT` an isolation-level byte.
 /// Returns the request type and (for BEGIN) the isolation byte.
-fn parse_tm_request(payload: &[u8]) -> io::Result<(u16, u8)> {
-    let body = skip_all_headers(payload);
+fn parse_tm_request(body: &[u8]) -> io::Result<(u16, u8)> {
     if body.len() < 2 {
         return Err(protocol_err("transaction manager request too short"));
     }
@@ -416,10 +421,10 @@ async fn run_batch(
 async fn run_rpc(
     engine: &EngineHandle,
     session: SessionId,
-    payload: &[u8],
+    body: &[u8],
     cancel: Arc<AtomicBool>,
 ) -> Vec<u8> {
-    let request = match rpc::parse_rpc_request(skip_all_headers(payload)) {
+    let request = match rpc::parse_rpc_request(body) {
         Ok(request) => request,
         Err(err) => return rpc_error(&format!("malformed RPC request: {err}")),
     };
@@ -504,27 +509,85 @@ fn build_batch_tokens(outcome: &BatchOutcome, in_transaction: bool) -> Vec<u8> {
     out
 }
 
-/// Skips a request payload's ALL_HEADERS block, returning the bytes after it.
-/// ALL_HEADERS starts with a `TotalLength u32` covering the whole block (incl.
-/// itself); a missing or malformed block means the payload has no headers.
-fn skip_all_headers(payload: &[u8]) -> &[u8] {
-    let start = if payload.len() >= 4 {
-        let total = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
-        if (4..=payload.len()).contains(&total) {
-            total
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-    &payload[start..]
+/// The Transaction Descriptor header (MS-TDS 2.2.5.3.1): the descriptor the
+/// server handed out via ENVCHANGE 8, plus an outstanding-request count.
+const HEADER_TRANSACTION_DESCRIPTOR: u16 = 0x0002;
+
+/// A request's parsed ALL_HEADERS block.
+struct AllHeaders<'a> {
+    /// The descriptor from the Transaction Descriptor header, if the client
+    /// sent one (the header is mandatory in MS-TDS, but absence is tolerated —
+    /// see [`check_transaction_descriptor`]).
+    transaction_descriptor: Option<u64>,
+    /// The request body following the header block.
+    body: &'a [u8],
 }
 
-/// Extracts the SQL text from a SQLBatch payload: an ALL_HEADERS block
-/// (`TotalLength u32` covering the headers) followed by the UCS-2LE query.
-fn batch_sql(payload: &[u8]) -> io::Result<String> {
-    let text = skip_all_headers(payload);
+/// Parses a request payload's ALL_HEADERS block (MS-TDS 2.2.5.2): a
+/// `TotalLength u32` covering the whole block (including itself), then headers
+/// of `HeaderLength u32 | HeaderType u16 | data`. Unknown header types are
+/// skipped (forward compatibility).
+///
+/// A malformed block is a protocol error rather than being silently taken as
+/// request data: treating a bad `TotalLength` as "no headers" would hand the
+/// header bytes to the SQL/RPC decoder as if they were the request.
+fn parse_all_headers(payload: &[u8]) -> io::Result<AllHeaders<'_>> {
+    if payload.len() < 4 {
+        return Err(protocol_err("request is missing its ALL_HEADERS block"));
+    }
+    let total = u32::from_le_bytes(payload[0..4].try_into().unwrap()) as usize;
+    if !(4..=payload.len()).contains(&total) {
+        return Err(protocol_err("ALL_HEADERS TotalLength is out of range"));
+    }
+    let mut rest = &payload[4..total];
+    let mut transaction_descriptor = None;
+    while !rest.is_empty() {
+        // Each entry is at least its own length field plus a type.
+        if rest.len() < 6 {
+            return Err(protocol_err("ALL_HEADERS entry is truncated"));
+        }
+        let len = u32::from_le_bytes(rest[0..4].try_into().unwrap()) as usize;
+        // `len` must cover the header itself and stay inside the block — a zero
+        // or oversized length would otherwise stall or overrun the walk.
+        if !(6..=rest.len()).contains(&len) {
+            return Err(protocol_err("ALL_HEADERS HeaderLength is out of range"));
+        }
+        if u16::from_le_bytes([rest[4], rest[5]]) == HEADER_TRANSACTION_DESCRIPTOR {
+            // TransactionDescriptor u64, then OutstandingRequestCount u32.
+            let data = &rest[6..len];
+            if data.len() < 12 {
+                return Err(protocol_err("transaction descriptor header is truncated"));
+            }
+            transaction_descriptor = Some(u64::from_le_bytes(data[0..8].try_into().unwrap()));
+        }
+        rest = &rest[len..];
+    }
+    Ok(AllHeaders {
+        transaction_descriptor,
+        body: &payload[total..],
+    })
+}
+
+/// Rejects a request whose transaction descriptor disagrees with the
+/// transaction this connection is actually in — the client's view has
+/// desynchronised from the server's, so running the request would apply it to
+/// the wrong transaction.
+///
+/// A client that sends no descriptor header is not checked: the header is only
+/// meaningful when present, and refusing requests without one would break
+/// clients that omit it (MS-TDS mandates it, but tolerating absence costs
+/// nothing here — a client that never sends one never desynchronises).
+fn check_transaction_descriptor(headers: &AllHeaders<'_>, current: u64) -> io::Result<()> {
+    match headers.transaction_descriptor {
+        Some(descriptor) if descriptor != current => Err(protocol_err(&format!(
+            "transaction descriptor {descriptor} does not match this connection's transaction {current}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// Decodes a SQLBatch body (the UCS-2LE query text after ALL_HEADERS).
+fn batch_sql(text: &[u8]) -> io::Result<String> {
     if !text.len().is_multiple_of(2) {
         return Err(protocol_err("SQLBatch text is not UCS-2 aligned"));
     }
