@@ -86,6 +86,24 @@ pub struct EvalContext {
     /// The last identity value inserted in this scope — `SCOPE_IDENTITY()`.
     /// `None` until an identity INSERT runs.
     pub scope_identity: Option<i64>,
+    /// The error that transferred control to the innermost active `CATCH`
+    /// block, read by `ERROR_NUMBER()`/`ERROR_MESSAGE()`/etc. `None` outside any
+    /// `CATCH` block (where those functions return NULL).
+    pub error: Option<ErrorInfo>,
+    /// `XACT_STATE()`: 1 = an active, committable transaction; -1 = an active
+    /// but uncommittable (doomed) transaction; 0 = no transaction.
+    pub xact_state: i8,
+}
+
+/// The error captured by a `CATCH` block, surfaced by the `ERROR_*()`
+/// functions. Line and procedure are not tracked (no statement-line map, no
+/// stored procedures), so `ERROR_LINE()` reports 0 and `ERROR_PROCEDURE()` NULL.
+#[derive(Debug, Clone, Default)]
+pub struct ErrorInfo {
+    pub number: i32,
+    pub message: String,
+    pub severity: u8,
+    pub state: u8,
 }
 
 /// Evaluates `expr` against `row`, resolving columns via `resolver`.
@@ -429,6 +447,31 @@ fn eval_session_function(name: &str, args: &[Expr]) -> Option<fn(&EvalContext) -
             Some(value) => SqlValue::Decimal(Box::new(Decimal::new(value as i128, 38, 0))),
             None => SqlValue::Null,
         }),
+        // Error intrinsics — NULL outside a CATCH block, the caught error's
+        // fields within one. (Line/procedure untracked: 0 / NULL.)
+        "ERROR_NUMBER" if args.is_empty() => Some(|ctx| match &ctx.error {
+            Some(e) => SqlValue::Int(e.number as i64),
+            None => SqlValue::Null,
+        }),
+        "ERROR_MESSAGE" if args.is_empty() => Some(|ctx| match &ctx.error {
+            Some(e) => SqlValue::Str(e.message.clone()),
+            None => SqlValue::Null,
+        }),
+        "ERROR_SEVERITY" if args.is_empty() => Some(|ctx| match &ctx.error {
+            Some(e) => SqlValue::Int(e.severity as i64),
+            None => SqlValue::Null,
+        }),
+        "ERROR_STATE" if args.is_empty() => Some(|ctx| match &ctx.error {
+            Some(e) => SqlValue::Int(e.state as i64),
+            None => SqlValue::Null,
+        }),
+        "ERROR_LINE" if args.is_empty() => Some(|ctx| match &ctx.error {
+            Some(_) => SqlValue::Int(0),
+            None => SqlValue::Null,
+        }),
+        "ERROR_PROCEDURE" if args.is_empty() => Some(|_| SqlValue::Null),
+        // Committability of the current transaction (independent of any CATCH).
+        "XACT_STATE" if args.is_empty() => Some(|ctx| SqlValue::Int(ctx.xact_state as i64)),
         _ => None,
     }
 }

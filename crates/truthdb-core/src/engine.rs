@@ -3865,11 +3865,15 @@ mod tests {
         );
         assert_eq!(out.error.as_ref().map(|e| e.number), Some(2627));
 
-        // A doomed transaction rejects further work with 3930...
-        let out = batch(&engine, &mut ctx, "SELECT 1 AS n");
+        // A doomed transaction rejects further writes with 3930...
+        let out = batch(&engine, &mut ctx, "INSERT INTO t VALUES (2)");
         assert_eq!(out.error.as_ref().map(|e| e.number), Some(3930));
 
-        // ...but ROLLBACK is allowed and clears the doom.
+        // ...but a read is still allowed (so a CATCH can inspect state)...
+        let out = batch(&engine, &mut ctx, "SELECT 1 AS n");
+        assert_eq!(ids(&out), vec![1]);
+
+        // ...and ROLLBACK is allowed and clears the doom.
         let out = batch(&engine, &mut ctx, "ROLLBACK");
         assert!(out.error.is_none(), "{:?}", out.error);
         assert!(!ctx.has_open_transaction());
@@ -3877,6 +3881,238 @@ mod tests {
         // The table is usable again and holds nothing (the txn rolled back).
         let out = batch(&engine, &mut ctx, "SELECT id FROM t");
         assert_eq!(ids(&out), Vec::<i32>::new());
+        let _ = std::fs::remove_file(path);
+    }
+
+    // ---- TRY/CATCH + XACT_STATE() / ERROR_*() (Stage 6) ------------------
+
+    /// Every rowset's integer column 0, in statement order (a batch with
+    /// TRY/CATCH can emit several rowsets).
+    fn all_int_rows(outcome: &BatchOutcome) -> Vec<Vec<i32>> {
+        outcome
+            .results
+            .iter()
+            .filter_map(|r| match r {
+                StatementResult::Rows(rowset) => Some(
+                    rowset
+                        .rows
+                        .iter()
+                        .map(|row| match row[0] {
+                            Datum::TinyInt(v) => v as i32,
+                            Datum::SmallInt(v) => v as i32,
+                            Datum::Int(v) => v,
+                            Datum::BigInt(v) => v as i32,
+                            ref other => panic!("expected integer, got {other:?}"),
+                        })
+                        .collect(),
+                ),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn try_catch_error_transfers_to_catch() {
+        let path = unique_temp_path("try-catch-basic");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        // The first TRY statement is a duplicate PK (2627); control jumps to the
+        // CATCH, so the second INSERT never runs and the batch reports no error.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRY \
+               INSERT INTO t VALUES (1); \
+               INSERT INTO t VALUES (99); \
+             END TRY \
+             BEGIN CATCH \
+               SELECT ERROR_NUMBER() AS n; \
+             END CATCH",
+        );
+        assert!(
+            out.error.is_none(),
+            "a caught error is not reported: {:?}",
+            out.error
+        );
+        assert_eq!(ids(&out), vec![2627], "CATCH sees the error number");
+        // The post-error TRY statement was skipped; only the seed row exists.
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t ORDER BY id");
+        assert_eq!(ids(&out), vec![1]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn try_catch_error_message_and_null_outside() {
+        let path = unique_temp_path("try-catch-msg");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRY INSERT INTO t VALUES (1); END TRY \
+             BEGIN CATCH SELECT ERROR_MESSAGE() AS m; END CATCH",
+        );
+        let StatementResult::Rows(rowset) = &out.results[0] else {
+            panic!("expected a rowset");
+        };
+        let Datum::NVarChar(msg) = &rowset.rows[0][0] else {
+            panic!("expected a string, got {:?}", rowset.rows[0][0]);
+        };
+        assert!(
+            msg.contains("PRIMARY KEY") || msg.to_lowercase().contains("duplicate"),
+            "ERROR_MESSAGE() text: {msg}"
+        );
+        // Outside any CATCH block, ERROR_*() are NULL.
+        let out = batch(&engine, &mut ctx, "SELECT ERROR_NUMBER() AS n");
+        let StatementResult::Rows(rowset) = &out.results[0] else {
+            panic!("expected a rowset");
+        };
+        assert_eq!(rowset.rows[0][0], Datum::Null);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn try_catch_canonical_form_without_terminators_runs() {
+        // The way TRY/CATCH is actually written: no `;` before END TRY/END CATCH.
+        let path = unique_temp_path("try-catch-canonical");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRY\n    INSERT INTO t VALUES (1)\nEND TRY\nBEGIN CATCH\n    SELECT ERROR_NUMBER() AS n\nEND CATCH",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![2627]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn try_catch_success_skips_catch() {
+        let path = unique_temp_path("try-catch-ok");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRY SELECT 1 AS n; END TRY BEGIN CATCH SELECT 2 AS n; END CATCH",
+        );
+        assert!(out.error.is_none());
+        assert_eq!(all_int_rows(&out), vec![vec![1]], "the CATCH did not run");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn try_catch_xact_state_committable() {
+        // A caught non-fatal error inside a transaction leaves it committable
+        // (XACT_STATE = 1); the transaction survives and COMMIT persists its work.
+        let path = unique_temp_path("try-catch-xs1");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRAN; \
+             INSERT INTO t VALUES (1); \
+             BEGIN TRY INSERT INTO t VALUES (1); END TRY \
+             BEGIN CATCH SELECT XACT_STATE() AS n; END CATCH; \
+             COMMIT;",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![1], "committable (1) inside the CATCH");
+        assert!(!ctx.has_open_transaction(), "COMMIT closed the transaction");
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t");
+        assert_eq!(ids(&out), vec![1], "the surviving insert committed");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn try_catch_xact_state_doomed_under_xact_abort() {
+        // Under SET XACT_ABORT ON, an error inside TRY still transfers to CATCH,
+        // but the transaction is doomed (XACT_STATE = -1) and only ROLLBACK works.
+        let path = unique_temp_path("try-catch-xs-doomed");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "SET XACT_ABORT ON; \
+             BEGIN TRAN; \
+             INSERT INTO t VALUES (1); \
+             BEGIN TRY INSERT INTO t VALUES (1); END TRY \
+             BEGIN CATCH SELECT XACT_STATE() AS n; END CATCH",
+        );
+        assert!(out.error.is_none(), "the error was caught: {:?}", out.error);
+        assert_eq!(ids(&out), vec![-1], "doomed (-1) inside the CATCH");
+        assert!(ctx.has_open_transaction(), "still open, awaiting ROLLBACK");
+        // A doomed transaction rejects further writes with 3930.
+        let out = batch(&engine, &mut ctx, "INSERT INTO t VALUES (2)");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(3930));
+        // ROLLBACK clears it; nothing persisted.
+        batch(&engine, &mut ctx, "ROLLBACK");
+        assert!(!ctx.has_open_transaction());
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t");
+        assert_eq!(ids(&out), Vec::<i32>::new());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn try_catch_nested_inner_handles_outer_continues() {
+        // The inner CATCH handles the inner error; because it does not re-raise,
+        // the outer TRY continues and the outer CATCH never runs.
+        let path = unique_temp_path("try-catch-nested");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRY \
+               BEGIN TRY INSERT INTO t VALUES (1); END TRY \
+               BEGIN CATCH SELECT ERROR_NUMBER() AS n; END CATCH; \
+               SELECT 777 AS n; \
+             END TRY \
+             BEGIN CATCH SELECT 999 AS n; END CATCH",
+        );
+        assert!(out.error.is_none());
+        assert_eq!(
+            all_int_rows(&out),
+            vec![vec![2627], vec![777]],
+            "inner CATCH ran (2627), outer TRY continued (777), outer CATCH skipped"
+        );
         let _ = std::fs::remove_file(path);
     }
 

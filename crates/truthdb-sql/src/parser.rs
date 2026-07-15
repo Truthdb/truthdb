@@ -129,7 +129,12 @@ impl Parser {
 
     fn parse_begin(&mut self) -> SqlResult<Statement> {
         let start = self.expect_keyword("BEGIN")?;
-        // Stage 6 has no BEGIN...END blocks; BEGIN must open a transaction.
+        // `BEGIN` opens either a transaction or a `TRY` block; there are no
+        // general `BEGIN...END` blocks. (A bare `BEGIN CATCH` is invalid — it
+        // is only reachable inside `parse_try_catch`, after `END TRY`.)
+        if matches!(self.peek_keyword().as_deref(), Some("TRY")) {
+            return self.parse_try_catch(start);
+        }
         let mut end = match self.peek_keyword().as_deref() {
             Some("TRAN") | Some("TRANSACTION") => self.bump().span,
             _ => {
@@ -145,6 +150,47 @@ impl Parser {
             name,
             span: start.to(end),
         })
+    }
+
+    /// `BEGIN TRY <block> END TRY BEGIN CATCH <block> END CATCH` (the opening
+    /// `BEGIN` is already consumed).
+    fn parse_try_catch(&mut self, start: Span) -> SqlResult<Statement> {
+        self.expect_keyword("TRY")?;
+        let try_block = self.parse_block()?;
+        self.expect_keyword("END")?;
+        self.expect_keyword("TRY")?;
+        self.expect_keyword("BEGIN")?;
+        self.expect_keyword("CATCH")?;
+        let catch_block = self.parse_block()?;
+        self.expect_keyword("END")?;
+        let end = self.expect_keyword("CATCH")?;
+        Ok(Statement::TryCatch {
+            try_block,
+            catch_block,
+            span: start.to(end),
+        })
+    }
+
+    /// Parses statements up to (but not consuming) the closing `END` of a
+    /// `TRY`/`CATCH` block. A nested `BEGIN TRY` is consumed whole by
+    /// `parse_statement`, so a top-level `END` here always closes this block.
+    fn parse_block(&mut self) -> SqlResult<Vec<Statement>> {
+        let mut statements = Vec::new();
+        loop {
+            while self.eat(&TokenKind::Semicolon) {}
+            if matches!(self.peek_keyword().as_deref(), Some("END")) || self.at_eof() {
+                break;
+            }
+            statements.push(self.parse_statement()?);
+            if !self.at_eof()
+                && !matches!(self.peek_keyword().as_deref(), Some("END"))
+                && !self.check(&TokenKind::Semicolon)
+            {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+        }
+        Ok(statements)
     }
 
     fn parse_commit(&mut self) -> SqlResult<Statement> {
@@ -2161,9 +2207,13 @@ fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
 
 /// Keywords that end the SELECT-list / cannot be an implicit alias.
 fn is_clause_keyword(keyword: &str) -> bool {
+    // `END` closes a TRY/CATCH block and is reserved in T-SQL, so a bare `END`
+    // is never an implicit alias — without this, `SELECT 1 END TRY` would read
+    // `END` as the alias for `1` and then fail on `TRY`. (An explicit `AS end`
+    // or a delimited `[end]` still aliases, as before.)
     matches!(
         keyword,
-        "FROM" | "WHERE" | "ORDER" | "GROUP" | "HAVING" | "AS"
+        "FROM" | "WHERE" | "ORDER" | "GROUP" | "HAVING" | "AS" | "END"
     )
 }
 
@@ -2262,6 +2312,85 @@ mod tests {
         assert!(Parser::parse_str(&sql).is_ok());
         let chain = format!("SELECT 1{}", " + 1".repeat(100));
         assert!(Parser::parse_str(&chain).is_ok());
+    }
+
+    #[test]
+    fn try_catch_parses_into_blocks() {
+        let stmts = Parser::parse_str(
+            "BEGIN TRY \
+               INSERT INTO t VALUES (1); \
+               SELECT 2; \
+             END TRY \
+             BEGIN CATCH \
+               SELECT ERROR_NUMBER(); \
+             END CATCH",
+        )
+        .expect("parse");
+        let Statement::TryCatch {
+            try_block,
+            catch_block,
+            ..
+        } = &stmts[0]
+        else {
+            panic!("expected a TRY/CATCH, got {:?}", stmts[0]);
+        };
+        assert_eq!(try_block.len(), 2, "two statements in the TRY block");
+        assert_eq!(catch_block.len(), 1, "one statement in the CATCH block");
+        assert!(matches!(try_block[0], Statement::Insert(_)));
+
+        // A nested TRY inside the TRY block is consumed whole (its END TRY / END
+        // CATCH do not close the outer block).
+        let stmts = Parser::parse_str(
+            "BEGIN TRY \
+               BEGIN TRY SELECT 1; END TRY BEGIN CATCH SELECT 2; END CATCH; \
+               SELECT 3; \
+             END TRY \
+             BEGIN CATCH SELECT 4; END CATCH",
+        )
+        .expect("parse");
+        let Statement::TryCatch { try_block, .. } = &stmts[0] else {
+            panic!("expected a TRY/CATCH");
+        };
+        assert_eq!(try_block.len(), 2, "nested TRY + the following SELECT");
+        assert!(matches!(try_block[0], Statement::TryCatch { .. }));
+
+        // An unterminated TRY block is a syntax error, not a hang.
+        assert_eq!(
+            Parser::parse_str("BEGIN TRY SELECT 1;").unwrap_err().number,
+            102,
+        );
+    }
+
+    #[test]
+    fn try_catch_parses_without_statement_terminators() {
+        // The canonical T-SQL form omits the `;` before END TRY / END CATCH.
+        // `END` must not be read as an implicit alias for the preceding select
+        // item (or table), which would leave the cursor on `TRY`.
+        for sql in [
+            "BEGIN TRY SELECT 1 END TRY BEGIN CATCH SELECT 2 END CATCH",
+            "BEGIN TRY SELECT * FROM t END TRY BEGIN CATCH SELECT 2 END CATCH",
+            "BEGIN TRY SELECT a FROM t WHERE a = 1 END TRY \
+             BEGIN CATCH SELECT ERROR_MESSAGE() END CATCH",
+        ] {
+            let stmts = Parser::parse_str(sql).unwrap_or_else(|e| panic!("{sql}: {e:?}"));
+            let Statement::TryCatch {
+                try_block,
+                catch_block,
+                ..
+            } = &stmts[0]
+            else {
+                panic!("expected a TRY/CATCH for {sql}");
+            };
+            assert_eq!(try_block.len(), 1, "{sql}");
+            assert_eq!(catch_block.len(), 1, "{sql}");
+        }
+
+        // An explicit `AS end` still aliases (only the *bare* END is declined),
+        // and a delimited [end] is an identifier, not the block terminator.
+        let stmts = Parser::parse_str("SELECT 1 AS end").expect("AS end still aliases");
+        assert!(matches!(stmts[0], Statement::Select(_)));
+        let stmts = Parser::parse_str("SELECT 1 [end]").expect("[end] still aliases");
+        assert!(matches!(stmts[0], Statement::Select(_)));
     }
 
     #[test]

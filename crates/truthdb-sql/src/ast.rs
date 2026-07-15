@@ -42,6 +42,13 @@ pub enum Statement {
     AlterTable(AlterTable),
     /// `DECLARE @a TYPE [= expr], ...` — batch variable declarations.
     Declare(Vec<Declaration>),
+    /// `BEGIN TRY <try_block> END TRY BEGIN CATCH <catch_block> END CATCH`. An
+    /// error in the try block transfers control to the catch block.
+    TryCatch {
+        try_block: Vec<Statement>,
+        catch_block: Vec<Statement>,
+        span: Span,
+    },
 }
 
 /// One `@name TYPE [= initializer]` in a `DECLARE`.
