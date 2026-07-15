@@ -1001,13 +1001,24 @@ fn a_sliced_scan_reads_the_same_rows_as_a_whole_one() {
 }
 
 #[test]
-fn a_sliced_scan_lets_another_thread_take_the_storage_lock_mid_scan() {
-    // The point of slicing: one large read must stop blocking every other
-    // session for its whole duration. With a single lock hold, the probe below
-    // cannot run until the scan finishes.
-    use std::sync::Arc;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-
+fn a_sliced_scan_takes_the_storage_lock_once_per_slice_not_once_per_table() {
+    // The point of slicing (#96): one large read must stop blocking every other
+    // session for its whole duration.
+    //
+    // This used to assert that a probe thread spinning on `rel_get` won the
+    // storage lock at least once while the scan ran. That is not a property the
+    // code has: `std::sync::Mutex` is not fair, so the scanning thread may
+    // release and immediately re-acquire, and the probe is never guaranteed a
+    // turn — under CPU starvation it may not even be scheduled. It failed ~35%
+    // of the time on a loaded box and intermittently in CI, which is a test
+    // asserting the scheduler's behaviour rather than this module's.
+    //
+    // The mechanism *is* deterministic, and it implies the property for any
+    // mutex that is not pathologically unfair: the scan acquires the lock once
+    // per slice. A non-reentrant mutex acquired N times must have been released
+    // N-1 times, so counting the acquisitions proves the releases. A scan that
+    // hoisted the guard out of the loop — the exact regression this guards, and
+    // an easy one to write — takes the count to zero and fails here.
     let path = unique_temp_path("scan-sliced-lock");
     let mut storage = Storage::create_with_wal_bounds(
         path.clone(),
@@ -1022,33 +1033,26 @@ fn a_sliced_scan_lets_another_thread_take_the_storage_lock_mid_scan() {
             .rel_insert("t", row(i, &"x".repeat(400)))
             .expect("insert");
     }
-    let storage = Arc::new(storage);
 
-    let stop = Arc::new(AtomicBool::new(false));
-    let probes = Arc::new(AtomicUsize::new(0));
-    let probe = {
-        let storage = Arc::clone(&storage);
-        let stop = Arc::clone(&stop);
-        let probes = Arc::clone(&probes);
-        std::thread::spawn(move || {
-            // Each rel_get takes the storage lock briefly. If the scan held it
-            // throughout, none of these could complete while it ran.
-            while !stop.load(Ordering::Relaxed) {
-                let _ = storage.rel_get("t", &[Datum::Int(0)]);
-                probes.fetch_add(1, Ordering::Relaxed);
-            }
-        })
-    };
-
+    let before = storage.scan_slices();
     let rows = storage.rel_scan_sliced("t", 8).expect("sliced scan");
-    let during = probes.load(Ordering::Relaxed);
-    stop.store(true, Ordering::Relaxed);
-    probe.join().expect("probe thread");
+    let slices = storage.scan_slices() - before;
 
     assert_eq!(rows.len(), 1500, "the scan still reads everything");
     assert!(
-        during > 0,
-        "another thread must get the storage lock while a sliced scan runs"
+        slices >= 1500 / 8,
+        "1500 rows at 8 per slice is at least 187 separate lock holds, not one; got {slices}"
+    );
+
+    // The counter means what the assertion above assumes: a whole-table scan
+    // takes the lock once. Without this, `slices` could be counting something
+    // else entirely and the test would still pass.
+    let before = storage.scan_slices();
+    storage.rel_scan("t").expect("whole scan");
+    assert_eq!(
+        storage.scan_slices() - before,
+        0,
+        "rel_scan is the single-hold path and takes no slices"
     );
     let _ = std::fs::remove_file(path);
 }
