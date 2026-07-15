@@ -452,6 +452,8 @@ fn spawn_engine_pool(
         stop: AtomicBool::new(false),
         idle: Mutex::new(()),
         wake: Condvar::new(),
+        #[cfg(test)]
+        sweeps: std::sync::atomic::AtomicUsize::new(0),
     });
     // A supervisor thread spawns the workers and joins them; its handle is what
     // callers join at shutdown. When all workers have exited, any batch still
@@ -521,6 +523,12 @@ struct Shared {
     /// Wakes the maintenance thread out of its sleep at shutdown, so the pool
     /// does not wait out a whole sweep interval before exiting.
     wake: Condvar,
+    /// This pool's maintenance sweeps, so a test can prove the thread sleeps
+    /// between them rather than spinning. Per-pool, not global: the tests run
+    /// in parallel in one binary, and a global counter measures every other
+    /// pool's sweeps too.
+    #[cfg(test)]
+    sweeps: std::sync::atomic::AtomicUsize,
 }
 
 // The pool shares `Arc<Engine>` across worker threads, so the engine — and thus
@@ -598,7 +606,7 @@ fn maintenance_loop(shared: &Arc<Shared>) {
                 .expect("idle mutex poisoned");
         }
         #[cfg(test)]
-        MAINTENANCE_SWEEPS.fetch_add(1, Ordering::Relaxed);
+        shared.sweeps.fetch_add(1, Ordering::Relaxed);
         {
             let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
             // One victim per sweep, and the floor on the sleep means a worker
@@ -1679,12 +1687,12 @@ mod tests {
             stop: AtomicBool::new(false),
             idle: Mutex::new(()),
             wake: Condvar::new(),
+            sweeps: std::sync::atomic::AtomicUsize::new(0),
         });
-        MAINTENANCE_SWEEPS.store(0, Ordering::Relaxed);
         let keeper = Arc::clone(&shared);
         let maintenance = std::thread::spawn(move || maintenance_loop(&keeper));
         std::thread::sleep(Duration::from_millis(200));
-        let sweeps = MAINTENANCE_SWEEPS.load(Ordering::Relaxed);
+        let sweeps = shared.sweeps.load(Ordering::Relaxed);
         {
             let _idle = shared.idle.lock().expect("idle mutex poisoned");
             shared.stop.store(true, Ordering::Release);
@@ -1740,6 +1748,7 @@ mod tests {
             stop: AtomicBool::new(false),
             idle: Mutex::new(()),
             wake: Condvar::new(),
+            sweeps: std::sync::atomic::AtomicUsize::new(0),
         });
         let keeper = Arc::clone(&shared);
         let maintenance = std::thread::spawn(move || maintenance_loop(&keeper));
