@@ -22,6 +22,7 @@ use truthdb_sql::ast::{
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
 use truthdb_sql::eval::{ColumnResolver, EvalContext};
+use truthdb_sql::lexer::Span;
 use truthdb_sql::value::{SqlValue, order_key_cmp};
 use truthdb_sql::{ast, eval};
 
@@ -3964,6 +3965,117 @@ fn expr_column_refs(expr: &Expr, f: &mut impl FnMut(&Name)) {
     }
 }
 
+/// Rewrites ORDER BY so a SELECT-list alias resolves on the path that sorts the
+/// *source* rows.
+///
+/// ORDER BY is the one clause where a SELECT alias is in scope, but this path
+/// sorts base rows against a [`JoinScope`], which knows only base columns — so
+/// `SELECT v AS vv FROM a ORDER BY vv` would not resolve, and an alias over a
+/// computed expression (`SELECT v * 2 AS dbl ... ORDER BY dbl`) has no base
+/// column to fall back on at all. Each unqualified name matching an alias is
+/// replaced by that alias's expression, which the existing sort machinery then
+/// evaluates against the base row. (The grouped/DISTINCT path projects first and
+/// resolves ORDER BY against the output names, so it already sees aliases.)
+///
+/// An alias shadows a base column of the same name, as in SQL Server. A
+/// qualified name (`a.v`) always means that table's column and is never
+/// rewritten. `map_expr_columns` does not rescan what it substitutes, so a
+/// self-referential alias (`SELECT v + 1 AS v ... ORDER BY v`) substitutes once
+/// instead of recursing forever. Ordinals (`ORDER BY 1`) are integers, not
+/// column references, so they are untouched.
+fn order_by_with_aliases(
+    order_by: &[OrderItem],
+    items: &[SelectItem],
+    scope: &JoinScope,
+) -> Result<Vec<OrderItem>, SqlError> {
+    let aliases: Vec<(&str, &Expr)> = items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr {
+                expr,
+                alias: Some(name),
+            } => Some((name.value.as_str(), expr)),
+            _ => None,
+        })
+        .collect();
+    let outputs = output_exprs(items, scope);
+    order_by
+        .iter()
+        .map(|item| {
+            // A bare integer is a 1-based output-column ordinal, not a value.
+            let expr = if let ExprKind::Int(n) = &item.expr.kind {
+                usize::try_from(*n)
+                    .ok()
+                    .and_then(|n| n.checked_sub(1))
+                    .and_then(|i| outputs.get(i).cloned())
+                    .ok_or_else(|| {
+                        SqlError::new(
+                            108,
+                            16,
+                            1,
+                            format!("The ORDER BY position number {n} is out of range."),
+                        )
+                    })?
+            } else {
+                map_expr_columns(&item.expr, &|name: &Name| {
+                    if name.value.contains('.') {
+                        return None;
+                    }
+                    aliases
+                        .iter()
+                        .find(|(alias, _)| name.eq_ignore_case(alias))
+                        .map(|(_, expr)| (*expr).clone())
+                })
+            };
+            Ok(OrderItem {
+                expr,
+                descending: item.descending,
+            })
+        })
+        .collect()
+}
+
+/// The select list as one source-evaluable expression per *output* column, so a
+/// positional `ORDER BY <n>` can name what it points at. A wildcard expands to
+/// its source columns, each referenced by qualifier where it has one — `a.v`
+/// rather than `v` — so a join with a repeated column name stays unambiguous.
+fn output_exprs(items: &[SelectItem], scope: &JoinScope) -> Vec<Expr> {
+    // Synthetic: built from the scope, so it resolves by construction and its
+    // span is never surfaced in an error.
+    let synthetic = Span::new(0, 0);
+    let column_expr = |index: usize| {
+        let (qualifier, column) = &scope.columns[index];
+        let value = match qualifier {
+            Some(q) => format!("{q}.{column}"),
+            None => column.clone(),
+        };
+        Expr {
+            span: synthetic,
+            kind: ExprKind::Column(Name {
+                value,
+                quoted: false,
+                span: synthetic,
+            }),
+        }
+    };
+    let mut out = Vec::new();
+    for item in items {
+        match item {
+            SelectItem::Wildcard => out.extend((0..scope.columns.len()).map(column_expr)),
+            SelectItem::QualifiedWildcard(qualifier) => out.extend(
+                scope
+                    .indices_for_qualifier(&qualifier.value)
+                    .into_iter()
+                    .map(column_expr),
+            ),
+            SelectItem::Expr { expr, .. } => out.push(expr.clone()),
+            // An assignment SELECT produces no result columns to order by.
+            SelectItem::Assign { .. } => {}
+        }
+    }
+    out
+}
+
 /// Replaces every column reference in an expression via `f` (a replacement, or
 /// `None` to keep), not descending into nested subquery bodies (but mapping an
 /// `IN (SELECT)` operand, which is at this scope).
@@ -4392,10 +4504,11 @@ fn exec_select(
     // ORDER BY (evaluated against the source row; stable so equal keys keep
     // input order). Spills to temp extents when the input exceeds the budget.
     if !select.order_by.is_empty() {
+        let order_by = order_by_with_aliases(&select.order_by, &select.items, &resolver)?;
         rows = order_rows(
             storage,
             rows,
-            &select.order_by,
+            &order_by,
             &types,
             &source.collations,
             &resolver,

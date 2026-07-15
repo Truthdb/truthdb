@@ -1,0 +1,137 @@
+# ORDER BY is the one clause where a SELECT-list alias is in scope (Stage 8).
+# The grouped/DISTINCT path always resolved aliases (it projects first); the
+# plain path sorts the source rows, so aliases were invisible there and these
+# all failed with 207.
+
+statement ok
+CREATE TABLE a (id INT NOT NULL PRIMARY KEY, v INT, g VARCHAR(10))
+
+statement ok
+INSERT INTO a VALUES (1, 30, 'x'), (2, 10, 'y'), (3, 20, 'x')
+
+# A bare alias.
+query I
+SELECT v AS vv FROM a ORDER BY vv
+----
+10
+20
+30
+
+# An alias over a computed expression: there is no base column to fall back on,
+# so this form has no workaround.
+query I
+SELECT v * 2 AS dbl FROM a ORDER BY dbl
+----
+20
+40
+60
+
+# An alias nested inside a larger ORDER BY expression.
+query I
+SELECT v AS vv FROM a ORDER BY vv * -1
+----
+30
+20
+10
+
+# DESC, and an alias used twice.
+query I
+SELECT v AS vv FROM a ORDER BY vv DESC
+----
+30
+20
+10
+
+# ORDER BY may still name a base column that is not selected at all.
+query I
+SELECT v AS vv FROM a ORDER BY id DESC
+----
+20
+10
+30
+
+# An alias shadows a base column of the same name: ORDER BY v means the alias
+# (which is id here), not the table's v column.
+query I
+SELECT id AS v FROM a ORDER BY v
+----
+1
+2
+3
+
+# A qualified name always means the table's column, never the alias.
+query I
+SELECT a.id AS v FROM a ORDER BY a.v
+----
+2
+3
+1
+
+# A self-referential alias substitutes once rather than recursing.
+query I
+SELECT v + 1 AS v FROM a ORDER BY v
+----
+11
+21
+31
+
+# The grouped path keeps resolving aliases (it always did).
+query TI
+SELECT g, COUNT(*) AS c FROM a GROUP BY g ORDER BY c, g
+----
+y 1
+x 2
+
+# An alias over an expression, ordered by the alias, with a WHERE filter.
+query I
+SELECT v * 10 AS big FROM a WHERE v > 10 ORDER BY big DESC
+----
+300
+200
+
+# --- ORDER BY <ordinal> on the plain path ---
+# A bare integer is a 1-based output-column ordinal, not a constant. It used to
+# evaluate as a constant, so every sort key was equal and the rows came back in
+# insertion order — silently unsorted.
+
+query I
+SELECT v FROM a ORDER BY 1
+----
+10
+20
+30
+
+# The ordinal points at the output column, so it follows the alias's expression.
+query I
+SELECT v * 2 AS dbl FROM a ORDER BY 1
+----
+20
+40
+60
+
+query I
+SELECT v FROM a ORDER BY 1 DESC
+----
+30
+20
+10
+
+# Ordinals over a wildcard resolve to the source columns, in order.
+query IIT
+SELECT * FROM a ORDER BY 2
+----
+2 10 y
+3 20 x
+1 30 x
+
+# Mixed: an ordinal and a named column together.
+query TI
+SELECT g, v FROM a ORDER BY 1, 2
+----
+x 20
+x 30
+y 10
+
+# Out of range is 108, not a panic or a silent no-op.
+statement error
+SELECT v FROM a ORDER BY 7
