@@ -131,10 +131,25 @@ async fn main() {
                 return;
             }
         };
+        let encryption = match config.tds.encryption {
+            crate::config::Encryption::Off => truthdb_tds::Encryption::Off,
+            crate::config::Encryption::Optional => truthdb_tds::Encryption::Optional,
+            crate::config::Encryption::Required => truthdb_tds::Encryption::Required,
+        };
+        // `required` with no certificate could satisfy nobody: every connection
+        // would be refused. Say so at startup rather than at each client.
+        if encryption == truthdb_tds::Encryption::Required && tls.is_none() {
+            eprintln!("TDS encryption = \"required\" needs tls_cert and tls_key");
+            return;
+        }
+        if encryption == truthdb_tds::Encryption::Off && tls.is_some() {
+            info!("TDS encryption = \"off\": the configured certificate will not be offered");
+        }
         let tds_config = truthdb_tds::TdsConfig {
             users: config.tds.auth.clone(),
             database: config.tds.database.clone(),
             tls,
+            encryption,
         };
         match truthdb_tds::TdsListener::bind(
             &config.tds.addr,

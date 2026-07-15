@@ -22,7 +22,7 @@ use tokio::sync::watch;
 use tracing::{debug, error, info};
 use truthdb_core::session::EngineHandle;
 
-pub use server::{TdsConfig, serve_connection};
+pub use server::{Encryption, TdsConfig, serve_connection};
 
 /// A TDS listener bound to an address; serves connections until shutdown.
 pub struct TdsListener {

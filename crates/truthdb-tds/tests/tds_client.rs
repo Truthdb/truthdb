@@ -51,6 +51,7 @@ fn config() -> TdsConfig {
         users,
         database: "truthdb".to_string(),
         tls: None,
+        encryption: truthdb_tds::Encryption::default(),
     }
 }
 
@@ -137,6 +138,21 @@ impl Client {
         self.write_packet(PKT_PRELOGIN, &[0xff]).await;
         let (kind, _) = self.read_message().await;
         assert!(kind == 0x04 || kind == PKT_PRELOGIN);
+    }
+
+    /// A PRELOGIN carrying an ENCRYPTION option, returning the byte the server
+    /// advertises back (or None if it hung up).
+    async fn prelogin_with_encryption(&mut self, client: u8) -> Option<u8> {
+        // One ENCRYPTION option: token | offset u16 BE | length u16 BE, then
+        // the terminator, then the data.
+        let mut payload = vec![0x01u8];
+        payload.extend_from_slice(&6u16.to_be_bytes());
+        payload.extend_from_slice(&1u16.to_be_bytes());
+        payload.push(0xff);
+        payload.push(client);
+        self.write_packet(PKT_PRELOGIN, &payload).await;
+        let (_, response) = self.try_read_message().await?;
+        Some(read_encryption_option(&response))
     }
 
     async fn login(&mut self, user: &str, password: &str) -> Vec<Token> {
@@ -482,6 +498,18 @@ fn parse_row(bytes: &[u8], meta: &[ColType]) -> (Vec<Cell>, usize) {
     (cells, i)
 }
 
+async fn connect_with(engine: EngineHandle, cfg: TdsConfig) -> Client {
+    let (client_half, server_half) = tokio::io::duplex(64 * 1024);
+    let cfg = Arc::new(cfg);
+    tokio::spawn(async move {
+        let _ = serve_connection(server_half, engine, cfg).await;
+    });
+    Client {
+        stream: client_half,
+        tran_descriptor: 0,
+    }
+}
+
 async fn connect(engine: EngineHandle) -> Client {
     let (client_half, server_half) = tokio::io::duplex(64 * 1024);
     let cfg = Arc::new(config());
@@ -492,6 +520,84 @@ async fn connect(engine: EngineHandle) -> Client {
         stream: client_half,
         tran_descriptor: 0,
     }
+}
+
+/// Reads the ENCRYPTION option out of a PRELOGIN response.
+fn read_encryption_option(payload: &[u8]) -> u8 {
+    let mut i = 0;
+    while i + 4 < payload.len() {
+        let token = payload[i];
+        if token == 0xff {
+            break;
+        }
+        let offset = u16::from_be_bytes([payload[i + 1], payload[i + 2]]) as usize;
+        if token == 0x01 {
+            return payload[offset];
+        }
+        i += 5;
+    }
+    panic!("no ENCRYPTION option in PRELOGIN response: {payload:?}");
+}
+
+#[tokio::test]
+async fn encryption_off_never_offers_tls_even_to_a_client_that_asks() {
+    let path = temp_path("enc-off");
+    let engine = engine(&path);
+    let mut cfg = config();
+    cfg.encryption = truthdb_tds::Encryption::Off;
+    let mut client = connect_with(engine, cfg).await;
+    let advertised = client
+        .prelogin_with_encryption(0x01) // ENCRYPT_ON: the client wants TLS
+        .await
+        .expect("server answered");
+    assert_eq!(advertised, 0x02, "must advertise NOT_SUP");
+    // ...and the session continues in plaintext.
+    client.login("sa", "secret").await;
+    let rows = client.batch("SELECT 1 AS n").await;
+    assert!(rows.iter().any(|t| matches!(t, Token::Row(_))), "{rows:?}");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn encryption_optional_serves_a_plaintext_client() {
+    // The default: a client that does not ask to encrypt is served as before.
+    let path = temp_path("enc-optional");
+    let engine = engine(&path);
+    let mut client = connect_with(engine, config()).await;
+    let advertised = client
+        .prelogin_with_encryption(0x02) // NOT_SUP: the client will not encrypt
+        .await
+        .expect("server answered");
+    assert_eq!(advertised, 0x02);
+    client.login("sa", "secret").await;
+    let rows = client.batch("SELECT 1 AS n").await;
+    assert!(rows.iter().any(|t| matches!(t, Token::Row(_))), "{rows:?}");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn encryption_required_refuses_a_client_that_cannot_encrypt() {
+    // The server must say encryption is mandatory and then refuse — falling
+    // back to plaintext would silently defeat the setting.
+    let path = temp_path("enc-required");
+    let engine = engine(&path);
+    let mut cfg = config();
+    cfg.encryption = truthdb_tds::Encryption::Required;
+    let mut client = connect_with(engine, cfg).await;
+    let advertised = client
+        .prelogin_with_encryption(0x02) // NOT_SUP
+        .await
+        .expect("server answers the PRELOGIN first");
+    assert_eq!(
+        advertised, 0x03,
+        "must advertise REQ so the client learns why"
+    );
+    // The connection is then dropped rather than served in plaintext.
+    assert!(
+        client.try_read_message().await.is_none(),
+        "a client that cannot encrypt must not be served"
+    );
+    let _ = std::fs::remove_file(path);
 }
 
 #[tokio::test]

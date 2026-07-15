@@ -8,12 +8,15 @@ pub const ENCRYPT_REQ: u8 = 0x03;
 
 const TOKEN_ENCRYPTION: u8 = 0x01;
 
-/// Builds a PRELOGIN response: version, an ENCRYPTION option, MARS off. When
-/// `offer_tls` is set the server advertises `ENCRYPT_ON` (the whole session is
-/// encrypted after a tunneled TLS handshake); otherwise `ENCRYPT_NOT_SUP`
-/// (plaintext). The option table is a list of `token u8 | offset u16 (BE) |
-/// length u16 (BE)` entries ended by `0xFF`, followed by the option data.
-pub fn prelogin_response(offer_tls: bool) -> Vec<u8> {
+/// Builds a PRELOGIN response: version, an ENCRYPTION option, MARS off.
+///
+/// `encryption` is the byte the server advertises: `ENCRYPT_ON` (the whole
+/// session is encrypted after a tunneled TLS handshake), `ENCRYPT_NOT_SUP`
+/// (plaintext), or `ENCRYPT_REQ` (the server *demands* encryption, so a client
+/// that cannot encrypt must give up). The option table is a list of
+/// `token u8 | offset u16 (BE) | length u16 (BE)` entries ended by `0xFF`,
+/// followed by the option data.
+pub fn prelogin_response(encryption: u8) -> Vec<u8> {
     const TOKEN_VERSION: u8 = 0x00;
     const TOKEN_MARS: u8 = 0x04;
     const TERMINATOR: u8 = 0xff;
@@ -38,11 +41,7 @@ pub fn prelogin_response(offer_tls: bool) -> Vec<u8> {
     out.push(TERMINATOR);
 
     out.extend_from_slice(&version);
-    out.push(if offer_tls {
-        ENCRYPT_ON
-    } else {
-        ENCRYPT_NOT_SUP
-    });
+    out.push(encryption);
     out.push(0x00); // MARS off
     out
 }
@@ -209,7 +208,7 @@ mod tests {
 
     #[test]
     fn prelogin_response_is_well_formed() {
-        let resp = prelogin_response(false);
+        let resp = prelogin_response(ENCRYPT_NOT_SUP);
         // First option token is VERSION with a sane offset.
         assert_eq!(resp[0], 0x00);
         let version_off = u16::from_be_bytes([resp[1], resp[2]]) as usize;
@@ -226,9 +225,9 @@ mod tests {
     #[test]
     fn prelogin_response_advertises_encryption() {
         // The ENCRYPTION option value is the last byte before the MARS byte.
-        let off = prelogin_response(false);
+        let off = prelogin_response(ENCRYPT_NOT_SUP);
         assert_eq!(off[off.len() - 2], ENCRYPT_NOT_SUP);
-        let on = prelogin_response(true);
+        let on = prelogin_response(ENCRYPT_ON);
         assert_eq!(on[on.len() - 2], ENCRYPT_ON);
     }
 
@@ -236,11 +235,11 @@ mod tests {
     fn prelogin_client_encryption_parses_option() {
         // Round-trip: a response built with ENCRYPT_ON is read back as ON.
         assert_eq!(
-            prelogin_client_encryption(&prelogin_response(true)),
+            prelogin_client_encryption(&prelogin_response(ENCRYPT_ON)),
             ENCRYPT_ON
         );
         assert_eq!(
-            prelogin_client_encryption(&prelogin_response(false)),
+            prelogin_client_encryption(&prelogin_response(ENCRYPT_NOT_SUP)),
             ENCRYPT_NOT_SUP
         );
         // A payload without an ENCRYPTION option defaults to NOT_SUP.

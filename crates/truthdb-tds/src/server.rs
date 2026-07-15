@@ -22,8 +22,23 @@ const TM_BEGIN_XACT: u16 = 5;
 const TM_COMMIT_XACT: u16 = 7;
 const TM_ROLLBACK_XACT: u16 = 8;
 
-/// Server-side TDS configuration: the login users, the reported database, and
-/// optional TLS.
+/// What the server does about encryption on a connection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Encryption {
+    /// Never encrypt: TLS is not offered even if certificates are configured.
+    Off,
+    /// Encrypt when the client asks to (the default, and what SQL Server calls
+    /// opportunistic): a client that does not ask is served in plaintext.
+    #[default]
+    Optional,
+    /// Refuse any client that will not encrypt. The server advertises
+    /// `ENCRYPT_REQ`, so a compliant client either encrypts or gives up, and a
+    /// client that says it cannot encrypt is dropped rather than served.
+    Required,
+}
+
+/// Server-side TDS configuration: the login users, the reported database,
+/// optional TLS, and the encryption policy.
 #[derive(Debug, Clone)]
 pub struct TdsConfig {
     /// username -> password (plaintext config auth for Stage 4).
@@ -34,6 +49,10 @@ pub struct TdsConfig {
     /// clients that request it (a tunneled TLS handshake, then an encrypted
     /// session).
     pub tls: Option<crate::tls::TlsConfig>,
+    /// Whether encryption is off, opportunistic, or mandatory. `Required`
+    /// needs `tls` to be configured; the server refuses to start otherwise,
+    /// since it could satisfy no one.
+    pub encryption: Encryption,
 }
 
 /// Handles one TDS connection to completion (or disconnect).
@@ -52,20 +71,34 @@ where
     if prelogin.kind != PKT_PRELOGIN {
         return Err(protocol_err("expected PRELOGIN"));
     }
-    // Offer TLS only when configured AND the client asks to encrypt (ENCRYPT_ON
-    // /REQ). We encrypt the whole session, not the login-only mode.
+    // Encryption policy. `Optional` (the default) is opportunistic: encrypt
+    // only when configured AND the client asks (ENCRYPT_ON/REQ). `Off` never
+    // encrypts. `Required` advertises ENCRYPT_REQ so a compliant client knows it
+    // must encrypt — and a client that answered "cannot" is dropped below rather
+    // than quietly served in plaintext. We encrypt the whole session, not the
+    // login-only mode.
     let client_enc = login::prelogin_client_encryption(&prelogin.payload);
-    let offer_tls =
-        config.tls.is_some() && matches!(client_enc, login::ENCRYPT_ON | login::ENCRYPT_REQ);
+    let (advertised, offer_tls) =
+        negotiate_encryption(config.encryption, config.tls.is_some(), client_enc);
     // The PRELOGIN *response* is sent as a REPLY (Tabular Result) packet;
     // clients (pytds/go-mssqldb) expect type 0x04 here, not 0x12.
     write_message(
         &mut stream,
         PKT_TABULAR_RESULT,
-        &login::prelogin_response(offer_tls),
+        &login::prelogin_response(advertised),
         packet_size,
     )
     .await?;
+    // The client was told encryption is mandatory but says it cannot: answer
+    // the PRELOGIN (so it learns why) and then refuse, rather than fall back to
+    // plaintext — a fallback would silently defeat the whole setting.
+    if config.encryption == Encryption::Required
+        && !matches!(client_enc, login::ENCRYPT_ON | login::ENCRYPT_REQ)
+    {
+        return Err(protocol_err(
+            "the server requires encryption; the client does not support it",
+        ));
+    }
 
     // If encryption was negotiated, complete the tunneled TLS handshake and run
     // the rest of the session over the encrypted stream.
@@ -619,6 +652,25 @@ fn batch_sql(text: &[u8]) -> io::Result<String> {
     String::from_utf16(&units).map_err(|_| protocol_err("SQLBatch text is not valid UTF-16"))
 }
 
+/// Decides what to advertise in PRELOGIN, and whether to run a TLS handshake.
+///
+/// Split out from the connection flow because the interesting cases are the
+/// combinations — notably `Off` while a certificate *is* configured, which an
+/// end-to-end test cannot reach without shipping a key.
+fn negotiate_encryption(policy: Encryption, tls_configured: bool, client: u8) -> (u8, bool) {
+    let client_wants_tls = matches!(client, login::ENCRYPT_ON | login::ENCRYPT_REQ);
+    match policy {
+        // Never encrypt, whatever is configured or asked for.
+        Encryption::Off => (login::ENCRYPT_NOT_SUP, false),
+        Encryption::Optional if tls_configured && client_wants_tls => (login::ENCRYPT_ON, true),
+        Encryption::Optional => (login::ENCRYPT_NOT_SUP, false),
+        // Startup refuses `Required` without a certificate, so offering here is
+        // always satisfiable; a client that will not encrypt is refused after
+        // the response tells it why.
+        Encryption::Required => (login::ENCRYPT_REQ, true),
+    }
+}
+
 fn protocol_err(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
 }
@@ -678,5 +730,60 @@ mod attention_tests {
             .expect("not disconnected");
         assert!(!cancel.load(Ordering::Relaxed));
         assert_eq!(out, b"RESULT".to_vec(), "no attention -> the real result");
+    }
+}
+
+#[cfg(test)]
+mod encryption_tests {
+    use super::*;
+
+    const ON: u8 = login::ENCRYPT_ON;
+    const NOT_SUP: u8 = login::ENCRYPT_NOT_SUP;
+    const REQ: u8 = login::ENCRYPT_REQ;
+
+    #[test]
+    fn off_never_offers_tls_even_with_a_certificate_configured() {
+        // The setting overrides the certificate: this is the case the setting
+        // exists for, and the one an end-to-end test cannot reach.
+        for client in [ON, NOT_SUP, REQ] {
+            assert_eq!(
+                negotiate_encryption(Encryption::Off, true, client),
+                (NOT_SUP, false),
+                "client {client}"
+            );
+        }
+    }
+
+    #[test]
+    fn optional_encrypts_only_when_configured_and_asked() {
+        assert_eq!(
+            negotiate_encryption(Encryption::Optional, true, ON),
+            (ON, true)
+        );
+        assert_eq!(
+            negotiate_encryption(Encryption::Optional, true, REQ),
+            (ON, true)
+        );
+        // Asked for, but no certificate to offer.
+        assert_eq!(
+            negotiate_encryption(Encryption::Optional, false, ON),
+            (NOT_SUP, false)
+        );
+        // Configured, but the client does not want it.
+        assert_eq!(
+            negotiate_encryption(Encryption::Optional, true, NOT_SUP),
+            (NOT_SUP, false)
+        );
+    }
+
+    #[test]
+    fn required_always_demands_encryption() {
+        for client in [ON, NOT_SUP, REQ] {
+            assert_eq!(
+                negotiate_encryption(Encryption::Required, true, client),
+                (REQ, true),
+                "client {client}"
+            );
+        }
     }
 }
