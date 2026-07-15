@@ -744,6 +744,27 @@ impl Scheduler {
         }
     }
 
+    /// Whether the parked batch at `i` could take every lock it needs right
+    /// now — i.e. it is waiting for a worker to pick it up, not for a lock.
+    fn grantable(&self, i: usize) -> bool {
+        let owner = self.parked[i].session.raw();
+        // Only waiters ahead in the queue have priority (FIFO); a waiter never
+        // yields to itself or to those behind it.
+        let ahead: Vec<(Resource, LockMode)> = self
+            .parked
+            .iter()
+            .take(i)
+            .filter(|p| p.session.raw() != owner)
+            .flat_map(|p| p.needs.iter().copied())
+            .collect();
+        self.parked[i].needs.iter().all(|(resource, mode)| {
+            // A resource the waiter already holds is exempt from the FIFO yield
+            // (it is not jumping the queue for it), matching try_acquire.
+            (self.locks.holds(owner, *resource) || !ahead.iter().any(|(r, _)| r == resource))
+                && self.locks.conflict(owner, *resource, *mode).is_none()
+        })
+    }
+
     /// Removes and returns the first parked batch (FIFO) whose locks are now
     /// grantable, having granted them and taken its session's transaction
     /// context out to run with. `None` if none can proceed. The caller runs it
@@ -752,23 +773,7 @@ impl Scheduler {
         let mut i = 0;
         while i < self.parked.len() {
             let owner = self.parked[i].session.raw();
-            // Only waiters ahead in the queue have priority (FIFO); a waiter
-            // never yields to itself or to those behind it.
-            let ahead: Vec<(Resource, LockMode)> = self
-                .parked
-                .iter()
-                .take(i)
-                .filter(|p| p.session.raw() != owner)
-                .flat_map(|p| p.needs.iter().copied())
-                .collect();
-            let grantable = self.parked[i].needs.iter().all(|(resource, mode)| {
-                // A resource the waiter already holds is exempt from the FIFO
-                // yield (it is not jumping the queue for it), matching
-                // try_acquire.
-                (self.locks.holds(owner, *resource) || !ahead.iter().any(|(r, _)| r == resource))
-                    && self.locks.conflict(owner, *resource, *mode).is_none()
-            });
-            if grantable {
+            if self.grantable(i) {
                 let parked = self.parked.remove(i).expect("index in bounds");
                 for (resource, mode) in &parked.needs {
                     self.locks.grant(owner, *resource, *mode);
@@ -793,13 +798,25 @@ impl Scheduler {
     /// released locks unblock — typically rescuing its deadlock partner before
     /// that partner is itself reaped. Any further expired waiters are handled on
     /// the next loop iteration.
+    ///
+    /// A waiter whose locks are already grantable is never a victim, however
+    /// long it has sat there: it is not blocked on anyone, it is waiting for a
+    /// worker to run it, and killing it would report a lock conflict (1205)
+    /// that does not exist. The gap is narrow today — the worker that releases
+    /// the locks drains the queue microseconds later, so only an unlucky
+    /// deschedule between the two exposes it — but it widens as soon as
+    /// anything can delay a worker between releasing locks and draining, which
+    /// is exactly what pushing result rows to a client will do. The reaper's
+    /// contract is about lock waits either way.
     fn reap_expired(&mut self, engine: &Engine) {
         let now = Instant::now();
         let victim_idx = self
             .parked
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.deadline <= now)
+            // `grantable` is only consulted for a waiter that has actually
+            // expired, so the common case (nothing expired) does no extra work.
+            .filter(|(i, p)| p.deadline <= now && !self.grantable(*i))
             .min_by_key(|(_, p)| p.deadline)
             .map(|(i, _)| i);
         if let Some(idx) = victim_idx {
@@ -1373,6 +1390,45 @@ mod tests {
         assert!(
             sched.reap_idle_txns(&engine),
             "with nothing parked, the idle transaction is reaped"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_parked_batch_whose_locks_are_free_is_never_reaped_as_a_victim() {
+        // The deadline is a backstop for a batch stuck behind someone else's
+        // lock. A waiter whose locks are free is not stuck — it is queued for a
+        // worker — so reaping it would report a conflict (1205) that never
+        // existed.
+        let (engine, mut sched, path) = bare("reap-grantable", None);
+        let id = sched.sessions.open("truthdb".into(), "sa".into());
+        let (reply, _rx) = oneshot::channel();
+        // Parked, deadline long gone, and nothing holds the lock it wants.
+        sched.parked.push_back(Parked {
+            session: id,
+            sql: "SELECT 1".into(),
+            params: Vec::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            reply,
+            needs: vec![(Resource::Table(1), LockMode::Shared)],
+            deadline: Instant::now() - Duration::from_secs(60),
+        });
+        sched.reap_expired(&engine);
+        assert_eq!(
+            sched.parked.len(),
+            1,
+            "an expired waiter whose locks are free is not a deadlock victim"
+        );
+
+        // The same waiter, once something actually blocks it, is reaped — so it
+        // is grantability doing the work above, not a dead reaper.
+        sched
+            .locks
+            .grant(999, Resource::Table(1), LockMode::Exclusive);
+        sched.reap_expired(&engine);
+        assert!(
+            sched.parked.is_empty(),
+            "an expired waiter that is genuinely blocked is still the victim"
         );
         let _ = std::fs::remove_file(path);
     }
