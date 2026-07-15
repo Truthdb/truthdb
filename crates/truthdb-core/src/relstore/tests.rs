@@ -738,3 +738,102 @@ fn heap_update_on_stub_starved_page_fails_cleanly() {
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
+
+// ---- batched scans (ScanCursor) -------------------------------------------
+
+/// Walks a table in slices of `budget` rows, as a streaming reader would.
+fn scan_batched_ids(storage: &mut Storage, table: &str, budget: usize) -> Vec<i32> {
+    use crate::relstore::btree::{BTree, ScanCursor};
+    use crate::relstore::heap::Heap;
+    let (def, schema) = storage.rel_def_for_test(table).expect("def");
+    let mut raw: Vec<Vec<u8>> = Vec::new();
+    let mut cursor = ScanCursor::start();
+    let mut slices = 0;
+    while !cursor.done() {
+        // One lock acquisition per slice, released between: what lets a large
+        // scan stop holding the storage mutex for its whole duration.
+        let (next, got) = storage.with_rel_ctx_for_test(|ctx| {
+            let mut got = Vec::new();
+            let next = if def.is_tree() {
+                let tree = BTree {
+                    object_id: def.object_id,
+                    root: def.root_page,
+                };
+                let mut keyed = Vec::new();
+                let next = tree
+                    .scan_from(ctx, cursor, budget, &mut keyed)
+                    .expect("scan_from");
+                got.extend(keyed.into_iter().map(|(_, row)| row));
+                next
+            } else {
+                let heap = Heap {
+                    object_id: def.object_id,
+                    first_page: def.root_page,
+                };
+                let mut located = Vec::new();
+                let next = heap
+                    .scan_from(ctx, cursor, budget, &mut located)
+                    .expect("scan_from");
+                got.extend(located.into_iter().map(|(_, row)| row));
+                next
+            };
+            (next, got)
+        });
+        assert!(got.len() <= budget, "a slice must respect its budget");
+        raw.extend(got);
+        cursor = next;
+        slices += 1;
+        assert!(slices < 100_000, "the cursor must always advance");
+    }
+    raw.iter()
+        .map(
+            |r| match crate::relstore::row::decode_row(&schema, r).expect("decode")[0] {
+                Datum::Int(v) => v,
+                ref other => panic!("expected int id, got {other:?}"),
+            },
+        )
+        .collect()
+}
+
+#[test]
+fn batched_scan_matches_a_whole_scan_at_every_budget() {
+    // A slice boundary must fall anywhere without losing or repeating a row —
+    // including mid-page and exactly on a page boundary.
+    let path = unique_temp_path("scan-batched");
+    let mut storage = create_storage(&path);
+    create_tree_table(&mut storage, "t");
+    create_heap_table(&mut storage, "h");
+    // Enough rows, each large, to span many pages.
+    for i in 0..200 {
+        storage
+            .rel_insert("t", row(i, &"x".repeat(200)))
+            .expect("insert t");
+        storage
+            .rel_insert("h", row(i, &"x".repeat(200)))
+            .expect("insert h");
+    }
+    for table in ["t", "h"] {
+        let whole = scan_ids(&mut storage, table);
+        assert_eq!(whole.len(), 200, "{table}: precondition");
+        for budget in [1, 2, 7, 199, 200, 201, 1000] {
+            assert_eq!(
+                scan_batched_ids(&mut storage, table, budget),
+                whole,
+                "{table}: budget {budget} must agree with a whole scan"
+            );
+        }
+    }
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn batched_scan_of_an_empty_table_terminates() {
+    let path = unique_temp_path("scan-empty");
+    let mut storage = create_storage(&path);
+    create_tree_table(&mut storage, "t");
+    create_heap_table(&mut storage, "h");
+    for table in ["t", "h"] {
+        assert_eq!(scan_batched_ids(&mut storage, table, 4), Vec::<i32>::new());
+    }
+    let _ = std::fs::remove_file(path);
+}

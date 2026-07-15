@@ -11,8 +11,9 @@
 //! All mutations are physical slot operations logged with physical undos
 //! (RIDs are stable, so physical undo is exact).
 
+use crate::relstore::btree::ScanCursor;
 use crate::relstore::ctx::{LogMode, RelCtx, TxnLink};
-use crate::relstore::page::PAGE_TYPE_HEAP;
+use crate::relstore::page::{self, PAGE_TYPE_HEAP};
 use crate::relstore::slotted::{NO_PAGE, STRUCT_HEADER_END, SlottedRead};
 use crate::storage::StorageError;
 use crate::storage_layout::PAGE_SIZE;
@@ -362,14 +363,52 @@ impl Heap {
     /// RID; stubs and tombstones are skipped.
     pub fn scan(&self, ctx: &mut RelCtx<'_>) -> Result<Vec<(Rid, Vec<u8>)>, StorageError> {
         let mut out = Vec::new();
-        let mut page_no = self.first_page;
+        let mut cursor = ScanCursor::start();
+        while !cursor.done() {
+            cursor = self.scan_from(ctx, cursor, usize::MAX, &mut out)?;
+        }
+        Ok(out)
+    }
+
+    /// Appends at most `budget` rows from `cursor` onward, returning where to
+    /// resume. Lets a caller walk a large heap in bounded slices instead of
+    /// materializing it, so the storage mutex can be dropped between slices.
+    ///
+    /// A resumed page is checked against this heap's `object_id` before it is
+    /// read: nothing holds the page between calls, so a page freed and recycled
+    /// to another object in the meantime would otherwise be read as if it were
+    /// still ours. On a mismatch the scan stops rather than return another
+    /// object's rows. (Callers holding a table lock cannot see that happen; a
+    /// READ UNCOMMITTED scan takes no lock and can.)
+    pub fn scan_from(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        cursor: ScanCursor,
+        budget: usize,
+        out: &mut Vec<(Rid, Vec<u8>)>,
+    ) -> Result<ScanCursor, StorageError> {
+        let mut page_no = cursor.page().unwrap_or(self.first_page);
+        let mut slot = cursor.slot();
+        let mut taken = 0;
         while page_no != NO_PAGE {
             let frame = ctx.fetch(page_no)?;
+            if page::read_header(ctx.pool.page(frame)).object_id != self.object_id {
+                ctx.pool.unpin(frame);
+                return Ok(ScanCursor::finished());
+            }
             let page = SlottedRead::new(ctx.pool.page(frame));
             let next = page.next_page();
             let mut bad_tag = None;
-            for slot in 0..page.slot_count() {
-                let Some(cell) = page.get(slot) else { continue };
+            let mut stopped = None;
+            while slot < page.slot_count() {
+                if taken == budget {
+                    stopped = Some(ScanCursor::at(page_no, slot));
+                    break;
+                }
+                let Some(cell) = page.get(slot) else {
+                    slot += 1;
+                    continue;
+                };
                 match cell[0] {
                     TAG_ROW => out.push((
                         Rid {
@@ -379,12 +418,18 @@ impl Heap {
                         cell[1..].to_vec(),
                     )),
                     TAG_MOVED => out.push((parse_rid(&cell[1..]), cell[11..].to_vec())),
-                    TAG_STUB => {}
+                    TAG_STUB => {
+                        // A stub yields no row and must not spend the budget.
+                        slot += 1;
+                        continue;
+                    }
                     other => {
                         bad_tag = Some(other);
                         break;
                     }
                 }
+                slot += 1;
+                taken += 1;
             }
             ctx.pool.unpin(frame);
             if let Some(tag) = bad_tag {
@@ -392,9 +437,13 @@ impl Heap {
                     "unknown heap cell tag {tag}"
                 )));
             }
+            if let Some(at) = stopped {
+                return Ok(at);
+            }
             page_no = next;
+            slot = 0;
         }
-        Ok(out)
+        Ok(ScanCursor::finished())
     }
 }
 
