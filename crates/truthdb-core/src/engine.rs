@@ -5714,6 +5714,10 @@ mod tests {
                 &format!("INSERT INTO hp VALUES ({i}, {i})"),
             );
         }
+        // A secondary index, so the seek access path is compared as well as the
+        // scan — `plan::choose` only considers secondary indexes, so a PK
+        // equality is not a seek here.
+        batch(&engine, &mut ctx, "CREATE INDEX ix_ab_v ON ab (v)");
 
         let queries = [
             // Bare columns, wildcards, aliases, qualified names.
@@ -5738,25 +5742,44 @@ mod tests {
             "SELECT id FROM ab WHERE 1 = 0",
             // TOP, with and without a filter, at and past the row count.
             "SELECT TOP 5 id FROM ab",
-            "SELECT TOP 0 id FROM ab",
+            "SELECT TOP 1 id FROM ab",
             "SELECT TOP 5 id FROM ab WHERE v > 100",
             "SELECT TOP 1000 id FROM ab",
             "SELECT TOP 5 * FROM ab",
-            // Slice boundaries: 300 rows is well inside one 1024-row slice, so
-            // exercise a table that spans several as well.
+            // The seek access path: `v` is indexed, so these choose IndexSeek
+            // and its candidates are re-filtered and projected the same way.
+            "SELECT id FROM ab WHERE v = 100",
+            "SELECT id, v FROM ab WHERE v = 100",
+            "SELECT * FROM ab WHERE v > 500",
+            "SELECT * FROM ab WHERE v >= 100 AND v <= 200",
+            "SELECT TOP 3 id FROM ab WHERE v > 100",
+            "SELECT id FROM ab WHERE v = 99999",
+            // The heap: 300 rows is inside one 1024-row slice either way.
             "SELECT id FROM hp",
             "SELECT TOP 3 id FROM hp",
             "SELECT id FROM hp WHERE v > 290",
         ];
 
         for query in queries {
+            // Both guards are needed, and for the same reason: an A/B whose two
+            // sides run the same code agrees with itself. The first proves the
+            // scan path ran; the second proves `without_scan_path` really took
+            // it away, which nothing else here would notice if it stopped
+            // working.
             let before = engine.storage.scan_selects();
             let streamed = batch(&engine, &mut ctx, query);
-            assert!(
-                engine.storage.scan_selects() > before,
+            assert_eq!(
+                engine.storage.scan_selects(),
+                before + 1,
                 "{query} did not take the scan path, so comparing it proves nothing"
             );
+            let before = engine.storage.scan_selects();
             let collected = crate::rel::without_scan_path(|| batch(&engine, &mut ctx, query));
+            assert_eq!(
+                engine.storage.scan_selects(),
+                before,
+                "{query} took the scan path for both runs, so it was compared with itself"
+            );
             assert!(streamed.error.is_none(), "{query}: {:?}", streamed.error);
             assert!(collected.error.is_none(), "{query}: {:?}", collected.error);
             assert_eq!(
@@ -5800,16 +5823,6 @@ mod tests {
             "TOP 1 must read one slice, not walk the whole table"
         );
 
-        // TOP 0 reads nothing at all — the loop never starts.
-        let before = engine.storage.scan_slices();
-        let out = batch(&engine, &mut ctx, "SELECT TOP 0 id FROM big");
-        assert_eq!(
-            engine.storage.scan_slices() - before,
-            0,
-            "TOP 0 must not read a slice"
-        );
-        assert!(first_rowset(&out).rows.is_empty(), "TOP 0 returns no rows");
-
         // The counter means what the assertions above assume: an unlimited scan
         // of the same table reads every slice. Without this the two could pass
         // against a scan that never ran.
@@ -5824,10 +5837,63 @@ mod tests {
     }
 
     #[test]
+    fn top_0_is_left_to_the_collecting_path_so_an_invalid_where_still_errors() {
+        // The engine has no separate binding pass: an unresolvable column (207)
+        // and a non-boolean predicate (4145) are both raised by *evaluating* the
+        // predicate on a row. `TOP 0` wants no rows, so a scan path that honours
+        // it evaluates nothing and answers an invalid query with an empty result
+        // set instead of rejecting it. The gate declines TOP 0 for that reason.
+        let path = unique_temp_path("scan-top0");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE p (id INT PRIMARY KEY, v INT)",
+        );
+        for i in 1..4 {
+            batch(
+                &engine,
+                &mut ctx,
+                &format!("INSERT INTO p VALUES ({i}, {i})"),
+            );
+        }
+
+        for (query, expected) in [
+            ("SELECT TOP 0 id FROM p WHERE bogus = 1", 207),
+            ("SELECT TOP 0 id FROM p WHERE id", 4145),
+        ] {
+            assert_eq!(
+                batch(&engine, &mut ctx, query).error.map(|e| e.number),
+                Some(expected),
+                "{query} must still be rejected, not answered with no rows"
+            );
+        }
+        // The same errors without TOP, so the cases above are about TOP 0 and
+        // not about a query that is broken some other way.
+        for (query, expected) in [
+            ("SELECT id FROM p WHERE bogus = 1", 207),
+            ("SELECT id FROM p WHERE id", 4145),
+        ] {
+            assert_eq!(
+                batch(&engine, &mut ctx, query).error.map(|e| e.number),
+                Some(expected),
+                "{query}"
+            );
+        }
+        // And a valid TOP 0 still answers with an empty result set.
+        let out = batch(&engine, &mut ctx, "SELECT TOP 0 id FROM p");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(first_rowset(&out).rows.is_empty(), "TOP 0 returns no rows");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn a_sargable_where_still_seeks_its_index_instead_of_scanning() {
-        // The gate declines an index seek: reading the whole table to filter it
-        // down would trade the planner's work for this path's. A results-only
-        // test cannot see the difference — the slice counter can.
+        // The scan path takes the planner's access path rather than declining a
+        // seek — declining would throw away the table definition, the schema and
+        // the choice, all of which build_table_source would then recompute. A
+        // results-only test cannot see which path ran; the slice counter can.
         let path = unique_temp_path("scan-seek");
         let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
@@ -5847,12 +5913,18 @@ mod tests {
         // clustered PK is not a seekable path here.
         batch(&engine, &mut ctx, "CREATE INDEX ix_sk_v ON sk (v)");
 
-        let before = engine.storage.scan_slices();
+        let slices = engine.storage.scan_slices();
+        let selects = engine.storage.scan_selects();
         let out = batch(&engine, &mut ctx, "SELECT id FROM sk WHERE v = 1500");
         assert_eq!(
-            engine.storage.scan_slices() - before,
+            engine.storage.scan_slices() - slices,
             0,
             "an equality on an indexed column must seek, not scan"
+        );
+        assert_eq!(
+            engine.storage.scan_selects() - selects,
+            1,
+            "and the seek is still answered on the scan path, not handed back"
         );
         assert_eq!(first_rowset(&out).rows.len(), 1, "the seek finds the row");
 

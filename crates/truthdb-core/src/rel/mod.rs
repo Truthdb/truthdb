@@ -4600,6 +4600,8 @@ pub(crate) fn without_scan_path<R>(f: impl FnOnce() -> R) -> R {
 struct ScanPlan {
     /// The base table's catalog name — what the scan reads.
     table: String,
+    /// How to read it: the planner's choice, made once (see [`scan_plan`]).
+    access: plan::AccessPath,
     /// Source column metadata, in table order.
     source: Vec<ResultColumn>,
     /// Resolves the WHERE clause's column references against the source.
@@ -4633,14 +4635,38 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     {
         return None;
     }
+    // `TOP 0` wants no rows, so this path would never evaluate the WHERE — and
+    // the engine reports an unresolvable column (207) or a non-boolean predicate
+    // (4145) from that evaluation, having no separate binding pass. Reading a
+    // table to discard all of it is not worth answering an invalid query with an
+    // empty result set, so the degenerate case stays on the collecting path.
+    if select.top == Some(0) {
+        return None;
+    }
     // An uncorrelated subquery is executed by the rewrite this path skips; a
     // correlated one runs a query per row. (A subquery in the SELECT list is
     // already excluded: it is not a bare column.)
-    if select
-        .where_clause
-        .as_ref()
-        .is_some_and(expr_has_subquery)
-    {
+    if select.where_clause.as_ref().is_some_and(expr_has_subquery) {
+        return None;
+    }
+    // Whether every output column *could* be a source column, which is a
+    // property of the syntax alone. Deciding it before the catalog is read keeps
+    // `SELECT id + 1 FROM t` from paying for a table definition, a schema and a
+    // resolver it is only going to discard.
+    if !select.items.iter().all(|item| {
+        matches!(
+            item,
+            SelectItem::Wildcard
+                | SelectItem::QualifiedWildcard(_)
+                | SelectItem::Expr {
+                    expr: Expr {
+                        kind: ExprKind::Column(_),
+                        ..
+                    },
+                    ..
+                }
+        )
+    }) {
         return None;
     }
     let Some(TableRef::Table { name, alias }) = select.from.as_ref() else {
@@ -4662,13 +4688,11 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
         return None;
     }
     let schema = def.schema().ok()?;
-    // A sargable WHERE seeks the index instead; this path only replaces a scan.
-    if !matches!(
-        plan::choose(&def, &schema, &select.where_clause, eval_ctx),
-        plan::AccessPath::TableScan
-    ) {
-        return None;
-    }
+    // The same access path `build_table_source` would take. Taking it here too,
+    // rather than declining a seek, is what keeps this gate free for the queries
+    // it rejects: a decline would have thrown away the definition, the schema
+    // and this choice, and `build_table_source` would compute all three again.
+    let access = plan::choose(&def, &schema, &select.where_clause, eval_ctx);
 
     let qualifier = alias
         .as_ref()
@@ -4735,6 +4759,7 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
 
     Some(ScanPlan {
         table: def.name,
+        access,
         source,
         resolver,
         columns,
@@ -4768,7 +4793,16 @@ fn is_sys_view(name: &str) -> bool {
 /// than truncating afterwards.
 ///
 /// The result is still collected; what this drops is the *input's*
-/// materialization, which is the part that has no upper bound.
+/// materialization, which is the part that has no upper bound. An index seek
+/// keeps its input materialized — `rel_index_scan` has no cursor — so it gains
+/// the per-row savings but not that one; a seek's candidate set is bounded by
+/// the seek.
+///
+/// `TOP n` therefore stops the scan without evaluating the predicate on rows
+/// past the nth kept one, where the collecting path evaluated every source row
+/// before truncating. A predicate that errors on one of those rows (a divide by
+/// zero, an overflow) now goes unraised — which is SQL Server's behaviour, whose
+/// Top operator likewise stops asking its child for rows.
 fn scan_select(
     storage: &Storage,
     plan: &ScanPlan,
@@ -4783,28 +4817,55 @@ fn scan_select(
         rows: Vec::new(),
     };
     // TOP counts rows *kept*, matching the collecting path's truncation of the
-    // filtered rows. `TOP 0` therefore reads nothing at all.
-    let enough = |kept: usize| select.top.is_some_and(|top| kept as u64 >= top);
-    let mut cursor = ScanCursor::start();
-    let mut slice: Vec<Vec<Datum>> = Vec::new();
-    while !cursor.done() && !enough(out.rows.len()) {
-        slice.clear();
-        cursor = storage
-            .rel_scan_slice(&plan.table, cursor, SCAN_SLICE_ROWS, &mut slice)
-            .map_err(|err| map_storage_err(err, &plan.table))?;
-        for row in slice.drain(..) {
-            if enough(out.rows.len()) {
-                break;
+    // filtered rows. `TOP 0` never reaches here (the gate declines it).
+    let enough = |out: &RowSet| select.top.is_some_and(|top| out.rows.len() as u64 >= top);
+
+    // One row: filter it, and project it or drop it. `Ok(false)` once TOP is
+    // satisfied and the caller should stop reading.
+    let take = |row: Vec<Datum>, out: &mut RowSet| -> Result<bool, SqlError> {
+        check_cancelled()?;
+        if let Some(predicate) = &select.where_clause {
+            let sql_row = row_values(&row, &types);
+            if !where_keeps(predicate, &sql_row, &plan.resolver, eval_ctx)? {
+                return Ok(true);
             }
-            check_cancelled()?;
-            if let Some(predicate) = &select.where_clause {
-                let sql_row = row_values(&row, &types);
-                if !where_keeps(predicate, &sql_row, &plan.resolver, eval_ctx)? {
-                    continue;
+        }
+        out.rows
+            .push(plan.picks.iter().map(|i| row[*i].clone()).collect());
+        Ok(!enough(out))
+    };
+
+    match &plan.access {
+        plan::AccessPath::TableScan => {
+            let mut cursor = ScanCursor::start();
+            let mut slice: Vec<Vec<Datum>> = Vec::new();
+            'scan: while !cursor.done() {
+                cursor = storage
+                    .rel_scan_slice(&plan.table, cursor, SCAN_SLICE_ROWS, &mut slice)
+                    .map_err(|err| map_storage_err(err, &plan.table))?;
+                for row in slice.drain(..) {
+                    if !take(row, &mut out)? {
+                        break 'scan;
+                    }
                 }
             }
-            out.rows
-                .push(plan.picks.iter().map(|i| row[*i].clone()).collect());
+        }
+        plan::AccessPath::IndexSeek {
+            index_object_id,
+            lower,
+            upper,
+            ..
+        } => {
+            // The seek narrows the candidates; the predicate still re-checks
+            // each one, so the result matches a full scan.
+            let rows = storage
+                .rel_index_scan(&plan.table, *index_object_id, lower.clone(), upper.clone())
+                .map_err(|err| map_storage_err(err, &plan.table))?;
+            for row in rows {
+                if !take(row, &mut out)? {
+                    break;
+                }
+            }
         }
     }
     Ok(out)
