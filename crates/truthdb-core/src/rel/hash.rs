@@ -63,7 +63,7 @@ pub fn fold_hash_key(key: &[SqlValue], sensitivities: &[CollationSensitivity]) -
             let sens = sensitivities
                 .get(index)
                 .copied()
-                .unwrap_or(CollationSensitivity::DEFAULT);
+                .unwrap_or(CollationSensitivity::default_collation());
             sens.fold_value(value.clone())
         })
         .collect()

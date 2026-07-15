@@ -15,7 +15,7 @@
 //! is likewise unique (NULL encodes to one byte), as in SQL Server.
 
 use crate::relstore::heap::Rid;
-use crate::relstore::key::{encode_datum, fold_key_datum};
+use crate::relstore::key::encode_datum_collated;
 use crate::relstore::types::{Datum, TypeError};
 
 /// The collation of the schema column at `index` (empty/short slice → the
@@ -49,12 +49,12 @@ pub fn encode_index_columns(
         let value = values
             .get(index)
             .ok_or_else(|| TypeError(format!("index column {index} out of range")))?;
-        let folded = fold_key_datum(value, column_collation(collations, index));
+        let collation = column_collation(collations, index);
         if ascending {
-            encode_datum(&folded, &mut out)?;
+            encode_datum_collated(value, collation, &mut out)?;
         } else {
             let start = out.len();
-            encode_datum(&folded, &mut out)?;
+            encode_datum_collated(value, collation, &mut out)?;
             // DESC: invert this column's bytes so ordering reverses.
             for b in &mut out[start..] {
                 *b = !*b;
@@ -66,9 +66,8 @@ pub fn encode_index_columns(
 
 /// Encodes a leading prefix of an index's columns directly from seek values
 /// (`values[i]` is the value for `columns[i]`), applying ASC/DESC. Used to
-/// build index-seek bounds. Folds the same way as [`encode_index_columns`], so a
-/// seek literal matches the stored (folded) key under a case-insensitive
-/// collation.
+/// build index-seek bounds. Encodes the same way as [`encode_index_columns`], so
+/// a seek literal matches the stored key under the column's collation.
 pub fn encode_index_prefix(
     values: &[Datum],
     columns: &[(usize, bool)],
@@ -77,12 +76,12 @@ pub fn encode_index_prefix(
     let mut out = Vec::new();
     for (i, value) in values.iter().enumerate() {
         let (index, ascending) = columns[i];
-        let folded = fold_key_datum(value, column_collation(collations, index));
+        let collation = column_collation(collations, index);
         if ascending {
-            encode_datum(&folded, &mut out)?;
+            encode_datum_collated(value, collation, &mut out)?;
         } else {
             let start = out.len();
-            encode_datum(&folded, &mut out)?;
+            encode_datum_collated(value, collation, &mut out)?;
             for b in &mut out[start..] {
                 *b = !*b;
             }

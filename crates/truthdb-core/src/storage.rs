@@ -1163,16 +1163,16 @@ impl StorageFile {
                 "wrong number of key values".to_string(),
             ));
         }
-        // Fold each key column so a case-insensitive character PK lookup matches
-        // the stored (folded) key — the seek literal must fold exactly as the
-        // stored key did.
+        // Encode each key column under its collation, exactly as the stored key
+        // was, so a character PK lookup matches whatever the collation calls
+        // equal.
         let mut key = Vec::new();
         for (value, &col) in key_values.iter().zip(&def.key_columns) {
-            let folded = crate::relstore::key::fold_key_datum(
+            crate::relstore::key::encode_datum_collated(
                 value,
                 schema.columns[col].collation.as_deref(),
-            );
-            crate::relstore::key::encode_datum(&folded, &mut key)?;
+                &mut key,
+            )?;
         }
         let tree = BTree {
             object_id: def.object_id,

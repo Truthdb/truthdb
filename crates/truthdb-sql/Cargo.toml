@@ -6,5 +6,7 @@ description = "TruthDB SQL front end: hand-rolled T-SQL-flavored lexer, parser, 
 license = "MIT"
 
 [dependencies]
+icu_collator = { version = "2.2", features = ["compiled_data", "unstable"] }
+icu_locale_core = "2.0"
 
 [dev-dependencies]

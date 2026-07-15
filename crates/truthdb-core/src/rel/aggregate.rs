@@ -82,7 +82,7 @@ impl truthdb_sql::eval::ColumnResolver for SynthScope {
         self.collations
             .get(index)
             .copied()
-            .unwrap_or(CollationSensitivity::DEFAULT)
+            .unwrap_or(CollationSensitivity::default_collation())
     }
 }
 
@@ -146,7 +146,7 @@ pub fn execute(
         .group_by
         .iter()
         .map(|expr| eval::key_collation(expr, resolver))
-        .chain((0..aggs.len()).map(|_| CollationSensitivity::DEFAULT))
+        .chain((0..aggs.len()).map(|_| CollationSensitivity::default_collation()))
         .collect();
     let synth = SynthScope { names, collations };
 
