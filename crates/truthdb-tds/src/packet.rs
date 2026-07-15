@@ -98,34 +98,91 @@ pub async fn write_message<W: AsyncWrite + Unpin>(
     payload: &[u8],
     packet_size: usize,
 ) -> io::Result<()> {
-    let data_per_packet = packet_size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE) - HEADER_LEN;
-    let mut packet_id: u8 = 1;
-    let mut offset = 0;
-    loop {
-        let end = (offset + data_per_packet).min(payload.len());
-        let is_last = end == payload.len();
-        let chunk = &payload[offset..end];
-        let length = (HEADER_LEN + chunk.len()) as u16;
-        let header = [
+    let mut out = MessageWriter::new(writer, kind, packet_size);
+    out.write(payload).await?;
+    out.finish().await
+}
+
+/// Writes one TDS message incrementally, so a response need not exist as a
+/// single buffer before any of it reaches the socket.
+///
+/// Bytes are appended with [`Self::write`] and leave as soon as a full packet's
+/// worth has accumulated; [`Self::finish`] emits whatever is left as the EOM
+/// packet. Only one packet of data is ever buffered, so the memory a response
+/// costs here is bounded by the negotiated packet size no matter how many rows
+/// it carries. [`write_message`] is this writer over an already-built payload.
+///
+/// A message must always be finished: a client reads packets until EOM, so
+/// dropping a writer mid-message leaves the connection waiting for a packet
+/// that never comes. `finish` takes `self` by value to make that hard to get
+/// wrong by accident.
+pub struct MessageWriter<'a, W> {
+    writer: &'a mut W,
+    kind: u8,
+    /// Pending bytes, flushed once they reach `data_per_packet`.
+    buf: Vec<u8>,
+    data_per_packet: usize,
+    packet_id: u8,
+}
+
+impl<'a, W: AsyncWrite + Unpin> MessageWriter<'a, W> {
+    pub fn new(writer: &'a mut W, kind: u8, packet_size: usize) -> Self {
+        let data_per_packet = packet_size.clamp(MIN_PACKET_SIZE, MAX_PACKET_SIZE) - HEADER_LEN;
+        MessageWriter {
+            writer,
             kind,
-            if is_last { STATUS_EOM } else { 0 },
+            buf: Vec::with_capacity(data_per_packet),
+            data_per_packet,
+            packet_id: 1,
+        }
+    }
+
+    /// Appends `bytes` to the message, emitting packets as they fill.
+    ///
+    /// A token may straddle a packet boundary — TDS packets split the token
+    /// stream at arbitrary byte offsets — so this never pads a packet to keep a
+    /// token whole.
+    pub async fn write(&mut self, bytes: &[u8]) -> io::Result<()> {
+        let mut rest = bytes;
+        // Strictly greater, never equal: a message whose bytes exactly fill a
+        // packet ends as that packet with EOM set, not as a full packet plus an
+        // empty one. (An exactly-full buffer stays pending until either more
+        // bytes arrive or `finish` sends it.)
+        while self.buf.len() + rest.len() > self.data_per_packet {
+            let take = self.data_per_packet - self.buf.len();
+            self.buf.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            self.emit(false).await?;
+        }
+        self.buf.extend_from_slice(rest);
+        Ok(())
+    }
+
+    /// Emits the trailing packet with EOM set and flushes the socket.
+    pub async fn finish(mut self) -> io::Result<()> {
+        self.emit(true).await?;
+        self.writer.flush().await
+    }
+
+    /// Writes `buf` as one packet and clears it. `last` sets EOM.
+    async fn emit(&mut self, last: bool) -> io::Result<()> {
+        let length = (HEADER_LEN + self.buf.len()) as u16;
+        let header = [
+            self.kind,
+            if last { STATUS_EOM } else { 0 },
             (length >> 8) as u8,
             (length & 0xff) as u8,
             0,
             0, // SPID (server sends 0 in Stage 4)
-            packet_id,
+            self.packet_id,
             0, // window
         ];
-        writer.write_all(&header).await?;
-        writer.write_all(chunk).await?;
-        packet_id = packet_id.wrapping_add(1);
-        offset = end;
-        if is_last {
-            break;
-        }
+        self.writer.write_all(&header).await?;
+        self.writer.write_all(&self.buf).await?;
+        self.packet_id = self.packet_id.wrapping_add(1);
+        self.buf.clear();
+        Ok(())
     }
-    writer.flush().await?;
-    Ok(())
 }
 
 #[cfg(test)]
@@ -164,6 +221,42 @@ mod tests {
         let message = read_message(&mut cursor).await.unwrap();
         assert_eq!(message.kind, PKT_TABULAR_RESULT);
         assert_eq!(message.payload, payload);
+    }
+
+    #[tokio::test]
+    async fn a_payload_that_exactly_fills_a_packet_is_one_packet() {
+        // The boundary the incremental writer has to get right: at exactly a
+        // packet's worth it must hold the bytes back for `finish` to send with
+        // EOM, not emit a full packet and then an empty one to carry the flag.
+        let payload = vec![7u8; MIN_PACKET_SIZE - HEADER_LEN];
+        let mut buf = Vec::new();
+        write_message(&mut buf, PKT_TABULAR_RESULT, &payload, MIN_PACKET_SIZE)
+            .await
+            .unwrap();
+        assert_eq!(buf.len(), MIN_PACKET_SIZE, "exactly one packet");
+        assert_eq!(buf[1], STATUS_EOM, "and it ends the message");
+    }
+
+    #[tokio::test]
+    async fn an_incrementally_written_message_frames_like_a_built_one() {
+        // Rows are written a chunk at a time, and packet boundaries fall
+        // wherever they fall. Whatever the write sizes, the bytes on the wire
+        // must be the ones a single buffered payload would have produced.
+        let payload: Vec<u8> = (0..3000).map(|i| (i % 251) as u8).collect();
+        let mut whole = Vec::new();
+        write_message(&mut whole, PKT_TABULAR_RESULT, &payload, MIN_PACKET_SIZE)
+            .await
+            .unwrap();
+
+        for chunk in [1usize, 7, 100, MIN_PACKET_SIZE - HEADER_LEN, 4096] {
+            let mut piecewise = Vec::new();
+            let mut out = MessageWriter::new(&mut piecewise, PKT_TABULAR_RESULT, MIN_PACKET_SIZE);
+            for part in payload.chunks(chunk) {
+                out.write(part).await.unwrap();
+            }
+            out.finish().await.unwrap();
+            assert_eq!(piecewise, whole, "written {chunk} bytes at a time");
+        }
     }
 
     #[tokio::test]
