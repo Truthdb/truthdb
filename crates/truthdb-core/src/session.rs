@@ -56,6 +56,18 @@ use crate::rel::{BatchOutcome, Isolation, TxnContext};
 /// abort youngest").
 const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// How long a session may sit idle with a transaction still open before the
+/// engine rolls it back and releases its locks.
+///
+/// This is a deliberate divergence from SQL Server, which never reaps an idle
+/// transaction: a client that dies without closing its TCP connection would
+/// otherwise hold its locks until the OS notices, which can take hours, and
+/// every conflicting batch fails with 1205 in the meantime. Ten minutes is far
+/// longer than any interactive transaction should stay idle, so a legitimate
+/// client is never reaped. `spawn_engine_pool` takes it as `Option`, so it can
+/// be disabled outright.
+const IDLE_TXN_TIMEOUT: Duration = Duration::from_secs(600);
+
 /// The result of running a batch for a session: its typed outcome plus
 /// whether the connection is still inside a transaction afterwards (so the
 /// TDS gateway can set `DONE_INXACT`).
@@ -78,9 +90,22 @@ impl SessionId {
 /// Per-connection engine-side state: the transaction context carried across a
 /// connection's batches (open transaction, `@@TRANCOUNT`, isolation, SET
 /// options).
-#[derive(Default)]
 struct Session {
     txn_ctx: TxnContext,
+    /// When this session last started or finished a batch. Only meaningful
+    /// while the session is idle: a running batch's context is moved out by
+    /// [`Scheduler::take_ctx`], so a session mid-batch reports no open
+    /// transaction and is never a reap candidate regardless of this stamp.
+    last_activity: Instant,
+}
+
+impl Default for Session {
+    fn default() -> Self {
+        Session {
+            txn_ctx: TxnContext::default(),
+            last_activity: Instant::now(),
+        }
+    }
 }
 
 struct SessionManager {
@@ -117,6 +142,18 @@ impl SessionManager {
 
     fn get_mut(&mut self, id: SessionId) -> Option<&mut Session> {
         self.sessions.get_mut(&id)
+    }
+
+    fn iter(&self) -> impl Iterator<Item = (&SessionId, &Session)> {
+        self.sessions.iter()
+    }
+
+    /// Marks a session as active now, so the idle reaper does not count time
+    /// spent running a batch against it.
+    fn touch(&mut self, id: SessionId) {
+        if let Some(state) = self.sessions.get_mut(&id) {
+            state.last_activity = Instant::now();
+        }
     }
 }
 
@@ -272,25 +309,41 @@ fn worker_count() -> usize {
 /// Spawns the engine worker pool and returns a handle plus a join handle for a
 /// supervisor thread that outlives every worker.
 pub fn spawn_engine(engine: Engine) -> (EngineHandle, JoinHandle<()>) {
-    spawn_engine_pool(engine, LOCK_WAIT_TIMEOUT, worker_count())
+    spawn_engine_pool(
+        engine,
+        LOCK_WAIT_TIMEOUT,
+        Some(IDLE_TXN_TIMEOUT),
+        worker_count(),
+    )
 }
 
 /// Like [`spawn_engine`] but with a custom lock-wait timeout, so tests can
 /// exercise the deadlock reaper without a real 5 s wait.
 #[cfg(test)]
 fn spawn_engine_with_timeout(engine: Engine, timeout: Duration) -> (EngineHandle, JoinHandle<()>) {
-    spawn_engine_pool(engine, timeout, worker_count())
+    spawn_engine_pool(engine, timeout, Some(IDLE_TXN_TIMEOUT), worker_count())
+}
+
+/// Like [`spawn_engine`] but with a custom idle-transaction timeout, so tests
+/// can exercise the idle reaper without a real 10 min wait.
+#[cfg(test)]
+fn spawn_engine_with_idle_timeout(
+    engine: Engine,
+    idle: Option<Duration>,
+) -> (EngineHandle, JoinHandle<()>) {
+    spawn_engine_pool(engine, LOCK_WAIT_TIMEOUT, idle, worker_count())
 }
 
 fn spawn_engine_pool(
     engine: Engine,
     timeout: Duration,
+    idle_txn_timeout: Option<Duration>,
     workers: usize,
 ) -> (EngineHandle, JoinHandle<()>) {
     let (tx, rx) = mpsc::channel();
     let shared = Arc::new(Shared {
         engine: Arc::new(engine),
-        scheduler: Mutex::new(Scheduler::new(timeout)),
+        scheduler: Mutex::new(Scheduler::new(timeout, idle_txn_timeout)),
         rx: Mutex::new(rx),
         stop: AtomicBool::new(false),
     });
@@ -371,10 +424,12 @@ fn worker_loop(shared: &Arc<Shared>) {
         // deadline, so it is reaped on time. (Only the brief `recv` holds rx.)
         let (deadline, cap) = {
             let sched = shared.scheduler.lock().expect("scheduler poisoned");
-            (sched.earliest_deadline(), sched.lock_wait_timeout)
+            (sched.earliest_deadline(), sched.wake_cap())
         };
         let wait = match deadline {
-            Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+            // Never sleep past the periodic cap, even when the nearest parked
+            // deadline is further out: the idle sweep still has to run.
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(cap),
             None => cap,
         };
         let call = {
@@ -394,6 +449,9 @@ fn worker_loop(shared: &Arc<Shared>) {
         {
             let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
             sched.reap_expired(&shared.engine);
+            // The loop above never blocks longer than `lock_wait_timeout`, so
+            // this sweep runs regularly even on a completely idle server.
+            sched.reap_idle_txns(&shared.engine);
         }
         drain_ready(shared);
         match call {
@@ -454,6 +512,7 @@ fn dispatch_batch(
         // locks the batch needs — analyse the statement text as usual.
         let needs = shared.engine.analyze_locks(&sql, isolation);
         if sched.try_acquire(session.raw(), &needs, true) {
+            sched.sessions.touch(session);
             let txn_ctx = sched.take_ctx(session);
             Some(Runnable {
                 session,
@@ -551,20 +610,39 @@ struct Scheduler {
     locks: LockManager,
     parked: VecDeque<Parked>,
     lock_wait_timeout: Duration,
+    /// How long a session may sit idle *with a transaction open* before that
+    /// transaction is rolled back and its locks released. `None` disables the
+    /// reaper.
+    idle_txn_timeout: Option<Duration>,
 }
 
 impl Scheduler {
-    fn new(lock_wait_timeout: Duration) -> Self {
+    fn new(lock_wait_timeout: Duration, idle_txn_timeout: Option<Duration>) -> Self {
         Scheduler {
             sessions: SessionManager::new(),
             locks: LockManager::new(),
             parked: VecDeque::new(),
             lock_wait_timeout,
+            idle_txn_timeout,
         }
     }
 
     fn earliest_deadline(&self) -> Option<Instant> {
         self.parked.iter().map(|p| p.deadline).min()
+    }
+
+    /// The longest a worker may block before re-evaluating. A worker has two
+    /// periodic duties — reaping a parked batch at its deadline and reaping a
+    /// transaction left idle — so it must wake for whichever comes first. With
+    /// the default timeouts the lock-wait bound (5 s) dominates the idle one
+    /// (10 min) and this is unchanged; a deployment (or test) that sets a short
+    /// idle timeout gets a correspondingly shorter cap instead of a reaper that
+    /// silently runs late.
+    fn wake_cap(&self) -> Duration {
+        match self.idle_txn_timeout {
+            Some(idle) => self.lock_wait_timeout.min(idle),
+            None => self.lock_wait_timeout,
+        }
     }
 
     /// A session's current isolation level (default if the session is unknown).
@@ -628,6 +706,9 @@ impl Scheduler {
         match self.sessions.get_mut(session) {
             Some(state) => {
                 state.txn_ctx = txn_ctx;
+                // The idle clock restarts when the batch finishes: time spent
+                // running is not time spent idle.
+                state.last_activity = Instant::now();
                 let open = state.txn_ctx.has_open_transaction();
                 let is_read_committed =
                     matches!(state.txn_ctx.isolation(), Isolation::ReadCommitted);
@@ -717,6 +798,46 @@ impl Scheduler {
         if let Some(idx) = victim_idx {
             self.abort_parked_victim(engine, idx);
         }
+    }
+
+    /// Rolls back transactions abandoned by idle sessions, releasing their
+    /// locks; returns whether anything was released (so the caller drains the
+    /// batches those locks unblock).
+    ///
+    /// A connection that opens a transaction and then goes silent *without
+    /// disconnecting* — a crashed client, a severed network — would otherwise
+    /// hold its locks indefinitely: the connection-drop path only covers a
+    /// connection that actually closed, and TCP may not notice for hours.
+    ///
+    /// Only genuinely idle sessions are candidates. A session running a batch
+    /// has had its context moved out by [`Self::take_ctx`], so it reports no
+    /// open transaction and cannot be reaped mid-batch; a session with a parked
+    /// batch is skipped explicitly, since that batch is only waiting on locks
+    /// (and its own deadline reaps it) rather than being abandoned.
+    fn reap_idle_txns(&mut self, engine: &Engine) -> bool {
+        let Some(timeout) = self.idle_txn_timeout else {
+            return false;
+        };
+        let now = Instant::now();
+        let parked: Vec<SessionId> = self.parked.iter().map(|p| p.session).collect();
+        let victims: Vec<SessionId> = self
+            .sessions
+            .iter()
+            .filter(|(id, state)| {
+                state.txn_ctx.has_open_transaction()
+                    && now.duration_since(state.last_activity) >= timeout
+                    && !parked.contains(id)
+            })
+            .map(|(id, _)| *id)
+            .collect();
+        for session in &victims {
+            if let Some(state) = self.sessions.get_mut(*session) {
+                engine.abort_session_txn(&mut state.txn_ctx);
+                state.last_activity = now;
+            }
+            self.locks.release_all(session.raw());
+        }
+        !victims.is_empty()
     }
 
     /// Aborts the parked batch at `idx` as a deadlock victim: rolls back its
@@ -950,6 +1071,16 @@ mod tests {
         Harness { handle, path }
     }
 
+    /// A harness whose idle-transaction reaper fires after `idle` (or never,
+    /// when `None`), so the reaper is testable without a real 10 min wait.
+    fn start_with_idle(idle: Option<Duration>) -> Harness {
+        let path = unique_temp_path("engine-idle");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let engine = Engine::new(storage).expect("engine");
+        let (handle, _join) = spawn_engine_with_idle_timeout(engine, idle);
+        Harness { handle, path }
+    }
+
     /// The `id` column (column 0) of the first rowset, as i64s.
     fn ids(reply: &BatchReply) -> Vec<i64> {
         for result in &reply.outcome.results {
@@ -972,6 +1103,133 @@ mod tests {
 
     fn error_number(reply: &BatchReply) -> Option<i32> {
         reply.outcome.error.as_ref().map(|e| e.number)
+    }
+
+    // ---- idle-transaction reaper ----------------------------------------
+
+    #[tokio::test]
+    async fn idle_transaction_is_reaped_and_its_locks_released() {
+        // A client that opens a transaction and goes silent without
+        // disconnecting must not hold its locks forever.
+        let h = start_with_idle(Some(Duration::from_millis(150)));
+        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let b = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        h.handle
+            .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
+            .await
+            .unwrap();
+        // Session A takes a write lock and then abandons the transaction.
+        h.handle
+            .run_batch(a, "BEGIN TRAN; INSERT INTO t VALUES (1);".into())
+            .await
+            .unwrap();
+
+        // B blocks on A's lock while A still holds it, so wait for the reaper.
+        // Once it fires, A's write is rolled back and B sees an empty table.
+        let reply = h
+            .handle
+            .run_batch(b, "SELECT id FROM t".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            error_number(&reply),
+            None,
+            "B must proceed once the abandoned transaction is reaped: {:?}",
+            reply.outcome.error
+        );
+        assert_eq!(ids(&reply), Vec::<i64>::new(), "the reaped write is undone");
+
+        // A's transaction is gone: its COMMIT has nothing to commit (3902).
+        let reply = h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
+        assert_eq!(error_number(&reply), Some(3902));
+    }
+
+    #[tokio::test]
+    async fn active_transaction_is_not_reaped() {
+        // The reaper must only touch *idle* sessions: a session that keeps
+        // working keeps its transaction, however long it stays open.
+        let h = start_with_idle(Some(Duration::from_millis(150)));
+        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        h.handle
+            .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
+            .await
+            .unwrap();
+        h.handle
+            .run_batch(a, "BEGIN TRAN; INSERT INTO t VALUES (1);".into())
+            .await
+            .unwrap();
+        // Keep touching the session across more than the idle timeout.
+        for i in 2..=6 {
+            tokio::time::sleep(Duration::from_millis(50)).await;
+            let reply = h
+                .handle
+                .run_batch(a, format!("INSERT INTO t VALUES ({i})"))
+                .await
+                .unwrap();
+            assert_eq!(
+                error_number(&reply),
+                None,
+                "an active session must keep its transaction"
+            );
+        }
+        // The transaction survived and commits everything it wrote.
+        let reply = h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        let reply = h
+            .handle
+            .run_batch(a, "SELECT id FROM t ORDER BY id".into())
+            .await
+            .unwrap();
+        assert_eq!(ids(&reply), vec![1, 2, 3, 4, 5, 6]);
+    }
+
+    #[tokio::test]
+    async fn idle_reaper_can_be_disabled() {
+        // With the reaper off, an idle transaction is left alone.
+        let h = start_with_idle(None);
+        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        h.handle
+            .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
+            .await
+            .unwrap();
+        h.handle
+            .run_batch(a, "BEGIN TRAN; INSERT INTO t VALUES (1);".into())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        // The transaction is still open and still commits.
+        let reply = h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        let reply = h
+            .handle
+            .run_batch(a, "SELECT id FROM t".into())
+            .await
+            .unwrap();
+        assert_eq!(ids(&reply), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn idle_session_without_a_transaction_is_untouched() {
+        // Only sessions holding a transaction are candidates; an idle session
+        // with none must keep working normally.
+        let h = start_with_idle(Some(Duration::from_millis(100)));
+        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        h.handle
+            .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
+            .await
+            .unwrap();
+        h.handle
+            .run_batch(a, "INSERT INTO t VALUES (1)".into())
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_millis(250)).await;
+        let reply = h
+            .handle
+            .run_batch(a, "SELECT id FROM t".into())
+            .await
+            .unwrap();
+        assert_eq!(error_number(&reply), None);
+        assert_eq!(ids(&reply), vec![1], "autocommitted data is untouched");
     }
 
     #[tokio::test]
