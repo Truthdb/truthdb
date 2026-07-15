@@ -64,6 +64,10 @@ pub struct TxnContext {
     /// lowercased) → the point to which `ROLLBACK TRANSACTION <name>` returns.
     /// Cleared when the transaction ends.
     savepoints: std::collections::HashMap<String, crate::relstore::ctx::Savepoint>,
+    /// Errors caught by the currently-executing `CATCH` blocks (a stack, so
+    /// nested `TRY`/`CATCH` restore the outer error on exit). `ERROR_*()` read
+    /// the top; empty outside any `CATCH` block.
+    error_stack: Vec<truthdb_sql::eval::ErrorInfo>,
 }
 
 /// Session isolation level (defaults to READ COMMITTED, like SQL Server).
@@ -93,7 +97,37 @@ impl TxnContext {
             login: self.login.clone(),
             spid: self.spid,
             scope_identity: self.scope_identity,
+            error: self.error_stack.last().cloned(),
+            xact_state: self.xact_state(),
         }
+    }
+
+    /// `XACT_STATE()`: 0 with no open transaction, -1 when the open transaction
+    /// is doomed (uncommittable), else 1.
+    fn xact_state(&self) -> i8 {
+        if !self.in_txn() {
+            0
+        } else if self.doomed {
+            -1
+        } else {
+            1
+        }
+    }
+
+    /// Enters a `CATCH` block: records the caught error so `ERROR_*()` resolve
+    /// to it (pushed, so nested `TRY`/`CATCH` restore the outer error on exit).
+    fn push_error(&mut self, error: &SqlError) {
+        self.error_stack.push(truthdb_sql::eval::ErrorInfo {
+            number: error.number,
+            message: error.message.clone(),
+            severity: error.level,
+            state: error.state,
+        });
+    }
+
+    /// Leaves a `CATCH` block, restoring the enclosing error context (if any).
+    fn pop_error(&mut self) {
+        self.error_stack.pop();
     }
 
     /// Records the connection identity used by session intrinsics. Called once
@@ -215,62 +249,123 @@ pub fn execute_batch_with_params(
             };
         }
     };
-    let mut results = Vec::with_capacity(statements.len());
-    // Whether any statement may have made a durable commit: group commit defers
-    // the WAL fsync to one call at the end of the batch (see
-    // [`finalize_durability`]).
-    let mut committed = false;
-    // The last non-dooming statement error under `SET XACT_ABORT OFF` — the batch
-    // continues past it (SQL Server default), so it is reported alongside the
-    // results rather than terminating the batch.
-    let mut last_error: Option<SqlError> = None;
-    for statement in &statements {
+    let mut run = BatchRun {
+        results: Vec::with_capacity(statements.len()),
+        committed: false,
+        last_error: None,
+    };
+    // `run_block` returns Err only when the batch must terminate (a cancel, or a
+    // dooming/uncaught error outside any TRY); a non-dooming error under
+    // `XACT_ABORT OFF` is recorded in `run.last_error` and the batch continues.
+    let terminating = run_block(storage, &statements, txn_ctx, &mut run, false).err();
+    let prior = terminating.or(run.last_error);
+    let error = finalize_durability(storage, run.committed, prior);
+    BatchOutcome {
+        results: run.results,
+        error,
+    }
+}
+
+/// The mutable accumulator threaded through [`run_block`] across a batch and its
+/// nested `TRY`/`CATCH` blocks.
+struct BatchRun {
+    results: Vec<StatementResult>,
+    /// Whether any executed statement may have made a durable commit: group
+    /// commit defers the WAL fsync to one call at the end of the batch.
+    committed: bool,
+    /// The last non-dooming statement error under `SET XACT_ABORT OFF` (outside
+    /// any TRY) — the batch continues past it (SQL Server default) and it is
+    /// reported alongside the results rather than terminating the batch.
+    last_error: Option<SqlError>,
+}
+
+/// Runs a statement list, recursing into `TRY`/`CATCH`. `in_try` is true while
+/// executing inside a `TRY` block, where a statement error transfers control to
+/// the matching `CATCH` (returned as `Err`) instead of applying the normal
+/// batch policy. Returns `Err` when the enclosing context must stop: a cancel,
+/// an error that propagates to a `CATCH`, or a dooming/terminating error at the
+/// top level.
+fn run_block(
+    storage: &Storage,
+    statements: &[Statement],
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun,
+    in_try: bool,
+) -> Result<(), SqlError> {
+    for statement in statements {
         // A TDS Attention (cancel) aborts the batch before the next statement.
-        if let Err(cancel) = check_cancelled() {
-            let error = finalize_durability(storage, committed, Some(cancel));
-            return BatchOutcome { results, error };
+        // It is never catchable — it propagates straight out, past any TRY.
+        check_cancelled()?;
+        if let Statement::TryCatch {
+            try_block,
+            catch_block,
+            ..
+        } = statement
+        {
+            match run_block(storage, try_block, txn_ctx, run, true) {
+                Ok(()) => {}
+                // An Attention that landed inside the TRY block is not caught.
+                Err(cancel) if cancel.number == CANCEL_ERROR => return Err(cancel),
+                Err(error) => {
+                    // The failed statement's own writes were already undone to
+                    // its savepoint (`rel_statement_scoped`). `SET XACT_ABORT`
+                    // (or a high-severity error) still dooms the transaction —
+                    // but control transfers to CATCH either way (unlike outside
+                    // a TRY, where a dooming error ends the batch). Inside CATCH,
+                    // XACT_STATE() then reports -1 for a doomed transaction.
+                    let dooms = txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY;
+                    if txn_ctx.in_txn() && dooms {
+                        txn_ctx.doomed = true;
+                    }
+                    txn_ctx.push_error(&error);
+                    // The CATCH block runs in the *enclosing* try-context: its
+                    // own errors are not caught here, so they propagate to an
+                    // outer CATCH (or end the batch) per `in_try`.
+                    let caught = run_block(storage, catch_block, txn_ctx, run, in_try);
+                    txn_ctx.pop_error();
+                    caught?;
+                }
+            }
+            continue;
         }
         // Flag durability by statement kind, before matching the result: a
         // write/DDL/COMMIT can commit even when it then errors — an autocommit
         // statement, an identity reservation (its own mini-commit, made even
         // inside an open transaction and even if the row insert later fails),
         // or the outermost COMMIT.
-        committed |= statement_may_commit(statement);
+        run.committed |= statement_may_commit(statement);
         match exec_statement(storage, statement, txn_ctx) {
-            Ok(result) => results.push(result),
+            Ok(result) => run.results.push(result),
             Err(error) => {
-                // A cancelled statement (whose `check_cancelled` fired inside an
-                // operator) aborts the batch immediately — the transaction stays
-                // open (its partial write was already undone to a savepoint), not
-                // doomed. Key on the cancel marker, not the flag: an Attention
-                // landing concurrently with an *unrelated* failure must not
-                // suppress that failure's XACT_ABORT/severity dooming.
+                // A cancelled statement aborts the batch immediately (see above):
+                // key on the cancel marker, not any flag, so an Attention landing
+                // concurrently with an unrelated failure cannot suppress that
+                // failure's dooming.
                 if error.number == CANCEL_ERROR {
-                    let error = finalize_durability(storage, committed, Some(error));
-                    return BatchOutcome { results, error };
+                    return Err(error);
                 }
-                // Inside an explicit transaction the statement's partial writes
-                // were already undone to a savepoint (`rel_statement_scoped`), so
-                // the transaction is consistent either way. `SET XACT_ABORT` (and
-                // error severity) then decides its fate: OFF (the default) with a
-                // non-fatal error rolls back only the statement and the batch
-                // continues; ON — or a high-severity error — dooms the whole
-                // transaction (only ROLLBACK is then accepted, error 3930).
+                // Inside a TRY, any error transfers to the matching CATCH.
+                if in_try {
+                    return Err(error);
+                }
+                // Outside a TRY: `SET XACT_ABORT` (and error severity) decides
+                // the transaction's fate. OFF (the default) with a non-fatal
+                // error rolls back only the statement and the batch continues;
+                // ON — or a high-severity error — dooms the whole transaction
+                // (only ROLLBACK is then accepted, error 3930).
                 let dooms = txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY;
                 if txn_ctx.in_txn() && !dooms {
-                    last_error = Some(error);
+                    run.last_error = Some(error);
                     continue;
                 }
                 if txn_ctx.in_txn() {
                     txn_ctx.doomed = true;
                 }
-                let error = finalize_durability(storage, committed, Some(error));
-                return BatchOutcome { results, error };
+                return Err(error);
             }
         }
     }
-    let error = finalize_durability(storage, committed, last_error);
-    BatchOutcome { results, error }
+    Ok(())
 }
 
 /// Whether a statement can make a durable commit that the batch must fsync: any
@@ -613,9 +708,13 @@ pub fn analyze_locks(
     sql: &str,
     isolation: Isolation,
 ) -> Vec<(Resource, LockMode)> {
-    let Ok(statements) = truthdb_sql::parse(sql) else {
+    let Ok(parsed) = truthdb_sql::parse(sql) else {
         return Vec::new();
     };
+    // Flatten TRY/CATCH so the locks a batch needs are pre-acquired for the
+    // statements inside its try/catch blocks too, not just the top level.
+    let mut statements: Vec<&Statement> = Vec::new();
+    flatten_statements(&parsed, &mut statements);
     // Reads take shared locks except under READ UNCOMMITTED, which takes none.
     // A batch that raises the isolation level (e.g. `SET ISOLATION LEVEL
     // SERIALIZABLE; SELECT ...`) must lock its reads even if the session was
@@ -637,7 +736,7 @@ pub fn analyze_locks(
             .and_modify(|m| *m = m.combine(mode))
             .or_insert(mode);
     };
-    for statement in &statements {
+    for statement in statements.iter().copied() {
         match statement {
             Statement::Select(select) => {
                 if !reads_lock {
@@ -780,12 +879,15 @@ pub fn analyze_locks(
                 add(Resource::Database, LockMode::Exclusive);
             }
             // Transaction control, SET, and DECLARE take no data locks.
+            // TRY/CATCH was flattened away by `flatten_statements`, so its
+            // contained statements appear here directly.
             Statement::BeginTransaction { .. }
             | Statement::Commit { .. }
             | Statement::Rollback { .. }
             | Statement::SaveTransaction { .. }
             | Statement::Set(_)
-            | Statement::Declare(_) => {}
+            | Statement::Declare(_)
+            | Statement::TryCatch { .. } => {}
         }
     }
     // Batch-level lock escalation: if a table accumulated more than the
@@ -848,10 +950,12 @@ fn exec_statement(
     statement: &Statement,
     txn_ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
-    // A doomed transaction rejects everything but ROLLBACK.
-    // A doomed transaction accepts only a full ROLLBACK (no savepoint name); a
-    // partial rollback or a new savepoint on a doomed transaction is rejected.
-    if txn_ctx.doomed && !matches!(statement, Statement::Rollback { name: None, .. }) {
+    // A doomed (uncommittable) transaction rejects log writes with 3930, but —
+    // like SQL Server — still allows reads (`SELECT`), `SET`, `DECLARE`, and a
+    // full `ROLLBACK`, so a CATCH block can inspect `XACT_STATE()`/`ERROR_*()`
+    // and then roll back. A partial rollback to a savepoint and `SAVE` stay
+    // rejected (an uncommittable transaction can only be fully rolled back).
+    if txn_ctx.doomed && !doomed_allows(statement) {
         return Err(SqlError::new(
             3930,
             16,
@@ -950,6 +1054,46 @@ fn exec_statement(
                     storage, select, &eval_ctx,
                 )?))
             }
+        }
+        // TRY/CATCH is control flow, handled by `run_block`, which never routes
+        // it here.
+        Statement::TryCatch { .. } => Err(SqlError::message_only(
+            0,
+            "internal error: TRY/CATCH must be executed by run_block",
+        )),
+    }
+}
+
+/// Statements a doomed (uncommittable) transaction still permits: reads
+/// (`SELECT`, including `SELECT @v = ...`), session-state changes (`SET`,
+/// `DECLARE`), and a full `ROLLBACK`. Everything else (DML/DDL, `COMMIT`,
+/// `SAVE`, a partial `ROLLBACK` to a savepoint) writes to the log and is
+/// rejected with 3930.
+fn doomed_allows(statement: &Statement) -> bool {
+    matches!(
+        statement,
+        Statement::Select(_)
+            | Statement::Set(_)
+            | Statement::Declare(_)
+            | Statement::Rollback { name: None, .. }
+    )
+}
+
+/// Flattens `TRY`/`CATCH` blocks into the leaf statements they contain, so lock
+/// analysis (which pre-acquires every table lock a batch needs) sees the
+/// statements nested inside try/catch blocks too.
+fn flatten_statements<'a>(statements: &'a [Statement], out: &mut Vec<&'a Statement>) {
+    for statement in statements {
+        match statement {
+            Statement::TryCatch {
+                try_block,
+                catch_block,
+                ..
+            } => {
+                flatten_statements(try_block, out);
+                flatten_statements(catch_block, out);
+            }
+            other => out.push(other),
         }
     }
 }
