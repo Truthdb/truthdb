@@ -2166,7 +2166,13 @@ fn enforce_parent_fks(
                         Ok(lower) => {
                             let upper = crate::relstore::index::prefix_upper_bound(&lower);
                             let matches = storage
-                                .rel_index_scan(&child.name, index.object_id, Some(lower), upper)
+                                .rel_index_scan(
+                                    &child.name,
+                                    index.object_id,
+                                    Some(lower),
+                                    upper,
+                                    None,
+                                )
                                 .map_err(|e| map_storage_err(e, &child.name))?;
                             if !matches.is_empty() {
                                 return Err(reference_conflict(verb, &fk.name, &child.name));
@@ -4602,15 +4608,21 @@ struct ScanPlan {
     table: String,
     /// How to read it: the planner's choice, made once (see [`scan_plan`]).
     access: plan::AccessPath,
-    /// Source column metadata, in table order.
-    source: Vec<ResultColumn>,
-    /// Resolves the WHERE clause's column references against the source.
+    /// The schema columns this query reads at all — its projection plus the
+    /// WHERE clause's — ascending and distinct. Everything below is expressed
+    /// in *these* coordinates, not the table's: the storage layer decodes only
+    /// these, so a scanned row has exactly this width.
+    needed: Vec<usize>,
+    /// Type of each needed column, parallel to `needed`.
+    types: Vec<ColumnType>,
+    /// Resolves the WHERE clause's column references against a scanned row.
     resolver: JoinScope,
     /// Output columns. Every type here is the schema's, which is what makes the
     /// shape work: a computed column's type comes from `infer_type` over every
     /// value in it, so it cannot be known until the last row has been seen.
     columns: Vec<ResultColumn>,
-    /// The source column each output column reads.
+    /// The scanned-row position each output column reads (an index into
+    /// `needed`, not into the table's columns).
     picks: Vec<usize>,
 }
 
@@ -4708,12 +4720,15 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
         .collect();
     let collations: Vec<Option<String>> =
         schema.columns.iter().map(|c| c.collation.clone()).collect();
+    // The full-width scope, used to plan the projection and resolve the WHERE's
+    // references. What the scan actually runs on is the pruned scope built
+    // below, once the needed columns are known.
     let resolver = JoinScope {
         columns: source
             .iter()
             .map(|c| (Some(qualifier.clone()), c.name.clone()))
             .collect(),
-        collations,
+        collations: collations.clone(),
     };
 
     // The projection plan, mirroring `project`'s: every item must resolve to a
@@ -4757,14 +4772,126 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
         }
     }
 
+    // Projection pruning. The query reads the columns it projects plus the ones
+    // its WHERE names, and nothing else — so those are the only ones the storage
+    // layer decodes, and a scanned row is exactly that wide. A character column
+    // costs a `String` allocation to decode, so on a wide table this is most of
+    // the per-row work.
+    //
+    // A WHERE reference that does not resolve is simply not collected: it is not
+    // a column of this table, so there is nothing to decode for it, and `eval`
+    // still reports it (207) against the same resolver as before.
+    let mut needed = picks.clone();
+    let mut where_columns = Vec::new();
+    if let Some(predicate) = &select.where_clause {
+        collect_column_refs(predicate, &mut where_columns);
+    }
+    needed.extend(
+        where_columns
+            .iter()
+            .filter_map(|name| resolver.resolve(name)),
+    );
+    needed.sort_unstable();
+    needed.dedup();
+
+    // Everything downstream now speaks in the scanned row's coordinates.
+    let position = |index: usize| {
+        needed
+            .binary_search(&index)
+            .expect("a needed column is in `needed`")
+    };
+    let picks = picks.into_iter().map(position).collect();
+    let types = needed.iter().map(|&i| source[i].column_type).collect();
+    let resolver = JoinScope {
+        columns: needed
+            .iter()
+            .map(|&i| (Some(qualifier.clone()), source[i].name.clone()))
+            .collect(),
+        collations: needed.iter().map(|&i| collations[i].clone()).collect(),
+    };
+
     Some(ScanPlan {
         table: def.name,
         access,
-        source,
+        needed,
+        types,
         resolver,
         columns,
         picks,
     })
+}
+
+/// Every column name a predicate references, in no particular order (duplicates
+/// included — the caller dedups after resolving).
+///
+/// Exhaustive by construction: no wildcard arm, so a new [`ExprKind`] is a
+/// compile error here rather than a column silently left undecoded.
+fn collect_column_refs(expr: &Expr, out: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Column(name) => out.push(name.value.clone()),
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_) => {}
+        ExprKind::Unary { expr: e, .. }
+        | ExprKind::IsNull { expr: e, .. }
+        | ExprKind::Cast { expr: e, .. } => collect_column_refs(e, out),
+        ExprKind::Binary { left, right, .. } => {
+            collect_column_refs(left, out);
+            collect_column_refs(right, out);
+        }
+        ExprKind::Like {
+            expr: e, pattern, ..
+        } => {
+            collect_column_refs(e, out);
+            collect_column_refs(pattern, out);
+        }
+        ExprKind::InList { expr: e, list, .. } => {
+            collect_column_refs(e, out);
+            for item in list {
+                collect_column_refs(item, out);
+            }
+        }
+        ExprKind::Between {
+            expr: e, low, high, ..
+        } => {
+            collect_column_refs(e, out);
+            collect_column_refs(low, out);
+            collect_column_refs(high, out);
+        }
+        ExprKind::Function { args, .. } => {
+            for arg in args {
+                collect_column_refs(arg, out);
+            }
+        }
+        ExprKind::Aggregate { arg, .. } => {
+            if let Some(arg) = arg {
+                collect_column_refs(arg, out);
+            }
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            if let Some(operand) = operand {
+                collect_column_refs(operand, out);
+            }
+            for (when, then) in branches {
+                collect_column_refs(when, out);
+                collect_column_refs(then, out);
+            }
+            if let Some(else_result) = else_result {
+                collect_column_refs(else_result, out);
+            }
+        }
+        // The gate rejects a subquery before this runs.
+        ExprKind::Subquery(_) | ExprKind::Exists(_) | ExprKind::InSubquery { .. } => {}
+    }
 }
 
 /// The `sys.*` catalog views, which [`build_table_source`] answers by name
@@ -4811,7 +4938,7 @@ fn scan_select(
 ) -> Result<RowSet, SqlError> {
     #[cfg(test)]
     storage.count_scan_select();
-    let types: Vec<ColumnType> = plan.source.iter().map(|c| c.column_type).collect();
+    let types = &plan.types;
     let mut out = RowSet {
         columns: plan.columns.clone(),
         rows: Vec::new(),
@@ -4825,7 +4952,7 @@ fn scan_select(
     let take = |row: Vec<Datum>, out: &mut RowSet| -> Result<bool, SqlError> {
         check_cancelled()?;
         if let Some(predicate) = &select.where_clause {
-            let sql_row = row_values(&row, &types);
+            let sql_row = row_values(&row, types);
             if !where_keeps(predicate, &sql_row, &plan.resolver, eval_ctx)? {
                 return Ok(true);
             }
@@ -4841,7 +4968,13 @@ fn scan_select(
             let mut slice: Vec<Vec<Datum>> = Vec::new();
             'scan: while !cursor.done() {
                 cursor = storage
-                    .rel_scan_slice(&plan.table, cursor, SCAN_SLICE_ROWS, &mut slice)
+                    .rel_scan_slice(
+                        &plan.table,
+                        cursor,
+                        SCAN_SLICE_ROWS,
+                        Some(&plan.needed),
+                        &mut slice,
+                    )
                     .map_err(|err| map_storage_err(err, &plan.table))?;
                 for row in slice.drain(..) {
                     if !take(row, &mut out)? {
@@ -4859,7 +4992,13 @@ fn scan_select(
             // The seek narrows the candidates; the predicate still re-checks
             // each one, so the result matches a full scan.
             let rows = storage
-                .rel_index_scan(&plan.table, *index_object_id, lower.clone(), upper.clone())
+                .rel_index_scan(
+                    &plan.table,
+                    *index_object_id,
+                    lower.clone(),
+                    upper.clone(),
+                    Some(&plan.needed),
+                )
                 .map_err(|err| map_storage_err(err, &plan.table))?;
             for row in rows {
                 if !take(row, &mut out)? {
@@ -5928,7 +6067,7 @@ fn build_table_source(
                     upper,
                     ..
                 } => storage
-                    .rel_index_scan(&def.name, index_object_id, lower, upper)
+                    .rel_index_scan(&def.name, index_object_id, lower, upper, None)
                     .map_err(|err| map_storage_err(err, &def.name))?,
             };
             let columns = schema

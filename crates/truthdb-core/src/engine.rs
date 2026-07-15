@@ -5718,6 +5718,26 @@ mod tests {
         // scan — `plan::choose` only considers secondary indexes, so a PK
         // equality is not a seek here.
         batch(&engine, &mut ctx, "CREATE INDEX ix_ab_v ON ab (v)");
+        // A wide table, where projection pruning has something to prune.
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE wd (id INT PRIMARY KEY, a VARCHAR(20), b VARCHAR(20), c INT, d VARCHAR(20), e INT NULL)",
+        );
+        for i in 0..200 {
+            batch(
+                &engine,
+                &mut ctx,
+                &format!(
+                    "INSERT INTO wd VALUES ({i}, 'a{i}', 'b{i}', {i}, 'd{i}', {})",
+                    if i % 4 == 0 {
+                        "NULL".into()
+                    } else {
+                        i.to_string()
+                    }
+                ),
+            );
+        }
 
         let queries = [
             // Bare columns, wildcards, aliases, qualified names.
@@ -5754,6 +5774,22 @@ mod tests {
             "SELECT * FROM ab WHERE v >= 100 AND v <= 200",
             "SELECT TOP 3 id FROM ab WHERE v > 100",
             "SELECT id FROM ab WHERE v = 99999",
+            // Projection pruning: the scan decodes only what the query reads,
+            // so a WHERE on a column that is *not* projected must still keep
+            // that column — these are the shapes that catch a pruned-away
+            // predicate column.
+            "SELECT id FROM wd",
+            "SELECT id FROM wd WHERE a = 'a7'",
+            "SELECT a FROM wd WHERE c > 100",
+            "SELECT id, d FROM wd WHERE b = 'b3' AND e IS NULL",
+            "SELECT e FROM wd WHERE e IS NOT NULL",
+            "SELECT id FROM wd WHERE CASE WHEN c > 100 THEN a ELSE d END = 'a150'",
+            "SELECT id FROM wd WHERE a LIKE 'a1%'",
+            "SELECT id FROM wd WHERE c IN (1, 2, 3)",
+            "SELECT id FROM wd WHERE c BETWEEN 10 AND 12",
+            "SELECT id FROM wd WHERE LEN(a) > 3",
+            "SELECT d, c, a FROM wd WHERE id = 5",
+            "SELECT * FROM wd WHERE c = 5",
             // The heap: 300 rows is inside one 1024-row slice either way.
             "SELECT id FROM hp",
             "SELECT TOP 3 id FROM hp",
@@ -5833,6 +5869,169 @@ mod tests {
             engine.storage.scan_slices() - before >= 3,
             "3000 rows at 1024 per slice is at least three slices"
         );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_scan_decodes_only_the_columns_the_query_reads() {
+        // The rows returned are identical whether or not the projection is
+        // pruned, so nothing about the result can see this — the width the scan
+        // asked for is the only observable.
+        let path = unique_temp_path("scan-prune");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE w (id INT PRIMARY KEY, a VARCHAR(20), b VARCHAR(20), c INT)",
+        );
+        for i in 0..50 {
+            batch(
+                &engine,
+                &mut ctx,
+                &format!("INSERT INTO w VALUES ({i}, 'a{i}', 'b{i}', {i})"),
+            );
+        }
+
+        for (query, expected, why) in [
+            ("SELECT id FROM w", 1, "one projected column"),
+            ("SELECT id, c FROM w", 2, "two projected columns"),
+            ("SELECT * FROM w", 4, "a wildcard needs every column"),
+            // The WHERE's columns are read even when nothing projects them.
+            (
+                "SELECT id FROM w WHERE a = 'a1'",
+                2,
+                "id + the predicate's a",
+            ),
+            (
+                "SELECT id FROM w WHERE a = 'a1' AND c > 2",
+                3,
+                "id + both predicate columns",
+            ),
+            // A column named twice costs one decode.
+            ("SELECT id, id FROM w WHERE id > 1", 1, "id, deduped"),
+            // A predicate column that is also projected is not counted twice.
+            ("SELECT a FROM w WHERE a = 'a1'", 1, "a, deduped"),
+        ] {
+            let out = batch(&engine, &mut ctx, query);
+            assert!(out.error.is_none(), "{query}: {:?}", out.error);
+            assert_eq!(
+                engine.storage.last_scan_width(),
+                expected,
+                "{query} should decode {expected} columns ({why})"
+            );
+        }
+
+        // The counter reports the whole row when nothing prunes, so the numbers
+        // above are a pruned width and not a stuck reading.
+        crate::rel::without_scan_path(|| batch(&engine, &mut ctx, "SELECT id FROM w"));
+        assert_eq!(
+            engine.storage.last_scan_width(),
+            usize::MAX,
+            "the collecting path decodes the whole row"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn pruning_carries_each_kept_column_its_own_type_and_collation() {
+        // `needed` renumbers the columns, so `types` and `collations` are
+        // rebuilt in the scanned row's coordinates. Both are silent when wrong:
+        // a misindexed type mis-restores a DECIMAL's scale, and a misindexed
+        // collation makes a _CS column compare case-insensitively. The columns
+        // that matter sit at HIGH schema indices and are projected/filtered from
+        // LOW ones, so a rebuild that kept the schema's numbering reads the
+        // wrong entry rather than coincidentally the right one.
+        let path = unique_temp_path("scan-prune-types");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE tc (id INT PRIMARY KEY, pad1 VARCHAR(10), pad2 VARCHAR(10), \
+             amount DECIMAL(10,4), cs VARCHAR(20) COLLATE SQL_Latin1_General_CP1_CS_AS, \
+             ci VARCHAR(20))",
+        );
+        batch(
+            &engine,
+            &mut ctx,
+            "INSERT INTO tc VALUES (1, 'p', 'q', 12.3456, 'Match', 'Match')",
+        );
+        batch(
+            &engine,
+            &mut ctx,
+            "INSERT INTO tc VALUES (2, 'p', 'q', 0.5000, 'other', 'other')",
+        );
+
+        // A _CS column is exact; a default (_CI) one is not. Both are read via
+        // the WHERE only, so both live at a remapped position.
+        let out = batch(&engine, &mut ctx, "SELECT id FROM tc WHERE cs = 'MATCH'");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(
+            first_rowset(&out).rows.is_empty(),
+            "a _CS column must not match a different casing"
+        );
+        let out = batch(&engine, &mut ctx, "SELECT id FROM tc WHERE cs = 'Match'");
+        assert_eq!(
+            first_rowset(&out).rows.len(),
+            1,
+            "_CS matches its own casing"
+        );
+        let out = batch(&engine, &mut ctx, "SELECT id FROM tc WHERE ci = 'MATCH'");
+        assert_eq!(
+            first_rowset(&out).rows.len(),
+            1,
+            "the default collation is case-insensitive"
+        );
+
+        // The DECIMAL's scale survives the `types` remap. It has to be read
+        // through the WHERE to test that: `datum_to_sql` consults the column
+        // type for a DECIMAL's precision/scale and for nothing else, so this is
+        // the only shape a misindexed `types` is visible in. (Asserting the
+        // *output* column's type would prove nothing — that comes from
+        // `plan.columns`, which is not remapped.) Read at position 1 of
+        // [id, amount] while the schema puts it at 3, so a rebuild that kept the
+        // schema's numbering finds `pad1` and falls back to scale 0 — turning
+        // 12.3456 into 123456.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "SELECT id FROM tc WHERE amount = 12.3456",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(
+            first_rowset(&out).rows.len(),
+            1,
+            "a DECIMAL in the WHERE keeps its scale through the remap"
+        );
+        let out = batch(&engine, &mut ctx, "SELECT amount FROM tc WHERE id = 1");
+        assert_eq!(
+            first_rowset(&out).columns[0].column_type,
+            crate::relstore::types::ColumnType::Decimal {
+                precision: 10,
+                scale: 4
+            },
+            "the projected column keeps its schema type"
+        );
+
+        // And every one of these agrees with the collecting path, which reads
+        // the whole row and so cannot be remapped wrong.
+        for query in [
+            "SELECT id FROM tc WHERE cs = 'MATCH'",
+            "SELECT id FROM tc WHERE cs = 'Match'",
+            "SELECT id FROM tc WHERE ci = 'MATCH'",
+            "SELECT amount FROM tc WHERE id = 1",
+            "SELECT id FROM tc WHERE amount = 12.3456",
+            "SELECT amount, cs FROM tc WHERE ci = 'match'",
+        ] {
+            let streamed = batch(&engine, &mut ctx, query);
+            let collected = crate::rel::without_scan_path(|| batch(&engine, &mut ctx, query));
+            assert_eq!(
+                first_rowset(&streamed),
+                first_rowset(&collected),
+                "{query} differs between the pruned scan and the collecting path"
+            );
+        }
         let _ = std::fs::remove_file(path);
     }
 
