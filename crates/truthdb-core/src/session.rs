@@ -288,10 +288,11 @@ impl Inbox {
 
 /// Closes the [`Inbox`] when the last [`EngineHandle`] goes.
 ///
-/// The pool's usual shutdown is the handle being dropped — nothing calls
-/// [`EngineHandle::shutdown`] — and an `Arc<Inbox>` the workers also hold could
-/// never reach zero to signal it. This token is held only by handles, so its
-/// count reaching zero means exactly "no more calls will ever arrive".
+/// Both shutdown paths matter: the server calls [`EngineHandle::shutdown`]
+/// explicitly, while tests just drop the handle. An `Arc<Inbox>` the workers
+/// also hold could never reach zero to signal the second, so this token — held
+/// only by handles — does: its count reaching zero means exactly "no more calls
+/// will ever arrive".
 struct HandleToken(Arc<Inbox>);
 
 impl Drop for HandleToken {
@@ -476,11 +477,11 @@ fn spawn_engine_pool(
             for handle in handles {
                 let _ = handle.join();
             }
-            // The workers are gone — either on a Shutdown pill, or because the
-            // last handle dropped and the channel disconnected, which sets no
-            // flag. Tell the maintenance thread either way, or it would outlive
-            // the pool. Setting the flag under `idle` is what makes the wake
-            // reliable rather than a race against its next sleep.
+            // The workers are gone, and neither way of getting here sets the
+            // flag: `shutdown` and the last handle dropping both just close the
+            // inbox. Tell the maintenance thread, or it would outlive the pool.
+            // Setting the flag under `idle` is what makes the wake reliable
+            // rather than a race against its next sleep.
             {
                 let _idle = supervisor.idle.lock().expect("idle mutex poisoned");
                 supervisor.stop.store(true, Ordering::Release);
@@ -1594,6 +1595,30 @@ mod tests {
             "the pool spawns a maintenance thread"
         );
         drop(h);
+    }
+
+    #[test]
+    fn both_ways_of_shutting_the_pool_down_stop_every_thread() {
+        // The server calls `shutdown` and then joins; the tests just drop the
+        // handle. Only the first closes the inbox by itself — the second relies
+        // on the handle token, since the `Arc<Inbox>` the workers hold can never
+        // reach zero. Joining the supervisor is what proves it: it joins the
+        // workers and the maintenance thread first, so it only returns if every
+        // one of them noticed.
+        for explicit in [true, false] {
+            let path = unique_temp_path("shutdown");
+            let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+            let engine = Engine::new(storage).expect("engine");
+            let (handle, join) = spawn_engine(engine);
+            if explicit {
+                handle.shutdown();
+                drop(handle);
+            } else {
+                drop(handle);
+            }
+            join.join().expect("the pool shut down");
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[tokio::test]
