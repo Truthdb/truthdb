@@ -1225,6 +1225,10 @@ dependencies = [
 [[package]]
 name = "truthdb-sql"
 version = "0.1.0"
+dependencies = [
+ "icu_collator",
+ "icu_locale_core",
+]
 
 [[package]]
 name = "truthdb-tds"

@@ -4493,7 +4493,7 @@ fn exec_select(
                     resolver
                         .resolve(&c.name)
                         .map(|i| resolver.collation(i))
-                        .unwrap_or(CollationSensitivity::DEFAULT)
+                        .unwrap_or(CollationSensitivity::default_collation())
                 })
                 .collect();
             dedup_rows(storage, &mut out, &out_sens)?;
