@@ -39,7 +39,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -346,6 +346,8 @@ fn spawn_engine_pool(
         scheduler: Mutex::new(Scheduler::new(timeout, idle_txn_timeout)),
         rx: Mutex::new(rx),
         stop: AtomicBool::new(false),
+        idle: Mutex::new(()),
+        wake: Condvar::new(),
     });
     // A supervisor thread spawns the workers and joins them; its handle is what
     // callers join at shutdown. When all workers have exited, any batch still
@@ -354,6 +356,11 @@ fn spawn_engine_pool(
     let join = std::thread::Builder::new()
         .name("truthdb-engine".to_string())
         .spawn(move || {
+            let keeper = Arc::clone(&supervisor);
+            let maintenance = std::thread::Builder::new()
+                .name("truthdb-maintenance".to_string())
+                .spawn(move || maintenance_loop(&keeper))
+                .expect("spawn maintenance thread");
             let handles: Vec<_> = (0..workers)
                 .map(|i| {
                     let shared = Arc::clone(&supervisor);
@@ -366,6 +373,17 @@ fn spawn_engine_pool(
             for handle in handles {
                 let _ = handle.join();
             }
+            // The workers are gone — either on a Shutdown pill, or because the
+            // last handle dropped and the channel disconnected, which sets no
+            // flag. Tell the maintenance thread either way, or it would outlive
+            // the pool. Setting the flag under `idle` is what makes the wake
+            // reliable rather than a race against its next sleep.
+            {
+                let _idle = supervisor.idle.lock().expect("idle mutex poisoned");
+                supervisor.stop.store(true, Ordering::Release);
+            }
+            supervisor.wake.notify_all();
+            let _ = maintenance.join();
             let mut sched = supervisor.scheduler.lock().expect("scheduler poisoned");
             for parked in sched.parked.drain(..) {
                 let _ = parked.reply.send(Err(EngineError::Unavailable));
@@ -388,6 +406,12 @@ struct Shared {
     /// Set when a `Shutdown` is seen, so a worker between calls exits promptly
     /// rather than picking up more work.
     stop: AtomicBool,
+    /// Companion mutex for [`Self::wake`]. Guards nothing — a `Condvar` needs
+    /// one.
+    idle: Mutex<()>,
+    /// Wakes the maintenance thread out of its sleep at shutdown, so the pool
+    /// does not wait out a whole sweep interval before exiting.
+    wake: Condvar,
 }
 
 // The pool shares `Arc<Engine>` across worker threads, so the engine — and thus
@@ -407,6 +431,55 @@ struct Runnable {
     cancel: Arc<AtomicBool>,
     reply: oneshot::Sender<Result<BatchReply, EngineError>>,
     txn_ctx: TxnContext,
+}
+
+/// The engine's housekeeping, on a thread that never runs a batch: the
+/// deadlock backstop (reap a lock wait past its deadline) and the idle-
+/// transaction reaper.
+///
+/// The workers sweep too, between calls, and that is still where a reap and the
+/// drain it unblocks happen in one pass. This thread is what makes the sweep
+/// *punctual*. A worker only reaches it between batches, so the reapers were
+/// only ever as prompt as the pool was free — and the pool is `cores-2`
+/// threads, two on a four-core box. A few long scans already delayed the sweep
+/// for as long as they ran, which is backwards: the idle reaper exists to
+/// release the locks of a client that has stopped responding, and a loaded
+/// engine is exactly when that matters most. Nothing a client does can delay
+/// this thread, because it never executes anything on their behalf.
+///
+/// It only *releases* locks; running whatever that unblocks still needs a
+/// worker, and always did.
+fn maintenance_loop(shared: &Arc<Shared>) {
+    while !shared.stop.load(Ordering::Acquire) {
+        // Sleep until the nearest parked deadline, but never past the sweep
+        // cap: an idle transaction has no deadline in the parked queue, so with
+        // nothing parked the cap is the only thing that brings us back.
+        let wait = {
+            let sched = shared.scheduler.lock().expect("scheduler poisoned");
+            let cap = sched.wake_cap();
+            match sched.earliest_deadline() {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(cap),
+                None => cap,
+            }
+        };
+        {
+            // `stop` is read and written under this mutex, so a shutdown that
+            // lands between the check and the wait cannot be missed — it would
+            // otherwise be slept through for a whole sweep interval, and the
+            // supervisor is joining this thread.
+            let idle = shared.idle.lock().expect("idle mutex poisoned");
+            if shared.stop.load(Ordering::Acquire) {
+                break;
+            }
+            let _ = shared
+                .wake
+                .wait_timeout(idle, wait)
+                .expect("idle mutex poisoned");
+        }
+        let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
+        sched.reap_expired(&shared.engine);
+        sched.reap_idle_txns(&shared.engine);
+    }
 }
 
 /// One worker thread: pull a call, dispatch it, repeat until shutdown.
@@ -1390,6 +1463,73 @@ mod tests {
         assert!(
             sched.reap_idle_txns(&engine),
             "with nothing parked, the idle transaction is reaped"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn housekeeping_runs_with_no_worker_free_to_do_it() {
+        // The reapers are the engine's safety valves and must not be hostage to
+        // the pool: a worker only sweeps between batches, so a busy pool used to
+        // mean no sweep. Pinned in its strongest form — a pool with *no workers
+        // at all*, which no amount of load can distinguish itself from — where
+        // only the maintenance thread can do it.
+        let (engine, mut sched, path) = bare("maintenance", Some(Duration::from_millis(50)));
+        let id = sched.sessions.open("truthdb".into(), "sa".into());
+        {
+            let ctx = &mut sched.sessions.get_mut(id).expect("session").txn_ctx;
+            engine
+                .sql_batch("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)", ctx)
+                .expect("create");
+            engine
+                .sql_batch("BEGIN TRAN; INSERT INTO t VALUES (1);", ctx)
+                .expect("begin");
+            assert!(
+                ctx.has_open_transaction(),
+                "the session starts with an open txn"
+            );
+        }
+        // Keep the sender alive so the (worker-less) channel stays open.
+        let (_tx, rx) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            engine: Arc::new(engine),
+            scheduler: Mutex::new(sched),
+            rx: Mutex::new(rx),
+            stop: AtomicBool::new(false),
+            idle: Mutex::new(()),
+            wake: Condvar::new(),
+        });
+        let keeper = Arc::clone(&shared);
+        let maintenance = std::thread::spawn(move || maintenance_loop(&keeper));
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let reaped = loop {
+            {
+                let sched = shared.scheduler.lock().expect("scheduler poisoned");
+                if !sched
+                    .sessions
+                    .get(id)
+                    .expect("session")
+                    .txn_ctx
+                    .has_open_transaction()
+                {
+                    break true;
+                }
+            }
+            if Instant::now() > deadline {
+                break false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        {
+            let _idle = shared.idle.lock().expect("idle mutex poisoned");
+            shared.stop.store(true, Ordering::Release);
+        }
+        shared.wake.notify_all();
+        maintenance.join().expect("maintenance thread");
+        assert!(
+            reaped,
+            "the idle transaction was reaped with no worker to do it"
         );
         let _ = std::fs::remove_file(path);
     }
