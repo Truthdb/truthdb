@@ -3964,6 +3964,55 @@ fn expr_column_refs(expr: &Expr, f: &mut impl FnMut(&Name)) {
     }
 }
 
+/// Rewrites ORDER BY so a SELECT-list alias resolves on the path that sorts the
+/// *source* rows.
+///
+/// ORDER BY is the one clause where a SELECT alias is in scope, but this path
+/// sorts base rows against a [`JoinScope`], which knows only base columns — so
+/// `SELECT v AS vv FROM a ORDER BY vv` would not resolve, and an alias over a
+/// computed expression (`SELECT v * 2 AS dbl ... ORDER BY dbl`) has no base
+/// column to fall back on at all. Each unqualified name matching an alias is
+/// replaced by that alias's expression, which the existing sort machinery then
+/// evaluates against the base row. (The grouped/DISTINCT path projects first and
+/// resolves ORDER BY against the output names, so it already sees aliases.)
+///
+/// An alias shadows a base column of the same name, as in SQL Server. A
+/// qualified name (`a.v`) always means that table's column and is never
+/// rewritten. `map_expr_columns` does not rescan what it substitutes, so a
+/// self-referential alias (`SELECT v + 1 AS v ... ORDER BY v`) substitutes once
+/// instead of recursing forever. Ordinals (`ORDER BY 1`) are integers, not
+/// column references, so they are untouched.
+fn order_by_with_aliases(order_by: &[OrderItem], items: &[SelectItem]) -> Vec<OrderItem> {
+    let aliases: Vec<(&str, &Expr)> = items
+        .iter()
+        .filter_map(|item| match item {
+            SelectItem::Expr {
+                expr,
+                alias: Some(name),
+            } => Some((name.value.as_str(), expr)),
+            _ => None,
+        })
+        .collect();
+    if aliases.is_empty() {
+        return order_by.to_vec();
+    }
+    order_by
+        .iter()
+        .map(|item| OrderItem {
+            expr: map_expr_columns(&item.expr, &|name: &Name| {
+                if name.value.contains('.') {
+                    return None;
+                }
+                aliases
+                    .iter()
+                    .find(|(alias, _)| name.eq_ignore_case(alias))
+                    .map(|(_, expr)| (*expr).clone())
+            }),
+            descending: item.descending,
+        })
+        .collect()
+}
+
 /// Replaces every column reference in an expression via `f` (a replacement, or
 /// `None` to keep), not descending into nested subquery bodies (but mapping an
 /// `IN (SELECT)` operand, which is at this scope).
@@ -4392,10 +4441,11 @@ fn exec_select(
     // ORDER BY (evaluated against the source row; stable so equal keys keep
     // input order). Spills to temp extents when the input exceeds the budget.
     if !select.order_by.is_empty() {
+        let order_by = order_by_with_aliases(&select.order_by, &select.items);
         rows = order_rows(
             storage,
             rows,
-            &select.order_by,
+            &order_by,
             &types,
             &source.collations,
             &resolver,
