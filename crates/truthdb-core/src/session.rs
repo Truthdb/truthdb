@@ -68,6 +68,10 @@ const LOCK_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 /// be disabled outright.
 const IDLE_TXN_TIMEOUT: Duration = Duration::from_secs(600);
 
+/// Floor on the maintenance thread's sleep, so no configuration of the timeouts
+/// can turn its loop into a spin.
+const MIN_SWEEP_INTERVAL: Duration = Duration::from_millis(10);
+
 /// The result of running a batch for a session: its typed outcome plus
 /// whether the connection is still inside a transaction afterwards (so the
 /// TDS gateway can set `DONE_INXACT`).
@@ -439,41 +443,46 @@ struct Runnable {
 #[cfg(test)]
 static MAINTENANCE_STARTS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
 
-/// The engine's housekeeping, on a thread that never runs a batch: the
-/// deadlock backstop (reap a lock wait past its deadline) and the idle-
-/// transaction reaper.
+/// Counts maintenance sweeps, so a test can prove the thread sleeps between
+/// them rather than spinning.
+#[cfg(test)]
+static MAINTENANCE_SWEEPS: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The idle-transaction reaper, on a thread that never runs a batch.
 ///
-/// The workers sweep too, between calls, and that is still where a reap and the
-/// drain it unblocks happen in one pass. This thread is what makes the sweep
-/// *punctual*. A worker only reaches it between batches, so the reapers were
-/// only ever as prompt as the pool was free — and the pool is `cores-2`
-/// threads, two on a four-core box. A few long scans already delayed the sweep
-/// for as long as they ran, which is backwards: the idle reaper exists to
-/// release the locks of a client that has stopped responding, and a loaded
-/// engine is exactly when that matters most. Nothing a client does can delay
-/// this thread, because it never executes anything on their behalf.
+/// It used to run only on the workers, between calls, which made it exactly as
+/// punctual as the pool was free — and the pool is `cores-2` threads, two on a
+/// four-core box. A few long scans deferred it for as long as they ran, which
+/// is backwards: it exists to release the locks of a client that has stopped
+/// responding, and a loaded engine is when that matters most. Nothing a client
+/// does can delay this thread, because it never executes anything on anyone's
+/// behalf.
 ///
-/// It only *releases* locks; running whatever that unblocks still needs a
-/// worker, and always did.
+/// **Only the idle reaper lives here.** The deadlock backstop
+/// ([`Scheduler::reap_expired`]) stays on the workers, because it is coupled to
+/// draining: reaping a victim releases locks that rescue the waiters behind it,
+/// and its contract is that the same pass then runs them. A sweeper that reaps
+/// without draining is worse than none — it re-reaps the waiters a drain would
+/// have rescued, and (since a waiter it must *not* reap keeps a deadline in the
+/// past) it spins doing so. The idle reaper has no such coupling: it is purely
+/// a function of `last_activity`, and the locks it frees are drained by
+/// whichever worker gets there, exactly as before.
+///
+/// Its cadence therefore never depends on the parked queue — see
+/// [`Scheduler::sweep_interval`].
 fn maintenance_loop(shared: &Arc<Shared>) {
     #[cfg(test)]
     MAINTENANCE_STARTS.fetch_add(1, Ordering::Relaxed);
     while !shared.stop.load(Ordering::Acquire) {
-        // Sleep until the nearest parked deadline, but never past the sweep
-        // cap: an idle transaction has no deadline in the parked queue, so with
-        // nothing parked the cap is the only thing that brings us back.
-        let wait = {
-            let sched = shared.scheduler.lock().expect("scheduler poisoned");
-            let cap = sched.wake_cap();
-            match sched.earliest_deadline() {
-                Some(deadline) => deadline.saturating_duration_since(Instant::now()).min(cap),
-                None => cap,
-            }
-        };
+        let wait = shared
+            .scheduler
+            .lock()
+            .expect("scheduler poisoned")
+            .sweep_interval();
         {
             // `stop` is read and written under this mutex, so a shutdown that
             // lands between the check and the wait cannot be missed — it would
-            // otherwise be slept through for a whole sweep interval, and the
+            // otherwise be slept through for a whole interval, and the
             // supervisor is joining this thread.
             let idle = shared.idle.lock().expect("idle mutex poisoned");
             if shared.stop.load(Ordering::Acquire) {
@@ -484,8 +493,9 @@ fn maintenance_loop(shared: &Arc<Shared>) {
                 .wait_timeout(idle, wait)
                 .expect("idle mutex poisoned");
         }
+        #[cfg(test)]
+        MAINTENANCE_SWEEPS.fetch_add(1, Ordering::Relaxed);
         let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
-        sched.reap_expired(&shared.engine);
         sched.reap_idle_txns(&shared.engine);
     }
 }
@@ -726,6 +736,26 @@ impl Scheduler {
     /// (10 min) and this is unchanged; a deployment (or test) that sets a short
     /// idle timeout gets a correspondingly shorter cap instead of a reaper that
     /// silently runs late.
+    /// How long the maintenance thread sleeps between idle sweeps.
+    ///
+    /// Deliberately a function of the timeouts alone, never of the parked
+    /// queue: a deadline in the past — which [`Self::reap_expired`] leaves
+    /// there on purpose, for a waiter that is grantable and so must not be
+    /// reaped — would drive the wait to zero and spin a core against the
+    /// scheduler mutex. The idle reaper has no business with parked deadlines
+    /// anyway.
+    ///
+    /// Floored, because `idle_txn_timeout` is a tuning knob and tests already
+    /// pass `Duration::ZERO`; without it, that setting alone would peg a core.
+    fn sweep_interval(&self) -> Duration {
+        match self.idle_txn_timeout {
+            Some(idle) => idle.min(self.lock_wait_timeout),
+            // The reaper is disabled; there is nothing to be prompt for.
+            None => self.lock_wait_timeout,
+        }
+        .max(MIN_SWEEP_INTERVAL)
+    }
+
     fn wake_cap(&self) -> Duration {
         match self.idle_txn_timeout {
             Some(idle) => self.lock_wait_timeout.min(idle),
@@ -1493,6 +1523,67 @@ mod tests {
             "the pool spawns a maintenance thread"
         );
         drop(h);
+    }
+
+    #[test]
+    fn the_maintenance_thread_sleeps_between_sweeps_whatever_is_parked() {
+        // An expired waiter that `reap_expired` must NOT reap (its locks are
+        // free, so it is queued for a worker rather than blocked) keeps a
+        // deadline in the past for as long as it sits there. A sweeper that
+        // derived its sleep from that deadline would compute zero and spin,
+        // taking the scheduler mutex thousands of times a second — and would do
+        // it precisely while every worker was busy, which is the case this
+        // thread exists for.
+        let (engine, mut sched, path) = bare("no-spin", Some(Duration::from_millis(50)));
+        let id = sched.sessions.open("truthdb".into(), "sa".into());
+        let (reply, _rx) = oneshot::channel();
+        sched.parked.push_back(Parked {
+            session: id,
+            sql: "SELECT 1".into(),
+            params: Vec::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            reply,
+            needs: vec![(Resource::Table(1), LockMode::Shared)],
+            deadline: Instant::now() - Duration::from_secs(60),
+        });
+        let (_tx, rx) = mpsc::channel();
+        let shared = Arc::new(Shared {
+            engine: Arc::new(engine),
+            scheduler: Mutex::new(sched),
+            rx: Mutex::new(rx),
+            stop: AtomicBool::new(false),
+            idle: Mutex::new(()),
+            wake: Condvar::new(),
+        });
+        MAINTENANCE_SWEEPS.store(0, Ordering::Relaxed);
+        let keeper = Arc::clone(&shared);
+        let maintenance = std::thread::spawn(move || maintenance_loop(&keeper));
+        std::thread::sleep(Duration::from_millis(200));
+        let sweeps = MAINTENANCE_SWEEPS.load(Ordering::Relaxed);
+        {
+            let _idle = shared.idle.lock().expect("idle mutex poisoned");
+            shared.stop.store(true, Ordering::Release);
+        }
+        shared.wake.notify_all();
+        maintenance.join().expect("maintenance thread");
+
+        // 200ms at a 50ms interval is ~4 sweeps. A spin measures in thousands,
+        // so the bound is loose enough not to be a timing test.
+        assert!(
+            sweeps <= 20,
+            "the thread slept between sweeps; it ran {sweeps} in 200ms"
+        );
+        assert!(
+            shared
+                .scheduler
+                .lock()
+                .expect("scheduler poisoned")
+                .parked
+                .len()
+                == 1,
+            "and it left the grantable waiter for a worker, rather than reaping it"
+        );
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
