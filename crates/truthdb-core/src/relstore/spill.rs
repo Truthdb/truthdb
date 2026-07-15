@@ -363,6 +363,7 @@ mod tests {
                 snapshot_ratio: 0.02,
                 allocator_ratio: 0.02,
                 reserved_ratio: 0.17,
+                default_collation: None,
             },
             8 * 1024 * 1024,
             8 * 1024 * 1024,

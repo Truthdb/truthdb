@@ -37,6 +37,7 @@ fn engine(path: &std::path::Path) -> EngineHandle {
         snapshot_ratio: 0.02,
         allocator_ratio: 0.02,
         reserved_ratio: 0.17,
+        default_collation: None,
     };
     let storage = Storage::create(path.to_path_buf(), opts).expect("storage");
     // The JoinHandle is dropped; the engine thread exits when the last

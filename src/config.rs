@@ -130,6 +130,13 @@ pub struct StorageConfig {
 
     #[serde(default = "default_storage_snapshot_wal_threshold")]
     pub snapshot_wal_threshold: f64,
+
+    /// The database's default collation: what a character column declared
+    /// without an explicit COLLATE gets. Applied when the database file is
+    /// created and stamped into it; an existing file keeps the collation it was
+    /// created with, since its keys are already encoded under it.
+    #[serde(default)]
+    pub default_collation: Option<String>,
 }
 
 fn default_addr() -> String {
@@ -212,6 +219,7 @@ impl Default for StorageConfig {
             backpressure_timeout_ms: default_storage_backpressure_timeout_ms(),
             snapshot_min_interval_ms: default_storage_snapshot_min_interval_ms(),
             snapshot_wal_threshold: default_storage_snapshot_wal_threshold(),
+            default_collation: None,
         }
     }
 }

@@ -65,6 +65,7 @@ async fn main() {
         snapshot_ratio: config.storage.snapshot_ratio,
         allocator_ratio: config.storage.allocator_ratio,
         reserved_ratio: config.storage.reserved_ratio,
+        default_collation: config.storage.default_collation.clone(),
     };
 
     let storage = if storage_path.exists() {
