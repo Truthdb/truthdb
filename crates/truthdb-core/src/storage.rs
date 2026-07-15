@@ -17,7 +17,7 @@ use crate::relstore::heap::{Heap, Rid};
 use crate::relstore::index::{self, Locator};
 use crate::relstore::key::encode_key;
 use crate::relstore::recovery as rel_recovery;
-use crate::relstore::row::{Column, Schema, decode_row, encode_row};
+use crate::relstore::row::{Column, Schema, decode_row, decode_row_projected, encode_row};
 use crate::relstore::types::{Datum, TypeError};
 use crate::storage_layout::{
     FileHeader, PAGE_SIZE, SNAPSHOT_DESCRIPTOR_SIZE, SUPERBLOCK_ACTIVE_A, SUPERBLOCK_ACTIVE_B,
@@ -144,6 +144,11 @@ pub struct Storage {
     /// are the same code agrees with itself. Per-instance for the same reason.
     #[cfg(test)]
     scan_selects: std::sync::atomic::AtomicUsize,
+    /// Columns the last scan slice asked for (`usize::MAX` = the whole row), so
+    /// a test can prove the planner pruned the projection. The rows returned are
+    /// identical either way, so nothing else can see the difference.
+    #[cfg(test)]
+    last_scan_width: std::sync::atomic::AtomicUsize,
 }
 
 // The point of the mutex: `Storage` is shareable across worker threads. Assert
@@ -161,6 +166,22 @@ impl Drop for Storage {
         if let Some(writer) = self.log_writer.take() {
             let _ = writer.join();
         }
+    }
+}
+
+/// Decodes a row, honouring a caller's projection: `None` means every column.
+///
+/// The read paths take `Option<&[usize]>` rather than always being handed a
+/// full list, so a caller that wants the whole row neither builds one nor pays
+/// to walk it.
+fn decode_projected(
+    schema: &Schema,
+    row: &[u8],
+    projection: Option<&[usize]>,
+) -> Result<Vec<Datum>, crate::relstore::types::TypeError> {
+    match projection {
+        Some(projection) => decode_row_projected(schema, row, projection),
+        None => decode_row(schema, row),
     }
 }
 
@@ -183,6 +204,8 @@ impl Storage {
             scan_slices: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
             scan_selects: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
+            last_scan_width: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
 
@@ -196,6 +219,13 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn scan_selects(&self) -> usize {
         self.scan_selects.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Columns the last scan slice decoded per row (`usize::MAX` = every one).
+    #[cfg(test)]
+    pub(crate) fn last_scan_width(&self) -> usize {
+        self.last_scan_width
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Counts one row-at-a-time SELECT (called by `rel::scan_select`).
@@ -412,9 +442,10 @@ impl Storage {
         index_object_id: u32,
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
+        projection: Option<&[usize]>,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.lock()
-            .rel_index_scan(table, index_object_id, lower, upper)
+            .rel_index_scan(table, index_object_id, lower, upper, projection)
     }
 
     pub fn rel_insert(&self, name: &str, values: Vec<Datum>) -> Result<(), StorageError> {
@@ -463,7 +494,7 @@ impl Storage {
         let mut out = Vec::new();
         let mut cursor = ScanCursor::start();
         while !cursor.done() {
-            cursor = self.rel_scan_slice(name, cursor, budget, &mut out)?;
+            cursor = self.rel_scan_slice(name, cursor, budget, None, &mut out)?;
         }
         Ok(out)
     }
@@ -483,12 +514,20 @@ impl Storage {
         name: &str,
         cursor: ScanCursor,
         budget: usize,
+        projection: Option<&[usize]>,
         out: &mut Vec<Vec<Datum>>,
     ) -> Result<ScanCursor, StorageError> {
         #[cfg(test)]
-        self.scan_slices
-            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        self.lock().rel_scan_slice(name, cursor, budget, out)
+        {
+            self.scan_slices
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.last_scan_width.store(
+                projection.map_or(usize::MAX, <[usize]>::len),
+                std::sync::atomic::Ordering::Relaxed,
+            );
+        }
+        self.lock()
+            .rel_scan_slice(name, cursor, budget, projection, out)
     }
 
     /// Test hook: a table's definition + schema, for driving a batched scan.
@@ -1150,6 +1189,7 @@ impl StorageFile {
         index_object_id: u32,
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
+        projection: Option<&[usize]>,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(table)?;
@@ -1175,7 +1215,7 @@ impl StorageFile {
                 if let Locator::Key(pk) = index::decode_locator(&value)
                     && let Some(row) = base.get(&mut ctx, &pk)?
                 {
-                    rows.push(decode_row(&schema, &row)?);
+                    rows.push(decode_projected(&schema, &row, projection)?);
                 }
             }
         } else {
@@ -1187,7 +1227,7 @@ impl StorageFile {
                 if let Locator::Rid(rid) = index::decode_locator(&value)
                     && let Some(row) = heap.read_row(&mut ctx, rid)?
                 {
-                    rows.push(decode_row(&schema, &row)?);
+                    rows.push(decode_projected(&schema, &row, projection)?);
                 }
             }
         }
@@ -1319,6 +1359,7 @@ impl StorageFile {
         name: &str,
         cursor: ScanCursor,
         budget: usize,
+        projection: Option<&[usize]>,
         out: &mut Vec<Vec<Datum>>,
     ) -> Result<ScanCursor, StorageError> {
         self.ensure_rel_usable()?;
@@ -1345,7 +1386,7 @@ impl StorageFile {
             next
         };
         for row in raw {
-            out.push(decode_row(&schema, &row)?);
+            out.push(decode_projected(&schema, &row, projection)?);
         }
         Ok(next)
     }
