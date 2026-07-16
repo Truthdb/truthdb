@@ -19,7 +19,9 @@ use crate::relstore::key::encode_key;
 use crate::relstore::recovery as rel_recovery;
 use crate::relstore::row::{Column, Schema, decode_row, decode_row_projected, encode_row};
 use crate::relstore::types::{Datum, TypeError};
-use crate::relstore::version::{PendingVersion, ReadSnapshot, Resolved, RowChange, rid_identity};
+use crate::relstore::version::{
+    PendingVersion, ReadSnapshot, Resolved, RowChange, decode_rid_identity, rid_identity,
+};
 use crate::storage_layout::{
     FileHeader, PAGE_SIZE, SNAPSHOT_DESCRIPTOR_SIZE, SUPERBLOCK_ACTIVE_A, SUPERBLOCK_ACTIVE_B,
     SnapshotDescriptor, Superblock, WAL_ENTRY_TYPE_REL, WAL_MAX_BYTES, WAL_MIN_BYTES, align_down,
@@ -118,6 +120,12 @@ pub enum StorageError {
 
     #[error("constraint violation: {0}")]
     Constraint(String),
+
+    /// A SNAPSHOT transaction touched a table whose schema a later-committed
+    /// DDL changed (its version images cannot decode under the new schema).
+    /// Maps to SQL Server's 3961.
+    #[error("schema of '{0}' changed under the snapshot")]
+    SnapshotSchemaChange(String),
 }
 
 /// Thread-safe handle to the storage engine. All mutable state lives in a
@@ -536,7 +544,6 @@ impl Storage {
     }
 
     /// Whether `ALLOW_SNAPSHOT_ISOLATION` is on.
-    #[allow(dead_code)] // consumed when SNAPSHOT isolation lands
     pub(crate) fn snapshot_isolation_allowed(&self) -> bool {
         self.allow_snapshot
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -601,6 +608,13 @@ impl Storage {
         snapshot: ReadSnapshot,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.lock().rel_scan_snapshot(name, projection, snapshot)
+    }
+
+    /// Whether any read snapshot is registered (an idle SNAPSHOT transaction
+    /// between batches — running batches are excluded by the caller's
+    /// Database X). `ALTER DATABASE` option flips refuse while one lives.
+    pub(crate) fn has_registered_snapshots(&self) -> bool {
+        self.lock().version.has_snapshots()
     }
 
     /// Drops version history no live snapshot can need (runs on the
@@ -762,6 +776,16 @@ impl Storage {
         name: &str,
     ) -> Result<Vec<(RowLocator, Vec<Datum>)>, StorageError> {
         self.lock().rel_scan_located(name)
+    }
+
+    /// SNAPSHOT-isolation DML target scan: snapshot rows plus a conflict mark
+    /// per row whose current state a snapshot-invisible writer produced.
+    pub(crate) fn rel_scan_located_snapshot(
+        &self,
+        name: &str,
+        snapshot: ReadSnapshot,
+    ) -> Result<Vec<(RowLocator, Vec<Datum>, bool)>, StorageError> {
+        self.lock().rel_scan_located_snapshot(name, snapshot)
     }
 
     pub(crate) fn rel_delete_located(
@@ -1209,6 +1233,11 @@ impl StorageFile {
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
+        // Stamp the new object: a SNAPSHOT transaction whose view predates
+        // this CREATE must 3961 rather than silently read the (possibly
+        // same-named, post-DROP) new table as empty — its snapshot has no
+        // history for an object that did not exist.
+        self.version.stamp_schema(def.object_id);
         self.rel.tables.insert(name.to_string(), def);
         Ok(())
     }
@@ -1465,6 +1494,13 @@ impl StorageFile {
             Ok(def)
         })?;
         self.rel.tables.insert(table.to_string(), updated);
+        // ALTER ADD re-encodes every row: version images from before it
+        // cannot decode under the widened schema, so a SNAPSHOT transaction
+        // whose view predates this commit gets 3961 at its next access
+        // (statement snapshots cannot be live here — the ALTER holds
+        // Database X). Stamped with this ALTER's own commit sequence, the
+        // newest assigned (recorded a moment ago in `rel_statement`).
+        self.version.stamp_schema(object_id);
         Ok(())
     }
 
@@ -1538,6 +1574,11 @@ impl StorageFile {
             .find(|i| i.object_id == index_object_id)
             .cloned()
             .ok_or_else(|| StorageError::InvalidConfig("unknown index".to_string()))?;
+        if let Some(snap) = snapshot
+            && self.version.schema_changed_after(def.object_id, snap)
+        {
+            return Err(StorageError::SnapshotSchemaChange(def.name));
+        }
         let entries = {
             let mut ctx = self.rel_ctx();
             let index_tree = BTree {
@@ -1904,6 +1945,9 @@ impl StorageFile {
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(name)?;
+        if self.version.schema_changed_after(def.object_id, snapshot) {
+            return Err(StorageError::SnapshotSchemaChange(def.name));
+        }
         let physical: Vec<(Vec<u8>, Vec<u8>)> = {
             let mut ctx = self.rel_ctx();
             if def.is_tree() {
@@ -2139,6 +2183,89 @@ impl StorageFile {
             };
             for (rid, row) in heap.scan(&mut ctx)? {
                 out.push((RowLocator::Rid(rid), decode_row(&schema, &row)?));
+            }
+        }
+        Ok(out)
+    }
+
+    /// The SNAPSHOT-isolation DML target scan: like [`Self::rel_scan_located`]
+    /// but rows are the snapshot's versions, and each carries a conflict mark
+    /// when its current state was produced by a writer the snapshot cannot
+    /// see — physically present rows served from an older image, and rows
+    /// deleted (or re-keyed away) since the snapshot, whose locators are
+    /// synthesized from their identities. Targeting a marked row is a 3960
+    /// update conflict; the mark is computed here because only this layer
+    /// sees both the physical state and the chains, atomically under the
+    /// storage mutex. (A marked row can also mean a live writer is mid-flight
+    /// on it — but the caller holds the statement's X locks, so a marked row
+    /// it actually targets can only be a committed-invisible change.)
+    fn rel_scan_located_snapshot(
+        &mut self,
+        name: &str,
+        snapshot: ReadSnapshot,
+    ) -> Result<Vec<(RowLocator, Vec<Datum>, bool)>, StorageError> {
+        self.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(name)?;
+        if self.version.schema_changed_after(def.object_id, snapshot) {
+            return Err(StorageError::SnapshotSchemaChange(def.name));
+        }
+        let physical: Vec<(Vec<u8>, RowLocator, Vec<u8>)> = {
+            let mut ctx = self.rel_ctx();
+            if def.is_tree() {
+                let tree = BTree {
+                    object_id: def.object_id,
+                    root: def.root_page,
+                };
+                tree.scan(&mut ctx)?
+                    .into_iter()
+                    .map(|(key, row)| (key.clone(), RowLocator::Key(key), row))
+                    .collect()
+            } else {
+                let heap = Heap {
+                    object_id: def.object_id,
+                    first_page: def.root_page,
+                };
+                heap.scan(&mut ctx)?
+                    .into_iter()
+                    .map(|(rid, row)| (rid_identity(rid), RowLocator::Rid(rid), row))
+                    .collect()
+            }
+        };
+        let merging = self.version.table_has_chains(def.object_id);
+        let mut out = Vec::with_capacity(physical.len());
+        let mut seen: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::with_capacity(if merging { physical.len() } else { 0 });
+        for (identity, locator, row) in physical {
+            if !merging {
+                out.push((locator, decode_row(&schema, &row)?, false));
+                continue;
+            }
+            match self.version.resolve(def.object_id, &identity, snapshot) {
+                None | Some(Resolved::Current) => {
+                    out.push((locator, decode_row(&schema, &row)?, false));
+                }
+                // Served from an older image: the current row belongs to a
+                // writer the snapshot cannot see.
+                Some(Resolved::Image(image)) => {
+                    out.push((locator, decode_row(&schema, &image)?, true));
+                }
+                Some(Resolved::Gone) => {}
+            }
+            seen.insert(identity);
+        }
+        if merging {
+            for (identity, image) in
+                self.version
+                    .unseen_images_with_identity(def.object_id, &seen, snapshot)
+            {
+                // Deleted or re-keyed since the snapshot: visible to it, but
+                // its current state is gone — always a conflict if targeted.
+                let locator = if def.is_tree() {
+                    RowLocator::Key(identity)
+                } else {
+                    RowLocator::Rid(decode_rid_identity(&identity))
+                };
+                out.push((locator, decode_row(&schema, &image)?, true));
             }
         }
         Ok(out)
@@ -4153,6 +4280,36 @@ mod tests {
             "a raising SET disables the snapshot path: {needs:?}"
         );
 
+        // SNAPSHOT isolation is versioned regardless of RCSI: Database IS
+        // only, and the EXEC-literal recursion preserves the level (the
+        // #120 review's collapse bug, from the other direction).
+        let needs = crate::rel::analyze_locks(&storage, "SELECT v FROM t", Isolation::Snapshot);
+        assert!(
+            !table_s(&needs),
+            "SNAPSHOT reads take no Table S: {needs:?}"
+        );
+        assert!(needs.contains(&(Resource::Database, LockMode::IntentShared)));
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "EXEC sp_executesql N'SELECT v FROM t'",
+            Isolation::Snapshot,
+        );
+        assert!(
+            !table_s(&needs),
+            "the recursion must not turn SNAPSHOT into a locking level: {needs:?}"
+        );
+        // ...and a SET SNAPSHOT inside a batch is not a lock-escalating
+        // raise, but the batch still holds the Database IS fence.
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT; SELECT v FROM t",
+            Isolation::ReadUncommitted,
+        );
+        assert!(
+            needs.contains(&(Resource::Database, LockMode::IntentShared)),
+            "SET SNAPSHOT from RU keeps the DDL fence: {needs:?}"
+        );
+
         drop(storage);
         let _ = std::fs::remove_file(&path);
     }
@@ -4279,6 +4436,147 @@ mod tests {
             storage.version_chain_count("t"),
             0,
             "settled history is dropped by the maintenance prune"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Version cleanup under load (Stage 13 exit): a live snapshot pins
+    /// exactly the history it may still read through sustained churn — and
+    /// keeps reading its own consistent view — while releasing it lets the
+    /// maintenance prune drop everything.
+    #[test]
+    fn version_cleanup_under_load_pins_then_drops_history() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("cleanup-load");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let mut seed = String::from("INSERT INTO t VALUES ");
+        for i in 0..100 {
+            seed.push_str(&format!("({i}, 0),"));
+        }
+        seed.pop();
+        for sql in [
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            seed.as_str(),
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        storage
+            .ensure_durable(storage.wal_tail())
+            .expect("durability");
+        storage.version_prune();
+        assert_eq!(storage.version_chain_count("t"), 0, "settled baseline");
+
+        // A long-lived snapshot (an idle SNAPSHOT transaction's view) while
+        // a writer churns every row, five rounds, pruning between rounds.
+        let pinned = storage.capture_read_snapshot(None);
+        for round in 1..=5 {
+            let outcome = execute_batch(&storage, &format!("UPDATE t SET v = {round}"), &mut ctx);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            storage
+                .ensure_durable(storage.wal_tail())
+                .expect("durability");
+            storage.version_prune();
+        }
+        assert_eq!(
+            storage.version_chain_count("t"),
+            100,
+            "the live snapshot pins one chain per churned row"
+        );
+        // The pinned view still reads its consistent state through all of it.
+        let rows = storage
+            .rel_scan_snapshot("t", Some(&[1]), pinned)
+            .expect("snapshot scan");
+        assert_eq!(rows.len(), 100);
+        assert!(
+            rows.iter().all(|r| r == &vec![Datum::Int(0)]),
+            "the snapshot sees the pre-churn value on every row"
+        );
+
+        // Released: the next prune drops the whole store.
+        storage.release_read_snapshot(pinned.seq);
+        storage.version_prune();
+        assert_eq!(
+            storage.version_chain_count("t"),
+            0,
+            "released history is dropped, the store is bounded"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// SI review PoC: the 3960 auto-abort path must release the
+    /// transaction's snapshot registration - a leak would pin the prune
+    /// watermark forever. Observable through pruning: while the snapshot is
+    /// registered the conflicting chain must survive a prune; after the 3960
+    /// rolled the transaction back, the same prune must drop it.
+    #[test]
+    fn a_3960_abort_releases_the_snapshot_registration() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("si-3960-release");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut setup = TxnContext::default();
+        for sql in [
+            "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON",
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            "INSERT INTO t VALUES (1, 10)",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut setup);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        storage
+            .ensure_durable(storage.wal_tail())
+            .expect("durability");
+        storage.version_prune();
+        assert_eq!(storage.version_chain_count("t"), 0);
+
+        // B: SNAPSHOT transaction, snapshot captured at first access.
+        let mut b = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT; BEGIN TRAN; SELECT v FROM t",
+            &mut b,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // A: a conflicting committed write B's snapshot cannot see.
+        let mut a = TxnContext::default();
+        let outcome = execute_batch(&storage, "UPDATE t SET v = 99 WHERE id = 1", &mut a);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // While B's snapshot is registered, its history is pinned.
+        storage
+            .ensure_durable(storage.wal_tail())
+            .expect("durability");
+        storage.version_prune();
+        assert_eq!(
+            storage.version_chain_count("t"),
+            1,
+            "a registered snapshot pins the chain"
+        );
+
+        // B writes the same row: 3960, and the whole transaction (with its
+        // snapshot registration) must be gone.
+        let outcome = execute_batch(&storage, "UPDATE t SET v = 100 WHERE id = 1", &mut b);
+        assert_eq!(
+            outcome.error.as_ref().map(|e| e.number),
+            Some(3960),
+            "{:?}",
+            outcome.error
+        );
+
+        storage.version_prune();
+        assert_eq!(
+            storage.version_chain_count("t"),
+            0,
+            "the 3960 abort must release the snapshot registration"
         );
 
         drop(storage);

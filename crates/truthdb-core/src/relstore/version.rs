@@ -128,6 +128,11 @@ pub(crate) struct VersionState {
     next_seq: u64,
     /// object id -> identity -> chain.
     tables: HashMap<u32, HashMap<Vec<u8>, Chain>>,
+    /// object id -> commit sequence of the last schema-changing DDL (ALTER
+    /// TABLE ADD column — the one DDL that re-encodes rows, so version images
+    /// from before it cannot decode under the live schema). A SNAPSHOT
+    /// transaction whose view predates the stamp gets 3961 at access.
+    schema_stamps: HashMap<u32, u64>,
     /// Active snapshots by sequence (multiset): the prune watermark.
     snapshots: BTreeMap<u64, usize>,
 }
@@ -154,8 +159,27 @@ impl VersionState {
             self.tables.clear();
             self.commits.clear();
             self.commit_points.clear();
+            self.schema_stamps.clear();
             self.durable_floor = 0;
         }
+    }
+
+    /// Records that a schema-changing DDL just committed against `object_id`
+    /// (called under the storage mutex right after its commit was recorded,
+    /// so the newest assigned sequence is the DDL's own).
+    pub fn stamp_schema(&mut self, object_id: u32) {
+        if self.publishing() {
+            self.schema_stamps.insert(object_id, self.next_seq);
+        }
+    }
+
+    /// Whether a schema-changing DDL committed after this snapshot's view —
+    /// the 3961 gate for SNAPSHOT transactions (statement snapshots cannot
+    /// race DDL: their batch's Database IS fences it out).
+    pub fn schema_changed_after(&self, object_id: u32, snap: ReadSnapshot) -> bool {
+        self.schema_stamps
+            .get(&object_id)
+            .is_some_and(|&seq| seq > snap.seq)
     }
 
     /// The two option bits as persisted in the superblock reserved area.
@@ -199,6 +223,11 @@ impl VersionState {
         } else {
             self.commit_points[idx - 1].1
         }
+    }
+
+    /// Whether any snapshot is registered.
+    pub fn has_snapshots(&self) -> bool {
+        !self.snapshots.is_empty()
     }
 
     pub fn register_snapshot(&mut self, seq: u64) {
@@ -275,6 +304,29 @@ impl VersionState {
             // value is outside).
             if let Some(Resolved::Image(image)) = self.resolve(object_id, identity, snap) {
                 out.push(image);
+            }
+        }
+        out
+    }
+
+    /// [`Self::unseen_images`], but pairing each image with its identity —
+    /// the SNAPSHOT DML target scan synthesizes locators from them.
+    pub fn unseen_images_with_identity(
+        &self,
+        object_id: u32,
+        seen: &HashSet<Vec<u8>>,
+        snap: ReadSnapshot,
+    ) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(chains) = self.tables.get(&object_id) else {
+            return Vec::new();
+        };
+        let mut out = Vec::new();
+        for identity in chains.keys() {
+            if seen.contains(identity) {
+                continue;
+            }
+            if let Some(Resolved::Image(image)) = self.resolve(object_id, identity, snap) {
+                out.push((identity.clone(), image));
             }
         }
         out
@@ -452,6 +504,7 @@ impl VersionState {
         }
         self.commits
             .retain(|txn, seq| *seq > watermark || referenced.contains(txn));
+        self.schema_stamps.retain(|_, seq| *seq > watermark);
         // Commit points whose sequence the watermark has passed are only
         // needed as the durable floor.
         let cut = self
@@ -476,6 +529,15 @@ pub(crate) fn rid_identity(rid: crate::relstore::heap::Rid) -> Vec<u8> {
     out.extend_from_slice(&rid.page.to_le_bytes());
     out.extend_from_slice(&rid.slot.to_le_bytes());
     out
+}
+
+/// Inverse of [`rid_identity`].
+pub(crate) fn decode_rid_identity(identity: &[u8]) -> crate::relstore::heap::Rid {
+    debug_assert_eq!(identity.len(), 10);
+    crate::relstore::heap::Rid {
+        page: u64::from_le_bytes(identity[0..8].try_into().expect("rid identity page")),
+        slot: u16::from_le_bytes(identity[8..10].try_into().expect("rid identity slot")),
+    }
 }
 
 #[cfg(test)]

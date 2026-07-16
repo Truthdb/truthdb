@@ -223,6 +223,9 @@ jobs:
       - name: Conformance — pytds prepared statements (sp_prepare family)
         run: python3 scripts/tds_conformance_prepared.py 127.0.0.1 1433 sa secret
 
+      - name: Conformance — pytds isolation matrix (five levels, Stage 13)
+        run: python3 scripts/tds_isolation_matrix.py 127.0.0.1 1433 sa secret
+
       - name: Conformance — pytds over TLS (tunneled handshake)
         run: python3 scripts/tds_conformance_tls.py 127.0.0.1 1433 sa secret /etc/truthdb/tls.crt
 

@@ -34,7 +34,7 @@ use crate::relstore::catalog::{self, TableDef};
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
 use crate::relstore::version::ReadSnapshot;
-use crate::storage::{Storage, StorageError, StorageTxn, TxnScope};
+use crate::storage::{RowLocator, Storage, StorageError, StorageTxn, TxnScope};
 
 /// Per-session transaction state carried across statements/batches. Lives in
 /// the session (engine thread); autocommit statements use `Default`.
@@ -71,6 +71,10 @@ pub struct TxnContext {
     /// nested `TRY`/`CATCH` restore the outer error on exit). `ERROR_*()` read
     /// the top; empty outside any `CATCH` block.
     error_stack: Vec<truthdb_sql::eval::ErrorInfo>,
+    /// The SNAPSHOT-isolation transaction's read view, captured (and
+    /// registered against pruning) at its first data access and released
+    /// when the transaction ends — commit, rollback, reap, or disconnect.
+    txn_snapshot: Option<ReadSnapshot>,
     /// Set when the idle reaper rolled this session's transaction back. The
     /// session's next batch fails with 1205 and clears it, so a client that
     /// comes back believing it is still in a transaction is told the
@@ -88,6 +92,9 @@ pub enum Isolation {
     ReadCommitted,
     RepeatableRead,
     Serializable,
+    /// Transaction-scoped versioned reads (Stage 13): one snapshot at the
+    /// transaction's first data access, reused by every statement in it.
+    Snapshot,
 }
 
 impl TxnContext {
@@ -184,9 +191,19 @@ impl TxnContext {
         if let Some(txn) = self.txn.take() {
             let _ = storage.rel_rollback(txn);
         }
+        self.release_txn_snapshot(storage);
         self.trancount = 0;
         self.doomed = false;
         self.savepoints.clear();
+    }
+
+    /// Releases the SNAPSHOT transaction's registered read view, if any —
+    /// called on every transaction-ending path (a leaked registration pins
+    /// the version store's prune watermark forever).
+    fn release_txn_snapshot(&mut self, storage: &Storage) {
+        if let Some(snap) = self.txn_snapshot.take() {
+            storage.release_read_snapshot(snap.seq);
+        }
     }
 
     /// Rolls back this session's transaction because it sat idle too long, and
@@ -1067,6 +1084,55 @@ impl Drop for SnapshotScope<'_> {
     }
 }
 
+/// Statement-scoped view of a TRANSACTION's snapshot (SNAPSHOT isolation):
+/// sets the thread-local for this statement and clears it on exit, but the
+/// registration lives with the transaction, not the statement.
+struct TxnSnapshotScope;
+
+impl TxnSnapshotScope {
+    fn enter(snap: ReadSnapshot) -> Self {
+        CURRENT_SNAPSHOT.set(Some(snap));
+        TxnSnapshotScope
+    }
+}
+
+impl Drop for TxnSnapshotScope {
+    fn drop(&mut self) {
+        CURRENT_SNAPSHOT.set(None);
+    }
+}
+
+/// Whether a statement touches any base table: DML always does; a SELECT
+/// only when its FROM/subqueries name one. `SELECT 1` under SNAPSHOT must
+/// neither raise 3952 nor establish the transaction's snapshot — SQL Server
+/// defers both to the first read of an actual object.
+fn statement_reads_tables(statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(select) => {
+            let expanded = expand_ctes(select);
+            let mut tables = Vec::new();
+            collect_locked_tables(&expanded, &mut tables);
+            !tables.is_empty()
+        }
+        _ => true,
+    }
+}
+
+/// SQL Server 3952: SNAPSHOT isolation used while the database does not
+/// allow it — raised at data access, not at SET, exactly as SQL Server does.
+fn snapshot_not_allowed_error(database: &str) -> SqlError {
+    SqlError::new(
+        3952,
+        16,
+        1,
+        format!(
+            "Snapshot isolation transaction failed accessing database '{database}' because \
+             snapshot isolation is not allowed in this database. Use ALTER DATABASE to allow \
+             snapshot isolation."
+        ),
+    )
+}
+
 /// Runs one statement. A plain `SELECT` the scan planner accepts streams its
 /// rows through `run` as the scan reads them — the whole point of the event
 /// stream: the client sees rows while the scan runs, and the statement's peak
@@ -1078,24 +1144,59 @@ fn exec_statement_streamed(
     txn_ctx: &mut TxnContext,
     run: &mut BatchRun<'_>,
 ) -> Result<StatementOutcome, SqlError> {
-    // RCSI: a SELECT under READ COMMITTED with the database option on reads
-    // a statement snapshot instead of blocking on writers' locks. DML (and
-    // the reads inside it) stays lock-based — conservative versus SQL
-    // Server, which versions DML's reads too; the write locks it takes here
-    // subsume what versioning would relax.
-    let versioned = matches!(statement, Statement::Select(_))
-        && matches!(txn_ctx.isolation(), Isolation::ReadCommitted)
-        && storage.rcsi_enabled();
-    if versioned {
-        // The snapshot is the durable commit prefix, so the session's own
-        // just-committed statements must be fsync-durable before capture or
-        // the statement would not see them. Rowset-producing SELECTs already
-        // flushed in `run_block`; this covers assignment SELECTs (and then
-        // no-ops when nothing committed since the last durability point).
-        run.flush(storage)?;
+    // Versioned reads (Stage 13). RCSI: a SELECT under READ COMMITTED with
+    // the option on reads a per-statement snapshot instead of blocking on
+    // writers' locks (DML and the reads inside it stay lock-based —
+    // conservative versus SQL Server; the write locks subsume what
+    // versioning would relax). SNAPSHOT isolation: every data-access
+    // statement shares the transaction's snapshot, captured at its first
+    // data access; outside a transaction each statement is its own.
+    let data_access = matches!(
+        statement,
+        Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+    );
+    let mut _stmt_scope = None;
+    let mut _txn_scope = None;
+    match txn_ctx.isolation() {
+        Isolation::ReadCommitted
+            if matches!(statement, Statement::Select(_)) && storage.rcsi_enabled() =>
+        {
+            // The snapshot is the durable commit prefix, so the session's
+            // own just-committed statements must be fsync-durable before
+            // capture or the statement would not see them. Rowset-producing
+            // SELECTs already flushed in `run_block`; this covers assignment
+            // SELECTs (and then no-ops when nothing committed since the
+            // last durability point).
+            run.flush(storage)?;
+            _stmt_scope = Some(SnapshotScope::enter(
+                storage,
+                txn_ctx.txn.as_ref().map(StorageTxn::txn_id),
+            ));
+        }
+        Isolation::Snapshot if data_access && statement_reads_tables(statement) => {
+            if !storage.snapshot_isolation_allowed() {
+                if txn_ctx.in_txn() {
+                    txn_ctx.doomed = true;
+                }
+                return Err(snapshot_not_allowed_error(&txn_ctx.database));
+            }
+            if txn_ctx.in_txn() {
+                if txn_ctx.txn_snapshot.is_none() {
+                    // First data access establishes the transaction's view.
+                    run.flush(storage)?;
+                    let own = txn_ctx.txn.as_ref().map(StorageTxn::txn_id);
+                    txn_ctx.txn_snapshot = Some(storage.capture_read_snapshot(own));
+                }
+                _txn_scope = txn_ctx.txn_snapshot.map(TxnSnapshotScope::enter);
+            } else {
+                // Autocommit: the statement is its own transaction, so its
+                // snapshot is statement-scoped, like RCSI's.
+                run.flush(storage)?;
+                _stmt_scope = Some(SnapshotScope::enter(storage, None));
+            }
+        }
+        _ => {}
     }
-    let _snapshot_scope = versioned
-        .then(|| SnapshotScope::enter(storage, txn_ctx.txn.as_ref().map(StorageTxn::txn_id)));
     exec_statement_streamed_inner(storage, statement, txn_ctx, run)
 }
 
@@ -1454,21 +1555,35 @@ pub fn analyze_locks(
     // READ UNCOMMITTED on entry — otherwise the post-SET read would run
     // unlocked. We therefore take read locks unless the whole batch is READ
     // UNCOMMITTED: the session is RU and no SET raises it above RU.
+    // SNAPSHOT is a versioned level, not a raise: a SET to it must not force
+    // lock-based analysis (its whole point is to read without Table S).
     let escalates_reads = statements.iter().any(|s| {
         matches!(
             s,
             Statement::Set(SetStatement::IsolationLevel(level))
-                if !matches!(level, IsolationLevel::ReadUncommitted)
+                if !matches!(level, IsolationLevel::ReadUncommitted | IsolationLevel::Snapshot)
         )
     });
-    let reads_lock = !matches!(isolation, Isolation::ReadUncommitted) || escalates_reads;
-    // Under READ_COMMITTED_SNAPSHOT, a READ COMMITTED SELECT reads a
-    // statement snapshot instead of blocking on writers: it takes Database IS
-    // only — the DDL fence for the batch's duration — and no Table S. A batch
+    // A batch that SETs SNAPSHOT mid-stream still read-locks (statements
+    // before the SET run at the session level, and batch analysis cannot see
+    // the boundary) — but it must at least hold the Database IS fence, so an
+    // RU session's `SET SNAPSHOT; SELECT` is not entirely lock-free.
+    let sets_snapshot = statements.iter().any(|s| {
+        matches!(
+            s,
+            Statement::Set(SetStatement::IsolationLevel(IsolationLevel::Snapshot))
+        )
+    });
+    let reads_lock =
+        !matches!(isolation, Isolation::ReadUncommitted) || escalates_reads || sets_snapshot;
+    // Versioned reads take Database IS only — the DDL fence for the batch's
+    // duration — and no Table S: READ COMMITTED under RCSI (per-statement
+    // snapshots) and SNAPSHOT isolation (the transaction's snapshot). A batch
     // whose SET raises the level is analyzed lock-based (conservative: the
     // raise is seen here, the exact statement boundary is not).
-    let versioned_reads =
-        matches!(isolation, Isolation::ReadCommitted) && !escalates_reads && storage.rcsi_enabled();
+    let versioned_reads = !escalates_reads
+        && (matches!(isolation, Isolation::Snapshot)
+            || (matches!(isolation, Isolation::ReadCommitted) && storage.rcsi_enabled()));
     let mut needs: std::collections::HashMap<Resource, LockMode> = std::collections::HashMap::new();
     let mut add = |resource: Resource, mode: LockMode| {
         needs
@@ -1647,8 +1762,15 @@ pub fn analyze_locks(
                     // (caught by the adversarial review). READ COMMITTED is
                     // passed only when it truly is the effective level.
                     let inner_isolation = if reads_lock {
-                        if matches!(isolation, Isolation::ReadCommitted) && !escalates_reads {
-                            Isolation::ReadCommitted
+                        if matches!(
+                            isolation,
+                            Isolation::ReadCommitted | Isolation::Snapshot
+                        ) && !escalates_reads
+                        {
+                            // Both survive the recursion faithfully: the
+                            // inner analysis reaches the same versioned/
+                            // lock-based decision execution will.
+                            isolation
                         } else {
                             Isolation::RepeatableRead
                         }
@@ -1746,6 +1868,24 @@ fn exec_statement(
             "The current transaction cannot be committed and cannot support operations that write to the log file. Roll back the transaction.",
         ));
     }
+    let result = exec_statement_dispatch(storage, statement, txn_ctx);
+    // SQL Server rolls a SNAPSHOT transaction back entirely on an update
+    // conflict — "transaction aborted", not statement-failed-transaction-
+    // doomed. @@TRANCOUNT drops to zero and the session continues.
+    if let Err(error) = &result
+        && error.number == 3960
+        && txn_ctx.in_txn()
+    {
+        txn_ctx.abort(storage);
+    }
+    result
+}
+
+fn exec_statement_dispatch(
+    storage: &Storage,
+    statement: &Statement,
+    txn_ctx: &mut TxnContext,
+) -> Result<StatementResult, SqlError> {
     match statement {
         Statement::BeginTransaction { .. } => exec_begin(storage, txn_ctx),
         Statement::Commit { .. } => exec_commit(storage, txn_ctx),
@@ -2000,6 +2140,8 @@ fn exec_commit(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementResul
         && let Some(txn) = ctx.txn.take()
     {
         ctx.savepoints.clear();
+        // The transaction is over either way the commit goes.
+        ctx.release_txn_snapshot(storage);
         storage
             .rel_commit(txn)
             .map_err(|e| map_storage_err(e, ""))?;
@@ -2059,6 +2201,7 @@ fn exec_rollback(
             .map_err(|e| map_storage_err(e, "")),
         None => Ok(()),
     };
+    ctx.release_txn_snapshot(storage);
     ctx.trancount = 0;
     ctx.doomed = false;
     ctx.savepoints.clear();
@@ -2091,6 +2234,7 @@ fn exec_set(ctx: &mut TxnContext, set: &SetStatement) -> Result<StatementResult,
                 IsolationLevel::ReadCommitted => Isolation::ReadCommitted,
                 IsolationLevel::RepeatableRead => Isolation::RepeatableRead,
                 IsolationLevel::Serializable => Isolation::Serializable,
+                IsolationLevel::Snapshot => Isolation::Snapshot,
             }
         }
         SetStatement::ShowplanText(on) => ctx.showplan_text = *on,
@@ -3331,6 +3475,23 @@ fn exec_alter_database(
         )
         .at(name.span));
     }
+    // A SNAPSHOT transaction idle between batches holds no locks, so the
+    // batch's Database X does not prove no snapshot is live. Flipping the
+    // options under one would reset (or stop publishing to) the store its
+    // reads depend on; SQL Server waits the transactions out, TruthDB
+    // refuses and lets the operator retry.
+    if storage.has_registered_snapshots() {
+        return Err(SqlError::new(
+            5061,
+            16,
+            1,
+            format!(
+                "ALTER DATABASE failed because a lock could not be placed on database '{}'. \
+                 Try again later.",
+                txn_ctx.database
+            ),
+        ));
+    }
     let mut rcsi = None;
     let mut allow_snapshot = None;
     for (option, on) in &alter.options {
@@ -3865,6 +4026,46 @@ fn identity_datum(column_type: &ColumnType, v: i64) -> Result<Datum, SqlError> {
 
 // ---- UPDATE / DELETE ----------------------------------------------------
 
+/// The DML target scan: current rows under lock-based isolation; under
+/// SNAPSHOT isolation (the statement's thread-local snapshot is set), the
+/// transaction-snapshot rows instead, each carrying a conflict mark when its
+/// current state was changed or deleted by a writer the snapshot cannot see.
+/// Targeting a marked row is SQL Server's 3960 update conflict.
+fn scan_located_for_dml(
+    storage: &Storage,
+    def: &TableDef,
+) -> Result<Vec<(RowLocator, Vec<Datum>, bool)>, SqlError> {
+    match current_snapshot() {
+        Some(snap) => storage
+            .rel_scan_located_snapshot(&def.name, snap)
+            .map_err(|e| map_storage_err(e, &def.name)),
+        None => Ok(storage
+            .rel_scan_located(&def.name)
+            .map_err(|e| map_storage_err(e, &def.name))?
+            .into_iter()
+            .map(|(locator, row)| (locator, row, false))
+            .collect()),
+    }
+}
+
+/// SQL Server 3960: a SNAPSHOT transaction tried to write a row a later
+/// committed transaction already changed. The whole transaction is rolled
+/// back (see `exec_statement`'s 3960 handling), as SQL Server does.
+fn update_conflict_error(table: &str, database: &str) -> SqlError {
+    SqlError::new(
+        3960,
+        16,
+        1,
+        format!(
+            "Snapshot isolation transaction aborted due to update conflict. You cannot use \
+             snapshot isolation to access table '{table}' directly or indirectly in database \
+             '{database}' to update, delete, or insert the row that has been modified or \
+             deleted by another transaction. Retry the transaction or change the isolation \
+             level for the update/delete statement."
+        ),
+    )
+}
+
 fn exec_update(
     storage: &Storage,
     update: &Update,
@@ -3914,15 +4115,16 @@ fn exec_update(
 
     // Materialize the whole table (Halloween-safe), filter, and compute new
     // rows before any mutation.
-    let located = storage
-        .rel_scan_located(&def.name)
-        .map_err(|e| map_storage_err(e, &def.name))?;
+    let located = scan_located_for_dml(storage, &def)?;
     let types = schema_types(&schema);
     let mut updates = Vec::new();
-    for (locator, row) in located {
+    for (locator, row, conflict) in located {
         check_cancelled()?;
         if !predicate_true(&update.where_clause, &row, &types, &resolver, eval_ctx)? {
             continue;
+        }
+        if conflict {
+            return Err(update_conflict_error(&def.name, &eval_ctx.database));
         }
         // Every SET expression sees the pre-update row; keep the old values
         // for secondary-index maintenance.
@@ -4032,13 +4234,14 @@ fn exec_delete(
     let resolver = SchemaScope { schema: &schema };
 
     let types = schema_types(&schema);
-    let located = storage
-        .rel_scan_located(&def.name)
-        .map_err(|e| map_storage_err(e, &def.name))?;
+    let located = scan_located_for_dml(storage, &def)?;
     let mut targets = Vec::new();
-    for (locator, row) in located {
+    for (locator, row, conflict) in located {
         check_cancelled()?;
         if predicate_true(&delete.where_clause, &row, &types, &resolver, eval_ctx)? {
+            if conflict {
+                return Err(update_conflict_error(&def.name, &eval_ctx.database));
+            }
             // Keep the row values for secondary-index maintenance.
             targets.push((locator, row));
         }
@@ -8475,6 +8678,17 @@ fn map_storage_err(err: StorageError, table: &str) -> SqlError {
             SqlError::new(515, 16, 2, msg)
         }
         StorageError::Constraint(msg) => SqlError::new(547, 16, 0, msg),
+        StorageError::SnapshotSchemaChange(name) => SqlError::new(
+            3961,
+            16,
+            1,
+            format!(
+                "Snapshot isolation transaction failed in database because the object accessed \
+                 by the statement has been modified by a DDL statement in another concurrent \
+                 transaction since the start of this transaction. It is disallowed because the \
+                 metadata is not versioned. Object: '{name}'."
+            ),
+        ),
         StorageError::InvalidConfig(msg) => SqlError::new(1701, 16, 1, msg),
         other => SqlError::new(
             3621,

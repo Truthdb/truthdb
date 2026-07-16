@@ -1,0 +1,74 @@
+# SNAPSHOT isolation (Stage 13), single-session surface: the SET is always
+# accepted; data access without ALLOW_SNAPSHOT_ISOLATION is 3952; with it,
+# statements read/write normally (own writes always visible; the concurrency
+# semantics live in the session tests).
+
+statement ok
+CREATE TABLE snap (id INT NOT NULL PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO snap VALUES (1, 10), (2, 20)
+
+statement ok
+SET TRANSACTION ISOLATION LEVEL SNAPSHOT
+
+# The option is off: the SET stood, the ACCESS fails (SQL Server defers the
+# check exactly this way).
+statement error
+SELECT v FROM snap
+
+statement ok
+ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON
+
+query II rowsort
+SELECT id, v FROM snap
+----
+1 10
+2 20
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+UPDATE snap SET v = 11 WHERE id = 1
+
+# The snapshot transaction reads its own writes.
+query I
+SELECT v FROM snap WHERE id = 1
+----
+11
+
+statement ok
+ROLLBACK
+
+query I
+SELECT v FROM snap WHERE id = 1
+----
+10
+
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+DELETE FROM snap WHERE id = 2
+
+query I
+SELECT COUNT(*) FROM snap
+----
+1
+
+statement ok
+COMMIT
+
+query I
+SELECT COUNT(*) FROM snap
+----
+1
+
+statement ok
+SET TRANSACTION ISOLATION LEVEL READ COMMITTED
+
+query I
+SELECT COUNT(*) FROM snap
+----
+1
