@@ -1,0 +1,19 @@
+(3 rows affected)
+id          name                
+----------- --------------------
+          1 one                 
+          2 two                 
+          3 NULL                
+
+(3 rows affected)
+n                    
+---------------------
+                    2
+
+(1 row affected)
+(1 row affected)
+name                
+--------------------
+one                 
+
+(1 row affected)

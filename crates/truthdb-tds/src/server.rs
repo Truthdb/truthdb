@@ -133,7 +133,7 @@ where
             14,
             &format!("Login failed for user '{}'.", login.username),
         );
-        token::done(&mut out, false, true, false, None);
+        token::done(&mut out, false, true, false, None, 0);
         write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
         return Ok(());
     }
@@ -153,6 +153,7 @@ where
     let mut out = Vec::new();
     token::loginack(&mut out);
     token::envchange_database(&mut out, &database);
+    token::envchange_sql_collation(&mut out);
     token::envchange_packet_size(&mut out, packet_size, DEFAULT_PACKET_SIZE);
     token::info(
         &mut out,
@@ -161,7 +162,7 @@ where
         10,
         &format!("Changed database context to '{database}'."),
     );
-    token::done(&mut out, false, false, false, None);
+    token::done(&mut out, false, false, false, None, 0);
     write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
 
     // Each connection gets an engine-side session; it is closed (rolling back
@@ -298,7 +299,7 @@ async fn handle_tm_request(
         Err(err) => {
             let mut out = Vec::new();
             token::error(&mut out, 50000, 1, 16, &err.to_string());
-            token::done(&mut out, false, true, false, None);
+            token::done(&mut out, false, true, false, None, 0);
             return Ok(out);
         }
     };
@@ -314,7 +315,7 @@ async fn handle_tm_request(
             error.level,
             &error.message,
         );
-        token::done(&mut out, false, true, reply.in_transaction, None);
+        token::done(&mut out, false, true, reply.in_transaction, None, 0);
         return Ok(out);
     }
 
@@ -344,7 +345,7 @@ async fn handle_tm_request(
         }
         _ => unreachable!("request type validated above"),
     }
-    token::done(&mut out, false, false, reply.in_transaction, None);
+    token::done(&mut out, false, false, reply.in_transaction, None, 0);
     Ok(out)
 }
 
@@ -680,9 +681,9 @@ fn start_rpc(
     let rpc_error = |message: String| (50000, message);
     match request.proc {
         RpcProc::SpExecuteSql => {
-            let (sql, params) = rpc::split_sp_executesql(request.params)
+            let (sql, decls, params) = rpc::split_sp_executesql(request.params)
                 .map_err(|err| rpc_error(err.to_string()))?;
-            Ok(engine.stream_rpc(session, sql, params, cancel))
+            Ok(engine.stream_rpc(session, sql, decls, params, cancel))
         }
         RpcProc::SpPrepare => {
             let (decls, stmt) =
@@ -766,6 +767,19 @@ struct BatchRender {
 struct PendingDone {
     count: Option<u64>,
     in_transaction: bool,
+    curcmd: u16,
+}
+
+/// The DONE `CurCmd` value for a statement's command class.
+fn curcmd_of(command: truthdb_core::rel::DoneCommand) -> u16 {
+    use truthdb_core::rel::DoneCommand;
+    match command {
+        DoneCommand::Select => token::CMD_SELECT,
+        DoneCommand::Insert => token::CMD_INSERT,
+        DoneCommand::Update => token::CMD_UPDATE,
+        DoneCommand::Delete => token::CMD_DELETE,
+        DoneCommand::Other => 0,
+    }
 }
 
 impl BatchRender {
@@ -797,11 +811,13 @@ impl BatchRender {
             BatchEvent::StatementDone {
                 count,
                 in_transaction,
+                command,
             } => {
                 self.flush_pending(out, true).await?;
                 self.pending = Some(PendingDone {
                     count,
                     in_transaction,
+                    curcmd: curcmd_of(command),
                 });
             }
             BatchEvent::StatementAborted { in_transaction } => {
@@ -821,6 +837,7 @@ impl BatchRender {
                 self.pending = Some(PendingDone {
                     count: None,
                     in_transaction,
+                    curcmd: 0,
                 });
             }
             BatchEvent::PreparedHandle(handle) => {
@@ -889,8 +906,15 @@ impl BatchRender {
         more: bool,
     ) -> io::Result<()> {
         if let Some(done) = self.pending.take() {
-            self.done(out, more, false, done.in_transaction, done.count)
-                .await?;
+            self.done(
+                out,
+                more,
+                false,
+                done.in_transaction,
+                done.count,
+                done.curcmd,
+            )
+            .await?;
         }
         Ok(())
     }
@@ -904,12 +928,13 @@ impl BatchRender {
         error: bool,
         in_transaction: bool,
         count: Option<u64>,
+        curcmd: u16,
     ) -> io::Result<()> {
         self.buf.clear();
         if self.rpc {
-            token::done_in_proc(&mut self.buf, more, error, in_transaction, count);
+            token::done_in_proc(&mut self.buf, more, error, in_transaction, count, curcmd);
         } else {
-            token::done(&mut self.buf, more, error, in_transaction, count);
+            token::done(&mut self.buf, more, error, in_transaction, count, curcmd);
         }
         out.write(&self.buf).await
     }
@@ -932,7 +957,7 @@ impl BatchRender {
                 None,
             );
         } else {
-            token::done(&mut self.buf, false, error, in_transaction, None);
+            token::done(&mut self.buf, false, error, in_transaction, None, 0);
         }
         out.write(&self.buf).await
     }
@@ -941,7 +966,7 @@ impl BatchRender {
 fn rpc_error(message: &str) -> Vec<u8> {
     let mut out = Vec::new();
     token::error(&mut out, 50000, 1, 16, message);
-    token::done(&mut out, false, true, false, None);
+    token::done(&mut out, false, true, false, None, 0);
     out
 }
 
@@ -1102,13 +1127,14 @@ mod render_tests {
                         false,
                         in_transaction,
                         Some(rowset.rows.len() as u64),
+                        token::CMD_SELECT,
                     );
                 }
                 StatementResult::RowsAffected(n) => {
-                    token::done(&mut out, more, false, in_transaction, Some(*n));
+                    token::done(&mut out, more, false, in_transaction, Some(*n), 0);
                 }
                 StatementResult::Done => {
-                    token::done(&mut out, more, false, in_transaction, None);
+                    token::done(&mut out, more, false, in_transaction, None, 0);
                 }
             }
         }
@@ -1120,9 +1146,9 @@ mod render_tests {
                 error.level,
                 &error.message,
             );
-            token::done(&mut out, false, true, in_transaction, None);
+            token::done(&mut out, false, true, in_transaction, None, 0);
         } else if outcome.results.is_empty() {
-            token::done(&mut out, false, false, in_transaction, None);
+            token::done(&mut out, false, false, in_transaction, None, 0);
         }
         out
     }
@@ -1188,6 +1214,7 @@ mod render_tests {
                     tx.send(BatchEvent::StatementDone {
                         count: Some(rowset.rows.len() as u64),
                         in_transaction: in_xact,
+                        command: truthdb_core::rel::DoneCommand::Select,
                     })
                     .unwrap();
                 }
@@ -1195,12 +1222,14 @@ mod render_tests {
                     .send(BatchEvent::StatementDone {
                         count: Some(*n),
                         in_transaction: in_xact,
+                        command: truthdb_core::rel::DoneCommand::Other,
                     })
                     .unwrap(),
                 StatementResult::Done => tx
                     .send(BatchEvent::StatementDone {
                         count: None,
                         in_transaction: in_xact,
+                        command: truthdb_core::rel::DoneCommand::Other,
                     })
                     .unwrap(),
             }
@@ -1225,6 +1254,7 @@ mod render_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
+            command: truthdb_core::rel::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::PreparedHandle(7)).unwrap();
@@ -1235,7 +1265,7 @@ mod render_tests {
         drop(tx);
 
         let mut expected = Vec::new();
-        token::done_in_proc(&mut expected, true, false, false, Some(1));
+        token::done_in_proc(&mut expected, true, false, false, Some(1), 0);
         token::return_status(&mut expected, 0);
         token::return_value_int(&mut expected, "handle", 7);
         token::done_proc(&mut expected, false, false, false, None);
@@ -1247,6 +1277,7 @@ mod render_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(3),
             in_transaction: false,
+            command: truthdb_core::rel::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::Complete {
@@ -1255,7 +1286,7 @@ mod render_tests {
         .unwrap();
         drop(tx);
         let mut expected = Vec::new();
-        token::done_in_proc(&mut expected, true, false, false, Some(3));
+        token::done_in_proc(&mut expected, true, false, false, Some(3), 0);
         token::return_status(&mut expected, 0);
         token::done_proc(&mut expected, false, false, false, None);
         assert_eq!(rendered_events_framed(rx, 4096, true).await, expected);
@@ -1314,6 +1345,7 @@ mod render_tests {
             tx.send(BatchEvent::StatementDone {
                 count,
                 in_transaction,
+                command: truthdb_core::rel::DoneCommand::Other,
             })
             .unwrap();
         }
@@ -1324,9 +1356,9 @@ mod render_tests {
         drop(tx);
 
         let mut expected = Vec::new();
-        token::done(&mut expected, true, false, true, None);
-        token::done(&mut expected, true, false, true, Some(1));
-        token::done(&mut expected, false, false, false, None);
+        token::done(&mut expected, true, false, true, None, 0);
+        token::done(&mut expected, true, false, true, Some(1), 0);
+        token::done(&mut expected, false, false, false, None, 0);
         assert_eq!(rendered_events(rx, 4096).await, expected);
     }
 
@@ -1351,6 +1383,7 @@ mod render_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
+            command: truthdb_core::rel::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::Complete {
@@ -1362,10 +1395,10 @@ mod render_tests {
         let mut expected = Vec::new();
         token::colmetadata(&mut expected, &columns());
         token::row(&mut expected, &[Datum::Int(1)], &columns());
-        token::done(&mut expected, true, false, false, None);
+        token::done(&mut expected, true, false, false, None, 0);
         token::colmetadata(&mut expected, &columns());
         token::row(&mut expected, &[Datum::Int(9)], &columns());
-        token::done(&mut expected, false, false, false, Some(1));
+        token::done(&mut expected, false, false, false, Some(1), 0);
         assert_eq!(rendered_events(rx, 4096).await, expected);
     }
 
@@ -1393,7 +1426,7 @@ mod render_tests {
         let mut expected = Vec::new();
         token::colmetadata(&mut expected, &columns());
         token::row(&mut expected, &[Datum::Int(1)], &columns());
-        token::done(&mut expected, false, false, false, None);
+        token::done(&mut expected, false, false, false, None, 0);
         assert_eq!(rendered_events(rx, 4096).await, expected);
     }
 
@@ -1747,6 +1780,7 @@ mod attention_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
+            command: truthdb_core::rel::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::Complete {
@@ -1777,7 +1811,7 @@ mod attention_tests {
         let mut expected = Vec::new();
         token::colmetadata(&mut expected, &columns());
         token::row(&mut expected, &[Datum::Int(1)], &columns());
-        token::done(&mut expected, false, false, false, Some(1));
+        token::done(&mut expected, false, false, false, Some(1), 0);
         assert_eq!(payload, expected);
     }
 
@@ -1797,6 +1831,7 @@ mod attention_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
+            command: truthdb_core::rel::DoneCommand::Other,
         })
         .unwrap();
         drop(tx);
@@ -1824,7 +1859,7 @@ mod attention_tests {
         let mut expected = Vec::new();
         token::colmetadata(&mut expected, &columns());
         token::row(&mut expected, &[Datum::Int(1)], &columns());
-        token::done(&mut expected, true, false, false, Some(1));
+        token::done(&mut expected, true, false, false, Some(1), 0);
         token::error(
             &mut expected,
             50000,
@@ -1832,7 +1867,7 @@ mod attention_tests {
             16,
             &EngineError::Unavailable.to_string(),
         );
-        token::done(&mut expected, false, true, false, None);
+        token::done(&mut expected, false, true, false, None, 0);
         assert_eq!(payload, expected);
     }
 

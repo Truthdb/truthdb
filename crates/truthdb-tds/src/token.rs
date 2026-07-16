@@ -28,6 +28,7 @@ const DONE_ATTN: u16 = 0x0020;
 // ENVCHANGE types.
 const ENV_DATABASE: u8 = 1;
 const ENV_PACKET_SIZE: u8 = 4;
+const ENV_SQL_COLLATION: u8 = 7;
 const ENV_BEGIN_TRAN: u8 = 8;
 const ENV_COMMIT_TRAN: u8 = 9;
 const ENV_ROLLBACK_TRAN: u8 = 10;
@@ -81,6 +82,21 @@ pub fn envchange_database(out: &mut Vec<u8>, database: &str) {
     body.push(ENV_DATABASE);
     push_b_varchar(&mut body, database);
     push_b_varchar(&mut body, database);
+    out.push(TOKEN_ENVCHANGE);
+    out.extend_from_slice(&(body.len() as u16).to_le_bytes());
+    out.extend_from_slice(&body);
+}
+
+/// ENVCHANGE for the connection's default SQL collation (login response).
+/// mssql-jdbc dereferences this collation when encoding every NVARCHAR RPC
+/// parameter — a login without it NPEs the driver client-side. The bytes are
+/// the LCID+flags+sort form COLMETADATA already uses for character columns.
+pub fn envchange_sql_collation(out: &mut Vec<u8>) {
+    let mut body = Vec::new();
+    body.push(ENV_SQL_COLLATION);
+    body.push(5); // B_VARBYTE new value: the collation
+    body.extend_from_slice(&[0x09, 0x04, 0xd0, 0x00, 0x34]);
+    body.push(0); // B_VARBYTE old value: none
     out.push(TOKEN_ENVCHANGE);
     out.extend_from_slice(&(body.len() as u16).to_le_bytes());
     out.extend_from_slice(&body);
@@ -212,20 +228,51 @@ pub fn row(out: &mut Vec<u8>, values: &[Datum], columns: &[ResultColumn]) {
 /// DONE token. `more` sets DONE_MORE (another result follows); `count`
 /// carries a row count (DONE_COUNT); `error` sets DONE_ERROR; `in_xact` sets
 /// DONE_INXACT (a transaction is still active for the connection).
-pub fn done(out: &mut Vec<u8>, more: bool, error: bool, in_xact: bool, count: Option<u64>) {
-    done_kind(out, TOKEN_DONE, more, error, in_xact, count);
+pub fn done(
+    out: &mut Vec<u8>,
+    more: bool,
+    error: bool,
+    in_xact: bool,
+    count: Option<u64>,
+    curcmd: u16,
+) {
+    done_kind(out, TOKEN_DONE, more, error, in_xact, count, curcmd);
 }
 
 /// DONEINPROC (0xFF): a statement's DONE inside an RPC response. Same body as
 /// DONE; only the token byte differs.
-pub fn done_in_proc(out: &mut Vec<u8>, more: bool, error: bool, in_xact: bool, count: Option<u64>) {
-    done_kind(out, TOKEN_DONEINPROC, more, error, in_xact, count);
+pub fn done_in_proc(
+    out: &mut Vec<u8>,
+    more: bool,
+    error: bool,
+    in_xact: bool,
+    count: Option<u64>,
+    curcmd: u16,
+) {
+    done_kind(out, TOKEN_DONEINPROC, more, error, in_xact, count, curcmd);
 }
 
-/// DONEPROC (0xFE): the final DONE of an RPC response.
+/// DONEPROC (0xFE): the final DONE of an RPC response. `CurCmd` is EXECUTE
+/// (0xE0), as SQL Server stamps a procedure's final DONE.
 pub fn done_proc(out: &mut Vec<u8>, more: bool, error: bool, in_xact: bool, count: Option<u64>) {
-    done_kind(out, TOKEN_DONEPROC, more, error, in_xact, count);
+    done_kind(
+        out,
+        TOKEN_DONEPROC,
+        more,
+        error,
+        in_xact,
+        count,
+        CMD_EXECUTE,
+    );
 }
+
+/// `CurCmd` command classes (StreamDone in every driver that reads them —
+/// mssql-jdbc requires a DML value here to accept a DONE's row count).
+pub const CMD_SELECT: u16 = 0xc1;
+pub const CMD_INSERT: u16 = 0xc3;
+pub const CMD_DELETE: u16 = 0xc4;
+pub const CMD_UPDATE: u16 = 0xc5;
+pub const CMD_EXECUTE: u16 = 0xe0;
 
 fn done_kind(
     out: &mut Vec<u8>,
@@ -234,6 +281,7 @@ fn done_kind(
     error: bool,
     in_xact: bool,
     count: Option<u64>,
+    curcmd: u16,
 ) {
     let mut status = if more { DONE_MORE } else { DONE_FINAL };
     if error {
@@ -247,7 +295,7 @@ fn done_kind(
     }
     out.push(token);
     out.extend_from_slice(&status.to_le_bytes());
-    out.extend_from_slice(&0u16.to_le_bytes()); // CurCmd
+    out.extend_from_slice(&curcmd.to_le_bytes());
     out.extend_from_slice(&count.unwrap_or(0).to_le_bytes());
 }
 
@@ -314,7 +362,7 @@ mod tests {
     #[test]
     fn done_status_bits() {
         let mut out = Vec::new();
-        done(&mut out, false, false, false, Some(3));
+        done(&mut out, false, false, false, Some(3), 0);
         assert_eq!(out[0], TOKEN_DONE);
         let status = u16::from_le_bytes([out[1], out[2]]);
         assert_eq!(status, DONE_COUNT);
@@ -325,7 +373,7 @@ mod tests {
     #[test]
     fn done_sets_inxact_flag() {
         let mut out = Vec::new();
-        done(&mut out, false, false, true, None);
+        done(&mut out, false, false, true, None, 0);
         let status = u16::from_le_bytes([out[1], out[2]]);
         assert_eq!(status & DONE_INXACT, DONE_INXACT);
     }

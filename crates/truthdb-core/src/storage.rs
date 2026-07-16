@@ -3937,7 +3937,12 @@ mod tests {
             fn rows(&mut self, _rows: Vec<Vec<Datum>>) {
                 self.note("rows");
             }
-            fn statement_done(&mut self, _count: Option<u64>, _in_transaction: bool) {
+            fn statement_done(
+                &mut self,
+                _count: Option<u64>,
+                _in_transaction: bool,
+                _command: crate::rel::DoneCommand,
+            ) {
                 self.note("done");
             }
             fn statement_aborted(&mut self, _in_transaction: bool) {
@@ -4016,7 +4021,12 @@ mod tests {
             fn rows(&mut self, _rows: Vec<Vec<Datum>>) {
                 self.note("rows");
             }
-            fn statement_done(&mut self, _count: Option<u64>, _in_transaction: bool) {
+            fn statement_done(
+                &mut self,
+                _count: Option<u64>,
+                _in_transaction: bool,
+                _command: crate::rel::DoneCommand,
+            ) {
                 self.note("done");
             }
             fn statement_aborted(&mut self, _in_transaction: bool) {

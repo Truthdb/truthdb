@@ -103,6 +103,8 @@ pub enum BatchEvent {
         /// The transaction state to stamp on this statement's DONE
         /// (`DONE_INXACT`).
         in_transaction: bool,
+        /// The DONE's `CurCmd` class — mssql-jdbc drops the count without it.
+        command: crate::rel::DoneCommand,
     },
     /// Ends a statement that failed after its result set had begun streaming:
     /// closes the set (with a clean DONE — an error-flagged DONE without an
@@ -256,10 +258,12 @@ impl BatchSink {
                 StatementResult::RowsAffected(n) => self.send(BatchEvent::StatementDone {
                     count: Some(n),
                     in_transaction,
+                    command: crate::rel::DoneCommand::Other,
                 }),
                 StatementResult::Done => self.send(BatchEvent::StatementDone {
                     count: None,
                     in_transaction,
+                    command: crate::rel::DoneCommand::Other,
                 }),
             };
             if !sent {
@@ -296,6 +300,7 @@ impl BatchSink {
         self.send(BatchEvent::StatementDone {
             count: Some(count),
             in_transaction,
+            command: crate::rel::DoneCommand::Select,
         })
     }
 
@@ -326,10 +331,16 @@ impl crate::rel::BatchEmitter for BatchSink {
         self.send(BatchEvent::Rows(rows));
     }
 
-    fn statement_done(&mut self, count: Option<u64>, in_transaction: bool) {
+    fn statement_done(
+        &mut self,
+        count: Option<u64>,
+        in_transaction: bool,
+        command: crate::rel::DoneCommand,
+    ) {
         self.send(BatchEvent::StatementDone {
             count,
             in_transaction,
+            command,
         });
     }
 
@@ -734,7 +745,7 @@ impl EngineHandle {
         params: Vec<crate::rel::RpcParam>,
         cancel: Arc<AtomicBool>,
     ) -> Result<BatchReply, EngineError> {
-        let mut events = self.stream_rpc(session, sql, params, cancel);
+        let mut events = self.stream_rpc(session, sql, String::new(), params, cancel);
         collect_reply(&mut events).await
     }
 
@@ -746,7 +757,7 @@ impl EngineHandle {
         sql: String,
         cancel: Arc<AtomicBool>,
     ) -> mpsc::UnboundedReceiver<BatchEvent> {
-        self.stream_rpc(session, sql, Vec::new(), cancel)
+        self.stream_rpc(session, sql, String::new(), Vec::new(), cancel)
     }
 
     /// Runs a batch and returns its reply as a stream of [`BatchEvent`]s, so a
@@ -763,10 +774,24 @@ impl EngineHandle {
         &self,
         session: SessionId,
         sql: String,
+        decls: String,
         params: Vec<crate::rel::RpcParam>,
         cancel: Arc<AtomicBool>,
     ) -> mpsc::UnboundedReceiver<BatchEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
+        // Unnamed values take the declaration list's names (mssql-jdbc sends
+        // them unnamed), exactly as sp_execute binds them.
+        let params = match bind_decl_names(&decls, params) {
+            Ok(params) => params,
+            Err(error) => {
+                let sink = BatchSink::new(tx);
+                sink.send(BatchEvent::Error(error));
+                sink.send(BatchEvent::Complete {
+                    in_transaction: false,
+                });
+                return rx;
+            }
+        };
         self.inbox.send(EngineCall::RunBatch {
             session,
             sql,
@@ -1183,6 +1208,7 @@ fn dispatch_rpc(
                 reply.send(BatchEvent::StatementDone {
                     count: Some(count),
                     in_transaction,
+                    command: crate::rel::DoneCommand::Select,
                 });
                 reply.send(BatchEvent::Complete { in_transaction });
             }

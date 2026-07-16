@@ -174,10 +174,14 @@ pub fn parse_rpc_request(body: &[u8]) -> io::Result<RpcRequest> {
     Ok(requests.remove(0))
 }
 
-/// Splits an `sp_executesql` parameter list into (statement text, value
-/// parameters). Layout: `@stmt`, optional `@params` declaration, then the
-/// value parameters — which are the only ones seeded as batch variables.
-pub fn split_sp_executesql(mut params: Vec<RpcParam>) -> io::Result<(String, Vec<RpcParam>)> {
+/// Splits an `sp_executesql` parameter list into (statement text, parameter
+/// declarations, value parameters). Layout: `@stmt`, optional `@params`
+/// declaration, then the values — which seed batch variables, named from the
+/// declaration list when the driver sends them unnamed (mssql-jdbc does;
+/// pytds and go-mssqldb name theirs).
+pub fn split_sp_executesql(
+    mut params: Vec<RpcParam>,
+) -> io::Result<(String, String, Vec<RpcParam>)> {
     if params.is_empty() {
         return Err(protocol_err("sp_executesql: missing statement parameter"));
     }
@@ -187,7 +191,11 @@ pub fn split_sp_executesql(mut params: Vec<RpcParam>) -> io::Result<(String, Vec
         Datum::Null => return Err(protocol_err("sp_executesql: NULL statement")),
         _ => return Err(protocol_err("sp_executesql: statement is not a string")),
     };
-    Ok((stmt, values))
+    let decls = match params.get(1) {
+        Some(p) => opt_string(p, "sp_executesql: @params")?,
+        None => String::new(),
+    };
+    Ok((stmt, decls, values))
 }
 
 /// Reads a string parameter that may be NULL (an empty declaration list).
@@ -671,7 +679,7 @@ mod tests {
         assert_eq!(requests.len(), 2);
         for (request, want) in requests.into_iter().zip(["SELECT 1 AS a", "SELECT 2 AS b"]) {
             assert!(matches!(request.proc, RpcProc::SpExecuteSql));
-            let (sql, values) = split_sp_executesql(request.params).expect("split");
+            let (sql, _decls, values) = split_sp_executesql(request.params).expect("split");
             assert_eq!(sql, want);
             assert!(values.is_empty());
         }
@@ -683,7 +691,7 @@ mod tests {
         assert!(matches!(req.proc, RpcProc::SpExecuteSql));
         assert_eq!(req.params.len(), 3);
 
-        let (sql, values) = split_sp_executesql(req.params).expect("split");
+        let (sql, _decls, values) = split_sp_executesql(req.params).expect("split");
         assert_eq!(sql, "SELECT @p1");
         assert_eq!(values.len(), 1);
         assert_eq!(values[0].name, "@p1");
@@ -716,7 +724,7 @@ mod tests {
         b.push(0); // NULL
 
         let req = parse_rpc_request(&b).expect("parse");
-        let (_sql, values) = split_sp_executesql(req.params).expect("split");
+        let (_sql, _decls, values) = split_sp_executesql(req.params).expect("split");
         assert_eq!(values.len(), 3);
         assert!(matches!(&values[0].value, Datum::NVarChar(s) if s == "café"));
         assert!(matches!(values[1].value, Datum::BigInt(5_000_000_000)));
@@ -745,7 +753,7 @@ mod tests {
         b.extend_from_slice(&7i32.to_le_bytes());
 
         let req = parse_rpc_request(&b).expect("parse");
-        let (_sql, values) = split_sp_executesql(req.params).expect("split");
+        let (_sql, _decls, values) = split_sp_executesql(req.params).expect("split");
         assert_eq!(values.len(), 2);
         assert!(matches!(values[0].value, Datum::Null));
         assert!(matches!(values[1].value, Datum::Int(7)));
