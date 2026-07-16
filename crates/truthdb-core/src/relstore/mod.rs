@@ -19,6 +19,7 @@ pub mod spill;
 #[cfg(test)]
 mod tests;
 pub mod types;
+pub(crate) mod version;
 
 use std::collections::HashMap;
 

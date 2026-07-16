@@ -40,6 +40,8 @@ pub enum Statement {
     Set(SetStatement),
     /// `ALTER TABLE ...`.
     AlterTable(AlterTable),
+    /// `ALTER DATABASE {name | CURRENT} SET <option> {ON|OFF} [, ...]`.
+    AlterDatabase(AlterDatabase),
     /// `DECLARE @a TYPE [= expr], ...` — batch variable declarations.
     Declare(Vec<Declaration>),
     /// `EXEC[UTE] <proc> [args...]` — the T-SQL text path to the system
@@ -97,6 +99,21 @@ pub enum AlterAction {
     AddForeignKey(ForeignKey),
     /// `DROP CONSTRAINT <name>`.
     DropConstraint(Name),
+}
+
+/// `ALTER DATABASE {name | CURRENT} SET <option> {ON|OFF} [, ...]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AlterDatabase {
+    /// `None` = `CURRENT`.
+    pub name: Option<Name>,
+    pub options: Vec<(DatabaseOption, bool)>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DatabaseOption {
+    ReadCommittedSnapshot,
+    AllowSnapshotIsolation,
 }
 
 #[derive(Debug, Clone, PartialEq)]

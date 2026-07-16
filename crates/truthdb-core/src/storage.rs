@@ -19,6 +19,7 @@ use crate::relstore::key::encode_key;
 use crate::relstore::recovery as rel_recovery;
 use crate::relstore::row::{Column, Schema, decode_row, decode_row_projected, encode_row};
 use crate::relstore::types::{Datum, TypeError};
+use crate::relstore::version::{PendingVersion, ReadSnapshot, Resolved, RowChange, rid_identity};
 use crate::storage_layout::{
     FileHeader, PAGE_SIZE, SNAPSHOT_DESCRIPTOR_SIZE, SUPERBLOCK_ACTIVE_A, SUPERBLOCK_ACTIVE_B,
     SnapshotDescriptor, Superblock, WAL_ENTRY_TYPE_REL, WAL_MAX_BYTES, WAL_MIN_BYTES, align_down,
@@ -133,6 +134,11 @@ pub struct Storage {
     gc: Arc<GroupCommit>,
     /// The log-writer thread's join handle, taken in `Drop` after signalling it.
     log_writer: Option<JoinHandle<()>>,
+    /// `READ_COMMITTED_SNAPSHOT` / `ALLOW_SNAPSHOT_ISOLATION` mirrors of the
+    /// version store's options, readable without the storage mutex (lock
+    /// analysis and the per-statement snapshot gate are on the hot path).
+    rcsi: std::sync::atomic::AtomicBool,
+    allow_snapshot: std::sync::atomic::AtomicBool,
     /// Scan slices read, so a test can prove a scan stopped early rather than
     /// reading the table and discarding the rest. On the instance and not in a
     /// `static`: the suite runs in parallel in one binary, so a static would
@@ -199,11 +205,15 @@ impl Storage {
     fn with_log_writer(path: PathBuf, file: StorageFile) -> Result<Self, StorageError> {
         let wal_fd = file.try_clone_wal_fd()?;
         let (gc, log_writer) = GroupCommit::start(wal_fd);
+        let rcsi = file.version.rcsi;
+        let allow_snapshot = file.version.allow_snapshot;
         Ok(Storage {
             path,
             inner: std::sync::Mutex::new(file),
             gc,
             log_writer: Some(log_writer),
+            rcsi: std::sync::atomic::AtomicBool::new(rcsi),
+            allow_snapshot: std::sync::atomic::AtomicBool::new(allow_snapshot),
             #[cfg(test)]
             scan_slices: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -487,6 +497,7 @@ impl Storage {
         self.lock().rel_row_count(table)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn rel_index_scan(
         &self,
         table: &str,
@@ -495,14 +506,110 @@ impl Storage {
         upper: Option<Vec<u8>>,
         projection: Option<&[usize]>,
         covering: bool,
+        snapshot: Option<ReadSnapshot>,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         #[cfg(test)]
         if covering {
             self.covering_scans
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.lock()
-            .rel_index_scan(table, index_object_id, lower, upper, projection, covering)
+        self.lock().rel_index_scan(
+            table,
+            index_object_id,
+            lower,
+            upper,
+            projection,
+            covering,
+            snapshot,
+        )
+    }
+
+    /// Whether `READ_COMMITTED_SNAPSHOT` is on (readable without the storage
+    /// mutex — checked per statement and during lock analysis).
+    pub(crate) fn rcsi_enabled(&self) -> bool {
+        self.rcsi.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Whether `ALLOW_SNAPSHOT_ISOLATION` is on.
+    #[allow(dead_code)] // consumed when SNAPSHOT isolation lands
+    pub(crate) fn snapshot_isolation_allowed(&self) -> bool {
+        self.allow_snapshot
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Applies `ALTER DATABASE SET` option changes: updates the version
+    /// store, persists the options in the superblocks, and refreshes the
+    /// lock-free mirrors. The caller holds Database X, so no snapshot is live
+    /// and no writer is mid-transaction.
+    pub(crate) fn rel_set_db_options(
+        &self,
+        rcsi: Option<bool>,
+        allow_snapshot: Option<bool>,
+    ) -> Result<(), StorageError> {
+        let mut guard = self.lock();
+        guard.set_db_options(rcsi, allow_snapshot)?;
+        let (rcsi_now, allow_now) = (guard.version.rcsi, guard.version.allow_snapshot);
+        drop(guard);
+        self.rcsi
+            .store(rcsi_now, std::sync::atomic::Ordering::Relaxed);
+        self.allow_snapshot
+            .store(allow_now, std::sync::atomic::Ordering::Relaxed);
+        Ok(())
+    }
+
+    /// Captures a read snapshot: the durable commit prefix as of now, plus
+    /// the session's own open transaction. Registered so pruning cannot drop
+    /// versions the snapshot may still need; the caller MUST pair this with
+    /// [`Self::release_read_snapshot`].
+    pub(crate) fn capture_read_snapshot(&self, own_txn: Option<u64>) -> ReadSnapshot {
+        let durable = self.gc.flushed();
+        let mut guard = self.lock();
+        // Whichever watermark is ahead: the group-commit fsync or a direct
+        // WAL sync (rollbacks, checkpoints) — both are durability floors.
+        let durable = durable.max(guard.wal.flushed_lsn());
+        let seq = guard.version.durable_seq(durable);
+        guard.version.register_snapshot(seq);
+        ReadSnapshot { seq, own_txn }
+    }
+
+    pub(crate) fn release_read_snapshot(&self, seq: u64) {
+        self.lock().version.release_snapshot(seq);
+    }
+
+    /// Atomic snapshot scan: the whole table under one storage-lock hold
+    /// (a versioned reader holds no table lock, so a sliced cursor could be
+    /// restructured under it mid-walk), merged against the version store.
+    pub(crate) fn rel_scan_snapshot(
+        &self,
+        name: &str,
+        projection: Option<&[usize]>,
+        snapshot: ReadSnapshot,
+    ) -> Result<Vec<Vec<Datum>>, StorageError> {
+        self.lock().rel_scan_snapshot(name, projection, snapshot)
+    }
+
+    /// Drops version history no live snapshot can need (runs on the
+    /// maintenance thread; cheap when nothing is versioned).
+    pub(crate) fn version_prune(&self) {
+        let durable = self.gc.flushed();
+        let mut guard = self.lock();
+        let durable = durable.max(guard.wal.flushed_lsn());
+        let fallback = guard.version.durable_seq(durable);
+        let watermark = guard.version.watermark(fallback);
+        let alive: std::collections::HashSet<u32> =
+            guard.rel.tables.values().map(|def| def.object_id).collect();
+        guard.version.prune(watermark, &alive);
+    }
+
+    /// Test observability: version chains held for `table`.
+    #[cfg(test)]
+    pub(crate) fn version_chain_count(&self, table: &str) -> usize {
+        let guard = self.lock();
+        guard
+            .rel
+            .tables
+            .get(table)
+            .map_or(0, |def| guard.version.chain_count(def.object_id))
     }
 
     pub fn rel_insert(&self, name: &str, values: Vec<Datum>) -> Result<(), StorageError> {
@@ -880,6 +987,14 @@ pub(crate) struct StorageTxn {
     roots: std::collections::HashMap<u32, u64>,
 }
 
+impl StorageTxn {
+    /// The transaction's id — a versioned reader's "own transaction" for
+    /// visibility of its own uncommitted writes.
+    pub(crate) fn txn_id(&self) -> u64 {
+        self.txn.txn_id
+    }
+}
+
 /// The transaction a statement runs under.
 pub(crate) enum TxnScope<'a> {
     /// Autocommit: begin + commit around the single statement.
@@ -917,6 +1032,11 @@ struct StorageFile {
     /// this at CREATE TABLE and stored with it, so the column keeps the
     /// collation it was created under even if the default later changes.
     default_collation: Option<String>,
+    /// Stage 13 version store: row-version chains for snapshot reads, plus
+    /// the RCSI / ALLOW_SNAPSHOT_ISOLATION options (persisted in the
+    /// superblock reserved area; the chains themselves are memory-only — no
+    /// snapshot survives a restart, so neither must they).
+    version: crate::relstore::version::VersionState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1384,6 +1504,7 @@ impl StorageFile {
         self.rel_ctx().counter_read(page).ok()
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn rel_index_scan(
         &mut self,
         table: &str,
@@ -1392,6 +1513,7 @@ impl StorageFile {
         upper: Option<Vec<u8>>,
         projection: Option<&[usize]>,
         covering: bool,
+        snapshot: Option<ReadSnapshot>,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(table)?;
@@ -1401,13 +1523,58 @@ impl StorageFile {
             .find(|i| i.object_id == index_object_id)
             .cloned()
             .ok_or_else(|| StorageError::InvalidConfig("unknown index".to_string()))?;
-        let mut ctx = self.rel_ctx();
-        let index_tree = BTree {
-            object_id: index.object_id,
-            root: index.root_page,
+        let entries = {
+            let mut ctx = self.rel_ctx();
+            let index_tree = BTree {
+                object_id: index.object_id,
+                root: index.root_page,
+            };
+            index_tree.scan_range(&mut ctx, lower.as_deref(), upper.as_deref())?
         };
-        let entries = index_tree.scan_range(&mut ctx, lower.as_deref(), upper.as_deref())?;
-        let mut rows = Vec::with_capacity(entries.len());
+        // The leaf-value format depends on the index: an INCLUDE index
+        // length-prefixes its locator (a Key locator's payload would
+        // otherwise swallow the include bytes that follow it).
+        let locator_of = |value: &[u8]| -> Locator {
+            if index.include.is_empty() {
+                index::decode_locator(value)
+            } else {
+                index::decode_leaf_value_with_include(value).0
+            }
+        };
+        // Resolve each entry against the version store first (a snapshot
+        // reader may need an entry's row served from an older image, or
+        // dropped when its writer is invisible), then do the page lookups.
+        // Rows the seek could not encounter — their index entry was moved or
+        // removed by a writer the snapshot does not see — are appended from
+        // their chain images; the executor's predicate re-checks every row,
+        // so over-returning is filtered, never wrong.
+        enum Entry {
+            Physical(Vec<u8>),
+            Image(Vec<u8>),
+        }
+        let merging = snapshot.is_some_and(|_| self.version.table_has_chains(def.object_id));
+        let mut decided: Vec<Entry> = Vec::with_capacity(entries.len());
+        let mut extra_images: Vec<Vec<u8>> = Vec::new();
+        if let (Some(snap), true) = (snapshot, merging) {
+            let mut seen: std::collections::HashSet<Vec<u8>> = std::collections::HashSet::new();
+            for (_, value) in entries {
+                let identity = match locator_of(&value) {
+                    Locator::Key(pk) => pk,
+                    Locator::Rid(rid) => rid_identity(rid),
+                };
+                match self.version.resolve(def.object_id, &identity, snap) {
+                    None | Some(Resolved::Current) => decided.push(Entry::Physical(value)),
+                    Some(Resolved::Image(image)) => decided.push(Entry::Image(image)),
+                    Some(Resolved::Gone) => {}
+                }
+                seen.insert(identity);
+            }
+            extra_images = self.version.unseen_images(def.object_id, &seen, snap);
+        } else {
+            decided.extend(entries.into_iter().map(|(_, value)| Entry::Physical(value)));
+        }
+
+        let mut rows = Vec::with_capacity(decided.len());
         if covering {
             // Answer from the leaves alone: every projected column's original
             // value is stored in the entry (after the length-prefixed
@@ -1428,33 +1595,39 @@ impl StorageFile {
                     })
                 })
                 .collect::<Result<_, _>>()?;
-            for (_, value) in entries {
-                let (_, include_bytes) = index::decode_leaf_value_with_include(&value);
-                let decoded = index::decode_include(&schema, &index.include, include_bytes)
-                    .map_err(|err| StorageError::InvalidFile(err.0))?;
-                rows.push(positions.iter().map(|&p| decoded[p].clone()).collect());
+            for entry in decided {
+                match entry {
+                    Entry::Physical(value) => {
+                        let (_, include_bytes) = index::decode_leaf_value_with_include(&value);
+                        let decoded = index::decode_include(&schema, &index.include, include_bytes)
+                            .map_err(|err| StorageError::InvalidFile(err.0))?;
+                        rows.push(positions.iter().map(|&p| decoded[p].clone()).collect());
+                    }
+                    // A version image is the full row: project it directly.
+                    Entry::Image(image) => {
+                        rows.push(decode_row_projected(&schema, &image, projection)?);
+                    }
+                }
             }
         } else {
-            // The leaf-value format depends on the index: an INCLUDE index
-            // length-prefixes its locator (a Key locator's payload would
-            // otherwise swallow the include bytes that follow it).
-            let locator_of = |value: &[u8]| -> Locator {
-                if index.include.is_empty() {
-                    index::decode_locator(value)
-                } else {
-                    index::decode_leaf_value_with_include(value).0
-                }
-            };
+            let mut ctx = self.rel_ctx();
             if def.is_tree() {
                 let base = BTree {
                     object_id: def.object_id,
                     root: def.root_page,
                 };
-                for (_, value) in entries {
-                    if let Locator::Key(pk) = locator_of(&value)
-                        && let Some(row) = base.get(&mut ctx, &pk)?
-                    {
-                        rows.push(decode_projected(&schema, &row, projection)?);
+                for entry in decided {
+                    match entry {
+                        Entry::Physical(value) => {
+                            if let Locator::Key(pk) = locator_of(&value)
+                                && let Some(row) = base.get(&mut ctx, &pk)?
+                            {
+                                rows.push(decode_projected(&schema, &row, projection)?);
+                            }
+                        }
+                        Entry::Image(image) => {
+                            rows.push(decode_projected(&schema, &image, projection)?);
+                        }
                     }
                 }
             } else {
@@ -1462,14 +1635,24 @@ impl StorageFile {
                     object_id: def.object_id,
                     first_page: def.root_page,
                 };
-                for (_, value) in entries {
-                    if let Locator::Rid(rid) = locator_of(&value)
-                        && let Some(row) = heap.read_row(&mut ctx, rid)?
-                    {
-                        rows.push(decode_projected(&schema, &row, projection)?);
+                for entry in decided {
+                    match entry {
+                        Entry::Physical(value) => {
+                            if let Locator::Rid(rid) = locator_of(&value)
+                                && let Some(row) = heap.read_row(&mut ctx, rid)?
+                            {
+                                rows.push(decode_projected(&schema, &row, projection)?);
+                            }
+                        }
+                        Entry::Image(image) => {
+                            rows.push(decode_projected(&schema, &image, projection)?);
+                        }
                     }
                 }
             }
+        }
+        for image in extra_images {
+            rows.push(decode_projected(&schema, &image, projection)?);
         }
         Ok(rows)
     }
@@ -1507,6 +1690,7 @@ impl StorageFile {
         let collations = def.collations.clone();
         let counter_page = def.counter_page;
         let inserted = rows.len() as i64;
+        let publishing = self.version.publishing();
         if def.is_tree() {
             let tree = BTree {
                 object_id: def.object_id,
@@ -1533,6 +1717,13 @@ impl StorageFile {
                         values,
                         &Locator::Key(key.clone()),
                     )?;
+                    if publishing {
+                        txn.pending_versions.push(PendingVersion {
+                            object_id: tree.object_id,
+                            identity: key.clone(),
+                            change: RowChange::Insert,
+                        });
+                    }
                 }
                 if let Some(page) = counter_page {
                     ctx.counter_add(txn, page, inserted)?;
@@ -1557,6 +1748,13 @@ impl StorageFile {
                         values,
                         &Locator::Rid(rid),
                     )?;
+                    if publishing {
+                        txn.pending_versions.push(PendingVersion {
+                            object_id: heap.object_id,
+                            identity: rid_identity(rid),
+                            change: RowChange::Insert,
+                        });
+                    }
                 }
                 if let Some(page) = counter_page {
                     ctx.counter_add(txn, page, inserted)?;
@@ -1674,6 +1872,67 @@ impl StorageFile {
         raw.into_iter()
             .map(|row| decode_row(&schema, &row).map_err(StorageError::from))
             .collect()
+    }
+
+    /// Snapshot scan (Stage 13): the whole table read atomically under this
+    /// one lock hold, each row resolved through the version store — a row
+    /// last written by a transaction the snapshot cannot see is served from
+    /// its chain image instead — plus the images of rows the physical walk
+    /// could not encounter (deleted or re-keyed by writers the snapshot does
+    /// not see). Atomic because a versioned reader holds no table lock, so a
+    /// sliced cursor could be restructured under it mid-walk.
+    fn rel_scan_snapshot(
+        &mut self,
+        name: &str,
+        projection: Option<&[usize]>,
+        snapshot: ReadSnapshot,
+    ) -> Result<Vec<Vec<Datum>>, StorageError> {
+        self.ensure_rel_usable()?;
+        let (def, schema) = self.rel_def(name)?;
+        let physical: Vec<(Vec<u8>, Vec<u8>)> = {
+            let mut ctx = self.rel_ctx();
+            if def.is_tree() {
+                let tree = BTree {
+                    object_id: def.object_id,
+                    root: def.root_page,
+                };
+                tree.scan(&mut ctx)?
+            } else {
+                let heap = Heap {
+                    object_id: def.object_id,
+                    first_page: def.root_page,
+                };
+                heap.scan(&mut ctx)?
+                    .into_iter()
+                    .map(|(rid, row)| (rid_identity(rid), row))
+                    .collect()
+            }
+        };
+        let mut out = Vec::with_capacity(physical.len());
+        if !self.version.table_has_chains(def.object_id) {
+            for (_, row) in physical {
+                out.push(decode_projected(&schema, &row, projection)?);
+            }
+            return Ok(out);
+        }
+        let mut seen: std::collections::HashSet<Vec<u8>> =
+            std::collections::HashSet::with_capacity(physical.len());
+        for (identity, row) in physical {
+            match self.version.resolve(def.object_id, &identity, snapshot) {
+                None | Some(Resolved::Current) => {
+                    out.push(decode_projected(&schema, &row, projection)?);
+                }
+                Some(Resolved::Image(image)) => {
+                    out.push(decode_projected(&schema, &image, projection)?);
+                }
+                Some(Resolved::Gone) => {}
+            }
+            seen.insert(identity);
+        }
+        for image in self.version.unseen_images(def.object_id, &seen, snapshot) {
+            out.push(decode_projected(&schema, &image, projection)?);
+        }
+        Ok(out)
     }
 
     /// Deletes every row where `column = value`; returns the count. Targets
@@ -1879,7 +2138,7 @@ impl StorageFile {
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, _schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(name)?;
         let count = targets.len();
         if count == 0 {
             return Ok(0);
@@ -1887,6 +2146,17 @@ impl StorageFile {
         let indexes = def.indexes.clone();
         let collations = def.collations.clone();
         let counter_page = def.counter_page;
+        // Version staging: the deleted rows' images, encoded up front (the
+        // schema stays out of the closure), indexed alongside `targets`.
+        let publishing = self.version.publishing();
+        let priors: Vec<Option<Vec<u8>>> = if publishing {
+            targets
+                .iter()
+                .map(|(_, values)| encode_row(&schema, values).map(Some))
+                .collect::<Result<_, _>>()?
+        } else {
+            targets.iter().map(|_| None).collect()
+        };
         // The counter follows the rows actually removed inside the statement,
         // which the arms count as they go (a locator of the wrong kind is
         // skipped, exactly as the row loop skips it).
@@ -1897,7 +2167,7 @@ impl StorageFile {
             };
             self.rel_statement_scoped(scope, move |ctx, txn| {
                 let mut removed: i64 = 0;
-                for (loc, values) in &targets {
+                for ((loc, values), prior) in targets.iter().zip(priors) {
                     if let RowLocator::Key(key) = loc {
                         tree.delete(ctx, &mut OpMode::Txn(txn), key)?;
                         index_delete_row(
@@ -1908,6 +2178,13 @@ impl StorageFile {
                             values,
                             &Locator::Key(key.clone()),
                         )?;
+                        if let Some(prior) = prior {
+                            txn.pending_versions.push(PendingVersion {
+                                object_id: tree.object_id,
+                                identity: key.clone(),
+                                change: RowChange::Delete { prior },
+                            });
+                        }
                         removed += 1;
                     }
                 }
@@ -1923,7 +2200,7 @@ impl StorageFile {
             };
             self.rel_statement_scoped(scope, move |ctx, txn| {
                 let mut removed: i64 = 0;
-                for (loc, values) in &targets {
+                for ((loc, values), prior) in targets.iter().zip(priors) {
                     if let RowLocator::Rid(rid) = loc {
                         heap.delete(ctx, txn, *rid)?;
                         index_delete_row(
@@ -1934,6 +2211,13 @@ impl StorageFile {
                             values,
                             &Locator::Rid(*rid),
                         )?;
+                        if let Some(prior) = prior {
+                            txn.pending_versions.push(PendingVersion {
+                                object_id: heap.object_id,
+                                identity: rid_identity(*rid),
+                                change: RowChange::Delete { prior },
+                            });
+                        }
                         removed += 1;
                     }
                 }
@@ -1967,6 +2251,7 @@ impl StorageFile {
         }
         let indexes = def.indexes.clone();
         let collations = def.collations.clone();
+        let publishing = self.version.publishing();
         // (old values, old locator, new values, new locator) for index upkeep.
         let mut idx_ops: Vec<(Vec<Datum>, Locator, Vec<Datum>, Locator)> = Vec::new();
         if def.is_tree() {
@@ -1977,6 +2262,13 @@ impl StorageFile {
             // Partition into in-place (key unchanged) and re-key (key changed).
             let mut in_place: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
             let mut rekey: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
+            // Version staging, split to mirror the closure's op order (all
+            // re-key deletes, then re-key inserts, then in-place updates), so
+            // an identity touched twice in one statement — a key swap — has
+            // its chain built in the order the physical states change.
+            let mut staged_rekey_del: Vec<PendingVersion> = Vec::new();
+            let mut staged_rekey_ins: Vec<PendingVersion> = Vec::new();
+            let mut staged_in_place: Vec<PendingVersion> = Vec::new();
             for (loc, old_values, new_values) in updates {
                 let RowLocator::Key(old_key) = loc else {
                     return Err(StorageError::InvalidConfig(
@@ -1986,6 +2278,11 @@ impl StorageFile {
                 validate_not_null(&schema, &new_values)?;
                 let row = encode_row(&schema, &new_values)?;
                 let new_key = encode_key(&schema, &def.key_columns, &new_values)?;
+                let prior = if publishing {
+                    Some(encode_row(&schema, &old_values)?)
+                } else {
+                    None
+                };
                 if !indexes.is_empty() {
                     idx_ops.push((
                         old_values,
@@ -1995,8 +2292,29 @@ impl StorageFile {
                     ));
                 }
                 if new_key == old_key {
+                    if let Some(prior) = prior {
+                        staged_in_place.push(PendingVersion {
+                            object_id: tree.object_id,
+                            identity: old_key.clone(),
+                            change: RowChange::Update { prior },
+                        });
+                    }
                     in_place.push((old_key, row));
                 } else {
+                    if let Some(prior) = prior {
+                        // A key change is a delete of the old identity and an
+                        // insert of the new one, exactly as the tree applies it.
+                        staged_rekey_del.push(PendingVersion {
+                            object_id: tree.object_id,
+                            identity: old_key.clone(),
+                            change: RowChange::Delete { prior },
+                        });
+                        staged_rekey_ins.push(PendingVersion {
+                            object_id: tree.object_id,
+                            identity: new_key.clone(),
+                            change: RowChange::Insert,
+                        });
+                    }
                     rekey.push((old_key, new_key, row));
                 }
             }
@@ -2019,6 +2337,9 @@ impl StorageFile {
                     tree.update(ctx, &mut OpMode::Txn(txn), key, row)?;
                 }
                 apply_index_updates(ctx, txn, &indexes, &schema, &collations, &idx_ops)?;
+                txn.pending_versions.extend(staged_rekey_del);
+                txn.pending_versions.extend(staged_rekey_ins);
+                txn.pending_versions.extend(staged_in_place);
                 Ok(())
             })?;
         } else {
@@ -2027,6 +2348,7 @@ impl StorageFile {
                 first_page: def.root_page,
             };
             let mut encoded: Vec<(Rid, Vec<u8>)> = Vec::with_capacity(count);
+            let mut staged: Vec<PendingVersion> = Vec::new();
             for (loc, old_values, new_values) in updates {
                 let RowLocator::Rid(rid) = loc else {
                     return Err(StorageError::InvalidConfig(
@@ -2035,6 +2357,15 @@ impl StorageFile {
                 };
                 validate_not_null(&schema, &new_values)?;
                 encoded.push((rid, encode_row(&schema, &new_values)?));
+                if publishing {
+                    staged.push(PendingVersion {
+                        object_id: heap.object_id,
+                        identity: rid_identity(rid),
+                        change: RowChange::Update {
+                            prior: encode_row(&schema, &old_values)?,
+                        },
+                    });
+                }
                 if !indexes.is_empty() {
                     // Heap RIDs are stable across an update.
                     idx_ops.push((old_values, Locator::Rid(rid), new_values, Locator::Rid(rid)));
@@ -2045,6 +2376,7 @@ impl StorageFile {
                     heap.update(ctx, txn, *rid, row)?;
                 }
                 apply_index_updates(ctx, txn, &indexes, &schema, &collations, &idx_ops)?;
+                txn.pending_versions.extend(staged);
                 Ok(())
             })?;
         }
@@ -2332,6 +2664,8 @@ impl StorageFile {
                 Some((active_sb.metadata_root - layout.data_offset) / PAGE_SIZE as u64);
         }
 
+        let mut version = crate::relstore::version::VersionState::default();
+        version.set_options_byte(active_sb.db_options());
         let mut storage = StorageFile {
             default_collation: header.default_collation(),
             file,
@@ -2343,6 +2677,7 @@ impl StorageFile {
             allocator: PageAllocator::new(layout.data_size),
             rel,
             replay_cache: scan.records,
+            version,
         };
         storage.recover_allocator()?;
 
@@ -2434,6 +2769,7 @@ impl StorageFile {
             allocator: PageAllocator::new(layout.data_size),
             rel: RelState::new(DEFAULT_CAPACITY_BYTES),
             replay_cache: Vec::new(),
+            version: crate::relstore::version::VersionState::default(),
         })
     }
 
@@ -2534,15 +2870,25 @@ impl StorageFile {
         let roots = self.rel.tree_roots();
         let mut ctx = self.rel_ctx();
         let mut txn = ctx.begin(txn_id)?;
+        // Staged versions publish only on a successful commit — and inside
+        // this same mutex hold, so no reader can see pages and version
+        // chains disagree. A statement error discards them with `txn`.
+        let mut publish: Option<(Vec<PendingVersion>, u64)> = None;
         let (result, wedged) = match f(&mut ctx, &mut txn) {
-            Ok(value) => match ctx.commit(txn) {
-                Ok(()) => (Ok(value), false),
-                // The commit record may or may not have reached the disk;
-                // writing CLRs now could undo a durable commit. Wedge and
-                // let restart recovery decide (commit durable -> winner,
-                // else -> loser undone).
-                Err(err) => (Err(err), true),
-            },
+            Ok(value) => {
+                let pending = std::mem::take(&mut txn.pending_versions);
+                match ctx.commit(txn) {
+                    Ok(commit_lsn) => {
+                        publish = Some((pending, commit_lsn));
+                        (Ok(value), false)
+                    }
+                    // The commit record may or may not have reached the disk;
+                    // writing CLRs now could undo a durable commit. Wedge and
+                    // let restart recovery decide (commit durable -> winner,
+                    // else -> loser undone).
+                    Err(err) => (Err(err), true),
+                }
+            }
             Err(err) => match rel_recovery::rollback(&mut ctx, txn, &roots) {
                 Ok(()) => {
                     let _ = ctx.io.wal.sync_all();
@@ -2557,6 +2903,14 @@ impl StorageFile {
         let _ = ctx;
         if wedged {
             self.rel.wedged = true;
+        }
+        if let Some((pending, commit_lsn)) = publish {
+            for version in pending {
+                // Autocommit: the transaction is already committed, so the
+                // publish records (rollback bookkeeping) are not needed.
+                let _ = self.version.publish(version, txn_id);
+            }
+            self.version.record_commit(txn_id, commit_lsn);
         }
         result
     }
@@ -2582,6 +2936,8 @@ impl StorageFile {
                 let (result, wedged) = match f(&mut ctx, &mut stx.txn) {
                     Ok(value) => (Ok(value), false),
                     Err(err) => {
+                        // The failed statement's staged versions die with it.
+                        stx.txn.pending_versions.clear();
                         match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &roots) {
                             Ok(()) => (Err(err), false),
                             // A half-undone statement the WAL cannot explain:
@@ -2594,6 +2950,20 @@ impl StorageFile {
                 let _ = ctx;
                 if wedged {
                     self.rel.wedged = true;
+                }
+                // Publish the successful statement's versions inside this
+                // mutex hold (atomic with its page mutations, as far as any
+                // reader can tell), stamped with the still-open transaction —
+                // invisible to every snapshot until the commit is recorded,
+                // which is exactly how a versioned reader sees the pre-image
+                // of a row a running transaction has already changed.
+                if result.is_ok() && !stx.txn.pending_versions.is_empty() {
+                    let txn_id = stx.txn.txn_id;
+                    let pending = std::mem::take(&mut stx.txn.pending_versions);
+                    for version in pending {
+                        let record = self.version.publish(version, txn_id);
+                        stx.txn.published_versions.push(record);
+                    }
                 }
                 result
             }
@@ -2620,9 +2990,22 @@ impl StorageFile {
     fn commit_txn(&mut self, stx: StorageTxn) -> Result<(), StorageError> {
         // The transaction is ending (the `StorageTxn` is consumed either way).
         self.rel.active_txn_begins.remove(&stx.txn.txn_id);
-        let mut ctx = self.rel_ctx();
-        match ctx.commit(stx.txn) {
-            Ok(()) => Ok(()),
+        let txn_id = stx.txn.txn_id;
+        debug_assert!(
+            stx.txn.pending_versions.is_empty(),
+            "versions staged but never published by their statement"
+        );
+        let commit = {
+            let mut ctx = self.rel_ctx();
+            ctx.commit(stx.txn)
+        };
+        match commit {
+            Ok(commit_lsn) => {
+                // The recorded sequence is what flips this transaction's
+                // published versions visible, atomically under this hold.
+                self.version.record_commit(txn_id, commit_lsn);
+                Ok(())
+            }
             Err(err) => {
                 self.rel.wedged = true;
                 Err(err)
@@ -2631,20 +3014,32 @@ impl StorageFile {
     }
 
     /// Rolls back a caller-held transaction via its in-memory undo log (CLRs).
-    fn rollback_txn(&mut self, stx: StorageTxn) -> Result<(), StorageError> {
+    fn rollback_txn(&mut self, mut stx: StorageTxn) -> Result<(), StorageError> {
         self.rel.active_txn_begins.remove(&stx.txn.txn_id);
+        let txn_id = stx.txn.txn_id;
+        let published = std::mem::take(&mut stx.txn.published_versions);
         let roots = stx.roots;
-        let mut ctx = self.rel_ctx();
-        match rel_recovery::rollback(&mut ctx, stx.txn, &roots) {
-            Ok(()) => {
-                let _ = ctx.io.wal.sync_all();
-                Ok(())
+        let result = {
+            let mut ctx = self.rel_ctx();
+            match rel_recovery::rollback(&mut ctx, stx.txn, &roots) {
+                Ok(()) => {
+                    let _ = ctx.io.wal.sync_all();
+                    Ok(())
+                }
+                Err(err) => Err(err),
             }
-            Err(err) => {
-                self.rel.wedged = true;
-                Err(err)
-            }
+        };
+        // Reverse the publications (newest first, so nested demotions unwind)
+        // whether or not the physical rollback succeeded — a failure wedges
+        // the store and nothing reads it again, but the chains must not claim
+        // a rolled-back writer owns current rows.
+        for record in published.into_iter().rev() {
+            self.version.unpublish(record, txn_id);
         }
+        if result.is_err() {
+            self.rel.wedged = true;
+        }
+        result
     }
 
     /// Rolls a still-open transaction back to a savepoint (partial rollback,
@@ -2656,18 +3051,30 @@ impl StorageFile {
         savepoint: crate::relstore::ctx::Savepoint,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        let txn_id = stx.txn.txn_id;
+        let published = stx.txn.published_versions.split_off(
+            savepoint
+                .published_len
+                .min(stx.txn.published_versions.len()),
+        );
         let roots = stx.roots.clone();
-        let mut ctx = self.rel_ctx();
-        match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &roots) {
-            Ok(()) => {
-                let _ = ctx.io.wal.sync_all();
-                Ok(())
+        let result = {
+            let mut ctx = self.rel_ctx();
+            match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &roots) {
+                Ok(()) => {
+                    let _ = ctx.io.wal.sync_all();
+                    Ok(())
+                }
+                Err(err) => Err(err),
             }
-            Err(err) => {
-                self.rel.wedged = true;
-                Err(err)
-            }
+        };
+        for record in published.into_iter().rev() {
+            self.version.unpublish(record, txn_id);
         }
+        if result.is_err() {
+            self.rel.wedged = true;
+        }
+        result
     }
 
     /// Whether any explicit transaction is open.
@@ -2849,6 +3256,65 @@ impl StorageFile {
         let offset = self.layout.data_offset + page * PAGE_SIZE as u64;
         self.file.read_page_into(offset, &mut frame)?;
         out.copy_from_slice(frame.as_slice());
+        Ok(())
+    }
+
+    /// Applies `ALTER DATABASE SET` option changes and persists them durably
+    /// in both superblocks (generation-bumped, active slot first with an
+    /// fsync between — a torn first write falls back to the backup with the
+    /// old options, and the un-acknowledged ALTER is simply lost).
+    fn set_db_options(
+        &mut self,
+        rcsi: Option<bool>,
+        allow_snapshot: Option<bool>,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        self.version.set_options(rcsi, allow_snapshot);
+        let byte = self.version.options_byte();
+        let generation = self
+            .superblock_a
+            .generation
+            .max(self.superblock_b.generation)
+            .saturating_add(1);
+        // The lazy active-slot rewrite leaves the backup's dynamic fields
+        // stale; both slots get the same generation here, so equalize them
+        // from the active slot (whichever wins at open must carry the
+        // freshest recovery hints).
+        let (active, backup_flag) = match self.active_superblock {
+            ActiveSuperblock::A => (self.superblock_a, SUPERBLOCK_ACTIVE_B),
+            ActiveSuperblock::B => (self.superblock_b, SUPERBLOCK_ACTIVE_A),
+        };
+        let mut equalized = active;
+        equalized.active = backup_flag;
+        match self.active_superblock {
+            ActiveSuperblock::A => self.superblock_b = equalized,
+            ActiveSuperblock::B => self.superblock_a = equalized,
+        }
+        for sb in [&mut self.superblock_a, &mut self.superblock_b] {
+            sb.set_db_options(byte);
+            sb.generation = generation;
+            sb.checksum = sb.compute_checksum();
+        }
+        let (primary, primary_offset, backup, backup_offset) = match self.active_superblock {
+            ActiveSuperblock::A => (
+                self.superblock_a,
+                self.layout.superblock_a_offset,
+                self.superblock_b,
+                self.layout.superblock_b_offset,
+            ),
+            ActiveSuperblock::B => (
+                self.superblock_b,
+                self.layout.superblock_b_offset,
+                self.superblock_a,
+                self.layout.superblock_a_offset,
+            ),
+        };
+        self.file
+            .write_all_at(primary_offset, &primary.to_le_bytes_with_checksum())?;
+        self.file.sync_data()?;
+        self.file
+            .write_all_at(backup_offset, &backup.to_le_bytes_with_checksum())?;
+        self.file.sync_data()?;
         Ok(())
     }
 
@@ -3068,16 +3534,20 @@ impl StorageFile {
             .catalog_root
             .map(|page| self.layout.data_offset + page * PAGE_SIZE as u64)
             .unwrap_or(0);
+        let db_options = self.version.options_byte();
         let new_sb = |active_flag: u8| -> Superblock {
-            let mut sb = Superblock::default();
-            sb.generation = generation;
-            sb.active = active_flag;
-            sb.wal_head = head;
-            sb.wal_tail = tail;
-            sb.last_committed_seq = checkpoint_seq;
-            sb.snapshot_root = desc_offset;
-            sb.data_root = data_write_offset;
-            sb.metadata_root = metadata_root;
+            let mut sb = Superblock {
+                generation,
+                active: active_flag,
+                wal_head: head,
+                wal_tail: tail,
+                last_committed_seq: checkpoint_seq,
+                snapshot_root: desc_offset,
+                data_root: data_write_offset,
+                metadata_root,
+                ..Superblock::default()
+            };
+            sb.set_db_options(db_options);
             sb.checksum = sb.compute_checksum();
             sb
         };
@@ -3525,6 +3995,310 @@ mod tests {
             "an inner SET raise must lock the inner reads: {needs:?}"
         );
 
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The Stage 13 database options round-trip the superblock: they survive
+    /// a reopen, and a checkpoint — which rebuilds both superblocks from
+    /// scratch — must carry them forward rather than silently resetting them.
+    #[test]
+    fn db_options_persist_across_reopen_and_checkpoint() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("db-options");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        assert!(!storage.rcsi_enabled());
+        assert!(!storage.snapshot_isolation_allowed());
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON, ALLOW_SNAPSHOT_ISOLATION ON",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert!(storage.rcsi_enabled());
+        assert!(storage.snapshot_isolation_allowed());
+        drop(storage);
+
+        let storage = Storage::open(path.clone()).expect("reopen");
+        assert!(storage.rcsi_enabled(), "RCSI survives a restart");
+        assert!(storage.snapshot_isolation_allowed());
+
+        // One option off, then a checkpoint, then a reopen: the checkpoint's
+        // fresh superblocks must keep the surviving option.
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION OFF",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        storage
+            .write_checkpoint(b"cp", 1, 2, 1)
+            .expect("checkpoint");
+        drop(storage);
+        let storage = Storage::open(path.clone()).expect("reopen after checkpoint");
+        assert!(
+            storage.rcsi_enabled(),
+            "the checkpoint must not reset the option"
+        );
+        assert!(!storage.snapshot_isolation_allowed());
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A READ COMMITTED SELECT under RCSI takes only Database IS — no Table
+    /// S — which is the entire readers-don't-block mechanism; and the other
+    /// levels are untouched by the option.
+    #[test]
+    fn analyze_locks_drops_table_s_under_rcsi() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::{Isolation, TxnContext, execute_batch};
+
+        let path = unique_temp_path("rcsi-locks");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let table_s = |needs: &[(Resource, LockMode)]| {
+            needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Shared)
+        };
+
+        // Off: the SELECT read-locks, as ever.
+        let needs =
+            crate::rel::analyze_locks(&storage, "SELECT v FROM t", Isolation::ReadCommitted);
+        assert!(
+            table_s(&needs),
+            "without RCSI a RC SELECT takes Table S: {needs:?}"
+        );
+
+        let outcome = execute_batch(
+            &storage,
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // On: Database IS only — the DDL fence — and no Table S.
+        let needs =
+            crate::rel::analyze_locks(&storage, "SELECT v FROM t", Isolation::ReadCommitted);
+        assert!(
+            !table_s(&needs),
+            "under RCSI a RC SELECT takes no Table S: {needs:?}"
+        );
+        assert!(
+            needs.contains(&(Resource::Database, LockMode::IntentShared)),
+            "the Database IS fence stays: {needs:?}"
+        );
+
+        // The other levels are untouched: RR still read-locks, RU still
+        // takes nothing, and a batch that raises isolation falls back to
+        // locking even though the session level is RC.
+        let needs =
+            crate::rel::analyze_locks(&storage, "SELECT v FROM t", Isolation::RepeatableRead);
+        assert!(table_s(&needs), "RR is not versioned: {needs:?}");
+        let needs =
+            crate::rel::analyze_locks(&storage, "SELECT v FROM t", Isolation::ReadUncommitted);
+        assert!(needs.is_empty(), "RU takes no locks at all: {needs:?}");
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT v FROM t",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            table_s(&needs),
+            "a raising SET disables the snapshot path: {needs:?}"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A covering (INCLUDE) seek must serve the snapshot's image, not the
+    /// index leaf's freshly-updated include payload — pinned on the covering
+    /// path itself via the covering-scan counter.
+    #[test]
+    fn covering_seek_serves_the_snapshot_image() {
+        use crate::rel::{StatementResult, TxnContext, execute_batch};
+
+        let path = unique_temp_path("rcsi-covering");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut writer = TxnContext::default();
+        let mut fill = String::from("INSERT INTO c VALUES ");
+        for i in 1..=25 {
+            fill.push_str(&format!("({}, {}, {}),", i, i * 10, i * 1000));
+        }
+        fill.pop();
+        for sql in [
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+            "CREATE TABLE c (id INT NOT NULL PRIMARY KEY, v INT, w INT)",
+            fill.as_str(),
+            "CREATE INDEX ix_cv ON c (v) INCLUDE (v, w)",
+            // The open transaction updates only the INCLUDE column: the
+            // seek still finds the entry under v = 10, now carrying the NEW
+            // include bytes.
+            "BEGIN TRAN; UPDATE c SET w = 777 WHERE id = 1;",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut writer);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+
+        let select = |label: &str| {
+            let mut reader = TxnContext::default();
+            let outcome = execute_batch(&storage, "SELECT w FROM c WHERE v = 10", &mut reader);
+            assert!(outcome.error.is_none(), "{label}: {:?}", outcome.error);
+            match &outcome.results[0] {
+                StatementResult::Rows(rowset) => rowset.rows.clone(),
+                other => panic!("{label}: expected rows, got {other:?}"),
+            }
+        };
+
+        let covering_before = storage.covering_scans();
+        let rows = select("during the writer's transaction");
+        assert!(
+            storage.covering_scans() > covering_before,
+            "the read must have gone down the covering path for this to test anything"
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Datum::Int(1000)]],
+            "the snapshot image, not the new include payload"
+        );
+
+        let outcome = execute_batch(&storage, "COMMIT", &mut writer);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(rows_i32(&select("after the commit")), vec![777]);
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    fn rows_i32(rows: &[Vec<Datum>]) -> Vec<i32> {
+        rows.iter()
+            .map(|row| match row[0] {
+                Datum::Int(v) => v,
+                ref other => panic!("expected INT, got {other:?}"),
+            })
+            .collect()
+    }
+
+    /// Rollback unpublishes: a rolled-back transaction leaves no version
+    /// chains behind (pruning would otherwise treat its entries as an open
+    /// transaction's and pin them forever), and pruning drops the history of
+    /// committed transactions once no snapshot is live.
+    #[test]
+    fn rollback_unpublishes_and_prune_drops_settled_history() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("rcsi-prune");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        for sql in [
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            "INSERT INTO t VALUES (1, 10), (2, 20)",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+
+        // The seed INSERTs published their own (committed) chains; settle
+        // them first so the rollback assertion sees only the rollback's work.
+        storage
+            .ensure_durable(storage.wal_tail())
+            .expect("durability");
+        storage.version_prune();
+        assert_eq!(storage.version_chain_count("t"), 0);
+
+        // Rolled back: the chains its statements published are reversed.
+        let outcome = execute_batch(
+            &storage,
+            "BEGIN TRAN; UPDATE t SET v = 99 WHERE id = 1; ROLLBACK",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            storage.version_chain_count("t"),
+            0,
+            "a rolled-back transaction leaves no chains"
+        );
+
+        // Committed: the chain exists until pruning decides nothing can need
+        // it (no live snapshot, commit durable).
+        let outcome = execute_batch(&storage, "UPDATE t SET v = 11 WHERE id = 1", &mut ctx);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(storage.version_chain_count("t"), 1);
+        storage
+            .ensure_durable(storage.wal_tail())
+            .expect("durability");
+        storage.version_prune();
+        assert_eq!(
+            storage.version_chain_count("t"),
+            0,
+            "settled history is dropped by the maintenance prune"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Publishing versions changes nothing about crash recovery: the store
+    /// (chains and commit table) is memory-only, so a kill-and-reopen with
+    /// RCSI on recovers exactly the committed state, options intact, chains
+    /// empty.
+    #[test]
+    fn rcsi_survives_a_crash_with_clean_recovery() {
+        use crate::rel::{StatementResult, TxnContext, execute_batch};
+
+        let path = unique_temp_path("rcsi-crash");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        for sql in [
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            "INSERT INTO t VALUES (1, 10), (2, 20)",
+            "UPDATE t SET v = 11 WHERE id = 1",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        // An open transaction with published versions dies with the crash.
+        let outcome = execute_batch(
+            &storage,
+            "BEGIN TRAN; UPDATE t SET v = 999 WHERE id = 2;",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        // Kill without checkpoint: drop the handle mid-transaction.
+        drop(ctx);
+        drop(storage);
+
+        let storage = Storage::open(path.clone()).expect("recovery");
+        assert!(storage.rcsi_enabled());
+        assert_eq!(
+            storage.version_chain_count("t"),
+            0,
+            "chains do not survive a restart"
+        );
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(&storage, "SELECT v FROM t ORDER BY id", &mut ctx);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => assert_eq!(
+                rows_i32(&rowset.rows),
+                vec![11, 20],
+                "committed wins, the in-flight update is undone"
+            ),
+            other => panic!("expected rows, got {other:?}"),
+        }
         drop(storage);
         let _ = std::fs::remove_file(&path);
     }

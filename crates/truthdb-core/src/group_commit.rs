@@ -106,6 +106,16 @@ impl GroupCommit {
         self.flushed_cv.notify_all();
     }
 
+    /// The durable watermark: the highest WAL tail known fsync-durable. The
+    /// version store's snapshot capture reads this to bound visibility to the
+    /// durable commit prefix.
+    pub(crate) fn flushed(&self) -> u64 {
+        self.state
+            .lock()
+            .expect("group-commit state poisoned")
+            .flushed
+    }
+
     /// The number of fsyncs the log-writer has issued so far.
     #[cfg(test)]
     pub(crate) fn fsync_count(&self) -> u64 {
