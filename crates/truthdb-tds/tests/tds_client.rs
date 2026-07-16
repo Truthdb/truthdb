@@ -1331,3 +1331,92 @@ async fn tm_begin_rollback_discards_writes() {
     assert_eq!(row_ints(&select), vec![1], "only the pre-txn row survives");
     let _ = std::fs::remove_file(path);
 }
+
+/// REVIEW PoC: SQL Server emits a prior statement's DONE before a later
+/// USE's ENVCHANGE. TruthDB's core-side DONE deferral lets the ENVCHANGE
+/// jump the queue: for "INSERT ...; USE truthdb" the ENVCHANGE (and INFO
+/// 5701) reach the wire before the INSERT's DONE.
+#[tokio::test]
+async fn use_envchange_follows_prior_statement_done() {
+    let path = temp_path("use-order");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE TABLE uo (id INT NOT NULL PRIMARY KEY)")
+        .await;
+
+    let tokens = client.batch("INSERT INTO uo VALUES (1); USE truthdb").await;
+    let done_at = tokens
+        .iter()
+        .position(|t| matches!(t, Token::Done { count: Some(1), .. }))
+        .expect("the INSERT's DONE");
+    let env_at = tokens
+        .iter()
+        .position(|t| matches!(t, Token::EnvChange { kind: 1, .. }))
+        .expect("the USE's ENVCHANGE");
+    assert!(
+        done_at < env_at,
+        "SQL Server order: DONE(insert) before ENVCHANGE(database); got {tokens:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REVIEW PoC: `sp_executesql N'USE truthdb'` over RPC — ENVCHANGE 1 + INFO
+/// 5701 arrive, the statement's DONE is a DONEINPROC, and the RPC tail
+/// (RETURNSTATUS, DONEPROC) stays framed.
+#[tokio::test]
+async fn use_inside_exec_rpc_keeps_doneinproc_framing() {
+    let path = temp_path("use-rpc");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+
+    let tokens = client.rpc(&sp_executesql_rpc("USE truthdb")).await;
+    assert!(has_envchange(&tokens, 1), "ENVCHANGE 1: {tokens:?}");
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(t, Token::Info { number: 5701 })),
+        "INFO 5701: {tokens:?}"
+    );
+    assert!(
+        tokens.iter().any(|t| matches!(t, Token::DoneInProc { .. })),
+        "the USE's DONE renders as DONEINPROC: {tokens:?}"
+    );
+    assert!(
+        tokens.iter().any(|t| matches!(t, Token::ReturnStatus(0))),
+        "RETURNSTATUS: {tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(t, Token::DoneProc { error: false, .. })),
+        "DONEPROC: {tokens:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// REVIEW PoC: two USEs in one batch — each emits its own ENVCHANGE + INFO.
+#[tokio::test]
+async fn two_uses_in_one_batch_emit_two_envchanges() {
+    let path = temp_path("use-two");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+
+    let tokens = client.batch("USE truthdb; USE truthdb").await;
+    let envs = tokens
+        .iter()
+        .filter(|t| matches!(t, Token::EnvChange { kind: 1, .. }))
+        .count();
+    let infos = tokens
+        .iter()
+        .filter(|t| matches!(t, Token::Info { number: 5701 }))
+        .count();
+    assert_eq!((envs, infos), (2, 2), "tokens: {tokens:?}");
+    let _ = std::fs::remove_file(&path);
+}

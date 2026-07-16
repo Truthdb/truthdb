@@ -49,8 +49,11 @@ pub struct TxnContext {
     doomed: bool,
     xact_abort: bool,
     isolation: Isolation,
-    /// `SET NOCOUNT ON` — statement DONEs carry no row count on the wire
-    /// (results and the native protocol are unaffected).
+    /// `SET NOCOUNT ON` — statements report no row count to the client:
+    /// TDS DONEs drop `DONE_COUNT`, and the native protocol's count envelope
+    /// becomes a bare done (the CLI then prints no "(n rows affected)" line,
+    /// exactly as sqlcmd goes quiet against SQL Server). Result rows and
+    /// `@@ROWCOUNT` are untouched.
     nocount: bool,
     /// Rows affected/returned by the previous statement — `@@ROWCOUNT`.
     rowcount: i64,
@@ -786,7 +789,14 @@ fn run_block(
             // same shape as TRY/CATCH dispatch. Errors take the ordinary
             // statement path: cancels and durability failures propagate, a
             // TRY transfers to CATCH, XACT_ABORT OFF continues the batch.
-            match run_exec(storage, exec, txn_ctx, run, in_try) {
+            let exec_result = run_exec(storage, exec, txn_ctx, run, in_try);
+            if exec_result.is_err() {
+                // A failed EXEC sets @@ROWCOUNT to 0 like any failed
+                // statement — run_exec's own error exits (unknown proc, 214,
+                // 8144, parse, nesting cap) never reach the generic Err arm.
+                txn_ctx.rowcount = 0;
+            }
+            match exec_result {
                 Ok(()) => {}
                 Err(error) if error.number == CANCEL_ERROR => return Err(error),
                 Err(error) if run.durability_failed => return Err(error),
@@ -867,6 +877,14 @@ fn run_block(
                 let nocount = txn_ctx.nocount;
                 let wire_count =
                     |count: u64| -> Option<u64> { if nocount { None } else { Some(count) } };
+                // `USE` succeeded: earlier statements' deferred DONEs go out
+                // first, then the database-context ENVCHANGE + 5701 INFO the
+                // client (SSMS) expects, then the USE's own DONE below —
+                // SQL Server's exact order.
+                if let Statement::Use { database, .. } = statement {
+                    run.flush(storage)?;
+                    run.database_context(&database.value);
+                }
                 match outcome {
                     StatementOutcome::Streamed { rows } => {
                         txn_ctx.rowcount = rows as i64;
@@ -887,17 +905,14 @@ fn run_block(
                         // A simple variable assignment (`SET @x = ...`) sets
                         // @@ROWCOUNT to 1 — recorded by exec_set, preserved
                         // here; every other Done statement resets it to 0.
-                        if !matches!(statement, Statement::Set(SetStatement::Variable { .. })) {
+                        if !matches!(
+                            statement,
+                            Statement::Set(SetStatement::Variable { .. }) | Statement::Declare(_)
+                        ) {
                             txn_ctx.rowcount = 0;
                         }
                         run.done(None, in_transaction, command);
                     }
-                }
-                // `USE` succeeded: the client (SSMS) expects the database-
-                // context ENVCHANGE before the statement's DONE reaches it;
-                // DONEs are deferred, so emitting now orders correctly.
-                if let Statement::Use { database, .. } = statement {
-                    run.database_context(&database.value);
                 }
             }
             Err(error) => {
