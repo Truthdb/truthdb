@@ -180,13 +180,30 @@ impl Engine {
         txn_ctx: &mut crate::rel::TxnContext,
         params: &[crate::rel::RpcParam],
     ) -> Result<crate::rel::BatchOutcome, EngineError> {
+        let mut collector = crate::rel::Collector::default();
+        let error = self.sql_batch_streamed(input, txn_ctx, params, &mut collector)?;
+        Ok(collector.into_outcome(error))
+    }
+
+    /// Like [`Self::sql_batch_with_params`], but each statement's result
+    /// leaves through `emitter` as it is produced (see
+    /// [`crate::rel::execute_batch_streamed`]). Returns the batch's terminal
+    /// error, which the caller reports after the statement events.
+    pub fn sql_batch_streamed(
+        &self,
+        input: &str,
+        txn_ctx: &mut crate::rel::TxnContext,
+        params: &[crate::rel::RpcParam],
+        emitter: &mut dyn crate::rel::BatchEmitter,
+    ) -> Result<Option<truthdb_sql::error::SqlError>, EngineError> {
         // Hold the execution gate shared for the whole batch: concurrent
         // relational batches run together, but a native writer is excluded (see
         // [`Engine`]). The guard also gives the checkpointer its `meta` read.
         let meta = self.meta.read().expect("engine meta poisoned");
-        let outcome = crate::rel::execute_batch_with_params(&self.storage, input, txn_ctx, params);
+        let error =
+            crate::rel::execute_batch_streamed(&self.storage, input, txn_ctx, params, emitter);
         self.maybe_checkpoint(&meta)?;
-        Ok(outcome)
+        Ok(error)
     }
 
     /// Rolls back and discards a session's open transaction (connection

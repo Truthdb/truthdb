@@ -3150,6 +3150,114 @@ mod tests {
         .expect("create storage")
     }
 
+    /// The DONE acknowledging an autocommit write is never emitted before the
+    /// write's commit record is fsync-durable: the executor's deferred DONEs
+    /// flush — fsyncing first — before the next result set opens, so a client
+    /// can never act on an acknowledgment a crash then silently revokes.
+    #[test]
+    fn a_commit_acknowledgement_never_precedes_its_fsync() {
+        use crate::rel::{
+            BatchEmitter, ResultColumn, TxnContext, execute_batch, execute_batch_streamed,
+        };
+        use crate::relstore::types::Datum;
+
+        /// Logs each emitted event alongside the fsync count at that moment.
+        struct Probe<'a> {
+            storage: &'a Storage,
+            log: Vec<(&'static str, u64)>,
+        }
+        impl Probe<'_> {
+            fn note(&mut self, what: &'static str) {
+                self.log.push((what, self.storage.group_commit_fsyncs()));
+            }
+        }
+        impl BatchEmitter for Probe<'_> {
+            fn columns(&mut self, _columns: Vec<ResultColumn>) {
+                self.note("columns");
+            }
+            fn rows(&mut self, _rows: Vec<Vec<Datum>>) {
+                self.note("rows");
+            }
+            fn statement_done(&mut self, _count: Option<u64>, _in_transaction: bool) {
+                self.note("done");
+            }
+            fn statement_aborted(&mut self, _in_transaction: bool) {
+                self.note("aborted");
+            }
+        }
+
+        let path = unique_temp_path("stream-durability");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut setup = TxnContext::default();
+        let create = execute_batch(&storage, "CREATE TABLE t (v INT NOT NULL)", &mut setup);
+        assert!(create.error.is_none(), "create table: {:?}", create.error);
+        let baseline = storage.group_commit_fsyncs();
+
+        let mut ctx = TxnContext::default();
+        let mut probe = Probe {
+            storage: &storage,
+            log: Vec::new(),
+        };
+        let error = execute_batch_streamed(
+            &storage,
+            "INSERT INTO t VALUES (1); SELECT v FROM t",
+            &mut ctx,
+            &[],
+            &mut probe,
+        );
+        assert!(error.is_none(), "{error:?}");
+        // The INSERT's DONE comes first — already past its fsync — and only
+        // then does the SELECT's result set open.
+        assert_eq!(
+            probe.log.first(),
+            Some(&("done", baseline + 1)),
+            "the write's acknowledgment waits for its fsync: {:?}",
+            probe.log
+        );
+        assert_eq!(
+            probe.log.get(1).map(|(what, _)| *what),
+            Some("columns"),
+            "the rowset opens after the acknowledgment: {:?}",
+            probe.log
+        );
+        // One fsync total: the mid-batch flush covered the batch's only commit.
+        assert_eq!(storage.group_commit_fsyncs(), baseline + 1);
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A batch of autocommit writes with nothing to stream between them still
+    /// coalesces to a single fsync at the end of the batch: the DONEs are
+    /// deferred to that durability point rather than each buying an fsync.
+    #[test]
+    fn a_write_only_batch_still_fsyncs_once() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("stream-one-fsync");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut setup = TxnContext::default();
+        let create = execute_batch(&storage, "CREATE TABLE t (v INT NOT NULL)", &mut setup);
+        assert!(create.error.is_none(), "create table: {:?}", create.error);
+        let baseline = storage.group_commit_fsyncs();
+
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3)",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            storage.group_commit_fsyncs(),
+            baseline + 1,
+            "three autocommit writes, one batch-end fsync"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Group commit: many transactions whose commit records are already in the
     /// WAL, all waiting for durability up to the same point, are made durable by
     /// a single log-writer fsync. Deterministic (independent of fsync latency):

@@ -592,6 +592,9 @@ struct BatchRender {
 struct PendingDone {
     count: Option<u64>,
     in_transaction: bool,
+    /// `DONE_ERROR`: the statement failed after its result set began
+    /// streaming, and this DONE closes that set.
+    error: bool,
 }
 
 impl BatchRender {
@@ -628,6 +631,20 @@ impl BatchRender {
                 self.pending = Some(PendingDone {
                     count,
                     in_transaction,
+                    error: false,
+                });
+            }
+            BatchEvent::StatementAborted { in_transaction } => {
+                // Closes a result set whose statement failed mid-stream, with
+                // an error-flagged DONE. The error text, if the client gets
+                // one at all, follows at the end of the batch — a caught
+                // (TRY/CATCH) error never surfaces, and the batch's final DONE
+                // then stays clean.
+                self.flush_pending(out, true).await?;
+                self.pending = Some(PendingDone {
+                    count: None,
+                    in_transaction,
+                    error: true,
                 });
             }
             BatchEvent::Error(error) => {
@@ -677,7 +694,7 @@ impl BatchRender {
         more: bool,
     ) -> io::Result<()> {
         if let Some(done) = self.pending.take() {
-            self.done(out, more, false, done.in_transaction, done.count)
+            self.done(out, more, done.error, done.in_transaction, done.count)
                 .await?;
         }
         Ok(())
@@ -897,7 +914,15 @@ mod render_tests {
     /// the deferred DONE has to settle `DONE_MORE` by lookahead, which is the
     /// part most likely to disagree with the oracle.
     async fn rendered(outcome: &BatchOutcome, in_xact: bool, packet_size: usize) -> Vec<u8> {
-        let events = events_for(outcome, in_xact);
+        rendered_events(events_for(outcome, in_xact), packet_size).await
+    }
+
+    /// Renders an event stream through the real `stream_reply` and reassembles
+    /// the message payload.
+    async fn rendered_events(
+        events: mpsc::UnboundedReceiver<BatchEvent>,
+        packet_size: usize,
+    ) -> Vec<u8> {
         let mut wire = Duplex {
             read: std::io::Cursor::new(Vec::new()),
             written: Vec::new(),
@@ -957,6 +982,70 @@ mod render_tests {
         })
         .unwrap();
         rx
+    }
+
+    /// Each DONE carries the transaction state of *its own* statement on the
+    /// wire — `BEGIN TRAN; SELECT ...; COMMIT` reads INXACT 1, 1, 0 — instead
+    /// of the batch's final state stamped on all of them retroactively.
+    #[tokio::test]
+    async fn done_inxact_is_per_statement() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for (count, in_transaction) in [(None, true), (Some(1), true), (None, false)] {
+            tx.send(BatchEvent::StatementDone {
+                count,
+                in_transaction,
+            })
+            .unwrap();
+        }
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut expected = Vec::new();
+        token::done(&mut expected, true, false, true, None);
+        token::done(&mut expected, true, false, true, Some(1));
+        token::done(&mut expected, false, false, false, None);
+        assert_eq!(rendered_events(rx, 4096).await, expected);
+    }
+
+    /// A statement that fails after its result set began streaming closes the
+    /// set with an error-flagged DONE, and the stream stays framed for what
+    /// follows — here a CATCH block's own result set, with no ERROR token at
+    /// all (the error was caught) and a clean final DONE.
+    #[tokio::test]
+    async fn an_aborted_statement_closes_its_rowset_with_an_error_done() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(BatchEvent::Columns(columns())).unwrap();
+        tx.send(BatchEvent::Rows(vec![vec![Datum::Int(1)]]))
+            .unwrap();
+        tx.send(BatchEvent::StatementAborted {
+            in_transaction: false,
+        })
+        .unwrap();
+        tx.send(BatchEvent::Columns(columns())).unwrap();
+        tx.send(BatchEvent::Rows(vec![vec![Datum::Int(9)]]))
+            .unwrap();
+        tx.send(BatchEvent::StatementDone {
+            count: Some(1),
+            in_transaction: false,
+        })
+        .unwrap();
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut expected = Vec::new();
+        token::colmetadata(&mut expected, &columns());
+        token::row(&mut expected, &[Datum::Int(1)], &columns());
+        token::done(&mut expected, true, true, false, None);
+        token::colmetadata(&mut expected, &columns());
+        token::row(&mut expected, &[Datum::Int(9)], &columns());
+        token::done(&mut expected, false, false, false, Some(1));
+        assert_eq!(rendered_events(rx, 4096).await, expected);
     }
 
     /// A stream whose read half never yields (no Attention ever arrives) and

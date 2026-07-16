@@ -262,21 +262,45 @@ pub fn execute_batch_with_params(
     txn_ctx: &mut TxnContext,
     params: &[RpcParam],
 ) -> BatchOutcome {
+    let mut collector = Collector::default();
+    let error = execute_batch_streamed(storage, sql, txn_ctx, params, &mut collector);
+    collector.into_outcome(error)
+}
+
+/// Like [`execute_batch_with_params`], but each statement's result leaves
+/// through `emitter` as the statement produces it instead of accumulating into
+/// a [`BatchOutcome`]: a result set opens with its columns, its rows follow (in
+/// chunks read straight off the scan for the streamed shape), and each
+/// statement's DONE carries the transaction state *after that statement* —
+/// which is what TDS `DONE_INXACT` means per statement. The returned error is
+/// the batch's terminal error (what `BatchOutcome::error` carried), reported by
+/// the caller after the statement events.
+///
+/// Durability keeps its ordering: a DONE that acknowledges a commit the client
+/// may rely on (an autocommit write, DDL, the outermost `COMMIT`) is never
+/// emitted before that commit is fsync-durable. DONEs queue in the run and
+/// flush — fsyncing first if any of them acknowledges a commit — before the
+/// next result set opens and at the end of the batch, so a batch of writes
+/// with nothing to stream between them still costs one fsync, as before.
+pub fn execute_batch_streamed(
+    storage: &Storage,
+    sql: &str,
+    txn_ctx: &mut TxnContext,
+    params: &[RpcParam],
+    emitter: &mut dyn BatchEmitter,
+) -> Option<SqlError> {
     // A transaction reaped for idleness is reported to the session's next batch
     // (once). 1205 is the code this engine already uses for a server-initiated
     // transaction abort (the parked deadlock victim), and every driver treats it
     // as "the transaction is gone, retry it" — which is exactly the right
     // recovery here.
     if txn_ctx.take_reaped() {
-        return BatchOutcome {
-            results: Vec::new(),
-            error: Some(SqlError::new(
-                1205,
-                13,
-                51,
-                "The transaction was rolled back because the session was idle for too long. Rerun the transaction.",
-            )),
-        };
+        return Some(SqlError::new(
+            1205,
+            13,
+            51,
+            "The transaction was rolled back because the session was idle for too long. Rerun the transaction.",
+        ));
     }
     // Variables are batch-scoped: each batch starts with none.
     txn_ctx.clear_variables();
@@ -289,15 +313,14 @@ pub fn execute_batch_with_params(
     }
     let statements = match truthdb_sql::parse(sql) {
         Ok(statements) => statements,
-        Err(error) => {
-            return BatchOutcome {
-                results: Vec::new(),
-                error: Some(error),
-            };
-        }
+        Err(error) => return Some(error),
     };
     let mut run = BatchRun {
-        results: Vec::with_capacity(statements.len()),
+        emitter,
+        deferred: Vec::new(),
+        ack_pending: false,
+        rowset_open: false,
+        durability_failed: false,
         committed: false,
         last_error: None,
     };
@@ -305,25 +328,217 @@ pub fn execute_batch_with_params(
     // dooming/uncaught error outside any TRY); a non-dooming error under
     // `XACT_ABORT OFF` is recorded in `run.last_error` and the batch continues.
     let terminating = run_block(storage, &statements, txn_ctx, &mut run, false).err();
-    let prior = terminating.or(run.last_error);
-    let error = finalize_durability(storage, run.committed, prior);
-    BatchOutcome {
-        results: run.results,
-        error,
+    // The batch-end durability point, and the DONEs it was holding back. A
+    // durability failure outranks any statement error: a lost commit is more
+    // severe than an error the client asked about, and a benign continued error
+    // must not mask one.
+    let durability = run.finish(storage);
+    durability.or(terminating).or(run.last_error)
+}
+
+/// Receives a batch's results as the executor produces them. The session layer
+/// forwards each call as a `BatchEvent` onto the reply channel; buffered
+/// callers (the native command path, the SLT runner, tests) use [`Collector`]
+/// to reassemble a [`BatchOutcome`].
+pub trait BatchEmitter {
+    /// Opens a result set: its column metadata.
+    fn columns(&mut self, columns: Vec<ResultColumn>);
+    /// A chunk of rows for the open result set.
+    fn rows(&mut self, rows: Vec<Vec<Datum>>);
+    /// Ends one statement: its row count / rows-affected (`None` for DDL), and
+    /// the transaction state after it ran.
+    fn statement_done(&mut self, count: Option<u64>, in_transaction: bool);
+    /// Ends a statement that failed after its result set had begun streaming:
+    /// the set is closed with an error-flagged DONE so the stream stays framed
+    /// for the statements that follow. The error itself is reported separately
+    /// — at the end of the batch for a continued error, or not at all for one
+    /// a `CATCH` handled.
+    fn statement_aborted(&mut self, in_transaction: bool);
+}
+
+/// Reassembles emitted results into the whole-batch [`BatchOutcome`] for the
+/// callers that want everything at once.
+#[derive(Default)]
+pub struct Collector {
+    results: Vec<StatementResult>,
+    /// The result set currently streaming, if a statement opened one.
+    open: Option<RowSet>,
+}
+
+impl Collector {
+    /// The collected outcome. A result set still open belongs to a statement
+    /// that failed after its rows started streaming; a failed statement
+    /// contributes no result, so it is dropped.
+    pub fn into_outcome(self, error: Option<SqlError>) -> BatchOutcome {
+        BatchOutcome {
+            results: self.results,
+            error,
+        }
     }
 }
 
-/// The mutable accumulator threaded through [`run_block`] across a batch and its
-/// nested `TRY`/`CATCH` blocks.
-struct BatchRun {
-    results: Vec<StatementResult>,
+impl BatchEmitter for Collector {
+    fn columns(&mut self, columns: Vec<ResultColumn>) {
+        self.open = Some(RowSet {
+            columns,
+            rows: Vec::new(),
+        });
+    }
+
+    fn rows(&mut self, mut rows: Vec<Vec<Datum>>) {
+        if let Some(rowset) = self.open.as_mut() {
+            rowset.rows.append(&mut rows);
+        }
+    }
+
+    fn statement_done(&mut self, count: Option<u64>, _in_transaction: bool) {
+        self.results.push(match self.open.take() {
+            Some(rowset) => StatementResult::Rows(rowset),
+            None => match count {
+                Some(n) => StatementResult::RowsAffected(n),
+                None => StatementResult::Done,
+            },
+        });
+    }
+
+    fn statement_aborted(&mut self, _in_transaction: bool) {
+        self.open = None;
+    }
+}
+
+/// The mutable accumulator threaded through [`run_block`] across a batch and
+/// its nested `TRY`/`CATCH` blocks: the emitter results leave through, the
+/// DONEs held back for durability, and the batch's error state.
+struct BatchRun<'a> {
+    emitter: &'a mut dyn BatchEmitter,
+    /// Finished statements' DONEs, held back until the next durability point
+    /// (the next result set opening, or the end of the batch) so a DONE that
+    /// acknowledges a commit is never emitted before that commit is durable.
+    deferred: Vec<DeferredDone>,
+    /// Some deferred DONE acknowledges a commit (a write/DDL/`COMMIT` completed
+    /// with no transaction left open), so the next flush must fsync first.
+    ack_pending: bool,
+    /// A result set's columns have been emitted but its statement has not
+    /// finished — the state [`BatchRun::abort_open_rowset`] closes on failure.
+    rowset_open: bool,
+    /// A durability (fsync) failure wedged the store. The error terminates the
+    /// batch and is never catchable: the old batch-end fsync ran past every
+    /// TRY, and a CATCH must not be able to swallow a lost commit.
+    durability_failed: bool,
     /// Whether any executed statement may have made a durable commit: group
-    /// commit defers the WAL fsync to one call at the end of the batch.
+    /// commit defers the WAL fsync, so the end of the batch fsyncs once if so.
     committed: bool,
     /// The last non-dooming statement error under `SET XACT_ABORT OFF` (outside
     /// any TRY) — the batch continues past it (SQL Server default) and it is
     /// reported alongside the results rather than terminating the batch.
     last_error: Option<SqlError>,
+}
+
+/// A statement's DONE, parked until the next durability point.
+struct DeferredDone {
+    count: Option<u64>,
+    in_transaction: bool,
+}
+
+impl BatchRun<'_> {
+    /// Opens a result set. [`run_block`] flushed the deferred DONEs before any
+    /// statement that can produce one, so statement order on the stream holds.
+    fn open_rowset(&mut self, columns: Vec<ResultColumn>) {
+        debug_assert!(
+            self.deferred.is_empty(),
+            "a result set opened over deferred DONEs"
+        );
+        self.rowset_open = true;
+        self.emitter.columns(columns);
+    }
+
+    /// Emits a chunk of rows for the open result set.
+    fn rows(&mut self, rows: Vec<Vec<Datum>>) {
+        if !rows.is_empty() {
+            self.emitter.rows(rows);
+        }
+    }
+
+    /// Ends a statement. Its DONE is deferred to the next durability point;
+    /// `acks_commit` marks one that acknowledges a durable commit, which
+    /// forces that point to fsync first.
+    fn done(&mut self, count: Option<u64>, acks_commit: bool, in_transaction: bool) {
+        self.rowset_open = false;
+        self.ack_pending |= acks_commit;
+        self.deferred.push(DeferredDone {
+            count,
+            in_transaction,
+        });
+    }
+
+    /// Closes the open result set of a statement that failed after its columns
+    /// (and possibly rows) were already emitted, so the stream stays framed for
+    /// the statements that follow (a caught or continued error). No-op when
+    /// nothing is open — a statement that failed before emitting anything
+    /// leaves no trace, as before.
+    fn abort_open_rowset(&mut self, in_transaction: bool) {
+        if self.rowset_open {
+            self.rowset_open = false;
+            self.emitter.statement_aborted(in_transaction);
+        }
+    }
+
+    /// Emits the deferred DONEs, fsyncing first when one of them acknowledges
+    /// a commit. On a durability failure the DONEs it can no longer stand
+    /// behind are dropped and the batch terminates (see [`Self::make_durable`]).
+    fn flush(&mut self, storage: &Storage) -> Result<(), SqlError> {
+        if self.ack_pending {
+            self.ack_pending = false;
+            if let Some(error) = self.make_durable(storage) {
+                return Err(error);
+            }
+            // Everything appended so far is durable; the batch-end fsync is
+            // owed only for what later statements append.
+            self.committed = false;
+        }
+        for done in self.deferred.drain(..) {
+            self.emitter.statement_done(done.count, done.in_transaction);
+        }
+        Ok(())
+    }
+
+    /// The end of the batch: one fsync if any statement may have committed —
+    /// by kind, not transaction state, so a hidden mini-commit (an identity
+    /// reservation, even inside an open transaction or under a statement that
+    /// then failed) is never missed — then the remaining DONEs. Returns the
+    /// durability error, if any.
+    fn finish(&mut self, storage: &Storage) -> Option<SqlError> {
+        // An acknowledgment implies a commit, so `committed` alone gates.
+        debug_assert!(!self.ack_pending || self.committed);
+        if self.committed {
+            self.committed = false;
+            self.ack_pending = false;
+            if let Some(error) = self.make_durable(storage) {
+                return Some(error);
+            }
+        }
+        for done in self.deferred.drain(..) {
+            self.emitter.statement_done(done.count, done.in_transaction);
+        }
+        None
+    }
+
+    /// Blocks until the batch's commit records are fsync-durable (group
+    /// commit). A durability failure wedges the store — the in-memory state is
+    /// now ahead of the log, so no further op may serve it — and drops the
+    /// deferred DONEs, which would otherwise acknowledge commits a restart is
+    /// about to undo.
+    fn make_durable(&mut self, storage: &Storage) -> Option<SqlError> {
+        match storage.ensure_durable(storage.wal_tail()) {
+            Ok(()) => None,
+            Err(err) => {
+                storage.wedge();
+                self.deferred.clear();
+                self.durability_failed = true;
+                Some(map_storage_err(err, ""))
+            }
+        }
+    }
 }
 
 /// Runs a statement list, recursing into `TRY`/`CATCH`. `in_try` is true while
@@ -336,7 +551,7 @@ fn run_block(
     storage: &Storage,
     statements: &[Statement],
     txn_ctx: &mut TxnContext,
-    run: &mut BatchRun,
+    run: &mut BatchRun<'_>,
     in_try: bool,
 ) -> Result<(), SqlError> {
     for statement in statements {
@@ -353,6 +568,9 @@ fn run_block(
                 Ok(()) => {}
                 // An Attention that landed inside the TRY block is not caught.
                 Err(cancel) if cancel.number == CANCEL_ERROR => return Err(cancel),
+                // A durability failure wedged the store: no CATCH swallows a
+                // lost commit (the old batch-end fsync ran past every TRY).
+                Err(error) if run.durability_failed => return Err(error),
                 Err(error) => {
                     // The failed statement's own writes were already undone to
                     // its savepoint (`rel_statement_scoped`). `SET XACT_ABORT`
@@ -375,24 +593,58 @@ fn run_block(
             }
             continue;
         }
+        // A statement that can open a result set is a durability point: the
+        // deferred DONEs — and the fsync a commit acknowledgment among them
+        // owes — must reach the stream before its columns do.
+        if produces_rowset(statement) {
+            run.flush(storage)?;
+        }
         // Flag durability by statement kind, before matching the result: a
         // write/DDL/COMMIT can commit even when it then errors — an autocommit
         // statement, an identity reservation (its own mini-commit, made even
         // inside an open transaction and even if the row insert later fails),
         // or the outermost COMMIT.
         run.committed |= statement_may_commit(statement);
-        match exec_statement(storage, statement, txn_ctx) {
-            Ok(result) => run.results.push(result),
+        match exec_statement_streamed(storage, statement, txn_ctx, run) {
+            Ok(outcome) => {
+                let in_transaction = txn_ctx.in_txn();
+                // This statement's DONE acknowledges a durable commit when it
+                // could commit and no transaction remains open to take it back
+                // (autocommit, DDL, or the outermost COMMIT itself). An in-
+                // transaction write's DONE promises nothing durable yet.
+                let acks_commit = statement_may_commit(statement) && !in_transaction;
+                match outcome {
+                    StatementOutcome::Streamed { rows } => {
+                        run.done(Some(rows), acks_commit, in_transaction);
+                    }
+                    StatementOutcome::Result(StatementResult::Rows(rowset)) => {
+                        let count = rowset.rows.len() as u64;
+                        run.open_rowset(rowset.columns);
+                        run.rows(rowset.rows);
+                        run.done(Some(count), acks_commit, in_transaction);
+                    }
+                    StatementOutcome::Result(StatementResult::RowsAffected(n)) => {
+                        run.done(Some(n), acks_commit, in_transaction);
+                    }
+                    StatementOutcome::Result(StatementResult::Done) => {
+                        run.done(None, acks_commit, in_transaction);
+                    }
+                }
+            }
             Err(error) => {
                 // A cancelled statement aborts the batch immediately (see above):
                 // key on the cancel marker, not any flag, so an Attention landing
                 // concurrently with an unrelated failure cannot suppress that
-                // failure's dooming.
+                // failure's dooming. (No rowset close: the batch ends here, and
+                // its terminal DONE closes anything the statement left open.)
                 if error.number == CANCEL_ERROR {
                     return Err(error);
                 }
-                // Inside a TRY, any error transfers to the matching CATCH.
+                // Inside a TRY, any error transfers to the matching CATCH. The
+                // CATCH runs more statements, so a result set this one already
+                // started streaming must be closed first.
                 if in_try {
+                    run.abort_open_rowset(txn_ctx.in_txn());
                     return Err(error);
                 }
                 // Outside a TRY: `SET XACT_ABORT` (and error severity) decides
@@ -402,6 +654,7 @@ fn run_block(
                 // (only ROLLBACK is then accepted, error 3930).
                 let dooms = txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY;
                 if txn_ctx.in_txn() && !dooms {
+                    run.abort_open_rowset(txn_ctx.in_txn());
                     run.last_error = Some(error);
                     continue;
                 }
@@ -413,6 +666,59 @@ fn run_block(
         }
     }
     Ok(())
+}
+
+/// Whether a statement can open a result set on the stream: a `SELECT` that
+/// returns rows (an assignment `SELECT @v = ...` returns none). `SET
+/// SHOWPLAN_TEXT`'s plan rows ride the same `SELECT` arm.
+fn produces_rowset(statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(select) => !select
+            .items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Assign { .. })),
+        _ => false,
+    }
+}
+
+/// One executed statement's outcome, from [`exec_statement_streamed`].
+enum StatementOutcome {
+    /// The statement's whole result, for the caller to emit.
+    Result(StatementResult),
+    /// A streamed `SELECT`: its columns and rows already left through the
+    /// emitter as the scan produced them; only its DONE remains.
+    Streamed { rows: u64 },
+}
+
+/// Runs one statement. A plain `SELECT` the scan planner accepts streams its
+/// rows through `run` as the scan reads them — the whole point of the event
+/// stream: the client sees rows while the scan runs, and the statement's peak
+/// memory is one chunk, not the result. Everything else executes exactly as
+/// before and returns its materialized result.
+fn exec_statement_streamed(
+    storage: &Storage,
+    statement: &Statement,
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun<'_>,
+) -> Result<StatementOutcome, SqlError> {
+    // The streamed shape: a plain SELECT — no SHOWPLAN (its rows are the plan's,
+    // not the table's), no assignment (routed to exec_select_assign) — that
+    // `scan_plan` accepts. A doomed transaction still allows reads, so the gate
+    // needs no doomed check for a SELECT.
+    if let Statement::Select(select) = statement
+        && !txn_ctx.showplan_text
+        && !select
+            .items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Assign { .. }))
+    {
+        let eval_ctx = txn_ctx.eval_context();
+        if let Some(plan) = scan_plan(storage, select, &eval_ctx) {
+            let rows = scan_select_streamed(storage, &plan, select, &eval_ctx, run)?;
+            return Ok(StatementOutcome::Streamed { rows });
+        }
+    }
+    exec_statement(storage, statement, txn_ctx).map(StatementOutcome::Result)
 }
 
 /// Whether a statement can make a durable commit that the batch must fsync: any
@@ -435,32 +741,6 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::AlterTable(_)
             | Statement::Commit { .. }
     )
-}
-
-/// Blocks until the batch's commit records are fsync-durable (group commit),
-/// when the batch may have committed anything. A durability (fsync) failure
-/// wedges the store — the in-memory state is now ahead of the log, so no further
-/// op may serve it — and *takes precedence over any `prior` statement error*: a
-/// lost commit is more severe than a statement error the client asked about, and
-/// a benign, continued error (e.g. a duplicate-key under `XACT_ABORT OFF` that
-/// the batch ran past before a real `COMMIT`) must not mask it — otherwise the
-/// client would be told the transaction committed while its data is silently
-/// undone as a loser on restart.
-fn finalize_durability(
-    storage: &Storage,
-    committed: bool,
-    prior: Option<SqlError>,
-) -> Option<SqlError> {
-    if !committed {
-        return prior;
-    }
-    match storage.ensure_durable(storage.wal_tail()) {
-        Ok(()) => prior,
-        Err(err) => {
-            storage.wedge();
-            Some(map_storage_err(err, ""))
-        }
-    }
 }
 
 /// The table/database locks a batch needs, from its statements and the
@@ -4936,20 +5216,67 @@ fn scan_select(
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
-    #[cfg(test)]
-    storage.count_scan_select();
-    let types = &plan.types;
     let mut out = RowSet {
         columns: plan.columns.clone(),
         rows: Vec::new(),
     };
-    // TOP counts rows *kept*, matching the collecting path's truncation of the
-    // filtered rows. `TOP 0` never reaches here (the gate declines it).
-    let enough = |out: &RowSet| select.top.is_some_and(|top| out.rows.len() as u64 >= top);
+    scan_select_rows(storage, plan, select, eval_ctx, &mut |row| {
+        out.rows.push(row);
+    })?;
+    Ok(out)
+}
+
+/// Rows per [`BatchEmitter::rows`] chunk on the streamed scan path: enough to
+/// amortize the per-event cost, small enough that the statement's peak memory
+/// is a chunk, not the result.
+const STREAM_CHUNK_ROWS: usize = 256;
+
+/// The streamed shape of [`scan_select`]: opens the result set, then emits
+/// kept rows in [`STREAM_CHUNK_ROWS`] chunks as the scan produces them, so the
+/// client sees rows while the scan is still running. On a mid-scan error the
+/// full chunks already emitted stand — the caller closes the set (see
+/// [`BatchRun::abort_open_rowset`]) — and the partial chunk is dropped.
+fn scan_select_streamed(
+    storage: &Storage,
+    plan: &ScanPlan,
+    select: &Select,
+    eval_ctx: &EvalContext,
+    run: &mut BatchRun<'_>,
+) -> Result<u64, SqlError> {
+    run.open_rowset(plan.columns.clone());
+    let mut chunk: Vec<Vec<Datum>> = Vec::new();
+    let kept = scan_select_rows(storage, plan, select, eval_ctx, &mut |row| {
+        chunk.push(row);
+        if chunk.len() >= STREAM_CHUNK_ROWS {
+            run.rows(std::mem::take(&mut chunk));
+        }
+    })?;
+    run.rows(chunk);
+    Ok(kept)
+}
+
+/// Walks the plan's access path, filters, projects, and hands each kept row to
+/// `sink`, stopping once `TOP` is satisfied. Returns the number of rows kept
+/// (which `TOP` counts, matching the collecting path's truncation of the
+/// filtered rows — `TOP 0` never reaches here, the gate declines it). Both
+/// executions of the scan shape ride this walk: [`scan_select`] collects into
+/// a `RowSet`, [`scan_select_streamed`] emits chunks as slices are read.
+fn scan_select_rows(
+    storage: &Storage,
+    plan: &ScanPlan,
+    select: &Select,
+    eval_ctx: &EvalContext,
+    sink: &mut dyn FnMut(Vec<Datum>),
+) -> Result<u64, SqlError> {
+    #[cfg(test)]
+    storage.count_scan_select();
+    let types = &plan.types;
+    let mut kept: u64 = 0;
+    let enough = |kept: u64| select.top.is_some_and(|top| kept >= top);
 
     // One row: filter it, and project it or drop it. `Ok(false)` once TOP is
     // satisfied and the caller should stop reading.
-    let take = |row: Vec<Datum>, out: &mut RowSet| -> Result<bool, SqlError> {
+    let mut take = |row: Vec<Datum>| -> Result<bool, SqlError> {
         check_cancelled()?;
         if let Some(predicate) = &select.where_clause {
             let sql_row = row_values(&row, types);
@@ -4957,9 +5284,9 @@ fn scan_select(
                 return Ok(true);
             }
         }
-        out.rows
-            .push(plan.picks.iter().map(|i| row[*i].clone()).collect());
-        Ok(!enough(out))
+        sink(plan.picks.iter().map(|i| row[*i].clone()).collect());
+        kept += 1;
+        Ok(!enough(kept))
     };
 
     match &plan.access {
@@ -4977,7 +5304,7 @@ fn scan_select(
                     )
                     .map_err(|err| map_storage_err(err, &plan.table))?;
                 for row in slice.drain(..) {
-                    if !take(row, &mut out)? {
+                    if !take(row)? {
                         break 'scan;
                     }
                 }
@@ -5001,13 +5328,13 @@ fn scan_select(
                 )
                 .map_err(|err| map_storage_err(err, &plan.table))?;
             for row in rows {
-                if !take(row, &mut out)? {
+                if !take(row)? {
                     break;
                 }
             }
         }
     }
-    Ok(out)
+    Ok(kept)
 }
 
 /// `SELECT @a = expr, @b = expr2 [FROM ...]` — an assignment SELECT. The value
