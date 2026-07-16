@@ -4430,6 +4430,75 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Version cleanup under load (Stage 13 exit): a live snapshot pins
+    /// exactly the history it may still read through sustained churn — and
+    /// keeps reading its own consistent view — while releasing it lets the
+    /// maintenance prune drop everything.
+    #[test]
+    fn version_cleanup_under_load_pins_then_drops_history() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("cleanup-load");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let mut seed = String::from("INSERT INTO t VALUES ");
+        for i in 0..100 {
+            seed.push_str(&format!("({i}, 0),"));
+        }
+        seed.pop();
+        for sql in [
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            seed.as_str(),
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        storage
+            .ensure_durable(storage.wal_tail())
+            .expect("durability");
+        storage.version_prune();
+        assert_eq!(storage.version_chain_count("t"), 0, "settled baseline");
+
+        // A long-lived snapshot (an idle SNAPSHOT transaction's view) while
+        // a writer churns every row, five rounds, pruning between rounds.
+        let pinned = storage.capture_read_snapshot(None);
+        for round in 1..=5 {
+            let outcome = execute_batch(&storage, &format!("UPDATE t SET v = {round}"), &mut ctx);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            storage
+                .ensure_durable(storage.wal_tail())
+                .expect("durability");
+            storage.version_prune();
+        }
+        assert_eq!(
+            storage.version_chain_count("t"),
+            100,
+            "the live snapshot pins one chain per churned row"
+        );
+        // The pinned view still reads its consistent state through all of it.
+        let rows = storage
+            .rel_scan_snapshot("t", Some(&[1]), pinned)
+            .expect("snapshot scan");
+        assert_eq!(rows.len(), 100);
+        assert!(
+            rows.iter().all(|r| r == &vec![Datum::Int(0)]),
+            "the snapshot sees the pre-churn value on every row"
+        );
+
+        // Released: the next prune drops the whole store.
+        storage.release_read_snapshot(pinned.seq);
+        storage.version_prune();
+        assert_eq!(
+            storage.version_chain_count("t"),
+            0,
+            "released history is dropped, the store is bounded"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Publishing versions changes nothing about crash recovery: the store
     /// (chains and commit table) is memory-only, so a kill-and-reopen with
     /// RCSI on recovers exactly the committed state, options intact, chains
