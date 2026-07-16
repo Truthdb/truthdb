@@ -3562,38 +3562,26 @@ impl ScanStream {
     }
 }
 
-/// A [`Source`] with its rows fully in hand — what the join operators (which
-/// walk their inputs repeatedly) consume.
+/// A [`Source`] with its rows fully in hand — the join operators' BUILD side,
+/// which is walked repeatedly (nested loop) or hashed whole (the grace-hash
+/// spill bounds it past the memory budget). The probe side never takes this
+/// form: it streams via [`SourceRows::next_slice`].
 struct MaterializedSource {
     columns: Vec<ResultColumn>,
-    qualifiers: Vec<Option<String>>,
     collations: Vec<Option<String>>,
     rows: Vec<Vec<Datum>>,
 }
 
 impl MaterializedSource {
-    fn scope(&self) -> JoinScope {
-        JoinScope {
-            columns: self
-                .qualifiers
-                .iter()
-                .zip(&self.columns)
-                .map(|(qualifier, column)| (qualifier.clone(), column.name.clone()))
-                .collect(),
-            collations: self.collations.clone(),
-        }
-    }
-
     fn from(source: Source, storage: &Storage) -> Result<Self, SqlError> {
         let Source {
             columns,
-            qualifiers,
             collations,
             rows,
+            ..
         } = source;
         Ok(MaterializedSource {
             columns,
-            qualifiers,
             collations,
             rows: rows.materialize(storage)?,
         })
@@ -3601,6 +3589,22 @@ impl MaterializedSource {
 }
 
 impl SourceRows {
+    /// Pulls the next batch of rows, for a consumer that walks the source
+    /// exactly once (a join's probe side). A scan hands over its next slice; a
+    /// materialized source hands everything in one batch.
+    fn next_slice(&mut self, storage: &Storage) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        match self {
+            SourceRows::Materialized(rows) => {
+                if rows.is_empty() {
+                    Ok(None)
+                } else {
+                    Ok(Some(std::mem::take(rows)))
+                }
+            }
+            SourceRows::Scan(stream) => stream.next_slice(storage),
+        }
+    }
+
     /// The whole input, for consumers that need it at once. A scan drains its
     /// remaining slices; a materialized source hands its rows over as-is.
     fn materialize(self, storage: &Storage) -> Result<Vec<Vec<Datum>>, SqlError> {
@@ -6719,9 +6723,11 @@ fn build_derived_source(
     })
 }
 
-/// Nested-loop join of two materialized sources. The ON predicate (absent for
-/// CROSS) is evaluated against the concatenated row; outer joins emit NULL-
-/// extended rows for unmatched sides.
+/// Joins two sources. The PROBE side — the side driving output, walked exactly
+/// once: left, or right for a RIGHT join — streams slice-by-slice; only the
+/// BUILD side is materialized here, and the hash join grace-spills it past the
+/// memory budget. The ON predicate (absent for CROSS) is evaluated against the
+/// concatenated row; outer joins emit NULL-extended rows for unmatched sides.
 fn join_sources(
     storage: &Storage,
     left: Source,
@@ -6730,12 +6736,6 @@ fn join_sources(
     on: Option<&Expr>,
     eval_ctx: &EvalContext,
 ) -> Result<Source, SqlError> {
-    // The join operators walk both inputs (the build side repeatedly), so a
-    // lazily-scanned input is drained here; the operators themselves bound or
-    // spill their working set past the budget. Streaming the PROBE side is
-    // the follow-up this shape allows.
-    let left = MaterializedSource::from(left, storage)?;
-    let right = MaterializedSource::from(right, storage)?;
     let mut columns = left.columns.clone();
     columns.extend(right.columns.clone());
     let mut qualifiers = left.qualifiers.clone();
@@ -6789,82 +6789,85 @@ fn join_sources(
         None => Vec::new(),
     };
 
+    // The build side is the one NOT driving output: left for RIGHT, else
+    // right. It is walked repeatedly (nested loop) or hashed whole, so it
+    // materializes here (bounded by the grace-hash spill past the budget);
+    // the probe side stays a stream.
+    let build_left = matches!(kind, JoinKind::Right);
+    let (probe, build) = if build_left {
+        (right, left)
+    } else {
+        (left, right)
+    };
+    let build = MaterializedSource::from(build, storage)?;
+    // LEFT/RIGHT/FULL null-extend unmatched probe rows; FULL also null-extends
+    // unmatched build rows. Emission is oriented so output is always
+    // [left columns .. right columns].
+    let preserve_probe = matches!(kind, JoinKind::Left | JoinKind::Right | JoinKind::Full);
+    let preserve_build = matches!(kind, JoinKind::Full);
+    let emit_match = |p: &[Datum], b: &[Datum]| -> Vec<Datum> {
+        if build_left {
+            concat(b, p)
+        } else {
+            concat(p, b)
+        }
+    };
+    let emit_probe_only = |p: &[Datum]| -> Vec<Datum> {
+        if build_left {
+            concat(&left_nulls, p)
+        } else {
+            concat(p, &right_nulls)
+        }
+    };
+    let emit_build_only = |b: &[Datum]| -> Vec<Datum> {
+        if build_left {
+            concat(b, &right_nulls)
+        } else {
+            concat(&left_nulls, b)
+        }
+    };
+
     let mut rows = Vec::new();
     if !equi.is_empty() && !matches!(kind, JoinKind::Cross) {
         hash_join(
             storage,
-            &left,
-            &right,
-            kind,
+            probe,
+            &build,
+            build_left,
             &equi,
+            preserve_probe,
+            preserve_build,
             &matches,
-            &concat,
-            &left_nulls,
-            &right_nulls,
+            &emit_match,
+            &emit_probe_only,
+            &emit_build_only,
             &mut rows,
         )?;
     } else {
-        match kind {
-            JoinKind::Cross | JoinKind::Inner => {
-                for l in &left.rows {
-                    check_cancelled()?;
-                    for r in &right.rows {
-                        if matches(l, r)? {
-                            rows.push(concat(l, r));
-                        }
+        // Nested loop: stream the probe side, walking the whole build side
+        // per probe row.
+        let mut build_matched = vec![false; build.rows.len()];
+        let mut probe_rows = probe.rows;
+        while let Some(slice) = probe_rows.next_slice(storage)? {
+            for p in &slice {
+                check_cancelled()?;
+                let mut matched = false;
+                for (bi, b) in build.rows.iter().enumerate() {
+                    if matches_oriented(p, b, build_left, &matches)? {
+                        rows.push(emit_match(p, b));
+                        matched = true;
+                        build_matched[bi] = true;
                     }
+                }
+                if preserve_probe && !matched {
+                    rows.push(emit_probe_only(p));
                 }
             }
-            JoinKind::Left => {
-                for l in &left.rows {
-                    check_cancelled()?;
-                    let mut matched = false;
-                    for r in &right.rows {
-                        if matches(l, r)? {
-                            rows.push(concat(l, r));
-                            matched = true;
-                        }
-                    }
-                    if !matched {
-                        rows.push(concat(l, &right_nulls));
-                    }
-                }
-            }
-            JoinKind::Right => {
-                for r in &right.rows {
-                    check_cancelled()?;
-                    let mut matched = false;
-                    for l in &left.rows {
-                        if matches(l, r)? {
-                            rows.push(concat(l, r));
-                            matched = true;
-                        }
-                    }
-                    if !matched {
-                        rows.push(concat(&left_nulls, r));
-                    }
-                }
-            }
-            JoinKind::Full => {
-                let mut right_matched = vec![false; right.rows.len()];
-                for l in &left.rows {
-                    check_cancelled()?;
-                    let mut matched = false;
-                    for (index, r) in right.rows.iter().enumerate() {
-                        if matches(l, r)? {
-                            rows.push(concat(l, r));
-                            matched = true;
-                            right_matched[index] = true;
-                        }
-                    }
-                    if !matched {
-                        rows.push(concat(l, &right_nulls));
-                    }
-                }
-                for (index, r) in right.rows.iter().enumerate() {
-                    if !right_matched[index] {
-                        rows.push(concat(&left_nulls, r));
-                    }
+        }
+        if preserve_build {
+            for (bi, b) in build.rows.iter().enumerate() {
+                if !build_matched[bi] {
+                    rows.push(emit_build_only(b));
                 }
             }
         }
@@ -6888,11 +6891,7 @@ type EquiKey = (usize, usize);
 /// join, an expression key, or a type-mismatched equality) yields an empty list
 /// and the caller keeps the nested-loop join. Non-equi conjuncts are left for
 /// the full-ON re-check on each hash candidate, so results are unchanged.
-fn extract_equi_keys(
-    pred: &Expr,
-    left: &MaterializedSource,
-    right: &MaterializedSource,
-) -> Vec<EquiKey> {
+fn extract_equi_keys(pred: &Expr, left: &Source, right: &Source) -> Vec<EquiKey> {
     let left_scope = left.scope();
     let right_scope = right.scope();
     // `Some(true)` = resolves uniquely to the left source, `Some(false)` = right,
@@ -6956,73 +6955,31 @@ fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 /// temp extents (matching rows share a partition, since equal keys hash equally,
 /// so per-partition matched/unmatched equals globally matched/unmatched), then
 /// join each partition pair in memory — the build hash table is bounded to one
-/// partition. Each partition materializes only the build side and streams the
-/// probe side. NULL-keyed rows never match: the outer side's are null-extended
+/// partition. The probe input streams straight into its partitions; each
+/// partition then materializes only its build rows and streams its probe rows
+/// back. NULL-keyed rows never match: the outer side's are null-extended
 /// directly, the inner side's are dropped. Output order is by partition
 /// (immaterial — a spilling join is not order-sensitive).
 #[allow(clippy::too_many_arguments)]
 fn grace_hash_join(
     storage: &Storage,
-    left: &MaterializedSource,
-    right: &MaterializedSource,
-    kind: JoinKind,
-    left_key: &impl Fn(&[Datum]) -> Vec<SqlValue>,
-    right_key: &impl Fn(&[Datum]) -> Vec<SqlValue>,
+    mut probe_rows: SourceRows,
+    build: &MaterializedSource,
+    build_left: bool,
+    preserve_probe: bool,
+    preserve_build: bool,
+    probe_key: &impl Fn(&[Datum]) -> Vec<SqlValue>,
+    build_key: &impl Fn(&[Datum]) -> Vec<SqlValue>,
     matches: &impl Fn(&[Datum], &[Datum]) -> Result<bool, SqlError>,
-    concat: &impl Fn(&[Datum], &[Datum]) -> Vec<Datum>,
-    left_nulls: &[Datum],
-    right_nulls: &[Datum],
+    emit_match: &impl Fn(&[Datum], &[Datum]) -> Vec<Datum>,
+    emit_probe_only: &impl Fn(&[Datum]) -> Vec<Datum>,
+    emit_build_only: &impl Fn(&[Datum]) -> Vec<Datum>,
     rows: &mut Vec<Vec<Datum>>,
 ) -> Result<(), SqlError> {
     use hash::{HashKey, key_has_null};
     use std::collections::HashMap;
 
-    // The build side is the one NOT driving output: left for RIGHT, else right.
-    let build_left = matches!(kind, JoinKind::Right);
-    let preserve_probe = !matches!(kind, JoinKind::Inner); // LEFT/RIGHT/FULL keep the probe side
-    let preserve_build = matches!(kind, JoinKind::Full); // FULL also keeps the build side
-
-    // Orientation helpers so output is always [left columns .. right columns].
-    let emit_match = |probe: &[Datum], build: &[Datum]| -> Vec<Datum> {
-        if build_left {
-            concat(build, probe)
-        } else {
-            concat(probe, build)
-        }
-    };
-    let emit_probe_only = |probe: &[Datum]| -> Vec<Datum> {
-        if build_left {
-            concat(left_nulls, probe)
-        } else {
-            concat(probe, right_nulls)
-        }
-    };
-    let emit_build_only = |build: &[Datum]| -> Vec<Datum> {
-        if build_left {
-            concat(build, right_nulls)
-        } else {
-            concat(left_nulls, build)
-        }
-    };
-    // build side = left for RIGHT (build_left), else right; probe is the other.
-    let build_rows_all = if build_left { &left.rows } else { &right.rows };
-    let probe_rows = if build_left { &right.rows } else { &left.rows };
-    let build_key = |r: &[Datum]| {
-        if build_left {
-            left_key(r)
-        } else {
-            right_key(r)
-        }
-    };
-    let probe_key = |r: &[Datum]| {
-        if build_left {
-            right_key(r)
-        } else {
-            left_key(r)
-        }
-    };
-
-    let build_bytes: usize = build_rows_all.iter().map(|r| approx_row_bytes(r)).sum();
+    let build_bytes: usize = build.rows.iter().map(|r| approx_row_bytes(r)).sum();
     let partitions = (build_bytes / sort_budget() + 1).max(2);
     let partition_of = |key: &[SqlValue]| -> usize {
         use std::hash::{Hash, Hasher};
@@ -7039,21 +6996,23 @@ fn grace_hash_join(
         .map(|_| crate::relstore::spill::RowSpool::new(storage))
         .collect();
     // Partition non-null-key rows; null-key rows can't match, so emit the outer
-    // side's now and drop the rest.
-    for p in probe_rows {
-        check_cancelled()?;
-        let key = probe_key(p);
-        if key_has_null(&key) {
-            if preserve_probe {
-                rows.push(emit_probe_only(p));
+    // side's now and drop the rest. The probe side streams slice-by-slice.
+    while let Some(slice) = probe_rows.next_slice(storage)? {
+        for p in &slice {
+            check_cancelled()?;
+            let key = probe_key(p);
+            if key_has_null(&key) {
+                if preserve_probe {
+                    rows.push(emit_probe_only(p));
+                }
+                continue;
             }
-            continue;
+            probe_parts[partition_of(&key)]
+                .write_row(p)
+                .map_err(spill_err)?;
         }
-        probe_parts[partition_of(&key)]
-            .write_row(p)
-            .map_err(spill_err)?;
     }
-    for b in build_rows_all {
+    for b in &build.rows {
         check_cancelled()?;
         let key = build_key(b);
         if key_has_null(&key) {
@@ -7125,181 +7084,148 @@ fn matches_oriented(
     }
 }
 
-/// Hash join over two materialized sources on the given equi-key columns. The
-/// build side is hashed by its key tuple; the probe side drives output so row
-/// order matches the nested loop exactly (INNER/LEFT drive from the left,
-/// RIGHT from the right, FULL from the left with a right-side matched bitmap).
-/// NULL key components never match (`x = NULL` is UNKNOWN), so NULL-keyed rows
-/// are excluded from the table and treated as unmatched. The full ON predicate
-/// is re-evaluated on every candidate, so residual (non-equi) conjuncts and the
-/// 3VL of the equality are honored identically to the nested loop. A large INNER
-/// join spills via [`grace_hash_inner_join`].
+/// Hash join on the given equi-key columns. The build side is hashed by its
+/// key tuple; the probe side streams and drives output, so row order matches
+/// the nested loop exactly (unmatched build rows for FULL are null-extended at
+/// the end, as the loop does). NULL key components never match (`x = NULL` is
+/// UNKNOWN), so NULL-keyed rows are excluded from the table and treated as
+/// unmatched. The full ON predicate is re-evaluated on every candidate, so
+/// residual (non-equi) conjuncts and the 3VL of the equality are honored
+/// identically to the nested loop. A build side past the memory budget spills
+/// via [`grace_hash_join`].
 #[allow(clippy::too_many_arguments)]
 fn hash_join(
     storage: &Storage,
-    left: &MaterializedSource,
-    right: &MaterializedSource,
-    kind: JoinKind,
+    probe: Source,
+    build: &MaterializedSource,
+    build_left: bool,
     equi: &[EquiKey],
+    preserve_probe: bool,
+    preserve_build: bool,
     matches: &impl Fn(&[Datum], &[Datum]) -> Result<bool, SqlError>,
-    concat: &impl Fn(&[Datum], &[Datum]) -> Vec<Datum>,
-    left_nulls: &[Datum],
-    right_nulls: &[Datum],
+    emit_match: &impl Fn(&[Datum], &[Datum]) -> Vec<Datum>,
+    emit_probe_only: &impl Fn(&[Datum]) -> Vec<Datum>,
+    emit_build_only: &impl Fn(&[Datum]) -> Vec<Datum>,
     rows: &mut Vec<Vec<Datum>>,
 ) -> Result<(), SqlError> {
     use hash::{HashKey, key_has_null};
     use std::collections::HashMap;
 
+    let Source {
+        columns: probe_columns,
+        collations: probe_collations,
+        rows: mut probe_rows,
+        ..
+    } = probe;
+
     // The case sensitivity governing each equi-key pair — the combined collation
-    // of its two columns. The hash key is only a *pre-filter*: the full ON
-    // predicate (collation-aware `matches`) re-checks each candidate, so the
-    // buckets must be a superset of true matches. Folding both sides' key strings
-    // by this sensitivity ensures case-insensitive-equal keys share a bucket (an
+    // of its two columns, combined in left/right order (`combine` favors its
+    // first operand when both sides are exact, and `matches` combines in that
+    // same order). The hash key is only a *pre-filter*: the full ON predicate
+    // (collation-aware `matches`) re-checks each candidate, so the buckets must
+    // be a superset of true matches. Folding both sides' key strings by this
+    // sensitivity ensures case-insensitive-equal keys share a bucket (an
     // unfolded, case-sensitive hash would put `'abc'` and `'ABC'` in different
     // buckets, and the CI `matches` would never be consulted → a lost match).
+    let (left_collations, right_collations) = if build_left {
+        (&build.collations, &probe_collations)
+    } else {
+        (&probe_collations, &build.collations)
+    };
     let key_sens: Vec<CollationSensitivity> = equi
         .iter()
         .map(|&(i, j)| {
-            CollationSensitivity::from_optional(left.collations.get(i).and_then(|c| c.as_deref()))
+            CollationSensitivity::from_optional(left_collations.get(i).and_then(|c| c.as_deref()))
                 .combine(CollationSensitivity::from_optional(
-                    right.collations.get(j).and_then(|c| c.as_deref()),
+                    right_collations.get(j).and_then(|c| c.as_deref()),
                 ))
         })
         .collect();
-    let left_key = |l: &[Datum]| -> Vec<SqlValue> {
-        equi.iter()
+    // Each equi pair reoriented as (probe column, build column): the pairs are
+    // (left, right), and the build side is left exactly for a RIGHT join.
+    let key_cols: Vec<(usize, usize)> = equi
+        .iter()
+        .map(|&(i, j)| if build_left { (j, i) } else { (i, j) })
+        .collect();
+    let probe_key = |p: &[Datum]| -> Vec<SqlValue> {
+        key_cols
+            .iter()
             .zip(&key_sens)
-            .map(|(&(i, _), &sens)| {
-                sens.fold_value(value::datum_to_sql(&l[i], &left.columns[i].column_type))
+            .map(|(&(pc, _), &sens)| {
+                sens.fold_value(value::datum_to_sql(&p[pc], &probe_columns[pc].column_type))
             })
             .collect()
     };
-    let right_key = |r: &[Datum]| -> Vec<SqlValue> {
-        equi.iter()
+    let build_key = |b: &[Datum]| -> Vec<SqlValue> {
+        key_cols
+            .iter()
             .zip(&key_sens)
-            .map(|(&(_, j), &sens)| {
-                sens.fold_value(value::datum_to_sql(&r[j], &right.columns[j].column_type))
+            .map(|(&(_, bc), &sens)| {
+                sens.fold_value(value::datum_to_sql(&b[bc], &build.columns[bc].column_type))
             })
             .collect()
     };
 
-    // Grace-hash spill for a large join (any kind): partition both sides by
-    // join-key hash so each partition's build table fits in the memory budget.
-    {
-        let build_rows = if matches!(kind, JoinKind::Right) {
-            &left.rows
-        } else {
-            &right.rows
-        };
-        let build_bytes: usize = build_rows.iter().map(|r| approx_row_bytes(r)).sum();
-        if build_bytes > sort_budget() {
-            return grace_hash_join(
-                storage,
-                left,
-                right,
-                kind,
-                &left_key,
-                &right_key,
-                matches,
-                concat,
-                left_nulls,
-                right_nulls,
-                rows,
-            );
-        }
+    // Grace-hash spill for a large build side (any kind): partition both sides
+    // by join-key hash so each partition's build table fits the memory budget.
+    let build_bytes: usize = build.rows.iter().map(|r| approx_row_bytes(r)).sum();
+    if build_bytes > sort_budget() {
+        return grace_hash_join(
+            storage,
+            probe_rows,
+            build,
+            build_left,
+            preserve_probe,
+            preserve_build,
+            &probe_key,
+            &build_key,
+            matches,
+            emit_match,
+            emit_probe_only,
+            emit_build_only,
+            rows,
+        );
     }
 
-    // The build side is the one NOT driving output: right for INNER/LEFT/FULL,
-    // left for RIGHT.
-    let build_left = matches!(kind, JoinKind::Right);
     let mut table: HashMap<HashKey, Vec<usize>> = HashMap::new();
-    let build_rows = if build_left { &left.rows } else { &right.rows };
-    for (index, row) in build_rows.iter().enumerate() {
+    for (index, row) in build.rows.iter().enumerate() {
         check_cancelled()?;
-        let key = if build_left {
-            left_key(row)
-        } else {
-            right_key(row)
-        };
+        let key = build_key(row);
         if key_has_null(&key) {
             continue;
         }
         table.entry(HashKey(key)).or_default().push(index);
     }
 
-    match kind {
-        JoinKind::Inner | JoinKind::Left => {
-            for l in &left.rows {
-                check_cancelled()?;
-                let key = left_key(l);
-                let mut matched = false;
-                if !key_has_null(&key)
-                    && let Some(cands) = table.get(&HashKey(key))
-                {
-                    for &ri in cands {
-                        let r = &right.rows[ri];
-                        if matches(l, r)? {
-                            rows.push(concat(l, r));
-                            matched = true;
-                        }
+    let mut build_matched = vec![false; build.rows.len()];
+    while let Some(slice) = probe_rows.next_slice(storage)? {
+        for p in &slice {
+            check_cancelled()?;
+            let key = probe_key(p);
+            let mut matched = false;
+            if !key_has_null(&key)
+                && let Some(cands) = table.get(&HashKey(key))
+            {
+                for &bi in cands {
+                    let b = &build.rows[bi];
+                    if matches_oriented(p, b, build_left, matches)? {
+                        rows.push(emit_match(p, b));
+                        matched = true;
+                        build_matched[bi] = true;
                     }
                 }
-                if kind == JoinKind::Left && !matched {
-                    rows.push(concat(l, right_nulls));
-                }
+            }
+            if preserve_probe && !matched {
+                rows.push(emit_probe_only(p));
             }
         }
-        JoinKind::Right => {
-            for r in &right.rows {
-                check_cancelled()?;
-                let key = right_key(r);
-                let mut matched = false;
-                if !key_has_null(&key)
-                    && let Some(cands) = table.get(&HashKey(key))
-                {
-                    for &li in cands {
-                        let l = &left.rows[li];
-                        if matches(l, r)? {
-                            rows.push(concat(l, r));
-                            matched = true;
-                        }
-                    }
-                }
-                if !matched {
-                    rows.push(concat(left_nulls, r));
-                }
+    }
+    if preserve_build {
+        for (bi, b) in build.rows.iter().enumerate() {
+            if !build_matched[bi] {
+                rows.push(emit_build_only(b));
             }
         }
-        JoinKind::Full => {
-            let mut right_matched = vec![false; right.rows.len()];
-            for l in &left.rows {
-                check_cancelled()?;
-                let key = left_key(l);
-                let mut matched = false;
-                if !key_has_null(&key)
-                    && let Some(cands) = table.get(&HashKey(key))
-                {
-                    for &ri in cands {
-                        let r = &right.rows[ri];
-                        if matches(l, r)? {
-                            rows.push(concat(l, r));
-                            matched = true;
-                            right_matched[ri] = true;
-                        }
-                    }
-                }
-                if !matched {
-                    rows.push(concat(l, right_nulls));
-                }
-            }
-            for (index, r) in right.rows.iter().enumerate() {
-                if !right_matched[index] {
-                    rows.push(concat(left_nulls, r));
-                }
-            }
-        }
-        // CROSS never reaches here (the caller keeps the nested loop for it).
-        JoinKind::Cross => unreachable!("cross join has no equi keys"),
     }
     Ok(())
 }
