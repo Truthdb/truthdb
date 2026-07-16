@@ -160,6 +160,53 @@ def main() -> int:
         print(f"FAIL: session intrinsics: db={db!r} login={login!r} spid={spid!r}")
         return 1
 
+    # A statement that fails after its result set began streaming (the server
+    # emits rows as the scan runs since #105). The failed set is closed with a
+    # clean DONE — an error-flagged DONE without an ERROR token would make
+    # this driver raise "Request failed, server didn't send error message"
+    # and strand the results behind it.
+    cur.execute("CREATE TABLE stream_err (id INT NOT NULL PRIMARY KEY)")
+    cur.execute("INSERT INTO stream_err VALUES " +
+                ", ".join(f"({i})" for i in range(1, 401)))
+
+    # Caught mid-stream error: the batch succeeds, the CATCH set is readable.
+    cur.execute("BEGIN TRY SELECT id FROM stream_err WHERE 10 / (id - 300) > -100 END TRY "
+                "BEGIN CATCH SELECT 99 AS caught END CATCH")
+    partial = cur.fetchall()
+    if len(partial) >= 300:
+        print(f"FAIL: caught mid-stream error returned {len(partial)} rows, expected a partial set")
+        return 1
+    if not cur.nextset():
+        print("FAIL: the CATCH result set is unreachable after a caught mid-stream error")
+        return 1
+    if cur.fetchall() != [(99,)]:
+        print("FAIL: the CATCH result set did not arrive intact")
+        return 1
+
+    # Caught mid-stream error with an EMPTY catch: the whole batch reads as
+    # success (the buffered path sent one clean final DONE for this shape).
+    cur.execute("BEGIN TRY SELECT id FROM stream_err WHERE 10 / (id - 300) > -100 END TRY "
+                "BEGIN CATCH END CATCH")
+    cur.fetchall()
+    while cur.nextset():
+        cur.fetchall()
+
+    # Continued mid-stream error (XACT_ABORT OFF, in-transaction): the batch
+    # runs to the end and the real error text arrives with the final DONE.
+    try:
+        cur.execute("BEGIN TRANSACTION; "
+                    "SELECT id FROM stream_err WHERE 10 / (id - 300) > -100; "
+                    "SELECT 7 AS after; COMMIT")
+        cur.fetchall()
+        while cur.nextset():
+            cur.fetchall()
+        print("FAIL: the continued divide-by-zero never surfaced")
+        return 1
+    except pytds.tds_base.Error as e:
+        if "divide" not in str(e).lower() and "8134" not in str(e):
+            print(f"FAIL: continued error lost its text: {e}")
+            return 1
+
     conn.close()
     print("tds conformance: OK")
     return 0

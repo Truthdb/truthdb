@@ -276,12 +276,14 @@ pub fn execute_batch_with_params(
 /// the batch's terminal error (what `BatchOutcome::error` carried), reported by
 /// the caller after the statement events.
 ///
-/// Durability keeps its ordering: a DONE that acknowledges a commit the client
-/// may rely on (an autocommit write, DDL, the outermost `COMMIT`) is never
-/// emitted before that commit is fsync-durable. DONEs queue in the run and
-/// flush — fsyncing first if any of them acknowledges a commit — before the
-/// next result set opens and at the end of the batch, so a batch of writes
-/// with nothing to stream between them still costs one fsync, as before.
+/// Durability keeps its ordering: nothing the client can rely on — a DONE
+/// acknowledging a commit, or rows carrying commit-derived state such as a
+/// reserved identity value — is emitted before the commit behind it is
+/// fsync-durable. DONEs queue in the run and flush before the next result set
+/// opens and at the end of the batch; both points fsync first when any
+/// statement since the last one may have committed (the same kind-based test
+/// as before), so a batch of writes with nothing to stream between them still
+/// costs one fsync.
 pub fn execute_batch_streamed(
     storage: &Storage,
     sql: &str,
@@ -318,7 +320,6 @@ pub fn execute_batch_streamed(
     let mut run = BatchRun {
         emitter,
         deferred: Vec::new(),
-        ack_pending: false,
         rowset_open: false,
         durability_failed: false,
         committed: false,
@@ -349,10 +350,9 @@ pub trait BatchEmitter {
     /// the transaction state after it ran.
     fn statement_done(&mut self, count: Option<u64>, in_transaction: bool);
     /// Ends a statement that failed after its result set had begun streaming:
-    /// the set is closed with an error-flagged DONE so the stream stays framed
-    /// for the statements that follow. The error itself is reported separately
-    /// — at the end of the batch for a continued error, or not at all for one
-    /// a `CATCH` handled.
+    /// the set is closed so the stream stays framed for the statements that
+    /// follow. The error itself is reported separately — at the end of the
+    /// batch for a continued error, or not at all for one a `CATCH` handled.
     fn statement_aborted(&mut self, in_transaction: bool);
 }
 
@@ -415,9 +415,6 @@ struct BatchRun<'a> {
     /// (the next result set opening, or the end of the batch) so a DONE that
     /// acknowledges a commit is never emitted before that commit is durable.
     deferred: Vec<DeferredDone>,
-    /// Some deferred DONE acknowledges a commit (a write/DDL/`COMMIT` completed
-    /// with no transaction left open), so the next flush must fsync first.
-    ack_pending: bool,
     /// A result set's columns have been emitted but its statement has not
     /// finished — the state [`BatchRun::abort_open_rowset`] closes on failure.
     rowset_open: bool,
@@ -459,12 +456,9 @@ impl BatchRun<'_> {
         }
     }
 
-    /// Ends a statement. Its DONE is deferred to the next durability point;
-    /// `acks_commit` marks one that acknowledges a durable commit, which
-    /// forces that point to fsync first.
-    fn done(&mut self, count: Option<u64>, acks_commit: bool, in_transaction: bool) {
+    /// Ends a statement. Its DONE is deferred to the next durability point.
+    fn done(&mut self, count: Option<u64>, in_transaction: bool) {
         self.rowset_open = false;
-        self.ack_pending |= acks_commit;
         self.deferred.push(DeferredDone {
             count,
             in_transaction,
@@ -483,18 +477,23 @@ impl BatchRun<'_> {
         }
     }
 
-    /// Emits the deferred DONEs, fsyncing first when one of them acknowledges
-    /// a commit. On a durability failure the DONEs it can no longer stand
-    /// behind are dropped and the batch terminates (see [`Self::make_durable`]).
+    /// Emits the deferred DONEs, fsyncing first when any statement since the
+    /// last durability point may have committed. The gate is the same
+    /// kind-based `committed` flag the batch-end fsync uses — not "does some
+    /// DONE acknowledge a commit" — because commit-derived state escapes
+    /// through the *rows* of whatever result set opens next, not only through
+    /// DONEs: an identity value reserved by an in-transaction INSERT (a
+    /// mini-commit) is readable one statement later via `SELECT
+    /// SCOPE_IDENTITY()`, and a value the client has seen must never be
+    /// reissued after a crash. On a durability failure the DONEs the batch
+    /// can no longer stand behind are dropped and the batch terminates (see
+    /// [`Self::make_durable`]).
     fn flush(&mut self, storage: &Storage) -> Result<(), SqlError> {
-        if self.ack_pending {
-            self.ack_pending = false;
+        if self.committed {
+            self.committed = false;
             if let Some(error) = self.make_durable(storage) {
                 return Err(error);
             }
-            // Everything appended so far is durable; the batch-end fsync is
-            // owed only for what later statements append.
-            self.committed = false;
         }
         for done in self.deferred.drain(..) {
             self.emitter.statement_done(done.count, done.in_transaction);
@@ -502,17 +501,14 @@ impl BatchRun<'_> {
         Ok(())
     }
 
-    /// The end of the batch: one fsync if any statement may have committed —
-    /// by kind, not transaction state, so a hidden mini-commit (an identity
-    /// reservation, even inside an open transaction or under a statement that
-    /// then failed) is never missed — then the remaining DONEs. Returns the
-    /// durability error, if any.
+    /// The end of the batch: one fsync if any statement may have committed
+    /// since the last durability point — by kind, not transaction state, so a
+    /// hidden mini-commit (an identity reservation, even inside an open
+    /// transaction or under a statement that then failed) is never missed —
+    /// then the remaining DONEs. Returns the durability error, if any.
     fn finish(&mut self, storage: &Storage) -> Option<SqlError> {
-        // An acknowledgment implies a commit, so `committed` alone gates.
-        debug_assert!(!self.ack_pending || self.committed);
         if self.committed {
             self.committed = false;
-            self.ack_pending = false;
             if let Some(error) = self.make_durable(storage) {
                 return Some(error);
             }
@@ -594,8 +590,9 @@ fn run_block(
             continue;
         }
         // A statement that can open a result set is a durability point: the
-        // deferred DONEs — and the fsync a commit acknowledgment among them
-        // owes — must reach the stream before its columns do.
+        // deferred DONEs must reach the stream before its columns do, and any
+        // commit made so far must be fsync-durable before rows that can carry
+        // its state (an identity value, via SCOPE_IDENTITY()) leave the server.
         if produces_rowset(statement) {
             run.flush(storage)?;
         }
@@ -608,26 +605,21 @@ fn run_block(
         match exec_statement_streamed(storage, statement, txn_ctx, run) {
             Ok(outcome) => {
                 let in_transaction = txn_ctx.in_txn();
-                // This statement's DONE acknowledges a durable commit when it
-                // could commit and no transaction remains open to take it back
-                // (autocommit, DDL, or the outermost COMMIT itself). An in-
-                // transaction write's DONE promises nothing durable yet.
-                let acks_commit = statement_may_commit(statement) && !in_transaction;
                 match outcome {
                     StatementOutcome::Streamed { rows } => {
-                        run.done(Some(rows), acks_commit, in_transaction);
+                        run.done(Some(rows), in_transaction);
                     }
                     StatementOutcome::Result(StatementResult::Rows(rowset)) => {
                         let count = rowset.rows.len() as u64;
                         run.open_rowset(rowset.columns);
                         run.rows(rowset.rows);
-                        run.done(Some(count), acks_commit, in_transaction);
+                        run.done(Some(count), in_transaction);
                     }
                     StatementOutcome::Result(StatementResult::RowsAffected(n)) => {
-                        run.done(Some(n), acks_commit, in_transaction);
+                        run.done(Some(n), in_transaction);
                     }
                     StatementOutcome::Result(StatementResult::Done) => {
-                        run.done(None, acks_commit, in_transaction);
+                        run.done(None, in_transaction);
                     }
                 }
             }

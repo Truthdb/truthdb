@@ -183,7 +183,89 @@ func main() {
 	parameterizedQueries(db)
 	blockingDemo(db, host, port, user, pass)
 
+	// 14. A statement failing after its result set began streaming (rows are
+	// emitted as the scan runs since #105). The failed set must close with a
+	// clean DONE: an error-flagged DONE with no ERROR token makes this driver
+	// synthesize "Request failed but didn't provide reason" and strand every
+	// result set behind it.
+	midStreamFailures(db)
+
 	fmt.Println("tds conformance (go-mssqldb): OK")
+}
+
+// midStreamFailures exercises statements that fail after their result set has
+// started streaming: caught by TRY/CATCH (batch succeeds, CATCH set intact),
+// caught by an empty CATCH (batch succeeds outright), and continued under
+// XACT_ABORT OFF inside a transaction (the real error text arrives at the end
+// of the batch).
+func midStreamFailures(db *sql.DB) {
+	mustExec(db, "CREATE TABLE stream_err_go (id INT NOT NULL PRIMARY KEY)")
+	values := make([]string, 0, 400)
+	for i := 1; i <= 400; i++ {
+		values = append(values, fmt.Sprintf("(%d)", i))
+	}
+	mustExec(db, "INSERT INTO stream_err_go VALUES "+strings.Join(values, ", "))
+
+	// Caught: a partial first set, then the CATCH's set, no error anywhere.
+	rows, err := db.Query("BEGIN TRY SELECT id FROM stream_err_go WHERE 10 / (id - 300) > -100 END TRY " +
+		"BEGIN CATCH SELECT 99 AS caught END CATCH")
+	if err != nil {
+		fail("caught mid-stream query: %v", err)
+	}
+	partial := drainInts(rows)
+	if len(partial) >= 300 {
+		fail("caught mid-stream error returned %d rows, expected a partial set", len(partial))
+	}
+	if !rows.NextResultSet() {
+		fail("the CATCH result set is unreachable after a caught mid-stream error: %v", rows.Err())
+	}
+	if caught := drainInts(rows); len(caught) != 1 || caught[0] != 99 {
+		fail("the CATCH result set did not arrive intact: %v", caught)
+	}
+	if err := rows.Err(); err != nil {
+		fail("caught mid-stream batch reported an error: %v", err)
+	}
+	rows.Close()
+
+	// Empty CATCH: the whole batch reads as success.
+	rows, err = db.Query("BEGIN TRY SELECT id FROM stream_err_go WHERE 10 / (id - 300) > -100 END TRY " +
+		"BEGIN CATCH END CATCH")
+	if err != nil {
+		fail("empty-catch query: %v", err)
+	}
+	drainInts(rows)
+	for rows.NextResultSet() {
+		drainInts(rows)
+	}
+	if err := rows.Err(); err != nil {
+		fail("empty-catch batch reported an error: %v", err)
+	}
+	rows.Close()
+
+	// Continued (in-transaction, XACT_ABORT OFF): the batch runs on and the
+	// divide-by-zero arrives as a real error with its text, not a synthesized
+	// "didn't provide reason".
+	rows, err = db.Query("BEGIN TRANSACTION; " +
+		"SELECT id FROM stream_err_go WHERE 10 / (id - 300) > -100; " +
+		"SELECT 7 AS after; COMMIT")
+	var continuedErr error
+	if err != nil {
+		continuedErr = err
+	} else {
+		drainInts(rows)
+		for rows.NextResultSet() {
+			drainInts(rows)
+		}
+		continuedErr = rows.Err()
+		rows.Close()
+	}
+	if continuedErr == nil {
+		fail("the continued divide-by-zero never surfaced")
+	}
+	if !strings.Contains(strings.ToLower(continuedErr.Error()), "divide") &&
+		!strings.Contains(continuedErr.Error(), "8134") {
+		fail("continued error lost its text: %v", continuedErr)
+	}
 }
 
 // parameterizedQueries exercises the sp_executesql RPC path: go-mssqldb sends

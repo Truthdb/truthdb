@@ -105,10 +105,11 @@ pub enum BatchEvent {
         in_transaction: bool,
     },
     /// Ends a statement that failed after its result set had begun streaming:
-    /// closes the set with an error-flagged DONE so the stream stays framed
-    /// for the statements that follow. The error itself travels separately —
-    /// in the batch-final [`BatchEvent::Error`] for a continued error, or not
-    /// at all for one a `CATCH` handled.
+    /// closes the set (with a clean DONE — an error-flagged DONE without an
+    /// ERROR token reads as "severe failure" to real drivers) so the stream
+    /// stays framed for the statements that follow. The error itself travels
+    /// separately — in the batch-final [`BatchEvent::Error`] for a continued
+    /// error, or not at all for one a `CATCH` handled.
     StatementAborted { in_transaction: bool },
     /// A SQL error that stopped the batch. The statements before it kept their
     /// results, which were already sent.
