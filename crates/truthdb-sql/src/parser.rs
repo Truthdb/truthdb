@@ -959,17 +959,27 @@ impl Parser {
         let (action, end) = match self.peek_keyword().as_deref() {
             Some("ADD") => {
                 self.bump();
-                // `ADD [CONSTRAINT name] (CHECK | FOREIGN KEY ...)`. ADD column
-                // arrives in a later part.
-                let name = self.parse_optional_constraint_name()?;
-                if self.peek_keyword().as_deref() == Some("FOREIGN") {
-                    let fk = self.parse_foreign_key(name)?;
-                    let end = fk.span;
-                    (AlterAction::AddForeignKey(fk), end)
-                } else {
-                    let check = self.parse_check_constraint(name)?;
-                    let end = check.span;
-                    (AlterAction::AddCheck(check), end)
+                // `ADD [CONSTRAINT name] (CHECK | FOREIGN KEY ...)`, or
+                // `ADD <column> <type> ...` — T-SQL has no COLUMN keyword
+                // here, so anything but a constraint introducer is a column.
+                match self.peek_keyword().as_deref() {
+                    Some("CONSTRAINT") | Some("FOREIGN") | Some("CHECK") => {
+                        let name = self.parse_optional_constraint_name()?;
+                        if self.peek_keyword().as_deref() == Some("FOREIGN") {
+                            let fk = self.parse_foreign_key(name)?;
+                            let end = fk.span;
+                            (AlterAction::AddForeignKey(fk), end)
+                        } else {
+                            let check = self.parse_check_constraint(name)?;
+                            let end = check.span;
+                            (AlterAction::AddCheck(check), end)
+                        }
+                    }
+                    _ => {
+                        let column = self.parse_column_def()?;
+                        let end = column.span;
+                        (AlterAction::AddColumn(column), end)
+                    }
                 }
             }
             Some("DROP") => {

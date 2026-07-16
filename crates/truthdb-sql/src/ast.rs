@@ -71,6 +71,8 @@ pub struct AlterTable {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum AlterAction {
+    /// `ADD <column> <type> [NULL|NOT NULL] [DEFAULT expr] [COLLATE name]`.
+    AddColumn(ColumnDef),
     /// `ADD [CONSTRAINT name] CHECK (expr)`.
     AddCheck(CheckConstraint),
     /// `ADD [CONSTRAINT name] FOREIGN KEY (...) REFERENCES ...`.

@@ -2992,6 +2992,7 @@ fn exec_alter_table(
         .ok_or_else(|| SqlError::invalid_object(&alter.table.value).at(alter.table.span))?;
     reject_view_as_table(&def)?;
     match &alter.action {
+        AlterAction::AddColumn(column) => alter_add_column(storage, &def, column, eval_ctx),
         AlterAction::AddCheck(check) => alter_add_check(storage, &def, check, eval_ctx),
         AlterAction::AddForeignKey(fk) => alter_add_foreign_key(storage, &def, fk),
         AlterAction::DropConstraint(name) => alter_drop_constraint(storage, &def, name),
@@ -3072,6 +3073,91 @@ fn alter_add_foreign_key(
     storage
         .rel_set_foreign_keys(&def.name, fks)
         .map_err(|e| map_storage_err(e, &def.name))?;
+    Ok(StatementResult::Done)
+}
+
+/// `ALTER TABLE ADD <column>`: appends the column to the catalog and
+/// rewrites every existing row under the new schema. The row codec is
+/// positional (every offset derives from the schema, with no per-row version
+/// stamp), so a metadata-only ADD cannot exist — the rewrite is the honest
+/// implementation, one transactional statement under the ALTER's exclusive
+/// lock. Existing rows take a FROZEN fill: NULL, or the DEFAULT evaluated
+/// once now (SQL Server freezes it the same way); later INSERTs evaluate the
+/// live default text per row like any other column.
+fn alter_add_column(
+    storage: &Storage,
+    def: &catalog::TableDef,
+    column: &ColumnDef,
+    eval_ctx: &EvalContext,
+) -> Result<StatementResult, SqlError> {
+    if def
+        .columns
+        .iter()
+        .any(|(name, _, _)| name.eq_ignore_ascii_case(&column.name.value))
+    {
+        return Err(SqlError::new(
+            2705,
+            16,
+            4,
+            format!(
+                "Column names in each table must be unique. Column name '{}' is specified more than once.",
+                column.name.value
+            ),
+        )
+        .at(column.name.span));
+    }
+    // The plan's scope: a plain column with nullability, DEFAULT and COLLATE.
+    // Constraint-carrying additions are their own statements in T-SQL anyway.
+    if column.primary_key
+        || column.unique
+        || column.identity.is_some()
+        || !column.checks.is_empty()
+        || !column.foreign_keys.is_empty()
+    {
+        return Err(SqlError::new(
+            40510,
+            16,
+            1,
+            "ALTER TABLE ADD supports a plain column (with NULL/NOT NULL, DEFAULT and COLLATE); add constraints with their own ALTER TABLE ADD CONSTRAINT statements.",
+        )
+        .at(column.span));
+    }
+    let bound = bind_column(column)?;
+    // An authoritative emptiness probe (one-row scan under the ALTER's
+    // exclusive lock) — the row counter is a statistic and must not become
+    // load-bearing here: an under-count would let NULL fills into a NOT NULL
+    // column, and a pre-upgrade table without a counter would 4901 even when
+    // empty.
+    let has_rows = {
+        let mut probe = Vec::new();
+        storage
+            .rel_scan_slice(&def.name, ScanCursor::start(), 1, None, &mut probe)
+            .map_err(|err| map_storage_err(err, &def.name))?;
+        !probe.is_empty()
+    };
+    // The frozen fill existing rows take.
+    let fill = match &column.default {
+        Some(text) => {
+            let sql_value = eval_default(text, eval_ctx)?;
+            value::sql_to_datum(&sql_value, &bound.column_type, &bound.name)?
+        }
+        None => Datum::Null,
+    };
+    if !bound.nullable && fill.is_null() && has_rows {
+        return Err(SqlError::new(
+            4901,
+            16,
+            1,
+            format!(
+                "ALTER TABLE only allows columns to be added that can contain nulls, or have a DEFAULT definition specified, or the column being added is an identity or timestamp column, or alternatively if none of the previous conditions are satisfied the table must be empty to allow addition of this column. Column '{}' cannot be added to non-empty table '{}' because it does not satisfy these conditions.",
+                bound.name, def.name
+            ),
+        )
+        .at(column.span));
+    }
+    storage
+        .rel_alter_add_column(&def.name, bound, column.default.clone(), fill)
+        .map_err(|err| map_storage_err(err, &def.name))?;
     Ok(StatementResult::Done)
 }
 
