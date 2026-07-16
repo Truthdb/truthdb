@@ -249,7 +249,7 @@ jobs:
           apt-get update
           ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 mssql-tools18
           /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1,1433 -U sa -P secret -d truthdb -N o -I \
-            -v TABLE=conf_odbc -i scripts/tds_conformance_sqlcmd.sql > /tmp/odbc.out 2>&1
+            -v TABLE=conf_odbc -i scripts/tds_conformance_sqlcmd.sql > /tmp/odbc.out
           diff -u scripts/tds_conformance_sqlcmd.expected /tmp/odbc.out
           echo "tds conformance (ODBC sqlcmd): OK"
 
@@ -257,7 +257,7 @@ jobs:
         run: |
           curl -sfL https://github.com/microsoft/go-sqlcmd/releases/download/v1.8.2/sqlcmd-linux-amd64.tar.bz2 | tar xj -C /usr/local/bin sqlcmd
           sqlcmd -S 127.0.0.1,1433 -U sa -P secret -d truthdb -N disable -I \
-            -v TABLE=conf_go -i scripts/tds_conformance_sqlcmd.sql > /tmp/gosqlcmd.out 2>&1
+            -v TABLE=conf_go -i scripts/tds_conformance_sqlcmd.sql > /tmp/gosqlcmd.out
           diff -u scripts/tds_conformance_gosqlcmd.expected /tmp/gosqlcmd.out
           echo "tds conformance (go-sqlcmd): OK"
 

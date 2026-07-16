@@ -90,12 +90,15 @@ pub fn envchange_database(out: &mut Vec<u8>, database: &str) {
 /// ENVCHANGE for the connection's default SQL collation (login response).
 /// mssql-jdbc dereferences this collation when encoding every NVARCHAR RPC
 /// parameter — a login without it NPEs the driver client-side. The bytes are
-/// the LCID+flags+sort form COLMETADATA already uses for character columns.
+/// [`crate::typeinfo::COLLATION`], the same value COLMETADATA stamps on every
+/// character column, so login and metadata can never diverge. (A configured
+/// non-default `default_collation` is still not advertised — pre-existing,
+/// recorded in the plan.)
 pub fn envchange_sql_collation(out: &mut Vec<u8>) {
     let mut body = Vec::new();
     body.push(ENV_SQL_COLLATION);
     body.push(5); // B_VARBYTE new value: the collation
-    body.extend_from_slice(&[0x09, 0x04, 0xd0, 0x00, 0x34]);
+    body.extend_from_slice(&crate::typeinfo::COLLATION);
     body.push(0); // B_VARBYTE old value: none
     out.push(TOKEN_ENVCHANGE);
     out.extend_from_slice(&(body.len() as u16).to_le_bytes());

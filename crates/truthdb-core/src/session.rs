@@ -1266,10 +1266,17 @@ fn bind_decl_names(
     mut values: Vec<crate::rel::RpcParam>,
 ) -> Result<Vec<crate::rel::RpcParam>, SqlError> {
     let names = decl_names(decls);
-    // More values than declarations is SQL Server's 8144. (Fewer is legal —
-    // a declared parameter the statement never reads goes unmissed, and one
-    // it does read errors when the variable lookup fails at execution.)
-    if values.len() > names.len() {
+    // An unnamed value with no declaration to name it is SQL Server's 8144.
+    // (Fewer values than declarations is legal — a declared parameter the
+    // statement never reads goes unmissed, and one it does read errors when
+    // the variable lookup fails at execution. Extra NAMED values pass
+    // through: they seed variables by their own names, which keeps the
+    // `run_rpc` wrappers' seed-named-params contract intact.)
+    if values
+        .iter()
+        .skip(names.len())
+        .any(|value| value.name.is_empty())
+    {
         return Err(SqlError::new(
             8144,
             16,
@@ -3865,5 +3872,10 @@ mod tests {
         // Fewer values than declarations stays legal (an unread declared
         // parameter goes unmissed).
         assert!(bind_decl_names("@p1 int, @p2 int", vec![int_param(1)]).is_ok());
+        // Extra NAMED values pass through — they seed variables by their own
+        // names (the run_rpc wrappers' contract).
+        let mut named = int_param(9);
+        named.name = "@extra".into();
+        assert!(bind_decl_names("", vec![named]).is_ok());
     }
 }

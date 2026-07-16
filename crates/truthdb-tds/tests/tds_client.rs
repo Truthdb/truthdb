@@ -299,11 +299,27 @@ enum Token {
     LoginAck,
     ColMetadata(Vec<ColType>),
     Row(Vec<Cell>),
-    Error { number: i32 },
-    EnvChange { kind: u8, descriptor: u64 },
-    Done { count: Option<u64>, in_xact: bool },
-    DoneInProc { count: Option<u64> },
-    DoneProc { more: bool, error: bool },
+    Error {
+        number: i32,
+    },
+    EnvChange {
+        kind: u8,
+        descriptor: u64,
+    },
+    Done {
+        count: Option<u64>,
+        in_xact: bool,
+        cmd: u16,
+    },
+    DoneInProc {
+        count: Option<u64>,
+        cmd: u16,
+    },
+    DoneProc {
+        more: bool,
+        error: bool,
+        cmd: u16,
+    },
     ReturnStatus(i32),
     ReturnValue,
     Other(u8),
@@ -375,6 +391,7 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
             0xfd..=0xff => {
                 // DONE / DONEPROC / DONEINPROC: status u16, curcmd u16, count u64.
                 let status = u16::from_le_bytes([payload[i], payload[i + 1]]);
+                let cmd = u16::from_le_bytes([payload[i + 2], payload[i + 3]]);
                 let count = u64::from_le_bytes(payload[i + 4..i + 12].try_into().unwrap());
                 let has_count = status & 0x0010 != 0;
                 let in_xact = status & 0x0004 != 0;
@@ -383,13 +400,16 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
                     0xfd => Token::Done {
                         count: has_count.then_some(count),
                         in_xact,
+                        cmd,
                     },
                     0xfe => Token::DoneProc {
                         more: status & 0x0001 != 0,
                         error: status & 0x0002 != 0,
+                        cmd,
                     },
                     _ => Token::DoneInProc {
                         count: has_count.then_some(count),
+                        cmd,
                     },
                 });
             }
@@ -788,7 +808,7 @@ async fn a_multi_rpc_request_answers_each_rpc_in_one_response() {
     let procs: Vec<(bool, bool)> = tokens
         .iter()
         .filter_map(|t| match t {
-            Token::DoneProc { more, error } => Some((*more, *error)),
+            Token::DoneProc { more, error, .. } => Some((*more, *error)),
             _ => None,
         })
         .collect();
@@ -828,11 +848,93 @@ async fn a_multi_rpc_request_answers_each_rpc_in_one_response() {
     let procs: Vec<(bool, bool)> = tokens
         .iter()
         .filter_map(|t| match t {
-            Token::DoneProc { more, error } => Some((*more, *error)),
+            Token::DoneProc { more, error, .. } => Some((*more, *error)),
             _ => None,
         })
         .collect();
     assert_eq!(procs, [(true, true), (false, false)], "tokens: {tokens:?}");
+
+    // A decode-level error mid-request (an unknown procedure never reaches
+    // the engine) renders in-frame and the RPCs after it still run.
+    let mut body = Vec::new();
+    body.extend_from_slice(&5u16.to_le_bytes()); // name length in chars
+    body.extend(ucs2le("sp_no"));
+    body.extend_from_slice(&0u16.to_le_bytes()); // option flags
+    body.push(0xff);
+    body.extend(sp_executesql_rpc("SELECT 4 AS d"));
+    let tokens = client.rpc(&body).await;
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(t, Token::Error { number: 2812 })),
+        "tokens: {tokens:?}"
+    );
+    assert_eq!(row_ints(&tokens), [4], "tokens: {tokens:?}");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// The login response advertises the connection's default SQL collation
+/// (ENVCHANGE 7) — mssql-jdbc dereferences it to encode every NVARCHAR RPC
+/// parameter and NPEs client-side without it — and every DONE stamps its
+/// statement's command class in CurCmd, which the same driver requires
+/// before it accepts a DONE's row count (executeUpdate returns -1 without
+/// it). Both regressions previously survived every in-repo test.
+#[tokio::test]
+async fn login_advertises_collation_and_dones_carry_their_command_class() {
+    let path = temp_path("curcmd");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    let login = client.login("sa", "secret").await;
+    assert!(
+        has_envchange(&login, 7),
+        "login must carry ENVCHANGE 7 (SQL collation): {login:?}"
+    );
+
+    client
+        .batch("CREATE TABLE cc (id INT NOT NULL PRIMARY KEY)")
+        .await;
+    // The REAL engine's statement→command mapping, batch path: INSERT 0xC3,
+    // UPDATE 0xC5, SELECT 0xC1, DELETE 0xC4 on the statement's own DONE.
+    for (sql, want) in [
+        ("INSERT INTO cc VALUES (1), (2)", 0xc3u16),
+        ("UPDATE cc SET id = 3 WHERE id = 1", 0xc5),
+        ("SELECT id FROM cc ORDER BY id", 0xc1),
+        ("DELETE FROM cc WHERE id = 3", 0xc4),
+    ] {
+        let tokens = client.batch(sql).await;
+        let cmds: Vec<u16> = tokens
+            .iter()
+            .filter_map(|t| match t {
+                Token::Done { cmd, .. } => Some(*cmd),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(cmds, [want], "{sql}: {tokens:?}");
+    }
+
+    // The RPC path: the DONEINPROC carries the statement's class, the final
+    // DONEPROC carries EXECUTE (0xE0).
+    let tokens = client
+        .rpc(&sp_executesql_rpc("INSERT INTO cc VALUES (9)"))
+        .await;
+    let inproc: Vec<u16> = tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::DoneInProc { cmd, .. } => Some(*cmd),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(inproc, [0xc3], "tokens: {tokens:?}");
+    let procs: Vec<u16> = tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::DoneProc { cmd, .. } => Some(*cmd),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(procs, [0xe0], "tokens: {tokens:?}");
 
     let _ = std::fs::remove_file(&path);
 }
