@@ -189,6 +189,16 @@ impl Engine {
     /// leaves through `emitter` as it is produced (see
     /// [`crate::rel::execute_batch_streamed`]). Returns the batch's terminal
     /// error, which the caller reports after the statement events.
+    /// `sp_describe_first_result_set`: statically-derivable column metadata
+    /// for `tsql`'s first statement, without executing it.
+    pub fn describe_first_result_set(
+        &self,
+        tsql: &str,
+    ) -> Result<crate::rel::RowSet, truthdb_sql::error::SqlError> {
+        let _meta = self.meta.read().expect("engine meta poisoned");
+        crate::rel::describe_first_result_set(&self.storage, tsql)
+    }
+
     pub fn sql_batch_streamed(
         &self,
         input: &str,

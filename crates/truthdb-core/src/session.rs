@@ -145,6 +145,10 @@ pub enum PreparedRpc {
     Unprepare {
         handle: i32,
     },
+    /// `sp_describe_first_result_set`: metadata discovery, no execution.
+    Describe {
+        tsql: String,
+    },
 }
 
 /// A statement a session prepared: its text and parameter declarations, both
@@ -1167,6 +1171,23 @@ fn dispatch_rpc(
             };
             immediate(&reply, (!dropped).then(|| missing_handle(handle)));
         }
+        PreparedRpc::Describe { tsql } => match shared.engine.describe_first_result_set(&tsql) {
+            Ok(rowset) => {
+                let count = rowset.rows.len() as u64;
+                let in_transaction = {
+                    let sched = shared.scheduler.lock().expect("scheduler poisoned");
+                    sched.sessions.in_transaction(session)
+                };
+                reply.send(BatchEvent::Columns(rowset.columns));
+                reply.send(BatchEvent::Rows(rowset.rows));
+                reply.send(BatchEvent::StatementDone {
+                    count: Some(count),
+                    in_transaction,
+                });
+                reply.send(BatchEvent::Complete { in_transaction });
+            }
+            Err(error) => immediate(&reply, Some(error)),
+        },
         PreparedRpc::Execute { handle, values } => {
             let resolved = {
                 let sched = shared.scheduler.lock().expect("scheduler poisoned");
@@ -3686,6 +3707,61 @@ mod tests {
         ))
         .await;
         assert_eq!(rows_of(&events), vec![vec![Datum::Int(4)]]);
+    }
+
+    #[tokio::test]
+    async fn describe_first_result_set_covers_static_shapes_only() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        h.handle
+            .run_batch(
+                s,
+                "CREATE TABLE d (id INT NOT NULL PRIMARY KEY, name NVARCHAR(40))".into(),
+            )
+            .await
+            .unwrap();
+
+        // A parameterized single-table SELECT describes without executing:
+        // the declared @p1 resolves (as NULL) during planning.
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Describe {
+                tsql: "SELECT id, name FROM d WHERE id = @p1".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+        let rows = rows_of(&events);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][1], Datum::Int(1)); // column_ordinal
+        assert_eq!(rows[0][2], Datum::NVarChar("id".into()));
+        assert_eq!(rows[0][4], Datum::Int(56)); // system_type_id: int
+        assert_eq!(rows[1][2], Datum::NVarChar("name".into()));
+        assert_eq!(rows[1][5], Datum::NVarChar("nvarchar(40)".into()));
+
+        // A statement producing no result set describes as zero rows.
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Describe {
+                tsql: "INSERT INTO d VALUES (1, 'x')".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+        assert_eq!(rows_of(&events), Vec::<Vec<Datum>>::new());
+
+        // A shape whose types are only known by executing answers 11514.
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Describe {
+                tsql: "SELECT a.id FROM d a JOIN d b ON a.id = b.id".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), Some(11514), "{events:?}");
     }
 
     #[test]

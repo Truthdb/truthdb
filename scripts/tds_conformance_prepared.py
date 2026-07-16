@@ -112,6 +112,27 @@ def main() -> int:
     except pytds.Error:
         pass
 
+    # sp_describe_first_result_set: metadata without execution, over real RPC.
+    cur.callproc(
+        "sp_describe_first_result_set",
+        ("SELECT id, name FROM prep_py WHERE id = @p1", "@p1 int", 0),
+    )
+    described = [(row[1], row[2], row[5]) for row in cur.fetchall()]
+    want = [(1, "id", "int"), (2, "name", "nvarchar(40)")]
+    if described != want:
+        fail(f"describe: got {described!r} want {want!r}")
+    # An execution-typed shape (join) answers 11514 rather than guessing.
+    try:
+        cur.callproc(
+            "sp_describe_first_result_set",
+            ("SELECT a.id FROM prep_py a JOIN prep_py b ON a.id = b.id", None, 0),
+        )
+        cur.fetchall()
+        fail("describe of a join did not raise")
+    except pytds.Error as err:
+        if getattr(err, "number", None) != 11514:
+            fail(f"describe join: expected 11514, got {err}")
+
     conn.close()
     print("tds conformance (sp_prepare family, pytds): OK")
     return 0

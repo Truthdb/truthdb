@@ -70,6 +70,8 @@ pub enum RpcProc {
     SpPrepExec,
     /// `sp_unprepare` (ProcID 15): drop a prepared handle.
     SpUnprepare,
+    /// `sp_describe_first_result_set` (by name): metadata discovery.
+    SpDescribeFirstResultSet,
     /// An `sp_cursor*` procedure — server-side cursors are not supported, and
     /// say so distinctly rather than "not found".
     SpCursor(String),
@@ -113,6 +115,8 @@ pub fn parse_rpc_request(body: &[u8]) -> io::Result<RpcRequest> {
             RpcProc::SpPrepExec
         } else if name.eq_ignore_ascii_case("sp_unprepare") {
             RpcProc::SpUnprepare
+        } else if name.eq_ignore_ascii_case("sp_describe_first_result_set") {
+            RpcProc::SpDescribeFirstResultSet
         } else if name.to_ascii_lowercase().starts_with("sp_cursor") {
             RpcProc::SpCursor(name)
         } else {
@@ -222,6 +226,19 @@ pub fn split_sp_prepexec(mut params: Vec<RpcParam>) -> io::Result<(String, Strin
         s => s,
     };
     Ok((decls, stmt, values))
+}
+
+/// Splits an `sp_describe_first_result_set` parameter list — `@tsql`, then
+/// optional `@params`/`@browse_information_mode` (both ignored: declared
+/// parameters need no binding to derive columns) — into the statement text.
+pub fn split_sp_describe(params: Vec<RpcParam>) -> io::Result<String> {
+    if params.is_empty() {
+        return Err(protocol_err("sp_describe_first_result_set: missing @tsql"));
+    }
+    match opt_string(&params[0], "sp_describe_first_result_set: @tsql")? {
+        s if s.is_empty() => Err(protocol_err("sp_describe_first_result_set: NULL @tsql")),
+        s => Ok(s),
+    }
 }
 
 /// Splits an `sp_unprepare` parameter list into its handle.
