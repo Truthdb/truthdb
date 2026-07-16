@@ -4609,6 +4609,70 @@ fn is_correlated(storage: &Storage, subquery: &Select, outer: &JoinScope) -> boo
     correlated || from_has_correlated_derived(storage, subquery.from.as_ref(), outer)
 }
 
+/// Calls `f` on every column reference inside an AGGREGATE argument anywhere
+/// in the select's own clauses (not descending into nested subqueries).
+fn select_aggregate_arg_refs(select: &Select, f: &mut impl FnMut(&Name)) {
+    fn walk(expr: &Expr, f: &mut impl FnMut(&Name)) {
+        match &expr.kind {
+            ExprKind::Aggregate { arg: Some(a), .. } => expr_column_refs(a, f),
+            ExprKind::Aggregate { arg: None, .. } => {}
+            ExprKind::Unary { expr: e, .. }
+            | ExprKind::IsNull { expr: e, .. }
+            | ExprKind::Cast { expr: e, .. } => walk(e, f),
+            ExprKind::Binary { left, right, .. } => {
+                walk(left, f);
+                walk(right, f);
+            }
+            ExprKind::Like {
+                expr: e, pattern, ..
+            } => {
+                walk(e, f);
+                walk(pattern, f);
+            }
+            ExprKind::InList { expr: e, list, .. } => {
+                walk(e, f);
+                list.iter().for_each(|x| walk(x, f));
+            }
+            ExprKind::Between {
+                expr: e, low, high, ..
+            } => {
+                walk(e, f);
+                walk(low, f);
+                walk(high, f);
+            }
+            ExprKind::Function { args, .. } => args.iter().for_each(|x| walk(x, f)),
+            ExprKind::Case {
+                operand,
+                branches,
+                else_result,
+            } => {
+                if let Some(o) = operand {
+                    walk(o, f);
+                }
+                for (w, r) in branches {
+                    walk(w, f);
+                    walk(r, f);
+                }
+                if let Some(e) = else_result {
+                    walk(e, f);
+                }
+            }
+            _ => {}
+        }
+    }
+    if let Some(w) = &select.where_clause {
+        walk(w, f);
+    }
+    for item in &select.items {
+        if let SelectItem::Expr { expr, .. } = item {
+            walk(expr, f);
+        }
+    }
+    if let Some(h) = &select.having {
+        walk(h, f);
+    }
+}
+
 /// Whether any derived-table body in a FROM tree is correlated to `outer`.
 fn from_has_correlated_derived(
     storage: &Storage,
@@ -4955,6 +5019,19 @@ fn substitute_subquery_outer_refs(
             span: name.span,
         })
     };
+    // An outer reference INSIDE an aggregate argument has outer-aggregate
+    // semantics in SQL Server (the aggregate computes over the OUTER group);
+    // substituting a per-row literal would silently compute something else.
+    // Bail — the subquery runs unchanged and errors cleanly.
+    let mut outer_in_agg = false;
+    select_aggregate_arg_refs(subquery, &mut |name| {
+        if !inner.matches_any(&name.value) && outer(&name.value).is_some() {
+            outer_in_agg = true;
+        }
+    });
+    if outer_in_agg {
+        return None;
+    }
     let mut out = subquery.clone();
     out.where_clause = out
         .where_clause

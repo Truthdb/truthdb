@@ -86,6 +86,26 @@ impl truthdb_sql::eval::ColumnResolver for SynthScope {
     }
 }
 
+/// Resolves an outer reference from a correlated HAVING/projection subquery
+/// to a group-key position — binding ONLY when the reference and a bare-
+/// column group key name the SAME source column of this query's FROM. A
+/// qualified reference to a different table that merely shares the bare name
+/// stays unresolved (and errors inside the subquery, as SQL Server rejects
+/// non-grouped outer references).
+fn group_key_resolver<'a>(
+    select: &'a Select,
+    resolver: &'a JoinScope,
+) -> impl Fn(&str) -> Option<usize> + 'a {
+    use truthdb_sql::eval::ColumnResolver;
+    move |name: &str| {
+        let source = resolver.resolve(name)?;
+        select.group_by.iter().position(|key| match &key.kind {
+            truthdb_sql::ast::ExprKind::Column(n) => resolver.resolve(&n.value) == Some(source),
+            _ => false,
+        })
+    }
+}
+
 /// One aggregate to compute over each group.
 struct AggSpec {
     func: AggFunc,
@@ -213,26 +233,12 @@ fn aggregate_partition(
             // inside the subquery, as SQL Server rejects it too.
             let bound;
             let having = if crate::rel::expr_has_subquery(having) {
-                // The synth scope's names are synthetic ($gk0, $agg0) — an
-                // outer reference binds against the ORIGINAL group-by
-                // expressions instead: a bare-column key at position i is
-                // group_row[i]. Qualified and bare spellings match either way
-                // (the qualifier can only name this query's own FROM, which
-                // is where the grouping column came from).
-                let resolve = |name: &str| -> Option<usize> {
-                    let bare = name.rsplit_once('.').map(|(_, b)| b).unwrap_or(name);
-                    select.group_by.iter().position(|key| match &key.kind {
-                        truthdb_sql::ast::ExprKind::Column(n) => {
-                            let key_bare =
-                                n.value.rsplit_once('.').map(|(_, b)| b).unwrap_or(&n.value);
-                            n.value.eq_ignore_ascii_case(name)
-                                || key_bare.eq_ignore_ascii_case(bare)
-                        }
-                        _ => false,
-                    })
-                };
                 bound = crate::rel::substitute_correlated_in_expr(
-                    storage, having, &resolve, &group_row, eval_ctx,
+                    storage,
+                    having,
+                    &group_key_resolver(select, resolver),
+                    &group_row,
+                    eval_ctx,
                 )?;
                 &bound
             } else {
@@ -253,6 +259,21 @@ fn aggregate_partition(
         }
         let mut row = Vec::with_capacity(out_exprs.len());
         for expr in out_exprs {
+            // A subquery here is correlated to a grouping column (the
+            // rewrite left it): bind the group row, exactly as HAVING does.
+            let bound;
+            let expr = if crate::rel::expr_has_subquery(expr) {
+                bound = crate::rel::substitute_correlated_in_expr(
+                    storage,
+                    expr,
+                    &group_key_resolver(select, resolver),
+                    &group_row,
+                    eval_ctx,
+                )?;
+                &bound
+            } else {
+                expr
+            };
             row.push(eval::eval(expr, &group_row, synth, eval_ctx)?);
         }
         out_rows.push(row);
@@ -555,8 +576,8 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggs: &mut Vec<AggSpec>) -> Result<Ex
         | ExprKind::Literal(_)
         | ExprKind::GlobalVar(_)
         | ExprKind::LocalVar(_) => expr.kind.clone(),
-        // Subqueries are rewritten to literals before aggregation runs; clone
-        // defensively (evaluation would reject any that slipped through).
+        // A subquery surviving to here is correlated to a grouping column;
+        // the per-group loops bind and evaluate it (HAVING and projection).
         ExprKind::Subquery(_) | ExprKind::Exists(_) | ExprKind::InSubquery { .. } => {
             expr.kind.clone()
         }

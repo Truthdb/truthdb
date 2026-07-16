@@ -153,3 +153,45 @@ alice 250
 bob 50
 carol NULL
 dave NULL
+
+# ---- Review-pinned cases -------------------------------------------------
+
+# A correlated scalar in the SELECT list of an AGGREGATED query: correlation
+# on the grouping column (SQL Server accepts this).
+query IT rowsort
+SELECT cust_id, (SELECT name FROM cust WHERE cust.id = ord.cust_id) AS who
+FROM ord WHERE cust_id IS NOT NULL GROUP BY cust_id
+----
+1 alice
+2 bob
+
+# A qualified reference to a NON-GROUPED sibling column that merely shares
+# the bare name with a group key must NOT silently bind — it errors, as SQL
+# Server rejects non-grouped outer references.
+statement ok
+CREATE TABLE gt (id INT NOT NULL PRIMARY KEY, x INT)
+
+statement ok
+CREATE TABLE gs (id INT NOT NULL PRIMARY KEY, x INT)
+
+statement ok
+CREATE TABLE gu (y INT)
+
+statement ok
+INSERT INTO gt VALUES (1,10),(2,20),(3,20)
+
+statement ok
+INSERT INTO gs VALUES (1,99),(2,77),(3,66)
+
+statement ok
+INSERT INTO gu VALUES (30),(10)
+
+statement error
+SELECT gt.x, COUNT(*) FROM gt JOIN gs ON gs.id = gt.id GROUP BY gt.x
+HAVING EXISTS (SELECT 1 FROM gu WHERE gu.y = gs.x)
+
+# An outer reference INSIDE an aggregate argument has outer-aggregate
+# semantics in SQL Server; substituting a literal would silently compute
+# something else — it errors instead.
+statement error
+SELECT gt.x FROM gt GROUP BY gt.x HAVING (SELECT SUM(gt.x) FROM gu) = 20
