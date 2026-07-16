@@ -133,7 +133,7 @@ where
             14,
             &format!("Login failed for user '{}'.", login.username),
         );
-        token::done(&mut out, false, true, false, None);
+        token::done(&mut out, false, true, false, None, 0);
         write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
         return Ok(());
     }
@@ -153,6 +153,7 @@ where
     let mut out = Vec::new();
     token::loginack(&mut out);
     token::envchange_database(&mut out, &database);
+    token::envchange_sql_collation(&mut out);
     token::envchange_packet_size(&mut out, packet_size, DEFAULT_PACKET_SIZE);
     token::info(
         &mut out,
@@ -161,7 +162,7 @@ where
         10,
         &format!("Changed database context to '{database}'."),
     );
-    token::done(&mut out, false, false, false, None);
+    token::done(&mut out, false, false, false, None, 0);
     write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
 
     // Each connection gets an engine-side session; it is closed (rolling back
@@ -202,7 +203,11 @@ where
                 let sql = batch_sql(headers.body)?;
                 let cancel = Arc::new(AtomicBool::new(false));
                 let events = engine.stream_batch(session, sql, cancel.clone());
-                if !stream_reply(stream, events, cancel, packet_size).await? {
+                let source = ReplySource::Single {
+                    events: Some(events),
+                    rpc: false,
+                };
+                if !stream_reply(stream, source, cancel, packet_size).await? {
                     return Ok(());
                 }
             }
@@ -210,15 +215,21 @@ where
                 let headers = parse_all_headers(&message.payload)?;
                 check_transaction_descriptor(headers.transaction_descriptor, tran_descriptor)?;
                 let cancel = Arc::new(AtomicBool::new(false));
-                match start_rpc(engine, session, headers.body, cancel.clone()) {
-                    Ok(events) => {
-                        if !stream_reply(stream, events, cancel, packet_size).await? {
+                match rpc::parse_rpc_requests(headers.body) {
+                    Ok(requests) => {
+                        let source = ReplySource::Rpcs {
+                            engine,
+                            session,
+                            requests: requests.into_iter(),
+                        };
+                        if !stream_reply(stream, source, cancel, packet_size).await? {
                             return Ok(());
                         }
                     }
-                    // A malformed or unsupported request never reached the
-                    // engine, so there is no stream — just the error tokens.
-                    Err(tokens) => {
+                    // An undecodable body never identified an RPC to run —
+                    // just the error tokens.
+                    Err(err) => {
+                        let tokens = rpc_error(&format!("malformed RPC request: {err}"));
                         write_message(stream, PKT_TABULAR_RESULT, &tokens, packet_size).await?
                     }
                 }
@@ -288,7 +299,7 @@ async fn handle_tm_request(
         Err(err) => {
             let mut out = Vec::new();
             token::error(&mut out, 50000, 1, 16, &err.to_string());
-            token::done(&mut out, false, true, false, None);
+            token::done(&mut out, false, true, false, None, 0);
             return Ok(out);
         }
     };
@@ -304,7 +315,7 @@ async fn handle_tm_request(
             error.level,
             &error.message,
         );
-        token::done(&mut out, false, true, reply.in_transaction, None);
+        token::done(&mut out, false, true, reply.in_transaction, None, 0);
         return Ok(out);
     }
 
@@ -334,7 +345,7 @@ async fn handle_tm_request(
         }
         _ => unreachable!("request type validated above"),
     }
-    token::done(&mut out, false, false, reply.in_transaction, None);
+    token::done(&mut out, false, false, reply.in_transaction, None, 0);
     Ok(out)
 }
 
@@ -421,9 +432,62 @@ async fn write_attention_ack<S: AsyncWrite + Unpin>(
 /// `AsyncReadExt::read` is cancellation-safe, so bytes read into `hdr` survive a
 /// `select!` iteration that resolves to an event instead; any partial header
 /// left when the batch ends is completed afterwards so packet framing is intact.
+/// What a response renders: one already-started reply stream (a SQL batch, or
+/// the render tests' RPC framing), or an RPC request's one-or-more RPCs — each
+/// issued only after the previous one's terminal event, since a session runs
+/// one call at a time.
+enum ReplySource<'a> {
+    Single {
+        events: Option<mpsc::UnboundedReceiver<BatchEvent>>,
+        rpc: bool,
+    },
+    Rpcs {
+        engine: &'a EngineHandle,
+        session: SessionId,
+        requests: std::vec::IntoIter<rpc::RpcRequest>,
+    },
+}
+
+impl ReplySource<'_> {
+    fn is_rpc(&self) -> bool {
+        match self {
+            ReplySource::Single { rpc, .. } => *rpc,
+            ReplySource::Rpcs { .. } => true,
+        }
+    }
+
+    /// Whether more replies follow the one about to render — what sets
+    /// `DONE_MORE` on a non-last RPC's DONEPROC.
+    fn has_more(&self) -> bool {
+        match self {
+            ReplySource::Single { .. } => false,
+            ReplySource::Rpcs { requests, .. } => requests.len() > 0,
+        }
+    }
+
+    /// Starts the next reply, or `None` when the response is complete. `Err`
+    /// is a decode error to render in-frame (no engine call was made).
+    fn next(
+        &mut self,
+        cancel: &Arc<AtomicBool>,
+    ) -> Option<Result<mpsc::UnboundedReceiver<BatchEvent>, (i32, String)>> {
+        match self {
+            ReplySource::Single { events, .. } => events.take().map(Ok),
+            ReplySource::Rpcs {
+                engine,
+                session,
+                requests,
+            } => {
+                let request = requests.next()?;
+                Some(start_rpc(engine, *session, request, cancel.clone()))
+            }
+        }
+    }
+}
+
 async fn stream_reply<S>(
     stream: &mut S,
-    mut events: mpsc::UnboundedReceiver<BatchEvent>,
+    mut source: ReplySource<'_>,
     cancel: Arc<AtomicBool>,
     packet_size: usize,
 ) -> io::Result<bool>
@@ -432,96 +496,136 @@ where
 {
     let (mut rd, mut wr) = tokio::io::split(stream);
     let mut out = MessageWriter::new(&mut wr, PKT_TABULAR_RESULT, packet_size);
-    let mut render = BatchRender::default();
+    let rpc = source.is_rpc();
     let mut hdr = [0u8; HEADER_LEN];
     let mut got = 0usize;
     let mut attention = false;
-    loop {
-        tokio::select! {
-            event = events.recv() => match event {
-                // Render until the terminal event. After an Attention the
-                // remaining events are drained without rendering: they would
-                // otherwise put the executor's internal "query was canceled"
-                // error on the wire, which the buffered path never showed.
-                Some(event) => {
-                    if attention {
-                        continue;
-                    }
-                    match render.event(&mut out, event).await {
-                        Ok(terminal) => {
-                            if terminal {
-                                break;
+    'replies: while let Some(start) = source.next(&cancel) {
+        let mut render = BatchRender {
+            rpc,
+            more_responses: source.has_more(),
+            ..BatchRender::default()
+        };
+        let mut events = match start {
+            Ok(events) => events,
+            // A decode error: render it in-frame so the multi-RPC response
+            // stays token-legal, and keep going — each RPC in a request
+            // answers independently, like statements in a batch.
+            Err((number, message)) => {
+                if attention {
+                    continue;
+                }
+                render
+                    .event(
+                        &mut out,
+                        BatchEvent::Error(truthdb_sql::error::SqlError::new(
+                            number, 16, 1, message,
+                        )),
+                    )
+                    .await?;
+                render
+                    .event(
+                        &mut out,
+                        BatchEvent::Complete {
+                            in_transaction: false,
+                        },
+                    )
+                    .await?;
+                continue;
+            }
+        };
+        loop {
+            tokio::select! {
+                event = events.recv() => match event {
+                    // Render until the terminal event. After an Attention the
+                    // remaining events are drained without rendering: they would
+                    // otherwise put the executor's internal "query was canceled"
+                    // error on the wire, which the buffered path never showed.
+                    Some(event) => {
+                        if attention {
+                            continue;
+                        }
+                        match render.event(&mut out, event).await {
+                            Ok(terminal) => {
+                                if terminal {
+                                    break;
+                                }
+                            }
+                            // A socket write failed mid-batch — the ordinary way a
+                            // client dies while a result streams. The batch is
+                            // still RUNNING and holds its locks, and the caller
+                            // will close the session the moment this returns —
+                            // which releases those locks out from under it. Same
+                            // contract as every other early exit: cancel the
+                            // batch, wait for it to actually end, then leave.
+                            Err(err) => {
+                                cancel.store(true, Ordering::Relaxed);
+                                drain_to_end(&mut events).await;
+                                return Err(err);
                             }
                         }
-                        // A socket write failed mid-batch — the ordinary way a
-                        // client dies while a result streams. The batch is
-                        // still RUNNING and holds its locks, and the caller
-                        // will close the session the moment this returns —
-                        // which releases those locks out from under it. Same
-                        // contract as every other early exit: cancel the
-                        // batch, wait for it to actually end, then leave.
-                        Err(err) => {
-                            cancel.store(true, Ordering::Relaxed);
-                            drain_to_end(&mut events).await;
-                            return Err(err);
+                    }
+                    // The stream ended without a terminal event: the worker panicked,
+                    // or the pool dropped the call at shutdown. Falling through here
+                    // would emit a message with no DONE at all — an empty EOM packet
+                    // that leaves the client waiting for a result that never
+                    // terminates. The buffered path turned a dead reply channel into
+                    // a clean 50000, so render exactly that, flushing any DONE still
+                    // held back on the way (a stream that died between
+                    // `StatementDone` and `Complete` would otherwise leave its result
+                    // set unterminated).
+                    None => {
+                        if !attention {
+                            render
+                                .event(&mut out, BatchEvent::Failed(EngineError::Unavailable))
+                                .await?;
+                        }
+                        break;
+                    }
+                },
+                read = rd.read(&mut hdr[got..]) => match read {
+                    // A read error is a disconnect with an errno: same treatment
+                    // as the clean EOF below, or the still-running batch would
+                    // have its locks released by the caller's close_session.
+                    Err(err) => {
+                        cancel.store(true, Ordering::Relaxed);
+                        drain_to_end(&mut events).await;
+                        return Err(err);
+                    }
+                    Ok(0) => {
+                        // Client disconnected mid-batch.
+                        cancel.store(true, Ordering::Relaxed);
+                        drain_to_end(&mut events).await;
+                        return Ok(false);
+                    }
+                    Ok(n) => {
+                        got += n;
+                        if got == HEADER_LEN {
+                            // Only an Attention (a header-only packet) is legal during
+                            // a running batch — TDS is request/response with no MARS.
+                            if hdr[0] == PKT_ATTENTION {
+                                attention = true;
+                                cancel.store(true, Ordering::Relaxed);
+                                got = 0;
+                            } else {
+                                // A pipelined non-Attention packet: fail loud rather
+                                // than silently ignore its (undrained) body and misframe
+                                // the next read. Abort the batch, then error out.
+                                cancel.store(true, Ordering::Relaxed);
+                                drain_to_end(&mut events).await;
+                                return Err(protocol_err(
+                                    "unexpected TDS packet during a running batch",
+                                ));
+                            }
                         }
                     }
-                }
-                // The stream ended without a terminal event: the worker panicked,
-                // or the pool dropped the call at shutdown. Falling through here
-                // would emit a message with no DONE at all — an empty EOM packet
-                // that leaves the client waiting for a result that never
-                // terminates. The buffered path turned a dead reply channel into
-                // a clean 50000, so render exactly that, flushing any DONE still
-                // held back on the way (a stream that died between
-                // `StatementDone` and `Complete` would otherwise leave its result
-                // set unterminated).
-                None => {
-                    if !attention {
-                        render
-                            .event(&mut out, BatchEvent::Failed(EngineError::Unavailable))
-                            .await?;
-                    }
-                    break;
-                }
-            },
-            read = rd.read(&mut hdr[got..]) => match read {
-                // A read error is a disconnect with an errno: same treatment
-                // as the clean EOF below, or the still-running batch would
-                // have its locks released by the caller's close_session.
-                Err(err) => {
-                    cancel.store(true, Ordering::Relaxed);
-                    drain_to_end(&mut events).await;
-                    return Err(err);
-                }
-                Ok(0) => {
-                    // Client disconnected mid-batch.
-                    cancel.store(true, Ordering::Relaxed);
-                    drain_to_end(&mut events).await;
-                    return Ok(false);
-                }
-                Ok(n) => {
-                    got += n;
-                    if got == HEADER_LEN {
-                        // Only an Attention (a header-only packet) is legal during
-                        // a running batch — TDS is request/response with no MARS.
-                        if hdr[0] == PKT_ATTENTION {
-                            attention = true;
-                            cancel.store(true, Ordering::Relaxed);
-                            got = 0;
-                        } else {
-                            // A pipelined non-Attention packet: fail loud rather
-                            // than silently ignore its (undrained) body and misframe
-                            // the next read. Abort the batch, then error out.
-                            cancel.store(true, Ordering::Relaxed);
-                            drain_to_end(&mut events).await;
-                            return Err(protocol_err(
-                                "unexpected TDS packet during a running batch",
-                            ));
-                        }
-                    }
-                }
-            },
+                },
+            }
+        }
+        if attention {
+            // Everything after the Attention is discarded; the RPCs not yet
+            // issued never run.
+            break 'replies;
         }
     }
     // The batch finished before a header fully arrived: complete it so the next
@@ -563,39 +667,37 @@ where
     Ok(true)
 }
 
-/// Starts an RPC request on the engine, returning its reply stream.
+/// Starts one RPC on the engine, returning its reply stream.
 ///
-/// Supports `sp_executesql` — decode its statement and typed parameters and run
-/// them, streaming exactly what a batch would. Any other procedure, or a
-/// malformed request, never reaches the engine and comes back as ready-made
-/// error tokens (`Err`) plus a final DONE, so the connection stays usable.
+/// A malformed or unsupported procedure never reaches the engine and comes
+/// back as an error `(number, message)` the caller renders in-frame, so the
+/// connection stays usable and a multi-RPC response stays token-legal.
 fn start_rpc(
     engine: &EngineHandle,
     session: SessionId,
-    body: &[u8],
+    request: rpc::RpcRequest,
     cancel: Arc<AtomicBool>,
-) -> Result<mpsc::UnboundedReceiver<BatchEvent>, Vec<u8>> {
-    let request = rpc::parse_rpc_request(body)
-        .map_err(|err| rpc_error(&format!("malformed RPC request: {err}")))?;
+) -> Result<mpsc::UnboundedReceiver<BatchEvent>, (i32, String)> {
+    let rpc_error = |message: String| (50000, message);
     match request.proc {
         RpcProc::SpExecuteSql => {
-            let (sql, params) = rpc::split_sp_executesql(request.params)
-                .map_err(|err| rpc_error(&err.to_string()))?;
-            Ok(engine.stream_rpc(session, sql, params, cancel))
+            let (sql, decls, params) = rpc::split_sp_executesql(request.params)
+                .map_err(|err| rpc_error(err.to_string()))?;
+            Ok(engine.stream_rpc(session, sql, decls, params, cancel))
         }
         RpcProc::SpPrepare => {
             let (decls, stmt) =
-                rpc::split_sp_prepare(request.params).map_err(|err| rpc_error(&err.to_string()))?;
+                rpc::split_sp_prepare(request.params).map_err(|err| rpc_error(err.to_string()))?;
             Ok(engine.stream_prepared(session, PreparedRpc::Prepare { decls, stmt }, cancel))
         }
         RpcProc::SpExecute => {
             let (handle, values) =
-                rpc::split_sp_execute(request.params).map_err(|err| rpc_error(&err.to_string()))?;
+                rpc::split_sp_execute(request.params).map_err(|err| rpc_error(err.to_string()))?;
             Ok(engine.stream_prepared(session, PreparedRpc::Execute { handle, values }, cancel))
         }
         RpcProc::SpPrepExec => {
-            let (decls, stmt, values) = rpc::split_sp_prepexec(request.params)
-                .map_err(|err| rpc_error(&err.to_string()))?;
+            let (decls, stmt, values) =
+                rpc::split_sp_prepexec(request.params).map_err(|err| rpc_error(err.to_string()))?;
             Ok(engine.stream_prepared(
                 session,
                 PreparedRpc::PrepExec {
@@ -608,27 +710,24 @@ fn start_rpc(
         }
         RpcProc::SpUnprepare => {
             let handle = rpc::split_sp_unprepare(request.params)
-                .map_err(|err| rpc_error(&err.to_string()))?;
+                .map_err(|err| rpc_error(err.to_string()))?;
             Ok(engine.stream_prepared(session, PreparedRpc::Unprepare { handle }, cancel))
         }
         RpcProc::SpDescribeFirstResultSet => {
-            let tsql = rpc::split_sp_describe(request.params)
-                .map_err(|err| rpc_error(&err.to_string()))?;
+            let tsql =
+                rpc::split_sp_describe(request.params).map_err(|err| rpc_error(err.to_string()))?;
             Ok(engine.stream_prepared(session, PreparedRpc::Describe { tsql }, cancel))
         }
         // Server-side cursors are not implemented; say so rather than "not
         // found" so a driver's fallback logic gets an honest signal.
-        RpcProc::SpCursor(name) => Err(rpc_error_num(
+        RpcProc::SpCursor(name) => Err((
             40510,
-            &format!(
+            format!(
                 "The stored procedure '{name}' is not supported (server-side cursors are not implemented)."
             ),
         )),
         // Error 2812 is SQL Server's "Could not find stored procedure".
-        RpcProc::Other(name) => Err(rpc_error_num(
-            2812,
-            &format!("Could not find stored procedure '{name}'."),
-        )),
+        RpcProc::Other(name) => Err((2812, format!("Could not find stored procedure '{name}'."))),
     }
 }
 
@@ -649,6 +748,17 @@ struct BatchRender {
     /// Set once a batch-stopping ERROR has been written, so the final DONE
     /// carries `DONE_ERROR`.
     errored: bool,
+    /// RPC response framing: per-statement DONEs render as DONEINPROC, and the
+    /// response ends RETURNSTATUS → RETURNVALUE(s) → DONEPROC, as SQL Server
+    /// frames a procedure's reply. A SQL batch keeps plain DONEs (the #97
+    /// oracle pins those bytes).
+    rpc: bool,
+    /// A prepared handle to report as a RETURNVALUE just before the final
+    /// DONEPROC — held so RETURNSTATUS precedes it, SQL Server's order.
+    pending_handle: Option<i32>,
+    /// More replies follow this one in the same response (a multi-RPC
+    /// request): the final DONEPROC keeps `DONE_MORE` instead of `DONE_FINAL`.
+    more_responses: bool,
     /// Scratch for encoding tokens, reused so a row costs no allocation here.
     buf: Vec<u8>,
 }
@@ -657,6 +767,19 @@ struct BatchRender {
 struct PendingDone {
     count: Option<u64>,
     in_transaction: bool,
+    curcmd: u16,
+}
+
+/// The DONE `CurCmd` value for a statement's command class.
+fn curcmd_of(command: truthdb_core::rel::DoneCommand) -> u16 {
+    use truthdb_core::rel::DoneCommand;
+    match command {
+        DoneCommand::Select => token::CMD_SELECT,
+        DoneCommand::Insert => token::CMD_INSERT,
+        DoneCommand::Update => token::CMD_UPDATE,
+        DoneCommand::Delete => token::CMD_DELETE,
+        DoneCommand::Other => 0,
+    }
 }
 
 impl BatchRender {
@@ -688,11 +811,13 @@ impl BatchRender {
             BatchEvent::StatementDone {
                 count,
                 in_transaction,
+                command,
             } => {
                 self.flush_pending(out, true).await?;
                 self.pending = Some(PendingDone {
                     count,
                     in_transaction,
+                    curcmd: curcmd_of(command),
                 });
             }
             BatchEvent::StatementAborted { in_transaction } => {
@@ -712,15 +837,13 @@ impl BatchRender {
                 self.pending = Some(PendingDone {
                     count: None,
                     in_transaction,
+                    curcmd: 0,
                 });
             }
             BatchEvent::PreparedHandle(handle) => {
-                // The handle rides a RETURNVALUE token, after every result
-                // set (return values follow results in an RPC response).
-                self.flush_pending(out, true).await?;
-                self.buf.clear();
-                token::return_value_int(&mut self.buf, "handle", handle);
-                out.write(&self.buf).await?;
+                // Held for the response tail: RETURNSTATUS precedes the
+                // RETURNVALUE, which precedes the final DONEPROC.
+                self.pending_handle = Some(handle);
             }
             BatchEvent::Error(error) => {
                 self.flush_pending(out, true).await?;
@@ -736,16 +859,30 @@ impl BatchRender {
                 self.errored = true;
             }
             BatchEvent::Complete { in_transaction } => {
-                if self.errored {
+                if self.rpc {
+                    // The last statement's DONEINPROC keeps DONE_MORE — the
+                    // RETURNSTATUS/RETURNVALUE/DONEPROC tail always follows.
+                    self.flush_pending(out, true).await?;
+                    self.buf.clear();
+                    if !self.errored {
+                        // A failed procedure returns no status.
+                        token::return_status(&mut self.buf, 0);
+                    }
+                    if let Some(handle) = self.pending_handle.take() {
+                        token::return_value_int(&mut self.buf, "handle", handle);
+                    }
+                    out.write(&self.buf).await?;
+                    self.final_done(out, self.errored, in_transaction).await?;
+                } else if self.errored {
                     // The error's own final DONE, after the last statement's.
                     self.flush_pending(out, true).await?;
-                    self.done(out, false, true, in_transaction, None).await?;
+                    self.final_done(out, true, in_transaction).await?;
                 } else if self.pending.is_some() {
                     self.flush_pending(out, false).await?;
                 } else {
                     // A batch with no statements at all (e.g. only comments):
                     // one final DONE.
-                    self.done(out, false, false, in_transaction, None).await?;
+                    self.final_done(out, false, in_transaction).await?;
                 }
                 return Ok(true);
             }
@@ -755,7 +892,7 @@ impl BatchRender {
                 self.buf.clear();
                 token::error(&mut self.buf, 50000, 1, 16, &err.to_string());
                 out.write(&self.buf).await?;
-                self.done(out, false, true, false, None).await?;
+                self.final_done(out, true, false).await?;
                 return Ok(true);
             }
         }
@@ -769,12 +906,21 @@ impl BatchRender {
         more: bool,
     ) -> io::Result<()> {
         if let Some(done) = self.pending.take() {
-            self.done(out, more, false, done.in_transaction, done.count)
-                .await?;
+            self.done(
+                out,
+                more,
+                false,
+                done.in_transaction,
+                done.count,
+                done.curcmd,
+            )
+            .await?;
         }
         Ok(())
     }
 
+    /// A statement's DONE: DONEINPROC inside an RPC response, plain DONE in a
+    /// batch (where `more = false` makes it the batch's final).
     async fn done<W: AsyncWrite + Unpin>(
         &mut self,
         out: &mut MessageWriter<'_, W>,
@@ -782,21 +928,45 @@ impl BatchRender {
         error: bool,
         in_transaction: bool,
         count: Option<u64>,
+        curcmd: u16,
     ) -> io::Result<()> {
         self.buf.clear();
-        token::done(&mut self.buf, more, error, in_transaction, count);
+        if self.rpc {
+            token::done_in_proc(&mut self.buf, more, error, in_transaction, count, curcmd);
+        } else {
+            token::done(&mut self.buf, more, error, in_transaction, count, curcmd);
+        }
+        out.write(&self.buf).await
+    }
+
+    /// The reply's final DONE: DONEPROC for an RPC (keeping `DONE_MORE` when
+    /// more RPCs follow in the same response), plain final DONE for a batch.
+    async fn final_done<W: AsyncWrite + Unpin>(
+        &mut self,
+        out: &mut MessageWriter<'_, W>,
+        error: bool,
+        in_transaction: bool,
+    ) -> io::Result<()> {
+        self.buf.clear();
+        if self.rpc {
+            token::done_proc(
+                &mut self.buf,
+                self.more_responses,
+                error,
+                in_transaction,
+                None,
+            );
+        } else {
+            token::done(&mut self.buf, false, error, in_transaction, None, 0);
+        }
         out.write(&self.buf).await
     }
 }
 
 fn rpc_error(message: &str) -> Vec<u8> {
-    rpc_error_num(50000, message)
-}
-
-fn rpc_error_num(number: i32, message: &str) -> Vec<u8> {
     let mut out = Vec::new();
-    token::error(&mut out, number, 1, 16, message);
-    token::done(&mut out, false, true, false, None);
+    token::error(&mut out, 50000, 1, 16, message);
+    token::done(&mut out, false, true, false, None, 0);
     out
 }
 
@@ -957,13 +1127,14 @@ mod render_tests {
                         false,
                         in_transaction,
                         Some(rowset.rows.len() as u64),
+                        token::CMD_SELECT,
                     );
                 }
                 StatementResult::RowsAffected(n) => {
-                    token::done(&mut out, more, false, in_transaction, Some(*n));
+                    token::done(&mut out, more, false, in_transaction, Some(*n), 0);
                 }
                 StatementResult::Done => {
-                    token::done(&mut out, more, false, in_transaction, None);
+                    token::done(&mut out, more, false, in_transaction, None, 0);
                 }
             }
         }
@@ -975,9 +1146,9 @@ mod render_tests {
                 error.level,
                 &error.message,
             );
-            token::done(&mut out, false, true, in_transaction, None);
+            token::done(&mut out, false, true, in_transaction, None, 0);
         } else if outcome.results.is_empty() {
-            token::done(&mut out, false, false, in_transaction, None);
+            token::done(&mut out, false, false, in_transaction, None, 0);
         }
         out
     }
@@ -998,13 +1169,24 @@ mod render_tests {
         events: mpsc::UnboundedReceiver<BatchEvent>,
         packet_size: usize,
     ) -> Vec<u8> {
+        rendered_events_framed(events, packet_size, false).await
+    }
+
+    async fn rendered_events_framed(
+        events: mpsc::UnboundedReceiver<BatchEvent>,
+        packet_size: usize,
+        rpc: bool,
+    ) -> Vec<u8> {
         let mut wire = Duplex {
             read: std::io::Cursor::new(Vec::new()),
             written: Vec::new(),
         };
         let kept = stream_reply(
             &mut wire,
-            events,
+            ReplySource::Single {
+                events: Some(events),
+                rpc,
+            },
             Arc::new(AtomicBool::new(false)),
             packet_size,
         )
@@ -1032,6 +1214,7 @@ mod render_tests {
                     tx.send(BatchEvent::StatementDone {
                         count: Some(rowset.rows.len() as u64),
                         in_transaction: in_xact,
+                        command: truthdb_core::rel::DoneCommand::Select,
                     })
                     .unwrap();
                 }
@@ -1039,12 +1222,14 @@ mod render_tests {
                     .send(BatchEvent::StatementDone {
                         count: Some(*n),
                         in_transaction: in_xact,
+                        command: truthdb_core::rel::DoneCommand::Other,
                     })
                     .unwrap(),
                 StatementResult::Done => tx
                     .send(BatchEvent::StatementDone {
                         count: None,
                         in_transaction: in_xact,
+                        command: truthdb_core::rel::DoneCommand::Other,
                     })
                     .unwrap(),
             }
@@ -1059,15 +1244,17 @@ mod render_tests {
         rx
     }
 
-    /// A prepared handle renders as a RETURNVALUE token after the statement's
-    /// DONE (return values follow results), with the exact bytes MS-TDS
-    /// 2.2.7.19 prescribes for an INT output parameter.
+    /// An RPC response frames as SQL Server does: per-statement DONEINPROC
+    /// (DONE_MORE kept on the last), then RETURNSTATUS, then RETURNVALUE (the
+    /// prepared handle, when there is one), then a final DONEPROC. A SQL
+    /// batch's plain-DONE framing is untouched — the oracle pins those bytes.
     #[tokio::test]
     async fn a_prepared_handle_renders_as_a_returnvalue_token() {
         let (tx, rx) = mpsc::unbounded_channel();
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
+            command: truthdb_core::rel::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::PreparedHandle(7)).unwrap();
@@ -1078,10 +1265,57 @@ mod render_tests {
         drop(tx);
 
         let mut expected = Vec::new();
-        token::done(&mut expected, true, false, false, Some(1));
+        token::done_in_proc(&mut expected, true, false, false, Some(1), 0);
+        token::return_status(&mut expected, 0);
         token::return_value_int(&mut expected, "handle", 7);
-        token::done(&mut expected, false, false, false, None);
-        assert_eq!(rendered_events(rx, 4096).await, expected);
+        token::done_proc(&mut expected, false, false, false, None);
+        assert_eq!(rendered_events_framed(rx, 4096, true).await, expected);
+
+        // Without a handle (sp_executesql, sp_execute): DONEINPROC,
+        // RETURNSTATUS, DONEPROC.
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(BatchEvent::StatementDone {
+            count: Some(3),
+            in_transaction: false,
+            command: truthdb_core::rel::DoneCommand::Other,
+        })
+        .unwrap();
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+        let mut expected = Vec::new();
+        token::done_in_proc(&mut expected, true, false, false, Some(3), 0);
+        token::return_status(&mut expected, 0);
+        token::done_proc(&mut expected, false, false, false, None);
+        assert_eq!(rendered_events_framed(rx, 4096, true).await, expected);
+
+        // A failed RPC returns no status: ERROR, DONEINPROC for what ran,
+        // then DONEPROC with DONE_ERROR.
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(BatchEvent::Error(truthdb_sql::error::SqlError::new(
+            8179,
+            16,
+            1,
+            "Could not find prepared statement with handle 42.",
+        )))
+        .unwrap();
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+        let mut expected = Vec::new();
+        token::error(
+            &mut expected,
+            8179,
+            1,
+            16,
+            "Could not find prepared statement with handle 42.",
+        );
+        token::done_proc(&mut expected, false, true, false, None);
+        assert_eq!(rendered_events_framed(rx, 4096, true).await, expected);
 
         // The token's own bytes, pinned: 0xAC, ordinal 0, B_VARCHAR name,
         // status 0x01 (output param), UserType 0, Flags 0, INTN(4), value.
@@ -1111,6 +1345,7 @@ mod render_tests {
             tx.send(BatchEvent::StatementDone {
                 count,
                 in_transaction,
+                command: truthdb_core::rel::DoneCommand::Other,
             })
             .unwrap();
         }
@@ -1121,9 +1356,9 @@ mod render_tests {
         drop(tx);
 
         let mut expected = Vec::new();
-        token::done(&mut expected, true, false, true, None);
-        token::done(&mut expected, true, false, true, Some(1));
-        token::done(&mut expected, false, false, false, None);
+        token::done(&mut expected, true, false, true, None, 0);
+        token::done(&mut expected, true, false, true, Some(1), 0);
+        token::done(&mut expected, false, false, false, None, 0);
         assert_eq!(rendered_events(rx, 4096).await, expected);
     }
 
@@ -1148,6 +1383,7 @@ mod render_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
+            command: truthdb_core::rel::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::Complete {
@@ -1159,10 +1395,10 @@ mod render_tests {
         let mut expected = Vec::new();
         token::colmetadata(&mut expected, &columns());
         token::row(&mut expected, &[Datum::Int(1)], &columns());
-        token::done(&mut expected, true, false, false, None);
+        token::done(&mut expected, true, false, false, None, 0);
         token::colmetadata(&mut expected, &columns());
         token::row(&mut expected, &[Datum::Int(9)], &columns());
-        token::done(&mut expected, false, false, false, Some(1));
+        token::done(&mut expected, false, false, false, Some(1), 0);
         assert_eq!(rendered_events(rx, 4096).await, expected);
     }
 
@@ -1190,7 +1426,7 @@ mod render_tests {
         let mut expected = Vec::new();
         token::colmetadata(&mut expected, &columns());
         token::row(&mut expected, &[Datum::Int(1)], &columns());
-        token::done(&mut expected, false, false, false, None);
+        token::done(&mut expected, false, false, false, None, 0);
         assert_eq!(rendered_events(rx, 4096).await, expected);
     }
 
@@ -1262,7 +1498,16 @@ mod render_tests {
         });
 
         let mut wire = FailingWrite;
-        let result = stream_reply(&mut wire, rx, cancel.clone(), MIN_PACKET_SIZE).await;
+        let result = stream_reply(
+            &mut wire,
+            ReplySource::Single {
+                events: Some(rx),
+                rpc: false,
+            },
+            cancel.clone(),
+            MIN_PACKET_SIZE,
+        )
+        .await;
         assert!(result.is_err(), "the write error surfaces");
         assert!(
             cancel.load(Ordering::Relaxed),
@@ -1410,7 +1655,10 @@ mod render_tests {
         };
         stream_reply(
             &mut duplex,
-            events,
+            ReplySource::Single {
+                events: Some(events),
+                rpc: false,
+            },
             Arc::new(AtomicBool::new(false)),
             MIN_PACKET_SIZE,
         )
@@ -1490,9 +1738,17 @@ mod attention_tests {
         let events = cancellable_batch(cancel.clone());
         // The client sends an Attention (header-only packet) during the batch.
         client.write_all(&ATTN).await.expect("send attention");
-        let kept = stream_reply(&mut server, events, cancel.clone(), 4096)
-            .await
-            .expect("io ok");
+        let kept = stream_reply(
+            &mut server,
+            ReplySource::Single {
+                events: Some(events),
+                rpc: false,
+            },
+            cancel.clone(),
+            4096,
+        )
+        .await
+        .expect("io ok");
         assert!(kept, "the client is still connected");
         assert!(
             cancel.load(Ordering::Relaxed),
@@ -1524,6 +1780,7 @@ mod attention_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
+            command: truthdb_core::rel::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::Complete {
@@ -1532,9 +1789,17 @@ mod attention_tests {
         .unwrap();
         drop(tx);
 
-        let kept = stream_reply(&mut server, rx, cancel.clone(), 4096)
-            .await
-            .expect("io ok");
+        let kept = stream_reply(
+            &mut server,
+            ReplySource::Single {
+                events: Some(rx),
+                rpc: false,
+            },
+            cancel.clone(),
+            4096,
+        )
+        .await
+        .expect("io ok");
         assert!(kept);
         assert!(!cancel.load(Ordering::Relaxed));
         let mut cursor = std::io::Cursor::new(read_client_bytes(&mut client).await);
@@ -1546,7 +1811,7 @@ mod attention_tests {
         let mut expected = Vec::new();
         token::colmetadata(&mut expected, &columns());
         token::row(&mut expected, &[Datum::Int(1)], &columns());
-        token::done(&mut expected, false, false, false, Some(1));
+        token::done(&mut expected, false, false, false, Some(1), 0);
         assert_eq!(payload, expected);
     }
 
@@ -1566,13 +1831,22 @@ mod attention_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
+            command: truthdb_core::rel::DoneCommand::Other,
         })
         .unwrap();
         drop(tx);
 
-        let kept = stream_reply(&mut server, rx, Arc::new(AtomicBool::new(false)), 4096)
-            .await
-            .expect("io ok");
+        let kept = stream_reply(
+            &mut server,
+            ReplySource::Single {
+                events: Some(rx),
+                rpc: false,
+            },
+            Arc::new(AtomicBool::new(false)),
+            4096,
+        )
+        .await
+        .expect("io ok");
         assert!(kept);
         let mut cursor = std::io::Cursor::new(read_client_bytes(&mut client).await);
         let payload = crate::packet::read_message(&mut cursor)
@@ -1585,7 +1859,7 @@ mod attention_tests {
         let mut expected = Vec::new();
         token::colmetadata(&mut expected, &columns());
         token::row(&mut expected, &[Datum::Int(1)], &columns());
-        token::done(&mut expected, true, false, false, Some(1));
+        token::done(&mut expected, true, false, false, Some(1), 0);
         token::error(
             &mut expected,
             50000,
@@ -1593,7 +1867,7 @@ mod attention_tests {
             16,
             &EngineError::Unavailable.to_string(),
         );
-        token::done(&mut expected, false, true, false, None);
+        token::done(&mut expected, false, true, false, None, 0);
         assert_eq!(payload, expected);
     }
 
@@ -1631,9 +1905,17 @@ mod attention_tests {
             // `tx` drops here: the sink dying is what says the batch is over.
         });
 
-        let kept = stream_reply(&mut server, rx, cancel.clone(), 4096)
-            .await
-            .expect("io ok");
+        let kept = stream_reply(
+            &mut server,
+            ReplySource::Single {
+                events: Some(rx),
+                rpc: false,
+            },
+            cancel.clone(),
+            4096,
+        )
+        .await
+        .expect("io ok");
         assert!(!kept, "the client disconnected");
         assert!(
             cancel.load(Ordering::Relaxed),
@@ -1653,9 +1935,17 @@ mod attention_tests {
         drop(client);
         let cancel = Arc::new(AtomicBool::new(false));
         let events = cancellable_batch(cancel.clone());
-        let kept = stream_reply(&mut server, events, cancel.clone(), 4096)
-            .await
-            .expect("io ok");
+        let kept = stream_reply(
+            &mut server,
+            ReplySource::Single {
+                events: Some(events),
+                rpc: false,
+            },
+            cancel.clone(),
+            4096,
+        )
+        .await
+        .expect("io ok");
         assert!(!kept, "the client disconnected");
         assert!(
             cancel.load(Ordering::Relaxed),

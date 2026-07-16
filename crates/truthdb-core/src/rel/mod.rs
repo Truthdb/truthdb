@@ -352,9 +352,10 @@ pub trait BatchEmitter {
     fn columns(&mut self, columns: Vec<ResultColumn>);
     /// A chunk of rows for the open result set.
     fn rows(&mut self, rows: Vec<Vec<Datum>>);
-    /// Ends one statement: its row count / rows-affected (`None` for DDL), and
-    /// the transaction state after it ran.
-    fn statement_done(&mut self, count: Option<u64>, in_transaction: bool);
+    /// Ends one statement: its row count / rows-affected (`None` for DDL),
+    /// the transaction state after it ran, and its command class (the DONE's
+    /// `CurCmd` on the wire).
+    fn statement_done(&mut self, count: Option<u64>, in_transaction: bool, command: DoneCommand);
     /// Ends a statement that failed after its result set had begun streaming:
     /// the set is closed so the stream stays framed for the statements that
     /// follow. The error itself is reported separately — at the end of the
@@ -397,7 +398,7 @@ impl BatchEmitter for Collector {
         }
     }
 
-    fn statement_done(&mut self, count: Option<u64>, _in_transaction: bool) {
+    fn statement_done(&mut self, count: Option<u64>, _in_transaction: bool, _command: DoneCommand) {
         self.results.push(match self.open.take() {
             Some(rowset) => StatementResult::Rows(rowset),
             None => match count {
@@ -441,6 +442,32 @@ struct BatchRun<'a> {
 struct DeferredDone {
     count: Option<u64>,
     in_transaction: bool,
+    command: DoneCommand,
+}
+
+/// The command class a statement's DONE reports in its `CurCmd` field.
+/// mssql-jdbc discards a DONE's row count unless `CurCmd` names a DML
+/// command, so `executeUpdate` returns -1 against a server that leaves it
+/// zero (pytds and go-mssqldb ignore the field).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum DoneCommand {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    /// DDL, SET, transaction control — anything whose count nobody reads.
+    Other,
+}
+
+/// The `CurCmd` class of a statement.
+fn done_command(statement: &Statement) -> DoneCommand {
+    match statement {
+        Statement::Select(_) => DoneCommand::Select,
+        Statement::Insert(_) => DoneCommand::Insert,
+        Statement::Update(_) => DoneCommand::Update,
+        Statement::Delete(_) => DoneCommand::Delete,
+        _ => DoneCommand::Other,
+    }
 }
 
 impl BatchRun<'_> {
@@ -463,11 +490,12 @@ impl BatchRun<'_> {
     }
 
     /// Ends a statement. Its DONE is deferred to the next durability point.
-    fn done(&mut self, count: Option<u64>, in_transaction: bool) {
+    fn done(&mut self, count: Option<u64>, in_transaction: bool, command: DoneCommand) {
         self.rowset_open = false;
         self.deferred.push(DeferredDone {
             count,
             in_transaction,
+            command,
         });
     }
 
@@ -502,7 +530,8 @@ impl BatchRun<'_> {
             }
         }
         for done in self.deferred.drain(..) {
-            self.emitter.statement_done(done.count, done.in_transaction);
+            self.emitter
+                .statement_done(done.count, done.in_transaction, done.command);
         }
         Ok(())
     }
@@ -520,7 +549,8 @@ impl BatchRun<'_> {
             }
         }
         for done in self.deferred.drain(..) {
-            self.emitter.statement_done(done.count, done.in_transaction);
+            self.emitter
+                .statement_done(done.count, done.in_transaction, done.command);
         }
         None
     }
@@ -611,21 +641,22 @@ fn run_block(
         match exec_statement_streamed(storage, statement, txn_ctx, run) {
             Ok(outcome) => {
                 let in_transaction = txn_ctx.in_txn();
+                let command = done_command(statement);
                 match outcome {
                     StatementOutcome::Streamed { rows } => {
-                        run.done(Some(rows), in_transaction);
+                        run.done(Some(rows), in_transaction, command);
                     }
                     StatementOutcome::Result(StatementResult::Rows(rowset)) => {
                         let count = rowset.rows.len() as u64;
                         run.open_rowset(rowset.columns);
                         run.rows(rowset.rows);
-                        run.done(Some(count), in_transaction);
+                        run.done(Some(count), in_transaction, command);
                     }
                     StatementOutcome::Result(StatementResult::RowsAffected(n)) => {
-                        run.done(Some(n), in_transaction);
+                        run.done(Some(n), in_transaction, command);
                     }
                     StatementOutcome::Result(StatementResult::Done) => {
-                        run.done(None, in_transaction);
+                        run.done(None, in_transaction, command);
                     }
                 }
             }

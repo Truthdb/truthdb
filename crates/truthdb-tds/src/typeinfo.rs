@@ -20,7 +20,7 @@ const BIGVARBINARY: u8 = 0xa5;
 /// A 5-byte collation for a Latin1-general, case-insensitive, accent-
 /// sensitive locale (LCID 0x0409, SortId 0x34 = code page 1252). Character
 /// columns carry it; clients use it to pick a decoder for BIGVARCHR bytes.
-const COLLATION: [u8; 5] = [0x09, 0x04, 0xd0, 0x00, 0x34];
+pub const COLLATION: [u8; 5] = [0x09, 0x04, 0xd0, 0x00, 0x34];
 
 /// Max UCS-2 code units in a non-MAX NVARCHAR row value: 32767 units = 65534
 /// bytes, the largest even byte count a u16 value-length prefix can hold.
