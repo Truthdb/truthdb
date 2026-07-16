@@ -235,9 +235,22 @@ pub(crate) fn undo_one(
     tree_roots: &HashMap<u32, u64>,
 ) -> Result<(), StorageError> {
     {
+        // In-group CLRs point AT the record (`record_lsn`): the group re-runs
+        // after a crash, and each op tolerates partial prior application —
+        // heap arms by occupancy guard, tree arms by logical presence check.
+        // A counter compensation is a blind arithmetic delta and CANNOT: a
+        // crash after its CLR but before the sealing no-op would re-undo the
+        // record and apply the delta twice, permanently. Its group is exactly
+        // one op, so its CLR points *past* the compensated record instead
+        // (textbook ARIES): a re-run resumes at `record_prev` and can never
+        // revisit it.
+        let undo_next = match undo {
+            PageOpUndo::CounterAdd { .. } => record_prev,
+            _ => record_lsn,
+        };
         let mut mode = OpMode::Clr {
             txn: link,
-            undo_next: record_lsn,
+            undo_next,
         };
         match undo {
             PageOpUndo::None => {}
@@ -254,6 +267,19 @@ pub(crate) fn undo_one(
                     root,
                 };
                 apply_tree_undo(ctx, &mut mode, &tree, undo)?;
+            }
+            PageOpUndo::CounterAdd { page, delta } => {
+                // The inverse delta was baked in when the undo record was
+                // built. This CLR's `undo_next` is `record_prev` (see above),
+                // which is what makes the compensation exactly-once across a
+                // crash mid-undo.
+                ctx.apply_op(
+                    mode.log_mode(PageOpUndo::None),
+                    PageOpRedo::CounterAdd {
+                        page: *page,
+                        delta: *delta,
+                    },
+                )?;
             }
             PageOpUndo::HeapDeleteSlot { page, slot } => {
                 if heap_slot_occupied(ctx, *page, *slot)? {

@@ -448,6 +448,14 @@ impl Storage {
         self.lock().rel_drop_index(table, index_name)
     }
 
+    /// The table's committed row count, when it has a counter page (tables
+    /// created before counters existed do not — the planner then applies no
+    /// tie-break). Errors degrade to `None`: the count is a statistic, never
+    /// load-bearing for results.
+    pub(crate) fn rel_row_count(&self, table: &str) -> Option<u64> {
+        self.lock().rel_row_count(table)
+    }
+
     pub(crate) fn rel_index_scan(
         &self,
         table: &str,
@@ -691,6 +699,15 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn rel_flush_pool_only(&self) -> Result<(), StorageError> {
         self.lock().rel_flush_pool_only()
+    }
+
+    /// Test hook: the relational WAL records currently recoverable from the
+    /// ring, exactly as restart's analysis would see them.
+    #[cfg(test)]
+    pub(crate) fn rel_wal_records(
+        &self,
+    ) -> Result<Vec<(u64, crate::wal::records::RelRecord)>, StorageError> {
+        self.lock().rel_records()
     }
 
     #[cfg(test)]
@@ -1006,6 +1023,7 @@ impl StorageFile {
             } else {
                 Heap::create(ctx, object_id)?.first_page
             };
+            let counter_page = ctx.counter_create(object_id)?;
             let def = TableDef {
                 object_id,
                 name: table_name,
@@ -1019,6 +1037,7 @@ impl StorageFile {
                 check_constraints,
                 foreign_keys,
                 view_query: None,
+                counter_page: Some(counter_page),
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
@@ -1064,6 +1083,7 @@ impl StorageFile {
                 check_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 view_query: Some(query),
+                counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
@@ -1231,6 +1251,14 @@ impl StorageFile {
     /// `[lower, upper]`, then fetches each row by its locator. Returns a
     /// superset the caller re-filters with the full WHERE (so loose bounds are
     /// safe).
+    pub(crate) fn rel_row_count(&mut self, table: &str) -> Option<u64> {
+        if self.ensure_rel_usable().is_err() {
+            return None;
+        }
+        let page = self.rel.tables.get(table)?.counter_page?;
+        self.rel_ctx().counter_read(page).ok()
+    }
+
     pub(crate) fn rel_index_scan(
         &mut self,
         table: &str,
@@ -1352,6 +1380,8 @@ impl StorageFile {
 
         let indexes = def.indexes.clone();
         let collations = def.collations.clone();
+        let counter_page = def.counter_page;
+        let inserted = rows.len() as i64;
         if def.is_tree() {
             let tree = BTree {
                 object_id: def.object_id,
@@ -1379,6 +1409,9 @@ impl StorageFile {
                         &Locator::Key(key.clone()),
                     )?;
                 }
+                if let Some(page) = counter_page {
+                    ctx.counter_add(txn, page, inserted)?;
+                }
                 Ok(())
             })
         } else {
@@ -1399,6 +1432,9 @@ impl StorageFile {
                         values,
                         &Locator::Rid(rid),
                     )?;
+                }
+                if let Some(page) = counter_page {
+                    ctx.counter_add(txn, page, inserted)?;
                 }
                 Ok(())
             })
@@ -1725,12 +1761,17 @@ impl StorageFile {
         }
         let indexes = def.indexes.clone();
         let collations = def.collations.clone();
+        let counter_page = def.counter_page;
+        // The counter follows the rows actually removed inside the statement,
+        // which the arms count as they go (a locator of the wrong kind is
+        // skipped, exactly as the row loop skips it).
         if def.is_tree() {
             let tree = BTree {
                 object_id: def.object_id,
                 root: def.root_page,
             };
             self.rel_statement_scoped(scope, move |ctx, txn| {
+                let mut removed: i64 = 0;
                 for (loc, values) in &targets {
                     if let RowLocator::Key(key) = loc {
                         tree.delete(ctx, &mut OpMode::Txn(txn), key)?;
@@ -1742,7 +1783,11 @@ impl StorageFile {
                             values,
                             &Locator::Key(key.clone()),
                         )?;
+                        removed += 1;
                     }
+                }
+                if let Some(page) = counter_page {
+                    ctx.counter_add(txn, page, -removed)?;
                 }
                 Ok(())
             })?;
@@ -1752,6 +1797,7 @@ impl StorageFile {
                 first_page: def.root_page,
             };
             self.rel_statement_scoped(scope, move |ctx, txn| {
+                let mut removed: i64 = 0;
                 for (loc, values) in &targets {
                     if let RowLocator::Rid(rid) = loc {
                         heap.delete(ctx, txn, *rid)?;
@@ -1763,7 +1809,11 @@ impl StorageFile {
                             values,
                             &Locator::Rid(*rid),
                         )?;
+                        removed += 1;
                     }
+                }
+                if let Some(page) = counter_page {
+                    ctx.counter_add(txn, page, -removed)?;
                 }
                 Ok(())
             })?;
@@ -2018,6 +2068,11 @@ impl StorageFile {
                 first_page: def.root_page,
             };
             heap.insert(&mut ctx, &mut txn, &row)?;
+        }
+        // A real statement's op stream includes the counter op, so the crash
+        // window this hook simulates must too.
+        if let Some(page) = def.counter_page {
+            ctx.counter_add(&mut txn, page, 1)?;
         }
         // Durable ops, no commit record: exactly the crash window.
         ctx.io.wal.sync_all()?;
@@ -3300,6 +3355,182 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The row counter tracks every DML shape through the SQL layer — and
+    /// because it is an ordinary transactional page op, statement atomicity,
+    /// savepoints, transaction rollback and crash recovery all keep it exact
+    /// without counter-specific recovery code.
+    #[test]
+    fn row_counts_track_dml_transactions_and_recovery() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("row-count");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let run = |storage: &Storage, ctx: &mut TxnContext, sql: &str| {
+            let outcome = execute_batch(storage, sql, ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        };
+
+        run(
+            &storage,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+        );
+        assert_eq!(storage.rel_row_count("t"), Some(0));
+
+        run(
+            &storage,
+            &mut ctx,
+            "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
+        );
+        assert_eq!(storage.rel_row_count("t"), Some(3));
+
+        run(&storage, &mut ctx, "DELETE FROM t WHERE id = 3");
+        run(&storage, &mut ctx, "UPDATE t SET v = 99 WHERE id = 1");
+        assert_eq!(storage.rel_row_count("t"), Some(2), "delete -1, update 0");
+
+        // A failing multi-row statement (duplicate key on its last row) is
+        // atomic: no rows land, and neither does its count.
+        let dup = execute_batch(&storage, "INSERT INTO t VALUES (5, 1), (1, 1)", &mut ctx);
+        assert!(dup.error.is_some(), "duplicate key must fail");
+        assert_eq!(storage.rel_row_count("t"), Some(2));
+
+        // Transaction rollback restores the count with the rows.
+        run(
+            &storage,
+            &mut ctx,
+            "BEGIN TRANSACTION; INSERT INTO t VALUES (10, 1), (11, 1)",
+        );
+        assert_eq!(storage.rel_row_count("t"), Some(4), "in-flight rows count");
+        run(&storage, &mut ctx, "ROLLBACK");
+        assert_eq!(storage.rel_row_count("t"), Some(2));
+
+        // A savepoint rollback restores exactly the statements behind it.
+        run(
+            &storage,
+            &mut ctx,
+            "BEGIN TRANSACTION; INSERT INTO t VALUES (20, 1); SAVE TRANSACTION sp; \
+             INSERT INTO t VALUES (21, 1); ROLLBACK TRANSACTION sp; COMMIT",
+        );
+        assert_eq!(storage.rel_row_count("t"), Some(3));
+
+        // Crash (no checkpoint, pool never flushed): recovery replays the ops,
+        // counter page included.
+        drop(storage);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        assert_eq!(
+            storage.rel_row_count("t"),
+            Some(3),
+            "count survives recovery"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Rows of a transaction still open at the crash are undone by recovery —
+    /// and so is their count.
+    #[test]
+    fn an_uncommitted_transactions_rows_are_uncounted_after_crash() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("row-count-crash");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY); INSERT INTO t VALUES (1), (2)",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+
+        let mut open_txn = TxnContext::default();
+        let pending = execute_batch(
+            &storage,
+            "BEGIN TRANSACTION; INSERT INTO t VALUES (10), (11), (12)",
+            &mut open_txn,
+        );
+        assert!(pending.error.is_none(), "{:?}", pending.error);
+        assert_eq!(storage.rel_row_count("t"), Some(5), "in-flight rows count");
+        drop(storage); // crash with the transaction open
+
+        let storage = Storage::open(path.clone()).expect("reopen");
+        assert_eq!(
+            storage.rel_row_count("t"),
+            Some(2),
+            "the loser transaction's rows and count are both undone"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// "Row counts as tie-breakers only": a table at or under the tiny
+    /// threshold plans its seek as the scan it ties with, grows into the seek
+    /// past the threshold — and a covering seek keeps its win at any size,
+    /// since it reads less than the table either way.
+    #[test]
+    fn a_tiny_table_scans_until_it_grows_into_its_seek() {
+        use crate::rel::{StatementResult, TxnContext, execute_batch};
+
+        let path = unique_temp_path("row-count-tiebreak");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let run = |storage: &Storage, ctx: &mut TxnContext, sql: &str| {
+            let outcome = execute_batch(storage, sql, ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+            outcome
+        };
+        let plan_of = |storage: &Storage, ctx: &mut TxnContext, sql: &str| -> String {
+            let outcome = run(storage, ctx, &format!("SET SHOWPLAN_TEXT ON; {sql}"));
+            let mut ctx2 = TxnContext::default();
+            let _ = execute_batch(storage, "SET SHOWPLAN_TEXT OFF", &mut ctx2);
+            match &outcome.results[1] {
+                StatementResult::Rows(rowset) => rowset
+                    .rows
+                    .iter()
+                    .map(|r| format!("{:?}", r[0]))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+                other => panic!("expected plan rows, got {other:?}"),
+            }
+        };
+
+        run(
+            &storage,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT, v INT); \
+             CREATE INDEX ix_a ON t (a); \
+             CREATE INDEX ix_cover ON t (v) INCLUDE (v, id); \
+             INSERT INTO t VALUES (1, 10, 5), (2, 20, 6), (3, 30, 7)",
+        );
+
+        // Tiny: the non-covering seek ties with the scan; the tie goes to the
+        // scan. The covering seek still wins — it reads less than the table.
+        let tiny = plan_of(&storage, &mut ctx, "SELECT id FROM t WHERE a = 20");
+        assert!(tiny.contains("Table Scan"), "tiny table scans: {tiny}");
+        let covering = plan_of(&storage, &mut ctx, "SELECT v, id FROM t WHERE v = 6");
+        assert!(
+            covering.contains("Index Seek (covering)"),
+            "covering exempt from the tie-break: {covering}"
+        );
+
+        // Past the threshold the same query seeks.
+        let mut pad = String::from("INSERT INTO t VALUES (100, 900, 900)");
+        for i in 1..20 {
+            pad.push_str(&format!(", ({}, 900, 900)", 100 + i));
+        }
+        run(&storage, &mut ctx, &pad);
+        let grown = plan_of(&storage, &mut ctx, "SELECT id FROM t WHERE a = 20");
+        assert!(
+            grown.contains("Index Seek") && grown.contains("Key Lookup"),
+            "grown table seeks: {grown}"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// A covering index wins its tie against an equal-scoring non-INCLUDE
     /// index — the "add a covering index to an existing database" workflow.
     /// Coverage breaks equality ties only: it never outranks a fully-matched
@@ -3443,6 +3674,14 @@ mod tests {
              INSERT INTO t VALUES (1, 'a@x.com', 'Alice')",
             &mut ctx,
         );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+        // Pad past the tiny-table tie-break: a <= 16-row table plans as a
+        // scan, and this test is about the seek's two plan shapes.
+        let mut pad = String::from("INSERT INTO t VALUES (100, 'z0@x.com', 'p')");
+        for i in 1..20 {
+            pad.push_str(&format!(", ({}, 'z{i}@x.com', 'p')", 100 + i));
+        }
+        let setup = execute_batch(&storage, &pad, &mut ctx);
         assert!(setup.error.is_none(), "{:?}", setup.error);
 
         // `name` is not included: the seek fetches the base row by PK key.

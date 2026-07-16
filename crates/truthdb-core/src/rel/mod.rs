@@ -1438,8 +1438,21 @@ fn showplan_rows(
                         plan::plan_text(&plan.access, &def.name, plan.covering)
                     } else {
                         let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
-                        let path =
-                            plan::choose(&def, &schema, &select.where_clause, eval_ctx, None);
+                        // Fetched only when choose() can use it (it returns a
+                        // scan outright without a predicate or indexes).
+                        let row_count = if def.indexes.is_empty() || select.where_clause.is_none() {
+                            None
+                        } else {
+                            storage.rel_row_count(&def.name)
+                        };
+                        let path = plan::choose(
+                            &def,
+                            &schema,
+                            &select.where_clause,
+                            eval_ctx,
+                            None,
+                            row_count,
+                        );
                         plan::plan_text(&path, &def.name, false)
                     }
                 }
@@ -5126,7 +5139,22 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     // `build_table_source` would compute all three again. Chosen after
     // `needed` is known so a covering index can win its tie (see
     // [`plan::choose`]).
-    let access = plan::choose(&def, &schema, &select.where_clause, eval_ctx, Some(&needed));
+    // The row count is a statistic (one buffer-pool-cached page read),
+    // fetched only when choose() can use it (it returns a scan outright
+    // without a predicate or indexes).
+    let row_count = if def.indexes.is_empty() || select.where_clause.is_none() {
+        None
+    } else {
+        storage.rel_row_count(&def.name)
+    };
+    let access = plan::choose(
+        &def,
+        &schema,
+        &select.where_clause,
+        eval_ctx,
+        Some(&needed),
+        row_count,
+    );
 
     // Everything downstream now speaks in the scanned row's coordinates.
     let position = |index: usize| {
@@ -6451,7 +6479,14 @@ fn build_table_source(
             let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
             // An index seek narrows the candidate set; the WHERE filter later
             // re-checks, so results match a full scan.
-            let rows = match plan::choose(&def, &schema, where_clause, eval_ctx, None) {
+            // Fetched only when choose() can use it (it returns a scan
+            // outright without a predicate or indexes).
+            let row_count = if def.indexes.is_empty() || where_clause.is_none() {
+                None
+            } else {
+                storage.rel_row_count(&def.name)
+            };
+            let rows = match plan::choose(&def, &schema, where_clause, eval_ctx, None, row_count) {
                 // Sliced: a read holds the table's lock, so it need not also
                 // hold the storage lock for the whole table and block every
                 // other session while it walks.

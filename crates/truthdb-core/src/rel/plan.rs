@@ -48,13 +48,16 @@ type Bounds = (Option<Vec<u8>>, Option<Vec<u8>>);
 /// the query reads (`needed`, when the caller knows it) wins: it answers
 /// from its leaves with no per-row base-table lookup. Coverage never
 /// outranks a better equality match or a fully-matched UNIQUE seek — a
-/// single-row lookup beats a covering scan of many.
+/// single-row lookup beats a covering scan of many. A `row_count` at or
+/// below [`TINY_TABLE_ROWS`] demotes a non-covering seek to the scan it ties
+/// with (a covering seek still reads less than the table and keeps its win).
 pub fn choose(
     def: &TableDef,
     schema: &Schema,
     where_clause: &Option<Expr>,
     eval_ctx: &EvalContext,
     needed: Option<&[usize]>,
+    row_count: Option<u64>,
 ) -> AccessPath {
     let Some(predicate) = where_clause else {
         return AccessPath::TableScan;
@@ -67,7 +70,7 @@ pub fn choose(
     if sargs.is_empty() {
         return AccessPath::TableScan;
     }
-    let mut best: Option<(u32, AccessPath)> = None;
+    let mut best: Option<(u32, AccessPath, bool)> = None;
     for index in &def.indexes {
         if let Some((mut score, path)) = try_index(index, schema, &sargs) {
             let covers =
@@ -78,13 +81,27 @@ pub fn choose(
                 // narrower range, never a more selective seek.
                 score += 5;
             }
-            if best.as_ref().is_none_or(|(s, _)| score > *s) {
-                best = Some((score, path));
+            if best.as_ref().is_none_or(|(s, _, _)| score > *s) {
+                best = Some((score, path, covers));
             }
         }
     }
-    best.map(|(_, path)| path).unwrap_or(AccessPath::TableScan)
+    match best {
+        // "Row counts as tie-breakers only": on a tiny table the scan reads
+        // about one page, so a seek that would still visit the base table
+        // buys nothing — take the scan. A covering seek keeps its win.
+        Some((_, _, false)) if row_count.is_some_and(|rows| rows <= TINY_TABLE_ROWS) => {
+            AccessPath::TableScan
+        }
+        Some((_, path, _)) => path,
+        None => AccessPath::TableScan,
+    }
 }
+
+/// Rows at or below which a table is "tiny": a full scan touches about one
+/// page, so a non-covering seek — an index descent plus a base-table lookup
+/// per row — ties with it at best, and the tie goes to the scan.
+const TINY_TABLE_ROWS: u64 = 16;
 
 /// Renders the plan as `SHOWPLAN_TEXT` rows. A covering seek (every needed
 /// column INCLUDEd in the leaf) answers from the index alone, so it has no

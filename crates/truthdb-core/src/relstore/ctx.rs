@@ -301,6 +301,58 @@ impl RelCtx<'_> {
         Ok(lsn)
     }
 
+    /// Creates a table's row-counter page: allocated, formatted, zero count,
+    /// logged as a system image (like a fresh tree root — a rolled-back
+    /// CREATE TABLE leaves it an unreferenced orphan, which is safe).
+    pub fn counter_create(&mut self, object_id: u32) -> Result<u64, StorageError> {
+        let page_no = self.allocate_page(0)?;
+        let frame = self.format_page(page_no, page::PAGE_TYPE_COUNTER, object_id, 0)?;
+        let at = page::COUNTER_OFFSET;
+        self.pool.page_mut(frame)[at..at + 8].copy_from_slice(&0u64.to_le_bytes());
+        self.pool.unpin(frame);
+        self.log_system_image(page_no)?;
+        Ok(page_no)
+    }
+
+    /// Adds `delta` rows to a table's counter as a transactional page op: the
+    /// undo record carries the inverse delta, so statement savepoints, txn
+    /// rollback and crash recovery keep the count exactly consistent with the
+    /// committed rows.
+    pub fn counter_add(
+        &mut self,
+        txn: &mut TxnLink,
+        page: u64,
+        delta: i64,
+    ) -> Result<(), StorageError> {
+        if delta == 0 {
+            return Ok(());
+        }
+        self.apply_op(
+            LogMode::Txn(
+                txn,
+                PageOpUndo::CounterAdd {
+                    page,
+                    delta: -delta,
+                },
+            ),
+            PageOpRedo::CounterAdd { page, delta },
+        )?;
+        Ok(())
+    }
+
+    /// Reads a counter page's row count.
+    pub fn counter_read(&mut self, page: u64) -> Result<u64, StorageError> {
+        let frame = self.fetch(page)?;
+        let at = page::COUNTER_OFFSET;
+        let count = u64::from_le_bytes(
+            self.pool.page(frame)[at..at + 8]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        self.pool.unpin(frame);
+        Ok(count)
+    }
+
     /// Logs the current full image of a page as a system record (used for
     /// freshly formatted pages whose creation would not be idempotent as
     /// per-op records). On append failure the page stays an orphan (never
@@ -406,6 +458,18 @@ pub(crate) fn apply_redo_to_page(
             .map_err(|_| full("HeapUpdate")),
         PageOpRedo::SetNextPage { next, .. } => {
             page.set_next_page(*next);
+            Ok(())
+        }
+        PageOpRedo::CounterAdd { delta, .. } => {
+            let _ = page;
+            let at = crate::relstore::page::COUNTER_OFFSET;
+            let count = u64::from_le_bytes(page_bytes[at..at + 8].try_into().expect("8 bytes"));
+            // Wrapping, deliberately: a delta the logic never produces (an
+            // undo without its op, an op without its undo) must not turn into
+            // a panic inside redo — the count is a statistic, and the
+            // surrounding ARIES discipline is what keeps it exact.
+            let count = count.wrapping_add_signed(*delta);
+            page_bytes[at..at + 8].copy_from_slice(&count.to_le_bytes());
             Ok(())
         }
     }

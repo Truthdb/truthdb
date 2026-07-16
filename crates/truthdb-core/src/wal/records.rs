@@ -85,6 +85,10 @@ pub enum PageOpRedo {
     },
     /// Heap page chain link.
     SetNextPage { page: u64, next: u64 },
+    /// Adds `delta` to a table's row-counter page (planner statistics). The
+    /// same shape serves redo and — with the sign flipped, via a CLR — undo,
+    /// and the page-LSN gate makes replay idempotent like any page op.
+    CounterAdd { page: u64, delta: i64 },
 }
 
 impl PageOpRedo {
@@ -96,7 +100,8 @@ impl PageOpRedo {
             | PageOpRedo::HeapInsert { page, .. }
             | PageOpRedo::HeapDelete { page, .. }
             | PageOpRedo::HeapUpdate { page, .. }
-            | PageOpRedo::SetNextPage { page, .. } => *page,
+            | PageOpRedo::SetNextPage { page, .. }
+            | PageOpRedo::CounterAdd { page, .. } => *page,
         }
     }
 
@@ -141,6 +146,11 @@ impl PageOpRedo {
                 put_u64(out, *page);
                 put_u64(out, *next);
             }
+            PageOpRedo::CounterAdd { page, delta } => {
+                out.push(8);
+                put_u64(out, *page);
+                put_u64(out, *delta as u64);
+            }
         }
     }
 
@@ -177,6 +187,10 @@ impl PageOpRedo {
             7 => PageOpRedo::SetNextPage {
                 page: cursor.u64()?,
                 next: cursor.u64()?,
+            },
+            8 => PageOpRedo::CounterAdd {
+                page: cursor.u64()?,
+                delta: cursor.u64()? as i64,
             },
             other => {
                 return Err(StorageError::InvalidFile(format!(
@@ -227,6 +241,12 @@ pub enum PageOpUndo {
         slot: u16,
         bytes: Vec<u8>,
     },
+    /// Undo of a counter add: apply the inverse delta (already negated when
+    /// the undo record was built).
+    CounterAdd {
+        page: u64,
+        delta: i64,
+    },
 }
 
 impl PageOpUndo {
@@ -275,6 +295,11 @@ impl PageOpUndo {
                 put_u16(out, *slot);
                 put_bytes(out, bytes);
             }
+            PageOpUndo::CounterAdd { page, delta } => {
+                out.push(7);
+                put_u64(out, *page);
+                put_u64(out, *delta as u64);
+            }
         }
     }
 
@@ -308,6 +333,10 @@ impl PageOpUndo {
                 page: cursor.u64()?,
                 slot: cursor.u16()?,
                 bytes: cursor.bytes()?,
+            },
+            7 => PageOpUndo::CounterAdd {
+                page: cursor.u64()?,
+                delta: cursor.u64()? as i64,
             },
             other => {
                 return Err(StorageError::InvalidFile(format!(

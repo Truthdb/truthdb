@@ -105,6 +105,12 @@ pub struct TableDef {
     /// `FOREIGN KEY` constraints (this table is the referencing child).
     #[serde(default)]
     pub foreign_keys: Vec<ForeignKeyDef>,
+    /// The table's row-counter page (planner statistics), maintained
+    /// transactionally by DML. `None` for views and for tables created before
+    /// counters existed — the planner then has no count and applies no
+    /// tie-break, which is exactly the old behavior.
+    #[serde(default)]
+    pub counter_page: Option<u64>,
     /// For a VIEW: the source text of its `SELECT`, re-parsed and inlined (as a
     /// derived table) wherever the view is referenced. `None` for a base table.
     /// A view carries no data pages, columns, or key.
