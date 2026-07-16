@@ -3426,8 +3426,9 @@ mod tests {
             other => panic!("expected rows, got {other:?}"),
         }
 
-        // A join drains its scanned inputs (one materialization per side) —
-        // the documented current behavior, and the counter's positive control.
+        // A join materializes only its BUILD side (the counter's positive
+        // control); the probe side streams. INNER probes from the left, so the
+        // right input is the one drained.
         let outcome = execute_batch(
             &storage,
             "SELECT COUNT(*) FROM t a JOIN t b ON a.id = b.id WHERE a.v > 5",
@@ -3436,8 +3437,96 @@ mod tests {
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         assert_eq!(
             storage.scan_materializations(),
+            1,
+            "an inner hash join materializes only its build side"
+        );
+
+        // RIGHT reverses orientation: the probe is the right input, the left
+        // input is built — still exactly one materialization.
+        let outcome = execute_batch(
+            &storage,
+            "SELECT COUNT(*) FROM t a RIGHT JOIN t b ON a.id = b.id",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            storage.scan_materializations(),
             2,
-            "a join still drains both scanned inputs"
+            "a right join materializes only its (left) build side"
+        );
+
+        // The nested loop (no equi key) streams its probe side too. A small
+        // table keeps the O(n·m) loop cheap; its base scan is still lazy.
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE s (id INT NOT NULL PRIMARY KEY); INSERT INTO s VALUES (1), (2), (3), (4)",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+        let outcome = execute_batch(
+            &storage,
+            "SELECT COUNT(*) FROM s a JOIN s b ON a.id < b.id",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => assert_eq!(rowset.rows[0][0], Datum::BigInt(6)),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        assert_eq!(
+            storage.scan_materializations(),
+            3,
+            "a nested-loop join materializes only its build side"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The grace-hash spill path partitions the probe side straight off the
+    /// scan stream: still exactly one materialization (the build side), and
+    /// the same result as the in-memory join.
+    #[test]
+    fn a_spilling_join_streams_its_probe_side_into_partitions() {
+        use crate::rel::{StatementResult, TxnContext, execute_batch, set_test_sort_budget};
+
+        let path = unique_temp_path("grace-probe-stream");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+        for chunk in (1..=2000).collect::<Vec<i64>>().chunks(500) {
+            let values: Vec<String> = chunk.iter().map(|i| format!("({i}, {})", i % 7)).collect();
+            let outcome = execute_batch(
+                &storage,
+                &format!("INSERT INTO t VALUES {}", values.join(", ")),
+                &mut ctx,
+            );
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        }
+
+        set_test_sort_budget(Some(4000));
+        let outcome = execute_batch(
+            &storage,
+            "SELECT COUNT(*) FROM t a LEFT JOIN t b ON a.id = b.id AND b.v = 3",
+            &mut ctx,
+        );
+        set_test_sort_budget(None);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            // Every a-row appears once: matched where b.v = 3, null-extended
+            // otherwise — 2000 either way.
+            StatementResult::Rows(rowset) => assert_eq!(rowset.rows[0][0], Datum::BigInt(2000)),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        assert_eq!(
+            storage.scan_materializations(),
+            1,
+            "the spilling join materialized only its build side"
         );
 
         drop(storage);
