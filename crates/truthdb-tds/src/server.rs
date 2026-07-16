@@ -447,8 +447,24 @@ where
                     if attention {
                         continue;
                     }
-                    if render.event(&mut out, event).await? {
-                        break;
+                    match render.event(&mut out, event).await {
+                        Ok(terminal) => {
+                            if terminal {
+                                break;
+                            }
+                        }
+                        // A socket write failed mid-batch — the ordinary way a
+                        // client dies while a result streams. The batch is
+                        // still RUNNING and holds its locks, and the caller
+                        // will close the session the moment this returns —
+                        // which releases those locks out from under it. Same
+                        // contract as every other early exit: cancel the
+                        // batch, wait for it to actually end, then leave.
+                        Err(err) => {
+                            cancel.store(true, Ordering::Relaxed);
+                            drain_to_end(&mut events).await;
+                            return Err(err);
+                        }
                     }
                 }
                 // The stream ended without a terminal event: the worker panicked,
@@ -469,14 +485,22 @@ where
                     break;
                 }
             },
-            read = rd.read(&mut hdr[got..]) => match read? {
-                0 => {
+            read = rd.read(&mut hdr[got..]) => match read {
+                // A read error is a disconnect with an errno: same treatment
+                // as the clean EOF below, or the still-running batch would
+                // have its locks released by the caller's close_session.
+                Err(err) => {
+                    cancel.store(true, Ordering::Relaxed);
+                    drain_to_end(&mut events).await;
+                    return Err(err);
+                }
+                Ok(0) => {
                     // Client disconnected mid-batch.
                     cancel.store(true, Ordering::Relaxed);
                     drain_to_end(&mut events).await;
                     return Ok(false);
                 }
-                n => {
+                Ok(n) => {
                     got += n;
                     if got == HEADER_LEN {
                         // Only an Attention (a header-only packet) is legal during
@@ -627,6 +651,25 @@ impl BatchRender {
                 self.flush_pending(out, true).await?;
                 self.pending = Some(PendingDone {
                     count,
+                    in_transaction,
+                });
+            }
+            BatchEvent::StatementAborted { in_transaction } => {
+                // Closes a result set whose statement failed mid-stream — with
+                // a CLEAN done, deliberately. Setting `DONE_ERROR` here without
+                // a preceding ERROR token reads as "severe failure, discard
+                // results" to every real driver: pytds raises "Request failed,
+                // server didn't send error message" (`process_end` raises on
+                // the flag with no accumulated messages), go-mssqldb v1.8.0
+                // synthesizes "Request failed but didn't provide reason" and
+                // strands the result sets behind it, and SqlClient's
+                // equivalent branch is documented as covering server aborts.
+                // The error itself, when the client gets one at all, travels
+                // as the batch-final ERROR token exactly as before; a caught
+                // (TRY/CATCH) error never surfaces at all.
+                self.flush_pending(out, true).await?;
+                self.pending = Some(PendingDone {
+                    count: None,
                     in_transaction,
                 });
             }
@@ -897,7 +940,15 @@ mod render_tests {
     /// the deferred DONE has to settle `DONE_MORE` by lookahead, which is the
     /// part most likely to disagree with the oracle.
     async fn rendered(outcome: &BatchOutcome, in_xact: bool, packet_size: usize) -> Vec<u8> {
-        let events = events_for(outcome, in_xact);
+        rendered_events(events_for(outcome, in_xact), packet_size).await
+    }
+
+    /// Renders an event stream through the real `stream_reply` and reassembles
+    /// the message payload.
+    async fn rendered_events(
+        events: mpsc::UnboundedReceiver<BatchEvent>,
+        packet_size: usize,
+    ) -> Vec<u8> {
         let mut wire = Duplex {
             read: std::io::Cursor::new(Vec::new()),
             written: Vec::new(),
@@ -957,6 +1008,176 @@ mod render_tests {
         })
         .unwrap();
         rx
+    }
+
+    /// Each DONE carries the transaction state of *its own* statement on the
+    /// wire — `BEGIN TRAN; SELECT ...; COMMIT` reads INXACT 1, 1, 0 — instead
+    /// of the batch's final state stamped on all of them retroactively.
+    #[tokio::test]
+    async fn done_inxact_is_per_statement() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        for (count, in_transaction) in [(None, true), (Some(1), true), (None, false)] {
+            tx.send(BatchEvent::StatementDone {
+                count,
+                in_transaction,
+            })
+            .unwrap();
+        }
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut expected = Vec::new();
+        token::done(&mut expected, true, false, true, None);
+        token::done(&mut expected, true, false, true, Some(1));
+        token::done(&mut expected, false, false, false, None);
+        assert_eq!(rendered_events(rx, 4096).await, expected);
+    }
+
+    /// A statement that fails after its result set began streaming closes the
+    /// set with a CLEAN done — never `DONE_ERROR` without an ERROR token,
+    /// which pytds and go-mssqldb both turn into a synthesized "request
+    /// failed" error that strands every result set behind it — and the stream
+    /// stays framed for what follows, here a CATCH block's own result set.
+    #[tokio::test]
+    async fn an_aborted_statement_closes_its_rowset_with_a_clean_done() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(BatchEvent::Columns(columns())).unwrap();
+        tx.send(BatchEvent::Rows(vec![vec![Datum::Int(1)]]))
+            .unwrap();
+        tx.send(BatchEvent::StatementAborted {
+            in_transaction: false,
+        })
+        .unwrap();
+        tx.send(BatchEvent::Columns(columns())).unwrap();
+        tx.send(BatchEvent::Rows(vec![vec![Datum::Int(9)]]))
+            .unwrap();
+        tx.send(BatchEvent::StatementDone {
+            count: Some(1),
+            in_transaction: false,
+        })
+        .unwrap();
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut expected = Vec::new();
+        token::colmetadata(&mut expected, &columns());
+        token::row(&mut expected, &[Datum::Int(1)], &columns());
+        token::done(&mut expected, true, false, false, None);
+        token::colmetadata(&mut expected, &columns());
+        token::row(&mut expected, &[Datum::Int(9)], &columns());
+        token::done(&mut expected, false, false, false, Some(1));
+        assert_eq!(rendered_events(rx, 4096).await, expected);
+    }
+
+    /// An abort as the batch's LAST statement event (an empty CATCH at the end
+    /// of the batch): its pending DONE becomes the batch-final DONE and must
+    /// be clean — the batch succeeded, its one error was caught. The buffered
+    /// path sent a single clean final DONE for this batch; a final
+    /// `DONE_ERROR` with no ERROR token would read as a failed batch.
+    #[tokio::test]
+    async fn an_abort_ending_the_batch_leaves_the_final_done_clean() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(BatchEvent::Columns(columns())).unwrap();
+        tx.send(BatchEvent::Rows(vec![vec![Datum::Int(1)]]))
+            .unwrap();
+        tx.send(BatchEvent::StatementAborted {
+            in_transaction: false,
+        })
+        .unwrap();
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut expected = Vec::new();
+        token::colmetadata(&mut expected, &columns());
+        token::row(&mut expected, &[Datum::Int(1)], &columns());
+        token::done(&mut expected, false, false, false, None);
+        assert_eq!(rendered_events(rx, 4096).await, expected);
+    }
+
+    /// A write half that fails on the first socket write, read half pending
+    /// forever — a client that died while a result was streaming to it.
+    struct FailingWrite;
+
+    impl AsyncRead for FailingWrite {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Pending
+        }
+    }
+
+    impl AsyncWrite for FailingWrite {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<io::Result<usize>> {
+            std::task::Poll::Ready(Err(io::Error::from(io::ErrorKind::BrokenPipe)))
+        }
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A socket write failure mid-stream must cancel the batch and wait for
+    /// it to end before returning — the caller closes the session the moment
+    /// `stream_reply` returns, which releases the batch's locks, so returning
+    /// while the batch still runs would let another session read its
+    /// uncommitted writes. `stream_reply` returning at all proves the drain
+    /// ran (it waits for the channel to close), and the sender task below
+    /// only closes the channel once it observes the cancel flag.
+    #[tokio::test]
+    async fn a_write_error_mid_stream_cancels_and_drains_the_batch() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        // Enough rows that rendering must write a packet to the (dead) socket.
+        tx.send(BatchEvent::Columns(columns())).unwrap();
+        tx.send(BatchEvent::Rows(
+            (0..200).map(|i| vec![Datum::Int(i)]).collect(),
+        ))
+        .unwrap();
+
+        let cancel = Arc::new(AtomicBool::new(false));
+        let observed = cancel.clone();
+        // The "worker": keeps the batch open until it sees the cancel, then
+        // ends it — as the real executor's check_cancelled poll does.
+        let worker = tokio::spawn(async move {
+            while !observed.load(Ordering::Relaxed) {
+                tokio::task::yield_now().await;
+            }
+            let _ = tx.send(BatchEvent::Complete {
+                in_transaction: false,
+            });
+            drop(tx);
+        });
+
+        let mut wire = FailingWrite;
+        let result = stream_reply(&mut wire, rx, cancel.clone(), MIN_PACKET_SIZE).await;
+        assert!(result.is_err(), "the write error surfaces");
+        assert!(
+            cancel.load(Ordering::Relaxed),
+            "the running batch was cancelled before stream_reply returned"
+        );
+        worker.await.expect("worker");
     }
 
     /// A stream whose read half never yields (no Attention ever arrives) and

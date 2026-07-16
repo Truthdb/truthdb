@@ -90,6 +90,7 @@ const EVENT_ROWS: usize = 256;
 /// row count). A batch-stopping `Error` may follow the statements that ran.
 /// Every stream ends with exactly one terminal event — `Complete` or `Failed` —
 /// unless the receiver is dropped first.
+#[derive(Debug)]
 pub enum BatchEvent {
     /// Starts a result set: its column metadata.
     Columns(Vec<ResultColumn>),
@@ -103,6 +104,13 @@ pub enum BatchEvent {
         /// (`DONE_INXACT`).
         in_transaction: bool,
     },
+    /// Ends a statement that failed after its result set had begun streaming:
+    /// closes the set (with a clean DONE — an error-flagged DONE without an
+    /// ERROR token reads as "severe failure" to real drivers) so the stream
+    /// stays framed for the statements that follow. The error itself travels
+    /// separately — in the batch-final [`BatchEvent::Error`] for a continued
+    /// error, or not at all for one a `CATCH` handled.
+    StatementAborted { in_transaction: bool },
     /// A SQL error that stopped the batch. The statements before it kept their
     /// results, which were already sent.
     Error(SqlError),
@@ -144,12 +152,11 @@ impl BatchSink {
         self.tx.send(event).is_ok()
     }
 
-    /// Sends a finished outcome as events.
-    ///
-    /// The executor still materializes each statement's rows before this runs,
-    /// so `in_transaction` is the batch's final state for every DONE — exactly
-    /// what the non-streaming path stamped. Once statements emit rows as they
-    /// produce them, each DONE will carry its own statement's state.
+    /// Sends a finished outcome as events — the reply of a batch that never
+    /// ran (the parked deadlock victim) and the tests' shorthand. A batch that
+    /// runs streams through the [`crate::rel::BatchEmitter`] impl below
+    /// instead, stamping each DONE with its own statement's state; here every
+    /// DONE carries the one final state, which is all an error-only reply has.
     fn send_outcome(&self, outcome: BatchOutcome, in_transaction: bool) {
         for result in outcome.results {
             let sent = match result {
@@ -199,6 +206,44 @@ impl BatchSink {
             in_transaction,
         })
     }
+
+    /// Sends a batch's terminal events: its error, if it ended with one, then
+    /// `Complete` with the post-batch transaction state (which the TDS
+    /// transaction-manager path reads — it stays batch-final by design).
+    fn send_tail(&self, error: Option<truthdb_sql::error::SqlError>, in_transaction: bool) {
+        if let Some(error) = error
+            && !self.send(BatchEvent::Error(error))
+        {
+            return;
+        }
+        self.send(BatchEvent::Complete { in_transaction });
+    }
+}
+
+/// The worker-side face of the reply channel: the executor emits each
+/// statement's results through this as it runs, which is what puts rows on
+/// the wire while the batch still executes. Send failures mean the client is
+/// gone; the batch still runs to completion (its effects do not depend on
+/// anyone listening) and the disconnect path's cancel flag stops it early.
+impl crate::rel::BatchEmitter for BatchSink {
+    fn columns(&mut self, columns: Vec<ResultColumn>) {
+        self.send(BatchEvent::Columns(columns));
+    }
+
+    fn rows(&mut self, rows: Vec<Vec<Datum>>) {
+        self.send(BatchEvent::Rows(rows));
+    }
+
+    fn statement_done(&mut self, count: Option<u64>, in_transaction: bool) {
+        self.send(BatchEvent::StatementDone {
+            count,
+            in_transaction,
+        });
+    }
+
+    fn statement_aborted(&mut self, in_transaction: bool) {
+        self.send(BatchEvent::StatementAborted { in_transaction });
+    }
 }
 
 /// Reassembles an event stream into a whole [`BatchReply`] — the shape every
@@ -232,6 +277,9 @@ async fn collect_reply(
                     None => StatementResult::Done,
                 },
             }),
+            // The aborted statement contributes no result; its partly-streamed
+            // rowset is dropped, which is what the buffered path returned too.
+            BatchEvent::StatementAborted { .. } => open = None,
             BatchEvent::Error(err) => error = Some(err),
             BatchEvent::Complete { in_transaction } => {
                 return Ok(BatchReply {
@@ -956,18 +1004,21 @@ fn run_and_finish(shared: &Arc<Shared>, work: Runnable) {
     // Bind the cancel flag to this worker thread for the batch, so the executor's
     // `check_cancelled` polls see a TDS Attention; the guard clears it on return.
     let _cancel_guard = crate::rel::CancelScope::enter(cancel);
+    // Statement events stream out *while the batch runs* — the executor emits
+    // each result as it is produced, and the send never blocks, so a client
+    // that reads slowly delays neither this worker nor the locks it holds.
+    let mut reply = reply;
     let outcome = shared
         .engine
-        .sql_batch_with_params(&sql, &mut txn_ctx, &params);
+        .sql_batch_streamed(&sql, &mut txn_ctx, &params, &mut reply);
     let in_transaction = {
         let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
         sched.finish(&shared.engine, session, txn_ctx)
     };
-    // The reply goes out after the batch's locks are settled, and the send
-    // never blocks, so a client that reads slowly delays neither this worker nor
-    // the locks it held.
+    // The terminal events wait for the locks to settle: `Complete` carries the
+    // post-batch transaction state, which only `finish` knows.
     match outcome {
-        Ok(outcome) => reply.send_outcome(outcome, in_transaction),
+        Ok(error) => reply.send_tail(error, in_transaction),
         Err(err) => {
             reply.send(BatchEvent::Failed(err));
         }
@@ -1587,6 +1638,178 @@ mod tests {
         // ordinary 3902.
         let reply = h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
         assert_eq!(error_number(&reply), Some(3902));
+    }
+
+    /// Drains a batch's event stream through its terminal event.
+    async fn drain_events(mut rx: mpsc::UnboundedReceiver<BatchEvent>) -> Vec<BatchEvent> {
+        let mut events = Vec::new();
+        while let Some(event) = rx.recv().await {
+            let terminal = matches!(event, BatchEvent::Complete { .. } | BatchEvent::Failed(_));
+            events.push(event);
+            if terminal {
+                break;
+            }
+        }
+        events
+    }
+
+    fn no_cancel() -> Arc<AtomicBool> {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    /// The `in_transaction` flag of every StatementDone, in stream order.
+    fn done_flags(events: &[BatchEvent]) -> Vec<bool> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                BatchEvent::StatementDone { in_transaction, .. } => Some(*in_transaction),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn statement_dones_carry_their_own_transaction_state() {
+        // Each DONE reports the transaction state after *its own* statement —
+        // BEGIN and the SELECT inside the transaction say so, the COMMIT says
+        // it ended — instead of the batch's final state stamped on all three.
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let events = drain_events(h.handle.stream_batch(
+            s,
+            "BEGIN TRANSACTION; SELECT 1 AS one; COMMIT".into(),
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(done_flags(&events), [true, true, false]);
+        assert!(
+            matches!(
+                events.last(),
+                Some(BatchEvent::Complete {
+                    in_transaction: false
+                })
+            ),
+            "Complete carries the batch-final state: {events:?}"
+        );
+    }
+
+    /// Fills `t` with `1..=n` single-column PK rows.
+    async fn fill(h: &Harness, s: SessionId, n: usize) {
+        h.handle
+            .run_batch(s, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
+            .await
+            .unwrap();
+        let mut insert = String::from("INSERT INTO t VALUES (1)");
+        for i in 2..=n {
+            insert.push_str(&format!(", ({i})"));
+        }
+        let reply = h.handle.run_batch(s, insert).await.unwrap();
+        assert!(reply.outcome.error.is_none(), "{:?}", reply.outcome.error);
+    }
+
+    #[tokio::test]
+    async fn a_mid_scan_error_keeps_the_rows_already_streamed() {
+        // A streamed SELECT that fails part-way has already emitted the rows
+        // that preceded the failure — rows leave while the statement is still
+        // running. The buffered path emitted nothing for a failed statement,
+        // so any Columns/Rows here prove the stream is real.
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 600).await;
+        // The WHERE divides by zero at id = 600, after 599 kept rows: two full
+        // 256-row chunks are already out, the partial third is dropped.
+        let events = drain_events(h.handle.stream_batch(
+            s,
+            "SELECT id FROM t WHERE 10 / (id - 600) > -100".into(),
+            no_cancel(),
+        ))
+        .await;
+        let streamed: usize = events
+            .iter()
+            .map(|event| match event {
+                BatchEvent::Rows(rows) => rows.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(streamed, 512, "two full chunks precede the failure");
+        assert!(
+            events
+                .iter()
+                .any(|e| matches!(e, BatchEvent::Error(err) if err.number == 8134)),
+            "the divide-by-zero still reaches the client: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_caught_mid_scan_error_closes_the_open_rowset() {
+        // A TRY/CATCH swallows the error, but the failed SELECT's result set
+        // had already started streaming — it must be closed (StatementAborted)
+        // before the CATCH's own result set opens, and no Error event follows.
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 300).await;
+        let events = drain_events(
+            h.handle.stream_batch(
+                s,
+                "BEGIN TRY SELECT id FROM t WHERE 10 / (id - 300) > -100 END TRY \
+             BEGIN CATCH SELECT 99 AS caught END CATCH"
+                    .into(),
+                no_cancel(),
+            ),
+        )
+        .await;
+        let aborted = events
+            .iter()
+            .position(|e| matches!(e, BatchEvent::StatementAborted { .. }))
+            .expect("the failed SELECT's rowset is closed");
+        let caught = events
+            .iter()
+            .position(
+                |e| matches!(e, BatchEvent::Columns(cols) if cols.first().is_some_and(|c| c.name == "caught")),
+            )
+            .expect("the CATCH's rowset follows");
+        assert!(aborted < caught, "close before reopening: {events:?}");
+        assert!(
+            !events.iter().any(|e| matches!(e, BatchEvent::Error(_))),
+            "a caught error never surfaces: {events:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_continued_mid_scan_error_closes_the_rowset_and_reports_last() {
+        // Under XACT_ABORT OFF a non-fatal in-transaction error rolls back only
+        // its statement and the batch continues — so the half-streamed rowset
+        // closes, the following statements run, and the error is reported at
+        // the end of the batch, exactly where the buffered path put it.
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 300).await;
+        let events = drain_events(
+            h.handle.stream_batch(
+                s,
+                "BEGIN TRANSACTION; SELECT id FROM t WHERE 10 / (id - 300) > -100; \
+             SELECT 7 AS after; COMMIT"
+                    .into(),
+                no_cancel(),
+            ),
+        )
+        .await;
+        assert!(
+            events.iter().any(|e| matches!(
+                e,
+                BatchEvent::StatementAborted {
+                    in_transaction: true
+                }
+            )),
+            "the failed SELECT's rowset closes, still in-transaction: {events:?}"
+        );
+        // BEGIN, the surviving SELECT, then COMMIT — each DONE with its own state.
+        assert_eq!(done_flags(&events), [true, true, false]);
+        let error = events
+            .iter()
+            .position(|e| matches!(e, BatchEvent::Error(err) if err.number == 8134))
+            .expect("the continued error is still reported");
+        assert_eq!(error, events.len() - 2, "after every result: {events:?}");
     }
 
     #[tokio::test]
