@@ -1,0 +1,60 @@
+# A group whose every aggregated value is NULL (Stage 8 exit matrix): the
+# aggregates must distinguish "no values" from "no rows" — SUM/MIN/MAX/AVG
+# answer NULL, COUNT(col) answers 0, and COUNT(*) still counts the rows.
+
+statement ok
+CREATE TABLE g (id INT NOT NULL PRIMARY KEY, k VARCHAR(10), v INT)
+
+# Group 'a' is all-NULL (three rows), group 'b' mixes NULL and values, and
+# group 'c' has no NULLs at all.
+statement ok
+INSERT INTO g VALUES (1, 'a', NULL), (2, 'a', NULL), (3, 'a', NULL), (4, 'b', NULL), (5, 'b', 10), (6, 'b', 30), (7, 'c', 7)
+
+query TIIIII rowsort
+SELECT k, COUNT(*), COUNT(v), SUM(v), MIN(v), MAX(v) FROM g GROUP BY k
+----
+a 3 0 NULL NULL NULL
+b 3 2 40 10 30
+c 1 1 7 7 7
+
+# AVG over an all-NULL group is NULL too — and never a divide-by-zero.
+query TI rowsort
+SELECT k, AVG(v) FROM g GROUP BY k
+----
+a NULL
+b 20
+c 7
+
+# HAVING sees the same semantics: COUNT(v) = 0 selects exactly the all-NULL
+# group, and a NULL SUM comparison is UNKNOWN, so `SUM(v) > 0` drops it.
+query T
+SELECT k FROM g GROUP BY k HAVING COUNT(v) = 0
+----
+a
+
+query T rowsort
+SELECT k FROM g GROUP BY k HAVING SUM(v) > 0
+----
+b
+c
+
+# COUNT(DISTINCT col) over an all-NULL group is 0 as well.
+query TI rowsort
+SELECT k, COUNT(DISTINCT v) FROM g GROUP BY k
+----
+a 0
+b 2
+c 1
+
+# The ungrouped (single-group) shape over an all-NULL table: SUM/MIN/MAX/AVG
+# NULL, COUNT(col) 0, COUNT(*) counts rows.
+statement ok
+CREATE TABLE n (id INT NOT NULL PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO n VALUES (1, NULL), (2, NULL)
+
+query IIIIII
+SELECT COUNT(*), COUNT(v), SUM(v), MIN(v), MAX(v), AVG(v) FROM n
+----
+2 0 NULL NULL NULL NULL

@@ -5780,6 +5780,53 @@ mod tests {
     // ---- Regression tests for adversarial-review findings on #82 -------------
 
     #[test]
+    fn all_null_groups_aggregate_identically_through_the_spill_path() {
+        // A group whose every value is NULL: SUM/MIN/MAX/AVG NULL, COUNT(col)
+        // 0, COUNT(*) counts rows — and the grace-hash spill path must answer
+        // exactly as the in-memory path does (an all-NULL group must not read
+        // as "no group" after partitioning).
+        let path = unique_temp_path("all-null-spill");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, k VARCHAR(10), v INT)")
+            .expect("create");
+        // 100 all-NULL rows in group 'a', 100 mixed rows in group 'b'.
+        for i in 0..100 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, 'a', NULL)"))
+                .expect("insert a");
+            let v = if i % 2 == 0 {
+                "NULL".to_string()
+            } else {
+                i.to_string()
+            };
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({}, 'b', {v})", 100 + i))
+                .expect("insert b");
+        }
+        let query = "SELECT k, COUNT(*), COUNT(v), SUM(v), MIN(v), MAX(v), AVG(v)                      FROM t GROUP BY k ORDER BY k";
+        let (_, in_memory) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(Some(400));
+        let (_, spilled) = sql_rows(&engine, query);
+        crate::rel::set_test_sort_budget(None);
+        assert_eq!(spilled, in_memory, "spill path changes all-NULL groups");
+        assert_eq!(
+            in_memory[0],
+            vec![
+                Some("a".into()),
+                Some("100".into()),
+                Some("0".into()),
+                None,
+                None,
+                None,
+                None
+            ],
+            "all-NULL group: COUNT(*) counts, everything else is NULL/0"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn collation_ci_group_by_spill_folds_case() {
         // The grace-hash GROUP BY spill path must partition by the FOLDED key, or
         // case-variant groups split across partitions on large input. 'World'/
