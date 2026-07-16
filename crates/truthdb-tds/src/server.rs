@@ -202,7 +202,7 @@ where
                 let sql = batch_sql(headers.body)?;
                 let cancel = Arc::new(AtomicBool::new(false));
                 let events = engine.stream_batch(session, sql, cancel.clone());
-                if !stream_reply(stream, events, cancel, packet_size).await? {
+                if !stream_reply(stream, events, cancel, packet_size, false).await? {
                     return Ok(());
                 }
             }
@@ -212,7 +212,7 @@ where
                 let cancel = Arc::new(AtomicBool::new(false));
                 match start_rpc(engine, session, headers.body, cancel.clone()) {
                     Ok(events) => {
-                        if !stream_reply(stream, events, cancel, packet_size).await? {
+                        if !stream_reply(stream, events, cancel, packet_size, true).await? {
                             return Ok(());
                         }
                     }
@@ -426,13 +426,17 @@ async fn stream_reply<S>(
     mut events: mpsc::UnboundedReceiver<BatchEvent>,
     cancel: Arc<AtomicBool>,
     packet_size: usize,
+    rpc: bool,
 ) -> io::Result<bool>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     let (mut rd, mut wr) = tokio::io::split(stream);
     let mut out = MessageWriter::new(&mut wr, PKT_TABULAR_RESULT, packet_size);
-    let mut render = BatchRender::default();
+    let mut render = BatchRender {
+        rpc,
+        ..BatchRender::default()
+    };
     let mut hdr = [0u8; HEADER_LEN];
     let mut got = 0usize;
     let mut attention = false;
@@ -649,6 +653,14 @@ struct BatchRender {
     /// Set once a batch-stopping ERROR has been written, so the final DONE
     /// carries `DONE_ERROR`.
     errored: bool,
+    /// RPC response framing: per-statement DONEs render as DONEINPROC, and the
+    /// response ends RETURNSTATUS → RETURNVALUE(s) → DONEPROC, as SQL Server
+    /// frames a procedure's reply. A SQL batch keeps plain DONEs (the #97
+    /// oracle pins those bytes).
+    rpc: bool,
+    /// A prepared handle to report as a RETURNVALUE just before the final
+    /// DONEPROC — held so RETURNSTATUS precedes it, SQL Server's order.
+    pending_handle: Option<i32>,
     /// Scratch for encoding tokens, reused so a row costs no allocation here.
     buf: Vec<u8>,
 }
@@ -715,12 +727,9 @@ impl BatchRender {
                 });
             }
             BatchEvent::PreparedHandle(handle) => {
-                // The handle rides a RETURNVALUE token, after every result
-                // set (return values follow results in an RPC response).
-                self.flush_pending(out, true).await?;
-                self.buf.clear();
-                token::return_value_int(&mut self.buf, "handle", handle);
-                out.write(&self.buf).await?;
+                // Held for the response tail: RETURNSTATUS precedes the
+                // RETURNVALUE, which precedes the final DONEPROC.
+                self.pending_handle = Some(handle);
             }
             BatchEvent::Error(error) => {
                 self.flush_pending(out, true).await?;
@@ -736,7 +745,22 @@ impl BatchRender {
                 self.errored = true;
             }
             BatchEvent::Complete { in_transaction } => {
-                if self.errored {
+                if self.rpc {
+                    // The last statement's DONEINPROC keeps DONE_MORE — the
+                    // RETURNSTATUS/RETURNVALUE/DONEPROC tail always follows.
+                    self.flush_pending(out, true).await?;
+                    self.buf.clear();
+                    if !self.errored {
+                        // A failed procedure returns no status.
+                        token::return_status(&mut self.buf, 0);
+                    }
+                    if let Some(handle) = self.pending_handle.take() {
+                        token::return_value_int(&mut self.buf, "handle", handle);
+                    }
+                    out.write(&self.buf).await?;
+                    self.done(out, false, self.errored, in_transaction, None)
+                        .await?;
+                } else if self.errored {
                     // The error's own final DONE, after the last statement's.
                     self.flush_pending(out, true).await?;
                     self.done(out, false, true, in_transaction, None).await?;
@@ -784,7 +808,13 @@ impl BatchRender {
         count: Option<u64>,
     ) -> io::Result<()> {
         self.buf.clear();
-        token::done(&mut self.buf, more, error, in_transaction, count);
+        if !self.rpc {
+            token::done(&mut self.buf, more, error, in_transaction, count);
+        } else if more {
+            token::done_in_proc(&mut self.buf, more, error, in_transaction, count);
+        } else {
+            token::done_proc(&mut self.buf, more, error, in_transaction, count);
+        }
         out.write(&self.buf).await
     }
 }
@@ -998,6 +1028,14 @@ mod render_tests {
         events: mpsc::UnboundedReceiver<BatchEvent>,
         packet_size: usize,
     ) -> Vec<u8> {
+        rendered_events_framed(events, packet_size, false).await
+    }
+
+    async fn rendered_events_framed(
+        events: mpsc::UnboundedReceiver<BatchEvent>,
+        packet_size: usize,
+        rpc: bool,
+    ) -> Vec<u8> {
         let mut wire = Duplex {
             read: std::io::Cursor::new(Vec::new()),
             written: Vec::new(),
@@ -1007,6 +1045,7 @@ mod render_tests {
             events,
             Arc::new(AtomicBool::new(false)),
             packet_size,
+            rpc,
         )
         .await
         .expect("stream");
@@ -1059,9 +1098,10 @@ mod render_tests {
         rx
     }
 
-    /// A prepared handle renders as a RETURNVALUE token after the statement's
-    /// DONE (return values follow results), with the exact bytes MS-TDS
-    /// 2.2.7.19 prescribes for an INT output parameter.
+    /// An RPC response frames as SQL Server does: per-statement DONEINPROC
+    /// (DONE_MORE kept on the last), then RETURNSTATUS, then RETURNVALUE (the
+    /// prepared handle, when there is one), then a final DONEPROC. A SQL
+    /// batch's plain-DONE framing is untouched — the oracle pins those bytes.
     #[tokio::test]
     async fn a_prepared_handle_renders_as_a_returnvalue_token() {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -1078,10 +1118,56 @@ mod render_tests {
         drop(tx);
 
         let mut expected = Vec::new();
-        token::done(&mut expected, true, false, false, Some(1));
+        token::done_in_proc(&mut expected, true, false, false, Some(1));
+        token::return_status(&mut expected, 0);
         token::return_value_int(&mut expected, "handle", 7);
-        token::done(&mut expected, false, false, false, None);
-        assert_eq!(rendered_events(rx, 4096).await, expected);
+        token::done_proc(&mut expected, false, false, false, None);
+        assert_eq!(rendered_events_framed(rx, 4096, true).await, expected);
+
+        // Without a handle (sp_executesql, sp_execute): DONEINPROC,
+        // RETURNSTATUS, DONEPROC.
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(BatchEvent::StatementDone {
+            count: Some(3),
+            in_transaction: false,
+        })
+        .unwrap();
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+        let mut expected = Vec::new();
+        token::done_in_proc(&mut expected, true, false, false, Some(3));
+        token::return_status(&mut expected, 0);
+        token::done_proc(&mut expected, false, false, false, None);
+        assert_eq!(rendered_events_framed(rx, 4096, true).await, expected);
+
+        // A failed RPC returns no status: ERROR, DONEINPROC for what ran,
+        // then DONEPROC with DONE_ERROR.
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(BatchEvent::Error(truthdb_sql::error::SqlError::new(
+            8179,
+            16,
+            1,
+            "Could not find prepared statement with handle 42.",
+        )))
+        .unwrap();
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+        let mut expected = Vec::new();
+        token::error(
+            &mut expected,
+            8179,
+            1,
+            16,
+            "Could not find prepared statement with handle 42.",
+        );
+        token::done_proc(&mut expected, false, true, false, None);
+        assert_eq!(rendered_events_framed(rx, 4096, true).await, expected);
 
         // The token's own bytes, pinned: 0xAC, ordinal 0, B_VARCHAR name,
         // status 0x01 (output param), UserType 0, Flags 0, INTN(4), value.
@@ -1262,7 +1348,7 @@ mod render_tests {
         });
 
         let mut wire = FailingWrite;
-        let result = stream_reply(&mut wire, rx, cancel.clone(), MIN_PACKET_SIZE).await;
+        let result = stream_reply(&mut wire, rx, cancel.clone(), MIN_PACKET_SIZE, false).await;
         assert!(result.is_err(), "the write error surfaces");
         assert!(
             cancel.load(Ordering::Relaxed),
@@ -1413,6 +1499,7 @@ mod render_tests {
             events,
             Arc::new(AtomicBool::new(false)),
             MIN_PACKET_SIZE,
+            false,
         )
         .await
         .expect("stream");
@@ -1490,7 +1577,7 @@ mod attention_tests {
         let events = cancellable_batch(cancel.clone());
         // The client sends an Attention (header-only packet) during the batch.
         client.write_all(&ATTN).await.expect("send attention");
-        let kept = stream_reply(&mut server, events, cancel.clone(), 4096)
+        let kept = stream_reply(&mut server, events, cancel.clone(), 4096, false)
             .await
             .expect("io ok");
         assert!(kept, "the client is still connected");
@@ -1532,7 +1619,7 @@ mod attention_tests {
         .unwrap();
         drop(tx);
 
-        let kept = stream_reply(&mut server, rx, cancel.clone(), 4096)
+        let kept = stream_reply(&mut server, rx, cancel.clone(), 4096, false)
             .await
             .expect("io ok");
         assert!(kept);
@@ -1570,9 +1657,15 @@ mod attention_tests {
         .unwrap();
         drop(tx);
 
-        let kept = stream_reply(&mut server, rx, Arc::new(AtomicBool::new(false)), 4096)
-            .await
-            .expect("io ok");
+        let kept = stream_reply(
+            &mut server,
+            rx,
+            Arc::new(AtomicBool::new(false)),
+            4096,
+            false,
+        )
+        .await
+        .expect("io ok");
         assert!(kept);
         let mut cursor = std::io::Cursor::new(read_client_bytes(&mut client).await);
         let payload = crate::packet::read_message(&mut cursor)
@@ -1631,7 +1724,7 @@ mod attention_tests {
             // `tx` drops here: the sink dying is what says the batch is over.
         });
 
-        let kept = stream_reply(&mut server, rx, cancel.clone(), 4096)
+        let kept = stream_reply(&mut server, rx, cancel.clone(), 4096, false)
             .await
             .expect("io ok");
         assert!(!kept, "the client disconnected");
@@ -1653,7 +1746,7 @@ mod attention_tests {
         drop(client);
         let cancel = Arc::new(AtomicBool::new(false));
         let events = cancellable_batch(cancel.clone());
-        let kept = stream_reply(&mut server, events, cancel.clone(), 4096)
+        let kept = stream_reply(&mut server, events, cancel.clone(), 4096, false)
             .await
             .expect("io ok");
         assert!(!kept, "the client disconnected");

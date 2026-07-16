@@ -13,6 +13,9 @@ const TOKEN_LOGINACK: u8 = 0xad;
 const TOKEN_ROW: u8 = 0xd1;
 const TOKEN_ENVCHANGE: u8 = 0xe3;
 const TOKEN_DONE: u8 = 0xfd;
+const TOKEN_DONEPROC: u8 = 0xfe;
+const TOKEN_DONEINPROC: u8 = 0xff;
+const TOKEN_RETURNSTATUS: u8 = 0x79;
 
 // DONE status bits.
 const DONE_FINAL: u16 = 0x0000;
@@ -210,6 +213,28 @@ pub fn row(out: &mut Vec<u8>, values: &[Datum], columns: &[ResultColumn]) {
 /// carries a row count (DONE_COUNT); `error` sets DONE_ERROR; `in_xact` sets
 /// DONE_INXACT (a transaction is still active for the connection).
 pub fn done(out: &mut Vec<u8>, more: bool, error: bool, in_xact: bool, count: Option<u64>) {
+    done_kind(out, TOKEN_DONE, more, error, in_xact, count);
+}
+
+/// DONEINPROC (0xFF): a statement's DONE inside an RPC response. Same body as
+/// DONE; only the token byte differs.
+pub fn done_in_proc(out: &mut Vec<u8>, more: bool, error: bool, in_xact: bool, count: Option<u64>) {
+    done_kind(out, TOKEN_DONEINPROC, more, error, in_xact, count);
+}
+
+/// DONEPROC (0xFE): the final DONE of an RPC response.
+pub fn done_proc(out: &mut Vec<u8>, more: bool, error: bool, in_xact: bool, count: Option<u64>) {
+    done_kind(out, TOKEN_DONEPROC, more, error, in_xact, count);
+}
+
+fn done_kind(
+    out: &mut Vec<u8>,
+    token: u8,
+    more: bool,
+    error: bool,
+    in_xact: bool,
+    count: Option<u64>,
+) {
     let mut status = if more { DONE_MORE } else { DONE_FINAL };
     if error {
         status |= DONE_ERROR;
@@ -220,10 +245,17 @@ pub fn done(out: &mut Vec<u8>, more: bool, error: bool, in_xact: bool, count: Op
     if count.is_some() {
         status |= DONE_COUNT;
     }
-    out.push(TOKEN_DONE);
+    out.push(token);
     out.extend_from_slice(&status.to_le_bytes());
     out.extend_from_slice(&0u16.to_le_bytes()); // CurCmd
     out.extend_from_slice(&count.unwrap_or(0).to_le_bytes());
+}
+
+/// RETURNSTATUS (0x79): the RETURN value of the procedure an RPC invoked.
+/// The sp_* procedures here return 0 (success); a failed one sends none.
+pub fn return_status(out: &mut Vec<u8>, value: i32) {
+    out.push(TOKEN_RETURNSTATUS);
+    out.extend_from_slice(&value.to_le_bytes());
 }
 
 /// DONE acknowledging an Attention (cancel) request.
