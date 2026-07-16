@@ -167,6 +167,25 @@ fn message_token(out: &mut Vec<u8>, token: u8, number: i32, state: u8, class: u8
     out.extend_from_slice(&body);
 }
 
+const TOKEN_RETURNVALUE: u8 = 0xac;
+
+/// RETURNVALUE carrying an INT output parameter — the prepared-statement
+/// handle `sp_prepare`/`sp_prepexec` reports. Layout (MS-TDS 2.2.7.19):
+/// ParamOrdinal, ParamName, Status (0x01 = output parameter), UserType,
+/// Flags, TYPE_INFO (INTN, 4), value.
+pub fn return_value_int(out: &mut Vec<u8>, name: &str, value: i32) {
+    out.push(TOKEN_RETURNVALUE);
+    out.extend_from_slice(&0u16.to_le_bytes()); // ParamOrdinal
+    push_b_varchar(out, name);
+    out.push(0x01); // Status: output parameter
+    out.extend_from_slice(&0u32.to_le_bytes()); // UserType
+    out.extend_from_slice(&0u16.to_le_bytes()); // Flags
+    out.push(0x26); // INTN
+    out.push(4);
+    out.push(4); // value length
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
 /// COLMETADATA for a result set's columns.
 pub fn colmetadata(out: &mut Vec<u8>, columns: &[ResultColumn]) {
     out.push(TOKEN_COLMETADATA);

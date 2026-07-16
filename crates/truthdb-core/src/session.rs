@@ -114,11 +114,84 @@ pub enum BatchEvent {
     /// A SQL error that stopped the batch. The statements before it kept their
     /// results, which were already sent.
     Error(SqlError),
+    /// The handle `sp_prepare`/`sp_prepexec` allocated, reported to the client
+    /// as a RETURNVALUE token. Sent after every statement's events, just
+    /// before `Complete` — where SQL Server puts return values.
+    PreparedHandle(i32),
     /// Terminal: the batch ended. Carries the batch's *final* transaction
     /// state, which is what the TDS transaction-manager path needs.
     Complete { in_transaction: bool },
     /// Terminal: the engine could not run the batch at all.
     Failed(EngineError),
+}
+
+/// A prepared-statement RPC (the `sp_prepare` handle family). `Prepare` and
+/// `Unprepare` touch only session state; `Execute` and `PrepExec` run the
+/// statement through the ordinary batch path (locks, parking, streaming).
+pub enum PreparedRpc {
+    Prepare {
+        decls: String,
+        stmt: String,
+    },
+    Execute {
+        handle: i32,
+        values: Vec<crate::rel::RpcParam>,
+    },
+    PrepExec {
+        decls: String,
+        stmt: String,
+        values: Vec<crate::rel::RpcParam>,
+    },
+    Unprepare {
+        handle: i32,
+    },
+}
+
+/// A statement a session prepared: its text and parameter declarations, both
+/// verbatim from `sp_prepare`. There is no cached plan to go stale — every
+/// execution re-parses and re-binds against the live catalog, exactly like
+/// `sp_executesql`, so DDL between prepare and execute behaves like SQL
+/// Server's recompile-on-schema-change with no invalidation machinery.
+struct PreparedStatement {
+    decls: String,
+    text: String,
+}
+
+/// The parameter names of a declaration list (`@p1 int, @p2 nvarchar(10)`),
+/// in order: the first token of each top-level comma-separated entry.
+/// `sp_execute` values arrive unnamed on the wire; these names bind them.
+fn decl_names(decls: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut entry = String::new();
+    for ch in decls.chars().chain(std::iter::once(',')) {
+        match ch {
+            // A quoted default value (`@p varchar(10) = 'a,b'`) may contain
+            // commas and parens; none of them separate declarations. A
+            // doubled '' escape toggles twice, landing back where it was.
+            '\'' => {
+                in_quote = !in_quote;
+                entry.push(ch);
+            }
+            '(' if !in_quote => {
+                depth += 1;
+                entry.push(ch);
+            }
+            ')' if !in_quote => {
+                depth = depth.saturating_sub(1);
+                entry.push(ch);
+            }
+            ',' if !in_quote && depth == 0 => {
+                if let Some(name) = entry.split_whitespace().next() {
+                    names.push(name.to_string());
+                }
+                entry.clear();
+            }
+            _ => entry.push(ch),
+        }
+    }
+    names
 }
 
 /// The reply channel for one batch.
@@ -141,14 +214,29 @@ pub enum BatchEvent {
 /// any client that keeps up it is bounded by what is in flight.
 pub struct BatchSink {
     tx: mpsc::UnboundedSender<BatchEvent>,
+    /// A handle `sp_prepexec` allocated, reported as a `PreparedHandle` event
+    /// just before `Complete` — return values follow every result set.
+    prepared_handle: Option<i32>,
 }
 
 impl BatchSink {
+    fn new(tx: mpsc::UnboundedSender<BatchEvent>) -> BatchSink {
+        BatchSink {
+            tx,
+            prepared_handle: None,
+        }
+    }
+
     /// Sends one event. Never blocks: `UnboundedSender::send` is a plain
     /// function, which is the point (see the type's docs). `false` once the
     /// receiver is gone — the client disconnected, or its connection task was
     /// dropped — which is the producer's signal to stop.
     fn send(&self, event: BatchEvent) -> bool {
+        if matches!(event, BatchEvent::Complete { .. })
+            && let Some(handle) = self.prepared_handle
+        {
+            let _ = self.tx.send(BatchEvent::PreparedHandle(handle));
+        }
         self.tx.send(event).is_ok()
     }
 
@@ -280,6 +368,9 @@ async fn collect_reply(
             // The aborted statement contributes no result; its partly-streamed
             // rowset is dropped, which is what the buffered path returned too.
             BatchEvent::StatementAborted { .. } => open = None,
+            // A whole-reply caller has nowhere to carry a prepared handle —
+            // only the TDS renderer (RETURNVALUE) consumes it.
+            BatchEvent::PreparedHandle(_) => {}
             BatchEvent::Error(err) => error = Some(err),
             BatchEvent::Complete { in_transaction } => {
                 return Ok(BatchReply {
@@ -315,6 +406,12 @@ struct Session {
     /// [`Scheduler::take_ctx`], so a session mid-batch reports no open
     /// transaction and is never a reap candidate regardless of this stamp.
     last_activity: Instant,
+    /// Statements prepared over the `sp_prepare` family, by handle. Dropped
+    /// with the session (SQL Server scopes prepared handles the same way).
+    prepared: HashMap<i32, PreparedStatement>,
+    /// The next handle to allocate. Handles are opaque to the client and never
+    /// reused within a session.
+    next_prepared_handle: i32,
 }
 
 impl Default for Session {
@@ -322,6 +419,8 @@ impl Default for Session {
         Session {
             txn_ctx: TxnContext::default(),
             last_activity: Instant::now(),
+            prepared: HashMap::new(),
+            next_prepared_handle: 1,
         }
     }
 }
@@ -373,6 +472,41 @@ impl SessionManager {
             state.last_activity = Instant::now();
         }
     }
+
+    /// Stores a prepared statement for the session and returns its handle.
+    fn prepare(&mut self, id: SessionId, decls: String, text: String) -> i32 {
+        let session = self.sessions.entry(id).or_default();
+        let handle = session.next_prepared_handle;
+        session.next_prepared_handle += 1;
+        session
+            .prepared
+            .insert(handle, PreparedStatement { decls, text });
+        handle
+    }
+
+    /// Looks up a session's prepared statement by handle.
+    fn prepared(&self, id: SessionId, handle: i32) -> Option<(String, String)> {
+        self.sessions
+            .get(&id)?
+            .prepared
+            .get(&handle)
+            .map(|p| (p.decls.clone(), p.text.clone()))
+    }
+
+    /// Drops a prepared handle. `false` if the session never prepared it.
+    fn unprepare(&mut self, id: SessionId, handle: i32) -> bool {
+        self.sessions
+            .get_mut(&id)
+            .is_some_and(|s| s.prepared.remove(&handle).is_some())
+    }
+
+    /// Whether the session has an open explicit transaction — the state an
+    /// immediate (no-batch) reply's DONE stamps as `DONE_INXACT`.
+    fn in_transaction(&self, id: SessionId) -> bool {
+        self.sessions
+            .get(&id)
+            .is_some_and(|s| s.txn_ctx.in_transaction())
+    }
 }
 
 /// A message to the engine thread. Each carries a one-shot reply channel the
@@ -391,6 +525,15 @@ enum EngineCall {
         sql: String,
         params: Vec<crate::rel::RpcParam>,
         /// Set by the connection on a TDS Attention to abort the batch mid-flight.
+        cancel: Arc<AtomicBool>,
+        reply: BatchSink,
+    },
+    /// A prepared-statement RPC (`sp_prepare` handle family) on behalf of a
+    /// session. `Execute`/`PrepExec` re-enter the ordinary batch path once the
+    /// handle is resolved; `Prepare`/`Unprepare` answer immediately.
+    RunRpc {
+        session: SessionId,
+        command: PreparedRpc,
         cancel: Arc<AtomicBool>,
         reply: BatchSink,
     },
@@ -625,11 +768,29 @@ impl EngineHandle {
             sql,
             params,
             cancel,
-            reply: BatchSink { tx },
+            reply: BatchSink::new(tx),
         });
         // A closed inbox drops the call, taking the sink with it, so the stream
         // ends with no terminal event — which every reader here turns into the
         // same "the engine is gone" the dead oneshot used to mean.
+        rx
+    }
+
+    /// Runs a prepared-statement RPC (the `sp_prepare` handle family),
+    /// streaming its reply exactly like [`Self::stream_rpc`].
+    pub fn stream_prepared(
+        &self,
+        session: SessionId,
+        command: PreparedRpc,
+        cancel: Arc<AtomicBool>,
+    ) -> mpsc::UnboundedReceiver<BatchEvent> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inbox.send(EngineCall::RunRpc {
+            session,
+            command,
+            cancel,
+            reply: BatchSink::new(tx),
+        });
         rx
     }
 
@@ -896,8 +1057,12 @@ fn worker_loop(shared: &Arc<Shared>) {
             // arbitrary times and would otherwise reap the transaction of a
             // session whose next batch is already in hand.
             let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
-            if let Work::Call(EngineCall::RunBatch { session, .. }) = &work {
-                sched.sessions.touch(*session);
+            match &work {
+                Work::Call(EngineCall::RunBatch { session, .. })
+                | Work::Call(EngineCall::RunRpc { session, .. }) => {
+                    sched.sessions.touch(*session);
+                }
+                _ => {}
             }
         }
         drain_ready(shared);
@@ -923,6 +1088,12 @@ fn worker_loop(shared: &Arc<Shared>) {
                 cancel,
                 reply,
             }) => dispatch_batch(shared, session, sql, params, cancel, reply),
+            Work::Call(EngineCall::RunRpc {
+                session,
+                command,
+                cancel,
+                reply,
+            }) => dispatch_rpc(shared, session, command, cancel, reply),
             Work::Call(EngineCall::RunNative { command, reply }) => {
                 let _ = reply.send(shared.engine.execute(&command));
             }
@@ -936,6 +1107,135 @@ fn worker_loop(shared: &Arc<Shared>) {
             }
         }
     }
+}
+
+/// Resolves a prepared-statement RPC. `Prepare`/`Unprepare` touch only the
+/// session's handle table and answer immediately; `Execute`/`PrepExec`
+/// re-enter [`dispatch_batch`] with the resolved statement text, so locks,
+/// parking and streaming behave exactly as for a plain batch. There is no
+/// cached plan: execution re-parses and re-binds against the live catalog
+/// (like `sp_executesql`), so DDL between prepare and execute needs no
+/// invalidation — the next execute simply sees the new schema.
+fn dispatch_rpc(
+    shared: &Arc<Shared>,
+    session: SessionId,
+    command: PreparedRpc,
+    cancel: Arc<AtomicBool>,
+    mut reply: BatchSink,
+) {
+    // The immediate replies (no batch runs) still stamp DONE_INXACT from the
+    // session's real transaction state.
+    let immediate = |reply: &BatchSink, error: Option<SqlError>| {
+        let in_transaction = {
+            let sched = shared.scheduler.lock().expect("scheduler poisoned");
+            sched.sessions.in_transaction(session)
+        };
+        if let Some(error) = error {
+            reply.send(BatchEvent::Error(error));
+        }
+        reply.send(BatchEvent::Complete { in_transaction });
+    };
+    let missing_handle = |handle: i32| {
+        SqlError::new(
+            8179,
+            16,
+            1,
+            format!("Could not find prepared statement with handle {handle}."),
+        )
+    };
+    match command {
+        PreparedRpc::Prepare { decls, stmt } => {
+            // Parse now so a syntax error surfaces at prepare time, as SQL
+            // Server's compile does. Binding stays at execute (names resolve
+            // against the live catalog there) — a divergence: an unknown
+            // table or column errors at execute, not prepare.
+            if let Err(error) = truthdb_sql::parse(&stmt) {
+                immediate(&reply, Some(error));
+                return;
+            }
+            let handle = {
+                let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
+                sched.sessions.prepare(session, decls, stmt)
+            };
+            reply.send(BatchEvent::PreparedHandle(handle));
+            immediate(&reply, None);
+        }
+        PreparedRpc::Unprepare { handle } => {
+            let dropped = {
+                let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
+                sched.sessions.unprepare(session, handle)
+            };
+            immediate(&reply, (!dropped).then(|| missing_handle(handle)));
+        }
+        PreparedRpc::Execute { handle, values } => {
+            let resolved = {
+                let sched = shared.scheduler.lock().expect("scheduler poisoned");
+                sched.sessions.prepared(session, handle)
+            };
+            let Some((decls, text)) = resolved else {
+                immediate(&reply, Some(missing_handle(handle)));
+                return;
+            };
+            let values = match bind_decl_names(&decls, values) {
+                Ok(values) => values,
+                Err(error) => {
+                    immediate(&reply, Some(error));
+                    return;
+                }
+            };
+            dispatch_batch(shared, session, text, values, cancel, reply);
+        }
+        PreparedRpc::PrepExec {
+            decls,
+            stmt,
+            values,
+        } => {
+            if let Err(error) = truthdb_sql::parse(&stmt) {
+                immediate(&reply, Some(error));
+                return;
+            }
+            let handle = {
+                let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
+                sched.sessions.prepare(session, decls.clone(), stmt.clone())
+            };
+            reply.prepared_handle = Some(handle);
+            let values = match bind_decl_names(&decls, values) {
+                Ok(values) => values,
+                Err(error) => {
+                    immediate(&reply, Some(error));
+                    return;
+                }
+            };
+            dispatch_batch(shared, session, stmt, values, cancel, reply);
+        }
+    }
+}
+
+/// Names any unnamed value parameters from the declaration list, in order —
+/// `sp_execute` values arrive unnamed on the wire, and seeding a batch
+/// variable needs its name. A value that already has a name keeps it.
+fn bind_decl_names(
+    decls: &str,
+    mut values: Vec<crate::rel::RpcParam>,
+) -> Result<Vec<crate::rel::RpcParam>, SqlError> {
+    let names = decl_names(decls);
+    // More values than declarations is SQL Server's 8144. (Fewer is legal —
+    // a declared parameter the statement never reads goes unmissed, and one
+    // it does read errors when the variable lookup fails at execution.)
+    if values.len() > names.len() {
+        return Err(SqlError::new(
+            8144,
+            16,
+            2,
+            "Procedure or function has too many arguments specified.",
+        ));
+    }
+    for (value, name) in values.iter_mut().zip(names) {
+        if value.name.is_empty() {
+            value.name = name;
+        }
+    }
+    Ok(values)
 }
 
 /// Acquires a batch's locks and runs it, or parks it behind a conflict. Either
@@ -1992,7 +2292,7 @@ mod tests {
                 .expect("begin");
         }
         let (tx, _rx) = mpsc::unbounded_channel();
-        let reply = BatchSink { tx };
+        let reply = BatchSink::new(tx);
         sched.parked.push_back(Parked {
             session: id,
             sql: "SELECT id FROM t".into(),
@@ -2103,7 +2403,7 @@ mod tests {
         let (engine, mut sched, path) = bare("no-spin", Some(Duration::from_millis(50)));
         let id = sched.sessions.open("truthdb".into(), "sa".into());
         let (tx, _rx) = mpsc::unbounded_channel();
-        let reply = BatchSink { tx };
+        let reply = BatchSink::new(tx);
         sched.parked.push_back(Parked {
             session: id,
             sql: "SELECT 1".into(),
@@ -2227,7 +2527,7 @@ mod tests {
         let (engine, mut sched, path) = bare("reap-grantable", None);
         let id = sched.sessions.open("truthdb".into(), "sa".into());
         let (tx, _rx) = mpsc::unbounded_channel();
-        let reply = BatchSink { tx };
+        let reply = BatchSink::new(tx);
         // Parked, deadline long gone, and nothing holds the lock it wants.
         sched.parked.push_back(Parked {
             session: id,
@@ -3147,5 +3447,284 @@ mod tests {
             Some(1205),
             "the lone waiter should time out as a 1205 victim"
         );
+    }
+
+    // ---- sp_prepare handle family -----------------------------------------
+
+    /// The PreparedHandle event's value, if the stream carried one.
+    fn handle_of(events: &[BatchEvent]) -> Option<i32> {
+        events.iter().find_map(|event| match event {
+            BatchEvent::PreparedHandle(h) => Some(*h),
+            _ => None,
+        })
+    }
+
+    /// The first Error event's number, if any.
+    fn event_error(events: &[BatchEvent]) -> Option<i32> {
+        events.iter().find_map(|event| match event {
+            BatchEvent::Error(e) => Some(e.number),
+            _ => None,
+        })
+    }
+
+    fn int_param(value: i32) -> crate::rel::RpcParam {
+        crate::rel::RpcParam {
+            name: String::new(),
+            column_type: crate::relstore::types::ColumnType::Int,
+            value: Datum::Int(value),
+        }
+    }
+
+    /// All streamed rows, flattened.
+    fn rows_of(events: &[BatchEvent]) -> Vec<Vec<Datum>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                BatchEvent::Rows(rows) => Some(rows.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn prepare_execute_unprepare_roundtrip() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 5).await;
+
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Prepare {
+                decls: "@p1 int".into(),
+                stmt: "SELECT id FROM t WHERE id = @p1".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+        let handle = handle_of(&events).expect("prepare returns a handle");
+
+        // Execute twice with different values: the same handle re-binds each
+        // time, and the unnamed wire value takes the declaration's name.
+        for wanted in [3, 5] {
+            let events = drain_events(h.handle.stream_prepared(
+                s,
+                PreparedRpc::Execute {
+                    handle,
+                    values: vec![int_param(wanted)],
+                },
+                no_cancel(),
+            ))
+            .await;
+            assert_eq!(event_error(&events), None, "{events:?}");
+            assert_eq!(rows_of(&events), vec![vec![Datum::Int(wanted)]]);
+        }
+
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Unprepare { handle },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+
+        // The dropped handle is gone: 8179, SQL Server's number for it.
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Execute {
+                handle,
+                values: vec![int_param(1)],
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), Some(8179), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_handle_answers_8179() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Execute {
+                handle: 42,
+                values: Vec::new(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), Some(8179));
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Unprepare { handle: 42 },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), Some(8179));
+    }
+
+    #[tokio::test]
+    async fn a_parse_error_at_prepare_allocates_no_handle() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Prepare {
+                decls: String::new(),
+                stmt: "SELEC oops".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert!(event_error(&events).is_some(), "{events:?}");
+        assert_eq!(handle_of(&events), None, "no handle on a failed prepare");
+
+        // The failed prepare consumed nothing: the next handle is still 1.
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Prepare {
+                decls: String::new(),
+                stmt: "SELECT 1 AS one".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(handle_of(&events), Some(1));
+    }
+
+    #[tokio::test]
+    async fn ddl_between_prepare_and_execute_sees_the_new_schema() {
+        // There is no cached plan: every execute re-binds against the live
+        // catalog, so DDL between prepare and execute needs no invalidation —
+        // the same handle simply sees the new schema (the plan's
+        // catalog_version/rebind machinery is moot by design).
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 3).await;
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Prepare {
+                decls: String::new(),
+                stmt: "SELECT * FROM t ORDER BY id".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        let handle = handle_of(&events).expect("prepare returns a handle");
+
+        h.handle
+            .run_batch(
+                s,
+                "DROP TABLE t; CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT NOT NULL); INSERT INTO t VALUES (7, 70)".into(),
+            )
+            .await
+            .unwrap();
+
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Execute {
+                handle,
+                values: Vec::new(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+        // The wildcard expands against the NEW table: two columns, new row.
+        assert_eq!(rows_of(&events), vec![vec![Datum::Int(7), Datum::Int(70)]]);
+    }
+
+    #[tokio::test]
+    async fn prepexec_reports_the_handle_after_the_results() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 4).await;
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::PrepExec {
+                decls: "@p1 int".into(),
+                stmt: "SELECT id FROM t WHERE id > @p1 ORDER BY id".into(),
+                values: vec![int_param(2)],
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+        assert_eq!(
+            rows_of(&events),
+            vec![vec![Datum::Int(3)], vec![Datum::Int(4)]]
+        );
+        // Return values follow every result set: the handle event comes after
+        // the statement's DONE, immediately before Complete.
+        let positions: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                BatchEvent::Columns(_) => "columns",
+                BatchEvent::Rows(_) => "rows",
+                BatchEvent::StatementDone { .. } => "done",
+                BatchEvent::PreparedHandle(_) => "handle",
+                BatchEvent::Complete { .. } => "complete",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            positions.iter().rev().take(2).copied().collect::<Vec<_>>(),
+            ["complete", "handle"],
+            "{positions:?}"
+        );
+        // And the stored handle is executable afterwards.
+        let handle = handle_of(&events).expect("prepexec returns a handle");
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Execute {
+                handle,
+                values: vec![int_param(3)],
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(rows_of(&events), vec![vec![Datum::Int(4)]]);
+    }
+
+    #[test]
+    fn decl_names_splits_top_level_commas_only() {
+        assert_eq!(
+            decl_names("@p1 int, @p2 nvarchar(10), @p3 decimal(10,2)"),
+            ["@p1", "@p2", "@p3"]
+        );
+        assert_eq!(decl_names(""), Vec::<String>::new());
+        assert_eq!(decl_names("@a int"), ["@a"]);
+        // A quoted default may contain commas and parens; a doubled ''
+        // escape stays inside the string.
+        assert_eq!(
+            decl_names("@p1 varchar(10) = 'a,b', @p2 int, @p3 varchar(5) = 'it''s, ok'"),
+            ["@p1", "@p2", "@p3"]
+        );
+    }
+
+    #[test]
+    fn bind_decl_names_keeps_existing_names() {
+        let mut named = int_param(1);
+        named.name = "@mine".into();
+        let bound = bind_decl_names("@p1 int, @p2 int", vec![named, int_param(2)]).expect("bind");
+        assert_eq!(bound[0].name, "@mine");
+        assert_eq!(bound[1].name, "@p2");
+    }
+
+    #[test]
+    fn more_values_than_declarations_is_8144() {
+        // SQL Server rejects extra arguments rather than silently ignoring
+        // them; without this an unmatched value seeded nothing and vanished.
+        let err = bind_decl_names("@p1 int", vec![int_param(1), int_param(2)])
+            .expect_err("extra value must be rejected");
+        assert_eq!(err.number, 8144);
+        let err = bind_decl_names("", vec![int_param(1)])
+            .expect_err("values against an empty declaration list must be rejected");
+        assert_eq!(err.number, 8144);
+        // Fewer values than declarations stays legal (an unread declared
+        // parameter goes unmissed).
+        assert!(bind_decl_names("@p1 int, @p2 int", vec![int_param(1)]).is_ok());
     }
 }

@@ -7,8 +7,9 @@
 //! as batch variables. Parameters are decoded as typed values, never spliced
 //! back into SQL text, so a parameter can never change the statement's shape.
 //!
-//! `sp_prepare`/`sp_execute`/`sp_prepexec`/`sp_unprepare` (handle-based prepared
-//! statements) are a later increment; they surface here as [`RpcProc::Other`].
+//! `sp_prepare`/`sp_execute`/`sp_prepexec`/`sp_unprepare` (handle-based
+//! prepared statements) dispatch by well-known ProcID or by name; `sp_cursor*`
+//! is recognized so the server can reject server-side cursors distinctly.
 
 use std::io;
 
@@ -44,6 +45,15 @@ const PLP_NULL: u64 = 0xffff_ffff_ffff_ffff;
 
 /// The well-known `ProcID` for `sp_executesql` (MS-TDS 2.2.6.6).
 const SP_EXECUTESQL_PROCID: u16 = 10;
+/// Well-known `ProcID`s for the prepared-statement handle family.
+const SP_PREPARE_PROCID: u16 = 11;
+const SP_EXECUTE_PROCID: u16 = 12;
+const SP_PREPEXEC_PROCID: u16 = 13;
+const SP_UNPREPARE_PROCID: u16 = 15;
+/// The `sp_cursor*` family occupies ProcIDs 1–9 (sp_cursor through
+/// sp_cursorunprepare) — recognized so they can be rejected politely.
+const SP_CURSOR_FIRST_PROCID: u16 = 1;
+const SP_CURSOR_LAST_PROCID: u16 = 9;
 /// Sentinel `NameLenProcID` length selecting a well-known `ProcID` instead of a
 /// procedure name.
 const PROCID_SENTINEL: u16 = 0xffff;
@@ -52,6 +62,17 @@ const PROCID_SENTINEL: u16 = 0xffff;
 pub enum RpcProc {
     /// `sp_executesql` (by ProcID 10 or by name).
     SpExecuteSql,
+    /// `sp_prepare` (ProcID 11): store a statement, return a handle.
+    SpPrepare,
+    /// `sp_execute` (ProcID 12): run a prepared handle with values.
+    SpExecute,
+    /// `sp_prepexec` (ProcID 13): prepare and run in one round trip.
+    SpPrepExec,
+    /// `sp_unprepare` (ProcID 15): drop a prepared handle.
+    SpUnprepare,
+    /// An `sp_cursor*` procedure — server-side cursors are not supported, and
+    /// say so distinctly rather than "not found".
+    SpCursor(String),
     /// Any other procedure — reported back to the client as unsupported.
     Other(String),
 }
@@ -69,15 +90,31 @@ pub fn parse_rpc_request(body: &[u8]) -> io::Result<RpcRequest> {
     let name_len = c.u16()?;
     let proc = if name_len == PROCID_SENTINEL {
         let procid = c.u16()?;
-        if procid == SP_EXECUTESQL_PROCID {
-            RpcProc::SpExecuteSql
-        } else {
-            RpcProc::Other(format!("ProcID #{procid}"))
+        match procid {
+            SP_EXECUTESQL_PROCID => RpcProc::SpExecuteSql,
+            SP_PREPARE_PROCID => RpcProc::SpPrepare,
+            SP_EXECUTE_PROCID => RpcProc::SpExecute,
+            SP_PREPEXEC_PROCID => RpcProc::SpPrepExec,
+            SP_UNPREPARE_PROCID => RpcProc::SpUnprepare,
+            SP_CURSOR_FIRST_PROCID..=SP_CURSOR_LAST_PROCID => {
+                RpcProc::SpCursor(format!("ProcID #{procid}"))
+            }
+            _ => RpcProc::Other(format!("ProcID #{procid}")),
         }
     } else {
         let name = c.utf16(name_len as usize * 2)?;
         if name.eq_ignore_ascii_case("sp_executesql") {
             RpcProc::SpExecuteSql
+        } else if name.eq_ignore_ascii_case("sp_prepare") {
+            RpcProc::SpPrepare
+        } else if name.eq_ignore_ascii_case("sp_execute") {
+            RpcProc::SpExecute
+        } else if name.eq_ignore_ascii_case("sp_prepexec") {
+            RpcProc::SpPrepExec
+        } else if name.eq_ignore_ascii_case("sp_unprepare") {
+            RpcProc::SpUnprepare
+        } else if name.to_ascii_lowercase().starts_with("sp_cursor") {
+            RpcProc::SpCursor(name)
         } else {
             RpcProc::Other(name)
         }
@@ -119,6 +156,80 @@ pub fn split_sp_executesql(mut params: Vec<RpcParam>) -> io::Result<(String, Vec
         _ => return Err(protocol_err("sp_executesql: statement is not a string")),
     };
     Ok((stmt, values))
+}
+
+/// Reads a string parameter that may be NULL (an empty declaration list).
+fn opt_string(param: &RpcParam, what: &str) -> io::Result<String> {
+    match &param.value {
+        Datum::NVarChar(s) | Datum::VarChar(s) => Ok(s.clone()),
+        Datum::Null => Ok(String::new()),
+        _ => Err(protocol_err(&format!("{what} is not a string"))),
+    }
+}
+
+/// Reads a required integer parameter (a prepared-statement handle).
+fn int_param(param: &RpcParam, what: &str) -> io::Result<i32> {
+    match param.value {
+        Datum::Int(v) => Ok(v),
+        Datum::SmallInt(v) => Ok(v as i32),
+        Datum::TinyInt(v) => Ok(v as i32),
+        Datum::BigInt(v) => {
+            i32::try_from(v).map_err(|_| protocol_err(&format!("{what} out of range: {v}")))
+        }
+        _ => Err(protocol_err(&format!("{what} is not an integer"))),
+    }
+}
+
+/// Splits an `sp_prepare` parameter list — `@handle` OUTPUT (ignored on input),
+/// `@params` declarations, `@stmt`, optional `@options` — into (declarations,
+/// statement text).
+pub fn split_sp_prepare(params: Vec<RpcParam>) -> io::Result<(String, String)> {
+    if params.len() < 3 {
+        return Err(protocol_err("sp_prepare: expected @handle, @params, @stmt"));
+    }
+    let decls = opt_string(&params[1], "sp_prepare: @params")?;
+    let stmt = match opt_string(&params[2], "sp_prepare: @stmt")? {
+        s if s.is_empty() => return Err(protocol_err("sp_prepare: NULL statement")),
+        s => s,
+    };
+    Ok((decls, stmt))
+}
+
+/// Splits an `sp_execute` parameter list — `@handle`, then the value
+/// parameters — into (handle, values).
+pub fn split_sp_execute(mut params: Vec<RpcParam>) -> io::Result<(i32, Vec<RpcParam>)> {
+    if params.is_empty() {
+        return Err(protocol_err("sp_execute: missing @handle"));
+    }
+    let values = params.split_off(1);
+    let handle = int_param(&params[0], "sp_execute: @handle")?;
+    Ok((handle, values))
+}
+
+/// Splits an `sp_prepexec` parameter list — `@handle` OUTPUT (ignored on
+/// input), `@params` declarations, `@stmt`, then the value parameters — into
+/// (declarations, statement text, values).
+pub fn split_sp_prepexec(mut params: Vec<RpcParam>) -> io::Result<(String, String, Vec<RpcParam>)> {
+    if params.len() < 3 {
+        return Err(protocol_err(
+            "sp_prepexec: expected @handle, @params, @stmt",
+        ));
+    }
+    let values = params.split_off(3);
+    let decls = opt_string(&params[1], "sp_prepexec: @params")?;
+    let stmt = match opt_string(&params[2], "sp_prepexec: @stmt")? {
+        s if s.is_empty() => return Err(protocol_err("sp_prepexec: NULL statement")),
+        s => s,
+    };
+    Ok((decls, stmt, values))
+}
+
+/// Splits an `sp_unprepare` parameter list into its handle.
+pub fn split_sp_unprepare(params: Vec<RpcParam>) -> io::Result<i32> {
+    if params.is_empty() {
+        return Err(protocol_err("sp_unprepare: missing @handle"));
+    }
+    int_param(&params[0], "sp_unprepare: @handle")
 }
 
 /// Decodes one parameter's TYPE_INFO and value into a column type + datum.
@@ -571,10 +682,40 @@ mod tests {
     fn unknown_proc_reports_other() {
         let mut b = Vec::new();
         b.extend_from_slice(&PROCID_SENTINEL.to_le_bytes());
-        b.extend_from_slice(&11u16.to_le_bytes()); // sp_prepare
+        b.extend_from_slice(&200u16.to_le_bytes()); // no such well-known ProcID
         b.extend_from_slice(&0u16.to_le_bytes());
         let req = parse_rpc_request(&b).expect("parse");
         assert!(matches!(req.proc, RpcProc::Other(_)));
+    }
+
+    #[test]
+    fn the_handle_family_and_cursors_dispatch_by_procid_and_name() {
+        let by_procid = |procid: u16| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&PROCID_SENTINEL.to_le_bytes());
+            b.extend_from_slice(&procid.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+            parse_rpc_request(&b).expect("parse").proc
+        };
+        assert!(matches!(by_procid(11), RpcProc::SpPrepare));
+        assert!(matches!(by_procid(12), RpcProc::SpExecute));
+        assert!(matches!(by_procid(13), RpcProc::SpPrepExec));
+        assert!(matches!(by_procid(15), RpcProc::SpUnprepare));
+        assert!(matches!(by_procid(2), RpcProc::SpCursor(_))); // sp_cursoropen
+
+        let by_name = |name: &str| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            for unit in name.encode_utf16() {
+                b.extend_from_slice(&unit.to_le_bytes());
+            }
+            b.extend_from_slice(&0u16.to_le_bytes());
+            parse_rpc_request(&b).expect("parse").proc
+        };
+        assert!(matches!(by_name("sp_prepare"), RpcProc::SpPrepare));
+        assert!(matches!(by_name("SP_EXECUTE"), RpcProc::SpExecute));
+        assert!(matches!(by_name("sp_unprepare"), RpcProc::SpUnprepare));
+        assert!(matches!(by_name("sp_cursorfetch"), RpcProc::SpCursor(_)));
     }
 
     #[test]
