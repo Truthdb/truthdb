@@ -13,10 +13,13 @@ use crate::lexer::{Span, Token, TokenKind};
 /// even a 2 MiB thread stack. Real SQL never nests remotely this deep.
 const MAX_EXPR_DEPTH: usize = 64;
 
-/// Maximum number of expression nodes per batch. Bounds the AST size so a
-/// long operator chain (`1 OR 1 OR 1 ...`), which parses iteratively but
-/// evaluates recursively down its spine, cannot overflow the stack during
-/// evaluation.
+/// Maximum number of expression nodes per TOP-LEVEL expression. Bounds each
+/// expression's size so a long operator chain (`1 OR 1 OR 1 ...`), which
+/// parses iteratively but evaluates recursively down its spine, cannot
+/// overflow the stack during evaluation. Per expression, not per batch: a
+/// 1000-tuple `INSERT ... VALUES` is thousands of tiny FLAT expressions —
+/// none deepens any evaluation spine — and a per-batch count made row-lock
+/// escalation unreachable (its threshold sat above the whole-batch budget).
 const MAX_EXPR_NODES: usize = 2000;
 
 pub struct Parser {
@@ -94,6 +97,11 @@ impl Parser {
             if self.at_eof() {
                 break;
             }
+            // The expression-node budget also resets per statement: CTE and
+            // derived-table bodies parse under depth >= 1, so their
+            // expressions never reach parse_expr's depth-0 reset and would
+            // otherwise inherit the previous statement's count.
+            self.nodes = 0;
             statements.push(self.parse_statement()?);
             if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
                 let token = self.peek().clone();
@@ -1608,6 +1616,13 @@ impl Parser {
     /// Expression entry point with a recursion-depth guard (parens, the only
     /// unbounded nesting other than NOT/unary, re-enter here).
     fn parse_expr(&mut self) -> SqlResult<Expr> {
+        if self.depth == 0 {
+            // The node budget is per top-level expression (see
+            // MAX_EXPR_NODES): reset it here rather than accumulating across
+            // the batch, or flat many-expression statements (a 1000-tuple
+            // INSERT) exhaust a budget meant for one deep spine.
+            self.nodes = 0;
+        }
         self.depth += 1;
         if self.depth > MAX_EXPR_DEPTH {
             return Err(Self::too_deep());
@@ -2374,6 +2389,38 @@ mod tests {
         // Parses iteratively but would overflow eval; the node budget caps it.
         let sql = format!("SELECT 1{}", " OR 1".repeat(20_000));
         assert_eq!(Parser::parse_str(&sql).unwrap_err().number, 191);
+    }
+
+    #[test]
+    fn the_node_budget_is_per_expression_not_per_batch() {
+        // Thousands of tiny FLAT expressions are fine — none deepens an
+        // evaluation spine. A per-batch count once made a 1001-tuple INSERT
+        // unparseable, which put row-lock escalation above the reachable
+        // ceiling.
+        let tuples: Vec<String> = (0..3000).map(|i| format!("({i}, {i})")).collect();
+        let sql = format!("INSERT INTO t VALUES {}", tuples.join(", "));
+        assert!(Parser::parse_str(&sql).is_ok());
+        // Two statements each near the budget: legal — the budget resets.
+        // Each `OR` costs ~2 nodes (the operator and its literal): 900 ORs
+        // ≈ 1801 nodes, inside the 2000 budget — twice over in one batch.
+        let chain = format!("SELECT 1{}", " OR 1".repeat(900));
+        let batch = format!("{chain}; {chain}");
+        assert!(Parser::parse_str(&batch).is_ok());
+        // One expression over the budget still errors, even at the end of an
+        // otherwise-light batch (1001 ORs ≈ 2003 nodes).
+        let over = format!("SELECT 1; SELECT 1{}", " OR 1".repeat(1001));
+        assert_eq!(Parser::parse_str(&over).unwrap_err().number, 191);
+        // CTE and derived-table bodies parse under depth >= 1 (no depth-0
+        // reset for their expressions): the per-statement reset must cover
+        // them, or a big-but-legal statement poisons the next one's budget.
+        let big = format!("SELECT 1{}", " OR 1".repeat(900));
+        let derived = format!("{big}; SELECT * FROM (SELECT 1{}) d", " OR 1".repeat(200));
+        assert!(Parser::parse_str(&derived).is_ok(), "derived after big");
+        let cte = format!(
+            "{big}; WITH c AS (SELECT 1{} AS x) SELECT x FROM c",
+            " OR 1".repeat(200)
+        );
+        assert!(Parser::parse_str(&cte).is_ok(), "cte after big");
     }
 
     #[test]

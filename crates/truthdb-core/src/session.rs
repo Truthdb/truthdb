@@ -1590,7 +1590,11 @@ impl Scheduler {
             .min_by_key(|(_, p)| p.deadline)
             .map(|(i, _)| i);
         if let Some(idx) = victim_idx {
-            self.abort_parked_victim(engine, idx);
+            // An expired wait behind a LIVE holder is not a deadlock: SQL
+            // Server raises 1205 only for real cycles and 1222 for a lock
+            // wait that timed out. Reporting a false deadlock sends drivers
+            // into retry loops for a condition retrying cannot fix.
+            self.abort_parked_victim(engine, idx, lock_timeout_error());
         }
     }
 
@@ -1641,13 +1645,19 @@ impl Scheduler {
     /// Aborts the parked batch at `idx` as a deadlock victim: rolls back its
     /// transaction, releases its locks, and replies with error 1205. The caller
     /// drains any batches the released locks unblock.
-    fn abort_parked_victim(&mut self, engine: &Engine, idx: usize) {
+    fn abort_parked_victim(&mut self, engine: &Engine, idx: usize, error: SqlError) {
         let victim = self.parked.remove(idx).expect("index in bounds");
         if let Some(state) = self.sessions.get_mut(victim.session) {
             engine.abort_session_txn(&mut state.txn_ctx);
         }
         self.locks.release_all(victim.session.raw());
-        victim.reply.send_outcome(deadlock_victim_reply(), false);
+        victim.reply.send_outcome(
+            BatchOutcome {
+                results: Vec::new(),
+                error: Some(error),
+            },
+            false,
+        );
     }
 
     /// Detects lock-wait *cycles* among the parked batches — a waits-for graph
@@ -1657,7 +1667,7 @@ impl Scheduler {
     /// wait-timeout backstop. Aborts victims until the graph is acyclic.
     fn detect_deadlock(&mut self, engine: &Engine) {
         while let Some(idx) = self.find_deadlock_victim() {
-            self.abort_parked_victim(engine, idx);
+            self.abort_parked_victim(engine, idx, deadlock_victim_error());
         }
     }
 
@@ -1773,16 +1783,19 @@ fn find_cycle(
     None
 }
 
-fn deadlock_victim_reply() -> BatchOutcome {
-    BatchOutcome {
-        results: Vec::new(),
-        error: Some(SqlError::new(
-            1205,
-            13,
-            51,
-            "Transaction was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.",
-        )),
-    }
+fn deadlock_victim_error() -> SqlError {
+    SqlError::new(
+        1205,
+        13,
+        51,
+        "Transaction was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.",
+    )
+}
+
+/// A lock wait that outlived the timeout behind a LIVE holder — no cycle.
+/// SQL Server's number for an expired lock wait is 1222.
+fn lock_timeout_error() -> SqlError {
+    SqlError::new(1222, 16, 56, "Lock request time out period exceeded.")
 }
 
 #[cfg(test)]
@@ -2016,12 +2029,19 @@ mod tests {
             .run_batch(s, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
             .unwrap();
-        let mut insert = String::from("INSERT INTO t VALUES (1)");
-        for i in 2..=n {
-            insert.push_str(&format!(", ({i})"));
+        // Batched into 500-tuple inserts: the per-expression node budget
+        // keeps giant single statements bounded, and chunks stay far from
+        // every limit.
+        let ids: Vec<usize> = (1..=n).collect();
+        for chunk in ids.chunks(500) {
+            let values: Vec<String> = chunk.iter().map(|i| format!("({i})")).collect();
+            let reply = h
+                .handle
+                .run_batch(s, format!("INSERT INTO t VALUES {}", values.join(", ")))
+                .await
+                .unwrap();
+            assert!(reply.outcome.error.is_none(), "{:?}", reply.outcome.error);
         }
-        let reply = h.handle.run_batch(s, insert).await.unwrap();
-        assert!(reply.outcome.error.is_none(), "{:?}", reply.outcome.error);
     }
 
     #[tokio::test]
@@ -2857,8 +2877,12 @@ mod tests {
 
     #[tokio::test]
     async fn deadlock_is_broken_by_timeout_with_1205() {
-        // Short timeout so the reaper fires quickly.
-        let h = start(Duration::from_millis(300));
+        // Wide enough that BOTH conflicting batches park (forming the cycle)
+        // before any deadline expires: since the 1222 split, an expired
+        // waiter with no cycle is reaped as a lock timeout, and a loaded
+        // runner delaying the second park past the deadline would otherwise
+        // turn this test's deadlock into a 1222.
+        let h = start(Duration::from_secs(2));
         let a = h.handle.open_session(String::new(), String::new()).await;
         let b = h.handle.open_session(String::new(), String::new()).await;
 
@@ -3461,9 +3485,72 @@ mod tests {
         .unwrap();
         assert_eq!(
             error_number(&out),
-            Some(1205),
-            "the lone waiter should time out as a 1205 victim"
+            Some(1222),
+            "a lone waiter behind a live holder times out as 1222 — there is \
+             no cycle, so 1205 would report a deadlock that never happened"
         );
+    }
+
+    /// Stage 12's exit case: the engine stays responsive during a large
+    /// scan. A protocol heartbeat never touches the engine (the dispatcher
+    /// answers it), so the meaningful half is a native search completing
+    /// WHILE a worker is mid-scan holding the batch-long read gate — pinned
+    /// by synchronizing on the scan's first Columns event (the worker is
+    /// provably inside the batch) and asserting the search returns before
+    /// the scan finishes. A regression to an exclusive gate blocks the
+    /// search behind the whole scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_search_is_answered_while_a_large_scan_runs() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 60_000).await;
+        h.handle
+            .run_native(
+                r#"create index bench { "mappings": { "properties": { "title": { "type": "text" } } } }"#
+                    .to_string(),
+            )
+            .await
+            .expect("create index");
+        h.handle
+            .run_native(r#"insert document bench { "title": "hello world" }"#.to_string())
+            .await
+            .expect("insert doc");
+
+        let mut events = h
+            .handle
+            .stream_batch(s, "SELECT id FROM t".into(), no_cancel());
+        // The first Columns event: the worker is inside the batch, gate held.
+        loop {
+            match events.recv().await.expect("stream lives") {
+                BatchEvent::Columns(_) => break,
+                BatchEvent::Failed(err) => panic!("scan failed to start: {err}"),
+                _ => {}
+            }
+        }
+
+        let search = h
+            .handle
+            .run_native(r#"search bench {"query": {"match": {"title": "hello"}}}"#.to_string())
+            .await
+            .expect("search");
+        assert!(search.contains("hello world"), "search answered: {search}");
+        // The scan must have STILL BEEN RUNNING when the search returned.
+        // The channel is unbounded, so "the next event" proves nothing —
+        // instead drain everything already buffered at this instant without
+        // blocking: if the batch's terminal event is among it, the batch
+        // finished before the search did (an exclusive gate makes the search
+        // wait out the whole scan, and this assertion catches exactly that).
+        let mut already_finished = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, BatchEvent::Complete { .. } | BatchEvent::Failed(_)) {
+                already_finished = true;
+            }
+        }
+        assert!(
+            !already_finished,
+            "the search must complete while the scan is mid-stream, not after it"
+        );
+        drain_events(events).await;
     }
 
     // ---- sp_prepare handle family -----------------------------------------

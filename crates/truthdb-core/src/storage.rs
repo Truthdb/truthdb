@@ -3529,6 +3529,94 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// Row-lock escalation (Stage 12), pinned at its actual threshold: a
+    /// statement naming more than 1000 row keys takes ONE table lock instead
+    /// of flooding the lock table; at or below the threshold it takes row
+    /// locks. (The plan sketched ~5000; 1000 is the shipped value — this
+    /// test is the record of that divergence.)
+    #[test]
+    fn row_locks_escalate_past_the_threshold() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::{Isolation, TxnContext, execute_batch};
+
+        let path = unique_temp_path("escalation");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let insert = |n: usize| {
+            let tuples: Vec<String> = (0..n).map(|i| format!("({i}, 0)")).collect();
+            format!("INSERT INTO t VALUES {}", tuples.join(", "))
+        };
+
+        // At the threshold: per-row locks (plus the table intent).
+        let needs = crate::rel::analyze_locks(&storage, &insert(1000), Isolation::ReadCommitted);
+        let rows = needs
+            .iter()
+            .filter(|(r, _)| matches!(r, Resource::Row(_, _)))
+            .count();
+        assert_eq!(rows, 1000, "at the threshold every key gets a row lock");
+        assert!(
+            !needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Exclusive),
+            "no table X below escalation: {:?}",
+            needs.len()
+        );
+
+        // A single statement past the threshold: the per-statement cap
+        // declines to enumerate 1001 row hashes and the INSERT falls back to
+        // one table-exclusive lock. (Reachable since the node budget became
+        // per-expression — a 1001-tuple INSERT parses now.)
+        let needs = crate::rel::analyze_locks(&storage, &insert(1001), Isolation::ReadCommitted);
+        assert!(
+            needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Exclusive),
+            "a single over-threshold statement takes table X: {needs:?}"
+        );
+        assert_eq!(
+            needs
+                .iter()
+                .filter(|(r, _)| matches!(r, Resource::Row(_, _)))
+                .count(),
+            0
+        );
+
+        // Past it — summed across the WHOLE BATCH: a 1000-tuple INSERT plus
+        // 20 point DELETEs on DISTINCT keys wants 1020 row locks on one
+        // table (the needs map dedups by key hash, so overlapping keys would
+        // not count twice), and the batch-level pass replaces them all with
+        // one table-exclusive lock.
+        let deletes: Vec<String> = (2000..2020)
+            .map(|i| format!("DELETE FROM t WHERE id = {i}"))
+            .collect();
+        let over = format!("{}; {}", insert(1000), deletes.join("; "));
+        let needs = crate::rel::analyze_locks(&storage, &over, Isolation::ReadCommitted);
+        assert!(
+            needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Exclusive),
+            "past the threshold the statement takes table X: {needs:?}"
+        );
+        assert_eq!(
+            needs
+                .iter()
+                .filter(|(r, _)| matches!(r, Resource::Row(_, _)))
+                .count(),
+            0,
+            "row locks are replaced, not added to"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// EXEC scope semantics, pinned: outer variables are restored after the
     /// inner batch (a regression previously went green), and SET options
     /// revert at scope exit as SQL Server reverts them — an inner
