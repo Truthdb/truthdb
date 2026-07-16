@@ -2016,12 +2016,18 @@ mod tests {
             .run_batch(s, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
             .unwrap();
-        let mut insert = String::from("INSERT INTO t VALUES (1)");
-        for i in 2..=n {
-            insert.push_str(&format!(", ({i})"));
+        // Batched into 500-tuple inserts: one giant tuple list hits the
+        // parser's nesting guard (error 191).
+        let ids: Vec<usize> = (1..=n).collect();
+        for chunk in ids.chunks(500) {
+            let values: Vec<String> = chunk.iter().map(|i| format!("({i})")).collect();
+            let reply = h
+                .handle
+                .run_batch(s, format!("INSERT INTO t VALUES {}", values.join(", ")))
+                .await
+                .unwrap();
+            assert!(reply.outcome.error.is_none(), "{:?}", reply.outcome.error);
         }
-        let reply = h.handle.run_batch(s, insert).await.unwrap();
-        assert!(reply.outcome.error.is_none(), "{:?}", reply.outcome.error);
     }
 
     #[tokio::test]
@@ -3464,6 +3470,68 @@ mod tests {
             Some(1205),
             "the lone waiter should time out as a 1205 victim"
         );
+    }
+
+    /// Stage 12's exit case: the engine stays responsive during a large
+    /// scan. A protocol heartbeat never touches the engine (the dispatcher
+    /// answers it), so the meaningful half is a native search completing
+    /// WHILE a worker is mid-scan holding the batch-long read gate — pinned
+    /// by synchronizing on the scan's first Columns event (the worker is
+    /// provably inside the batch) and asserting the search returns before
+    /// the scan finishes. A regression to an exclusive gate blocks the
+    /// search behind the whole scan.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn a_search_is_answered_while_a_large_scan_runs() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 60_000).await;
+        h.handle
+            .run_native(
+                r#"create index bench { "mappings": { "properties": { "title": { "type": "text" } } } }"#
+                    .to_string(),
+            )
+            .await
+            .expect("create index");
+        h.handle
+            .run_native(r#"insert document bench { "title": "hello world" }"#.to_string())
+            .await
+            .expect("insert doc");
+
+        let mut events = h
+            .handle
+            .stream_batch(s, "SELECT id FROM t".into(), no_cancel());
+        // The first Columns event: the worker is inside the batch, gate held.
+        loop {
+            match events.recv().await.expect("stream lives") {
+                BatchEvent::Columns(_) => break,
+                BatchEvent::Failed(err) => panic!("scan failed to start: {err}"),
+                _ => {}
+            }
+        }
+
+        let search = h
+            .handle
+            .run_native(r#"search bench {"query": {"match": {"title": "hello"}}}"#.to_string())
+            .await
+            .expect("search");
+        assert!(search.contains("hello world"), "search answered: {search}");
+        // The scan must have STILL BEEN RUNNING when the search returned.
+        // The channel is unbounded, so "the next event" proves nothing —
+        // instead drain everything already buffered at this instant without
+        // blocking: if the batch's terminal event is among it, the batch
+        // finished before the search did (an exclusive gate makes the search
+        // wait out the whole scan, and this assertion catches exactly that).
+        let mut already_finished = false;
+        while let Ok(event) = events.try_recv() {
+            if matches!(event, BatchEvent::Complete { .. } | BatchEvent::Failed(_)) {
+                already_finished = true;
+            }
+        }
+        assert!(
+            !already_finished,
+            "the search must complete while the scan is mid-stream, not after it"
+        );
+        drain_events(events).await;
     }
 
     // ---- sp_prepare handle family -----------------------------------------
