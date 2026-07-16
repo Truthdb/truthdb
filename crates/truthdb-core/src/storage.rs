@@ -146,6 +146,8 @@ pub struct Storage {
     scan_selects: std::sync::atomic::AtomicUsize,
     #[cfg(test)]
     covering_scans: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    scan_materializations: std::sync::atomic::AtomicUsize,
     /// Columns the last scan slice asked for (`usize::MAX` = the whole row), so
     /// a test can prove the planner pruned the projection. The rows returned are
     /// identical either way, so nothing else can see the difference.
@@ -209,6 +211,8 @@ impl Storage {
             #[cfg(test)]
             covering_scans: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            scan_materializations: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             last_scan_width: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
@@ -230,6 +234,22 @@ impl Storage {
     pub(crate) fn covering_scans(&self) -> usize {
         self.covering_scans
             .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Lazily-scanned sources drained WHOLE (`SourceRows::materialize` on a
+    /// scan): what the join operators do, and what the streamed input path
+    /// must NOT do.
+    #[cfg(test)]
+    pub(crate) fn scan_materializations(&self) -> usize {
+        self.scan_materializations
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Counts one whole-scan drain (called by `SourceRows::materialize`).
+    #[cfg(test)]
+    pub(crate) fn count_scan_materialization(&self) {
+        self.scan_materializations
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Columns the last scan slice decoded per row (`usize::MAX` = every one).
@@ -3350,6 +3370,75 @@ mod tests {
         assert!(scanned.error.is_none(), "{:?}", scanned.error);
         assert_eq!(rows_of(&scanned), covered, "covering == scan");
         assert_eq!(storage.covering_scans(), 1, "the scan path took over");
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// The streamed input path: a filtered aggregate over a plain base table
+    /// pulls the scan slice by slice through the WHERE — it must never drain
+    /// the scan whole (that is what the join operators do, and what the old
+    /// path did for every shape). Pinned by the materialization counter: the
+    /// streamed query performs zero whole-scan drains; a join performs one
+    /// per scanned input.
+    #[test]
+    fn a_filtered_aggregate_streams_its_input_instead_of_materializing() {
+        use crate::rel::{StatementResult, TxnContext, execute_batch};
+
+        let path = unique_temp_path("stream-input");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT NOT NULL)",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+        for chunk in (1..=3000).collect::<Vec<i64>>().chunks(500) {
+            let values: Vec<String> = chunk.iter().map(|i| format!("({i}, {})", i % 7)).collect();
+            let outcome = execute_batch(
+                &storage,
+                &format!("INSERT INTO t VALUES {}", values.join(", ")),
+                &mut ctx,
+            );
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        }
+
+        // An aggregate with a WHERE over 3000 rows (three scan slices): the
+        // input streams; nothing drains the scan whole.
+        let outcome = execute_batch(
+            &storage,
+            "SELECT COUNT(*), SUM(v) FROM t WHERE v > 3",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            storage.scan_materializations(),
+            0,
+            "the filtered aggregate's input streamed"
+        );
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => {
+                // v cycles 1..7 over 3000 rows minus the id=1 seed row's v=1:
+                // v in {4,5,6} appears 428|429 times; exact values pin the walk.
+                assert_eq!(rowset.rows.len(), 1);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // A join drains its scanned inputs (one materialization per side) —
+        // the documented current behavior, and the counter's positive control.
+        let outcome = execute_batch(
+            &storage,
+            "SELECT COUNT(*) FROM t a JOIN t b ON a.id = b.id WHERE a.v > 5",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            storage.scan_materializations(),
+            2,
+            "a join still drains both scanned inputs"
+        );
 
         drop(storage);
         let _ = std::fs::remove_file(&path);

@@ -3525,7 +3525,95 @@ struct Source {
     /// default). Used by ORDER BY on character columns.
     collations: Vec<Option<String>>,
     /// Rows of typed values (real-table Datums; virtual sources build them).
+    rows: SourceRows,
+}
+
+/// A source's rows: already whole, or pulled slice-by-slice from a base-table
+/// scan as the consumer iterates (Stage 8 streaming scans, the input side). A
+/// consumer that filters or folds row-at-a-time holds one slice, not the
+/// table; one that needs the whole input calls [`SourceRows::materialize`].
+enum SourceRows {
+    Materialized(Vec<Vec<Datum>>),
+    Scan(ScanStream),
+}
+
+/// A base-table scan not yet read: full-width rows, [`SCAN_SLICE_ROWS`] at a
+/// time on the resumable cursor (the storage lock is taken per slice, as
+/// everywhere since #96; the table's S lock is held for the whole batch, so
+/// slicing changes no isolation semantics).
+struct ScanStream {
+    table: String,
+    cursor: ScanCursor,
+}
+
+impl ScanStream {
+    fn next_slice(&mut self, storage: &Storage) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        let mut slice = Vec::new();
+        while !self.cursor.done() && slice.is_empty() {
+            check_cancelled()?;
+            self.cursor = storage
+                .rel_scan_slice(&self.table, self.cursor, SCAN_SLICE_ROWS, None, &mut slice)
+                .map_err(|err| map_storage_err(err, &self.table))?;
+        }
+        Ok(if slice.is_empty() { None } else { Some(slice) })
+    }
+}
+
+/// A [`Source`] with its rows fully in hand — what the join operators (which
+/// walk their inputs repeatedly) consume.
+struct MaterializedSource {
+    columns: Vec<ResultColumn>,
+    qualifiers: Vec<Option<String>>,
+    collations: Vec<Option<String>>,
     rows: Vec<Vec<Datum>>,
+}
+
+impl MaterializedSource {
+    fn scope(&self) -> JoinScope {
+        JoinScope {
+            columns: self
+                .qualifiers
+                .iter()
+                .zip(&self.columns)
+                .map(|(qualifier, column)| (qualifier.clone(), column.name.clone()))
+                .collect(),
+            collations: self.collations.clone(),
+        }
+    }
+
+    fn from(source: Source, storage: &Storage) -> Result<Self, SqlError> {
+        let Source {
+            columns,
+            qualifiers,
+            collations,
+            rows,
+        } = source;
+        Ok(MaterializedSource {
+            columns,
+            qualifiers,
+            collations,
+            rows: rows.materialize(storage)?,
+        })
+    }
+}
+
+impl SourceRows {
+    /// The whole input, for consumers that need it at once. A scan drains its
+    /// remaining slices; a materialized source hands its rows over as-is.
+    fn materialize(self, storage: &Storage) -> Result<Vec<Vec<Datum>>, SqlError> {
+        match self {
+            SourceRows::Materialized(rows) => Ok(rows),
+            SourceRows::Scan(mut stream) => {
+                #[cfg(test)]
+                storage.count_scan_materialization();
+                let mut rows = Vec::new();
+                while let Some(mut slice) = stream.next_slice(storage)? {
+                    rows.append(&mut slice);
+                }
+                Ok(rows)
+            }
+        }
+    }
 }
 
 impl Source {
@@ -4813,7 +4901,8 @@ fn exec_select(
     // outer row into it and evaluate per row.
     let where_correlated = select.where_clause.as_ref().is_some_and(expr_has_subquery);
     let mut rows: Vec<Vec<Datum>> = Vec::new();
-    for row in source.rows {
+    // One row: filter it into `rows` or drop it. Shared by both input shapes.
+    let take = |row: Vec<Datum>, rows: &mut Vec<Vec<Datum>>| -> Result<(), SqlError> {
         check_cancelled()?;
         let sql_row = row_values(&row, &types);
         let keep = match &select.where_clause {
@@ -4833,6 +4922,25 @@ fn exec_select(
         };
         if keep {
             rows.push(row);
+        }
+        Ok(())
+    };
+    // A scanned base table streams in slices: peak input memory is one slice
+    // plus the survivors, not the table (Stage 8 streaming scans). Everything
+    // downstream (aggregate/sort/join operators) bounds or spills its own
+    // working set, so a filtered pipeline is bounded end to end.
+    match source.rows {
+        SourceRows::Materialized(input) => {
+            for row in input {
+                take(row, &mut rows)?;
+            }
+        }
+        SourceRows::Scan(mut stream) => {
+            while let Some(slice) = stream.next_slice(storage)? {
+                for row in slice {
+                    take(row, &mut rows)?;
+                }
+            }
         }
     }
 
@@ -6389,7 +6497,7 @@ fn build_source_inner(
             columns: Vec::new(),
             qualifiers: Vec::new(),
             collations: Vec::new(),
-            rows: vec![Vec::new()],
+            rows: SourceRows::Materialized(vec![Vec::new()]),
         }),
         // A single top-level table may use the WHERE for an index seek; base
         // tables inside a join scan fully (join-order planning is later).
@@ -6487,20 +6595,23 @@ fn build_table_source(
                 storage.rel_row_count(&def.name)
             };
             let rows = match plan::choose(&def, &schema, where_clause, eval_ctx, None, row_count) {
-                // Sliced: a read holds the table's lock, so it need not also
-                // hold the storage lock for the whole table and block every
-                // other session while it walks.
-                plan::AccessPath::TableScan => storage
-                    .rel_scan_sliced(&def.name, SCAN_SLICE_ROWS)
-                    .map_err(|err| map_storage_err(err, &def.name))?,
+                // A scan is handed out LAZY: the consumer pulls slices, so a
+                // filtering/folding reader holds one slice, not the table
+                // (and the storage lock is still taken per slice, as before).
+                plan::AccessPath::TableScan => SourceRows::Scan(ScanStream {
+                    table: def.name.clone(),
+                    cursor: ScanCursor::start(),
+                }),
                 plan::AccessPath::IndexSeek {
                     index_object_id,
                     lower,
                     upper,
                     ..
-                } => storage
-                    .rel_index_scan(&def.name, index_object_id, lower, upper, None, false)
-                    .map_err(|err| map_storage_err(err, &def.name))?,
+                } => SourceRows::Materialized(
+                    storage
+                        .rel_index_scan(&def.name, index_object_id, lower, upper, None, false)
+                        .map_err(|err| map_storage_err(err, &def.name))?,
+                ),
             };
             let columns = schema
                 .columns
@@ -6601,7 +6712,7 @@ fn build_derived_source(
         // column's COLLATE. Fixing this needs collation threaded through the
         // project/RowSet boundary; deferred (narrow, non-default-collation only).
         collations: vec![None; count],
-        rows: rowset.rows,
+        rows: SourceRows::Materialized(rowset.rows),
     })
 }
 
@@ -6616,6 +6727,12 @@ fn join_sources(
     on: Option<&Expr>,
     eval_ctx: &EvalContext,
 ) -> Result<Source, SqlError> {
+    // The join operators walk both inputs (the build side repeatedly), so a
+    // lazily-scanned input is drained here; the operators themselves bound or
+    // spill their working set past the budget. Streaming the PROBE side is
+    // the follow-up this shape allows.
+    let left = MaterializedSource::from(left, storage)?;
+    let right = MaterializedSource::from(right, storage)?;
     let mut columns = left.columns.clone();
     columns.extend(right.columns.clone());
     let mut qualifiers = left.qualifiers.clone();
@@ -6753,7 +6870,7 @@ fn join_sources(
         columns,
         qualifiers,
         collations,
-        rows,
+        rows: SourceRows::Materialized(rows),
     })
 }
 
@@ -6768,7 +6885,11 @@ type EquiKey = (usize, usize);
 /// join, an expression key, or a type-mismatched equality) yields an empty list
 /// and the caller keeps the nested-loop join. Non-equi conjuncts are left for
 /// the full-ON re-check on each hash candidate, so results are unchanged.
-fn extract_equi_keys(pred: &Expr, left: &Source, right: &Source) -> Vec<EquiKey> {
+fn extract_equi_keys(
+    pred: &Expr,
+    left: &MaterializedSource,
+    right: &MaterializedSource,
+) -> Vec<EquiKey> {
     let left_scope = left.scope();
     let right_scope = right.scope();
     // `Some(true)` = resolves uniquely to the left source, `Some(false)` = right,
@@ -6839,8 +6960,8 @@ fn flatten_and<'a>(expr: &'a Expr, out: &mut Vec<&'a Expr>) {
 #[allow(clippy::too_many_arguments)]
 fn grace_hash_join(
     storage: &Storage,
-    left: &Source,
-    right: &Source,
+    left: &MaterializedSource,
+    right: &MaterializedSource,
     kind: JoinKind,
     left_key: &impl Fn(&[Datum]) -> Vec<SqlValue>,
     right_key: &impl Fn(&[Datum]) -> Vec<SqlValue>,
@@ -7013,8 +7134,8 @@ fn matches_oriented(
 #[allow(clippy::too_many_arguments)]
 fn hash_join(
     storage: &Storage,
-    left: &Source,
-    right: &Source,
+    left: &MaterializedSource,
+    right: &MaterializedSource,
     kind: JoinKind,
     equi: &[EquiKey],
     matches: &impl Fn(&[Datum], &[Datum]) -> Result<bool, SqlError>,
@@ -7210,7 +7331,7 @@ fn sys_tables(storage: &Storage) -> Source {
         columns,
         qualifiers,
         collations,
-        rows,
+        rows: SourceRows::Materialized(rows),
     }
 }
 
@@ -7240,7 +7361,7 @@ fn sys_views(storage: &Storage) -> Source {
         columns,
         qualifiers,
         collations,
-        rows,
+        rows: SourceRows::Materialized(rows),
     }
 }
 
@@ -7263,7 +7384,7 @@ fn sys_sql_modules(storage: &Storage) -> Source {
         columns,
         qualifiers,
         collations,
-        rows,
+        rows: SourceRows::Materialized(rows),
     }
 }
 
@@ -7305,7 +7426,7 @@ fn sys_columns(storage: &Storage) -> Source {
         columns,
         qualifiers,
         collations,
-        rows,
+        rows: SourceRows::Materialized(rows),
     }
 }
 
@@ -7336,7 +7457,7 @@ fn sys_indexes(storage: &Storage) -> Source {
         columns,
         qualifiers,
         collations,
-        rows,
+        rows: SourceRows::Materialized(rows),
     }
 }
 
@@ -7362,7 +7483,7 @@ fn sys_check_constraints(storage: &Storage) -> Source {
         columns,
         qualifiers,
         collations,
-        rows,
+        rows: SourceRows::Materialized(rows),
     }
 }
 
@@ -7398,7 +7519,7 @@ fn sys_foreign_keys(storage: &Storage) -> Source {
         columns,
         qualifiers,
         collations,
-        rows,
+        rows: SourceRows::Materialized(rows),
     }
 }
 
@@ -7430,7 +7551,7 @@ fn sys_default_constraints(storage: &Storage) -> Source {
         columns,
         qualifiers,
         collations,
-        rows,
+        rows: SourceRows::Materialized(rows),
     }
 }
 
