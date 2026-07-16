@@ -30,10 +30,11 @@ struct EngineMeta {
 /// **execution gate** decoupling the two execution paths, which do not share a
 /// lock manager: a relational batch ([`Self::sql_batch_with_params`]) holds
 /// `meta.read()` for its whole run (many run concurrently), while a native
-/// command ([`Self::execute`], which bypasses table locks) takes `meta.write()`
-/// and so runs exclusively. Without this, a concurrent native batch could read
-/// a relational batch's half-applied writes — which the old single-threaded
-/// actor prevented for free.
+/// WRITE ([`Self::execute`] on a mutating command) takes `meta.write()` and so
+/// runs exclusively; a native SEARCH takes `meta.read()` like the batches (it
+/// is `&self` throughout, and readers must scale). Without the write gate, a
+/// concurrent native batch could read a relational batch's half-applied
+/// writes — which the old single-threaded actor prevented for free.
 pub struct Engine {
     storage: Storage,
     meta: RwLock<EngineMeta>,

@@ -3569,16 +3569,30 @@ mod tests {
             needs.len()
         );
 
-        // Past it — summed across the whole batch: 1001 point DELETEs each
-        // want one Row X, and the batch-level pass replaces them with one
-        // table-exclusive lock. (A single statement cannot textually exceed
-        // the threshold: a 1001-tuple INSERT hits the parser's depth guard
-        // before the lock analysis ever sees it.)
-        // Past it — summed across the whole batch: a 1000-tuple INSERT plus
-        // 20 point DELETEs wants 1020 row locks on one table, and the
-        // batch-level pass replaces them all with one table-exclusive lock.
-        // (No single statement can exceed the threshold alone: a 1001-tuple
-        // INSERT hits the parser's guards before lock analysis sees it.)
+        // A single statement past the threshold: the per-statement cap
+        // declines to enumerate 1001 row hashes and the INSERT falls back to
+        // one table-exclusive lock. (Reachable since the node budget became
+        // per-expression — a 1001-tuple INSERT parses now.)
+        let needs = crate::rel::analyze_locks(&storage, &insert(1001), Isolation::ReadCommitted);
+        assert!(
+            needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Exclusive),
+            "a single over-threshold statement takes table X: {needs:?}"
+        );
+        assert_eq!(
+            needs
+                .iter()
+                .filter(|(r, _)| matches!(r, Resource::Row(_, _)))
+                .count(),
+            0
+        );
+
+        // Past it — summed across the WHOLE BATCH: a 1000-tuple INSERT plus
+        // 20 point DELETEs on DISTINCT keys wants 1020 row locks on one
+        // table (the needs map dedups by key hash, so overlapping keys would
+        // not count twice), and the batch-level pass replaces them all with
+        // one table-exclusive lock.
         let deletes: Vec<String> = (2000..2020)
             .map(|i| format!("DELETE FROM t WHERE id = {i}"))
             .collect();

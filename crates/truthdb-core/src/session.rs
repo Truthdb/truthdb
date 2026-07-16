@@ -2029,8 +2029,9 @@ mod tests {
             .run_batch(s, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
             .unwrap();
-        // Batched into 500-tuple inserts: one giant tuple list hits the
-        // parser's nesting guard (error 191).
+        // Batched into 500-tuple inserts: the per-expression node budget
+        // keeps giant single statements bounded, and chunks stay far from
+        // every limit.
         let ids: Vec<usize> = (1..=n).collect();
         for chunk in ids.chunks(500) {
             let values: Vec<String> = chunk.iter().map(|i| format!("({i})")).collect();
@@ -2876,8 +2877,12 @@ mod tests {
 
     #[tokio::test]
     async fn deadlock_is_broken_by_timeout_with_1205() {
-        // Short timeout so the reaper fires quickly.
-        let h = start(Duration::from_millis(300));
+        // Wide enough that BOTH conflicting batches park (forming the cycle)
+        // before any deadline expires: since the 1222 split, an expired
+        // waiter with no cycle is reaped as a lock timeout, and a loaded
+        // runner delaying the second park past the deadline would otherwise
+        // turn this test's deadlock into a 1222.
+        let h = start(Duration::from_secs(2));
         let a = h.handle.open_session(String::new(), String::new()).await;
         let b = h.handle.open_session(String::new(), String::new()).await;
 

@@ -97,6 +97,11 @@ impl Parser {
             if self.at_eof() {
                 break;
             }
+            // The expression-node budget also resets per statement: CTE and
+            // derived-table bodies parse under depth >= 1, so their
+            // expressions never reach parse_expr's depth-0 reset and would
+            // otherwise inherit the previous statement's count.
+            self.nodes = 0;
             statements.push(self.parse_statement()?);
             if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
                 let token = self.peek().clone();
@@ -2405,6 +2410,17 @@ mod tests {
         // otherwise-light batch (1001 ORs ≈ 2003 nodes).
         let over = format!("SELECT 1; SELECT 1{}", " OR 1".repeat(1001));
         assert_eq!(Parser::parse_str(&over).unwrap_err().number, 191);
+        // CTE and derived-table bodies parse under depth >= 1 (no depth-0
+        // reset for their expressions): the per-statement reset must cover
+        // them, or a big-but-legal statement poisons the next one's budget.
+        let big = format!("SELECT 1{}", " OR 1".repeat(900));
+        let derived = format!("{big}; SELECT * FROM (SELECT 1{}) d", " OR 1".repeat(200));
+        assert!(Parser::parse_str(&derived).is_ok(), "derived after big");
+        let cte = format!(
+            "{big}; WITH c AS (SELECT 1{} AS x) SELECT x FROM c",
+            " OR 1".repeat(200)
+        );
+        assert!(Parser::parse_str(&cte).is_ok(), "cte after big");
     }
 
     #[test]
