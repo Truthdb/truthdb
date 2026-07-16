@@ -4233,10 +4233,11 @@ fn rewrite_select_subqueries(
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<Select, SqlError> {
-    // The columns this query exposes to a correlated subquery in its WHERE. A
-    // correlated WHERE subquery is left un-evaluated here (the per-row loop runs
-    // it with the outer row bound); other positions (SELECT list, HAVING, GROUP
-    // BY, ORDER BY) do not support correlation and evaluate as before.
+    // The columns this query exposes to a correlated subquery. A correlated
+    // subquery in the WHERE or the SELECT list is left un-evaluated here (the
+    // per-row loops bind the outer row), and one in HAVING likewise (the
+    // per-group loop binds the group row). GROUP BY and ORDER BY do not
+    // support correlation and evaluate as before.
     let self_scope = select
         .from
         .as_ref()
@@ -4250,7 +4251,7 @@ fn rewrite_select_subqueries(
         .iter()
         .map(|item| match item {
             SelectItem::Expr { expr, alias } => Ok(SelectItem::Expr {
-                expr: rewrite_subqueries(storage, expr, eval_ctx, None)?,
+                expr: rewrite_subqueries(storage, expr, eval_ctx, self_scope.as_ref())?,
                 alias: alias.clone(),
             }),
             other => Ok(other.clone()),
@@ -4264,7 +4265,7 @@ fn rewrite_select_subqueries(
     let having = select
         .having
         .as_ref()
-        .map(|e| rewrite_subqueries(storage, e, eval_ctx, None))
+        .map(|e| rewrite_subqueries(storage, e, eval_ctx, self_scope.as_ref()))
         .transpose()?;
     let group_by = select
         .group_by
@@ -4537,7 +4538,42 @@ fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<S
             cols.extend(from_column_names(storage, right)?);
             Some(cols)
         }
-        TableRef::Derived { .. } => None,
+        TableRef::Derived { subquery, alias } => {
+            let mut cols = Vec::new();
+            for item in &subquery.items {
+                match item {
+                    SelectItem::Expr { expr, alias: a } => {
+                        let name = a
+                            .as_ref()
+                            .map(|n| n.value.clone())
+                            .or_else(|| bare_column_name(expr))?;
+                        cols.push((Some(alias.value.clone()), name));
+                    }
+                    SelectItem::Wildcard => {
+                        let inner = from_column_names(storage, subquery.from.as_ref()?)?;
+                        cols.extend(
+                            inner
+                                .into_iter()
+                                .map(|(_, n)| (Some(alias.value.clone()), n)),
+                        );
+                    }
+                    SelectItem::QualifiedWildcard(q) => {
+                        let inner = from_column_names(storage, subquery.from.as_ref()?)?;
+                        cols.extend(
+                            inner
+                                .into_iter()
+                                .filter(|(qu, _)| {
+                                    qu.as_deref()
+                                        .is_some_and(|x| x.eq_ignore_ascii_case(&q.value))
+                                })
+                                .map(|(_, n)| (Some(alias.value.clone()), n)),
+                        );
+                    }
+                    SelectItem::Assign { .. } => return None,
+                }
+            }
+            Some(cols)
+        }
     }
 }
 
@@ -4568,7 +4604,25 @@ fn is_correlated(storage: &Storage, subquery: &Select, outer: &JoinScope) -> boo
             correlated = true;
         }
     });
-    correlated
+    // A correlated reference may live inside a derived table's body — its own
+    // clauses resolve in the derived scope, so the walk above never sees it.
+    correlated || from_has_correlated_derived(storage, subquery.from.as_ref(), outer)
+}
+
+/// Whether any derived-table body in a FROM tree is correlated to `outer`.
+fn from_has_correlated_derived(
+    storage: &Storage,
+    from: Option<&TableRef>,
+    outer: &JoinScope,
+) -> bool {
+    match from {
+        None | Some(TableRef::Table { .. }) => false,
+        Some(TableRef::Join { left, right, .. }) => {
+            from_has_correlated_derived(storage, Some(left), outer)
+                || from_has_correlated_derived(storage, Some(right), outer)
+        }
+        Some(TableRef::Derived { subquery, .. }) => is_correlated(storage, subquery, outer),
+    }
 }
 
 /// Calls `f` on every column reference in a select's own clauses (WHERE, SELECT
@@ -4887,7 +4941,7 @@ fn map_expr_columns(expr: &Expr, f: &impl Fn(&Name) -> Option<Expr>) -> Expr {
 fn substitute_subquery_outer_refs(
     storage: &Storage,
     subquery: &Select,
-    outer: &JoinScope,
+    outer: &dyn Fn(&str) -> Option<usize>,
     outer_row: &[SqlValue],
 ) -> Option<Select> {
     let inner = subquery_inner_scope(storage, subquery)?;
@@ -4895,7 +4949,7 @@ fn substitute_subquery_outer_refs(
         if inner.matches_any(&name.value) {
             return None; // the subquery's own column wins (even if ambiguous)
         }
-        let index = outer.resolve(&name.value)?;
+        let index = outer(&name.value)?;
         Some(Expr {
             kind: ExprKind::Literal(outer_row.get(index)?.clone()),
             span: name.span,
@@ -4934,7 +4988,34 @@ fn substitute_subquery_outer_refs(
             descending: o.descending,
         })
         .collect();
+    // A correlated reference INSIDE a derived table's body lives in `from`,
+    // not in any expression above — descend and substitute there too. The
+    // recursive call's own inner-scope check handles shadowing.
+    if let Some(from) = out.from.as_mut() {
+        substitute_from_outer_refs(storage, from, outer, outer_row)?;
+    }
     Some(out)
+}
+
+/// Substitutes outer references inside every derived-table body of a FROM
+/// tree. `None` when any derived body's scope cannot be determined.
+fn substitute_from_outer_refs(
+    storage: &Storage,
+    from: &mut TableRef,
+    outer: &dyn Fn(&str) -> Option<usize>,
+    outer_row: &[SqlValue],
+) -> Option<()> {
+    match from {
+        TableRef::Table { .. } => Some(()),
+        TableRef::Join { left, right, .. } => {
+            substitute_from_outer_refs(storage, left, outer, outer_row)?;
+            substitute_from_outer_refs(storage, right, outer, outer_row)
+        }
+        TableRef::Derived { subquery, .. } => {
+            **subquery = substitute_subquery_outer_refs(storage, subquery, outer, outer_row)?;
+            Some(())
+        }
+    }
 }
 
 /// Evaluates each correlated subquery in `expr` against `outer_row` (binding the
@@ -4943,7 +5024,7 @@ fn substitute_subquery_outer_refs(
 fn substitute_correlated_in_expr(
     storage: &Storage,
     expr: &Expr,
-    outer: &JoinScope,
+    outer: &dyn Fn(&str) -> Option<usize>,
     outer_row: &[SqlValue],
     eval_ctx: &EvalContext,
 ) -> Result<Expr, SqlError> {
@@ -5163,7 +5244,11 @@ fn exec_select(
                 let bound;
                 let predicate = if where_correlated {
                     bound = substitute_correlated_in_expr(
-                        storage, predicate, &resolver, &sql_row, eval_ctx,
+                        storage,
+                        predicate,
+                        &|name| resolver.resolve(name),
+                        &sql_row,
+                        eval_ctx,
                     )?;
                     &bound
                 } else {
@@ -5204,6 +5289,7 @@ fn exec_select(
             aggregate::execute(storage, select, &rows, &types, &resolver, eval_ctx)?
         } else {
             project(
+                storage,
                 &select.items,
                 &source.columns,
                 &rows,
@@ -5257,6 +5343,7 @@ fn exec_select(
     }
 
     project(
+        storage,
         &select.items,
         &source.columns,
         &rows,
@@ -6350,6 +6437,7 @@ fn read_head(
 }
 
 fn project(
+    storage: &Storage,
     items: &[SelectItem],
     source_columns: &[ResultColumn],
     rows: &[Vec<Datum>],
@@ -6432,9 +6520,26 @@ fn project(
                 }
             }
             Proj::Expr { name, expr } => {
-                // Evaluate the column for every row, then infer one type.
+                // Evaluate the column for every row, then infer one type. A
+                // subquery still present here is correlated (the rewrite pass
+                // left it for the per-row bind): substitute the outer row's
+                // values in, making it uncorrelated for that row.
+                let correlated = expr_has_subquery(expr);
                 let mut values = Vec::with_capacity(rows.len());
                 for row in &row_sql {
+                    let bound;
+                    let expr = if correlated {
+                        bound = substitute_correlated_in_expr(
+                            storage,
+                            expr,
+                            &|name| resolver.resolve(name),
+                            row,
+                            eval_ctx,
+                        )?;
+                        &bound
+                    } else {
+                        expr
+                    };
                     values.push(eval::eval(expr, row, resolver, eval_ctx)?);
                 }
                 let column_type = value::infer_type(&values);

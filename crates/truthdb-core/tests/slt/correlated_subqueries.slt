@@ -87,3 +87,69 @@ SELECT name FROM cust WHERE EXISTS (SELECT 1 FROM ord WHERE ord.cust_id = cust.i
 ----
 alice
 bob
+
+# ---- Correlation beyond the WHERE clause (Stage 11) ---------------------
+# State here: cust = (1,alice)(2,bob)(3,carol)(4,dave);
+# ord = (10,1,100)(11,1,250)(12,2,50)(13,NULL,5).
+
+# A correlated scalar subquery in the SELECT list — the most common
+# real-world form. dave (no orders) reads NULL; the NULL-cust_id order
+# matches nobody.
+query TI rowsort
+SELECT name, (SELECT SUM(amount) FROM ord WHERE ord.cust_id = cust.id) AS total FROM cust
+----
+alice 350
+bob 50
+carol NULL
+dave NULL
+
+# Correlated EXISTS inside a CASE in the SELECT list.
+query TT rowsort
+SELECT name, CASE WHEN EXISTS (SELECT 1 FROM ord WHERE ord.cust_id = cust.id) THEN 'yes' ELSE 'no' END AS has_orders FROM cust
+----
+alice yes
+bob yes
+carol no
+dave no
+
+# Inner-shadows-outer holds in the SELECT list too: the subquery's own `id`
+# wins, so this counts orders whose id equals their own cust_id (none).
+query TI rowsort
+SELECT name, (SELECT COUNT(*) FROM ord WHERE cust_id = id) AS n FROM cust
+----
+alice 0
+bob 0
+carol 0
+dave 0
+
+# A correlated subquery in HAVING, referencing a grouping column.
+query II rowsort
+SELECT cust_id, COUNT(*) FROM ord WHERE cust_id IS NOT NULL GROUP BY cust_id
+HAVING EXISTS (SELECT 1 FROM cust WHERE cust.id = ord.cust_id AND cust.name = 'alice')
+----
+1 2
+
+# A correlated scalar in HAVING compared against an aggregate.
+query I
+SELECT cust_id FROM ord WHERE cust_id IS NOT NULL GROUP BY cust_id
+HAVING COUNT(*) > (SELECT COUNT(*) FROM cust WHERE cust.id = ord.cust_id)
+----
+1
+
+# A correlated reference inside a DERIVED TABLE's body, within a WHERE
+# subquery: the derived table's inner query reads the outer cust.id.
+query T rowsort
+SELECT name FROM cust
+WHERE EXISTS (SELECT 1 FROM (SELECT amount FROM ord WHERE ord.cust_id = cust.id) d WHERE d.amount > 200)
+----
+alice
+
+# The derived table's own columns shadow the outer scope inside its body's
+# consumers: d.amount belongs to d, not to any outer table.
+query TI rowsort
+SELECT name, (SELECT MAX(d.amount) FROM (SELECT amount FROM ord WHERE ord.cust_id = cust.id) d) AS top_amount FROM cust
+----
+alice 250
+bob 50
+carol NULL
+dave NULL

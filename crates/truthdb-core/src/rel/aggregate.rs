@@ -158,7 +158,7 @@ pub fn execute(
     let input_bytes: usize = rows.iter().map(|r| super::approx_row_bytes(r)).sum();
     let out_rows = if select.group_by.is_empty() || input_bytes <= budget {
         aggregate_partition(
-            select, rows, types, resolver, eval_ctx, &aggs, &having, &out_exprs, &synth,
+            storage, select, rows, types, resolver, eval_ctx, &aggs, &having, &out_exprs, &synth,
         )?
     } else {
         grace_hash_aggregate(
@@ -185,6 +185,7 @@ pub fn execute(
 /// grace-hash partition.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_partition(
+    storage: &crate::storage::Storage,
     select: &Select,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
@@ -205,6 +206,38 @@ fn aggregate_partition(
             )?);
         }
         if let Some(having) = having {
+            // A subquery still present in HAVING is correlated to this
+            // query's grouping columns (the rewrite pass left it): bind the
+            // group row's values in, making it uncorrelated for this group.
+            // A reference to a non-grouped column stays unresolved and errors
+            // inside the subquery, as SQL Server rejects it too.
+            let bound;
+            let having = if crate::rel::expr_has_subquery(having) {
+                // The synth scope's names are synthetic ($gk0, $agg0) — an
+                // outer reference binds against the ORIGINAL group-by
+                // expressions instead: a bare-column key at position i is
+                // group_row[i]. Qualified and bare spellings match either way
+                // (the qualifier can only name this query's own FROM, which
+                // is where the grouping column came from).
+                let resolve = |name: &str| -> Option<usize> {
+                    let bare = name.rsplit_once('.').map(|(_, b)| b).unwrap_or(name);
+                    select.group_by.iter().position(|key| match &key.kind {
+                        truthdb_sql::ast::ExprKind::Column(n) => {
+                            let key_bare =
+                                n.value.rsplit_once('.').map(|(_, b)| b).unwrap_or(&n.value);
+                            n.value.eq_ignore_ascii_case(name)
+                                || key_bare.eq_ignore_ascii_case(bare)
+                        }
+                        _ => false,
+                    })
+                };
+                bound = crate::rel::substitute_correlated_in_expr(
+                    storage, having, &resolve, &group_row, eval_ctx,
+                )?;
+                &bound
+            } else {
+                having
+            };
             match eval::eval(having, &group_row, synth, eval_ctx)? {
                 SqlValue::Bool(true) => {}
                 SqlValue::Bool(false) | SqlValue::Null => continue,
@@ -273,7 +306,7 @@ fn grace_hash_aggregate(
             part_rows.push(row);
         }
         out_rows.extend(aggregate_partition(
-            select, &part_rows, types, resolver, eval_ctx, aggs, having, out_exprs, synth,
+            storage, select, &part_rows, types, resolver, eval_ctx, aggs, having, out_exprs, synth,
         )?);
     }
     Ok(out_rows)
