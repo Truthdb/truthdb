@@ -374,7 +374,8 @@ fn isolation_set_clause(isolation: u8) -> Option<&'static str> {
         2 => Some("SET TRANSACTION ISOLATION LEVEL READ COMMITTED"),
         3 => Some("SET TRANSACTION ISOLATION LEVEL REPEATABLE READ"),
         4 => Some("SET TRANSACTION ISOLATION LEVEL SERIALIZABLE"),
-        // 0 (unspecified) and 5 (snapshot, unsupported) keep the default.
+        5 => Some("SET TRANSACTION ISOLATION LEVEL SNAPSHOT"),
+        // 0 (unspecified) keeps the default.
         _ => None,
     }
 }

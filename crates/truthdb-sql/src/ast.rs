@@ -168,6 +168,9 @@ pub enum IsolationLevel {
     ReadCommitted,
     RepeatableRead,
     Serializable,
+    /// `SNAPSHOT` — transaction-scoped versioned reads (Stage 13). Gated at
+    /// data access on `ALLOW_SNAPSHOT_ISOLATION` (3952), not at SET.
+    Snapshot,
 }
 
 #[derive(Debug, Clone, PartialEq)]

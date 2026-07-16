@@ -505,6 +505,10 @@ impl Parser {
                 self.bump();
                 Ok(IsolationLevel::Serializable)
             }
+            Some("SNAPSHOT") => {
+                self.bump();
+                Ok(IsolationLevel::Snapshot)
+            }
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
