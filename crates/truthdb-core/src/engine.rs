@@ -4778,11 +4778,15 @@ mod tests {
             "case-insensitive equality matches both 'abc' and 'ABC'"
         );
 
-        // A range on NVARCHAR must NOT seek (UTF-16BE key order can diverge from
-        // the filter's order at astral characters); it scans and stays correct.
-        // Case-insensitive: 'ABC' folds to 'abc' > 'a', so all three match.
+        // An NVARCHAR range SEEKS since the keys became collation sort keys
+        // (#94): sort-key byte order IS the filter's compare order, so the old
+        // UTF-16BE divergence that forced a scan no longer exists.
+        // Case-insensitive: 'ABC' folds with 'abc' > 'a', so all three match.
         let plan = plan_lines(&engine, "SELECT id FROM t WHERE name > 'a'");
-        assert_eq!(plan, vec!["Table Scan(t)".to_string()]);
+        assert!(
+            plan.iter().any(|l| l.contains("Index Seek")),
+            "NVARCHAR ranges seek over sort keys: {plan:?}"
+        );
         let (_, mut rows) = sql_rows(&engine, "SELECT id FROM t WHERE name > 'a'");
         rows.sort();
         assert_eq!(
@@ -4824,6 +4828,54 @@ mod tests {
         let (_, mut rows) = sql_rows(&engine, "SELECT id FROM t WHERE code > 'b'");
         rows.sort();
         assert_eq!(rows, vec![vec![Some("2".into())], vec![Some("3".into())]]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sql_range_seek_follows_linguistic_order_not_code_points() {
+        // Under the default collation, accented letters sort next to their
+        // base letter ('å' < 'b') while their UTF-8 bytes sort past 'z'. The
+        // index keys are collation SORT KEYS, so a range seek's bounds agree
+        // with the filter — a code-point-keyed index would exclude 'å'/'ä'
+        // from `w < 'b'` and silently drop matching rows.
+        let path = unique_temp_path("sql-index-locale-range");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, w VARCHAR(20))")
+            .expect("create");
+        engine
+            .execute("INSERT INTO t VALUES (1,'a'),(2,'å'),(3,'ä'),(4,'b'),(5,'z')")
+            .expect("insert");
+        // Pad past the tiny-table tie-break; 'z...' sorts above 'b' in every
+        // collation involved, so the range's row set is untouched.
+        for i in 0..20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({}, 'zz{i}')", 100 + i))
+                .expect("pad");
+        }
+        engine.execute("CREATE INDEX ix_w ON t (w)").expect("index");
+
+        let q = "SELECT id FROM t WHERE w < 'b' ORDER BY id";
+        let plan = plan_lines(&engine, "SELECT id FROM t WHERE w < 'b'");
+        assert!(
+            plan.iter().any(|l| l.contains("Index Seek")),
+            "the range seeks: {plan:?}"
+        );
+        let (_, seeked) = sql_rows(&engine, q);
+        assert_eq!(
+            seeked,
+            vec![
+                vec![Some("1".into())],
+                vec![Some("2".into())],
+                vec![Some("3".into())]
+            ],
+            "'å' and 'ä' sort below 'b' linguistically and the seek keeps them"
+        );
+
+        // A/B: the scan agrees.
+        engine.execute("DROP INDEX ix_w ON t").expect("drop");
+        let (_, scanned) = sql_rows(&engine, q);
+        assert_eq!(scanned, seeked, "seek == scan");
         let _ = std::fs::remove_file(path);
     }
 

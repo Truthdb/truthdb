@@ -9,8 +9,8 @@ use truthdb_sql::eval::{self, EvalContext};
 
 use crate::relstore::catalog::{IndexDef, TableDef};
 use crate::relstore::index;
-use crate::relstore::row::{Column, Schema};
-use crate::relstore::types::{ColumnType, Datum};
+use crate::relstore::row::Schema;
+use crate::relstore::types::Datum;
 
 use super::value::sql_to_datum;
 
@@ -204,24 +204,6 @@ fn as_sarg(
     None
 }
 
-/// Whether a column may back an index *range* seek. A seek is correct only when
-/// the index's key byte order matches the WHERE filter's compare order for that
-/// column. The filter now compares strings by the column's collation (Stage 5)
-/// and the index key is folded the same way (`fold_key_datum`), so VARCHAR keys
-/// (UTF-8 bytes of the folded string) match the filter order — equality seeks
-/// (folded literal vs folded key) and VARCHAR ranges stay correct, including
-/// case-insensitively. NVARCHAR index keys are UTF-16BE, whose byte order
-/// diverges from the filter's order at supplementary-plane characters (surrogate
-/// pairs) regardless of folding — so an NVARCHAR *range* bound could exclude a
-/// matching row the filter keeps, and only NVARCHAR ranges are excluded here.
-/// (Equality seeks stay correct for NVARCHAR: they are exact folded-key matches.)
-///
-/// Locale-specific ordering (Swedish å-after-z) would still need collation sort
-/// keys; case-folding alone gives correct *equality*, not linguistic order.
-fn range_seekable_column(column: &Column) -> bool {
-    !matches!(column.column_type, ColumnType::NVarChar { .. })
-}
-
 /// Evaluates a would-be constant operand. Returns None if it references a
 /// column, is NULL, or does not coerce to the column type (all non-sargable —
 /// execution's own filter handles them).
@@ -276,7 +258,13 @@ fn try_index(index: &IndexDef, schema: &Schema, sargs: &[Sarg]) -> Option<(u32, 
     let mut upper_extra: Option<Datum> = None;
     if i < index.columns.len() {
         let (col, ascending) = index.columns[i];
-        if ascending && range_seekable_column(&schema.columns[col]) {
+        // Character range seeks are correct for VARCHAR and NVARCHAR alike
+        // since #94: both key encodings are the collation's SORT KEY
+        // (`encode_datum_collated`), whose byte order IS the filter's compare
+        // order (`Collation::sort_key` is asserted to agree with `compare`
+        // exhaustively). The old NVARCHAR exclusion guarded UTF-16BE keys,
+        // which no longer exist.
+        if ascending {
             for sarg in sargs.iter().filter(|s| s.column == col) {
                 match sarg.op {
                     BinaryOp::Gt | BinaryOp::Ge => {

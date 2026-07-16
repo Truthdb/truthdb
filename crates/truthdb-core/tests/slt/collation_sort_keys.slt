@@ -132,3 +132,37 @@ query T
 SELECT w FROM bin WHERE w = 'a'
 ----
 a
+
+# --- the index BYTES are in linguistic order, not just ORDER BY's output ---
+# A bare scan of a clustered table returns key order: no executor sort runs,
+# so this pins the on-disk sort-key ordering itself.
+
+query T
+SELECT w FROM sv
+----
+a
+b
+z
+å
+ä
+ö
+
+query T
+SELECT w FROM root
+----
+a
+å
+ä
+b
+ö
+z
+
+# A range through the clustered key follows linguistic order too: under the
+# root collation 'å'/'ä' fall BELOW 'b' even though their code points sort
+# past 'z' — a code-point-ordered key would drop them.
+query T rowsort
+SELECT w FROM root WHERE w < 'b'
+----
+a
+å
+ä
