@@ -104,6 +104,9 @@ pub struct CreateIndex {
     pub table: Name,
     pub unique: bool,
     pub columns: Vec<IndexColumn>,
+    /// `INCLUDE (col, ...)`: non-key columns whose values are stored in the
+    /// index leaves so a query over them is answered from the index alone.
+    pub include: Vec<Name>,
     pub span: Span,
 }
 

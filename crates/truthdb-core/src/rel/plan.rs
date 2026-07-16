@@ -72,8 +72,10 @@ pub fn choose(
     best.map(|(_, path)| path).unwrap_or(AccessPath::TableScan)
 }
 
-/// Renders the plan as `SHOWPLAN_TEXT` rows.
-pub fn plan_text(path: &AccessPath, table: &str) -> Vec<String> {
+/// Renders the plan as `SHOWPLAN_TEXT` rows. A covering seek (every needed
+/// column INCLUDEd in the leaf) answers from the index alone, so it has no
+/// Key Lookup line.
+pub fn plan_text(path: &AccessPath, table: &str, covering: bool) -> Vec<String> {
     match path {
         AccessPath::TableScan => vec![format!("Table Scan({table})")],
         AccessPath::IndexSeek {
@@ -82,18 +84,19 @@ pub fn plan_text(path: &AccessPath, table: &str) -> Vec<String> {
             unique,
             ..
         } => {
-            let kind = if *unique {
-                "Index Seek (unique)"
-            } else {
-                "Index Seek"
+            let kind = match (covering, *unique) {
+                (true, _) => "Index Seek (covering)",
+                (false, true) => "Index Seek (unique)",
+                (false, false) => "Index Seek",
             };
-            vec![
-                format!(
-                    "{kind}({table}.{index_name}), SEEK: {}",
-                    predicates.join(", ")
-                ),
-                format!("Key Lookup({table})"),
-            ]
+            let mut lines = vec![format!(
+                "{kind}({table}.{index_name}), SEEK: {}",
+                predicates.join(", ")
+            )];
+            if !covering {
+                lines.push(format!("Key Lookup({table})"));
+            }
+            lines
         }
     }
 }

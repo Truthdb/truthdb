@@ -1431,9 +1431,16 @@ fn showplan_rows(
         {
             match resolve_table(storage, &name.value) {
                 Some(def) => {
-                    let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
-                    let path = plan::choose(&def, &schema, &select.where_clause, eval_ctx);
-                    plan::plan_text(&path, &def.name)
+                    // The scan shape carries the covering decision (it knows
+                    // which columns the query reads); other shapes never
+                    // cover, so the plain choose() answer is exact for them.
+                    if let Some(plan) = scan_plan(storage, select, eval_ctx) {
+                        plan::plan_text(&plan.access, &def.name, plan.covering)
+                    } else {
+                        let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
+                        let path = plan::choose(&def, &schema, &select.where_clause, eval_ctx);
+                        plan::plan_text(&path, &def.name, false)
+                    }
                 }
                 None => vec![format!("Table Scan({})", name.value)],
             }
@@ -1824,7 +1831,7 @@ fn exec_create_table(storage: &Storage, create: &CreateTable) -> Result<Statemen
         .map_err(|err| map_storage_err(err, table_name))?;
     for (name, cols) in unique_indexes {
         storage
-            .rel_create_index(table_name, name, cols, true)
+            .rel_create_index(table_name, name, cols, true, Vec::new())
             .map_err(|err| map_storage_err(err, table_name))?;
     }
     Ok(StatementResult::Done)
@@ -2444,6 +2451,7 @@ fn enforce_parent_fks(
                                     Some(lower),
                                     upper,
                                     None,
+                                    false,
                                 )
                                 .map_err(|e| map_storage_err(e, &child.name))?;
                             if !matches.is_empty() {
@@ -2729,8 +2737,40 @@ fn exec_create_index(storage: &Storage, create: &CreateIndex) -> Result<Statemen
             .ok_or_else(|| SqlError::invalid_column(&col.name.value).at(col.name.span))?;
         columns.push((index, col.ascending));
     }
+    // INCLUDE columns: resolved against the schema, no duplicates (1909, as
+    // SQL Server). A *key* column may be INCLUDEd — a deliberate divergence
+    // from SQL Server, which rejects that: our index keys are one-way
+    // collation sort keys, so a query reading the key column itself can only
+    // be covered by also storing its original value.
+    let mut include = Vec::with_capacity(create.include.len());
+    for col in &create.include {
+        let index = schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&col.value))
+            .ok_or_else(|| SqlError::invalid_column(&col.value).at(col.span))?;
+        if include.contains(&index) {
+            return Err(SqlError::new(
+                1909,
+                16,
+                1,
+                format!(
+                    "Cannot use duplicate column names in index. Column name '{}' listed more than once.",
+                    col.value
+                ),
+            )
+            .at(col.span));
+        }
+        include.push(index);
+    }
     storage
-        .rel_create_index(&def.name, create.name.value.clone(), columns, create.unique)
+        .rel_create_index(
+            &def.name,
+            create.name.value.clone(),
+            columns,
+            create.unique,
+            include,
+        )
         .map_err(|e| map_storage_err(e, &def.name))?;
     Ok(StatementResult::Done)
 }
@@ -4896,6 +4936,11 @@ struct ScanPlan {
     /// The scanned-row position each output column reads (an index into
     /// `needed`, not into the table's columns).
     picks: Vec<usize>,
+    /// An index seek that is *covering*: every needed column's original value
+    /// is stored in the index leaves (`INCLUDE`), so the scan answers from the
+    /// index alone — no per-row base-table lookup. Never true for a table
+    /// scan.
+    covering: bool,
 }
 
 /// Recognises the shape [`scan_select`] can run, or `None` for everything else
@@ -5082,6 +5127,20 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
         collations: needed.iter().map(|&i| collations[i].clone()).collect(),
     };
 
+    // A seek covers when every column the query reads is INCLUDEd in the
+    // index — original values in the leaf, since the key bytes are one-way
+    // collation sort keys and cannot serve.
+    let covering = match &access {
+        plan::AccessPath::IndexSeek {
+            index_object_id, ..
+        } => def
+            .indexes
+            .iter()
+            .find(|i| i.object_id == *index_object_id)
+            .is_some_and(|i| needed.iter().all(|c| i.include.contains(c))),
+        plan::AccessPath::TableScan => false,
+    };
+
     Some(ScanPlan {
         table: def.name,
         access,
@@ -5090,6 +5149,7 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
         resolver,
         columns,
         picks,
+        covering,
     })
 }
 
@@ -5317,6 +5377,7 @@ fn scan_select_rows(
                     lower.clone(),
                     upper.clone(),
                     Some(&plan.needed),
+                    plan.covering,
                 )
                 .map_err(|err| map_storage_err(err, &plan.table))?;
             for row in rows {
@@ -6386,7 +6447,7 @@ fn build_table_source(
                     upper,
                     ..
                 } => storage
-                    .rel_index_scan(&def.name, index_object_id, lower, upper, None)
+                    .rel_index_scan(&def.name, index_object_id, lower, upper, None, false)
                     .map_err(|err| map_storage_err(err, &def.name))?,
             };
             let columns = schema

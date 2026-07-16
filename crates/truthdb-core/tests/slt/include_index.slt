@@ -1,0 +1,85 @@
+# CREATE INDEX ... INCLUDE (Stage 7): included columns' original values are
+# stored in the index leaves, so a query over key + included columns is
+# answered from the index alone (a covering seek). A key column may be
+# INCLUDEd — a deliberate divergence from SQL Server, whose two-way keys make
+# that redundant; ours are one-way collation sort keys.
+
+statement ok
+CREATE TABLE users (id INT NOT NULL PRIMARY KEY, email VARCHAR(50) NOT NULL, display VARCHAR(30), score INT)
+
+statement ok
+CREATE INDEX ix_email ON users (email) INCLUDE (email, id, score)
+
+statement ok
+INSERT INTO users VALUES (1, 'a@x.com', 'Alice', 10), (2, 'B@X.com', 'Bob', NULL), (3, 'c@x.com', NULL, 30)
+
+# Covering: every read column is INCLUDEd. NULLs in included columns survive.
+query TII rowsort
+SELECT email, id, score FROM users WHERE email = 'b@x.com'
+----
+B@X.com 2 NULL
+
+# The stored value is the ORIGINAL (case preserved), found case-insensitively.
+query T
+SELECT email FROM users WHERE email = 'B@X.COM'
+----
+B@X.com
+
+# Not covering (display is not included): the key lookup still answers.
+query TT
+SELECT email, display FROM users WHERE email = 'a@x.com'
+----
+a@x.com Alice
+
+# Included values follow UPDATEs.
+statement ok
+UPDATE users SET score = 99 WHERE id = 2
+
+query I
+SELECT score FROM users WHERE email = 'b@x.com'
+----
+99
+
+# And DELETEs.
+statement ok
+DELETE FROM users WHERE id = 3
+
+query I rowsort
+SELECT id FROM users WHERE email = 'c@x.com'
+----
+
+# A UNIQUE index with INCLUDE still enforces uniqueness on the key alone.
+statement ok
+CREATE TABLE codes (id INT NOT NULL PRIMARY KEY, code VARCHAR(10) NOT NULL, label VARCHAR(20))
+
+statement ok
+CREATE UNIQUE INDEX ux_code ON codes (code) INCLUDE (label)
+
+statement ok
+INSERT INTO codes VALUES (1, 'A1', 'first')
+
+statement error
+INSERT INTO codes VALUES (2, 'A1', 'different label')
+
+# A heap table (no PK) covers through RID locators the same way.
+statement ok
+CREATE TABLE notes (tag VARCHAR(10), body VARCHAR(40))
+
+statement ok
+CREATE INDEX ix_tag ON notes (tag) INCLUDE (tag, body)
+
+statement ok
+INSERT INTO notes VALUES ('todo', 'buy milk'), ('todo', 'call bob'), ('done', 'ship it')
+
+query TT rowsort
+SELECT tag, body FROM notes WHERE tag = 'todo'
+----
+todo buy milk
+todo call bob
+
+# Errors: a duplicate INCLUDE column is 1909; an unknown column is invalid.
+statement error
+CREATE INDEX ix_dup ON users (email) INCLUDE (id, id)
+
+statement error
+CREATE INDEX ix_missing ON users (email) INCLUDE (nope)
