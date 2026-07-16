@@ -470,7 +470,9 @@ impl SessionManager {
         let session = self.sessions.entry(id).or_default();
         let handle = session.next_prepared_handle;
         session.next_prepared_handle += 1;
-        session.prepared.insert(handle, PreparedStatement { decls, text });
+        session
+            .prepared
+            .insert(handle, PreparedStatement { decls, text });
         handle
     }
 
@@ -3414,5 +3416,263 @@ mod tests {
             Some(1205),
             "the lone waiter should time out as a 1205 victim"
         );
+    }
+
+    // ---- sp_prepare handle family -----------------------------------------
+
+    /// The PreparedHandle event's value, if the stream carried one.
+    fn handle_of(events: &[BatchEvent]) -> Option<i32> {
+        events.iter().find_map(|event| match event {
+            BatchEvent::PreparedHandle(h) => Some(*h),
+            _ => None,
+        })
+    }
+
+    /// The first Error event's number, if any.
+    fn event_error(events: &[BatchEvent]) -> Option<i32> {
+        events.iter().find_map(|event| match event {
+            BatchEvent::Error(e) => Some(e.number),
+            _ => None,
+        })
+    }
+
+    fn int_param(value: i32) -> crate::rel::RpcParam {
+        crate::rel::RpcParam {
+            name: String::new(),
+            column_type: crate::relstore::types::ColumnType::Int,
+            value: Datum::Int(value),
+        }
+    }
+
+    /// All streamed rows, flattened.
+    fn rows_of(events: &[BatchEvent]) -> Vec<Vec<Datum>> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                BatchEvent::Rows(rows) => Some(rows.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn prepare_execute_unprepare_roundtrip() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 5).await;
+
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Prepare {
+                decls: "@p1 int".into(),
+                stmt: "SELECT id FROM t WHERE id = @p1".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+        let handle = handle_of(&events).expect("prepare returns a handle");
+
+        // Execute twice with different values: the same handle re-binds each
+        // time, and the unnamed wire value takes the declaration's name.
+        for wanted in [3, 5] {
+            let events = drain_events(h.handle.stream_prepared(
+                s,
+                PreparedRpc::Execute {
+                    handle,
+                    values: vec![int_param(wanted)],
+                },
+                no_cancel(),
+            ))
+            .await;
+            assert_eq!(event_error(&events), None, "{events:?}");
+            assert_eq!(rows_of(&events), vec![vec![Datum::Int(wanted)]]);
+        }
+
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Unprepare { handle },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+
+        // The dropped handle is gone: 8179, SQL Server's number for it.
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Execute {
+                handle,
+                values: vec![int_param(1)],
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), Some(8179), "{events:?}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_handle_answers_8179() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Execute {
+                handle: 42,
+                values: Vec::new(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), Some(8179));
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Unprepare { handle: 42 },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), Some(8179));
+    }
+
+    #[tokio::test]
+    async fn a_parse_error_at_prepare_allocates_no_handle() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Prepare {
+                decls: String::new(),
+                stmt: "SELEC oops".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert!(event_error(&events).is_some(), "{events:?}");
+        assert_eq!(handle_of(&events), None, "no handle on a failed prepare");
+
+        // The failed prepare consumed nothing: the next handle is still 1.
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Prepare {
+                decls: String::new(),
+                stmt: "SELECT 1 AS one".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(handle_of(&events), Some(1));
+    }
+
+    #[tokio::test]
+    async fn ddl_between_prepare_and_execute_sees_the_new_schema() {
+        // There is no cached plan: every execute re-binds against the live
+        // catalog, so DDL between prepare and execute needs no invalidation —
+        // the same handle simply sees the new schema (the plan's
+        // catalog_version/rebind machinery is moot by design).
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 3).await;
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Prepare {
+                decls: String::new(),
+                stmt: "SELECT * FROM t ORDER BY id".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        let handle = handle_of(&events).expect("prepare returns a handle");
+
+        h.handle
+            .run_batch(
+                s,
+                "DROP TABLE t; CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT NOT NULL); INSERT INTO t VALUES (7, 70)".into(),
+            )
+            .await
+            .unwrap();
+
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Execute {
+                handle,
+                values: Vec::new(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+        // The wildcard expands against the NEW table: two columns, new row.
+        assert_eq!(rows_of(&events), vec![vec![Datum::Int(7), Datum::Int(70)]]);
+    }
+
+    #[tokio::test]
+    async fn prepexec_reports_the_handle_after_the_results() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        fill(&h, s, 4).await;
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::PrepExec {
+                decls: "@p1 int".into(),
+                stmt: "SELECT id FROM t WHERE id > @p1 ORDER BY id".into(),
+                values: vec![int_param(2)],
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+        assert_eq!(
+            rows_of(&events),
+            vec![vec![Datum::Int(3)], vec![Datum::Int(4)]]
+        );
+        // Return values follow every result set: the handle event comes after
+        // the statement's DONE, immediately before Complete.
+        let positions: Vec<&str> = events
+            .iter()
+            .map(|e| match e {
+                BatchEvent::Columns(_) => "columns",
+                BatchEvent::Rows(_) => "rows",
+                BatchEvent::StatementDone { .. } => "done",
+                BatchEvent::PreparedHandle(_) => "handle",
+                BatchEvent::Complete { .. } => "complete",
+                _ => "other",
+            })
+            .collect();
+        assert_eq!(
+            positions.iter().rev().take(2).copied().collect::<Vec<_>>(),
+            ["complete", "handle"],
+            "{positions:?}"
+        );
+        // And the stored handle is executable afterwards.
+        let handle = handle_of(&events).expect("prepexec returns a handle");
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Execute {
+                handle,
+                values: vec![int_param(3)],
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(rows_of(&events), vec![vec![Datum::Int(4)]]);
+    }
+
+    #[test]
+    fn decl_names_splits_top_level_commas_only() {
+        assert_eq!(
+            decl_names("@p1 int, @p2 nvarchar(10), @p3 decimal(10,2)"),
+            ["@p1", "@p2", "@p3"]
+        );
+        assert_eq!(decl_names(""), Vec::<String>::new());
+        assert_eq!(decl_names("@a int"), ["@a"]);
+    }
+
+    #[test]
+    fn bind_decl_names_keeps_existing_names() {
+        let mut named = int_param(1);
+        named.name = "@mine".into();
+        let bound = bind_decl_names("@p1 int, @p2 int", vec![named, int_param(2)]);
+        assert_eq!(bound[0].name, "@mine");
+        assert_eq!(bound[1].name, "@p2");
     }
 }

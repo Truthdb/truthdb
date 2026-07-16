@@ -584,13 +584,13 @@ fn start_rpc(
             Ok(engine.stream_rpc(session, sql, params, cancel))
         }
         RpcProc::SpPrepare => {
-            let (decls, stmt) = rpc::split_sp_prepare(request.params)
-                .map_err(|err| rpc_error(&err.to_string()))?;
+            let (decls, stmt) =
+                rpc::split_sp_prepare(request.params).map_err(|err| rpc_error(&err.to_string()))?;
             Ok(engine.stream_prepared(session, PreparedRpc::Prepare { decls, stmt }, cancel))
         }
         RpcProc::SpExecute => {
-            let (handle, values) = rpc::split_sp_execute(request.params)
-                .map_err(|err| rpc_error(&err.to_string()))?;
+            let (handle, values) =
+                rpc::split_sp_execute(request.params).map_err(|err| rpc_error(&err.to_string()))?;
             Ok(engine.stream_prepared(session, PreparedRpc::Execute { handle, values }, cancel))
         }
         RpcProc::SpPrepExec => {
@@ -615,7 +615,9 @@ fn start_rpc(
         // found" so a driver's fallback logic gets an honest signal.
         RpcProc::SpCursor(name) => Err(rpc_error_num(
             40510,
-            &format!("The stored procedure '{name}' is not supported (server-side cursors are not implemented)."),
+            &format!(
+                "The stored procedure '{name}' is not supported (server-side cursors are not implemented)."
+            ),
         )),
         // Error 2812 is SQL Server's "Could not find stored procedure".
         RpcProc::Other(name) => Err(rpc_error_num(
@@ -1050,6 +1052,48 @@ mod render_tests {
         })
         .unwrap();
         rx
+    }
+
+    /// A prepared handle renders as a RETURNVALUE token after the statement's
+    /// DONE (return values follow results), with the exact bytes MS-TDS
+    /// 2.2.7.19 prescribes for an INT output parameter.
+    #[tokio::test]
+    async fn a_prepared_handle_renders_as_a_returnvalue_token() {
+        let (tx, rx) = mpsc::unbounded_channel();
+        tx.send(BatchEvent::StatementDone {
+            count: Some(1),
+            in_transaction: false,
+        })
+        .unwrap();
+        tx.send(BatchEvent::PreparedHandle(7)).unwrap();
+        tx.send(BatchEvent::Complete {
+            in_transaction: false,
+        })
+        .unwrap();
+        drop(tx);
+
+        let mut expected = Vec::new();
+        token::done(&mut expected, true, false, false, Some(1));
+        token::return_value_int(&mut expected, "handle", 7);
+        token::done(&mut expected, false, false, false, None);
+        assert_eq!(rendered_events(rx, 4096).await, expected);
+
+        // The token's own bytes, pinned: 0xAC, ordinal 0, B_VARCHAR name,
+        // status 0x01 (output param), UserType 0, Flags 0, INTN(4), value.
+        let mut token_bytes = Vec::new();
+        token::return_value_int(&mut token_bytes, "h", 7);
+        assert_eq!(
+            token_bytes,
+            [
+                0xac, 0x00, 0x00, // token, ParamOrdinal
+                0x01, b'h' as u8, 0x00, // B_VARCHAR "h"
+                0x01, // Status: output parameter
+                0x00, 0x00, 0x00, 0x00, // UserType
+                0x00, 0x00, // Flags
+                0x26, 0x04, // TYPE_INFO: INTN, max 4
+                0x04, 0x07, 0x00, 0x00, 0x00, // 4-byte value 7
+            ]
+        );
     }
 
     /// Each DONE carries the transaction state of *its own* statement on the

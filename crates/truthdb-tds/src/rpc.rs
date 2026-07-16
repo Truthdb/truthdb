@@ -7,8 +7,9 @@
 //! as batch variables. Parameters are decoded as typed values, never spliced
 //! back into SQL text, so a parameter can never change the statement's shape.
 //!
-//! `sp_prepare`/`sp_execute`/`sp_prepexec`/`sp_unprepare` (handle-based prepared
-//! statements) are a later increment; they surface here as [`RpcProc::Other`].
+//! `sp_prepare`/`sp_execute`/`sp_prepexec`/`sp_unprepare` (handle-based
+//! prepared statements) dispatch by well-known ProcID or by name; `sp_cursor*`
+//! is recognized so the server can reject server-side cursors distinctly.
 
 use std::io;
 
@@ -172,8 +173,9 @@ fn int_param(param: &RpcParam, what: &str) -> io::Result<i32> {
         Datum::Int(v) => Ok(v),
         Datum::SmallInt(v) => Ok(v as i32),
         Datum::TinyInt(v) => Ok(v as i32),
-        Datum::BigInt(v) => i32::try_from(v)
-            .map_err(|_| protocol_err(&format!("{what} out of range: {v}"))),
+        Datum::BigInt(v) => {
+            i32::try_from(v).map_err(|_| protocol_err(&format!("{what} out of range: {v}")))
+        }
         _ => Err(protocol_err(&format!("{what} is not an integer"))),
     }
 }
@@ -680,10 +682,40 @@ mod tests {
     fn unknown_proc_reports_other() {
         let mut b = Vec::new();
         b.extend_from_slice(&PROCID_SENTINEL.to_le_bytes());
-        b.extend_from_slice(&11u16.to_le_bytes()); // sp_prepare
+        b.extend_from_slice(&200u16.to_le_bytes()); // no such well-known ProcID
         b.extend_from_slice(&0u16.to_le_bytes());
         let req = parse_rpc_request(&b).expect("parse");
         assert!(matches!(req.proc, RpcProc::Other(_)));
+    }
+
+    #[test]
+    fn the_handle_family_and_cursors_dispatch_by_procid_and_name() {
+        let by_procid = |procid: u16| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&PROCID_SENTINEL.to_le_bytes());
+            b.extend_from_slice(&procid.to_le_bytes());
+            b.extend_from_slice(&0u16.to_le_bytes());
+            parse_rpc_request(&b).expect("parse").proc
+        };
+        assert!(matches!(by_procid(11), RpcProc::SpPrepare));
+        assert!(matches!(by_procid(12), RpcProc::SpExecute));
+        assert!(matches!(by_procid(13), RpcProc::SpPrepExec));
+        assert!(matches!(by_procid(15), RpcProc::SpUnprepare));
+        assert!(matches!(by_procid(2), RpcProc::SpCursor(_))); // sp_cursoropen
+
+        let by_name = |name: &str| {
+            let mut b = Vec::new();
+            b.extend_from_slice(&(name.len() as u16).to_le_bytes());
+            for unit in name.encode_utf16() {
+                b.extend_from_slice(&unit.to_le_bytes());
+            }
+            b.extend_from_slice(&0u16.to_le_bytes());
+            parse_rpc_request(&b).expect("parse").proc
+        };
+        assert!(matches!(by_name("sp_prepare"), RpcProc::SpPrepare));
+        assert!(matches!(by_name("SP_EXECUTE"), RpcProc::SpExecute));
+        assert!(matches!(by_name("sp_unprepare"), RpcProc::SpUnprepare));
+        assert!(matches!(by_name("sp_cursorfetch"), RpcProc::SpCursor(_)));
     }
 
     #[test]
