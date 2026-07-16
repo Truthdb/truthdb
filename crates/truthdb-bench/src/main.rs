@@ -304,6 +304,7 @@ fn format_latency(us: f64) -> String {
 
 async fn connect(addr: &str) -> Result<TcpStream> {
     let mut stream = TcpStream::connect(addr).await?;
+    stream.set_nodelay(true)?;
 
     let req = HelloReq {
         protocol_version: PROTOCOL_VERSION,

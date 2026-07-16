@@ -43,6 +43,10 @@ impl ClientListener {
                 }
                 res = listener.accept() => {
                     let (stream, _) = res?;
+                    // The protocol is write-write-read per request; Nagle +
+                    // delayed ACK turns that into a ~40-200ms stall per
+                    // round trip (measured ~90ms on WSL2 loopback).
+                    let _ = stream.set_nodelay(true);
                     let mut conn_shutdown = shutdown.clone();
                     let engine = self.engine.clone();
                     tokio::spawn(async move {
