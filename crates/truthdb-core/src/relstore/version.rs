@@ -225,6 +225,11 @@ impl VersionState {
         }
     }
 
+    /// Whether any snapshot is registered.
+    pub fn has_snapshots(&self) -> bool {
+        !self.snapshots.is_empty()
+    }
+
     pub fn register_snapshot(&mut self, seq: u64) {
         *self.snapshots.entry(seq).or_insert(0) += 1;
     }

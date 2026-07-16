@@ -4854,4 +4854,423 @@ mod tests {
         got.sort();
         assert_eq!(got, vec![1, 2, 3, 4]);
     }
+
+    // ---- SI review PoC tests ---------------------------------------------
+
+    /// Attack A: a row re-keyed by a snapshot-invisible writer. Targeting the
+    /// snapshot row by its OLD key must be 3960 (its current state was
+    /// produced by an invisible writer); targeting the NEW key must affect
+    /// nothing (the snapshot has no such row) and must not touch the current
+    /// row.
+    #[tokio::test]
+    async fn snapshot_rekeyed_row_conflicts_on_old_key_and_misses_on_new_key() {
+        let (h, a, b) = si_harness().await;
+        h.handle.run_batch(b, "BEGIN TRAN".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 2").await;
+        assert_eq!(values(&reply), vec![20]);
+        // A re-keys row 2 -> 5 after B's snapshot.
+        let reply = h
+            .handle
+            .run_batch(a, "UPDATE t SET id = 5 WHERE id = 2".into())
+            .await
+            .unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        // Targeting by the NEW key: the snapshot has no row with id = 5.
+        let reply = h
+            .handle
+            .run_batch(b, "DELETE FROM t WHERE id = 5".into())
+            .await
+            .unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        match reply.outcome.results.as_slice() {
+            [StatementResult::RowsAffected(n)] => assert_eq!(*n, 0, "snapshot has no id = 5"),
+            other => panic!("expected RowsAffected, got {other:?}"),
+        }
+        // Targeting by the OLD key: the snapshot row exists but its current
+        // state was produced by an invisible writer - update conflict.
+        let reply = h
+            .handle
+            .run_batch(b, "UPDATE t SET v = 200 WHERE id = 2".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            error_number(&reply),
+            Some(3960),
+            "{:?}",
+            reply.outcome.error
+        );
+        // The 3960 rolled B back; the current row was never touched by the
+        // no-op DELETE or the conflicting UPDATE.
+        let reply = must_not_block(&h, a, "SELECT v FROM t WHERE id = 5").await;
+        assert_eq!(values(&reply), vec![20], "A's re-keyed row survived");
+        let reply = must_not_block(&h, a, "SELECT COUNT(*) FROM t").await;
+        assert_eq!(values(&reply), vec![2]);
+    }
+
+    /// Attack E: an index created AFTER the snapshot only contains
+    /// post-snapshot states. A seek through it must still produce exactly the
+    /// snapshot's rows: old values found via chain images, new values
+    /// filtered out.
+    #[tokio::test]
+    async fn snapshot_reads_merge_through_an_index_created_after_the_snapshot() {
+        let (h, a, b) = si_harness().await;
+        h.handle.run_batch(b, "BEGIN TRAN".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(values(&reply), vec![10]);
+        // Post-snapshot: an index on v, then an update that moves row 1's
+        // entry from 10 to 99 (the new index only ever contains 99).
+        let reply = h
+            .handle
+            .run_batch(a, "CREATE INDEX ix_v ON t (v)".into())
+            .await
+            .unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        let reply = h
+            .handle
+            .run_batch(a, "UPDATE t SET v = 99 WHERE id = 1".into())
+            .await
+            .unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        // Seek for the snapshot's value: nothing physical in range, so the
+        // row must come from its chain image.
+        let reply = must_not_block(&h, b, "SELECT id FROM t WHERE v = 10").await;
+        assert_eq!(
+            values(&reply),
+            vec![1],
+            "the snapshot's v = 10 row must be found through the new index"
+        );
+        // Seek for the current value: the physical entry resolves to an
+        // image with v = 10, which the predicate must filter out.
+        let reply = must_not_block(&h, b, "SELECT id FROM t WHERE v = 99").await;
+        assert_eq!(
+            values(&reply),
+            Vec::<i64>::new(),
+            "the current v = 99 row postdates the snapshot"
+        );
+        h.handle.run_batch(b, "COMMIT".into()).await.unwrap();
+    }
+
+    /// Attack C: EXEC of a literal shares the transaction's snapshot - the
+    /// inner statement both CAPTURES it (first access inside an EXEC) and
+    /// REUSES it, and 3952 fires at the inner statement's access when the
+    /// option is off.
+    #[tokio::test]
+    async fn exec_literal_shares_the_transaction_snapshot() {
+        let (h, a, b) = si_harness().await;
+        h.handle.run_batch(b, "BEGIN TRAN".into()).await.unwrap();
+        // First data access happens INSIDE the EXEC: it must establish the
+        // transaction's snapshot.
+        let reply =
+            must_not_block(&h, b, "EXEC sp_executesql N'SELECT v FROM t WHERE id = 1'").await;
+        assert_eq!(values(&reply), vec![10]);
+        h.handle
+            .run_batch(a, "UPDATE t SET v = 99 WHERE id = 1".into())
+            .await
+            .unwrap();
+        // Both a plain statement and another EXEC read the SAME view.
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(
+            values(&reply),
+            vec![10],
+            "captured inside EXEC, reused outside"
+        );
+        let reply =
+            must_not_block(&h, b, "EXEC sp_executesql N'SELECT v FROM t WHERE id = 1'").await;
+        assert_eq!(values(&reply), vec![10], "reused inside EXEC");
+        h.handle.run_batch(b, "COMMIT".into()).await.unwrap();
+    }
+
+    /// Attack C/D: without ALLOW_SNAPSHOT_ISOLATION, the 3952 fires at the
+    /// INNER statement of an EXEC too, and dooms the open transaction.
+    #[tokio::test]
+    async fn exec_literal_under_snapshot_without_allow_is_3952() {
+        let h = start(Duration::from_secs(30));
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        h.handle
+            .run_batch(
+                a,
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY); INSERT INTO t VALUES (1);".into(),
+            )
+            .await
+            .unwrap();
+        h.handle
+            .run_batch(a, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT".into())
+            .await
+            .unwrap();
+        h.handle.run_batch(a, "BEGIN TRAN".into()).await.unwrap();
+        let reply = h
+            .handle
+            .run_batch(a, "EXEC sp_executesql N'SELECT id FROM t'".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            error_number(&reply),
+            Some(3952),
+            "{:?}",
+            reply.outcome.error
+        );
+        let reply = h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
+        assert_eq!(error_number(&reply), Some(3930), "doomed");
+        let reply = h.handle.run_batch(a, "ROLLBACK".into()).await.unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        // The session is usable again (autocommit statements still 3952
+        // until the level changes, but the SET path works).
+        h.handle
+            .run_batch(a, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".into())
+            .await
+            .unwrap();
+        let reply = must_not_block(&h, a, "SELECT id FROM t").await;
+        assert_eq!(values(&reply), vec![1]);
+    }
+
+    /// Attack B / leak audit: nested BEGIN and a savepoint rollback keep the
+    /// transaction - and must keep its snapshot.
+    #[tokio::test]
+    async fn nested_begin_and_savepoint_rollback_keep_the_snapshot() {
+        let (h, a, b) = si_harness().await;
+        h.handle.run_batch(b, "BEGIN TRAN".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(values(&reply), vec![10]);
+        h.handle
+            .run_batch(a, "UPDATE t SET v = 99 WHERE id = 1".into())
+            .await
+            .unwrap();
+        // Nested BEGIN + inner COMMIT: trancount 2 -> 1, transaction alive.
+        h.handle.run_batch(b, "BEGIN TRAN".into()).await.unwrap();
+        h.handle.run_batch(b, "COMMIT".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(
+            values(&reply),
+            vec![10],
+            "inner COMMIT must not drop the view"
+        );
+        // Savepoint rollback: own write undone, transaction and view alive.
+        h.handle.run_batch(b, "SAVE TRAN sp1".into()).await.unwrap();
+        let reply = h
+            .handle
+            .run_batch(b, "UPDATE t SET v = 500 WHERE id = 2".into())
+            .await
+            .unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        h.handle
+            .run_batch(b, "ROLLBACK TRAN sp1".into())
+            .await
+            .unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 2").await;
+        assert_eq!(
+            values(&reply),
+            vec![20],
+            "own write rolled back to the savepoint"
+        );
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(
+            values(&reply),
+            vec![10],
+            "the view survives the savepoint rollback"
+        );
+        h.handle.run_batch(b, "COMMIT".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(values(&reply), vec![99]);
+    }
+
+    /// Attack E (option toggle): ALTER DATABASE SET ALLOW_SNAPSHOT_ISOLATION
+    /// OFF while a SNAPSHOT transaction holds a registered snapshot between
+    /// batches (it holds no locks then, so Database X does not exclude it).
+    /// Expected correct behavior: the toggle succeeds (or waits), the
+    /// snapshot transaction gets 3952 at its next access, and the session
+    /// recovers. Today the version store's reset debug_asserts that no
+    /// snapshot is live - which is false here.
+    #[tokio::test]
+    async fn alter_options_refuse_while_a_snapshot_transaction_lives() {
+        // A SNAPSHOT transaction idle between batches holds no locks, so the
+        // ALTER's Database X grants — but flipping the options under its
+        // registered snapshot would reset the store its reads depend on
+        // (the review's HIGH: a debug panic, silent wrong data in release).
+        // The ALTER refuses with 5061 instead; SQL Server would wait.
+        let (h, a, b) = si_harness().await;
+        h.handle.run_batch(b, "BEGIN TRAN".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(values(&reply), vec![10], "snapshot registered");
+        let reply = tokio::time::timeout(
+            Duration::from_secs(5),
+            h.handle.run_batch(
+                a,
+                "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION OFF".into(),
+            ),
+        )
+        .await
+        .expect("the ALTER must not hang")
+        .unwrap();
+        assert_eq!(
+            error_number(&reply),
+            Some(5061),
+            "refused while the snapshot lives: {:?}",
+            reply.outcome.error
+        );
+        // The transaction is untouched — still repeatable.
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(values(&reply), vec![10]);
+        h.handle.run_batch(b, "COMMIT".into()).await.unwrap();
+        // Snapshot released: the retry succeeds, and SNAPSHOT access is gone.
+        let reply = h
+            .handle
+            .run_batch(
+                a,
+                "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION OFF".into(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        let reply = h
+            .handle
+            .run_batch(b, "SELECT v FROM t WHERE id = 1".into())
+            .await
+            .unwrap();
+        assert_eq!(error_number(&reply), Some(3952));
+    }
+
+    /// A statement-scoped (autocommit) 3952 does not wedge the session.
+    #[tokio::test]
+    async fn autocommit_3952_leaves_the_session_usable() {
+        let h = start(Duration::from_secs(30));
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        h.handle
+            .run_batch(
+                a,
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY); INSERT INTO t VALUES (1);".into(),
+            )
+            .await
+            .unwrap();
+        h.handle
+            .run_batch(a, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT".into())
+            .await
+            .unwrap();
+        let reply = h
+            .handle
+            .run_batch(a, "SELECT id FROM t".into())
+            .await
+            .unwrap();
+        assert_eq!(error_number(&reply), Some(3952));
+        // A table-free SELECT is not data access: no 3952, and it does not
+        // establish a snapshot (SQL Server defers both to the first read of
+        // an actual object) — the review's finding 3.
+        let reply = h.handle.run_batch(a, "SELECT 1".into()).await.unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        h.handle
+            .run_batch(a, "SET TRANSACTION ISOLATION LEVEL READ COMMITTED".into())
+            .await
+            .unwrap();
+        let reply = must_not_block(&h, a, "SELECT id FROM t").await;
+        assert_eq!(values(&reply), vec![1]);
+    }
+
+    /// 3961 completeness: DROP TABLE + CREATE TABLE of the same name between
+    /// a SNAPSHOT transaction's batches. SQL Server raises 3961 (metadata is
+    /// not versioned); at minimum the reader must not silently see the NEW
+    /// table's contents as if they were its snapshot.
+    #[tokio::test]
+    async fn snapshot_drop_and_recreate_between_batches_is_3961() {
+        let (h, a, b) = si_harness().await;
+        h.handle.run_batch(b, "BEGIN TRAN".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(values(&reply), vec![10]);
+        for sql in [
+            "DROP TABLE t",
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            "INSERT INTO t VALUES (7, 70)",
+        ] {
+            let reply = h.handle.run_batch(a, sql.into()).await.unwrap();
+            assert_eq!(
+                error_number(&reply),
+                None,
+                "{sql}: {:?}",
+                reply.outcome.error
+            );
+        }
+        let reply = h
+            .handle
+            .run_batch(b, "SELECT v FROM t".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            error_number(&reply),
+            Some(3961),
+            "SQL Server: DDL since the snapshot is 3961, got {:?} / rows {:?}",
+            reply.outcome.error,
+            reply.outcome.results
+        );
+        h.handle.run_batch(b, "ROLLBACK".into()).await.unwrap();
+    }
+
+    /// The heap arm of the SI DML target scan: conflicts through synthesized
+    /// RID locators (no primary key anywhere).
+    #[tokio::test]
+    async fn snapshot_heap_dml_conflicts_via_rid_identities() {
+        let h = start(Duration::from_secs(30));
+        let a = h.handle.open_session(String::new(), String::new()).await;
+        let b = h.handle.open_session(String::new(), String::new()).await;
+        for sql in [
+            "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON",
+            "CREATE TABLE hp (v INT)",
+            "INSERT INTO hp VALUES (10), (20)",
+        ] {
+            let reply = h.handle.run_batch(a, sql.into()).await.unwrap();
+            assert_eq!(
+                error_number(&reply),
+                None,
+                "{sql}: {:?}",
+                reply.outcome.error
+            );
+        }
+        h.handle
+            .run_batch(b, "SET TRANSACTION ISOLATION LEVEL SNAPSHOT".into())
+            .await
+            .unwrap();
+        h.handle.run_batch(b, "BEGIN TRAN".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM hp WHERE v = 10").await;
+        assert_eq!(values(&reply), vec![10]);
+        // A deletes the row B's snapshot still sees.
+        let reply = h
+            .handle
+            .run_batch(a, "DELETE FROM hp WHERE v = 10".into())
+            .await
+            .unwrap();
+        assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+        // Targeting it via its synthesized RID locator is the conflict.
+        let reply = h
+            .handle
+            .run_batch(b, "DELETE FROM hp WHERE v = 10".into())
+            .await
+            .unwrap();
+        assert_eq!(
+            error_number(&reply),
+            Some(3960),
+            "{:?}",
+            reply.outcome.error
+        );
+        // B was rolled back; the surviving row is intact.
+        let reply = must_not_block(&h, b, "SELECT v FROM hp").await;
+        assert_eq!(values(&reply), vec![20]);
+    }
+
+    /// Full-table DML under SI: DELETE with no WHERE keeps every snapshot
+    /// row; if ANY of them was changed since the snapshot, 3960.
+    #[tokio::test]
+    async fn snapshot_full_table_delete_conflicts_when_any_row_changed() {
+        let (h, a, b) = si_harness().await;
+        h.handle.run_batch(b, "BEGIN TRAN".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(values(&reply), vec![10]);
+        h.handle
+            .run_batch(a, "UPDATE t SET v = 99 WHERE id = 2".into())
+            .await
+            .unwrap();
+        let reply = h.handle.run_batch(b, "DELETE FROM t".into()).await.unwrap();
+        assert_eq!(
+            error_number(&reply),
+            Some(3960),
+            "{:?}",
+            reply.outcome.error
+        );
+    }
 }

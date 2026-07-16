@@ -1102,6 +1102,22 @@ impl Drop for TxnSnapshotScope {
     }
 }
 
+/// Whether a statement touches any base table: DML always does; a SELECT
+/// only when its FROM/subqueries name one. `SELECT 1` under SNAPSHOT must
+/// neither raise 3952 nor establish the transaction's snapshot — SQL Server
+/// defers both to the first read of an actual object.
+fn statement_reads_tables(statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(select) => {
+            let expanded = expand_ctes(select);
+            let mut tables = Vec::new();
+            collect_locked_tables(&expanded, &mut tables);
+            !tables.is_empty()
+        }
+        _ => true,
+    }
+}
+
 /// SQL Server 3952: SNAPSHOT isolation used while the database does not
 /// allow it — raised at data access, not at SET, exactly as SQL Server does.
 fn snapshot_not_allowed_error(database: &str) -> SqlError {
@@ -1157,7 +1173,7 @@ fn exec_statement_streamed(
                 txn_ctx.txn.as_ref().map(StorageTxn::txn_id),
             ));
         }
-        Isolation::Snapshot if data_access => {
+        Isolation::Snapshot if data_access && statement_reads_tables(statement) => {
             if !storage.snapshot_isolation_allowed() {
                 if txn_ctx.in_txn() {
                     txn_ctx.doomed = true;
@@ -3458,6 +3474,23 @@ fn exec_alter_database(
             ),
         )
         .at(name.span));
+    }
+    // A SNAPSHOT transaction idle between batches holds no locks, so the
+    // batch's Database X does not prove no snapshot is live. Flipping the
+    // options under one would reset (or stop publishing to) the store its
+    // reads depend on; SQL Server waits the transactions out, TruthDB
+    // refuses and lets the operator retry.
+    if storage.has_registered_snapshots() {
+        return Err(SqlError::new(
+            5061,
+            16,
+            1,
+            format!(
+                "ALTER DATABASE failed because a lock could not be placed on database '{}'. \
+                 Try again later.",
+                txn_ctx.database
+            ),
+        ));
     }
     let mut rcsi = None;
     let mut allow_snapshot = None;

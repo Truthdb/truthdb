@@ -610,6 +610,13 @@ impl Storage {
         self.lock().rel_scan_snapshot(name, projection, snapshot)
     }
 
+    /// Whether any read snapshot is registered (an idle SNAPSHOT transaction
+    /// between batches — running batches are excluded by the caller's
+    /// Database X). `ALTER DATABASE` option flips refuse while one lives.
+    pub(crate) fn has_registered_snapshots(&self) -> bool {
+        self.lock().version.has_snapshots()
+    }
+
     /// Drops version history no live snapshot can need (runs on the
     /// maintenance thread; cheap when nothing is versioned).
     pub(crate) fn version_prune(&self) {
@@ -1226,6 +1233,11 @@ impl StorageFile {
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
+        // Stamp the new object: a SNAPSHOT transaction whose view predates
+        // this CREATE must 3961 rather than silently read the (possibly
+        // same-named, post-DROP) new table as empty — its snapshot has no
+        // history for an object that did not exist.
+        self.version.stamp_schema(def.object_id);
         self.rel.tables.insert(name.to_string(), def);
         Ok(())
     }
@@ -4493,6 +4505,78 @@ mod tests {
             storage.version_chain_count("t"),
             0,
             "released history is dropped, the store is bounded"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// SI review PoC: the 3960 auto-abort path must release the
+    /// transaction's snapshot registration - a leak would pin the prune
+    /// watermark forever. Observable through pruning: while the snapshot is
+    /// registered the conflicting chain must survive a prune; after the 3960
+    /// rolled the transaction back, the same prune must drop it.
+    #[test]
+    fn a_3960_abort_releases_the_snapshot_registration() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("si-3960-release");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut setup = TxnContext::default();
+        for sql in [
+            "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON",
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            "INSERT INTO t VALUES (1, 10)",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut setup);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        storage
+            .ensure_durable(storage.wal_tail())
+            .expect("durability");
+        storage.version_prune();
+        assert_eq!(storage.version_chain_count("t"), 0);
+
+        // B: SNAPSHOT transaction, snapshot captured at first access.
+        let mut b = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT; BEGIN TRAN; SELECT v FROM t",
+            &mut b,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // A: a conflicting committed write B's snapshot cannot see.
+        let mut a = TxnContext::default();
+        let outcome = execute_batch(&storage, "UPDATE t SET v = 99 WHERE id = 1", &mut a);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // While B's snapshot is registered, its history is pinned.
+        storage
+            .ensure_durable(storage.wal_tail())
+            .expect("durability");
+        storage.version_prune();
+        assert_eq!(
+            storage.version_chain_count("t"),
+            1,
+            "a registered snapshot pins the chain"
+        );
+
+        // B writes the same row: 3960, and the whole transaction (with its
+        // snapshot registration) must be gone.
+        let outcome = execute_batch(&storage, "UPDATE t SET v = 100 WHERE id = 1", &mut b);
+        assert_eq!(
+            outcome.error.as_ref().map(|e| e.number),
+            Some(3960),
+            "{:?}",
+            outcome.error
+        );
+
+        storage.version_prune();
+        assert_eq!(
+            storage.version_chain_count("t"),
+            0,
+            "the 3960 abort must release the snapshot registration"
         );
 
         drop(storage);
