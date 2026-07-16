@@ -884,7 +884,12 @@ fn run_block(
                         run.done(wire_count(n), in_transaction, command);
                     }
                     StatementOutcome::Result(StatementResult::Done) => {
-                        txn_ctx.rowcount = 0;
+                        // A simple variable assignment (`SET @x = ...`) sets
+                        // @@ROWCOUNT to 1 — recorded by exec_set, preserved
+                        // here; every other Done statement resets it to 0.
+                        if !matches!(statement, Statement::Set(SetStatement::Variable { .. })) {
+                            txn_ctx.rowcount = 0;
+                        }
                         run.done(None, in_transaction, command);
                     }
                 }
@@ -896,6 +901,8 @@ fn run_block(
                 }
             }
             Err(error) => {
+                // A failed statement sets @@ROWCOUNT to 0, as SQL Server does.
+                txn_ctx.rowcount = 0;
                 // A cancelled statement aborts the batch immediately (see above):
                 // key on the cancel marker, not any flag, so an Attention landing
                 // concurrently with an unrelated failure cannot suppress that
@@ -2298,6 +2305,10 @@ fn exec_set(ctx: &mut TxnContext, set: &SetStatement) -> Result<StatementResult,
         SetStatement::ShowplanText(on) => ctx.showplan_text = *on,
         SetStatement::NoCount(on) => ctx.nocount = *on,
         SetStatement::Variable { name, value } => {
+            // "Statements that make a simple assignment always set the
+            // @@ROWCOUNT value to 1" — the Done result would reset it to 0,
+            // so the assignment records its own count here.
+            ctx.rowcount = 1;
             let column_type = ctx
                 .variables
                 .get(name)

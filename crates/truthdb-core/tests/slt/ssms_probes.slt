@@ -103,9 +103,26 @@ SELECT @@ROWCOUNT
 ----
 0
 
-# An assignment SELECT counts the rows it processed.
-statement ok
+# An assignment SELECT counts the rows it processed (3 rows in rc).
+query I
 DECLARE @top INT; SELECT @top = v FROM rc; SELECT @@ROWCOUNT
+----
+3
+
+# A simple variable assignment sets @@ROWCOUNT to 1 (documented SQL Server
+# behavior); a failed statement resets it to 0.
+query I
+DECLARE @v INT; SET @v = 42; SELECT @@ROWCOUNT
+----
+1
+
+statement error
+INSERT INTO rc VALUES (2, 0)
+
+query I
+SELECT @@ROWCOUNT
+----
+0
 
 # SET NOCOUNT does not change @@ROWCOUNT (it only silences the wire counts).
 statement ok
