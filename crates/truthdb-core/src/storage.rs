@@ -144,6 +144,8 @@ pub struct Storage {
     /// are the same code agrees with itself. Per-instance for the same reason.
     #[cfg(test)]
     scan_selects: std::sync::atomic::AtomicUsize,
+    #[cfg(test)]
+    covering_scans: std::sync::atomic::AtomicUsize,
     /// Columns the last scan slice asked for (`usize::MAX` = the whole row), so
     /// a test can prove the planner pruned the projection. The rows returned are
     /// identical either way, so nothing else can see the difference.
@@ -205,6 +207,8 @@ impl Storage {
             #[cfg(test)]
             scan_selects: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
+            covering_scans: std::sync::atomic::AtomicUsize::new(0),
+            #[cfg(test)]
             last_scan_width: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
@@ -219,6 +223,13 @@ impl Storage {
     #[cfg(test)]
     pub(crate) fn scan_selects(&self) -> usize {
         self.scan_selects.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Index scans answered from the leaves alone (covering, no base lookup).
+    #[cfg(test)]
+    pub(crate) fn covering_scans(&self) -> usize {
+        self.covering_scans
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Columns the last scan slice decoded per row (`usize::MAX` = every one).
@@ -423,9 +434,10 @@ impl Storage {
         index_name: String,
         columns: Vec<(usize, bool)>,
         unique: bool,
+        include: Vec<usize>,
     ) -> Result<(), StorageError> {
         self.lock()
-            .rel_create_index(table, index_name, columns, unique)
+            .rel_create_index(table, index_name, columns, unique, include)
     }
 
     pub(crate) fn rel_drop_index(
@@ -443,9 +455,15 @@ impl Storage {
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
         projection: Option<&[usize]>,
+        covering: bool,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
+        #[cfg(test)]
+        if covering {
+            self.covering_scans
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.lock()
-            .rel_index_scan(table, index_object_id, lower, upper, projection)
+            .rel_index_scan(table, index_object_id, lower, upper, projection, covering)
     }
 
     pub fn rel_insert(&self, name: &str, values: Vec<Datum>) -> Result<(), StorageError> {
@@ -687,6 +705,7 @@ fn index_insert_row(
     ctx: &mut RelCtx<'_>,
     txn: &mut TxnLink,
     indexes: &[IndexDef],
+    schema: &Schema,
     collations: &[Option<String>],
     values: &[Datum],
     locator: &Locator,
@@ -694,7 +713,15 @@ fn index_insert_row(
     for index in indexes {
         let index_key = index::encode_index_columns(values, &index.columns, collations)
             .map_err(|err| StorageError::InvalidConfig(err.0))?;
-        let (key, value) = index::leaf_entry(&index_key, locator, index.unique);
+        let include = if index.include.is_empty() {
+            None
+        } else {
+            Some(
+                index::encode_include(schema, &index.include, values)
+                    .map_err(|err| StorageError::InvalidConfig(err.0))?,
+            )
+        };
+        let (key, value) = index::leaf_entry(&index_key, locator, index.unique, include.as_deref());
         let tree = BTree {
             object_id: index.object_id,
             root: index.root_page,
@@ -719,6 +746,7 @@ fn apply_index_updates(
     ctx: &mut RelCtx<'_>,
     txn: &mut TxnLink,
     indexes: &[IndexDef],
+    schema: &Schema,
     collations: &[Option<String>],
     ops: &[(Vec<Datum>, Locator, Vec<Datum>, Locator)],
 ) -> Result<(), StorageError> {
@@ -729,7 +757,15 @@ fn apply_index_updates(
         index_delete_row(ctx, txn, indexes, collations, old_values, old_locator)?;
     }
     for (_, _, new_values, new_locator) in ops {
-        index_insert_row(ctx, txn, indexes, collations, new_values, new_locator)?;
+        index_insert_row(
+            ctx,
+            txn,
+            indexes,
+            schema,
+            collations,
+            new_values,
+            new_locator,
+        )?;
     }
     Ok(())
 }
@@ -746,7 +782,7 @@ fn index_delete_row(
     for index in indexes {
         let index_key = index::encode_index_columns(values, &index.columns, collations)
             .map_err(|err| StorageError::InvalidConfig(err.0))?;
-        let (key, _) = index::leaf_entry(&index_key, locator, index.unique);
+        let (key, _) = index::leaf_entry(&index_key, locator, index.unique, None);
         let tree = BTree {
             object_id: index.object_id,
             root: index.root_page,
@@ -1078,6 +1114,7 @@ impl StorageFile {
         index_name: String,
         columns: Vec<(usize, bool)>,
         unique: bool,
+        include: Vec<usize>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
         let mut def = self
@@ -1103,6 +1140,7 @@ impl StorageFile {
         // Snapshot the rows to backfill (materialized before any mutation).
         let located = self.rel_scan_located(table)?;
 
+        let schema = def.schema()?;
         let updated = self.rel_statement(move |ctx, txn| {
             let tree = BTree::create(ctx, object_id)?;
             for (loc, values) in &located {
@@ -1112,7 +1150,16 @@ impl StorageFile {
                 };
                 let index_key = index::encode_index_columns(values, &columns, &def.collations)
                     .map_err(|err| StorageError::InvalidConfig(err.0))?;
-                let (key, value) = index::leaf_entry(&index_key, &locator, unique);
+                let include_bytes = if include.is_empty() {
+                    None
+                } else {
+                    Some(
+                        index::encode_include(&schema, &include, values)
+                            .map_err(|err| StorageError::InvalidConfig(err.0))?,
+                    )
+                };
+                let (key, value) =
+                    index::leaf_entry(&index_key, &locator, unique, include_bytes.as_deref());
                 // Backfill is system-logged: the fresh tree is not in the
                 // rollback roots, so a failure leaks it (the catalog entry
                 // below is undone, leaving it unreferenced).
@@ -1131,6 +1178,7 @@ impl StorageFile {
                 columns,
                 unique,
                 root_page: tree.root,
+                include,
             });
             catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
@@ -1190,6 +1238,7 @@ impl StorageFile {
         lower: Option<Vec<u8>>,
         upper: Option<Vec<u8>>,
         projection: Option<&[usize]>,
+        covering: bool,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(table)?;
@@ -1206,28 +1255,66 @@ impl StorageFile {
         };
         let entries = index_tree.scan_range(&mut ctx, lower.as_deref(), upper.as_deref())?;
         let mut rows = Vec::with_capacity(entries.len());
-        if def.is_tree() {
-            let base = BTree {
-                object_id: def.object_id,
-                root: def.root_page,
-            };
+        if covering {
+            // Answer from the leaves alone: every projected column's original
+            // value is stored in the entry (after the length-prefixed
+            // locator), so the base-table lookup is skipped entirely. The
+            // planner only chooses covering when projection ⊆ include; this
+            // re-checks so a planner bug reads as an error, not wrong data.
+            let projection = projection.ok_or_else(|| {
+                StorageError::InvalidConfig("covering scan requires a projection".to_string())
+            })?;
+            let positions: Vec<usize> = projection
+                .iter()
+                .map(|col| {
+                    index.include.iter().position(|i| i == col).ok_or_else(|| {
+                        StorageError::InvalidConfig(format!(
+                            "column {col} is not included in index '{}'",
+                            index.name
+                        ))
+                    })
+                })
+                .collect::<Result<_, _>>()?;
             for (_, value) in entries {
-                if let Locator::Key(pk) = index::decode_locator(&value)
-                    && let Some(row) = base.get(&mut ctx, &pk)?
-                {
-                    rows.push(decode_projected(&schema, &row, projection)?);
-                }
+                let (_, include_bytes) = index::decode_leaf_value_with_include(&value);
+                let decoded = index::decode_include(&schema, &index.include, include_bytes)
+                    .map_err(|err| StorageError::InvalidFile(err.0))?;
+                rows.push(positions.iter().map(|&p| decoded[p].clone()).collect());
             }
         } else {
-            let heap = Heap {
-                object_id: def.object_id,
-                first_page: def.root_page,
+            // The leaf-value format depends on the index: an INCLUDE index
+            // length-prefixes its locator (a Key locator's payload would
+            // otherwise swallow the include bytes that follow it).
+            let locator_of = |value: &[u8]| -> Locator {
+                if index.include.is_empty() {
+                    index::decode_locator(value)
+                } else {
+                    index::decode_leaf_value_with_include(value).0
+                }
             };
-            for (_, value) in entries {
-                if let Locator::Rid(rid) = index::decode_locator(&value)
-                    && let Some(row) = heap.read_row(&mut ctx, rid)?
-                {
-                    rows.push(decode_projected(&schema, &row, projection)?);
+            if def.is_tree() {
+                let base = BTree {
+                    object_id: def.object_id,
+                    root: def.root_page,
+                };
+                for (_, value) in entries {
+                    if let Locator::Key(pk) = locator_of(&value)
+                        && let Some(row) = base.get(&mut ctx, &pk)?
+                    {
+                        rows.push(decode_projected(&schema, &row, projection)?);
+                    }
+                }
+            } else {
+                let heap = Heap {
+                    object_id: def.object_id,
+                    first_page: def.root_page,
+                };
+                for (_, value) in entries {
+                    if let Locator::Rid(rid) = locator_of(&value)
+                        && let Some(row) = heap.read_row(&mut ctx, rid)?
+                    {
+                        rows.push(decode_projected(&schema, &row, projection)?);
+                    }
                 }
             }
         }
@@ -1286,6 +1373,7 @@ impl StorageFile {
                         ctx,
                         txn,
                         &indexes,
+                        &schema,
                         &collations,
                         values,
                         &Locator::Key(key.clone()),
@@ -1302,7 +1390,15 @@ impl StorageFile {
                 for ((_, row), values) in encoded.iter().zip(rows.iter()) {
                     // Heap rows locate by their home RID.
                     let rid = heap.insert(ctx, txn, row)?;
-                    index_insert_row(ctx, txn, &indexes, &collations, values, &Locator::Rid(rid))?;
+                    index_insert_row(
+                        ctx,
+                        txn,
+                        &indexes,
+                        &schema,
+                        &collations,
+                        values,
+                        &Locator::Rid(rid),
+                    )?;
                 }
                 Ok(())
             })
@@ -1747,7 +1843,7 @@ impl StorageFile {
                 for (key, row) in &in_place {
                     tree.update(ctx, &mut OpMode::Txn(txn), key, row)?;
                 }
-                apply_index_updates(ctx, txn, &indexes, &collations, &idx_ops)?;
+                apply_index_updates(ctx, txn, &indexes, &schema, &collations, &idx_ops)?;
                 Ok(())
             })?;
         } else {
@@ -1773,7 +1869,7 @@ impl StorageFile {
                 for (rid, row) in &encoded {
                     heap.update(ctx, txn, *rid, row)?;
                 }
-                apply_index_updates(ctx, txn, &indexes, &collations, &idx_ops)?;
+                apply_index_updates(ctx, txn, &indexes, &schema, &collations, &idx_ops)?;
                 Ok(())
             })?;
         }
@@ -3148,6 +3244,252 @@ mod tests {
             TEST_WAL_BYTES,
         )
         .expect("create storage")
+    }
+
+    /// A covering seek (every read column INCLUDEd) answers from the index
+    /// leaves alone — the counter proves the covering path ran — and returns
+    /// exactly what a table scan returns, original case and NULLs included.
+    #[test]
+    fn a_covering_seek_answers_from_the_index_alone_and_matches_a_scan() {
+        use crate::rel::{StatementResult, TxnContext, execute_batch};
+
+        let path = unique_temp_path("include-covering");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, email VARCHAR(40) NOT NULL, v INT); \
+             CREATE INDEX ix ON t (email) INCLUDE (email, v); \
+             INSERT INTO t VALUES (1, 'a@x.com', 10), (2, 'B@X.com', NULL), (3, 'c@x.com', 30)",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+
+        let rows_of = |outcome: &crate::rel::BatchOutcome| match &outcome.results[0] {
+            StatementResult::Rows(rowset) => rowset.rows.clone(),
+            other => panic!("expected rows, got {other:?}"),
+        };
+
+        // Sought case-insensitively, answered with the stored ORIGINAL value.
+        let covered = execute_batch(
+            &storage,
+            "SELECT email, v FROM t WHERE email = 'b@x.com'",
+            &mut ctx,
+        );
+        assert!(covered.error.is_none(), "{:?}", covered.error);
+        assert_eq!(storage.covering_scans(), 1, "the covering path answered");
+        let covered = rows_of(&covered);
+        assert_eq!(
+            covered,
+            vec![vec![Datum::VarChar("B@X.com".into()), Datum::Null]]
+        );
+
+        // A/B: without the index the same query scans — identical rows.
+        let dropped = execute_batch(&storage, "DROP INDEX ix ON t", &mut ctx);
+        assert!(dropped.error.is_none(), "{:?}", dropped.error);
+        let scanned = execute_batch(
+            &storage,
+            "SELECT email, v FROM t WHERE email = 'b@x.com'",
+            &mut ctx,
+        );
+        assert!(scanned.error.is_none(), "{:?}", scanned.error);
+        assert_eq!(rows_of(&scanned), covered, "covering == scan");
+        assert_eq!(storage.covering_scans(), 1, "the scan path took over");
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A covering index wins its tie against an equal-scoring non-INCLUDE
+    /// index — the "add a covering index to an existing database" workflow.
+    /// Coverage breaks equality ties only: it never outranks a fully-matched
+    /// UNIQUE seek (one row plus one lookup beats a covering scan).
+    #[test]
+    fn a_covering_index_wins_the_tie_against_an_older_plain_index() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("include-tiebreak");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        // The plain index is created FIRST, so a first-wins tie keeps it.
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, email VARCHAR(40) NOT NULL, v INT); \
+             CREATE INDEX ix ON t (email); \
+             CREATE INDEX ix2 ON t (email) INCLUDE (email, v); \
+             INSERT INTO t VALUES (1, 'a@x.com', 10)",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+        let outcome = execute_batch(
+            &storage,
+            "SELECT email, v FROM t WHERE email = 'a@x.com'",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            storage.covering_scans(),
+            1,
+            "the covering index wins the equality tie"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// CREATE INDEX with a column that does not exist on the table reports
+    /// SQL Server's 1911 (not the generic 207) — for the key list and the
+    /// INCLUDE list alike; a duplicate INCLUDE column reports 1909.
+    #[test]
+    fn create_index_errors_carry_sql_server_numbers() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("include-errors");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, email VARCHAR(40) NOT NULL)",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+
+        let cases = [
+            ("CREATE INDEX ix ON t (nope)", 1911),
+            ("CREATE INDEX ix ON t (email) INCLUDE (nope)", 1911),
+            ("CREATE INDEX ix ON t (email) INCLUDE (id, id)", 1909),
+        ];
+        for (sql, number) in cases {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert_eq!(
+                outcome.error.as_ref().map(|e| e.number),
+                Some(number),
+                "{sql}: {:?}",
+                outcome.error
+            );
+        }
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Included leaf values follow UPDATE and DELETE, and survive a restart
+    /// (the include list rides the catalog; the leaf format rides the pages).
+    #[test]
+    fn included_values_survive_update_delete_and_restart() {
+        use crate::rel::{StatementResult, TxnContext, execute_batch};
+
+        let path = unique_temp_path("include-restart");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, email VARCHAR(40) NOT NULL, v INT); \
+             CREATE INDEX ix ON t (email) INCLUDE (email, v); \
+             INSERT INTO t VALUES (1, 'a@x.com', 10), (2, 'b@x.com', 20); \
+             UPDATE t SET v = 99 WHERE id = 1; \
+             DELETE FROM t WHERE id = 2",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+        drop(storage);
+
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "SELECT email, v FROM t WHERE email = 'a@x.com'",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(storage.covering_scans(), 1, "covering after reopen");
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => assert_eq!(
+                rowset.rows,
+                vec![vec![Datum::VarChar("a@x.com".into()), Datum::Int(99)]],
+                "the UPDATE reached the leaf; the DELETEd row is gone"
+            ),
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let gone = execute_batch(
+            &storage,
+            "SELECT email, v FROM t WHERE email = 'b@x.com'",
+            &mut ctx,
+        );
+        match &gone.results[0] {
+            StatementResult::Rows(rowset) => assert!(rowset.rows.is_empty()),
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A query reading a column that is NOT included falls back to the key
+    /// lookup — through the INCLUDE index's length-prefixed leaf value, whose
+    /// `Locator::Key` payload would be swallowed by the old bare decode.
+    /// SHOWPLAN tells the two apart: covering has no Key Lookup line.
+    #[test]
+    fn a_non_covering_read_on_an_include_index_still_finds_rows() {
+        use crate::rel::{StatementResult, TxnContext, execute_batch};
+
+        let path = unique_temp_path("include-fallback");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, email VARCHAR(40) NOT NULL, name VARCHAR(20)); \
+             CREATE INDEX ix ON t (email) INCLUDE (email, id); \
+             INSERT INTO t VALUES (1, 'a@x.com', 'Alice')",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+
+        // `name` is not included: the seek fetches the base row by PK key.
+        let outcome = execute_batch(
+            &storage,
+            "SELECT name FROM t WHERE email = 'a@x.com'",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(storage.covering_scans(), 0, "not covering");
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => {
+                assert_eq!(rowset.rows, vec![vec![Datum::VarChar("Alice".into())]]);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // SHOWPLAN: the covering shape has no Key Lookup; the fallback does.
+        let plans = execute_batch(
+            &storage,
+            "SET SHOWPLAN_TEXT ON; \
+             SELECT id FROM t WHERE email = 'a@x.com'; \
+             SELECT name FROM t WHERE email = 'a@x.com'",
+            &mut ctx,
+        );
+        assert!(plans.error.is_none(), "{:?}", plans.error);
+        let lines_of = |result: &StatementResult| -> Vec<String> {
+            match result {
+                StatementResult::Rows(rowset) => {
+                    rowset.rows.iter().map(|r| format!("{:?}", r[0])).collect()
+                }
+                other => panic!("expected plan rows, got {other:?}"),
+            }
+        };
+        let covering = lines_of(&plans.results[1]).join("\n");
+        assert!(
+            covering.contains("Index Seek (covering)") && !covering.contains("Key Lookup"),
+            "covering plan: {covering}"
+        );
+        let lookup = lines_of(&plans.results[2]).join("\n");
+        assert!(
+            lookup.contains("Key Lookup"),
+            "non-covering plan keeps the lookup: {lookup}"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
     }
 
     /// The DONE acknowledging an autocommit write is never emitted before the

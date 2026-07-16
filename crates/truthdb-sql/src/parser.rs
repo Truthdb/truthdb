@@ -537,12 +537,26 @@ impl Parser {
                 break;
             }
         }
-        let end = self.expect(&TokenKind::RParen)?;
+        let mut end = self.expect(&TokenKind::RParen)?;
+        // Optional INCLUDE (col [, ...]): non-key columns stored in the leaf.
+        let mut include = Vec::new();
+        if self.peek_keyword().as_deref() == Some("INCLUDE") {
+            self.bump();
+            self.expect(&TokenKind::LParen)?;
+            loop {
+                include.push(self.parse_name()?);
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+            end = self.expect(&TokenKind::RParen)?;
+        }
         Ok(Statement::CreateIndex(CreateIndex {
             name,
             table,
             unique,
             columns,
+            include,
             span: start.to(end),
         }))
     }

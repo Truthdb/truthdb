@@ -31,6 +31,7 @@
                     ascending: true,
                 },
             ],
+            include: [],
             span: Span {
                 start: 0,
                 end: 51,
@@ -80,6 +81,7 @@
                     ascending: false,
                 },
             ],
+            include: [],
             span: Span {
                 start: 53,
                 end: 125,
@@ -107,6 +109,110 @@
             span: Span {
                 start: 127,
                 end: 161,
+            },
+        },
+    ),
+    CreateIndex(
+        CreateIndex {
+            name: Name {
+                value: "ix_users_lookup",
+                quoted: false,
+                span: Span {
+                    start: 177,
+                    end: 192,
+                },
+            },
+            table: Name {
+                value: "users",
+                quoted: false,
+                span: Span {
+                    start: 196,
+                    end: 201,
+                },
+            },
+            unique: false,
+            columns: [
+                IndexColumn {
+                    name: Name {
+                        value: "email",
+                        quoted: false,
+                        span: Span {
+                            start: 203,
+                            end: 208,
+                        },
+                    },
+                    ascending: true,
+                },
+            ],
+            include: [
+                Name {
+                    value: "id",
+                    quoted: false,
+                    span: Span {
+                        start: 219,
+                        end: 221,
+                    },
+                },
+                Name {
+                    value: "display_name",
+                    quoted: false,
+                    span: Span {
+                        start: 223,
+                        end: 235,
+                    },
+                },
+            ],
+            span: Span {
+                start: 164,
+                end: 236,
+            },
+        },
+    ),
+    CreateIndex(
+        CreateIndex {
+            name: Name {
+                value: "ix_code",
+                quoted: false,
+                span: Span {
+                    start: 258,
+                    end: 265,
+                },
+            },
+            table: Name {
+                value: "items",
+                quoted: false,
+                span: Span {
+                    start: 269,
+                    end: 274,
+                },
+            },
+            unique: true,
+            columns: [
+                IndexColumn {
+                    name: Name {
+                        value: "code",
+                        quoted: false,
+                        span: Span {
+                            start: 276,
+                            end: 280,
+                        },
+                    },
+                    ascending: false,
+                },
+            ],
+            include: [
+                Name {
+                    value: "price",
+                    quoted: false,
+                    span: Span {
+                        start: 296,
+                        end: 301,
+                    },
+                },
+            ],
+            span: Span {
+                start: 238,
+                end: 302,
             },
         },
     ),

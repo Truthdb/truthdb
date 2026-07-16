@@ -43,12 +43,18 @@ type Bounds = (Option<Vec<u8>>, Option<Vec<u8>>);
 
 /// Chooses the access path for a table read given its WHERE clause. Prefers
 /// the index matching the most equality columns (a fully-matched UNIQUE index
-/// — a unique seek — wins outright), else a range seek, else a scan.
+/// — a unique seek — wins outright), else a range seek, else a scan. Among
+/// equality-equal candidates, one whose `INCLUDE` list covers every column
+/// the query reads (`needed`, when the caller knows it) wins: it answers
+/// from its leaves with no per-row base-table lookup. Coverage never
+/// outranks a better equality match or a fully-matched UNIQUE seek — a
+/// single-row lookup beats a covering scan of many.
 pub fn choose(
     def: &TableDef,
     schema: &Schema,
     where_clause: &Option<Expr>,
     eval_ctx: &EvalContext,
+    needed: Option<&[usize]>,
 ) -> AccessPath {
     let Some(predicate) = where_clause else {
         return AccessPath::TableScan;
@@ -63,17 +69,27 @@ pub fn choose(
     }
     let mut best: Option<(u32, AccessPath)> = None;
     for index in &def.indexes {
-        if let Some((score, path)) = try_index(index, schema, &sargs)
-            && best.as_ref().is_none_or(|(s, _)| score > *s)
-        {
-            best = Some((score, path));
+        if let Some((mut score, path)) = try_index(index, schema, &sargs) {
+            let covers =
+                needed.is_some_and(|needed| needed.iter().all(|c| index.include.contains(c)));
+            if covers {
+                // Between the range bonus (+1) and an extra equality column
+                // (+10): an avoided lookup per row outranks a somewhat
+                // narrower range, never a more selective seek.
+                score += 5;
+            }
+            if best.as_ref().is_none_or(|(s, _)| score > *s) {
+                best = Some((score, path));
+            }
         }
     }
     best.map(|(_, path)| path).unwrap_or(AccessPath::TableScan)
 }
 
-/// Renders the plan as `SHOWPLAN_TEXT` rows.
-pub fn plan_text(path: &AccessPath, table: &str) -> Vec<String> {
+/// Renders the plan as `SHOWPLAN_TEXT` rows. A covering seek (every needed
+/// column INCLUDEd in the leaf) answers from the index alone, so it has no
+/// Key Lookup line.
+pub fn plan_text(path: &AccessPath, table: &str, covering: bool) -> Vec<String> {
     match path {
         AccessPath::TableScan => vec![format!("Table Scan({table})")],
         AccessPath::IndexSeek {
@@ -82,18 +98,19 @@ pub fn plan_text(path: &AccessPath, table: &str) -> Vec<String> {
             unique,
             ..
         } => {
-            let kind = if *unique {
-                "Index Seek (unique)"
-            } else {
-                "Index Seek"
+            let kind = match (covering, *unique) {
+                (true, _) => "Index Seek (covering)",
+                (false, true) => "Index Seek (unique)",
+                (false, false) => "Index Seek",
             };
-            vec![
-                format!(
-                    "{kind}({table}.{index_name}), SEEK: {}",
-                    predicates.join(", ")
-                ),
-                format!("Key Lookup({table})"),
-            ]
+            let mut lines = vec![format!(
+                "{kind}({table}.{index_name}), SEEK: {}",
+                predicates.join(", ")
+            )];
+            if !covering {
+                lines.push(format!("Key Lookup({table})"));
+            }
+            lines
         }
     }
 }

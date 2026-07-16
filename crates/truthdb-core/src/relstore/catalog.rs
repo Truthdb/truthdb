@@ -45,6 +45,14 @@ pub struct IndexDef {
     pub unique: bool,
     /// The index tree's root page.
     pub root_page: u64,
+    /// Schema column indices of `INCLUDE`d columns: their *original* values are
+    /// stored in the leaf (after the locator), so a query whose every column is
+    /// included can be answered from the index alone — the key bytes cannot
+    /// serve, being one-way collation sort keys. Empty for an index created
+    /// without `INCLUDE` (and for every pre-existing index: `serde(default)`),
+    /// which also keeps the old locator-only leaf-value format for them.
+    #[serde(default)]
+    pub include: Vec<usize>,
 }
 
 /// A `CHECK` constraint. The predicate is stored as source text (re-parsed and
