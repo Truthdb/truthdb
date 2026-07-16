@@ -3721,8 +3721,10 @@ mod tests {
             .await
             .unwrap();
 
-        // A parameterized single-table SELECT describes without executing:
-        // the declared @p1 resolves (as NULL) during planning.
+        // A parameterized single-table SELECT describes without executing.
+        // The @p1 is unresolvable in describe's default context — the planner
+        // swallows that and falls back to a scan (non-sargable predicate);
+        // the columns come from the table schema either way.
         let events = drain_events(h.handle.stream_prepared(
             s,
             PreparedRpc::Describe {
@@ -3740,7 +3742,8 @@ mod tests {
         assert_eq!(rows[1][2], Datum::NVarChar("name".into()));
         assert_eq!(rows[1][5], Datum::NVarChar("nvarchar(40)".into()));
 
-        // A statement producing no result set describes as zero rows.
+        // A statement producing no result set describes as zero rows — and
+        // describing it executes nothing: the table stays empty.
         let events = drain_events(h.handle.stream_prepared(
             s,
             PreparedRpc::Describe {
@@ -3751,6 +3754,40 @@ mod tests {
         .await;
         assert_eq!(event_error(&events), None, "{events:?}");
         assert_eq!(rows_of(&events), Vec::<Vec<Datum>>::new());
+        let reply = h
+            .handle
+            .run_batch(s, "SELECT COUNT(*) FROM d".into())
+            .await
+            .unwrap();
+        match &reply.outcome.results[0] {
+            StatementResult::Rows(rowset) => assert_eq!(
+                rowset.rows[0][0],
+                Datum::BigInt(0),
+                "describe must not execute the INSERT"
+            ),
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // The contract is the first RESULT SET, not the first statement:
+        // `INSERT; SELECT` (and a SELECT inside a TRY block) describe the
+        // SELECT, and `TOP 0` — the standard metadata-discovery idiom —
+        // describes like any other TOP.
+        for tsql in [
+            "INSERT INTO d VALUES (9, 'y'); SELECT id FROM d",
+            "BEGIN TRY SELECT id FROM d END TRY BEGIN CATCH END CATCH",
+            "SELECT TOP 0 id FROM d",
+        ] {
+            let events = drain_events(h.handle.stream_prepared(
+                s,
+                PreparedRpc::Describe { tsql: tsql.into() },
+                no_cancel(),
+            ))
+            .await;
+            assert_eq!(event_error(&events), None, "{tsql}: {events:?}");
+            let rows = rows_of(&events);
+            assert_eq!(rows.len(), 1, "{tsql}");
+            assert_eq!(rows[0][2], Datum::NVarChar("id".into()), "{tsql}");
+        }
 
         // A shape whose types are only known by executing answers 11514.
         let events = drain_events(h.handle.stream_prepared(

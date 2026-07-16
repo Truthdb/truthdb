@@ -231,13 +231,18 @@ pub fn split_sp_prepexec(mut params: Vec<RpcParam>) -> io::Result<(String, Strin
 /// Splits an `sp_describe_first_result_set` parameter list — `@tsql`, then
 /// optional `@params`/`@browse_information_mode` (both ignored: declared
 /// parameters need no binding to derive columns) — into the statement text.
+/// An empty `@tsql` is a valid empty batch (describes as zero rows); only a
+/// NULL one is rejected.
 pub fn split_sp_describe(params: Vec<RpcParam>) -> io::Result<String> {
     if params.is_empty() {
         return Err(protocol_err("sp_describe_first_result_set: missing @tsql"));
     }
-    match opt_string(&params[0], "sp_describe_first_result_set: @tsql")? {
-        s if s.is_empty() => Err(protocol_err("sp_describe_first_result_set: NULL @tsql")),
-        s => Ok(s),
+    match &params[0].value {
+        Datum::NVarChar(s) | Datum::VarChar(s) => Ok(s.clone()),
+        Datum::Null => Err(protocol_err("sp_describe_first_result_set: NULL @tsql")),
+        _ => Err(protocol_err(
+            "sp_describe_first_result_set: @tsql is not a string",
+        )),
     }
 }
 

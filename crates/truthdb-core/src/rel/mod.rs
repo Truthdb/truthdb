@@ -692,12 +692,19 @@ pub fn describe_first_result_set(storage: &Storage, tsql: &str) -> Result<RowSet
         )
     };
     let statements = truthdb_sql::parse(tsql)?;
-    let columns = match statements.first() {
+    // The contract is the batch's first RESULT SET, not its first statement:
+    // `INSERT ...; SELECT ...` describes the SELECT. TRY blocks are entered
+    // (their statements run unless an error preempts them); a rowset only a
+    // CATCH can produce stays undescribed — that path is conditional.
+    let columns = match first_rowset_statement(&statements) {
         None => Vec::new(),
-        Some(statement) if !produces_rowset(statement) => Vec::new(),
         Some(Statement::Select(select)) => {
+            // TOP never changes the columns, and `scan_plan` rejects `TOP 0`
+            // for an execution-path reason describe does not share.
+            let mut select = select.clone();
+            select.top = None;
             let ctx = TxnContext::default();
-            match scan_plan(storage, select, &ctx.eval_context()) {
+            match scan_plan(storage, &select, &ctx.eval_context()) {
                 Some(plan) => plan.columns,
                 None => return Err(undeterminable()),
             }
@@ -745,6 +752,17 @@ pub fn describe_first_result_set(storage: &Storage, tsql: &str) -> Result<RowSet
             },
         ],
         rows,
+    })
+}
+
+/// The first statement in `statements` that opens a result set, descending
+/// into TRY blocks (entered unless an error preempts them) but not CATCH
+/// blocks (conditional).
+fn first_rowset_statement(statements: &[Statement]) -> Option<&Statement> {
+    statements.iter().find_map(|statement| match statement {
+        Statement::TryCatch { try_block, .. } => first_rowset_statement(try_block),
+        s if produces_rowset(s) => Some(s),
+        _ => None,
     })
 }
 

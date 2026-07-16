@@ -185,12 +185,8 @@ impl Engine {
         Ok(collector.into_outcome(error))
     }
 
-    /// Like [`Self::sql_batch_with_params`], but each statement's result
-    /// leaves through `emitter` as it is produced (see
-    /// [`crate::rel::execute_batch_streamed`]). Returns the batch's terminal
-    /// error, which the caller reports after the statement events.
     /// `sp_describe_first_result_set`: statically-derivable column metadata
-    /// for `tsql`'s first statement, without executing it.
+    /// for `tsql`'s first result set, without executing anything.
     pub fn describe_first_result_set(
         &self,
         tsql: &str,
@@ -199,6 +195,10 @@ impl Engine {
         crate::rel::describe_first_result_set(&self.storage, tsql)
     }
 
+    /// Like [`Self::sql_batch_with_params`], but each statement's result
+    /// leaves through `emitter` as it is produced (see
+    /// [`crate::rel::execute_batch_streamed`]). Returns the batch's terminal
+    /// error, which the caller reports after the statement events.
     pub fn sql_batch_streamed(
         &self,
         input: &str,
