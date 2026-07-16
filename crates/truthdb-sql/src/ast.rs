@@ -47,6 +47,13 @@ pub enum Statement {
     /// `EXEC[UTE] <proc> [args...]` — the T-SQL text path to the system
     /// procedures (`sp_executesql` is the supported one).
     Exec(ExecStatement),
+    /// `USE <database>` — a database context switch. TruthDB is a single-
+    /// database instance, so the only accepted target is the current
+    /// database; the point is the ENVCHANGE clients (SSMS) expect back.
+    Use {
+        database: Name,
+        span: Span,
+    },
     /// `BEGIN TRY <try_block> END TRY BEGIN CATCH <catch_block> END CATCH`. An
     /// error in the try block transfers control to the catch block.
     TryCatch {
@@ -119,6 +126,9 @@ pub enum DatabaseOption {
 #[derive(Debug, Clone, PartialEq)]
 pub enum SetStatement {
     XactAbort(bool),
+    /// `SET NOCOUNT ON|OFF` — when on, statement DONEs carry no row count
+    /// (the "(n rows affected)" chatter SSMS scripts turn off).
+    NoCount(bool),
     IsolationLevel(IsolationLevel),
     /// `SET SHOWPLAN_TEXT ON|OFF` — when on, statements return their plan text
     /// instead of executing.

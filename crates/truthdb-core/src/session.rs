@@ -113,6 +113,9 @@ pub enum BatchEvent {
     /// separately — in the batch-final [`BatchEvent::Error`] for a continued
     /// error, or not at all for one a `CATCH` handled.
     StatementAborted { in_transaction: bool },
+    /// The session's database context was (re-)established (`USE`): the TDS
+    /// layer renders the ENVCHANGE + 5701 INFO clients (SSMS) expect.
+    DatabaseContext { database: String },
     /// A SQL error that stopped the batch. The statements before it kept their
     /// results, which were already sent.
     Error(SqlError),
@@ -310,6 +313,12 @@ impl crate::rel::BatchEmitter for BatchSink {
     fn statement_aborted(&mut self, in_transaction: bool) {
         self.send(BatchEvent::StatementAborted { in_transaction });
     }
+
+    fn database_context(&mut self, database: &str) {
+        self.send(BatchEvent::DatabaseContext {
+            database: database.to_string(),
+        });
+    }
 }
 
 /// Reassembles an event stream into a whole [`BatchReply`] — the shape every
@@ -347,8 +356,10 @@ async fn collect_reply(
             // rowset is dropped, which is what the buffered path returned too.
             BatchEvent::StatementAborted { .. } => open = None,
             // A whole-reply caller has nowhere to carry a prepared handle —
-            // only the TDS renderer (RETURNVALUE) consumes it.
+            // only the TDS renderer (RETURNVALUE) consumes it. Same for a
+            // database-context change (the ENVCHANGE is wire-only).
             BatchEvent::PreparedHandle(_) => {}
+            BatchEvent::DatabaseContext { .. } => {}
             BatchEvent::Error(err) => error = Some(err),
             BatchEvent::Complete { in_transaction } => {
                 return Ok(BatchReply {

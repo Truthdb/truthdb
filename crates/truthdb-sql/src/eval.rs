@@ -83,6 +83,9 @@ pub struct EvalContext {
     pub login: String,
     /// The session process id — `@@SPID`.
     pub spid: i32,
+    /// Rows affected/returned by the session's previous statement —
+    /// `@@ROWCOUNT`.
+    pub rowcount: i64,
     /// The last identity value inserted in this scope — `SCOPE_IDENTITY()`.
     /// `None` until an identity INSERT runs.
     pub scope_identity: Option<i64>,
@@ -237,7 +240,8 @@ fn eval_global_var(name: &str, ctx: &EvalContext) -> SqlResult<SqlValue> {
         "version" => Ok(SqlValue::Str(
             "TruthDB - 16.0.1000.6\n\tMicrosoft SQL Server 2022 compatible edition".to_string(),
         )),
-        "error" | "rowcount" | "identity" => Ok(SqlValue::Int(0)),
+        "rowcount" => Ok(SqlValue::Int(ctx.rowcount)),
+        "error" | "identity" => Ok(SqlValue::Int(0)),
         other => Err(SqlError::message_only(
             102,
             format!("Incorrect syntax near '@@{other}'."),
@@ -431,7 +435,44 @@ fn eval_call<R: ColumnResolver>(
     for arg in args {
         values.push(eval_at(arg, row, resolver, ctx, depth + 1)?);
     }
+    // SERVERPROPERTY dispatches on its ARGUMENT VALUE and reads the session
+    // context — it fits neither tier (session functions never see argument
+    // values; pure functions never see the context).
+    if name.eq_ignore_ascii_case("SERVERPROPERTY") {
+        if values.len() != 1 {
+            return Err(SqlError::message_only(
+                174,
+                "The SERVERPROPERTY function requires 1 argument(s).".to_string(),
+            ));
+        }
+        return Ok(serverproperty(&values[0]));
+    }
     functions::eval_function(name, values)
+}
+
+/// `SERVERPROPERTY(<name>)` — the SSMS query-window probes. Unknown
+/// properties return NULL, exactly as SQL Server does; the version strings
+/// agree with `@@VERSION` and the LOGINACK bytes.
+fn serverproperty(property: &SqlValue) -> SqlValue {
+    let SqlValue::Str(property) = property else {
+        return SqlValue::Null;
+    };
+    match property.to_ascii_lowercase().as_str() {
+        "productversion" => SqlValue::Str("16.0.1000.6".to_string()),
+        "productmajorversion" => SqlValue::Str("16".to_string()),
+        "productlevel" => SqlValue::Str("RTM".to_string()),
+        "edition" => SqlValue::Str("TruthDB Edition (64-bit)".to_string()),
+        // 3 = Enterprise-class engine; what tools branch on.
+        "engineedition" => SqlValue::Int(3),
+        "servername" | "machinename" => SqlValue::Str("TruthDB".to_string()),
+        // Default instance: no instance name.
+        "instancename" => SqlValue::Null,
+        "collation" => SqlValue::Str("SQL_Latin1_General_CP1_CI_AS".to_string()),
+        "isintegratedsecurityonly" | "isclustered" | "ishadrenabled" | "issingleuser" => {
+            SqlValue::Int(0)
+        }
+        _ => SqlValue::Null,
+    }
 }
 
 /// Session-identity intrinsics that resolve against the [`EvalContext`] rather

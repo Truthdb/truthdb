@@ -80,6 +80,9 @@ fn run_file(path: &Path) {
     let db = temp_path(path.file_stem().unwrap().to_str().unwrap());
     let mut engine = new_engine(&db);
     let mut ctx = TxnContext::default();
+    // A real session identity, as every connected session has one: DB_NAME(),
+    // sys.databases and USE read it.
+    ctx.set_session_identity("truthdb".into(), "sa".into(), 1);
 
     let file = path.display();
     let mut lines = text.lines().peekable();

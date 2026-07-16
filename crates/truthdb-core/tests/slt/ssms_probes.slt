@@ -1,0 +1,123 @@
+# Stage 14 SSMS query-window probes: SERVERPROPERTY, sys.databases,
+# sys.configurations, USE, @@ROWCOUNT. (SET NOCOUNT's wire effect is pinned
+# in the TDS end-to-end tests — it never changes results, only DONE counts.)
+
+query T
+SELECT SERVERPROPERTY('ProductVersion')
+----
+16.0.1000.6
+
+query T
+SELECT SERVERPROPERTY('productlevel')
+----
+RTM
+
+query I
+SELECT SERVERPROPERTY('EngineEdition')
+----
+3
+
+# Unknown properties are NULL, exactly as SQL Server answers them.
+query T
+SELECT SERVERPROPERTY('NoSuchProperty')
+----
+NULL
+
+query TII rowsort
+SELECT name, database_id, compatibility_level FROM sys.databases
+----
+truthdb 1 160
+
+# The versioning flags report the live ALTER DATABASE options.
+query I
+SELECT snapshot_isolation_state FROM sys.databases
+----
+0
+
+statement ok
+ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON
+
+query I
+SELECT snapshot_isolation_state FROM sys.databases
+----
+1
+
+statement ok
+ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION OFF
+
+query I
+SELECT COUNT(*) FROM sys.configurations
+----
+3
+
+query T
+SELECT name FROM sys.configurations WHERE configuration_id = 16384
+----
+show advanced options
+
+# USE: the current database is the only database; anything else is 911.
+statement ok
+USE truthdb
+
+statement error
+USE somewhere_else
+
+# @@ROWCOUNT reports the previous statement's rows.
+statement ok
+CREATE TABLE rc (id INT NOT NULL PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO rc VALUES (1, 10), (2, 20), (3, 30)
+
+query I
+SELECT @@ROWCOUNT
+----
+3
+
+statement ok
+UPDATE rc SET v = 0 WHERE id >= 2
+
+query I
+SELECT @@ROWCOUNT
+----
+2
+
+# A SELECT sets it to the rows it returned; the @@ROWCOUNT probe itself then
+# reports 1 (its own single row) for the next reader.
+query I
+SELECT COUNT(*) FROM rc
+----
+3
+
+query I
+SELECT @@ROWCOUNT
+----
+1
+
+# DDL resets it to zero.
+statement ok
+CREATE TABLE rc2 (id INT NOT NULL PRIMARY KEY)
+
+query I
+SELECT @@ROWCOUNT
+----
+0
+
+# An assignment SELECT counts the rows it processed.
+statement ok
+DECLARE @top INT; SELECT @top = v FROM rc; SELECT @@ROWCOUNT
+
+# SET NOCOUNT does not change @@ROWCOUNT (it only silences the wire counts).
+statement ok
+SET NOCOUNT ON
+
+statement ok
+DELETE FROM rc WHERE id = 1
+
+query I
+SELECT @@ROWCOUNT
+----
+1
+
+statement ok
+SET NOCOUNT OFF
