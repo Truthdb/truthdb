@@ -113,6 +113,31 @@ SELECT id, extra FROM b WHERE tag = 'x'
 1 5
 3 5
 
+# Adding the 9th column crosses the null bitmap's byte boundary (8 → 9
+# columns grows the bitmap), with NULLs present on both sides of the ALTER.
+statement ok
+CREATE TABLE wide (c1 INT NOT NULL PRIMARY KEY, c2 INT, c3 INT, c4 INT, c5 INT, c6 INT, c7 INT, c8 INT)
+
+statement ok
+INSERT INTO wide VALUES (1, NULL, 3, NULL, 5, NULL, 7, NULL)
+
+statement ok
+ALTER TABLE wide ADD c9 INT
+
+query IIIIIIIII
+SELECT c1, c2, c3, c4, c5, c6, c7, c8, c9 FROM wide
+----
+1 NULL 3 NULL 5 NULL 7 NULL NULL
+
+statement ok
+INSERT INTO wide VALUES (2, 2, NULL, 4, NULL, 6, NULL, 8, 9)
+
+query II rowsort
+SELECT c1, c9 FROM wide
+----
+1 NULL
+2 9
+
 # A heap table (no PRIMARY KEY) rewrites the same way.
 statement ok
 CREATE TABLE h (v INT)

@@ -3076,9 +3076,6 @@ fn alter_add_foreign_key(
     Ok(StatementResult::Done)
 }
 
-/// `ALTER TABLE ... ADD [CONSTRAINT name] CHECK (expr)`. Validates the new
-/// constraint against every existing row (SQL Server's default WITH CHECK); a
-/// violating row is error 547 and the constraint is not added.
 /// `ALTER TABLE ADD <column>`: appends the column to the catalog and
 /// rewrites every existing row under the new schema. The row codec is
 /// positional (every offset derives from the schema, with no per-row version
@@ -3126,11 +3123,18 @@ fn alter_add_column(
         .at(column.span));
     }
     let bound = bind_column(column)?;
-    // No counter (a pre-upgrade table) means "assume rows exist".
-    let has_rows = storage
-        .rel_row_count(&def.name)
-        .map(|n| n > 0)
-        .unwrap_or(true);
+    // An authoritative emptiness probe (one-row scan under the ALTER's
+    // exclusive lock) — the row counter is a statistic and must not become
+    // load-bearing here: an under-count would let NULL fills into a NOT NULL
+    // column, and a pre-upgrade table without a counter would 4901 even when
+    // empty.
+    let has_rows = {
+        let mut probe = Vec::new();
+        storage
+            .rel_scan_slice(&def.name, ScanCursor::start(), 1, None, &mut probe)
+            .map_err(|err| map_storage_err(err, &def.name))?;
+        !probe.is_empty()
+    };
     // The frozen fill existing rows take.
     let fill = match &column.default {
         Some(text) => {
@@ -3157,6 +3161,9 @@ fn alter_add_column(
     Ok(StatementResult::Done)
 }
 
+/// `ALTER TABLE ... ADD [CONSTRAINT name] CHECK (expr)`. Validates the new
+/// constraint against every existing row (SQL Server's default WITH CHECK); a
+/// violating row is error 547 and the constraint is not added.
 fn alter_add_check(
     storage: &Storage,
     def: &TableDef,
