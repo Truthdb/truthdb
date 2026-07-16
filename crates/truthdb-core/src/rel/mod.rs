@@ -1438,7 +1438,8 @@ fn showplan_rows(
                         plan::plan_text(&plan.access, &def.name, plan.covering)
                     } else {
                         let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
-                        let path = plan::choose(&def, &schema, &select.where_clause, eval_ctx);
+                        let path =
+                            plan::choose(&def, &schema, &select.where_clause, eval_ctx, None);
                         plan::plan_text(&path, &def.name, false)
                     }
                 }
@@ -2734,7 +2735,7 @@ fn exec_create_index(storage: &Storage, create: &CreateIndex) -> Result<Statemen
             .columns
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&col.name.value))
-            .ok_or_else(|| SqlError::invalid_column(&col.name.value).at(col.name.span))?;
+            .ok_or_else(|| index_column_missing(&col.name.value, &def.name).at(col.name.span))?;
         columns.push((index, col.ascending));
     }
     // INCLUDE columns: resolved against the schema, no duplicates (1909, as
@@ -2748,7 +2749,7 @@ fn exec_create_index(storage: &Storage, create: &CreateIndex) -> Result<Statemen
             .columns
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&col.value))
-            .ok_or_else(|| SqlError::invalid_column(&col.value).at(col.span))?;
+            .ok_or_else(|| index_column_missing(&col.value, &def.name).at(col.span))?;
         if include.contains(&index) {
             return Err(SqlError::new(
                 1909,
@@ -2773,6 +2774,17 @@ fn exec_create_index(storage: &Storage, create: &CreateIndex) -> Result<Statemen
         )
         .map_err(|e| map_storage_err(e, &def.name))?;
     Ok(StatementResult::Done)
+}
+
+/// SQL Server's 1911 for a `CREATE INDEX` column (key or `INCLUDE`) that does
+/// not exist on the target table — where most statements answer 207.
+fn index_column_missing(column: &str, table: &str) -> SqlError {
+    SqlError::new(
+        1911,
+        16,
+        1,
+        format!("Column name '{column}' does not exist in the target table or view '{table}'."),
+    )
 }
 
 fn exec_drop_index(storage: &Storage, drop: &DropIndex) -> Result<StatementResult, SqlError> {
@@ -5017,11 +5029,6 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
         return None;
     }
     let schema = def.schema().ok()?;
-    // The same access path `build_table_source` would take. Taking it here too,
-    // rather than declining a seek, is what keeps this gate free for the queries
-    // it rejects: a decline would have thrown away the definition, the schema
-    // and this choice, and `build_table_source` would compute all three again.
-    let access = plan::choose(&def, &schema, &select.where_clause, eval_ctx);
 
     let qualifier = alias
         .as_ref()
@@ -5110,6 +5117,16 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     );
     needed.sort_unstable();
     needed.dedup();
+
+    // The same access path `build_table_source` would take (it passes no
+    // `needed`, so its choice can differ only toward a covering index — and it
+    // never reaches this shape). Choosing here, rather than declining a seek,
+    // is what keeps this gate free for the queries it rejects: a decline would
+    // have thrown away the definition, the schema and this choice, and
+    // `build_table_source` would compute all three again. Chosen after
+    // `needed` is known so a covering index can win its tie (see
+    // [`plan::choose`]).
+    let access = plan::choose(&def, &schema, &select.where_clause, eval_ctx, Some(&needed));
 
     // Everything downstream now speaks in the scanned row's coordinates.
     let position = |index: usize| {
@@ -6434,7 +6451,7 @@ fn build_table_source(
             let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
             // An index seek narrows the candidate set; the WHERE filter later
             // re-checks, so results match a full scan.
-            let rows = match plan::choose(&def, &schema, where_clause, eval_ctx) {
+            let rows = match plan::choose(&def, &schema, where_clause, eval_ctx, None) {
                 // Sliced: a read holds the table's lock, so it need not also
                 // hold the storage lock for the whole table and block every
                 // other session while it walks.

@@ -3300,6 +3300,79 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// A covering index wins its tie against an equal-scoring non-INCLUDE
+    /// index — the "add a covering index to an existing database" workflow.
+    /// Coverage breaks equality ties only: it never outranks a fully-matched
+    /// UNIQUE seek (one row plus one lookup beats a covering scan).
+    #[test]
+    fn a_covering_index_wins_the_tie_against_an_older_plain_index() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("include-tiebreak");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        // The plain index is created FIRST, so a first-wins tie keeps it.
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, email VARCHAR(40) NOT NULL, v INT); \
+             CREATE INDEX ix ON t (email); \
+             CREATE INDEX ix2 ON t (email) INCLUDE (email, v); \
+             INSERT INTO t VALUES (1, 'a@x.com', 10)",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+        let outcome = execute_batch(
+            &storage,
+            "SELECT email, v FROM t WHERE email = 'a@x.com'",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            storage.covering_scans(),
+            1,
+            "the covering index wins the equality tie"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// CREATE INDEX with a column that does not exist on the table reports
+    /// SQL Server's 1911 (not the generic 207) — for the key list and the
+    /// INCLUDE list alike; a duplicate INCLUDE column reports 1909.
+    #[test]
+    fn create_index_errors_carry_sql_server_numbers() {
+        use crate::rel::{TxnContext, execute_batch};
+
+        let path = unique_temp_path("include-errors");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let setup = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, email VARCHAR(40) NOT NULL)",
+            &mut ctx,
+        );
+        assert!(setup.error.is_none(), "{:?}", setup.error);
+
+        let cases = [
+            ("CREATE INDEX ix ON t (nope)", 1911),
+            ("CREATE INDEX ix ON t (email) INCLUDE (nope)", 1911),
+            ("CREATE INDEX ix ON t (email) INCLUDE (id, id)", 1909),
+        ];
+        for (sql, number) in cases {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert_eq!(
+                outcome.error.as_ref().map(|e| e.number),
+                Some(number),
+                "{sql}: {:?}",
+                outcome.error
+            );
+        }
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Included leaf values follow UPDATE and DELETE, and survive a restart
     /// (the include list rides the catalog; the leaf format rides the pages).
     #[test]
