@@ -601,12 +601,6 @@ fn exec_literal_sql(exec: &ExecStatement) -> Option<String> {
     }
 }
 
-#[cfg(test)]
-thread_local! {
-    /// Test hook mirroring EXEC_DEPTH assertions.
-    static EXEC_DEPTH_SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
-}
-
 thread_local! {
     /// Nesting depth of EXEC inner batches on this worker (SQL Server caps
     /// procedure nesting at 32, error 217).
@@ -701,8 +695,15 @@ fn run_exec(
     }
     let statements = truthdb_sql::parse(&sql)?;
 
-    // The inner batch is its own variable scope, on the shared transaction.
+    // The inner batch is its own variable scope, on the shared transaction —
+    // and SET options revert at scope exit, as SQL Server reverts them: an
+    // inner SET (XACT_ABORT, ISOLATION LEVEL, SHOWPLAN) must not outlive the
+    // EXEC, or a post-EXEC statement would run under an isolation the up-front
+    // lock analysis never saw.
     let outer_vars = std::mem::take(&mut txn_ctx.variables);
+    let outer_xact_abort = txn_ctx.xact_abort;
+    let outer_isolation = txn_ctx.isolation;
+    let outer_showplan = txn_ctx.showplan_text;
     for (name, value) in seeded {
         let key = name.trim_start_matches('@').to_ascii_lowercase();
         let column_type = value::infer_type(std::slice::from_ref(&value));
@@ -725,6 +726,9 @@ fn run_exec(
     };
     EXEC_DEPTH.with(|d| d.set(d.get() - 1));
     txn_ctx.variables = outer_vars;
+    txn_ctx.xact_abort = outer_xact_abort;
+    txn_ctx.isolation = outer_isolation;
+    txn_ctx.showplan_text = outer_showplan;
     result
 }
 
@@ -1544,7 +1548,19 @@ pub fn analyze_locks(
             // (2PL acquires the full set up front).
             Statement::Exec(exec) => match exec_literal_sql(exec) {
                 Some(inner) => {
-                    for (resource, mode) in analyze_locks(storage, &inner, isolation) {
+                    // The inner text runs under the batch's EFFECTIVE
+                    // isolation: a `SET ... SERIALIZABLE` before the EXEC
+                    // must lock the inner reads too, so the recursion gets a
+                    // read-locking level whenever this batch locks reads.
+                    // (An inner SET raising isolation is seen by the
+                    // recursion's own scan; it cannot outlive the EXEC — SET
+                    // options revert at scope exit.)
+                    let inner_isolation = if reads_lock {
+                        Isolation::ReadCommitted
+                    } else {
+                        isolation
+                    };
+                    for (resource, mode) in analyze_locks(storage, &inner, inner_isolation) {
                         add(resource, mode);
                     }
                 }

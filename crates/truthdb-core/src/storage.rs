@@ -3467,6 +3467,131 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The EXEC text path's two load-bearing lock properties, pinned: a
+    /// variable @stmt cannot be analyzed up front and takes the conservative
+    /// database-exclusive lock, and isolation escalation crosses the EXEC
+    /// boundary in both directions (mutating either previously went green).
+    #[test]
+    fn exec_lock_analysis_never_under_locks() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::{Isolation, TxnContext, execute_batch};
+
+        let path = unique_temp_path("exec-locks");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // A variable statement text is unknowable before it runs: the batch
+        // locks the database exclusively rather than ever under-locking.
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "DECLARE @s NVARCHAR(50) = N'SELECT v FROM t'; EXEC sp_executesql @s",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            needs.contains(&(Resource::Database, LockMode::Exclusive)),
+            "variable @stmt must take Database X: {needs:?}"
+        );
+
+        // Direction 1: a SET raise BEFORE the EXEC locks the inner reads.
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; EXEC sp_executesql N'SELECT v FROM t'",
+            Isolation::ReadUncommitted,
+        );
+        assert!(
+            needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Shared),
+            "escalated isolation must lock the inner SELECT: {needs:?}"
+        );
+
+        // Direction 2 (intra-EXEC): a SET raise INSIDE the literal locks the
+        // statements after it inside the same literal.
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "EXEC sp_executesql N'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT v FROM t'",
+            Isolation::ReadUncommitted,
+        );
+        assert!(
+            needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Shared),
+            "an inner SET raise must lock the inner reads: {needs:?}"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// EXEC scope semantics, pinned: outer variables are restored after the
+    /// inner batch (a regression previously went green), and SET options
+    /// revert at scope exit as SQL Server reverts them — an inner
+    /// `SET XACT_ABORT ON` must not doom the outer batch's transaction.
+    #[test]
+    fn exec_scope_restores_variables_and_set_options() {
+        use crate::rel::{StatementResult, TxnContext, execute_batch};
+
+        let path = unique_temp_path("exec-scope");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // Inner @o shadows; the outer @o is intact after the EXEC returns.
+        let outcome = execute_batch(
+            &storage,
+            "DECLARE @o INT = 1; EXEC sp_executesql N'DECLARE @o INT = 99; SELECT @o AS inner_o'; SELECT @o AS outer_o",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let values: Vec<i64> = outcome
+            .results
+            .iter()
+            .filter_map(|r| match r {
+                StatementResult::Rows(rs) => match rs.rows[0][0] {
+                    Datum::Int(v) => Some(v as i64),
+                    Datum::BigInt(v) => Some(v),
+                    _ => None,
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(values, [99, 1], "{:?}", outcome.results);
+
+        // An inner SET XACT_ABORT ON reverts at EXEC exit: the later duplicate
+        // key fails its own statement but the batch continues and commits.
+        let outcome = execute_batch(
+            &storage,
+            "BEGIN TRANSACTION; INSERT INTO t VALUES (1); \
+             EXEC sp_executesql N'SET XACT_ABORT ON'; \
+             INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); COMMIT",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_some(), "the dup insert reports its error");
+        let outcome = execute_batch(&storage, "SELECT COUNT(*) FROM t", &mut ctx);
+        match &outcome.results[0] {
+            StatementResult::Rows(rs) => assert_eq!(
+                rs.rows[0][0],
+                Datum::BigInt(2),
+                "XACT_ABORT must revert at scope exit; the transaction commits"
+            ),
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
     fn unique_temp_path(label: &str) -> PathBuf {
         let mut path = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
