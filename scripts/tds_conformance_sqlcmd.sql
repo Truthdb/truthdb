@@ -13,3 +13,5 @@ ROLLBACK;
 GO
 SELECT name FROM $(TABLE) WHERE id = 1;
 GO
+EXEC sp_executesql N'SELECT COUNT(*) AS via_exec FROM $(TABLE) WHERE id > @min', N'@min int', 0;
+GO

@@ -163,43 +163,6 @@ struct PreparedStatement {
     text: String,
 }
 
-/// The parameter names of a declaration list (`@p1 int, @p2 nvarchar(10)`),
-/// in order: the first token of each top-level comma-separated entry.
-/// `sp_execute` values arrive unnamed on the wire; these names bind them.
-fn decl_names(decls: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut depth = 0usize;
-    let mut in_quote = false;
-    let mut entry = String::new();
-    for ch in decls.chars().chain(std::iter::once(',')) {
-        match ch {
-            // A quoted default value (`@p varchar(10) = 'a,b'`) may contain
-            // commas and parens; none of them separate declarations. A
-            // doubled '' escape toggles twice, landing back where it was.
-            '\'' => {
-                in_quote = !in_quote;
-                entry.push(ch);
-            }
-            '(' if !in_quote => {
-                depth += 1;
-                entry.push(ch);
-            }
-            ')' if !in_quote => {
-                depth = depth.saturating_sub(1);
-                entry.push(ch);
-            }
-            ',' if !in_quote && depth == 0 => {
-                if let Some(name) = entry.split_whitespace().next() {
-                    names.push(name.to_string());
-                }
-                entry.clear();
-            }
-            _ => entry.push(ch),
-        }
-    }
-    names
-}
-
 /// The reply channel for one batch.
 ///
 /// **Unbounded, deliberately.** A bounded queue would make the worker block
@@ -1265,7 +1228,7 @@ fn bind_decl_names(
     decls: &str,
     mut values: Vec<crate::rel::RpcParam>,
 ) -> Result<Vec<crate::rel::RpcParam>, SqlError> {
-    let names = decl_names(decls);
+    let names = crate::rel::decl_names(decls);
     // An unnamed value with no declaration to name it is SQL Server's 8144.
     // (Fewer values than declarations is legal — a declared parameter the
     // statement never reads goes unmissed, and one it does read errors when
@@ -3837,15 +3800,17 @@ mod tests {
     #[test]
     fn decl_names_splits_top_level_commas_only() {
         assert_eq!(
-            decl_names("@p1 int, @p2 nvarchar(10), @p3 decimal(10,2)"),
+            crate::rel::decl_names("@p1 int, @p2 nvarchar(10), @p3 decimal(10,2)"),
             ["@p1", "@p2", "@p3"]
         );
-        assert_eq!(decl_names(""), Vec::<String>::new());
-        assert_eq!(decl_names("@a int"), ["@a"]);
+        assert_eq!(crate::rel::decl_names(""), Vec::<String>::new());
+        assert_eq!(crate::rel::decl_names("@a int"), ["@a"]);
         // A quoted default may contain commas and parens; a doubled ''
         // escape stays inside the string.
         assert_eq!(
-            decl_names("@p1 varchar(10) = 'a,b', @p2 int, @p3 varchar(5) = 'it''s, ok'"),
+            crate::rel::decl_names(
+                "@p1 varchar(10) = 'a,b', @p2 int, @p3 varchar(5) = 'it''s, ok'"
+            ),
             ["@p1", "@p2", "@p3"]
         );
     }

@@ -118,11 +118,57 @@ impl Parser {
             Some("SAVE") => self.parse_save(),
             Some("SET") => self.parse_set(),
             Some("DECLARE") => self.parse_declare(),
+            Some("EXEC") | Some("EXECUTE") => self.parse_exec(),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
             }
         }
+    }
+
+    /// `EXEC[UTE] <proc> [[@name =] <expr> [, ...]]` — the T-SQL text path to
+    /// the system procedures. Arguments end at the statement boundary.
+    fn parse_exec(&mut self) -> SqlResult<Statement> {
+        let start = self.bump().span; // EXEC or EXECUTE
+        let proc = self.parse_name()?;
+        let mut args = Vec::new();
+        let mut end = proc.span;
+        if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
+            loop {
+                // `@name = expr` names the argument (the `=` after a local
+                // variable disambiguates from a positional `@var` argument);
+                // a bare expr is positional.
+                let next = &self.tokens[(self.pos + 1).min(self.tokens.len() - 1)];
+                let name = if matches!(self.peek().kind, TokenKind::LocalVar(_))
+                    && next.kind == TokenKind::Eq
+                {
+                    let token = self.bump();
+                    let TokenKind::LocalVar(var) = &token.kind else {
+                        unreachable!("matched above");
+                    };
+                    let named = Name {
+                        value: var.clone(),
+                        quoted: false,
+                        span: token.span,
+                    };
+                    self.bump(); // `=`
+                    Some(named)
+                } else {
+                    None
+                };
+                let value = self.parse_expr()?;
+                end = value.span;
+                args.push(ExecArg { name, value });
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(Statement::Exec(ExecStatement {
+            proc,
+            args,
+            span: start.to(end),
+        }))
     }
 
     // ---- transaction control --------------------------------------------

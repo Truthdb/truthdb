@@ -1,0 +1,86 @@
+# EXEC sp_executesql as T-SQL text (Stage 11): the same machinery as the RPC
+# path — the inner text runs as its own batch scope (fresh variables seeded
+# from the declared parameters; inner DECLAREs do not leak; outer variables
+# are not visible inside) on the shared transaction.
+
+statement ok
+CREATE TABLE ex (id INT NOT NULL PRIMARY KEY, v INT)
+
+statement ok
+EXEC sp_executesql N'INSERT INTO ex VALUES (1, 10), (2, 20)'
+
+query II rowsort
+SELECT id, v FROM ex
+----
+1 10
+2 20
+
+# Parameterized, positional values bound from the declaration list.
+statement ok
+EXEC sp_executesql N'INSERT INTO ex VALUES (@a, @b)', N'@a int, @b int', 3, 30
+
+# Named argument form, in any order.
+statement ok
+EXEC sp_executesql @params = N'@a int, @b int', @stmt = N'INSERT INTO ex VALUES (@a, @b)', @a = 4, @b = 40
+
+query I
+SELECT COUNT(*) FROM ex
+----
+4
+
+# The inner text may SELECT — its rowset streams like a top-level statement.
+query I
+EXEC sp_executesql N'SELECT v FROM ex WHERE id = @p', N'@p int', 3
+----
+30
+
+# EXECUTE spelling; a variable carrying the statement text (dynamic SQL —
+# lock analysis falls back to a conservative exclusive lock, but it runs).
+statement ok
+DECLARE @sql NVARCHAR(100) = N'SELECT COUNT(*) FROM ex'; EXECUTE sp_executesql @sql
+
+# The inner batch is its own variable scope: an outer variable is not
+# visible inside.
+statement error
+DECLARE @outer INT = 7; EXEC sp_executesql N'SELECT @outer'
+
+# An unknown procedure answers 2812 like the RPC path.
+statement error
+EXEC sp_no_such_thing
+
+# Too many positional values for the declaration list is 8144.
+statement error
+EXEC sp_executesql N'SELECT 1', N'@a int', 1, 2
+
+# Errors inside the inner batch surface like ordinary statement errors: under
+# XACT_ABORT OFF outside a transaction the batch stops with the error.
+statement error
+EXEC sp_executesql N'INSERT INTO ex VALUES (1, 99)'
+
+# The failed duplicate insert left the table unchanged.
+query I
+SELECT COUNT(*) FROM ex
+----
+4
+
+# EXEC participates in an open transaction (shared context): a rollback
+# undoes the inner batch's writes.
+statement ok
+BEGIN TRANSACTION
+
+statement ok
+EXEC sp_executesql N'INSERT INTO ex VALUES (9, 90)'
+
+statement ok
+ROLLBACK
+
+query I
+SELECT COUNT(*) FROM ex
+----
+4
+
+# Nested EXEC works (depth-capped at 32 like SQL Server's 217).
+query I
+EXEC sp_executesql N'EXEC sp_executesql N''SELECT 5 AS five'''
+----
+5
