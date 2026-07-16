@@ -1097,8 +1097,10 @@ fn a_collation_name_too_long_for_the_header_is_refused() {
 
 #[test]
 fn a_sliced_scan_reads_the_same_rows_as_a_whole_one() {
-    // The SELECT path reads through rel_scan_sliced; it must agree with the
-    // atomic rel_scan the integrity checks still use, at any slice size.
+    // The SELECT paths read through rel_scan_slice (ScanStream pulls it lazily
+    // since the streaming-scans leg; rel_scan_sliced composes the same slices
+    // eagerly); either way the slices must agree with the atomic rel_scan the
+    // integrity checks still use, at any slice size.
     let path = unique_temp_path("scan-sliced");
     let mut storage = create_storage(&path);
     create_tree_table(&mut storage, "t");

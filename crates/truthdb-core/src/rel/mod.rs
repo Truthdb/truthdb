@@ -3538,9 +3538,12 @@ enum SourceRows {
 }
 
 /// A base-table scan not yet read: full-width rows, [`SCAN_SLICE_ROWS`] at a
-/// time on the resumable cursor (the storage lock is taken per slice, as
-/// everywhere since #96; the table's S lock is held for the whole batch, so
-/// slicing changes no isolation semantics).
+/// time on the resumable cursor. The storage lock is taken per slice, as
+/// everywhere since #96; under every isolation level that takes read locks
+/// the table's S lock spans the whole batch, so lazy pulling changes no
+/// isolation semantics — and READ UNCOMMITTED took no read lock before
+/// either (the cursor's per-page object check safe-stops on a recycled
+/// page, as the B+ tree layer documents).
 struct ScanStream {
     table: String,
     cursor: ScanCursor,
