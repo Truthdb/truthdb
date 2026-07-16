@@ -236,6 +236,31 @@ jobs:
           go get github.com/microsoft/go-mssqldb@v1.8.0
           go run . 127.0.0.1 1433 sa secret
 
+      - name: Conformance — mssql-jdbc (Java, prepared-statement flow)
+        run: |
+          apt-get install -y --no-install-recommends openjdk-17-jdk-headless
+          curl -sfLo /tmp/mssql-jdbc.jar https://repo1.maven.org/maven2/com/microsoft/sqlserver/mssql-jdbc/12.8.1.jre11/mssql-jdbc-12.8.1.jre11.jar
+          java -cp /tmp/mssql-jdbc.jar scripts/TdsConformance.java 127.0.0.1 1433 sa secret
+
+      - name: Conformance — ODBC sqlcmd (mssql-tools18, scripted with output diff)
+        run: |
+          curl -s https://packages.microsoft.com/keys/microsoft.asc | gpg --dearmor > /usr/share/keyrings/ms.gpg
+          echo 'deb [signed-by=/usr/share/keyrings/ms.gpg] https://packages.microsoft.com/debian/12/prod bookworm main' > /etc/apt/sources.list.d/mssql.list
+          apt-get update
+          ACCEPT_EULA=Y apt-get install -y --no-install-recommends msodbcsql18 mssql-tools18
+          /opt/mssql-tools18/bin/sqlcmd -S 127.0.0.1,1433 -U sa -P secret -d truthdb -N o -I \
+            -v TABLE=conf_odbc -i scripts/tds_conformance_sqlcmd.sql > /tmp/odbc.out 2>&1
+          diff -u scripts/tds_conformance_sqlcmd.expected /tmp/odbc.out
+          echo "tds conformance (ODBC sqlcmd): OK"
+
+      - name: Conformance — go-sqlcmd (scripted with output diff)
+        run: |
+          curl -sfL https://github.com/microsoft/go-sqlcmd/releases/download/v1.8.2/sqlcmd-linux-amd64.tar.bz2 | tar xj -C /usr/local/bin sqlcmd
+          sqlcmd -S 127.0.0.1,1433 -U sa -P secret -d truthdb -N disable -I \
+            -v TABLE=conf_go -i scripts/tds_conformance_sqlcmd.sql > /tmp/gosqlcmd.out 2>&1
+          diff -u scripts/tds_conformance_gosqlcmd.expected /tmp/gosqlcmd.out
+          echo "tds conformance (go-sqlcmd): OK"
+
       - name: Stop server
         if: always()
         run: |
