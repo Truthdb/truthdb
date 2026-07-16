@@ -1590,7 +1590,11 @@ impl Scheduler {
             .min_by_key(|(_, p)| p.deadline)
             .map(|(i, _)| i);
         if let Some(idx) = victim_idx {
-            self.abort_parked_victim(engine, idx);
+            // An expired wait behind a LIVE holder is not a deadlock: SQL
+            // Server raises 1205 only for real cycles and 1222 for a lock
+            // wait that timed out. Reporting a false deadlock sends drivers
+            // into retry loops for a condition retrying cannot fix.
+            self.abort_parked_victim(engine, idx, lock_timeout_error());
         }
     }
 
@@ -1641,13 +1645,19 @@ impl Scheduler {
     /// Aborts the parked batch at `idx` as a deadlock victim: rolls back its
     /// transaction, releases its locks, and replies with error 1205. The caller
     /// drains any batches the released locks unblock.
-    fn abort_parked_victim(&mut self, engine: &Engine, idx: usize) {
+    fn abort_parked_victim(&mut self, engine: &Engine, idx: usize, error: SqlError) {
         let victim = self.parked.remove(idx).expect("index in bounds");
         if let Some(state) = self.sessions.get_mut(victim.session) {
             engine.abort_session_txn(&mut state.txn_ctx);
         }
         self.locks.release_all(victim.session.raw());
-        victim.reply.send_outcome(deadlock_victim_reply(), false);
+        victim.reply.send_outcome(
+            BatchOutcome {
+                results: Vec::new(),
+                error: Some(error),
+            },
+            false,
+        );
     }
 
     /// Detects lock-wait *cycles* among the parked batches — a waits-for graph
@@ -1657,7 +1667,7 @@ impl Scheduler {
     /// wait-timeout backstop. Aborts victims until the graph is acyclic.
     fn detect_deadlock(&mut self, engine: &Engine) {
         while let Some(idx) = self.find_deadlock_victim() {
-            self.abort_parked_victim(engine, idx);
+            self.abort_parked_victim(engine, idx, deadlock_victim_error());
         }
     }
 
@@ -1773,16 +1783,19 @@ fn find_cycle(
     None
 }
 
-fn deadlock_victim_reply() -> BatchOutcome {
-    BatchOutcome {
-        results: Vec::new(),
-        error: Some(SqlError::new(
-            1205,
-            13,
-            51,
-            "Transaction was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.",
-        )),
-    }
+fn deadlock_victim_error() -> SqlError {
+    SqlError::new(
+        1205,
+        13,
+        51,
+        "Transaction was deadlocked on lock resources with another process and has been chosen as the deadlock victim. Rerun the transaction.",
+    )
+}
+
+/// A lock wait that outlived the timeout behind a LIVE holder — no cycle.
+/// SQL Server's number for an expired lock wait is 1222.
+fn lock_timeout_error() -> SqlError {
+    SqlError::new(1222, 16, 56, "Lock request time out period exceeded.")
 }
 
 #[cfg(test)]
@@ -3467,8 +3480,9 @@ mod tests {
         .unwrap();
         assert_eq!(
             error_number(&out),
-            Some(1205),
-            "the lone waiter should time out as a 1205 victim"
+            Some(1222),
+            "a lone waiter behind a live holder times out as 1222 — there is \
+             no cycle, so 1205 would report a deadlock that never happened"
         );
     }
 
