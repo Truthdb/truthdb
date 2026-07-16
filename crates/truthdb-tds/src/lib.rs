@@ -57,6 +57,9 @@ impl TdsListener {
             tokio::select! {
                 accepted = self.listener.accept() => {
                     let (stream, peer) = accepted?;
+                    // TDS is request/response with multi-write framing; Nagle
+                    // + delayed ACK stalls each round trip without this.
+                    let _ = stream.set_nodelay(true);
                     debug!(%peer, "TDS connection accepted");
                     let engine = self.engine.clone();
                     let config = Arc::clone(&self.config);
