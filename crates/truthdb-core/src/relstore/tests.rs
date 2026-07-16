@@ -683,6 +683,136 @@ fn crash_during_recovery_undo_reruns_cleanly() {
     let _ = std::fs::remove_file(path);
 }
 
+/// Review finding: a counter compensation is a blind arithmetic delta, so it
+/// cannot tolerate the CLR-group re-run the other undo arms survive by being
+/// guarded (occupancy checks, logical presence). Its CLR must therefore point
+/// *past* the compensated record — a crash after the CLR but before the
+/// sealing no-op then resumes at the previous record instead of re-applying
+/// the delta. This test pins the mechanism itself, on the WAL bytes: the CLR
+/// compensating a CounterAdd record carries `undo_next == prev_lsn` of that
+/// record, never its own LSN.
+#[test]
+fn counter_compensation_clr_points_past_its_record() {
+    use crate::storage::TxnScope;
+    use crate::wal::records::{PageOpRedo, REL_KIND_CLR, REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_OP};
+
+    let path = unique_temp_path("counter-clr-pointer");
+    let mut storage = create_storage(&path);
+    create_tree_table(&mut storage, "t");
+    storage
+        .rel_insert("t", row(1, "committed"))
+        .expect("insert");
+
+    let mut txn = storage.rel_begin().expect("begin");
+    storage
+        .rel_insert_many(
+            "t",
+            vec![row(2, "rolled back")],
+            &mut TxnScope::Explicit(&mut txn),
+        )
+        .expect("insert under txn");
+    storage.rel_rollback(txn).expect("rollback");
+    assert_eq!(storage.rel_row_count("t"), Some(1), "count restored");
+    // The record scan reads the open-time replay cache, so reopen: the ring
+    // still holds the rollback's records (nothing checkpointed).
+    drop(storage);
+    let mut storage = Storage::open(path.clone()).expect("reopen");
+    assert_eq!(storage.rel_row_count("t"), Some(1));
+
+    let records = storage.rel_wal_records().expect("scan");
+    // The rolled-back statement's forward CounterAdd record. It may have been
+    // logged as a plain page op or — on the counter page's first touch since
+    // a checkpoint — as a full page image; either way its UNDO carries the
+    // inverse CounterAdd.
+    // Both inserts log a +1; the rolled-back transaction's is the LAST one.
+    let (forward_lsn, forward_prev) = records
+        .iter()
+        .filter_map(|(lsn, record)| {
+            if record.txn_id == 0
+                || record.kind != REL_KIND_PAGE_OP && record.kind != REL_KIND_PAGE_IMAGE
+            {
+                return None;
+            }
+            let is_forward_counter = matches!(
+                record.decode_page_op_redo(),
+                Ok(PageOpRedo::CounterAdd { delta, .. }) if delta > 0
+            ) || matches!(
+                record.decode_page_op_undo(),
+                Ok(crate::wal::records::PageOpUndo::CounterAdd { delta, .. }) if delta < 0
+            );
+            if is_forward_counter {
+                Some((*lsn, record.prev_lsn))
+            } else {
+                None
+            }
+        })
+        .last()
+        .expect("the rolled-back insert logged a forward CounterAdd");
+    // The CLR that compensates it.
+    let undo_next = records
+        .iter()
+        .find_map(|(_, record)| {
+            if record.kind != REL_KIND_CLR {
+                return None;
+            }
+            match record.decode_clr() {
+                Ok((undo_next, Some(PageOpRedo::CounterAdd { delta, .. }))) if delta < 0 => {
+                    Some(undo_next)
+                }
+                _ => None,
+            }
+        })
+        .expect("the rollback logged a compensating CounterAdd CLR");
+    assert_eq!(
+        undo_next, forward_prev,
+        "the counter CLR points PAST its record (a crash-resumed undo must \
+         never revisit it: the delta would apply twice)"
+    );
+    assert_ne!(undo_next, forward_lsn, "not the group-re-run pointer");
+
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
+/// The behavioral face of the same property: a crash mid-recovery-undo whose
+/// re-run walks the loser again must apply the counter compensation exactly
+/// once (the CLR pointer above is what makes the re-run skip the record).
+#[test]
+fn counter_compensation_survives_a_crash_during_recovery_undo() {
+    let path = unique_temp_path("counter-crash-mid-undo");
+    let mut storage = create_storage(&path);
+    create_tree_table(&mut storage, "t");
+    storage
+        .rel_insert("t", row(1, "committed"))
+        .expect("insert");
+    assert_eq!(storage.rel_row_count("t"), Some(1));
+    storage
+        .rel_insert_without_commit("t", row(2, "loser"))
+        .expect("loser");
+    drop(storage); // crash with the loser open
+
+    // Recovery undoes the loser LIFO: the counter compensation lands first,
+    // then the injected fault aborts recovery on the row op behind it.
+    crate::relstore::ctx::FAIL_APPLY_OPS_AFTER.with(|c| c.set(Some(1)));
+    let result = Storage::open(path.clone());
+    crate::relstore::ctx::FAIL_APPLY_OPS_AFTER.with(|c| c.set(None));
+    assert!(
+        result.is_err(),
+        "injected fault must abort recovery mid-undo"
+    );
+    drop(result);
+
+    let mut storage = Storage::open(path.clone()).expect("recovery rerun");
+    assert_eq!(scan_ids(&mut storage, "t"), vec![1], "loser row undone");
+    assert_eq!(
+        storage.rel_row_count("t"),
+        Some(1),
+        "the compensation applied exactly once across the re-run"
+    );
+    drop(storage);
+    let _ = std::fs::remove_file(path);
+}
+
 /// Review finding: a growing update of a tiny row on a page too full to
 /// hold a forwarding stub must fail cleanly (constraint error), not with an
 /// internal logging error or partial application.

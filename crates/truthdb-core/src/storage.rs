@@ -701,6 +701,15 @@ impl Storage {
         self.lock().rel_flush_pool_only()
     }
 
+    /// Test hook: the relational WAL records currently recoverable from the
+    /// ring, exactly as restart's analysis would see them.
+    #[cfg(test)]
+    pub(crate) fn rel_wal_records(
+        &self,
+    ) -> Result<Vec<(u64, crate::wal::records::RelRecord)>, StorageError> {
+        self.lock().rel_records()
+    }
+
     #[cfg(test)]
     pub(crate) fn data_page_offset(&self, page: u64) -> u64 {
         self.lock().data_page_offset(page)
@@ -2059,6 +2068,11 @@ impl StorageFile {
                 first_page: def.root_page,
             };
             heap.insert(&mut ctx, &mut txn, &row)?;
+        }
+        // A real statement's op stream includes the counter op, so the crash
+        // window this hook simulates must too.
+        if let Some(page) = def.counter_page {
+            ctx.counter_add(&mut txn, page, 1)?;
         }
         // Durable ops, no commit record: exactly the crash window.
         ctx.io.wal.sync_all()?;

@@ -4721,6 +4721,13 @@ mod tests {
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
             .expect("create");
         engine.execute("CREATE INDEX ix_a ON t (a)").expect("index");
+        // Pad past the tiny-table tie-break, or the post-drop "Table Scan"
+        // assertion below would hold with the index still present (vacuous).
+        for i in 0..20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({}, 900)", 100 + i))
+                .expect("pad");
+        }
 
         // sys.indexes lists it.
         let (_, rows) = sql_rows(&engine, "SELECT name FROM sys.indexes");
