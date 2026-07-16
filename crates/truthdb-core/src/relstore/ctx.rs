@@ -72,6 +72,13 @@ pub(crate) struct TxnLink {
     pub txn_id: u64,
     pub last_lsn: u64,
     pub undo_log: Vec<(u64, PageOpUndo)>,
+    /// Row versions staged by the running statement (Stage 13), published to
+    /// the version store when the statement succeeds and discarded when it
+    /// rolls back. Empty unless a versioned isolation is enabled.
+    pub pending_versions: Vec<crate::relstore::version::PendingVersion>,
+    /// Versions this transaction has published, so a rollback (full or to a
+    /// savepoint) can reverse the publications exactly.
+    pub published_versions: Vec<crate::relstore::version::PublishRecord>,
 }
 
 /// A marker in a live transaction's log to which a later partial rollback can
@@ -81,6 +88,9 @@ pub(crate) struct TxnLink {
 pub(crate) struct Savepoint {
     pub undo_len: usize,
     pub last_lsn: u64,
+    /// Published-version count at capture, so a partial rollback unpublishes
+    /// exactly the versions of the statements it undoes.
+    pub published_len: usize,
 }
 
 impl TxnLink {
@@ -89,6 +99,7 @@ impl TxnLink {
         Savepoint {
             undo_len: self.undo_log.len(),
             last_lsn: self.last_lsn,
+            published_len: self.published_versions.len(),
         }
     }
 }
@@ -196,13 +207,17 @@ impl RelCtx<'_> {
             txn_id,
             last_lsn: lsn,
             undo_log: Vec::new(),
+            pending_versions: Vec::new(),
+            published_versions: Vec::new(),
         })
     }
 
     /// Commit = force the log at the commit record, then an end record. The
     /// end record is an ATT-cleanup optimization (analysis already treats
     /// COMMIT as terminal), so its failure must not fail a durable commit.
-    pub fn commit(&mut self, txn: TxnLink) -> Result<(), StorageError> {
+    /// Returns the commit record's LSN — the version store orders commits and
+    /// finds the durable prefix by it.
+    pub fn commit(&mut self, txn: TxnLink) -> Result<u64, StorageError> {
         // The commit record is written but NOT fsynced here: group commit makes
         // it durable via the log-writer once the executor calls
         // `Storage::ensure_durable` at the end of the batch, so one fsync serves
@@ -210,7 +225,7 @@ impl RelCtx<'_> {
         // batch is acknowledged; nothing before that ack depends on it.
         let commit_lsn = self.append(&RelRecord::txn_commit(txn.txn_id, txn.last_lsn), false)?;
         let _ = self.append(&RelRecord::txn_end(txn.txn_id, commit_lsn), false);
-        Ok(())
+        Ok(commit_lsn)
     }
 
     /// Applies a physiological op to its page and logs it. Callers must have

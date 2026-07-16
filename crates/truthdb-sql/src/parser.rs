@@ -1008,6 +1008,9 @@ impl Parser {
 
     fn parse_alter(&mut self) -> SqlResult<Statement> {
         let start = self.expect_keyword("ALTER")?;
+        if self.peek_keyword().as_deref() == Some("DATABASE") {
+            return self.parse_alter_database(start);
+        }
         self.expect_keyword("TABLE")?;
         let table = self.parse_name()?;
         let (action, end) = match self.peek_keyword().as_deref() {
@@ -1051,6 +1054,46 @@ impl Parser {
         Ok(Statement::AlterTable(AlterTable {
             table,
             action,
+            span: start.to(end),
+        }))
+    }
+
+    // ---- ALTER DATABASE -------------------------------------------------
+
+    /// `ALTER DATABASE {name | CURRENT} SET <option> {ON|OFF} [, ...]`.
+    /// Only the Stage 13 versioning options are recognized; anything else is
+    /// a syntax error rather than a silent no-op (these options change what
+    /// concurrent readers see).
+    fn parse_alter_database(&mut self, start: Span) -> SqlResult<Statement> {
+        self.expect_keyword("DATABASE")?;
+        let name = if self.peek_keyword().as_deref() == Some("CURRENT") {
+            self.bump();
+            None
+        } else {
+            Some(self.parse_name()?)
+        };
+        self.expect_keyword("SET")?;
+        let mut options = Vec::new();
+        let mut end;
+        loop {
+            let option = match self.peek_keyword().as_deref() {
+                Some("READ_COMMITTED_SNAPSHOT") => DatabaseOption::ReadCommittedSnapshot,
+                Some("ALLOW_SNAPSHOT_ISOLATION") => DatabaseOption::AllowSnapshotIsolation,
+                _ => {
+                    let token = self.peek().clone();
+                    return Err(SqlError::syntax(self.token_text(&token), token.span));
+                }
+            };
+            end = self.bump().span;
+            let on = self.parse_on_off()?;
+            options.push((option, on));
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        Ok(Statement::AlterDatabase(AlterDatabase {
+            name,
+            options,
             span: start.to(end),
         }))
     }

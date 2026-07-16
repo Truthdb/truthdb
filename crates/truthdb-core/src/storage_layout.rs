@@ -310,6 +310,18 @@ impl Superblock {
         out[72..80].copy_from_slice(&0u64.to_le_bytes());
         xxh64(&out, 0)
     }
+
+    /// Stage 13 database options, persisted as a bitfield in the first
+    /// reserved byte (zero on files created before the options existed —
+    /// both off, the defaults): bit 0 = `READ_COMMITTED_SNAPSHOT`, bit 1 =
+    /// `ALLOW_SNAPSHOT_ISOLATION`.
+    pub fn db_options(&self) -> u8 {
+        self.reserved[0]
+    }
+
+    pub fn set_db_options(&mut self, byte: u8) {
+        self.reserved[0] = byte;
+    }
 }
 
 #[repr(C)]

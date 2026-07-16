@@ -14,10 +14,10 @@ mod plan;
 mod value;
 
 use truthdb_sql::ast::{
-    AlterAction, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable, CreateView,
-    DataType, Declaration, Delete, DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind,
-    ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem, Select,
-    SelectItem, SetStatement, Statement, TableRef, Update,
+    AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable,
+    CreateView, DataType, DatabaseOption, Declaration, Delete, DropIndex, DropTable, DropView,
+    ExecStatement, Expr, ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind,
+    Name, OrderItem, Select, SelectItem, SetStatement, Statement, TableRef, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -33,6 +33,7 @@ use crate::relstore::btree::ScanCursor;
 use crate::relstore::catalog::{self, TableDef};
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
+use crate::relstore::version::ReadSnapshot;
 use crate::storage::{Storage, StorageError, StorageTxn, TxnScope};
 
 /// Per-session transaction state carried across statements/batches. Lives in
@@ -1025,12 +1026,80 @@ enum StatementOutcome {
     Streamed { rows: u64 },
 }
 
+thread_local! {
+    /// The running statement's read snapshot (Stage 13), when its isolation
+    /// is versioned — RCSI's per-statement view. Thread-local rather than
+    /// threaded through every read path: a batch executes synchronously on
+    /// one worker thread, and every nested read of the statement (subqueries,
+    /// views, derived tables, correlated re-evaluation) shares the statement
+    /// snapshot by construction.
+    static CURRENT_SNAPSHOT: std::cell::Cell<Option<ReadSnapshot>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The running statement's read snapshot, if it reads versioned.
+fn current_snapshot() -> Option<ReadSnapshot> {
+    CURRENT_SNAPSHOT.get()
+}
+
+/// Statement-scoped snapshot registration: capture on entry, and release —
+/// pruning must not wait on a statement that errored — on every exit path.
+struct SnapshotScope<'a> {
+    storage: &'a Storage,
+    seq: u64,
+}
+
+impl<'a> SnapshotScope<'a> {
+    fn enter(storage: &'a Storage, own_txn: Option<u64>) -> Self {
+        let snap = storage.capture_read_snapshot(own_txn);
+        CURRENT_SNAPSHOT.set(Some(snap));
+        SnapshotScope {
+            storage,
+            seq: snap.seq,
+        }
+    }
+}
+
+impl Drop for SnapshotScope<'_> {
+    fn drop(&mut self) {
+        CURRENT_SNAPSHOT.set(None);
+        self.storage.release_read_snapshot(self.seq);
+    }
+}
+
 /// Runs one statement. A plain `SELECT` the scan planner accepts streams its
 /// rows through `run` as the scan reads them — the whole point of the event
 /// stream: the client sees rows while the scan runs, and the statement's peak
 /// memory is one chunk, not the result. Everything else executes exactly as
 /// before and returns its materialized result.
 fn exec_statement_streamed(
+    storage: &Storage,
+    statement: &Statement,
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun<'_>,
+) -> Result<StatementOutcome, SqlError> {
+    // RCSI: a SELECT under READ COMMITTED with the database option on reads
+    // a statement snapshot instead of blocking on writers' locks. DML (and
+    // the reads inside it) stays lock-based — conservative versus SQL
+    // Server, which versions DML's reads too; the write locks it takes here
+    // subsume what versioning would relax.
+    let versioned = matches!(statement, Statement::Select(_))
+        && matches!(txn_ctx.isolation(), Isolation::ReadCommitted)
+        && storage.rcsi_enabled();
+    if versioned {
+        // The snapshot is the durable commit prefix, so the session's own
+        // just-committed statements must be fsync-durable before capture or
+        // the statement would not see them. Rowset-producing SELECTs already
+        // flushed in `run_block`; this covers assignment SELECTs (and then
+        // no-ops when nothing committed since the last durability point).
+        run.flush(storage)?;
+    }
+    let _snapshot_scope = versioned
+        .then(|| SnapshotScope::enter(storage, txn_ctx.txn.as_ref().map(StorageTxn::txn_id)));
+    exec_statement_streamed_inner(storage, statement, txn_ctx, run)
+}
+
+fn exec_statement_streamed_inner(
     storage: &Storage,
     statement: &Statement,
     txn_ctx: &mut TxnContext,
@@ -1074,6 +1143,7 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
             | Statement::AlterTable(_)
+            | Statement::AlterDatabase(_)
             | Statement::Exec(_)
             | Statement::Commit { .. }
     )
@@ -1392,6 +1462,13 @@ pub fn analyze_locks(
         )
     });
     let reads_lock = !matches!(isolation, Isolation::ReadUncommitted) || escalates_reads;
+    // Under READ_COMMITTED_SNAPSHOT, a READ COMMITTED SELECT reads a
+    // statement snapshot instead of blocking on writers: it takes Database IS
+    // only — the DDL fence for the batch's duration — and no Table S. A batch
+    // whose SET raises the level is analyzed lock-based (conservative: the
+    // raise is seen here, the exact statement boundary is not).
+    let versioned_reads =
+        matches!(isolation, Isolation::ReadCommitted) && !escalates_reads && storage.rcsi_enabled();
     let mut needs: std::collections::HashMap<Resource, LockMode> = std::collections::HashMap::new();
     let mut add = |resource: Resource, mode: LockMode| {
         needs
@@ -1414,7 +1491,9 @@ pub fn analyze_locks(
                 for name in tables {
                     for oid in read_lock_object_ids(storage, &name.value) {
                         add(Resource::Database, LockMode::IntentShared);
-                        add(Resource::Table(oid), LockMode::Shared);
+                        if !versioned_reads {
+                            add(Resource::Table(oid), LockMode::Shared);
+                        }
                     }
                 }
             }
@@ -1538,7 +1617,10 @@ pub fn analyze_locks(
             | Statement::DropView(_)
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
-            | Statement::AlterTable(_) => {
+            | Statement::AlterTable(_)
+            // ALTER DATABASE quiesces the database: no snapshot may be live
+            // and no writer mid-transaction while the options flip.
+            | Statement::AlterDatabase(_) => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // EXEC sp_executesql with a LITERAL statement is analyzable up
@@ -1555,8 +1637,21 @@ pub fn analyze_locks(
                     // (An inner SET raising isolation is seen by the
                     // recursion's own scan; it cannot outlive the EXEC — SET
                     // options revert at scope exit.)
+                    //
+                    // That level must be one the versioned-read path can
+                    // never claim: under RCSI the recursion's own
+                    // `versioned_reads` would drop Table S for a plain
+                    // READ COMMITTED, while at runtime the inner statement
+                    // executes under the OUTER effective level and reads
+                    // lock-based — a reachable dirty read at SERIALIZABLE
+                    // (caught by the adversarial review). READ COMMITTED is
+                    // passed only when it truly is the effective level.
                     let inner_isolation = if reads_lock {
-                        Isolation::ReadCommitted
+                        if matches!(isolation, Isolation::ReadCommitted) && !escalates_reads {
+                            Isolation::ReadCommitted
+                        } else {
+                            Isolation::RepeatableRead
+                        }
                     } else {
                         isolation
                     };
@@ -1700,6 +1795,19 @@ fn exec_statement(
             }
             let eval_ctx = txn_ctx.eval_context();
             exec_alter_table(storage, alter, &eval_ctx)
+        }
+        Statement::AlterDatabase(alter) => {
+            if txn_ctx.in_txn() {
+                // SQL Server 226: ALTER DATABASE is not allowed inside a
+                // multi-statement transaction.
+                return Err(SqlError::new(
+                    226,
+                    16,
+                    6,
+                    "ALTER DATABASE statement not allowed within multi-statement transaction.",
+                ));
+            }
+            exec_alter_database(storage, alter, txn_ctx)
         }
         Statement::Insert(insert) => {
             let eval_ctx = txn_ctx.eval_context();
@@ -2840,6 +2948,9 @@ fn enforce_parent_fks(
                                     upper,
                                     None,
                                     false,
+                                    // Integrity probe: must see the current
+                                    // state, never a snapshot.
+                                    None,
                                 )
                                 .map_err(|e| map_storage_err(e, &child.name))?;
                             if !matches.is_empty() {
@@ -3197,6 +3308,42 @@ fn exec_drop_index(storage: &Storage, drop: &DropIndex) -> Result<StatementResul
 }
 
 // ---- ALTER TABLE --------------------------------------------------------
+
+/// `ALTER DATABASE {name | CURRENT} SET READ_COMMITTED_SNAPSHOT /
+/// ALLOW_SNAPSHOT_ISOLATION {ON|OFF}`. The batch's Database X lock has
+/// quiesced the store: no snapshot is live, no writer is mid-transaction.
+fn exec_alter_database(
+    storage: &Storage,
+    alter: &AlterDatabase,
+    txn_ctx: &TxnContext,
+) -> Result<StatementResult, SqlError> {
+    if let Some(name) = &alter.name
+        && !name.value.eq_ignore_ascii_case(&txn_ctx.database)
+    {
+        return Err(SqlError::new(
+            911,
+            16,
+            1,
+            format!(
+                "Database '{}' does not exist. Make sure that the name is entered correctly.",
+                name.value
+            ),
+        )
+        .at(name.span));
+    }
+    let mut rcsi = None;
+    let mut allow_snapshot = None;
+    for (option, on) in &alter.options {
+        match option {
+            DatabaseOption::ReadCommittedSnapshot => rcsi = Some(*on),
+            DatabaseOption::AllowSnapshotIsolation => allow_snapshot = Some(*on),
+        }
+    }
+    storage
+        .rel_set_db_options(rcsi, allow_snapshot)
+        .map_err(|err| map_storage_err(err, &txn_ctx.database))?;
+    Ok(StatementResult::Done)
+}
 
 fn exec_alter_table(
     storage: &Storage,
@@ -6164,21 +6311,36 @@ fn scan_select_rows(
 
     match &plan.access {
         plan::AccessPath::TableScan => {
-            let mut cursor = ScanCursor::start();
-            let mut slice: Vec<Vec<Datum>> = Vec::new();
-            'scan: while !cursor.done() {
-                cursor = storage
-                    .rel_scan_slice(
-                        &plan.table,
-                        cursor,
-                        SCAN_SLICE_ROWS,
-                        Some(&plan.needed),
-                        &mut slice,
-                    )
+            if let Some(snapshot) = current_snapshot() {
+                // A versioned reader holds no table lock, so the sliced
+                // cursor's between-slice contract does not hold for it; the
+                // snapshot scan reads the table atomically and merges the
+                // version store.
+                let rows = storage
+                    .rel_scan_snapshot(&plan.table, Some(&plan.needed), snapshot)
                     .map_err(|err| map_storage_err(err, &plan.table))?;
-                for row in slice.drain(..) {
+                for row in rows {
                     if !take(row)? {
-                        break 'scan;
+                        break;
+                    }
+                }
+            } else {
+                let mut cursor = ScanCursor::start();
+                let mut slice: Vec<Vec<Datum>> = Vec::new();
+                'scan: while !cursor.done() {
+                    cursor = storage
+                        .rel_scan_slice(
+                            &plan.table,
+                            cursor,
+                            SCAN_SLICE_ROWS,
+                            Some(&plan.needed),
+                            &mut slice,
+                        )
+                        .map_err(|err| map_storage_err(err, &plan.table))?;
+                    for row in slice.drain(..) {
+                        if !take(row)? {
+                            break 'scan;
+                        }
                     }
                 }
             }
@@ -6199,6 +6361,7 @@ fn scan_select_rows(
                     upper.clone(),
                     Some(&plan.needed),
                     plan.covering,
+                    current_snapshot(),
                 )
                 .map_err(|err| map_storage_err(err, &plan.table))?;
             for row in rows {
@@ -7284,10 +7447,20 @@ fn build_table_source(
                 // A scan is handed out LAZY: the consumer pulls slices, so a
                 // filtering/folding reader holds one slice, not the table
                 // (and the storage lock is still taken per slice, as before).
-                plan::AccessPath::TableScan => SourceRows::Scan(ScanStream {
-                    table: def.name.clone(),
-                    cursor: ScanCursor::start(),
-                }),
+                // Under a read snapshot the scan materializes atomically
+                // instead: a versioned reader holds no table lock, so the
+                // sliced cursor's contract does not hold for it.
+                plan::AccessPath::TableScan => match current_snapshot() {
+                    Some(snapshot) => SourceRows::Materialized(
+                        storage
+                            .rel_scan_snapshot(&def.name, None, snapshot)
+                            .map_err(|err| map_storage_err(err, &def.name))?,
+                    ),
+                    None => SourceRows::Scan(ScanStream {
+                        table: def.name.clone(),
+                        cursor: ScanCursor::start(),
+                    }),
+                },
                 plan::AccessPath::IndexSeek {
                     index_object_id,
                     lower,
@@ -7295,7 +7468,15 @@ fn build_table_source(
                     ..
                 } => SourceRows::Materialized(
                     storage
-                        .rel_index_scan(&def.name, index_object_id, lower, upper, None, false)
+                        .rel_index_scan(
+                            &def.name,
+                            index_object_id,
+                            lower,
+                            upper,
+                            None,
+                            false,
+                            current_snapshot(),
+                        )
                         .map_err(|err| map_storage_err(err, &def.name))?,
                 ),
             };

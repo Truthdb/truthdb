@@ -283,6 +283,19 @@ impl Engine {
         self.storage.wal_usage_ratio()
     }
 
+    /// Drops version-store history no live snapshot can need (called by the
+    /// session pool's maintenance thread; cheap when nothing is versioned).
+    pub(crate) fn version_prune(&self) {
+        self.storage.version_prune();
+    }
+
+    /// The lock-analysis epoch (bumped by `ALTER DATABASE` option flips): the
+    /// scheduler re-analyzes parked batches whose epoch is stale before
+    /// granting them.
+    pub(crate) fn lock_analysis_epoch(&self) -> u64 {
+        self.storage.lock_analysis_epoch()
+    }
+
     fn maybe_checkpoint(&self, meta: &EngineMeta) -> Result<(), EngineError> {
         // A (fuzzy) checkpoint flushes dirty pages and truncates the WAL head to
         // the oldest open transaction's begin LSN, so it may run with open
