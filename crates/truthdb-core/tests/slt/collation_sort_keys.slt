@@ -157,9 +157,11 @@ b
 ö
 z
 
-# A range through the clustered key follows linguistic order too: under the
-# root collation 'å'/'ä' fall BELOW 'b' even though their code points sort
-# past 'z' — a code-point-ordered key would drop them.
+# A range filter over the clustered table agrees with linguistic order: under
+# the root collation 'å'/'ä' fall BELOW 'b' even though their code points sort
+# past 'z'. (This runs as a filtered scan — the planner seeks only secondary
+# indexes — so it pins the FILTER's order; the seek-side pin is the engine
+# test sql_range_seek_follows_linguistic_order_not_code_points.)
 query T rowsort
 SELECT w FROM root WHERE w < 'b'
 ----

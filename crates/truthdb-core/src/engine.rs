@@ -4879,6 +4879,172 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// A/B (seek vs scan) equality for character range seeks
+    /// across collations, with supplementary-plane characters, empty strings
+    /// and NULLs in both the stored data and the bounds.
+    #[test]
+    fn character_range_seeks_match_scans_across_collations() {
+        let values = [
+            "a",
+            "A",
+            "b",
+            "z",
+            "Z",
+            "å",
+            "ä",
+            "ö",
+            "é",
+            "e",
+            "aa",
+            "ab",
+            "",
+            "z\u{1F600}",
+            "a\u{1F600}",
+            "\u{1F600}",
+            "\u{1F600}a",
+            "\u{20000}",
+            "\u{10000}",
+            "\u{E000}",
+            "\u{FFFD}",
+            "\u{10FFFF}",
+        ];
+        let bounds = ["a", "å", "b", "z", "\u{1F600}", "\u{E000}", "\u{20000}", ""];
+        let ops = [">", ">=", "<", "<="];
+        for (label, decl) in [
+            ("nv-default", "NVARCHAR(40)"),
+            ("nv-cs", "NVARCHAR(40) COLLATE Latin1_General_CS_AS"),
+            ("nv-ai", "NVARCHAR(40) COLLATE Latin1_General_CI_AI"),
+            ("nv-bin2", "NVARCHAR(40) COLLATE Latin1_General_BIN2"),
+            ("nv-sv", "NVARCHAR(40) COLLATE Finnish_Swedish_CI_AS"),
+            ("vc-default", "VARCHAR(40)"),
+            ("vc-bin2", "VARCHAR(40) COLLATE Latin1_General_BIN2"),
+        ] {
+            let path = unique_temp_path(&format!("probe-ab-{label}"));
+            let engine = new_engine(&path);
+            engine
+                .execute(&format!(
+                    "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, w {decl})"
+                ))
+                .expect("create");
+            for (i, v) in values.iter().enumerate() {
+                // BIN2/CS keep 'a'/'A' distinct; CI collations make some
+                // values duplicate keys — allowed (non-unique index).
+                engine
+                    .execute(&format!("INSERT INTO t VALUES ({i}, '{v}')"))
+                    .expect("insert");
+            }
+            // NULLs and padding past the tiny-table tie-break.
+            for i in 0..12 {
+                engine
+                    .execute(&format!("INSERT INTO t VALUES ({}, NULL)", 100 + i))
+                    .expect("insert null");
+            }
+            engine.execute("CREATE INDEX ix_w ON t (w)").expect("index");
+            let mut queries = Vec::new();
+            for b in bounds {
+                for op in ops {
+                    queries.push(format!("SELECT id FROM t WHERE w {op} '{b}' ORDER BY id"));
+                }
+            }
+            let mut with_index = Vec::new();
+            for q in &queries {
+                let plan = plan_lines(&engine, q.strip_suffix(" ORDER BY id").unwrap());
+                assert!(
+                    plan.iter().any(|l| l.contains("Index Seek")),
+                    "{label}: expected seek for {q}: {plan:?}"
+                );
+                with_index.push(sql_rows(&engine, q).1);
+            }
+            engine.execute("DROP INDEX ix_w ON t").expect("drop");
+            for (q, seeked) in queries.iter().zip(with_index) {
+                let scanned = sql_rows(&engine, q).1;
+                assert_eq!(scanned, seeked, "{label}: seek != scan for {q}");
+            }
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    /// Composite (eq prefix + NVARCHAR range) and DESC-column
+    /// bounds, exercising prefix_upper_bound's carry over inverted bytes.
+    #[test]
+    fn composite_and_desc_index_bounds_match_scans() {
+        let path = unique_temp_path("probe-composite-desc");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, k INT, w NVARCHAR(40))")
+            .expect("create");
+        let values = [
+            "a",
+            "b",
+            "z",
+            "å",
+            "ä",
+            "\u{1F600}",
+            "z\u{1F600}",
+            "\u{20000}",
+            "\u{E000}",
+            "aa",
+        ];
+        let mut id = 0;
+        for k in [1, 2, 3] {
+            for v in values {
+                engine
+                    .execute(&format!("INSERT INTO t VALUES ({id}, {k}, '{v}')"))
+                    .expect("insert");
+                id += 1;
+            }
+        }
+        engine
+            .execute("CREATE INDEX ix_kw ON t (k, w)")
+            .expect("index");
+        let mut queries = Vec::new();
+        for b in ["å", "b", "\u{1F600}", "z"] {
+            for op in [">", ">=", "<", "<="] {
+                queries.push(format!(
+                    "SELECT id FROM t WHERE k = 2 AND w {op} '{b}' ORDER BY id"
+                ));
+            }
+        }
+        // Equality-only on k too (prefix_upper_bound over the eq prefix).
+        queries.push("SELECT id FROM t WHERE k = 2 ORDER BY id".to_string());
+        let mut with_index = Vec::new();
+        for q in &queries {
+            let plan = plan_lines(&engine, q.strip_suffix(" ORDER BY id").unwrap());
+            assert!(
+                plan.iter().any(|l| l.contains("Index Seek")),
+                "expected seek for {q}: {plan:?}"
+            );
+            with_index.push(sql_rows(&engine, q).1);
+        }
+        engine.execute("DROP INDEX ix_kw ON t").expect("drop");
+        for (q, seeked) in queries.iter().zip(with_index) {
+            let scanned = sql_rows(&engine, q).1;
+            assert_eq!(scanned, seeked, "composite: seek != scan for {q}");
+        }
+
+        // DESC index: a range must NOT seek (bounds are not inverted), an
+        // equality must seek correctly through inverted-byte bounds
+        // (prefix_upper_bound's 0xFF carry path).
+        engine
+            .execute("CREATE INDEX ix_wd ON t (w DESC)")
+            .expect("desc index");
+        let plan = plan_lines(&engine, "SELECT id FROM t WHERE w < 'b'");
+        assert!(
+            plan.iter().all(|l| !l.contains("Index Seek")),
+            "a DESC column must not back a range seek: {plan:?}"
+        );
+        let q = "SELECT id FROM t WHERE w = 'å' ORDER BY id";
+        let plan = plan_lines(&engine, "SELECT id FROM t WHERE w = 'å'");
+        assert!(
+            plan.iter().any(|l| l.contains("Index Seek")),
+            "DESC equality seeks: {plan:?}"
+        );
+        let seeked = sql_rows(&engine, q).1;
+        engine.execute("DROP INDEX ix_wd ON t").expect("drop");
+        assert_eq!(sql_rows(&engine, q).1, seeked, "desc eq: seek != scan");
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn sql_drop_index_is_table_scoped() {
         let path = unique_temp_path("sql-drop-scoped");

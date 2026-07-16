@@ -250,20 +250,20 @@ fn try_index(index: &IndexDef, schema: &Schema, sargs: &[Sarg]) -> Option<(u32, 
             break;
         }
     }
-    // Optional single range on the next column. Ascending only (a descending
-    // range would need reversed bounds) and never NVARCHAR (UTF-16BE key order
-    // can diverge from the filter's code-point order); equality prefixes above
-    // are exact matches and stay correct for all types.
+    // Optional single range on the next column. Ascending only: a descending
+    // range would need reversed bounds. Equality prefixes above are exact
+    // matches and stay correct for all types.
     let mut lower_extra: Option<Datum> = None;
     let mut upper_extra: Option<Datum> = None;
     if i < index.columns.len() {
         let (col, ascending) = index.columns[i];
         // Character range seeks are correct for VARCHAR and NVARCHAR alike
         // since #94: both key encodings are the collation's SORT KEY
-        // (`encode_datum_collated`), whose byte order IS the filter's compare
-        // order (`Collation::sort_key` is asserted to agree with `compare`
-        // exhaustively). The old NVARCHAR exclusion guarded UTF-16BE keys,
-        // which no longer exist.
+        // (`encode_datum_collated`), whose byte order is the filter's compare
+        // order — pinned by `truthdb-sql/tests/sortkey_order.rs`, the
+        // tripwire for icu updates (sort keys ride a semver-exempt icu
+        // feature). The old NVARCHAR exclusion guarded UTF-16BE keys, which
+        // no longer exist.
         if ascending {
             for sarg in sargs.iter().filter(|s| s.column == col) {
                 match sarg.op {
