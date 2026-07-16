@@ -9,11 +9,10 @@ license = "MIT"
 tokio = { workspace = true }
 tracing = { workspace = true }
 truthdb-core = { path = "../truthdb-core", version = "0.1.0" }
+# The SqlError a decode failure renders in-frame (and tests model with).
+truthdb-sql = { path = "../truthdb-sql", version = "0.1.0" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
 rustls-pemfile = "2"
 
 [dev-dependencies]
-# Only to build the SqlError an engine reply carries, so a test can model what
-# the executor really sends on cancellation.
-truthdb-sql = { path = "../truthdb-sql", version = "0.1.0" }

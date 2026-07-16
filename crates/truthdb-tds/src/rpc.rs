@@ -86,8 +86,29 @@ pub struct RpcRequest {
 }
 
 /// Decodes an RPC request body (the bytes *after* the ALL_HEADERS block).
-pub fn parse_rpc_request(body: &[u8]) -> io::Result<RpcRequest> {
+/// A request may carry several RPCs separated by batch flags (0xFF, or 0x80
+/// from older TDS versions) — mssql-jdbc batches sp_unprepare calls with the
+/// next execution's sp_prepexec this way. Each runs in order and answers its
+/// own DONEPROC-framed reply within the one response.
+pub fn parse_rpc_requests(body: &[u8]) -> io::Result<Vec<RpcRequest>> {
     let mut c = Cursor::new(body);
+    let mut requests = Vec::new();
+    loop {
+        requests.push(parse_one_rpc(&mut c)?);
+        if c.remaining() == 0 {
+            return Ok(requests);
+        }
+        // The separator byte; the next RPC's NameLenProcID follows.
+        let _flag = c.u8()?;
+        if c.remaining() == 0 {
+            // A trailing separator with nothing after it.
+            return Ok(requests);
+        }
+    }
+}
+
+/// Decodes one RPC from the cursor, stopping at a batch separator.
+fn parse_one_rpc(c: &mut Cursor) -> io::Result<RpcRequest> {
     // NameLenProcID: a US_VARCHAR proc name, or 0xFFFF + a well-known ProcID.
     let name_len = c.u16()?;
     let proc = if name_len == PROCID_SENTINEL {
@@ -127,8 +148,8 @@ pub fn parse_rpc_request(body: &[u8]) -> io::Result<RpcRequest> {
 
     let mut params = Vec::new();
     while c.remaining() > 0 {
-        // A batch flag (0x80 = fWithRecompile / 0xFF = separator) begins the
-        // next RPC in a multi-RPC request; we run the first and stop there.
+        // A batch flag (0x80 = old-style / 0xFF = separator) begins the next
+        // RPC in a multi-RPC request; the caller consumes it and loops.
         let lead = c.peek_u8();
         if lead == 0xff || lead == 0x80 {
             break;
@@ -136,7 +157,7 @@ pub fn parse_rpc_request(body: &[u8]) -> io::Result<RpcRequest> {
         let name_len = c.u8()? as usize;
         let name = c.utf16(name_len * 2)?;
         let _status = c.u8()?; // StatusFlags: fByRefValue / fDefaultValue.
-        let (column_type, value) = decode_param(&mut c)?;
+        let (column_type, value) = decode_param(c)?;
         params.push(RpcParam {
             name,
             column_type,
@@ -144,6 +165,13 @@ pub fn parse_rpc_request(body: &[u8]) -> io::Result<RpcRequest> {
         });
     }
     Ok(RpcRequest { proc, params })
+}
+
+/// Decodes a body expected to hold exactly one RPC (tests' shorthand).
+#[cfg(test)]
+pub fn parse_rpc_request(body: &[u8]) -> io::Result<RpcRequest> {
+    let mut requests = parse_rpc_requests(body)?;
+    Ok(requests.remove(0))
 }
 
 /// Splits an `sp_executesql` parameter list into (statement text, value
@@ -624,6 +652,29 @@ mod tests {
         let bytes: Vec<u8> = value.encode_utf16().flat_map(|u| u.to_le_bytes()).collect();
         b.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
         b.extend_from_slice(&bytes);
+    }
+
+    #[test]
+    fn a_multi_rpc_body_parses_each_rpc() {
+        let mut b = Vec::new();
+        b.extend_from_slice(&PROCID_SENTINEL.to_le_bytes());
+        b.extend_from_slice(&SP_EXECUTESQL_PROCID.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        push_nvarchar_param(&mut b, "", "SELECT 1 AS a");
+        b.push(0xff); // batch separator
+        b.extend_from_slice(&PROCID_SENTINEL.to_le_bytes());
+        b.extend_from_slice(&SP_EXECUTESQL_PROCID.to_le_bytes());
+        b.extend_from_slice(&0u16.to_le_bytes());
+        push_nvarchar_param(&mut b, "", "SELECT 2 AS b");
+
+        let requests = parse_rpc_requests(&b).expect("parse");
+        assert_eq!(requests.len(), 2);
+        for (request, want) in requests.into_iter().zip(["SELECT 1 AS a", "SELECT 2 AS b"]) {
+            assert!(matches!(request.proc, RpcProc::SpExecuteSql));
+            let (sql, values) = split_sp_executesql(request.params).expect("split");
+            assert_eq!(sql, want);
+            assert!(values.is_empty());
+        }
     }
 
     #[test]

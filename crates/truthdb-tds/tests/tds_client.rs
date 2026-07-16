@@ -163,6 +163,20 @@ impl Client {
         parse_tokens(&payload)
     }
 
+    /// Sends a PKT_RPC message with the given (post-headers) body and
+    /// returns the response tokens.
+    async fn rpc(&mut self, body: &[u8]) -> Vec<Token> {
+        let mut payload = Vec::new();
+        let headers = all_headers(self.tran_descriptor);
+        let total = 4 + headers.len();
+        payload.extend_from_slice(&(total as u32).to_le_bytes());
+        payload.extend_from_slice(&headers);
+        payload.extend_from_slice(body);
+        self.write_packet(0x03, &payload).await;
+        let (_, response) = self.read_message().await;
+        parse_tokens(&response)
+    }
+
     async fn batch(&mut self, sql: &str) -> Vec<Token> {
         let mut payload = Vec::new();
         // ALL_HEADERS: TotalLength includes itself (the 4-byte field) plus
@@ -288,6 +302,10 @@ enum Token {
     Error { number: i32 },
     EnvChange { kind: u8, descriptor: u64 },
     Done { count: Option<u64>, in_xact: bool },
+    DoneInProc { count: Option<u64> },
+    DoneProc { more: bool, error: bool },
+    ReturnStatus(i32),
+    ReturnValue,
     Other(u8),
 }
 
@@ -361,10 +379,36 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
                 let has_count = status & 0x0010 != 0;
                 let in_xact = status & 0x0004 != 0;
                 i += 12;
-                tokens.push(Token::Done {
-                    count: has_count.then_some(count),
-                    in_xact,
+                tokens.push(match token {
+                    0xfd => Token::Done {
+                        count: has_count.then_some(count),
+                        in_xact,
+                    },
+                    0xfe => Token::DoneProc {
+                        more: status & 0x0001 != 0,
+                        error: status & 0x0002 != 0,
+                    },
+                    _ => Token::DoneInProc {
+                        count: has_count.then_some(count),
+                    },
                 });
+            }
+            0x79 => {
+                let value = i32::from_le_bytes(payload[i..i + 4].try_into().unwrap());
+                i += 4;
+                tokens.push(Token::ReturnStatus(value));
+            }
+            0xac => {
+                // RETURNVALUE: ordinal u16, B_VARCHAR name, status u8,
+                // usertype u32, flags u16, TYPE_INFO(INTN,4), value.
+                i += 2;
+                let name_chars = payload[i] as usize;
+                i += 1 + name_chars * 2;
+                i += 1 + 4 + 2; // status, usertype, flags
+                i += 2; // INTN + max len
+                let len = payload[i] as usize;
+                i += 1 + len;
+                tokens.push(Token::ReturnValue);
             }
             other => {
                 tokens.push(Token::Other(other));
@@ -705,6 +749,101 @@ async fn computed_columns_and_constant_select() {
 const TM_BEGIN_XACT: u16 = 5;
 const TM_COMMIT_XACT: u16 = 7;
 const TM_ROLLBACK_XACT: u16 = 8;
+
+/// One sp_executesql RPC (by ProcID) with a single unnamed @stmt param.
+fn sp_executesql_rpc(sql: &str) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&0xffffu16.to_le_bytes()); // ProcID sentinel
+    b.extend_from_slice(&10u16.to_le_bytes()); // sp_executesql
+    b.extend_from_slice(&0u16.to_le_bytes()); // option flags
+    b.push(0); // empty param name
+    b.push(0); // status
+    b.push(0xe7); // NVARCHAR
+    b.extend_from_slice(&8000u16.to_le_bytes());
+    b.extend_from_slice(&[0x09, 0x04, 0xd0, 0x00, 0x34]); // collation
+    let bytes = ucs2le(sql);
+    b.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+    b.extend_from_slice(&bytes);
+    b
+}
+
+/// A multi-RPC request (mssql-jdbc's default flow batches sp_unprepare with
+/// the next sp_prepexec this way): each RPC answers its own DONEPROC-framed
+/// reply — DONE_MORE on every DONEPROC but the last — inside one response.
+#[tokio::test]
+async fn a_multi_rpc_request_answers_each_rpc_in_one_response() {
+    let path = temp_path("multirpc");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+
+    let mut body = sp_executesql_rpc("SELECT 1 AS a");
+    body.push(0xff); // batch separator
+    body.extend(sp_executesql_rpc("SELECT 2 AS b"));
+    let tokens = client.rpc(&body).await;
+
+    let ints: Vec<i64> = row_ints(&tokens);
+    assert_eq!(ints, [1, 2], "tokens: {tokens:?}");
+    let procs: Vec<(bool, bool)> = tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::DoneProc { more, error } => Some((*more, *error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        procs,
+        [(true, false), (false, false)],
+        "every DONEPROC but the last carries DONE_MORE: {tokens:?}"
+    );
+    assert_eq!(
+        tokens
+            .iter()
+            .filter(|t| matches!(t, Token::ReturnStatus(0)))
+            .count(),
+        2,
+        "one RETURNSTATUS per RPC: {tokens:?}"
+    );
+
+    // An erroring RPC does not take the rest of the request with it: the
+    // second RPC still runs and the response stays framed.
+    let mut body = Vec::new();
+    body.extend_from_slice(&0xffffu16.to_le_bytes());
+    body.extend_from_slice(&15u16.to_le_bytes()); // sp_unprepare
+    body.extend_from_slice(&0u16.to_le_bytes());
+    body.push(0); // empty param name
+    body.push(0); // status
+    b_int(&mut body, 42); // a handle that was never prepared
+    body.push(0xff);
+    body.extend(sp_executesql_rpc("SELECT 3 AS c"));
+    let tokens = client.rpc(&body).await;
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(t, Token::Error { number: 8179 })),
+        "tokens: {tokens:?}"
+    );
+    assert_eq!(row_ints(&tokens), [3], "tokens: {tokens:?}");
+    let procs: Vec<(bool, bool)> = tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::DoneProc { more, error } => Some((*more, *error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(procs, [(true, true), (false, false)], "tokens: {tokens:?}");
+
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An INTN(4) parameter value.
+fn b_int(b: &mut Vec<u8>, value: i32) {
+    b.push(0x26); // INTN
+    b.push(4);
+    b.push(4);
+    b.extend_from_slice(&value.to_le_bytes());
+}
 
 fn has_envchange(tokens: &[Token], kind: u8) -> bool {
     tokens
