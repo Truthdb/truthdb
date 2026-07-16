@@ -42,6 +42,9 @@ pub enum Statement {
     AlterTable(AlterTable),
     /// `DECLARE @a TYPE [= expr], ...` — batch variable declarations.
     Declare(Vec<Declaration>),
+    /// `EXEC[UTE] <proc> [args...]` — the T-SQL text path to the system
+    /// procedures (`sp_executesql` is the supported one).
+    Exec(ExecStatement),
     /// `BEGIN TRY <try_block> END TRY BEGIN CATCH <catch_block> END CATCH`. An
     /// error in the try block transfers control to the catch block.
     TryCatch {
@@ -59,6 +62,21 @@ pub struct Declaration {
     pub data_type: DataType,
     pub initializer: Option<Expr>,
     pub span: Span,
+}
+
+/// `EXEC[UTE] <proc> [@name =] <expr> [, ...]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecStatement {
+    pub proc: Name,
+    pub args: Vec<ExecArg>,
+    pub span: Span,
+}
+
+/// One argument of an `EXEC`: optionally named (`@p = expr`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct ExecArg {
+    pub name: Option<Name>,
+    pub value: Expr,
 }
 
 /// `ALTER TABLE <table> <action>`.

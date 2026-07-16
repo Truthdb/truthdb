@@ -255,6 +255,12 @@ impl<'a> Lexer<'a> {
                 Ok(single(TokenKind::Ne, 2))
             }
             b'\'' => self.lex_string(start),
+            // A Unicode string literal: `N'...'`. Everything here is Unicode
+            // already, so the prefix only selects string lexing.
+            b'N' | b'n' if self.peek2() == Some(b'\'') => {
+                self.pos += 1;
+                self.lex_string(start)
+            }
             b'[' => self.lex_bracket_ident(start),
             b'"' => self.lex_quoted_ident(start),
             b'@' if self.peek2() == Some(b'@') => {

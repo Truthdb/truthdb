@@ -19,3 +19,8 @@ name
 one                 
 
 (1 rows affected)
+via_exec            
+--------------------
+                   3
+
+(1 rows affected)

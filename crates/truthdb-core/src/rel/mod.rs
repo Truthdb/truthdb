@@ -15,9 +15,9 @@ mod value;
 
 use truthdb_sql::ast::{
     AlterAction, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable, CreateView,
-    DataType, Declaration, Delete, DropIndex, DropTable, DropView, Expr, ExprKind, ForeignKey,
-    Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem, Select, SelectItem,
-    SetStatement, Statement, TableRef, Update,
+    DataType, Declaration, Delete, DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind,
+    ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem, Select,
+    SelectItem, SetStatement, Statement, TableRef, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -579,6 +579,155 @@ impl BatchRun<'_> {
 /// batch policy. Returns `Err` when the enclosing context must stop: a cancel,
 /// an error that propagates to a `CATCH`, or a dooming/terminating error at the
 /// top level.
+/// The inner SQL text of an `EXEC sp_executesql N'...'` whose statement
+/// argument is a string LITERAL — the analyzable case. `None` for any other
+/// procedure or a non-literal statement argument.
+fn exec_literal_sql(exec: &ExecStatement) -> Option<String> {
+    if !strip_schema(&exec.proc.value).eq_ignore_ascii_case("sp_executesql") {
+        return None;
+    }
+    let stmt = exec
+        .args
+        .iter()
+        .find(|a| {
+            a.name.as_ref().is_some_and(|n| {
+                n.value.eq_ignore_ascii_case("stmt") || n.value.eq_ignore_ascii_case("statement")
+            })
+        })
+        .or_else(|| exec.args.first().filter(|a| a.name.is_none()))?;
+    match &stmt.value.kind {
+        ExprKind::Str(text) => Some(text.clone()),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test hook mirroring EXEC_DEPTH assertions.
+    static EXEC_DEPTH_SEEN: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+thread_local! {
+    /// Nesting depth of EXEC inner batches on this worker (SQL Server caps
+    /// procedure nesting at 32, error 217).
+    static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// Runs `EXEC sp_executesql @stmt [, @params, values...]`: evaluates the
+/// arguments against the CURRENT variables, then runs the inner text as its
+/// own batch scope — fresh variables seeded from the declared parameters
+/// (inner DECLAREs do not leak out; outer variables are not visible inside),
+/// sharing the transaction context. Each inner statement emits its own
+/// events, exactly like a top-level statement. Any other procedure answers
+/// 2812, the same as the RPC path.
+fn run_exec(
+    storage: &Storage,
+    exec: &ExecStatement,
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun<'_>,
+    in_try: bool,
+) -> Result<(), SqlError> {
+    if !strip_schema(&exec.proc.value).eq_ignore_ascii_case("sp_executesql") {
+        return Err(SqlError::new(
+            2812,
+            16,
+            62,
+            format!("Could not find stored procedure '{}'.", exec.proc.value),
+        )
+        .at(exec.proc.span));
+    }
+    let eval_ctx = txn_ctx.eval_context();
+    let mut positional = Vec::new();
+    let mut named: Vec<(String, SqlValue)> = Vec::new();
+    for arg in &exec.args {
+        let value = eval_constant(&arg.value, &eval_ctx)?;
+        match &arg.name {
+            Some(n) => named.push((n.value.clone(), value)),
+            None => positional.push(value),
+        }
+    }
+    let take_named = |named: &mut Vec<(String, SqlValue)>, keys: &[&str]| -> Option<SqlValue> {
+        let index = named
+            .iter()
+            .position(|(n, _)| keys.iter().any(|k| n.eq_ignore_ascii_case(k)))?;
+        Some(named.remove(index).1)
+    };
+    let mut positional = positional.into_iter();
+    let stmt = take_named(&mut named, &["stmt", "statement"])
+        .or_else(|| positional.next())
+        .ok_or_else(|| {
+            SqlError::new(
+                214,
+                16,
+                2,
+                "Procedure expects parameter '@statement' of type 'ntext/nchar/nvarchar'.",
+            )
+        })?;
+    let SqlValue::Str(sql) = stmt else {
+        return Err(SqlError::new(
+            214,
+            16,
+            2,
+            "Procedure expects parameter '@statement' of type 'ntext/nchar/nvarchar'.",
+        ));
+    };
+    let decls =
+        match take_named(&mut named, &["params", "parameters"]).or_else(|| positional.next()) {
+            Some(SqlValue::Str(d)) => d,
+            Some(SqlValue::Null) | None => String::new(),
+            Some(_) => {
+                return Err(SqlError::new(
+                    214,
+                    16,
+                    3,
+                    "Procedure expects parameter '@params' of type 'ntext/nchar/nvarchar'.",
+                ));
+            }
+        };
+    // Bind values: named ones by their own names, positional ones from the
+    // declaration list, exactly as the RPC path binds unnamed wire values.
+    let names = decl_names(&decls);
+    let mut seeded: Vec<(String, SqlValue)> = named;
+    for (i, value) in positional.enumerate() {
+        let Some(name) = names.get(i) else {
+            return Err(SqlError::new(
+                8144,
+                16,
+                2,
+                "Procedure or function has too many arguments specified.",
+            ));
+        };
+        seeded.push((name.clone(), value));
+    }
+    let statements = truthdb_sql::parse(&sql)?;
+
+    // The inner batch is its own variable scope, on the shared transaction.
+    let outer_vars = std::mem::take(&mut txn_ctx.variables);
+    for (name, value) in seeded {
+        let key = name.trim_start_matches('@').to_ascii_lowercase();
+        let column_type = value::infer_type(std::slice::from_ref(&value));
+        txn_ctx.variables.insert(key, (column_type, value));
+    }
+    let depth = EXEC_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    let result = if depth > 32 {
+        Err(SqlError::new(
+            217,
+            16,
+            1,
+            "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).",
+        ))
+    } else {
+        run_block(storage, &statements, txn_ctx, run, in_try)
+    };
+    EXEC_DEPTH.with(|d| d.set(d.get() - 1));
+    txn_ctx.variables = outer_vars;
+    result
+}
+
 fn run_block(
     storage: &Storage,
     statements: &[Statement],
@@ -590,6 +739,35 @@ fn run_block(
         // A TDS Attention (cancel) aborts the batch before the next statement.
         // It is never catchable — it propagates straight out, past any TRY.
         check_cancelled()?;
+        if let Statement::Exec(exec) = statement {
+            // The inner statements flow through `run_block` recursion, whose
+            // own loop applies the per-statement flush and commit flag — the
+            // same shape as TRY/CATCH dispatch. Errors take the ordinary
+            // statement path: cancels and durability failures propagate, a
+            // TRY transfers to CATCH, XACT_ABORT OFF continues the batch.
+            match run_exec(storage, exec, txn_ctx, run, in_try) {
+                Ok(()) => {}
+                Err(error) if error.number == CANCEL_ERROR => return Err(error),
+                Err(error) if run.durability_failed => return Err(error),
+                Err(error) if in_try => {
+                    run.abort_open_rowset(txn_ctx.in_txn());
+                    return Err(error);
+                }
+                Err(error) => {
+                    let dooms = txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY;
+                    if txn_ctx.in_txn() && !dooms {
+                        run.abort_open_rowset(txn_ctx.in_txn());
+                        run.last_error = Some(error);
+                        continue;
+                    }
+                    if txn_ctx.in_txn() {
+                        txn_ctx.doomed = true;
+                    }
+                    return Err(error);
+                }
+            }
+            continue;
+        }
         if let Statement::TryCatch {
             try_block,
             catch_block,
@@ -828,6 +1006,8 @@ fn produces_rowset(statement: &Statement) -> bool {
             .items
             .iter()
             .any(|i| matches!(i, SelectItem::Assign { .. })),
+        // EXEC's inner batch may open result sets; conservative.
+        Statement::Exec(_) => true,
         _ => false,
     }
 }
@@ -890,6 +1070,7 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::CreateIndex(_)
             | Statement::DropIndex(_)
             | Statement::AlterTable(_)
+            | Statement::Exec(_)
             | Statement::Commit { .. }
     )
 }
@@ -1356,6 +1537,19 @@ pub fn analyze_locks(
             | Statement::AlterTable(_) => {
                 add(Resource::Database, LockMode::Exclusive);
             }
+            // EXEC sp_executesql with a LITERAL statement is analyzable up
+            // front: recurse into the inner text. Anything else (a variable
+            // statement, an unknown procedure) cannot be analyzed before it
+            // runs — lock the database exclusively rather than under-lock
+            // (2PL acquires the full set up front).
+            Statement::Exec(exec) => match exec_literal_sql(exec) {
+                Some(inner) => {
+                    for (resource, mode) in analyze_locks(storage, &inner, isolation) {
+                        add(resource, mode);
+                    }
+                }
+                None => add(Resource::Database, LockMode::Exclusive),
+            },
             // Transaction control, SET, and DECLARE take no data locks.
             // TRY/CATCH was flattened away by `flatten_statements`, so its
             // contained statements appear here directly.
@@ -1538,6 +1732,11 @@ fn exec_statement(
         Statement::TryCatch { .. } => Err(SqlError::message_only(
             0,
             "internal error: TRY/CATCH must be executed by run_block",
+        )),
+        // EXEC recurses into its inner batch, handled by `run_block` too.
+        Statement::Exec(_) => Err(SqlError::message_only(
+            0,
+            "internal error: EXEC must be executed by run_block",
         )),
     }
 }
@@ -5490,6 +5689,43 @@ struct ScanPlan {
     /// index alone — no per-row base-table lookup. Never true for a table
     /// scan.
     covering: bool,
+}
+
+/// The parameter names of a declaration list (`@p1 int, @p2 nvarchar(10)`),
+/// in order: the first token of each top-level comma-separated entry.
+/// `sp_execute` values arrive unnamed on the wire; these names bind them.
+pub(crate) fn decl_names(decls: &str) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut depth = 0usize;
+    let mut in_quote = false;
+    let mut entry = String::new();
+    for ch in decls.chars().chain(std::iter::once(',')) {
+        match ch {
+            // A quoted default value (`@p varchar(10) = 'a,b'`) may contain
+            // commas and parens; none of them separate declarations. A
+            // doubled '' escape toggles twice, landing back where it was.
+            '\'' => {
+                in_quote = !in_quote;
+                entry.push(ch);
+            }
+            '(' if !in_quote => {
+                depth += 1;
+                entry.push(ch);
+            }
+            ')' if !in_quote => {
+                depth = depth.saturating_sub(1);
+                entry.push(ch);
+            }
+            ',' if !in_quote && depth == 0 => {
+                if let Some(name) = entry.split_whitespace().next() {
+                    names.push(name.to_string());
+                }
+                entry.clear();
+            }
+            _ => entry.push(ch),
+        }
+    }
+    names
 }
 
 /// Recognises the shape [`scan_select`] can run, or `None` for everything else
