@@ -139,6 +139,10 @@ pub struct Storage {
     /// analysis and the per-statement snapshot gate are on the hot path).
     rcsi: std::sync::atomic::AtomicBool,
     allow_snapshot: std::sync::atomic::AtomicBool,
+    /// Bumped whenever the options change: a parked batch whose lock set was
+    /// analyzed under an older epoch is re-analyzed before it can be granted
+    /// (its versioned-read decision may no longer match execution).
+    lock_epoch: std::sync::atomic::AtomicU64,
     /// Scan slices read, so a test can prove a scan stopped early rather than
     /// reading the table and discarding the rest. On the instance and not in a
     /// `static`: the suite runs in parallel in one binary, so a static would
@@ -214,6 +218,7 @@ impl Storage {
             log_writer: Some(log_writer),
             rcsi: std::sync::atomic::AtomicBool::new(rcsi),
             allow_snapshot: std::sync::atomic::AtomicBool::new(allow_snapshot),
+            lock_epoch: std::sync::atomic::AtomicU64::new(0),
             #[cfg(test)]
             scan_slices: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(test)]
@@ -554,7 +559,17 @@ impl Storage {
             .store(rcsi_now, std::sync::atomic::Ordering::Relaxed);
         self.allow_snapshot
             .store(allow_now, std::sync::atomic::Ordering::Relaxed);
+        // After the mirrors, so a batch analyzed against a stale epoch is
+        // always re-analyzed against the settled options.
+        self.lock_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// The lock-analysis epoch: parked batches analyzed under an older value
+    /// are re-analyzed before grant (see the scheduler).
+    pub(crate) fn lock_analysis_epoch(&self) -> u64 {
+        self.lock_epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Captures a read snapshot: the durable commit prefix as of now, plus
@@ -3269,8 +3284,23 @@ impl StorageFile {
         allow_snapshot: Option<bool>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
-        self.version.set_options(rcsi, allow_snapshot);
-        let byte = self.version.options_byte();
+        // Build the new superblocks in LOCALS and write them BEFORE mutating
+        // any in-memory state: a failed write must leave the version store,
+        // the option mirrors, and the cached superblocks exactly as they
+        // were (a half-applied OFF would otherwise stop publishing while
+        // readers still take the versioned path — silent dirty reads), and
+        // a later lazy active-slot rewrite must not leak the failed ALTER's
+        // options to disk.
+        let byte = {
+            let mut next = self.version.options_byte();
+            if let Some(on) = rcsi {
+                next = (next & !1) | (on as u8);
+            }
+            if let Some(on) = allow_snapshot {
+                next = (next & !2) | ((on as u8) << 1);
+            }
+            next
+        };
         let generation = self
             .superblock_a
             .generation
@@ -3284,28 +3314,21 @@ impl StorageFile {
             ActiveSuperblock::A => (self.superblock_a, SUPERBLOCK_ACTIVE_B),
             ActiveSuperblock::B => (self.superblock_b, SUPERBLOCK_ACTIVE_A),
         };
-        let mut equalized = active;
-        equalized.active = backup_flag;
-        match self.active_superblock {
-            ActiveSuperblock::A => self.superblock_b = equalized,
-            ActiveSuperblock::B => self.superblock_a = equalized,
-        }
-        for sb in [&mut self.superblock_a, &mut self.superblock_b] {
+        let mut primary = active;
+        let mut backup = active;
+        backup.active = backup_flag;
+        for sb in [&mut primary, &mut backup] {
             sb.set_db_options(byte);
             sb.generation = generation;
             sb.checksum = sb.compute_checksum();
         }
-        let (primary, primary_offset, backup, backup_offset) = match self.active_superblock {
+        let (primary_offset, backup_offset) = match self.active_superblock {
             ActiveSuperblock::A => (
-                self.superblock_a,
                 self.layout.superblock_a_offset,
-                self.superblock_b,
                 self.layout.superblock_b_offset,
             ),
             ActiveSuperblock::B => (
-                self.superblock_b,
                 self.layout.superblock_b_offset,
-                self.superblock_a,
                 self.layout.superblock_a_offset,
             ),
         };
@@ -3315,6 +3338,18 @@ impl StorageFile {
         self.file
             .write_all_at(backup_offset, &backup.to_le_bytes_with_checksum())?;
         self.file.sync_data()?;
+        // Durable on disk — now commit to memory.
+        match self.active_superblock {
+            ActiveSuperblock::A => {
+                self.superblock_a = primary;
+                self.superblock_b = backup;
+            }
+            ActiveSuperblock::B => {
+                self.superblock_b = primary;
+                self.superblock_a = backup;
+            }
+        }
+        self.version.set_options(rcsi, allow_snapshot);
         Ok(())
     }
 

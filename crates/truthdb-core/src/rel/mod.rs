@@ -1637,8 +1637,21 @@ pub fn analyze_locks(
                     // (An inner SET raising isolation is seen by the
                     // recursion's own scan; it cannot outlive the EXEC — SET
                     // options revert at scope exit.)
+                    //
+                    // That level must be one the versioned-read path can
+                    // never claim: under RCSI the recursion's own
+                    // `versioned_reads` would drop Table S for a plain
+                    // READ COMMITTED, while at runtime the inner statement
+                    // executes under the OUTER effective level and reads
+                    // lock-based — a reachable dirty read at SERIALIZABLE
+                    // (caught by the adversarial review). READ COMMITTED is
+                    // passed only when it truly is the effective level.
                     let inner_isolation = if reads_lock {
-                        Isolation::ReadCommitted
+                        if matches!(isolation, Isolation::ReadCommitted) && !escalates_reads {
+                            Isolation::ReadCommitted
+                        } else {
+                            Isolation::RepeatableRead
+                        }
                     } else {
                         isolation
                     };

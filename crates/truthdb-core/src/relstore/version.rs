@@ -182,10 +182,18 @@ impl VersionState {
 
     /// The snapshot sequence as of `durable_lsn`: the newest commit whose
     /// record the log-writer has already made durable.
+    ///
+    /// Strictly `<`: the stored LSN is the commit record's START offset,
+    /// while durability watermarks count covered bytes (end offsets), and
+    /// every flush target lands on an entry boundary — so a record whose
+    /// start equals the watermark is entirely NOT durable, and one whose
+    /// start is below it is entirely durable (no boundary falls inside a
+    /// record). `<=` here counted an unflushed commit as visible, breaking
+    /// this module's crash-visibility contract by exactly one record.
     pub fn durable_seq(&self, durable_lsn: u64) -> u64 {
         let idx = self
             .commit_points
-            .partition_point(|&(lsn, _)| lsn <= durable_lsn);
+            .partition_point(|&(lsn, _)| lsn < durable_lsn);
         if idx == 0 {
             self.durable_floor
         } else {
@@ -663,10 +671,11 @@ mod tests {
             10,
         );
         v.record_commit(10, 500);
-        // The commit record sits at LSN 500; a snapshot captured while the
-        // durable watermark is below it must not see the commit.
+        // The commit record STARTS at LSN 500; watermarks count covered
+        // bytes. A watermark at exactly 500 covers nothing of the record —
+        // the commit must stay invisible until the watermark passes it.
         let undurable = ReadSnapshot {
-            seq: v.durable_seq(499),
+            seq: v.durable_seq(500),
             own_txn: None,
         };
         assert_eq!(
@@ -674,7 +683,7 @@ mod tests {
             Some(Resolved::Image(b"old".to_vec()))
         );
         let durable = ReadSnapshot {
-            seq: v.durable_seq(500),
+            seq: v.durable_seq(501),
             own_txn: None,
         };
         assert_eq!(v.resolve(OID, b"k", durable), Some(Resolved::Current));

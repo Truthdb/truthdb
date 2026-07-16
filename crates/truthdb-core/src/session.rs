@@ -1274,6 +1274,7 @@ fn dispatch_batch(
         let isolation = sched.isolation(session);
         // Parameters are values, not statements, so they never change which
         // locks the batch needs — analyse the statement text as usual.
+        let epoch = shared.engine.lock_analysis_epoch();
         let needs = shared.engine.analyze_locks(&sql, isolation);
         if sched.try_acquire(session.raw(), &needs, true) {
             sched.sessions.touch(session);
@@ -1296,6 +1297,7 @@ fn dispatch_batch(
                 reply,
                 needs,
                 deadline,
+                epoch,
             });
             // The new waiter may have closed a lock-wait cycle; break it now
             // rather than waiting for the deadline backstop.
@@ -1353,7 +1355,7 @@ fn drain_ready(shared: &Arc<Shared>) {
     loop {
         let work = {
             let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
-            sched.next_grantable()
+            sched.next_grantable(&shared.engine)
         };
         match work {
             Some(work) => run_and_finish(shared, work),
@@ -1372,6 +1374,12 @@ struct Parked {
     reply: BatchSink,
     needs: Vec<(Resource, LockMode)>,
     deadline: Instant,
+    /// The lock-analysis epoch `needs` was computed under. A pending `ALTER
+    /// DATABASE` option flip bumps the epoch; a parked batch whose epoch is
+    /// stale is re-analyzed before it can be granted, so the lock set it
+    /// runs with always matches the versioning regime it will execute under
+    /// (analyzed-versioned-but-executes-lock-based was a dirty read).
+    epoch: u64,
 }
 
 /// The scheduler's mutable world: the sessions, the lock manager, and the FIFO
@@ -1543,9 +1551,21 @@ impl Scheduler {
     /// grantable, having granted them and taken its session's transaction
     /// context out to run with. `None` if none can proceed. The caller runs it
     /// with the scheduler lock released, then calls again.
-    fn next_grantable(&mut self) -> Option<Runnable> {
+    fn next_grantable(&mut self, engine: &Engine) -> Option<Runnable> {
+        let current_epoch = engine.lock_analysis_epoch();
         let mut i = 0;
         while i < self.parked.len() {
+            // An ALTER DATABASE option flip since this batch was analyzed may
+            // have changed which locks its reads need (versioned vs Table S):
+            // re-analyze before considering the grant, so the lock set always
+            // matches the regime the batch will execute under. The deadlock
+            // graph may see one sweep of stale needs; the grant path never
+            // does.
+            if self.parked[i].epoch != current_epoch {
+                let isolation = self.isolation(self.parked[i].session);
+                self.parked[i].needs = engine.analyze_locks(&self.parked[i].sql, isolation);
+                self.parked[i].epoch = current_epoch;
+            }
             let owner = self.parked[i].session.raw();
             if self.grantable(i) {
                 let parked = self.parked.remove(i).expect("index in bounds");
@@ -2342,6 +2362,7 @@ mod tests {
             reply,
             needs: Vec::new(),
             deadline: Instant::now() + Duration::from_secs(5),
+            epoch: 0,
         });
         assert!(
             !sched.reap_idle_txns(&engine),
@@ -2453,6 +2474,7 @@ mod tests {
             reply,
             needs: vec![(Resource::Table(1), LockMode::Shared)],
             deadline: Instant::now() - Duration::from_secs(60),
+            epoch: 0,
         });
         let shared = Arc::new(Shared {
             engine: Arc::new(engine),
@@ -2578,6 +2600,7 @@ mod tests {
             reply,
             needs: vec![(Resource::Table(1), LockMode::Shared)],
             deadline: Instant::now() - Duration::from_secs(60),
+            epoch: 0,
         });
         sched.reap_expired(&engine);
         assert_eq!(
@@ -4318,5 +4341,238 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(error_number(&reply), None, "{:?}", reply.outcome.error);
+    }
+
+    // The next six tests came out of the adversarial review: the first two
+    // pin its confirmed findings (both reproduced as dirty reads before the
+    // fixes), the rest are its passing probes kept as regressions.
+
+    #[tokio::test]
+    async fn serializable_exec_literal_select_must_not_dirty_read_under_rcsi() {
+        // A SERIALIZABLE session EXECs a literal SELECT while another
+        // session's transaction holds an uncommitted UPDATE. The reader must
+        // wait for the writer (SERIALIZABLE reads lock) and, after the
+        // writer's ROLLBACK, see the original value 10. A dirty read
+        // returns 99 — a value that never committed.
+        let (h, a, b) = rcsi_harness().await;
+        h.handle
+            .run_batch(b, "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE".into())
+            .await
+            .unwrap();
+        h.handle
+            .run_batch(a, "BEGIN TRAN; UPDATE t SET v = 99 WHERE id = 1;".into())
+            .await
+            .unwrap();
+        let reader = {
+            let handle = h.handle.clone();
+            tokio::spawn(async move {
+                handle
+                    .run_batch(
+                        b,
+                        "EXEC sp_executesql N'SELECT v FROM t WHERE id = 1'".into(),
+                    )
+                    .await
+            })
+        };
+        // Give the reader time to (incorrectly) run without blocking.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        h.handle.run_batch(a, "ROLLBACK".into()).await.unwrap();
+        let reply = reader.await.unwrap().unwrap();
+        assert_eq!(
+            values(&reply),
+            vec![10],
+            "a SERIALIZABLE reader must never see the uncommitted 99"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_reader_is_reanalyzed_when_rcsi_flips_off() {
+        // A reader analyzed while RCSI is ON (Database IS only, no Table S)
+        // parks behind a pending ALTER ... OFF; when granted, RCSI is OFF so
+        // it executes lock-based — with the stale (versioned) lock set. A
+        // concurrent uncommitted writer is then readable: dirty read at
+        // READ COMMITTED with RCSI off.
+        for round in 0..5 {
+            let (h, a, b) = rcsi_harness().await;
+            let c = h.handle.open_session(String::new(), String::new()).await;
+            // Writer A holds Database IX -> the ALTER (Database X) parks.
+            h.handle
+                .run_batch(a, "BEGIN TRAN; UPDATE t SET v = 55 WHERE id = 2;".into())
+                .await
+                .unwrap();
+            let admin = {
+                let handle = h.handle.clone();
+                let s = h.handle.open_session(String::new(), String::new()).await;
+                tokio::spawn(async move {
+                    handle
+                        .run_batch(
+                            s,
+                            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT OFF".into(),
+                        )
+                        .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Writer C parks behind the ALTER (fairness on Database).
+            let writer = {
+                let handle = h.handle.clone();
+                tokio::spawn(async move {
+                    handle
+                        .run_batch(c, "BEGIN TRAN; UPDATE t SET v = 777 WHERE id = 1;".into())
+                        .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // Reader B analyzed NOW (RCSI still on -> no Table S), parks.
+            let reader = {
+                let handle = h.handle.clone();
+                tokio::spawn(async move {
+                    handle
+                        .run_batch(b, "SELECT v FROM t WHERE id = 1".into())
+                        .await
+                })
+            };
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            // A commits: the ALTER runs and flips RCSI off. B's lock set was
+            // analyzed under RCSI-on (no Table S); the grant path must
+            // re-analyze it, so B now blocks behind C's open transaction
+            // instead of reading its uncommitted 777 lock-free.
+            h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
+            // C's UPDATE batch completes (transaction stays open, holding
+            // its locks); B must still be waiting on them.
+            tokio::time::timeout(Duration::from_secs(5), writer)
+                .await
+                .expect("writer hung")
+                .unwrap()
+                .unwrap();
+            h.handle.run_batch(c, "ROLLBACK".into()).await.unwrap();
+            let reply = tokio::time::timeout(Duration::from_secs(5), reader)
+                .await
+                .expect("reader hung")
+                .unwrap()
+                .unwrap();
+            let seen = values(&reply);
+            assert_eq!(
+                seen,
+                vec![10],
+                "round {round}: the reader may only see committed state \
+                 (777 never committed — seeing it is the dirty read)"
+            );
+            admin.await.unwrap().unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn rcsi_insert_after_delete_in_one_txn_serves_the_old_image() {
+        let (h, a, b) = rcsi_harness().await;
+        h.handle
+            .run_batch(
+                a,
+                "BEGIN TRAN; DELETE FROM t WHERE id = 1; INSERT INTO t VALUES (1, 111);".into(),
+            )
+            .await
+            .unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(values(&reply), vec![10], "pre-txn image, not the re-insert");
+        h.handle.run_batch(a, "ROLLBACK".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(values(&reply), vec![10]);
+        h.handle
+            .run_batch(
+                a,
+                "BEGIN TRAN; DELETE FROM t WHERE id = 1; INSERT INTO t VALUES (1, 222);".into(),
+            )
+            .await
+            .unwrap();
+        h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT v FROM t WHERE id = 1").await;
+        assert_eq!(values(&reply), vec![222]);
+    }
+
+    #[tokio::test]
+    async fn rcsi_aggregates_and_subqueries_read_the_snapshot() {
+        let (h, a, b) = rcsi_harness().await;
+        h.handle
+            .run_batch(
+                a,
+                "BEGIN TRAN; DELETE FROM t WHERE id = 2; UPDATE t SET v = 99 WHERE id = 1;".into(),
+            )
+            .await
+            .unwrap();
+        // Aggregate over the collecting path (build_table_source).
+        let reply = must_not_block(&h, b, "SELECT COUNT(*) FROM t").await;
+        assert_eq!(
+            values(&reply),
+            vec![2],
+            "the uncommitted delete is invisible"
+        );
+        let reply = must_not_block(&h, b, "SELECT SUM(v) FROM t").await;
+        assert_eq!(values(&reply), vec![30], "10 + 20, not 99 + (deleted)");
+        // Uncorrelated subquery: reads t under the same statement snapshot.
+        let reply =
+            must_not_block(&h, b, "SELECT v FROM t WHERE id = (SELECT MAX(id) FROM t)").await;
+        assert_eq!(values(&reply), vec![20], "MAX(id) = 2 in the snapshot");
+        h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT COUNT(*) FROM t").await;
+        assert_eq!(values(&reply), vec![1]);
+    }
+
+    #[tokio::test]
+    async fn rcsi_range_seek_does_not_double_count_a_moved_entry() {
+        let (h, a, b) = rcsi_harness().await;
+        let mut fill = String::from("INSERT INTO t VALUES ");
+        for i in 3..=25 {
+            fill.push_str(&format!("({}, {}),", i, i * 100));
+        }
+        fill.pop();
+        h.handle.run_batch(a, fill).await.unwrap();
+        h.handle
+            .run_batch(a, "CREATE INDEX ix_v ON t (v)".into())
+            .await
+            .unwrap();
+        // Uncommitted: moves id=1's entry from v=10 to v=15 — both inside
+        // the seek range below.
+        h.handle
+            .run_batch(a, "BEGIN TRAN; UPDATE t SET v = 15 WHERE id = 1;".into())
+            .await
+            .unwrap();
+        let reply = must_not_block(
+            &h,
+            b,
+            "SELECT id FROM t WHERE v >= 5 AND v <= 20 ORDER BY id",
+        )
+        .await;
+        assert_eq!(
+            values(&reply),
+            vec![1, 2],
+            "id=1 exactly once (image v=10), id=2 (v=20); no double count"
+        );
+        h.handle.run_batch(a, "ROLLBACK".into()).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rcsi_covering_seek_serves_a_deleted_row_image() {
+        let (h, a, b) = rcsi_harness().await;
+        let mut fill = String::from("INSERT INTO t VALUES ");
+        for i in 3..=25 {
+            fill.push_str(&format!("({}, {}),", i, i * 100));
+        }
+        fill.pop();
+        h.handle.run_batch(a, fill).await.unwrap();
+        h.handle
+            .run_batch(a, "CREATE INDEX ix_vc ON t (v) INCLUDE (v, id)".into())
+            .await
+            .unwrap();
+        h.handle
+            .run_batch(a, "BEGIN TRAN; DELETE FROM t WHERE id = 1;".into())
+            .await
+            .unwrap();
+        // The deleted row's index entry is gone; the covering seek must
+        // append its image from the version store.
+        let reply = must_not_block(&h, b, "SELECT id FROM t WHERE v = 10").await;
+        assert_eq!(values(&reply), vec![1], "the deleted row's image is served");
+        h.handle.run_batch(a, "COMMIT".into()).await.unwrap();
+        let reply = must_not_block(&h, b, "SELECT id FROM t WHERE v = 10").await;
+        assert_eq!(values(&reply), Vec::<i64>::new());
     }
 }
