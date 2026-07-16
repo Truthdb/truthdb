@@ -145,6 +145,10 @@ pub enum PreparedRpc {
     Unprepare {
         handle: i32,
     },
+    /// `sp_describe_first_result_set`: metadata discovery, no execution.
+    Describe {
+        tsql: String,
+    },
 }
 
 /// A statement a session prepared: its text and parameter declarations, both
@@ -1167,6 +1171,23 @@ fn dispatch_rpc(
             };
             immediate(&reply, (!dropped).then(|| missing_handle(handle)));
         }
+        PreparedRpc::Describe { tsql } => match shared.engine.describe_first_result_set(&tsql) {
+            Ok(rowset) => {
+                let count = rowset.rows.len() as u64;
+                let in_transaction = {
+                    let sched = shared.scheduler.lock().expect("scheduler poisoned");
+                    sched.sessions.in_transaction(session)
+                };
+                reply.send(BatchEvent::Columns(rowset.columns));
+                reply.send(BatchEvent::Rows(rowset.rows));
+                reply.send(BatchEvent::StatementDone {
+                    count: Some(count),
+                    in_transaction,
+                });
+                reply.send(BatchEvent::Complete { in_transaction });
+            }
+            Err(error) => immediate(&reply, Some(error)),
+        },
         PreparedRpc::Execute { handle, values } => {
             let resolved = {
                 let sched = shared.scheduler.lock().expect("scheduler poisoned");
@@ -3686,6 +3707,98 @@ mod tests {
         ))
         .await;
         assert_eq!(rows_of(&events), vec![vec![Datum::Int(4)]]);
+    }
+
+    #[tokio::test]
+    async fn describe_first_result_set_covers_static_shapes_only() {
+        let h = start(LOCK_WAIT_TIMEOUT);
+        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        h.handle
+            .run_batch(
+                s,
+                "CREATE TABLE d (id INT NOT NULL PRIMARY KEY, name NVARCHAR(40))".into(),
+            )
+            .await
+            .unwrap();
+
+        // A parameterized single-table SELECT describes without executing.
+        // The @p1 is unresolvable in describe's default context — the planner
+        // swallows that and falls back to a scan (non-sargable predicate);
+        // the columns come from the table schema either way.
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Describe {
+                tsql: "SELECT id, name FROM d WHERE id = @p1".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+        let rows = rows_of(&events);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0][1], Datum::Int(1)); // column_ordinal
+        assert_eq!(rows[0][2], Datum::NVarChar("id".into()));
+        assert_eq!(rows[0][4], Datum::Int(56)); // system_type_id: int
+        assert_eq!(rows[1][2], Datum::NVarChar("name".into()));
+        assert_eq!(rows[1][5], Datum::NVarChar("nvarchar(40)".into()));
+
+        // A statement producing no result set describes as zero rows — and
+        // describing it executes nothing: the table stays empty.
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Describe {
+                tsql: "INSERT INTO d VALUES (1, 'x')".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), None, "{events:?}");
+        assert_eq!(rows_of(&events), Vec::<Vec<Datum>>::new());
+        let reply = h
+            .handle
+            .run_batch(s, "SELECT COUNT(*) FROM d".into())
+            .await
+            .unwrap();
+        match &reply.outcome.results[0] {
+            StatementResult::Rows(rowset) => assert_eq!(
+                rowset.rows[0][0],
+                Datum::BigInt(0),
+                "describe must not execute the INSERT"
+            ),
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // The contract is the first RESULT SET, not the first statement:
+        // `INSERT; SELECT` (and a SELECT inside a TRY block) describe the
+        // SELECT, and `TOP 0` — the standard metadata-discovery idiom —
+        // describes like any other TOP.
+        for tsql in [
+            "INSERT INTO d VALUES (9, 'y'); SELECT id FROM d",
+            "BEGIN TRY SELECT id FROM d END TRY BEGIN CATCH END CATCH",
+            "SELECT TOP 0 id FROM d",
+        ] {
+            let events = drain_events(h.handle.stream_prepared(
+                s,
+                PreparedRpc::Describe { tsql: tsql.into() },
+                no_cancel(),
+            ))
+            .await;
+            assert_eq!(event_error(&events), None, "{tsql}: {events:?}");
+            let rows = rows_of(&events);
+            assert_eq!(rows.len(), 1, "{tsql}");
+            assert_eq!(rows[0][2], Datum::NVarChar("id".into()), "{tsql}");
+        }
+
+        // A shape whose types are only known by executing answers 11514.
+        let events = drain_events(h.handle.stream_prepared(
+            s,
+            PreparedRpc::Describe {
+                tsql: "SELECT a.id FROM d a JOIN d b ON a.id = b.id".into(),
+            },
+            no_cancel(),
+        ))
+        .await;
+        assert_eq!(event_error(&events), Some(11514), "{events:?}");
     }
 
     #[test]

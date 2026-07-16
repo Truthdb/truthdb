@@ -185,6 +185,16 @@ impl Engine {
         Ok(collector.into_outcome(error))
     }
 
+    /// `sp_describe_first_result_set`: statically-derivable column metadata
+    /// for `tsql`'s first result set, without executing anything.
+    pub fn describe_first_result_set(
+        &self,
+        tsql: &str,
+    ) -> Result<crate::rel::RowSet, truthdb_sql::error::SqlError> {
+        let _meta = self.meta.read().expect("engine meta poisoned");
+        crate::rel::describe_first_result_set(&self.storage, tsql)
+    }
+
     /// Like [`Self::sql_batch_with_params`], but each statement's result
     /// leaves through `emitter` as it is produced (see
     /// [`crate::rel::execute_batch_streamed`]). Returns the batch's terminal

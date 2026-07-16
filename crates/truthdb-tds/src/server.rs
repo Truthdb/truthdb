@@ -611,6 +611,11 @@ fn start_rpc(
                 .map_err(|err| rpc_error(&err.to_string()))?;
             Ok(engine.stream_prepared(session, PreparedRpc::Unprepare { handle }, cancel))
         }
+        RpcProc::SpDescribeFirstResultSet => {
+            let tsql = rpc::split_sp_describe(request.params)
+                .map_err(|err| rpc_error(&err.to_string()))?;
+            Ok(engine.stream_prepared(session, PreparedRpc::Describe { tsql }, cancel))
+        }
         // Server-side cursors are not implemented; say so rather than "not
         // found" so a driver's fallback logic gets an honest signal.
         RpcProc::SpCursor(name) => Err(rpc_error_num(
