@@ -86,6 +86,26 @@ impl truthdb_sql::eval::ColumnResolver for SynthScope {
     }
 }
 
+/// Resolves an outer reference from a correlated HAVING/projection subquery
+/// to a group-key position — binding ONLY when the reference and a bare-
+/// column group key name the SAME source column of this query's FROM. A
+/// qualified reference to a different table that merely shares the bare name
+/// stays unresolved (and errors inside the subquery, as SQL Server rejects
+/// non-grouped outer references).
+fn group_key_resolver<'a>(
+    select: &'a Select,
+    resolver: &'a JoinScope,
+) -> impl Fn(&str) -> Option<usize> + 'a {
+    use truthdb_sql::eval::ColumnResolver;
+    move |name: &str| {
+        let source = resolver.resolve(name)?;
+        select.group_by.iter().position(|key| match &key.kind {
+            truthdb_sql::ast::ExprKind::Column(n) => resolver.resolve(&n.value) == Some(source),
+            _ => false,
+        })
+    }
+}
+
 /// One aggregate to compute over each group.
 struct AggSpec {
     func: AggFunc,
@@ -158,7 +178,7 @@ pub fn execute(
     let input_bytes: usize = rows.iter().map(|r| super::approx_row_bytes(r)).sum();
     let out_rows = if select.group_by.is_empty() || input_bytes <= budget {
         aggregate_partition(
-            select, rows, types, resolver, eval_ctx, &aggs, &having, &out_exprs, &synth,
+            storage, select, rows, types, resolver, eval_ctx, &aggs, &having, &out_exprs, &synth,
         )?
     } else {
         grace_hash_aggregate(
@@ -185,6 +205,7 @@ pub fn execute(
 /// grace-hash partition.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_partition(
+    storage: &crate::storage::Storage,
     select: &Select,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
@@ -205,6 +226,24 @@ fn aggregate_partition(
             )?);
         }
         if let Some(having) = having {
+            // A subquery still present in HAVING is correlated to this
+            // query's grouping columns (the rewrite pass left it): bind the
+            // group row's values in, making it uncorrelated for this group.
+            // A reference to a non-grouped column stays unresolved and errors
+            // inside the subquery, as SQL Server rejects it too.
+            let bound;
+            let having = if crate::rel::expr_has_subquery(having) {
+                bound = crate::rel::substitute_correlated_in_expr(
+                    storage,
+                    having,
+                    &group_key_resolver(select, resolver),
+                    &group_row,
+                    eval_ctx,
+                )?;
+                &bound
+            } else {
+                having
+            };
             match eval::eval(having, &group_row, synth, eval_ctx)? {
                 SqlValue::Bool(true) => {}
                 SqlValue::Bool(false) | SqlValue::Null => continue,
@@ -220,6 +259,21 @@ fn aggregate_partition(
         }
         let mut row = Vec::with_capacity(out_exprs.len());
         for expr in out_exprs {
+            // A subquery here is correlated to a grouping column (the
+            // rewrite left it): bind the group row, exactly as HAVING does.
+            let bound;
+            let expr = if crate::rel::expr_has_subquery(expr) {
+                bound = crate::rel::substitute_correlated_in_expr(
+                    storage,
+                    expr,
+                    &group_key_resolver(select, resolver),
+                    &group_row,
+                    eval_ctx,
+                )?;
+                &bound
+            } else {
+                expr
+            };
             row.push(eval::eval(expr, &group_row, synth, eval_ctx)?);
         }
         out_rows.push(row);
@@ -273,7 +327,7 @@ fn grace_hash_aggregate(
             part_rows.push(row);
         }
         out_rows.extend(aggregate_partition(
-            select, &part_rows, types, resolver, eval_ctx, aggs, having, out_exprs, synth,
+            storage, select, &part_rows, types, resolver, eval_ctx, aggs, having, out_exprs, synth,
         )?);
     }
     Ok(out_rows)
@@ -522,8 +576,8 @@ fn rewrite(expr: &Expr, group_by: &[Expr], aggs: &mut Vec<AggSpec>) -> Result<Ex
         | ExprKind::Literal(_)
         | ExprKind::GlobalVar(_)
         | ExprKind::LocalVar(_) => expr.kind.clone(),
-        // Subqueries are rewritten to literals before aggregation runs; clone
-        // defensively (evaluation would reject any that slipped through).
+        // A subquery surviving to here is correlated to a grouping column;
+        // the per-group loops bind and evaluate it (HAVING and projection).
         ExprKind::Subquery(_) | ExprKind::Exists(_) | ExprKind::InSubquery { .. } => {
             expr.kind.clone()
         }
