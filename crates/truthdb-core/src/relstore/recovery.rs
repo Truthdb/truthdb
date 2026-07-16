@@ -255,6 +255,18 @@ pub(crate) fn undo_one(
                 };
                 apply_tree_undo(ctx, &mut mode, &tree, undo)?;
             }
+            PageOpUndo::CounterAdd { page, delta } => {
+                // The inverse delta was baked in when the undo record was
+                // built; the CLR chain (`undo_next`) guarantees exactly-once
+                // compensation across a crash mid-undo, like every page op.
+                ctx.apply_op(
+                    mode.log_mode(PageOpUndo::None),
+                    PageOpRedo::CounterAdd {
+                        page: *page,
+                        delta: *delta,
+                    },
+                )?;
+            }
             PageOpUndo::HeapDeleteSlot { page, slot } => {
                 if heap_slot_occupied(ctx, *page, *slot)? {
                     ctx.apply_op(

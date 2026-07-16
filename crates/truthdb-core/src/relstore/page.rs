@@ -23,6 +23,11 @@ pub const PAGE_TYPE_FREE: u16 = 0;
 /// level field).
 pub const PAGE_TYPE_TREE: u16 = 1;
 pub const PAGE_TYPE_HEAP: u16 = 2;
+/// A table's row-counter page (planner statistics): one u64 count at
+/// [`COUNTER_OFFSET`], maintained transactionally via `CounterAdd` page ops.
+pub const PAGE_TYPE_COUNTER: u16 = 3;
+/// Byte offset of the row count on a counter page (right after the header).
+pub const COUNTER_OFFSET: usize = PAGE_HEADER_SIZE;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct PageHeader {

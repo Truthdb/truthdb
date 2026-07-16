@@ -4471,6 +4471,12 @@ mod tests {
                     "INSERT INTO {t} VALUES (1,10,'a'),(2,20,'b'),(3,20,'c'),(4,30,NULL),(5,10,'e')"
                 ))
                 .expect("insert");
+            // Pad past the tiny-table tie-break (identically on both sides).
+            for i in 0..20 {
+                engine
+                    .execute(&format!("INSERT INTO {t} VALUES ({}, 900, 'p')", 100 + i))
+                    .expect("pad");
+            }
         }
         engine
             .execute("CREATE INDEX ix_a ON idx (a)")
@@ -4590,6 +4596,13 @@ mod tests {
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT)")
             .expect("create");
         engine.execute("CREATE INDEX ix_a ON t (a)").expect("index");
+        // Pad past the tiny-table tie-break: a table of <= 16 rows plans as
+        // a scan (the seek ties with it), and this test is about the seek.
+        for i in 0..20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({}, 900)", 100 + i))
+                .expect("pad");
+        }
 
         let seek = plan_lines(&engine, "SELECT id FROM t WHERE a = 7");
         assert_eq!(seek[0], "Index Seek(t.ix_a), SEEK: a = 7");
@@ -4611,6 +4624,12 @@ mod tests {
         engine
             .execute("INSERT INTO t VALUES (1,10),(2,20)")
             .expect("insert");
+        // Pad past the tiny-table tie-break (a <= 16-row table plans as a scan).
+        for i in 0..20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({}, 900)", 100 + i))
+                .expect("pad");
+        }
         engine.execute("CREATE INDEX ix_a ON t (a)").expect("index");
 
         drop(engine);
@@ -4640,6 +4659,12 @@ mod tests {
         engine
             .execute("INSERT INTO t VALUES (1,1,100),(2,1,200),(3,2,100),(4,2,200)")
             .expect("insert");
+        // Pad past the tiny-table tie-break (a <= 16-row table plans as a scan).
+        for i in 0..20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({}, 900, 900)", 100 + i))
+                .expect("pad");
+        }
         engine
             .execute("CREATE INDEX ix_ab ON t (a, b DESC)")
             .expect("create composite index");
@@ -4666,6 +4691,12 @@ mod tests {
         engine
             .execute("INSERT INTO h VALUES (10,'x'),(20,'y'),(10,'z')")
             .expect("insert");
+        // Pad past the tiny-table tie-break (a <= 16-row table plans as a scan).
+        for i in 0..20 {
+            engine
+                .execute(&format!("INSERT INTO h VALUES ({}, 'p')", 900 + i))
+                .expect("pad");
+        }
         engine.execute("CREATE INDEX ix_a ON h (a)").expect("index");
 
         let plan = plan_lines(&engine, "SELECT name FROM h WHERE a = 10");
@@ -4716,6 +4747,13 @@ mod tests {
         engine
             .execute("INSERT INTO t VALUES (1, 'abc'), (2, 'ABC'), (3, 'xyz')")
             .expect("insert");
+        // Pad past the tiny-table tie-break; '0...' sorts below 'a', so the
+        // range assertions below keep their exact row sets.
+        for i in 0..20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({}, '0p{i}')", 100 + i))
+                .expect("pad");
+        }
         engine
             .execute("CREATE INDEX ix_name ON t (name)")
             .expect("index");
@@ -4763,6 +4801,13 @@ mod tests {
         engine
             .execute("INSERT INTO t VALUES (1,'aaa'),(2,'mmm'),(3,'zzz')")
             .expect("insert");
+        // Pad past the tiny-table tie-break; '0...' sorts below 'b', so the
+        // range assertion below keeps its exact row set.
+        for i in 0..20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({}, '0c{i}')", 100 + i))
+                .expect("pad");
+        }
         engine
             .execute("CREATE INDEX ix_code ON t (code)")
             .expect("index");
@@ -4787,6 +4832,12 @@ mod tests {
                     "CREATE TABLE {t} (id INT NOT NULL PRIMARY KEY, a INT)"
                 ))
                 .expect("create");
+            // Pad past the tiny-table tie-break (an empty table plans as a scan).
+            for i in 0..20 {
+                engine
+                    .execute(&format!("INSERT INTO {t} VALUES ({}, 900)", 100 + i))
+                    .expect("pad");
+            }
             engine
                 .execute(&format!("CREATE INDEX ix ON {t} (a)"))
                 .expect("index");
@@ -5477,6 +5528,12 @@ mod tests {
             engine
                 .execute("INSERT INTO t VALUES (1, 'Hello'), (2, 'WORLD')")
                 .expect("insert");
+            // Pad past the tiny-table tie-break (a <= 16-row table scans).
+            for i in 0..20 {
+                engine
+                    .execute(&format!("INSERT INTO t VALUES ({}, '0p{i}')", 100 + i))
+                    .expect("pad");
+            }
             engine
                 .execute("CREATE INDEX ix ON t (name)")
                 .expect("index");
