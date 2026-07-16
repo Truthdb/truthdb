@@ -468,6 +468,17 @@ impl Storage {
         self.lock().rel_drop_index(table, index_name)
     }
 
+    pub(crate) fn rel_alter_add_column(
+        &self,
+        table: &str,
+        column: Column,
+        default_text: Option<String>,
+        fill: Datum,
+    ) -> Result<(), StorageError> {
+        self.lock()
+            .rel_alter_add_column(table, column, default_text, fill)
+    }
+
     /// The table's committed row count, when it has a counter page (tables
     /// created before counters existed do not — the planner then applies no
     /// tie-break). Errors degrade to `None`: the count is a statistic, never
@@ -1224,6 +1235,100 @@ impl StorageFile {
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
+        self.rel.tables.insert(table.to_string(), updated);
+        Ok(())
+    }
+
+    /// `ALTER TABLE ADD <column>`: appends the column to the table's catalog
+    /// entry and rewrites every existing row under the widened schema, all in
+    /// one transactional statement — the row codec is positional, so an old
+    /// row cannot be read under the new schema without re-encoding. Keys and
+    /// index entries are untouched: appending a column shifts no schema index
+    /// the key or any secondary index refers to, tree rewrites are in-place
+    /// by key, and heap RIDs are stable across an update.
+    pub(crate) fn rel_alter_add_column(
+        &mut self,
+        table: &str,
+        column: Column,
+        default_text: Option<String>,
+        fill: Datum,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        let mut column = column;
+        // A character column without an explicit COLLATE inherits the database
+        // default by name, exactly as CREATE TABLE records it.
+        if column.collation.is_none()
+            && matches!(
+                column.column_type,
+                crate::relstore::types::ColumnType::VarChar { .. }
+                    | crate::relstore::types::ColumnType::NVarChar { .. }
+            )
+        {
+            column.collation = self.default_collation.clone();
+        }
+        let mut def = self
+            .rel
+            .tables
+            .get(table)
+            .cloned()
+            .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{table}'")))?;
+        let catalog_root = self
+            .rel
+            .catalog_root
+            .ok_or_else(|| StorageError::InvalidFile("catalog root missing".to_string()))?;
+        // Snapshot every row under the OLD schema (with its locator), before
+        // the definition widens.
+        let located = self.rel_scan_located(table)?;
+
+        // Parallel catalog arrays: `defaults`/`collations` may be shorter than
+        // `columns` (serde(default) on pre-upgrade tables) — pad before push.
+        def.defaults.resize(def.columns.len(), None);
+        def.collations.resize(def.columns.len(), None);
+        def.columns.push((
+            column.name.clone(),
+            column.column_type.name(),
+            column.nullable,
+        ));
+        def.defaults.push(default_text);
+        def.collations.push(column.collation.clone());
+        let new_schema = def.schema()?;
+
+        // Re-encode every row with the frozen fill appended.
+        let mut tree_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        let mut heap_rows: Vec<(Rid, Vec<u8>)> = Vec::new();
+        for (loc, mut values) in located {
+            values.push(fill.clone());
+            let row = encode_row(&new_schema, &values)?;
+            match loc {
+                RowLocator::Key(key) => tree_rows.push((key, row)),
+                RowLocator::Rid(rid) => heap_rows.push((rid, row)),
+            }
+        }
+
+        let is_tree = def.is_tree();
+        let object_id = def.object_id;
+        let root_page = def.root_page;
+        let updated = self.rel_statement(move |ctx, txn| {
+            if is_tree {
+                let tree = BTree {
+                    object_id,
+                    root: root_page,
+                };
+                for (key, row) in &tree_rows {
+                    tree.update(ctx, &mut OpMode::Txn(txn), key, row)?;
+                }
+            } else {
+                let heap = Heap {
+                    object_id,
+                    first_page: root_page,
+                };
+                for (rid, row) in &heap_rows {
+                    heap.update(ctx, txn, *rid, row)?;
+                }
+            }
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
+            Ok(def)
+        })?;
         self.rel.tables.insert(table.to_string(), updated);
         Ok(())
     }
@@ -3299,6 +3404,67 @@ mod tests {
             reserved_ratio: 0.17,
             default_collation: None,
         }
+    }
+
+    /// ALTER TABLE ADD survives a restart — the widened schema and the frozen
+    /// fills are one durable statement — and a failure mid-rewrite rolls the
+    /// whole ALTER back: old schema, old rows, fully readable.
+    #[test]
+    fn alter_add_column_is_durable_and_atomic() {
+        use crate::rel::{StatementResult, TxnContext, execute_batch};
+
+        let path = unique_temp_path("alter-add");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        for sql in [
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))",
+            "INSERT INTO t VALUES (1, 'one'), (2, 'two')",
+            "ALTER TABLE t ADD score INT DEFAULT 7",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        drop(storage);
+
+        // Reopen: the widened schema and the frozen fill survived.
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(&storage, "SELECT id, score FROM t ORDER BY id", &mut ctx);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => assert_eq!(
+                rowset.rows,
+                vec![
+                    vec![Datum::Int(1), Datum::Int(7)],
+                    vec![Datum::Int(2), Datum::Int(7)],
+                ]
+            ),
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // A failure mid-rewrite (fault injection inside the ALTER's statement)
+        // rolls the whole thing back: the new column does not exist and the
+        // old rows are intact.
+        crate::relstore::ctx::FAIL_APPLY_OPS_AFTER.with(|c| c.set(Some(1)));
+        let outcome = execute_batch(&storage, "ALTER TABLE t ADD flag BIT DEFAULT 1", &mut ctx);
+        crate::relstore::ctx::FAIL_APPLY_OPS_AFTER.with(|c| c.set(None));
+        assert!(outcome.error.is_some(), "the injected failure must surface");
+
+        let outcome = execute_batch(&storage, "SELECT flag FROM t", &mut ctx);
+        assert!(
+            outcome.error.is_some(),
+            "the rolled-back column must not exist: {:?}",
+            outcome.results
+        );
+        let outcome = execute_batch(&storage, "SELECT id, score FROM t ORDER BY id", &mut ctx);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => assert_eq!(rowset.rows.len(), 2),
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
     }
 
     fn unique_temp_path(label: &str) -> PathBuf {

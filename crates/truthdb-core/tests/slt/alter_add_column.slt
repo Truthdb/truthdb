@@ -1,0 +1,130 @@
+# ALTER TABLE ADD <column> (Stage 10): the catalog widens and every existing
+# row is rewritten under the new schema in one transactional statement. Old
+# rows take a FROZEN fill — NULL, or the DEFAULT evaluated at ALTER time —
+# while later INSERTs evaluate the live default per row.
+
+statement ok
+CREATE TABLE a (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))
+
+statement ok
+INSERT INTO a VALUES (1, 'one'), (2, 'two')
+
+# A nullable column: old rows read NULL.
+statement ok
+ALTER TABLE a ADD note NVARCHAR(30)
+
+query ITT rowsort
+SELECT id, name, note FROM a
+----
+1 one NULL
+2 two NULL
+
+# New inserts carry values for it; the wildcard sees the new column.
+statement ok
+INSERT INTO a VALUES (3, 'three', 'noted')
+
+query ITT rowsort
+SELECT * FROM a
+----
+1 one NULL
+2 two NULL
+3 three noted
+
+# A DEFAULT column: old rows take the frozen default, an INSERT that omits it
+# takes the live default.
+statement ok
+ALTER TABLE a ADD score INT DEFAULT 7
+
+query II rowsort
+SELECT id, score FROM a
+----
+1 7
+2 7
+3 7
+
+statement ok
+INSERT INTO a (id, name) VALUES (4, 'four')
+
+query I
+SELECT score FROM a WHERE id = 4
+----
+7
+
+# NOT NULL with DEFAULT works on a non-empty table.
+statement ok
+ALTER TABLE a ADD flag BIT NOT NULL DEFAULT 1
+
+query I
+SELECT COUNT(*) FROM a WHERE flag = 1
+----
+4
+
+# NOT NULL without DEFAULT on a non-empty table is SQL Server's 4901.
+statement error
+ALTER TABLE a ADD strict INT NOT NULL
+
+# ...but legal on an empty table.
+statement ok
+CREATE TABLE empty_t (id INT NOT NULL PRIMARY KEY)
+
+statement ok
+ALTER TABLE empty_t ADD strict INT NOT NULL
+
+# A duplicate column name is 2705.
+statement error
+ALTER TABLE a ADD name INT
+
+# Constraint-carrying additions are their own statements.
+statement error
+ALTER TABLE a ADD extra INT UNIQUE
+
+# Old rows remain updatable and deletable after the rewrite, and a UPDATE can
+# set the added column.
+statement ok
+UPDATE a SET note = 'filled' WHERE id = 1
+
+statement ok
+DELETE FROM a WHERE id = 2
+
+query ITT rowsort
+SELECT id, name, note FROM a
+----
+1 one filled
+3 three noted
+4 four NULL
+
+# An index created before the ADD still seeks correctly afterwards (index
+# entries reference schema positions the append never shifts).
+statement ok
+CREATE TABLE b (id INT NOT NULL PRIMARY KEY, tag NVARCHAR(10))
+
+statement ok
+CREATE INDEX ix_b_tag ON b (tag)
+
+statement ok
+INSERT INTO b VALUES (1, 'x'), (2, 'y'), (3, 'x')
+
+statement ok
+ALTER TABLE b ADD extra INT DEFAULT 5
+
+query II rowsort
+SELECT id, extra FROM b WHERE tag = 'x'
+----
+1 5
+3 5
+
+# A heap table (no PRIMARY KEY) rewrites the same way.
+statement ok
+CREATE TABLE h (v INT)
+
+statement ok
+INSERT INTO h VALUES (10), (20)
+
+statement ok
+ALTER TABLE h ADD label NVARCHAR(10) DEFAULT 'pad'
+
+query IT rowsort
+SELECT v, label FROM h
+----
+10 pad
+20 pad
