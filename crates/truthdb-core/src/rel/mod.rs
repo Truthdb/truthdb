@@ -49,6 +49,14 @@ pub struct TxnContext {
     doomed: bool,
     xact_abort: bool,
     isolation: Isolation,
+    /// `SET NOCOUNT ON` — statements report no row count to the client:
+    /// TDS DONEs drop `DONE_COUNT`, and the native protocol's count envelope
+    /// becomes a bare done (the CLI then prints no "(n rows affected)" line,
+    /// exactly as sqlcmd goes quiet against SQL Server). Result rows and
+    /// `@@ROWCOUNT` are untouched.
+    nocount: bool,
+    /// Rows affected/returned by the previous statement — `@@ROWCOUNT`.
+    rowcount: i64,
     /// `SET SHOWPLAN_TEXT ON` — a SELECT returns its plan text, not results.
     showplan_text: bool,
     /// Declared batch variables (name without `@`, lowercased) to their type
@@ -113,6 +121,7 @@ impl TxnContext {
             database: self.database.clone(),
             login: self.login.clone(),
             spid: self.spid,
+            rowcount: self.rowcount,
             scope_identity: self.scope_identity,
             error: self.error_stack.last().cloned(),
             xact_state: self.xact_state(),
@@ -379,6 +388,11 @@ pub trait BatchEmitter {
     /// follow. The error itself is reported separately — at the end of the
     /// batch for a continued error, or not at all for one a `CATCH` handled.
     fn statement_aborted(&mut self, in_transaction: bool);
+
+    /// The session's database context was (re-)established (`USE`): TDS
+    /// renders the ENVCHANGE + 5701 INFO SSMS expects. Emitters that have no
+    /// wire (the collecting native path, tests) ignore it.
+    fn database_context(&mut self, _database: &str) {}
 }
 
 /// Reassembles emitted results into the whole-batch [`BatchOutcome`] for the
@@ -505,6 +519,12 @@ impl BatchRun<'_> {
         if !rows.is_empty() {
             self.emitter.rows(rows);
         }
+    }
+
+    /// Forwards a database-context change (`USE`) to the emitter, ahead of
+    /// the statement's (deferred) DONE.
+    fn database_context(&mut self, database: &str) {
+        self.emitter.database_context(database);
     }
 
     /// Ends a statement. Its DONE is deferred to the next durability point.
@@ -720,6 +740,7 @@ fn run_exec(
     // lock analysis never saw.
     let outer_vars = std::mem::take(&mut txn_ctx.variables);
     let outer_xact_abort = txn_ctx.xact_abort;
+    let outer_nocount = txn_ctx.nocount;
     let outer_isolation = txn_ctx.isolation;
     let outer_showplan = txn_ctx.showplan_text;
     for (name, value) in seeded {
@@ -745,6 +766,7 @@ fn run_exec(
     EXEC_DEPTH.with(|d| d.set(d.get() - 1));
     txn_ctx.variables = outer_vars;
     txn_ctx.xact_abort = outer_xact_abort;
+    txn_ctx.nocount = outer_nocount;
     txn_ctx.isolation = outer_isolation;
     txn_ctx.showplan_text = outer_showplan;
     result
@@ -767,7 +789,14 @@ fn run_block(
             // same shape as TRY/CATCH dispatch. Errors take the ordinary
             // statement path: cancels and durability failures propagate, a
             // TRY transfers to CATCH, XACT_ABORT OFF continues the batch.
-            match run_exec(storage, exec, txn_ctx, run, in_try) {
+            let exec_result = run_exec(storage, exec, txn_ctx, run, in_try);
+            if exec_result.is_err() {
+                // A failed EXEC sets @@ROWCOUNT to 0 like any failed
+                // statement — run_exec's own error exits (unknown proc, 214,
+                // 8144, parse, nesting cap) never reach the generic Err arm.
+                txn_ctx.rowcount = 0;
+            }
+            match exec_result {
                 Ok(()) => {}
                 Err(error) if error.number == CANCEL_ERROR => return Err(error),
                 Err(error) if run.durability_failed => return Err(error),
@@ -842,25 +871,53 @@ fn run_block(
             Ok(outcome) => {
                 let in_transaction = txn_ctx.in_txn();
                 let command = done_command(statement);
+                // `SET NOCOUNT ON` suppresses the DONE's count on the wire;
+                // rows/results are untouched. `@@ROWCOUNT` records the true
+                // count either way (NOCOUNT does not change it).
+                let nocount = txn_ctx.nocount;
+                let wire_count =
+                    |count: u64| -> Option<u64> { if nocount { None } else { Some(count) } };
+                // `USE` succeeded: earlier statements' deferred DONEs go out
+                // first, then the database-context ENVCHANGE + 5701 INFO the
+                // client (SSMS) expects, then the USE's own DONE below —
+                // SQL Server's exact order.
+                if let Statement::Use { database, .. } = statement {
+                    run.flush(storage)?;
+                    run.database_context(&database.value);
+                }
                 match outcome {
                     StatementOutcome::Streamed { rows } => {
-                        run.done(Some(rows), in_transaction, command);
+                        txn_ctx.rowcount = rows as i64;
+                        run.done(wire_count(rows), in_transaction, command);
                     }
                     StatementOutcome::Result(StatementResult::Rows(rowset)) => {
                         let count = rowset.rows.len() as u64;
+                        txn_ctx.rowcount = count as i64;
                         run.open_rowset(rowset.columns);
                         run.rows(rowset.rows);
-                        run.done(Some(count), in_transaction, command);
+                        run.done(wire_count(count), in_transaction, command);
                     }
                     StatementOutcome::Result(StatementResult::RowsAffected(n)) => {
-                        run.done(Some(n), in_transaction, command);
+                        txn_ctx.rowcount = n as i64;
+                        run.done(wire_count(n), in_transaction, command);
                     }
                     StatementOutcome::Result(StatementResult::Done) => {
+                        // A simple variable assignment (`SET @x = ...`) sets
+                        // @@ROWCOUNT to 1 — recorded by exec_set, preserved
+                        // here; every other Done statement resets it to 0.
+                        if !matches!(
+                            statement,
+                            Statement::Set(SetStatement::Variable { .. }) | Statement::Declare(_)
+                        ) {
+                            txn_ctx.rowcount = 0;
+                        }
                         run.done(None, in_transaction, command);
                     }
                 }
             }
             Err(error) => {
+                // A failed statement sets @@ROWCOUNT to 0, as SQL Server does.
+                txn_ctx.rowcount = 0;
                 // A cancelled statement aborts the batch immediately (see above):
                 // key on the cancel marker, not any flag, so an Attention landing
                 // concurrently with an unrelated failure cannot suppress that
@@ -1792,6 +1849,7 @@ pub fn analyze_locks(
             | Statement::SaveTransaction { .. }
             | Statement::Set(_)
             | Statement::Declare(_)
+            | Statement::Use { .. }
             | Statement::TryCatch { .. } => {}
         }
     }
@@ -1888,6 +1946,7 @@ fn exec_statement_dispatch(
 ) -> Result<StatementResult, SqlError> {
     match statement {
         Statement::BeginTransaction { .. } => exec_begin(storage, txn_ctx),
+        Statement::Use { database, .. } => exec_use(database, txn_ctx),
         Statement::Commit { .. } => exec_commit(storage, txn_ctx),
         Statement::Rollback { name, .. } => exec_rollback(storage, txn_ctx, name.as_ref()),
         Statement::SaveTransaction { name, .. } => exec_save(storage, txn_ctx, name),
@@ -2016,6 +2075,7 @@ fn doomed_allows(statement: &Statement) -> bool {
         Statement::Select(_)
             | Statement::Set(_)
             | Statement::Declare(_)
+            | Statement::Use { .. }
             | Statement::Rollback { name: None, .. }
     )
 }
@@ -2115,6 +2175,26 @@ fn ddl_in_txn_err() -> SqlError {
 }
 
 // ---- transaction control -----------------------------------------------
+
+/// `USE <database>`: a single-database instance, so the only accepted target
+/// is the session's current database — the statement exists for the
+/// database-context ENVCHANGE clients (SSMS) expect back (emitted by
+/// `run_block` on success).
+fn exec_use(database: &Name, ctx: &TxnContext) -> Result<StatementResult, SqlError> {
+    if !database.value.eq_ignore_ascii_case(&ctx.database) {
+        return Err(SqlError::new(
+            911,
+            16,
+            1,
+            format!(
+                "Database '{}' does not exist. Make sure that the name is entered correctly.",
+                database.value
+            ),
+        )
+        .at(database.span));
+    }
+    Ok(StatementResult::Done)
+}
 
 fn exec_begin(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
     if ctx.txn.is_none() {
@@ -2238,7 +2318,12 @@ fn exec_set(ctx: &mut TxnContext, set: &SetStatement) -> Result<StatementResult,
             }
         }
         SetStatement::ShowplanText(on) => ctx.showplan_text = *on,
+        SetStatement::NoCount(on) => ctx.nocount = *on,
         SetStatement::Variable { name, value } => {
+            // "Statements that make a simple assignment always set the
+            // @@ROWCOUNT value to 1" — the Done result would reset it to 0,
+            // so the assignment records its own count here.
+            ctx.rowcount = 1;
             let column_type = ctx
                 .variables
                 .get(name)
@@ -6410,6 +6495,8 @@ fn is_sys_view(name: &str) -> bool {
             | "sys.check_constraints"
             | "sys.foreign_keys"
             | "sys.default_constraints"
+            | "sys.databases"
+            | "sys.configurations"
     )
 }
 
@@ -6655,7 +6742,9 @@ fn exec_select_assign(
                 .insert(name.clone(), (*column_type, coerced));
         }
     }
-    Ok(StatementResult::Done)
+    // SQL Server counts the rows an assignment SELECT processed: the DONE
+    // carries it and `@@ROWCOUNT` reports it.
+    Ok(StatementResult::RowsAffected(rowset.rows.len() as u64))
 }
 
 /// Removes duplicate output rows (SELECT DISTINCT), keeping first occurrence.
@@ -7610,6 +7699,8 @@ fn build_table_source(
         .unwrap_or_else(|| strip_schema(&name.value).to_string());
     let base = match name.value.to_ascii_lowercase().as_str() {
         "sys.tables" => sys_tables(storage),
+        "sys.databases" => sys_databases(storage, eval_ctx),
+        "sys.configurations" => sys_configurations(),
         "sys.views" => sys_views(storage),
         "sys.sql_modules" => sys_sql_modules(storage),
         "sys.columns" => sys_columns(storage),
@@ -8328,6 +8419,108 @@ fn sys_tables(storage: &Storage) -> Source {
 }
 
 /// `sys.views` — one row per view, with its stored definition text.
+/// `sys.databases` (Stage 14, SSMS query-window probes): the one database
+/// this instance serves, with the columns tools actually read. The
+/// versioning flags report the live `ALTER DATABASE` options.
+fn sys_databases(storage: &Storage, eval_ctx: &EvalContext) -> Source {
+    let columns = vec![
+        nvarchar("name", 128),
+        int_col("database_id"),
+        int_col("compatibility_level"),
+        nvarchar("collation_name", 128),
+        nvarchar("user_access_desc", 60),
+        nvarchar("state_desc", 60),
+        nvarchar("recovery_model_desc", 60),
+        int_col("snapshot_isolation_state"),
+        ResultColumn {
+            name: "is_read_committed_snapshot_on".into(),
+            column_type: ColumnType::Bit,
+        },
+        ResultColumn {
+            name: "is_read_only".into(),
+            column_type: ColumnType::Bit,
+        },
+    ];
+    let rows = vec![vec![
+        Datum::NVarChar(eval_ctx.database.clone()),
+        Datum::Int(1),
+        Datum::Int(160),
+        Datum::NVarChar("SQL_Latin1_General_CP1_CI_AS".into()),
+        Datum::NVarChar("MULTI_USER".into()),
+        Datum::NVarChar("ONLINE".into()),
+        Datum::NVarChar("SIMPLE".into()),
+        Datum::Int(storage.snapshot_isolation_allowed() as i32),
+        Datum::Bit(storage.rcsi_enabled()),
+        Datum::Bit(false),
+    ]];
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+/// `sys.configurations` (Stage 14): the handful of static rows connection
+/// tools probe. Values are INT here (SQL Server uses sql_variant) — a
+/// documented simplification.
+fn sys_configurations() -> Source {
+    let columns = vec![
+        int_col("configuration_id"),
+        nvarchar("name", 35),
+        int_col("value"),
+        int_col("minimum"),
+        int_col("maximum"),
+        int_col("value_in_use"),
+        nvarchar("description", 255),
+        ResultColumn {
+            name: "is_dynamic".into(),
+            column_type: ColumnType::Bit,
+        },
+        ResultColumn {
+            name: "is_advanced".into(),
+            column_type: ColumnType::Bit,
+        },
+    ];
+    let entry =
+        |id: i32, name: &str, value: i32, min: i32, max: i32, dynamic: bool, advanced: bool| {
+            vec![
+                Datum::Int(id),
+                Datum::NVarChar(name.into()),
+                Datum::Int(value),
+                Datum::Int(min),
+                Datum::Int(max),
+                Datum::Int(value),
+                Datum::NVarChar(name.into()),
+                Datum::Bit(dynamic),
+                Datum::Bit(advanced),
+            ]
+        };
+    let rows = vec![
+        entry(16384, "show advanced options", 0, 0, 1, true, false),
+        entry(1539, "user options", 0, 0, 32767, true, false),
+        entry(
+            1544,
+            "max server memory (MB)",
+            i32::MAX,
+            16,
+            i32::MAX,
+            true,
+            true,
+        ),
+    ];
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
 fn sys_views(storage: &Storage) -> Source {
     let columns = vec![
         int_col("object_id"),

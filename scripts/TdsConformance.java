@@ -85,6 +85,39 @@ public class TdsConformance {
                     fail("count: got " + rs.getInt(1) + " want 6");
                 }
             }
+
+            // Stage 14: the SSMS query-window probes over the real driver.
+            try (Statement st = conn.createStatement()) {
+                try (ResultSet rs = st.executeQuery("SELECT SERVERPROPERTY('ProductVersion')")) {
+                    rs.next();
+                    if (!"16.0.1000.6".equals(rs.getString(1))) {
+                        fail("SERVERPROPERTY(ProductVersion): " + rs.getString(1));
+                    }
+                }
+                try (ResultSet rs = st.executeQuery(
+                        "SELECT name, database_id, is_read_committed_snapshot_on FROM sys.databases")) {
+                    rs.next();
+                    if (!"truthdb".equals(rs.getString(1)) || rs.getInt(2) != 1) {
+                        fail("sys.databases: " + rs.getString(1) + "/" + rs.getInt(2));
+                    }
+                }
+                // USE round-trips as the database ENVCHANGE the driver applies
+                // to its connection state.
+                st.execute("USE truthdb");
+                if (!"truthdb".equals(conn.getCatalog())) {
+                    fail("USE did not round-trip the ENVCHANGE: " + conn.getCatalog());
+                }
+                // NOCOUNT: the DONE carries no count, so executeUpdate sees -1.
+                st.execute("SET NOCOUNT ON");
+                int n = st.executeUpdate("INSERT INTO prep_jdbc VALUES (7, 'row7')");
+                if (n != -1) {
+                    fail("NOCOUNT executeUpdate must be -1, got " + n);
+                }
+                st.execute("SET NOCOUNT OFF");
+                if (st.executeUpdate("DELETE FROM prep_jdbc WHERE id = 7") != 1) {
+                    fail("count must return after NOCOUNT OFF");
+                }
+            }
         }
         System.out.println("tds conformance (mssql-jdbc): OK");
     }

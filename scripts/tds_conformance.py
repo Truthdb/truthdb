@@ -207,6 +207,28 @@ def main() -> int:
             print(f"FAIL: continued error lost its text: {e}")
             return 1
 
+    # Stage 14 SSMS probes over pytds: SERVERPROPERTY, sys.databases, USE,
+    # and NOCOUNT (rowcount reads -1 when the DONE carries no count).
+    cur.execute("SELECT SERVERPROPERTY('ProductVersion')")
+    if cur.fetchone()[0] != "16.0.1000.6":
+        print("FAIL: SERVERPROPERTY('ProductVersion')")
+        return 1
+    cur.execute("SELECT name, database_id FROM sys.databases")
+    if cur.fetchone() != ("truthdb", 1):
+        print("FAIL: sys.databases row")
+        return 1
+    cur.execute("USE truthdb")
+    cur.execute("SET NOCOUNT ON")
+    cur.execute("INSERT INTO nints VALUES (3, 3)")
+    if cur.rowcount != -1:
+        print(f"FAIL: NOCOUNT insert must report no count, got {cur.rowcount}")
+        return 1
+    cur.execute("SET NOCOUNT OFF")
+    cur.execute("DELETE FROM nints WHERE id = 3")
+    if cur.rowcount != 1:
+        print(f"FAIL: count must return after NOCOUNT OFF, got {cur.rowcount}")
+        return 1
+
     conn.close()
     print("tds conformance: OK")
     return 0

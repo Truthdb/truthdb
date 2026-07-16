@@ -841,6 +841,22 @@ impl BatchRender {
                     curcmd: 0,
                 });
             }
+            BatchEvent::DatabaseContext { database } => {
+                // `USE` succeeded: the database-context ENVCHANGE plus the
+                // 5701 INFO, exactly what the login sequence emits and what
+                // SSMS listens for. The statement's own DONE follows.
+                self.flush_pending(out, true).await?;
+                token::envchange_database(&mut self.buf, &database);
+                token::info(
+                    &mut self.buf,
+                    5701,
+                    2,
+                    0,
+                    &format!("Changed database context to '{database}'."),
+                );
+                out.write(&self.buf).await?;
+                self.buf.clear();
+            }
             BatchEvent::PreparedHandle(handle) => {
                 // Held for the response tail: RETURNSTATUS precedes the
                 // RETURNVALUE, which precedes the final DONEPROC.

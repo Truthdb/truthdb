@@ -127,6 +127,7 @@ impl Parser {
             Some("SET") => self.parse_set(),
             Some("DECLARE") => self.parse_declare(),
             Some("EXEC") | Some("EXECUTE") => self.parse_exec(),
+            Some("USE") => self.parse_use(),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -355,6 +356,14 @@ impl Parser {
         Ok(Statement::Declare(decls))
     }
 
+    /// `USE <database>`.
+    fn parse_use(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("USE")?;
+        let database = self.parse_name()?;
+        let span = start.to(database.span);
+        Ok(Statement::Use { database, span })
+    }
+
     fn parse_set(&mut self) -> SqlResult<Statement> {
         self.expect_keyword("SET")?;
         // `SET @v = expr` — a variable assignment.
@@ -382,6 +391,11 @@ impl Parser {
                 self.bump();
                 let on = self.parse_on_off()?;
                 Ok(Statement::Set(SetStatement::ShowplanText(on)))
+            }
+            Some("NOCOUNT") => {
+                self.bump();
+                let on = self.parse_on_off()?;
+                Ok(Statement::Set(SetStatement::NoCount(on)))
             }
             Some(kw) if Self::set_option_requires_on(kw) => {
                 // The SQL Server default for these is ON, and TruthDB's engine
@@ -448,7 +462,6 @@ impl Parser {
                 | "ARITHABORT"
                 | "ARITHIGNORE"
                 | "NUMERIC_ROUNDABORT"
-                | "NOCOUNT"
                 | "CURSOR_CLOSE_ON_COMMIT"
                 | "FORCEPLAN"
                 | "TEXTSIZE"
@@ -2589,16 +2602,26 @@ mod tests {
     fn ignorable_set_options_parse_as_noops() {
         // Cosmetic/advisory options clients send at connection time: ON/OFF
         // flags, value forms, a signed value, and a required-ON option at ON.
-        let sql = "SET QUOTED_IDENTIFIER ON; SET NOCOUNT ON; SET ANSI_WARNINGS OFF; \
+        // (NOCOUNT graduated to a real option in Stage 14.)
+        let sql = "SET QUOTED_IDENTIFIER ON; SET ANSI_WARNINGS OFF; \
                    SET TEXTSIZE 2147483647; SET DATEFORMAT mdy; SET LOCK_TIMEOUT -1";
         let stmts = Parser::parse_str(sql).expect("all recognized as no-ops");
-        assert_eq!(stmts.len(), 6);
+        assert_eq!(stmts.len(), 5);
         assert!(
             stmts
                 .iter()
                 .all(|s| matches!(s, Statement::Set(SetStatement::Ignored))),
             "every option should parse to SetStatement::Ignored: {stmts:?}",
         );
+        // NOCOUNT is a real session option now.
+        let stmts = Parser::parse_str("SET NOCOUNT ON; SET NOCOUNT OFF").expect("parses");
+        assert!(matches!(
+            stmts.as_slice(),
+            [
+                Statement::Set(SetStatement::NoCount(true)),
+                Statement::Set(SetStatement::NoCount(false))
+            ]
+        ));
         // An unknown option is still a syntax error, not silently ignored.
         assert_eq!(Parser::parse_str("SET WHATSIT ON").unwrap_err().number, 102);
     }
