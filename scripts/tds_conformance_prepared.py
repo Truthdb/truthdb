@@ -96,7 +96,7 @@ def main() -> int:
         fail(f"sp_prepexec rowset: got {rows!r}")
     handle2 = cur.get_proc_outputs()[0]
     if not isinstance(handle2, int):
-        fail(f"sp_prepexec returned no integer handle: {result!r}")
+        fail(f"sp_prepexec returned no integer handle: {handle2!r}")
     cur.callproc("sp_execute", (handle2, 3))
     rows = cur.fetchall()
     if rows != [(4,)]:

@@ -163,18 +163,26 @@ struct PreparedStatement {
 fn decl_names(decls: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut depth = 0usize;
+    let mut in_quote = false;
     let mut entry = String::new();
     for ch in decls.chars().chain(std::iter::once(',')) {
         match ch {
-            '(' => {
+            // A quoted default value (`@p varchar(10) = 'a,b'`) may contain
+            // commas and parens; none of them separate declarations. A
+            // doubled '' escape toggles twice, landing back where it was.
+            '\'' => {
+                in_quote = !in_quote;
+                entry.push(ch);
+            }
+            '(' if !in_quote => {
                 depth += 1;
                 entry.push(ch);
             }
-            ')' => {
+            ')' if !in_quote => {
                 depth = depth.saturating_sub(1);
                 entry.push(ch);
             }
-            ',' if depth == 0 => {
+            ',' if !in_quote && depth == 0 => {
                 if let Some(name) = entry.split_whitespace().next() {
                     names.push(name.to_string());
                 }
@@ -1168,7 +1176,13 @@ fn dispatch_rpc(
                 immediate(&reply, Some(missing_handle(handle)));
                 return;
             };
-            let values = bind_decl_names(&decls, values);
+            let values = match bind_decl_names(&decls, values) {
+                Ok(values) => values,
+                Err(error) => {
+                    immediate(&reply, Some(error));
+                    return;
+                }
+            };
             dispatch_batch(shared, session, text, values, cancel, reply);
         }
         PreparedRpc::PrepExec {
@@ -1185,7 +1199,13 @@ fn dispatch_rpc(
                 sched.sessions.prepare(session, decls.clone(), stmt.clone())
             };
             reply.prepared_handle = Some(handle);
-            let values = bind_decl_names(&decls, values);
+            let values = match bind_decl_names(&decls, values) {
+                Ok(values) => values,
+                Err(error) => {
+                    immediate(&reply, Some(error));
+                    return;
+                }
+            };
             dispatch_batch(shared, session, stmt, values, cancel, reply);
         }
     }
@@ -1197,14 +1217,25 @@ fn dispatch_rpc(
 fn bind_decl_names(
     decls: &str,
     mut values: Vec<crate::rel::RpcParam>,
-) -> Vec<crate::rel::RpcParam> {
+) -> Result<Vec<crate::rel::RpcParam>, SqlError> {
     let names = decl_names(decls);
+    // More values than declarations is SQL Server's 8144. (Fewer is legal —
+    // a declared parameter the statement never reads goes unmissed, and one
+    // it does read errors when the variable lookup fails at execution.)
+    if values.len() > names.len() {
+        return Err(SqlError::new(
+            8144,
+            16,
+            2,
+            "Procedure or function has too many arguments specified.",
+        ));
+    }
     for (value, name) in values.iter_mut().zip(names) {
         if value.name.is_empty() {
             value.name = name;
         }
     }
-    values
+    Ok(values)
 }
 
 /// Acquires a batch's locks and runs it, or parks it behind a conflict. Either
@@ -3665,14 +3696,35 @@ mod tests {
         );
         assert_eq!(decl_names(""), Vec::<String>::new());
         assert_eq!(decl_names("@a int"), ["@a"]);
+        // A quoted default may contain commas and parens; a doubled ''
+        // escape stays inside the string.
+        assert_eq!(
+            decl_names("@p1 varchar(10) = 'a,b', @p2 int, @p3 varchar(5) = 'it''s, ok'"),
+            ["@p1", "@p2", "@p3"]
+        );
     }
 
     #[test]
     fn bind_decl_names_keeps_existing_names() {
         let mut named = int_param(1);
         named.name = "@mine".into();
-        let bound = bind_decl_names("@p1 int, @p2 int", vec![named, int_param(2)]);
+        let bound = bind_decl_names("@p1 int, @p2 int", vec![named, int_param(2)]).expect("bind");
         assert_eq!(bound[0].name, "@mine");
         assert_eq!(bound[1].name, "@p2");
+    }
+
+    #[test]
+    fn more_values_than_declarations_is_8144() {
+        // SQL Server rejects extra arguments rather than silently ignoring
+        // them; without this an unmatched value seeded nothing and vanished.
+        let err = bind_decl_names("@p1 int", vec![int_param(1), int_param(2)])
+            .expect_err("extra value must be rejected");
+        assert_eq!(err.number, 8144);
+        let err = bind_decl_names("", vec![int_param(1)])
+            .expect_err("values against an empty declaration list must be rejected");
+        assert_eq!(err.number, 8144);
+        // Fewer values than declarations stays legal (an unread declared
+        // parameter goes unmissed).
+        assert!(bind_decl_names("@p1 int, @p2 int", vec![int_param(1)]).is_ok());
     }
 }
