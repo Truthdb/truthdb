@@ -158,6 +158,12 @@ impl TxnContext {
         self.txn.is_some()
     }
 
+    /// Whether an explicit transaction is open (`@@TRANCOUNT > 0`) — what a
+    /// reply's DONE stamps as `DONE_INXACT`.
+    pub fn in_transaction(&self) -> bool {
+        self.trancount > 0
+    }
+
     /// The session's current isolation level (drives which locks reads take).
     pub fn isolation(&self) -> Isolation {
         self.isolation

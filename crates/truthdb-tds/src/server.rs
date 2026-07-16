@@ -8,7 +8,7 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::mpsc;
 use truthdb_core::engine::EngineError;
 use truthdb_core::rel::ResultColumn;
-use truthdb_core::session::{BatchEvent, EngineHandle, SessionId};
+use truthdb_core::session::{BatchEvent, EngineHandle, PreparedRpc, SessionId};
 
 use crate::login::{self, parse_login7};
 use crate::packet::{
@@ -583,6 +583,40 @@ fn start_rpc(
                 .map_err(|err| rpc_error(&err.to_string()))?;
             Ok(engine.stream_rpc(session, sql, params, cancel))
         }
+        RpcProc::SpPrepare => {
+            let (decls, stmt) = rpc::split_sp_prepare(request.params)
+                .map_err(|err| rpc_error(&err.to_string()))?;
+            Ok(engine.stream_prepared(session, PreparedRpc::Prepare { decls, stmt }, cancel))
+        }
+        RpcProc::SpExecute => {
+            let (handle, values) = rpc::split_sp_execute(request.params)
+                .map_err(|err| rpc_error(&err.to_string()))?;
+            Ok(engine.stream_prepared(session, PreparedRpc::Execute { handle, values }, cancel))
+        }
+        RpcProc::SpPrepExec => {
+            let (decls, stmt, values) = rpc::split_sp_prepexec(request.params)
+                .map_err(|err| rpc_error(&err.to_string()))?;
+            Ok(engine.stream_prepared(
+                session,
+                PreparedRpc::PrepExec {
+                    decls,
+                    stmt,
+                    values,
+                },
+                cancel,
+            ))
+        }
+        RpcProc::SpUnprepare => {
+            let handle = rpc::split_sp_unprepare(request.params)
+                .map_err(|err| rpc_error(&err.to_string()))?;
+            Ok(engine.stream_prepared(session, PreparedRpc::Unprepare { handle }, cancel))
+        }
+        // Server-side cursors are not implemented; say so rather than "not
+        // found" so a driver's fallback logic gets an honest signal.
+        RpcProc::SpCursor(name) => Err(rpc_error_num(
+            40510,
+            &format!("The stored procedure '{name}' is not supported (server-side cursors are not implemented)."),
+        )),
         // Error 2812 is SQL Server's "Could not find stored procedure".
         RpcProc::Other(name) => Err(rpc_error_num(
             2812,
@@ -672,6 +706,14 @@ impl BatchRender {
                     count: None,
                     in_transaction,
                 });
+            }
+            BatchEvent::PreparedHandle(handle) => {
+                // The handle rides a RETURNVALUE token, after every result
+                // set (return values follow results in an RPC response).
+                self.flush_pending(out, true).await?;
+                self.buf.clear();
+                token::return_value_int(&mut self.buf, "handle", handle);
+                out.write(&self.buf).await?;
             }
             BatchEvent::Error(error) => {
                 self.flush_pending(out, true).await?;
