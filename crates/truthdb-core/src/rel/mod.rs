@@ -14,11 +14,11 @@ mod plan;
 mod value;
 
 use truthdb_sql::ast::{
-    AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable,
-    CreateView, DataType, DatabaseOption, Declaration, Delete, DropIndex, DropTable, DropView,
-    ExecStatement, Expr, ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind,
-    Name, OrderItem, RaiseError, Select, SelectItem, SetStatement, Statement, TableRef, ThrowArgs,
-    ThrowStatement, Update,
+    AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateIndex,
+    CreateProcedure, CreateTable, CreateView, DataType, DatabaseOption, Declaration, Delete,
+    DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind, ForeignKey, Insert,
+    InsertSource, IsolationLevel, JoinKind, Name, OrderItem, RaiseError, Select, SelectItem,
+    SetStatement, Statement, TableRef, ThrowArgs, ThrowStatement, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -31,7 +31,7 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::lock::{LockMode, Resource};
 use crate::relstore::btree::ScanCursor;
-use crate::relstore::catalog::{self, TableDef};
+use crate::relstore::catalog::{self, ProcParamDef, ProcedureDef, TableDef};
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
 use crate::relstore::version::ReadSnapshot;
@@ -60,6 +60,17 @@ pub struct TxnContext {
     rowcount: i64,
     /// The previous statement's error number, 0 on success — `@@ERROR`.
     last_error: i32,
+    /// Names of the stored procedures currently executing (innermost last),
+    /// for `ERROR_PROCEDURE()`; empty in an ad-hoc batch.
+    proc_stack: Vec<String>,
+    /// The procedure executing when the LAST error was raised — captured at
+    /// the raise site, because by CATCH entry the procedure's frame has
+    /// already unwound off `proc_stack`.
+    error_procedure: Option<String>,
+    /// A procedure body's `RETURN [value]` status, stashed by the Return arm
+    /// for `EXEC @rc = name` to read after the body unwinds; 0 when the body
+    /// falls off the end.
+    proc_return: Option<i64>,
     /// `SET SHOWPLAN_TEXT ON` — a SELECT returns its plan text, not results.
     showplan_text: bool,
     /// Declared batch variables (name without `@`, lowercased) to their type
@@ -96,7 +107,7 @@ pub struct TxnContext {
 }
 
 /// Session isolation level (defaults to READ COMMITTED, like SQL Server).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub enum Isolation {
     ReadUncommitted,
     #[default]
@@ -129,6 +140,7 @@ impl TxnContext {
             error: self.error_stack.last().cloned(),
             xact_state: self.xact_state(),
             last_error: self.last_error,
+            nestlevel: EXEC_DEPTH.with(|d| d.get()) as i32,
         }
     }
 
@@ -146,12 +158,21 @@ impl TxnContext {
 
     /// Enters a `CATCH` block: records the caught error so `ERROR_*()` resolve
     /// to it (pushed, so nested `TRY`/`CATCH` restore the outer error on exit).
+    /// Records the error context every failed statement leaves behind:
+    /// `@@ERROR` and the raising procedure (for `ERROR_PROCEDURE()`). Called
+    /// at the RAISE site — the only place the procedure frame is still live.
+    fn record_error(&mut self, number: i32) {
+        self.last_error = number;
+        self.error_procedure = self.proc_stack.last().cloned();
+    }
+
     fn push_error(&mut self, error: &SqlError) {
         self.error_stack.push(truthdb_sql::eval::ErrorInfo {
             number: error.number,
             message: error.message.clone(),
             severity: error.level,
             state: error.state,
+            procedure: self.error_procedure.clone(),
         });
     }
 
@@ -696,6 +717,259 @@ fn doom_per_rule(txn_ctx: &mut TxnContext, error: SqlError) -> SqlError {
     error
 }
 
+/// Executes a user stored procedure: binds arguments to declared parameters
+/// (positional and named, defaults filling gaps, OUTPUT validated), runs the
+/// stored body text under a fresh variable scope with SET options reverting
+/// at exit (the sp_executesql posture), captures the RETURN status into
+/// `EXEC @rc =`, and copies OUTPUT parameters back — both only when the body
+/// completes (SQL Server skips them when execution aborts).
+fn run_user_procedure(
+    storage: &Storage,
+    exec: &ExecStatement,
+    def: &TableDef,
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun<'_>,
+    in_try: bool,
+) -> Result<(), ExecError> {
+    let procedure = def.procedure.as_ref().expect("checked by the caller");
+    let own = |txn_ctx: &mut TxnContext, error: SqlError| -> ExecError {
+        ExecError::Own(doom_per_rule(txn_ctx, error))
+    };
+    // Evaluate arguments in the CALLER's scope.
+    let eval_ctx = txn_ctx.eval_context();
+    let mut positional = Vec::new();
+    let mut named: Vec<(String, SqlValue, bool, Option<String>)> = Vec::new();
+    let mut positional_meta: Vec<(bool, Option<String>)> = Vec::new();
+    for (arg_index, arg) in exec.args.iter().enumerate() {
+        // Once an argument is named, the rest must be (SQL Server 119) —
+        // silently continuing would bind positions past the named one.
+        if arg.name.is_none() && !named.is_empty() {
+            let error = SqlError::new(
+                119,
+                15,
+                1,
+                format!(
+                    "Must pass parameter number {} and subsequent parameters as '@name = value'. \
+                     After the form '@name = value' has been used, all subsequent parameters must \
+                     be passed in the form '@name = value'.",
+                    arg_index + 1
+                ),
+            );
+            return Err(own(txn_ctx, error));
+        }
+        // An OUTPUT argument must be a bare variable (it receives a value).
+        let arg_var = match &arg.value.kind {
+            ExprKind::LocalVar(name) => Some(name.clone()),
+            _ => None,
+        };
+        if arg.output && arg_var.is_none() {
+            let error = SqlError::new(
+                179,
+                16,
+                1,
+                "Cannot use the OUTPUT option when passing a constant to a stored procedure.",
+            );
+            return Err(own(txn_ctx, error));
+        }
+        let value = eval_constant(&arg.value, &eval_ctx).map_err(|e| own(txn_ctx, e))?;
+        match &arg.name {
+            Some(n) => {
+                let key = n.value.trim_start_matches('@').to_ascii_lowercase();
+                // A parameter supplied twice (named twice, or named on top
+                // of a positional binding) is an error, not a silent pick.
+                let position_of = |name: &str| procedure.params.iter().position(|p| p.name == name);
+                let already_positional =
+                    position_of(&key).is_some_and(|index| index < positional.len());
+                if already_positional || named.iter().any(|(n, ..)| *n == key) {
+                    let error = SqlError::new(
+                        8143,
+                        16,
+                        1,
+                        format!(
+                            "Parameter '@{key}' was supplied multiple times for procedure {}.",
+                            def.name
+                        ),
+                    );
+                    return Err(own(txn_ctx, error));
+                }
+                named.push((key, value, arg.output, arg_var));
+            }
+            None => {
+                positional.push(value);
+                positional_meta.push((arg.output, arg_var));
+            }
+        }
+    }
+    // `EXEC @rc = p`: the status variable must already be declared (137).
+    if let Some(rc) = &exec.return_var
+        && !txn_ctx.variables.contains_key(rc)
+    {
+        let error = undeclared_variable_err(rc);
+        return Err(own(txn_ctx, error));
+    }
+    if positional.len() > procedure.params.len() {
+        let error = SqlError::new(
+            8144,
+            16,
+            2,
+            format!(
+                "Procedure or function {} has too many arguments specified.",
+                def.name
+            ),
+        );
+        return Err(own(txn_ctx, error));
+    }
+    // Named arguments that match no declared parameter fail before any
+    // binding (8145 precedes 201, as SQL Server orders it).
+    for (name, ..) in &named {
+        if !procedure.params.iter().any(|p| p.name == *name) {
+            let error = SqlError::new(
+                8145,
+                16,
+                2,
+                format!("@{name} is not a parameter for procedure {}.", def.name),
+            );
+            return Err(own(txn_ctx, error));
+        }
+    }
+    // Bind: positional in declaration order, then named by name, then
+    // defaults; a missing non-default parameter is 201. OUTPUT copy-back
+    // targets (param name -> caller variable) are collected as we bind.
+    let mut bound: Vec<(String, ColumnType, SqlValue)> = Vec::new();
+    let mut copy_back: Vec<(String, String)> = Vec::new();
+    for (index, param) in procedure.params.iter().enumerate() {
+        let column_type = ColumnType::parse(&param.type_spec).map_err(|e| {
+            let error = SqlError::message_only(245, e.to_string());
+            own(txn_ctx, error)
+        })?;
+        let supplied = if index < positional.len() {
+            let (output, arg_var) = positional_meta[index].clone();
+            Some((positional[index].clone(), output, arg_var))
+        } else {
+            named
+                .iter()
+                .find(|(n, ..)| *n == param.name)
+                .map(|(_, v, output, arg_var)| (v.clone(), *output, arg_var.clone()))
+        };
+        let coerce = |value: SqlValue| -> Result<SqlValue, SqlError> {
+            let datum = value::sql_to_datum(&value, &column_type, &param.name)?;
+            Ok(value::datum_to_sql(&datum, &column_type))
+        };
+        let value = match supplied {
+            Some((value, output, arg_var)) => {
+                if output {
+                    if !param.output {
+                        let error = SqlError::new(
+                            8162,
+                            16,
+                            2,
+                            format!(
+                                "The formal parameter \"@{}\" was not declared as an OUTPUT \
+                                 parameter, but the actual parameter passed in requested output.",
+                                param.name
+                            ),
+                        );
+                        return Err(own(txn_ctx, error));
+                    }
+                    copy_back.push((
+                        param.name.clone(),
+                        arg_var.expect("validated: OUTPUT arguments are variables"),
+                    ));
+                }
+                // Bind-time conversion to the DECLARED type, as SQL Server
+                // converts (or errors) at the call — without it a string
+                // argument flows into an INT parameter mistagged.
+                coerce(value).map_err(|e| own(txn_ctx, e))?
+            }
+            None => match &param.default {
+                Some(text) => {
+                    let expr = truthdb_sql::parse_expr(text).map_err(|e| own(txn_ctx, e))?;
+                    let value = eval_constant(&expr, &eval_ctx).map_err(|e| own(txn_ctx, e))?;
+                    coerce(value).map_err(|e| own(txn_ctx, e))?
+                }
+                None => {
+                    let error = SqlError::new(
+                        201,
+                        16,
+                        4,
+                        format!(
+                            "Procedure or function '{}' expects parameter '@{}', which was not \
+                             supplied.",
+                            def.name, param.name
+                        ),
+                    );
+                    return Err(own(txn_ctx, error));
+                }
+            },
+        };
+        bound.push((param.name.clone(), column_type, value));
+    }
+    // The stored body parses under the in-procedure grammar.
+    let statements =
+        truthdb_sql::parse_procedure_body(&procedure.body).map_err(|e| own(txn_ctx, e))?;
+
+    // Fresh scope, SET options reverting at exit — the sp_executesql shape.
+    let outer_vars = std::mem::take(&mut txn_ctx.variables);
+    let outer_xact_abort = txn_ctx.xact_abort;
+    let outer_nocount = txn_ctx.nocount;
+    let outer_isolation = txn_ctx.isolation;
+    let outer_showplan = txn_ctx.showplan_text;
+    for (name, column_type, value) in bound {
+        txn_ctx.variables.insert(name, (column_type, value));
+    }
+    txn_ctx.proc_stack.push(def.name.clone());
+    txn_ctx.proc_return = None;
+    let depth = EXEC_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    let result = if depth > 32 {
+        let error = SqlError::new(
+            217,
+            16,
+            1,
+            "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).",
+        );
+        Err(ExecError::Own(doom_per_rule(txn_ctx, error)))
+    } else {
+        run_block(storage, &statements, txn_ctx, run, in_try)
+            .map(|_| ())
+            .map_err(ExecError::Inner)
+    };
+    EXEC_DEPTH.with(|d| d.set(d.get() - 1));
+    txn_ctx.proc_stack.pop();
+    // Capture OUTPUT values from the inner scope BEFORE restoring the outer.
+    let output_values: Vec<(String, (ColumnType, SqlValue))> = copy_back
+        .iter()
+        .filter_map(|(param, var)| {
+            txn_ctx
+                .variables
+                .get(param)
+                .map(|slot| (var.clone(), slot.clone()))
+        })
+        .collect();
+    txn_ctx.variables = outer_vars;
+    txn_ctx.xact_abort = outer_xact_abort;
+    txn_ctx.nocount = outer_nocount;
+    txn_ctx.isolation = outer_isolation;
+    txn_ctx.showplan_text = outer_showplan;
+    let return_status = txn_ctx.proc_return.take().unwrap_or(0);
+    if result.is_ok() {
+        // OUTPUT copy-back and the return status land only when the body
+        // completed (SQL Server skips both when execution aborts).
+        for (var, slot) in output_values {
+            txn_ctx.variables.insert(var, slot);
+        }
+        if let Some(rc) = &exec.return_var {
+            txn_ctx
+                .variables
+                .insert(rc.clone(), (ColumnType::Int, SqlValue::Int(return_status)));
+        }
+    }
+    result
+}
+
 fn run_exec(
     storage: &Storage,
     exec: &ExecStatement,
@@ -704,6 +978,12 @@ fn run_exec(
     in_try: bool,
 ) -> Result<(), ExecError> {
     if !strip_schema(&exec.proc.value).eq_ignore_ascii_case("sp_executesql") {
+        // A user procedure, if the catalog has one; 2812 otherwise.
+        if let Some(def) = resolve_table(storage, &exec.proc.value)
+            && def.is_procedure()
+        {
+            return run_user_procedure(storage, exec, &def, txn_ctx, run, in_try);
+        }
         let error = SqlError::new(
             2812,
             16,
@@ -711,6 +991,15 @@ fn run_exec(
             format!("Could not find stored procedure '{}'.", exec.proc.value),
         )
         .at(exec.proc.span);
+        return Err(ExecError::Own(doom_per_rule(txn_ctx, error)));
+    }
+    if exec.return_var.is_some() {
+        let error = SqlError::new(
+            179,
+            16,
+            1,
+            "Cannot capture a return status from sp_executesql.",
+        );
         return Err(ExecError::Own(doom_per_rule(txn_ctx, error)));
     }
     let eval_ctx = txn_ctx.eval_context();
@@ -852,7 +1141,7 @@ fn statement_error_ladder(
     if error.number == CANCEL_ERROR {
         return Err(error);
     }
-    txn_ctx.last_error = error.number;
+    txn_ctx.record_error(error.number);
     // A durability failure wedged the store (a flush inside the statement,
     // e.g. before a snapshot capture): never continue past a lost commit.
     if run.durability_failed {
@@ -1028,7 +1317,12 @@ fn run_block(
                     if error.number == CANCEL_ERROR {
                         return Err(error);
                     }
-                    txn_ctx.last_error = error.number;
+                    // Inner errors were recorded at their raise site (the
+                    // inner ladder), where the procedure frame was still
+                    // live; re-recording here would blank ERROR_PROCEDURE().
+                    if !from_inner {
+                        txn_ctx.record_error(error.number);
+                    }
                     if run.durability_failed {
                         return Err(error);
                     }
@@ -1141,9 +1435,35 @@ fn run_block(
             // these only ever propagate up to an enclosing loop.
             Statement::Break { .. } => return Ok(Flow::Break),
             Statement::Continue { .. } => return Ok(Flow::Continue),
-            // The parser rejects `RETURN <value>` outside a procedure (178),
-            // so a reachable RETURN just exits the batch.
-            Statement::Return { .. } => return Ok(Flow::Return),
+            // The parser rejects `RETURN <value>` outside a procedure (178);
+            // inside one the status is stashed for `EXEC @rc =` to read.
+            Statement::Return { value, .. } => {
+                if let Some(value) = value {
+                    let eval_ctx = txn_ctx.eval_context();
+                    match eval_constant(value, &eval_ctx) {
+                        Ok(SqlValue::Int(status)) => txn_ctx.proc_return = Some(status),
+                        Ok(SqlValue::Null) => {
+                            // SQL Server warns and returns 0; we return 0.
+                            txn_ctx.proc_return = Some(0);
+                        }
+                        Ok(_) | Err(_) => {
+                            let error =
+                                eval_constant(value, &eval_ctx).err().unwrap_or_else(|| {
+                                    SqlError::new(
+                                        257,
+                                        16,
+                                        3,
+                                        "The RETURN status must be an integer.",
+                                    )
+                                });
+                            txn_ctx.rowcount = 0;
+                            statement_error_ladder(statement, error, txn_ctx, run, in_try)?;
+                            continue;
+                        }
+                    }
+                }
+                return Ok(Flow::Return);
+            }
             _ => {}
         }
         if let Statement::TryCatch {
@@ -1161,14 +1481,9 @@ fn run_block(
                 // A durability failure wedged the store: no CATCH swallows a
                 // lost commit (the old batch-end fsync ran past every TRY).
                 Err(error) if run.durability_failed => return Err(error),
-                // Severity >= 20 is fatal to the connection: no CATCH sees it.
-                Err(error) if error.level >= FATAL_SEVERITY => {
-                    txn_ctx.last_error = error.number;
-                    if txn_ctx.in_txn() {
-                        txn_ctx.doomed = true;
-                    }
-                    return Err(error);
-                }
+                // Severity >= 20 is fatal to the connection: no CATCH sees
+                // it. Already recorded (and doomed) at the raise site.
+                Err(error) if error.level >= FATAL_SEVERITY => return Err(error),
                 Err(error) => {
                     // The failed statement's own writes were already undone to
                     // its savepoint (`rel_statement_scoped`), and the doom
@@ -1628,6 +1943,8 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::Block { .. }
             | Statement::If { .. }
             | Statement::While { .. }
+            | Statement::CreateProcedure(_)
+            | Statement::DropProcedure { .. }
             | Statement::Commit { .. }
     )
 }
@@ -1927,10 +2244,28 @@ pub fn analyze_locks(
     let Ok(parsed) = truthdb_sql::parse(sql) else {
         return Vec::new();
     };
+    // The visited set terminates recursive procedures. Keyed on (procedure,
+    // effective analysis regime), NOT the name alone: a body's lock
+    // contribution is ISOLATION-DEPENDENT (versioned RC contributes Database
+    // IS; an escalated re-entry needs Table S), so a body re-entered under a
+    // different regime must re-analyze — the review's HIGH showed a shared
+    // body analyzed versioned first and then skipped under SERIALIZABLE,
+    // executing with no Table S. The regime lattice is finite, so
+    // termination survives.
+    let mut visited = std::collections::HashSet::new();
+    analyze_statements_locks(storage, &parsed, isolation, &mut visited)
+}
+
+fn analyze_statements_locks(
+    storage: &Storage,
+    parsed: &[Statement],
+    isolation: Isolation,
+    visited: &mut std::collections::HashSet<(String, Isolation)>,
+) -> Vec<(Resource, LockMode)> {
     // Flatten TRY/CATCH so the locks a batch needs are pre-acquired for the
     // statements inside its try/catch blocks too, not just the top level.
     let mut statements: Vec<&Statement> = Vec::new();
-    flatten_statements(&parsed, &mut statements);
+    flatten_statements(parsed, &mut statements);
     // Reads take shared locks except under READ UNCOMMITTED, which takes none.
     // A batch that raises the isolation level (e.g. `SET ISOLATION LEVEL
     // SERIALIZABLE; SELECT ...`) must lock its reads even if the session was
@@ -2125,7 +2460,37 @@ pub fn analyze_locks(
             // statement, an unknown procedure) cannot be analyzed before it
             // runs — lock the database exclusively rather than under-lock
             // (2PL acquires the full set up front).
-            Statement::Exec(exec) => match exec_literal_sql(exec) {
+            Statement::Exec(exec) => {
+                // A user procedure: its stored body analyzes like literal
+                // inner text, parsed with the IN-PROCEDURE grammar — a plain
+                // parse would reject `RETURN <value>` (178), yield no locks,
+                // and the body would run UNLOCKED (the 2PL hole class).
+                if let Some(def) = resolve_table(storage, &exec.proc.value)
+                    && let Some(procedure) = &def.procedure
+                {
+                    let inner_isolation = if reads_lock {
+                        if matches!(isolation, Isolation::ReadCommitted | Isolation::Snapshot)
+                            && !escalates_reads
+                        {
+                            isolation
+                        } else {
+                            Isolation::RepeatableRead
+                        }
+                    } else {
+                        isolation
+                    };
+                    if visited.insert((def.name.clone(), inner_isolation))
+                        && let Ok(body) = truthdb_sql::parse_procedure_body(&procedure.body)
+                    {
+                        for (resource, mode) in
+                            analyze_statements_locks(storage, &body, inner_isolation, visited)
+                        {
+                            add(resource, mode);
+                        }
+                    }
+                    continue;
+                }
+                match exec_literal_sql(exec) {
                 Some(inner) => {
                     // The inner text runs under the batch's EFFECTIVE
                     // isolation: a `SET ... SERIALIZABLE` before the EXEC
@@ -2159,12 +2524,21 @@ pub fn analyze_locks(
                     } else {
                         isolation
                     };
-                    for (resource, mode) in analyze_locks(storage, &inner, inner_isolation) {
-                        add(resource, mode);
+                    if let Ok(parsed) = truthdb_sql::parse(&inner) {
+                        for (resource, mode) in
+                            analyze_statements_locks(storage, &parsed, inner_isolation, visited)
+                        {
+                            add(resource, mode);
+                        }
                     }
                 }
                 None => add(Resource::Database, LockMode::Exclusive),
-            },
+                }
+            }
+            // Procedure DDL rewrites the catalog: Database X, like other DDL.
+            Statement::CreateProcedure(_) | Statement::DropProcedure { .. } => {
+                add(Resource::Database, LockMode::Exclusive);
+            }
             // IF/WHILE conditions read tables through their subqueries —
             // locked exactly like a SELECT's tables (their bodies were
             // flattened into this list and analyze as themselves).
@@ -2298,6 +2672,20 @@ fn exec_statement_dispatch(
         Statement::BeginTransaction { .. } => exec_begin(storage, txn_ctx),
         Statement::Use { database, .. } => exec_use(database, txn_ctx),
         Statement::Throw(throw) => Err(exec_throw(throw, txn_ctx)),
+        Statement::CreateProcedure(create) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_procedure(storage, create)
+        }
+        Statement::DropProcedure {
+            name, if_exists, ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_procedure(storage, name, *if_exists)
+        }
         // Executed by `run_block`'s own arms; nothing routes them here.
         Statement::Block { .. }
         | Statement::If { .. }
@@ -3993,9 +4381,11 @@ fn length(n: u32, name: &str) -> Result<u16, SqlError> {
 // ---- DROP TABLE ---------------------------------------------------------
 
 fn exec_drop_table(storage: &Storage, drop: &DropTable) -> Result<StatementResult, SqlError> {
-    // DROP TABLE does not drop a view (use DROP VIEW). The object exists but is
-    // the wrong type, so error even under IF EXISTS rather than silently no-op.
-    if resolve_table(storage, &drop.table.value).is_some_and(|d| d.is_view()) {
+    // DROP TABLE does not drop a view or a procedure (use the matching DROP).
+    // The object exists but is the wrong type, so error even under IF EXISTS
+    // rather than silently no-op — the review showed DROP TABLE silently
+    // DESTROYING a procedure through the shared catalog path.
+    if resolve_table(storage, &drop.table.value).is_some_and(|d| d.is_view() || d.is_procedure()) {
         return Err(SqlError::new(
             3701,
             11,
@@ -4082,6 +4472,126 @@ fn exec_create_view(storage: &Storage, create: &CreateView) -> Result<StatementR
         .rel_create_view(bare, &create.query_text)
         .map_err(|e| map_storage_err(e, &create.name.value))?;
     Ok(StatementResult::Done)
+}
+
+/// A parameter default must be a CONSTANT (SQL Server rejects at CREATE):
+/// literals, NULL, and a signed literal — never variables or functions,
+/// which would otherwise evaluate against each CALLER's scope and drift.
+fn constant_default(expr: &Expr) -> bool {
+    match &expr.kind {
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_) => true,
+        ExprKind::Unary { expr, .. } => constant_default(expr),
+        _ => false,
+    }
+}
+
+fn exec_create_procedure(
+    storage: &Storage,
+    create: &CreateProcedure,
+) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&create.name.value);
+    // The builtin dispatcher checks `sp_executesql` BEFORE the catalog, so a
+    // user procedure with that name would execute as the builtin while lock
+    // ANALYSIS resolved the catalog first — an unanalyzed inner batch (the
+    // review's shadow finding). Refuse the shadow outright.
+    if bare.eq_ignore_ascii_case("sp_executesql") {
+        return Err(SqlError::new(
+            2714,
+            16,
+            6,
+            "The name 'sp_executesql' is reserved for the system procedure.",
+        ));
+    }
+    let params = create
+        .params
+        .iter()
+        .map(|p| -> Result<ProcParamDef, SqlError> {
+            // The declared type round-trips through the column-type spec
+            // parser, exactly like table columns.
+            let column_type = data_type_to_column_type(&p.data_type, &p.name)?;
+            if let Some(text) = &p.default_text {
+                let expr = truthdb_sql::parse_expr(text)?;
+                if !constant_default(&expr) {
+                    return Err(SqlError::new(
+                        102,
+                        15,
+                        1,
+                        format!(
+                            "The default for parameter '@{}' must be a constant.",
+                            p.name
+                        ),
+                    )
+                    .at(p.span));
+                }
+            }
+            Ok(ProcParamDef {
+                name: p.name.clone(),
+                type_spec: column_type.name(),
+                default: p.default_text.clone(),
+                output: p.output,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let procedure = ProcedureDef {
+        params,
+        body: create.body.clone(),
+    };
+    if create.alter {
+        match resolve_table(storage, &create.name.value) {
+            Some(def) if def.is_procedure() => {
+                storage
+                    .rel_alter_procedure(&def.name, procedure)
+                    .map_err(|e| map_storage_err(e, &create.name.value))?;
+                return Ok(StatementResult::Done);
+            }
+            _ => {
+                return Err(SqlError::invalid_object(bare).at(create.name.span));
+            }
+        }
+    }
+    if resolve_table(storage, &create.name.value).is_some() {
+        return Err(SqlError::new(
+            2714,
+            16,
+            6,
+            format!("There is already an object named '{bare}' in the database."),
+        ));
+    }
+    storage
+        .rel_create_procedure(bare, procedure)
+        .map_err(|e| map_storage_err(e, &create.name.value))?;
+    Ok(StatementResult::Done)
+}
+
+fn exec_drop_procedure(
+    storage: &Storage,
+    name: &Name,
+    if_exists: bool,
+) -> Result<StatementResult, SqlError> {
+    match resolve_table(storage, &name.value) {
+        Some(def) if def.is_procedure() => {
+            storage
+                .rel_drop_table(&def.name)
+                .map_err(|e| map_storage_err(e, &def.name))?;
+            Ok(StatementResult::Done)
+        }
+        Some(_) | None if if_exists => Ok(StatementResult::Done),
+        _ => Err(SqlError::new(
+            3701,
+            11,
+            5,
+            format!(
+                "Cannot drop the procedure '{}', because it does not exist or you do not have \
+                 permission.",
+                name.value
+            ),
+        )),
+    }
 }
 
 fn exec_drop_view(storage: &Storage, drop: &DropView) -> Result<StatementResult, SqlError> {
@@ -5857,7 +6367,10 @@ fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<S
     match from {
         TableRef::Table { name, alias } => {
             let def = resolve_table(storage, &name.value)?;
-            if def.is_view() {
+            // A view defers to its expansion; a PROCEDURE must not read as a
+            // zero-column table — bailing here routes to the collecting path,
+            // which errors 2809.
+            if def.is_view() || def.is_procedure() {
                 return None;
             }
             let qualifier = alias
@@ -6936,8 +7449,10 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     let def = resolve_table(storage, &name.value)?;
     // A view is its own SELECT, expanded as a derived table — and its TableDef
     // has no columns and a `root_page` of 0, so a wildcard over it would project
-    // nothing and the scan would read the catalog root instead of the view.
-    if def.view_query.is_some() {
+    // nothing and the scan would read the catalog root instead of the view. A
+    // PROCEDURE has the same empty shape and must not stream as an empty
+    // table: the collecting path rejects it (2809).
+    if def.view_query.is_some() || def.is_procedure() {
         return None;
     }
     let schema = def.schema().ok()?;
@@ -8399,6 +8914,9 @@ fn build_table_source(
         "sys.databases" => sys_databases(storage, eval_ctx),
         "sys.configurations" => sys_configurations(),
         "sys.views" => sys_views(storage),
+        "sys.procedures" => sys_procedures(storage),
+        "sys.parameters" => sys_parameters(storage),
+        "sys.objects" => sys_objects(storage),
         "sys.sql_modules" => sys_sql_modules(storage),
         "sys.columns" => sys_columns(storage),
         "sys.indexes" => sys_indexes(storage),
@@ -8408,6 +8926,10 @@ fn build_table_source(
         _ => {
             let def = resolve_table(storage, &name.value)
                 .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
+            // A procedure is not a queryable object (SQL Server 2809).
+            if def.is_procedure() {
+                return Err(procedure_not_a_table(&def.name).at(name.span));
+            }
             // A view: run its stored SELECT as a derived table under the view's
             // qualifier. A view over another view expands recursively — building
             // the derived source re-enters `build_table_source` for the inner
@@ -9256,8 +9778,110 @@ fn sys_sql_modules(storage: &Storage) -> Source {
         .rel_tables()
         .into_iter()
         .filter_map(|def| {
-            def.view_query
-                .map(|q| vec![Datum::Int(def.object_id as i32), Datum::NVarChar(q)])
+            // Views store their SELECT; procedures their body text.
+            let definition = def
+                .view_query
+                .clone()
+                .or_else(|| def.procedure.as_ref().map(|p| p.body.clone()))?;
+            Some(vec![
+                Datum::Int(def.object_id as i32),
+                Datum::NVarChar(definition),
+            ])
+        })
+        .collect();
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_procedures(storage: &Storage) -> Source {
+    let columns = vec![nvarchar("name", 128), int_col("object_id")];
+    let rows = storage
+        .rel_tables()
+        .into_iter()
+        .filter(|def| def.is_procedure())
+        .map(|def| {
+            vec![
+                Datum::NVarChar(def.name.clone()),
+                Datum::Int(def.object_id as i32),
+            ]
+        })
+        .collect();
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_parameters(storage: &Storage) -> Source {
+    let columns = vec![
+        int_col("object_id"),
+        nvarchar("name", 128),
+        int_col("parameter_id"),
+        nvarchar("system_type_name", 128),
+        int_col("is_output"),
+        int_col("has_default_value"),
+    ];
+    let mut rows = Vec::new();
+    for def in storage.rel_tables() {
+        let Some(procedure) = &def.procedure else {
+            continue;
+        };
+        for (index, param) in procedure.params.iter().enumerate() {
+            rows.push(vec![
+                Datum::Int(def.object_id as i32),
+                Datum::NVarChar(format!("@{}", param.name)),
+                Datum::Int(index as i32 + 1),
+                Datum::NVarChar(param.type_spec.clone()),
+                Datum::Int(i32::from(param.output)),
+                Datum::Int(i32::from(param.default.is_some())),
+            ]);
+        }
+    }
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_objects(storage: &Storage) -> Source {
+    let columns = vec![
+        nvarchar("name", 128),
+        int_col("object_id"),
+        nvarchar("type", 2),
+        nvarchar("type_desc", 60),
+    ];
+    let rows = storage
+        .rel_tables()
+        .into_iter()
+        .map(|def| {
+            // SQL Server's type codes carry a trailing space.
+            let (code, desc) = if def.is_procedure() {
+                ("P ", "SQL_STORED_PROCEDURE")
+            } else if def.is_view() {
+                ("V ", "VIEW")
+            } else {
+                ("U ", "USER_TABLE")
+            };
+            vec![
+                Datum::NVarChar(def.name.clone()),
+                Datum::Int(def.object_id as i32),
+                Datum::NVarChar(code.to_string()),
+                Datum::NVarChar(desc.to_string()),
+            ]
         })
         .collect();
     let collations = vec![None; columns.len()];
@@ -9504,8 +10128,12 @@ fn collect_read_lock_ids(storage: &Storage, name: &str, depth: u32, out: &mut Ve
     }
 }
 
-/// Views are read-only here; INSERT/UPDATE/DELETE against one is rejected.
+/// Views are read-only here; INSERT/UPDATE/DELETE against one is rejected —
+/// and a PROCEDURE is not a data object at all (SQL Server 2809).
 fn reject_dml_on_view(def: &TableDef) -> Result<(), SqlError> {
+    if def.is_procedure() {
+        return Err(procedure_not_a_table(&def.name));
+    }
     if def.is_view() {
         return Err(SqlError::new(
             4406,
@@ -9520,10 +10148,25 @@ fn reject_dml_on_view(def: &TableDef) -> Result<(), SqlError> {
     Ok(())
 }
 
+/// SQL Server 2809: a procedure referenced where a table/view is required.
+fn procedure_not_a_table(name: &str) -> SqlError {
+    SqlError::new(
+        2809,
+        16,
+        1,
+        format!(
+            "The request for procedure '{name}' failed because '{name}' is a procedure object."
+        ),
+    )
+}
+
 /// Table-only DDL (ALTER TABLE, CREATE INDEX) rejects a view. Without this a
 /// view's `root_page = 0` would be heap-scanned — and page 0 is the catalog
 /// root, so a bare `ALTER TABLE view ADD CHECK (1=1)` could corrupt the catalog.
 fn reject_view_as_table(def: &TableDef) -> Result<(), SqlError> {
+    if def.is_procedure() {
+        return Err(procedure_not_a_table(&def.name));
+    }
     if def.is_view() {
         return Err(SqlError::new(
             4928,

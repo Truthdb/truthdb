@@ -2405,6 +2405,75 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Adversarial review probe: ALTER PROCEDURE bumps the lock-analysis
+    /// epoch, so a batch parked with a lock set analyzed over the OLD body is
+    /// re-analyzed at grant time against the NEW body — otherwise the new
+    /// body's writes would run under the old body's read locks (the stale
+    /// twice-derived-decision class from the Stage 13 review).
+    #[test]
+    fn review_poc_alter_procedure_reanalyzes_a_parked_exec() {
+        let (engine, mut sched, path) = bare("epoch-proc-alter", None);
+        let blocker = sched.sessions.open("truthdb".into(), "sa".into());
+        let waiter = sched.sessions.open("truthdb".into(), "sa".into());
+        {
+            let mut ctx = crate::rel::TxnContext::default();
+            engine
+                .sql_batch("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)", &mut ctx)
+                .expect("create table");
+            engine
+                .sql_batch("CREATE PROCEDURE p AS SELECT id FROM t", &mut ctx)
+                .expect("create proc");
+        }
+        // The blocker holds Database X so nothing becomes grantable.
+        assert!(sched.try_acquire(
+            blocker.raw(),
+            &[(Resource::Database, LockMode::Exclusive)],
+            true
+        ));
+        // Park an EXEC analyzed against the OLD (read-only) body.
+        let epoch = engine.lock_analysis_epoch();
+        let needs = engine.analyze_locks("EXEC p", crate::rel::Isolation::ReadCommitted);
+        assert!(
+            !needs
+                .iter()
+                .any(|(_, m)| matches!(m, LockMode::IntentExclusive | LockMode::Exclusive)),
+            "precondition: the old body takes no write locks: {needs:?}"
+        );
+        let (tx, _rx) = mpsc::unbounded_channel();
+        sched.parked.push_back(Parked {
+            session: waiter,
+            sql: "EXEC p".into(),
+            params: Vec::new(),
+            cancel: Arc::new(AtomicBool::new(false)),
+            reply: BatchSink::new(tx),
+            needs,
+            deadline: Instant::now() + Duration::from_secs(5),
+            epoch,
+        });
+        // The body is replaced while the batch is parked.
+        {
+            let mut ctx = crate::rel::TxnContext::default();
+            engine
+                .sql_batch("ALTER PROCEDURE p AS INSERT INTO t VALUES (1)", &mut ctx)
+                .expect("alter proc");
+        }
+        // The grant path must re-analyze (the blocker still prevents the
+        // grant itself, so the refreshed needs stay inspectable).
+        assert!(
+            sched.next_grantable(&engine).is_none(),
+            "Database X is still held; nothing may be granted"
+        );
+        let refreshed = &sched.parked.front().expect("still parked").needs;
+        assert!(
+            refreshed
+                .iter()
+                .any(|(_, m)| matches!(m, LockMode::IntentExclusive | LockMode::Exclusive)),
+            "the parked EXEC's lock set was re-analyzed against the NEW \
+             body (INSERT): {refreshed:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
     #[tokio::test]
     async fn the_pool_actually_spawns_a_maintenance_thread() {
         // `housekeeping_runs_with_no_worker_free_to_do_it` builds `Shared` by

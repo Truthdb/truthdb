@@ -116,12 +116,45 @@ pub struct TableDef {
     /// A view carries no data pages, columns, or key.
     #[serde(default)]
     pub view_query: Option<String>,
+    /// For a STORED PROCEDURE: its parameters and body source text, re-parsed
+    /// at each EXEC (the view posture: text is the stored form, recompile-on-
+    /// schema-change semantics for free). `None` for tables and views. A
+    /// procedure carries no data pages, columns, or key.
+    #[serde(default)]
+    pub procedure: Option<ProcedureDef>,
+}
+
+/// A stored procedure's catalog payload: declared parameters and body text.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcedureDef {
+    pub params: Vec<ProcParamDef>,
+    /// The body's source text (the statements after `AS`), parsed with the
+    /// in-procedure grammar (RETURN <value> is legal) at EXEC time.
+    pub body: String,
+}
+
+/// One declared procedure parameter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProcParamDef {
+    /// Lowercased, without the `@`.
+    pub name: String,
+    /// Parseable type spec, same round-trip as column types.
+    pub type_spec: String,
+    /// Default value source text (the parameter is then optional).
+    pub default: Option<String>,
+    /// `OUTPUT`/`OUT`: the argument variable receives the final value.
+    pub output: bool,
 }
 
 impl TableDef {
     /// True if this catalog entry is a view rather than a base table.
     pub fn is_view(&self) -> bool {
         self.view_query.is_some()
+    }
+
+    /// True if this catalog entry is a stored procedure.
+    pub fn is_procedure(&self) -> bool {
+        self.procedure.is_some()
     }
 }
 

@@ -99,6 +99,40 @@ pub enum Statement {
         value: Option<Expr>,
         span: Span,
     },
+    /// `CREATE PROCEDURE` / `ALTER PROCEDURE` — the body is stored as source
+    /// text (the view posture) and re-parsed at EXEC.
+    CreateProcedure(CreateProcedure),
+    /// `DROP PROCEDURE [IF EXISTS] <name>`.
+    DropProcedure {
+        name: Name,
+        if_exists: bool,
+        span: Span,
+    },
+}
+
+/// `CREATE|ALTER PROC[EDURE] <name> [@p TYPE [= default] [OUTPUT], ...] AS <body>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateProcedure {
+    pub name: Name,
+    pub params: Vec<ProcParam>,
+    /// The body's source text: everything after `AS`, verbatim.
+    pub body: String,
+    /// `ALTER PROCEDURE` replaces an existing definition.
+    pub alter: bool,
+    pub span: Span,
+}
+
+/// One declared procedure parameter.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ProcParam {
+    /// Lowercased, without the `@`.
+    pub name: String,
+    pub data_type: DataType,
+    /// Default value source text (the parameter is then optional at EXEC).
+    pub default_text: Option<String>,
+    /// `OUTPUT`/`OUT`.
+    pub output: bool,
+    pub span: Span,
 }
 
 /// `THROW [number, message, state]`.
@@ -143,19 +177,25 @@ pub struct Declaration {
     pub span: Span,
 }
 
-/// `EXEC[UTE] <proc> [@name =] <expr> [, ...]`.
+/// `EXEC[UTE] [@rc =] <proc> [[@name =] <expr> [OUTPUT] [, ...]]`.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecStatement {
     pub proc: Name,
+    /// `EXEC @rc = proc`: the variable receiving the RETURN status
+    /// (lowercased, without the `@`).
+    pub return_var: Option<String>,
     pub args: Vec<ExecArg>,
     pub span: Span,
 }
 
-/// One argument of an `EXEC`: optionally named (`@p = expr`).
+/// One argument of an `EXEC`: optionally named (`@p = expr`), optionally
+/// `OUTPUT` (the argument must then be a variable, which receives the
+/// parameter's final value).
 #[derive(Debug, Clone, PartialEq)]
 pub struct ExecArg {
     pub name: Option<Name>,
     pub value: Expr,
+    pub output: bool,
 }
 
 /// `ALTER TABLE <table> <action>`.

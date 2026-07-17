@@ -1,0 +1,64 @@
+# Stored procedures (Stage 15): DDL, EXEC with binding forms, RETURN status,
+# OUTPUT copy-back, and the catalog views. The interaction matrix (errors,
+# nesting, aborts) lives in the engine tests.
+
+statement ok
+CREATE TABLE pt (id INT NOT NULL PRIMARY KEY)
+
+statement ok
+CREATE PROCEDURE add_row @id INT, @doubled INT OUTPUT AS INSERT INTO pt VALUES (@id); SET @doubled = @id * 2; RETURN @id + 100
+
+statement ok
+DECLARE @d INT, @rc INT; EXEC @rc = add_row 21, @d OUTPUT; INSERT INTO pt VALUES (@d); INSERT INTO pt VALUES (@rc)
+
+query I rowsort
+SELECT id FROM pt
+----
+21
+42
+121
+
+# Named binding and defaults.
+statement ok
+CREATE PROC greet @who NVARCHAR(50) = 'world' AS SELECT @who
+
+query T
+EXEC greet
+----
+world
+
+query T
+EXEC greet @who = 'truthdb'
+----
+truthdb
+
+# Catalog views.
+query TI rowsort
+SELECT name, object_id > 0 FROM sys.procedures
+----
+add_row 1
+greet 1
+
+query TII rowsort
+SELECT name, parameter_id, is_output FROM sys.parameters WHERE name LIKE '@d%'
+----
+@doubled 2 1
+
+# (the `type` code itself carries SQL Server's trailing space, which this
+# file format cannot express — the WHERE proves it round-trips)
+query TT rowsort
+SELECT name, type_desc FROM sys.objects WHERE type = 'P '
+----
+add_row SQL_STORED_PROCEDURE
+greet SQL_STORED_PROCEDURE
+
+query I
+SELECT COUNT(*) FROM sys.sql_modules m JOIN sys.procedures p ON m.object_id = p.object_id
+----
+2
+
+statement ok
+DROP PROCEDURE greet
+
+statement error
+EXEC greet

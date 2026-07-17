@@ -555,6 +555,29 @@ impl Storage {
         self.lock().rel_create_view(name, query_text)
     }
 
+    pub fn rel_create_procedure(
+        &self,
+        name: &str,
+        procedure: crate::relstore::catalog::ProcedureDef,
+    ) -> Result<(), StorageError> {
+        let result = self.lock().rel_create_procedure(name, procedure);
+        // A parked batch analyzed against the OLD catalog could carry a stale
+        // lock set for an EXEC of this name — same class as the option-flip
+        // epoch (Stage 13): bump so the grant path re-analyzes.
+        self.bump_lock_epoch();
+        result
+    }
+
+    pub fn rel_alter_procedure(
+        &self,
+        name: &str,
+        procedure: crate::relstore::catalog::ProcedureDef,
+    ) -> Result<(), StorageError> {
+        let result = self.lock().rel_alter_procedure(name, procedure);
+        self.bump_lock_epoch();
+        result
+    }
+
     pub fn rel_table(&self, name: &str) -> Option<TableDef> {
         self.lock().rel_table(name)
     }
@@ -676,6 +699,14 @@ impl Storage {
         self.lock_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// Bumps the lock-analysis epoch: a parked batch analyzed before a
+    /// catalog/option change re-analyzes at grant instead of running under a
+    /// stale lock set.
+    fn bump_lock_epoch(&self) {
+        self.lock_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// The lock-analysis epoch: parked batches analyzed under an older value
@@ -1344,6 +1375,7 @@ impl StorageFile {
                 check_constraints,
                 foreign_keys,
                 view_query: None,
+                procedure: None,
                 counter_page: Some(counter_page),
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1395,12 +1427,94 @@ impl StorageFile {
                 check_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 view_query: Some(query),
+                procedure: None,
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
+        self.rel.tables.insert(name.to_string(), def);
+        Ok(())
+    }
+
+    /// Creates a stored procedure: a catalog entry whose stored form is its
+    /// parameter list and body text (the view posture — re-parsed at EXEC).
+    pub fn rel_create_procedure(
+        &mut self,
+        name: &str,
+        procedure: crate::relstore::catalog::ProcedureDef,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        if self.rel.tables.contains_key(name) {
+            return Err(StorageError::Constraint(format!(
+                "object '{name}' already exists"
+            )));
+        }
+        if self.rel.catalog_root.is_none() {
+            let root = {
+                let mut ctx = self.rel_ctx();
+                catalog::create_catalog(&mut ctx)?
+            };
+            self.rel.catalog_root = Some(root);
+        }
+        let catalog_root = self.rel.catalog_root.expect("catalog exists");
+        let object_id = self.rel.next_object_id;
+        let proc_name = name.to_string();
+        let def = self.rel_statement(move |ctx, txn| {
+            let def = TableDef {
+                object_id,
+                name: proc_name,
+                columns: Vec::new(),
+                key_columns: Vec::new(),
+                root_page: 0,
+                defaults: Vec::new(),
+                collations: Vec::new(),
+                identity: None,
+                indexes: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                view_query: None,
+                procedure: Some(procedure),
+                counter_page: None,
+            };
+            catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
+            Ok(def)
+        })?;
+        self.rel.next_object_id += 1;
+        self.rel.tables.insert(name.to_string(), def);
+        Ok(())
+    }
+
+    /// Replaces an existing procedure's parameters and body (`ALTER
+    /// PROCEDURE`): the object id is kept, the stored text swapped.
+    pub fn rel_alter_procedure(
+        &mut self,
+        name: &str,
+        procedure: crate::relstore::catalog::ProcedureDef,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        let Some(existing) = self.rel.tables.get(name) else {
+            return Err(StorageError::Constraint(format!(
+                "procedure '{name}' does not exist"
+            )));
+        };
+        if !existing.is_procedure() {
+            return Err(StorageError::Constraint(format!(
+                "object '{name}' is not a procedure"
+            )));
+        }
+        let mut def = existing.clone();
+        def.procedure = Some(procedure);
+        let catalog_root = self
+            .rel
+            .catalog_root
+            .expect("procedures live in the catalog");
+        let write = def.clone();
+        self.rel_statement(move |ctx, txn| {
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &write)?;
+            Ok(())
+        })?;
         self.rel.tables.insert(name.to_string(), def);
         Ok(())
     }
@@ -4534,6 +4648,179 @@ mod tests {
     /// levels are untouched by the option.
     /// Lock analysis descends control-flow bodies: a WHILE body's INSERT and
     /// an IF condition's EXISTS table are in the batch's up-front lock set.
+    /// EXEC of a user procedure locks the STORED BODY's tables up front —
+    /// parsed with the in-procedure grammar (a plain parse would 178 on
+    /// `RETURN <value>`, yield no locks, and the body would run unlocked).
+    /// Recursive procedures terminate analysis via the visited set.
+    #[test]
+    fn analyze_locks_covers_procedure_bodies() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::{Isolation, TxnContext, execute_batch};
+
+        let path = unique_temp_path("proc-locks");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        for sql in [
+            "CREATE TABLE plt (id INT NOT NULL PRIMARY KEY)",
+            "CREATE PROCEDURE writer @v INT AS INSERT INTO plt VALUES (@v); \
+             EXEC writer @v; RETURN 5",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        let needs = crate::rel::analyze_locks(&storage, "EXEC writer 1", Isolation::ReadCommitted);
+        assert!(
+            needs.iter().any(
+                |(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Exclusive
+                    || matches!(r, Resource::Row(..))
+            ),
+            "the recursive body's INSERT locks its table (and analysis \
+             terminated): {needs:?}"
+        );
+        // An unknown procedure contributes no locks (2812 at execution).
+        let needs =
+            crate::rel::analyze_locks(&storage, "EXEC no_such_proc", Isolation::ReadCommitted);
+        assert!(
+            !needs
+                .iter()
+                .any(|(r, _)| matches!(r, Resource::Table(_) | Resource::Row(..))),
+            "unknown proc: {needs:?}"
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Adversarial review probe: the visited set dedups a procedure's lock
+    /// contribution, but a body's lock set DEPENDS on the effective
+    /// isolation. Under RCSI, `EXEC pread` analyzed first contributes only
+    /// Database IS (versioned read); a later `EXEC pser` — whose body raises
+    /// to SERIALIZABLE and EXECs pread — finds pread already visited and
+    /// skips it, so the lock-based re-analysis (Table S) is dropped. At
+    /// execution the SET is live inside pser and pread's SELECT reads
+    /// lock-based with no Table S held: the 2PL under-lock class.
+    #[test]
+    fn review_poc_analyze_locks_procedure_reanalyzed_under_escalated_isolation() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::{Isolation, TxnContext, execute_batch};
+
+        let path = unique_temp_path("proc-visited-isolation");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        for sql in [
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+            "CREATE PROCEDURE pread AS SELECT v FROM t",
+            "CREATE PROCEDURE pser AS \
+             SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; EXEC pread",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        let table_s = |needs: &[(Resource, LockMode)]| {
+            needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Shared)
+        };
+        // Control: analyzed alone, the escalated body read-locks.
+        let needs = crate::rel::analyze_locks(&storage, "EXEC pser", Isolation::ReadCommitted);
+        assert!(
+            table_s(&needs),
+            "control: pser's escalated body takes Table S: {needs:?}"
+        );
+        // The seam: pread analyzed first under the versioned regime, then
+        // pser's escalated re-entry is dropped by the visited set.
+        let needs =
+            crate::rel::analyze_locks(&storage, "EXEC pread; EXEC pser", Isolation::ReadCommitted);
+        assert!(
+            table_s(&needs),
+            "pser still runs pread's SELECT under SERIALIZABLE — Table S \
+             must be in the up-front set: {needs:?}"
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Adversarial review probe: a stored procedure EXEC'd from INSIDE a
+    /// dynamic-SQL literal is still resolved by lock analysis (the literal
+    /// recursion's Exec arm hits the procedure branch).
+    #[test]
+    fn review_poc_analyze_locks_procedure_via_dynamic_sql() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::{Isolation, TxnContext, execute_batch};
+
+        let path = unique_temp_path("proc-dyn-locks");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        for sql in [
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+            "CREATE PROCEDURE wtr @v INT AS INSERT INTO t VALUES (@v)",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "EXEC sp_executesql N'EXEC wtr 1'",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            needs.iter().any(|(r, m)| matches!(r, Resource::Table(_))
+                && matches!(m, LockMode::IntentExclusive | LockMode::Exclusive)
+                || matches!(r, Resource::Row(..))),
+            "the proc body's INSERT is in the up-front set via the literal \
+             path: {needs:?}"
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Adversarial review probe: analysis resolves the catalog FIRST, but
+    /// execution checks the sp_executesql builtin FIRST. A user procedure
+    /// named sp_executesql makes the two disagree: analysis analyzes the
+    /// user body, execution runs the builtin over the literal — whose locks
+    /// were never analyzed (under-lock). Either the CREATE must be refused
+    /// or the analysis must mirror execution's builtin-first order.
+    #[test]
+    fn review_poc_user_procedure_named_sp_executesql_cannot_shadow_builtin() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::{Isolation, TxnContext, execute_batch};
+
+        let path = unique_temp_path("proc-spexec-shadow");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let outcome = execute_batch(
+            &storage,
+            "CREATE PROCEDURE sp_executesql AS SELECT 1 AS n",
+            &mut ctx,
+        );
+        if outcome.error.is_none() {
+            // The shadow exists: analysis and execution must still agree.
+            // Execution runs the BUILTIN (its name check comes first), so the
+            // literal's INSERT locks must be in the analyzed set.
+            let needs = crate::rel::analyze_locks(
+                &storage,
+                "EXEC sp_executesql N'INSERT INTO t VALUES (1)'",
+                Isolation::ReadCommitted,
+            );
+            assert!(
+                needs.iter().any(|(r, m)| matches!(r, Resource::Table(_))
+                    && matches!(m, LockMode::IntentExclusive | LockMode::Exclusive)
+                    || matches!(r, Resource::Row(..))
+                    || (matches!(r, Resource::Database) && *m == LockMode::Exclusive)),
+                "execution runs the builtin INSERT; analysis followed the \
+                 user proc's body instead: {needs:?}"
+            );
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn analyze_locks_descends_control_flow() {
         use crate::lock::{LockMode, Resource};

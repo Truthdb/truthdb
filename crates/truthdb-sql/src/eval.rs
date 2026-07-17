@@ -98,17 +98,22 @@ pub struct EvalContext {
     pub xact_state: i8,
     /// `@@ERROR` — the previous statement's error number, 0 on success.
     pub last_error: i32,
+    /// `@@NESTLEVEL` — the current procedure nesting depth (0 in a batch).
+    pub nestlevel: i32,
 }
 
 /// The error captured by a `CATCH` block, surfaced by the `ERROR_*()`
-/// functions. Line and procedure are not tracked (no statement-line map, no
-/// stored procedures), so `ERROR_LINE()` reports 0 and `ERROR_PROCEDURE()` NULL.
+/// functions. Lines are not tracked (no statement-line map), so
+/// `ERROR_LINE()` reports 0.
 #[derive(Debug, Clone, Default)]
 pub struct ErrorInfo {
     pub number: i32,
     pub message: String,
     pub severity: u8,
     pub state: u8,
+    /// The stored procedure executing when the error was raised, for
+    /// `ERROR_PROCEDURE()` — `None` in ad-hoc batches.
+    pub procedure: Option<String>,
 }
 
 /// Evaluates `expr` against `row`, resolving columns via `resolver`.
@@ -244,6 +249,7 @@ fn eval_global_var(name: &str, ctx: &EvalContext) -> SqlResult<SqlValue> {
         )),
         "rowcount" => Ok(SqlValue::Int(ctx.rowcount)),
         "error" => Ok(SqlValue::Int(ctx.last_error as i64)),
+        "nestlevel" => Ok(SqlValue::Int(ctx.nestlevel as i64)),
         "identity" => Ok(SqlValue::Int(0)),
         other => Err(SqlError::message_only(
             102,
@@ -516,7 +522,13 @@ fn eval_session_function(name: &str, args: &[Expr]) -> Option<fn(&EvalContext) -
             Some(_) => SqlValue::Int(0),
             None => SqlValue::Null,
         }),
-        "ERROR_PROCEDURE" if args.is_empty() => Some(|_| SqlValue::Null),
+        "ERROR_PROCEDURE" if args.is_empty() => Some(|ctx| match &ctx.error {
+            Some(ErrorInfo {
+                procedure: Some(name),
+                ..
+            }) => SqlValue::Str(name.clone()),
+            _ => SqlValue::Null,
+        }),
         // Committability of the current transaction (independent of any CATCH).
         "XACT_STATE" if args.is_empty() => Some(|ctx| SqlValue::Int(ctx.xact_state as i64)),
         _ => None,
