@@ -67,7 +67,35 @@ fn datum_matches(column_type: &ColumnType, datum: &Datum) -> bool {
             | (ColumnType::VarChar { .. }, Datum::VarChar(_))
             | (ColumnType::NVarChar { .. }, Datum::NVarChar(_))
             | (ColumnType::VarBinary { .. }, Datum::VarBinary(_))
+            | (ColumnType::VarCharMax, Datum::VarChar(_))
+            | (ColumnType::NVarCharMax, Datum::NVarChar(_))
+            | (ColumnType::VarBinaryMax, Datum::VarBinary(_))
+            | (ColumnType::VarCharMax, Datum::OverflowRef { .. })
+            | (ColumnType::NVarCharMax, Datum::OverflowRef { .. })
+            | (ColumnType::VarBinaryMax, Datum::OverflowRef { .. })
     )
+}
+
+/// The var payload of a (MAX) column: a tag byte, then either the inline
+/// base encoding (0) or a 16-byte overflow-chain reference (1).
+fn encode_max_var(value: &Datum) -> Vec<u8> {
+    match value {
+        Datum::OverflowRef {
+            total_len,
+            first_page,
+        } => {
+            let mut out = Vec::with_capacity(17);
+            out.push(1);
+            out.extend_from_slice(&total_len.to_le_bytes());
+            out.extend_from_slice(&first_page.to_le_bytes());
+            out
+        }
+        other => {
+            let mut out = vec![0u8];
+            out.extend(other.encode_var());
+            out
+        }
+    }
 }
 
 pub fn encode_row(schema: &Schema, values: &[Datum]) -> Result<Vec<u8>, TypeError> {
@@ -119,6 +147,8 @@ pub fn encode_row(schema: &Schema, values: &[Datum]) -> Result<Vec<u8>, TypeErro
         if column.column_type.fixed_size().is_none() {
             var_payloads.push(if value.is_null() {
                 Vec::new()
+            } else if column.column_type.is_max() {
+                encode_max_var(value)
             } else {
                 value.encode_var()
             });

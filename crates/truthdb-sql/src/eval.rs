@@ -569,6 +569,8 @@ fn cast_value(value: SqlValue, target: &DataType) -> SqlResult<SqlValue> {
             let s: String = cast_to_string(&value).chars().take(*n as usize).collect();
             Ok(SqlValue::Str(s))
         }
+        // (MAX): no cap to truncate to.
+        DataType::VarCharMax | DataType::NVarCharMax => Ok(SqlValue::Str(cast_to_string(&value))),
         DataType::Date => match &value {
             SqlValue::Date(d) => Ok(SqlValue::Date(*d)),
             SqlValue::DateTime2(d, _) => Ok(SqlValue::Date(*d)),
@@ -606,6 +608,10 @@ fn cast_value(value: SqlValue, target: &DataType) -> SqlResult<SqlValue> {
             )),
             _ => Err(cfail("varbinary")),
         },
+        DataType::VarBinaryMax => match &value {
+            SqlValue::Binary(b) => Ok(SqlValue::Binary(b.clone())),
+            _ => Err(cfail("varbinary")),
+        },
     }
 }
 
@@ -623,9 +629,9 @@ fn type_label(target: &DataType) -> &'static str {
         DataType::Time => "time",
         DataType::DateTime2 => "datetime2",
         DataType::UniqueIdentifier => "uniqueidentifier",
-        DataType::VarChar(_) => "varchar",
-        DataType::NVarChar(_) => "nvarchar",
-        DataType::VarBinary(_) => "varbinary",
+        DataType::VarChar(_) | DataType::VarCharMax => "varchar",
+        DataType::NVarChar(_) | DataType::NVarCharMax => "nvarchar",
+        DataType::VarBinary(_) | DataType::VarBinaryMax => "varbinary",
     }
 }
 

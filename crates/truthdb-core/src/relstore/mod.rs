@@ -11,6 +11,7 @@ pub(crate) mod ctx;
 pub mod heap;
 pub mod index;
 pub mod key;
+pub(crate) mod overflow;
 pub mod page;
 pub mod recovery;
 pub mod row;

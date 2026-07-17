@@ -44,6 +44,13 @@ pub enum ColumnType {
     VarBinary {
         max_len: u16,
     },
+    /// `VARCHAR(MAX)` (Stage 14): no declared length cap; values above the
+    /// in-row threshold live in overflow page chains.
+    VarCharMax,
+    /// `NVARCHAR(MAX)`.
+    NVarCharMax,
+    /// `VARBINARY(MAX)`.
+    VarBinaryMax,
 }
 
 impl ColumnType {
@@ -60,8 +67,20 @@ impl ColumnType {
             ColumnType::DateTime2 => Some(8),
             ColumnType::VarChar { .. }
             | ColumnType::NVarChar { .. }
-            | ColumnType::VarBinary { .. } => None,
+            | ColumnType::VarBinary { .. }
+            | ColumnType::VarCharMax
+            | ColumnType::NVarCharMax
+            | ColumnType::VarBinaryMax => None,
         }
+    }
+
+    /// Whether this is a (MAX)-class type: values may exceed the in-row cap
+    /// and are stored behind a tag byte (inline or an overflow-chain ref).
+    pub fn is_max(&self) -> bool {
+        matches!(
+            self,
+            ColumnType::VarCharMax | ColumnType::NVarCharMax | ColumnType::VarBinaryMax
+        )
     }
 
     /// Parses the debug-command type syntax: `int`, `varchar(30)`,
@@ -99,6 +118,9 @@ impl ColumnType {
             "time" => Ok(ColumnType::Time),
             "datetime2" => Ok(ColumnType::DateTime2),
             "uniqueidentifier" => Ok(ColumnType::UniqueIdentifier),
+            "varchar" if args == ["max"] => Ok(ColumnType::VarCharMax),
+            "nvarchar" if args == ["max"] => Ok(ColumnType::NVarCharMax),
+            "varbinary" if args == ["max"] => Ok(ColumnType::VarBinaryMax),
             "varchar" => Ok(ColumnType::VarChar {
                 max_len: one_arg(&args)?,
             }),
@@ -146,6 +168,9 @@ impl ColumnType {
             ColumnType::VarChar { max_len } => format!("varchar({max_len})"),
             ColumnType::NVarChar { max_len } => format!("nvarchar({max_len})"),
             ColumnType::VarBinary { max_len } => format!("varbinary({max_len})"),
+            ColumnType::VarCharMax => "varchar(max)".to_string(),
+            ColumnType::NVarCharMax => "nvarchar(max)".to_string(),
+            ColumnType::VarBinaryMax => "varbinary(max)".to_string(),
         }
     }
 }
@@ -164,6 +189,13 @@ impl std::fmt::Display for TypeError {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Datum {
     Null,
+    /// A (MAX) value stored in an overflow page chain (Stage 14). Internal
+    /// to the storage layer: every public read path resolves it to the real
+    /// value before returning, and it never reaches the executor.
+    OverflowRef {
+        total_len: u64,
+        first_page: u64,
+    },
     TinyInt(u8),
     SmallInt(i16),
     Int(i32),
@@ -193,6 +225,7 @@ impl Datum {
     /// Fixed-width on-disk encoding (only valid for fixed-width types).
     pub fn encode_fixed(&self, out: &mut Vec<u8>) {
         match self {
+            Datum::OverflowRef { .. } => unreachable!("overflow refs are var-class"),
             Datum::TinyInt(v) => out.push(*v),
             Datum::SmallInt(v) => out.extend_from_slice(&v.to_le_bytes()),
             Datum::Int(v) => out.extend_from_slice(&v.to_le_bytes()),
@@ -274,6 +307,35 @@ impl Datum {
                 )
             }
             ColumnType::VarBinary { .. } => Datum::VarBinary(bytes.to_vec()),
+            // (MAX): a tag byte — 0 = inline (base encoding follows), 1 = an
+            // overflow-chain reference.
+            ColumnType::VarCharMax | ColumnType::NVarCharMax | ColumnType::VarBinaryMax => {
+                let (&tag, payload) = bytes
+                    .split_first()
+                    .ok_or_else(|| TypeError("missing (MAX) tag byte".to_string()))?;
+                match tag {
+                    0 => {
+                        let base = match column_type {
+                            ColumnType::VarCharMax => ColumnType::VarChar { max_len: u16::MAX },
+                            ColumnType::NVarCharMax => ColumnType::NVarChar { max_len: u16::MAX },
+                            _ => ColumnType::VarBinary { max_len: u16::MAX },
+                        };
+                        Datum::decode_var(&base, payload)?
+                    }
+                    1 => {
+                        if payload.len() != 16 {
+                            return Err(TypeError("corrupt overflow reference".to_string()));
+                        }
+                        Datum::OverflowRef {
+                            total_len: u64::from_le_bytes(payload[0..8].try_into().unwrap()),
+                            first_page: u64::from_le_bytes(payload[8..16].try_into().unwrap()),
+                        }
+                    }
+                    other => {
+                        return Err(TypeError(format!("unknown (MAX) tag byte {other}")));
+                    }
+                }
+            }
             _ => unreachable!("not a var-width type"),
         })
     }
@@ -386,6 +448,14 @@ impl Datum {
                 }
                 Ok(Datum::VarBinary(bytes))
             }
+            ColumnType::VarCharMax => Ok(Datum::VarChar(string_in()?.to_string())),
+            ColumnType::NVarCharMax => Ok(Datum::NVarChar(string_in()?.to_string())),
+            ColumnType::VarBinaryMax => {
+                let hex = string_in()?;
+                Ok(Datum::VarBinary(parse_hex(
+                    hex.strip_prefix("0x").unwrap_or(hex),
+                )?))
+            }
         }
     }
 
@@ -393,6 +463,9 @@ impl Datum {
     pub fn to_json(&self, column_type: &ColumnType) -> Json {
         match self {
             Datum::Null => Json::Null,
+            Datum::OverflowRef { .. } => {
+                unreachable!("overflow reference escaped the storage layer")
+            }
             Datum::TinyInt(v) => Json::from(*v),
             Datum::SmallInt(v) => Json::from(*v),
             Datum::Int(v) => Json::from(*v),

@@ -39,6 +39,10 @@ enum TdsType {
     NVarChar(u16),
     VarChar(u16),
     VarBinary(u16),
+    /// (MAX) types: 0xFFFF max length in COLMETADATA, PLP-encoded values.
+    NVarCharMax,
+    VarCharMax,
+    VarBinaryMax,
 }
 
 fn tds_type(column_type: &ColumnType) -> TdsType {
@@ -57,6 +61,9 @@ fn tds_type(column_type: &ColumnType) -> TdsType {
         ColumnType::NVarChar { max_len } => TdsType::NVarChar((*max_len).max(1)),
         ColumnType::VarChar { max_len } => TdsType::VarChar((*max_len).max(1)),
         ColumnType::VarBinary { max_len } => TdsType::VarBinary((*max_len).max(1)),
+        ColumnType::NVarCharMax => TdsType::NVarCharMax,
+        ColumnType::VarCharMax => TdsType::VarCharMax,
+        ColumnType::VarBinaryMax => TdsType::VarBinaryMax,
         // TIME (rare) falls back to NVARCHAR of its rendered text.
         _ => TdsType::NVarChar(4000),
     }
@@ -121,8 +128,39 @@ pub fn encode_type_info(column_type: &ColumnType) -> Vec<u8> {
             out.extend_from_slice(&max_len.min(8000).to_le_bytes());
             out.extend_from_slice(&COLLATION);
         }
+        // (MAX): the 0xFFFF length IS the PLP marker drivers key on.
+        TdsType::NVarCharMax => {
+            out.push(NVARCHAR);
+            out.extend_from_slice(&0xffffu16.to_le_bytes());
+            out.extend_from_slice(&COLLATION);
+        }
+        TdsType::VarCharMax => {
+            out.push(BIGVARCHR);
+            out.extend_from_slice(&0xffffu16.to_le_bytes());
+            out.extend_from_slice(&COLLATION);
+        }
+        TdsType::VarBinaryMax => {
+            out.push(BIGVARBINARY);
+            out.extend_from_slice(&0xffffu16.to_le_bytes());
+        }
     }
     out
+}
+
+/// PLP (partially length-prefixed) value: total length u64, one data chunk,
+/// zero terminator. NULL is the PLP null sentinel.
+fn encode_plp(out: &mut Vec<u8>, bytes: Option<Vec<u8>>) {
+    match bytes {
+        None => out.extend_from_slice(&u64::MAX.to_le_bytes()),
+        Some(bytes) => {
+            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
+            if !bytes.is_empty() {
+                out.extend_from_slice(&(bytes.len() as u32).to_le_bytes());
+                out.extend_from_slice(&bytes);
+            }
+            out.extend_from_slice(&0u32.to_le_bytes());
+        }
+    }
 }
 
 /// NVARCHAR max byte length, clamped to the non-MAX limit (8000 bytes).
@@ -229,6 +267,18 @@ pub fn encode_value(datum: &Datum, column_type: &ColumnType) -> Vec<u8> {
             }
             None => out.extend_from_slice(&0xffffu16.to_le_bytes()),
         },
+        TdsType::NVarCharMax => encode_plp(
+            &mut out,
+            string_value(datum).map(|s| s.encode_utf16().flat_map(|u| u.to_le_bytes()).collect()),
+        ),
+        TdsType::VarCharMax => encode_plp(&mut out, string_value(datum).map(|s| encode_cp1252(&s))),
+        TdsType::VarBinaryMax => encode_plp(
+            &mut out,
+            match datum {
+                Datum::VarBinary(bytes) => Some(bytes.clone()),
+                _ => None,
+            },
+        ),
     }
     out
 }
@@ -375,6 +425,37 @@ mod tests {
         let value = encode_value(&Datum::VarChar("café€中".to_string()), &ct);
         assert_eq!(u16::from_le_bytes([value[0], value[1]]), 6);
         assert_eq!(&value[2..], &[b'c', b'a', b'f', 0xE9, 0x80, b'?']);
+    }
+
+    /// (MAX) columns advertise the 0xFFFF PLP marker and their values ride
+    /// PLP framing: total u64, one chunk, zero terminator; NULL is the PLP
+    /// null sentinel. Byte-pinned — drivers key on exactly these shapes.
+    #[test]
+    fn max_types_are_plp_on_the_wire() {
+        let info = encode_type_info(&ColumnType::NVarCharMax);
+        assert_eq!(info[0], NVARCHAR);
+        assert_eq!(&info[1..3], &0xffffu16.to_le_bytes());
+        assert_eq!(&info[3..8], &COLLATION);
+
+        let value = encode_value(&Datum::NVarChar("hi".into()), &ColumnType::NVarCharMax);
+        let mut expected = Vec::new();
+        expected.extend_from_slice(&4u64.to_le_bytes()); // total bytes (UCS-2)
+        expected.extend_from_slice(&4u32.to_le_bytes()); // one chunk
+        expected.extend_from_slice(&[b'h', 0, b'i', 0]);
+        expected.extend_from_slice(&0u32.to_le_bytes()); // terminator
+        assert_eq!(value, expected);
+
+        assert_eq!(
+            encode_value(&Datum::Null, &ColumnType::VarBinaryMax),
+            u64::MAX.to_le_bytes().to_vec(),
+            "PLP NULL sentinel"
+        );
+
+        // An empty value is a zero total with just the terminator.
+        assert_eq!(
+            encode_value(&Datum::VarChar(String::new()), &ColumnType::VarCharMax),
+            [0u64.to_le_bytes().as_slice(), 0u32.to_le_bytes().as_slice()].concat(),
+        );
     }
 
     #[test]

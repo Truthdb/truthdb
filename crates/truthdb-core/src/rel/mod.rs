@@ -1073,6 +1073,9 @@ fn describe_type(column_type: &ColumnType) -> (i32, String) {
         ColumnType::VarChar { max_len } => (167, format!("varchar({max_len})")),
         ColumnType::NVarChar { max_len } => (231, format!("nvarchar({max_len})")),
         ColumnType::VarBinary { max_len } => (165, format!("varbinary({max_len})")),
+        ColumnType::VarCharMax => (167, "varchar(max)".into()),
+        ColumnType::NVarCharMax => (231, "nvarchar(max)".into()),
+        ColumnType::VarBinaryMax => (165, "varbinary(max)".into()),
     }
 }
 
@@ -2461,6 +2464,9 @@ fn exec_create_table(storage: &Storage, create: &CreateTable) -> Result<Statemen
                 ),
             ));
         }
+        if columns[index].column_type.is_max() {
+            return Err(max_key_column_error(&key.value, table_name).at(key.span));
+        }
         columns[index].nullable = false;
         key_names.push(columns[index].name.clone());
     }
@@ -3276,6 +3282,9 @@ fn data_type_to_column_type(data_type: &DataType, name: &str) -> Result<ColumnTy
         DataType::VarBinary(n) => ColumnType::VarBinary {
             max_len: length(*n, name)?,
         },
+        DataType::VarCharMax => ColumnType::VarCharMax,
+        DataType::NVarCharMax => ColumnType::NVarCharMax,
+        DataType::VarBinaryMax => ColumnType::VarBinaryMax,
     })
 }
 
@@ -3451,6 +3460,19 @@ fn exec_drop_view(storage: &Storage, drop: &DropView) -> Result<StatementResult,
 
 // ---- CREATE / DROP INDEX ------------------------------------------------
 
+/// SQL Server 1919: a (MAX)-class column cannot be an index/key column.
+fn max_key_column_error(column: &str, table: &str) -> SqlError {
+    SqlError::new(
+        1919,
+        16,
+        1,
+        format!(
+            "Column '{column}' in table '{table}' is of a type that is invalid for use as a \
+             key column in an index."
+        ),
+    )
+}
+
 fn exec_create_index(storage: &Storage, create: &CreateIndex) -> Result<StatementResult, SqlError> {
     let def = resolve_table(storage, &create.table.value)
         .ok_or_else(|| SqlError::invalid_object(&create.table.value).at(create.table.span))?;
@@ -3463,6 +3485,9 @@ fn exec_create_index(storage: &Storage, create: &CreateIndex) -> Result<Statemen
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&col.name.value))
             .ok_or_else(|| index_column_missing(&col.name.value, &def.name).at(col.name.span))?;
+        if schema.columns[index].column_type.is_max() {
+            return Err(max_key_column_error(&col.name.value, &def.name).at(col.name.span));
+        }
         columns.push((index, col.ascending));
     }
     // INCLUDE columns: resolved against the schema, no duplicates (1909, as
@@ -3477,6 +3502,12 @@ fn exec_create_index(storage: &Storage, create: &CreateIndex) -> Result<Statemen
             .iter()
             .position(|c| c.name.eq_ignore_ascii_case(&col.value))
             .ok_or_else(|| index_column_missing(&col.value, &def.name).at(col.span))?;
+        // (MAX) columns cannot be INCLUDEd either — a divergence from SQL
+        // Server (whose row-overflow indexes can carry them): our include
+        // payloads live in ordinary index leaf cells under the tree cell cap.
+        if schema.columns[index].column_type.is_max() {
+            return Err(max_key_column_error(&col.value, &def.name).at(col.span));
+        }
         if include.contains(&index) {
             return Err(SqlError::new(
                 1909,
