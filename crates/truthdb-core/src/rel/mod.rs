@@ -3167,6 +3167,12 @@ fn showplan_rows(
             }
         }
         Some(TableRef::Table { name, .. }) => vec![format!("Table Scan({})", name.value)],
+        // A lone table-valued function call: name it honestly rather than
+        // letting it fall into the join catch-all (which would invent a
+        // "Nested Loops" over a phantom base table named after the function).
+        Some(TableRef::Function { name, .. }) => {
+            vec![format!("Table-valued Function({})", name.value)]
+        }
         Some(join) => {
             // Multi-table: a nested-loop join over full scans (Stage 8).
             let mut tables = Vec::new();
@@ -10988,7 +10994,8 @@ fn strip_schema(name: &str) -> &str {
 /// one level deep, matching the executor.
 fn read_lock_object_ids(storage: &Storage, name: &str) -> Vec<u32> {
     let mut out = Vec::new();
-    collect_read_lock_ids(storage, name, 0, &mut out);
+    let mut visited = std::collections::HashSet::new();
+    collect_read_lock_ids(storage, name, 0, &mut out, &mut visited);
     out
 }
 
@@ -11000,8 +11007,9 @@ fn select_function_read_ids(storage: &Storage, select: &Select) -> Vec<u32> {
     let mut funcs = Vec::new();
     collect_select_read_names(select, &mut tables, &mut funcs);
     let mut out = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     for func in &funcs {
-        collect_read_lock_ids(storage, func, 0, &mut out);
+        collect_read_lock_ids(storage, func, 0, &mut out, &mut visited);
     }
     out
 }
@@ -11013,8 +11021,9 @@ fn expr_function_read_ids(storage: &Storage, expr: &Expr) -> Vec<u32> {
     let mut funcs = Vec::new();
     collect_expr_read_names(expr, &mut tables, &mut funcs);
     let mut out = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     for func in &funcs {
-        collect_read_lock_ids(storage, func, 0, &mut out);
+        collect_read_lock_ids(storage, func, 0, &mut out, &mut visited);
     }
     out
 }
@@ -11022,13 +11031,27 @@ fn expr_function_read_ids(storage: &Storage, expr: &Expr) -> Vec<u32> {
 /// Resolves `name` to the base-table object ids the executor will read,
 /// recursing through nested views (so a view over a view locks the inner view's
 /// base tables). Bounded by [`MAX_VIEW_NESTING`] so a view cycle terminates.
-fn collect_read_lock_ids(storage: &Storage, name: &str, depth: u32, out: &mut Vec<u32>) {
+fn collect_read_lock_ids(
+    storage: &Storage,
+    name: &str,
+    depth: u32,
+    out: &mut Vec<u32>,
+    visited: &mut std::collections::HashSet<u32>,
+) {
     if depth > MAX_VIEW_NESTING || name.to_ascii_lowercase().starts_with("sys.") {
         return;
     }
     let Some(def) = resolve_table(storage, name) else {
         return;
     };
+    // Expand each function/view body at most once per analysis. The depth guard
+    // bounds recursion depth but NOT fan-out: a self- or mutually-referential
+    // body that references itself twice would otherwise recurse exponentially
+    // (2^depth), hanging analysis — and, because analyze_locks runs under the
+    // scheduler mutex, freezing every session.
+    if (def.is_function() || def.view_query.is_some()) && !visited.insert(def.object_id) {
+        return;
+    }
     // A function: its inner reads (subqueries in a scalar body, or an inline
     // TVF's body SELECT, plus nested function calls) must be locked up front, or
     // the body would read tables with no lock held under 2PL — the seam-defect
@@ -11052,7 +11075,7 @@ fn collect_read_lock_ids(storage: &Storage, name: &str, depth: u32, out: &mut Ve
             }
         }
         for referenced in tables.iter().chain(funcs.iter()) {
-            collect_read_lock_ids(storage, referenced, depth + 1, out);
+            collect_read_lock_ids(storage, referenced, depth + 1, out, visited);
         }
         return;
     }
@@ -11075,7 +11098,7 @@ fn collect_read_lock_ids(storage: &Storage, name: &str, depth: u32, out: &mut Ve
     let mut funcs = Vec::new();
     collect_select_read_names(&expanded, &mut tables, &mut funcs);
     for referenced in tables.iter().chain(funcs.iter()) {
-        collect_read_lock_ids(storage, referenced, depth + 1, out);
+        collect_read_lock_ids(storage, referenced, depth + 1, out, visited);
     }
 }
 
