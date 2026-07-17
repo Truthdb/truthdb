@@ -325,6 +325,7 @@ enum Token {
     },
     ReturnStatus(i32),
     ReturnValue {
+        ordinal: u16,
         name: String,
         value: Cell,
     },
@@ -431,6 +432,7 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
                 // RETURNVALUE: ordinal u16, B_VARCHAR name, status u8,
                 // usertype u32, flags u16, TYPE_INFO, then the value in that
                 // type's row encoding.
+                let ordinal = u16::from_le_bytes([payload[i], payload[i + 1]]);
                 i += 2; // ParamOrdinal
                 let name_chars = payload[i] as usize;
                 i += 1;
@@ -446,6 +448,7 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
                 let (cells, consumed) = parse_row(&payload[i..], &[col_type]);
                 i += consumed;
                 tokens.push(Token::ReturnValue {
+                    ordinal,
                     name,
                     value: cells.into_iter().next().unwrap(),
                 });
@@ -955,12 +958,16 @@ async fn a_multi_rpc_request_answers_each_rpc_in_one_response() {
     let _ = std::fs::remove_file(&path);
 }
 
-/// Extracts the (name, value) of every RETURNVALUE token in order.
-fn return_values(tokens: &[Token]) -> Vec<(String, Cell)> {
+/// Extracts the (ordinal, name, value) of every RETURNVALUE token in order.
+fn return_values(tokens: &[Token]) -> Vec<(u16, String, Cell)> {
     tokens
         .iter()
         .filter_map(|t| match t {
-            Token::ReturnValue { name, value } => Some((name.clone(), value.clone())),
+            Token::ReturnValue {
+                ordinal,
+                name,
+                value,
+            } => Some((*ordinal, name.clone(), value.clone())),
             _ => None,
         })
         .collect()
@@ -1000,7 +1007,7 @@ async fn rpc_by_name_returns_status_and_named_output() {
     assert_eq!(return_status(&tokens), Some(7), "tokens: {tokens:?}");
     assert_eq!(
         return_values(&tokens),
-        vec![("@out".to_string(), Cell::Int(11))],
+        vec![(1, "@out".to_string(), Cell::Int(11))],
         "tokens: {tokens:?}"
     );
     // The reply frames as a procedure reply and ends clean.
@@ -1036,7 +1043,7 @@ async fn rpc_by_name_positional_output() {
     assert_eq!(return_status(&tokens), Some(3), "tokens: {tokens:?}");
     assert_eq!(
         return_values(&tokens),
-        vec![(String::new(), Cell::Int(42))],
+        vec![(1, String::new(), Cell::Int(42))],
         "tokens: {tokens:?}"
     );
     let _ = std::fs::remove_file(&path);
@@ -1071,7 +1078,7 @@ async fn rpc_by_name_nvarchar_output() {
     assert_eq!(return_status(&tokens), Some(0), "tokens: {tokens:?}");
     assert_eq!(
         return_values(&tokens),
-        vec![("@msg".to_string(), Cell::Str("hello world".to_string()))],
+        vec![(1, "@msg".to_string(), Cell::Str("hello world".to_string()))],
         "tokens: {tokens:?}"
     );
     let _ = std::fs::remove_file(&path);
@@ -1094,7 +1101,7 @@ async fn rpc_by_name_null_output() {
 
     assert_eq!(
         return_values(&tokens),
-        vec![("@out".to_string(), Cell::Null)],
+        vec![(0, "@out".to_string(), Cell::Null)],
         "tokens: {tokens:?}"
     );
     let _ = std::fs::remove_file(&path);
@@ -1167,8 +1174,8 @@ async fn multi_rpc_proc_calls_each_carry_their_own_tail() {
     assert_eq!(
         return_values(&tokens),
         vec![
-            ("@out".to_string(), Cell::Int(101)),
-            ("@out".to_string(), Cell::Int(102)),
+            (1, "@out".to_string(), Cell::Int(101)),
+            (1, "@out".to_string(), Cell::Int(102)),
         ],
         "each RPC's OUTPUT in order: {tokens:?}"
     );
@@ -1181,6 +1188,115 @@ async fn multi_rpc_proc_calls_each_carry_their_own_tail() {
         })
         .collect();
     assert_eq!(procs, [(true, false), (false, false)], "tokens: {tokens:?}");
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A procedure that raises a non-fatal error (severity 11-16) and then RETURNs
+/// still *completes*, so its RETURN status and OUTPUT parameters are transmitted
+/// alongside the error — as SQL Server does. The batch surfacing a continued
+/// error must not suppress the tail (the emission gate and the copy-back gate
+/// have to agree; they are unified on the procedure-completion signal).
+#[tokio::test]
+async fn rpc_by_name_completed_proc_with_warning_still_returns_tail() {
+    let path = temp_path("rpc-warn-tail");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch(
+            "CREATE PROCEDURE warnproc @x INT, @out INT OUTPUT AS \
+             BEGIN SET @out = @x + 1; RAISERROR('warn', 16, 1); RETURN 7; END",
+        )
+        .await;
+
+    let body = proc_rpc(
+        "warnproc",
+        &[
+            ("@x", RpcArg::Int(10), false),
+            ("@out", RpcArg::IntNull, true),
+        ],
+    );
+    let tokens = client.rpc(&body).await;
+
+    // The warning is delivered as an ERROR token and DONEPROC keeps DONE_ERROR,
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(t, Token::Error { number: 50000 })),
+        "tokens: {tokens:?}"
+    );
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(t, Token::DoneProc { error: true, .. })),
+        "tokens: {tokens:?}"
+    );
+    // ...yet the completed procedure's status and OUTPUT are still returned.
+    assert_eq!(return_status(&tokens), Some(7), "tokens: {tokens:?}");
+    assert_eq!(
+        return_values(&tokens),
+        vec![(1, "@out".to_string(), Cell::Int(11))],
+        "tokens: {tokens:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Two OUTPUT parameters each carry their own 0-based ParamOrdinal — pytds
+/// places OUTPUT values into the caller's list by this field, so a hardcoded 0
+/// would collide both at index 0 and lose the first. Positional call.
+#[tokio::test]
+async fn rpc_by_name_multiple_outputs_carry_distinct_ordinals() {
+    let path = temp_path("rpc-ordinals");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE PROCEDURE two @x INT OUTPUT, @y INT OUTPUT AS BEGIN SET @x = 1; SET @y = 2; END")
+        .await;
+
+    let body = proc_rpc(
+        "two",
+        &[("", RpcArg::IntNull, true), ("", RpcArg::IntNull, true)],
+    );
+    let tokens = client.rpc(&body).await;
+
+    assert_eq!(
+        return_values(&tokens),
+        vec![
+            (0, String::new(), Cell::Int(1)),
+            (1, String::new(), Cell::Int(2)),
+        ],
+        "each OUTPUT carries its 0-based position, not a shared 0: {tokens:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A RETURN value outside the int32 range overflows (error 8115) like SQL
+/// Server, rather than being silently reported as a clean status 0.
+#[tokio::test]
+async fn rpc_by_name_out_of_range_return_is_8115() {
+    let path = temp_path("rpc-bigrc");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE PROCEDURE bigrc AS BEGIN RETURN 3000000000; END")
+        .await;
+
+    let tokens = client.rpc(&proc_rpc("bigrc", &[])).await;
+
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(t, Token::Error { number: 8115 })),
+        "tokens: {tokens:?}"
+    );
+    // The procedure aborted, so no clean status and no OUTPUT are reported.
+    assert_eq!(return_status(&tokens), None, "tokens: {tokens:?}");
+    assert!(return_values(&tokens).is_empty(), "tokens: {tokens:?}");
     let _ = std::fs::remove_file(&path);
 }
 

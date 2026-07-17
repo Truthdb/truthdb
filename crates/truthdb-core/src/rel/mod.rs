@@ -441,13 +441,6 @@ pub trait BatchEmitter {
     /// An informational message (RAISERROR severity <= 10): TDS renders an
     /// INFO token in-stream, not an error. Emitters with no wire ignore it.
     fn info(&mut self, _error: &SqlError) {}
-
-    /// A procedure's RETURN status (RPC-by-name): the RETURNSTATUS value.
-    fn return_status(&mut self, _status: i32) {}
-
-    /// A procedure OUTPUT parameter's final value (RPC-by-name): a typed
-    /// RETURNVALUE token.
-    fn return_value(&mut self, _name: &str, _column_type: &ColumnType, _value: &Datum) {}
 }
 
 /// Reassembles emitted results into the whole-batch [`BatchOutcome`] for the
@@ -1461,7 +1454,27 @@ fn run_block(
                 if let Some(value) = value {
                     let eval_ctx = txn_ctx.eval_context();
                     match eval_constant(value, &eval_ctx) {
-                        Ok(SqlValue::Int(status)) => txn_ctx.proc_return = Some(status),
+                        Ok(SqlValue::Int(status))
+                            if (i32::MIN as i64..=i32::MAX as i64).contains(&status) =>
+                        {
+                            txn_ctx.proc_return = Some(status)
+                        }
+                        // A RETURN value outside int range overflows, as SQL
+                        // Server does (8115) — the status is an int. Without this
+                        // the out-of-range value would be stashed and later fail
+                        // to encode (and, on the RPC path, read back as NULL and
+                        // be mistaken for a procedure that never completed).
+                        Ok(SqlValue::Int(_)) => {
+                            let error = SqlError::new(
+                                8115,
+                                16,
+                                2,
+                                "Arithmetic overflow error converting expression to data type int.",
+                            );
+                            txn_ctx.rowcount = 0;
+                            statement_error_ladder(statement, error, txn_ctx, run, in_try)?;
+                            continue;
+                        }
                         Ok(SqlValue::Null) => {
                             // SQL Server warns and returns 0; we return 0.
                             txn_ctx.proc_return = Some(0);

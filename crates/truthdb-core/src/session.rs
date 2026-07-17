@@ -126,8 +126,11 @@ pub enum BatchEvent {
     /// token's value (hardcoded 0 before this event existed).
     ReturnStatus(i32),
     /// A procedure OUTPUT parameter's final value for an RPC-by-name call,
-    /// rendered as a typed RETURNVALUE token after RETURNSTATUS.
+    /// rendered as a typed RETURNVALUE token after RETURNSTATUS. `ordinal` is
+    /// the parameter's 0-based position in the RPC call (ordinal-keyed drivers
+    /// place the value there).
     ReturnValue {
+        ordinal: u16,
         name: String,
         column_type: crate::relstore::types::ColumnType,
         value: Datum,
@@ -336,23 +339,6 @@ impl crate::rel::BatchEmitter for BatchSink {
     fn info(&mut self, error: &truthdb_sql::error::SqlError) {
         self.send(BatchEvent::Info(error.clone()));
     }
-
-    fn return_status(&mut self, status: i32) {
-        self.send(BatchEvent::ReturnStatus(status));
-    }
-
-    fn return_value(
-        &mut self,
-        name: &str,
-        column_type: &crate::relstore::types::ColumnType,
-        value: &Datum,
-    ) {
-        self.send(BatchEvent::ReturnValue {
-            name: name.to_string(),
-            column_type: *column_type,
-            value: value.clone(),
-        });
-    }
 }
 
 /// Reassembles an event stream into a whole [`BatchReply`] — the shape every
@@ -551,14 +537,18 @@ impl SessionManager {
 /// exactly when the copy-back and status assignment happened.
 #[derive(Clone)]
 struct ProcRpcTail {
-    /// The seeded variable holding the RETURN status.
+    /// The seeded variable holding the RETURN status. It is seeded NULL and the
+    /// procedure overwrites it with an Int only if it completes; a still-NULL
+    /// value at read time means the procedure aborted, so no tail is emitted.
     status_var: String,
     /// One entry per OUTPUT parameter, in call order: the caller-scope variable
-    /// to read the final value back from, and the name the RETURNVALUE token
-    /// carries. For a named argument both are the wire name (`@out`); for a
+    /// to read the final value back from, the name the RETURNVALUE token
+    /// carries, and the parameter's 0-based position in the RPC call (the
+    /// RETURNVALUE ParamOrdinal — ordinal-keyed drivers place values by it). For
+    /// a named argument the read/token names are the wire name (`@out`); for a
     /// positional one (JDBC `{call p(?)}`) the read variable is a synthetic seed
-    /// and the token name is empty, which drivers match by ordinal.
-    output_vars: Vec<(String, String)>,
+    /// and the token name is empty.
+    output_vars: Vec<(String, String, u16)>,
 }
 
 enum EngineCall {
@@ -875,6 +865,7 @@ impl EngineHandle {
             let sep = if index == 0 { " " } else { ", " };
             let is_output = outputs.get(index).copied().unwrap_or(false);
             let output_kw = if is_output { " OUTPUT" } else { "" };
+            let ordinal = index as u16;
             if param.name.trim_start_matches('@').is_empty() {
                 // Positional (unnamed) argument — a JDBC `{call p(?, ?)}` shape.
                 // Seed under a synthetic variable and pass it positionally; the
@@ -882,23 +873,26 @@ impl EngineHandle {
                 let var = format!("__truthdb_arg{index}");
                 sql.push_str(&format!("{sep}@{var}{output_kw}"));
                 if is_output {
-                    output_vars.push((format!("@{var}"), String::new()));
+                    output_vars.push((format!("@{var}"), String::new(), ordinal));
                 }
                 param.name = format!("@{var}");
             } else {
                 let bare = param.name.trim_start_matches('@').to_string();
                 sql.push_str(&format!("{sep}@{bare} = @{bare}{output_kw}"));
                 if is_output {
-                    output_vars.push((param.name.clone(), param.name.clone()));
+                    output_vars.push((param.name.clone(), param.name.clone(), ordinal));
                 }
             }
             seeded.push(param);
         }
-        // Seed the return-status variable as an ordinary batch variable.
+        // Seed the return-status variable NULL: the procedure overwrites it with
+        // an Int only on completion, so a still-NULL read means it aborted (see
+        // read_proc_tail). Seeding it also satisfies `EXEC @rc =`'s declared-var
+        // requirement (137).
         seeded.push(crate::rel::RpcParam {
             name: format!("@{status_var}"),
             column_type: crate::relstore::types::ColumnType::Int,
-            value: Datum::Int(0),
+            value: Datum::Null,
         });
         let proc_tail = ProcRpcTail {
             status_var,
@@ -1489,11 +1483,15 @@ fn run_and_finish(shared: &Arc<Shared>, work: Runnable) {
         .engine
         .sql_batch_streamed(&sql, &mut txn_ctx, &params, &mut reply);
     // RPC-by-name tail: a procedure copies its OUTPUT parameters back and stores
-    // its RETURN status only when it completed, so the tokens are emitted only
-    // when the batch ran clean (`Ok(None)`). Read the values off the context now,
-    // before `finish` hands it back to the scheduler.
+    // its RETURN status only when it *completed* — which is not the same as the
+    // *batch* running clean. A procedure that raises a continued (non-dooming)
+    // error and then returns completes, yet the batch surfaces that error
+    // (`Ok(Some(err))`); SQL Server still sends the tail there. So read the tail
+    // on any `Ok` outcome and let `read_proc_tail` decide from the completion
+    // signal (the status variable is non-NULL only if the procedure completed).
+    // Read it now, before `finish` hands the context back to the scheduler.
     let tail_events = match (&proc_tail, &outcome) {
-        (Some(tail), Ok(None)) => Some(read_proc_tail(&txn_ctx, tail)),
+        (Some(tail), Ok(_)) => Some(read_proc_tail(&txn_ctx, tail)),
         _ => None,
     };
     let in_transaction = {
@@ -1520,20 +1518,27 @@ fn run_and_finish(shared: &Arc<Shared>, work: Runnable) {
 }
 
 /// Reads an RPC-by-name call's response tail off the finished context: the
-/// RETURN status (always emitted — SQL Server sends RETURNSTATUS for every proc
-/// RPC, defaulting to 0), then each OUTPUT parameter as a typed RETURNVALUE. The
-/// renderer orders the tokens (RETURNSTATUS before RETURNVALUEs) regardless of
-/// event order, but they are produced status-first to match.
+/// RETURN status, then each OUTPUT parameter as a typed RETURNVALUE.
+///
+/// The status variable is the completion signal. It was seeded NULL, and
+/// `run_user_procedure` overwrites it with an Int (and copies OUTPUT parameters
+/// back) only when the body completes — both under the one `result.is_ok()`
+/// gate. So a NULL status here means the procedure aborted: emit nothing, which
+/// is what SQL Server does for a failed procedure. A non-NULL Int status means
+/// it completed (possibly after a continued, non-dooming error), and the OUTPUT
+/// copy-back happened too, so the whole tail is emitted. This single observable
+/// keeps the emission decision in agreement with the copy-back decision.
 fn read_proc_tail(txn_ctx: &TxnContext, tail: &ProcRpcTail) -> Vec<BatchEvent> {
-    let mut events = Vec::with_capacity(tail.output_vars.len() + 1);
     let status = match txn_ctx.variable_datum(&tail.status_var) {
         Some((_, Datum::Int(status))) => status,
-        _ => 0,
+        _ => return Vec::new(),
     };
+    let mut events = Vec::with_capacity(tail.output_vars.len() + 1);
     events.push(BatchEvent::ReturnStatus(status));
-    for (read_var, wire_name) in &tail.output_vars {
+    for (read_var, wire_name, ordinal) in &tail.output_vars {
         if let Some((column_type, value)) = txn_ctx.variable_datum(read_var) {
             events.push(BatchEvent::ReturnValue {
+                ordinal: *ordinal,
                 name: wire_name.clone(),
                 column_type,
                 value,

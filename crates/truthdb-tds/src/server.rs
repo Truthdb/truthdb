@@ -775,9 +775,10 @@ struct BatchRender {
     /// The procedure's real RETURN status (RPC-by-name); None keeps the
     /// legacy 0.
     return_status: Option<i32>,
-    /// OUTPUT parameter values, held for the response tail after
-    /// RETURNSTATUS, before DONEPROC — SQL Server's order.
+    /// OUTPUT parameter values (ParamOrdinal, name, type, value), held for the
+    /// response tail after RETURNSTATUS, before DONEPROC — SQL Server's order.
     return_values: Vec<(
+        u16,
         String,
         truthdb_core::relstore::types::ColumnType,
         truthdb_core::relstore::types::Datum,
@@ -891,11 +892,12 @@ impl BatchRender {
                 self.return_status = Some(status);
             }
             BatchEvent::ReturnValue {
+                ordinal,
                 name,
                 column_type,
                 value,
             } => {
-                self.return_values.push((name, column_type, value));
+                self.return_values.push((ordinal, name, column_type, value));
             }
             BatchEvent::Info(info) => {
                 // RAISERROR severity <= 10: an INFO token, not an error — the
@@ -938,17 +940,25 @@ impl BatchRender {
                     // RETURNSTATUS/RETURNVALUE/DONEPROC tail always follows.
                     self.flush_pending(out, true).await?;
                     self.buf.clear();
-                    if !self.errored {
-                        // A failed procedure returns no status.
-                        token::return_status(&mut self.buf, self.return_status.unwrap_or(0));
+                    // RETURNSTATUS: a procedure that completed reports its real
+                    // status — the engine sends the event only on completion,
+                    // even under a continued error, so a warned-but-completed
+                    // proc still reports it. Any other clean RPC reply
+                    // (sp_executesql, a prepared handle) keeps the status-0
+                    // default. An aborted procedure or a failed RPC sends no
+                    // status event and is errored, so nothing is emitted.
+                    if let Some(status) = self.return_status {
+                        token::return_status(&mut self.buf, status);
+                    } else if !self.errored {
+                        token::return_status(&mut self.buf, 0);
                     }
                     if let Some(handle) = self.pending_handle.take() {
                         token::return_value_int(&mut self.buf, "handle", handle);
                     }
-                    if !self.errored {
-                        for (name, column_type, value) in self.return_values.drain(..) {
-                            token::return_value(&mut self.buf, &name, &column_type, &value);
-                        }
+                    // OUTPUT parameters: populated only when the procedure
+                    // completed, so emit whatever the engine sent.
+                    for (ordinal, name, column_type, value) in self.return_values.drain(..) {
+                        token::return_value(&mut self.buf, ordinal, &name, &column_type, &value);
                     }
                     out.write(&self.buf).await?;
                     self.final_done(out, self.errored, in_transaction).await?;
