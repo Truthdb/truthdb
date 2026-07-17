@@ -94,6 +94,12 @@ impl Parser {
         Parser::from_tokens(sql, crate::lexer::Lexer::new(sql).tokenize()?).parse_statements()
     }
 
+    /// Switches to the in-procedure grammar (`RETURN <value>` legal): the
+    /// entry for parsing a stored procedure's body text.
+    pub fn set_in_procedure(&mut self) {
+        self.in_procedure = true;
+    }
+
     /// Parses exactly one expression followed by EOF (for a re-parsed DEFAULT).
     pub fn parse_single_expr(mut self) -> SqlResult<Expr> {
         let expr = self.parse_expr()?;
@@ -1420,6 +1426,18 @@ impl Parser {
     /// stored as its source text.
     fn parse_create_procedure(&mut self, start: Span, alter: bool) -> SqlResult<Statement> {
         self.bump(); // PROCEDURE | PROC
+        if self.in_procedure {
+            // No nested CREATE/ALTER PROCEDURE inside a body (SQL Server's
+            // 156 class) — without this the inner body-capture would swallow
+            // the rest of the outer body.
+            return Err(SqlError::new(
+                156,
+                15,
+                1,
+                "Incorrect syntax near the keyword 'PROCEDURE'.",
+            )
+            .at(start));
+        }
         if self.statement_index > 0 || self.sub_depth > 0 {
             return Err(SqlError::new(
                 111,
