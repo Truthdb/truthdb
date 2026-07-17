@@ -38,6 +38,20 @@ struct Cli {
 enum Command {
     /// Start an interactive session (psql-like REPL).
     Repl,
+    /// OFFLINE: grow a stopped server's storage file by whole GiB. The
+    /// server must not be running — this rewrites the file's region layout
+    /// directly (crash-safe: the header flips last; a re-run completes an
+    /// interrupted grow).
+    Grow {
+        /// Path to the storage file (e.g. /var/lib/truthdb/truth.db).
+        #[arg(long)]
+        path: std::path::PathBuf,
+        /// GiB to add to the data region. A safe minimum applies (the
+        /// relocated tail regions must clear the old layout); the error
+        /// names it when the request is below it.
+        #[arg(long)]
+        add_gib: u64,
+    },
 }
 
 #[tokio::main]
@@ -50,6 +64,19 @@ async fn main() -> Result<()> {
 
     match cli.command.unwrap_or(Command::Repl) {
         Command::Repl => repl(&addr).await,
+        Command::Grow { path, add_gib } => {
+            match truthdb_core::storage::Storage::grow_data_region(&path, add_gib) {
+                Ok(data_pages) => {
+                    println!(
+                        "grew {} by {add_gib} GiB: data region now {data_pages} pages ({} GiB)",
+                        path.display(),
+                        data_pages * 4096 / (1024 * 1024 * 1024),
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(anyhow::anyhow!("grow failed: {err}")),
+            }
+        }
     }
 }
 

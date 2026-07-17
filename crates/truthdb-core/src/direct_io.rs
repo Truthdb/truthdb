@@ -131,6 +131,12 @@ mod imp {
 
     pub struct DirectFile {
         file: File,
+        /// Holds the advisory lock (see [`Self::lock_exclusive`]). A separate
+        /// plain fd rather than a lock on `file`: the O_DIRECT fd is
+        /// registered with io_uring, whose kernel-side file release at ring
+        /// teardown is deferred, so a lock on it would linger past drop. This
+        /// fd closes synchronously, releasing the lock at drop.
+        _lock: Option<File>,
         ring: IoUring,
         buffers: Vec<AlignedBuffer>,
         next_user_data: u64,
@@ -144,12 +150,25 @@ mod imp {
 
     impl DirectFile {
         pub fn open_existing(path: PathBuf) -> io::Result<Self> {
+            let lock = Self::lock_exclusive(&path)?;
             let file = OpenOptions::new()
                 .read(true)
                 .write(true)
                 .custom_flags(libc::O_DIRECT)
                 .open(&path)?;
-            Self::from_file(file)
+            Self::from_file(file, Some(lock))
+        }
+
+        /// The storage layer's SECOND handle on a file its primary handle
+        /// already holds the advisory lock for (the log writer's). Taking
+        /// the lock here would conflict with our own primary.
+        pub fn open_existing_unlocked(path: PathBuf) -> io::Result<Self> {
+            let file = OpenOptions::new()
+                .read(true)
+                .write(true)
+                .custom_flags(libc::O_DIRECT)
+                .open(&path)?;
+            Self::from_file(file, None)
         }
 
         pub fn create_new(path: PathBuf, total_size: u64) -> io::Result<Self> {
@@ -160,11 +179,36 @@ mod imp {
                 .mode(0o644)
                 .custom_flags(libc::O_DIRECT)
                 .open(&path)?;
+            let lock = Self::lock_exclusive(&path)?;
             file.set_len(total_size)?;
-            Self::from_file(file)
+            Self::from_file(file, Some(lock))
         }
 
-        fn from_file(file: File) -> io::Result<Self> {
+        /// Advisory whole-file lock, held for the life of the handle: the
+        /// server keeps it while running, so the offline `grow` command's
+        /// open fails fast instead of operating under a live server (and a
+        /// second server open fails instead of corrupting). Advisory only —
+        /// it fences TruthDB processes, not arbitrary writers. flock is per
+        /// open file description, so two opens in one process conflict too.
+        fn lock_exclusive(path: &PathBuf) -> io::Result<File> {
+            let lock = OpenOptions::new().read(true).open(path)?;
+            if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+                return Ok(lock);
+            }
+            let err = io::Error::last_os_error();
+            if err.kind() == io::ErrorKind::WouldBlock {
+                return Err(io::Error::new(
+                    io::ErrorKind::WouldBlock,
+                    format!(
+                        "{} is locked by another TruthDB process; stop it first",
+                        path.display()
+                    ),
+                ));
+            }
+            Err(err)
+        }
+
+        fn from_file(file: File, lock: Option<File>) -> io::Result<Self> {
             let len = file.metadata()?.len();
             let buffers = vec![AlignedBuffer::new(PAGE_SIZE, PAGE_SIZE)?];
             let ring = IoUring::new(IO_URING_ENTRIES).map_err(annotate_io_uring_error)?;
@@ -184,6 +228,7 @@ mod imp {
 
             Ok(Self {
                 file,
+                _lock: lock,
                 ring,
                 buffers,
                 next_user_data: 1,
@@ -552,6 +597,13 @@ mod imp {
 
     impl DirectFile {
         pub fn open_existing(path: std::path::PathBuf) -> io::Result<Self> {
+            Err(io::Error::other(format!(
+                "truthdb storage requires Linux io_uring; unsupported platform for {}",
+                path.display()
+            )))
+        }
+
+        pub fn open_existing_unlocked(path: std::path::PathBuf) -> io::Result<Self> {
             Err(io::Error::other(format!(
                 "truthdb storage requires Linux io_uring; unsupported platform for {}",
                 path.display()
