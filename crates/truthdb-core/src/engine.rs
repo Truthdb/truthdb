@@ -5576,6 +5576,96 @@ mod tests {
     }
 
     #[test]
+    fn scalar_function_body_tables_locked_up_front() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("udf-lock-seam");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE secret (id INT NOT NULL PRIMARY KEY)")
+            .expect("secret");
+        engine
+            .execute("CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY)")
+            .expect("t2");
+        engine
+            .execute(
+                "CREATE FUNCTION dbo.secret_count () RETURNS INT AS \
+                 BEGIN RETURN (SELECT COUNT(*) FROM secret) END",
+            )
+            .expect("fn");
+        let secret = table_object_id(&engine, "secret");
+        // A query that calls the function must Shared-lock the table its body
+        // reads, up front — otherwise the body would read it with no lock held
+        // under 2PL (the seam-defect class). Checked in the SELECT list, the
+        // WHERE clause, and an IF condition.
+        for sql in [
+            "SELECT id, dbo.secret_count() FROM t2",
+            "SELECT id FROM t2 WHERE dbo.secret_count() > 0",
+            "IF dbo.secret_count() > 0 SELECT 1 AS n",
+        ] {
+            let locks = engine.analyze_locks(sql, Isolation::ReadCommitted);
+            assert!(
+                locks.contains(&(Resource::Table(secret), LockMode::Shared)),
+                "the function's inner-read table must be Shared-locked for `{sql}`: {locks:?}"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scalar_function_isolation_error_and_nesting() {
+        let path = unique_temp_path("udf-isolation");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        // A function does not see caller locals: a body reference to `@outer`
+        // is undeclared inside the function scope (137), never the caller's
+        // value.
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE FUNCTION dbo.leak () RETURNS INT AS BEGIN RETURN @outer END",
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @outer INT = 5; SELECT dbo.leak() AS n",
+        );
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(137),
+            "a function must not see caller locals: {:?}",
+            out.error
+        );
+        // An error inside the body aborts the calling statement.
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE FUNCTION dbo.divzero (@x INT) RETURNS INT AS BEGIN RETURN 1 / @x END",
+        );
+        let out = batch(&engine, &mut ctx, "SELECT dbo.divzero(0) AS n");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(8134),
+            "divide-by-zero in a function aborts the query: {:?}",
+            out.error
+        );
+        // Unbounded recursion hits the shared nesting cap (217), and unwinds.
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE FUNCTION dbo.recur (@x INT) RETURNS INT AS BEGIN RETURN dbo.recur(@x) END",
+        );
+        let out = batch(&engine, &mut ctx, "SELECT dbo.recur(1) AS n");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(217),
+            "recursion must hit the nesting cap: {:?}",
+            out.error
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn cf_review_describe_stops_at_control_flow() {
         // sp_describe_first_result_set: a batch whose FIRST possible rowset
         // sits inside an IF must answer "not statically derivable" — skipping

@@ -38,6 +38,15 @@ pub fn parse_procedure_body(sql: &str) -> SqlResult<Vec<Statement>> {
     parser.parse_statements()
 }
 
+/// Parses a scalar-function body: the in-function grammar, where `RETURN <expr>`
+/// yields the function's mandatory typed result.
+pub fn parse_function_body(sql: &str) -> SqlResult<Vec<Statement>> {
+    let tokens = lexer::Lexer::new(sql).tokenize()?;
+    let mut parser = parser::Parser::from_tokens(sql, tokens);
+    parser.set_in_function();
+    parser.parse_statements()
+}
+
 /// Parses a single standalone expression (e.g. a column DEFAULT re-parsed at
 /// INSERT time). Rejects trailing tokens.
 pub fn parse_expr(sql: &str) -> SqlResult<Expr> {

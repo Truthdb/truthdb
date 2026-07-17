@@ -122,6 +122,12 @@ pub struct TableDef {
     /// procedure carries no data pages, columns, or key.
     #[serde(default)]
     pub procedure: Option<ProcedureDef>,
+    /// For a user-defined FUNCTION: its parameters, return shape, and body
+    /// source text, re-parsed at each call (the same view posture as a
+    /// procedure). `None` for every other object kind. A function carries no
+    /// data pages, columns, or key.
+    #[serde(default)]
+    pub function: Option<FunctionDef>,
 }
 
 /// A stored procedure's catalog payload: declared parameters and body text.
@@ -146,6 +152,26 @@ pub struct ProcParamDef {
     pub output: bool,
 }
 
+/// A user-defined function's catalog payload: its declared parameters (reusing
+/// [`ProcParamDef`], with `output` always false — functions have no OUTPUT
+/// parameters) and its return shape.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionDef {
+    pub params: Vec<ProcParamDef>,
+    pub returns: FunctionReturns,
+}
+
+/// A function's return shape. Only the scalar form exists today; the inline and
+/// multi-statement table-valued forms are added by later work (the enum is
+/// forward-compatible — an old catalog only ever holds `Scalar`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum FunctionReturns {
+    /// `RETURNS <type> AS BEGIN … RETURN <expr>; END`: a scalar UDF. `type_spec`
+    /// is the declared return type (same round-trip as a column type); `body` is
+    /// the source text after `AS`, re-parsed per call.
+    Scalar { type_spec: String, body: String },
+}
+
 impl TableDef {
     /// True if this catalog entry is a view rather than a base table.
     pub fn is_view(&self) -> bool {
@@ -155,6 +181,11 @@ impl TableDef {
     /// True if this catalog entry is a stored procedure.
     pub fn is_procedure(&self) -> bool {
         self.procedure.is_some()
+    }
+
+    /// True if this catalog entry is a user-defined function.
+    pub fn is_function(&self) -> bool {
+        self.function.is_some()
     }
 }
 

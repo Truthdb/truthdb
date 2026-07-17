@@ -108,6 +108,15 @@ pub enum Statement {
         if_exists: bool,
         span: Span,
     },
+    /// `CREATE FUNCTION` / `ALTER FUNCTION` — the body is stored as source text
+    /// (the view posture) and re-parsed at each call.
+    CreateFunction(CreateFunction),
+    /// `DROP FUNCTION [IF EXISTS] <name>`.
+    DropFunction {
+        name: Name,
+        if_exists: bool,
+        span: Span,
+    },
 }
 
 /// `CREATE|ALTER PROC[EDURE] <name> [@p TYPE [= default] [OUTPUT], ...] AS <body>`.
@@ -120,6 +129,27 @@ pub struct CreateProcedure {
     /// `ALTER PROCEDURE` replaces an existing definition.
     pub alter: bool,
     pub span: Span,
+}
+
+/// `CREATE|ALTER FUNCTION <name> ( [@p TYPE [= default], ...] ) RETURNS <ret> AS <body>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateFunction {
+    pub name: Name,
+    pub params: Vec<ProcParam>,
+    pub returns: ReturnsClause,
+    /// The body's source text: everything after `AS`, verbatim (scalar form).
+    pub body: String,
+    /// `ALTER FUNCTION` replaces an existing definition.
+    pub alter: bool,
+    pub span: Span,
+}
+
+/// A function's declared return shape. Only the scalar form exists today; the
+/// table-valued forms are added by later work.
+#[derive(Debug, Clone, PartialEq)]
+pub enum ReturnsClause {
+    /// `RETURNS <scalar type>`: a scalar UDF.
+    Scalar(DataType),
 }
 
 /// One declared procedure parameter.

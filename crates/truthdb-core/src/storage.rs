@@ -578,6 +578,30 @@ impl Storage {
         result
     }
 
+    pub fn rel_create_function(
+        &self,
+        name: &str,
+        function: crate::relstore::catalog::FunctionDef,
+    ) -> Result<(), StorageError> {
+        let result = self.lock().rel_create_function(name, function);
+        // Like a procedure: a table-reading function changes which locks a batch
+        // that references it must hold, so a parked batch analyzed against the
+        // old catalog carries a stale lock set — bump so the grant path
+        // re-analyzes.
+        self.bump_lock_epoch();
+        result
+    }
+
+    pub fn rel_alter_function(
+        &self,
+        name: &str,
+        function: crate::relstore::catalog::FunctionDef,
+    ) -> Result<(), StorageError> {
+        let result = self.lock().rel_alter_function(name, function);
+        self.bump_lock_epoch();
+        result
+    }
+
     pub fn rel_table(&self, name: &str) -> Option<TableDef> {
         self.lock().rel_table(name)
     }
@@ -1376,6 +1400,7 @@ impl StorageFile {
                 foreign_keys,
                 view_query: None,
                 procedure: None,
+                function: None,
                 counter_page: Some(counter_page),
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1428,6 +1453,7 @@ impl StorageFile {
                 foreign_keys: Vec::new(),
                 view_query: Some(query),
                 procedure: None,
+                function: None,
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1476,12 +1502,96 @@ impl StorageFile {
                 foreign_keys: Vec::new(),
                 view_query: None,
                 procedure: Some(procedure),
+                function: None,
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
+        self.rel.tables.insert(name.to_string(), def);
+        Ok(())
+    }
+
+    /// Records a user-defined function in the catalog (`CREATE FUNCTION`): its
+    /// parameters, return shape, and body text (the view posture — re-parsed at
+    /// each call).
+    pub fn rel_create_function(
+        &mut self,
+        name: &str,
+        function: crate::relstore::catalog::FunctionDef,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        if self.rel.tables.contains_key(name) {
+            return Err(StorageError::Constraint(format!(
+                "object '{name}' already exists"
+            )));
+        }
+        if self.rel.catalog_root.is_none() {
+            let root = {
+                let mut ctx = self.rel_ctx();
+                catalog::create_catalog(&mut ctx)?
+            };
+            self.rel.catalog_root = Some(root);
+        }
+        let catalog_root = self.rel.catalog_root.expect("catalog exists");
+        let object_id = self.rel.next_object_id;
+        let func_name = name.to_string();
+        let def = self.rel_statement(move |ctx, txn| {
+            let def = TableDef {
+                object_id,
+                name: func_name,
+                columns: Vec::new(),
+                key_columns: Vec::new(),
+                root_page: 0,
+                defaults: Vec::new(),
+                collations: Vec::new(),
+                identity: None,
+                indexes: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                view_query: None,
+                procedure: None,
+                function: Some(function),
+                counter_page: None,
+            };
+            catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
+            Ok(def)
+        })?;
+        self.rel.next_object_id += 1;
+        self.rel.tables.insert(name.to_string(), def);
+        Ok(())
+    }
+
+    /// Replaces an existing function's definition (`ALTER FUNCTION`): the object
+    /// id is kept, the stored definition swapped.
+    pub fn rel_alter_function(
+        &mut self,
+        name: &str,
+        function: crate::relstore::catalog::FunctionDef,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        let Some(existing) = self.rel.tables.get(name) else {
+            return Err(StorageError::Constraint(format!(
+                "function '{name}' does not exist"
+            )));
+        };
+        if !existing.is_function() {
+            return Err(StorageError::Constraint(format!(
+                "object '{name}' is not a function"
+            )));
+        }
+        let mut def = existing.clone();
+        def.function = Some(function);
+        let catalog_root = self
+            .rel
+            .catalog_root
+            .expect("functions live in the catalog");
+        let write = def.clone();
+        self.rel_statement(move |ctx, txn| {
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &write)?;
+            Ok(())
+        })?;
         self.rel.tables.insert(name.to_string(), def);
         Ok(())
     }

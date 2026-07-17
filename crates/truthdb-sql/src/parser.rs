@@ -35,6 +35,10 @@ pub struct Parser {
     while_depth: usize,
     /// Parsing a stored-procedure body: `RETURN <value>` is then legal.
     in_procedure: bool,
+    /// Parsing a scalar-function body: `RETURN <expr>` is mandatory and yields
+    /// the function's typed result, so the value is always parsed (not gated on
+    /// a leading-token whitelist) and the 178 batch-return check does not apply.
+    in_function: bool,
     /// Nesting depth inside blocks / IF branches / WHILE bodies — procedure
     /// DDL must be top-level (SQL Server 156/111 classes).
     sub_depth: usize,
@@ -58,6 +62,7 @@ impl Parser {
             depth: 0,
             while_depth: 0,
             in_procedure: false,
+            in_function: false,
             sub_depth: 0,
             statement_index: 0,
             nodes: 0,
@@ -98,6 +103,12 @@ impl Parser {
     /// entry for parsing a stored procedure's body text.
     pub fn set_in_procedure(&mut self) {
         self.in_procedure = true;
+    }
+
+    /// Switches to the in-function grammar (`RETURN <expr>` mandatory): the
+    /// entry for parsing a scalar function's body text.
+    pub fn set_in_function(&mut self) {
+        self.in_function = true;
     }
 
     /// Parses exactly one expression followed by EOF (for a re-parsed DEFAULT).
@@ -313,6 +324,18 @@ impl Parser {
     /// start one (T-SQL RETURN takes an integer expression).
     fn parse_return(&mut self) -> SqlResult<Statement> {
         let start = self.expect_keyword("RETURN")?;
+        // A scalar function's RETURN yields its mandatory typed result, so the
+        // expression is always parsed (it commonly begins with a word — a
+        // column, CASE, CAST, NULL, or a nested call — which the batch/procedure
+        // whitelist below deliberately excludes).
+        if self.in_function {
+            let value = self.parse_expr()?;
+            let end = self.prev_span();
+            return Ok(Statement::Return {
+                span: start.to(end),
+                value: Some(value),
+            });
+        }
         let has_value = matches!(
             self.peek().kind,
             TokenKind::Int(_)
@@ -807,6 +830,7 @@ impl Parser {
             Some("PROCEDURE") | Some("PROC") if !unique => {
                 self.parse_create_procedure(start, false)
             }
+            Some("FUNCTION") if !unique => self.parse_create_function(start, false),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1317,6 +1341,9 @@ impl Parser {
         ) {
             return self.parse_create_procedure(start, true);
         }
+        if self.peek_keyword().as_deref() == Some("FUNCTION") {
+            return self.parse_create_function(start, true);
+        }
         self.expect_keyword("TABLE")?;
         let table = self.parse_name()?;
         let (action, end) = match self.peek_keyword().as_deref() {
@@ -1414,6 +1441,7 @@ impl Parser {
             Some("TABLE") => self.parse_drop_table(start),
             Some("VIEW") => self.parse_drop_view(start),
             Some("PROCEDURE") | Some("PROC") => self.parse_drop_procedure(start),
+            Some("FUNCTION") => self.parse_drop_function(start),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1538,6 +1566,127 @@ impl Parser {
         };
         let name = self.parse_name()?;
         Ok(Statement::DropProcedure {
+            span: start.to(name.span),
+            name,
+            if_exists,
+        })
+    }
+
+    /// `CREATE|ALTER FUNCTION <name> ( [params] ) RETURNS <type> AS <body>`.
+    /// Only the scalar form is parsed here; the body is validated by parsing it
+    /// (with `RETURN <expr>` mandatory) and stored as source text.
+    fn parse_create_function(&mut self, start: Span, alter: bool) -> SqlResult<Statement> {
+        self.bump(); // FUNCTION
+        if self.in_procedure || self.in_function {
+            return Err(
+                SqlError::new(156, 15, 1, "Incorrect syntax near the keyword 'FUNCTION'.")
+                    .at(start),
+            );
+        }
+        if self.statement_index > 0 || self.sub_depth > 0 {
+            return Err(SqlError::new(
+                111,
+                15,
+                1,
+                "'CREATE/ALTER FUNCTION' must be the first statement in a query batch.",
+            )
+            .at(start));
+        }
+        let name = self.parse_name()?;
+        // Function parameter lists are always parenthesized (SQL Server requires
+        // the parentheses even for a zero-parameter function).
+        self.expect(&TokenKind::LParen)?;
+        let mut params = Vec::new();
+        while matches!(self.peek().kind, TokenKind::LocalVar(_)) {
+            let token = self.bump();
+            let TokenKind::LocalVar(param_name) = &token.kind else {
+                unreachable!("matched above");
+            };
+            let param_name = param_name.clone();
+            let param_start = token.span;
+            let (data_type, mut end) = self.parse_data_type()?;
+            let default_text = if self.eat(&TokenKind::Eq) {
+                let expr_start = self.peek().span.start;
+                let expr = self.parse_expr()?;
+                end = expr.span;
+                Some(
+                    self.slice(Span::new(expr_start, expr.span.end))
+                        .trim()
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            // A function parameter cannot be OUTPUT (SQL Server 156-class); the
+            // executor re-checks, but reject the keyword early for a clear error.
+            if matches!(self.peek_keyword().as_deref(), Some("OUTPUT") | Some("OUT")) {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+            params.push(ProcParam {
+                name: param_name,
+                data_type,
+                default_text,
+                output: false,
+                span: param_start.to(end),
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        self.expect_keyword("RETURNS")?;
+        // Scalar form only: the return is a system type. (RETURNS TABLE / @t
+        // TABLE — the table-valued forms — are added by later work; a TABLE
+        // return type falls through to parse_data_type's 243.)
+        let (return_type, _) = self.parse_data_type()?;
+        let returns = ReturnsClause::Scalar(return_type);
+        self.expect_keyword("AS")?;
+        let body_start = self.peek().span.start;
+        let body = self.src[body_start..].trim().to_string();
+        if body.is_empty() {
+            let token = self.peek().clone();
+            return Err(SqlError::syntax(self.token_text(&token), token.span));
+        }
+        self.in_function = true;
+        let validated = (|| -> SqlResult<()> {
+            loop {
+                while self.eat(&TokenKind::Semicolon) {}
+                if self.at_eof() {
+                    return Ok(());
+                }
+                self.nodes = 0;
+                self.parse_statement()?;
+                if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
+                    let token = self.peek().clone();
+                    return Err(SqlError::syntax(self.token_text(&token), token.span));
+                }
+            }
+        })();
+        self.in_function = false;
+        validated?;
+        let span = start.to(self.prev_span());
+        Ok(Statement::CreateFunction(CreateFunction {
+            name,
+            params,
+            returns,
+            body,
+            alter,
+            span,
+        }))
+    }
+
+    fn parse_drop_function(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // FUNCTION
+        let if_exists = if self.peek_keyword().as_deref() == Some("IF") {
+            self.bump();
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_name()?;
+        Ok(Statement::DropFunction {
             span: start.to(name.span),
             name,
             if_exists,
@@ -2587,8 +2736,11 @@ impl Parser {
                     }
                     _ => {
                         let name = self.parse_name()?;
-                        // A single identifier followed by `(` is a function call.
-                        if !name.value.contains('.') && self.check(&TokenKind::LParen) {
+                        // A name followed by `(` is a function call — including a
+                        // schema-qualified one (`dbo.f(@x)`), the canonical way to
+                        // call a user-defined function. A column reference is
+                        // never followed by `(`, so this never misreads one.
+                        if self.check(&TokenKind::LParen) {
                             self.parse_function(name)
                         } else {
                             Ok(Expr {

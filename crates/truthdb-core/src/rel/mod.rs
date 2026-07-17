@@ -14,11 +14,11 @@ mod plan;
 mod value;
 
 use truthdb_sql::ast::{
-    AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateIndex,
-    CreateProcedure, CreateTable, CreateView, DataType, DatabaseOption, Declaration, Delete,
-    DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind, ForeignKey, Insert,
-    InsertSource, IsolationLevel, JoinKind, Name, OrderItem, RaiseError, Select, SelectItem,
-    SetStatement, Statement, TableRef, ThrowArgs, ThrowStatement, Update,
+    AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateFunction,
+    CreateIndex, CreateProcedure, CreateTable, CreateView, DataType, DatabaseOption, Declaration,
+    Delete, DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind, ForeignKey, Insert,
+    InsertSource, IsolationLevel, JoinKind, Name, OrderItem, RaiseError, ReturnsClause, Select,
+    SelectItem, SetStatement, Statement, TableRef, ThrowArgs, ThrowStatement, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -31,7 +31,9 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::lock::{LockMode, Resource};
 use crate::relstore::btree::ScanCursor;
-use crate::relstore::catalog::{self, ProcParamDef, ProcedureDef, TableDef};
+use crate::relstore::catalog::{
+    self, FunctionDef, FunctionReturns, ProcParamDef, ProcedureDef, TableDef,
+};
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
 use crate::relstore::version::ReadSnapshot;
@@ -71,6 +73,10 @@ pub struct TxnContext {
     /// for `EXEC @rc = name` to read after the body unwinds; 0 when the body
     /// falls off the end.
     proc_return: Option<i64>,
+    /// A scalar function body's `RETURN <expr>` value, coerced to the declared
+    /// return type and stashed by the Return arm for the caller to read. Only
+    /// set while a function body runs (see [`run_user_scalar_function`]).
+    func_return: Option<SqlValue>,
     /// `SET SHOWPLAN_TEXT ON` — a SELECT returns its plan text, not results.
     showplan_text: bool,
     /// Declared batch variables (name without `@`, lowercased) to their type
@@ -401,6 +407,7 @@ pub fn execute_batch_streamed(
         durability_failed: false,
         committed: false,
         last_error: None,
+        function_return_type: None,
     };
     // `run_block` returns Err only when the batch must terminate (a cancel, or a
     // dooming/uncaught error outside any TRY); a non-dooming error under
@@ -441,6 +448,24 @@ pub trait BatchEmitter {
     /// An informational message (RAISERROR severity <= 10): TDS renders an
     /// INFO token in-stream, not an error. Emitters with no wire ignore it.
     fn info(&mut self, _error: &SqlError) {}
+}
+
+/// A [`BatchEmitter`] that drops everything: a scalar function body produces no
+/// result sets (a data-returning SELECT is rejected at CREATE, 444), so its
+/// per-statement DONE events have nowhere to go.
+struct DiscardEmitter;
+
+impl BatchEmitter for DiscardEmitter {
+    fn columns(&mut self, _columns: Vec<ResultColumn>) {}
+    fn rows(&mut self, _rows: Vec<Vec<Datum>>) {}
+    fn statement_done(
+        &mut self,
+        _count: Option<u64>,
+        _in_transaction: bool,
+        _command: DoneCommand,
+    ) {
+    }
+    fn statement_aborted(&mut self, _in_transaction: bool) {}
 }
 
 /// Reassembles emitted results into the whole-batch [`BatchOutcome`] for the
@@ -516,6 +541,11 @@ struct BatchRun<'a> {
     /// any TRY) — the batch continues past it (SQL Server default) and it is
     /// reported alongside the results rather than terminating the batch.
     last_error: Option<SqlError>,
+    /// Set while running a scalar function body: the declared return type. The
+    /// `RETURN <expr>` arm then evaluates its value, coerces it to this type,
+    /// and stashes it in `TxnContext::func_return` (rather than the procedure
+    /// int-status path).
+    function_return_type: Option<ColumnType>,
 }
 
 /// A statement's DONE, parked until the next durability point.
@@ -981,6 +1011,103 @@ fn run_user_procedure(
         }
     }
     result
+}
+
+/// Runs a scalar user-defined function's body once with `arg_values` bound to
+/// its parameters, returning the value its `RETURN` produced, coerced to the
+/// declared return type.
+///
+/// The body runs in an isolated throwaway context — only the parameters are
+/// visible (SQL Server functions do not see caller locals), no transaction is
+/// open (functions are side-effect-free), and any table reads observe the
+/// caller's ambient snapshot on this thread. Nesting shares the `EXEC_DEPTH`
+/// budget (217 at depth 32). Because the context has no transaction, an error in
+/// the body always terminates the function (there is no XACT_ABORT-OFF continue
+/// path), which is exactly the SQL Server posture: a function error aborts the
+/// statement that called it.
+fn run_user_scalar_function(
+    storage: &Storage,
+    def: &TableDef,
+    arg_values: &[SqlValue],
+    caller: &EvalContext,
+) -> Result<SqlValue, SqlError> {
+    let function = def.function.as_ref().expect("checked by the caller");
+    let FunctionReturns::Scalar { type_spec, body } = &function.returns;
+    if arg_values.len() < function.params.len() {
+        return Err(SqlError::new(
+            313,
+            16,
+            3,
+            format!(
+                "An insufficient number of arguments were supplied for the procedure or function {}.",
+                def.name
+            ),
+        ));
+    }
+    if arg_values.len() > function.params.len() {
+        return Err(SqlError::new(
+            8144,
+            16,
+            2,
+            format!(
+                "Procedure or function {} has too many arguments specified.",
+                def.name
+            ),
+        ));
+    }
+    let return_type =
+        ColumnType::parse(type_spec).map_err(|e| SqlError::message_only(245, e.to_string()))?;
+    // Fresh scope with only the parameters; the caller's session identity is
+    // carried so DB_NAME()/SUSER_SNAME()/@@SPID resolve inside the body.
+    let mut txn_ctx = TxnContext::default();
+    txn_ctx.set_session_identity(caller.database.clone(), caller.login.clone(), caller.spid);
+    for (param, value) in function.params.iter().zip(arg_values) {
+        let column_type = ColumnType::parse(&param.type_spec)
+            .map_err(|e| SqlError::message_only(245, e.to_string()))?;
+        let datum = value::sql_to_datum(value, &column_type, &param.name)?;
+        let coerced = value::datum_to_sql(&datum, &column_type);
+        txn_ctx
+            .variables
+            .insert(param.name.clone(), (column_type, coerced));
+    }
+    let statements = truthdb_sql::parse_function_body(body)?;
+    let depth = EXEC_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    let result = if depth > 32 {
+        Err(SqlError::new(
+            217,
+            16,
+            1,
+            "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).",
+        ))
+    } else {
+        let mut emitter = DiscardEmitter;
+        let mut run = BatchRun {
+            emitter: &mut emitter,
+            deferred: Vec::new(),
+            rowset_open: false,
+            durability_failed: false,
+            committed: false,
+            last_error: None,
+            function_return_type: Some(return_type),
+        };
+        run_block(storage, &statements, &mut txn_ctx, &mut run, false).map(|_| ())
+    };
+    EXEC_DEPTH.with(|d| d.set(d.get() - 1));
+    result?;
+    // The body ends in `RETURN <expr>` (enforced at CREATE, 455), so a completed
+    // body always set `func_return`.
+    txn_ctx.func_return.take().ok_or_else(|| {
+        SqlError::new(
+            455,
+            16,
+            2,
+            "The last statement included within a function must be a return statement.",
+        )
+    })
 }
 
 fn run_exec(
@@ -1451,6 +1578,37 @@ fn run_block(
             // The parser rejects `RETURN <value>` outside a procedure (178);
             // inside one the status is stashed for `EXEC @rc =` to read.
             Statement::Return { value, .. } => {
+                // A scalar function body's RETURN: evaluate its (mandatory)
+                // value, coerce it to the declared return type, and stash it for
+                // the caller. Nested user functions and subqueries in the RETURN
+                // expression are rewritten to literals first, exactly like an
+                // IF/WHILE condition.
+                if let Some(return_type) = run.function_return_type.clone() {
+                    let value = value
+                        .as_ref()
+                        .expect("a scalar function RETURN carries a value (parser-enforced)");
+                    let eval_ctx = txn_ctx.eval_context();
+                    let no_outer = |_: &str| -> Option<usize> { None };
+                    let coerced =
+                        substitute_correlated_in_expr(storage, value, &no_outer, &[], &eval_ctx)
+                            .and_then(|bound| eval_constant(&bound, &eval_ctx))
+                            .and_then(|raw| {
+                                let datum =
+                                    value::sql_to_datum(&raw, &return_type, "return value")?;
+                                Ok(value::datum_to_sql(&datum, &return_type))
+                            });
+                    match coerced {
+                        Ok(coerced) => {
+                            txn_ctx.func_return = Some(coerced);
+                            return Ok(Flow::Return);
+                        }
+                        Err(error) => {
+                            txn_ctx.rowcount = 0;
+                            statement_error_ladder(statement, error, txn_ctx, run, in_try)?;
+                            continue;
+                        }
+                    }
+                }
                 if let Some(value) = value {
                     let eval_ctx = txn_ctx.eval_context();
                     match eval_constant(value, &eval_ctx) {
@@ -1978,6 +2136,8 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::While { .. }
             | Statement::CreateProcedure(_)
             | Statement::DropProcedure { .. }
+            | Statement::CreateFunction(_)
+            | Statement::DropFunction { .. }
             | Statement::Commit { .. }
     )
 }
@@ -2361,6 +2521,15 @@ fn analyze_statements_locks(
                         }
                     }
                 }
+                // A scalar function the query calls reads tables through its
+                // body; lock those up front too (2PL), or the body would read
+                // with no lock held. read_lock_object_ids recurses the body.
+                for oid in select_function_read_ids(storage, &expanded) {
+                    add(Resource::Database, LockMode::IntentShared);
+                    if !versioned_reads {
+                        add(Resource::Table(oid), LockMode::Shared);
+                    }
+                }
             }
             Statement::Insert(insert) => {
                 if let Some(def) = resolve_table(storage, &insert.table.value) {
@@ -2409,6 +2578,10 @@ fn analyze_statements_locks(
                             add(Resource::Database, LockMode::IntentShared);
                             add(Resource::Table(oid), LockMode::Shared);
                         }
+                    }
+                    for oid in select_function_read_ids(storage, &expanded) {
+                        add(Resource::Database, LockMode::IntentShared);
+                        add(Resource::Table(oid), LockMode::Shared);
                     }
                 }
             }
@@ -2569,7 +2742,10 @@ fn analyze_statements_locks(
                 }
             }
             // Procedure DDL rewrites the catalog: Database X, like other DDL.
-            Statement::CreateProcedure(_) | Statement::DropProcedure { .. } => {
+            Statement::CreateProcedure(_)
+            | Statement::DropProcedure { .. }
+            | Statement::CreateFunction(_)
+            | Statement::DropFunction { .. } => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // IF/WHILE conditions read tables through their subqueries —
@@ -2587,6 +2763,12 @@ fn analyze_statements_locks(
                         if !versioned_reads {
                             add(Resource::Table(oid), LockMode::Shared);
                         }
+                    }
+                }
+                for oid in expr_function_read_ids(storage, condition) {
+                    add(Resource::Database, LockMode::IntentShared);
+                    if !versioned_reads {
+                        add(Resource::Table(oid), LockMode::Shared);
                     }
                 }
             }
@@ -2718,6 +2900,20 @@ fn exec_statement_dispatch(
                 return Err(ddl_in_txn_err());
             }
             exec_drop_procedure(storage, name, *if_exists)
+        }
+        Statement::CreateFunction(create) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_function(storage, create)
+        }
+        Statement::DropFunction {
+            name, if_exists, ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_function(storage, name, *if_exists)
         }
         // Executed by `run_block`'s own arms; nothing routes them here.
         Statement::Block { .. }
@@ -4418,7 +4614,9 @@ fn exec_drop_table(storage: &Storage, drop: &DropTable) -> Result<StatementResul
     // The object exists but is the wrong type, so error even under IF EXISTS
     // rather than silently no-op — the review showed DROP TABLE silently
     // DESTROYING a procedure through the shared catalog path.
-    if resolve_table(storage, &drop.table.value).is_some_and(|d| d.is_view() || d.is_procedure()) {
+    if resolve_table(storage, &drop.table.value)
+        .is_some_and(|d| d.is_view() || d.is_procedure() || d.is_function())
+    {
         return Err(SqlError::new(
             3701,
             11,
@@ -4620,6 +4818,185 @@ fn exec_drop_procedure(
             5,
             format!(
                 "Cannot drop the procedure '{}', because it does not exist or you do not have \
+                 permission.",
+                name.value
+            ),
+        )),
+    }
+}
+
+fn exec_create_function(
+    storage: &Storage,
+    create: &CreateFunction,
+) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&create.name.value);
+    let params = create
+        .params
+        .iter()
+        .map(|p| -> Result<ProcParamDef, SqlError> {
+            let column_type = data_type_to_column_type(&p.data_type, &p.name)?;
+            if let Some(text) = &p.default_text {
+                let expr = truthdb_sql::parse_expr(text)?;
+                if !constant_default(&expr) {
+                    return Err(SqlError::new(
+                        102,
+                        15,
+                        1,
+                        format!(
+                            "The default for parameter '@{}' must be a constant.",
+                            p.name
+                        ),
+                    )
+                    .at(p.span));
+                }
+            }
+            Ok(ProcParamDef {
+                name: p.name.clone(),
+                type_spec: column_type.name(),
+                default: p.default_text.clone(),
+                output: false,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let ReturnsClause::Scalar(return_type) = &create.returns;
+    let return_type = data_type_to_column_type(return_type, bare)?;
+    // Validate the body: it must be side-effect-free and end in RETURN <expr>
+    // (SQL Server's function-body rules). Re-parse under the function grammar.
+    let body = truthdb_sql::parse_function_body(&create.body)?;
+    validate_scalar_function_body(&body)?;
+    let function = FunctionDef {
+        params,
+        returns: FunctionReturns::Scalar {
+            type_spec: return_type.name(),
+            body: create.body.clone(),
+        },
+    };
+    if create.alter {
+        match resolve_table(storage, &create.name.value) {
+            Some(def) if def.is_function() => {
+                storage
+                    .rel_alter_function(&def.name, function)
+                    .map_err(|e| map_storage_err(e, &create.name.value))?;
+                return Ok(StatementResult::Done);
+            }
+            _ => {
+                return Err(SqlError::invalid_object(bare).at(create.name.span));
+            }
+        }
+    }
+    if resolve_table(storage, &create.name.value).is_some() {
+        return Err(SqlError::new(
+            2714,
+            16,
+            6,
+            format!("There is already an object named '{bare}' in the database."),
+        ));
+    }
+    storage
+        .rel_create_function(bare, function)
+        .map_err(|e| map_storage_err(e, &create.name.value))?;
+    Ok(StatementResult::Done)
+}
+
+/// Validates a scalar function's body against SQL Server's rules: every
+/// statement must be side-effect-free (443 otherwise; a data-returning SELECT is
+/// 444), and the last statement must be a `RETURN <expr>` (455).
+fn validate_scalar_function_body(statements: &[Statement]) -> Result<(), SqlError> {
+    for statement in statements {
+        check_function_statement(statement)?;
+    }
+    match last_effective_statement(statements) {
+        Some(Statement::Return { value: Some(_), .. }) => Ok(()),
+        _ => Err(SqlError::new(
+            455,
+            16,
+            2,
+            "The last statement included within a function must be a return statement.",
+        )),
+    }
+}
+
+/// The body's terminal statement, unwrapping a trailing `BEGIN...END` block —
+/// SQL Server's 455 check looks at the last statement of the body block.
+fn last_effective_statement(statements: &[Statement]) -> Option<&Statement> {
+    match statements.last() {
+        Some(Statement::Block { body, .. }) => last_effective_statement(body),
+        other => other,
+    }
+}
+
+/// Rejects a statement a function body may not contain. Side-effecting
+/// statements (DML, DDL, EXEC, transaction control, THROW/RAISERROR) are 443; a
+/// data-returning SELECT is 444; control flow recurses.
+fn check_function_statement(statement: &Statement) -> Result<(), SqlError> {
+    match statement {
+        Statement::Declare(_)
+        | Statement::Set(_)
+        | Statement::Return { .. }
+        | Statement::Break { .. }
+        | Statement::Continue { .. } => Ok(()),
+        Statement::Block { body, .. } => {
+            for inner in body {
+                check_function_statement(inner)?;
+            }
+            Ok(())
+        }
+        Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            check_function_statement(then_branch)?;
+            if let Some(else_branch) = else_branch {
+                check_function_statement(else_branch)?;
+            }
+            Ok(())
+        }
+        Statement::While { body, .. } => check_function_statement(body),
+        // An assignment SELECT (`SELECT @x = …`) is allowed — it returns no
+        // rows. A SELECT that produces a result set cannot (444).
+        Statement::Select(select)
+            if select
+                .items
+                .iter()
+                .all(|i| matches!(i, SelectItem::Assign { .. })) =>
+        {
+            Ok(())
+        }
+        Statement::Select(_) => Err(SqlError::new(
+            444,
+            16,
+            2,
+            "Select statements included within a function cannot return data to a client.",
+        )),
+        _ => Err(SqlError::new(
+            443,
+            16,
+            1,
+            "Invalid use of a side-effecting operator within a function.",
+        )),
+    }
+}
+
+fn exec_drop_function(
+    storage: &Storage,
+    name: &Name,
+    if_exists: bool,
+) -> Result<StatementResult, SqlError> {
+    match resolve_table(storage, &name.value) {
+        Some(def) if def.is_function() => {
+            storage
+                .rel_drop_table(&def.name)
+                .map_err(|e| map_storage_err(e, &def.name))?;
+            Ok(StatementResult::Done)
+        }
+        Some(_) | None if if_exists => Ok(StatementResult::Done),
+        _ => Err(SqlError::new(
+            3701,
+            11,
+            5,
+            format!(
+                "Cannot drop the function '{}', because it does not exist or you do not have \
                  permission.",
                 name.value
             ),
@@ -6403,7 +6780,7 @@ fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<S
             // A view defers to its expansion; a PROCEDURE must not read as a
             // zero-column table — bailing here routes to the collecting path,
             // which errors 2809.
-            if def.is_view() || def.is_procedure() {
+            if def.is_view() || def.is_procedure() || def.is_function() {
                 return None;
             }
             let qualifier = alias
@@ -6982,6 +7359,80 @@ fn substitute_from_outer_refs(
 /// Evaluates each correlated subquery in `expr` against `outer_row` (binding the
 /// enclosing query's columns per `outer`) and replaces it with a literal —
 /// producing a subquery-free predicate for that outer row.
+/// A [`ColumnResolver`] over a bare name→index closure (the `outer` resolver the
+/// correlated-substitution pass carries), so a user scalar function's arguments
+/// can be evaluated against the current row.
+struct FnResolver<'a>(&'a dyn Fn(&str) -> Option<usize>);
+
+impl truthdb_sql::eval::ColumnResolver for FnResolver<'_> {
+    fn resolve(&self, name: &str) -> Option<usize> {
+        (self.0)(name)
+    }
+}
+
+/// Resolves a function-call name to a user-defined SCALAR function, or `None`
+/// (an unknown name, a built-in, or a table-valued function). Schema-qualified
+/// (`dbo.f`) and bare names both resolve; a bare name that shadows a built-in
+/// takes the user function (a documented minor divergence from SQL Server, which
+/// requires schema-qualified UDF calls).
+fn resolve_scalar_function(storage: &Storage, name: &str) -> Option<TableDef> {
+    let def = resolve_table(storage, name)?;
+    match def.function.as_ref()?.returns {
+        FunctionReturns::Scalar { .. } => Some(def),
+    }
+}
+
+/// True if an expression contains a call to a user-defined scalar function —
+/// which, like a subquery, cannot be evaluated by the pure eval crate and must
+/// be rewritten to a literal per row first.
+fn expr_has_user_function(storage: &Storage, expr: &Expr) -> bool {
+    let has = |e: &Expr| expr_has_user_function(storage, e);
+    match &expr.kind {
+        ExprKind::Function { name, args } => {
+            resolve_scalar_function(storage, name).is_some() || args.iter().any(has)
+        }
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
+        | ExprKind::Column(_)
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_)
+        | ExprKind::Subquery(_)
+        | ExprKind::Exists(_)
+        | ExprKind::InSubquery { .. } => false,
+        ExprKind::Unary { expr: e, .. }
+        | ExprKind::IsNull { expr: e, .. }
+        | ExprKind::Cast { expr: e, .. } => has(e),
+        ExprKind::Binary { left, right, .. } => has(left) || has(right),
+        ExprKind::Like {
+            expr: e, pattern, ..
+        } => has(e) || has(pattern),
+        ExprKind::InList { expr: e, list, .. } => has(e) || list.iter().any(has),
+        ExprKind::Between {
+            expr: e, low, high, ..
+        } => has(e) || has(low) || has(high),
+        ExprKind::Aggregate { arg, .. } => arg.as_deref().is_some_and(has),
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            operand.as_deref().is_some_and(has)
+                || branches.iter().any(|(w, r)| has(w) || has(r))
+                || else_result.as_deref().is_some_and(has)
+        }
+    }
+}
+
+/// True if an expression needs the per-row storage-aware rewrite (a subquery or
+/// a user scalar function) before the pure evaluator can run on it.
+fn expr_needs_binding(storage: &Storage, expr: &Expr) -> bool {
+    expr_has_subquery(expr) || expr_has_user_function(storage, expr)
+}
+
 fn substitute_correlated_in_expr(
     storage: &Storage,
     expr: &Expr,
@@ -7078,10 +7529,26 @@ fn substitute_correlated_in_expr(
             high: recur_box(high)?,
             negated: *negated,
         },
-        ExprKind::Function { name, args } => ExprKind::Function {
-            name: name.clone(),
-            args: args.iter().map(&recur).collect::<Result<_, _>>()?,
-        },
+        ExprKind::Function { name, args } => {
+            let args = args.iter().map(&recur).collect::<Result<Vec<_>, _>>()?;
+            // A call that resolves to a user scalar function runs its body once
+            // for this row (its arguments evaluated against the row) and folds to
+            // the returned value — the same rewrite-to-literal discipline
+            // subqueries use, keeping scalar evaluation free of storage access.
+            if let Some(def) = resolve_scalar_function(storage, name) {
+                let resolver = FnResolver(outer);
+                let values = args
+                    .iter()
+                    .map(|a| eval::eval(a, outer_row, &resolver, eval_ctx))
+                    .collect::<Result<Vec<_>, _>>()?;
+                ExprKind::Literal(run_user_scalar_function(storage, &def, &values, eval_ctx)?)
+            } else {
+                ExprKind::Function {
+                    name: name.clone(),
+                    args,
+                }
+            }
+        }
         ExprKind::Aggregate {
             func,
             distinct,
@@ -7193,7 +7660,10 @@ fn exec_select(
     // numeric/string expression is rejected rather than silently coerced. Any
     // subquery left in the (already-rewritten) predicate is correlated: bind the
     // outer row into it and evaluate per row.
-    let where_correlated = select.where_clause.as_ref().is_some_and(expr_has_subquery);
+    let where_correlated = select
+        .where_clause
+        .as_ref()
+        .is_some_and(|w| expr_needs_binding(storage, w));
     let mut rows: Vec<Vec<Datum>> = Vec::new();
     // One row: filter it into `rows` or drop it. Shared by both input shapes.
     let take = |row: Vec<Datum>, rows: &mut Vec<Vec<Datum>>| -> Result<(), SqlError> {
@@ -7444,8 +7914,13 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     }
     // An uncorrelated subquery is executed by the rewrite this path skips; a
     // correlated one runs a query per row. (A subquery in the SELECT list is
-    // already excluded: it is not a bare column.)
-    if select.where_clause.as_ref().is_some_and(expr_has_subquery) {
+    // already excluded: it is not a bare column.) A user scalar function in the
+    // WHERE needs the same rewrite, so decline it here too.
+    if select
+        .where_clause
+        .as_ref()
+        .is_some_and(|w| expr_needs_binding(storage, w))
+    {
         return None;
     }
     // Whether every output column *could* be a source column, which is a
@@ -7485,7 +7960,7 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     // nothing and the scan would read the catalog root instead of the view. A
     // PROCEDURE has the same empty shape and must not stream as an empty
     // table: the collecting path rejects it (2809).
-    if def.view_query.is_some() || def.is_procedure() {
+    if def.view_query.is_some() || def.is_procedure() || def.is_function() {
         return None;
     }
     let schema = def.schema().ok()?;
@@ -8544,7 +9019,7 @@ fn project(
                 // subquery still present here is correlated (the rewrite pass
                 // left it for the per-row bind): substitute the outer row's
                 // values in, making it uncorrelated for that row.
-                let correlated = expr_has_subquery(expr);
+                let correlated = expr_needs_binding(storage, expr);
                 let mut values = Vec::with_capacity(rows.len());
                 for row in &row_sql {
                     let bound;
@@ -8815,6 +9290,175 @@ fn collect_expr_tables<'a>(expr: &'a Expr, out: &mut Vec<&'a Name>) {
     }
 }
 
+/// Collects, as OWNED names, the read-lock targets an expression reaches: the
+/// tables its subqueries reference and the (user or built-in) functions it
+/// calls. Unlike [`collect_expr_tables`], the results do not borrow the input,
+/// so they can be gathered from a separately-parsed scalar-function body — the
+/// key to locking a table-reading function's inner reads up front under 2PL.
+/// Built-in function names collected here resolve to nothing and are harmless.
+fn collect_expr_read_names(expr: &Expr, tables: &mut Vec<String>, funcs: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Function { name, args } => {
+            funcs.push(name.clone());
+            args.iter()
+                .for_each(|a| collect_expr_read_names(a, tables, funcs));
+        }
+        ExprKind::Subquery(select) | ExprKind::Exists(select) => {
+            collect_select_read_names(select, tables, funcs)
+        }
+        ExprKind::InSubquery { expr, subquery, .. } => {
+            collect_expr_read_names(expr, tables, funcs);
+            collect_select_read_names(subquery, tables, funcs);
+        }
+        ExprKind::Unary { expr, .. }
+        | ExprKind::IsNull { expr, .. }
+        | ExprKind::Cast { expr, .. } => collect_expr_read_names(expr, tables, funcs),
+        ExprKind::Binary { left, right, .. } => {
+            collect_expr_read_names(left, tables, funcs);
+            collect_expr_read_names(right, tables, funcs);
+        }
+        ExprKind::Like { expr, pattern, .. } => {
+            collect_expr_read_names(expr, tables, funcs);
+            collect_expr_read_names(pattern, tables, funcs);
+        }
+        ExprKind::InList { expr, list, .. } => {
+            collect_expr_read_names(expr, tables, funcs);
+            list.iter()
+                .for_each(|e| collect_expr_read_names(e, tables, funcs));
+        }
+        ExprKind::Between {
+            expr, low, high, ..
+        } => {
+            collect_expr_read_names(expr, tables, funcs);
+            collect_expr_read_names(low, tables, funcs);
+            collect_expr_read_names(high, tables, funcs);
+        }
+        ExprKind::Aggregate { arg, .. } => {
+            if let Some(a) = arg {
+                collect_expr_read_names(a, tables, funcs);
+            }
+        }
+        ExprKind::Case {
+            operand,
+            branches,
+            else_result,
+        } => {
+            if let Some(o) = operand {
+                collect_expr_read_names(o, tables, funcs);
+            }
+            for (w, r) in branches {
+                collect_expr_read_names(w, tables, funcs);
+                collect_expr_read_names(r, tables, funcs);
+            }
+            if let Some(e) = else_result {
+                collect_expr_read_names(e, tables, funcs);
+            }
+        }
+        ExprKind::Null
+        | ExprKind::Int(_)
+        | ExprKind::Number(_)
+        | ExprKind::Str(_)
+        | ExprKind::Bool(_)
+        | ExprKind::Literal(_)
+        | ExprKind::Column(_)
+        | ExprKind::GlobalVar(_)
+        | ExprKind::LocalVar(_) => {}
+    }
+}
+
+/// Owned read-name collection over a SELECT (see [`collect_expr_read_names`]).
+fn collect_select_read_names(select: &Select, tables: &mut Vec<String>, funcs: &mut Vec<String>) {
+    for cte in &select.ctes {
+        collect_select_read_names(&cte.query, tables, funcs);
+    }
+    if let Some(from) = &select.from {
+        collect_from_read_names(from, tables, funcs);
+    }
+    for item in &select.items {
+        if let SelectItem::Expr { expr, .. } | SelectItem::Assign { value: expr, .. } = item {
+            collect_expr_read_names(expr, tables, funcs);
+        }
+    }
+    for expr in select
+        .where_clause
+        .iter()
+        .chain(select.having.iter())
+        .chain(select.group_by.iter())
+    {
+        collect_expr_read_names(expr, tables, funcs);
+    }
+    for item in &select.order_by {
+        collect_expr_read_names(&item.expr, tables, funcs);
+    }
+}
+
+fn collect_from_read_names(tref: &TableRef, tables: &mut Vec<String>, funcs: &mut Vec<String>) {
+    match tref {
+        TableRef::Table { name, .. } => tables.push(name.value.clone()),
+        TableRef::Join {
+            left, right, on, ..
+        } => {
+            collect_from_read_names(left, tables, funcs);
+            collect_from_read_names(right, tables, funcs);
+            if let Some(on) = on {
+                collect_expr_read_names(on, tables, funcs);
+            }
+        }
+        TableRef::Derived { subquery, .. } => collect_select_read_names(subquery, tables, funcs),
+    }
+}
+
+/// Owned read-name collection over a scalar function body's statement (its
+/// reads come only from expressions — a data-returning statement is rejected at
+/// CREATE, 444).
+fn collect_statement_read_names(
+    statement: &Statement,
+    tables: &mut Vec<String>,
+    funcs: &mut Vec<String>,
+) {
+    match statement {
+        Statement::Return {
+            value: Some(expr), ..
+        } => collect_expr_read_names(expr, tables, funcs),
+        Statement::Set(SetStatement::Variable { value, .. }) => {
+            collect_expr_read_names(value, tables, funcs)
+        }
+        // An assignment SELECT in a function body reads its FROM tables.
+        Statement::Select(select) => collect_select_read_names(select, tables, funcs),
+        Statement::Declare(declarations) => {
+            for decl in declarations {
+                if let Some(init) = &decl.initializer {
+                    collect_expr_read_names(init, tables, funcs);
+                }
+            }
+        }
+        Statement::If {
+            condition,
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            collect_expr_read_names(condition, tables, funcs);
+            collect_statement_read_names(then_branch, tables, funcs);
+            if let Some(e) = else_branch {
+                collect_statement_read_names(e, tables, funcs);
+            }
+        }
+        Statement::While {
+            condition, body, ..
+        } => {
+            collect_expr_read_names(condition, tables, funcs);
+            collect_statement_read_names(body, tables, funcs);
+        }
+        Statement::Block { body, .. } => {
+            for inner in body {
+                collect_statement_read_names(inner, tables, funcs);
+            }
+        }
+        _ => {}
+    }
+}
+
 /// A table's exposed name: its alias, else its (schema-stripped) name.
 fn exposed_name(name: &Name, alias: Option<&Name>) -> String {
     alias
@@ -8962,6 +9606,11 @@ fn build_table_source(
             // A procedure is not a queryable object (SQL Server 2809).
             if def.is_procedure() {
                 return Err(procedure_not_a_table(&def.name).at(name.span));
+            }
+            // A scalar function is not a rowset — it cannot appear in FROM.
+            // (Table-valued functions, added later, expand here instead.)
+            if def.is_function() {
+                return Err(function_not_a_table(&def.name).at(name.span));
             }
             // A view: run its stored SELECT as a derived table under the view's
             // qualifier. A view over another view expands recursively — building
@@ -9657,7 +10306,9 @@ fn sys_tables(storage: &Storage) -> Source {
     let rows = storage
         .rel_tables()
         .into_iter()
-        .filter(|def| !def.is_view())
+        // Only base tables. (The `!is_view()` filter alone let procedures leak
+        // in — a pre-existing gap — so exclude every non-table object kind.)
+        .filter(|def| !def.is_view() && !def.is_procedure() && !def.is_function())
         .map(|def| vec![Datum::Int(def.object_id as i32), Datum::NVarChar(def.name)])
         .collect();
     let collations = vec![None; columns.len()];
@@ -9811,11 +10462,16 @@ fn sys_sql_modules(storage: &Storage) -> Source {
         .rel_tables()
         .into_iter()
         .filter_map(|def| {
-            // Views store their SELECT; procedures their body text.
+            // Views store their SELECT; procedures and functions their body.
             let definition = def
                 .view_query
                 .clone()
-                .or_else(|| def.procedure.as_ref().map(|p| p.body.clone()))?;
+                .or_else(|| def.procedure.as_ref().map(|p| p.body.clone()))
+                .or_else(|| {
+                    def.function.as_ref().map(|f| match &f.returns {
+                        FunctionReturns::Scalar { body, .. } => body.clone(),
+                    })
+                })?;
             Some(vec![
                 Datum::Int(def.object_id as i32),
                 Datum::NVarChar(definition),
@@ -9865,19 +10521,55 @@ fn sys_parameters(storage: &Storage) -> Source {
         int_col("has_default_value"),
     ];
     let mut rows = Vec::new();
+    let mut push_param = |object_id: u32,
+                          name: String,
+                          id: i32,
+                          type_spec: String,
+                          output: bool,
+                          has_default: bool| {
+        rows.push(vec![
+            Datum::Int(object_id as i32),
+            Datum::NVarChar(name),
+            Datum::Int(id),
+            Datum::NVarChar(type_spec),
+            Datum::Int(i32::from(output)),
+            Datum::Int(i32::from(has_default)),
+        ]);
+    };
     for def in storage.rel_tables() {
-        let Some(procedure) = &def.procedure else {
-            continue;
-        };
-        for (index, param) in procedure.params.iter().enumerate() {
-            rows.push(vec![
-                Datum::Int(def.object_id as i32),
-                Datum::NVarChar(format!("@{}", param.name)),
-                Datum::Int(index as i32 + 1),
-                Datum::NVarChar(param.type_spec.clone()),
-                Datum::Int(i32::from(param.output)),
-                Datum::Int(i32::from(param.default.is_some())),
-            ]);
+        if let Some(procedure) = &def.procedure {
+            for (index, param) in procedure.params.iter().enumerate() {
+                push_param(
+                    def.object_id,
+                    format!("@{}", param.name),
+                    index as i32 + 1,
+                    param.type_spec.clone(),
+                    param.output,
+                    param.default.is_some(),
+                );
+            }
+        } else if let Some(function) = &def.function {
+            // A scalar function's return value is parameter_id 0 with an empty
+            // name and is_output set (SQL Server's convention).
+            let FunctionReturns::Scalar { type_spec, .. } = &function.returns;
+            push_param(
+                def.object_id,
+                String::new(),
+                0,
+                type_spec.clone(),
+                true,
+                false,
+            );
+            for (index, param) in function.params.iter().enumerate() {
+                push_param(
+                    def.object_id,
+                    format!("@{}", param.name),
+                    index as i32 + 1,
+                    param.type_spec.clone(),
+                    false,
+                    param.default.is_some(),
+                );
+            }
         }
     }
     let collations = vec![None; columns.len()];
@@ -9901,8 +10593,13 @@ fn sys_objects(storage: &Storage) -> Source {
         .rel_tables()
         .into_iter()
         .map(|def| {
-            // SQL Server's type codes carry a trailing space.
-            let (code, desc) = if def.is_procedure() {
+            // SQL Server's single-letter codes carry a trailing space; the
+            // two-letter function codes fill CHAR(2) exactly.
+            let (code, desc) = if let Some(function) = &def.function {
+                match function.returns {
+                    FunctionReturns::Scalar { .. } => ("FN", "SQL_SCALAR_FUNCTION"),
+                }
+            } else if def.is_procedure() {
                 ("P ", "SQL_STORED_PROCEDURE")
             } else if def.is_view() {
                 ("V ", "VIEW")
@@ -10131,6 +10828,33 @@ fn read_lock_object_ids(storage: &Storage, name: &str) -> Vec<u32> {
     out
 }
 
+/// The base-table object ids the scalar functions called in a SELECT read
+/// through their bodies (deduped). Non-function names collected along the way
+/// resolve to nothing.
+fn select_function_read_ids(storage: &Storage, select: &Select) -> Vec<u32> {
+    let mut tables = Vec::new();
+    let mut funcs = Vec::new();
+    collect_select_read_names(select, &mut tables, &mut funcs);
+    let mut out = Vec::new();
+    for func in &funcs {
+        collect_read_lock_ids(storage, func, 0, &mut out);
+    }
+    out
+}
+
+/// Like [`select_function_read_ids`] but for a bare expression (an IF/WHILE
+/// condition).
+fn expr_function_read_ids(storage: &Storage, expr: &Expr) -> Vec<u32> {
+    let mut tables = Vec::new();
+    let mut funcs = Vec::new();
+    collect_expr_read_names(expr, &mut tables, &mut funcs);
+    let mut out = Vec::new();
+    for func in &funcs {
+        collect_read_lock_ids(storage, func, 0, &mut out);
+    }
+    out
+}
+
 /// Resolves `name` to the base-table object ids the executor will read,
 /// recursing through nested views (so a view over a view locks the inner view's
 /// base tables). Bounded by [`MAX_VIEW_NESTING`] so a view cycle terminates.
@@ -10141,6 +10865,24 @@ fn collect_read_lock_ids(storage: &Storage, name: &str, depth: u32, out: &mut Ve
     let Some(def) = resolve_table(storage, name) else {
         return;
     };
+    // A scalar function: its inner reads (subqueries in its body, nested
+    // function calls) must be locked up front, or the body would read tables
+    // with no lock held under 2PL — the seam-defect class. Recurse into the
+    // body's read targets, bounded by the same depth guard.
+    if let Some(function) = &def.function {
+        let FunctionReturns::Scalar { body, .. } = &function.returns;
+        if let Ok(statements) = truthdb_sql::parse_function_body(body) {
+            let mut tables = Vec::new();
+            let mut funcs = Vec::new();
+            for statement in &statements {
+                collect_statement_read_names(statement, &mut tables, &mut funcs);
+            }
+            for referenced in tables.iter().chain(funcs.iter()) {
+                collect_read_lock_ids(storage, referenced, depth + 1, out);
+            }
+        }
+        return;
+    }
     let Some(text) = &def.view_query else {
         // A base table.
         if !out.contains(&def.object_id) {
@@ -10166,6 +10908,9 @@ fn collect_read_lock_ids(storage: &Storage, name: &str, depth: u32, out: &mut Ve
 fn reject_dml_on_view(def: &TableDef) -> Result<(), SqlError> {
     if def.is_procedure() {
         return Err(procedure_not_a_table(&def.name));
+    }
+    if def.is_function() {
+        return Err(function_not_a_table(&def.name));
     }
     if def.is_view() {
         return Err(SqlError::new(
@@ -10193,12 +10938,29 @@ fn procedure_not_a_table(name: &str) -> SqlError {
     )
 }
 
+/// A scalar function used where a table is required (`FROM`, DML target,
+/// table-only DDL). A scalar function is not a rowset; SQL Server 4121-class.
+fn function_not_a_table(name: &str) -> SqlError {
+    SqlError::new(
+        4121,
+        16,
+        1,
+        format!(
+            "Cannot find the user-defined function '{name}', or the name refers to a scalar \
+             function that cannot be used where a table is expected."
+        ),
+    )
+}
+
 /// Table-only DDL (ALTER TABLE, CREATE INDEX) rejects a view. Without this a
 /// view's `root_page = 0` would be heap-scanned — and page 0 is the catalog
 /// root, so a bare `ALTER TABLE view ADD CHECK (1=1)` could corrupt the catalog.
 fn reject_view_as_table(def: &TableDef) -> Result<(), SqlError> {
     if def.is_procedure() {
         return Err(procedure_not_a_table(&def.name));
+    }
+    if def.is_function() {
+        return Err(function_not_a_table(&def.name));
     }
     if def.is_view() {
         return Err(SqlError::new(
