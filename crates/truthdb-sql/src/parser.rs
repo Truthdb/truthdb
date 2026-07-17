@@ -544,6 +544,22 @@ impl Parser {
             let name = name.clone();
             self.bump();
             let _ = self.eat_keyword("AS"); // `DECLARE @v AS INT` — AS optional
+            // `DECLARE @t TABLE ( ... )` — an in-memory table variable, which
+            // must be a declaration on its own (SQL Server forbids mixing it).
+            if self.peek_keyword().as_deref() == Some("TABLE") {
+                if !decls.is_empty() {
+                    let token = self.peek().clone();
+                    return Err(SqlError::syntax(self.token_text(&token), token.span));
+                }
+                self.bump(); // TABLE
+                let (columns, primary_key) = self.parse_table_var_columns()?;
+                return Ok(Statement::DeclareTableVar {
+                    name,
+                    columns,
+                    primary_key,
+                    span: token.span.to(self.prev_span()),
+                });
+            }
             let (data_type, type_span) = self.parse_data_type()?;
             let (initializer, end) = if self.eat(&TokenKind::Eq) {
                 let expr = self.parse_expr()?;
@@ -563,6 +579,53 @@ impl Parser {
             }
         }
         Ok(Statement::Declare(decls))
+    }
+
+    /// Parses a table variable's `( <column-defs> )` body: column definitions
+    /// (with inline `NOT NULL` / `PRIMARY KEY`) plus a table-level `PRIMARY KEY
+    /// (cols)`. Other table constraints (UNIQUE/CHECK/FOREIGN KEY) are not yet
+    /// supported on a table variable.
+    fn parse_table_var_columns(&mut self) -> SqlResult<(Vec<ColumnDef>, Vec<Name>)> {
+        self.expect(&TokenKind::LParen)?;
+        let mut columns = Vec::new();
+        let mut primary_key: Vec<Name> = Vec::new();
+        loop {
+            if self.peek_keyword().as_deref() == Some("PRIMARY") {
+                if !primary_key.is_empty() {
+                    return Err(SqlError::message_only(
+                        8110,
+                        "Cannot add multiple PRIMARY KEY constraints to a table.",
+                    ));
+                }
+                self.bump();
+                self.expect_keyword("KEY")?;
+                self.expect(&TokenKind::LParen)?;
+                loop {
+                    primary_key.push(self.parse_name()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+                self.expect(&TokenKind::RParen)?;
+            } else {
+                let column = self.parse_column_def()?;
+                if column.primary_key {
+                    if !primary_key.is_empty() {
+                        return Err(SqlError::message_only(
+                            8110,
+                            "Cannot add multiple PRIMARY KEY constraints to a table.",
+                        ));
+                    }
+                    primary_key.push(column.name.clone());
+                }
+                columns.push(column);
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect(&TokenKind::RParen)?;
+        Ok((columns, primary_key))
     }
 
     /// `USE <database>`.
@@ -1772,7 +1835,7 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("INTO") {
             self.bump();
         }
-        let table = self.parse_name()?;
+        let table = self.parse_table_name()?;
         let columns = if self.check(&TokenKind::LParen) {
             // Column list, unless this paren opens VALUES-less tuple (it
             // does not in our grammar), so it is always a column list.
@@ -2226,9 +2289,10 @@ impl Parser {
             self.expect(&TokenKind::RParen)?;
             return Ok(inner);
         }
-        let name = self.parse_name()?;
-        // `name ( args )` in table position is a table-valued function call.
-        if self.check(&TokenKind::LParen) {
+        let name = self.parse_table_name()?;
+        // `name ( args )` in table position is a table-valued function call — but
+        // a `@t` table variable is never a function call.
+        if !name.value.starts_with('@') && self.check(&TokenKind::LParen) {
             self.bump(); // (
             let mut args = Vec::new();
             if !self.check(&TokenKind::RParen) {
@@ -2802,6 +2866,24 @@ impl Parser {
     /// parts with `.` into a single value (e.g. `sys.tables`). Stage 3 has
     /// one user schema (`dbo`) plus the `sys` catalog views; deeper
     /// qualification is left to later stages.
+    /// Parses a name in TABLE position (an INSERT/UPDATE/DELETE target or a FROM
+    /// primary): a `@t` local variable there names a table variable, kept with
+    /// its leading `@` in `Name.value` as the marker the executor detects (the
+    /// catalog resolver never matches a name containing `@`). Any other name is
+    /// an ordinary (possibly schema-qualified) table name.
+    fn parse_table_name(&mut self) -> SqlResult<Name> {
+        if let TokenKind::LocalVar(name) = &self.peek().kind {
+            let name = name.clone();
+            let span = self.bump().span;
+            return Ok(Name {
+                value: format!("@{name}"),
+                quoted: false,
+                span,
+            });
+        }
+        self.parse_name()
+    }
+
     fn parse_name(&mut self) -> SqlResult<Name> {
         let first = self.parse_ident()?;
         let mut value = first.value;

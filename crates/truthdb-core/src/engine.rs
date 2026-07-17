@@ -5807,6 +5807,110 @@ mod tests {
     }
 
     #[test]
+    fn table_variable_access_takes_no_table_locks() {
+        use crate::lock::Resource;
+        use crate::rel::Isolation;
+        let path = unique_temp_path("tablevar-nolocks");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE base (id INT NOT NULL PRIMARY KEY)")
+            .expect("base");
+        // A table variable is session memory: its name never resolves to a base
+        // table, so reads and writes of @t take no table/row locks. (A Database
+        // intent lock may still appear; only object locks are asserted absent.)
+        let has_object_lock = |sql: &str| {
+            engine
+                .analyze_locks(sql, Isolation::ReadCommitted)
+                .iter()
+                .any(|(r, _)| matches!(r, Resource::Table(_) | Resource::Row(..)))
+        };
+        assert!(
+            !has_object_lock("SELECT * FROM @t"),
+            "SELECT FROM @t must take no object locks"
+        );
+        assert!(
+            !has_object_lock("INSERT INTO @t VALUES (1)"),
+            "INSERT @t VALUES must take no object locks"
+        );
+        // But an INSERT @t whose SOURCE reads a real table still locks the
+        // source — the seam: the @t target is free, the source read is not.
+        let base = table_object_id(&engine, "base");
+        // A join of base with @t locks only base; the @t side adds nothing.
+        let join_locks = engine.analyze_locks(
+            "SELECT * FROM base AS b JOIN @t AS t ON b.id = t.id",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            !join_locks
+                .iter()
+                .any(|(r, _)| matches!(r, Resource::Table(id) if *id != base)),
+            "the @t side of a join must add no table lock beyond base's: {join_locks:?}"
+        );
+        let locks = engine.analyze_locks(
+            "INSERT INTO @t SELECT id FROM base",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            locks
+                .iter()
+                .any(|(r, _)| matches!(r, Resource::Table(id) if *id == base)),
+            "INSERT @t SELECT FROM base must lock base: {locks:?}"
+        );
+        assert!(
+            !locks
+                .iter()
+                .any(|(r, _)| matches!(r, Resource::Table(id) if *id != base)),
+            "no phantom lock for @t itself: {locks:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn table_variable_read_does_not_arm_snapshot() {
+        let path = unique_temp_path("tablevar-nosnapshot");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE base (id INT NOT NULL PRIMARY KEY)")
+            .expect("base");
+        engine.execute("INSERT INTO base VALUES (7)").expect("seed");
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+        );
+        // Under SNAPSHOT-not-allowed, a @t-only batch is NOT a data access: it
+        // must run to completion, not raise 3952.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); \
+             INSERT INTO @t VALUES (1), (2); SELECT id FROM @t",
+        );
+        assert!(
+            out.error.is_none(),
+            "a table-variable-only batch must not raise 3952: {:?}",
+            out.error
+        );
+        assert_eq!(ids(&out), vec![1, 2]);
+        // But INSERT @t whose SOURCE reads a real table IS a data access and
+        // must raise 3952 under SNAPSHOT-not-allowed (the source read needs the
+        // snapshot the database forbids).
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t SELECT id FROM base",
+        );
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(3952),
+            "INSERT @t SELECT FROM base must arm the snapshot scope: {:?}",
+            out.error
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn recursive_function_lock_analysis_terminates() {
         use crate::rel::Isolation;
         let path = unique_temp_path("udf-recursion-bomb");
