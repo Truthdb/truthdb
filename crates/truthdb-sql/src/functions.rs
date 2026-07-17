@@ -7,6 +7,65 @@ use crate::error::{SqlError, SqlResult};
 use crate::temporal;
 use crate::value::SqlValue;
 
+/// The built-in scalar and session function names (case-insensitive), used to
+/// keep a same-named user-defined function from hijacking a built-in when called
+/// by its bare (unqualified) name — SQL Server binds a one-part function name to
+/// the built-in and requires a two-part name (`dbo.f`) for a UDF.
+pub fn is_builtin_function(name: &str) -> bool {
+    const BUILTINS: &[&str] = &[
+        // Scalar built-ins (eval_function, below).
+        "ISNULL",
+        "COALESCE",
+        "IIF",
+        "NULLIF",
+        "LEN",
+        "DATALENGTH",
+        "UPPER",
+        "LOWER",
+        "LTRIM",
+        "RTRIM",
+        "TRIM",
+        "REVERSE",
+        "LEFT",
+        "RIGHT",
+        "SUBSTRING",
+        "CHARINDEX",
+        "REPLACE",
+        "REPLICATE",
+        "CONCAT",
+        "ABS",
+        "CEILING",
+        "FLOOR",
+        "SIGN",
+        "SQRT",
+        "ROUND",
+        "POWER",
+        "YEAR",
+        "MONTH",
+        "DAY",
+        "DATEPART",
+        "DATEADD",
+        "DATEDIFF",
+        "CAST",
+        "CONVERT",
+        // Session / niladic functions (eval::eval_session_function, SERVERPROPERTY).
+        "DB_NAME",
+        "SUSER_SNAME",
+        "SUSER_NAME",
+        "SCOPE_IDENTITY",
+        "ERROR_NUMBER",
+        "ERROR_MESSAGE",
+        "ERROR_SEVERITY",
+        "ERROR_STATE",
+        "ERROR_LINE",
+        "ERROR_PROCEDURE",
+        "XACT_STATE",
+        "SERVERPROPERTY",
+    ];
+    let upper = name.to_ascii_uppercase();
+    BUILTINS.contains(&upper.as_str())
+}
+
 pub fn eval_function(name: &str, args: Vec<SqlValue>) -> SqlResult<SqlValue> {
     let upper = name.to_ascii_uppercase();
     match upper.as_str() {

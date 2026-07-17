@@ -5666,6 +5666,107 @@ mod tests {
     }
 
     #[test]
+    fn scalar_function_snapshot_scope_covers_body_reads() {
+        // The snapshot-scope determination must recurse into a called UDF's
+        // body exactly as lock analysis does: under SNAPSHOT isolation with
+        // snapshot isolation NOT allowed, a statement whose ONLY table access is
+        // inside a UDF body must still raise 3952 (the body IS a data access).
+        // Before the fix these silently succeeded and read live/unlocked — the
+        // "neither lock nor snapshot" seam.
+        let path = unique_temp_path("udf-snapshot-scope");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE FUNCTION dbo.cnt () RETURNS INT AS BEGIN RETURN (SELECT COUNT(*) FROM t) END",
+        );
+        batch(
+            &engine,
+            &mut ctx,
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+        );
+        // A SELECT whose only table read is inside the UDF body.
+        let out = batch(&engine, &mut ctx, "SELECT dbo.cnt() AS n");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(3952),
+            "a UDF-only SELECT must arm the snapshot scope: {:?}",
+            out.error
+        );
+        // An IF condition whose only table read is inside the UDF body.
+        let out = batch(&engine, &mut ctx, "IF dbo.cnt() > 0 SELECT 1 AS n");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(3952),
+            "a UDF-only IF condition must arm the snapshot scope: {:?}",
+            out.error
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scalar_function_in_view_body_is_lock_analyzed() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("udf-view-lock");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE base (x INT NOT NULL PRIMARY KEY)")
+            .expect("base");
+        engine
+            .execute("CREATE TABLE secret (z INT NOT NULL PRIMARY KEY)")
+            .expect("secret");
+        engine
+            .execute(
+                "CREATE FUNCTION dbo.secret_count () RETURNS INT AS \
+                 BEGIN RETURN (SELECT COUNT(*) FROM secret) END",
+            )
+            .expect("fn");
+        engine
+            .execute("CREATE VIEW v AS SELECT x, dbo.secret_count() AS sc FROM base")
+            .expect("view");
+        let secret = table_object_id(&engine, "secret");
+        // A UDF reached THROUGH a view must still have its body's table Shared-
+        // locked — else the view-nested UDF reads secret unlocked under 2PL.
+        let locks = engine.analyze_locks("SELECT * FROM v", Isolation::ReadCommitted);
+        assert!(
+            locks.contains(&(Resource::Table(secret), LockMode::Shared)),
+            "a view-nested UDF's body table must be Shared-locked: {locks:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn scalar_function_does_not_shadow_builtin() {
+        let path = unique_temp_path("udf-builtin-shadow");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE FUNCTION dbo.abs (@x INT) RETURNS INT AS BEGIN RETURN 0 END")
+            .expect("fn");
+        // A bare call binds to the built-in ABS (5), not the same-named UDF (0).
+        let (_, rows) = sql_rows(&engine, "SELECT abs(-5) AS n");
+        assert_eq!(
+            rows,
+            vec![vec![Some("5".into())]],
+            "bare abs() must be the built-in"
+        );
+        // The schema-qualified name still reaches the UDF.
+        let (_, rows) = sql_rows(&engine, "SELECT dbo.abs(-5) AS n");
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".into())]],
+            "dbo.abs() must be the UDF"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn cf_review_describe_stops_at_control_flow() {
         // sp_describe_first_result_set: a batch whose FIRST possible rowset
         // sits inside an IF must answer "not statically derivable" — skipping

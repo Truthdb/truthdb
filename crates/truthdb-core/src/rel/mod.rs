@@ -1350,7 +1350,11 @@ fn enter_condition_scopes<'a>(
 ) -> Result<(Option<SnapshotScope<'a>>, Option<TxnSnapshotScope>), SqlError> {
     let mut tables = Vec::new();
     collect_expr_tables(condition, &mut tables);
-    if tables.is_empty() {
+    // A scalar function the condition calls may read tables through its body;
+    // those reads must observe the same snapshot as a direct read (the lock
+    // analysis already resolved them), so arm the scope when the condition
+    // reaches any table directly OR through a called function.
+    if tables.is_empty() && expr_function_read_ids(storage, condition).is_empty() {
         return Ok((None, None));
     }
     match txn_ctx.isolation() {
@@ -1946,41 +1950,52 @@ fn current_snapshot() -> Option<ReadSnapshot> {
 struct SnapshotScope<'a> {
     storage: &'a Storage,
     seq: u64,
+    /// The snapshot that was current when this scope was entered, restored on
+    /// exit. Scopes can nest — a scalar function's body statement runs under the
+    /// caller's active statement/transaction snapshot — so a nested scope must
+    /// restore the caller's snapshot on drop, not erase it.
+    prev: Option<ReadSnapshot>,
 }
 
 impl<'a> SnapshotScope<'a> {
     fn enter(storage: &'a Storage, own_txn: Option<u64>) -> Self {
+        let prev = CURRENT_SNAPSHOT.get();
         let snap = storage.capture_read_snapshot(own_txn);
         CURRENT_SNAPSHOT.set(Some(snap));
         SnapshotScope {
             storage,
             seq: snap.seq,
+            prev,
         }
     }
 }
 
 impl Drop for SnapshotScope<'_> {
     fn drop(&mut self) {
-        CURRENT_SNAPSHOT.set(None);
+        CURRENT_SNAPSHOT.set(self.prev);
         self.storage.release_read_snapshot(self.seq);
     }
 }
 
 /// Statement-scoped view of a TRANSACTION's snapshot (SNAPSHOT isolation):
-/// sets the thread-local for this statement and clears it on exit, but the
-/// registration lives with the transaction, not the statement.
-struct TxnSnapshotScope;
+/// sets the thread-local for this statement and restores the prior one on exit
+/// (see [`SnapshotScope::prev`]), but the registration lives with the
+/// transaction, not the statement.
+struct TxnSnapshotScope {
+    prev: Option<ReadSnapshot>,
+}
 
 impl TxnSnapshotScope {
     fn enter(snap: ReadSnapshot) -> Self {
+        let prev = CURRENT_SNAPSHOT.get();
         CURRENT_SNAPSHOT.set(Some(snap));
-        TxnSnapshotScope
+        TxnSnapshotScope { prev }
     }
 }
 
 impl Drop for TxnSnapshotScope {
     fn drop(&mut self) {
-        CURRENT_SNAPSHOT.set(None);
+        CURRENT_SNAPSHOT.set(self.prev);
     }
 }
 
@@ -1988,13 +2003,17 @@ impl Drop for TxnSnapshotScope {
 /// only when its FROM/subqueries name one. `SELECT 1` under SNAPSHOT must
 /// neither raise 3952 nor establish the transaction's snapshot — SQL Server
 /// defers both to the first read of an actual object.
-fn statement_reads_tables(statement: &Statement) -> bool {
+fn statement_reads_tables(storage: &Storage, statement: &Statement) -> bool {
     match statement {
         Statement::Select(select) => {
             let expanded = expand_ctes(select);
             let mut tables = Vec::new();
             collect_locked_tables(&expanded, &mut tables);
-            !tables.is_empty()
+            // A scalar function the SELECT calls reads tables through its body;
+            // that read must observe the statement/transaction snapshot too, so
+            // it counts as a table access (matching the lock analysis, which
+            // resolves the same function bodies).
+            !tables.is_empty() || !select_function_read_ids(storage, &expanded).is_empty()
         }
         _ => true,
     }
@@ -2055,7 +2074,7 @@ fn exec_statement_streamed(
                 txn_ctx.txn.as_ref().map(StorageTxn::txn_id),
             ));
         }
-        Isolation::Snapshot if data_access && statement_reads_tables(statement) => {
+        Isolation::Snapshot if data_access && statement_reads_tables(storage, statement) => {
             if !storage.snapshot_isolation_allowed() {
                 if txn_ctx.in_txn() {
                     txn_ctx.doomed = true;
@@ -7376,6 +7395,13 @@ impl truthdb_sql::eval::ColumnResolver for FnResolver<'_> {
 /// takes the user function (a documented minor divergence from SQL Server, which
 /// requires schema-qualified UDF calls).
 fn resolve_scalar_function(storage: &Storage, name: &str) -> Option<TableDef> {
+    // A bare (unqualified) name that matches a built-in always binds to the
+    // built-in — a same-named UDF is reached only by its schema-qualified name
+    // (`dbo.abs`), as SQL Server requires. Without this a UDF named like a
+    // built-in would silently hijack every unqualified call to that name.
+    if !name.contains('.') && truthdb_sql::functions::is_builtin_function(name) {
+        return None;
+    }
     let def = resolve_table(storage, name)?;
     match def.function.as_ref()?.returns {
         FunctionReturns::Scalar { .. } => Some(def),
@@ -10890,16 +10916,19 @@ fn collect_read_lock_ids(storage: &Storage, name: &str, depth: u32, out: &mut Ve
         }
         return;
     };
-    // A view: recurse into every table its body references. Inline the body's
-    // own CTEs so a base table reached only through a CTE is still locked.
+    // A view: recurse into every table its body references — and every scalar
+    // function it calls, whose body may read further tables (else a UDF reached
+    // through a view would read unlocked). Inline the body's own CTEs so a base
+    // table reached only through a CTE is still locked.
     let Ok(body) = parse_view_query(text, &def.name) else {
         return;
     };
     let expanded = expand_ctes(&body);
-    let mut names = Vec::new();
-    collect_locked_tables(&expanded, &mut names);
-    for referenced in names {
-        collect_read_lock_ids(storage, &referenced.value, depth + 1, out);
+    let mut tables = Vec::new();
+    let mut funcs = Vec::new();
+    collect_select_read_names(&expanded, &mut tables, &mut funcs);
+    for referenced in tables.iter().chain(funcs.iter()) {
+        collect_read_lock_ids(storage, referenced, depth + 1, out);
     }
 }
 
