@@ -96,6 +96,8 @@ pub struct EvalContext {
     /// `XACT_STATE()`: 1 = an active, committable transaction; -1 = an active
     /// but uncommittable (doomed) transaction; 0 = no transaction.
     pub xact_state: i8,
+    /// `@@ERROR` — the previous statement's error number, 0 on success.
+    pub last_error: i32,
 }
 
 /// The error captured by a `CATCH` block, surfaced by the `ERROR_*()`
@@ -241,7 +243,8 @@ fn eval_global_var(name: &str, ctx: &EvalContext) -> SqlResult<SqlValue> {
             "TruthDB - 16.0.1000.6\n\tMicrosoft SQL Server 2022 compatible edition".to_string(),
         )),
         "rowcount" => Ok(SqlValue::Int(ctx.rowcount)),
-        "error" | "identity" => Ok(SqlValue::Int(0)),
+        "error" => Ok(SqlValue::Int(ctx.last_error as i64)),
+        "identity" => Ok(SqlValue::Int(0)),
         other => Err(SqlError::message_only(
             102,
             format!("Incorrect syntax near '@@{other}'."),

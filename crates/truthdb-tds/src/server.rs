@@ -501,6 +501,7 @@ where
     let mut hdr = [0u8; HEADER_LEN];
     let mut got = 0usize;
     let mut attention = false;
+    let mut fatal = false;
     'replies: while let Some(start) = source.next(&cancel) {
         let mut render = BatchRender {
             rpc,
@@ -623,6 +624,12 @@ where
                 },
             }
         }
+        if render.fatal {
+            // A fatal-severity error (>= 20): the reply is complete, and the
+            // connection dies with it — any RPCs not yet issued never run.
+            fatal = true;
+            break 'replies;
+        }
         if attention {
             // Everything after the Attention is discarded; the RPCs not yet
             // issued never run.
@@ -665,7 +672,7 @@ where
         // ack where the client is looking for it.
         write_attention_ack(&mut wr, packet_size).await?;
     }
-    Ok(true)
+    Ok(!fatal)
 }
 
 /// Starts one RPC on the engine, returning its reply stream.
@@ -749,6 +756,9 @@ struct BatchRender {
     /// Set once a batch-stopping ERROR has been written, so the final DONE
     /// carries `DONE_ERROR`.
     errored: bool,
+    /// Set when the written ERROR's severity was fatal (>= 20): the reply
+    /// finishes, then the connection closes, as SQL Server does.
+    fatal: bool,
     /// RPC response framing: per-statement DONEs render as DONEINPROC, and the
     /// response ends RETURNSTATUS → RETURNVALUE(s) → DONEPROC, as SQL Server
     /// frames a procedure's reply. A SQL batch keeps plain DONEs (the #97
@@ -862,6 +872,22 @@ impl BatchRender {
                 // RETURNVALUE, which precedes the final DONEPROC.
                 self.pending_handle = Some(handle);
             }
+            BatchEvent::Info(info) => {
+                // RAISERROR severity <= 10: an INFO token, not an error — the
+                // batch continues and no DONE flag changes. Pending DONEs go
+                // out first so stream order holds.
+                self.flush_pending(out, true).await?;
+                self.buf.clear();
+                token::info(
+                    &mut self.buf,
+                    info.number,
+                    info.state,
+                    info.level,
+                    &info.message,
+                );
+                out.write(&self.buf).await?;
+                self.buf.clear();
+            }
             BatchEvent::Error(error) => {
                 self.flush_pending(out, true).await?;
                 self.buf.clear();
@@ -874,6 +900,12 @@ impl BatchRender {
                 );
                 out.write(&self.buf).await?;
                 self.errored = true;
+                // Severity >= 20 kills the connection, as SQL Server does:
+                // the reply still finishes (error + final DONE) and then the
+                // connection loop closes the stream.
+                if error.level >= truthdb_core::rel::FATAL_SEVERITY {
+                    self.fatal = true;
+                }
             }
             BatchEvent::Complete { in_transaction } => {
                 if self.rpc {

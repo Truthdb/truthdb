@@ -61,6 +61,43 @@ pub enum Statement {
         catch_block: Vec<Statement>,
         span: Span,
     },
+    /// `THROW [number, message, state]` — raises a severity-16 error that
+    /// terminates the batch; the bare form re-throws inside a `CATCH`.
+    Throw(ThrowStatement),
+    /// `RAISERROR(msg, severity, state [, args...]) [WITH LOG|NOWAIT|SETERROR]`.
+    RaiseError(RaiseError),
+}
+
+/// `THROW [number, message, state]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrowStatement {
+    /// `None` = the bare re-throw form.
+    pub args: Option<ThrowArgs>,
+    pub span: Span,
+}
+
+/// The three arguments of a parameterized `THROW`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ThrowArgs {
+    pub number: Expr,
+    pub message: Expr,
+    pub state: Expr,
+}
+
+/// `RAISERROR(msg, severity, state [, args...]) [WITH option, ...]`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RaiseError {
+    /// The message text (or a message id, which TruthDB rejects — there is no
+    /// `sys.messages`).
+    pub message: Expr,
+    pub severity: Expr,
+    pub state: Expr,
+    /// printf-style substitution arguments.
+    pub args: Vec<Expr>,
+    pub log: bool,
+    pub nowait: bool,
+    pub seterror: bool,
+    pub span: Span,
 }
 
 /// One `@name TYPE [= initializer]` in a `DECLARE`.

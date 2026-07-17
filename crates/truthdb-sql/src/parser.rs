@@ -128,6 +128,8 @@ impl Parser {
             Some("DECLARE") => self.parse_declare(),
             Some("EXEC") | Some("EXECUTE") => self.parse_exec(),
             Some("USE") => self.parse_use(),
+            Some("THROW") => self.parse_throw(),
+            Some("RAISERROR") => self.parse_raiserror(),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -362,6 +364,82 @@ impl Parser {
         let database = self.parse_name()?;
         let span = start.to(database.span);
         Ok(Statement::Use { database, span })
+    }
+
+    /// `THROW [number, message, state]`. The arguments are constants or
+    /// variables (SQL Server's rule); a bare `THROW` — the re-throw form — is
+    /// recognized by the next token NOT starting one.
+    fn parse_throw(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("THROW")?;
+        let has_args = matches!(
+            self.peek().kind,
+            TokenKind::Int(_) | TokenKind::Number(_) | TokenKind::LocalVar(_)
+        );
+        if !has_args {
+            return Ok(Statement::Throw(ThrowStatement {
+                args: None,
+                span: start,
+            }));
+        }
+        let number = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        let message = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        let state = self.parse_expr()?;
+        let span = start.to(state.span);
+        Ok(Statement::Throw(ThrowStatement {
+            args: Some(ThrowArgs {
+                number,
+                message,
+                state,
+            }),
+            span,
+        }))
+    }
+
+    /// `RAISERROR(msg, severity, state [, args...]) [WITH LOG|NOWAIT|SETERROR]`.
+    fn parse_raiserror(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("RAISERROR")?;
+        self.expect(&TokenKind::LParen)?;
+        let message = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        let severity = self.parse_expr()?;
+        self.expect(&TokenKind::Comma)?;
+        let state = self.parse_expr()?;
+        let mut args = Vec::new();
+        while self.eat(&TokenKind::Comma) {
+            args.push(self.parse_expr()?);
+        }
+        let mut end = self.expect(&TokenKind::RParen)?;
+        let (mut log, mut nowait, mut seterror) = (false, false, false);
+        if matches!(self.peek_keyword().as_deref(), Some("WITH")) {
+            self.bump();
+            loop {
+                match self.peek_keyword().as_deref() {
+                    Some("LOG") => log = true,
+                    Some("NOWAIT") => nowait = true,
+                    Some("SETERROR") => seterror = true,
+                    _ => {
+                        let token = self.peek().clone();
+                        return Err(SqlError::syntax(self.token_text(&token), token.span));
+                    }
+                }
+                end = self.bump().span;
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        Ok(Statement::RaiseError(RaiseError {
+            message,
+            severity,
+            state,
+            args,
+            log,
+            nowait,
+            seterror,
+            span: start.to(end),
+        }))
     }
 
     fn parse_set(&mut self) -> SqlResult<Statement> {

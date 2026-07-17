@@ -17,7 +17,8 @@ use truthdb_sql::ast::{
     AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable,
     CreateView, DataType, DatabaseOption, Declaration, Delete, DropIndex, DropTable, DropView,
     ExecStatement, Expr, ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind,
-    Name, OrderItem, Select, SelectItem, SetStatement, Statement, TableRef, Update,
+    Name, OrderItem, RaiseError, Select, SelectItem, SetStatement, Statement, TableRef, ThrowArgs,
+    ThrowStatement, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -57,6 +58,8 @@ pub struct TxnContext {
     nocount: bool,
     /// Rows affected/returned by the previous statement — `@@ROWCOUNT`.
     rowcount: i64,
+    /// The previous statement's error number, 0 on success — `@@ERROR`.
+    last_error: i32,
     /// `SET SHOWPLAN_TEXT ON` — a SELECT returns its plan text, not results.
     showplan_text: bool,
     /// Declared batch variables (name without `@`, lowercased) to their type
@@ -125,6 +128,7 @@ impl TxnContext {
             scope_identity: self.scope_identity,
             error: self.error_stack.last().cloned(),
             xact_state: self.xact_state(),
+            last_error: self.last_error,
         }
     }
 
@@ -258,6 +262,12 @@ pub struct RowSet {
 /// (2627/2601/515/547, severity 14–16) stay below it, so they roll back only the
 /// failing statement and the transaction survives.
 const XACT_ABORT_SEVERITY: u8 = 17;
+
+/// Error severity at or above which the error is fatal to the CONNECTION
+/// (SQL Server severity >= 20): it bypasses every `TRY`, dooms the
+/// transaction, and the protocol layers close the stream after delivering
+/// it. Only RAISERROR ... WITH LOG can currently produce one.
+pub const FATAL_SEVERITY: u8 = 20;
 
 /// A batch's outcome: the results of the statements that ran, plus the error
 /// that stopped the batch (if any). Statements before an error have already
@@ -393,6 +403,10 @@ pub trait BatchEmitter {
     /// renders the ENVCHANGE + 5701 INFO SSMS expects. Emitters that have no
     /// wire (the collecting native path, tests) ignore it.
     fn database_context(&mut self, _database: &str) {}
+
+    /// An informational message (RAISERROR severity <= 10): TDS renders an
+    /// INFO token in-stream, not an error. Emitters with no wire ignore it.
+    fn info(&mut self, _error: &SqlError) {}
 }
 
 /// Reassembles emitted results into the whole-batch [`BatchOutcome`] for the
@@ -527,6 +541,16 @@ impl BatchRun<'_> {
         self.emitter.database_context(database);
     }
 
+    /// Emits an informational message (RAISERROR severity <= 10). `run_block`
+    /// flushed the deferred DONEs before the statement, so stream order holds.
+    fn info(&mut self, error: SqlError) {
+        debug_assert!(
+            self.deferred.is_empty(),
+            "an INFO message over deferred DONEs"
+        );
+        self.emitter.info(&error);
+    }
+
     /// Ends a statement. Its DONE is deferred to the next durability point.
     fn done(&mut self, count: Option<u64>, in_transaction: bool, command: DoneCommand) {
         self.rowset_open = false;
@@ -652,27 +676,49 @@ thread_local! {
 /// sharing the transaction context. Each inner statement emits its own
 /// events, exactly like a top-level statement. Any other procedure answers
 /// 2812, the same as the RPC path.
+/// An EXEC failure, tagged by ORIGIN — the fact the EXEC arm needs and must
+/// not guess: `run_exec`'s own validation/depth errors are statement-scope at
+/// the EXEC site, while an error that crossed out of the inner batch already
+/// terminated it (batch-abort scope is the whole nest).
+enum ExecError {
+    Own(SqlError),
+    Inner(SqlError),
+}
+
+/// Applies the standard doom rule to an error raised outside any statement's
+/// own execution — `run_exec`'s validation and depth errors, which no inner
+/// `run_block` arm will see. The decision is made here, at the source, so the
+/// TRY boundary never has to re-derive it (it cannot know the error's origin).
+fn doom_per_rule(txn_ctx: &mut TxnContext, error: SqlError) -> SqlError {
+    if txn_ctx.in_txn() && (txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY) {
+        txn_ctx.doomed = true;
+    }
+    error
+}
+
 fn run_exec(
     storage: &Storage,
     exec: &ExecStatement,
     txn_ctx: &mut TxnContext,
     run: &mut BatchRun<'_>,
     in_try: bool,
-) -> Result<(), SqlError> {
+) -> Result<(), ExecError> {
     if !strip_schema(&exec.proc.value).eq_ignore_ascii_case("sp_executesql") {
-        return Err(SqlError::new(
+        let error = SqlError::new(
             2812,
             16,
             62,
             format!("Could not find stored procedure '{}'.", exec.proc.value),
         )
-        .at(exec.proc.span));
+        .at(exec.proc.span);
+        return Err(ExecError::Own(doom_per_rule(txn_ctx, error)));
     }
     let eval_ctx = txn_ctx.eval_context();
     let mut positional = Vec::new();
     let mut named: Vec<(String, SqlValue)> = Vec::new();
     for arg in &exec.args {
-        let value = eval_constant(&arg.value, &eval_ctx)?;
+        let value = eval_constant(&arg.value, &eval_ctx)
+            .map_err(|e| ExecError::Own(doom_per_rule(txn_ctx, e)))?;
         match &arg.name {
             Some(n) => named.push((n.value.clone(), value)),
             None => positional.push(value),
@@ -685,35 +731,39 @@ fn run_exec(
         Some(named.remove(index).1)
     };
     let mut positional = positional.into_iter();
-    let stmt = take_named(&mut named, &["stmt", "statement"])
-        .or_else(|| positional.next())
-        .ok_or_else(|| {
-            SqlError::new(
+    let stmt = match take_named(&mut named, &["stmt", "statement"]).or_else(|| positional.next()) {
+        Some(value) => value,
+        None => {
+            let error = SqlError::new(
                 214,
                 16,
                 2,
                 "Procedure expects parameter '@statement' of type 'ntext/nchar/nvarchar'.",
-            )
-        })?;
+            );
+            return Err(ExecError::Own(doom_per_rule(txn_ctx, error)));
+        }
+    };
     let SqlValue::Str(sql) = stmt else {
-        return Err(SqlError::new(
+        let error = SqlError::new(
             214,
             16,
             2,
             "Procedure expects parameter '@statement' of type 'ntext/nchar/nvarchar'.",
-        ));
+        );
+        return Err(ExecError::Own(doom_per_rule(txn_ctx, error)));
     };
     let decls =
         match take_named(&mut named, &["params", "parameters"]).or_else(|| positional.next()) {
             Some(SqlValue::Str(d)) => d,
             Some(SqlValue::Null) | None => String::new(),
             Some(_) => {
-                return Err(SqlError::new(
+                let error = SqlError::new(
                     214,
                     16,
                     3,
                     "Procedure expects parameter '@params' of type 'ntext/nchar/nvarchar'.",
-                ));
+                );
+                return Err(ExecError::Own(doom_per_rule(txn_ctx, error)));
             }
         };
     // Bind values: named ones by their own names, positional ones from the
@@ -722,16 +772,18 @@ fn run_exec(
     let mut seeded: Vec<(String, SqlValue)> = named;
     for (i, value) in positional.enumerate() {
         let Some(name) = names.get(i) else {
-            return Err(SqlError::new(
+            let error = SqlError::new(
                 8144,
                 16,
                 2,
                 "Procedure or function has too many arguments specified.",
-            ));
+            );
+            return Err(ExecError::Own(doom_per_rule(txn_ctx, error)));
         };
         seeded.push((name.clone(), value));
     }
-    let statements = truthdb_sql::parse(&sql)?;
+    let statements =
+        truthdb_sql::parse(&sql).map_err(|e| ExecError::Own(doom_per_rule(txn_ctx, e)))?;
 
     // The inner batch is its own variable scope, on the shared transaction —
     // and SET options revert at scope exit, as SQL Server reverts them: an
@@ -754,14 +806,17 @@ fn run_exec(
         v
     });
     let result = if depth > 32 {
-        Err(SqlError::new(
+        let error = SqlError::new(
             217,
             16,
             1,
             "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).",
-        ))
+        );
+        Err(ExecError::Own(doom_per_rule(txn_ctx, error)))
     } else {
-        run_block(storage, &statements, txn_ctx, run, in_try)
+        // An error crossing out of the inner batch already carries every
+        // decision (dooming, and by crossing at all: termination).
+        run_block(storage, &statements, txn_ctx, run, in_try).map_err(ExecError::Inner)
     };
     EXEC_DEPTH.with(|d| d.set(d.get() - 1));
     txn_ctx.variables = outer_vars;
@@ -789,30 +844,51 @@ fn run_block(
             // same shape as TRY/CATCH dispatch. Errors take the ordinary
             // statement path: cancels and durability failures propagate, a
             // TRY transfers to CATCH, XACT_ABORT OFF continues the batch.
-            let exec_result = run_exec(storage, exec, txn_ctx, run, in_try);
-            if exec_result.is_err() {
-                // A failed EXEC sets @@ROWCOUNT to 0 like any failed
-                // statement — run_exec's own error exits (unknown proc, 214,
-                // 8144, parse, nesting cap) never reach the generic Err arm.
-                txn_ctx.rowcount = 0;
-            }
-            match exec_result {
+            match run_exec(storage, exec, txn_ctx, run, in_try) {
                 Ok(()) => {}
-                Err(error) if error.number == CANCEL_ERROR => return Err(error),
-                Err(error) if run.durability_failed => return Err(error),
-                Err(error) if in_try => {
-                    run.abort_open_rowset(txn_ctx.in_txn());
-                    return Err(error);
-                }
-                Err(error) => {
-                    let dooms = txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY;
-                    if txn_ctx.in_txn() && !dooms {
+                Err(exec_error) => {
+                    // A failed EXEC sets @@ROWCOUNT to 0 like any failed
+                    // statement.
+                    txn_ctx.rowcount = 0;
+                    let (error, from_inner) = match exec_error {
+                        ExecError::Own(error) => (error, false),
+                        ExecError::Inner(error) => (error, true),
+                    };
+                    if error.number == CANCEL_ERROR {
+                        return Err(error);
+                    }
+                    txn_ctx.last_error = error.number;
+                    if run.durability_failed {
+                        return Err(error);
+                    }
+                    // Transfer to CATCH: decisions (dooming included) were
+                    // already made where the error arose — per-statement in
+                    // the inner `run_block`, or `doom_per_rule` for
+                    // `run_exec`'s own errors. A fatal (>= 20) error is
+                    // refused by the TryCatch arm's own filter.
+                    if in_try {
+                        run.abort_open_rowset(txn_ctx.in_txn());
+                        return Err(error);
+                    }
+                    // An error crossing OUT of the inner batch already
+                    // terminated it — and batch-abort scope is the whole
+                    // nest, so the outer batch ends too (a THROW inside
+                    // EXEC'd text ends the calling batch even when nothing
+                    // doomed; non-dooming ordinary errors never cross — the
+                    // inner run_block continued past them). Nothing is
+                    // re-derived from severity here: the review showed that
+                    // second derivation dropped THROW's termination.
+                    if from_inner {
+                        return Err(error);
+                    }
+                    // run_exec's OWN failure (unknown proc, 214, 8144, parse,
+                    // depth): statement-scope at the EXEC site. Dooming was
+                    // applied at the source; this decides only continuation.
+                    let terminates = txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY;
+                    if txn_ctx.in_txn() && !terminates {
                         run.abort_open_rowset(txn_ctx.in_txn());
                         run.last_error = Some(error);
                         continue;
-                    }
-                    if txn_ctx.in_txn() {
-                        txn_ctx.doomed = true;
                     }
                     return Err(error);
                 }
@@ -832,17 +908,22 @@ fn run_block(
                 // A durability failure wedged the store: no CATCH swallows a
                 // lost commit (the old batch-end fsync ran past every TRY).
                 Err(error) if run.durability_failed => return Err(error),
-                Err(error) => {
-                    // The failed statement's own writes were already undone to
-                    // its savepoint (`rel_statement_scoped`). `SET XACT_ABORT`
-                    // (or a high-severity error) still dooms the transaction —
-                    // but control transfers to CATCH either way (unlike outside
-                    // a TRY, where a dooming error ends the batch). Inside CATCH,
-                    // XACT_STATE() then reports -1 for a doomed transaction.
-                    let dooms = txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY;
-                    if txn_ctx.in_txn() && dooms {
+                // Severity >= 20 is fatal to the connection: no CATCH sees it.
+                Err(error) if error.level >= FATAL_SEVERITY => {
+                    txn_ctx.last_error = error.number;
+                    if txn_ctx.in_txn() {
                         txn_ctx.doomed = true;
                     }
+                    return Err(error);
+                }
+                Err(error) => {
+                    // The failed statement's own writes were already undone to
+                    // its savepoint (`rel_statement_scoped`), and the doom
+                    // decision was made where the statement failed — the inner
+                    // `run_block` knows the statement's kind (RAISERROR is
+                    // exempt from XACT_ABORT), this boundary does not. Control
+                    // transfers to CATCH either way; a doomed transaction
+                    // reports XACT_STATE() = -1 there.
                     txn_ctx.push_error(&error);
                     // The CATCH block runs in the *enclosing* try-context: its
                     // own errors are not caught here, so they propagate to an
@@ -858,7 +939,7 @@ fn run_block(
         // deferred DONEs must reach the stream before its columns do, and any
         // commit made so far must be fsync-durable before rows that can carry
         // its state (an identity value, via SCOPE_IDENTITY()) leave the server.
-        if produces_rowset(statement) {
+        if produces_rowset(statement) || matches!(statement, Statement::RaiseError(_)) {
             run.flush(storage)?;
         }
         // Flag durability by statement kind, before matching the result: a
@@ -869,6 +950,12 @@ fn run_block(
         run.committed |= statement_may_commit(statement);
         match exec_statement_streamed(storage, statement, txn_ctx, run) {
             Ok(outcome) => {
+                // The statement succeeded: `@@ERROR` reads 0 — except after a
+                // severity <= 10 RAISERROR, which set it itself (0, or 50000
+                // under SETERROR).
+                if !matches!(statement, Statement::RaiseError(_)) {
+                    txn_ctx.last_error = 0;
+                }
                 let in_transaction = txn_ctx.in_txn();
                 let command = done_command(statement);
                 // `SET NOCOUNT ON` suppresses the DONE's count on the wire;
@@ -923,29 +1010,65 @@ fn run_block(
                 // concurrently with an unrelated failure cannot suppress that
                 // failure's dooming. (No rowset close: the batch ends here, and
                 // its terminal DONE closes anything the statement left open.)
+                // A cancel is not a SQL error, so `@@ERROR` is untouched.
                 if error.number == CANCEL_ERROR {
                     return Err(error);
                 }
-                // Inside a TRY, any error transfers to the matching CATCH. The
-                // CATCH runs more statements, so a result set this one already
-                // started streaming must be closed first.
+                txn_ctx.last_error = error.number;
+                // A durability failure wedged the store (a flush inside the
+                // statement, e.g. before a snapshot capture): never continue
+                // past a lost commit.
+                if run.durability_failed {
+                    return Err(error);
+                }
+                // Severity >= 20 is fatal to the connection: it bypasses TRY
+                // (the TryCatch arm refuses it too), dooms the transaction,
+                // and the protocol layer closes the stream after delivering
+                // it.
+                if error.level >= FATAL_SEVERITY {
+                    if txn_ctx.in_txn() {
+                        txn_ctx.doomed = true;
+                    }
+                    return Err(error);
+                }
+                // The doom decision is made HERE, where the failing statement's
+                // kind is known — never re-derived at the TRY boundary, which
+                // cannot see it. `SET XACT_ABORT` (or severity >= 17) dooms the
+                // transaction; RAISERROR is exempt by definition (SQL Server:
+                // "errors raised by RAISERROR are not affected by SET
+                // XACT_ABORT") and never dooms.
+                let dooms = !matches!(statement, Statement::RaiseError(_))
+                    && (txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY);
+                if txn_ctx.in_txn() && dooms {
+                    txn_ctx.doomed = true;
+                }
+                // Inside a TRY, the error then transfers to the matching CATCH
+                // (which sees XACT_STATE() = -1 when it doomed). The CATCH runs
+                // more statements, so a result set this one already started
+                // streaming must be closed first.
                 if in_try {
                     run.abort_open_rowset(txn_ctx.in_txn());
                     return Err(error);
                 }
-                // Outside a TRY: `SET XACT_ABORT` (and error severity) decides
-                // the transaction's fate. OFF (the default) with a non-fatal
-                // error rolls back only the statement and the batch continues;
-                // ON — or a high-severity error — dooms the whole transaction
-                // (only ROLLBACK is then accepted, error 3930).
-                let dooms = txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY;
-                if txn_ctx.in_txn() && !dooms {
+                // RAISERROR is statement-scope: the batch always continues.
+                if matches!(statement, Statement::RaiseError(_)) {
                     run.abort_open_rowset(txn_ctx.in_txn());
                     run.last_error = Some(error);
                     continue;
                 }
-                if txn_ctx.in_txn() {
-                    txn_ctx.doomed = true;
+                // THROW always terminates the batch — even when it does not
+                // doom the transaction (XACT_ABORT OFF leaves the transaction
+                // open and committable from a later batch).
+                if matches!(statement, Statement::Throw(_)) {
+                    return Err(error);
+                }
+                // Other statements: a non-dooming error rolls back only the
+                // statement and the batch continues; a dooming one ends the
+                // batch (only ROLLBACK is then accepted, error 3930).
+                if txn_ctx.in_txn() && !dooms {
+                    run.abort_open_rowset(txn_ctx.in_txn());
+                    run.last_error = Some(error);
+                    continue;
                 }
                 return Err(error);
             }
@@ -1266,6 +1389,9 @@ fn exec_statement_streamed_inner(
     txn_ctx: &mut TxnContext,
     run: &mut BatchRun<'_>,
 ) -> Result<StatementOutcome, SqlError> {
+    if let Statement::RaiseError(raise) = statement {
+        return exec_raiserror(raise, txn_ctx, run);
+    }
     // The streamed shape: a plain SELECT — no SHOWPLAN (its rows are the plan's,
     // not the table's), no assignment (routed to exec_select_assign) — that
     // `scan_plan` accepts. A doomed transaction still allows reads, so the gate
@@ -1853,6 +1979,8 @@ pub fn analyze_locks(
             | Statement::Set(_)
             | Statement::Declare(_)
             | Statement::Use { .. }
+            | Statement::Throw(_)
+            | Statement::RaiseError(_)
             | Statement::TryCatch { .. } => {}
         }
     }
@@ -1950,6 +2078,10 @@ fn exec_statement_dispatch(
     match statement {
         Statement::BeginTransaction { .. } => exec_begin(storage, txn_ctx),
         Statement::Use { database, .. } => exec_use(database, txn_ctx),
+        Statement::Throw(throw) => Err(exec_throw(throw, txn_ctx)),
+        // Handled in `exec_statement_streamed_inner` (severity <= 10 emits an
+        // INFO event, which needs the emitter); nothing else routes it here.
+        Statement::RaiseError(_) => unreachable!("RAISERROR reaches only the streaming executor"),
         Statement::Commit { .. } => exec_commit(storage, txn_ctx),
         Statement::Rollback { name, .. } => exec_rollback(storage, txn_ctx, name.as_ref()),
         Statement::SaveTransaction { name, .. } => exec_save(storage, txn_ctx, name),
@@ -2079,6 +2211,8 @@ fn doomed_allows(statement: &Statement) -> bool {
             | Statement::Set(_)
             | Statement::Declare(_)
             | Statement::Use { .. }
+            | Statement::Throw(_)
+            | Statement::RaiseError(_)
             | Statement::Rollback { name: None, .. }
     )
 }
@@ -2197,6 +2331,280 @@ fn exec_use(database: &Name, ctx: &TxnContext) -> Result<StatementResult, SqlErr
         .at(database.span));
     }
     Ok(StatementResult::Done)
+}
+
+/// `THROW`: builds the error to raise (the caller returns it — `run_block`
+/// then applies THROW's batch-terminating rule). The bare form re-throws the
+/// innermost `CATCH`'s error verbatim, severity included; the argument form
+/// is always severity 16 with a user error number (>= 50000).
+fn exec_throw(throw: &ThrowStatement, ctx: &TxnContext) -> SqlError {
+    let Some(args) = &throw.args else {
+        return match ctx.error_stack.last() {
+            Some(info) => {
+                SqlError::new(info.number, info.severity, info.state, info.message.clone())
+            }
+            None => SqlError::new(
+                10704,
+                16,
+                1,
+                "To rethrow an error, a THROW statement must be used inside a CATCH block.",
+            ),
+        };
+    };
+    let eval_ctx = ctx.eval_context();
+    match exec_throw_args(args, &eval_ctx) {
+        // Both sides raise: the built error, or the argument evaluation's own.
+        Ok(error) | Err(error) => error,
+    }
+}
+
+fn exec_throw_args(args: &ThrowArgs, eval_ctx: &EvalContext) -> Result<SqlError, SqlError> {
+    let number = int_argument(&args.number, eval_ctx, "THROW", "error number")?;
+    if !(50_000..=i64::from(i32::MAX)).contains(&number) {
+        return Err(SqlError::new(
+            35100,
+            16,
+            1,
+            format!(
+                "Error number {number} in the THROW statement is outside the valid range. \
+                 Specify an error number in the valid range of 50000 to 2147483647."
+            ),
+        ));
+    }
+    let message = match eval_constant(&args.message, eval_ctx)? {
+        SqlValue::Str(text) => text,
+        other => {
+            return Err(SqlError::new(
+                102,
+                15,
+                1,
+                format!(
+                    "The THROW message must be a string, not {}.",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    let state = int_argument(&args.state, eval_ctx, "THROW", "state")?;
+    if !(0..=255).contains(&state) {
+        return Err(SqlError::new(
+            102,
+            15,
+            1,
+            format!("The THROW state must be between 0 and 255, not {state}."),
+        ));
+    }
+    Ok(SqlError::new(number as i32, 16, state as u8, message))
+}
+
+/// `RAISERROR(msg, severity, state, args...)`. Severity decides the shape:
+/// <= 10 emits an informational message (a TDS INFO token, not an error) and
+/// the statement SUCCEEDS; 11..=18 raises an ordinary error (statement-scope
+/// — `run_block` exempts it from XACT_ABORT and never dooms for it);
+/// 19..=25 additionally require `WITH LOG`, and >= 20 is fatal to the
+/// connection. The error number is always 50000 (message-id RAISERROR needs
+/// `sys.messages`, which TruthDB does not have — 18054 like an unknown id).
+fn exec_raiserror(
+    raise: &RaiseError,
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun<'_>,
+) -> Result<StatementOutcome, SqlError> {
+    let eval_ctx = txn_ctx.eval_context();
+    let severity = int_argument(&raise.severity, &eval_ctx, "RAISERROR", "severity")?;
+    if !(0..=25).contains(&severity) {
+        return Err(SqlError::new(
+            2754,
+            16,
+            1,
+            format!("Error severity {severity} is out of the range 0 through 25."),
+        ));
+    }
+    if severity > 18 && !raise.log {
+        return Err(SqlError::new(
+            2754,
+            16,
+            1,
+            "Error severity levels greater than 18 can only be specified by members of the \
+             sysadmin role, using the WITH LOG option.",
+        ));
+    }
+    // State 0 is reported as 1, as SQL Server does.
+    let state = int_argument(&raise.state, &eval_ctx, "RAISERROR", "state")?;
+    if !(0..=255).contains(&state) {
+        return Err(SqlError::new(
+            2753,
+            16,
+            1,
+            format!("The RAISERROR state must be between 0 and 255, not {state}."),
+        ));
+    }
+    let state = (state as u8).max(1);
+    let message = match eval_constant(&raise.message, &eval_ctx)? {
+        SqlValue::Str(format) => {
+            let mut args = Vec::with_capacity(raise.args.len());
+            for arg in &raise.args {
+                args.push(eval_constant(arg, &eval_ctx)?);
+            }
+            format_raiserror(&format, &args)?
+        }
+        // A message id: there is no `sys.messages`, so no id resolves.
+        SqlValue::Int(id) => {
+            return Err(SqlError::new(
+                18054,
+                16,
+                1,
+                format!(
+                    "Error {id}, severity {severity}, state {state} was raised, but no message \
+                     with that error number was found in sys.messages."
+                ),
+            ));
+        }
+        other => {
+            return Err(SqlError::new(
+                102,
+                15,
+                1,
+                format!(
+                    "The RAISERROR message must be a string or a message id, not {}.",
+                    other.type_name()
+                ),
+            ));
+        }
+    };
+    const AD_HOC_MESSAGE_NUMBER: i32 = 50000;
+    if severity <= 10 {
+        // Informational: `@@ERROR` reads 0 (or 50000 under SETERROR) — set
+        // here because `run_block`'s success path leaves RAISERROR's value.
+        txn_ctx.last_error = if raise.seterror {
+            AD_HOC_MESSAGE_NUMBER
+        } else {
+            0
+        };
+        run.info(SqlError::new(
+            AD_HOC_MESSAGE_NUMBER,
+            severity as u8,
+            state,
+            message,
+        ));
+        return Ok(StatementOutcome::Result(StatementResult::Done));
+    }
+    Err(SqlError::new(
+        AD_HOC_MESSAGE_NUMBER,
+        severity as u8,
+        state,
+        message,
+    ))
+}
+
+/// An integer statement argument (THROW/RAISERROR take constants or
+/// variables).
+fn int_argument(
+    expr: &Expr,
+    eval_ctx: &EvalContext,
+    statement: &str,
+    what: &str,
+) -> Result<i64, SqlError> {
+    match eval_constant(expr, eval_ctx)? {
+        SqlValue::Int(value) => Ok(value),
+        other => Err(SqlError::new(
+            102,
+            15,
+            1,
+            format!(
+                "The {statement} {what} must be an integer, not {}.",
+                other.type_name()
+            ),
+        )),
+    }
+}
+
+/// RAISERROR's printf subset: `%d`/`%i` (also `%u`, `%x`/`%X`, `%o`) for
+/// integer arguments, `%s` for strings, `%%` for a literal percent. Anything
+/// else is refused (2787), as is an argument of the wrong type or a missing
+/// one (2786). Surplus arguments are ignored, as SQL Server does.
+fn format_raiserror(format: &str, args: &[SqlValue]) -> Result<String, SqlError> {
+    let mut out = String::with_capacity(format.len());
+    let mut next_arg = 0usize;
+    let mut chars = format.chars();
+    while let Some(ch) = chars.next() {
+        if ch != '%' {
+            out.push(ch);
+            continue;
+        }
+        let Some(directive) = chars.next() else {
+            return Err(SqlError::new(
+                2787,
+                16,
+                1,
+                "Invalid format specification: '%' at the end of the message.",
+            ));
+        };
+        if directive == '%' {
+            out.push('%');
+            continue;
+        }
+        let argument = args.get(next_arg).ok_or_else(|| {
+            SqlError::new(
+                2786,
+                16,
+                1,
+                format!(
+                    "The data type of substitution parameter {} does not match the expected \
+                     type of the format specification (missing argument).",
+                    next_arg + 1
+                ),
+            )
+        })?;
+        let mismatch = || {
+            SqlError::new(
+                2786,
+                16,
+                1,
+                format!(
+                    "The data type of substitution parameter {} does not match the expected \
+                     type of the format specification.",
+                    next_arg + 1
+                ),
+            )
+        };
+        // A NULL argument prints "(null)" under every directive, as SQL
+        // Server does. Integer arguments are int-typed (32-bit) there, so
+        // the unsigned/hex forms wrap at 32 bits (-1 -> ffffffff) and a
+        // value outside int range is a type mismatch (2786, the bigint
+        // refusal).
+        if matches!(argument, SqlValue::Null) {
+            out.push_str("(null)");
+            next_arg += 1;
+            continue;
+        }
+        let int_arg = || -> Result<i32, SqlError> {
+            match argument {
+                SqlValue::Int(value) => i32::try_from(*value).map_err(|_| mismatch()),
+                _ => Err(mismatch()),
+            }
+        };
+        match directive {
+            'd' | 'i' => out.push_str(&int_arg()?.to_string()),
+            'u' => out.push_str(&(int_arg()? as u32).to_string()),
+            'x' => out.push_str(&format!("{:x}", int_arg()? as u32)),
+            'X' => out.push_str(&format!("{:X}", int_arg()? as u32)),
+            'o' => out.push_str(&format!("{:o}", int_arg()? as u32)),
+            's' => match argument {
+                SqlValue::Str(value) => out.push_str(value),
+                _ => return Err(mismatch()),
+            },
+            other => {
+                return Err(SqlError::new(
+                    2787,
+                    16,
+                    1,
+                    format!("Invalid format specification: '%{other}'."),
+                ));
+            }
+        }
+        next_arg += 1;
+    }
+    Ok(out)
 }
 
 fn exec_begin(storage: &Storage, ctx: &mut TxnContext) -> Result<StatementResult, SqlError> {
