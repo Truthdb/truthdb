@@ -39,6 +39,19 @@ use crate::relstore::types::{ColumnType, Datum};
 use crate::relstore::version::ReadSnapshot;
 use crate::storage::{RowLocator, Storage, StorageError, StorageTxn, TxnScope};
 
+/// A declared table variable's in-memory contents: its column schema, the key
+/// columns of its declared PRIMARY KEY (for uniqueness enforcement), the
+/// per-column `DEFAULT` source text (parallel to the schema columns, re-parsed
+/// and evaluated per INSERT), and its rows. A row is a `Vec<Datum>` in schema
+/// order, exactly like a base-table row.
+#[derive(Clone)]
+struct TableVar {
+    schema: Schema,
+    key_columns: Vec<usize>,
+    defaults: Vec<Option<String>>,
+    rows: Vec<Vec<Datum>>,
+}
+
 /// Per-session transaction state carried across statements/batches. Lives in
 /// the session (engine thread); autocommit statements use `Default`.
 #[derive(Default)]
@@ -82,6 +95,11 @@ pub struct TxnContext {
     /// Declared batch variables (name without `@`, lowercased) to their type
     /// and current value. Cleared at the start of each batch.
     variables: std::collections::HashMap<String, (ColumnType, SqlValue)>,
+    /// Declared table variables (name without `@`, lowercased): in-memory
+    /// rowsets that live only on the session (never on Storage), so they survive
+    /// ROLLBACK and are cleared at batch end — SQL Server table-variable
+    /// semantics. Kept disjoint from `variables`; a name lives in exactly one.
+    table_variables: std::collections::HashMap<String, TableVar>,
     /// Connection identity for session intrinsics (`DB_NAME()`,
     /// `SUSER_SNAME()`, `@@SPID`), set once when the session opens.
     database: String,
@@ -198,6 +216,7 @@ impl TxnContext {
     /// Clears batch-scoped variables (called at the start of each batch).
     pub fn clear_variables(&mut self) {
         self.variables.clear();
+        self.table_variables.clear();
     }
 
     /// The final value and type of a batch variable, as a `Datum`, for the
@@ -953,6 +972,7 @@ fn run_user_procedure(
 
     // Fresh scope, SET options reverting at exit — the sp_executesql shape.
     let outer_vars = std::mem::take(&mut txn_ctx.variables);
+    let outer_table_vars = std::mem::take(&mut txn_ctx.table_variables);
     let outer_xact_abort = txn_ctx.xact_abort;
     let outer_nocount = txn_ctx.nocount;
     let outer_isolation = txn_ctx.isolation;
@@ -993,6 +1013,7 @@ fn run_user_procedure(
         })
         .collect();
     txn_ctx.variables = outer_vars;
+    txn_ctx.table_variables = outer_table_vars;
     txn_ctx.xact_abort = outer_xact_abort;
     txn_ctx.nocount = outer_nocount;
     txn_ctx.isolation = outer_isolation;
@@ -1223,6 +1244,7 @@ fn run_exec(
     // EXEC, or a post-EXEC statement would run under an isolation the up-front
     // lock analysis never saw.
     let outer_vars = std::mem::take(&mut txn_ctx.variables);
+    let outer_table_vars = std::mem::take(&mut txn_ctx.table_variables);
     let outer_xact_abort = txn_ctx.xact_abort;
     let outer_nocount = txn_ctx.nocount;
     let outer_isolation = txn_ctx.isolation;
@@ -1256,6 +1278,7 @@ fn run_exec(
     };
     EXEC_DEPTH.with(|d| d.set(d.get() - 1));
     txn_ctx.variables = outer_vars;
+    txn_ctx.table_variables = outer_table_vars;
     txn_ctx.xact_abort = outer_xact_abort;
     txn_ctx.nocount = outer_nocount;
     txn_ctx.isolation = outer_isolation;
@@ -1524,6 +1547,10 @@ fn run_block(
                 // A successful condition evaluation resets `@@ERROR` (the IF
                 // itself is a statement) — AFTER the condition read it, which
                 // is what makes `IF @@ERROR <> 0` work.
+                // A condition subquery reads table variables through the same
+                // FROM path as a SELECT, so it needs the same read view armed —
+                // the IF/WHILE arms bypass exec_statement_streamed, so arm here.
+                let _table_var_scope = arm_table_var_view(&txn_ctx.table_variables);
                 let taken = match enter_condition_scopes(storage, condition, txn_ctx, run)
                     .and_then(|_scopes| eval_condition(storage, condition, txn_ctx))
                 {
@@ -1556,6 +1583,9 @@ fn run_block(
                     // infinite `WHILE 1 = 1` must die on cancel even when its
                     // body runs no cancellable statement.
                     check_cancelled()?;
+                    // Re-armed each iteration: the body may INSERT into @t, and
+                    // the next condition read must see the updated rows.
+                    let _table_var_scope = arm_table_var_view(&txn_ctx.table_variables);
                     let taken = match enter_condition_scopes(storage, condition, txn_ctx, run)
                         .and_then(|_scopes| eval_condition(storage, condition, txn_ctx))
                     {
@@ -1594,6 +1624,10 @@ fn run_block(
                     let value = value
                         .as_ref()
                         .expect("a scalar function RETURN carries a value (parser-enforced)");
+                    // A RETURN subquery reads table variables through the FROM
+                    // path; arm the body's own (empty) view so it shadows the
+                    // caller's rather than reading caller locals.
+                    let _table_var_scope = arm_table_var_view(&txn_ctx.table_variables);
                     let eval_ctx = txn_ctx.eval_context();
                     let no_outer = |_: &str| -> Option<usize> { None };
                     let coerced =
@@ -1948,6 +1982,59 @@ fn current_snapshot() -> Option<ReadSnapshot> {
     CURRENT_SNAPSHOT.get()
 }
 
+thread_local! {
+    /// The running statement's table variables (the session's, shared read-only
+    /// for the statement). Thread-local for the same reason as CURRENT_SNAPSHOT:
+    /// a batch runs on one worker thread, and the FROM-source builders carry
+    /// only an EvalContext (a truthdb-sql type that cannot hold core `Datum`
+    /// rows), so the store cannot ride through it.
+    static CURRENT_TABLE_VARS: std::cell::RefCell<
+        Option<std::rc::Rc<std::collections::HashMap<String, TableVar>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// The table variable `@name` visible to the running statement, cloned out for a
+/// FROM read (an in-memory rowset).
+fn current_table_var(name: &str) -> Option<TableVar> {
+    let key = name.trim_start_matches('@').to_ascii_lowercase();
+    CURRENT_TABLE_VARS.with(|c| c.borrow().as_ref().and_then(|m| m.get(&key).cloned()))
+}
+
+/// Installs the statement's table variables for its execution, restoring the
+/// prior installation on drop (scopes can nest — a subquery or TVF body reads
+/// within the caller's — so restore rather than clear).
+struct TableVarScope {
+    prev: Option<std::rc::Rc<std::collections::HashMap<String, TableVar>>>,
+}
+
+impl TableVarScope {
+    fn enter(vars: std::rc::Rc<std::collections::HashMap<String, TableVar>>) -> Self {
+        let prev = CURRENT_TABLE_VARS.with(|c| c.borrow_mut().replace(vars));
+        TableVarScope { prev }
+    }
+}
+
+impl Drop for TableVarScope {
+    fn drop(&mut self) {
+        CURRENT_TABLE_VARS.with(|c| *c.borrow_mut() = self.prev.take());
+    }
+}
+
+/// Installs `vars` as the table-variable read view for the returned guard's
+/// lifetime — the SINGLE arming rule shared by every path that can read a table
+/// variable: ordinary statements, IF/WHILE conditions, scalar-function RETURN
+/// expressions, and TVF bodies. Armed when `vars` is non-empty OR an outer scope
+/// is already armed. The second clause is the correctness hinge: a function,
+/// procedure, or TVF body runs with a fresh (empty) table-variable set, and it
+/// must SHADOW the caller's view — not inherit it — so its `FROM @t` resolves
+/// against its own (empty) locals and errors 1087, never the caller's rows.
+/// When neither holds (the common no-table-variable batch) it arms nothing, so
+/// the hot path pays only a thread-local read.
+fn arm_table_var_view(vars: &std::collections::HashMap<String, TableVar>) -> Option<TableVarScope> {
+    let outer_armed = CURRENT_TABLE_VARS.with(|c| c.borrow().is_some());
+    (!vars.is_empty() || outer_armed).then(|| TableVarScope::enter(std::rc::Rc::new(vars.clone())))
+}
+
 /// Statement-scoped snapshot registration: capture on entry, and release —
 /// pruning must not wait on a statement that errored — on every exit path.
 struct SnapshotScope<'a> {
@@ -2008,18 +2095,26 @@ impl Drop for TxnSnapshotScope {
 /// defers both to the first read of an actual object.
 fn statement_reads_tables(storage: &Storage, statement: &Statement) -> bool {
     match statement {
-        Statement::Select(select) => {
-            let expanded = expand_ctes(select);
-            let mut tables = Vec::new();
-            collect_locked_tables(&expanded, &mut tables);
-            // A scalar function the SELECT calls reads tables through its body;
-            // that read must observe the statement/transaction snapshot too, so
-            // it counts as a table access (matching the lock analysis, which
-            // resolves the same function bodies).
-            !tables.is_empty() || !select_function_read_ids(storage, &expanded).is_empty()
-        }
+        Statement::Select(select) => select_reads_tables(storage, select),
+        // An INSERT whose TARGET is a table variable writes only session memory,
+        // so — unlike a base-table INSERT — it is not itself a data access; but a
+        // `SELECT` source still reads real tables and must arm the snapshot.
+        Statement::Insert(insert) if insert.table.value.starts_with('@') => match &insert.source {
+            InsertSource::Select(select) => select_reads_tables(storage, select),
+            _ => false,
+        },
         _ => true,
     }
+}
+
+/// Whether a SELECT reads any real table — directly (FROM/subqueries) or through
+/// a scalar function it calls. A `@t` table-variable source is session-local and
+/// is not counted (it neither locks nor snapshots).
+fn select_reads_tables(storage: &Storage, select: &Select) -> bool {
+    let expanded = expand_ctes(select);
+    let mut tables = Vec::new();
+    collect_locked_tables(&expanded, &mut tables);
+    !tables.is_empty() || !select_function_read_ids(storage, &expanded).is_empty()
 }
 
 /// SQL Server 3952: SNAPSHOT isolation used while the database does not
@@ -2061,6 +2156,12 @@ fn exec_statement_streamed(
     );
     let mut _stmt_scope = None;
     let mut _txn_scope = None;
+    // Make the running context's table variables visible to this statement's
+    // FROM reads. The clone is the statement's read view; INSERT/UPDATE write
+    // the real store on TxnContext. Inside a function/procedure body (fresh,
+    // empty table variables) this shadows the caller's view with an empty one,
+    // so the body cannot read the caller's @t — see arm_table_var_view.
+    let _table_var_scope = arm_table_var_view(&txn_ctx.table_variables);
     match txn_ctx.isolation() {
         Isolation::ReadCommitted
             if matches!(statement, Statement::Select(_)) && storage.rcsi_enabled() =>
@@ -2808,6 +2909,7 @@ fn analyze_statements_locks(
             | Statement::SaveTransaction { .. }
             | Statement::Set(_)
             | Statement::Declare(_)
+            | Statement::DeclareTableVar { .. }
             | Statement::Use { .. }
             | Statement::Throw(_)
             | Statement::RaiseError(_)
@@ -2954,6 +3056,12 @@ fn exec_statement_dispatch(
         Statement::SaveTransaction { name, .. } => exec_save(storage, txn_ctx, name),
         Statement::Set(set) => exec_set(txn_ctx, set),
         Statement::Declare(decls) => exec_declare(txn_ctx, decls),
+        Statement::DeclareTableVar {
+            name,
+            columns,
+            primary_key,
+            ..
+        } => exec_declare_table_var(txn_ctx, name, columns, primary_key),
         Statement::CreateTable(create) => {
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
@@ -3012,6 +3120,12 @@ fn exec_statement_dispatch(
         }
         Statement::Insert(insert) => {
             let eval_ctx = txn_ctx.eval_context();
+            // INSERT into a `@t` table variable is pure session memory (no
+            // Storage, no lock, no WAL) — handled here where `&mut TxnContext`
+            // is in hand, before the storage scope is taken.
+            if insert.table.value.starts_with('@') {
+                return exec_insert_table_var(storage, insert, txn_ctx, &eval_ctx);
+            }
             let (result, identity) = {
                 let mut scope = txn_ctx.scope();
                 exec_insert(storage, insert, &mut scope, &eval_ctx)?
@@ -3648,7 +3762,9 @@ fn exec_set(ctx: &mut TxnContext, set: &SetStatement) -> Result<StatementResult,
 /// variable) is coerced to the declared type, else the value starts NULL.
 fn exec_declare(ctx: &mut TxnContext, decls: &[Declaration]) -> Result<StatementResult, SqlError> {
     for decl in decls {
-        if ctx.variables.contains_key(&decl.name) {
+        // A name occupies the scalar and table-variable stores jointly, so a
+        // scalar DECLARE after a `DECLARE @t TABLE` of the same name is 134 too.
+        if ctx.variables.contains_key(&decl.name) || ctx.table_variables.contains_key(&decl.name) {
             return Err(SqlError::new(
                 134,
                 15,
@@ -3670,6 +3786,109 @@ fn exec_declare(ctx: &mut TxnContext, decls: &[Declaration]) -> Result<Statement
         ctx.variables
             .insert(decl.name.clone(), (column_type, value));
     }
+    Ok(StatementResult::Done)
+}
+
+/// `DECLARE @t TABLE ( ... )`: registers an empty in-memory table variable. Its
+/// schema is bound like a base table's columns; its declared PRIMARY KEY becomes
+/// the key columns used for uniqueness at INSERT time.
+fn exec_declare_table_var(
+    ctx: &mut TxnContext,
+    name: &str,
+    columns: &[ColumnDef],
+    primary_key: &[Name],
+) -> Result<StatementResult, SqlError> {
+    // A name occupies the scalar and table-variable stores jointly.
+    if ctx.variables.contains_key(name) || ctx.table_variables.contains_key(name) {
+        return Err(SqlError::new(
+            134,
+            15,
+            2,
+            format!(
+                "The variable name '@{name}' has already been declared. Variable names must be \
+                 unique within a query batch."
+            ),
+        ));
+    }
+    // Column names within the table variable must be unique (2705), the same
+    // rule a base table enforces in exec_create_table.
+    let mut seen: Vec<&str> = Vec::new();
+    for column in columns {
+        if seen
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&column.name.value))
+        {
+            return Err(SqlError::new(
+                2705,
+                16,
+                3,
+                format!(
+                    "Column names in each table must be unique. Column name '{}' is specified more than once.",
+                    column.name.value
+                ),
+            )
+            .at(column.name.span));
+        }
+        seen.push(&column.name.value);
+    }
+    let bound = columns
+        .iter()
+        .map(bind_column)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut schema = Schema { columns: bound };
+    let mut key_columns = Vec::new();
+    for pk in primary_key {
+        let index = schema
+            .columns
+            .iter()
+            .position(|c| c.name.eq_ignore_ascii_case(&pk.value))
+            .ok_or_else(|| {
+                SqlError::new(
+                    1911,
+                    16,
+                    1,
+                    format!(
+                        "Column name '{}' does not exist in the target table or view.",
+                        pk.value
+                    ),
+                )
+            })?;
+        // A PRIMARY KEY column is implicitly NOT NULL; declaring it NULL is
+        // 8111, and a MAX-typed column cannot be a key — the same rules a base
+        // table enforces in exec_create_table.
+        let declared_null = columns
+            .iter()
+            .find(|c| c.name.eq_ignore_case(&pk.value))
+            .and_then(|c| c.nullable)
+            == Some(true);
+        if declared_null {
+            return Err(SqlError::new(
+                8111,
+                16,
+                1,
+                format!(
+                    "Cannot define PRIMARY KEY constraint on nullable column in table '@{name}'."
+                ),
+            ));
+        }
+        if schema.columns[index].column_type.is_max() {
+            return Err(max_key_column_error(&pk.value, &format!("@{name}")).at(pk.span));
+        }
+        schema.columns[index].nullable = false;
+        key_columns.push(index);
+    }
+    // Per-column DEFAULT source text (parallel to the schema columns), applied
+    // at INSERT to columns left unspecified — same as a base table.
+    let defaults: Vec<Option<String>> = columns.iter().map(|c| c.default.clone()).collect();
+    ctx.table_variables.insert(
+        name.to_string(),
+        TableVar {
+            schema,
+            key_columns,
+            defaults,
+            rows: Vec::new(),
+        },
+    );
     Ok(StatementResult::Done)
 }
 
@@ -5663,6 +5882,131 @@ fn exec_insert(
         _ => None,
     };
     Ok((StatementResult::RowsAffected(inserted), last_identity))
+}
+
+/// `INSERT [INTO] @t ...`: appends rows to an in-memory table variable. No
+/// Storage, no lock, no WAL, no identity/default/CHECK/FK (deferred) — just the
+/// declared column coercion, NOT NULL, and PRIMARY KEY uniqueness, all in memory
+/// so a ROLLBACK leaves the rows intact (SQL Server table-variable semantics).
+fn exec_insert_table_var(
+    storage: &Storage,
+    insert: &Insert,
+    ctx: &mut TxnContext,
+    eval_ctx: &EvalContext,
+) -> Result<StatementResult, SqlError> {
+    let key = insert
+        .table
+        .value
+        .trim_start_matches('@')
+        .to_ascii_lowercase();
+    let (schema, key_columns, defaults) = {
+        let tv = ctx
+            .table_variables
+            .get(&key)
+            .ok_or_else(|| must_declare_table_var(&insert.table.value).at(insert.table.span))?;
+        (
+            tv.schema.clone(),
+            tv.key_columns.clone(),
+            tv.defaults.clone(),
+        )
+    };
+    let ncols = schema.columns.len();
+    // Target columns: an explicit list resolves against the declared schema (264
+    // for a repeat); an omitted list targets every column in order.
+    let target: Vec<usize> = match &insert.columns {
+        Some(names) => {
+            let mut indices = Vec::with_capacity(names.len());
+            for n in names {
+                let index = column_index(&schema, &n.value)
+                    .ok_or_else(|| SqlError::invalid_column(&n.value).at(n.span))?;
+                if indices.contains(&index) {
+                    return Err(SqlError::new(
+                        264,
+                        16,
+                        1,
+                        format!(
+                            "The column name '{}' is specified more than once in the SET clause or column list of an INSERT.",
+                            n.value
+                        ),
+                    )
+                    .at(n.span));
+                }
+                indices.push(index);
+            }
+            indices
+        }
+        None => (0..ncols).collect(),
+    };
+    // A SELECT source is fully materialized here before any append, so
+    // `INSERT @t SELECT ... FROM @t` reads @t's pre-insert rows (Halloween-safe).
+    let input_rows = insert_input_rows(storage, &insert.source, target.len(), eval_ctx)?;
+    let mut new_rows = Vec::with_capacity(input_rows.len());
+    for input in &input_rows {
+        check_cancelled()?;
+        let mut values = vec![Datum::Null; ncols];
+        for (position, sql_value) in target.iter().zip(input) {
+            let column = &schema.columns[*position];
+            values[*position] = value::sql_to_datum(sql_value, &column.column_type, &column.name)?;
+        }
+        // DEFAULTs fill columns that were not targeted and are still NULL,
+        // before the NOT NULL check — so `c INT NOT NULL DEFAULT 5` inserts 5,
+        // not a spurious 515.
+        for (index, column) in schema.columns.iter().enumerate() {
+            if !values[index].is_null() || target.contains(&index) {
+                continue;
+            }
+            if let Some(text) = &defaults[index] {
+                let sql_value = eval_default(text, eval_ctx)?;
+                values[index] = value::sql_to_datum(&sql_value, &column.column_type, &column.name)?;
+            }
+        }
+        // NOT NULL after defaults applied; unspecified columns without a
+        // default remain NULL.
+        for (index, column) in schema.columns.iter().enumerate() {
+            if !column.nullable && values[index].is_null() {
+                return Err(SqlError::null_into_not_null(
+                    &column.name,
+                    &insert.table.value,
+                ));
+            }
+        }
+        new_rows.push(values);
+    }
+    let tv = ctx.table_variables.get_mut(&key).expect("checked above");
+    // PRIMARY KEY uniqueness (collation-aware, against existing and same-batch
+    // rows). Checked before any append, so a violation appends nothing.
+    if !key_columns.is_empty() {
+        let mut seen: std::collections::HashSet<Vec<u8>> = tv
+            .rows
+            .iter()
+            .filter_map(|r| crate::relstore::key::encode_key(&schema, &key_columns, r).ok())
+            .collect();
+        for row in &new_rows {
+            let encoded = crate::relstore::key::encode_key(&schema, &key_columns, row)
+                .map_err(|e| SqlError::message_only(245, e.to_string()))?;
+            if !seen.insert(encoded) {
+                return Err(SqlError::new(
+                    2627,
+                    14,
+                    1,
+                    "Violation of PRIMARY KEY constraint. Cannot insert duplicate key in a table variable.",
+                ));
+            }
+        }
+    }
+    let inserted = new_rows.len() as u64;
+    tv.rows.extend(new_rows);
+    Ok(StatementResult::RowsAffected(inserted))
+}
+
+/// SQL Server 1087: a `@t` table variable used before it was declared.
+fn must_declare_table_var(name: &str) -> SqlError {
+    SqlError::new(
+        1087,
+        15,
+        2,
+        format!("Must declare the table variable \"{name}\"."),
+    )
 }
 
 /// Produces the input rows an INSERT supplies, each already in target-column
@@ -9192,6 +9536,10 @@ fn collect_locked_tables<'a>(select: &'a Select, out: &mut Vec<&'a Name>) {
 /// join `ON` predicates (which may contain their own subqueries).
 fn collect_from_tables<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
     match tref {
+        // A `@t` table variable is session-local: it takes no lock and — via
+        // statement_reads_tables — must not arm a snapshot, so it is never
+        // collected as a locked/snapshotted table.
+        TableRef::Table { name, .. } if name.value.starts_with('@') => {}
         TableRef::Table { name, .. } => out.push(name),
         TableRef::Join {
             left, right, on, ..
@@ -9465,6 +9813,8 @@ fn collect_select_read_names(select: &Select, tables: &mut Vec<String>, funcs: &
 
 fn collect_from_read_names(tref: &TableRef, tables: &mut Vec<String>, funcs: &mut Vec<String>) {
     match tref {
+        // A `@t` table variable is session-local — no lock, no snapshot.
+        TableRef::Table { name, .. } if name.value.starts_with('@') => {}
         TableRef::Table { name, .. } => tables.push(name.value.clone()),
         TableRef::Join {
             left, right, on, ..
@@ -9666,6 +10016,35 @@ fn build_table_source(
     let qualifier = alias
         .map(|a| a.value.clone())
         .unwrap_or_else(|| strip_schema(&name.value).to_string());
+    // A `@t` table variable: serve its in-memory rows as a materialized source.
+    // (The catalog resolver never matches an `@`-name, so this is the only path
+    // that handles it — and it never touches Storage.)
+    if name.value.starts_with('@') {
+        let tv = current_table_var(&name.value)
+            .ok_or_else(|| must_declare_table_var(&name.value).at(name.span))?;
+        let count = tv.schema.columns.len();
+        let columns = tv
+            .schema
+            .columns
+            .iter()
+            .map(|c| ResultColumn {
+                name: c.name.clone(),
+                column_type: c.column_type,
+            })
+            .collect();
+        let collations = tv
+            .schema
+            .columns
+            .iter()
+            .map(|c| c.collation.clone())
+            .collect();
+        return Ok(Source {
+            columns,
+            qualifiers: vec![Some(qualifier); count],
+            collations,
+            rows: SourceRows::Materialized(tv.rows),
+        });
+    }
     let base = match name.value.to_ascii_lowercase().as_str() {
         "sys.tables" => sys_tables(storage),
         "sys.databases" => sys_databases(storage, eval_ctx),
@@ -9706,6 +10085,13 @@ fn build_table_source(
                     quoted: false,
                     span: name.span,
                 };
+                // A view body is a stored-object scope, like a function/TVF
+                // body: it must not read the CALLER's table variables. Shadow
+                // the read view with an empty one so `SELECT ... FROM @t` inside
+                // a view errors 1087 rather than returning caller rows. (An
+                // in-statement derived table or CTE is NOT a separate scope and
+                // keeps the statement's view — only stored bodies shadow.)
+                let _table_var_scope = arm_table_var_view(&std::collections::HashMap::new());
                 return build_derived_source(storage, &body, &qual, eval_ctx);
             }
             let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
@@ -9857,6 +10243,14 @@ fn build_function_source(
         quoted: false,
         span: name.span,
     };
+    // A TVF body sees only its parameters, not caller locals — the scalar side
+    // is isolated above (fresh `variables`); do the same for the table-variable
+    // read view. Without this the body's `FROM @t` would resolve against the
+    // CALLER's table variable, since build_derived_source runs under whatever
+    // scope the calling statement armed. An empty view makes such a body error
+    // 1087, as SQL Server rejects it. (arm_table_var_view no-ops when nothing is
+    // armed, so a body with no @t reference pays nothing.)
+    let _table_var_scope = arm_table_var_view(&std::collections::HashMap::new());
     build_derived_source(storage, &body, &qual, &fn_ctx)
 }
 

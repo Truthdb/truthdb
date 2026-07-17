@@ -44,6 +44,15 @@ pub enum Statement {
     AlterDatabase(AlterDatabase),
     /// `DECLARE @a TYPE [= expr], ...` — batch variable declarations.
     Declare(Vec<Declaration>),
+    /// `DECLARE @t TABLE ( <column-defs> )` — an in-memory table variable. It is
+    /// a standalone declaration (SQL Server forbids mixing it with others).
+    DeclareTableVar {
+        /// The variable name, without the leading `@`, lowercased.
+        name: String,
+        columns: Vec<ColumnDef>,
+        primary_key: Vec<Name>,
+        span: Span,
+    },
     /// `EXEC[UTE] <proc> [args...]` — the T-SQL text path to the system
     /// procedures (`sp_executesql` is the supported one).
     Exec(ExecStatement),

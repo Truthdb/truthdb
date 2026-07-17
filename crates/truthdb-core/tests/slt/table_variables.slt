@@ -1,0 +1,133 @@
+# Table variables (Stage 15): DECLARE @t TABLE, INSERT @t (VALUES and SELECT),
+# SELECT FROM @t, NOT NULL + PRIMARY KEY enforcement, ROLLBACK survival.
+
+statement ok
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20)); INSERT INTO @t (id, name) VALUES (1, 'a'), (2, 'b'); INSERT INTO @t (id, name) VALUES (3, 'c')
+
+# NOTE: each slt statement/query is its own batch, so a table variable declared
+# in one line is gone by the next. The read cases below declare + populate +
+# read within a single multi-statement batch (one `query` block).
+
+# SELECT FROM @t within the same batch.
+query IT rowsort
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20)); INSERT INTO @t VALUES (1, 'a'), (2, 'b'), (3, 'c'); SELECT id, name FROM @t
+----
+1 a
+2 b
+3 c
+
+# Filter and an alias.
+query I
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t VALUES (1), (2), (3); SELECT COUNT(*) AS n FROM @t AS x WHERE x.id >= 2
+----
+2
+
+# INSERT @t SELECT ... FROM a base table.
+statement ok
+CREATE TABLE src (id INT NOT NULL PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO src VALUES (10, 100), (20, 200)
+
+query II rowsort
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY, v INT); INSERT INTO @t SELECT id, v FROM src; SELECT id, v FROM @t
+----
+10 100
+20 200
+
+# Join @t against a base table.
+query IT rowsort
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY, tag NVARCHAR(10)); INSERT INTO @t VALUES (10, 'ten'), (20, 'twenty'); SELECT s.v, t.tag FROM src AS s JOIN @t AS t ON s.id = t.id
+----
+100 ten
+200 twenty
+
+# INSERT @t SELECT FROM @t is Halloween-safe (the SELECT reads the pre-insert
+# rows): starting from 2 rows, self-insert yields 4, not an unbounded loop.
+query I
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t VALUES (1), (2); INSERT INTO @t SELECT id + 100 FROM @t; SELECT COUNT(*) AS n FROM @t
+----
+4
+
+# NOT NULL is enforced.
+statement error
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t VALUES (NULL)
+
+# PRIMARY KEY uniqueness is enforced (2627), incl. within one INSERT.
+statement error
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t VALUES (1), (1)
+
+# A table variable survives ROLLBACK (it is session memory, not transactional).
+query I
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); BEGIN TRAN; INSERT INTO @t VALUES (1), (2); ROLLBACK; SELECT COUNT(*) AS n FROM @t
+----
+2
+
+# Re-declaring the same name in a batch is 134.
+statement error
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); DECLARE @t TABLE (x INT)
+
+# A name cannot be both a scalar and a table variable (134), either order.
+statement error
+DECLARE @t INT; DECLARE @t TABLE (id INT)
+
+statement error
+DECLARE @t TABLE (id INT); DECLARE @t INT
+
+# An undeclared table variable is an error.
+statement error
+SELECT * FROM @undeclared
+
+# A table variable is visible inside an IF condition subquery (the read view is
+# armed for condition evaluation, not only for ordinary statements).
+query I
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t VALUES (1), (2); IF EXISTS (SELECT 1 FROM @t) SELECT 42 AS n
+----
+42
+
+query I
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t VALUES (1), (2); IF (SELECT COUNT(*) FROM @t) = 2 SELECT 7 AS n
+----
+7
+
+# ... and inside a WHILE condition subquery (here the count is 1, so the loop
+# body never runs and control reaches the trailing SELECT).
+query I
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t VALUES (1); WHILE (SELECT COUNT(*) FROM @t) > 5 SELECT 0; SELECT 99 AS n
+----
+99
+
+# A table-level PRIMARY KEY column is implicitly NOT NULL (515 on a NULL insert),
+# exactly as the inline form is.
+statement error
+DECLARE @t TABLE (id INT, PRIMARY KEY (id)); INSERT INTO @t VALUES (NULL)
+
+# Declaring a PRIMARY KEY column explicitly NULL is 8111.
+statement error
+DECLARE @t TABLE (id INT NULL, PRIMARY KEY (id))
+
+# Column DEFAULT is applied to unspecified columns, before the NOT NULL check.
+query I
+DECLARE @t TABLE (id INT, c INT NOT NULL DEFAULT 5); INSERT INTO @t (id) VALUES (1); SELECT c FROM @t
+----
+5
+
+query I
+DECLARE @t TABLE (id INT, c INT DEFAULT 42); INSERT INTO @t (id) VALUES (1); SELECT c FROM @t
+----
+42
+
+# Column constraints the table-variable executor does not enforce are rejected
+# at parse time rather than silently ignored.
+statement error
+DECLARE @t TABLE (id INT IDENTITY(1,1))
+
+statement error
+DECLARE @t TABLE (id INT UNIQUE)
+
+statement error
+DECLARE @t TABLE (id INT CHECK (id > 0))
+
+# Duplicate column names in the declaration are 2705 (as for a base table).
+statement error
+DECLARE @t TABLE (id INT, id INT)
