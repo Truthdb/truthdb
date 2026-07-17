@@ -4803,6 +4803,1008 @@ mod tests {
     }
 
     #[test]
+    fn if_else_takes_the_right_branch_including_null() {
+        // T-SQL three-valued conditions: TRUE runs THEN; FALSE and NULL
+        // (UNKNOWN) take the ELSE.
+        let path = unique_temp_path("if-else");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF 1 = 1 SELECT 1 AS n ELSE SELECT 2 AS n",
+        );
+        assert_eq!(ids(&out), vec![1]);
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF 1 = 2 SELECT 1 AS n ELSE SELECT 2 AS n",
+        );
+        assert_eq!(ids(&out), vec![2]);
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF NULL = NULL SELECT 1 AS n ELSE SELECT 2 AS n",
+        );
+        assert_eq!(ids(&out), vec![2], "UNKNOWN takes the ELSE");
+        // ALIASLESS selects: `ELSE` must not be readable as an implicit
+        // column alias (`SELECT 1 ELSE` would silently detach the branch).
+        let out = batch(&engine, &mut ctx, "IF 1 = 2 SELECT 1 ELSE SELECT 2");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![2], "ELSE binds to the IF, not as an alias");
+        // Without an ELSE, an untaken IF runs nothing.
+        let out = batch(&engine, &mut ctx, "IF 1 = 2 SELECT 1 AS n; SELECT 3 AS n");
+        assert_eq!(ids(&out), vec![3]);
+        // A non-boolean condition is 4145.
+        let out = batch(&engine, &mut ctx, "IF 7 SELECT 1 AS n");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(4145));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn if_exists_subquery_condition_works() {
+        // The bread-and-butter SSMS shape: IF EXISTS (SELECT ...) over a real
+        // table, both polarities, plus a scalar-subquery comparison.
+        let path = unique_temp_path("if-exists");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF EXISTS (SELECT * FROM t WHERE id = 1) SELECT 10 AS n ELSE SELECT 20 AS n",
+        );
+        assert_eq!(ids(&out), vec![10]);
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF EXISTS (SELECT * FROM t WHERE id = 99) SELECT 10 AS n ELSE SELECT 20 AS n",
+        );
+        assert_eq!(ids(&out), vec![20]);
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF (SELECT COUNT(*) FROM t) = 1 SELECT 30 AS n",
+        );
+        assert_eq!(ids(&out), vec![30], "scalar subquery in the condition");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn while_loop_runs_with_break_and_continue() {
+        let path = unique_temp_path("while-loop");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        // A counted loop driven by a variable.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @i INT = 1; \
+             WHILE @i <= 5 \
+             BEGIN \
+               INSERT INTO t VALUES (@i); \
+               SET @i = @i + 1; \
+             END; \
+             SELECT COUNT(*) AS n FROM t",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![5]);
+        // CONTINUE skips even ids; BREAK stops at 8.
+        batch(&engine, &mut ctx, "DELETE FROM t");
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @i INT = 0; \
+             WHILE 1 = 1 \
+             BEGIN \
+               SET @i = @i + 1; \
+               IF @i >= 8 BREAK; \
+               IF @i % 2 = 0 CONTINUE; \
+               INSERT INTO t VALUES (@i); \
+             END; \
+             SELECT id FROM t ORDER BY id",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![1, 3, 5, 7]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn break_crosses_a_try_and_return_exits_the_batch() {
+        let path = unique_temp_path("flow-crossings");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        // BREAK inside a TRY leaves the loop without touching the CATCH.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @i INT = 0; \
+             WHILE 1 = 1 \
+             BEGIN \
+               SET @i = @i + 1; \
+               BEGIN TRY IF @i = 3 BREAK; END TRY BEGIN CATCH SELECT 99 AS n; END CATCH \
+             END; \
+             SELECT @i AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![3], "the CATCH never ran, the loop broke");
+        // RETURN exits the batch mid-way.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "INSERT INTO t VALUES (1); RETURN; INSERT INTO t VALUES (2)",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let out = batch(&engine, &mut ctx, "SELECT id FROM t ORDER BY id");
+        assert_eq!(ids(&out), vec![1], "the post-RETURN INSERT never ran");
+        // RETURN with a value is a batch-context error (178), and
+        // BREAK/CONTINUE outside a loop are compile-time 135/136.
+        let out = batch(&engine, &mut ctx, "RETURN 5");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(178));
+        let out = batch(&engine, &mut ctx, "BREAK");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(135));
+        let out = batch(&engine, &mut ctx, "CONTINUE");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(136));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn if_condition_reads_at_at_error_before_resetting_it() {
+        // The canonical pattern: `IF @@ERROR <> 0` sees the failed statement's
+        // number (the IF resets @@ERROR only AFTER its condition evaluated).
+        let path = unique_temp_path("if-at-at-error");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRAN; \
+             INSERT INTO t VALUES (1); \
+             IF @@ERROR <> 0 SELECT 111 AS n ELSE SELECT 222 AS n; \
+             SELECT @@ERROR AS n; \
+             COMMIT",
+        );
+        let firsts: Vec<i64> = out
+            .results
+            .iter()
+            .filter_map(|r| match r {
+                StatementResult::Rows(rowset) => match rowset.rows[0][0] {
+                    Datum::Int(v) => Some(i64::from(v)),
+                    Datum::BigInt(v) => Some(v),
+                    ref other => panic!("expected int, got {other:?}"),
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            firsts,
+            vec![111, 0],
+            "the IF saw 2627, then reset @@ERROR to 0"
+        );
+        // An untaken IF with no ELSE: the IF's own reset is the ONLY one (no
+        // branch statement runs to mask it) — @@ERROR reads 0 after it.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRAN; \
+             INSERT INTO t VALUES (1); \
+             IF 1 = 2 SELECT 999 AS n; \
+             SELECT @@ERROR AS n; \
+             COMMIT",
+        );
+        assert_eq!(
+            ids(&out),
+            vec![0],
+            "the IF itself reset @@ERROR though no branch ran"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn doomed_transaction_still_runs_the_canonical_catch_pattern() {
+        // IF XACT_STATE() = -1 ROLLBACK — the documented CATCH idiom — must
+        // work inside a doomed transaction.
+        let path = unique_temp_path("doomed-if-rollback");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "SET XACT_ABORT ON; \
+             BEGIN TRAN; \
+             BEGIN TRY INSERT INTO t VALUES (1); INSERT INTO t VALUES (1); END TRY \
+             BEGIN CATCH \
+               IF XACT_STATE() = -1 ROLLBACK; \
+             END CATCH; \
+             SELECT CAST(@@TRANCOUNT AS INT) AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![0], "the doomed transaction was rolled back");
+        assert!(!ctx.has_open_transaction());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_doomed_gate_condition_reads_branch_writes_gated() {
+        // In a doomed transaction's CATCH: an IF condition's subquery READ is
+        // legal (SQL Server allows reads in a doomed transaction), but a
+        // write inside a taken branch still hits the 3930 gate.
+        let path = unique_temp_path("cf-doomed-gate");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "SET XACT_ABORT ON; \
+             BEGIN TRAN; \
+             BEGIN TRY INSERT INTO t VALUES (1); INSERT INTO t VALUES (1); END TRY \
+             BEGIN CATCH \
+               IF EXISTS (SELECT * FROM t WHERE id = 1) SELECT 41 AS n ELSE SELECT 40 AS n; \
+               IF XACT_STATE() = -1 ROLLBACK; \
+             END CATCH; \
+             SELECT 42 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let firsts: Vec<i64> = out
+            .results
+            .iter()
+            .filter_map(|r| match r {
+                StatementResult::Rows(rowset) => match rowset.rows[0][0] {
+                    Datum::Int(v) => Some(i64::from(v)),
+                    Datum::BigInt(v) => Some(v),
+                    ref other => panic!("expected int, got {other:?}"),
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            firsts,
+            vec![41, 42],
+            "the doomed CATCH's condition read saw the txn's own row"
+        );
+        // A branch WRITE in the doomed CATCH is still rejected with 3930.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "SET XACT_ABORT ON; \
+             BEGIN TRAN; \
+             BEGIN TRY INSERT INTO t VALUES (1); INSERT INTO t VALUES (1); END TRY \
+             BEGIN CATCH \
+               IF 1 = 1 INSERT INTO t VALUES (9); \
+             END CATCH",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(3930));
+        batch(&engine, &mut ctx, "ROLLBACK");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_txn_control_inside_while() {
+        // BEGIN TRAN / COMMIT (and ROLLBACK) balanced per iteration:
+        // @@TRANCOUNT does not drift across iterations.
+        let path = unique_temp_path("cf-txn-in-while");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @i INT = 0; \
+             WHILE @i < 3 \
+             BEGIN \
+               BEGIN TRAN; INSERT INTO t VALUES (@i); COMMIT; \
+               SET @i = @i + 1; \
+             END; \
+             SELECT CAST(@@TRANCOUNT AS INT) AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![0], "trancount balanced after the loop");
+        let out = batch(&engine, &mut ctx, "SELECT COUNT(*) AS n FROM t");
+        assert_eq!(ids(&out), vec![3]);
+        // Per-iteration ROLLBACK: every iteration's insert is undone.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @i INT = 10; \
+             WHILE @i < 13 \
+             BEGIN \
+               BEGIN TRAN; INSERT INTO t VALUES (@i); ROLLBACK; \
+               SET @i = @i + 1; \
+             END; \
+             SELECT COUNT(*) AS n FROM t WHERE id >= 10",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![0]);
+        assert!(!ctx.has_open_transaction());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_break_inside_catch_inside_while() {
+        // BREAK issued from a CATCH block still terminates the enclosing
+        // WHILE (the CATCH's flow propagates through the TryCatch arm).
+        let path = unique_temp_path("cf-break-in-catch");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        // RETURN issued from a CATCH block exits the batch. This runs FIRST:
+        // it fails fast if the CATCH's flow is swallowed, where the BREAK
+        // case below would spin forever instead.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRY INSERT INTO t VALUES (1); END TRY \
+             BEGIN CATCH RETURN; END CATCH; \
+             SELECT 6 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(
+            !out.results
+                .iter()
+                .any(|r| matches!(r, StatementResult::Rows(_))),
+            "the CATCH's RETURN exited the batch: {:?}",
+            out.results
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "WHILE 1 = 1 \
+             BEGIN \
+               BEGIN TRY INSERT INTO t VALUES (1); END TRY \
+               BEGIN CATCH BREAK; END CATCH \
+             END; \
+             SELECT 77 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![77], "the CATCH's BREAK ended the loop");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_loop_body_error_continues_or_dooms() {
+        // XACT_ABORT OFF in a transaction: a non-dooming body error rolls
+        // back only that statement — the LOOP keeps iterating (it must not
+        // swallow the error either: the batch reports it at the end).
+        let path = unique_temp_path("cf-loop-body-error");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRAN; \
+             DECLARE @i INT = 0; \
+             WHILE @i < 3 \
+             BEGIN \
+               SET @i = @i + 1; \
+               INSERT INTO t VALUES (1); \
+             END; \
+             SELECT @i AS n; \
+             COMMIT",
+        );
+        assert_eq!(
+            ids(&out),
+            vec![3],
+            "all three iterations ran despite the per-iteration 2627"
+        );
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(2627),
+            "the continued error still surfaces at batch end"
+        );
+        assert!(!ctx.has_open_transaction(), "the COMMIT went through");
+        // XACT_ABORT ON: the first body error dooms and ends the batch
+        // mid-loop — the loop must NOT swallow it and keep iterating.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "SET XACT_ABORT ON; \
+             BEGIN TRAN; \
+             DECLARE @i INT = 0; \
+             WHILE @i < 3 \
+             BEGIN \
+               SET @i = @i + 1; \
+               INSERT INTO t VALUES (1); \
+             END; \
+             SELECT @i AS n; \
+             COMMIT",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(2627));
+        assert!(
+            !out.results
+                .iter()
+                .any(|r| matches!(r, StatementResult::Rows(_))),
+            "the batch ended mid-loop: no SELECT ran: {:?}",
+            out.results
+        );
+        assert!(ctx.has_open_transaction(), "doomed transaction stays open");
+        batch(&engine, &mut ctx, "ROLLBACK");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_raiserror_and_throw_inside_while() {
+        // RAISERROR >= 11 outside TRY is statement-scope: the loop keeps
+        // running and the error surfaces after the batch finishes. THROW is
+        // batch-terminating: it ends the loop AND the batch.
+        let path = unique_temp_path("cf-raise-throw-loop");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @i INT = 0; \
+             WHILE @i < 3 \
+             BEGIN \
+               SET @i = @i + 1; \
+               IF @i = 2 RAISERROR('boom', 16, 1); \
+             END; \
+             SELECT @i AS n",
+        );
+        assert_eq!(ids(&out), vec![3], "the loop survived the RAISERROR");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(50000),
+            "the RAISERROR still surfaces at batch end"
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @i INT = 0; \
+             WHILE 1 = 1 \
+             BEGIN \
+               SET @i = @i + 1; \
+               IF @i = 2 THROW 50001, 'stop', 1; \
+             END; \
+             SELECT 9 AS n",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(50001));
+        assert!(
+            !out.results
+                .iter()
+                .any(|r| matches!(r, StatementResult::Rows(_))),
+            "THROW ended the batch, not just the loop: {:?}",
+            out.results
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_return_unwinds_nested_control_flow() {
+        // RETURN inside WHILE exits the batch (not just the loop), and a
+        // RETURN nested in WHILE-inside-TRY-inside-BEGIN..END unwinds
+        // everything without running any CATCH.
+        let path = unique_temp_path("cf-return-unwind");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @i INT = 0; \
+             WHILE 1 = 1 \
+             BEGIN \
+               SET @i = @i + 1; \
+               IF @i = 2 RETURN; \
+             END; \
+             SELECT 1 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(
+            !out.results
+                .iter()
+                .any(|r| matches!(r, StatementResult::Rows(_))),
+            "RETURN exited the batch: the post-loop SELECT never ran: {:?}",
+            out.results
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRY \
+               BEGIN \
+                 WHILE 1 = 1 \
+                 BEGIN \
+                   RETURN; \
+                 END \
+               END \
+             END TRY \
+             BEGIN CATCH SELECT 5 AS n; END CATCH; \
+             SELECT 6 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(
+            !out.results
+                .iter()
+                .any(|r| matches!(r, StatementResult::Rows(_))),
+            "RETURN unwound block+loop+TRY without a CATCH: {:?}",
+            out.results
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_while_condition_resets_last_error() {
+        // The WHILE's per-iteration condition evaluation resets @@ERROR (like
+        // the IF's) — a body error set on the LAST iteration reads 0 after
+        // the final (false) condition evaluation. SQL Server ambiguity noted:
+        // the IF analogy (every statement evaluation resets @@ERROR) is what
+        // this pins.
+        let path = unique_temp_path("cf-while-at-at-error");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRAN; \
+             DECLARE @i INT = 0; \
+             WHILE @i < 1 \
+             BEGIN \
+               SET @i = @i + 1; \
+               INSERT INTO t VALUES (1); \
+             END; \
+             SELECT @@ERROR AS n; \
+             COMMIT",
+        );
+        assert_eq!(
+            ids(&out),
+            vec![0],
+            "the final condition evaluation reset @@ERROR"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_parser_edges() {
+        let path = unique_temp_path("cf-parser-edges");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        // Dangling ELSE binds to the INNERMOST IF (as in SQL Server): the
+        // inner condition is false, so the ELSE runs.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF 1 = 1 IF 1 = 2 SELECT 1 AS n ELSE SELECT 2 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![2], "the ELSE belongs to the inner IF");
+        // ...so when the OUTER condition is false, nothing runs at all.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF 1 = 2 IF 1 = 1 SELECT 1 AS n ELSE SELECT 2 AS n; SELECT 3 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![3]);
+        // CASE consumes its own ELSE; the IF grammar is unaffected.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF CASE WHEN 1 = 1 THEN 1 ELSE 2 END = 1 SELECT 4 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![4]);
+        // A semicolon ends the IF: `; ELSE` is a syntax error, as in T-SQL.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF 1 = 1 SELECT 1 AS n; ELSE SELECT 2 AS n",
+        );
+        assert!(out.error.is_some(), "`; ELSE` must not attach to the IF");
+        // A block whose first statement is BEGIN TRAN parses as a block.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN BEGIN TRAN; INSERT INTO t VALUES (21); COMMIT; END",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert!(!ctx.has_open_transaction());
+        // WHILE whose body is a bare BREAK parses and runs zero-or-more times.
+        let out = batch(&engine, &mut ctx, "WHILE 1 = 0 BREAK; SELECT 8 AS n");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![8]);
+        // BREAK inside EXEC'd text is its own batch scope: compile-time 135
+        // surfaces as the EXEC's error even though the EXEC sits in a WHILE.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @i INT = 0; \
+             WHILE @i < 1 \
+             BEGIN \
+               SET @i = 1; \
+               EXEC sp_executesql N'BREAK'; \
+             END",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(135));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_tsql_fidelity_gaps() {
+        let path = unique_temp_path("cf-fidelity");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        // An empty block is a compile-time syntax error in T-SQL ("Incorrect
+        // syntax near 'END'") — expectation is the recommended FIXED behavior
+        // (3360df1 accepts it as a no-op).
+        let out = batch(&engine, &mut ctx, "BEGIN END");
+        assert!(
+            out.error.is_some(),
+            "T-SQL rejects an empty BEGIN END block"
+        );
+        // RETURN with a string value is context error 178 in a batch, like
+        // any RETURN with a value — expectation is the recommended FIXED
+        // behavior (3360df1 gives 102 near 'x': the string is not parsed as
+        // the RETURN's value).
+        let out = batch(&engine, &mut ctx, "RETURN 'x'");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(178));
+        // Recorded divergence (pinning CURRENT behavior): SQL Server's
+        // IF EXISTS sets @@ROWCOUNT from the probe scan (0 here); TruthDB's
+        // condition evaluation leaves @@ROWCOUNT untouched, so the INSERT's
+        // count of 1 survives the untaken IF.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "INSERT INTO t VALUES (2); \
+             IF EXISTS (SELECT * FROM t WHERE id = 99) SELECT 7 AS n; \
+             SELECT CAST(@@ROWCOUNT AS INT) AS n",
+        );
+        assert_eq!(ids(&out), vec![1]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_condition_error_shapes() {
+        let path = unique_temp_path("cf-cond-errors");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1), (2)");
+        // An undeclared variable in the condition is the usual 137.
+        let out = batch(&engine, &mut ctx, "IF @nope = 1 SELECT 1 AS n");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(137));
+        // A scalar condition subquery returning two rows is 512.
+        let out = batch(&engine, &mut ctx, "IF (SELECT id FROM t) = 1 SELECT 1 AS n");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(512));
+        // An assignment SELECT nested in a condition subquery is rejected.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @x INT; IF (SELECT @x = 1) = 1 SELECT 1 AS n",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(141));
+        // Nested EXISTS inside the condition's subquery works.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF EXISTS (SELECT * FROM t WHERE EXISTS (SELECT * FROM t WHERE id = 2)) \
+             SELECT 8 AS n ELSE SELECT 9 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![8]);
+        // A condition error outside any transaction ends the batch (same
+        // ladder as a failed statement); in a transaction with XACT_ABORT
+        // OFF the batch continues past the failed IF, taking no branch.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF 1 / 0 = 1 SELECT 1 AS n ELSE SELECT 2 AS n",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(8134));
+        assert!(
+            !out.results
+                .iter()
+                .any(|r| matches!(r, StatementResult::Rows(_))),
+            "neither branch ran: {:?}",
+            out.results
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRAN; \
+             IF 1 / 0 = 1 SELECT 1 AS n ELSE SELECT 2 AS n; \
+             SELECT 99 AS n; \
+             COMMIT",
+        );
+        assert_eq!(ids(&out), vec![99], "no branch ran; the batch continued");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(8134));
+        assert!(!ctx.has_open_transaction());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_describe_stops_at_control_flow() {
+        // sp_describe_first_result_set: a batch whose FIRST possible rowset
+        // sits inside an IF must answer "not statically derivable" — skipping
+        // the IF and describing a LATER statement would hand a prepared
+        // driver the wrong COLMETADATA when the branch streams first.
+        let path = unique_temp_path("cf-describe");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v NVARCHAR(10))",
+        );
+        let described =
+            engine.describe_first_result_set("IF 1 = 1 SELECT id FROM t; SELECT v FROM t");
+        assert!(
+            described.is_err(),
+            "an IF-guarded first rowset is not statically derivable: {described:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_own_txn_writes_visible_in_condition() {
+        // A transaction's own uncommitted write is visible to its own IF
+        // condition (plain READ COMMITTED, no versioning).
+        let path = unique_temp_path("cf-own-writes");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRAN; \
+             INSERT INTO t VALUES (5); \
+             IF EXISTS (SELECT * FROM t WHERE id = 5) SELECT 1 AS n ELSE SELECT 0 AS n; \
+             ROLLBACK",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![1]);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_exec_inner_return_exits_inner_batch_only() {
+        // A RETURN inside EXEC'd text ends the INNER batch; the outer batch
+        // continues after the EXEC.
+        let path = unique_temp_path("cf-exec-return");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "EXEC sp_executesql N'INSERT INTO t VALUES (1); RETURN; INSERT INTO t VALUES (2)'; \
+             INSERT INTO t VALUES (3); \
+             SELECT id FROM t ORDER BY id",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(
+            ids(&out),
+            vec![1, 3],
+            "inner RETURN skipped only the inner tail"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_cancel_lands_mid_while() {
+        // An Attention arriving while a WHILE spins aborts the batch with the
+        // cancel marker instead of looping forever.
+        let path = unique_temp_path("cf-cancel-while");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        crate::rel::set_test_cancel(flag.clone());
+        let setter = {
+            let flag = flag.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(std::time::Duration::from_millis(150));
+                flag.store(true, std::sync::atomic::Ordering::Relaxed);
+            })
+        };
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @i INT = 0; WHILE 1 = 1 SET @i = @i + 1",
+        );
+        crate::rel::clear_test_cancel();
+        setter.join().expect("setter thread");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(3617),
+            "the spin died on the Attention"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_condition_cte_executes_but_analysis_misses_it() {
+        // Runtime reachability half of the CTE lock hole: the executor
+        // inlines a WITH inside an IF condition's subquery and reads the base
+        // table (see storage.rs cf_review_analyze_locks_condition_cte for the
+        // analysis half — the lock set contains nothing for it).
+        let path = unique_temp_path("cf-cond-cte-runtime");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "IF EXISTS (WITH x AS (SELECT id FROM t) SELECT id FROM x) \
+             SELECT 1 AS n ELSE SELECT 0 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![1], "the CTE condition read the table");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_rcsi_condition_read_is_versioned() {
+        // Under RCSI a READ COMMITTED read takes no Table S — it relies on
+        // the per-statement snapshot instead. The IF condition's subquery
+        // must therefore read through a snapshot exactly like a SELECT
+        // statement does; reading the raw latest state is a dirty read
+        // (expectations here are the FIXED behavior).
+        let path = unique_temp_path("cf-rcsi-cond");
+        let engine = new_engine(&path);
+        let mut admin = TxnContext::default();
+        batch(
+            &engine,
+            &mut admin,
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+        );
+        batch(
+            &engine,
+            &mut admin,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        let mut writer = TxnContext::default();
+        let out = batch(&engine, &mut writer, "BEGIN TRAN; INSERT INTO t VALUES (1)");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let mut reader = TxnContext::default();
+        let out = batch(&engine, &mut reader, "SELECT COUNT(*) AS n FROM t");
+        assert_eq!(
+            ids(&out),
+            vec![0],
+            "sanity: a plain SELECT reads the snapshot, not the writer's uncommitted row"
+        );
+        let out = batch(
+            &engine,
+            &mut reader,
+            "IF EXISTS (SELECT * FROM t WHERE id = 1) SELECT 1 AS n ELSE SELECT 0 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(
+            ids(&out),
+            vec![0],
+            "the IF condition must read the same snapshot a SELECT would — \
+             seeing the writer's uncommitted row is a dirty read"
+        );
+        batch(&engine, &mut writer, "ROLLBACK");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cf_review_snapshot_isolation_condition_uses_txn_snapshot() {
+        // SNAPSHOT isolation: every read in the transaction sees the
+        // transaction's snapshot. A commit that lands after the snapshot was
+        // established must stay invisible to an IF condition too
+        // (expectations here are the FIXED behavior).
+        let path = unique_temp_path("cf-snap-cond");
+        let engine = new_engine(&path);
+        let mut admin = TxnContext::default();
+        batch(
+            &engine,
+            &mut admin,
+            "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON",
+        );
+        batch(
+            &engine,
+            &mut admin,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(&engine, &mut admin, "INSERT INTO t VALUES (1)");
+        let mut reader = TxnContext::default();
+        batch(
+            &engine,
+            &mut reader,
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+        );
+        let out = batch(
+            &engine,
+            &mut reader,
+            "BEGIN TRAN; SELECT COUNT(*) AS n FROM t",
+        );
+        assert_eq!(ids(&out), vec![1], "the snapshot is established at 1 row");
+        let out = batch(&engine, &mut admin, "INSERT INTO t VALUES (2)");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let out = batch(
+            &engine,
+            &mut reader,
+            "IF EXISTS (SELECT * FROM t WHERE id = 2) SELECT 1 AS n ELSE SELECT 0 AS n",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(
+            ids(&out),
+            vec![0],
+            "the IF condition must read the transaction's snapshot, \
+             not the post-snapshot commit"
+        );
+        batch(&engine, &mut reader, "COMMIT");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn try_catch_nested_inner_handles_outer_continues() {
         // The inner CATCH handles the inner error; because it does not re-raise,
         // the outer TRY continues and the outer CATCH never runs.

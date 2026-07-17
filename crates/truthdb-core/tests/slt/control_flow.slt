@@ -1,0 +1,62 @@
+# Control flow (Stage 15): IF/ELSE, WHILE/BREAK/CONTINUE, BEGIN..END blocks,
+# RETURN. The engine tests carry the interaction matrix (TRY crossings,
+# doomed transactions, @@ERROR); these pin the surface end to end.
+
+statement ok
+CREATE TABLE cf (id INT NOT NULL PRIMARY KEY)
+
+statement ok
+IF 1 = 1 INSERT INTO cf VALUES (1) ELSE INSERT INTO cf VALUES (2)
+
+query I
+SELECT id FROM cf
+----
+1
+
+statement ok
+IF EXISTS (SELECT * FROM cf WHERE id = 1) INSERT INTO cf VALUES (10)
+
+statement ok
+IF EXISTS (SELECT * FROM cf WHERE id = 99) INSERT INTO cf VALUES (11)
+
+query I rowsort
+SELECT id FROM cf
+----
+1
+10
+
+statement ok
+DECLARE @i INT = 100; WHILE @i < 103 BEGIN INSERT INTO cf VALUES (@i); SET @i = @i + 1; END
+
+query I rowsort
+SELECT id FROM cf
+----
+1
+10
+100
+101
+102
+
+# RETURN ends the batch: the second DELETE never runs.
+statement ok
+DELETE FROM cf WHERE id >= 100; RETURN; DELETE FROM cf WHERE id = 10
+
+query I rowsort
+SELECT id FROM cf
+----
+1
+10
+
+# Compile-time rejections: BREAK/CONTINUE outside a WHILE, RETURN with a
+# value in a batch, a non-boolean condition.
+statement error
+BREAK
+
+statement error
+CONTINUE
+
+statement error
+RETURN 7
+
+statement error
+IF 42 SELECT 1

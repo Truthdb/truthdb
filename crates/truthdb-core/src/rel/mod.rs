@@ -814,9 +814,13 @@ fn run_exec(
         );
         Err(ExecError::Own(doom_per_rule(txn_ctx, error)))
     } else {
-        // An error crossing out of the inner batch already carries every
-        // decision (dooming, and by crossing at all: termination).
-        run_block(storage, &statements, txn_ctx, run, in_try).map_err(ExecError::Inner)
+        // An inner RETURN exits the inner batch only (Break/Continue cannot
+        // escape — the inner parse rejects them, its own 135/136 scope). An
+        // error crossing out already carries every decision: dooming, and by
+        // crossing at all, termination of the whole nest.
+        run_block(storage, &statements, txn_ctx, run, in_try)
+            .map(|_| ())
+            .map_err(ExecError::Inner)
     };
     EXEC_DEPTH.with(|d| d.set(d.get() - 1));
     txn_ctx.variables = outer_vars;
@@ -827,13 +831,180 @@ fn run_exec(
     result
 }
 
+/// The ONE place a failed statement's fate is decided — continue the batch
+/// (`Ok(())`), or end it (`Err`, dooming already applied). The doom decision
+/// needs the statement's KIND (RAISERROR is exempt from XACT_ABORT; THROW is
+/// batch-terminating without dooming), so every decide-now error site funnels
+/// here: the generic statement arm and IF/WHILE condition failures. (EXEC
+/// boundary errors do NOT — theirs were decided at the source, in the inner
+/// `run_block` or `doom_per_rule`.)
+fn statement_error_ladder(
+    statement: &Statement,
+    error: SqlError,
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun<'_>,
+    in_try: bool,
+) -> Result<(), SqlError> {
+    // A cancelled statement aborts the batch immediately: key on the cancel
+    // marker, not any flag, so an Attention landing concurrently with an
+    // unrelated failure cannot suppress that failure's dooming. A cancel is
+    // not a SQL error, so `@@ERROR` is untouched.
+    if error.number == CANCEL_ERROR {
+        return Err(error);
+    }
+    txn_ctx.last_error = error.number;
+    // A durability failure wedged the store (a flush inside the statement,
+    // e.g. before a snapshot capture): never continue past a lost commit.
+    if run.durability_failed {
+        return Err(error);
+    }
+    // Severity >= 20 is fatal to the connection: it bypasses TRY (the
+    // TryCatch arm refuses it too), dooms the transaction, and the protocol
+    // layer closes the stream after delivering it.
+    if error.level >= FATAL_SEVERITY {
+        if txn_ctx.in_txn() {
+            txn_ctx.doomed = true;
+        }
+        return Err(error);
+    }
+    // The doom decision is made HERE, where the failing statement's kind is
+    // known — never re-derived at the TRY boundary, which cannot see it.
+    // `SET XACT_ABORT` (or severity >= 17) dooms; RAISERROR is exempt by
+    // definition (SQL Server: "errors raised by RAISERROR are not affected
+    // by SET XACT_ABORT") and never dooms.
+    let dooms = !matches!(statement, Statement::RaiseError(_))
+        && (txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY);
+    if txn_ctx.in_txn() && dooms {
+        txn_ctx.doomed = true;
+    }
+    // Inside a TRY, the error then transfers to the matching CATCH (which
+    // sees XACT_STATE() = -1 when it doomed). The CATCH runs more statements,
+    // so a result set this one already started streaming must be closed.
+    if in_try {
+        run.abort_open_rowset(txn_ctx.in_txn());
+        return Err(error);
+    }
+    // RAISERROR is statement-scope: the batch always continues.
+    if matches!(statement, Statement::RaiseError(_)) {
+        run.abort_open_rowset(txn_ctx.in_txn());
+        run.last_error = Some(error);
+        return Ok(());
+    }
+    // THROW always terminates the batch — even when it does not doom the
+    // transaction (XACT_ABORT OFF leaves it open and committable later).
+    if matches!(statement, Statement::Throw(_)) {
+        return Err(error);
+    }
+    // Other statements: a non-dooming in-transaction error rolls back only
+    // the statement and the batch continues; a dooming one ends the batch
+    // (only ROLLBACK is then accepted, error 3930).
+    if txn_ctx.in_txn() && !dooms {
+        run.abort_open_rowset(txn_ctx.in_txn());
+        run.last_error = Some(error);
+        return Ok(());
+    }
+    Err(error)
+}
+
+/// Enters the versioned-read scopes for an IF/WHILE condition that reads
+/// tables — the SAME rules a SELECT gets in `exec_statement_streamed`: under
+/// RCSI the condition reads its own statement snapshot; under SNAPSHOT
+/// isolation it establishes/uses the transaction snapshot and enforces 3952.
+/// Without this the condition read holds NEITHER lock nor snapshot (analysis
+/// assumes versioned reads and drops Table S) — a live dirty read, the
+/// Stage 13 seam class, caught by the control-flow review.
+fn enter_condition_scopes<'a>(
+    storage: &'a Storage,
+    condition: &Expr,
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun<'_>,
+) -> Result<(Option<SnapshotScope<'a>>, Option<TxnSnapshotScope>), SqlError> {
+    let mut tables = Vec::new();
+    collect_expr_tables(condition, &mut tables);
+    if tables.is_empty() {
+        return Ok((None, None));
+    }
+    match txn_ctx.isolation() {
+        Isolation::ReadCommitted if storage.rcsi_enabled() => {
+            // The snapshot is the durable commit prefix: the session's own
+            // just-committed statements must be durable before capture.
+            run.flush(storage)?;
+            Ok((
+                Some(SnapshotScope::enter(
+                    storage,
+                    txn_ctx.txn.as_ref().map(StorageTxn::txn_id),
+                )),
+                None,
+            ))
+        }
+        Isolation::Snapshot => {
+            if !storage.snapshot_isolation_allowed() {
+                if txn_ctx.in_txn() {
+                    txn_ctx.doomed = true;
+                }
+                return Err(snapshot_not_allowed_error(&txn_ctx.database));
+            }
+            if txn_ctx.in_txn() {
+                if txn_ctx.txn_snapshot.is_none() {
+                    // First data access establishes the transaction's view —
+                    // a condition read counts.
+                    run.flush(storage)?;
+                    let own = txn_ctx.txn.as_ref().map(StorageTxn::txn_id);
+                    txn_ctx.txn_snapshot = Some(storage.capture_read_snapshot(own));
+                }
+                Ok((None, txn_ctx.txn_snapshot.map(TxnSnapshotScope::enter)))
+            } else {
+                run.flush(storage)?;
+                Ok((Some(SnapshotScope::enter(storage, None)), None))
+            }
+        }
+        _ => Ok((None, None)),
+    }
+}
+
+/// Evaluates an IF/WHILE condition: subqueries (EXISTS, scalar, IN) resolve
+/// eagerly through the same machinery as WHERE-clause subqueries, then the
+/// residual expression evaluates against the session context. T-SQL
+/// three-valued: TRUE runs the branch; FALSE and NULL (UNKNOWN) do not.
+fn eval_condition(
+    storage: &Storage,
+    condition: &Expr,
+    txn_ctx: &TxnContext,
+) -> Result<bool, SqlError> {
+    let eval_ctx = txn_ctx.eval_context();
+    let no_outer = |_: &str| -> Option<usize> { None };
+    let resolved = substitute_correlated_in_expr(storage, condition, &no_outer, &[], &eval_ctx)?;
+    match eval_constant(&resolved, &eval_ctx)? {
+        SqlValue::Bool(taken) => Ok(taken),
+        SqlValue::Null => Ok(false),
+        _ => Err(SqlError::new(
+            4145,
+            15,
+            1,
+            "An expression of non-boolean type specified in a context where a condition is              expected.",
+        )),
+    }
+}
+
+/// How a statement block ended: normally, or via a control-flow statement
+/// that must propagate to the construct that absorbs it (`WHILE` for
+/// Break/Continue, the batch — later the procedure — for Return). TRY/CATCH
+/// and plain blocks pass every non-Normal flow straight through.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Flow {
+    Normal,
+    Break,
+    Continue,
+    Return,
+}
+
 fn run_block(
     storage: &Storage,
     statements: &[Statement],
     txn_ctx: &mut TxnContext,
     run: &mut BatchRun<'_>,
     in_try: bool,
-) -> Result<(), SqlError> {
+) -> Result<Flow, SqlError> {
     for statement in statements {
         // A TDS Attention (cancel) aborts the batch before the next statement.
         // It is never catchable — it propagates straight out, past any TRY.
@@ -895,6 +1066,86 @@ fn run_block(
             }
             continue;
         }
+        match statement {
+            Statement::Block { body, .. } => {
+                match run_block(storage, body, txn_ctx, run, in_try)? {
+                    Flow::Normal => {}
+                    flow => return Ok(flow),
+                }
+                continue;
+            }
+            Statement::If {
+                condition,
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                // A successful condition evaluation resets `@@ERROR` (the IF
+                // itself is a statement) — AFTER the condition read it, which
+                // is what makes `IF @@ERROR <> 0` work.
+                let taken = match enter_condition_scopes(storage, condition, txn_ctx, run)
+                    .and_then(|_scopes| eval_condition(storage, condition, txn_ctx))
+                {
+                    Ok(taken) => taken,
+                    Err(error) => {
+                        txn_ctx.rowcount = 0;
+                        statement_error_ladder(statement, error, txn_ctx, run, in_try)?;
+                        continue;
+                    }
+                };
+                txn_ctx.last_error = 0;
+                let branch = if taken {
+                    Some(then_branch)
+                } else {
+                    else_branch.as_ref()
+                };
+                if let Some(branch) = branch {
+                    match run_block(storage, std::slice::from_ref(branch), txn_ctx, run, in_try)? {
+                        Flow::Normal => {}
+                        flow => return Ok(flow),
+                    }
+                }
+                continue;
+            }
+            Statement::While {
+                condition, body, ..
+            } => {
+                loop {
+                    // A TDS Attention lands between iterations too — an
+                    // infinite `WHILE 1 = 1` must die on cancel even when its
+                    // body runs no cancellable statement.
+                    check_cancelled()?;
+                    let taken = match enter_condition_scopes(storage, condition, txn_ctx, run)
+                        .and_then(|_scopes| eval_condition(storage, condition, txn_ctx))
+                    {
+                        Ok(taken) => taken,
+                        Err(error) => {
+                            txn_ctx.rowcount = 0;
+                            statement_error_ladder(statement, error, txn_ctx, run, in_try)?;
+                            break;
+                        }
+                    };
+                    txn_ctx.last_error = 0;
+                    if !taken {
+                        break;
+                    }
+                    match run_block(storage, std::slice::from_ref(body), txn_ctx, run, in_try)? {
+                        Flow::Normal | Flow::Continue => {}
+                        Flow::Break => break,
+                        Flow::Return => return Ok(Flow::Return),
+                    }
+                }
+                continue;
+            }
+            // The parser rejects BREAK/CONTINUE outside a WHILE (135/136), so
+            // these only ever propagate up to an enclosing loop.
+            Statement::Break { .. } => return Ok(Flow::Break),
+            Statement::Continue { .. } => return Ok(Flow::Continue),
+            // The parser rejects `RETURN <value>` outside a procedure (178),
+            // so a reachable RETURN just exits the batch.
+            Statement::Return { .. } => return Ok(Flow::Return),
+            _ => {}
+        }
         if let Statement::TryCatch {
             try_block,
             catch_block,
@@ -902,7 +1153,9 @@ fn run_block(
         } = statement
         {
             match run_block(storage, try_block, txn_ctx, run, true) {
-                Ok(()) => {}
+                Ok(Flow::Normal) => {}
+                // BREAK/CONTINUE/RETURN cross a TRY without running its CATCH.
+                Ok(flow) => return Ok(flow),
                 // An Attention that landed inside the TRY block is not caught.
                 Err(cancel) if cancel.number == CANCEL_ERROR => return Err(cancel),
                 // A durability failure wedged the store: no CATCH swallows a
@@ -930,7 +1183,10 @@ fn run_block(
                     // outer CATCH (or end the batch) per `in_try`.
                     let caught = run_block(storage, catch_block, txn_ctx, run, in_try);
                     txn_ctx.pop_error();
-                    caught?;
+                    match caught? {
+                        Flow::Normal => {}
+                        flow => return Ok(flow),
+                    }
                 }
             }
             continue;
@@ -1005,76 +1261,11 @@ fn run_block(
             Err(error) => {
                 // A failed statement sets @@ROWCOUNT to 0, as SQL Server does.
                 txn_ctx.rowcount = 0;
-                // A cancelled statement aborts the batch immediately (see above):
-                // key on the cancel marker, not any flag, so an Attention landing
-                // concurrently with an unrelated failure cannot suppress that
-                // failure's dooming. (No rowset close: the batch ends here, and
-                // its terminal DONE closes anything the statement left open.)
-                // A cancel is not a SQL error, so `@@ERROR` is untouched.
-                if error.number == CANCEL_ERROR {
-                    return Err(error);
-                }
-                txn_ctx.last_error = error.number;
-                // A durability failure wedged the store (a flush inside the
-                // statement, e.g. before a snapshot capture): never continue
-                // past a lost commit.
-                if run.durability_failed {
-                    return Err(error);
-                }
-                // Severity >= 20 is fatal to the connection: it bypasses TRY
-                // (the TryCatch arm refuses it too), dooms the transaction,
-                // and the protocol layer closes the stream after delivering
-                // it.
-                if error.level >= FATAL_SEVERITY {
-                    if txn_ctx.in_txn() {
-                        txn_ctx.doomed = true;
-                    }
-                    return Err(error);
-                }
-                // The doom decision is made HERE, where the failing statement's
-                // kind is known — never re-derived at the TRY boundary, which
-                // cannot see it. `SET XACT_ABORT` (or severity >= 17) dooms the
-                // transaction; RAISERROR is exempt by definition (SQL Server:
-                // "errors raised by RAISERROR are not affected by SET
-                // XACT_ABORT") and never dooms.
-                let dooms = !matches!(statement, Statement::RaiseError(_))
-                    && (txn_ctx.xact_abort || error.level >= XACT_ABORT_SEVERITY);
-                if txn_ctx.in_txn() && dooms {
-                    txn_ctx.doomed = true;
-                }
-                // Inside a TRY, the error then transfers to the matching CATCH
-                // (which sees XACT_STATE() = -1 when it doomed). The CATCH runs
-                // more statements, so a result set this one already started
-                // streaming must be closed first.
-                if in_try {
-                    run.abort_open_rowset(txn_ctx.in_txn());
-                    return Err(error);
-                }
-                // RAISERROR is statement-scope: the batch always continues.
-                if matches!(statement, Statement::RaiseError(_)) {
-                    run.abort_open_rowset(txn_ctx.in_txn());
-                    run.last_error = Some(error);
-                    continue;
-                }
-                // THROW always terminates the batch — even when it does not
-                // doom the transaction (XACT_ABORT OFF leaves the transaction
-                // open and committable from a later batch).
-                if matches!(statement, Statement::Throw(_)) {
-                    return Err(error);
-                }
-                // Other statements: a non-dooming error rolls back only the
-                // statement and the batch continues; a dooming one ends the
-                // batch (only ROLLBACK is then accepted, error 3930).
-                if txn_ctx.in_txn() && !dooms {
-                    run.abort_open_rowset(txn_ctx.in_txn());
-                    run.last_error = Some(error);
-                    continue;
-                }
-                return Err(error);
+                statement_error_ladder(statement, error, txn_ctx, run, in_try)?;
             }
         }
     }
-    Ok(())
+    Ok(Flow::Normal)
 }
 
 /// `sp_describe_first_result_set`: the column metadata of `tsql`'s first
@@ -1211,8 +1402,10 @@ fn produces_rowset(statement: &Statement) -> bool {
             .items
             .iter()
             .any(|i| matches!(i, SelectItem::Assign { .. })),
-        // EXEC's inner batch may open result sets; conservative.
+        // EXEC's inner batch — and any control-flow body — may open result
+        // sets; conservative.
         Statement::Exec(_) => true,
+        Statement::Block { .. } | Statement::If { .. } | Statement::While { .. } => true,
         _ => false,
     }
 }
@@ -1432,6 +1625,9 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::AlterTable(_)
             | Statement::AlterDatabase(_)
             | Statement::Exec(_)
+            | Statement::Block { .. }
+            | Statement::If { .. }
+            | Statement::While { .. }
             | Statement::Commit { .. }
     )
 }
@@ -1969,10 +2165,33 @@ pub fn analyze_locks(
                 }
                 None => add(Resource::Database, LockMode::Exclusive),
             },
+            // IF/WHILE conditions read tables through their subqueries —
+            // locked exactly like a SELECT's tables (their bodies were
+            // flattened into this list and analyze as themselves).
+            Statement::If { condition, .. } | Statement::While { condition, .. } => {
+                if !reads_lock {
+                    continue;
+                }
+                let mut tables = Vec::new();
+                collect_expr_tables(condition, &mut tables);
+                for name in tables {
+                    for oid in read_lock_object_ids(storage, &name.value) {
+                        add(Resource::Database, LockMode::IntentShared);
+                        if !versioned_reads {
+                            add(Resource::Table(oid), LockMode::Shared);
+                        }
+                    }
+                }
+            }
             // Transaction control, SET, and DECLARE take no data locks.
-            // TRY/CATCH was flattened away by `flatten_statements`, so its
-            // contained statements appear here directly.
-            Statement::BeginTransaction { .. }
+            // TRY/CATCH and plain blocks were flattened away by
+            // `flatten_statements`, so their contained statements appear here
+            // directly; BREAK/CONTINUE/RETURN touch nothing.
+            Statement::Block { .. }
+            | Statement::Break { .. }
+            | Statement::Continue { .. }
+            | Statement::Return { .. }
+            | Statement::BeginTransaction { .. }
             | Statement::Commit { .. }
             | Statement::Rollback { .. }
             | Statement::SaveTransaction { .. }
@@ -2079,6 +2298,15 @@ fn exec_statement_dispatch(
         Statement::BeginTransaction { .. } => exec_begin(storage, txn_ctx),
         Statement::Use { database, .. } => exec_use(database, txn_ctx),
         Statement::Throw(throw) => Err(exec_throw(throw, txn_ctx)),
+        // Executed by `run_block`'s own arms; nothing routes them here.
+        Statement::Block { .. }
+        | Statement::If { .. }
+        | Statement::While { .. }
+        | Statement::Break { .. }
+        | Statement::Continue { .. }
+        | Statement::Return { .. } => {
+            unreachable!("control flow is executed by run_block")
+        }
         // Handled in `exec_statement_streamed_inner` (severity <= 10 emits an
         // INFO event, which needs the emitter); nothing else routes it here.
         Statement::RaiseError(_) => unreachable!("RAISERROR reaches only the streaming executor"),
@@ -2230,6 +2458,27 @@ fn flatten_statements<'a>(statements: &'a [Statement], out: &mut Vec<&'a Stateme
             } => {
                 flatten_statements(try_block, out);
                 flatten_statements(catch_block, out);
+            }
+            Statement::Block { body, .. } => flatten_statements(body, out),
+            // IF/WHILE stay in the list (their CONDITIONS take read locks);
+            // their bodies flatten so the leaf statements analyze as
+            // themselves — a WHILE body's INSERT needs its lock up front like
+            // any other, and both IF branches are analyzed (conservative:
+            // which one runs is a runtime fact).
+            Statement::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                out.push(statement);
+                flatten_statements(std::slice::from_ref(then_branch), out);
+                if let Some(else_branch) = else_branch {
+                    flatten_statements(std::slice::from_ref(else_branch), out);
+                }
+            }
+            Statement::While { body, .. } => {
+                out.push(statement);
+                flatten_statements(std::slice::from_ref(body), out);
             }
             other => out.push(other),
         }
@@ -7822,6 +8071,15 @@ fn collect_table_names<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
 /// subquery embedded in its expressions (WHERE/SELECT list/HAVING/GROUP BY/
 /// ORDER BY). Recurses through nested subqueries.
 fn collect_locked_tables<'a>(select: &'a Select, out: &mut Vec<&'a Name>) {
+    // CTE bodies read their base tables like any derived table — collected
+    // HERE, not left to callers' inlining passes: a condition subquery's
+    // `WITH` has no expansion pass before lock analysis, and a missed table
+    // is a read with no lock under up-front 2PL (the review's finding). A
+    // CTE's own name may land in `out` via FROM references; it resolves to
+    // no object and locks nothing, which is correct.
+    for cte in &select.ctes {
+        collect_locked_tables(&cte.query, out);
+    }
     if let Some(from) = &select.from {
         collect_from_tables(from, out);
     }

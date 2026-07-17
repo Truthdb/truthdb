@@ -4532,6 +4532,156 @@ mod tests {
     /// A READ COMMITTED SELECT under RCSI takes only Database IS — no Table
     /// S — which is the entire readers-don't-block mechanism; and the other
     /// levels are untouched by the option.
+    /// Lock analysis descends control-flow bodies: a WHILE body's INSERT and
+    /// an IF condition's EXISTS table are in the batch's up-front lock set.
+    #[test]
+    fn analyze_locks_descends_control_flow() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::{Isolation, TxnContext, execute_batch};
+
+        let path = unique_temp_path("flow-locks");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "CREATE TABLE locked_t (id INT NOT NULL PRIMARY KEY)",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "DECLARE @i INT = 0; WHILE @i < 3 BEGIN INSERT INTO locked_t VALUES (@i); \
+             SET @i = @i + 1; END",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            needs.iter().any(
+                |(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Exclusive
+                    || matches!(r, Resource::Row(..))
+            ),
+            "the WHILE body's INSERT locks its table: {needs:?}"
+        );
+
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "IF EXISTS (SELECT * FROM locked_t) SELECT 1",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Shared),
+            "the IF condition's EXISTS table takes Table S: {needs:?}"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Adversarial probes (control-flow review): condition shapes whose table
+    /// reads must be in the up-front lock set — a WHILE condition, a derived
+    /// table and an IN-subquery inside the condition, a CASE-wrapped EXISTS,
+    /// a view, an untaken ELSE branch's write, and an EXEC literal inside a
+    /// WHILE body.
+    #[test]
+    fn cf_review_analyze_locks_condition_shapes() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::{Isolation, TxnContext, execute_batch};
+
+        let path = unique_temp_path("cf-flow-lock-shapes");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        for sql in [
+            "CREATE TABLE lt (id INT NOT NULL PRIMARY KEY)",
+            "CREATE VIEW lv AS SELECT id FROM lt",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        let table_s = |needs: &[(Resource, LockMode)]| {
+            needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Shared)
+        };
+        let table_write = |needs: &[(Resource, LockMode)]| {
+            needs.iter().any(|(r, m)| {
+                matches!(r, Resource::Table(_)) && *m == LockMode::Exclusive
+                    || matches!(r, Resource::Row(..))
+            })
+        };
+        for sql in [
+            "WHILE EXISTS (SELECT * FROM lt) SELECT 1",
+            "IF EXISTS (SELECT * FROM (SELECT id FROM lt) d) SELECT 1",
+            "IF 1 IN (SELECT id FROM lt) SELECT 1",
+            "IF CASE WHEN EXISTS (SELECT * FROM lt) THEN 1 ELSE 0 END = 1 SELECT 1",
+            "IF EXISTS (SELECT * FROM lv) SELECT 1",
+            "IF (SELECT COUNT(*) FROM lt) = 0 SELECT 1",
+        ] {
+            let needs = crate::rel::analyze_locks(&storage, sql, Isolation::ReadCommitted);
+            assert!(
+                table_s(&needs),
+                "{sql}: condition read takes Table S: {needs:?}"
+            );
+        }
+        // Both IF branches analyze — an untaken ELSE's INSERT is still locked.
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "IF 1 = 2 SELECT 1 ELSE INSERT INTO lt VALUES (9)",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            table_write(&needs),
+            "the ELSE branch's INSERT locks its table: {needs:?}"
+        );
+        // An EXEC literal inside a WHILE body analyzes through the Exec arm.
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "DECLARE @i INT = 0; WHILE @i < 1 BEGIN \
+             EXEC sp_executesql N'INSERT INTO lt VALUES (7)'; SET @i = @i + 1; END",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            table_write(&needs),
+            "the EXEC'd INSERT inside the loop locks its table: {needs:?}"
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// A CTE inside an IF condition's subquery: the executor inlines it and
+    /// reads the base table (engine.rs pins that half), so analysis must lock
+    /// that table like the Select arm does — the expectation here is the
+    /// FIXED behavior.
+    #[test]
+    fn cf_review_analyze_locks_condition_cte() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::{Isolation, TxnContext, execute_batch};
+
+        let path = unique_temp_path("cf-flow-lock-cte");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(
+            &storage,
+            "CREATE TABLE lt (id INT NOT NULL PRIMARY KEY)",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            "IF EXISTS (WITH x AS (SELECT id FROM lt) SELECT id FROM x) SELECT 1",
+            Isolation::ReadCommitted,
+        );
+        assert!(
+            needs
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Shared),
+            "the CTE's base table is read at runtime and must be locked: {needs:?}"
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn analyze_locks_drops_table_s_under_rcsi() {
         use crate::lock::{LockMode, Resource};
