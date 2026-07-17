@@ -15,10 +15,10 @@ mod value;
 
 use truthdb_sql::ast::{
     AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateFunction,
-    CreateIndex, CreateProcedure, CreateTable, CreateView, DataType, DatabaseOption, Declaration,
-    Delete, DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind, ForeignKey, Insert,
-    InsertSource, IsolationLevel, JoinKind, Name, OrderItem, RaiseError, ReturnsClause, Select,
-    SelectItem, SetStatement, Statement, TableRef, ThrowArgs, ThrowStatement, Update,
+    CreateIndex, CreateProcedure, CreateTable, CreateTrigger, CreateView, DataType, DatabaseOption,
+    Declaration, Delete, DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind, ForeignKey,
+    Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem, RaiseError, ReturnsClause,
+    Select, SelectItem, SetStatement, Statement, TableRef, ThrowArgs, ThrowStatement, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -32,7 +32,7 @@ use xxhash_rust::xxh64::xxh64;
 use crate::lock::{LockMode, Resource};
 use crate::relstore::btree::ScanCursor;
 use crate::relstore::catalog::{
-    self, FunctionDef, FunctionReturns, ProcParamDef, ProcedureDef, TableDef,
+    self, FunctionDef, FunctionReturns, ProcParamDef, ProcedureDef, TableDef, TriggerDef,
 };
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
@@ -2035,6 +2035,123 @@ fn arm_table_var_view(vars: &std::collections::HashMap<String, TableVar>) -> Opt
     (!vars.is_empty() || outer_armed).then(|| TableVarScope::enter(std::rc::Rc::new(vars.clone())))
 }
 
+/// The `inserted`/`deleted` pseudo-tables a firing trigger body reads: the new
+/// and old row images of the statement that fired it, with the parent table's
+/// schema. Rows are in schema order, exactly like a base-table row.
+struct TriggerTables {
+    schema: Schema,
+    inserted: Vec<Vec<Datum>>,
+    deleted: Vec<Vec<Datum>>,
+}
+
+thread_local! {
+    /// The `inserted`/`deleted` view visible to the running trigger body (like
+    /// CURRENT_TABLE_VARS for table variables — a batch runs on one thread and
+    /// the FROM-source builders carry only an EvalContext).
+    static CURRENT_TRIGGER_TABLES: std::cell::RefCell<Option<std::rc::Rc<TriggerTables>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The `inserted` or `deleted` pseudo-table rows visible to the running trigger,
+/// as a materialized source, if a trigger scope is armed and `name` is one of
+/// them. Returns `None` for any other name (falls through to catalog resolution).
+fn current_trigger_source(name: &str, qualifier: &str) -> Option<Source> {
+    let which = name.to_ascii_lowercase();
+    if which != "inserted" && which != "deleted" {
+        return None;
+    }
+    CURRENT_TRIGGER_TABLES.with(|c| {
+        let borrow = c.borrow();
+        let tables = borrow.as_ref()?;
+        let rows = if which == "inserted" {
+            tables.inserted.clone()
+        } else {
+            tables.deleted.clone()
+        };
+        let count = tables.schema.columns.len();
+        let columns = tables
+            .schema
+            .columns
+            .iter()
+            .map(|col| ResultColumn {
+                name: col.name.clone(),
+                column_type: col.column_type,
+            })
+            .collect();
+        let collations = tables
+            .schema
+            .columns
+            .iter()
+            .map(|col| col.collation.clone())
+            .collect();
+        Some(Source {
+            columns,
+            qualifiers: vec![Some(qualifier.to_string()); count],
+            collations,
+            rows: SourceRows::Materialized(rows),
+        })
+    })
+}
+
+/// Installs the `inserted`/`deleted` view for a trigger body's execution,
+/// restoring the prior installation on drop (a nested trigger's body shadows the
+/// outer's — restore rather than clear).
+struct TriggerScope {
+    prev: Option<std::rc::Rc<TriggerTables>>,
+}
+
+impl TriggerScope {
+    fn enter(tables: std::rc::Rc<TriggerTables>) -> Self {
+        let prev = CURRENT_TRIGGER_TABLES.with(|c| c.borrow_mut().replace(tables));
+        TriggerScope { prev }
+    }
+}
+
+impl Drop for TriggerScope {
+    fn drop(&mut self) {
+        CURRENT_TRIGGER_TABLES.with(|c| *c.borrow_mut() = self.prev.take());
+    }
+}
+
+thread_local! {
+    /// The row images captured by the DML that is currently firing triggers, so
+    /// exec_insert/update/delete can populate `inserted`/`deleted` without a
+    /// signature change. Armed by the firing wrapper ONLY when the target table
+    /// has triggers — the common no-trigger path leaves this `None` (no clone).
+    static TRIGGER_CAPTURE: std::cell::RefCell<Option<CapturedImages>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// New (`inserted`) and old (`deleted`) row images collected during a DML that
+/// has AFTER triggers to fire.
+#[derive(Default)]
+struct CapturedImages {
+    inserted: Vec<Vec<Datum>>,
+    deleted: Vec<Vec<Datum>>,
+}
+
+/// Records row images into the active capture, if one is armed. `f` builds the
+/// (inserted, deleted) images for a statement; it runs only when capture is on,
+/// so the no-trigger path pays nothing.
+fn capture_trigger_images(f: impl FnOnce() -> (Vec<Vec<Datum>>, Vec<Vec<Datum>>)) {
+    TRIGGER_CAPTURE.with(|c| {
+        let mut borrow = c.borrow_mut();
+        if let Some(images) = borrow.as_mut() {
+            let (ins, del) = f();
+            images.inserted.extend(ins);
+            images.deleted.extend(del);
+        }
+    });
+}
+
+thread_local! {
+    /// The object_ids of triggers whose bodies are currently on the stack. With
+    /// recursive triggers OFF (the default), a trigger must not re-fire itself
+    /// (direct recursion) — a trigger on T whose body DMLs T is suppressed for
+    /// that same trigger. Nested triggers on OTHER tables are not affected.
+    static FIRING_TRIGGERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Statement-scoped snapshot registration: capture on entry, and release —
 /// pruning must not wait on a statement that errored — on every exit path.
 struct SnapshotScope<'a> {
@@ -2261,6 +2378,8 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::DropProcedure { .. }
             | Statement::CreateFunction(_)
             | Statement::DropFunction { .. }
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger { .. }
             | Statement::Commit { .. }
     )
 }
@@ -2687,6 +2806,16 @@ fn analyze_statements_locks(
                         add(Resource::Database, LockMode::IntentShared);
                         add(Resource::Table(oid), LockMode::Shared);
                     }
+                    // A firing AFTER-INSERT trigger's body reads/writes further
+                    // tables; hold those locks up front too (strict 2PL).
+                    let mut tvisited = std::collections::HashSet::new();
+                    add_trigger_locks(
+                        storage,
+                        def.object_id,
+                        catalog::TriggerEvent::Insert,
+                        &mut tvisited,
+                        &mut add,
+                    );
                 }
                 // INSERT ... SELECT also reads its source tables (and any
                 // subqueries in the SELECT); lock them like a SELECT so it
@@ -2740,6 +2869,14 @@ fn analyze_statements_locks(
                         add(Resource::Database, LockMode::IntentShared);
                         add(Resource::Table(oid), LockMode::Shared);
                     }
+                    let mut tvisited = std::collections::HashSet::new();
+                    add_trigger_locks(
+                        storage,
+                        def.object_id,
+                        catalog::TriggerEvent::Update,
+                        &mut tvisited,
+                        &mut add,
+                    );
                 }
             }
             Statement::Delete(delete) => {
@@ -2768,6 +2905,14 @@ fn analyze_statements_locks(
                         add(Resource::Database, LockMode::IntentShared);
                         add(Resource::Table(oid), LockMode::Shared);
                     }
+                    let mut tvisited = std::collections::HashSet::new();
+                    add_trigger_locks(
+                        storage,
+                        def.object_id,
+                        catalog::TriggerEvent::Delete,
+                        &mut tvisited,
+                        &mut add,
+                    );
                 }
             }
             // DDL serializes against every active transaction via a
@@ -2868,7 +3013,9 @@ fn analyze_statements_locks(
             Statement::CreateProcedure(_)
             | Statement::DropProcedure { .. }
             | Statement::CreateFunction(_)
-            | Statement::DropFunction { .. } => {
+            | Statement::DropFunction { .. }
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger { .. } => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // IF/WHILE conditions read tables through their subqueries —
@@ -3039,6 +3186,20 @@ fn exec_statement_dispatch(
             }
             exec_drop_function(storage, name, *if_exists)
         }
+        Statement::CreateTrigger(create) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_trigger(storage, create)
+        }
+        Statement::DropTrigger {
+            name, if_exists, ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_trigger(storage, name, *if_exists)
+        }
         // Executed by `run_block`'s own arms; nothing routes them here.
         Statement::Block { .. }
         | Statement::If { .. }
@@ -3119,33 +3280,64 @@ fn exec_statement_dispatch(
             exec_alter_database(storage, alter, txn_ctx)
         }
         Statement::Insert(insert) => {
-            let eval_ctx = txn_ctx.eval_context();
             // INSERT into a `@t` table variable is pure session memory (no
             // Storage, no lock, no WAL) — handled here where `&mut TxnContext`
             // is in hand, before the storage scope is taken.
             if insert.table.value.starts_with('@') {
+                let eval_ctx = txn_ctx.eval_context();
                 return exec_insert_table_var(storage, insert, txn_ctx, &eval_ctx);
             }
-            let (result, identity) = {
-                let mut scope = txn_ctx.scope();
-                exec_insert(storage, insert, &mut scope, &eval_ctx)?
+            let (target, triggers) =
+                after_triggers_for(storage, &insert.table.value, catalog::TriggerEvent::Insert);
+            let run_insert = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
+                let eval_ctx = txn_ctx.eval_context();
+                let (result, identity) = {
+                    let mut scope = txn_ctx.scope();
+                    exec_insert(storage, insert, &mut scope, &eval_ctx)?
+                };
+                // An identity INSERT updates SCOPE_IDENTITY(); a non-identity one
+                // (identity == None) leaves it unchanged.
+                if let Some(value) = identity {
+                    txn_ctx.scope_identity = Some(value);
+                }
+                Ok(result)
             };
-            // An identity INSERT updates SCOPE_IDENTITY(); a non-identity one
-            // (identity == None) leaves it unchanged.
-            if let Some(value) = identity {
-                txn_ctx.scope_identity = Some(value);
+            match target {
+                Some(target) if !triggers.is_empty() => {
+                    run_dml_with_triggers(storage, txn_ctx, &target, triggers, run_insert)
+                }
+                _ => run_insert(txn_ctx),
             }
-            Ok(result)
         }
         Statement::Update(update) => {
-            let eval_ctx = txn_ctx.eval_context();
-            let mut scope = txn_ctx.scope();
-            exec_update(storage, update, &mut scope, &eval_ctx)
+            let (target, triggers) =
+                after_triggers_for(storage, &update.table.value, catalog::TriggerEvent::Update);
+            let run_update = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
+                let eval_ctx = txn_ctx.eval_context();
+                let mut scope = txn_ctx.scope();
+                exec_update(storage, update, &mut scope, &eval_ctx)
+            };
+            match target {
+                Some(target) if !triggers.is_empty() => {
+                    run_dml_with_triggers(storage, txn_ctx, &target, triggers, run_update)
+                }
+                _ => run_update(txn_ctx),
+            }
         }
         Statement::Delete(delete) => {
-            let eval_ctx = txn_ctx.eval_context();
-            let mut scope = txn_ctx.scope();
-            exec_delete(storage, delete, &mut scope, &eval_ctx)
+            let (target, triggers) =
+                after_triggers_for(storage, &delete.table.value, catalog::TriggerEvent::Delete);
+            let run_delete = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
+                let eval_ctx = txn_ctx.eval_context();
+                let mut scope = txn_ctx.scope();
+                exec_delete(storage, delete, &mut scope, &eval_ctx)
+            };
+            match target {
+                Some(target) if !triggers.is_empty() => {
+                    run_dml_with_triggers(storage, txn_ctx, &target, triggers, run_delete)
+                }
+                _ => run_delete(txn_ctx),
+            }
         }
         Statement::Select(select) => {
             if select
@@ -5352,6 +5544,249 @@ fn exec_drop_function(
     }
 }
 
+/// `CREATE|ALTER TRIGGER <name> ON <table> AFTER <events> AS <body>`: registers
+/// an AFTER DML trigger as a catalog object attached to its target table.
+fn exec_create_trigger(
+    storage: &Storage,
+    create: &CreateTrigger,
+) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&create.name.value);
+    // The target must be an existing base table (not a view/procedure/function/
+    // trigger). SQL Server 4929-class.
+    let target = resolve_table(storage, &create.target.value)
+        .ok_or_else(|| SqlError::invalid_object(&create.target.value).at(create.target.span))?;
+    if target.is_view() || target.is_procedure() || target.is_function() || target.is_trigger() {
+        return Err(SqlError::new(
+            4929,
+            16,
+            1,
+            format!(
+                "Cannot create trigger '{bare}' because its target '{}' is not a base table.",
+                target.name
+            ),
+        )
+        .at(create.target.span));
+    }
+    // Validate the body parses under the in-procedure grammar (re-parsed per
+    // firing). inserted/deleted resolve at firing time, not here.
+    truthdb_sql::parse_procedure_body(&create.body)?;
+    let events: Vec<catalog::TriggerEvent> = create
+        .events
+        .iter()
+        .map(|e| match e {
+            ast::TriggerEvent::Insert => catalog::TriggerEvent::Insert,
+            ast::TriggerEvent::Update => catalog::TriggerEvent::Update,
+            ast::TriggerEvent::Delete => catalog::TriggerEvent::Delete,
+        })
+        .collect();
+    let trigger = TriggerDef {
+        parent_object_id: target.object_id,
+        events,
+        body: create.body.clone(),
+        is_disabled: false,
+    };
+    if create.alter {
+        match resolve_table(storage, &create.name.value) {
+            Some(def) if def.is_trigger() => {
+                storage
+                    .rel_alter_trigger(&def.name, trigger)
+                    .map_err(|e| map_storage_err(e, &create.name.value))?;
+                return Ok(StatementResult::Done);
+            }
+            _ => {
+                return Err(SqlError::invalid_object(bare).at(create.name.span));
+            }
+        }
+    }
+    if resolve_table(storage, &create.name.value).is_some() {
+        return Err(SqlError::new(
+            2714,
+            16,
+            6,
+            format!("There is already an object named '{bare}' in the database."),
+        ));
+    }
+    storage
+        .rel_create_trigger(bare, trigger)
+        .map_err(|e| map_storage_err(e, &create.name.value))?;
+    Ok(StatementResult::Done)
+}
+
+fn exec_drop_trigger(
+    storage: &Storage,
+    name: &Name,
+    if_exists: bool,
+) -> Result<StatementResult, SqlError> {
+    match resolve_table(storage, &name.value) {
+        Some(def) if def.is_trigger() => {
+            storage
+                .rel_drop_table(&def.name)
+                .map_err(|e| map_storage_err(e, &def.name))?;
+            Ok(StatementResult::Done)
+        }
+        Some(_) | None if if_exists => Ok(StatementResult::Done),
+        _ => Err(SqlError::new(
+            3701,
+            11,
+            5,
+            format!(
+                "Cannot drop the trigger '{}', because it does not exist or you do not have \
+                 permission.",
+                name.value
+            ),
+        )),
+    }
+}
+
+/// Resolves the AFTER triggers to fire for a DML on `target_name` for `event`,
+/// plus the target's definition (for the pseudo-table schema). Empty when no
+/// trigger exists anywhere (the cheap `rel_has_triggers` gate keeps the common
+/// path free) or the target is not a base table.
+fn after_triggers_for(
+    storage: &Storage,
+    target_name: &str,
+    event: catalog::TriggerEvent,
+) -> (Option<TableDef>, Vec<TableDef>) {
+    if !storage.rel_has_triggers() {
+        return (None, Vec::new());
+    }
+    match resolve_table(storage, target_name) {
+        Some(def)
+            if def.trigger.is_none()
+                && def.procedure.is_none()
+                && def.function.is_none()
+                && def.view_query.is_none() =>
+        {
+            let triggers = storage.rel_triggers_for(def.object_id, event);
+            (Some(def), triggers)
+        }
+        _ => (None, Vec::new()),
+    }
+}
+
+/// Runs a DML statement (via `dml`) and fires its AFTER triggers atomically.
+/// Under autocommit an implicit transaction is opened so the DML stages rather
+/// than commits, so DML + triggers share one transaction (a trigger ROLLBACK
+/// undoes the DML) and a trigger that ends the transaction raises 3609.
+fn run_dml_with_triggers(
+    storage: &Storage,
+    txn_ctx: &mut TxnContext,
+    target_def: &TableDef,
+    triggers: Vec<TableDef>,
+    dml: impl FnOnce(&mut TxnContext) -> Result<StatementResult, SqlError>,
+) -> Result<StatementResult, SqlError> {
+    let schema = target_def
+        .schema()
+        .map_err(|e| map_storage_err(e, &target_def.name))?;
+    let implicit = !txn_ctx.in_txn();
+    if implicit {
+        exec_begin(storage, txn_ctx)?;
+    }
+    let tc_before = txn_ctx.trancount;
+    // Arm the row-image capture, run the DML (staged on the transaction), then
+    // take the captured images for the trigger bodies.
+    TRIGGER_CAPTURE.with(|c| *c.borrow_mut() = Some(CapturedImages::default()));
+    let dml_result = dml(txn_ctx);
+    let images = TRIGGER_CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default();
+    let result = match dml_result {
+        Ok(r) => r,
+        Err(e) => {
+            if implicit {
+                txn_ctx.abort(storage);
+            }
+            return Err(e);
+        }
+    };
+    let tables = std::rc::Rc::new(TriggerTables {
+        schema,
+        inserted: images.inserted,
+        deleted: images.deleted,
+    });
+    // Fire each trigger once, in creation order, even for an empty image set.
+    for trig_def in &triggers {
+        if let Err(e) = fire_one_trigger(storage, txn_ctx, trig_def, &tables) {
+            if implicit {
+                txn_ctx.abort(storage);
+            }
+            return Err(e);
+        }
+        // 3609: a trigger that issued ROLLBACK/COMMIT ended (or reduced) the
+        // transaction — the batch is aborted. `abort` normalizes the state.
+        if txn_ctx.trancount < tc_before {
+            txn_ctx.abort(storage);
+            return Err(SqlError::new(
+                3609,
+                16,
+                1,
+                "The transaction ended in the trigger. The batch has been aborted.",
+            ));
+        }
+    }
+    if implicit {
+        exec_commit(storage, txn_ctx)?;
+    }
+    Ok(result)
+}
+
+/// Fires one trigger body: parses it, runs it in the firing statement's
+/// transaction (procedure posture — shared txn, fresh variable scope) with the
+/// `inserted`/`deleted` view armed, bounded by the nesting cap. Direct
+/// self-recursion is suppressed (recursive triggers OFF).
+fn fire_one_trigger(
+    storage: &Storage,
+    txn_ctx: &mut TxnContext,
+    trig_def: &TableDef,
+    tables: &std::rc::Rc<TriggerTables>,
+) -> Result<(), SqlError> {
+    let trigger = trig_def.trigger.as_ref().expect("caller passes a trigger");
+    // Recursive triggers OFF (the default): a trigger must not re-fire itself.
+    if FIRING_TRIGGERS.with(|f| f.borrow().contains(&trig_def.object_id)) {
+        return Ok(());
+    }
+    let statements = truthdb_sql::parse_procedure_body(&trigger.body)?;
+    let depth = EXEC_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    if depth > 32 {
+        EXEC_DEPTH.with(|d| d.set(d.get() - 1));
+        return Err(SqlError::new(
+            217,
+            16,
+            1,
+            "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).",
+        ));
+    }
+    // Procedure posture: fresh variable/table-variable scope, shared transaction.
+    let outer_vars = std::mem::take(&mut txn_ctx.variables);
+    let outer_table_vars = std::mem::take(&mut txn_ctx.table_variables);
+    FIRING_TRIGGERS.with(|f| f.borrow_mut().push(trig_def.object_id));
+    let result = {
+        let _trigger_scope = TriggerScope::enter(std::rc::Rc::clone(tables));
+        let mut emitter = DiscardEmitter;
+        let mut run = BatchRun {
+            emitter: &mut emitter,
+            deferred: Vec::new(),
+            rowset_open: false,
+            durability_failed: false,
+            committed: false,
+            last_error: None,
+            function_return_type: None,
+        };
+        run_block(storage, &statements, txn_ctx, &mut run, false).map(|_| ())
+    };
+    FIRING_TRIGGERS.with(|f| {
+        f.borrow_mut().pop();
+    });
+    EXEC_DEPTH.with(|d| d.set(d.get() - 1));
+    txn_ctx.variables = outer_vars;
+    txn_ctx.table_variables = outer_table_vars;
+    result
+}
+
 fn exec_drop_view(storage: &Storage, drop: &DropView) -> Result<StatementResult, SqlError> {
     match resolve_table(storage, &drop.name.value) {
         Some(def) if def.is_view() => {
@@ -5960,6 +6395,9 @@ fn exec_insert(
         }
     }
 
+    // Capture the new row images for an AFTER trigger's `inserted` table (only
+    // when a capture is armed — the no-trigger path clones nothing).
+    capture_trigger_images(|| (rows.clone(), Vec::new()));
     let inserted = rows.len() as u64;
     storage
         .rel_insert_many(&def.name, rows, scope)
@@ -6381,6 +6819,15 @@ fn exec_update(
         }
     }
 
+    // Capture the old/new images for an AFTER trigger's `deleted`/`inserted`
+    // tables (a row that did not change still appears in both, as SQL Server
+    // does — every matched row is in `updates`).
+    capture_trigger_images(|| {
+        (
+            updates.iter().map(|(_, _, new)| new.clone()).collect(),
+            updates.iter().map(|(_, old, _)| old.clone()).collect(),
+        )
+    });
     let count = storage
         .rel_update_located(&def.name, updates, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
@@ -6420,6 +6867,13 @@ fn exec_delete(
         enforce_parent_fks(storage, &def, &removed, "DELETE", true)?;
     }
 
+    // Capture the deleted images for an AFTER trigger's `deleted` table.
+    capture_trigger_images(|| {
+        (
+            Vec::new(),
+            targets.iter().map(|(_, row)| row.clone()).collect(),
+        )
+    });
     let count = storage
         .rel_delete_located(&def.name, targets, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
@@ -10150,12 +10604,21 @@ fn build_table_source(
             rows: SourceRows::Materialized(tv.rows),
         });
     }
+    // `inserted`/`deleted`: the firing trigger's pseudo-tables. Resolved before
+    // the catalog so a real table named `inserted` cannot be reached from inside
+    // a trigger body (SQL Server reserves them there too). Only matches when a
+    // trigger scope is armed; otherwise falls through to catalog resolution.
+    if let Some(source) = current_trigger_source(&name.value, &qualifier) {
+        return Ok(source);
+    }
     let base = match name.value.to_ascii_lowercase().as_str() {
         "sys.tables" => sys_tables(storage),
         "sys.databases" => sys_databases(storage, eval_ctx),
         "sys.configurations" => sys_configurations(),
         "sys.views" => sys_views(storage),
         "sys.procedures" => sys_procedures(storage),
+        "sys.triggers" => sys_triggers(storage),
+        "sys.trigger_events" => sys_trigger_events(storage),
         "sys.parameters" => sys_parameters(storage),
         "sys.objects" => sys_objects(storage),
         "sys.sql_modules" => sys_sql_modules(storage),
@@ -11263,7 +11726,8 @@ fn sys_sql_modules(storage: &Storage) -> Source {
                         FunctionReturns::InlineTable { select_text } => select_text.clone(),
                         FunctionReturns::MultiStatementTable { body, .. } => body.clone(),
                     })
-                })?;
+                })
+                .or_else(|| def.trigger.as_ref().map(|t| t.body.clone()))?;
             Some(vec![
                 Datum::Int(def.object_id as i32),
                 Datum::NVarChar(definition),
@@ -11293,6 +11757,75 @@ fn sys_procedures(storage: &Storage) -> Source {
             ]
         })
         .collect();
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_triggers(storage: &Storage) -> Source {
+    let columns = vec![
+        nvarchar("name", 128),
+        int_col("object_id"),
+        int_col("parent_id"),
+        nvarchar("type", 2),
+        int_col("is_disabled"),
+        int_col("is_instead_of_trigger"),
+    ];
+    let rows = storage
+        .rel_tables()
+        .into_iter()
+        .filter_map(|def| {
+            let trigger = def.trigger.as_ref()?;
+            Some(vec![
+                Datum::NVarChar(def.name.clone()),
+                Datum::Int(def.object_id as i32),
+                Datum::Int(trigger.parent_object_id as i32),
+                Datum::NVarChar("TR".to_string()),
+                Datum::Int(i32::from(trigger.is_disabled)),
+                // Only AFTER triggers exist here (INSTEAD OF is not supported).
+                Datum::Int(0),
+            ])
+        })
+        .collect();
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_trigger_events(storage: &Storage) -> Source {
+    let columns = vec![
+        int_col("object_id"),
+        int_col("type"),
+        nvarchar("type_desc", 128),
+    ];
+    let mut rows = Vec::new();
+    for def in storage.rel_tables() {
+        let Some(trigger) = def.trigger.as_ref() else {
+            continue;
+        };
+        for event in &trigger.events {
+            let (code, desc) = match event {
+                catalog::TriggerEvent::Insert => (1, "INSERT"),
+                catalog::TriggerEvent::Update => (2, "UPDATE"),
+                catalog::TriggerEvent::Delete => (3, "DELETE"),
+            };
+            rows.push(vec![
+                Datum::Int(def.object_id as i32),
+                Datum::Int(code),
+                Datum::NVarChar(desc.to_string()),
+            ]);
+        }
+    }
     let collations = vec![None; columns.len()];
     let qualifiers = vec![None; columns.len()];
     Source {
@@ -11401,6 +11934,8 @@ fn sys_objects(storage: &Storage) -> Source {
                 }
             } else if def.is_procedure() {
                 ("P ", "SQL_STORED_PROCEDURE")
+            } else if def.is_trigger() {
+                ("TR", "SQL_TRIGGER")
             } else if def.is_view() {
                 ("V ", "VIEW")
             } else {
@@ -11627,6 +12162,145 @@ fn read_lock_object_ids(storage: &Storage, name: &str) -> Vec<u32> {
     let mut visited = std::collections::HashSet::new();
     collect_read_lock_ids(storage, name, 0, &mut out, &mut visited);
     out
+}
+
+/// Adds the locks the AFTER-`event` trigger bodies of `parent_object_id` take,
+/// so a DML that fires them holds every lock its bodies acquire UP FRONT (strict
+/// 2PL — a trigger body reading/writing another table with no pre-acquired lock
+/// is the recurring seam-defect class). Recursion (a trigger whose body DMLs a
+/// table with its own triggers) is bounded by `visited` (trigger object_ids), so
+/// a trigger cycle terminates cleanly rather than hanging analysis under the
+/// scheduler mutex.
+fn add_trigger_locks(
+    storage: &Storage,
+    parent_object_id: u32,
+    event: catalog::TriggerEvent,
+    visited: &mut std::collections::HashSet<u32>,
+    add: &mut impl FnMut(Resource, LockMode),
+) {
+    for trig in storage.rel_triggers_for(parent_object_id, event) {
+        if !visited.insert(trig.object_id) {
+            continue;
+        }
+        let Some(t) = &trig.trigger else { continue };
+        if let Ok(statements) = truthdb_sql::parse_procedure_body(&t.body) {
+            collect_trigger_body_locks(storage, &statements, visited, add);
+        }
+    }
+}
+
+/// Walks a trigger body's statements and adds the locks they require: Exclusive
+/// on DML write targets (plus their own triggers, recursively), Shared on the
+/// tables SELECTs and INSERT..SELECT sources read.
+fn collect_trigger_body_locks(
+    storage: &Storage,
+    statements: &[Statement],
+    visited: &mut std::collections::HashSet<u32>,
+    add: &mut impl FnMut(Resource, LockMode),
+) {
+    // A base table (not a view/proc/func/trigger, not a `@t` table variable):
+    // the write-lock target of a DML in a trigger body.
+    fn write_target(storage: &Storage, name: &str) -> Option<TableDef> {
+        if name.starts_with('@') {
+            return None;
+        }
+        resolve_table(storage, name).filter(|def| {
+            def.trigger.is_none()
+                && def.view_query.is_none()
+                && def.procedure.is_none()
+                && def.function.is_none()
+        })
+    }
+    let add_reads =
+        |storage: &Storage, select: &Select, add: &mut dyn FnMut(Resource, LockMode)| {
+            let expanded = expand_ctes(select);
+            let mut tables = Vec::new();
+            collect_locked_tables(&expanded, &mut tables);
+            for name in tables {
+                for oid in read_lock_object_ids(storage, &name.value) {
+                    add(Resource::Database, LockMode::IntentShared);
+                    add(Resource::Table(oid), LockMode::Shared);
+                }
+            }
+            for oid in select_function_read_ids(storage, &expanded) {
+                add(Resource::Database, LockMode::IntentShared);
+                add(Resource::Table(oid), LockMode::Shared);
+            }
+        };
+    for statement in statements {
+        match statement {
+            Statement::Insert(insert) => {
+                if let Some(def) = write_target(storage, &insert.table.value) {
+                    add(Resource::Database, LockMode::IntentExclusive);
+                    add(Resource::Table(def.object_id), LockMode::Exclusive);
+                    add_trigger_locks(
+                        storage,
+                        def.object_id,
+                        catalog::TriggerEvent::Insert,
+                        visited,
+                        add,
+                    );
+                }
+                if let InsertSource::Select(select) = &insert.source {
+                    add_reads(storage, select, add);
+                }
+            }
+            Statement::Update(update) => {
+                if let Some(def) = write_target(storage, &update.table.value) {
+                    add(Resource::Database, LockMode::IntentExclusive);
+                    add(Resource::Table(def.object_id), LockMode::Exclusive);
+                    add_trigger_locks(
+                        storage,
+                        def.object_id,
+                        catalog::TriggerEvent::Update,
+                        visited,
+                        add,
+                    );
+                }
+            }
+            Statement::Delete(delete) => {
+                if let Some(def) = write_target(storage, &delete.table.value) {
+                    add(Resource::Database, LockMode::IntentExclusive);
+                    add(Resource::Table(def.object_id), LockMode::Exclusive);
+                    add_trigger_locks(
+                        storage,
+                        def.object_id,
+                        catalog::TriggerEvent::Delete,
+                        visited,
+                        add,
+                    );
+                }
+            }
+            Statement::Select(select) => add_reads(storage, select, add),
+            Statement::Block { body, .. } => {
+                collect_trigger_body_locks(storage, body, visited, add)
+            }
+            Statement::If {
+                then_branch,
+                else_branch,
+                ..
+            } => {
+                collect_trigger_body_locks(
+                    storage,
+                    std::slice::from_ref(then_branch),
+                    visited,
+                    add,
+                );
+                if let Some(else_branch) = else_branch {
+                    collect_trigger_body_locks(
+                        storage,
+                        std::slice::from_ref(else_branch),
+                        visited,
+                        add,
+                    );
+                }
+            }
+            Statement::While { body, .. } => {
+                collect_trigger_body_locks(storage, std::slice::from_ref(body), visited, add)
+            }
+            _ => {}
+        }
+    }
 }
 
 /// The base-table object ids the scalar functions called in a SELECT read

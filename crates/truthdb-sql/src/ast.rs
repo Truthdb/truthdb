@@ -126,6 +126,39 @@ pub enum Statement {
         if_exists: bool,
         span: Span,
     },
+    /// `CREATE|ALTER TRIGGER <name> ON <table> AFTER {INSERT|UPDATE|DELETE}[,...]
+    /// AS <body>` — an AFTER DML trigger. The body is stored as source text and
+    /// re-parsed per firing (the procedure posture).
+    CreateTrigger(CreateTrigger),
+    /// `DROP TRIGGER [IF EXISTS] <name>`.
+    DropTrigger {
+        name: Name,
+        if_exists: bool,
+        span: Span,
+    },
+}
+
+/// `CREATE|ALTER TRIGGER <name> ON <table> AFTER <events> AS <body>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateTrigger {
+    pub name: Name,
+    /// The table the trigger is attached to.
+    pub target: Name,
+    /// The DML events it fires on (at least one; deduplicated by the parser).
+    pub events: Vec<TriggerEvent>,
+    /// The body source text (everything after `AS`), re-parsed per firing.
+    pub body: String,
+    /// `ALTER TRIGGER` replaces an existing definition.
+    pub alter: bool,
+    pub span: Span,
+}
+
+/// A DML event a trigger fires on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
 }
 
 /// `CREATE|ALTER PROC[EDURE] <name> [@p TYPE [= default] [OUTPUT], ...] AS <body>`.

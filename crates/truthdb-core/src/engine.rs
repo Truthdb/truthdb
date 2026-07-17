@@ -6010,6 +6010,191 @@ mod tests {
     }
 
     #[test]
+    fn after_insert_trigger_fires_reading_inserted() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("trg-insert");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("t");
+        engine
+            .execute("CREATE TABLE audit (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("audit");
+        engine
+            .execute("CREATE TRIGGER trg_t ON t AFTER INSERT AS INSERT INTO audit SELECT id, v FROM inserted")
+            .expect("trigger");
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "INSERT INTO t VALUES (1, 100), (2, 200)");
+        assert!(out.error.is_none(), "insert+trigger: {:?}", out.error);
+        let (_c, rows) = sql_rows(&engine, "SELECT id, v FROM audit ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("1".to_string()), Some("100".to_string())],
+                vec![Some("2".to_string()), Some("200".to_string())],
+            ],
+            "the AFTER INSERT trigger copied `inserted` into audit"
+        );
+        // The lock seam: analyze_locks over the INSERT must hold `audit`'s
+        // Exclusive lock up front (the trigger body writes it) — else the body
+        // writes unlocked under 2PL.
+        let audit = table_object_id(&engine, "audit");
+        let locks = engine.analyze_locks("INSERT INTO t VALUES (9, 9)", Isolation::ReadCommitted);
+        assert!(
+            locks.contains(&(Resource::Table(audit), LockMode::Exclusive)),
+            "the trigger body's audit write must be X-locked up front: {locks:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn after_update_and_delete_triggers_read_deleted_and_inserted() {
+        let path = unique_temp_path("trg-upd-del");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("t");
+        engine
+            .execute("INSERT INTO t VALUES (1, 10), (2, 20)")
+            .expect("seed");
+        engine
+            .execute("CREATE TABLE log (k INT NOT NULL PRIMARY KEY, oldv INT, newv INT)")
+            .expect("log");
+        // UPDATE trigger sees both `deleted` (old) and `inserted` (new).
+        engine
+            .execute(
+                "CREATE TRIGGER trg_u ON t AFTER UPDATE AS INSERT INTO log \
+                 SELECT i.id, d.v, i.v FROM inserted AS i JOIN deleted AS d ON i.id = d.id",
+            )
+            .expect("update trigger");
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "UPDATE t SET v = 99 WHERE id = 1");
+        assert!(out.error.is_none(), "update+trigger: {:?}", out.error);
+        let (_c, rows) = sql_rows(&engine, "SELECT k, oldv, newv FROM log");
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("1".to_string()),
+                Some("10".to_string()),
+                Some("99".to_string())
+            ]],
+            "UPDATE trigger joined deleted(old) and inserted(new)"
+        );
+        // DELETE trigger sees `deleted`.
+        engine
+            .execute("CREATE TABLE gone (id INT NOT NULL PRIMARY KEY)")
+            .expect("gone");
+        engine
+            .execute(
+                "CREATE TRIGGER trg_d ON t AFTER DELETE AS INSERT INTO gone SELECT id FROM deleted",
+            )
+            .expect("delete trigger");
+        let out = batch(&engine, &mut ctx, "DELETE FROM t WHERE id = 2");
+        assert!(out.error.is_none(), "delete+trigger: {:?}", out.error);
+        let (_c, rows) = sql_rows(&engine, "SELECT id FROM gone");
+        assert_eq!(
+            rows,
+            vec![vec![Some("2".to_string())]],
+            "DELETE trigger read deleted"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trigger_rollback_raises_3609_and_undoes_the_dml() {
+        let path = unique_temp_path("trg-3609");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        // A trigger that rolls back ends the transaction: 3609, and the firing
+        // INSERT is undone (atomic under the implicit transaction).
+        engine
+            .execute("CREATE TRIGGER trg_rb ON t AFTER INSERT AS ROLLBACK")
+            .expect("rollback trigger");
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(3609),
+            "a trigger ROLLBACK raises 3609: {:?}",
+            out.error
+        );
+        let (_c, rows) = sql_rows(&engine, "SELECT COUNT(*) AS n FROM t");
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".to_string())]],
+            "the INSERT must be rolled back with the trigger"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recursive_trigger_does_not_refire_itself() {
+        let path = unique_temp_path("trg-recursive");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        // A trigger whose body inserts into its OWN table must not re-fire itself
+        // (recursive triggers OFF by default) — otherwise it would loop.
+        engine
+            .execute(
+                "CREATE TRIGGER trg_self ON t AFTER INSERT AS INSERT INTO t SELECT id + 100 FROM inserted WHERE id < 100",
+            )
+            .expect("self trigger");
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        assert!(out.error.is_none(), "recursive-off insert: {:?}", out.error);
+        // The original row plus one from the (non-re-firing) trigger body.
+        let (_c, rows) = sql_rows(&engine, "SELECT id FROM t ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![vec![Some("1".to_string())], vec![Some("101".to_string())]],
+            "the trigger fired once, did not recurse on its own insert"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trigger_cycle_lock_analysis_terminates() {
+        use crate::rel::Isolation;
+        let path = unique_temp_path("trg-cycle");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE a (id INT NOT NULL PRIMARY KEY)")
+            .expect("a");
+        engine
+            .execute("CREATE TABLE b (id INT NOT NULL PRIMARY KEY)")
+            .expect("b");
+        // A trigger cycle: a's trigger writes b, b's trigger writes a. Lock
+        // analysis recurses trigger bodies — without the visited-set it would
+        // recurse forever and hang under the scheduler mutex. Run in a thread so
+        // a regression fails on the timeout rather than hanging the test binary.
+        engine
+            .execute(
+                "CREATE TRIGGER trg_a ON a AFTER INSERT AS INSERT INTO b SELECT id FROM inserted",
+            )
+            .expect("trg_a");
+        engine
+            .execute(
+                "CREATE TRIGGER trg_b ON b AFTER INSERT AS INSERT INTO a SELECT id FROM inserted",
+            )
+            .expect("trg_b");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = engine.analyze_locks("INSERT INTO a VALUES (1)", Isolation::ReadCommitted);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            "trigger-cycle lock analysis must terminate (visited-set)"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn showplan_names_a_table_valued_function() {
         let path = unique_temp_path("tvf-showplan");
         let engine = new_engine(&path);

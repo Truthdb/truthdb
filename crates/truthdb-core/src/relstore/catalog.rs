@@ -128,6 +128,35 @@ pub struct TableDef {
     /// data pages, columns, or key.
     #[serde(default)]
     pub function: Option<FunctionDef>,
+    /// For a TRIGGER: the table it is attached to, the events it fires on, and
+    /// its body source text (re-parsed per firing, procedure posture). `None`
+    /// for every other object kind. A trigger carries no data pages, columns, or
+    /// key — it is a schema object with its own object_id, like a procedure.
+    #[serde(default)]
+    pub trigger: Option<TriggerDef>,
+}
+
+/// A DML event a trigger can fire on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TriggerEvent {
+    Insert,
+    Update,
+    Delete,
+}
+
+/// A trigger's catalog payload: the parent table it fires on, the DML events it
+/// responds to, its body source text, and whether it is disabled.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TriggerDef {
+    /// The object_id of the table this trigger is attached to.
+    pub parent_object_id: u32,
+    /// The DML events (INSERT/UPDATE/DELETE) this trigger fires on.
+    pub events: Vec<TriggerEvent>,
+    /// The body source text (the statements after `AS`), parsed with the
+    /// in-procedure grammar per firing.
+    pub body: String,
+    /// `DISABLE TRIGGER` sets this; a disabled trigger does not fire.
+    pub is_disabled: bool,
 }
 
 /// A stored procedure's catalog payload: declared parameters and body text.
@@ -202,6 +231,11 @@ impl TableDef {
     /// True if this catalog entry is a user-defined function.
     pub fn is_function(&self) -> bool {
         self.function.is_some()
+    }
+
+    /// True if this catalog entry is a trigger.
+    pub fn is_trigger(&self) -> bool {
+        self.trigger.is_some()
     }
 }
 
