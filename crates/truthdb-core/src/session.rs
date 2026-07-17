@@ -818,6 +818,35 @@ impl EngineHandle {
         rx
     }
 
+    /// Runs an RPC-by-name call of a USER procedure: synthesizes the
+    /// equivalent `EXEC` batch with the wire parameters seeded as variables
+    /// (named binding, OUTPUT flags carried), and streams the reply like any
+    /// batch. Lock analysis resolves the procedure body through the EXEC
+    /// arm. TODO(next commit): emit ReturnStatus/ReturnValue from the
+    /// session's variables at batch end — the wire tail currently reports
+    /// status 0 and no OUTPUT values.
+    pub fn stream_proc_rpc(
+        &self,
+        session: SessionId,
+        name: String,
+        params: Vec<crate::rel::RpcParam>,
+        outputs: Vec<bool>,
+        cancel: Arc<AtomicBool>,
+    ) -> mpsc::UnboundedReceiver<BatchEvent> {
+        let mut sql = format!("EXEC [{}]", name.replace(']', "]]"));
+        for (index, param) in params.iter().enumerate() {
+            let sep = if index == 0 { " " } else { ", " };
+            let bare = param.name.trim_start_matches('@');
+            let output = if outputs.get(index).copied().unwrap_or(false) {
+                " OUTPUT"
+            } else {
+                ""
+            };
+            sql.push_str(&format!("{sep}@{bare} = @{bare}{output}"));
+        }
+        self.stream_rpc(session, sql, String::new(), params, cancel)
+    }
+
     /// Runs a prepared-statement RPC (the `sp_prepare` handle family),
     /// streaming its reply exactly like [`Self::stream_rpc`].
     pub fn stream_prepared(

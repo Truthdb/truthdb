@@ -735,7 +735,12 @@ fn start_rpc(
             ),
         )),
         // Error 2812 is SQL Server's "Could not find stored procedure".
-        RpcProc::Other(name) => Err((2812, format!("Could not find stored procedure '{name}'."))),
+        // A user procedure: the engine resolves the name (2812 if absent),
+        // binds the named params, and emits the real RETURNSTATUS and typed
+        // RETURNVALUEs for OUTPUT parameters.
+        RpcProc::Other(name) => {
+            Ok(engine.stream_proc_rpc(session, name, request.params, request.outputs, cancel))
+        }
     }
 }
 
