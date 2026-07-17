@@ -5911,6 +5911,54 @@ mod tests {
     }
 
     #[test]
+    fn function_body_cannot_read_caller_table_variable() {
+        let path = unique_temp_path("tablevar-fn-isolation");
+        let engine = new_engine(&path);
+        // A scalar UDF and an inline TVF whose bodies reference @t are created
+        // without a bind-time check, but at call time each runs with its OWN
+        // (empty) table-variable scope — it must NOT see the caller's @t. The
+        // body's `FROM @t` therefore errors 1087, not silently reading caller
+        // rows. This is the scope seam: the read view armed by the calling
+        // statement must be shadowed, not inherited, across the body boundary.
+        engine
+            .execute(
+                "CREATE FUNCTION dbo.cnt () RETURNS INT AS BEGIN RETURN (SELECT COUNT(*) FROM @t) END",
+            )
+            .expect("create scalar udf");
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); \
+             INSERT INTO @t VALUES (1), (2), (3); SELECT dbo.cnt() AS n",
+        );
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(1087),
+            "a scalar UDF body must not read the caller's table variable: {:?}",
+            out.error
+        );
+
+        engine
+            .execute("CREATE FUNCTION dbo.readt () RETURNS TABLE AS RETURN (SELECT id FROM @t)")
+            .expect("create inline tvf");
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); \
+             INSERT INTO @t VALUES (99); SELECT id FROM dbo.readt()",
+        );
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(1087),
+            "an inline TVF body must not read the caller's table variable: {:?}",
+            out.error
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn recursive_function_lock_analysis_terminates() {
         use crate::rel::Isolation;
         let path = unique_temp_path("udf-recursion-bomb");

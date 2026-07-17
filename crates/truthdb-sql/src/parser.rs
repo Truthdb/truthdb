@@ -582,9 +582,10 @@ impl Parser {
     }
 
     /// Parses a table variable's `( <column-defs> )` body: column definitions
-    /// (with inline `NOT NULL` / `PRIMARY KEY`) plus a table-level `PRIMARY KEY
-    /// (cols)`. Other table constraints (UNIQUE/CHECK/FOREIGN KEY) are not yet
-    /// supported on a table variable.
+    /// (with inline `NULL`/`NOT NULL`, `PRIMARY KEY`, and `DEFAULT`) plus a
+    /// table-level `PRIMARY KEY (cols)`. IDENTITY, UNIQUE, CHECK, and FOREIGN KEY
+    /// — supported on a base table — are rejected here rather than silently
+    /// ignored, since the table-variable executor does not enforce them.
     fn parse_table_var_columns(&mut self) -> SqlResult<(Vec<ColumnDef>, Vec<Name>)> {
         self.expect(&TokenKind::LParen)?;
         let mut columns = Vec::new();
@@ -609,6 +610,23 @@ impl Parser {
                 self.expect(&TokenKind::RParen)?;
             } else {
                 let column = self.parse_column_def()?;
+                // The table-variable executor honors columns, NULL/NOT NULL,
+                // PRIMARY KEY, and DEFAULT; the rest of parse_column_def's
+                // grammar it would ignore, so reject those constructs here.
+                let unsupported = if column.identity.is_some() {
+                    Some("IDENTITY")
+                } else if column.unique {
+                    Some("UNIQUE")
+                } else if !column.checks.is_empty() {
+                    Some("CHECK")
+                } else if !column.foreign_keys.is_empty() {
+                    Some("REFERENCES")
+                } else {
+                    None
+                };
+                if let Some(feature) = unsupported {
+                    return Err(SqlError::syntax(feature, column.span));
+                }
                 if column.primary_key {
                     if !primary_key.is_empty() {
                         return Err(SqlError::message_only(

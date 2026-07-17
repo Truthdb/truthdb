@@ -67,10 +67,63 @@ DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); BEGIN TRAN; INSERT INTO @t VALUE
 statement error
 DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); DECLARE @t TABLE (x INT)
 
-# A name cannot be both a scalar and a table variable (134).
+# A name cannot be both a scalar and a table variable (134), either order.
 statement error
 DECLARE @t INT; DECLARE @t TABLE (id INT)
+
+statement error
+DECLARE @t TABLE (id INT); DECLARE @t INT
 
 # An undeclared table variable is an error.
 statement error
 SELECT * FROM @undeclared
+
+# A table variable is visible inside an IF condition subquery (the read view is
+# armed for condition evaluation, not only for ordinary statements).
+query I
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t VALUES (1), (2); IF EXISTS (SELECT 1 FROM @t) SELECT 42 AS n
+----
+42
+
+query I
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t VALUES (1), (2); IF (SELECT COUNT(*) FROM @t) = 2 SELECT 7 AS n
+----
+7
+
+# ... and inside a WHILE condition subquery (here the count is 1, so the loop
+# body never runs and control reaches the trailing SELECT).
+query I
+DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); INSERT INTO @t VALUES (1); WHILE (SELECT COUNT(*) FROM @t) > 5 SELECT 0; SELECT 99 AS n
+----
+99
+
+# A table-level PRIMARY KEY column is implicitly NOT NULL (515 on a NULL insert),
+# exactly as the inline form is.
+statement error
+DECLARE @t TABLE (id INT, PRIMARY KEY (id)); INSERT INTO @t VALUES (NULL)
+
+# Declaring a PRIMARY KEY column explicitly NULL is 8111.
+statement error
+DECLARE @t TABLE (id INT NULL, PRIMARY KEY (id))
+
+# Column DEFAULT is applied to unspecified columns, before the NOT NULL check.
+query I
+DECLARE @t TABLE (id INT, c INT NOT NULL DEFAULT 5); INSERT INTO @t (id) VALUES (1); SELECT c FROM @t
+----
+5
+
+query I
+DECLARE @t TABLE (id INT, c INT DEFAULT 42); INSERT INTO @t (id) VALUES (1); SELECT c FROM @t
+----
+42
+
+# Column constraints the table-variable executor does not enforce are rejected
+# at parse time rather than silently ignored.
+statement error
+DECLARE @t TABLE (id INT IDENTITY(1,1))
+
+statement error
+DECLARE @t TABLE (id INT UNIQUE)
+
+statement error
+DECLARE @t TABLE (id INT CHECK (id > 0))
