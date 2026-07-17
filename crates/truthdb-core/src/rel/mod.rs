@@ -194,6 +194,19 @@ impl TxnContext {
         self.variables.clear();
     }
 
+    /// The final value and type of a batch variable, as a `Datum`, for the
+    /// RPC-by-name response tail: after the synthesized `EXEC` batch completes
+    /// the session reads the OUTPUT parameters (copied back into caller-scope
+    /// variables) and the seeded return-status variable back off the context.
+    /// `name` may carry a leading `@`; lookup is case-insensitive, matching how
+    /// variables are keyed.
+    pub fn variable_datum(&self, name: &str) -> Option<(ColumnType, Datum)> {
+        let key = name.trim_start_matches('@').to_ascii_lowercase();
+        let (column_type, value) = self.variables.get(&key)?;
+        let datum = value::sql_to_datum(value, column_type, &key).ok()?;
+        Some((*column_type, datum))
+    }
+
     /// True if a transaction is open (used by the session to decide whether a
     /// disconnect must roll back).
     pub fn has_open_transaction(&self) -> bool {

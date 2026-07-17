@@ -349,7 +349,7 @@ impl crate::rel::BatchEmitter for BatchSink {
     ) {
         self.send(BatchEvent::ReturnValue {
             name: name.to_string(),
-            column_type: column_type.clone(),
+            column_type: *column_type,
             value: value.clone(),
         });
     }
@@ -539,6 +539,28 @@ impl SessionManager {
 
 /// A message to the engine thread. Each carries a one-shot reply channel the
 /// async caller awaits.
+/// The response-tail descriptor for an RPC-by-name call of a user procedure.
+///
+/// The call is executed as a synthesized `EXEC @<status_var> = [proc] @p = @p
+/// [OUTPUT]…` batch: the wire parameters are seeded as batch variables, so once
+/// the batch completes the procedure's OUTPUT parameters have been copied back
+/// into their caller-scope variables and the RETURN status into `status_var`.
+/// The worker reads them off the context (before it is handed back to the
+/// scheduler) and emits the RETURNSTATUS / RETURNVALUE events the wire renderer
+/// turns into tokens — but only when the batch completed without error, which is
+/// exactly when the copy-back and status assignment happened.
+#[derive(Clone)]
+struct ProcRpcTail {
+    /// The seeded variable holding the RETURN status.
+    status_var: String,
+    /// One entry per OUTPUT parameter, in call order: the caller-scope variable
+    /// to read the final value back from, and the name the RETURNVALUE token
+    /// carries. For a named argument both are the wire name (`@out`); for a
+    /// positional one (JDBC `{call p(?)}`) the read variable is a synthetic seed
+    /// and the token name is empty, which drivers match by ordinal.
+    output_vars: Vec<(String, String)>,
+}
+
 enum EngineCall {
     OpenSession {
         database: String,
@@ -552,6 +574,10 @@ enum EngineCall {
         session: SessionId,
         sql: String,
         params: Vec<crate::rel::RpcParam>,
+        /// For an RPC-by-name call of a user procedure: the OUTPUT parameters
+        /// and return-status variable to read back off the context once the
+        /// synthesized `EXEC` batch completes. `None` for an ordinary batch.
+        proc_tail: Option<ProcRpcTail>,
         /// Set by the connection on a TDS Attention to abort the batch mid-flight.
         cancel: Arc<AtomicBool>,
         reply: BatchSink,
@@ -809,6 +835,7 @@ impl EngineHandle {
             session,
             sql,
             params,
+            proc_tail: None,
             cancel,
             reply: BatchSink::new(tx),
         });
@@ -818,13 +845,17 @@ impl EngineHandle {
         rx
     }
 
-    /// Runs an RPC-by-name call of a USER procedure: synthesizes the
-    /// equivalent `EXEC` batch with the wire parameters seeded as variables
-    /// (named binding, OUTPUT flags carried), and streams the reply like any
-    /// batch. Lock analysis resolves the procedure body through the EXEC
-    /// arm. TODO(next commit): emit ReturnStatus/ReturnValue from the
-    /// session's variables at batch end — the wire tail currently reports
-    /// status 0 and no OUTPUT values.
+    /// Runs an RPC-by-name call of a USER procedure: synthesizes the equivalent
+    /// `EXEC` batch with the wire parameters seeded as variables (named binding,
+    /// OUTPUT flags carried) and streams the reply like any batch. Lock analysis
+    /// resolves the procedure body through the EXEC arm.
+    ///
+    /// The RETURN status is captured with `EXEC @<rc> = …` into a synthetic
+    /// variable seeded from an extra Int parameter — no wire token, no extra
+    /// statement — and the OUTPUT parameters land back in their caller-scope
+    /// variables. A [`ProcRpcTail`] tells the worker which variables to read off
+    /// the context once the batch completes, so it can emit the real RETURNSTATUS
+    /// and typed RETURNVALUEs.
     pub fn stream_proc_rpc(
         &self,
         session: SessionId,
@@ -833,18 +864,56 @@ impl EngineHandle {
         outputs: Vec<bool>,
         cancel: Arc<AtomicBool>,
     ) -> mpsc::UnboundedReceiver<BatchEvent> {
-        let mut sql = format!("EXEC [{}]", name.replace(']', "]]"));
-        for (index, param) in params.iter().enumerate() {
+        // `@__truthdb_rc` is seeded (not a proc argument), so `EXEC @__truthdb_rc
+        // = …` finds it declared and stores the RETURN status there. The name is
+        // one no user variable would collide with in the synthesized batch.
+        let status_var = "__truthdb_rc".to_string();
+        let mut sql = format!("EXEC @{status_var} = [{}]", name.replace(']', "]]"));
+        let mut output_vars = Vec::new();
+        let mut seeded: Vec<crate::rel::RpcParam> = Vec::with_capacity(params.len() + 1);
+        for (index, mut param) in params.into_iter().enumerate() {
             let sep = if index == 0 { " " } else { ", " };
-            let bare = param.name.trim_start_matches('@');
-            let output = if outputs.get(index).copied().unwrap_or(false) {
-                " OUTPUT"
+            let is_output = outputs.get(index).copied().unwrap_or(false);
+            let output_kw = if is_output { " OUTPUT" } else { "" };
+            if param.name.trim_start_matches('@').is_empty() {
+                // Positional (unnamed) argument — a JDBC `{call p(?, ?)}` shape.
+                // Seed under a synthetic variable and pass it positionally; the
+                // RETURNVALUE carries no name, which drivers match by ordinal.
+                let var = format!("__truthdb_arg{index}");
+                sql.push_str(&format!("{sep}@{var}{output_kw}"));
+                if is_output {
+                    output_vars.push((format!("@{var}"), String::new()));
+                }
+                param.name = format!("@{var}");
             } else {
-                ""
-            };
-            sql.push_str(&format!("{sep}@{bare} = @{bare}{output}"));
+                let bare = param.name.trim_start_matches('@').to_string();
+                sql.push_str(&format!("{sep}@{bare} = @{bare}{output_kw}"));
+                if is_output {
+                    output_vars.push((param.name.clone(), param.name.clone()));
+                }
+            }
+            seeded.push(param);
         }
-        self.stream_rpc(session, sql, String::new(), params, cancel)
+        // Seed the return-status variable as an ordinary batch variable.
+        seeded.push(crate::rel::RpcParam {
+            name: format!("@{status_var}"),
+            column_type: crate::relstore::types::ColumnType::Int,
+            value: Datum::Int(0),
+        });
+        let proc_tail = ProcRpcTail {
+            status_var,
+            output_vars,
+        };
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inbox.send(EngineCall::RunBatch {
+            session,
+            sql,
+            params: seeded,
+            proc_tail: Some(proc_tail),
+            cancel,
+            reply: BatchSink::new(tx),
+        });
+        rx
     }
 
     /// Runs a prepared-statement RPC (the `sp_prepare` handle family),
@@ -1031,6 +1100,7 @@ struct Runnable {
     session: SessionId,
     sql: String,
     params: Vec<crate::rel::RpcParam>,
+    proc_tail: Option<ProcRpcTail>,
     cancel: Arc<AtomicBool>,
     reply: BatchSink,
     txn_ctx: TxnContext,
@@ -1160,9 +1230,10 @@ fn worker_loop(shared: &Arc<Shared>) {
                 session,
                 sql,
                 params,
+                proc_tail,
                 cancel,
                 reply,
-            }) => dispatch_batch(shared, session, sql, params, cancel, reply),
+            }) => dispatch_batch(shared, session, sql, params, proc_tail, cancel, reply),
             Work::Call(EngineCall::RunRpc {
                 session,
                 command,
@@ -1276,7 +1347,7 @@ fn dispatch_rpc(
                     return;
                 }
             };
-            dispatch_batch(shared, session, text, values, cancel, reply);
+            dispatch_batch(shared, session, text, values, None, cancel, reply);
         }
         PreparedRpc::PrepExec {
             decls,
@@ -1299,7 +1370,7 @@ fn dispatch_rpc(
                     return;
                 }
             };
-            dispatch_batch(shared, session, stmt, values, cancel, reply);
+            dispatch_batch(shared, session, stmt, values, None, cancel, reply);
         }
     }
 }
@@ -1345,6 +1416,7 @@ fn dispatch_batch(
     session: SessionId,
     sql: String,
     params: Vec<crate::rel::RpcParam>,
+    proc_tail: Option<ProcRpcTail>,
     cancel: Arc<AtomicBool>,
     reply: BatchSink,
 ) {
@@ -1362,6 +1434,7 @@ fn dispatch_batch(
                 session,
                 sql,
                 params,
+                proc_tail,
                 cancel,
                 reply,
                 txn_ctx,
@@ -1372,6 +1445,7 @@ fn dispatch_batch(
                 session,
                 sql,
                 params,
+                proc_tail,
                 cancel,
                 reply,
                 needs,
@@ -1399,6 +1473,7 @@ fn run_and_finish(shared: &Arc<Shared>, work: Runnable) {
         session,
         sql,
         params,
+        proc_tail,
         cancel,
         reply,
         mut txn_ctx,
@@ -1413,6 +1488,14 @@ fn run_and_finish(shared: &Arc<Shared>, work: Runnable) {
     let outcome = shared
         .engine
         .sql_batch_streamed(&sql, &mut txn_ctx, &params, &mut reply);
+    // RPC-by-name tail: a procedure copies its OUTPUT parameters back and stores
+    // its RETURN status only when it completed, so the tokens are emitted only
+    // when the batch ran clean (`Ok(None)`). Read the values off the context now,
+    // before `finish` hands it back to the scheduler.
+    let tail_events = match (&proc_tail, &outcome) {
+        (Some(tail), Ok(None)) => Some(read_proc_tail(&txn_ctx, tail)),
+        _ => None,
+    };
     let in_transaction = {
         let mut sched = shared.scheduler.lock().expect("scheduler poisoned");
         sched.finish(&shared.engine, session, txn_ctx)
@@ -1420,11 +1503,44 @@ fn run_and_finish(shared: &Arc<Shared>, work: Runnable) {
     // The terminal events wait for the locks to settle: `Complete` carries the
     // post-batch transaction state, which only `finish` knows.
     match outcome {
-        Ok(error) => reply.send_tail(error, in_transaction),
+        Ok(error) => {
+            if let Some(events) = tail_events {
+                for event in events {
+                    if !reply.send(event) {
+                        return;
+                    }
+                }
+            }
+            reply.send_tail(error, in_transaction);
+        }
         Err(err) => {
             reply.send(BatchEvent::Failed(err));
         }
     }
+}
+
+/// Reads an RPC-by-name call's response tail off the finished context: the
+/// RETURN status (always emitted — SQL Server sends RETURNSTATUS for every proc
+/// RPC, defaulting to 0), then each OUTPUT parameter as a typed RETURNVALUE. The
+/// renderer orders the tokens (RETURNSTATUS before RETURNVALUEs) regardless of
+/// event order, but they are produced status-first to match.
+fn read_proc_tail(txn_ctx: &TxnContext, tail: &ProcRpcTail) -> Vec<BatchEvent> {
+    let mut events = Vec::with_capacity(tail.output_vars.len() + 1);
+    let status = match txn_ctx.variable_datum(&tail.status_var) {
+        Some((_, Datum::Int(status))) => status,
+        _ => 0,
+    };
+    events.push(BatchEvent::ReturnStatus(status));
+    for (read_var, wire_name) in &tail.output_vars {
+        if let Some((column_type, value)) = txn_ctx.variable_datum(read_var) {
+            events.push(BatchEvent::ReturnValue {
+                name: wire_name.clone(),
+                column_type,
+                value,
+            });
+        }
+    }
+    events
 }
 
 /// Runs every parked batch whose locks are now grantable, in FIFO order, until
@@ -1449,6 +1565,7 @@ struct Parked {
     session: SessionId,
     sql: String,
     params: Vec<crate::rel::RpcParam>,
+    proc_tail: Option<ProcRpcTail>,
     cancel: Arc<AtomicBool>,
     reply: BatchSink,
     needs: Vec<(Resource, LockMode)>,
@@ -1661,6 +1778,7 @@ impl Scheduler {
                     session: parked.session,
                     sql: parked.sql,
                     params: parked.params,
+                    proc_tail: parked.proc_tail,
                     cancel: parked.cancel,
                     reply: parked.reply,
                     txn_ctx,
@@ -2442,6 +2560,7 @@ mod tests {
             session: id,
             sql: "SELECT id FROM t".into(),
             params: Vec::new(),
+            proc_tail: None,
             cancel: Arc::new(AtomicBool::new(false)),
             reply,
             needs: Vec::new(),
@@ -2502,6 +2621,7 @@ mod tests {
             session: waiter,
             sql: "EXEC p".into(),
             params: Vec::new(),
+            proc_tail: None,
             cancel: Arc::new(AtomicBool::new(false)),
             reply: BatchSink::new(tx),
             needs,
@@ -2623,6 +2743,7 @@ mod tests {
             session: id,
             sql: "SELECT 1".into(),
             params: Vec::new(),
+            proc_tail: None,
             cancel: Arc::new(AtomicBool::new(false)),
             reply,
             needs: vec![(Resource::Table(1), LockMode::Shared)],
@@ -2749,6 +2870,7 @@ mod tests {
             session: id,
             sql: "SELECT 1".into(),
             params: Vec::new(),
+            proc_tail: None,
             cancel: Arc::new(AtomicBool::new(false)),
             reply,
             needs: vec![(Resource::Table(1), LockMode::Shared)],

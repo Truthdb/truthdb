@@ -324,7 +324,10 @@ enum Token {
         cmd: u16,
     },
     ReturnStatus(i32),
-    ReturnValue,
+    ReturnValue {
+        name: String,
+        value: Cell,
+    },
     Other(u8),
 }
 
@@ -426,15 +429,26 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
             }
             0xac => {
                 // RETURNVALUE: ordinal u16, B_VARCHAR name, status u8,
-                // usertype u32, flags u16, TYPE_INFO(INTN,4), value.
-                i += 2;
+                // usertype u32, flags u16, TYPE_INFO, then the value in that
+                // type's row encoding.
+                i += 2; // ParamOrdinal
                 let name_chars = payload[i] as usize;
-                i += 1 + name_chars * 2;
+                i += 1;
+                let units: Vec<u16> = payload[i..i + name_chars * 2]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .collect();
+                let name = String::from_utf16(&units).unwrap();
+                i += name_chars * 2;
                 i += 1 + 4 + 2; // status, usertype, flags
-                i += 2; // INTN + max len
-                let len = payload[i] as usize;
-                i += 1 + len;
-                tokens.push(Token::ReturnValue);
+                let (col_type, consumed) = parse_type_info(&payload[i..]);
+                i += consumed;
+                let (cells, consumed) = parse_row(&payload[i..], &[col_type]);
+                i += consumed;
+                tokens.push(Token::ReturnValue {
+                    name,
+                    value: cells.into_iter().next().unwrap(),
+                });
             }
             other => {
                 tokens.push(Token::Other(other));
@@ -445,6 +459,38 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
     tokens
 }
 
+/// Parses one TYPE_INFO (the type token and its type-specific bytes), shared by
+/// COLMETADATA columns and the RETURNVALUE token. Returns the type and the
+/// number of bytes consumed.
+fn parse_type_info(bytes: &[u8]) -> (ColType, usize) {
+    let type_token = bytes[0];
+    let mut i = 1;
+    let col_type = match type_token {
+        0x26 => {
+            i += 1; // max len byte
+            ColType::Int
+        }
+        0x68 => {
+            i += 1;
+            ColType::Bit
+        }
+        0x6d => {
+            i += 1;
+            ColType::Float
+        }
+        0xe7 => {
+            i += 2 + 5; // max len u16 + collation
+            ColType::NVarChar
+        }
+        0xa7 => {
+            i += 2 + 5;
+            ColType::VarChar
+        }
+        other => panic!("unhandled type token {other:#x}"),
+    };
+    (col_type, i)
+}
+
 fn parse_colmetadata(bytes: &[u8]) -> (Vec<ColType>, usize) {
     let count = u16::from_le_bytes([bytes[0], bytes[1]]) as usize;
     let mut i = 2;
@@ -452,31 +498,8 @@ fn parse_colmetadata(bytes: &[u8]) -> (Vec<ColType>, usize) {
     for _ in 0..count {
         i += 4; // usertype
         i += 2; // flags
-        let type_token = bytes[i];
-        i += 1;
-        let col_type = match type_token {
-            0x26 => {
-                i += 1; // max len byte
-                ColType::Int
-            }
-            0x68 => {
-                i += 1;
-                ColType::Bit
-            }
-            0x6d => {
-                i += 1;
-                ColType::Float
-            }
-            0xe7 => {
-                i += 2 + 5; // max len u16 + collation
-                ColType::NVarChar
-            }
-            0xa7 => {
-                i += 2 + 5;
-                ColType::VarChar
-            }
-            other => panic!("unhandled type token {other:#x}"),
-        };
+        let (col_type, consumed) = parse_type_info(&bytes[i..]);
+        i += consumed;
         // ColName: b_varchar (char count then UCS-2).
         let name_len = bytes[i] as usize;
         i += 1 + name_len * 2;
@@ -776,6 +799,58 @@ const TM_BEGIN_XACT: u16 = 5;
 const TM_COMMIT_XACT: u16 = 7;
 const TM_ROLLBACK_XACT: u16 = 8;
 
+/// An RPC argument value, encoded as an input parameter (TYPE_INFO + value).
+enum RpcArg {
+    Int(i32),
+    IntNull,
+    NVarChar(String),
+}
+
+impl RpcArg {
+    fn encode(&self, b: &mut Vec<u8>) {
+        match self {
+            RpcArg::Int(v) => {
+                b.push(0x26); // INTN
+                b.push(4); // max len
+                b.push(4); // value len
+                b.extend_from_slice(&v.to_le_bytes());
+            }
+            RpcArg::IntNull => {
+                b.push(0x26);
+                b.push(4);
+                b.push(0); // NULL: zero-length value
+            }
+            RpcArg::NVarChar(s) => {
+                b.push(0xe7); // NVARCHAR
+                b.extend_from_slice(&8000u16.to_le_bytes());
+                b.extend_from_slice(&[0x09, 0x04, 0xd0, 0x00, 0x34]); // collation
+                let bytes = ucs2le(s);
+                b.extend_from_slice(&(bytes.len() as u16).to_le_bytes());
+                b.extend_from_slice(&bytes);
+            }
+        }
+    }
+}
+
+/// One RPC-by-name call of a user procedure. Each parameter is (name, value,
+/// output): an empty name is a positional argument; `output` sets the
+/// fByRefValue status bit (an OUTPUT argument returned as a RETURNVALUE).
+fn proc_rpc(name: &str, params: &[(&str, RpcArg, bool)]) -> Vec<u8> {
+    let mut b = Vec::new();
+    let name_units = ucs2le(name);
+    b.extend_from_slice(&((name_units.len() / 2) as u16).to_le_bytes()); // NameLen (chars)
+    b.extend_from_slice(&name_units);
+    b.extend_from_slice(&0u16.to_le_bytes()); // option flags
+    for (pname, value, output) in params {
+        let pn = ucs2le(pname);
+        b.push((pn.len() / 2) as u8); // param-name char count (0 = positional)
+        b.extend_from_slice(&pn);
+        b.push(if *output { 0x01 } else { 0x00 }); // StatusFlags: fByRefValue
+        value.encode(&mut b);
+    }
+    b
+}
+
 /// One sp_executesql RPC (by ProcID) with a single unnamed @stmt param.
 fn sp_executesql_rpc(sql: &str) -> Vec<u8> {
     let mut b = Vec::new();
@@ -877,6 +952,235 @@ async fn a_multi_rpc_request_answers_each_rpc_in_one_response() {
     );
     assert_eq!(row_ints(&tokens), [4], "tokens: {tokens:?}");
 
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Extracts the (name, value) of every RETURNVALUE token in order.
+fn return_values(tokens: &[Token]) -> Vec<(String, Cell)> {
+    tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::ReturnValue { name, value } => Some((name.clone(), value.clone())),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The one RETURNSTATUS value in a reply.
+fn return_status(tokens: &[Token]) -> Option<i32> {
+    tokens.iter().find_map(|t| match t {
+        Token::ReturnStatus(v) => Some(*v),
+        _ => None,
+    })
+}
+
+/// An RPC-by-name call of a user procedure with a named OUTPUT parameter and a
+/// RETURN carries the real status and the OUTPUT value back as RETURNSTATUS and
+/// a typed RETURNVALUE.
+#[tokio::test]
+async fn rpc_by_name_returns_status_and_named_output() {
+    let path = temp_path("rpc-named-output");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE PROCEDURE addone @x INT, @out INT OUTPUT AS BEGIN SET @out = @x + 1; RETURN 7; END")
+        .await;
+
+    let body = proc_rpc(
+        "addone",
+        &[
+            ("@x", RpcArg::Int(10), false),
+            ("@out", RpcArg::IntNull, true),
+        ],
+    );
+    let tokens = client.rpc(&body).await;
+
+    assert_eq!(return_status(&tokens), Some(7), "tokens: {tokens:?}");
+    assert_eq!(
+        return_values(&tokens),
+        vec![("@out".to_string(), Cell::Int(11))],
+        "tokens: {tokens:?}"
+    );
+    // The reply frames as a procedure reply and ends clean.
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(t, Token::DoneProc { error: false, .. })),
+        "tokens: {tokens:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A positional (unnamed-parameter) call — the JDBC `{call p(?, ?)}` shape —
+/// binds by position and returns the OUTPUT value as a nameless RETURNVALUE the
+/// driver matches by ordinal.
+#[tokio::test]
+async fn rpc_by_name_positional_output() {
+    let path = temp_path("rpc-positional");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE PROCEDURE double2 @a INT, @b INT OUTPUT AS BEGIN SET @b = @a * 2; RETURN 3; END")
+        .await;
+
+    let body = proc_rpc(
+        "double2",
+        &[("", RpcArg::Int(21), false), ("", RpcArg::IntNull, true)],
+    );
+    let tokens = client.rpc(&body).await;
+
+    assert_eq!(return_status(&tokens), Some(3), "tokens: {tokens:?}");
+    assert_eq!(
+        return_values(&tokens),
+        vec![(String::new(), Cell::Int(42))],
+        "tokens: {tokens:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A typed OUTPUT parameter other than INT round-trips through the RETURNVALUE
+/// encoder (exercises the TYPE_INFO path for a variable-length string).
+#[tokio::test]
+async fn rpc_by_name_nvarchar_output() {
+    let path = temp_path("rpc-nvarchar");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch(
+            "CREATE PROCEDURE greet @who NVARCHAR(50), @msg NVARCHAR(80) OUTPUT AS \
+             BEGIN SET @msg = N'hello ' + @who; END",
+        )
+        .await;
+
+    let body = proc_rpc(
+        "greet",
+        &[
+            ("@who", RpcArg::NVarChar("world".to_string()), false),
+            ("@msg", RpcArg::NVarChar(String::new()), true),
+        ],
+    );
+    let tokens = client.rpc(&body).await;
+
+    // No RETURN: the status defaults to 0, still emitted.
+    assert_eq!(return_status(&tokens), Some(0), "tokens: {tokens:?}");
+    assert_eq!(
+        return_values(&tokens),
+        vec![("@msg".to_string(), Cell::Str("hello world".to_string()))],
+        "tokens: {tokens:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// A NULL result in an OUTPUT parameter is returned as a NULL RETURNVALUE.
+#[tokio::test]
+async fn rpc_by_name_null_output() {
+    let path = temp_path("rpc-null-output");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE PROCEDURE clear1 @out INT OUTPUT AS BEGIN SET @out = NULL; END")
+        .await;
+
+    let body = proc_rpc("clear1", &[("@out", RpcArg::Int(5), true)]);
+    let tokens = client.rpc(&body).await;
+
+    assert_eq!(
+        return_values(&tokens),
+        vec![("@out".to_string(), Cell::Null)],
+        "tokens: {tokens:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// An RPC-by-name call of a procedure that does not exist is error 2812, the
+/// same as SQL Server, and no RETURNSTATUS or RETURNVALUE is emitted.
+#[tokio::test]
+async fn rpc_by_name_unknown_proc_is_2812() {
+    let path = temp_path("rpc-unknown");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+
+    let body = proc_rpc("no_such_proc", &[("@x", RpcArg::Int(1), false)]);
+    let tokens = client.rpc(&body).await;
+
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(t, Token::Error { number: 2812 })),
+        "tokens: {tokens:?}"
+    );
+    assert!(
+        return_values(&tokens).is_empty(),
+        "a failed procedure returns no OUTPUT values: {tokens:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}
+
+/// Two procedure RPCs in one request each carry their own RETURNSTATUS and
+/// RETURNVALUE tail — the tails do not bleed across the multi-RPC boundary.
+#[tokio::test]
+async fn multi_rpc_proc_calls_each_carry_their_own_tail() {
+    let path = temp_path("rpc-multi-tail");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client.login("sa", "secret").await;
+    client
+        .batch("CREATE PROCEDURE addk @x INT, @out INT OUTPUT AS BEGIN SET @out = @x + 100; RETURN @x; END")
+        .await;
+
+    let mut body = proc_rpc(
+        "addk",
+        &[
+            ("@x", RpcArg::Int(1), false),
+            ("@out", RpcArg::IntNull, true),
+        ],
+    );
+    body.push(0xff); // batch separator
+    body.extend(proc_rpc(
+        "addk",
+        &[
+            ("@x", RpcArg::Int(2), false),
+            ("@out", RpcArg::IntNull, true),
+        ],
+    ));
+    let tokens = client.rpc(&body).await;
+
+    let statuses: Vec<i32> = tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::ReturnStatus(v) => Some(*v),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(statuses, [1, 2], "one status per RPC, in order: {tokens:?}");
+    assert_eq!(
+        return_values(&tokens),
+        vec![
+            ("@out".to_string(), Cell::Int(101)),
+            ("@out".to_string(), Cell::Int(102)),
+        ],
+        "each RPC's OUTPUT in order: {tokens:?}"
+    );
+    // Every DONEPROC but the last carries DONE_MORE.
+    let procs: Vec<(bool, bool)> = tokens
+        .iter()
+        .filter_map(|t| match t {
+            Token::DoneProc { more, error, .. } => Some((*more, *error)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(procs, [(true, false), (false, false)], "tokens: {tokens:?}");
     let _ = std::fs::remove_file(&path);
 }
 
