@@ -66,6 +66,39 @@ pub enum Statement {
     Throw(ThrowStatement),
     /// `RAISERROR(msg, severity, state [, args...]) [WITH LOG|NOWAIT|SETERROR]`.
     RaiseError(RaiseError),
+    /// `BEGIN <statements> END` — a plain statement block (not TRY, not TRAN).
+    Block {
+        body: Vec<Statement>,
+        span: Span,
+    },
+    /// `IF <condition> <statement> [ELSE <statement>]`. T-SQL three-valued:
+    /// only TRUE runs the THEN branch; FALSE and NULL take the ELSE.
+    If {
+        condition: Expr,
+        then_branch: Box<Statement>,
+        else_branch: Option<Box<Statement>>,
+        span: Span,
+    },
+    /// `WHILE <condition> <statement>`.
+    While {
+        condition: Expr,
+        body: Box<Statement>,
+        span: Span,
+    },
+    /// `BREAK` — terminates the innermost enclosing WHILE. The parser rejects
+    /// it outside one (SQL Server's compile-time 135).
+    Break {
+        span: Span,
+    },
+    /// `CONTINUE` — restarts the innermost enclosing WHILE.
+    Continue {
+        span: Span,
+    },
+    /// `RETURN [expr]` — exits the batch (and, later, the procedure).
+    Return {
+        value: Option<Expr>,
+        span: Span,
+    },
 }
 
 /// `THROW [number, message, state]`.

@@ -30,6 +30,9 @@ pub struct Parser {
     pos: usize,
     /// Current expression recursion depth.
     depth: usize,
+    /// Lexical `WHILE` nesting depth: `BREAK`/`CONTINUE` outside a loop are
+    /// compile-time errors (SQL Server 135/136), so the parser tracks it.
+    while_depth: usize,
     /// Expression nodes built so far.
     nodes: usize,
 }
@@ -45,6 +48,7 @@ impl Parser {
             tokens,
             pos: 0,
             depth: 0,
+            while_depth: 0,
             nodes: 0,
         }
     }
@@ -130,6 +134,11 @@ impl Parser {
             Some("USE") => self.parse_use(),
             Some("THROW") => self.parse_throw(),
             Some("RAISERROR") => self.parse_raiserror(),
+            Some("IF") => self.parse_if(),
+            Some("WHILE") => self.parse_while(),
+            Some("BREAK") => self.parse_break(),
+            Some("CONTINUE") => self.parse_continue(),
+            Some("RETURN") => self.parse_return(),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -182,21 +191,134 @@ impl Parser {
         }))
     }
 
+    /// `IF <condition> <statement> [ELSE <statement>]`. A semicolon after the
+    /// THEN statement ends the IF — `; ELSE` is a syntax error, as in T-SQL.
+    fn parse_if(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("IF")?;
+        let condition = self.parse_expr()?;
+        let then_branch = Box::new(self.parse_statement()?);
+        let else_branch = if self.peek_keyword().as_deref() == Some("ELSE") {
+            self.bump();
+            Some(Box::new(self.parse_statement()?))
+        } else {
+            None
+        };
+        let end = self.prev_span();
+        Ok(Statement::If {
+            condition,
+            then_branch,
+            else_branch,
+            span: start.to(end),
+        })
+    }
+
+    /// `WHILE <condition> <statement>`.
+    fn parse_while(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("WHILE")?;
+        let condition = self.parse_expr()?;
+        self.while_depth += 1;
+        let body = self.parse_statement();
+        self.while_depth -= 1;
+        let body = Box::new(body?);
+        let end = self.prev_span();
+        Ok(Statement::While {
+            condition,
+            body,
+            span: start.to(end),
+        })
+    }
+
+    fn parse_break(&mut self) -> SqlResult<Statement> {
+        let span = self.expect_keyword("BREAK")?;
+        if self.while_depth == 0 {
+            return Err(SqlError::new(
+                135,
+                15,
+                1,
+                "Cannot use the BREAK statement outside the scope of a WHILE statement.",
+            )
+            .at(span));
+        }
+        Ok(Statement::Break { span })
+    }
+
+    fn parse_continue(&mut self) -> SqlResult<Statement> {
+        let span = self.expect_keyword("CONTINUE")?;
+        if self.while_depth == 0 {
+            return Err(SqlError::new(
+                136,
+                15,
+                1,
+                "Cannot use the CONTINUE statement outside the scope of a WHILE statement.",
+            )
+            .at(span));
+        }
+        Ok(Statement::Continue { span })
+    }
+
+    /// `RETURN [expr]` — the expression is parsed when the next token can
+    /// start one (T-SQL RETURN takes an integer expression).
+    fn parse_return(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("RETURN")?;
+        let has_value = matches!(
+            self.peek().kind,
+            TokenKind::Int(_)
+                | TokenKind::Number(_)
+                | TokenKind::String(_)
+                | TokenKind::LocalVar(_)
+                | TokenKind::GlobalVar(_)
+                | TokenKind::LParen
+                | TokenKind::Minus
+                | TokenKind::Plus
+        );
+        let value = if has_value {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        // Batches cannot return a value — SQL Server's compile-time 178. The
+        // grammar still parses one so procedure bodies (which may) share it.
+        if let Some(value) = &value {
+            return Err(SqlError::new(
+                178,
+                15,
+                1,
+                "A RETURN statement with a return value cannot be used in this context.",
+            )
+            .at(value.span));
+        }
+        let end = self.prev_span();
+        Ok(Statement::Return {
+            value,
+            span: start.to(end),
+        })
+    }
+
     // ---- transaction control --------------------------------------------
 
     fn parse_begin(&mut self) -> SqlResult<Statement> {
         let start = self.expect_keyword("BEGIN")?;
-        // `BEGIN` opens either a transaction or a `TRY` block; there are no
-        // general `BEGIN...END` blocks. (A bare `BEGIN CATCH` is invalid — it
-        // is only reachable inside `parse_try_catch`, after `END TRY`.)
+        // `BEGIN` opens a transaction, a `TRY` block, or a plain statement
+        // block. (A bare `BEGIN CATCH` is invalid — it is only reachable
+        // inside `parse_try_catch`, after `END TRY`.)
         if matches!(self.peek_keyword().as_deref(), Some("TRY")) {
             return self.parse_try_catch(start);
         }
         let mut end = match self.peek_keyword().as_deref() {
             Some("TRAN") | Some("TRANSACTION") => self.bump().span,
+            // Anything else: a plain `BEGIN <statements> END` block. An
+            // EMPTY block is a syntax error, as in SQL Server.
             _ => {
-                let token = self.peek().clone();
-                return Err(SqlError::syntax(self.token_text(&token), token.span));
+                let body = self.parse_block()?;
+                if body.is_empty() {
+                    let token = self.peek().clone();
+                    return Err(SqlError::syntax(self.token_text(&token), token.span));
+                }
+                let end = self.expect_keyword("END")?;
+                return Ok(Statement::Block {
+                    body,
+                    span: start.to(end),
+                });
             }
         };
         let name = self.parse_optional_txn_name();
@@ -2448,13 +2570,15 @@ fn binary(op: BinaryOp, left: Expr, right: Expr) -> Expr {
 
 /// Keywords that end the SELECT-list / cannot be an implicit alias.
 fn is_clause_keyword(keyword: &str) -> bool {
-    // `END` closes a TRY/CATCH block and is reserved in T-SQL, so a bare `END`
-    // is never an implicit alias — without this, `SELECT 1 END TRY` would read
-    // `END` as the alias for `1` and then fail on `TRY`. (An explicit `AS end`
-    // or a delimited `[end]` still aliases, as before.)
+    // `END` closes a block and `ELSE` continues an `IF` — both reserved in
+    // T-SQL, so neither is ever an implicit alias. Without this,
+    // `SELECT 1 END TRY` would read `END` as the alias for `1`, and
+    // `IF c SELECT 1 ELSE SELECT 2` would alias `1` as `ELSE` and silently
+    // detach the ELSE branch. (An explicit `AS end` or a delimited `[end]`
+    // still aliases, as before.)
     matches!(
         keyword,
-        "FROM" | "WHERE" | "ORDER" | "GROUP" | "HAVING" | "AS" | "END"
+        "FROM" | "WHERE" | "ORDER" | "GROUP" | "HAVING" | "AS" | "END" | "ELSE"
     )
 }
 
