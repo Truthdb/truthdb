@@ -1,0 +1,192 @@
+# Scalar user-defined functions (Stage 15): CREATE/ALTER/DROP FUNCTION, per-row
+# evaluation in SELECT/WHERE, nested calls, table-reading bodies, side-effect
+# restrictions, and the catalog views.
+
+statement ok
+CREATE FUNCTION dbo.addone (@x INT) RETURNS INT AS BEGIN RETURN @x + 1 END
+
+# A scalar call folds to its returned value (schema-qualified and bare).
+query I
+SELECT dbo.addone(5)
+----
+6
+
+query I
+SELECT addone(41)
+----
+42
+
+# Per-row over a table, in the SELECT list and the WHERE clause.
+statement ok
+CREATE TABLE ft (id INT NOT NULL PRIMARY KEY)
+
+statement ok
+INSERT INTO ft VALUES (1), (2), (3)
+
+query I rowsort
+SELECT dbo.addone(id) FROM ft
+----
+2
+3
+4
+
+query I rowsort
+SELECT id FROM ft WHERE dbo.addone(id) > 3
+----
+3
+
+# Control flow in the body.
+statement ok
+CREATE FUNCTION dbo.absval (@x INT) RETURNS INT AS BEGIN IF @x < 0 RETURN -@x; RETURN @x END
+
+query II
+SELECT dbo.absval(-7), dbo.absval(7)
+----
+7 7
+
+# One function calling another (nested); shares the nesting budget.
+statement ok
+CREATE FUNCTION dbo.addtwo (@x INT) RETURNS INT AS BEGIN RETURN dbo.addone(dbo.addone(@x)) END
+
+query I
+SELECT dbo.addtwo(10)
+----
+12
+
+# A body that reads a table (its inner reads are locked up front).
+statement ok
+CREATE FUNCTION dbo.rowcount () RETURNS INT AS BEGIN RETURN (SELECT COUNT(*) FROM ft) END
+
+query I
+SELECT dbo.rowcount()
+----
+3
+
+# An assignment SELECT (returns no rows) is allowed and reads its FROM table.
+statement ok
+CREATE FUNCTION dbo.rowcount2 () RETURNS INT AS BEGIN DECLARE @c INT; SELECT @c = COUNT(*) FROM ft; RETURN @c END
+
+query I
+SELECT dbo.rowcount2()
+----
+3
+
+# A non-INT return type.
+statement ok
+CREATE FUNCTION dbo.greet (@who NVARCHAR(50)) RETURNS NVARCHAR(80) AS BEGIN RETURN N'hello ' + @who END
+
+query T
+SELECT dbo.greet(N'world')
+----
+hello world
+
+# NULL flows through.
+query I
+SELECT dbo.addone(NULL)
+----
+NULL
+
+# ALTER FUNCTION replaces the definition.
+statement ok
+ALTER FUNCTION dbo.addone (@x INT) RETURNS INT AS BEGIN RETURN @x + 10 END
+
+query I
+SELECT dbo.addone(5)
+----
+15
+
+# DROP FUNCTION.
+statement ok
+DROP FUNCTION dbo.addtwo
+
+statement error
+SELECT dbo.addtwo(1)
+
+# --- Side-effect restrictions (function bodies must be side-effect-free) ---
+
+# INSERT/UPDATE/DELETE in a function body is rejected (443).
+statement error
+CREATE FUNCTION dbo.bad_dml (@x INT) RETURNS INT AS BEGIN INSERT INTO ft VALUES (@x); RETURN @x END
+
+# A data-returning SELECT is rejected (444).
+statement error
+CREATE FUNCTION dbo.bad_select () RETURNS INT AS BEGIN SELECT id FROM ft; RETURN 1 END
+
+# The last statement must be a RETURN (455).
+statement error
+CREATE FUNCTION dbo.no_return (@x INT) RETURNS INT AS BEGIN SET @x = @x + 1 END
+
+# EXEC of a procedure in a function body is rejected (443).
+statement error
+CREATE FUNCTION dbo.bad_exec () RETURNS INT AS BEGIN EXEC sp_executesql N'SELECT 1'; RETURN 1 END
+
+# Transaction control in a function body is rejected (443).
+statement error
+CREATE FUNCTION dbo.bad_txn () RETURNS INT AS BEGIN BEGIN TRANSACTION; RETURN 1 END
+
+# A function parameter cannot be OUTPUT.
+statement error
+CREATE FUNCTION dbo.bad_output (@x INT OUTPUT) RETURNS INT AS BEGIN RETURN @x END
+
+# --- Namespace classification (a scalar function is not a table) ---
+
+statement ok
+CREATE FUNCTION dbo.two () RETURNS INT AS BEGIN RETURN 2 END
+
+# A scalar function cannot appear in FROM.
+statement error
+SELECT * FROM dbo.two
+
+# It is not a DML target.
+statement error
+INSERT INTO dbo.two VALUES (1)
+
+# DROP TABLE must not destroy a function.
+statement error
+DROP TABLE dbo.two
+
+# EXEC of a function is not a procedure call (2812).
+statement error
+EXEC dbo.two
+
+# A name already used by a table cannot be a function, and vice versa.
+statement error
+CREATE FUNCTION ft () RETURNS INT AS BEGIN RETURN 1 END
+
+# --- Catalog views ---
+
+query T
+SELECT type FROM sys.objects WHERE name = 'two'
+----
+FN
+
+query T
+SELECT type_desc FROM sys.objects WHERE name = 'greet'
+----
+SQL_SCALAR_FUNCTION
+
+# sys.parameters: the return value is parameter_id 0 (is_output 1), then the
+# declared parameters (1-based).
+query III rowsort
+SELECT parameter_id, is_output, has_default_value FROM sys.parameters WHERE object_id = (SELECT object_id FROM sys.objects WHERE name = 'greet')
+----
+0 1 0
+1 0 0
+
+# The declared parameter keeps its @-prefixed name.
+query T
+SELECT name FROM sys.parameters WHERE object_id = (SELECT object_id FROM sys.objects WHERE name = 'greet') AND parameter_id = 1
+----
+@who
+
+# sys.sql_modules carries the body text.
+query T
+SELECT definition FROM sys.sql_modules WHERE object_id = (SELECT object_id FROM sys.objects WHERE name = 'two')
+----
+BEGIN RETURN 2 END
+
+# A function does not appear in sys.tables (only base tables do).
+query I
+SELECT COUNT(*) FROM sys.tables WHERE name = 'two'
+----
+0
