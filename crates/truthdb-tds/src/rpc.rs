@@ -83,6 +83,9 @@ pub enum RpcProc {
 pub struct RpcRequest {
     pub proc: RpcProc,
     pub params: Vec<RpcParam>,
+    /// Parallel to `params`: fByRefValue — the caller wants the parameter
+    /// back as a RETURNVALUE (an OUTPUT argument).
+    pub outputs: Vec<bool>,
 }
 
 /// Decodes an RPC request body (the bytes *after* the ALL_HEADERS block).
@@ -147,6 +150,7 @@ fn parse_one_rpc(c: &mut Cursor) -> io::Result<RpcRequest> {
     let _option_flags = c.u16()?;
 
     let mut params = Vec::new();
+    let mut outputs = Vec::new();
     while c.remaining() > 0 {
         // A batch flag (0x80 = old-style / 0xFF = separator) begins the next
         // RPC in a multi-RPC request; the caller consumes it and loops.
@@ -156,15 +160,22 @@ fn parse_one_rpc(c: &mut Cursor) -> io::Result<RpcRequest> {
         }
         let name_len = c.u8()? as usize;
         let name = c.utf16(name_len * 2)?;
-        let _status = c.u8()?; // StatusFlags: fByRefValue / fDefaultValue.
+        // StatusFlags: bit 0 = fByRefValue (an OUTPUT parameter the caller
+        // wants back as a RETURNVALUE); bit 1 = fDefaultValue.
+        let status = c.u8()?;
         let (column_type, value) = decode_param(c)?;
         params.push(RpcParam {
             name,
             column_type,
             value,
         });
+        outputs.push(status & 0x01 != 0);
     }
-    Ok(RpcRequest { proc, params })
+    Ok(RpcRequest {
+        proc,
+        params,
+        outputs,
+    })
 }
 
 /// Decodes a body expected to hold exactly one RPC (tests' shorthand).
