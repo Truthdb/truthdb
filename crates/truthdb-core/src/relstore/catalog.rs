@@ -170,6 +170,10 @@ pub enum FunctionReturns {
     /// is the declared return type (same round-trip as a column type); `body` is
     /// the source text after `AS`, re-parsed per call.
     Scalar { type_spec: String, body: String },
+    /// `RETURNS TABLE AS RETURN ( <select> )`: an inline table-valued function.
+    /// `select_text` is the body SELECT's source, re-parsed and expanded like a
+    /// parameterized view (the call's arguments bind to the `@params`).
+    InlineTable { select_text: String },
 }
 
 impl TableDef {

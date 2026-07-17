@@ -144,12 +144,14 @@ pub struct CreateFunction {
     pub span: Span,
 }
 
-/// A function's declared return shape. Only the scalar form exists today; the
-/// table-valued forms are added by later work.
+/// A function's declared return shape.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ReturnsClause {
     /// `RETURNS <scalar type>`: a scalar UDF.
     Scalar(DataType),
+    /// `RETURNS TABLE AS RETURN ( <select> )`: an inline table-valued function.
+    /// The body is the SELECT (its source captured in `CreateFunction.body`).
+    InlineTable,
 }
 
 /// One declared procedure parameter.
@@ -536,6 +538,13 @@ pub enum TableRef {
     Derived {
         subquery: Box<Select>,
         alias: Name,
+    },
+    /// A table-valued function call in FROM: `dbo.f(args) [AS alias]`. The alias
+    /// is optional (an unaliased call exposes the bare function name).
+    Function {
+        name: Name,
+        args: Vec<Expr>,
+        alias: Option<Name>,
     },
 }
 

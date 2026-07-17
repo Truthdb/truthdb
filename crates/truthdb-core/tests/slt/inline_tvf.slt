@@ -1,0 +1,118 @@
+# Inline table-valued functions (Stage 15): RETURNS TABLE AS RETURN(select),
+# invoked in FROM as a parameterized view.
+
+statement ok
+CREATE TABLE nums (id INT NOT NULL PRIMARY KEY, grp INT NOT NULL)
+
+statement ok
+INSERT INTO nums VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 20)
+
+statement ok
+CREATE FUNCTION dbo.in_group (@g INT) RETURNS TABLE AS RETURN (SELECT id FROM nums WHERE grp = @g)
+
+# Called in FROM; the argument binds to the body's @g.
+query I rowsort
+SELECT id FROM dbo.in_group(20)
+----
+3
+4
+5
+
+# Bare-name call and an alias.
+query I rowsort
+SELECT t.id FROM dbo.in_group(10) AS t
+----
+1
+2
+
+# Joined against a base table.
+statement ok
+CREATE TABLE label (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))
+
+statement ok
+INSERT INTO label VALUES (3, 'three'), (4, 'four'), (5, 'five')
+
+query IT rowsort
+SELECT g.id, l.name FROM dbo.in_group(20) AS g JOIN label AS l ON g.id = l.id
+----
+3 three
+4 four
+5 five
+
+# The argument can be an expression / a batch variable.
+query I rowsort
+SELECT id FROM dbo.in_group(10 + 10)
+----
+3
+4
+5
+
+# A projecting/aggregating body.
+statement ok
+CREATE FUNCTION dbo.group_count (@g INT) RETURNS TABLE AS RETURN (SELECT COUNT(*) AS n FROM nums WHERE grp = @g)
+
+query I
+SELECT n FROM dbo.group_count(20)
+----
+3
+
+# A TVF selecting from another TVF (nesting, bounded by the view-depth guard).
+statement ok
+CREATE FUNCTION dbo.in_group_twice (@g INT) RETURNS TABLE AS RETURN (SELECT id FROM dbo.in_group(@g) WHERE id > 3)
+
+query I rowsort
+SELECT id FROM dbo.in_group_twice(20)
+----
+4
+5
+
+# Wrong argument count is an error.
+statement error
+SELECT id FROM dbo.in_group()
+
+statement error
+SELECT id FROM dbo.in_group(1, 2)
+
+# A scalar function called in FROM (with args) is not a rowset.
+statement ok
+CREATE FUNCTION dbo.scalar_fn (@x INT) RETURNS INT AS BEGIN RETURN @x + 1 END
+
+statement error
+SELECT * FROM dbo.scalar_fn(1)
+
+# A table-valued function called in scalar position is not a scalar.
+statement error
+SELECT dbo.in_group(10)
+
+# ALTER and DROP.
+statement ok
+ALTER FUNCTION dbo.in_group (@g INT) RETURNS TABLE AS RETURN (SELECT id FROM nums WHERE grp = @g AND id < 5)
+
+query I rowsort
+SELECT id FROM dbo.in_group(20)
+----
+3
+4
+
+statement ok
+DROP FUNCTION dbo.group_count
+
+statement error
+SELECT n FROM dbo.group_count(20)
+
+# Catalog: sys.objects IF code, sys.sql_modules body, no parameter_id 0 row.
+query T
+SELECT type FROM sys.objects WHERE name = 'in_group'
+----
+IF
+
+query T
+SELECT type_desc FROM sys.objects WHERE name = 'in_group_twice'
+----
+SQL_INLINE_TABLE_VALUED_FUNCTION
+
+# An inline TVF has no scalar return row (parameter_id 0); only its @params.
+query I rowsort
+SELECT parameter_id FROM sys.parameters WHERE object_id = (SELECT object_id FROM sys.objects WHERE name = 'in_group')
+----
+1

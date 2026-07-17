@@ -1636,9 +1636,34 @@ impl Parser {
         }
         self.expect(&TokenKind::RParen)?;
         self.expect_keyword("RETURNS")?;
-        // Scalar form only: the return is a system type. (RETURNS TABLE / @t
-        // TABLE — the table-valued forms — are added by later work; a TABLE
-        // return type falls through to parse_data_type's 243.)
+        // `RETURNS TABLE` is an inline table-valued function: its body is a
+        // single `AS RETURN ( <select> )` captured as source text and expanded
+        // like a parameterized view. (Multi-statement `RETURNS @t TABLE(...)` is
+        // added by later work.) Anything else is a scalar return type.
+        if self.peek_keyword().as_deref() == Some("TABLE") {
+            self.bump(); // TABLE
+            self.expect_keyword("AS")?;
+            self.expect_keyword("RETURN")?;
+            let parens = self.eat(&TokenKind::LParen);
+            let select_start = self.peek().span.start;
+            let select = self.parse_select()?;
+            let select_text = self
+                .slice(Span::new(select_start, select.span.end))
+                .trim()
+                .to_string();
+            if parens {
+                self.expect(&TokenKind::RParen)?;
+            }
+            let span = start.to(self.prev_span());
+            return Ok(Statement::CreateFunction(CreateFunction {
+                name,
+                params,
+                returns: ReturnsClause::InlineTable,
+                body: select_text,
+                alter,
+                span,
+            }));
+        }
         let (return_type, _) = self.parse_data_type()?;
         let returns = ReturnsClause::Scalar(return_type);
         self.expect_keyword("AS")?;
@@ -2202,6 +2227,22 @@ impl Parser {
             return Ok(inner);
         }
         let name = self.parse_name()?;
+        // `name ( args )` in table position is a table-valued function call.
+        if self.check(&TokenKind::LParen) {
+            self.bump(); // (
+            let mut args = Vec::new();
+            if !self.check(&TokenKind::RParen) {
+                loop {
+                    args.push(self.parse_expr()?);
+                    if !self.eat(&TokenKind::Comma) {
+                        break;
+                    }
+                }
+            }
+            self.expect(&TokenKind::RParen)?;
+            let alias = self.parse_optional_table_alias()?;
+            return Ok(TableRef::Function { name, args, alias });
+        }
         let alias = self.parse_optional_table_alias()?;
         Ok(TableRef::Table { name, alias })
     }
