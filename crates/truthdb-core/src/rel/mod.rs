@@ -1587,7 +1587,7 @@ fn run_block(
                 // the caller. Nested user functions and subqueries in the RETURN
                 // expression are rewritten to literals first, exactly like an
                 // IF/WHILE condition.
-                if let Some(return_type) = run.function_return_type.clone() {
+                if let Some(return_type) = run.function_return_type {
                     let value = value
                         .as_ref()
                         .expect("a scalar function RETURN carries a value (parser-enforced)");
