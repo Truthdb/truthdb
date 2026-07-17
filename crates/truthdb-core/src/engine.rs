@@ -5805,6 +5805,62 @@ mod tests {
     }
 
     #[test]
+    fn procedure_ddl_round_trips_and_survives_reopen() {
+        // CREATE/ALTER/DROP PROCEDURE: catalog persistence (the body is
+        // stored text), name collision (2714), the first-statement rule
+        // (111), and RETURN <value> legal only inside a body.
+        let path = unique_temp_path("proc-ddl");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "CREATE PROCEDURE add_pair @a INT, @b INT = 7 OUTPUT AS \
+             SET @b = @a + @b; RETURN 0",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        // Name collision with any object class.
+        let out = batch(&engine, &mut ctx, "CREATE PROC add_pair AS SELECT 1");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(2714));
+        // Not the first statement in the batch: 111.
+        let out = batch(&engine, &mut ctx, "SELECT 1; CREATE PROC late AS SELECT 1");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(111));
+        // RETURN <value> stays illegal OUTSIDE a body.
+        let out = batch(&engine, &mut ctx, "RETURN 3");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(178));
+        // ALTER replaces; ALTER of a missing procedure errors.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "ALTER PROCEDURE add_pair @a INT AS RETURN @a",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let out = batch(&engine, &mut ctx, "ALTER PROC no_such AS SELECT 1");
+        assert!(out.error.is_some(), "ALTER of a missing procedure fails");
+        drop(engine);
+
+        // The definition survives a reopen; DROP removes it.
+        let engine = {
+            let storage = Storage::open(path.clone()).expect("reopen");
+            Engine::new(storage).expect("engine")
+        };
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "CREATE PROC add_pair AS SELECT 1");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(2714),
+            "the procedure survived the reopen"
+        );
+        let out = batch(&engine, &mut ctx, "DROP PROCEDURE add_pair");
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let out = batch(&engine, &mut ctx, "DROP PROCEDURE add_pair");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(3701));
+        let out = batch(&engine, &mut ctx, "DROP PROCEDURE IF EXISTS add_pair");
+        assert!(out.error.is_none(), "IF EXISTS swallows the miss");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn try_catch_nested_inner_handles_outer_continues() {
         // The inner CATCH handles the inner error; because it does not re-raise,
         // the outer TRY continues and the outer CATCH never runs.

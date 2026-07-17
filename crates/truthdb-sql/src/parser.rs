@@ -33,6 +33,14 @@ pub struct Parser {
     /// Lexical `WHILE` nesting depth: `BREAK`/`CONTINUE` outside a loop are
     /// compile-time errors (SQL Server 135/136), so the parser tracks it.
     while_depth: usize,
+    /// Parsing a stored-procedure body: `RETURN <value>` is then legal.
+    in_procedure: bool,
+    /// Nesting depth inside blocks / IF branches / WHILE bodies — procedure
+    /// DDL must be top-level (SQL Server 156/111 classes).
+    sub_depth: usize,
+    /// Index of the top-level statement being parsed (CREATE/ALTER PROCEDURE
+    /// must be the batch's first statement — SQL Server 111).
+    statement_index: usize,
     /// Expression nodes built so far.
     nodes: usize,
 }
@@ -49,6 +57,9 @@ impl Parser {
             pos: 0,
             depth: 0,
             while_depth: 0,
+            in_procedure: false,
+            sub_depth: 0,
+            statement_index: 0,
             nodes: 0,
         }
     }
@@ -106,6 +117,7 @@ impl Parser {
             // expressions never reach parse_expr's depth-0 reset and would
             // otherwise inherit the previous statement's count.
             self.nodes = 0;
+            self.statement_index = statements.len();
             statements.push(self.parse_statement()?);
             if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
                 let token = self.peek().clone();
@@ -150,6 +162,20 @@ impl Parser {
     /// the system procedures. Arguments end at the statement boundary.
     fn parse_exec(&mut self) -> SqlResult<Statement> {
         let start = self.bump().span; // EXEC or EXECUTE
+        // `EXEC @rc = proc ...` captures the RETURN status.
+        let next = &self.tokens[(self.pos + 1).min(self.tokens.len() - 1)];
+        let return_var =
+            if matches!(self.peek().kind, TokenKind::LocalVar(_)) && next.kind == TokenKind::Eq {
+                let token = self.bump();
+                let TokenKind::LocalVar(var) = &token.kind else {
+                    unreachable!("matched above");
+                };
+                let var = var.clone();
+                self.bump(); // `=`
+                Some(var)
+            } else {
+                None
+            };
         let proc = self.parse_name()?;
         let mut args = Vec::new();
         let mut end = proc.span;
@@ -178,7 +204,18 @@ impl Parser {
                 };
                 let value = self.parse_expr()?;
                 end = value.span;
-                args.push(ExecArg { name, value });
+                let output =
+                    if matches!(self.peek_keyword().as_deref(), Some("OUTPUT") | Some("OUT")) {
+                        end = self.bump().span;
+                        true
+                    } else {
+                        false
+                    };
+                args.push(ExecArg {
+                    name,
+                    value,
+                    output,
+                });
                 if !self.eat(&TokenKind::Comma) {
                     break;
                 }
@@ -186,6 +223,7 @@ impl Parser {
         }
         Ok(Statement::Exec(ExecStatement {
             proc,
+            return_var,
             args,
             span: start.to(end),
         }))
@@ -196,12 +234,19 @@ impl Parser {
     fn parse_if(&mut self) -> SqlResult<Statement> {
         let start = self.expect_keyword("IF")?;
         let condition = self.parse_expr()?;
-        let then_branch = Box::new(self.parse_statement()?);
-        let else_branch = if self.peek_keyword().as_deref() == Some("ELSE") {
+        self.sub_depth += 1;
+        let then_branch = self.parse_statement();
+        let else_branch = if then_branch.is_ok() && self.peek_keyword().as_deref() == Some("ELSE") {
             self.bump();
-            Some(Box::new(self.parse_statement()?))
+            Some(self.parse_statement())
         } else {
             None
+        };
+        self.sub_depth -= 1;
+        let then_branch = Box::new(then_branch?);
+        let else_branch = match else_branch {
+            Some(branch) => Some(Box::new(branch?)),
+            None => None,
         };
         let end = self.prev_span();
         Ok(Statement::If {
@@ -217,7 +262,9 @@ impl Parser {
         let start = self.expect_keyword("WHILE")?;
         let condition = self.parse_expr()?;
         self.while_depth += 1;
+        self.sub_depth += 1;
         let body = self.parse_statement();
+        self.sub_depth -= 1;
         self.while_depth -= 1;
         let body = Box::new(body?);
         let end = self.prev_span();
@@ -276,9 +323,11 @@ impl Parser {
         } else {
             None
         };
-        // Batches cannot return a value — SQL Server's compile-time 178. The
-        // grammar still parses one so procedure bodies (which may) share it.
-        if let Some(value) = &value {
+        // Batches cannot return a value — SQL Server's compile-time 178.
+        // Procedure bodies can (the RETURN status).
+        if let Some(value) = &value
+            && !self.in_procedure
+        {
             return Err(SqlError::new(
                 178,
                 15,
@@ -354,6 +403,13 @@ impl Parser {
     /// `TRY`/`CATCH` block. A nested `BEGIN TRY` is consumed whole by
     /// `parse_statement`, so a top-level `END` here always closes this block.
     fn parse_block(&mut self) -> SqlResult<Vec<Statement>> {
+        self.sub_depth += 1;
+        let block = self.parse_block_inner();
+        self.sub_depth -= 1;
+        block
+    }
+
+    fn parse_block_inner(&mut self) -> SqlResult<Vec<Statement>> {
         let mut statements = Vec::new();
         loop {
             while self.eat(&TokenKind::Semicolon) {}
@@ -742,6 +798,9 @@ impl Parser {
             Some("INDEX") => self.parse_create_index(start, unique),
             Some("TABLE") if !unique => self.parse_create_table(start),
             Some("VIEW") if !unique => self.parse_create_view(start),
+            Some("PROCEDURE") | Some("PROC") if !unique => {
+                self.parse_create_procedure(start, false)
+            }
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1246,6 +1305,12 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("DATABASE") {
             return self.parse_alter_database(start);
         }
+        if matches!(
+            self.peek_keyword().as_deref(),
+            Some("PROCEDURE") | Some("PROC")
+        ) {
+            return self.parse_create_procedure(start, true);
+        }
         self.expect_keyword("TABLE")?;
         let table = self.parse_name()?;
         let (action, end) = match self.peek_keyword().as_deref() {
@@ -1342,11 +1407,123 @@ impl Parser {
             Some("INDEX") => self.parse_drop_index(start),
             Some("TABLE") => self.parse_drop_table(start),
             Some("VIEW") => self.parse_drop_view(start),
+            Some("PROCEDURE") | Some("PROC") => self.parse_drop_procedure(start),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
             }
         }
+    }
+
+    /// `CREATE|ALTER PROC[EDURE] <name> [params] AS <body-to-end-of-batch>`.
+    /// The body is validated by parsing (with `RETURN <value>` legal) and
+    /// stored as its source text.
+    fn parse_create_procedure(&mut self, start: Span, alter: bool) -> SqlResult<Statement> {
+        self.bump(); // PROCEDURE | PROC
+        if self.statement_index > 0 || self.sub_depth > 0 {
+            return Err(SqlError::new(
+                111,
+                15,
+                1,
+                "'CREATE/ALTER PROCEDURE' must be the first statement in a query batch.",
+            )
+            .at(start));
+        }
+        let name = self.parse_name()?;
+        // Parameters: bare or parenthesized, comma-separated.
+        let parens = self.eat(&TokenKind::LParen);
+        let mut params = Vec::new();
+        while matches!(self.peek().kind, TokenKind::LocalVar(_)) {
+            let token = self.bump();
+            let TokenKind::LocalVar(param_name) = &token.kind else {
+                unreachable!("matched above");
+            };
+            let param_name = param_name.clone();
+            let param_start = token.span;
+            let (data_type, mut end) = self.parse_data_type()?;
+            let default_text = if self.eat(&TokenKind::Eq) {
+                let expr_start = self.peek().span.start;
+                let expr = self.parse_expr()?;
+                end = expr.span;
+                Some(
+                    self.slice(Span::new(expr_start, expr.span.end))
+                        .trim()
+                        .to_string(),
+                )
+            } else {
+                None
+            };
+            let output = if matches!(self.peek_keyword().as_deref(), Some("OUTPUT") | Some("OUT")) {
+                end = self.bump().span;
+                true
+            } else {
+                false
+            };
+            params.push(ProcParam {
+                name: param_name,
+                data_type,
+                default_text,
+                output,
+                span: param_start.to(end),
+            });
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        if parens {
+            self.expect(&TokenKind::RParen)?;
+        }
+        self.expect_keyword("AS")?;
+        // The body is everything to the end of the batch, stored verbatim;
+        // parse it now for validation (SQL Server checks syntax at CREATE).
+        let body_start = self.peek().span.start;
+        let body = self.src[body_start..].trim().to_string();
+        if body.is_empty() {
+            let token = self.peek().clone();
+            return Err(SqlError::syntax(self.token_text(&token), token.span));
+        }
+        self.in_procedure = true;
+        let validated = (|| -> SqlResult<()> {
+            loop {
+                while self.eat(&TokenKind::Semicolon) {}
+                if self.at_eof() {
+                    return Ok(());
+                }
+                self.nodes = 0;
+                self.parse_statement()?;
+                if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
+                    let token = self.peek().clone();
+                    return Err(SqlError::syntax(self.token_text(&token), token.span));
+                }
+            }
+        })();
+        self.in_procedure = false;
+        validated?;
+        let span = start.to(self.prev_span());
+        Ok(Statement::CreateProcedure(CreateProcedure {
+            name,
+            params,
+            body,
+            alter,
+            span,
+        }))
+    }
+
+    fn parse_drop_procedure(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // PROCEDURE | PROC
+        let if_exists = if self.peek_keyword().as_deref() == Some("IF") {
+            self.bump();
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_name()?;
+        Ok(Statement::DropProcedure {
+            span: start.to(name.span),
+            name,
+            if_exists,
+        })
     }
 
     fn parse_drop_view(&mut self, start: Span) -> SqlResult<Statement> {

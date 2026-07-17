@@ -555,6 +555,29 @@ impl Storage {
         self.lock().rel_create_view(name, query_text)
     }
 
+    pub fn rel_create_procedure(
+        &self,
+        name: &str,
+        procedure: crate::relstore::catalog::ProcedureDef,
+    ) -> Result<(), StorageError> {
+        let result = self.lock().rel_create_procedure(name, procedure);
+        // A parked batch analyzed against the OLD catalog could carry a stale
+        // lock set for an EXEC of this name — same class as the option-flip
+        // epoch (Stage 13): bump so the grant path re-analyzes.
+        self.bump_lock_epoch();
+        result
+    }
+
+    pub fn rel_alter_procedure(
+        &self,
+        name: &str,
+        procedure: crate::relstore::catalog::ProcedureDef,
+    ) -> Result<(), StorageError> {
+        let result = self.lock().rel_alter_procedure(name, procedure);
+        self.bump_lock_epoch();
+        result
+    }
+
     pub fn rel_table(&self, name: &str) -> Option<TableDef> {
         self.lock().rel_table(name)
     }
@@ -676,6 +699,14 @@ impl Storage {
         self.lock_epoch
             .fetch_add(1, std::sync::atomic::Ordering::Release);
         Ok(())
+    }
+
+    /// Bumps the lock-analysis epoch: a parked batch analyzed before a
+    /// catalog/option change re-analyzes at grant instead of running under a
+    /// stale lock set.
+    fn bump_lock_epoch(&self) {
+        self.lock_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::Release);
     }
 
     /// The lock-analysis epoch: parked batches analyzed under an older value
@@ -1344,6 +1375,7 @@ impl StorageFile {
                 check_constraints,
                 foreign_keys,
                 view_query: None,
+                procedure: None,
                 counter_page: Some(counter_page),
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1395,12 +1427,94 @@ impl StorageFile {
                 check_constraints: Vec::new(),
                 foreign_keys: Vec::new(),
                 view_query: Some(query),
+                procedure: None,
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
+        self.rel.tables.insert(name.to_string(), def);
+        Ok(())
+    }
+
+    /// Creates a stored procedure: a catalog entry whose stored form is its
+    /// parameter list and body text (the view posture — re-parsed at EXEC).
+    pub fn rel_create_procedure(
+        &mut self,
+        name: &str,
+        procedure: crate::relstore::catalog::ProcedureDef,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        if self.rel.tables.contains_key(name) {
+            return Err(StorageError::Constraint(format!(
+                "object '{name}' already exists"
+            )));
+        }
+        if self.rel.catalog_root.is_none() {
+            let root = {
+                let mut ctx = self.rel_ctx();
+                catalog::create_catalog(&mut ctx)?
+            };
+            self.rel.catalog_root = Some(root);
+        }
+        let catalog_root = self.rel.catalog_root.expect("catalog exists");
+        let object_id = self.rel.next_object_id;
+        let proc_name = name.to_string();
+        let def = self.rel_statement(move |ctx, txn| {
+            let def = TableDef {
+                object_id,
+                name: proc_name,
+                columns: Vec::new(),
+                key_columns: Vec::new(),
+                root_page: 0,
+                defaults: Vec::new(),
+                collations: Vec::new(),
+                identity: None,
+                indexes: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                view_query: None,
+                procedure: Some(procedure),
+                counter_page: None,
+            };
+            catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
+            Ok(def)
+        })?;
+        self.rel.next_object_id += 1;
+        self.rel.tables.insert(name.to_string(), def);
+        Ok(())
+    }
+
+    /// Replaces an existing procedure's parameters and body (`ALTER
+    /// PROCEDURE`): the object id is kept, the stored text swapped.
+    pub fn rel_alter_procedure(
+        &mut self,
+        name: &str,
+        procedure: crate::relstore::catalog::ProcedureDef,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        let Some(existing) = self.rel.tables.get(name) else {
+            return Err(StorageError::Constraint(format!(
+                "procedure '{name}' does not exist"
+            )));
+        };
+        if !existing.is_procedure() {
+            return Err(StorageError::Constraint(format!(
+                "object '{name}' is not a procedure"
+            )));
+        }
+        let mut def = existing.clone();
+        def.procedure = Some(procedure);
+        let catalog_root = self
+            .rel
+            .catalog_root
+            .expect("procedures live in the catalog");
+        let write = def.clone();
+        self.rel_statement(move |ctx, txn| {
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &write)?;
+            Ok(())
+        })?;
         self.rel.tables.insert(name.to_string(), def);
         Ok(())
     }

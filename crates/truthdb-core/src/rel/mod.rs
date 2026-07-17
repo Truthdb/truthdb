@@ -14,11 +14,11 @@ mod plan;
 mod value;
 
 use truthdb_sql::ast::{
-    AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateIndex, CreateTable,
-    CreateView, DataType, DatabaseOption, Declaration, Delete, DropIndex, DropTable, DropView,
-    ExecStatement, Expr, ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind,
-    Name, OrderItem, RaiseError, Select, SelectItem, SetStatement, Statement, TableRef, ThrowArgs,
-    ThrowStatement, Update,
+    AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateIndex,
+    CreateProcedure, CreateTable, CreateView, DataType, DatabaseOption, Declaration, Delete,
+    DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind, ForeignKey, Insert,
+    InsertSource, IsolationLevel, JoinKind, Name, OrderItem, RaiseError, Select, SelectItem,
+    SetStatement, Statement, TableRef, ThrowArgs, ThrowStatement, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -31,7 +31,7 @@ use xxhash_rust::xxh64::xxh64;
 
 use crate::lock::{LockMode, Resource};
 use crate::relstore::btree::ScanCursor;
-use crate::relstore::catalog::{self, TableDef};
+use crate::relstore::catalog::{self, ProcParamDef, ProcedureDef, TableDef};
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
 use crate::relstore::version::ReadSnapshot;
@@ -1628,6 +1628,8 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::Block { .. }
             | Statement::If { .. }
             | Statement::While { .. }
+            | Statement::CreateProcedure(_)
+            | Statement::DropProcedure { .. }
             | Statement::Commit { .. }
     )
 }
@@ -2165,6 +2167,10 @@ pub fn analyze_locks(
                 }
                 None => add(Resource::Database, LockMode::Exclusive),
             },
+            // Procedure DDL rewrites the catalog: Database X, like other DDL.
+            Statement::CreateProcedure(_) | Statement::DropProcedure { .. } => {
+                add(Resource::Database, LockMode::Exclusive);
+            }
             // IF/WHILE conditions read tables through their subqueries —
             // locked exactly like a SELECT's tables (their bodies were
             // flattened into this list and analyze as themselves).
@@ -2298,6 +2304,20 @@ fn exec_statement_dispatch(
         Statement::BeginTransaction { .. } => exec_begin(storage, txn_ctx),
         Statement::Use { database, .. } => exec_use(database, txn_ctx),
         Statement::Throw(throw) => Err(exec_throw(throw, txn_ctx)),
+        Statement::CreateProcedure(create) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_procedure(storage, create)
+        }
+        Statement::DropProcedure {
+            name, if_exists, ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_procedure(storage, name, *if_exists)
+        }
         // Executed by `run_block`'s own arms; nothing routes them here.
         Statement::Block { .. }
         | Statement::If { .. }
@@ -4082,6 +4102,83 @@ fn exec_create_view(storage: &Storage, create: &CreateView) -> Result<StatementR
         .rel_create_view(bare, &create.query_text)
         .map_err(|e| map_storage_err(e, &create.name.value))?;
     Ok(StatementResult::Done)
+}
+
+fn exec_create_procedure(
+    storage: &Storage,
+    create: &CreateProcedure,
+) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&create.name.value);
+    let params = create
+        .params
+        .iter()
+        .map(|p| -> Result<ProcParamDef, SqlError> {
+            // The declared type round-trips through the column-type spec
+            // parser, exactly like table columns.
+            let column_type = data_type_to_column_type(&p.data_type, &p.name)?;
+            Ok(ProcParamDef {
+                name: p.name.clone(),
+                type_spec: column_type.name(),
+                default: p.default_text.clone(),
+                output: p.output,
+            })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    let procedure = ProcedureDef {
+        params,
+        body: create.body.clone(),
+    };
+    if create.alter {
+        match resolve_table(storage, &create.name.value) {
+            Some(def) if def.is_procedure() => {
+                storage
+                    .rel_alter_procedure(&def.name, procedure)
+                    .map_err(|e| map_storage_err(e, &create.name.value))?;
+                return Ok(StatementResult::Done);
+            }
+            _ => {
+                return Err(SqlError::invalid_object(bare).at(create.name.span));
+            }
+        }
+    }
+    if resolve_table(storage, &create.name.value).is_some() {
+        return Err(SqlError::new(
+            2714,
+            16,
+            6,
+            format!("There is already an object named '{bare}' in the database."),
+        ));
+    }
+    storage
+        .rel_create_procedure(bare, procedure)
+        .map_err(|e| map_storage_err(e, &create.name.value))?;
+    Ok(StatementResult::Done)
+}
+
+fn exec_drop_procedure(
+    storage: &Storage,
+    name: &Name,
+    if_exists: bool,
+) -> Result<StatementResult, SqlError> {
+    match resolve_table(storage, &name.value) {
+        Some(def) if def.is_procedure() => {
+            storage
+                .rel_drop_table(&def.name)
+                .map_err(|e| map_storage_err(e, &def.name))?;
+            Ok(StatementResult::Done)
+        }
+        Some(_) | None if if_exists => Ok(StatementResult::Done),
+        _ => Err(SqlError::new(
+            3701,
+            11,
+            5,
+            format!(
+                "Cannot drop the procedure '{}', because it does not exist or you do not have \
+                 permission.",
+                name.value
+            ),
+        )),
+    }
 }
 
 fn exec_drop_view(storage: &Storage, drop: &DropView) -> Result<StatementResult, SqlError> {
