@@ -6195,6 +6195,210 @@ mod tests {
     }
 
     #[test]
+    fn trigger_raiserror_aborts_and_undoes_the_dml() {
+        let path = unique_temp_path("trg-validate");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        // A validation trigger: RAISERROR (severity 16) must abort the firing
+        // statement and roll it back — not be silently swallowed.
+        engine
+            .execute(
+                "CREATE TRIGGER trg ON t AFTER INSERT AS RAISERROR('rejected by trigger', 16, 1)",
+            )
+            .expect("trigger");
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        assert!(
+            out.error.is_some(),
+            "a trigger RAISERROR must fail the INSERT, not be swallowed"
+        );
+        let (_c, rows) = sql_rows(&engine, "SELECT COUNT(*) AS n FROM t");
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".to_string())]],
+            "the rejected INSERT must be rolled back"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trigger_body_exec_and_fk_reads_are_locked_up_front() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("trg-exec-fk-locks");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TABLE w (id INT NOT NULL PRIMARY KEY)")
+            .expect("w");
+        engine
+            .execute("CREATE PROCEDURE do_write AS INSERT INTO w VALUES (1)")
+            .expect("proc");
+        engine
+            .execute("CREATE TABLE parent (id INT NOT NULL PRIMARY KEY)")
+            .expect("parent");
+        engine
+            .execute("CREATE TABLE child (id INT NOT NULL PRIMARY KEY, pid INT NOT NULL REFERENCES parent(id))")
+            .expect("child");
+        // The body EXECs a proc that writes w, and inserts into child (FK to
+        // parent). analyze_locks over the firing INSERT must include w's X lock
+        // (the EXEC'd proc's write) AND parent's S lock (the FK integrity read) —
+        // the trigger-body analysis now reuses the real lock analysis.
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS BEGIN EXEC do_write; INSERT INTO child VALUES (1, 1) END")
+            .expect("trigger");
+        let w = table_object_id(&engine, "w");
+        let parent = table_object_id(&engine, "parent");
+        let locks = engine.analyze_locks("INSERT INTO t VALUES (1)", Isolation::ReadCommitted);
+        // The single-row proc INSERT locks w at Table-IX + Row-X; assert w is
+        // locked at all (a write lock, IX or X), proving the EXEC was analyzed.
+        assert!(
+            locks
+                .iter()
+                .any(|(r, m)| matches!(r, Resource::Table(id) if *id == w)
+                    && matches!(m, LockMode::Exclusive | LockMode::IntentExclusive)),
+            "the EXEC'd proc's write to w must be write-locked up front: {locks:?}"
+        );
+        assert!(
+            locks.contains(&(Resource::Table(parent), LockMode::Shared)),
+            "the trigger body's FK read of parent must be S-locked up front: {locks:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn procedure_called_from_trigger_cannot_read_inserted() {
+        let path = unique_temp_path("trg-proc-shadow");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TABLE sink (id INT NOT NULL PRIMARY KEY)")
+            .expect("sink");
+        engine
+            .execute("CREATE PROCEDURE logproc AS INSERT INTO sink SELECT id FROM inserted")
+            .expect("proc");
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS EXEC logproc")
+            .expect("trigger");
+        // inserted is visible only in the trigger's OWN statements; a proc it
+        // EXECs cannot see it — the reference errors (and aborts the INSERT).
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        assert!(
+            out.error.is_some(),
+            "a proc called from a trigger must not resolve `inserted`"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trigger_unbalanced_begin_transaction_raises_3609() {
+        let path = unique_temp_path("trg-leak-txn");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        // A trigger that opens a transaction without closing it changes
+        // @@TRANCOUNT — 3609, and the leaked transaction is rolled back.
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS BEGIN TRANSACTION")
+            .expect("trigger");
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "INSERT INTO t VALUES (1)");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(3609),
+            "an unbalanced BEGIN in a trigger raises 3609: {:?}",
+            out.error
+        );
+        assert!(
+            !ctx.has_open_transaction(),
+            "the leaked transaction must be rolled back"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trigger_name_is_not_a_droppable_or_queryable_table() {
+        let path = unique_temp_path("trg-not-a-table");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS INSERT INTO t SELECT 0 WHERE 1 = 0")
+            .expect("trigger");
+        let mut ctx = TxnContext::default();
+        // DROP TABLE on the trigger name must NOT silently destroy it (3701).
+        let out = batch(&engine, &mut ctx, "DROP TABLE trg");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(3701),
+            "DROP TABLE must not destroy a trigger: {:?}",
+            out.error
+        );
+        // SELECT FROM the trigger name must error, not heap-scan its root page.
+        let out = batch(&engine, &mut ctx, "SELECT * FROM trg");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(208),
+            "SELECT FROM a trigger name must be invalid object: {:?}",
+            out.error
+        );
+        // sys.tables must not list the trigger.
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT COUNT(*) AS n FROM sys.tables WHERE name = 'trg'",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".to_string())]],
+            "sys.tables excludes triggers"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn indirect_trigger_recursion_is_allowed() {
+        let path = unique_temp_path("trg-indirect");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE a (id INT NOT NULL PRIMARY KEY)")
+            .expect("a");
+        engine
+            .execute("CREATE TABLE b (id INT NOT NULL PRIMARY KEY)")
+            .expect("b");
+        // Recursive-OFF suppresses only DIRECT self-recursion; indirect
+        // recursion (a's trigger writes b, b's trigger writes a) is allowed and
+        // bounded by the nesting cap. The IF EXISTS guard stops the FIRING (not
+        // just the row insert) so the chain terminates — a bare WHERE would still
+        // do a 0-row INSERT that fires the next trigger, looping to the cap.
+        engine
+            .execute("CREATE TRIGGER ta ON a AFTER INSERT AS INSERT INTO b SELECT id FROM inserted")
+            .expect("ta");
+        engine
+            .execute("CREATE TRIGGER tb ON b AFTER INSERT AS IF EXISTS (SELECT 1 FROM inserted WHERE id < 10) INSERT INTO a SELECT id + 10 FROM inserted WHERE id < 10")
+            .expect("tb");
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "INSERT INTO a VALUES (1)");
+        assert!(out.error.is_none(), "indirect recursion: {:?}", out.error);
+        // a = {1 (seed), 11 (via a->b->a)}: the indirect path fired once.
+        let (_c, rows) = sql_rows(&engine, "SELECT id FROM a ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![vec![Some("1".to_string())], vec![Some("11".to_string())]],
+            "indirect a->b->a recursion must fire (id 11 came through b)"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn showplan_names_a_table_valued_function() {
         let path = unique_temp_path("tvf-showplan");
         let engine = new_engine(&path);
