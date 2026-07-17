@@ -34,9 +34,9 @@ pub const OVERFLOW_PAGE_DATA: usize = PAGE_SIZE - DATA_OFFSET;
 /// No next page.
 const CHAIN_END: u64 = u64::MAX;
 
-/// Writes `bytes` as a new overflow chain and returns its first page. Pages
-/// are allocated first (WAL-logged), then filled back to front so every next
-/// pointer is final before its page is imaged.
+/// Writes `bytes` as a new overflow chain and returns its first page. All
+/// pages are allocated up front (WAL-logged), so every next pointer is known
+/// before any page is filled and imaged.
 pub(crate) fn write_chain(ctx: &mut RelCtx<'_>, bytes: &[u8]) -> Result<u64, StorageError> {
     debug_assert!(!bytes.is_empty(), "empty values are inline");
     let pages_needed = bytes.len().div_ceil(OVERFLOW_PAGE_DATA);

@@ -1470,37 +1470,45 @@ impl StorageFile {
         def.collations.push(column.collation.clone());
         let new_schema = def.schema()?;
 
-        // Re-encode every row with the frozen fill appended.
-        let mut tree_rows: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-        let mut heap_rows: Vec<(Rid, Vec<u8>)> = Vec::new();
+        // Every row gets the frozen fill appended; the re-encode happens
+        // INSIDE the statement so a (MAX) value the located scan resolved
+        // re-spills to a fresh overflow chain instead of blowing the in-row
+        // caps (the #123 review's finding: ALTER was unusable once a table
+        // held a real payload). Non-MAX tables pay one no-op spill scan.
+        let mut tree_rows: Vec<(Vec<u8>, Vec<Datum>)> = Vec::new();
+        let mut heap_rows: Vec<(Rid, Vec<Datum>)> = Vec::new();
         for (loc, mut values) in located {
             values.push(fill.clone());
-            let row = encode_row(&new_schema, &values)?;
             match loc {
-                RowLocator::Key(key) => tree_rows.push((key, row)),
-                RowLocator::Rid(rid) => heap_rows.push((rid, row)),
+                RowLocator::Key(key) => tree_rows.push((key, values)),
+                RowLocator::Rid(rid) => heap_rows.push((rid, values)),
             }
         }
 
         let is_tree = def.is_tree();
         let object_id = def.object_id;
         let root_page = def.root_page;
+        let closure_schema = new_schema.clone();
         let updated = self.rel_statement(move |ctx, txn| {
             if is_tree {
                 let tree = BTree {
                     object_id,
                     root: root_page,
                 };
-                for (key, row) in &tree_rows {
-                    tree.update(ctx, &mut OpMode::Txn(txn), key, row)?;
+                for (key, mut values) in tree_rows {
+                    Self::spill_max_values(ctx, &closure_schema, &mut values)?;
+                    let row = encode_row(&closure_schema, &values)?;
+                    tree.update(ctx, &mut OpMode::Txn(txn), &key, &row)?;
                 }
             } else {
                 let heap = Heap {
                     object_id,
                     first_page: root_page,
                 };
-                for (rid, row) in &heap_rows {
-                    heap.update(ctx, txn, *rid, row)?;
+                for (rid, mut values) in heap_rows {
+                    Self::spill_max_values(ctx, &closure_schema, &mut values)?;
+                    let row = encode_row(&closure_schema, &values)?;
+                    heap.update(ctx, txn, rid, &row)?;
                 }
             }
             catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -2053,6 +2061,10 @@ impl StorageFile {
 
     /// Deletes every row where `column = value`; returns the count. Targets
     /// are materialized before any mutation (Halloween avoidance).
+    ///
+    /// Test-only surface (no SQL path reaches it): it compares UNRESOLVED
+    /// rows, so a chained (MAX) value never matches, and it bypasses version
+    /// staging. Resolve and stage before wiring it to anything real.
     pub fn rel_delete_where(
         &mut self,
         name: &str,
@@ -4928,6 +4940,424 @@ mod tests {
             }
             other => panic!("expected rows, got {other:?}"),
         }
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review PoC: HEAP tables' version priors come from `heap.read_row`
+    /// pre-images. An RCSI reader must see the pre-update big value of a heap
+    /// row (resolved through the image's overflow reference), and a deleted
+    /// heap row must stay visible to the open snapshot.
+    #[test]
+    fn heap_rcsi_reads_old_big_value_through_preimage() {
+        use crate::rel::{
+            RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
+        };
+
+        let path = unique_temp_path("review-heap-rcsi");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut writer = TxnContext::default();
+        let big_old: String = "old-heap".repeat(10_000); // 80k chars -> chain
+        let big_new: String = "new-heap".repeat(10_000);
+        for sql in [
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+            // No PRIMARY KEY: a heap.
+            "CREATE TABLE hbig (id INT NOT NULL, body NVARCHAR(MAX))",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut writer);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        let outcome = execute_batch_with_params(
+            &storage,
+            "INSERT INTO hbig VALUES (1, @v)",
+            &mut writer,
+            &[RpcParam {
+                name: "@v".into(),
+                column_type: ColumnType::NVarCharMax,
+                value: Datum::NVarChar(big_old.clone()),
+            }],
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let fetch = |ctx: &mut TxnContext| -> Option<Datum> {
+            let outcome = execute_batch(&storage, "SELECT body FROM hbig WHERE id = 1", ctx);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            match &outcome.results[0] {
+                StatementResult::Rows(rowset) => rowset.rows.first().map(|r| r[0].clone()),
+                other => panic!("expected rows, got {other:?}"),
+            }
+        };
+
+        // Uncommitted UPDATE: the reader sees the old value via the image.
+        let outcome = execute_batch(&storage, "BEGIN TRAN", &mut writer);
+        assert!(outcome.error.is_none());
+        let outcome = execute_batch_with_params(
+            &storage,
+            "UPDATE hbig SET body = @v WHERE id = 1",
+            &mut writer,
+            &[RpcParam {
+                name: "@v".into(),
+                column_type: ColumnType::NVarCharMax,
+                value: Datum::NVarChar(big_new.clone()),
+            }],
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let mut reader = TxnContext::default();
+        assert_eq!(
+            fetch(&mut reader),
+            Some(Datum::NVarChar(big_old.clone())),
+            "heap RCSI reader must get the pre-update value"
+        );
+        let outcome = execute_batch(&storage, "COMMIT", &mut writer);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(fetch(&mut reader), Some(Datum::NVarChar(big_new.clone())));
+
+        // Uncommitted DELETE: the reader still sees the (new) value.
+        let outcome = execute_batch(
+            &storage,
+            "BEGIN TRAN; DELETE FROM hbig WHERE id = 1;",
+            &mut writer,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(
+            fetch(&mut reader),
+            Some(Datum::NVarChar(big_new.clone())),
+            "heap RCSI reader must see the row an open txn deleted"
+        );
+        let outcome = execute_batch(&storage, "COMMIT", &mut writer);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(fetch(&mut reader), None);
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review PoC: a heap row that has MOVED (forwarding stub at its home
+    /// RID) must still read correctly, version correctly (the pre-image is
+    /// read through the stub), and keep its overflow value.
+    #[test]
+    fn moved_heap_row_versions_and_resolves_through_the_stub() {
+        use crate::rel::{
+            RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
+        };
+
+        let path = unique_temp_path("review-heap-moved");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut writer = TxnContext::default();
+        let big_old: String = "moved-old".repeat(5_000); // 45k chars -> chain
+        let big_new: String = "moved-new".repeat(5_000);
+        for sql in [
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+            "CREATE TABLE hm (id INT NOT NULL, pad VARCHAR(3000), body NVARCHAR(MAX))",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut writer);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        // Row 1 small; row 2 fills most of the first heap page, so growing
+        // row 1's pad to 3000 bytes cannot fit and must move the row.
+        let outcome = execute_batch_with_params(
+            &storage,
+            "INSERT INTO hm VALUES (1, 'a', @v)",
+            &mut writer,
+            &[RpcParam {
+                name: "@v".into(),
+                column_type: ColumnType::NVarCharMax,
+                value: Datum::NVarChar(big_old.clone()),
+            }],
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let filler = "f".repeat(3000);
+        let outcome = execute_batch(
+            &storage,
+            &format!("INSERT INTO hm VALUES (2, '{filler}', NULL)"),
+            &mut writer,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let grown = "g".repeat(3000);
+        let outcome = execute_batch(
+            &storage,
+            &format!("UPDATE hm SET pad = '{grown}' WHERE id = 1"),
+            &mut writer,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // The moved row still resolves its chain.
+        let fetch_body = |ctx: &mut TxnContext| -> Option<Datum> {
+            let outcome = execute_batch(&storage, "SELECT body FROM hm WHERE id = 1", ctx);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            match &outcome.results[0] {
+                StatementResult::Rows(rowset) => rowset.rows.first().map(|r| r[0].clone()),
+                other => panic!("expected rows, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            fetch_body(&mut writer),
+            Some(Datum::NVarChar(big_old.clone())),
+            "moved row reads its chain"
+        );
+
+        // Version an update of the moved row: the prior must be read through
+        // the forwarding stub, and the reader must get the old big value.
+        let outcome = execute_batch(&storage, "BEGIN TRAN", &mut writer);
+        assert!(outcome.error.is_none());
+        let outcome = execute_batch_with_params(
+            &storage,
+            "UPDATE hm SET body = @v WHERE id = 1",
+            &mut writer,
+            &[RpcParam {
+                name: "@v".into(),
+                column_type: ColumnType::NVarCharMax,
+                value: Datum::NVarChar(big_new.clone()),
+            }],
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let mut reader = TxnContext::default();
+        assert_eq!(
+            fetch_body(&mut reader),
+            Some(Datum::NVarChar(big_old.clone())),
+            "RCSI reader must get the pre-update value of a MOVED heap row"
+        );
+        // The pad read through the same image must be the grown one.
+        let outcome = execute_batch(&storage, "SELECT pad FROM hm WHERE id = 1", &mut reader);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => {
+                assert_eq!(rowset.rows[0][0], Datum::VarChar(grown.clone()));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let outcome = execute_batch(&storage, "COMMIT", &mut writer);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(fetch_body(&mut reader), Some(Datum::NVarChar(big_new)));
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review PoC: a statement that spills a chain and THEN fails (duplicate
+    /// key on a later row) must roll back cleanly — the chain leaks, the rows
+    /// do not land, the store stays usable, and recovery after a kill agrees.
+    #[test]
+    fn failed_statement_after_spill_rolls_back_cleanly() {
+        use crate::rel::{
+            RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
+        };
+
+        let path = unique_temp_path("review-spill-fail");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        for sql in [
+            "CREATE TABLE sf (id INT NOT NULL PRIMARY KEY, body NVARCHAR(MAX))",
+            "INSERT INTO sf VALUES (7, N'anchor')",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        let big: String = "spilled".repeat(10_000); // 70k chars -> chain
+        // Row 1 spills its chain, row 2 hits the duplicate key: the whole
+        // statement must fail and undo row 1.
+        let outcome = execute_batch_with_params(
+            &storage,
+            "INSERT INTO sf VALUES (1, @v), (7, N'dup')",
+            &mut ctx,
+            &[RpcParam {
+                name: "@v".into(),
+                column_type: ColumnType::NVarCharMax,
+                value: Datum::NVarChar(big.clone()),
+            }],
+        );
+        assert!(outcome.error.is_some(), "duplicate key must fail");
+
+        let count = |ctx: &mut TxnContext| -> Datum {
+            let outcome = execute_batch(&storage, "SELECT COUNT(*) FROM sf", ctx);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            match &outcome.results[0] {
+                StatementResult::Rows(rowset) => rowset.rows[0][0].clone(),
+                other => panic!("expected rows, got {other:?}"),
+            }
+        };
+        assert_eq!(count(&mut ctx), Datum::BigInt(1), "only the anchor row");
+
+        // The store is still usable: the same big value inserts fine now.
+        let outcome = execute_batch_with_params(
+            &storage,
+            "INSERT INTO sf VALUES (1, @v)",
+            &mut ctx,
+            &[RpcParam {
+                name: "@v".into(),
+                column_type: ColumnType::NVarCharMax,
+                value: Datum::NVarChar(big.clone()),
+            }],
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        assert_eq!(count(&mut ctx), Datum::BigInt(2));
+
+        // Kill and reopen: recovery replays the leaked chain's images and
+        // the committed rows; the value survives.
+        drop(storage);
+        let storage = Storage::open(path.clone()).expect("recovery");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(&storage, "SELECT body FROM sf WHERE id = 1", &mut ctx);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => {
+                assert_eq!(rowset.rows[0][0], Datum::NVarChar(big));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review PoC: ALTER TABLE ADD on a table with spilled (MAX) values.
+    /// The rewrite resolves every row and re-encodes it WITHOUT re-spilling,
+    /// so a chain value small enough for the row cap is silently re-inlined
+    /// (and must survive), while a big one fails the whole ALTER — which must
+    /// fail CLEANLY, leaving the table intact and the store usable.
+    #[test]
+    fn alter_add_column_respills_max_values() {
+        use crate::rel::{
+            RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
+        };
+
+        let path = unique_temp_path("review-alter-max");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+
+        // Case A: a 300-byte chain value fits back inline; ALTER succeeds.
+        let small_chain = "s".repeat(300); // VARCHAR: 300 bytes > 256 -> chain
+        for sql in [
+            "CREATE TABLE amax (id INT NOT NULL PRIMARY KEY, body VARCHAR(MAX))".to_string(),
+            format!("INSERT INTO amax VALUES (1, '{small_chain}')"),
+            "ALTER TABLE amax ADD extra INT NULL".to_string(),
+        ] {
+            let outcome = execute_batch(&storage, &sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        let outcome = execute_batch(&storage, "SELECT body, extra FROM amax", &mut ctx);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => {
+                assert_eq!(rowset.rows[0][0], Datum::VarChar(small_chain));
+                assert_eq!(rowset.rows[0][1], Datum::Null);
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+
+        // Case B: a 10k value re-spills to a fresh chain during the ALTER's
+        // rewrite (the review found the original rewrite re-inlined and
+        // failed; the re-encode now runs inside the statement with
+        // spill_max_values, like every other write path).
+        let big: String = "b".repeat(10_000);
+        let outcome = execute_batch_with_params(
+            &storage,
+            "CREATE TABLE bmax (id INT NOT NULL PRIMARY KEY, body VARCHAR(MAX)); \
+             INSERT INTO bmax VALUES (1, @v);",
+            &mut ctx,
+            &[RpcParam {
+                name: "@v".into(),
+                column_type: ColumnType::VarCharMax,
+                value: Datum::VarChar(big.clone()),
+            }],
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let outcome = execute_batch(&storage, "ALTER TABLE bmax ADD extra INT NULL", &mut ctx);
+        assert!(
+            outcome.error.is_none(),
+            "the rewrite must spill, not re-inline: {:?}",
+            outcome.error
+        );
+        let outcome = execute_batch(
+            &storage,
+            "SELECT body, extra FROM bmax WHERE id = 1",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => {
+                assert_eq!(rowset.rows[0][0], Datum::VarChar(big.clone()));
+                assert_eq!(rowset.rows[0][1], Datum::Null, "the frozen fill");
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        // ...and the widened row survives a reopen (the fresh chain is
+        // durable with the ALTER's statement).
+        drop(ctx);
+        drop(storage);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut ctx = TxnContext::default();
+        let outcome = execute_batch(&storage, "SELECT body FROM bmax WHERE id = 1", &mut ctx);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => {
+                assert_eq!(rowset.rows[0][0], Datum::VarChar(big));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let outcome = execute_batch(&storage, "INSERT INTO bmax VALUES (2, 'ok', 5)", &mut ctx);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Review PoC: codec edges — empty string, the 256/257 inline threshold,
+    /// NULL, and a VARBINARY(MAX) value — all round-trip, including across a
+    /// reopen.
+    #[test]
+    fn max_codec_edges_round_trip() {
+        use crate::rel::{
+            RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
+        };
+
+        let path = unique_temp_path("review-max-edges");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        let at_threshold = "t".repeat(256); // inline boundary
+        let over_threshold = "u".repeat(257); // first chained length
+        for sql in [
+            "CREATE TABLE edges (id INT NOT NULL PRIMARY KEY, v VARCHAR(MAX), b VARBINARY(MAX))"
+                .to_string(),
+            "INSERT INTO edges VALUES (1, '', NULL)".to_string(),
+            format!("INSERT INTO edges VALUES (2, '{at_threshold}', NULL)"),
+            format!("INSERT INTO edges VALUES (3, '{over_threshold}', NULL)"),
+            "INSERT INTO edges VALUES (4, NULL, NULL)".to_string(),
+        ] {
+            let outcome = execute_batch(&storage, &sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        let blob = vec![0xABu8; 300]; // > 256 -> chain
+        let outcome = execute_batch_with_params(
+            &storage,
+            "INSERT INTO edges VALUES (5, NULL, @b)",
+            &mut ctx,
+            &[RpcParam {
+                name: "@b".into(),
+                column_type: ColumnType::VarBinaryMax,
+                value: Datum::VarBinary(blob.clone()),
+            }],
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let check = |storage: &Storage, ctx: &mut TxnContext| {
+            let outcome = execute_batch(storage, "SELECT v, b FROM edges ORDER BY id", ctx);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            match &outcome.results[0] {
+                StatementResult::Rows(rowset) => {
+                    assert_eq!(rowset.rows[0][0], Datum::VarChar(String::new()), "empty");
+                    assert_eq!(rowset.rows[1][0], Datum::VarChar(at_threshold.clone()));
+                    assert_eq!(rowset.rows[2][0], Datum::VarChar(over_threshold.clone()));
+                    assert_eq!(rowset.rows[3][0], Datum::Null);
+                    assert_eq!(rowset.rows[4][1], Datum::VarBinary(blob.clone()));
+                }
+                other => panic!("expected rows, got {other:?}"),
+            }
+        };
+        check(&storage, &mut ctx);
+        drop(storage);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let mut ctx = TxnContext::default();
+        check(&storage, &mut ctx);
         drop(storage);
         let _ = std::fs::remove_file(&path);
     }
