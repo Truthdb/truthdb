@@ -119,6 +119,9 @@ pub enum BatchEvent {
     /// A SQL error that stopped the batch. The statements before it kept their
     /// results, which were already sent.
     Error(SqlError),
+    /// An informational message (RAISERROR severity <= 10): TDS renders an
+    /// INFO token in-stream; it is not an error and stops nothing.
+    Info(SqlError),
     /// The handle `sp_prepare`/`sp_prepexec` allocated, reported to the client
     /// as a RETURNVALUE token. Sent after every statement's events, just
     /// before `Complete` — where SQL Server puts return values.
@@ -319,6 +322,10 @@ impl crate::rel::BatchEmitter for BatchSink {
             database: database.to_string(),
         });
     }
+
+    fn info(&mut self, error: &truthdb_sql::error::SqlError) {
+        self.send(BatchEvent::Info(error.clone()));
+    }
 }
 
 /// Reassembles an event stream into a whole [`BatchReply`] — the shape every
@@ -360,6 +367,9 @@ async fn collect_reply(
             // database-context change (the ENVCHANGE is wire-only).
             BatchEvent::PreparedHandle(_) => {}
             BatchEvent::DatabaseContext { .. } => {}
+            // An informational message (RAISERROR <= 10) is wire-only too:
+            // it is not an error and carries no result.
+            BatchEvent::Info(_) => {}
             BatchEvent::Error(err) => error = Some(err),
             BatchEvent::Complete { in_transaction } => {
                 return Ok(BatchReply {

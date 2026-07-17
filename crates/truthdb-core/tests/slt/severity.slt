@@ -1,0 +1,63 @@
+# THROW / RAISERROR severity semantics (Stage 15). The full truth-table
+# matrix (XACT_ABORT interplay, dooming, CATCH transfer, the EXEC seam) is
+# pinned in the engine tests; these pin the statement surface end to end.
+
+# Severity <= 10 is informational: the statement SUCCEEDS.
+statement ok
+RAISERROR('just a message', 10, 1)
+
+statement ok
+RAISERROR('state zero reports as one', 0, 0)
+
+# Severity 11..=18 raises a real error.
+statement error
+RAISERROR('a user error', 16, 1)
+
+# @@ERROR carries the raised number (50000 for ad-hoc messages) into the
+# next batch, and reading it resets it.
+query I
+SELECT @@ERROR
+----
+50000
+
+query I
+SELECT @@ERROR
+----
+0
+
+# Severity above 18 needs WITH LOG; out-of-range severity is refused.
+statement error
+RAISERROR('needs the option', 19, 1)
+
+statement error
+RAISERROR('out of range', 26, 1) WITH LOG
+
+# printf formatting, adjudicated through ERROR_MESSAGE() in a CATCH.
+query T
+BEGIN TRY RAISERROR('%s ran %d times', 16, 1, 'job', 3); END TRY BEGIN CATCH SELECT ERROR_MESSAGE(); END CATCH
+----
+job ran 3 times
+
+# A message id needs sys.messages, which does not exist: 18054.
+statement error
+RAISERROR(50001, 16, 1)
+
+# THROW: number below 50000 is out of range (35100); the argument form
+# raises with severity 16; a bare THROW outside any CATCH is 10704.
+statement error
+THROW 999, 'too low', 1
+
+statement error
+THROW 50001, 'raised', 1
+
+statement error
+THROW
+
+# A bare THROW in a CATCH re-raises the original error.
+statement error
+BEGIN TRY THROW 50002, 'original', 3; END TRY BEGIN CATCH THROW; END CATCH
+
+query I
+SELECT @@ERROR
+----
+50002
