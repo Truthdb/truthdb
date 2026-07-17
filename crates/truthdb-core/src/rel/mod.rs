@@ -1032,7 +1032,10 @@ fn run_user_scalar_function(
     caller: &EvalContext,
 ) -> Result<SqlValue, SqlError> {
     let function = def.function.as_ref().expect("checked by the caller");
-    let FunctionReturns::Scalar { type_spec, body } = &function.returns;
+    // The caller (resolve_scalar_function) only routes scalar functions here.
+    let FunctionReturns::Scalar { type_spec, body } = &function.returns else {
+        return Err(function_not_a_table(&def.name));
+    };
     if arg_values.len() < function.params.len() {
         return Err(SqlError::new(
             313,
@@ -3164,6 +3167,12 @@ fn showplan_rows(
             }
         }
         Some(TableRef::Table { name, .. }) => vec![format!("Table Scan({})", name.value)],
+        // A lone table-valued function call: name it honestly rather than
+        // letting it fall into the join catch-all (which would invent a
+        // "Nested Loops" over a phantom base table named after the function).
+        Some(TableRef::Function { name, .. }) => {
+            vec![format!("Table-valued Function({})", name.value)]
+        }
         Some(join) => {
             // Multi-table: a nested-loop join over full scans (Stage 8).
             let mut tables = Vec::new();
@@ -4877,19 +4886,28 @@ fn exec_create_function(
             })
         })
         .collect::<Result<Vec<_>, _>>()?;
-    let ReturnsClause::Scalar(return_type) = &create.returns;
-    let return_type = data_type_to_column_type(return_type, bare)?;
-    // Validate the body: it must be side-effect-free and end in RETURN <expr>
-    // (SQL Server's function-body rules). Re-parse under the function grammar.
-    let body = truthdb_sql::parse_function_body(&create.body)?;
-    validate_scalar_function_body(&body)?;
-    let function = FunctionDef {
-        params,
-        returns: FunctionReturns::Scalar {
-            type_spec: return_type.name(),
-            body: create.body.clone(),
-        },
+    let returns = match &create.returns {
+        ReturnsClause::Scalar(return_type) => {
+            let return_type = data_type_to_column_type(return_type, bare)?;
+            // Validate the body: side-effect-free, ending in RETURN <expr> (SQL
+            // Server's function-body rules). Re-parse under the function grammar.
+            let body = truthdb_sql::parse_function_body(&create.body)?;
+            validate_scalar_function_body(&body)?;
+            FunctionReturns::Scalar {
+                type_spec: return_type.name(),
+                body: create.body.clone(),
+            }
+        }
+        ReturnsClause::InlineTable => {
+            // The body is a single SELECT expanded like a parameterized view —
+            // validate it parses (no side-effect body check: it is a query).
+            parse_view_query(&create.body, bare)?;
+            FunctionReturns::InlineTable {
+                select_text: create.body.clone(),
+            }
+        }
     };
+    let function = FunctionDef { params, returns };
     if create.alter {
         match resolve_table(storage, &create.name.value) {
             Some(def) if def.is_function() => {
@@ -6388,6 +6406,13 @@ fn expand_from_ctes(tref: &TableRef, resolved: &CteMap) -> TableRef {
             subquery: Box::new(expand_select_ctes(subquery, resolved)),
             alias: alias.clone(),
         },
+        // A TVF name is never a CTE (CTE names are unqualified); only its
+        // arguments may reference one.
+        TableRef::Function { name, args, alias } => TableRef::Function {
+            name: name.clone(),
+            args: args.iter().map(|a| expand_expr_ctes(a, resolved)).collect(),
+            alias: alias.clone(),
+        },
     }
 }
 
@@ -6854,6 +6879,9 @@ fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<S
             }
             Some(cols)
         }
+        // A TVF's output columns are its body SELECT's projection — only known
+        // after the body is parsed and bound, like a view. Defer to expansion.
+        TableRef::Function { .. } => None,
     }
 }
 
@@ -6966,6 +6994,9 @@ fn from_has_correlated_derived(
                 || from_has_correlated_derived(storage, Some(right), outer)
         }
         Some(TableRef::Derived { subquery, .. }) => is_correlated(storage, subquery, outer),
+        // A TVF's literal/non-outer arguments do not correlate it to the outer
+        // FROM (APPLY, with outer-referencing args, is out of scope).
+        Some(TableRef::Function { .. }) => false,
     }
 }
 
@@ -7372,6 +7403,9 @@ fn substitute_from_outer_refs(
             **subquery = substitute_subquery_outer_refs(storage, subquery, outer, outer_row)?;
             Some(())
         }
+        // A TVF's body lives in the catalog (bound at expansion, not here) and
+        // its literal arguments carry no outer references.
+        TableRef::Function { .. } => Some(()),
     }
 }
 
@@ -7405,6 +7439,8 @@ fn resolve_scalar_function(storage: &Storage, name: &str) -> Option<TableDef> {
     let def = resolve_table(storage, name)?;
     match def.function.as_ref()?.returns {
         FunctionReturns::Scalar { .. } => Some(def),
+        // A table-valued function is not a scalar call (it resolves in FROM).
+        FunctionReturns::InlineTable { .. } => None,
     }
 }
 
@@ -9112,6 +9148,7 @@ fn collect_table_names<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
                 collect_table_names(from, out);
             }
         }
+        TableRef::Function { name, .. } => out.push(name),
     }
 }
 
@@ -9166,6 +9203,14 @@ fn collect_from_tables<'a>(tref: &'a TableRef, out: &mut Vec<&'a Name>) {
             }
         }
         TableRef::Derived { subquery, .. } => collect_locked_tables(subquery, out),
+        // A TVF in FROM: its name resolves (via read_lock_object_ids) to the
+        // tables its body reads, and its arguments may embed subqueries.
+        TableRef::Function { name, args, .. } => {
+            out.push(name);
+            for arg in args {
+                collect_expr_tables(arg, out);
+            }
+        }
     }
 }
 
@@ -9431,6 +9476,14 @@ fn collect_from_read_names(tref: &TableRef, tables: &mut Vec<String>, funcs: &mu
             }
         }
         TableRef::Derived { subquery, .. } => collect_select_read_names(subquery, tables, funcs),
+        // A TVF in FROM: push the name into `funcs` so select_function_read_ids
+        // recurses its body (the owned-collector twin of collect_from_tables).
+        TableRef::Function { name, args, .. } => {
+            funcs.push(name.value.clone());
+            for arg in args {
+                collect_expr_read_names(arg, tables, funcs);
+            }
+        }
     }
 }
 
@@ -9503,6 +9556,7 @@ fn collect_exposed_names(tref: &TableRef, out: &mut Vec<String>) {
             collect_exposed_names(right, out);
         }
         TableRef::Derived { alias, .. } => out.push(alias.value.clone()),
+        TableRef::Function { name, alias, .. } => out.push(exposed_name(name, alias.as_ref())),
     }
 }
 
@@ -9725,6 +9779,87 @@ fn build_table_source(
     })
 }
 
+/// Expands an inline table-valued function call `dbo.f(args) [AS alias]` in a
+/// FROM clause: binds the call's argument values to the function's `@params`,
+/// then runs its stored body SELECT as a derived table under the call's
+/// qualifier — a parameterized view. The body's table reads are locked and
+/// snapshotted up front by the lock analysis and the snapshot-scope arming,
+/// which both resolve the function name into its body (see collect_read_lock_ids
+/// and statement_reads_tables); the body reads under the caller's ambient
+/// snapshot on this thread. Recursion is bounded by the shared view-depth guard.
+fn build_function_source(
+    storage: &Storage,
+    name: &Name,
+    args: &[Expr],
+    alias: Option<&Name>,
+    eval_ctx: &EvalContext,
+) -> Result<Source, SqlError> {
+    let def = resolve_table(storage, &name.value)
+        .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
+    let function = def
+        .function
+        .as_ref()
+        .ok_or_else(|| function_not_a_table(&def.name).at(name.span))?;
+    let FunctionReturns::InlineTable { select_text } = &function.returns else {
+        // A scalar function called in table position is not a rowset.
+        return Err(function_not_a_table(&def.name).at(name.span));
+    };
+    if args.len() < function.params.len() {
+        return Err(SqlError::new(
+            313,
+            16,
+            3,
+            format!(
+                "An insufficient number of arguments were supplied for the procedure or function {}.",
+                def.name
+            ),
+        )
+        .at(name.span));
+    }
+    if args.len() > function.params.len() {
+        return Err(SqlError::new(
+            8144,
+            16,
+            2,
+            format!(
+                "Procedure or function {} has too many arguments specified.",
+                def.name
+            ),
+        )
+        .at(name.span));
+    }
+    // Bind the arguments to the parameters, coercing to the declared types, in a
+    // FRESH variable scope (a TVF body sees only its parameters, not caller
+    // locals). Arguments may themselves contain subqueries or scalar UDFs.
+    let no_outer = |_: &str| -> Option<usize> { None };
+    let mut variables = std::collections::HashMap::new();
+    for (param, arg) in function.params.iter().zip(args) {
+        let column_type = ColumnType::parse(&param.type_spec)
+            .map_err(|e| SqlError::message_only(245, e.to_string()))?;
+        let value = substitute_correlated_in_expr(storage, arg, &no_outer, &[], eval_ctx)
+            .and_then(|bound| eval_constant(&bound, eval_ctx))?;
+        let datum = value::sql_to_datum(&value, &column_type, &param.name)?;
+        variables.insert(
+            param.name.clone(),
+            value::datum_to_sql(&datum, &column_type),
+        );
+    }
+    let mut fn_ctx = eval_ctx.clone();
+    fn_ctx.variables = variables;
+    // Expand the body like a view (bounded by the shared nesting guard).
+    let _guard = ViewDepthGuard::enter(&def.name)?;
+    let body = parse_view_query(select_text, &def.name)?;
+    let qualifier = alias
+        .map(|a| a.value.clone())
+        .unwrap_or_else(|| strip_schema(&name.value).to_string());
+    let qual = Name {
+        value: qualifier,
+        quoted: false,
+        span: name.span,
+    };
+    build_derived_source(storage, &body, &qual, &fn_ctx)
+}
+
 /// Recursively builds a join tree's combined row source (base tables scan
 /// fully).
 fn build_join(
@@ -9748,6 +9883,9 @@ fn build_join(
         }
         TableRef::Derived { subquery, alias } => {
             build_derived_source(storage, subquery, alias, eval_ctx)
+        }
+        TableRef::Function { name, args, alias } => {
+            build_function_source(storage, name, args, alias.as_ref(), eval_ctx)
         }
     }
 }
@@ -10496,6 +10634,7 @@ fn sys_sql_modules(storage: &Storage) -> Source {
                 .or_else(|| {
                     def.function.as_ref().map(|f| match &f.returns {
                         FunctionReturns::Scalar { body, .. } => body.clone(),
+                        FunctionReturns::InlineTable { select_text } => select_text.clone(),
                     })
                 })?;
             Some(vec![
@@ -10575,17 +10714,19 @@ fn sys_parameters(storage: &Storage) -> Source {
                 );
             }
         } else if let Some(function) = &def.function {
-            // A scalar function's return value is parameter_id 0 with an empty
-            // name and is_output set (SQL Server's convention).
-            let FunctionReturns::Scalar { type_spec, .. } = &function.returns;
-            push_param(
-                def.object_id,
-                String::new(),
-                0,
-                type_spec.clone(),
-                true,
-                false,
-            );
+            // A SCALAR function's return value is parameter_id 0 (empty name,
+            // is_output set — SQL Server's convention). A table-valued function
+            // returns a table, so it has no scalar return parameter.
+            if let FunctionReturns::Scalar { type_spec, .. } = &function.returns {
+                push_param(
+                    def.object_id,
+                    String::new(),
+                    0,
+                    type_spec.clone(),
+                    true,
+                    false,
+                );
+            }
             for (index, param) in function.params.iter().enumerate() {
                 push_param(
                     def.object_id,
@@ -10624,6 +10765,9 @@ fn sys_objects(storage: &Storage) -> Source {
             let (code, desc) = if let Some(function) = &def.function {
                 match function.returns {
                     FunctionReturns::Scalar { .. } => ("FN", "SQL_SCALAR_FUNCTION"),
+                    FunctionReturns::InlineTable { .. } => {
+                        ("IF", "SQL_INLINE_TABLE_VALUED_FUNCTION")
+                    }
                 }
             } else if def.is_procedure() {
                 ("P ", "SQL_STORED_PROCEDURE")
@@ -10850,7 +10994,8 @@ fn strip_schema(name: &str) -> &str {
 /// one level deep, matching the executor.
 fn read_lock_object_ids(storage: &Storage, name: &str) -> Vec<u32> {
     let mut out = Vec::new();
-    collect_read_lock_ids(storage, name, 0, &mut out);
+    let mut visited = std::collections::HashSet::new();
+    collect_read_lock_ids(storage, name, 0, &mut out, &mut visited);
     out
 }
 
@@ -10862,8 +11007,9 @@ fn select_function_read_ids(storage: &Storage, select: &Select) -> Vec<u32> {
     let mut funcs = Vec::new();
     collect_select_read_names(select, &mut tables, &mut funcs);
     let mut out = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     for func in &funcs {
-        collect_read_lock_ids(storage, func, 0, &mut out);
+        collect_read_lock_ids(storage, func, 0, &mut out, &mut visited);
     }
     out
 }
@@ -10875,8 +11021,9 @@ fn expr_function_read_ids(storage: &Storage, expr: &Expr) -> Vec<u32> {
     let mut funcs = Vec::new();
     collect_expr_read_names(expr, &mut tables, &mut funcs);
     let mut out = Vec::new();
+    let mut visited = std::collections::HashSet::new();
     for func in &funcs {
-        collect_read_lock_ids(storage, func, 0, &mut out);
+        collect_read_lock_ids(storage, func, 0, &mut out, &mut visited);
     }
     out
 }
@@ -10884,28 +11031,51 @@ fn expr_function_read_ids(storage: &Storage, expr: &Expr) -> Vec<u32> {
 /// Resolves `name` to the base-table object ids the executor will read,
 /// recursing through nested views (so a view over a view locks the inner view's
 /// base tables). Bounded by [`MAX_VIEW_NESTING`] so a view cycle terminates.
-fn collect_read_lock_ids(storage: &Storage, name: &str, depth: u32, out: &mut Vec<u32>) {
+fn collect_read_lock_ids(
+    storage: &Storage,
+    name: &str,
+    depth: u32,
+    out: &mut Vec<u32>,
+    visited: &mut std::collections::HashSet<u32>,
+) {
     if depth > MAX_VIEW_NESTING || name.to_ascii_lowercase().starts_with("sys.") {
         return;
     }
     let Some(def) = resolve_table(storage, name) else {
         return;
     };
-    // A scalar function: its inner reads (subqueries in its body, nested
-    // function calls) must be locked up front, or the body would read tables
-    // with no lock held under 2PL — the seam-defect class. Recurse into the
-    // body's read targets, bounded by the same depth guard.
+    // Expand each function/view body at most once per analysis. The depth guard
+    // bounds recursion depth but NOT fan-out: a self- or mutually-referential
+    // body that references itself twice would otherwise recurse exponentially
+    // (2^depth), hanging analysis — and, because analyze_locks runs under the
+    // scheduler mutex, freezing every session.
+    if (def.is_function() || def.view_query.is_some()) && !visited.insert(def.object_id) {
+        return;
+    }
+    // A function: its inner reads (subqueries in a scalar body, or an inline
+    // TVF's body SELECT, plus nested function calls) must be locked up front, or
+    // the body would read tables with no lock held under 2PL — the seam-defect
+    // class. Recurse into the body's read targets, bounded by the same guard.
     if let Some(function) = &def.function {
-        let FunctionReturns::Scalar { body, .. } = &function.returns;
-        if let Ok(statements) = truthdb_sql::parse_function_body(body) {
-            let mut tables = Vec::new();
-            let mut funcs = Vec::new();
-            for statement in &statements {
-                collect_statement_read_names(statement, &mut tables, &mut funcs);
+        let mut tables = Vec::new();
+        let mut funcs = Vec::new();
+        match &function.returns {
+            FunctionReturns::Scalar { body, .. } => {
+                if let Ok(statements) = truthdb_sql::parse_function_body(body) {
+                    for statement in &statements {
+                        collect_statement_read_names(statement, &mut tables, &mut funcs);
+                    }
+                }
             }
-            for referenced in tables.iter().chain(funcs.iter()) {
-                collect_read_lock_ids(storage, referenced, depth + 1, out);
+            FunctionReturns::InlineTable { select_text } => {
+                if let Ok(body) = parse_view_query(select_text, &def.name) {
+                    let expanded = expand_ctes(&body);
+                    collect_select_read_names(&expanded, &mut tables, &mut funcs);
+                }
             }
+        }
+        for referenced in tables.iter().chain(funcs.iter()) {
+            collect_read_lock_ids(storage, referenced, depth + 1, out, visited);
         }
         return;
     }
@@ -10928,7 +11098,7 @@ fn collect_read_lock_ids(storage: &Storage, name: &str, depth: u32, out: &mut Ve
     let mut funcs = Vec::new();
     collect_select_read_names(&expanded, &mut tables, &mut funcs);
     for referenced in tables.iter().chain(funcs.iter()) {
-        collect_read_lock_ids(storage, referenced, depth + 1, out);
+        collect_read_lock_ids(storage, referenced, depth + 1, out, visited);
     }
 }
 

@@ -5767,6 +5767,104 @@ mod tests {
     }
 
     #[test]
+    fn inline_tvf_body_tables_locked_and_snapshotted() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("tvf-seam");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE secret (z INT NOT NULL PRIMARY KEY)")
+            .expect("secret");
+        engine
+            .execute(
+                "CREATE FUNCTION dbo.rows_of (@x INT) RETURNS TABLE AS \
+                 RETURN (SELECT z FROM secret WHERE z >= @x)",
+            )
+            .expect("tvf");
+        let secret = table_object_id(&engine, "secret");
+        // A TVF in FROM must Shared-lock the table its body reads, up front.
+        let locks = engine.analyze_locks("SELECT z FROM dbo.rows_of(1)", Isolation::ReadCommitted);
+        assert!(
+            locks.contains(&(Resource::Table(secret), LockMode::Shared)),
+            "a TVF's body table must be Shared-locked: {locks:?}"
+        );
+        // And it must arm the snapshot scope: under SNAPSHOT-not-allowed a TVF
+        // whose body reads a table raises 3952 (the body IS a data access).
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+        );
+        let out = batch(&engine, &mut ctx, "SELECT z FROM dbo.rows_of(1)");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(3952),
+            "a TVF-reading SELECT must arm the snapshot scope: {:?}",
+            out.error
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn recursive_function_lock_analysis_terminates() {
+        use crate::rel::Isolation;
+        let path = unique_temp_path("udf-recursion-bomb");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        // A self-referencing TVF whose body references itself TWICE (fan-out 2):
+        // without the visited-set memoization in collect_read_lock_ids this
+        // recurses ~2^32 times and hangs analysis (and, under the scheduler
+        // mutex, the whole server). Run in a thread so a regression FAILS
+        // cleanly on the timeout rather than hanging the test binary.
+        engine
+            .execute(
+                "CREATE FUNCTION dbo.bomb (@x INT) RETURNS TABLE AS \
+                 RETURN (SELECT a.id FROM dbo.bomb(@x) AS a JOIN dbo.bomb(@x) AS b ON a.id = b.id)",
+            )
+            .expect("bomb");
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = engine.analyze_locks("SELECT id FROM dbo.bomb(1)", Isolation::ReadCommitted);
+            let _ = tx.send(());
+        });
+        assert!(
+            rx.recv_timeout(std::time::Duration::from_secs(10)).is_ok(),
+            "lock analysis of a recursive function must terminate (memoization)"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn showplan_names_a_table_valued_function() {
+        let path = unique_temp_path("tvf-showplan");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE nums (id INT NOT NULL PRIMARY KEY, grp INT NOT NULL)")
+            .expect("nums");
+        engine
+            .execute(
+                "CREATE FUNCTION dbo.in_group (@g INT) RETURNS TABLE AS \
+                 RETURN (SELECT id FROM nums WHERE grp = @g)",
+            )
+            .expect("tvf");
+        // A lone TVF in FROM must not render as a phantom nested-loops join over
+        // a base table named after the function.
+        let plan = plan_lines(&engine, "SELECT id FROM dbo.in_group(20)");
+        assert!(
+            plan.iter().any(|l| l.contains("Table-valued Function")),
+            "plan names the TVF: {plan:?}"
+        );
+        assert!(
+            !plan.iter().any(|l| l.contains("Nested Loops")),
+            "no phantom join: {plan:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn cf_review_describe_stops_at_control_flow() {
         // sp_describe_first_result_set: a batch whose FIRST possible rowset
         // sits inside an IF must answer "not statically derivable" — skipping
