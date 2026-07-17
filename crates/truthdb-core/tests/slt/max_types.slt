@@ -1,0 +1,73 @@
+# VARCHAR(MAX) / NVARCHAR(MAX) / VARBINARY(MAX) (Stage 14): declaration,
+# CRUD, CAST, and the key/index rejections. Values here are inline-sized;
+# the overflow-chain paths (and the 10 MiB round-trip) are pinned in the
+# engine tests, where big values are built programmatically.
+
+statement ok
+CREATE TABLE mx (id INT NOT NULL PRIMARY KEY, body NVARCHAR(MAX), raw VARBINARY(MAX))
+
+statement ok
+INSERT INTO mx VALUES (1, N'hello max', NULL), (2, NULL, NULL)
+
+query IT rowsort
+SELECT id, body FROM mx
+----
+1 hello max
+2 NULL
+
+statement ok
+UPDATE mx SET body = 'replaced' WHERE id = 1
+
+query T
+SELECT body FROM mx WHERE id = 1
+----
+replaced
+
+# No declared-length cap: a value longer than 8000 characters is legal (the
+# 8152 truncation error never fires for MAX).
+statement ok
+CREATE TABLE mx2 (id INT NOT NULL PRIMARY KEY, v VARCHAR(MAX))
+
+statement ok
+INSERT INTO mx2 VALUES (1, 'x')
+
+query I
+SELECT LEN(v) FROM mx2 WHERE id = 1
+----
+1
+
+# CAST to (MAX) types works and does not truncate.
+query T
+SELECT CAST('abc' AS VARCHAR(MAX))
+----
+abc
+
+query I
+SELECT LEN(CAST('abcdef' AS NVARCHAR(MAX)))
+----
+6
+
+# WHERE and expressions read (MAX) columns like any other.
+query I
+SELECT COUNT(*) FROM mx WHERE body = 'replaced'
+----
+1
+
+# (MAX) columns cannot be keys or index columns (1919), nor INCLUDEd (a
+# documented divergence — SQL Server allows INCLUDE).
+statement error
+CREATE TABLE bad (body NVARCHAR(MAX) NOT NULL PRIMARY KEY)
+
+statement error
+CREATE INDEX ix_mx ON mx (body)
+
+statement error
+CREATE INDEX ix_mx2 ON mx (id) INCLUDE (body)
+
+statement ok
+DELETE FROM mx WHERE id = 1
+
+query I
+SELECT COUNT(*) FROM mx
+----
+1

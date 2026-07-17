@@ -88,6 +88,11 @@ pub fn display(datum: &Datum, column_type: &ColumnType) -> Option<String> {
 pub fn datum_to_sql(datum: &Datum, column_type: &ColumnType) -> SqlValue {
     match datum {
         Datum::Null => SqlValue::Null,
+        // Resolved by every storage read path before rows escape; reaching
+        // the executor means a resolve hook was missed.
+        Datum::OverflowRef { .. } => {
+            unreachable!("overflow reference escaped the storage layer")
+        }
         Datum::TinyInt(v) => SqlValue::Int(*v as i64),
         Datum::SmallInt(v) => SqlValue::Int(*v as i64),
         Datum::Int(v) => SqlValue::Int(*v as i64),
@@ -230,6 +235,14 @@ pub fn sql_to_datum(
             }
             _ => Err(clash()),
         },
+        // (MAX) types have no declared-length cap: 8152 never fires; the
+        // storage layer decides in-row vs overflow.
+        ColumnType::VarCharMax => Ok(Datum::VarChar(to_string_value(value))),
+        ColumnType::NVarCharMax => Ok(Datum::NVarChar(to_string_value(value))),
+        ColumnType::VarBinaryMax => match value {
+            SqlValue::Binary(b) => Ok(Datum::VarBinary(b.clone())),
+            _ => Err(clash()),
+        },
     }
 }
 
@@ -319,6 +332,9 @@ fn convert_fail(text: &str, target: &str) -> SqlError {
 fn datum_display(datum: &Datum, column_type: &ColumnType) -> Option<String> {
     match datum {
         Datum::Null => None,
+        Datum::OverflowRef { .. } => {
+            unreachable!("overflow reference escaped the storage layer")
+        }
         Datum::Bit(b) => Some(if *b { "1" } else { "0" }.to_string()),
         Datum::Real(v) => Some(format_float(*v as f64)),
         Datum::Float(v) => Some(format_float(*v)),

@@ -229,6 +229,23 @@ def main() -> int:
         print(f"FAIL: count must return after NOCOUNT OFF, got {cur.rowcount}")
         return 1
 
+    # Stage 14: NVARCHAR(MAX) — PLP in both directions. pytds sends a long
+    # parameter as PLP (the decoder's live pin) and reads the PLP-encoded
+    # column back; 100k chars forces the overflow-chain storage path.
+    cur.execute("CREATE TABLE maxi (id INT NOT NULL PRIMARY KEY, body NVARCHAR(MAX))")
+    payload = "λx." * 33000 + "end"  # 99003 chars, non-ASCII included
+    cur.execute("INSERT INTO maxi VALUES (%s, %s)", (1, payload))
+    cur.execute("SELECT LEN(body), body FROM maxi WHERE id = 1")
+    length, body = cur.fetchone()
+    if length != len(payload) or body != payload:
+        print(f"FAIL: NVARCHAR(MAX) round-trip: len {length} vs {len(payload)}, "
+              f"equal={body == payload}")
+        return 1
+    cur.execute("SELECT body FROM maxi WHERE body = %s", (payload,))
+    if cur.fetchone() is None:
+        print("FAIL: NVARCHAR(MAX) equality predicate")
+        return 1
+
     conn.close()
     print("tds conformance: OK")
     return 0

@@ -16,9 +16,10 @@ use crate::relstore::ctx::{OpMode, PoolIo, RelCtx, TxnLink};
 use crate::relstore::heap::{Heap, Rid};
 use crate::relstore::index::{self, Locator};
 use crate::relstore::key::encode_key;
+use crate::relstore::overflow::{self, OVERFLOW_INLINE_MAX};
 use crate::relstore::recovery as rel_recovery;
 use crate::relstore::row::{Column, Schema, decode_row, decode_row_projected, encode_row};
-use crate::relstore::types::{Datum, TypeError};
+use crate::relstore::types::{ColumnType, Datum, TypeError};
 use crate::relstore::version::{
     PendingVersion, ReadSnapshot, Resolved, RowChange, decode_rid_identity, rid_identity,
 };
@@ -1010,6 +1011,18 @@ fn validate_not_null(schema: &Schema, values: &[Datum]) -> Result<(), StorageErr
     Ok(())
 }
 
+/// A row staged for insert: its clustered key (trees) and its encoding —
+/// `None` when the table has (MAX) columns, whose oversize values must spill
+/// inside the statement before the row can encode.
+type StagedInsert = (Option<Vec<u8>>, Option<Vec<u8>>);
+/// An in-place tree update: key, pre-encoded row or the values to encode
+/// in-statement ((MAX) tables).
+type StagedInPlace = (Vec<u8>, Option<Vec<u8>>, Option<Vec<Datum>>);
+/// A re-keying tree update: old key, new key, then as [`StagedInPlace`].
+type StagedRekey = (Vec<u8>, Vec<u8>, Option<Vec<u8>>, Option<Vec<Datum>>);
+/// A heap update: RID, then as [`StagedInPlace`]'s tail.
+type StagedHeapUpdate = (Rid, Option<Vec<u8>>, Option<Vec<Datum>>);
+
 /// Opaque handle to a stored row, addressing it for a targeted UPDATE/DELETE.
 /// Clustered tables locate by encoded PK key; heaps by RID.
 #[derive(Debug, Clone)]
@@ -1710,6 +1723,8 @@ impl StorageFile {
         for image in extra_images {
             rows.push(decode_projected(&schema, &image, projection)?);
         }
+        let types = Self::projected_types(&schema, projection);
+        self.resolve_overflow_rows(&types, &mut rows)?;
         Ok(rows)
     }
 
@@ -1729,11 +1744,19 @@ impl StorageFile {
         self.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(name)?;
         // Encode and validate every row up front (cheap failures before any
-        // mutation), keeping the key alongside for tree tables.
-        let mut encoded: Vec<(Option<Vec<u8>>, Vec<u8>)> = Vec::with_capacity(rows.len());
+        // mutation), keeping the key alongside for tree tables. Rows with
+        // (MAX) columns encode inside the statement instead: their oversize
+        // values spill to overflow chains first, which needs the page
+        // context.
+        let has_max = schema.columns.iter().any(|c| c.column_type.is_max());
+        let mut encoded: Vec<StagedInsert> = Vec::with_capacity(rows.len());
         for values in &rows {
             validate_not_null(&schema, values)?;
-            let row = encode_row(&schema, values)?;
+            let row = if has_max {
+                None
+            } else {
+                Some(encode_row(&schema, values)?)
+            };
             let key = if def.is_tree() {
                 Some(encode_key(&schema, &def.key_columns, values)?)
             } else {
@@ -1753,9 +1776,16 @@ impl StorageFile {
                 root: def.root_page,
             };
             self.rel_statement_scoped(scope, move |ctx, txn| {
-                for ((key, row), values) in encoded.iter().zip(rows.iter()) {
-                    let key = key.as_ref().expect("tree row has a key");
-                    match tree.insert_unique(ctx, &mut OpMode::Txn(txn), key, row)? {
+                for ((key, pre), mut values) in encoded.into_iter().zip(rows.into_iter()) {
+                    let key = key.expect("tree row has a key");
+                    let row = match pre {
+                        Some(row) => row,
+                        None => {
+                            Self::spill_max_values(ctx, &schema, &mut values)?;
+                            encode_row(&schema, &values)?
+                        }
+                    };
+                    match tree.insert_unique(ctx, &mut OpMode::Txn(txn), &key, &row)? {
                         TreeInsert::Inserted => {}
                         TreeInsert::DuplicateKey => {
                             return Err(StorageError::Constraint(
@@ -1770,13 +1800,13 @@ impl StorageFile {
                         &indexes,
                         &schema,
                         &collations,
-                        values,
+                        &values,
                         &Locator::Key(key.clone()),
                     )?;
                     if publishing {
                         txn.pending_versions.push(PendingVersion {
                             object_id: tree.object_id,
-                            identity: key.clone(),
+                            identity: key,
                             change: RowChange::Insert,
                         });
                     }
@@ -1792,16 +1822,23 @@ impl StorageFile {
                 first_page: def.root_page,
             };
             self.rel_statement_scoped(scope, move |ctx, txn| {
-                for ((_, row), values) in encoded.iter().zip(rows.iter()) {
+                for ((_, pre), mut values) in encoded.into_iter().zip(rows.into_iter()) {
+                    let row = match pre {
+                        Some(row) => row,
+                        None => {
+                            Self::spill_max_values(ctx, &schema, &mut values)?;
+                            encode_row(&schema, &values)?
+                        }
+                    };
                     // Heap rows locate by their home RID.
-                    let rid = heap.insert(ctx, txn, row)?;
+                    let rid = heap.insert(ctx, txn, &row)?;
                     index_insert_row(
                         ctx,
                         txn,
                         &indexes,
                         &schema,
                         &collations,
-                        values,
+                        &values,
                         &Locator::Rid(rid),
                     )?;
                     if publishing {
@@ -1853,9 +1890,17 @@ impl StorageFile {
             object_id: def.object_id,
             root: def.root_page,
         };
-        let mut ctx = self.rel_ctx();
-        match tree.get(&mut ctx, &key)? {
-            Some(row) => Ok(Some(decode_row(&schema, &row)?)),
+        let fetched = {
+            let mut ctx = self.rel_ctx();
+            tree.get(&mut ctx, &key)?
+        };
+        match fetched {
+            Some(row) => {
+                let mut rows = vec![decode_row(&schema, &row)?];
+                let types = Self::projected_types(&schema, None);
+                self.resolve_overflow_rows(&types, &mut rows)?;
+                Ok(rows.pop())
+            }
             None => Ok(None),
         }
     }
@@ -1896,9 +1941,13 @@ impl StorageFile {
             raw.extend(located.into_iter().map(|(_, row)| row));
             next
         };
+        let start = out.len();
         for row in raw {
             out.push(decode_projected(&schema, &row, projection)?);
         }
+        let _ = ctx;
+        let types = Self::projected_types(&schema, projection);
+        self.resolve_overflow_rows(&types, &mut out[start..])?;
         Ok(next)
     }
 
@@ -1925,9 +1974,13 @@ impl StorageFile {
                 .map(|(_, row)| row)
                 .collect()
         };
-        raw.into_iter()
+        let mut rows = raw
+            .into_iter()
             .map(|row| decode_row(&schema, &row).map_err(StorageError::from))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        let types = Self::projected_types(&schema, None);
+        self.resolve_overflow_rows(&types, &mut rows)?;
+        Ok(rows)
     }
 
     /// Snapshot scan (Stage 13): the whole table read atomically under this
@@ -1972,6 +2025,8 @@ impl StorageFile {
             for (_, row) in physical {
                 out.push(decode_projected(&schema, &row, projection)?);
             }
+            let types = Self::projected_types(&schema, projection);
+            self.resolve_overflow_rows(&types, &mut out)?;
             return Ok(out);
         }
         let mut seen: std::collections::HashSet<Vec<u8>> =
@@ -1991,6 +2046,8 @@ impl StorageFile {
         for image in self.version.unseen_images(def.object_id, &seen, snapshot) {
             out.push(decode_projected(&schema, &image, projection)?);
         }
+        let types = Self::projected_types(&schema, projection);
+        self.resolve_overflow_rows(&types, &mut out)?;
         Ok(out)
     }
 
@@ -2185,6 +2242,28 @@ impl StorageFile {
                 out.push((RowLocator::Rid(rid), decode_row(&schema, &row)?));
             }
         }
+        let _ = ctx;
+        if schema.columns.iter().any(|c| c.column_type.is_max()) {
+            let types = Self::projected_types(&schema, None);
+            let mut ctx = self.rel_ctx();
+            for (_, row) in out.iter_mut() {
+                for (column_type, value) in types.iter().zip(row.iter_mut()) {
+                    if let Datum::OverflowRef {
+                        total_len,
+                        first_page,
+                    } = *value
+                    {
+                        let bytes = overflow::read_chain(&mut ctx, first_page, total_len)?;
+                        let base = match column_type {
+                            ColumnType::VarCharMax => ColumnType::VarChar { max_len: u16::MAX },
+                            ColumnType::NVarCharMax => ColumnType::NVarChar { max_len: u16::MAX },
+                            _ => ColumnType::VarBinary { max_len: u16::MAX },
+                        };
+                        *value = Datum::decode_var(&base, &bytes)?;
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -2268,6 +2347,27 @@ impl StorageFile {
                 out.push((locator, decode_row(&schema, &image)?, true));
             }
         }
+        if schema.columns.iter().any(|c| c.column_type.is_max()) {
+            let types = Self::projected_types(&schema, None);
+            let mut ctx = self.rel_ctx();
+            for (_, row, _) in out.iter_mut() {
+                for (column_type, value) in types.iter().zip(row.iter_mut()) {
+                    if let Datum::OverflowRef {
+                        total_len,
+                        first_page,
+                    } = *value
+                    {
+                        let bytes = overflow::read_chain(&mut ctx, first_page, total_len)?;
+                        let base = match column_type {
+                            ColumnType::VarCharMax => ColumnType::VarChar { max_len: u16::MAX },
+                            ColumnType::NVarCharMax => ColumnType::NVarChar { max_len: u16::MAX },
+                            _ => ColumnType::VarBinary { max_len: u16::MAX },
+                        };
+                        *value = Datum::decode_var(&base, &bytes)?;
+                    }
+                }
+            }
+        }
         Ok(out)
     }
 
@@ -2288,17 +2388,10 @@ impl StorageFile {
         let indexes = def.indexes.clone();
         let collations = def.collations.clone();
         let counter_page = def.counter_page;
-        // Version staging: the deleted rows' images, encoded up front (the
-        // schema stays out of the closure), indexed alongside `targets`.
+        // Version priors come from the physical pre-images inside the
+        // statement (raw bytes, overflow refs intact), not a re-encode.
         let publishing = self.version.publishing();
-        let priors: Vec<Option<Vec<u8>>> = if publishing {
-            targets
-                .iter()
-                .map(|(_, values)| encode_row(&schema, values).map(Some))
-                .collect::<Result<_, _>>()?
-        } else {
-            targets.iter().map(|_| None).collect()
-        };
+        let _ = &schema;
         // The counter follows the rows actually removed inside the statement,
         // which the arms count as they go (a locator of the wrong kind is
         // skipped, exactly as the row loop skips it).
@@ -2309,9 +2402,9 @@ impl StorageFile {
             };
             self.rel_statement_scoped(scope, move |ctx, txn| {
                 let mut removed: i64 = 0;
-                for ((loc, values), prior) in targets.iter().zip(priors) {
+                for (loc, values) in &targets {
                     if let RowLocator::Key(key) = loc {
-                        tree.delete(ctx, &mut OpMode::Txn(txn), key)?;
+                        let prior = tree.delete(ctx, &mut OpMode::Txn(txn), key)?;
                         index_delete_row(
                             ctx,
                             txn,
@@ -2320,7 +2413,7 @@ impl StorageFile {
                             values,
                             &Locator::Key(key.clone()),
                         )?;
-                        if let Some(prior) = prior {
+                        if publishing && let Some(prior) = prior {
                             txn.pending_versions.push(PendingVersion {
                                 object_id: tree.object_id,
                                 identity: key.clone(),
@@ -2342,8 +2435,13 @@ impl StorageFile {
             };
             self.rel_statement_scoped(scope, move |ctx, txn| {
                 let mut removed: i64 = 0;
-                for ((loc, values), prior) in targets.iter().zip(priors) {
+                for (loc, values) in &targets {
                     if let RowLocator::Rid(rid) = loc {
+                        let prior = if publishing {
+                            heap.read_row(ctx, *rid)?
+                        } else {
+                            None
+                        };
                         heap.delete(ctx, txn, *rid)?;
                         index_delete_row(
                             ctx,
@@ -2353,7 +2451,7 @@ impl StorageFile {
                             values,
                             &Locator::Rid(*rid),
                         )?;
-                        if let Some(prior) = prior {
+                        if publishing && let Some(prior) = prior {
                             txn.pending_versions.push(PendingVersion {
                                 object_id: heap.object_id,
                                 identity: rid_identity(*rid),
@@ -2394,6 +2492,7 @@ impl StorageFile {
         let indexes = def.indexes.clone();
         let collations = def.collations.clone();
         let publishing = self.version.publishing();
+        let has_max = schema.columns.iter().any(|c| c.column_type.is_max());
         // (old values, old locator, new values, new locator) for index upkeep.
         let mut idx_ops: Vec<(Vec<Datum>, Locator, Vec<Datum>, Locator)> = Vec::new();
         if def.is_tree() {
@@ -2401,16 +2500,14 @@ impl StorageFile {
                 object_id: def.object_id,
                 root: def.root_page,
             };
-            // Partition into in-place (key unchanged) and re-key (key changed).
-            let mut in_place: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
-            let mut rekey: Vec<(Vec<u8>, Vec<u8>, Vec<u8>)> = Vec::new();
-            // Version staging, split to mirror the closure's op order (all
-            // re-key deletes, then re-key inserts, then in-place updates), so
-            // an identity touched twice in one statement — a key swap — has
-            // its chain built in the order the physical states change.
-            let mut staged_rekey_del: Vec<PendingVersion> = Vec::new();
-            let mut staged_rekey_ins: Vec<PendingVersion> = Vec::new();
-            let mut staged_in_place: Vec<PendingVersion> = Vec::new();
+            // Partition into in-place (key unchanged) and re-key (key
+            // changed). Version priors are captured INSIDE the statement
+            // from the physical ops' returned pre-images — raw row bytes,
+            // so a (MAX) image keeps its overflow reference instead of
+            // re-inlining the whole value. (MAX) rows also encode inside,
+            // after their oversize values spill.
+            let mut in_place: Vec<StagedInPlace> = Vec::new();
+            let mut rekey: Vec<StagedRekey> = Vec::new();
             for (loc, old_values, new_values) in updates {
                 let RowLocator::Key(old_key) = loc else {
                     return Err(StorageError::InvalidConfig(
@@ -2418,12 +2515,11 @@ impl StorageFile {
                     ));
                 };
                 validate_not_null(&schema, &new_values)?;
-                let row = encode_row(&schema, &new_values)?;
                 let new_key = encode_key(&schema, &def.key_columns, &new_values)?;
-                let prior = if publishing {
-                    Some(encode_row(&schema, &old_values)?)
+                let (row, carried) = if has_max {
+                    (None, Some(new_values.clone()))
                 } else {
-                    None
+                    (Some(encode_row(&schema, &new_values)?), None)
                 };
                 if !indexes.is_empty() {
                     idx_ops.push((
@@ -2434,39 +2530,40 @@ impl StorageFile {
                     ));
                 }
                 if new_key == old_key {
-                    if let Some(prior) = prior {
-                        staged_in_place.push(PendingVersion {
-                            object_id: tree.object_id,
-                            identity: old_key.clone(),
-                            change: RowChange::Update { prior },
-                        });
-                    }
-                    in_place.push((old_key, row));
+                    in_place.push((old_key, row, carried));
                 } else {
-                    if let Some(prior) = prior {
-                        // A key change is a delete of the old identity and an
-                        // insert of the new one, exactly as the tree applies it.
-                        staged_rekey_del.push(PendingVersion {
-                            object_id: tree.object_id,
+                    rekey.push((old_key, new_key, row, carried));
+                }
+            }
+            let object_id = tree.object_id;
+            self.rel_statement_scoped(scope, move |ctx, txn| {
+                let encode_new = |ctx: &mut RelCtx<'_>,
+                                  row: Option<Vec<u8>>,
+                                  carried: Option<Vec<Datum>>|
+                 -> Result<Vec<u8>, StorageError> {
+                    match row {
+                        Some(row) => Ok(row),
+                        None => {
+                            let mut values = carried.expect("carried values for a MAX row");
+                            Self::spill_max_values(ctx, &schema, &mut values)?;
+                            Ok(encode_row(&schema, &values)?)
+                        }
+                    }
+                };
+                // Delete all re-keyed olds first so a new key may reuse one.
+                for (old_key, _, _, _) in &rekey {
+                    let prior = tree.delete(ctx, &mut OpMode::Txn(txn), old_key)?;
+                    if publishing && let Some(prior) = prior {
+                        txn.pending_versions.push(PendingVersion {
+                            object_id,
                             identity: old_key.clone(),
                             change: RowChange::Delete { prior },
                         });
-                        staged_rekey_ins.push(PendingVersion {
-                            object_id: tree.object_id,
-                            identity: new_key.clone(),
-                            change: RowChange::Insert,
-                        });
                     }
-                    rekey.push((old_key, new_key, row));
                 }
-            }
-            self.rel_statement_scoped(scope, move |ctx, txn| {
-                // Delete all re-keyed olds first so a new key may reuse one.
-                for (old_key, _, _) in &rekey {
-                    tree.delete(ctx, &mut OpMode::Txn(txn), old_key)?;
-                }
-                for (_, new_key, row) in &rekey {
-                    match tree.insert_unique(ctx, &mut OpMode::Txn(txn), new_key, row)? {
+                for (_, new_key, row, carried) in rekey {
+                    let row = encode_new(ctx, row, carried)?;
+                    match tree.insert_unique(ctx, &mut OpMode::Txn(txn), &new_key, &row)? {
                         TreeInsert::Inserted => {}
                         TreeInsert::DuplicateKey => {
                             return Err(StorageError::Constraint(
@@ -2474,14 +2571,26 @@ impl StorageFile {
                             ));
                         }
                     }
+                    if publishing {
+                        txn.pending_versions.push(PendingVersion {
+                            object_id,
+                            identity: new_key,
+                            change: RowChange::Insert,
+                        });
+                    }
                 }
-                for (key, row) in &in_place {
-                    tree.update(ctx, &mut OpMode::Txn(txn), key, row)?;
+                for (key, row, carried) in in_place {
+                    let row = encode_new(ctx, row, carried)?;
+                    let prior = tree.update(ctx, &mut OpMode::Txn(txn), &key, &row)?;
+                    if publishing && let Some(prior) = prior {
+                        txn.pending_versions.push(PendingVersion {
+                            object_id,
+                            identity: key,
+                            change: RowChange::Update { prior },
+                        });
+                    }
                 }
                 apply_index_updates(ctx, txn, &indexes, &schema, &collations, &idx_ops)?;
-                txn.pending_versions.extend(staged_rekey_del);
-                txn.pending_versions.extend(staged_rekey_ins);
-                txn.pending_versions.extend(staged_in_place);
                 Ok(())
             })?;
         } else {
@@ -2489,8 +2598,7 @@ impl StorageFile {
                 object_id: def.object_id,
                 first_page: def.root_page,
             };
-            let mut encoded: Vec<(Rid, Vec<u8>)> = Vec::with_capacity(count);
-            let mut staged: Vec<PendingVersion> = Vec::new();
+            let mut encoded: Vec<StagedHeapUpdate> = Vec::with_capacity(count);
             for (loc, old_values, new_values) in updates {
                 let RowLocator::Rid(rid) = loc else {
                     return Err(StorageError::InvalidConfig(
@@ -2498,15 +2606,10 @@ impl StorageFile {
                     ));
                 };
                 validate_not_null(&schema, &new_values)?;
-                encoded.push((rid, encode_row(&schema, &new_values)?));
-                if publishing {
-                    staged.push(PendingVersion {
-                        object_id: heap.object_id,
-                        identity: rid_identity(rid),
-                        change: RowChange::Update {
-                            prior: encode_row(&schema, &old_values)?,
-                        },
-                    });
+                if has_max {
+                    encoded.push((rid, None, Some(new_values.clone())));
+                } else {
+                    encoded.push((rid, Some(encode_row(&schema, &new_values)?), None));
                 }
                 if !indexes.is_empty() {
                     // Heap RIDs are stable across an update.
@@ -2514,11 +2617,32 @@ impl StorageFile {
                 }
             }
             self.rel_statement_scoped(scope, move |ctx, txn| {
-                for (rid, row) in &encoded {
-                    heap.update(ctx, txn, *rid, row)?;
+                for (rid, pre, carried) in encoded {
+                    let row = match pre {
+                        Some(row) => row,
+                        None => {
+                            let mut values = carried.expect("carried values for a MAX row");
+                            Self::spill_max_values(ctx, &schema, &mut values)?;
+                            encode_row(&schema, &values)?
+                        }
+                    };
+                    // The pre-image (raw bytes, overflow refs intact) is the
+                    // version prior; read before the in-place update.
+                    let prior = if publishing {
+                        heap.read_row(ctx, rid)?
+                    } else {
+                        None
+                    };
+                    heap.update(ctx, txn, rid, &row)?;
+                    if publishing && let Some(prior) = prior {
+                        txn.pending_versions.push(PendingVersion {
+                            object_id: heap.object_id,
+                            identity: rid_identity(rid),
+                            change: RowChange::Update { prior },
+                        });
+                    }
                 }
                 apply_index_updates(ctx, txn, &indexes, &schema, &collations, &idx_ops)?;
-                txn.pending_versions.extend(staged);
                 Ok(())
             })?;
         }
@@ -2999,6 +3123,85 @@ impl StorageFile {
             .map(|def| (def.name.clone(), def))
             .collect();
         Ok(())
+    }
+
+    /// Spills every (MAX) value above the inline threshold to an overflow
+    /// chain, replacing the datum with a reference. Runs inside statement
+    /// closures, before the row is encoded; chain pages are WAL-imaged, so
+    /// they are crash-durable with the statement (and leak if it fails —
+    /// the drop-table posture).
+    fn spill_max_values(
+        ctx: &mut RelCtx<'_>,
+        schema: &Schema,
+        values: &mut [Datum],
+    ) -> Result<(), StorageError> {
+        for (column, value) in schema.columns.iter().zip(values.iter_mut()) {
+            if !column.column_type.is_max() || value.is_null() {
+                continue;
+            }
+            let bytes = match value {
+                Datum::VarChar(_) | Datum::NVarChar(_) | Datum::VarBinary(_) => value.encode_var(),
+                _ => continue,
+            };
+            if bytes.len() <= OVERFLOW_INLINE_MAX {
+                continue;
+            }
+            let first_page = overflow::write_chain(ctx, &bytes)?;
+            *value = Datum::OverflowRef {
+                total_len: bytes.len() as u64,
+                first_page,
+            };
+        }
+        Ok(())
+    }
+
+    /// Resolves overflow references in decoded rows back to their values.
+    /// `types` must align with the rows' columns (the projection's types for
+    /// projected reads).
+    fn resolve_overflow_rows(
+        &mut self,
+        types: &[ColumnType],
+        rows: &mut [Vec<Datum>],
+    ) -> Result<(), StorageError> {
+        if !types.iter().any(ColumnType::is_max) {
+            return Ok(());
+        }
+        let mut ctx = self.rel_ctx();
+        for row in rows.iter_mut() {
+            for (column_type, value) in types.iter().zip(row.iter_mut()) {
+                if let Datum::OverflowRef {
+                    total_len,
+                    first_page,
+                } = *value
+                {
+                    let bytes = overflow::read_chain(&mut ctx, first_page, total_len)?;
+                    let base = match column_type {
+                        ColumnType::VarCharMax => ColumnType::VarChar { max_len: u16::MAX },
+                        ColumnType::NVarCharMax => ColumnType::NVarChar { max_len: u16::MAX },
+                        ColumnType::VarBinaryMax => ColumnType::VarBinary { max_len: u16::MAX },
+                        other => {
+                            return Err(StorageError::InvalidFile(format!(
+                                "overflow reference under non-MAX column type {}",
+                                other.name()
+                            )));
+                        }
+                    };
+                    *value = Datum::decode_var(&base, &bytes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The column types a projection selects (`None` = every column).
+    fn projected_types(schema: &Schema, projection: Option<&[usize]>) -> Vec<ColumnType> {
+        match projection {
+            None => schema.columns.iter().map(|c| c.column_type).collect(),
+            Some(projection) => projection
+                .iter()
+                .map(|&i| schema.columns[i].column_type)
+                .collect(),
+        }
     }
 
     /// Runs one autocommit relational statement: begin, ops, commit (force
@@ -4583,6 +4786,152 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
+    /// The Stage 14 exit criterion: a 10 MiB value round-trips through an
+    /// overflow chain, survives a kill-and-reopen, and a mid-transaction
+    /// update of it recovers to the committed value.
+    #[test]
+    fn ten_mib_value_round_trips_and_survives_a_crash() {
+        use crate::rel::RpcParam;
+        use crate::rel::{StatementResult, TxnContext, execute_batch, execute_batch_with_params};
+
+        let path = unique_temp_path("max-10mib");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut ctx = TxnContext::default();
+        for sql in [
+            "CREATE TABLE big (id INT NOT NULL PRIMARY KEY, body NVARCHAR(MAX))",
+            "INSERT INTO big VALUES (1, N'seed')",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut ctx);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        // 10 MiB of UTF-16 payload = 5 * 1024 * 1024 characters.
+        let big: String = "abcdefgh".repeat(5 * 1024 * 1024 / 8);
+        assert_eq!(big.encode_utf16().count() * 2, 10 * 1024 * 1024);
+        let outcome = execute_batch_with_params(
+            &storage,
+            "UPDATE big SET body = @v WHERE id = 1",
+            &mut ctx,
+            &[RpcParam {
+                name: "@v".into(),
+                column_type: ColumnType::NVarCharMax,
+                value: crate::relstore::types::Datum::NVarChar(big.clone()),
+            }],
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        let fetch = |storage: &Storage, ctx: &mut TxnContext| -> String {
+            let outcome = execute_batch(storage, "SELECT body FROM big WHERE id = 1", ctx);
+            assert!(outcome.error.is_none(), "{:?}", outcome.error);
+            match &outcome.results[0] {
+                StatementResult::Rows(rowset) => match &rowset.rows[0][0] {
+                    Datum::NVarChar(s) => s.clone(),
+                    other => panic!("expected NVARCHAR, got {other:?}"),
+                },
+                other => panic!("expected rows, got {other:?}"),
+            }
+        };
+        assert_eq!(
+            fetch(&storage, &mut ctx),
+            big,
+            "round-trip before the crash"
+        );
+
+        // An in-flight update dies with the crash; the committed 10 MiB
+        // value must recover intact.
+        let outcome = execute_batch(
+            &storage,
+            "BEGIN TRAN; UPDATE big SET body = N'doomed' WHERE id = 1;",
+            &mut ctx,
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let _ = ctx;
+        drop(storage);
+
+        let storage = Storage::open(path.clone()).expect("recovery");
+        let mut ctx = TxnContext::default();
+        let recovered = fetch(&storage, &mut ctx);
+        assert_eq!(recovered.len(), big.len(), "length after recovery");
+        assert_eq!(
+            recovered, big,
+            "the committed chain survives, the loser is undone"
+        );
+
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// Versioning over (MAX): an RCSI reader sees the pre-update big value
+    /// through the version image's overflow REFERENCE (images carry raw row
+    /// bytes; chains are immutable and never freed, so the ref stays valid).
+    #[test]
+    fn rcsi_reads_the_old_big_value_through_the_image_reference() {
+        use crate::rel::{
+            RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
+        };
+
+        let path = unique_temp_path("max-rcsi");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let mut writer = TxnContext::default();
+        let big_old: String = "old-value".repeat(20_000); // ~180 KB
+        let big_new: String = "new-value".repeat(20_000);
+        for sql in [
+            "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
+            "CREATE TABLE big (id INT NOT NULL PRIMARY KEY, body NVARCHAR(MAX))",
+        ] {
+            let outcome = execute_batch(&storage, sql, &mut writer);
+            assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+        }
+        let outcome = execute_batch_with_params(
+            &storage,
+            "INSERT INTO big VALUES (1, @v)",
+            &mut writer,
+            &[RpcParam {
+                name: "@v".into(),
+                column_type: ColumnType::NVarCharMax,
+                value: Datum::NVarChar(big_old.clone()),
+            }],
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // Writer holds an uncommitted update to the big value...
+        let outcome = execute_batch(&storage, "BEGIN TRAN", &mut writer);
+        assert!(outcome.error.is_none());
+        let outcome = execute_batch_with_params(
+            &storage,
+            "UPDATE big SET body = @v WHERE id = 1",
+            &mut writer,
+            &[RpcParam {
+                name: "@v".into(),
+                column_type: ColumnType::NVarCharMax,
+                value: Datum::NVarChar(big_new.clone()),
+            }],
+        );
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+
+        // ...and a snapshot reader gets the OLD value, resolved through the
+        // image's overflow reference.
+        let mut reader = TxnContext::default();
+        let outcome = execute_batch(&storage, "SELECT body FROM big WHERE id = 1", &mut reader);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => {
+                assert_eq!(rowset.rows[0][0], Datum::NVarChar(big_old.clone()));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        let outcome = execute_batch(&storage, "COMMIT", &mut writer);
+        assert!(outcome.error.is_none(), "{:?}", outcome.error);
+        let outcome = execute_batch(&storage, "SELECT body FROM big WHERE id = 1", &mut reader);
+        match &outcome.results[0] {
+            StatementResult::Rows(rowset) => {
+                assert_eq!(rowset.rows[0][0], Datum::NVarChar(big_new.clone()));
+            }
+            other => panic!("expected rows, got {other:?}"),
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(&path);
+    }
+
     /// Publishing versions changes nothing about crash recovery: the store
     /// (chains and commit table) is memory-only, so a kill-and-reopen with
     /// RCSI on recovers exactly the committed state, options intact, chains
@@ -4611,7 +4960,7 @@ mod tests {
         );
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         // Kill without checkpoint: drop the handle mid-transaction.
-        drop(ctx);
+        let _ = ctx;
         drop(storage);
 
         let storage = Storage::open(path.clone()).expect("recovery");

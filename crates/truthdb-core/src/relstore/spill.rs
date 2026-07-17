@@ -139,6 +139,9 @@ pub fn encode_spill_row(row: &[Datum]) -> Vec<u8> {
     for datum in row {
         match datum {
             Datum::Null => out.push(0),
+            Datum::OverflowRef { .. } => {
+                unreachable!("overflow reference escaped the storage layer")
+            }
             Datum::TinyInt(v) => {
                 out.push(1);
                 out.push(*v);

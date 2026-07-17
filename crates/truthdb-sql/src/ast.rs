@@ -270,7 +270,10 @@ pub enum DataType {
     Bit,
     Real,
     Float,
-    Decimal { precision: u8, scale: u8 },
+    Decimal {
+        precision: u8,
+        scale: u8,
+    },
     Date,
     Time,
     DateTime2,
@@ -278,6 +281,10 @@ pub enum DataType {
     VarChar(u32),
     NVarChar(u32),
     VarBinary(u32),
+    /// `VARCHAR(MAX)` — no declared length cap (Stage 14).
+    VarCharMax,
+    NVarCharMax,
+    VarBinaryMax,
 }
 
 #[derive(Debug, Clone, PartialEq)]

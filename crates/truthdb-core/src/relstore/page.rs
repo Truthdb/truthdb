@@ -26,6 +26,9 @@ pub const PAGE_TYPE_HEAP: u16 = 2;
 /// A table's row-counter page (planner statistics): one u64 count at
 /// [`COUNTER_OFFSET`], maintained transactionally via `CounterAdd` page ops.
 pub const PAGE_TYPE_COUNTER: u16 = 3;
+/// Overflow chain page for (MAX)-class values (Stage 14): immutable once
+/// written, `[header | next_page u64 | len u16 | data]`.
+pub const PAGE_TYPE_OVERFLOW: u16 = 4;
 /// Byte offset of the row count on a counter page (right after the header).
 pub const COUNTER_OFFSET: usize = PAGE_HEADER_SIZE;
 

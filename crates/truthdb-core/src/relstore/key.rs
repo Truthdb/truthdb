@@ -92,6 +92,11 @@ pub fn encode_datum(value: &Datum, out: &mut Vec<u8>) -> Result<(), TypeError> {
     }
     out.push(VALUE_MARKER);
     match value {
+        Datum::OverflowRef { .. } => {
+            return Err(TypeError(
+                "(MAX) values cannot be index or key columns".to_string(),
+            ));
+        }
         Datum::TinyInt(v) => out.push(*v),
         Datum::SmallInt(v) => out.extend_from_slice(&((*v as u16) ^ 0x8000).to_be_bytes()),
         Datum::Int(v) => out.extend_from_slice(&((*v as u32) ^ 0x8000_0000).to_be_bytes()),

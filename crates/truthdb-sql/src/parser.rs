@@ -941,19 +941,19 @@ impl Parser {
         let keyword = token
             .keyword()
             .ok_or_else(|| SqlError::syntax(self.token_text(&token), span))?;
-        let with_len = |parser: &mut Self, default: u32| -> SqlResult<(u32, Span)> {
+        // `None` length = `(MAX)`.
+        let with_len = |parser: &mut Self, default: u32| -> SqlResult<(Option<u32>, Span)> {
             if parser.eat(&TokenKind::LParen) {
                 if parser.peek_keyword().as_deref() == Some("MAX") {
-                    return Err(SqlError::message_only(
-                        102,
-                        "(MAX) length types are not supported until a later stage.",
-                    ));
+                    parser.bump();
+                    let end = parser.expect(&TokenKind::RParen)?;
+                    return Ok((None, end));
                 }
                 let n = parser.parse_u32_literal()?;
                 let end = parser.expect(&TokenKind::RParen)?;
-                Ok((n, end))
+                Ok((Some(n), end))
             } else {
-                Ok((default, span))
+                Ok((Some(default), span))
             }
         };
         let data_type = match keyword.as_str() {
@@ -974,15 +974,33 @@ impl Parser {
             }
             "VARCHAR" | "CHAR" => {
                 let (n, end) = with_len(self, 1)?;
-                return Ok((DataType::VarChar(n), span.to(end)));
+                return Ok((
+                    match n {
+                        Some(n) => DataType::VarChar(n),
+                        None => DataType::VarCharMax,
+                    },
+                    span.to(end),
+                ));
             }
             "NVARCHAR" | "NCHAR" => {
                 let (n, end) = with_len(self, 1)?;
-                return Ok((DataType::NVarChar(n), span.to(end)));
+                return Ok((
+                    match n {
+                        Some(n) => DataType::NVarChar(n),
+                        None => DataType::NVarCharMax,
+                    },
+                    span.to(end),
+                ));
             }
             "VARBINARY" | "BINARY" => {
                 let (n, end) = with_len(self, 1)?;
-                return Ok((DataType::VarBinary(n), span.to(end)));
+                return Ok((
+                    match n {
+                        Some(n) => DataType::VarBinary(n),
+                        None => DataType::VarBinaryMax,
+                    },
+                    span.to(end),
+                ));
             }
             other => {
                 return Err(SqlError::message_only(

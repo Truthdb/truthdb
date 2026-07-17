@@ -100,12 +100,15 @@ pub fn hash_class(ty: ColumnType) -> HashClass {
         | ColumnType::Bit
         | ColumnType::Decimal { .. } => HashClass::ExactNumeric,
         ColumnType::Real | ColumnType::Float => HashClass::ApproxNumeric,
-        ColumnType::VarChar { .. } | ColumnType::NVarChar { .. } => HashClass::Str,
+        ColumnType::VarChar { .. }
+        | ColumnType::NVarChar { .. }
+        | ColumnType::VarCharMax
+        | ColumnType::NVarCharMax => HashClass::Str,
         ColumnType::Date => HashClass::Date,
         ColumnType::Time => HashClass::Time,
         ColumnType::DateTime2 => HashClass::DateTime2,
         ColumnType::UniqueIdentifier => HashClass::Guid,
-        ColumnType::VarBinary { .. } => HashClass::Binary,
+        ColumnType::VarBinary { .. } | ColumnType::VarBinaryMax => HashClass::Binary,
     }
 }
 
