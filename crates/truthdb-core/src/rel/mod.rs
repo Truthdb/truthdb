@@ -194,6 +194,19 @@ impl TxnContext {
         self.variables.clear();
     }
 
+    /// The final value and type of a batch variable, as a `Datum`, for the
+    /// RPC-by-name response tail: after the synthesized `EXEC` batch completes
+    /// the session reads the OUTPUT parameters (copied back into caller-scope
+    /// variables) and the seeded return-status variable back off the context.
+    /// `name` may carry a leading `@`; lookup is case-insensitive, matching how
+    /// variables are keyed.
+    pub fn variable_datum(&self, name: &str) -> Option<(ColumnType, Datum)> {
+        let key = name.trim_start_matches('@').to_ascii_lowercase();
+        let (column_type, value) = self.variables.get(&key)?;
+        let datum = value::sql_to_datum(value, column_type, &key).ok()?;
+        Some((*column_type, datum))
+    }
+
     /// True if a transaction is open (used by the session to decide whether a
     /// disconnect must roll back).
     pub fn has_open_transaction(&self) -> bool {
@@ -1441,7 +1454,27 @@ fn run_block(
                 if let Some(value) = value {
                     let eval_ctx = txn_ctx.eval_context();
                     match eval_constant(value, &eval_ctx) {
-                        Ok(SqlValue::Int(status)) => txn_ctx.proc_return = Some(status),
+                        Ok(SqlValue::Int(status))
+                            if (i32::MIN as i64..=i32::MAX as i64).contains(&status) =>
+                        {
+                            txn_ctx.proc_return = Some(status)
+                        }
+                        // A RETURN value outside int range overflows, as SQL
+                        // Server does (8115) — the status is an int. Without this
+                        // the out-of-range value would be stashed and later fail
+                        // to encode (and, on the RPC path, read back as NULL and
+                        // be mistaken for a procedure that never completed).
+                        Ok(SqlValue::Int(_)) => {
+                            let error = SqlError::new(
+                                8115,
+                                16,
+                                2,
+                                "Arithmetic overflow error converting expression to data type int.",
+                            );
+                            txn_ctx.rowcount = 0;
+                            statement_error_ladder(statement, error, txn_ctx, run, in_try)?;
+                            continue;
+                        }
                         Ok(SqlValue::Null) => {
                             // SQL Server warns and returns 0; we return 0.
                             txn_ctx.proc_return = Some(0);

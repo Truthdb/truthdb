@@ -197,7 +197,7 @@ const TOKEN_RETURNVALUE: u8 = 0xac;
 /// Flags, TYPE_INFO (INTN, 4), value.
 pub fn return_value_int(out: &mut Vec<u8>, name: &str, value: i32) {
     out.push(TOKEN_RETURNVALUE);
-    out.extend_from_slice(&0u16.to_le_bytes()); // ParamOrdinal
+    out.extend_from_slice(&0u16.to_le_bytes()); // ParamOrdinal (the handle is param 0)
     push_b_varchar(out, name);
     out.push(0x01); // Status: output parameter
     out.extend_from_slice(&0u32.to_le_bytes()); // UserType
@@ -206,6 +206,29 @@ pub fn return_value_int(out: &mut Vec<u8>, name: &str, value: i32) {
     out.push(4);
     out.push(4); // value length
     out.extend_from_slice(&value.to_le_bytes());
+}
+
+/// RETURNVALUE for a procedure's OUTPUT parameter, typed like a row cell:
+/// TYPE_INFO then the value in that type's wire encoding.
+pub fn return_value(
+    out: &mut Vec<u8>,
+    ordinal: u16,
+    name: &str,
+    column_type: &truthdb_core::relstore::types::ColumnType,
+    value: &Datum,
+) {
+    out.push(TOKEN_RETURNVALUE);
+    // ParamOrdinal: the parameter's 0-based position in the RPC call. pytds
+    // (TDS 7.2+) places each OUTPUT value into the caller's list at this index,
+    // so a wrong ordinal misplaces or collides values; go-mssqldb/mssql-jdbc
+    // match by name/order and ignore it.
+    out.extend_from_slice(&ordinal.to_le_bytes());
+    push_b_varchar(out, name);
+    out.push(0x01); // Status: output parameter
+    out.extend_from_slice(&0u32.to_le_bytes()); // UserType
+    out.extend_from_slice(&0u16.to_le_bytes()); // Flags
+    out.extend_from_slice(&typeinfo::encode_type_info(column_type));
+    out.extend_from_slice(&typeinfo::encode_value(value, column_type));
 }
 
 /// COLMETADATA for a result set's columns.

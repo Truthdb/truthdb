@@ -735,7 +735,12 @@ fn start_rpc(
             ),
         )),
         // Error 2812 is SQL Server's "Could not find stored procedure".
-        RpcProc::Other(name) => Err((2812, format!("Could not find stored procedure '{name}'."))),
+        // A user procedure: the engine resolves the name (2812 if absent),
+        // binds the named params, and emits the real RETURNSTATUS and typed
+        // RETURNVALUEs for OUTPUT parameters.
+        RpcProc::Other(name) => {
+            Ok(engine.stream_proc_rpc(session, name, request.params, request.outputs, cancel))
+        }
     }
 }
 
@@ -767,6 +772,17 @@ struct BatchRender {
     /// A prepared handle to report as a RETURNVALUE just before the final
     /// DONEPROC — held so RETURNSTATUS precedes it, SQL Server's order.
     pending_handle: Option<i32>,
+    /// The procedure's real RETURN status (RPC-by-name); None keeps the
+    /// legacy 0.
+    return_status: Option<i32>,
+    /// OUTPUT parameter values (ParamOrdinal, name, type, value), held for the
+    /// response tail after RETURNSTATUS, before DONEPROC — SQL Server's order.
+    return_values: Vec<(
+        u16,
+        String,
+        truthdb_core::relstore::types::ColumnType,
+        truthdb_core::relstore::types::Datum,
+    )>,
     /// More replies follow this one in the same response (a multi-RPC
     /// request): the final DONEPROC keeps `DONE_MORE` instead of `DONE_FINAL`.
     more_responses: bool,
@@ -872,6 +888,17 @@ impl BatchRender {
                 // RETURNVALUE, which precedes the final DONEPROC.
                 self.pending_handle = Some(handle);
             }
+            BatchEvent::ReturnStatus(status) => {
+                self.return_status = Some(status);
+            }
+            BatchEvent::ReturnValue {
+                ordinal,
+                name,
+                column_type,
+                value,
+            } => {
+                self.return_values.push((ordinal, name, column_type, value));
+            }
             BatchEvent::Info(info) => {
                 // RAISERROR severity <= 10: an INFO token, not an error — the
                 // batch continues and no DONE flag changes. Pending DONEs go
@@ -913,12 +940,25 @@ impl BatchRender {
                     // RETURNSTATUS/RETURNVALUE/DONEPROC tail always follows.
                     self.flush_pending(out, true).await?;
                     self.buf.clear();
-                    if !self.errored {
-                        // A failed procedure returns no status.
+                    // RETURNSTATUS: a procedure that completed reports its real
+                    // status — the engine sends the event only on completion,
+                    // even under a continued error, so a warned-but-completed
+                    // proc still reports it. Any other clean RPC reply
+                    // (sp_executesql, a prepared handle) keeps the status-0
+                    // default. An aborted procedure or a failed RPC sends no
+                    // status event and is errored, so nothing is emitted.
+                    if let Some(status) = self.return_status {
+                        token::return_status(&mut self.buf, status);
+                    } else if !self.errored {
                         token::return_status(&mut self.buf, 0);
                     }
                     if let Some(handle) = self.pending_handle.take() {
                         token::return_value_int(&mut self.buf, "handle", handle);
+                    }
+                    // OUTPUT parameters: populated only when the procedure
+                    // completed, so emit whatever the engine sent.
+                    for (ordinal, name, column_type, value) in self.return_values.drain(..) {
+                        token::return_value(&mut self.buf, ordinal, &name, &column_type, &value);
                     }
                     out.write(&self.buf).await?;
                     self.final_done(out, self.errored, in_transaction).await?;
