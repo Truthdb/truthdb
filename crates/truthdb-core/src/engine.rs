@@ -5955,6 +5955,26 @@ mod tests {
             "an inline TVF body must not read the caller's table variable: {:?}",
             out.error
         );
+
+        // A VIEW body is the same stored-object scope: it must not read the
+        // caller's @t either. (SQL Server rejects such a view at CREATE; TruthDB
+        // defers name resolution, so the isolation must hold at query time.)
+        engine
+            .execute("CREATE VIEW dbo.vt AS SELECT id FROM @t")
+            .expect("create view over @t");
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @t TABLE (id INT NOT NULL PRIMARY KEY); \
+             INSERT INTO @t VALUES (1), (2); SELECT id FROM dbo.vt",
+        );
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(1087),
+            "a view body must not read the caller's table variable: {:?}",
+            out.error
+        );
         let _ = std::fs::remove_file(path);
     }
 

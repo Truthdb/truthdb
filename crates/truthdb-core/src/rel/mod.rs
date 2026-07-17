@@ -3810,6 +3810,27 @@ fn exec_declare_table_var(
             ),
         ));
     }
+    // Column names within the table variable must be unique (2705), the same
+    // rule a base table enforces in exec_create_table.
+    let mut seen: Vec<&str> = Vec::new();
+    for column in columns {
+        if seen
+            .iter()
+            .any(|n| n.eq_ignore_ascii_case(&column.name.value))
+        {
+            return Err(SqlError::new(
+                2705,
+                16,
+                3,
+                format!(
+                    "Column names in each table must be unique. Column name '{}' is specified more than once.",
+                    column.name.value
+                ),
+            )
+            .at(column.name.span));
+        }
+        seen.push(&column.name.value);
+    }
     let bound = columns
         .iter()
         .map(bind_column)
@@ -10064,6 +10085,13 @@ fn build_table_source(
                     quoted: false,
                     span: name.span,
                 };
+                // A view body is a stored-object scope, like a function/TVF
+                // body: it must not read the CALLER's table variables. Shadow
+                // the read view with an empty one so `SELECT ... FROM @t` inside
+                // a view errors 1087 rather than returning caller rows. (An
+                // in-statement derived table or CTE is NOT a separate scope and
+                // keeps the statement's view — only stored bodies shadow.)
+                let _table_var_scope = arm_table_var_view(&std::collections::HashMap::new());
                 return build_derived_source(storage, &body, &qual, eval_ctx);
             }
             let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;

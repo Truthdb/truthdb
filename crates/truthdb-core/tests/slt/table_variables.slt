@@ -127,3 +127,7 @@ DECLARE @t TABLE (id INT UNIQUE)
 
 statement error
 DECLARE @t TABLE (id INT CHECK (id > 0))
+
+# Duplicate column names in the declaration are 2705 (as for a base table).
+statement error
+DECLARE @t TABLE (id INT, id INT)
