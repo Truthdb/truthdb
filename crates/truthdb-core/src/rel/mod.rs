@@ -3810,6 +3810,35 @@ fn exec_declare_table_var(
             ),
         ));
     }
+    let (schema, key_columns, defaults) = build_table_var_definition(name, columns, primary_key)?;
+    ctx.table_variables.insert(
+        name.to_string(),
+        TableVar {
+            schema,
+            key_columns,
+            defaults,
+            rows: Vec::new(),
+        },
+    );
+    Ok(StatementResult::Done)
+}
+
+/// A table variable's built definition: its column schema, the schema indices of
+/// its PRIMARY KEY columns, and the per-column DEFAULT source text (parallel to
+/// the schema columns).
+type TableVarDefinition = (Schema, Vec<usize>, Vec<Option<String>>);
+
+/// Builds the schema, key-column indices, and per-column DEFAULT source text for
+/// a table-variable declaration (`DECLARE @name TABLE(cols)` and the RETURNS
+/// clause of a multi-statement TVF share this): unique column names (2705), PK
+/// columns forced NOT NULL (8111 on explicit-NULL, MAX-key rejected), and the
+/// DEFAULT texts applied per INSERT. `name` (without `@`) names the table in the
+/// error messages.
+fn build_table_var_definition(
+    name: &str,
+    columns: &[ColumnDef],
+    primary_key: &[Name],
+) -> Result<TableVarDefinition, SqlError> {
     // Column names within the table variable must be unique (2705), the same
     // rule a base table enforces in exec_create_table.
     let mut seen: Vec<&str> = Vec::new();
@@ -3880,16 +3909,7 @@ fn exec_declare_table_var(
     // Per-column DEFAULT source text (parallel to the schema columns), applied
     // at INSERT to columns left unspecified — same as a base table.
     let defaults: Vec<Option<String>> = columns.iter().map(|c| c.default.clone()).collect();
-    ctx.table_variables.insert(
-        name.to_string(),
-        TableVar {
-            schema,
-            key_columns,
-            defaults,
-            rows: Vec::new(),
-        },
-    );
-    Ok(StatementResult::Done)
+    Ok((schema, key_columns, defaults))
 }
 
 fn undeclared_variable_err(name: &str) -> SqlError {
@@ -5125,6 +5145,25 @@ fn exec_create_function(
                 select_text: create.body.clone(),
             }
         }
+        ReturnsClause::MultiTable {
+            var_name,
+            columns_text,
+        } => {
+            // Validate the RETURNS table declaration builds (mirrors DECLARE @t
+            // TABLE) and the body parses under the multi-statement TVF rules (may
+            // populate the result / local table variables but not touch real
+            // tables; must end in RETURN). Both are stored as text, re-parsed and
+            // re-built per call.
+            let (columns, primary_key) = truthdb_sql::parse_table_var_columns(columns_text)?;
+            build_table_var_definition(var_name, &columns, &primary_key)?;
+            let body = truthdb_sql::parse_table_function_body(&create.body)?;
+            validate_multi_tvf_body(&body)?;
+            FunctionReturns::MultiStatementTable {
+                returns_var: var_name.clone(),
+                columns_text: columns_text.clone(),
+                body: create.body.clone(),
+            }
+        }
     };
     let function = FunctionDef { params, returns };
     if create.alter {
@@ -5231,6 +5270,59 @@ fn check_function_statement(statement: &Statement) -> Result<(), SqlError> {
             1,
             "Invalid use of a side-effecting operator within a function.",
         )),
+    }
+}
+
+/// Validates a multi-statement TVF body: like a scalar function it is
+/// side-effect-free against the database, but it MAY populate table variables
+/// (its result and any locals it declares), and its last statement must be a
+/// (valueless) RETURN.
+fn validate_multi_tvf_body(statements: &[Statement]) -> Result<(), SqlError> {
+    for statement in statements {
+        check_multi_tvf_statement(statement)?;
+    }
+    match last_effective_statement(statements) {
+        Some(Statement::Return { .. }) => Ok(()),
+        _ => Err(SqlError::new(
+            455,
+            16,
+            2,
+            "The last statement included within a function must be a return statement.",
+        )),
+    }
+}
+
+/// Rejects a statement a multi-statement TVF body may not contain. The only
+/// difference from a scalar body (`check_function_statement`) is that DML into a
+/// table variable (an `@`-target) is allowed — that is how the result is built.
+fn check_multi_tvf_statement(statement: &Statement) -> Result<(), SqlError> {
+    match statement {
+        // INSERT into a table variable (the result or a local) is how a
+        // multi-statement TVF produces rows.
+        Statement::Insert(insert) if insert.table.value.starts_with('@') => Ok(()),
+        Statement::DeclareTableVar { .. } => Ok(()),
+        Statement::Block { body, .. } => {
+            for inner in body {
+                check_multi_tvf_statement(inner)?;
+            }
+            Ok(())
+        }
+        Statement::If {
+            then_branch,
+            else_branch,
+            ..
+        } => {
+            check_multi_tvf_statement(then_branch)?;
+            if let Some(else_branch) = else_branch {
+                check_multi_tvf_statement(else_branch)?;
+            }
+            Ok(())
+        }
+        Statement::While { body, .. } => check_multi_tvf_statement(body),
+        // Everything else defers to the scalar-body rules (DECLARE/SET/RETURN/
+        // assignment-SELECT allowed; real-table DML/EXEC/DDL 443; data SELECT
+        // 444).
+        other => check_function_statement(other),
     }
 }
 
@@ -7784,7 +7876,7 @@ fn resolve_scalar_function(storage: &Storage, name: &str) -> Option<TableDef> {
     match def.function.as_ref()?.returns {
         FunctionReturns::Scalar { .. } => Some(def),
         // A table-valued function is not a scalar call (it resolves in FROM).
-        FunctionReturns::InlineTable { .. } => None,
+        FunctionReturns::InlineTable { .. } | FunctionReturns::MultiStatementTable { .. } => None,
     }
 }
 
@@ -9854,6 +9946,19 @@ fn collect_statement_read_names(
         }
         // An assignment SELECT in a function body reads its FROM tables.
         Statement::Select(select) => collect_select_read_names(select, tables, funcs),
+        // A multi-statement TVF body's `INSERT @t SELECT …` / `INSERT @t VALUES
+        // (subquery)` reads real tables through its source, which must be locked
+        // up front. The @t target itself is session-local (no lock).
+        Statement::Insert(insert) => match &insert.source {
+            InsertSource::Select(select) => collect_select_read_names(select, tables, funcs),
+            InsertSource::Values(rows) => {
+                for row in rows {
+                    for expr in row {
+                        collect_expr_read_names(expr, tables, funcs);
+                    }
+                }
+            }
+        },
         Statement::Declare(declarations) => {
             for decl in declarations {
                 if let Some(init) = &decl.initializer {
@@ -10186,10 +10291,6 @@ fn build_function_source(
         .function
         .as_ref()
         .ok_or_else(|| function_not_a_table(&def.name).at(name.span))?;
-    let FunctionReturns::InlineTable { select_text } = &function.returns else {
-        // A scalar function called in table position is not a rowset.
-        return Err(function_not_a_table(&def.name).at(name.span));
-    };
     if args.len() < function.params.len() {
         return Err(SqlError::new(
             313,
@@ -10214,27 +10315,6 @@ fn build_function_source(
         )
         .at(name.span));
     }
-    // Bind the arguments to the parameters, coercing to the declared types, in a
-    // FRESH variable scope (a TVF body sees only its parameters, not caller
-    // locals). Arguments may themselves contain subqueries or scalar UDFs.
-    let no_outer = |_: &str| -> Option<usize> { None };
-    let mut variables = std::collections::HashMap::new();
-    for (param, arg) in function.params.iter().zip(args) {
-        let column_type = ColumnType::parse(&param.type_spec)
-            .map_err(|e| SqlError::message_only(245, e.to_string()))?;
-        let value = substitute_correlated_in_expr(storage, arg, &no_outer, &[], eval_ctx)
-            .and_then(|bound| eval_constant(&bound, eval_ctx))?;
-        let datum = value::sql_to_datum(&value, &column_type, &param.name)?;
-        variables.insert(
-            param.name.clone(),
-            value::datum_to_sql(&datum, &column_type),
-        );
-    }
-    let mut fn_ctx = eval_ctx.clone();
-    fn_ctx.variables = variables;
-    // Expand the body like a view (bounded by the shared nesting guard).
-    let _guard = ViewDepthGuard::enter(&def.name)?;
-    let body = parse_view_query(select_text, &def.name)?;
     let qualifier = alias
         .map(|a| a.value.clone())
         .unwrap_or_else(|| strip_schema(&name.value).to_string());
@@ -10243,15 +10323,167 @@ fn build_function_source(
         quoted: false,
         span: name.span,
     };
-    // A TVF body sees only its parameters, not caller locals — the scalar side
-    // is isolated above (fresh `variables`); do the same for the table-variable
-    // read view. Without this the body's `FROM @t` would resolve against the
-    // CALLER's table variable, since build_derived_source runs under whatever
-    // scope the calling statement armed. An empty view makes such a body error
-    // 1087, as SQL Server rejects it. (arm_table_var_view no-ops when nothing is
-    // armed, so a body with no @t reference pays nothing.)
-    let _table_var_scope = arm_table_var_view(&std::collections::HashMap::new());
-    build_derived_source(storage, &body, &qual, &fn_ctx)
+    match &function.returns {
+        FunctionReturns::InlineTable { select_text } => {
+            // Bind the arguments to the parameters, coercing to the declared
+            // types, in a FRESH variable scope (a TVF body sees only its
+            // parameters, not caller locals). Arguments may themselves contain
+            // subqueries or scalar UDFs.
+            let no_outer = |_: &str| -> Option<usize> { None };
+            let mut variables = std::collections::HashMap::new();
+            for (param, arg) in function.params.iter().zip(args) {
+                let column_type = ColumnType::parse(&param.type_spec)
+                    .map_err(|e| SqlError::message_only(245, e.to_string()))?;
+                let value = substitute_correlated_in_expr(storage, arg, &no_outer, &[], eval_ctx)
+                    .and_then(|bound| eval_constant(&bound, eval_ctx))?;
+                let datum = value::sql_to_datum(&value, &column_type, &param.name)?;
+                variables.insert(
+                    param.name.clone(),
+                    value::datum_to_sql(&datum, &column_type),
+                );
+            }
+            let mut fn_ctx = eval_ctx.clone();
+            fn_ctx.variables = variables;
+            // Expand the body like a view (bounded by the shared nesting guard).
+            let _guard = ViewDepthGuard::enter(&def.name)?;
+            let body = parse_view_query(select_text, &def.name)?;
+            // A TVF body sees only its parameters, not caller locals — the scalar
+            // side is isolated above (fresh `variables`); do the same for the
+            // table-variable read view. Without this the body's `FROM @t` would
+            // resolve against the CALLER's table variable, since build_derived_
+            // source runs under whatever scope the calling statement armed. An
+            // empty view makes such a body error 1087, as SQL Server rejects it.
+            let _table_var_scope = arm_table_var_view(&std::collections::HashMap::new());
+            build_derived_source(storage, &body, &qual, &fn_ctx)
+        }
+        FunctionReturns::MultiStatementTable {
+            returns_var,
+            columns_text,
+            body,
+        } => run_multi_statement_tvf(
+            storage,
+            function,
+            returns_var,
+            columns_text,
+            body,
+            args,
+            &qual,
+            eval_ctx,
+        ),
+        // A scalar function called in table position is not a rowset.
+        FunctionReturns::Scalar { .. } => Err(function_not_a_table(&def.name).at(name.span)),
+    }
+}
+
+/// Runs a multi-statement TVF and returns its result table variable's rows as a
+/// materialized source. The body runs in an isolated context (a fresh
+/// `TxnContext`, like a scalar UDF: parameters only, no transaction, ambient
+/// snapshot for its reads) seeded with the empty result table variable, which
+/// its statements populate; the accumulated rows are the function's result.
+#[allow(clippy::too_many_arguments)]
+fn run_multi_statement_tvf(
+    storage: &Storage,
+    function: &FunctionDef,
+    returns_var: &str,
+    columns_text: &str,
+    body_text: &str,
+    args: &[Expr],
+    qual: &Name,
+    eval_ctx: &EvalContext,
+) -> Result<Source, SqlError> {
+    // Rebuild the result table variable's schema (re-parsed per call, like the
+    // body — the CREATE-time validation guarantees this succeeds).
+    let (columns, primary_key) = truthdb_sql::parse_table_var_columns(columns_text)?;
+    let (schema, key_columns, defaults) =
+        build_table_var_definition(returns_var, &columns, &primary_key)?;
+    // Fresh isolated scope: parameters only, caller session identity carried for
+    // DB_NAME()/SUSER_SNAME()/@@SPID. Arguments evaluate in the CALLER's context.
+    let mut txn_ctx = TxnContext::default();
+    txn_ctx.set_session_identity(
+        eval_ctx.database.clone(),
+        eval_ctx.login.clone(),
+        eval_ctx.spid,
+    );
+    let no_outer = |_: &str| -> Option<usize> { None };
+    for (param, arg) in function.params.iter().zip(args) {
+        let column_type = ColumnType::parse(&param.type_spec)
+            .map_err(|e| SqlError::message_only(245, e.to_string()))?;
+        let value = substitute_correlated_in_expr(storage, arg, &no_outer, &[], eval_ctx)
+            .and_then(|bound| eval_constant(&bound, eval_ctx))?;
+        let datum = value::sql_to_datum(&value, &column_type, &param.name)?;
+        txn_ctx.variables.insert(
+            param.name.clone(),
+            (column_type, value::datum_to_sql(&datum, &column_type)),
+        );
+    }
+    // Seed the empty result table variable; the body populates it.
+    txn_ctx.table_variables.insert(
+        returns_var.to_string(),
+        TableVar {
+            schema,
+            key_columns,
+            defaults,
+            rows: Vec::new(),
+        },
+    );
+    let statements = truthdb_sql::parse_table_function_body(body_text)?;
+    // Same nesting cap as a scalar UDF (217), decremented on every exit path.
+    let depth = EXEC_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    let result = if depth > 32 {
+        Err(SqlError::new(
+            217,
+            16,
+            1,
+            "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).",
+        ))
+    } else {
+        let mut emitter = DiscardEmitter;
+        let mut run = BatchRun {
+            emitter: &mut emitter,
+            deferred: Vec::new(),
+            rowset_open: false,
+            durability_failed: false,
+            committed: false,
+            last_error: None,
+            // A multi-statement TVF's RETURN carries no value.
+            function_return_type: None,
+        };
+        run_block(storage, &statements, &mut txn_ctx, &mut run, false).map(|_| ())
+    };
+    EXEC_DEPTH.with(|d| d.set(d.get() - 1));
+    result?;
+    // The accumulated rows are the result. Serve them as a materialized source
+    // stamped with the call's qualifier (identical shape to the @t FROM branch).
+    let tv = txn_ctx
+        .table_variables
+        .get(returns_var)
+        .expect("seeded above");
+    let count = tv.schema.columns.len();
+    let columns_out = tv
+        .schema
+        .columns
+        .iter()
+        .map(|c| ResultColumn {
+            name: c.name.clone(),
+            column_type: c.column_type,
+        })
+        .collect();
+    let collations = tv
+        .schema
+        .columns
+        .iter()
+        .map(|c| c.collation.clone())
+        .collect();
+    Ok(Source {
+        columns: columns_out,
+        qualifiers: vec![Some(qual.value.clone()); count],
+        collations,
+        rows: SourceRows::Materialized(tv.rows.clone()),
+    })
 }
 
 /// Recursively builds a join tree's combined row source (base tables scan
@@ -11029,6 +11261,7 @@ fn sys_sql_modules(storage: &Storage) -> Source {
                     def.function.as_ref().map(|f| match &f.returns {
                         FunctionReturns::Scalar { body, .. } => body.clone(),
                         FunctionReturns::InlineTable { select_text } => select_text.clone(),
+                        FunctionReturns::MultiStatementTable { body, .. } => body.clone(),
                     })
                 })?;
             Some(vec![
@@ -11161,6 +11394,9 @@ fn sys_objects(storage: &Storage) -> Source {
                     FunctionReturns::Scalar { .. } => ("FN", "SQL_SCALAR_FUNCTION"),
                     FunctionReturns::InlineTable { .. } => {
                         ("IF", "SQL_INLINE_TABLE_VALUED_FUNCTION")
+                    }
+                    FunctionReturns::MultiStatementTable { .. } => {
+                        ("TF", "SQL_TABLE_VALUED_FUNCTION")
                     }
                 }
             } else if def.is_procedure() {
@@ -11465,6 +11701,17 @@ fn collect_read_lock_ids(
                 if let Ok(body) = parse_view_query(select_text, &def.name) {
                     let expanded = expand_ctes(&body);
                     collect_select_read_names(&expanded, &mut tables, &mut funcs);
+                }
+            }
+            // A multi-statement TVF body may read real tables (e.g. INSERT @t
+            // SELECT FROM base): those reads must be locked up front, exactly
+            // like a scalar body. (@-targets are session-local and are skipped
+            // by the read-name collectors, so they add no lock.)
+            FunctionReturns::MultiStatementTable { body, .. } => {
+                if let Ok(statements) = truthdb_sql::parse_table_function_body(body) {
+                    for statement in &statements {
+                        collect_statement_read_names(statement, &mut tables, &mut funcs);
+                    }
                 }
             }
         }

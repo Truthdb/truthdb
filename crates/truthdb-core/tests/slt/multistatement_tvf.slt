@@ -1,0 +1,87 @@
+# Multi-statement table-valued functions (Stage 15):
+# RETURNS @t TABLE(cols) AS BEGIN <body populates @t>; RETURN END.
+
+statement ok
+CREATE TABLE nums (id INT NOT NULL PRIMARY KEY, grp INT NOT NULL)
+
+statement ok
+INSERT INTO nums VALUES (1, 10), (2, 10), (3, 20), (4, 20), (5, 30)
+
+# Body populates the result from VALUES and control flow.
+statement ok
+CREATE FUNCTION dbo.two_rows () RETURNS @r TABLE (v INT NOT NULL PRIMARY KEY) AS BEGIN INSERT INTO @r VALUES (7), (8); RETURN END
+
+query I rowsort
+SELECT v FROM dbo.two_rows()
+----
+7
+8
+
+# Body reads a base table with a parameter-driven filter.
+statement ok
+CREATE FUNCTION dbo.in_group (@g INT) RETURNS @r TABLE (id INT NOT NULL PRIMARY KEY) AS BEGIN INSERT INTO @r SELECT id FROM nums WHERE grp = @g; RETURN END
+
+query I rowsort
+SELECT id FROM dbo.in_group(20)
+----
+3
+4
+
+query I
+SELECT COUNT(*) AS n FROM dbo.in_group(10)
+----
+2
+
+# A multi-statement TVF joins against a base table like any rowset.
+query II rowsort
+SELECT n.id, n.grp FROM nums AS n JOIN dbo.in_group(20) AS g ON n.id = g.id
+----
+3 20
+4 20
+
+# Control flow inside the body (WHILE loop accumulating rows).
+statement ok
+CREATE FUNCTION dbo.count_to (@n INT) RETURNS @r TABLE (v INT NOT NULL PRIMARY KEY) AS BEGIN DECLARE @i INT = 1; WHILE @i <= @n BEGIN INSERT INTO @r VALUES (@i); SET @i = @i + 1 END; RETURN END
+
+query I rowsort
+SELECT v FROM dbo.count_to(3)
+----
+1
+2
+3
+
+# The RETURNS table's DEFAULT and NOT NULL apply to body inserts.
+statement ok
+CREATE FUNCTION dbo.with_default () RETURNS @r TABLE (id INT NOT NULL PRIMARY KEY, tag NVARCHAR(10) NOT NULL DEFAULT 'x') AS BEGIN INSERT INTO @r (id) VALUES (1); RETURN END
+
+query IT
+SELECT id, tag FROM dbo.with_default()
+----
+1 x
+
+# A body that violates the result PRIMARY KEY is accepted at CREATE (the body is
+# not run then) but errors (2627) when the function is called.
+statement ok
+CREATE FUNCTION dbo.dup_pk () RETURNS @r TABLE (id INT NOT NULL PRIMARY KEY) AS BEGIN INSERT INTO @r VALUES (1), (1); RETURN END
+
+statement error
+SELECT id FROM dbo.dup_pk()
+
+# An empty body result is a valid empty rowset.
+statement ok
+CREATE FUNCTION dbo.nothing () RETURNS @r TABLE (id INT NOT NULL PRIMARY KEY) AS BEGIN RETURN END
+
+query I
+SELECT COUNT(*) AS n FROM dbo.nothing()
+----
+0
+
+# sys.objects classifies a multi-statement TVF as TF.
+query TT
+SELECT name, type FROM sys.objects WHERE name = 'in_group'
+----
+in_group TF
+
+# A body writing a real table is rejected at CREATE (443).
+statement error
+CREATE FUNCTION dbo.side_effect () RETURNS @r TABLE (id INT NOT NULL PRIMARY KEY) AS BEGIN INSERT INTO nums VALUES (99, 99); RETURN END

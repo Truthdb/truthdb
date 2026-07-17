@@ -39,6 +39,10 @@ pub struct Parser {
     /// the function's typed result, so the value is always parsed (not gated on
     /// a leading-token whitelist) and the 178 batch-return check does not apply.
     in_function: bool,
+    /// Parsing a multi-statement table-valued function body: `RETURN` takes NO
+    /// value (it returns the accumulated result table variable), unlike the
+    /// scalar-function body where a value is mandatory.
+    in_table_function: bool,
     /// Nesting depth inside blocks / IF branches / WHILE bodies — procedure
     /// DDL must be top-level (SQL Server 156/111 classes).
     sub_depth: usize,
@@ -63,6 +67,7 @@ impl Parser {
             while_depth: 0,
             in_procedure: false,
             in_function: false,
+            in_table_function: false,
             sub_depth: 0,
             statement_index: 0,
             nodes: 0,
@@ -109,6 +114,22 @@ impl Parser {
     /// entry for parsing a scalar function's body text.
     pub fn set_in_function(&mut self) {
         self.in_function = true;
+    }
+
+    pub fn set_in_table_function(&mut self) {
+        self.in_table_function = true;
+    }
+
+    /// Parses a standalone table-variable column list `( <column-defs> )` and
+    /// rejects trailing tokens — the entry used to re-parse a multi-statement
+    /// TVF's stored RETURNS column text per call.
+    pub fn parse_table_var_columns_entry(&mut self) -> SqlResult<(Vec<ColumnDef>, Vec<Name>)> {
+        let result = self.parse_table_var_columns()?;
+        if !self.at_eof() {
+            let token = self.peek().clone();
+            return Err(SqlError::syntax(self.token_text(&token), token.span));
+        }
+        Ok(result)
     }
 
     /// Parses exactly one expression followed by EOF (for a re-parsed DEFAULT).
@@ -324,6 +345,14 @@ impl Parser {
     /// start one (T-SQL RETURN takes an integer expression).
     fn parse_return(&mut self) -> SqlResult<Statement> {
         let start = self.expect_keyword("RETURN")?;
+        // A multi-statement TVF's RETURN carries no value — it returns the
+        // accumulated result table variable — so never parse an expression.
+        if self.in_table_function {
+            return Ok(Statement::Return {
+                span: start.to(self.prev_span()),
+                value: None,
+            });
+        }
         // A scalar function's RETURN yields its mandatory typed result, so the
         // expression is always parsed (it commonly begins with a word — a
         // column, CASE, CAST, NULL, or a nested call — which the batch/procedure
@@ -1717,10 +1746,65 @@ impl Parser {
         }
         self.expect(&TokenKind::RParen)?;
         self.expect_keyword("RETURNS")?;
+        // `RETURNS @t TABLE ( <cols> ) AS BEGIN … RETURN END` is a
+        // multi-statement table-valued function: the named table variable is
+        // declared here and populated by the body (captured verbatim like a
+        // scalar body, re-parsed under the function grammar per call).
+        if let TokenKind::LocalVar(var_name) = &self.peek().kind {
+            let var_name = var_name.clone();
+            self.bump(); // @t
+            self.expect_keyword("TABLE")?;
+            // Capture the `( <cols> )` source verbatim (re-parsed per call, like
+            // the scalar/inline bodies); parse it now to validate it and to find
+            // where the column list ends.
+            let cols_start = self.peek().span.start;
+            self.parse_table_var_columns()?;
+            let columns_text = self
+                .slice(Span::new(cols_start, self.prev_span().end))
+                .trim()
+                .to_string();
+            self.expect_keyword("AS")?;
+            let body_start = self.peek().span.start;
+            let body = self.src[body_start..].trim().to_string();
+            if body.is_empty() {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+            // Validate the body parses under the multi-statement-TVF grammar
+            // (RETURN takes no value here — it returns the accumulated table).
+            self.in_table_function = true;
+            let validated = (|| -> SqlResult<()> {
+                loop {
+                    while self.eat(&TokenKind::Semicolon) {}
+                    if self.at_eof() {
+                        return Ok(());
+                    }
+                    self.nodes = 0;
+                    self.parse_statement()?;
+                    if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
+                        let token = self.peek().clone();
+                        return Err(SqlError::syntax(self.token_text(&token), token.span));
+                    }
+                }
+            })();
+            self.in_table_function = false;
+            validated?;
+            let span = start.to(self.prev_span());
+            return Ok(Statement::CreateFunction(CreateFunction {
+                name,
+                params,
+                returns: ReturnsClause::MultiTable {
+                    var_name,
+                    columns_text,
+                },
+                body,
+                alter,
+                span,
+            }));
+        }
         // `RETURNS TABLE` is an inline table-valued function: its body is a
         // single `AS RETURN ( <select> )` captured as source text and expanded
-        // like a parameterized view. (Multi-statement `RETURNS @t TABLE(...)` is
-        // added by later work.) Anything else is a scalar return type.
+        // like a parameterized view. Anything else is a scalar return type.
         if self.peek_keyword().as_deref() == Some("TABLE") {
             self.bump(); // TABLE
             self.expect_keyword("AS")?;

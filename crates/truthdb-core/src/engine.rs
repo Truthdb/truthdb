@@ -6037,6 +6037,132 @@ mod tests {
     }
 
     #[test]
+    fn multi_statement_tvf_returns_body_populated_rows() {
+        let path = unique_temp_path("multi-tvf-basic");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE nums (id INT NOT NULL PRIMARY KEY)")
+            .expect("nums");
+        engine
+            .execute("INSERT INTO nums VALUES (1),(2),(3),(4),(5),(6)")
+            .expect("seed");
+        // A multi-statement TVF: its body populates the RETURNS table variable
+        // from a real table, and the accumulated rows are the result.
+        engine
+            .execute(
+                "CREATE FUNCTION dbo.evens (@n INT) RETURNS @r TABLE (v INT NOT NULL PRIMARY KEY) \
+                 AS BEGIN INSERT INTO @r SELECT id FROM nums WHERE id % 2 = 0 AND id <= @n; RETURN END",
+            )
+            .expect("create multi-tvf");
+        let (_cols, rows) = sql_rows(&engine, "SELECT v FROM dbo.evens(5) ORDER BY v");
+        assert_eq!(
+            rows,
+            vec![vec![Some("2".to_string())], vec![Some("4".to_string())]],
+            "the body filtered nums to the evens ≤ 5"
+        );
+        // A different argument reruns the body.
+        let (_c, rows) = sql_rows(&engine, "SELECT COUNT(*) AS n FROM dbo.evens(6)");
+        assert_eq!(rows, vec![vec![Some("3".to_string())]], "evens ≤ 6 = 2,4,6");
+        // The RETURNS table's PRIMARY KEY is enforced when the body populates it:
+        // a duplicate key raises 2627 at call time (the body is not run at CREATE).
+        engine
+            .execute(
+                "CREATE FUNCTION dbo.dup () RETURNS @r TABLE (id INT NOT NULL PRIMARY KEY) \
+                 AS BEGIN INSERT INTO @r VALUES (1), (1); RETURN END",
+            )
+            .expect("create dup TVF");
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "SELECT id FROM dbo.dup()");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(2627),
+            "a duplicate result PRIMARY KEY raises 2627: {:?}",
+            out.error
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn multi_statement_tvf_body_reads_are_locked_and_snapshotted() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("multi-tvf-seam");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE secret (z INT NOT NULL PRIMARY KEY)")
+            .expect("secret");
+        engine
+            .execute(
+                "CREATE FUNCTION dbo.copy_secret () RETURNS @r TABLE (z INT NOT NULL PRIMARY KEY) \
+                 AS BEGIN INSERT INTO @r SELECT z FROM secret; RETURN END",
+            )
+            .expect("multi-tvf");
+        let secret = table_object_id(&engine, "secret");
+        // The body's read of `secret` must be Shared-locked up front, just like
+        // an inline TVF or a scalar UDF body — the lock seam.
+        let locks =
+            engine.analyze_locks("SELECT z FROM dbo.copy_secret()", Isolation::ReadCommitted);
+        assert!(
+            locks.contains(&(Resource::Table(secret), LockMode::Shared)),
+            "a multi-statement TVF's body table must be Shared-locked: {locks:?}"
+        );
+        // And it must arm the snapshot scope: under SNAPSHOT-not-allowed the body
+        // read is a data access, so the call raises 3952.
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "SET TRANSACTION ISOLATION LEVEL SNAPSHOT",
+        );
+        let out = batch(&engine, &mut ctx, "SELECT z FROM dbo.copy_secret()");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(3952),
+            "a body-reading multi-statement TVF must arm the snapshot scope: {:?}",
+            out.error
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn multi_statement_tvf_rejects_real_table_dml_at_create() {
+        let path = unique_temp_path("multi-tvf-sideeffect");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE log (id INT NOT NULL PRIMARY KEY)")
+            .expect("log");
+        let mut ctx = TxnContext::default();
+        // A multi-statement TVF may DML its result table variable, but writing a
+        // real table is a side effect rejected at CREATE (443).
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "CREATE FUNCTION dbo.bad () RETURNS @r TABLE (id INT NOT NULL PRIMARY KEY) \
+             AS BEGIN INSERT INTO log VALUES (1); RETURN END",
+        );
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(443),
+            "side-effecting DML in a TVF body is 443: {:?}",
+            out.error
+        );
+        // Its body must end in RETURN (455).
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "CREATE FUNCTION dbo.noret () RETURNS @r TABLE (id INT NOT NULL PRIMARY KEY) \
+             AS BEGIN INSERT INTO @r VALUES (1) END",
+        );
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(455),
+            "a function body must end in RETURN: {:?}",
+            out.error
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn cf_review_describe_stops_at_control_flow() {
         // sp_describe_first_result_set: a batch whose FIRST possible rowset
         // sits inside an IF must answer "not statically derivable" — skipping
