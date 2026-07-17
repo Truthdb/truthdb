@@ -161,6 +161,17 @@ pub enum ReturnsClause {
     /// `RETURNS TABLE AS RETURN ( <select> )`: an inline table-valued function.
     /// The body is the SELECT (its source captured in `CreateFunction.body`).
     InlineTable,
+    /// `RETURNS @t TABLE ( <column-defs> ) AS BEGIN … RETURN END`: a
+    /// multi-statement table-valued function. The named table variable is
+    /// declared here, populated by the body (captured in `CreateFunction.body`),
+    /// and its final rows are the function's result. The column list is kept as
+    /// source text and re-parsed per call, exactly like the scalar/inline body.
+    MultiTable {
+        /// The result table variable's name, without the leading `@`, lowercased.
+        var_name: String,
+        /// The `( <column-defs> )` source text (including the parentheses).
+        columns_text: String,
+    },
 }
 
 /// One declared procedure parameter.

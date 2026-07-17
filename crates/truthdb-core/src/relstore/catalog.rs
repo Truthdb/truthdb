@@ -161,9 +161,9 @@ pub struct FunctionDef {
     pub returns: FunctionReturns,
 }
 
-/// A function's return shape. Only the scalar form exists today; the inline and
-/// multi-statement table-valued forms are added by later work (the enum is
-/// forward-compatible — an old catalog only ever holds `Scalar`).
+/// A function's return shape (scalar, inline table-valued, or multi-statement
+/// table-valued). The enum is forward-compatible — an old catalog only ever
+/// holds the variants that existed when it was written.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum FunctionReturns {
     /// `RETURNS <type> AS BEGIN … RETURN <expr>; END`: a scalar UDF. `type_spec`
@@ -174,6 +174,18 @@ pub enum FunctionReturns {
     /// `select_text` is the body SELECT's source, re-parsed and expanded like a
     /// parameterized view (the call's arguments bind to the `@params`).
     InlineTable { select_text: String },
+    /// `RETURNS @t TABLE ( <cols> ) AS BEGIN … RETURN END`: a multi-statement
+    /// table-valued function. Both the RETURNS column list and the body are kept
+    /// as source text (re-parsed per call, exactly like the scalar/inline forms):
+    /// each call re-declares the (empty) result table variable, runs the body to
+    /// populate it, and returns its final rows.
+    MultiStatementTable {
+        /// The result table variable's name, without `@`, lowercased.
+        returns_var: String,
+        /// The `( <column-defs> )` source text of the RETURNS table.
+        columns_text: String,
+        body: String,
+    },
 }
 
 impl TableDef {

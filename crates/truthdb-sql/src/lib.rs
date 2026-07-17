@@ -19,7 +19,7 @@ pub mod parser;
 pub mod temporal;
 pub mod value;
 
-pub use ast::{Expr, Statement};
+pub use ast::{ColumnDef, Expr, Name, Statement};
 pub use error::{SqlError, SqlResult};
 pub use value::SqlValue;
 
@@ -45,6 +45,25 @@ pub fn parse_function_body(sql: &str) -> SqlResult<Vec<Statement>> {
     let mut parser = parser::Parser::from_tokens(sql, tokens);
     parser.set_in_function();
     parser.parse_statements()
+}
+
+/// Parses a multi-statement table-valued function body: the in-table-function
+/// grammar, where `RETURN` takes no value (it returns the accumulated result
+/// table variable).
+pub fn parse_table_function_body(sql: &str) -> SqlResult<Vec<Statement>> {
+    let tokens = lexer::Lexer::new(sql).tokenize()?;
+    let mut parser = parser::Parser::from_tokens(sql, tokens);
+    parser.set_in_table_function();
+    parser.parse_statements()
+}
+
+/// Parses a table-variable column list — the `( <column-defs> )` text of a
+/// multi-statement TVF's RETURNS clause, re-parsed per call to rebuild the
+/// result table variable's schema.
+pub fn parse_table_var_columns(sql: &str) -> SqlResult<(Vec<ColumnDef>, Vec<Name>)> {
+    let tokens = lexer::Lexer::new(sql).tokenize()?;
+    let mut parser = parser::Parser::from_tokens(sql, tokens);
+    parser.parse_table_var_columns_entry()
 }
 
 /// Parses a single standalone expression (e.g. a column DEFAULT re-parsed at
