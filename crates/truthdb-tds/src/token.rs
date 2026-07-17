@@ -208,6 +208,24 @@ pub fn return_value_int(out: &mut Vec<u8>, name: &str, value: i32) {
     out.extend_from_slice(&value.to_le_bytes());
 }
 
+/// RETURNVALUE for a procedure's OUTPUT parameter, typed like a row cell:
+/// TYPE_INFO then the value in that type's wire encoding.
+pub fn return_value(
+    out: &mut Vec<u8>,
+    name: &str,
+    column_type: &truthdb_core::relstore::types::ColumnType,
+    value: &Datum,
+) {
+    out.push(TOKEN_RETURNVALUE);
+    out.extend_from_slice(&0u16.to_le_bytes()); // ParamOrdinal
+    push_b_varchar(out, name);
+    out.push(0x01); // Status: output parameter
+    out.extend_from_slice(&0u32.to_le_bytes()); // UserType
+    out.extend_from_slice(&0u16.to_le_bytes()); // Flags
+    out.extend_from_slice(&typeinfo::encode_type_info(column_type));
+    out.extend_from_slice(&typeinfo::encode_value(value, column_type));
+}
+
 /// COLMETADATA for a result set's columns.
 pub fn colmetadata(out: &mut Vec<u8>, columns: &[ResultColumn]) {
     out.push(TOKEN_COLMETADATA);

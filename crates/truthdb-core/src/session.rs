@@ -122,6 +122,16 @@ pub enum BatchEvent {
     /// An informational message (RAISERROR severity <= 10): TDS renders an
     /// INFO token in-stream; it is not an error and stops nothing.
     Info(SqlError),
+    /// A procedure's RETURN status for an RPC-by-name call: the RETURNSTATUS
+    /// token's value (hardcoded 0 before this event existed).
+    ReturnStatus(i32),
+    /// A procedure OUTPUT parameter's final value for an RPC-by-name call,
+    /// rendered as a typed RETURNVALUE token after RETURNSTATUS.
+    ReturnValue {
+        name: String,
+        column_type: crate::relstore::types::ColumnType,
+        value: Datum,
+    },
     /// The handle `sp_prepare`/`sp_prepexec` allocated, reported to the client
     /// as a RETURNVALUE token. Sent after every statement's events, just
     /// before `Complete` — where SQL Server puts return values.
@@ -326,6 +336,23 @@ impl crate::rel::BatchEmitter for BatchSink {
     fn info(&mut self, error: &truthdb_sql::error::SqlError) {
         self.send(BatchEvent::Info(error.clone()));
     }
+
+    fn return_status(&mut self, status: i32) {
+        self.send(BatchEvent::ReturnStatus(status));
+    }
+
+    fn return_value(
+        &mut self,
+        name: &str,
+        column_type: &crate::relstore::types::ColumnType,
+        value: &Datum,
+    ) {
+        self.send(BatchEvent::ReturnValue {
+            name: name.to_string(),
+            column_type: column_type.clone(),
+            value: value.clone(),
+        });
+    }
 }
 
 /// Reassembles an event stream into a whole [`BatchReply`] — the shape every
@@ -370,6 +397,8 @@ async fn collect_reply(
             // An informational message (RAISERROR <= 10) is wire-only too:
             // it is not an error and carries no result.
             BatchEvent::Info(_) => {}
+            // Return status/values are wire-only (RETURNSTATUS/RETURNVALUE).
+            BatchEvent::ReturnStatus(_) | BatchEvent::ReturnValue { .. } => {}
             BatchEvent::Error(err) => error = Some(err),
             BatchEvent::Complete { in_transaction } => {
                 return Ok(BatchReply {

@@ -428,6 +428,13 @@ pub trait BatchEmitter {
     /// An informational message (RAISERROR severity <= 10): TDS renders an
     /// INFO token in-stream, not an error. Emitters with no wire ignore it.
     fn info(&mut self, _error: &SqlError) {}
+
+    /// A procedure's RETURN status (RPC-by-name): the RETURNSTATUS value.
+    fn return_status(&mut self, _status: i32) {}
+
+    /// A procedure OUTPUT parameter's final value (RPC-by-name): a typed
+    /// RETURNVALUE token.
+    fn return_value(&mut self, _name: &str, _column_type: &ColumnType, _value: &Datum) {}
 }
 
 /// Reassembles emitted results into the whole-batch [`BatchOutcome`] for the

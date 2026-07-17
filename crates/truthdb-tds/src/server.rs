@@ -767,6 +767,16 @@ struct BatchRender {
     /// A prepared handle to report as a RETURNVALUE just before the final
     /// DONEPROC — held so RETURNSTATUS precedes it, SQL Server's order.
     pending_handle: Option<i32>,
+    /// The procedure's real RETURN status (RPC-by-name); None keeps the
+    /// legacy 0.
+    return_status: Option<i32>,
+    /// OUTPUT parameter values, held for the response tail after
+    /// RETURNSTATUS, before DONEPROC — SQL Server's order.
+    return_values: Vec<(
+        String,
+        truthdb_core::relstore::types::ColumnType,
+        truthdb_core::relstore::types::Datum,
+    )>,
     /// More replies follow this one in the same response (a multi-RPC
     /// request): the final DONEPROC keeps `DONE_MORE` instead of `DONE_FINAL`.
     more_responses: bool,
@@ -872,6 +882,16 @@ impl BatchRender {
                 // RETURNVALUE, which precedes the final DONEPROC.
                 self.pending_handle = Some(handle);
             }
+            BatchEvent::ReturnStatus(status) => {
+                self.return_status = Some(status);
+            }
+            BatchEvent::ReturnValue {
+                name,
+                column_type,
+                value,
+            } => {
+                self.return_values.push((name, column_type, value));
+            }
             BatchEvent::Info(info) => {
                 // RAISERROR severity <= 10: an INFO token, not an error — the
                 // batch continues and no DONE flag changes. Pending DONEs go
@@ -915,10 +935,15 @@ impl BatchRender {
                     self.buf.clear();
                     if !self.errored {
                         // A failed procedure returns no status.
-                        token::return_status(&mut self.buf, 0);
+                        token::return_status(&mut self.buf, self.return_status.unwrap_or(0));
                     }
                     if let Some(handle) = self.pending_handle.take() {
                         token::return_value_int(&mut self.buf, "handle", handle);
+                    }
+                    if !self.errored {
+                        for (name, column_type, value) in self.return_values.drain(..) {
+                            token::return_value(&mut self.buf, &name, &column_type, &value);
+                        }
                     }
                     out.write(&self.buf).await?;
                     self.final_done(out, self.errored, in_transaction).await?;
