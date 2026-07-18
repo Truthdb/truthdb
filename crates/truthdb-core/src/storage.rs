@@ -593,7 +593,18 @@ impl Storage {
     /// `backup_end` point on restore, then undoes the transactions in flight
     /// there. `dst` is created; an existing file is truncated.
     pub fn backup_full(&self, dst: &Path) -> Result<crate::backup::BackupSummary, StorageError> {
-        let plan = self.lock().begin_backup(true, false)?;
+        self.backup_full_with(dst, true, false)
+    }
+
+    /// Online full backup with explicit `WITH` options (`checksum` = verify
+    /// every page as copied; `copy_only` = do not disturb the log-backup chain).
+    pub fn backup_full_with(
+        &self,
+        dst: &Path,
+        checksum: bool,
+        copy_only: bool,
+    ) -> Result<crate::backup::BackupSummary, StorageError> {
+        let plan = self.lock().begin_backup(checksum, copy_only)?;
         // Release the hold on EVERY exit — normal return, an early `?` error out
         // of write_backup, or an unwind — via the guard's Drop. A leaked hold
         // permanently freezes WAL truncation and eventually wedges writes.

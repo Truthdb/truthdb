@@ -3284,7 +3284,11 @@ fn analyze_statements_locks(
             | Statement::Use { .. }
             | Statement::Throw(_)
             | Statement::RaiseError(_)
-            | Statement::TryCatch { .. } => {}
+            | Statement::TryCatch { .. }
+            // BACKUP takes no batch lock: it is online and manages its own
+            // per-chunk storage locking. A Database X here would serialize it
+            // against every writer and defeat the fuzzy design.
+            | Statement::BackupDatabase { .. } => {}
         }
     }
     // Batch-level lock escalation: if a table accumulated more than the
@@ -3493,6 +3497,30 @@ fn exec_statement_dispatch(
                 return Err(ddl_in_txn_err());
             }
             exec_permission(storage, stmt, &txn_ctx.security)
+        }
+        Statement::BackupDatabase {
+            path,
+            checksum,
+            copy_only,
+            ..
+        } => {
+            // BACKUP manages its own (per-chunk) locking, so it cannot run
+            // inside a transaction that holds locks, and it is a privileged
+            // operation (gated by is_privileged_ddl above).
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            storage
+                .backup_full_with(std::path::Path::new(path), *checksum, *copy_only)
+                .map_err(|e| {
+                    SqlError::new(
+                        3013,
+                        16,
+                        1,
+                        format!("BACKUP DATABASE is terminating abnormally. {e}"),
+                    )
+                })?;
+            Ok(StatementResult::Done)
         }
         // Executed by `run_block`'s own arms; nothing routes them here.
         Statement::Block { .. }
@@ -6218,6 +6246,7 @@ fn is_privileged_ddl(stmt: &Statement) -> bool {
             | Statement::DropRole { .. }
             | Statement::AlterRole { .. }
             | Statement::Permission(_)
+            | Statement::BackupDatabase { .. }
     )
 }
 

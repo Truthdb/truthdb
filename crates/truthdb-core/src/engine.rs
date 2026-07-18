@@ -1891,6 +1891,64 @@ mod tests {
         let _ = std::fs::remove_file(restored);
     }
 
+    #[test]
+    fn backup_database_statement_backs_up_and_restores() {
+        let src = unique_temp_path("backup-stmt-src");
+        let bak = unique_temp_path("backup-stmt-bak");
+        let restored = unique_temp_path("backup-stmt-restored");
+
+        let engine = new_engine(&src);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))")
+            .expect("create");
+        for i in 1..=50 {
+            engine
+                .execute(&format!("INSERT INTO t (id, name) VALUES ({i}, 'r{i}')"))
+                .expect("insert");
+        }
+        let expected = sql_rows(&engine, "SELECT id, name FROM t ORDER BY id").1;
+
+        // The T-SQL BACKUP statement drives the online backup.
+        let path_lit = bak.to_str().unwrap().replace('\'', "''");
+        let env = sql(
+            &engine,
+            &format!("BACKUP DATABASE truthdb TO DISK = '{path_lit}' WITH CHECKSUM, COPY_ONLY"),
+        );
+        assert!(env["error"].is_null(), "BACKUP DATABASE failed: {env}");
+        drop(engine);
+
+        Storage::restore_full(&restored, &bak).expect("restore");
+        let engine2 =
+            Engine::new(Storage::open(restored.clone()).expect("open restored")).expect("engine");
+        assert_eq!(
+            sql_rows(&engine2, "SELECT id, name FROM t ORDER BY id").1,
+            expected,
+            "the BACKUP-statement backup restores row-for-row"
+        );
+        drop(engine2);
+
+        let _ = std::fs::remove_file(src);
+        let _ = std::fs::remove_file(bak);
+        let _ = std::fs::remove_file(restored);
+    }
+
+    #[test]
+    fn backup_database_is_rejected_inside_a_transaction() {
+        let path = unique_temp_path("backup-in-txn");
+        let engine = new_engine(&path);
+        // BACKUP manages its own per-chunk locking and cannot run inside an
+        // explicit transaction (226, like other DDL).
+        assert_eq!(
+            sql_error_number(
+                &engine,
+                "BEGIN TRANSACTION; BACKUP DATABASE d TO DISK = '/tmp/truthdb-never.bak'"
+            ),
+            226
+        );
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Runs SQL expected to error and returns the SQL error message.
     fn sql_error_message(engine: &Engine, text: &str) -> String {
         let env = sql(engine, text);
