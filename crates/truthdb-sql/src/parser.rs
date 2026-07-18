@@ -211,6 +211,16 @@ impl Parser {
             Some("RESTORE") => self.parse_restore(),
             Some("ENABLE") | Some("DISABLE") => self.parse_trigger_state(),
             Some("GOTO") => self.parse_goto(),
+            Some("OPEN") => {
+                self.parse_cursor_verb("OPEN", |name, span| Statement::OpenCursor { name, span })
+            }
+            Some("FETCH") => self.parse_fetch(),
+            Some("CLOSE") => {
+                self.parse_cursor_verb("CLOSE", |name, span| Statement::CloseCursor { name, span })
+            }
+            Some("DEALLOCATE") => self.parse_cursor_verb("DEALLOCATE", |name, span| {
+                Statement::DeallocateCursor { name, span }
+            }),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -589,7 +599,12 @@ impl Parser {
 
     /// `DECLARE @a TYPE [= expr], @b TYPE ...`.
     fn parse_declare(&mut self) -> SqlResult<Statement> {
-        self.expect_keyword("DECLARE")?;
+        let declare = self.expect_keyword("DECLARE")?;
+        // `DECLARE <name> [options] CURSOR FOR <select>` — a cursor is named
+        // without `@`, so a plain identifier here (rather than a `@var`) is one.
+        if matches!(self.peek().kind, TokenKind::Word { .. }) {
+            return self.parse_declare_cursor(declare);
+        }
         let mut decls = Vec::new();
         loop {
             let token = self.peek().clone();
@@ -634,6 +649,133 @@ impl Parser {
             }
         }
         Ok(Statement::Declare(decls))
+    }
+
+    /// `<name> [INSENSITIVE|STATIC|SCROLL|FORWARD_ONLY|READ_ONLY|LOCAL|GLOBAL|...]
+    /// CURSOR FOR <select> [FOR {READ ONLY | UPDATE [OF ...]}]`. The cursor is a
+    /// static snapshot; the type/concurrency options are accepted and ignored,
+    /// except SCROLL (which allows non-NEXT fetches).
+    fn parse_declare_cursor(&mut self, start: Span) -> SqlResult<Statement> {
+        let name = self.parse_name()?;
+        let mut scroll = false;
+        loop {
+            match self.peek_keyword().as_deref() {
+                Some("SCROLL") => {
+                    self.bump();
+                    scroll = true;
+                }
+                Some("INSENSITIVE") | Some("STATIC") | Some("FORWARD_ONLY") | Some("KEYSET")
+                | Some("DYNAMIC") | Some("FAST_FORWARD") | Some("READ_ONLY")
+                | Some("SCROLL_LOCKS") | Some("OPTIMISTIC") | Some("TYPE_WARNING")
+                | Some("LOCAL") | Some("GLOBAL") => {
+                    self.bump();
+                }
+                Some("CURSOR") => {
+                    self.bump();
+                    break;
+                }
+                _ => {
+                    let token = self.peek().clone();
+                    return Err(SqlError::syntax(self.token_text(&token), token.span));
+                }
+            }
+        }
+        self.expect_keyword("FOR")?;
+        let select = self.parse_select()?;
+        // Optional `FOR READ ONLY` / `FOR UPDATE [OF col, ...]` — accepted and
+        // ignored (the cursor is read-only; positioned updates are not supported).
+        if self.eat_keyword("FOR") {
+            if self.eat_keyword("READ") {
+                self.expect_keyword("ONLY")?;
+            } else if self.eat_keyword("UPDATE") {
+                if self.eat_keyword("OF") {
+                    loop {
+                        let _ = self.parse_name()?;
+                        if !self.eat(&TokenKind::Comma) {
+                            break;
+                        }
+                    }
+                }
+            } else {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+        }
+        let span = start.to(self.prev_span());
+        Ok(Statement::DeclareCursor {
+            name,
+            select: Box::new(select),
+            scroll,
+            span,
+        })
+    }
+
+    /// `FETCH [NEXT|PRIOR|FIRST|LAST|ABSOLUTE <n>|RELATIVE <n>] [FROM] <name>
+    /// [INTO @v[, ...]]`.
+    fn parse_fetch(&mut self) -> SqlResult<Statement> {
+        let start = self.expect_keyword("FETCH")?;
+        let direction = match self.peek_keyword().as_deref() {
+            Some("NEXT") => {
+                self.bump();
+                FetchDirection::Next
+            }
+            Some("PRIOR") => {
+                self.bump();
+                FetchDirection::Prior
+            }
+            Some("FIRST") => {
+                self.bump();
+                FetchDirection::First
+            }
+            Some("LAST") => {
+                self.bump();
+                FetchDirection::Last
+            }
+            Some("ABSOLUTE") => {
+                self.bump();
+                FetchDirection::Absolute(self.parse_expr()?)
+            }
+            Some("RELATIVE") => {
+                self.bump();
+                FetchDirection::Relative(self.parse_expr()?)
+            }
+            // No direction keyword: NEXT (and `FROM` was optional).
+            _ => FetchDirection::Next,
+        };
+        let _ = self.eat_keyword("FROM");
+        let name = self.parse_name()?;
+        let mut into = Vec::new();
+        if self.eat_keyword("INTO") {
+            loop {
+                let token = self.peek().clone();
+                let TokenKind::LocalVar(var) = &token.kind else {
+                    return Err(SqlError::syntax(self.token_text(&token), token.span));
+                };
+                into.push(var.clone());
+                self.bump();
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let span = start.to(self.prev_span());
+        Ok(Statement::FetchCursor {
+            name,
+            direction,
+            into,
+            span,
+        })
+    }
+
+    /// `parse_name` after an OPEN/CLOSE/DEALLOCATE keyword builds the statement.
+    fn parse_cursor_verb(
+        &mut self,
+        keyword: &str,
+        make: impl FnOnce(Name, Span) -> Statement,
+    ) -> SqlResult<Statement> {
+        let start = self.expect_keyword(keyword)?;
+        let name = self.parse_name()?;
+        Ok(make(name, start.to(self.prev_span())))
     }
 
     /// Parses a table variable's `( <column-defs> )` body: column definitions

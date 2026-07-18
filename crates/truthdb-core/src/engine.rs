@@ -6008,6 +6008,146 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// The first rowset's first row, as `i32`s across its columns.
+    fn row_ints(outcome: &BatchOutcome) -> Vec<i32> {
+        for result in &outcome.results {
+            if let StatementResult::Rows(rowset) = result {
+                return rowset.rows[0]
+                    .iter()
+                    .map(|d| match d {
+                        Datum::TinyInt(v) => *v as i32,
+                        Datum::SmallInt(v) => *v as i32,
+                        Datum::Int(v) => *v,
+                        Datum::BigInt(v) => *v as i32,
+                        other => panic!("expected integer, got {other:?}"),
+                    })
+                    .collect();
+            }
+        }
+        panic!("no rowset in outcome: {:?}", outcome.results);
+    }
+
+    #[test]
+    fn cursors_iterate_scroll_and_report_fetch_status() {
+        let path = unique_temp_path("cursors");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE nums (id INT NOT NULL PRIMARY KEY, v INT)",
+        );
+        batch(
+            &engine,
+            &mut ctx,
+            "INSERT INTO nums VALUES (1,10),(2,20),(3,30)",
+        );
+
+        // Forward iteration: FETCH INTO drives a @@FETCH_STATUS loop that sums v.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @sum INT = 0; \
+             DECLARE @v INT; \
+             DECLARE c CURSOR FOR SELECT v FROM nums ORDER BY id; \
+             OPEN c; \
+             FETCH NEXT FROM c INTO @v; \
+             WHILE @@FETCH_STATUS = 0 \
+             BEGIN \
+               SET @sum = @sum + @v; \
+               FETCH NEXT FROM c INTO @v; \
+             END; \
+             CLOSE c; \
+             DEALLOCATE c; \
+             SELECT @sum AS total",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![60]);
+
+        // A SCROLL cursor addresses rows by direction. The trailing FETCH PRIOR
+        // runs off the start: @@FETCH_STATUS becomes -1 and @v keeps its value.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @last INT; DECLARE @first INT; DECLARE @abs INT; \
+             DECLARE @rel INT; DECLARE @v INT; \
+             DECLARE c SCROLL CURSOR FOR SELECT v FROM nums ORDER BY id; \
+             OPEN c; \
+             FETCH LAST FROM c INTO @last; \
+             FETCH FIRST FROM c INTO @first; \
+             FETCH ABSOLUTE 2 FROM c INTO @abs; \
+             FETCH RELATIVE -1 FROM c INTO @rel; \
+             SET @v = @rel; \
+             FETCH PRIOR FROM c INTO @v; \
+             DECLARE @st INT = @@FETCH_STATUS; \
+             CLOSE c; DEALLOCATE c; \
+             SELECT @last, @first, @abs, @rel, @v, @st",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        // LAST=30, FIRST=10, ABSOLUTE 2=20, RELATIVE -1 (from row 2)=10, @v held
+        // at 10 (the off-start FETCH left it), @@FETCH_STATUS=-1.
+        assert_eq!(row_ints(&out), vec![30, 10, 20, 10, 10, -1]);
+
+        // FETCH without INTO returns the fetched row to the client.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE c CURSOR FOR SELECT v FROM nums ORDER BY id; \
+             OPEN c; FETCH NEXT FROM c; CLOSE c; DEALLOCATE c",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(ids(&out), vec![10]);
+
+        // FETCH on an unopened cursor -> 16917.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE c CURSOR FOR SELECT v FROM nums; FETCH NEXT FROM c",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(16917));
+
+        // A cursor name that was never declared -> 16916.
+        let out = batch(&engine, &mut ctx, "OPEN nope");
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(16916));
+
+        // Re-declaring an existing cursor name -> 16915.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE c CURSOR FOR SELECT v FROM nums; \
+             DECLARE c CURSOR FOR SELECT v FROM nums",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(16915));
+
+        // OPEN of an already-open cursor -> 16905.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE c CURSOR FOR SELECT v FROM nums; OPEN c; OPEN c",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(16905));
+
+        // A FETCH RELATIVE offset near i64::MAX must not overflow the position:
+        // it saturates off the end (status -1), leaving @v unchanged. (A checked
+        // build would panic without the saturating add.)
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @v INT = 7; \
+             DECLARE c SCROLL CURSOR FOR SELECT v FROM nums WHERE id < 99 ORDER BY id; \
+             OPEN c; \
+             FETCH NEXT FROM c INTO @v; \
+             FETCH RELATIVE 9223372036854775807 FROM c INTO @v; \
+             DECLARE @st INT = @@FETCH_STATUS; \
+             CLOSE c; DEALLOCATE c; \
+             SELECT @v, @st",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(row_ints(&out), vec![10, -1]);
+
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn break_crosses_a_try_and_return_exits_the_batch() {
         let path = unique_temp_path("flow-crossings");
