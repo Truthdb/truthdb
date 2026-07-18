@@ -731,10 +731,9 @@ impl Storage {
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
     ) -> Result<(), StorageError> {
-        use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
         assert_layout_invariants();
         let reader = std::io::BufReader::new(std::fs::File::open(bak_path)?);
-        let (mut backup, header) = crate::backup::BackupReader::new(reader)?;
+        let (backup, header) = crate::backup::BackupReader::new(reader)?;
         if header.page_size as usize != PAGE_SIZE {
             return Err(StorageError::InvalidFile(
                 "backup page size mismatch".to_string(),
@@ -753,13 +752,34 @@ impl Storage {
                 "backup header region sizes are inconsistent".to_string(),
             ));
         }
-        let data_pages = header.data_size / PAGE_SIZE as u64;
-        let mut file = StorageFile::create_from_layout(
+        let file = StorageFile::create_from_layout(
             dst_path.to_path_buf(),
             layout,
             header.default_collation.clone(),
         )?;
+        // The destination now exists and is ours: remove the partial file if any
+        // later step fails, so a retry (which requires a fresh destination) can
+        // proceed. Everything ABOVE this point errors without having created it.
+        let outcome = Self::restore_body(file, backup, &header, log_paths, dst_path);
+        if outcome.is_err() {
+            let _ = std::fs::remove_file(dst_path);
+        }
+        outcome
+    }
 
+    /// The part of a restore that owns the (already-created) destination: lays
+    /// down page images + the log, applies the log chain, writes the superblock,
+    /// and validates by opening (running recovery). A failure here leaves a
+    /// partial file the caller removes.
+    fn restore_body(
+        mut file: StorageFile,
+        mut backup: crate::backup::BackupReader<std::io::BufReader<std::fs::File>>,
+        header: &crate::backup::BackupHeader,
+        log_paths: &[std::path::PathBuf],
+        dst_path: &Path,
+    ) -> Result<(), StorageError> {
+        use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
+        let data_pages = header.data_size / PAGE_SIZE as u64;
         let mut runs: Vec<(u64, u64)> = Vec::new();
         let mut log: Option<(u64, Vec<u8>)> = None;
         while let Some((block_type, payload)) = backup.next_block()? {
@@ -817,7 +837,7 @@ impl Storage {
         }
         // The restored superblock brackets the ring at `[redo_start, tail)`; the
         // log-backup floor is the end of the applied chain (a fresh chain).
-        file.restore_superblock(&header, tail)?;
+        file.restore_superblock(header, tail)?;
         file.sync_file()?;
         drop(file);
 
@@ -6434,6 +6454,17 @@ fn apply_log_archive(
             path.display()
         )));
     }
+    // Partial identity guard: a log archive whose page or ring geometry differs
+    // was taken against a differently-configured database and cannot belong to
+    // this chain. (A full database-identity match — a persisted DB uuid checked
+    // against the full backup — is future work; today the LSN-continuity check
+    // and geometry are the only cross-database guards.)
+    if header.page_size as usize != PAGE_SIZE || header.wal_size != file.layout.wal_size {
+        return Err(StorageError::InvalidFile(format!(
+            "{}: log archive geometry does not match the restored database",
+            path.display()
+        )));
+    }
     // Concatenate the archive's (contiguous) log chunks.
     let mut chunk: Option<(u64, Vec<u8>)> = None;
     while let Some((block_type, payload)) = r.next_block()? {
@@ -6463,9 +6494,15 @@ fn apply_log_archive(
         )));
     }
     let new_end = start_lsn + bytes.len() as u64;
-    if new_end.saturating_sub(head) > file.layout.wal_size {
+    // Leave the CLR reserve free: on open, ARIES undo appends compensation
+    // records for the transactions in flight at the chain end (use_reserve), so
+    // the recoverable range must fit `wal_size - reserve`, exactly as the full
+    // backup caps its own shipped log. Otherwise a legitimate long chain fills
+    // the ring and recovery's first undo append hits WalFull.
+    let max_range = file.layout.wal_size.saturating_sub(file.wal.reserve());
+    if new_end.saturating_sub(head) > max_range {
         return Err(StorageError::InvalidFile(
-            "the full backup plus its log chain exceed the WAL ring size; \
+            "the full backup plus its log chain exceed the WAL ring's usable size; \
              incremental restore is not yet supported"
                 .to_string(),
         ));

@@ -2197,11 +2197,18 @@ mod tests {
             "the full backup alone is the point-in-time it was taken"
         );
 
-        // A gap in the chain (apply only the second log) is rejected (4305).
+        // A gap in the chain (apply only the second log) is rejected (4305), and
+        // the partial destination is removed so a retry can reuse the path.
         assert!(
             Storage::restore_full_with_logs(&restored_gap, &bak, &[trn2.clone()]).is_err(),
             "a log-chain gap is rejected"
         );
+        assert!(
+            !restored_gap.exists(),
+            "the partial destination is cleaned up on error"
+        );
+        Storage::restore_full_with_logs(&restored_gap, &bak, &[trn1.clone(), trn2.clone()])
+            .expect("retry with the full chain to the same path succeeds after cleanup");
 
         drop(engine2);
         drop(engine3);
