@@ -7433,6 +7433,113 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    // ---- Stage 16 exit matrices --------------------------------------------
+
+    #[test]
+    fn deny_beats_grant_across_nested_roles() {
+        // A user in a nested role chain (u ∈ r1 ∈ r2): a GRANT high in the chain
+        // is overridden by a DENY at any level, and REVOKE of the DENY restores
+        // the inherited GRANT — the DENY/GRANT truth table across nested roles.
+        let path = unique_temp_path("exit-deny");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .unwrap();
+        engine.execute("INSERT INTO t VALUES (1)").unwrap();
+        engine
+            .execute("CREATE LOGIN applogin WITH PASSWORD = 'x'")
+            .unwrap();
+        engine
+            .execute("CREATE USER appuser FOR LOGIN applogin")
+            .unwrap();
+        engine.execute("CREATE ROLE r1").unwrap();
+        engine.execute("CREATE ROLE r2").unwrap();
+        engine.execute("ALTER ROLE r1 ADD MEMBER appuser").unwrap();
+        engine.execute("ALTER ROLE r2 ADD MEMBER r1").unwrap(); // u ∈ r1 ∈ r2
+
+        let mut r = restricted_ctx(&engine, "applogin");
+        // Ungranted → denied.
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), Some(229));
+        // GRANT to the OUTER role r2 is inherited transitively through r1.
+        engine.execute("GRANT SELECT ON t TO r2").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), None);
+        // A DENY at the INTERMEDIATE role r1 beats the inherited grant.
+        engine.execute("DENY SELECT ON t TO r1").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), Some(229));
+        // REVOKE the DENY → the r2 grant is inherited again.
+        engine.execute("REVOKE SELECT ON t FROM r1").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), None);
+        // A DENY on the user directly also beats the role grant.
+        engine.execute("DENY SELECT ON t TO appuser").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), Some(229));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ownership_chaining_through_a_proc_over_a_view_over_a_table() {
+        // The classic chain: EXECUTE on a proc, which reads a view, which reads a
+        // table — the restricted user needs neither SELECT on the view nor on the
+        // table (all owned by dbo), only EXECUTE on the proc.
+        let path = unique_temp_path("exit-chain");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE base (id INT NOT NULL PRIMARY KEY)")
+            .unwrap();
+        engine.execute("INSERT INTO base VALUES (7)").unwrap();
+        engine
+            .execute("CREATE VIEW v AS SELECT id FROM base")
+            .unwrap();
+        engine
+            .execute("CREATE PROCEDURE p AS SELECT id FROM v")
+            .unwrap();
+        engine
+            .execute("CREATE LOGIN applogin WITH PASSWORD = 'x'")
+            .unwrap();
+        engine
+            .execute("CREATE USER appuser FOR LOGIN applogin")
+            .unwrap();
+        engine.execute("GRANT EXECUTE ON p TO appuser").unwrap();
+
+        let mut r = restricted_ctx(&engine, "applogin");
+        // Runs via the chain — no SELECT on v or base needed.
+        assert_eq!(err_num(&engine, &mut r, "EXEC p"), None);
+        // Direct reads of the view and the table are still denied.
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM v"), Some(229));
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM base"), Some(229));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn config_migration_upgrades_an_existing_pre_stage16_catalog() {
+        use std::collections::BTreeMap;
+        let path = unique_temp_path("exit-migrate");
+        // A "pre-Stage-16" database: it has schema objects but migration never
+        // ran, so there are no catalog logins yet.
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .unwrap();
+        assert!(engine.lookup_login("sa").is_none(), "no logins yet");
+        drop(engine);
+
+        // Reopen under the new build and run first-boot migration with config
+        // users — the existing catalog is upgraded in place.
+        let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("replay");
+        let mut users = BTreeMap::new();
+        users.insert("sa".to_string(), "secret".to_string());
+        users.insert("app".to_string(), "app-pw".to_string());
+        let created = engine.migrate_logins(&users).expect("migrate");
+        assert!(created.contains(&"app".to_string()), "config user migrated");
+        assert!(engine.lookup_login("sa").is_some(), "sa seeded");
+        assert!(engine.lookup_login("app").is_some(), "app seeded");
+        // The pre-existing table is untouched.
+        let (_c, rows) = sql_rows(&engine, "SELECT COUNT(*) FROM sys.tables WHERE name = 't'");
+        assert_eq!(rows, vec![vec![Some("1".to_string())]]);
+        // Idempotent: a subsequent start does not re-migrate.
+        assert!(engine.migrate_logins(&users).expect("second").is_empty());
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn ddl_and_grant_require_privilege() {
         let path = unique_temp_path("perms-ddl");
