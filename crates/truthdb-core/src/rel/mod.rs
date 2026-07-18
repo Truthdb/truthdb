@@ -4564,12 +4564,16 @@ fn exec_open_cursor(
     name: &Name,
 ) -> Result<StatementResult, SqlError> {
     let key = name.value.to_ascii_lowercase();
-    let select = ctx
+    let cursor = ctx
         .cursors
         .get(&key)
-        .ok_or_else(|| cursor_not_declared(name))?
-        .select
-        .clone();
+        .ok_or_else(|| cursor_not_declared(name))?;
+    if cursor.open {
+        return Err(
+            SqlError::new(16905, 16, 1, "The cursor is already open.".to_string()).at(name.span),
+        );
+    }
+    let select = cursor.select.clone();
     let eval_ctx = ctx.eval_context();
     let rowset = exec_select(storage, &select, &eval_ctx)?;
     let cursor = ctx.cursors.get_mut(&key).expect("cursor declared");
@@ -4646,7 +4650,10 @@ fn exec_fetch(
             FetchDirection::First => 1,
             FetchDirection::Last => n,
             FetchDirection::Absolute(_) => offset.unwrap_or(0),
-            FetchDirection::Relative(_) => cursor.position + offset.unwrap_or(0),
+            // Saturate: a huge offset overflows `position + offset` (i64), which
+            // panics in a checked build and silently wraps in release. Saturating
+            // lands off the end, where the range check below maps it to -1.
+            FetchDirection::Relative(_) => cursor.position.saturating_add(offset.unwrap_or(0)),
         };
         // ABSOLUTE -1 addresses the last row, -2 the second-to-last, etc.
         if matches!(direction, FetchDirection::Absolute(_)) && target < 0 {

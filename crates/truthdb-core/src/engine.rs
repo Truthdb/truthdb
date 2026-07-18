@@ -6119,6 +6119,32 @@ mod tests {
         );
         assert_eq!(out.error.as_ref().map(|e| e.number), Some(16915));
 
+        // OPEN of an already-open cursor -> 16905.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE c CURSOR FOR SELECT v FROM nums; OPEN c; OPEN c",
+        );
+        assert_eq!(out.error.as_ref().map(|e| e.number), Some(16905));
+
+        // A FETCH RELATIVE offset near i64::MAX must not overflow the position:
+        // it saturates off the end (status -1), leaving @v unchanged. (A checked
+        // build would panic without the saturating add.)
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "DECLARE @v INT = 7; \
+             DECLARE c SCROLL CURSOR FOR SELECT v FROM nums WHERE id < 99 ORDER BY id; \
+             OPEN c; \
+             FETCH NEXT FROM c INTO @v; \
+             FETCH RELATIVE 9223372036854775807 FROM c INTO @v; \
+             DECLARE @st INT = @@FETCH_STATUS; \
+             CLOSE c; DEALLOCATE c; \
+             SELECT @v, @st",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        assert_eq!(row_ints(&out), vec![10, -1]);
+
         let _ = std::fs::remove_file(path);
     }
 
