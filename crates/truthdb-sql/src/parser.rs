@@ -2904,13 +2904,27 @@ impl Parser {
                 }
                 Some("CROSS") => {
                     self.bump();
-                    self.expect_keyword("JOIN")?;
-                    JoinKind::Cross
+                    if self.eat_keyword("APPLY") {
+                        JoinKind::CrossApply
+                    } else {
+                        self.expect_keyword("JOIN")?;
+                        JoinKind::Cross
+                    }
+                }
+                // `OUTER APPLY` — a standalone OUTER (the LEFT/RIGHT/FULL forms
+                // eat their optional OUTER above).
+                Some("OUTER") => {
+                    self.bump();
+                    self.expect_keyword("APPLY")?;
+                    JoinKind::OuterApply
                 }
                 _ => break,
             };
             let right = self.parse_table_primary()?;
-            let on = if kind == JoinKind::Cross {
+            let on = if matches!(
+                kind,
+                JoinKind::Cross | JoinKind::CrossApply | JoinKind::OuterApply
+            ) {
                 None
             } else {
                 self.expect_keyword("ON")?;

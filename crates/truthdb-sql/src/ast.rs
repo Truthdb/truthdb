@@ -772,6 +772,12 @@ pub enum JoinKind {
     Right,
     Full,
     Cross,
+    /// `CROSS APPLY`: the right side is re-evaluated per left row (correlated to
+    /// it); a left row with no right rows is dropped (like an inner join).
+    CrossApply,
+    /// `OUTER APPLY`: like `CROSS APPLY`, but a left row with no right rows is
+    /// kept with NULLs for the right columns (like a left join).
+    OuterApply,
 }
 
 #[derive(Debug, Clone, PartialEq)]
