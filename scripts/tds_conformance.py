@@ -274,6 +274,28 @@ def main() -> int:
     except pytds.Error:
         pass  # expected
 
+    # Stage 16 exit: login backoff timing. Repeated failed logins from one client
+    # for one (login, IP) grow a delay. The first few (free) attempts are not
+    # delayed; a later one blocks for the exponential backoff (>= 100 ms) before
+    # the server answers 18456, so the connect call takes measurably longer.
+    import time as _time
+
+    def timed_fail(user: str) -> float:
+        start = _time.monotonic()
+        try:
+            pytds.connect(host, "truthdb", user, "wrong-pass",
+                          port=port, login_timeout=10)
+        except pytds.Error:
+            pass  # expected
+        return _time.monotonic() - start
+
+    for _ in range(4):  # burn the free attempts for this (login, IP)
+        timed_fail("backoff_probe")
+    delayed = timed_fail("backoff_probe")  # now past the free window
+    if delayed < 0.08:
+        print(f"FAIL: a throttled login was not delayed ({delayed:.3f}s)")
+        return 1
+
     conn.close()
     print("tds conformance: OK")
     return 0
