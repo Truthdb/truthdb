@@ -194,6 +194,7 @@ impl Parser {
             Some("REVOKE") => self.parse_permission(PermissionKind::Revoke),
             Some("BACKUP") => self.parse_backup(),
             Some("RESTORE") => self.parse_restore(),
+            Some("ENABLE") | Some("DISABLE") => self.parse_trigger_state(),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1969,6 +1970,28 @@ impl Parser {
         self.bump();
         let span = start.to(self.prev_span());
         Ok(Statement::Restore { mode, path, span })
+    }
+
+    /// `{ENABLE | DISABLE} TRIGGER {<name> | ALL} ON <table>`.
+    fn parse_trigger_state(&mut self) -> SqlResult<Statement> {
+        let start = self.peek().span;
+        let enable = self.peek_keyword().as_deref() == Some("ENABLE");
+        self.bump(); // ENABLE | DISABLE
+        self.expect_keyword("TRIGGER")?;
+        let trigger = if self.eat_keyword("ALL") {
+            None
+        } else {
+            Some(self.parse_name()?)
+        };
+        self.expect_keyword("ON")?;
+        let table = self.parse_name()?;
+        let span = start.to(self.prev_span());
+        Ok(Statement::SetTriggerState {
+            trigger,
+            table,
+            enable,
+            span,
+        })
     }
 
     fn parse_create_login(&mut self, start: Span, alter: bool) -> SqlResult<Statement> {

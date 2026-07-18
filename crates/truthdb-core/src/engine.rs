@@ -6755,6 +6755,79 @@ mod tests {
     }
 
     #[test]
+    fn disable_and_enable_trigger_controls_firing() {
+        let path = unique_temp_path("trigger-disable");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create t");
+        engine
+            .execute("CREATE TABLE log (n INT NOT NULL PRIMARY KEY)")
+            .expect("create log");
+        engine
+            .execute(
+                "CREATE TRIGGER trg ON t AFTER INSERT AS INSERT INTO log SELECT id FROM inserted",
+            )
+            .expect("create trigger");
+        let log_count = |e: &Engine| sql_rows(e, "SELECT COUNT(*) FROM log").1;
+
+        // Enabled by default: the insert fires the trigger.
+        engine
+            .execute("INSERT INTO t VALUES (1)")
+            .expect("insert 1");
+        assert_eq!(
+            log_count(&engine),
+            vec![vec![Some("1".into())]],
+            "trigger fired"
+        );
+
+        // DISABLE: the trigger no longer fires.
+        engine.execute("DISABLE TRIGGER trg ON t").expect("disable");
+        engine
+            .execute("INSERT INTO t VALUES (2)")
+            .expect("insert 2");
+        assert_eq!(
+            log_count(&engine),
+            vec![vec![Some("1".into())]],
+            "a disabled trigger does not fire"
+        );
+
+        // ENABLE: it fires again.
+        engine.execute("ENABLE TRIGGER trg ON t").expect("enable");
+        engine
+            .execute("INSERT INTO t VALUES (3)")
+            .expect("insert 3");
+        assert_eq!(
+            log_count(&engine),
+            vec![vec![Some("2".into())]],
+            "a re-enabled trigger fires"
+        );
+
+        // DISABLE TRIGGER ALL ON <table> disables every trigger on the table.
+        engine
+            .execute("DISABLE TRIGGER ALL ON t")
+            .expect("disable all");
+        engine
+            .execute("INSERT INTO t VALUES (4)")
+            .expect("insert 4");
+        assert_eq!(
+            log_count(&engine),
+            vec![vec![Some("2".into())]],
+            "DISABLE TRIGGER ALL stopped firing"
+        );
+
+        // A trigger that is not on the named table (or does not exist) errors.
+        assert_eq!(
+            sql_error_number(&engine, "DISABLE TRIGGER nope ON t"),
+            3701,
+            "a missing trigger errors"
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn user_scalar_function_works_in_all_query_clause_positions() {
         let path = unique_temp_path("udf-clauses");
         let engine = new_engine(&path);

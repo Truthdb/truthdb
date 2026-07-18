@@ -2566,6 +2566,7 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::DropRole { .. }
             | Statement::AlterRole { .. }
             | Statement::Permission(_)
+            | Statement::SetTriggerState { .. }
             | Statement::Commit { .. }
     )
 }
@@ -3244,7 +3245,8 @@ fn analyze_statements_locks(
             | Statement::CreateRole { .. }
             | Statement::DropRole { .. }
             | Statement::AlterRole { .. }
-            | Statement::Permission(_) => {
+            | Statement::Permission(_)
+            | Statement::SetTriggerState { .. } => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // IF/WHILE conditions read tables through their subqueries —
@@ -3447,6 +3449,17 @@ fn exec_statement_dispatch(
                 return Err(ddl_in_txn_err());
             }
             exec_drop_trigger(storage, name, *if_exists)
+        }
+        Statement::SetTriggerState {
+            trigger,
+            table,
+            enable,
+            ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_set_trigger_state(storage, trigger, table, *enable)
         }
         Statement::CreateLogin(create) => {
             if txn_ctx.in_txn() {
@@ -6044,6 +6057,64 @@ fn exec_drop_trigger(
     }
 }
 
+/// `{ENABLE | DISABLE} TRIGGER {<name> | ALL} ON <table>`: flips the disabled
+/// flag on one trigger (or every trigger on the table). A disabled trigger stays
+/// in the catalog but does not fire.
+fn exec_set_trigger_state(
+    storage: &Storage,
+    trigger: &Option<Name>,
+    table: &Name,
+    enable: bool,
+) -> Result<StatementResult, SqlError> {
+    let target = resolve_table(storage, &table.value)
+        .ok_or_else(|| SqlError::invalid_object(&table.value).at(table.span))?;
+    if target.is_view() || target.is_procedure() || target.is_function() || target.is_trigger() {
+        return Err(SqlError::invalid_object(&table.value).at(table.span));
+    }
+    let set_one = |def: &TableDef| -> Result<(), SqlError> {
+        let mut td = def.trigger.clone().expect("is_trigger");
+        td.is_disabled = !enable;
+        storage
+            .rel_alter_trigger(&def.name, td)
+            .map_err(|e| map_storage_err(e, &def.name))
+    };
+    match trigger {
+        Some(name) => {
+            let def = resolve_table(storage, &name.value)
+                .filter(|d| d.is_trigger())
+                .filter(|d| {
+                    d.trigger.as_ref().map(|t| t.parent_object_id) == Some(target.object_id)
+                })
+                .ok_or_else(|| {
+                    SqlError::new(
+                        3701,
+                        11,
+                        5,
+                        format!(
+                            "Cannot {} the trigger '{}', because it does not exist on table \
+                             '{}' or you do not have permission.",
+                            if enable { "enable" } else { "disable" },
+                            name.value,
+                            table.value
+                        ),
+                    )
+                    .at(name.span)
+                })?;
+            set_one(&def)?;
+        }
+        None => {
+            for def in storage.rel_tables() {
+                if def.is_trigger()
+                    && def.trigger.as_ref().map(|t| t.parent_object_id) == Some(target.object_id)
+                {
+                    set_one(&def)?;
+                }
+            }
+        }
+    }
+    Ok(StatementResult::Done)
+}
+
 /// `CREATE|ALTER LOGIN <name> WITH PASSWORD = '<pw>'` / `ALTER LOGIN <name>
 /// {ENABLE | DISABLE}`. Logins are server principals in their own namespace
 /// (disjoint from schema objects); the password is hashed here (on the worker —
@@ -6310,6 +6381,7 @@ fn is_privileged_ddl(stmt: &Statement) -> bool {
             | Statement::DropRole { .. }
             | Statement::AlterRole { .. }
             | Statement::Permission(_)
+            | Statement::SetTriggerState { .. }
             | Statement::BackupDatabase { .. }
             | Statement::BackupLog { .. }
             | Statement::Restore { .. }
