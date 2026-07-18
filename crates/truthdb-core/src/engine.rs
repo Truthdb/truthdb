@@ -6439,20 +6439,59 @@ mod tests {
         engine
             .execute("CREATE TRIGGER trg ON t AFTER INSERT AS RAISERROR('reject', 16, 1)")
             .expect("trigger");
-        // Inside an explicit transaction, a trigger error must roll back the
-        // firing statement — not just under autocommit.
+        // Inside an explicit transaction, a trigger error dooms it — the COMMIT
+        // of the uncommittable transaction fails, so the firing row can never
+        // durably commit (it stays staged in the doomed, still-open transaction).
         let mut ctx = TxnContext::default();
         let out = batch(
             &engine,
             &mut ctx,
             "BEGIN TRANSACTION; INSERT INTO t VALUES (1); COMMIT",
         );
-        assert!(out.error.is_some(), "the trigger error must surface");
+        assert!(
+            out.error.is_some(),
+            "the trigger error (and the failed COMMIT of the doomed txn) must surface"
+        );
+        // Roll the doomed transaction back; nothing was ever durable.
+        batch(&engine, &mut ctx, "IF @@TRANCOUNT > 0 ROLLBACK");
         let (_c, rows) = sql_rows(&engine, "SELECT COUNT(*) AS n FROM t");
         assert_eq!(
             rows,
             vec![vec![Some("0".to_string())]],
-            "the trigger error must roll back the row inside an explicit transaction"
+            "the firing row must never durably commit after a trigger error"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trigger_error_dooms_explicit_transaction_caught_by_try_catch() {
+        let path = unique_temp_path("trg-doomed-catch");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TABLE audit (id INT NOT NULL PRIMARY KEY)")
+            .expect("audit");
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS RAISERROR('reject', 16, 1)")
+            .expect("trigger");
+        // A trigger error inside an explicit transaction DOOMS it (does not tear
+        // it down): the CATCH runs under an uncommittable transaction, so its
+        // write is rejected (3930), never silently autocommitted. After the
+        // ROLLBACK nothing is durable.
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRANSACTION; BEGIN TRY INSERT INTO t VALUES (1); END TRY \
+             BEGIN CATCH INSERT INTO audit VALUES (99); END CATCH; ROLLBACK",
+        );
+        let (_c, rows) = sql_rows(&engine, "SELECT COUNT(*) AS n FROM audit");
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".to_string())]],
+            "the CATCH write must be rejected under the doomed transaction, not autocommitted"
         );
         let _ = std::fs::remove_file(path);
     }

@@ -5779,12 +5779,20 @@ fn run_dml_with_triggers(
     // Fire each trigger once, in creation order, even for an empty image set.
     for trig_def in &triggers {
         if let Err(e) = fire_one_trigger(storage, txn_ctx, trig_def, &tables) {
-            // An unhandled trigger error rolls back the WHOLE transaction — the
-            // firing statement and everything else in it — whether the
-            // transaction is the implicit one opened here or the caller's
-            // explicit one, matching SQL Server (and the 3609 path below). The
-            // `if implicit` gate is deliberately NOT used here.
-            txn_ctx.abort(storage);
+            // A trigger error makes the transaction uncommittable. For the
+            // IMPLICIT transaction opened here (autocommit), roll it back fully —
+            // there is no caller transaction to preserve. For the caller's
+            // EXPLICIT transaction, DOOM it (leave it open with @@TRANCOUNT
+            // intact, XACT_STATE() = -1) rather than tearing it down: SQL
+            // Server's uncommittable-transaction semantics, so a TRY/CATCH sees
+            // the doomed state and must ROLLBACK — never silently autocommitting
+            // CATCH work or losing pre-statement work. The doomed transaction's
+            // staged rows (including the firing row) can never commit.
+            if implicit {
+                txn_ctx.abort(storage);
+            } else {
+                txn_ctx.doomed = true;
+            }
             return Err(e);
         }
         // 3609: a trigger body that changed @@TRANCOUNT — a ROLLBACK/COMMIT that
