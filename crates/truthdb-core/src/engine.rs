@@ -2304,6 +2304,79 @@ mod tests {
         }
     }
 
+    // Stage 18 slice 3: a replication slot holds WAL-ring truncation at a
+    // standby's received LSN, survives a restart, and is invalidated once it
+    // lags past `max_slot_retain_bytes`.
+    #[test]
+    fn replication_slots_hold_truncation_persist_and_reap() {
+        let path = unique_temp_path("repl-slots");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=10 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let l1 = engine.storage().wal_flushed_lsn();
+        assert!(l1 > 0, "there is log to pin");
+
+        // A slot pinned at l1 holds the WAL head there even as the tail advances.
+        engine.storage().register_repl_slot(7, l1);
+        for i in 11..=30 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        engine.checkpoint().expect("checkpoint");
+        assert_eq!(
+            engine.storage().wal_head(),
+            l1,
+            "the slot pins the truncation floor at its LSN"
+        );
+
+        // Advancing the slot lets the floor follow.
+        let l2 = engine.storage().wal_flushed_lsn();
+        engine.storage().advance_repl_slot(7, l2);
+        engine.checkpoint().expect("checkpoint");
+        assert_eq!(
+            engine.storage().wal_head(),
+            l2,
+            "advancing the slot advances the floor"
+        );
+
+        // The slot's hold survives a restart (re-seeded from the superblock).
+        drop(engine);
+        let engine = Engine::new(Storage::open(path.clone()).expect("open")).expect("engine");
+        assert_eq!(
+            engine.storage().repl_slot_lsn(7),
+            Some(l2),
+            "the slot survives the restart"
+        );
+
+        // Lagging past max_slot_retain invalidates the slot at the next checkpoint.
+        engine.storage().set_max_slot_retain_bytes(64);
+        for i in 31..=60 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        engine.checkpoint().expect("checkpoint");
+        assert_eq!(
+            engine.storage().repl_slot_lsn(7),
+            None,
+            "an over-lagging slot is invalidated"
+        );
+        assert!(
+            engine.storage().wal_head() > l2,
+            "the reclaimed floor advances past the dropped slot"
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn point_in_time_restore_stops_at_a_commit_timestamp() {
         use crate::storage_layout::WAL_ENTRY_TYPE_REL;
