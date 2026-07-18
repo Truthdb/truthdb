@@ -81,6 +81,15 @@ pub struct EvalContext {
     pub database: String,
     /// The authenticated login name — `SUSER_SNAME()`.
     pub login: String,
+    /// The session's database user name — `USER_NAME()` (with no argument).
+    pub user: String,
+    /// The session's effective SERVER-role names (lowercased) — read by
+    /// `IS_SRVROLEMEMBER`.
+    pub server_roles: std::collections::HashSet<String>,
+    /// The session's effective DATABASE-role names (lowercased) — read by
+    /// `IS_ROLEMEMBER`. Separate from `server_roles` so the two role namespaces
+    /// do not cross-answer.
+    pub db_roles: std::collections::HashSet<String>,
     /// The session process id — `@@SPID`.
     pub spid: i32,
     /// Rows affected/returned by the session's previous statement —
@@ -456,7 +465,56 @@ fn eval_call<R: ColumnResolver>(
         }
         return Ok(serverproperty(&values[0]));
     }
+    // Role-membership intrinsics read an argument (the role name) AND the session
+    // context (its effective role set) — like SERVERPROPERTY, they fit neither
+    // tier. IS_SRVROLEMEMBER consults the SERVER roles, IS_ROLEMEMBER the DATABASE
+    // roles.
+    if name.eq_ignore_ascii_case("IS_SRVROLEMEMBER") {
+        return Ok(is_rolemember(&values, ctx, &ctx.server_roles));
+    }
+    if name.eq_ignore_ascii_case("IS_ROLEMEMBER") {
+        return Ok(is_rolemember(&values, ctx, &ctx.db_roles));
+    }
+    // The by-id/by-name forms of USER_NAME (the no-argument session form is
+    // handled in eval_session_function) need the catalog to resolve an arbitrary
+    // principal; without it, report NULL rather than a misleading not-a-builtin
+    // error.
+    if name.eq_ignore_ascii_case("USER_NAME") {
+        return Ok(SqlValue::Null);
+    }
     functions::eval_function(name, values)
+}
+
+/// `IS_ROLEMEMBER('role'[, 'principal'])` / `IS_SRVROLEMEMBER('role'[, 'login'])`.
+/// Returns 1 if the tested principal belongs to `role` (looked up in `roles`, the
+/// relevant server- or database-role set), 0 if not, and NULL when the role
+/// argument is NULL/empty. The optional second argument names a specific
+/// principal; only the session's own login/user can be answered here (an
+/// arbitrary principal needs the catalog), so any other name yields NULL. A role
+/// the session does not belong to reads as 0 (a nonexistent role is not
+/// distinguished from a non-membership without the catalog — a documented,
+/// membership-preserving simplification).
+fn is_rolemember(
+    values: &[SqlValue],
+    ctx: &EvalContext,
+    roles: &std::collections::HashSet<String>,
+) -> SqlValue {
+    let role = match values.first() {
+        Some(SqlValue::Str(role)) if !role.is_empty() => role.to_ascii_lowercase(),
+        _ => return SqlValue::Null,
+    };
+    if let Some(second) = values.get(1) {
+        let SqlValue::Str(named) = second else {
+            return SqlValue::Null;
+        };
+        let named = named.to_ascii_lowercase();
+        let is_self =
+            named == ctx.login.to_ascii_lowercase() || named == ctx.user.to_ascii_lowercase();
+        if !is_self {
+            return SqlValue::Null;
+        }
+    }
+    SqlValue::Int(i64::from(roles.contains(&role)))
 }
 
 /// `SERVERPROPERTY(<name>)` — the SSMS query-window probes. Unknown
@@ -494,6 +552,10 @@ fn eval_session_function(name: &str, args: &[Expr]) -> Option<fn(&EvalContext) -
         "SUSER_SNAME" | "SUSER_NAME" if args.is_empty() => {
             Some(|ctx| SqlValue::Str(ctx.login.clone()))
         }
+        // The session's database user. The by-id form USER_NAME(<id>) needs the
+        // catalog and is not resolved here. (The niladic CURRENT_USER — no
+        // parentheses — is a separate parser-token feature, not implemented.)
+        "USER_NAME" if args.is_empty() => Some(|ctx| SqlValue::Str(ctx.user.clone())),
         // SQL Server returns NUMERIC(38,0); NULL when no identity has been
         // generated in the scope yet.
         "SCOPE_IDENTITY" if args.is_empty() => Some(|ctx| match ctx.scope_identity {

@@ -15,11 +15,11 @@ mod value;
 
 use truthdb_sql::ast::{
     AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateFunction,
-    CreateIndex, CreateLogin, CreateProcedure, CreateTable, CreateTrigger, CreateView, DataType,
-    DatabaseOption, Declaration, Delete, DropIndex, DropTable, DropView, ExecStatement, Expr,
-    ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem,
-    RaiseError, ReturnsClause, Select, SelectItem, SetStatement, Statement, TableRef, ThrowArgs,
-    ThrowStatement, Update,
+    CreateIndex, CreateLogin, CreateProcedure, CreateTable, CreateTrigger, CreateUser, CreateView,
+    DataType, DatabaseOption, Declaration, Delete, DropIndex, DropTable, DropView, ExecStatement,
+    Expr, ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem,
+    RaiseError, ReturnsClause, RoleMemberAction, Select, SelectItem, SetStatement, Statement,
+    TableRef, ThrowArgs, ThrowStatement, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -107,6 +107,24 @@ pub struct TxnContext {
     database: String,
     login: String,
     spid: i32,
+    /// The session's database user name (`USER_NAME()`), resolved from the login
+    /// when the session opens (`dbo` for a sysadmin, else the mapped user, else
+    /// the login name). Distinct from `login` (the server principal).
+    user: String,
+    /// The login's server principal_id and the user's database principal_id —
+    /// the keys the membership intrinsics resolve against. Set at session open.
+    login_sid: u32,
+    user_sid: u32,
+    /// The session's effective SERVER-role names (lowercased) — the transitive
+    /// closure of the login's roles (today: `sysadmin`). Read by
+    /// `IS_SRVROLEMEMBER`. Kept separate from database roles so the two
+    /// namespaces do not cross-answer.
+    session_server_roles: std::collections::HashSet<String>,
+    /// The session's effective DATABASE-role names (lowercased) — the transitive
+    /// closure of the database user's roles. Read by `IS_ROLEMEMBER`. Both sets
+    /// are refreshed at batch start from the membership cache, so a security DDL
+    /// is seen by the next batch (SQL Server's per-batch permission caching).
+    session_db_roles: std::collections::HashSet<String>,
     /// The last identity value inserted in this session (SQL Server scope),
     /// surfaced as `SCOPE_IDENTITY()`. Persists across statements until the next
     /// identity INSERT; unaffected by non-identity inserts.
@@ -160,6 +178,9 @@ impl TxnContext {
                 .collect(),
             database: self.database.clone(),
             login: self.login.clone(),
+            user: self.user.clone(),
+            server_roles: self.session_server_roles.clone(),
+            db_roles: self.session_db_roles.clone(),
             spid: self.spid,
             rowcount: self.rowcount,
             scope_identity: self.scope_identity,
@@ -208,11 +229,39 @@ impl TxnContext {
     }
 
     /// Records the connection identity used by session intrinsics. Called once
-    /// when the session opens.
-    pub fn set_session_identity(&mut self, database: String, login: String, spid: i32) {
+    /// when the session opens. `session_roles` is filled separately, per batch,
+    /// from the membership cache (see [`Self::refresh_session_roles`]).
+    pub fn set_session_identity(
+        &mut self,
+        database: String,
+        login: String,
+        spid: i32,
+        user: String,
+        login_sid: u32,
+        user_sid: u32,
+    ) {
         self.database = database;
         self.login = login;
         self.spid = spid;
+        self.user = user;
+        self.login_sid = login_sid;
+        self.user_sid = user_sid;
+    }
+
+    /// Refreshes the session's effective role NAMES from the membership cache.
+    /// The login's roles are SERVER roles (`sysadmin`); the database user's roles
+    /// are DATABASE roles — kept in separate sets so `IS_SRVROLEMEMBER` and
+    /// `IS_ROLEMEMBER` never answer for the other's namespace. Called at batch
+    /// start; a security DDL is therefore visible to the next batch.
+    pub fn refresh_session_roles(&mut self, storage: &Storage) {
+        let names = |ids: std::collections::HashSet<u32>| -> std::collections::HashSet<String> {
+            ids.into_iter()
+                .filter_map(|id| storage.principal_name(id))
+                .map(|name| name.to_ascii_lowercase())
+                .collect()
+        };
+        self.session_server_roles = names(storage.effective_roles(self.login_sid));
+        self.session_db_roles = names(storage.effective_roles(self.user_sid));
     }
 
     /// Clears batch-scoped variables (called at the start of each batch).
@@ -410,6 +459,10 @@ pub fn execute_batch_streamed(
     }
     // Variables are batch-scoped: each batch starts with none.
     txn_ctx.clear_variables();
+    // Refresh the session's effective role set from the membership cache, so a
+    // security DDL committed since the last batch is reflected in this one's
+    // IS_ROLEMEMBER/IS_SRVROLEMEMBER (SQL Server's per-batch permission caching).
+    txn_ctx.refresh_session_roles(storage);
     for param in params {
         // The lexer keys `@p1` as `p1` (leading `@` stripped, lowercased); the
         // RPC name arrives as `@p1`, so normalise it the same way to match.
@@ -1087,9 +1140,20 @@ fn run_user_scalar_function(
     let return_type =
         ColumnType::parse(type_spec).map_err(|e| SqlError::message_only(245, e.to_string()))?;
     // Fresh scope with only the parameters; the caller's session identity is
-    // carried so DB_NAME()/SUSER_SNAME()/@@SPID resolve inside the body.
+    // carried so DB_NAME()/SUSER_SNAME()/USER_NAME()/@@SPID and role membership
+    // resolve inside the body. The sids are left 0 (the body reuses the caller's
+    // already-computed role set rather than re-resolving membership).
     let mut txn_ctx = TxnContext::default();
-    txn_ctx.set_session_identity(caller.database.clone(), caller.login.clone(), caller.spid);
+    txn_ctx.set_session_identity(
+        caller.database.clone(),
+        caller.login.clone(),
+        caller.spid,
+        caller.user.clone(),
+        0,
+        0,
+    );
+    txn_ctx.session_server_roles = caller.server_roles.clone();
+    txn_ctx.session_db_roles = caller.db_roles.clone();
     for (param, value) in function.params.iter().zip(arg_values) {
         let column_type = ColumnType::parse(&param.type_spec)
             .map_err(|e| SqlError::message_only(245, e.to_string()))?;
@@ -2406,6 +2470,11 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::DropTrigger { .. }
             | Statement::CreateLogin(_)
             | Statement::DropLogin { .. }
+            | Statement::CreateUser(_)
+            | Statement::DropUser { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::AlterRole { .. }
             | Statement::Commit { .. }
     )
 }
@@ -3078,7 +3147,12 @@ fn analyze_statements_locks(
             | Statement::CreateTrigger(_)
             | Statement::DropTrigger { .. }
             | Statement::CreateLogin(_)
-            | Statement::DropLogin { .. } => {
+            | Statement::DropLogin { .. }
+            | Statement::CreateUser(_)
+            | Statement::DropUser { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::AlterRole { .. } => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // IF/WHILE conditions read tables through their subqueries —
@@ -3276,6 +3350,45 @@ fn exec_statement_dispatch(
                 return Err(ddl_in_txn_err());
             }
             exec_drop_login(storage, name, *if_exists)
+        }
+        Statement::CreateUser(create) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_user(storage, create)
+        }
+        Statement::DropUser {
+            name, if_exists, ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_database_principal(storage, name, *if_exists, false)
+        }
+        Statement::CreateRole { name, .. } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_role(storage, name)
+        }
+        Statement::DropRole {
+            name, if_exists, ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_database_principal(storage, name, *if_exists, true)
+        }
+        Statement::AlterRole {
+            name,
+            action,
+            member,
+            ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_alter_role_member(storage, name, *action, member)
         }
         // Executed by `run_block`'s own arms; nothing routes them here.
         Statement::Block { .. }
@@ -5782,10 +5895,10 @@ fn exec_create_login(storage: &Storage, create: &CreateLogin) -> Result<Statemen
         .password
         .as_ref()
         .expect("CREATE LOGIN carries a password (parser-enforced)");
-    let principal = PrincipalDef {
-        password_blob: crate::auth::hash_password(password),
-        is_disabled: create.disable.unwrap_or(false),
-    };
+    let principal = PrincipalDef::login(
+        crate::auth::hash_password(password),
+        create.disable.unwrap_or(false),
+    );
     storage
         .rel_create_login(bare, principal)
         .map_err(|e| map_storage_err(e, &create.name.value))?;
@@ -5812,6 +5925,112 @@ fn exec_drop_login(
         )
         .at(name.span));
     }
+    Ok(StatementResult::Done)
+}
+
+/// `CREATE USER <name> [FOR LOGIN <login>]`. A database principal in its own
+/// namespace (out of the object namespace), optionally mapped to a login.
+fn exec_create_user(storage: &Storage, create: &CreateUser) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&create.name.value);
+    if storage.rel_database_principal(bare).is_some()
+        || crate::storage::fixed_principal_by_name(bare).is_some()
+    {
+        return Err(SqlError::new(
+            15023,
+            16,
+            1,
+            format!("User, group, or role '{bare}' already exists in the current database."),
+        )
+        .at(create.name.span));
+    }
+    let login_sid = match &create.for_login {
+        Some(login) => {
+            let login_bare = strip_schema(&login.value);
+            let Some(def) = storage.rel_login(login_bare) else {
+                return Err(SqlError::new(
+                    15007,
+                    16,
+                    1,
+                    format!("'{login_bare}' is not a valid login or you do not have permission."),
+                )
+                .at(login.span));
+            };
+            Some(def.object_id)
+        }
+        None => None,
+    };
+    storage
+        .rel_create_database_principal(bare, PrincipalDef::user(login_sid))
+        .map_err(|e| map_storage_err(e, &create.name.value))?;
+    Ok(StatementResult::Done)
+}
+
+/// `CREATE ROLE <name>`.
+fn exec_create_role(storage: &Storage, name: &Name) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&name.value);
+    if storage.rel_database_principal(bare).is_some()
+        || crate::storage::fixed_principal_by_name(bare).is_some()
+    {
+        return Err(SqlError::new(
+            15023,
+            16,
+            1,
+            format!("User, group, or role '{bare}' already exists in the current database."),
+        )
+        .at(name.span));
+    }
+    storage
+        .rel_create_database_principal(bare, PrincipalDef::role())
+        .map_err(|e| map_storage_err(e, &name.value))?;
+    Ok(StatementResult::Done)
+}
+
+/// `DROP USER`/`DROP ROLE`. `expect_role` selects which kind is being dropped;
+/// a mismatch (DROP USER on a role, or vice versa) reports not-found for the
+/// requested kind, as SQL Server does.
+fn exec_drop_database_principal(
+    storage: &Storage,
+    name: &Name,
+    if_exists: bool,
+    expect_role: bool,
+) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&name.value);
+    let kind = if expect_role { "role" } else { "user" };
+    match storage.rel_database_principal(bare) {
+        Some(def) if def.is_role() == expect_role => {}
+        _ if if_exists => return Ok(StatementResult::Done),
+        _ => {
+            return Err(SqlError::new(
+                15151,
+                16,
+                1,
+                format!(
+                    "Cannot drop the {kind} '{bare}', because it does not exist or you do not have permission."
+                ),
+            )
+            .at(name.span));
+        }
+    }
+    storage
+        .rel_drop_database_principal(bare)
+        .map_err(|e| map_storage_err(e, &name.value))?;
+    Ok(StatementResult::Done)
+}
+
+/// `ALTER ROLE <role> ADD|DROP MEMBER <member>`.
+fn exec_alter_role_member(
+    storage: &Storage,
+    role: &Name,
+    action: RoleMemberAction,
+    member: &Name,
+) -> Result<StatementResult, SqlError> {
+    let role_bare = strip_schema(&role.value);
+    let member_bare = strip_schema(&member.value);
+    match action {
+        RoleMemberAction::Add => storage.rel_add_role_member(role_bare, member_bare),
+        RoleMemberAction::Drop => storage.rel_drop_role_member(role_bare, member_bare),
+    }
+    .map_err(|e| map_storage_err(e, &role.value))?;
     Ok(StatementResult::Done)
 }
 
@@ -9369,6 +9588,8 @@ fn is_sys_view(name: &str) -> bool {
             | "sys.default_constraints"
             | "sys.databases"
             | "sys.configurations"
+            | "sys.database_principals"
+            | "sys.database_role_members"
     )
 }
 
@@ -10830,6 +11051,8 @@ fn build_table_source(
         "sys.trigger_events" => sys_trigger_events(storage),
         "sys.server_principals" => sys_server_principals(storage),
         "sys.sql_logins" => sys_sql_logins(storage),
+        "sys.database_principals" => sys_database_principals(storage),
+        "sys.database_role_members" => sys_database_role_members(storage),
         "sys.parameters" => sys_parameters(storage),
         "sys.objects" => sys_objects(storage),
         "sys.sql_modules" => sys_sql_modules(storage),
@@ -11078,13 +11301,20 @@ fn run_multi_statement_tvf(
     let (schema, key_columns, defaults) =
         build_table_var_definition(returns_var, &columns, &primary_key)?;
     // Fresh isolated scope: parameters only, caller session identity carried for
-    // DB_NAME()/SUSER_SNAME()/@@SPID. Arguments evaluate in the CALLER's context.
+    // DB_NAME()/SUSER_SNAME()/USER_NAME()/@@SPID and role membership. Arguments
+    // evaluate in the CALLER's context. The sids are left 0 (the body does not
+    // re-resolve membership — it reuses the caller's already-computed role set).
     let mut txn_ctx = TxnContext::default();
     txn_ctx.set_session_identity(
         eval_ctx.database.clone(),
         eval_ctx.login.clone(),
         eval_ctx.spid,
+        eval_ctx.user.clone(),
+        0,
+        0,
     );
+    txn_ctx.session_server_roles = eval_ctx.server_roles.clone();
+    txn_ctx.session_db_roles = eval_ctx.db_roles.clone();
     let no_outer = |_: &str| -> Option<usize> { None };
     for (param, arg) in function.params.iter().zip(args) {
         let column_type = ColumnType::parse(&param.type_spec)
@@ -12067,7 +12297,7 @@ fn sys_server_principals(storage: &Storage) -> Source {
         nvarchar("type_desc", 60),
         int_col("is_disabled"),
     ];
-    let rows = storage
+    let mut rows: Vec<Vec<Datum>> = storage
         .rel_logins()
         .into_iter()
         .filter_map(|def| {
@@ -12075,13 +12305,26 @@ fn sys_server_principals(storage: &Storage) -> Source {
             Some(vec![
                 Datum::NVarChar(def.name.clone()),
                 Datum::Int(def.object_id as i32),
-                // Only SQL logins exist today: type 'S' / SQL_LOGIN.
+                // SQL logins: type 'S' / SQL_LOGIN.
                 Datum::NVarChar("S".to_string()),
                 Datum::NVarChar("SQL_LOGIN".to_string()),
                 Datum::Int(i32::from(principal.is_disabled)),
             ])
         })
         .collect();
+    // The fixed server roles (today: sysadmin) — type 'R' / SERVER_ROLE.
+    for fixed in crate::storage::FIXED_PRINCIPALS
+        .iter()
+        .filter(|p| p.is_server)
+    {
+        rows.push(vec![
+            Datum::NVarChar(fixed.name.to_string()),
+            Datum::Int(fixed.id as i32),
+            Datum::NVarChar("R".to_string()),
+            Datum::NVarChar("SERVER_ROLE".to_string()),
+            Datum::Int(0),
+        ]);
+    }
     let collations = vec![None; columns.len()];
     let qualifiers = vec![None; columns.len()];
     Source {
@@ -12110,6 +12353,90 @@ fn sys_sql_logins(storage: &Storage) -> Source {
             ])
         })
         .collect();
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_database_principals(storage: &Storage) -> Source {
+    use crate::relstore::catalog::PrincipalKind;
+    let columns = vec![
+        nvarchar("name", 128),
+        int_col("principal_id"),
+        nvarchar("type", 1),
+        nvarchar("type_desc", 60),
+        nvarchar("default_schema_name", 128),
+        int_col("owning_principal_id"),
+    ];
+    // A user (SQL_USER 'S') defaults to the dbo schema; a role (DATABASE_ROLE
+    // 'R') has no default schema.
+    let row = |name: String, id: u32, kind: PrincipalKind| {
+        let (type_code, type_desc) = match kind {
+            PrincipalKind::Role => ("R", "DATABASE_ROLE"),
+            _ => ("S", "SQL_USER"),
+        };
+        let default_schema = if matches!(kind, PrincipalKind::User) {
+            Datum::NVarChar("dbo".to_string())
+        } else {
+            Datum::Null
+        };
+        vec![
+            Datum::NVarChar(name),
+            Datum::Int(id as i32),
+            Datum::NVarChar(type_code.to_string()),
+            Datum::NVarChar(type_desc.to_string()),
+            default_schema,
+            Datum::Null, // owning_principal_id
+        ]
+    };
+    let mut rows: Vec<Vec<Datum>> = Vec::new();
+    // Fixed database principals (dbo + the fixed database roles + public); the
+    // server-scoped sysadmin role belongs to sys.server_principals instead.
+    for fixed in crate::storage::FIXED_PRINCIPALS
+        .iter()
+        .filter(|p| !p.is_server)
+    {
+        rows.push(row(fixed.name.to_string(), fixed.id, fixed.kind));
+    }
+    for def in storage.rel_database_principals() {
+        if let Some(principal) = def.principal.as_ref() {
+            rows.push(row(def.name.clone(), def.object_id, principal.kind));
+        }
+    }
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_database_role_members(storage: &Storage) -> Source {
+    let columns = vec![int_col("role_principal_id"), int_col("member_principal_id")];
+    let mut rows: Vec<Vec<Datum>> = Vec::new();
+    // Synthesized: the dbo user is a member of db_owner.
+    rows.push(vec![
+        Datum::Int(crate::storage::DB_OWNER_ID as i32),
+        Datum::Int(crate::storage::DBO_ID as i32),
+    ]);
+    // Stored database membership edges (member -> role, from each member's row).
+    for def in storage.rel_database_principals() {
+        if let Some(principal) = def.principal.as_ref() {
+            for &role_id in &principal.member_of {
+                rows.push(vec![
+                    Datum::Int(role_id as i32),
+                    Datum::Int(def.object_id as i32),
+                ]);
+            }
+        }
+    }
     let collations = vec![None; columns.len()];
     let qualifiers = vec![None; columns.len()];
     Source {

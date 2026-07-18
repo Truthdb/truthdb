@@ -143,14 +143,78 @@ pub struct TableDef {
     pub principal: Option<PrincipalDef>,
 }
 
-/// A server principal's catalog payload. Today only SQL logins exist; the
-/// password blob is the versioned PBKDF2 hash from [`crate::auth`].
+/// Which kind of principal a [`PrincipalDef`] describes. `Login` is the default
+/// so a pre-Stage-16-roles catalog row (which had no `kind` field) deserializes
+/// as the server login it was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PrincipalKind {
+    /// A server-scoped SQL authentication principal (`CREATE LOGIN`).
+    #[default]
+    Login,
+    /// A database user (`CREATE USER`), optionally mapped to a login.
+    User,
+    /// A database role (`CREATE ROLE`), a container of members.
+    Role,
+}
+
+/// A principal's catalog payload — a login, a database user, or a role. Logins
+/// live in their own in-memory map; users and roles live in a second map, both
+/// out of the object namespace (they are never schema objects).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PrincipalDef {
-    /// The versioned PBKDF2 credential blob (`v1$iters$salt$hash`).
+    /// Login / user / role. Absent in old catalog rows → [`PrincipalKind::Login`].
+    #[serde(default)]
+    pub kind: PrincipalKind,
+    /// The versioned PBKDF2 credential blob (`v1$iters$salt$hash`). Only a login
+    /// has one; empty for users and roles.
+    #[serde(default)]
     pub password_blob: String,
     /// `ALTER LOGIN ... DISABLE` sets this; a disabled login cannot authenticate.
+    #[serde(default)]
     pub is_disabled: bool,
+    /// The role principal_ids this principal is a DIRECT member of (membership
+    /// edges). The effective set is the transitive closure of these.
+    #[serde(default)]
+    pub member_of: Vec<u32>,
+    /// For a [`PrincipalKind::User`] created `FOR LOGIN l`: the login's
+    /// principal_id, so a session's login resolves to its database user.
+    #[serde(default)]
+    pub login_sid: Option<u32>,
+}
+
+impl PrincipalDef {
+    /// A server login with a hashed credential.
+    pub fn login(password_blob: String, is_disabled: bool) -> Self {
+        PrincipalDef {
+            kind: PrincipalKind::Login,
+            password_blob,
+            is_disabled,
+            member_of: Vec::new(),
+            login_sid: None,
+        }
+    }
+
+    /// A database user, optionally mapped to a login.
+    pub fn user(login_sid: Option<u32>) -> Self {
+        PrincipalDef {
+            kind: PrincipalKind::User,
+            password_blob: String::new(),
+            is_disabled: false,
+            member_of: Vec::new(),
+            login_sid,
+        }
+    }
+
+    /// A database role.
+    pub fn role() -> Self {
+        PrincipalDef {
+            kind: PrincipalKind::Role,
+            password_blob: String::new(),
+            is_disabled: false,
+            member_of: Vec::new(),
+            login_sid: None,
+        }
+    }
 }
 
 /// A DML event a trigger can fire on.
@@ -258,7 +322,35 @@ impl TableDef {
     /// True if this catalog entry is a server login (a principal, not a schema
     /// object).
     pub fn is_login(&self) -> bool {
-        self.principal.is_some()
+        matches!(
+            self.principal.as_ref().map(|p| p.kind),
+            Some(PrincipalKind::Login)
+        )
+    }
+
+    /// True if this catalog entry is a database user or role — a database
+    /// principal, kept in its own map, out of the object namespace.
+    pub fn is_database_principal(&self) -> bool {
+        matches!(
+            self.principal.as_ref().map(|p| p.kind),
+            Some(PrincipalKind::User | PrincipalKind::Role)
+        )
+    }
+
+    /// True if this catalog entry is a database user.
+    pub fn is_user(&self) -> bool {
+        matches!(
+            self.principal.as_ref().map(|p| p.kind),
+            Some(PrincipalKind::User)
+        )
+    }
+
+    /// True if this catalog entry is a database role.
+    pub fn is_role(&self) -> bool {
+        matches!(
+            self.principal.as_ref().map(|p| p.kind),
+            Some(PrincipalKind::Role)
+        )
     }
 }
 

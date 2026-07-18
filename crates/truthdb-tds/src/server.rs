@@ -155,8 +155,10 @@ where
     let verified = tokio::task::spawn_blocking(move || auth::verify_password(&blob, &password))
         .await
         .map_err(|_| protocol_err("password verification task panicked"))?;
-    let canonical_login = match &record {
-        Some(rec) if !rec.is_disabled && verified == auth::VerifyOutcome::Ok => rec.name.clone(),
+    let (canonical_login, login_sid) = match &record {
+        Some(rec) if !rec.is_disabled && verified == auth::VerifyOutcome::Ok => {
+            (rec.name.clone(), rec.principal_id)
+        }
         _ => {
             // The attempt was already counted by note_attempt above.
             deny_login(&mut stream, &login.username, packet_size).await?;
@@ -195,7 +197,9 @@ where
     // Each connection gets an engine-side session; it is closed (rolling back
     // any open transaction) whenever the connection ends, cleanly or not. The
     // database and login are recorded for session intrinsics (DB_NAME() etc.).
-    let session = engine.open_session(database.clone(), canonical_login).await;
+    let session = engine
+        .open_session(database.clone(), canonical_login, login_sid)
+        .await;
     let result = request_loop(&mut stream, &engine, session, packet_size).await;
     engine.close_session(session);
     result

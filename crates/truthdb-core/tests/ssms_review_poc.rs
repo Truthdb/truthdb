@@ -36,7 +36,7 @@ fn new_engine(path: &Path) -> Engine {
 
 fn ctx() -> TxnContext {
     let mut ctx = TxnContext::default();
-    ctx.set_session_identity("truthdb".into(), "sa".into(), 1);
+    ctx.set_session_identity("truthdb".into(), "sa".into(), 1, "dbo".into(), 0, 0);
     ctx
 }
 

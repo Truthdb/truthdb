@@ -943,6 +943,8 @@ impl Parser {
             Some("FUNCTION") if !unique => self.parse_create_function(start, false),
             Some("TRIGGER") if !unique => self.parse_create_trigger(start, false),
             Some("LOGIN") if !unique => self.parse_create_login(start, false),
+            Some("USER") if !unique => self.parse_create_user(start),
+            Some("ROLE") if !unique => self.parse_create_role(start),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1462,6 +1464,9 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("LOGIN") {
             return self.parse_create_login(start, true);
         }
+        if self.peek_keyword().as_deref() == Some("ROLE") {
+            return self.parse_alter_role(start);
+        }
         self.expect_keyword("TABLE")?;
         let table = self.parse_name()?;
         let (action, end) = match self.peek_keyword().as_deref() {
@@ -1562,6 +1567,8 @@ impl Parser {
             Some("FUNCTION") => self.parse_drop_function(start),
             Some("TRIGGER") => self.parse_drop_trigger(start),
             Some("LOGIN") => self.parse_drop_login(start),
+            Some("USER") => self.parse_drop_user(start),
+            Some("ROLE") => self.parse_drop_role(start),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1865,6 +1872,106 @@ impl Parser {
             name,
             if_exists,
         })
+    }
+
+    /// `CREATE USER <name> [FOR LOGIN <login> | WITHOUT LOGIN]`.
+    fn parse_create_user(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // USER
+        let name = self.parse_name()?;
+        let mut for_login = None;
+        match self.peek_keyword().as_deref() {
+            Some("FOR") => {
+                self.bump();
+                self.expect_keyword("LOGIN")?;
+                for_login = Some(self.parse_name()?);
+            }
+            // `WITHOUT LOGIN` — a user with no mapped login (accepted, no map).
+            Some("WITHOUT") => {
+                self.bump();
+                self.expect_keyword("LOGIN")?;
+            }
+            _ => {}
+        }
+        let span = start.to(self.prev_span());
+        Ok(Statement::CreateUser(CreateUser {
+            name,
+            for_login,
+            span,
+        }))
+    }
+
+    /// `CREATE ROLE <name> [AUTHORIZATION <owner>]` (AUTHORIZATION accepted, ignored).
+    fn parse_create_role(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // ROLE
+        let name = self.parse_name()?;
+        if self.peek_keyword().as_deref() == Some("AUTHORIZATION") {
+            self.bump();
+            let _ = self.parse_name()?;
+        }
+        let span = start.to(self.prev_span());
+        Ok(Statement::CreateRole { name, span })
+    }
+
+    fn parse_drop_user(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // USER
+        let if_exists = self.parse_optional_if_exists()?;
+        let name = self.parse_name()?;
+        Ok(Statement::DropUser {
+            span: start.to(name.span),
+            name,
+            if_exists,
+        })
+    }
+
+    fn parse_drop_role(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // ROLE
+        let if_exists = self.parse_optional_if_exists()?;
+        let name = self.parse_name()?;
+        Ok(Statement::DropRole {
+            span: start.to(name.span),
+            name,
+            if_exists,
+        })
+    }
+
+    /// `ALTER ROLE <role> ADD|DROP MEMBER <member>`.
+    fn parse_alter_role(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // ROLE
+        let name = self.parse_name()?;
+        let action = match self.peek_keyword().as_deref() {
+            Some("ADD") => {
+                self.bump();
+                RoleMemberAction::Add
+            }
+            Some("DROP") => {
+                self.bump();
+                RoleMemberAction::Drop
+            }
+            _ => {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+        };
+        self.expect_keyword("MEMBER")?;
+        let member = self.parse_name()?;
+        let span = start.to(member.span);
+        Ok(Statement::AlterRole {
+            name,
+            action,
+            member,
+            span,
+        })
+    }
+
+    /// Parses an optional leading `IF EXISTS`.
+    fn parse_optional_if_exists(&mut self) -> SqlResult<bool> {
+        if self.peek_keyword().as_deref() == Some("IF") {
+            self.bump();
+            self.expect_keyword("EXISTS")?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
     }
 
     /// `CREATE|ALTER FUNCTION <name> ( [params] ) RETURNS <type> AS <body>`.

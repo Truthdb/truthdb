@@ -145,6 +145,48 @@ pub enum Statement {
         if_exists: bool,
         span: Span,
     },
+    /// `CREATE USER <name> [FOR LOGIN <login>]`.
+    CreateUser(CreateUser),
+    /// `DROP USER [IF EXISTS] <name>`.
+    DropUser {
+        name: Name,
+        if_exists: bool,
+        span: Span,
+    },
+    /// `CREATE ROLE <name>`.
+    CreateRole {
+        name: Name,
+        span: Span,
+    },
+    /// `DROP ROLE [IF EXISTS] <name>`.
+    DropRole {
+        name: Name,
+        if_exists: bool,
+        span: Span,
+    },
+    /// `ALTER ROLE <role> ADD|DROP MEMBER <member>`.
+    AlterRole {
+        name: Name,
+        action: RoleMemberAction,
+        member: Name,
+        span: Span,
+    },
+}
+
+/// Whether `ALTER ROLE` adds or removes the named member.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RoleMemberAction {
+    Add,
+    Drop,
+}
+
+/// `CREATE USER <name> [FOR LOGIN <login>]`. A user with no `FOR LOGIN` clause is
+/// a user without a login (valid, but cannot authenticate through it).
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateUser {
+    pub name: Name,
+    pub for_login: Option<Name>,
+    pub span: Span,
 }
 
 /// `CREATE|ALTER LOGIN <name> WITH PASSWORD = '<pw>'` / `ALTER LOGIN <name>
