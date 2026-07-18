@@ -220,6 +220,9 @@ jobs:
       - name: Conformance — pytds parameterized (sp_executesql RPC)
         run: python3 scripts/tds_conformance_rpc.py 127.0.0.1 1433 sa secret
 
+      - name: Conformance — pytds user-procedure callproc (OUTPUT + RETURN status)
+        run: python3 scripts/tds_conformance_procs.py 127.0.0.1 1433 sa secret
+
       - name: Conformance — pytds prepared statements (sp_prepare family)
         run: python3 scripts/tds_conformance_prepared.py 127.0.0.1 1433 sa secret
 

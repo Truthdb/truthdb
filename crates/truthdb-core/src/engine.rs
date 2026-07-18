@@ -7908,6 +7908,72 @@ mod tests {
     }
 
     #[test]
+    fn trigger_writes_are_fully_undone_after_a_crash() {
+        let path = unique_temp_path("trg-crash-undo");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TABLE audit (id INT NOT NULL PRIMARY KEY)",
+        );
+        batch(
+            &engine,
+            &mut ctx,
+            "CREATE TRIGGER trg ON t AFTER INSERT AS INSERT INTO audit SELECT id FROM inserted",
+        );
+
+        // Session A: an explicit transaction whose INSERT fires the trigger
+        // (writing `audit`), never committed. The firing row and the trigger's
+        // write both stage on A's transaction.
+        let mut ctx_a = TxnContext::default();
+        batch(&engine, &mut ctx_a, "BEGIN TRAN; INSERT INTO t VALUES (99)");
+        assert!(ctx_a.has_open_transaction());
+        // A committed autocommit insert forces the WAL (including A's
+        // uncommitted records) to disk.
+        batch(
+            &engine,
+            &mut TxnContext::default(),
+            "INSERT INTO audit VALUES (1)",
+        );
+
+        // Crash: no graceful rollback.
+        drop(ctx_a);
+        drop(engine);
+
+        // Recovery undoes the loser A entirely — the whole statement, DML AND
+        // its trigger's write, is atomic: t=99 is gone and the trigger's
+        // audit=99 is gone; the separately-committed audit=1 survives.
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let engine = Engine::new(storage).expect("replay");
+        let out_t = batch(
+            &engine,
+            &mut TxnContext::default(),
+            "SELECT id FROM t ORDER BY id",
+        );
+        assert!(
+            ids(&out_t).is_empty(),
+            "the firing row must be undone after the crash"
+        );
+        let out_a = batch(
+            &engine,
+            &mut TxnContext::default(),
+            "SELECT id FROM audit ORDER BY id",
+        );
+        assert_eq!(
+            ids(&out_a),
+            vec![1],
+            "the trigger's write must be undone with the statement; the committed row survives"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn txn_statement_rollback_then_crash_recovers_cleanly() {
         // A statement rolled back to a savepoint writes CLRs; if the transaction
         // then crashes uncommitted, recovery must undo the surviving ops and SKIP
