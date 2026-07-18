@@ -451,13 +451,18 @@ impl RelRecord {
         }
     }
 
-    pub fn txn_commit(txn_id: u64, prev_lsn: u64) -> Self {
+    pub fn txn_commit(txn_id: u64, prev_lsn: u64, timestamp_millis: u64) -> Self {
         RelRecord {
             prev_lsn,
             txn_id,
             kind: REL_KIND_TXN_COMMIT,
             flags: 0,
-            redo: Vec::new(),
+            // The commit wall-clock time (millis since the Unix epoch), for
+            // point-in-time restore. It rides in `redo` so the record stays
+            // length-self-describing; recovery never redoes a commit record, so
+            // these bytes are inert to redo. Entry-version-1 commit records have
+            // an empty `redo` (no timestamp) and decode unchanged.
+            redo: timestamp_millis.to_le_bytes().to_vec(),
             undo: Vec::new(),
         }
     }
@@ -831,13 +836,21 @@ mod tests {
     fn txn_and_catalog_records_round_trip() {
         for record in [
             RelRecord::txn_begin(7),
-            RelRecord::txn_commit(7, 123),
+            RelRecord::txn_commit(7, 123, 1_700_000_000_000),
             RelRecord::txn_end(7, 456),
             RelRecord::set_catalog_root(99),
         ] {
             let decoded = RelRecord::decode(&record.encode()).expect("decode");
             assert_eq!(decoded, record);
         }
+        // The commit timestamp survives the encode/decode round-trip and lands
+        // in the commit record's redo.
+        let commit = RelRecord::txn_commit(7, 123, 1_700_000_000_000);
+        let decoded = RelRecord::decode(&commit.encode()).expect("decode");
+        assert_eq!(
+            u64::from_le_bytes(decoded.redo[..8].try_into().unwrap()),
+            1_700_000_000_000
+        );
         assert_eq!(
             RelRecord::set_catalog_root(99)
                 .decode_catalog_root()

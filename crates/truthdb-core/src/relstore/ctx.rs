@@ -23,7 +23,9 @@ use crate::storage_layout::{PAGE_SIZE, WAL_ENTRY_TYPE_REL};
 use crate::wal::WalWriter;
 use crate::wal::records::{PageOpRedo, PageOpUndo, RelRecord};
 
-const REL_WAL_ENTRY_VERSION: u16 = 1;
+// v2 adds a commit-record timestamp (in the commit's `redo`) for point-in-time
+// restore. Nothing gates on the version, so v1 records decode unchanged.
+const REL_WAL_ENTRY_VERSION: u16 = 2;
 
 /// Raw page I/O + WAL watermark for the buffer pool, over the data region.
 pub(crate) struct PoolIo<'a> {
@@ -223,7 +225,14 @@ impl RelCtx<'_> {
         // `Storage::ensure_durable` at the end of the batch, so one fsync serves
         // every commit in the window. The record must reach the disk before the
         // batch is acknowledged; nothing before that ack depends on it.
-        let commit_lsn = self.append(&RelRecord::txn_commit(txn.txn_id, txn.last_lsn), false)?;
+        let timestamp_millis = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        let commit_lsn = self.append(
+            &RelRecord::txn_commit(txn.txn_id, txn.last_lsn, timestamp_millis),
+            false,
+        )?;
         let _ = self.append(&RelRecord::txn_end(txn.txn_id, commit_lsn), false);
         Ok(commit_lsn)
     }
