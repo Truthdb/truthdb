@@ -1959,6 +1959,48 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn recovery_model_sets_persists_and_reports() {
+        let path = unique_temp_path("recovery-model");
+        let engine = new_engine(&path);
+        let model = |e: &Engine| sql_rows(e, "SELECT recovery_model_desc FROM sys.databases").1;
+
+        // SIMPLE is the default.
+        assert_eq!(model(&engine), vec![vec![Some("SIMPLE".into())]]);
+
+        engine
+            .execute("ALTER DATABASE CURRENT SET RECOVERY FULL")
+            .expect("set full");
+        assert_eq!(model(&engine), vec![vec![Some("FULL".into())]]);
+
+        // An unrelated option in the same statement family leaves it untouched.
+        engine
+            .execute("ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON")
+            .expect("rcsi on");
+        assert_eq!(model(&engine), vec![vec![Some("FULL".into())]]);
+        drop(engine);
+
+        // FULL persists across a reopen (the set is itself durable).
+        let engine2 = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("engine");
+        assert_eq!(model(&engine2), vec![vec![Some("FULL".into())]]);
+        assert_eq!(
+            sql_rows(
+                &engine2,
+                "SELECT is_read_committed_snapshot_on FROM sys.databases"
+            )
+            .1,
+            vec![vec![Some("1".into())]],
+            "RCSI survived alongside the recovery model"
+        );
+
+        engine2
+            .execute("ALTER DATABASE CURRENT SET RECOVERY SIMPLE")
+            .expect("set simple");
+        assert_eq!(model(&engine2), vec![vec![Some("SIMPLE".into())]]);
+        drop(engine2);
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Runs SQL expected to error and returns the SQL error message.
     fn sql_error_message(engine: &Engine, text: &str) -> String {
         let env = sql(engine, text);

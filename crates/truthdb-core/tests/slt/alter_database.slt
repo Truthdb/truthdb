@@ -9,10 +9,19 @@ ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON
 statement ok
 ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON, READ_COMMITTED_SNAPSHOT ON
 
-# Only the recognized options are accepted; anything else is a syntax error,
-# never a silent no-op (these options change what concurrent readers see).
-statement error
+# RECOVERY {FULL|SIMPLE} is recognized and persists (engine tests cover
+# sys.databases reporting and reopen durability).
+statement ok
+ALTER DATABASE CURRENT SET RECOVERY FULL
+
+statement ok
 ALTER DATABASE CURRENT SET RECOVERY SIMPLE
+
+# Only the recognized options are accepted; anything else is a syntax error,
+# never a silent no-op (these options change what concurrent readers see). An
+# unsupported RECOVERY mode and a non-ON/OFF value both error.
+statement error
+ALTER DATABASE CURRENT SET RECOVERY BULK_LOGGED
 
 statement error
 ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT MAYBE

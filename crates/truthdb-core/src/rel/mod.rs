@@ -6622,14 +6622,17 @@ fn exec_alter_database(
     }
     let mut rcsi = None;
     let mut allow_snapshot = None;
+    let mut recovery_full = None;
     for (option, on) in &alter.options {
         match option {
             DatabaseOption::ReadCommittedSnapshot => rcsi = Some(*on),
             DatabaseOption::AllowSnapshotIsolation => allow_snapshot = Some(*on),
+            // For Recovery the bool is the mode: true = FULL, false = SIMPLE.
+            DatabaseOption::Recovery => recovery_full = Some(*on),
         }
     }
     storage
-        .rel_set_db_options(rcsi, allow_snapshot)
+        .rel_set_db_options(rcsi, allow_snapshot, recovery_full)
         .map_err(|err| map_storage_err(err, &txn_ctx.database))?;
     Ok(StatementResult::Done)
 }
@@ -12354,7 +12357,14 @@ fn sys_databases(storage: &Storage, eval_ctx: &EvalContext) -> Source {
         Datum::NVarChar("SQL_Latin1_General_CP1_CI_AS".into()),
         Datum::NVarChar("MULTI_USER".into()),
         Datum::NVarChar("ONLINE".into()),
-        Datum::NVarChar("SIMPLE".into()),
+        Datum::NVarChar(
+            if storage.recovery_model_full() {
+                "FULL"
+            } else {
+                "SIMPLE"
+            }
+            .into(),
+        ),
         Datum::Int(storage.snapshot_isolation_allowed() as i32),
         Datum::Bit(storage.rcsi_enabled()),
         Datum::Bit(false),
