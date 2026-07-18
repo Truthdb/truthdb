@@ -11,10 +11,12 @@ pub mod login;
 pub mod packet;
 pub mod rpc;
 pub mod server;
+pub mod throttle;
 pub mod tls;
 pub mod token;
 pub mod typeinfo;
 
+use std::net::IpAddr;
 use std::sync::Arc;
 
 use tokio::net::{TcpListener, TcpStream};
@@ -23,12 +25,15 @@ use tracing::{debug, error, info};
 use truthdb_core::session::EngineHandle;
 
 pub use server::{Encryption, TdsConfig, serve_connection};
+pub use throttle::LoginThrottle;
 
 /// A TDS listener bound to an address; serves connections until shutdown.
 pub struct TdsListener {
     listener: TcpListener,
     engine: EngineHandle,
     config: Arc<TdsConfig>,
+    /// Per-`(login, IP)` brute-force throttle, shared across connections.
+    throttle: LoginThrottle,
 }
 
 impl TdsListener {
@@ -44,6 +49,7 @@ impl TdsListener {
             listener,
             engine,
             config: Arc::new(config),
+            throttle: LoginThrottle::new(),
         })
     }
 
@@ -63,8 +69,9 @@ impl TdsListener {
                     debug!(%peer, "TDS connection accepted");
                     let engine = self.engine.clone();
                     let config = Arc::clone(&self.config);
+                    let throttle = self.throttle.clone();
                     tokio::spawn(async move {
-                        if let Err(err) = handle(stream, engine, config).await {
+                        if let Err(err) = handle(stream, engine, config, throttle, peer.ip()).await {
                             debug!(%peer, error = %err, "TDS connection closed");
                         }
                     });
@@ -84,9 +91,11 @@ async fn handle(
     stream: TcpStream,
     engine: EngineHandle,
     config: Arc<TdsConfig>,
+    throttle: LoginThrottle,
+    peer: IpAddr,
 ) -> std::io::Result<()> {
     stream.set_nodelay(true).ok();
-    match serve_connection(stream, engine, config).await {
+    match serve_connection(stream, engine, config, throttle, peer).await {
         Ok(()) => Ok(()),
         Err(err) => {
             error!(error = %err, "TDS connection error");

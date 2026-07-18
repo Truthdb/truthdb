@@ -134,6 +134,23 @@ pub struct TableDef {
     /// key — it is a schema object with its own object_id, like a procedure.
     #[serde(default)]
     pub trigger: Option<TriggerDef>,
+    /// For a server-scoped LOGIN (SQL authentication principal): its hashed
+    /// password blob and disabled flag. A login is NOT a schema object — the
+    /// storage layer keeps these rows in a separate in-memory map so they never
+    /// appear in the object namespace (sys.tables, name resolution, DROP TABLE).
+    /// `None` for every schema object.
+    #[serde(default)]
+    pub principal: Option<PrincipalDef>,
+}
+
+/// A server principal's catalog payload. Today only SQL logins exist; the
+/// password blob is the versioned PBKDF2 hash from [`crate::auth`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PrincipalDef {
+    /// The versioned PBKDF2 credential blob (`v1$iters$salt$hash`).
+    pub password_blob: String,
+    /// `ALTER LOGIN ... DISABLE` sets this; a disabled login cannot authenticate.
+    pub is_disabled: bool,
 }
 
 /// A DML event a trigger can fire on.
@@ -236,6 +253,12 @@ impl TableDef {
     /// True if this catalog entry is a trigger.
     pub fn is_trigger(&self) -> bool {
         self.trigger.is_some()
+    }
+
+    /// True if this catalog entry is a server login (a principal, not a schema
+    /// object).
+    pub fn is_login(&self) -> bool {
+        self.principal.is_some()
     }
 }
 

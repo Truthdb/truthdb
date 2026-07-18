@@ -4,14 +4,19 @@
 //! path a real driver would (PRELOGIN, LOGIN7, SQLBatch, COLMETADATA, ROW,
 //! DONE, ERROR) without needing an external SQL Server driver.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
+use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
 use truthdb_core::engine::Engine;
 use truthdb_core::session::{EngineHandle, spawn_engine};
 use truthdb_core::storage::{Storage, StorageOptions};
+use truthdb_tds::LoginThrottle;
 use truthdb_tds::server::{TdsConfig, serve_connection};
+
+/// The loopback IP the in-process test client presents to the server.
+const TEST_PEER: IpAddr = IpAddr::V4(Ipv4Addr::LOCALHOST);
 
 // Packet types.
 const PKT_SQL_BATCH: u8 = 0x01;
@@ -40,16 +45,19 @@ fn engine(path: &std::path::Path) -> EngineHandle {
         default_collation: None,
     };
     let storage = Storage::create(path.to_path_buf(), opts).expect("storage");
-    // The JoinHandle is dropped; the engine thread exits when the last
+    // Seed the login the tests authenticate as (sa/secret) into the catalog
+    // before the engine thread starts — auth is catalog-backed now, not from
+    // config. The JoinHandle is dropped; the engine thread exits when the last
     // EngineHandle drops at end of test.
-    spawn_engine(Engine::new(storage).expect("engine")).0
+    let engine = Engine::new(storage).expect("engine");
+    let mut users = BTreeMap::new();
+    users.insert("sa".to_string(), "secret".to_string());
+    engine.migrate_logins(&users).expect("seed logins");
+    spawn_engine(engine).0
 }
 
 fn config() -> TdsConfig {
-    let mut users = HashMap::new();
-    users.insert("sa".to_string(), "secret".to_string());
     TdsConfig {
-        users,
         database: "truthdb".to_string(),
         tls: None,
         encryption: truthdb_tds::Encryption::default(),
@@ -301,6 +309,7 @@ enum Token {
     Row(Vec<Cell>),
     Error {
         number: i32,
+        state: u8,
     },
     Info {
         number: i32,
@@ -372,7 +381,9 @@ fn parse_tokens(payload: &[u8]) -> Vec<Token> {
                 let body = &payload[i + 2..i + 2 + len];
                 if token == 0xaa {
                     let number = i32::from_le_bytes(body[0..4].try_into().unwrap());
-                    tokens.push(Token::Error { number });
+                    // ERROR token (MS-TDS 2.2.7.10): Number(4), State(1), Class(1)…
+                    let state = body[4];
+                    tokens.push(Token::Error { number, state });
                 } else if token == 0xab {
                     let number = i32::from_le_bytes(body[0..4].try_into().unwrap());
                     tokens.push(Token::Info { number });
@@ -596,10 +607,18 @@ fn parse_row(bytes: &[u8], meta: &[ColType]) -> (Vec<Cell>, usize) {
 }
 
 async fn connect_with(engine: EngineHandle, cfg: TdsConfig) -> Client {
+    connect_with_throttle(engine, cfg, LoginThrottle::new()).await
+}
+
+async fn connect_with_throttle(
+    engine: EngineHandle,
+    cfg: TdsConfig,
+    throttle: LoginThrottle,
+) -> Client {
     let (client_half, server_half) = tokio::io::duplex(64 * 1024);
     let cfg = Arc::new(cfg);
     tokio::spawn(async move {
-        let _ = serve_connection(server_half, engine, cfg).await;
+        let _ = serve_connection(server_half, engine, cfg, throttle, TEST_PEER).await;
     });
     Client {
         stream: client_half,
@@ -608,15 +627,7 @@ async fn connect_with(engine: EngineHandle, cfg: TdsConfig) -> Client {
 }
 
 async fn connect(engine: EngineHandle) -> Client {
-    let (client_half, server_half) = tokio::io::duplex(64 * 1024);
-    let cfg = Arc::new(config());
-    tokio::spawn(async move {
-        let _ = serve_connection(server_half, engine, cfg).await;
-    });
-    Client {
-        stream: client_half,
-        tran_descriptor: 0,
-    }
+    connect_with(engine, config()).await
 }
 
 /// Reads the ENCRYPTION option out of a PRELOGIN response.
@@ -748,11 +759,29 @@ async fn full_handshake_query_and_error() {
     let dup = client.batch("INSERT INTO t VALUES (1, 'x', 1)").await;
     assert!(
         dup.iter()
-            .any(|t| matches!(t, Token::Error { number: 2627 })),
+            .any(|t| matches!(t, Token::Error { number: 2627, .. })),
         "dup tokens: {dup:?}"
     );
 
     let _ = std::fs::remove_file(path);
+}
+
+/// The single 18456 error a login failure must produce: number 18456, wire
+/// state 1, and NO LoginAck. Returns the matched error's state for equality
+/// checks across failure kinds.
+fn assert_login_denied(tokens: &[Token]) -> u8 {
+    assert!(
+        !tokens.iter().any(|t| matches!(t, Token::LoginAck)),
+        "a denied login must not ack: {tokens:?}"
+    );
+    let state = tokens.iter().find_map(|t| match t {
+        Token::Error {
+            number: 18456,
+            state,
+        } => Some(*state),
+        _ => None,
+    });
+    state.unwrap_or_else(|| panic!("expected an 18456 error: {tokens:?}"))
 }
 
 #[tokio::test]
@@ -763,11 +792,102 @@ async fn login_failure_reports_18456() {
 
     client.prelogin().await;
     let tokens = client.login("sa", "wrong-password").await;
+    // SQL Server sanitizes the wire state to 1 for every login failure.
+    assert_eq!(assert_login_denied(&tokens), 1, "tokens: {tokens:?}");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn unknown_user_is_indistinguishable_from_a_wrong_password() {
+    // Username enumeration defense: a non-existent login and a real login with
+    // the wrong password must produce the SAME wire response (18456, state 1).
+    let path = temp_path("login-enum");
+    let engine = engine(&path);
+
+    let mut c1 = connect(engine.clone()).await;
+    c1.prelogin().await;
+    let wrong_pw = c1.login("sa", "definitely-not-secret").await;
+
+    let mut c2 = connect(engine).await;
+    c2.prelogin().await;
+    let no_such = c2.login("nobody-here", "whatever").await;
+
+    assert_eq!(assert_login_denied(&wrong_pw), 1);
+    assert_eq!(assert_login_denied(&no_such), 1);
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_migrated_login_authenticates_with_its_configured_password() {
+    // The engine() helper migrated sa=secret; the correct password logs in.
+    let path = temp_path("login-ok");
+    let engine = engine(&path);
+    let mut client = connect(engine).await;
+    client.prelogin().await;
+    let tokens = client.login("sa", "secret").await;
+    assert!(tokens.contains(&Token::LoginAck), "tokens: {tokens:?}");
+    assert!(!tokens.iter().any(|t| matches!(t, Token::Error { .. })));
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn a_disabled_login_cannot_authenticate_even_with_the_right_password() {
+    // CREATE a login, then DISABLE it: the correct password is still rejected,
+    // with the same generic 18456/state 1 as any other failure.
+    let path = temp_path("login-disabled");
+    let engine = engine(&path);
+    let mut admin = connect(engine.clone()).await;
+    admin.prelogin().await;
+    admin.login("sa", "secret").await;
+    admin
+        .batch("CREATE LOGIN app WITH PASSWORD = 'app-secret'")
+        .await;
+
+    // Enabled: the password works.
+    let mut ok = connect(engine.clone()).await;
+    ok.prelogin().await;
     assert!(
-        tokens
-            .iter()
-            .any(|t| matches!(t, Token::Error { number: 18456 })),
-        "tokens: {tokens:?}"
+        ok.login("app", "app-secret")
+            .await
+            .contains(&Token::LoginAck),
+        "enabled login should authenticate"
+    );
+
+    admin.batch("ALTER LOGIN app DISABLE").await;
+
+    // Disabled: the same correct password is now rejected, generically.
+    let mut denied = connect(engine).await;
+    denied.prelogin().await;
+    let tokens = denied.login("app", "app-secret").await;
+    assert_eq!(assert_login_denied(&tokens), 1, "tokens: {tokens:?}");
+    let _ = std::fs::remove_file(path);
+}
+
+#[tokio::test]
+async fn repeated_failures_from_one_pair_are_throttled() {
+    // A shared throttle across connections: after the free attempts, the next
+    // failure is delayed measurably. Keeps the delay small (backoff base) so
+    // the test stays fast while still proving the throttle is wired in.
+    let path = temp_path("login-throttle");
+    let engine = engine(&path);
+    let throttle = LoginThrottle::new();
+
+    // Burn the free attempts (each a fresh connection sharing the throttle).
+    for _ in 0..4 {
+        let mut c = connect_with_throttle(engine.clone(), config(), throttle.clone()).await;
+        c.prelogin().await;
+        let _ = c.login("sa", "nope").await;
+    }
+    // The next attempt is now delayed before the response arrives.
+    let mut c = connect_with_throttle(engine.clone(), config(), throttle.clone()).await;
+    c.prelogin().await;
+    let start = std::time::Instant::now();
+    let tokens = c.login("sa", "nope").await;
+    let elapsed = start.elapsed();
+    assert_eq!(assert_login_denied(&tokens), 1);
+    assert!(
+        elapsed >= std::time::Duration::from_millis(80),
+        "throttled attempt returned in {elapsed:?}, expected a backoff delay"
     );
     let _ = std::fs::remove_file(path);
 }
@@ -925,7 +1045,7 @@ async fn a_multi_rpc_request_answers_each_rpc_in_one_response() {
     assert!(
         tokens
             .iter()
-            .any(|t| matches!(t, Token::Error { number: 8179 })),
+            .any(|t| matches!(t, Token::Error { number: 8179, .. })),
         "tokens: {tokens:?}"
     );
     assert_eq!(row_ints(&tokens), [3], "tokens: {tokens:?}");
@@ -950,7 +1070,7 @@ async fn a_multi_rpc_request_answers_each_rpc_in_one_response() {
     assert!(
         tokens
             .iter()
-            .any(|t| matches!(t, Token::Error { number: 2812 })),
+            .any(|t| matches!(t, Token::Error { number: 2812, .. })),
         "tokens: {tokens:?}"
     );
     assert_eq!(row_ints(&tokens), [4], "tokens: {tokens:?}");
@@ -1123,7 +1243,7 @@ async fn rpc_by_name_unknown_proc_is_2812() {
     assert!(
         tokens
             .iter()
-            .any(|t| matches!(t, Token::Error { number: 2812 })),
+            .any(|t| matches!(t, Token::Error { number: 2812, .. })),
         "tokens: {tokens:?}"
     );
     assert!(
@@ -1223,7 +1343,7 @@ async fn rpc_by_name_completed_proc_with_warning_still_returns_tail() {
     assert!(
         tokens
             .iter()
-            .any(|t| matches!(t, Token::Error { number: 50000 })),
+            .any(|t| matches!(t, Token::Error { number: 50000, .. })),
         "tokens: {tokens:?}"
     );
     assert!(
@@ -1291,7 +1411,7 @@ async fn rpc_by_name_out_of_range_return_is_8115() {
     assert!(
         tokens
             .iter()
-            .any(|t| matches!(t, Token::Error { number: 8115 })),
+            .any(|t| matches!(t, Token::Error { number: 8115, .. })),
         "tokens: {tokens:?}"
     );
     // The procedure aborted, so no clean status and no OUTPUT are reported.
@@ -1392,7 +1512,7 @@ async fn use_statement_emits_the_database_envchange() {
     assert!(
         tokens
             .iter()
-            .any(|t| matches!(t, Token::Error { number: 911 })),
+            .any(|t| matches!(t, Token::Error { number: 911, .. })),
         "a wrong database is 911: {tokens:?}"
     );
     assert!(
@@ -1451,7 +1571,7 @@ async fn fatal_severity_closes_the_connection() {
     assert!(
         tokens
             .iter()
-            .any(|t| matches!(t, Token::Error { number: 50000 })),
+            .any(|t| matches!(t, Token::Error { number: 50000, .. })),
         "the fatal error is delivered first: {tokens:?}"
     );
     // The server hangs up: the next read is EOF (no reply will ever come).
@@ -1492,7 +1612,7 @@ async fn review_poc_fatal_inside_an_rpc_closes_the_connection() {
     assert!(
         tokens
             .iter()
-            .any(|t| matches!(t, Token::Error { number: 50000 })),
+            .any(|t| matches!(t, Token::Error { number: 50000, .. })),
         "the fatal error is delivered: {tokens:?}"
     );
     let mut byte = [0u8; 1];
@@ -1528,7 +1648,7 @@ async fn review_poc_fatal_in_a_multi_rpc_request_skips_the_rest() {
     assert!(
         tokens
             .iter()
-            .any(|t| matches!(t, Token::Error { number: 50000 })),
+            .any(|t| matches!(t, Token::Error { number: 50000, .. })),
         "the fatal error is delivered: {tokens:?}"
     );
     assert!(

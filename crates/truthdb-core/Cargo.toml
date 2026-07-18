@@ -17,6 +17,9 @@ libc = { workspace = true }
 io-uring = { workspace = true }
 icu_collator = { version = "2.2", features = ["compiled_data", "unstable"] }
 icu_locale_core = "2.0"
+# PBKDF2-HMAC-SHA256 for login password hashing. Already in the tree via rustls
+# (truthdb-tds), so this is a manifest entry only — zero new compiled crates.
+ring = "0.17"
 
 [dev-dependencies]
 rstest = { workspace = true }

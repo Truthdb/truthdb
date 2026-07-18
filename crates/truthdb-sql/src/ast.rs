@@ -136,6 +136,30 @@ pub enum Statement {
         if_exists: bool,
         span: Span,
     },
+    /// `CREATE|ALTER LOGIN <name> WITH PASSWORD = '<pw>'` or `ALTER LOGIN <name>
+    /// {ENABLE | DISABLE}` — a SQL-authentication server login.
+    CreateLogin(CreateLogin),
+    /// `DROP LOGIN [IF EXISTS] <name>`.
+    DropLogin {
+        name: Name,
+        if_exists: bool,
+        span: Span,
+    },
+}
+
+/// `CREATE|ALTER LOGIN <name> WITH PASSWORD = '<pw>'` / `ALTER LOGIN <name>
+/// {ENABLE | DISABLE}`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CreateLogin {
+    pub name: Name,
+    /// The plaintext password to hash. `Some` for CREATE and for ALTER ... WITH
+    /// PASSWORD; `None` for an ALTER that only toggles enabled/disabled.
+    pub password: Option<String>,
+    /// `Some(true)` = DISABLE, `Some(false)` = ENABLE, `None` = unchanged.
+    pub disable: Option<bool>,
+    /// `ALTER LOGIN` replaces an existing login's payload.
+    pub alter: bool,
+    pub span: Span,
 }
 
 /// `CREATE|ALTER TRIGGER <name> ON <table> AFTER <events> AS <body>`.

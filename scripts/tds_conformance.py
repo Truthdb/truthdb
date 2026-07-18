@@ -246,6 +246,34 @@ def main() -> int:
         print("FAIL: NVARCHAR(MAX) equality predicate")
         return 1
 
+    # Stage 16: catalog-backed authentication end to end, via an independent
+    # driver. A login created over the wire authenticates a *fresh* connection;
+    # a wrong password is refused; disabling it refuses even the right password.
+    cur.execute("CREATE LOGIN conf_login WITH PASSWORD = 'Conf-Pass-1'")
+    probe = pytds.connect(host, "truthdb", "conf_login", "Conf-Pass-1",
+                          port=port, login_timeout=10, autocommit=True)
+    pcur = probe.cursor()
+    pcur.execute("SELECT SUSER_SNAME()")
+    if pcur.fetchone()[0] != "conf_login":
+        print("FAIL: created login's SUSER_SNAME mismatch")
+        return 1
+    probe.close()
+    try:
+        pytds.connect(host, "truthdb", "conf_login", "wrong-pass",
+                      port=port, login_timeout=10)
+        print("FAIL: created login accepted a wrong password")
+        return 1
+    except pytds.Error:
+        pass  # expected
+    cur.execute("ALTER LOGIN conf_login DISABLE")
+    try:
+        pytds.connect(host, "truthdb", "conf_login", "Conf-Pass-1",
+                      port=port, login_timeout=10)
+        print("FAIL: disabled login still authenticated")
+        return 1
+    except pytds.Error:
+        pass  # expected
+
     conn.close()
     print("tds conformance: OK")
     return 0

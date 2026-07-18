@@ -15,10 +15,11 @@ mod value;
 
 use truthdb_sql::ast::{
     AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateFunction,
-    CreateIndex, CreateProcedure, CreateTable, CreateTrigger, CreateView, DataType, DatabaseOption,
-    Declaration, Delete, DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind, ForeignKey,
-    Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem, RaiseError, ReturnsClause,
-    Select, SelectItem, SetStatement, Statement, TableRef, ThrowArgs, ThrowStatement, Update,
+    CreateIndex, CreateLogin, CreateProcedure, CreateTable, CreateTrigger, CreateView, DataType,
+    DatabaseOption, Declaration, Delete, DropIndex, DropTable, DropView, ExecStatement, Expr,
+    ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem,
+    RaiseError, ReturnsClause, Select, SelectItem, SetStatement, Statement, TableRef, ThrowArgs,
+    ThrowStatement, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -32,7 +33,8 @@ use xxhash_rust::xxh64::xxh64;
 use crate::lock::{LockMode, Resource};
 use crate::relstore::btree::ScanCursor;
 use crate::relstore::catalog::{
-    self, FunctionDef, FunctionReturns, ProcParamDef, ProcedureDef, TableDef, TriggerDef,
+    self, FunctionDef, FunctionReturns, PrincipalDef, ProcParamDef, ProcedureDef, TableDef,
+    TriggerDef,
 };
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
@@ -2402,6 +2404,8 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::DropFunction { .. }
             | Statement::CreateTrigger(_)
             | Statement::DropTrigger { .. }
+            | Statement::CreateLogin(_)
+            | Statement::DropLogin { .. }
             | Statement::Commit { .. }
     )
 }
@@ -3072,7 +3076,9 @@ fn analyze_statements_locks(
             | Statement::CreateFunction(_)
             | Statement::DropFunction { .. }
             | Statement::CreateTrigger(_)
-            | Statement::DropTrigger { .. } => {
+            | Statement::DropTrigger { .. }
+            | Statement::CreateLogin(_)
+            | Statement::DropLogin { .. } => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // IF/WHILE conditions read tables through their subqueries —
@@ -3256,6 +3262,20 @@ fn exec_statement_dispatch(
                 return Err(ddl_in_txn_err());
             }
             exec_drop_trigger(storage, name, *if_exists)
+        }
+        Statement::CreateLogin(create) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_login(storage, create)
+        }
+        Statement::DropLogin {
+            name, if_exists, ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_login(storage, name, *if_exists)
         }
         // Executed by `run_block`'s own arms; nothing routes them here.
         Statement::Block { .. }
@@ -5713,6 +5733,86 @@ fn exec_drop_trigger(
             ),
         )),
     }
+}
+
+/// `CREATE|ALTER LOGIN <name> WITH PASSWORD = '<pw>'` / `ALTER LOGIN <name>
+/// {ENABLE | DISABLE}`. Logins are server principals in their own namespace
+/// (disjoint from schema objects); the password is hashed here (on the worker —
+/// CREATE/ALTER LOGIN is rare admin DDL, unlike verification which runs off the
+/// worker per connection).
+fn exec_create_login(storage: &Storage, create: &CreateLogin) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&create.name.value);
+    if create.alter {
+        let Some(existing) = storage.rel_login(bare) else {
+            return Err(SqlError::new(
+                15151,
+                16,
+                1,
+                format!(
+                    "Cannot alter the login '{bare}', because it does not exist or you do not have permission."
+                ),
+            )
+            .at(create.name.span));
+        };
+        let mut principal = existing
+            .principal
+            .clone()
+            .expect("rel_login returns a login");
+        if let Some(password) = &create.password {
+            principal.password_blob = crate::auth::hash_password(password);
+        }
+        if let Some(disable) = create.disable {
+            principal.is_disabled = disable;
+        }
+        storage
+            .rel_alter_login(bare, principal)
+            .map_err(|e| map_storage_err(e, &create.name.value))?;
+        return Ok(StatementResult::Done);
+    }
+    if storage.rel_login(bare).is_some() {
+        return Err(SqlError::new(
+            15025,
+            16,
+            1,
+            format!("The server principal '{bare}' already exists."),
+        )
+        .at(create.name.span));
+    }
+    let password = create
+        .password
+        .as_ref()
+        .expect("CREATE LOGIN carries a password (parser-enforced)");
+    let principal = PrincipalDef {
+        password_blob: crate::auth::hash_password(password),
+        is_disabled: create.disable.unwrap_or(false),
+    };
+    storage
+        .rel_create_login(bare, principal)
+        .map_err(|e| map_storage_err(e, &create.name.value))?;
+    Ok(StatementResult::Done)
+}
+
+fn exec_drop_login(
+    storage: &Storage,
+    name: &Name,
+    if_exists: bool,
+) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&name.value);
+    let dropped = storage
+        .rel_drop_login(bare)
+        .map_err(|e| map_storage_err(e, &name.value))?;
+    if !dropped && !if_exists {
+        return Err(SqlError::new(
+            15151,
+            16,
+            1,
+            format!(
+                "Cannot drop the login '{bare}', because it does not exist or you do not have permission."
+            ),
+        )
+        .at(name.span));
+    }
+    Ok(StatementResult::Done)
 }
 
 /// Resolves the AFTER triggers to fire for a DML on `target_name` for `event`,
@@ -10728,6 +10828,8 @@ fn build_table_source(
         "sys.procedures" => sys_procedures(storage),
         "sys.triggers" => sys_triggers(storage),
         "sys.trigger_events" => sys_trigger_events(storage),
+        "sys.server_principals" => sys_server_principals(storage),
+        "sys.sql_logins" => sys_sql_logins(storage),
         "sys.parameters" => sys_parameters(storage),
         "sys.objects" => sys_objects(storage),
         "sys.sql_modules" => sys_sql_modules(storage),
@@ -11947,6 +12049,67 @@ fn sys_trigger_events(storage: &Storage) -> Source {
             ]);
         }
     }
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_server_principals(storage: &Storage) -> Source {
+    let columns = vec![
+        nvarchar("name", 128),
+        int_col("principal_id"),
+        nvarchar("type", 1),
+        nvarchar("type_desc", 60),
+        int_col("is_disabled"),
+    ];
+    let rows = storage
+        .rel_logins()
+        .into_iter()
+        .filter_map(|def| {
+            let principal = def.principal.as_ref()?;
+            Some(vec![
+                Datum::NVarChar(def.name.clone()),
+                Datum::Int(def.object_id as i32),
+                // Only SQL logins exist today: type 'S' / SQL_LOGIN.
+                Datum::NVarChar("S".to_string()),
+                Datum::NVarChar("SQL_LOGIN".to_string()),
+                Datum::Int(i32::from(principal.is_disabled)),
+            ])
+        })
+        .collect();
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_sql_logins(storage: &Storage) -> Source {
+    let columns = vec![
+        nvarchar("name", 128),
+        int_col("principal_id"),
+        int_col("is_disabled"),
+    ];
+    let rows = storage
+        .rel_logins()
+        .into_iter()
+        .filter_map(|def| {
+            let principal = def.principal.as_ref()?;
+            Some(vec![
+                Datum::NVarChar(def.name.clone()),
+                Datum::Int(def.object_id as i32),
+                Datum::Int(i32::from(principal.is_disabled)),
+            ])
+        })
+        .collect();
     let collations = vec![None; columns.len()];
     let qualifiers = vec![None; columns.len()];
     Source {

@@ -108,6 +108,87 @@ impl Engine {
         }
     }
 
+    /// Reads a login's stored credential for the TDS handshake. This is a
+    /// session-less catalog read: the handshake runs before any session or
+    /// transaction exists. Returns `None` when no such login is registered.
+    pub fn lookup_login(&self, name: &str) -> Option<crate::session::LoginRecord> {
+        let def = self.storage.rel_login(name)?;
+        let principal = def.principal?;
+        Some(crate::session::LoginRecord {
+            principal_id: def.object_id,
+            name: def.name,
+            password_blob: principal.password_blob,
+            is_disabled: principal.is_disabled,
+        })
+    }
+
+    /// First-boot migration of config-file `[tds.auth]` users into catalog
+    /// logins. Each configured user becomes an enabled login; `sa` is always
+    /// ensured — enabled with its configured password, or, when the config
+    /// supplied none, created DISABLED with an unguessable random password so the
+    /// principal exists (SUSER_SNAME, the dbo↔sa mapping) but cannot authenticate
+    /// until an admin resets it over the unauthenticated native admin protocol.
+    /// After this runs, `[tds.auth]` is dead for authentication: the catalog is
+    /// authoritative, and a login is created here only if it does not already
+    /// exist. Returns the names created, for startup logging.
+    ///
+    /// `sa` is created LAST and doubles as the completion marker: the migration
+    /// is skipped entirely once `sa` exists. Because ARIES recovery restores only
+    /// a contiguous durable prefix of the log, `sa` present after a crash implies
+    /// every login written before it is durable too — so a crash mid-migration
+    /// leaves `sa` absent and the whole thing simply re-runs, with the
+    /// per-login existence check making that re-run idempotent (it also collapses
+    /// a case-variant duplicate config key onto the first-seen login rather than
+    /// erroring). This runs before the engine thread is spawned, single-threaded.
+    pub fn migrate_logins(
+        &self,
+        config_users: &BTreeMap<String, String>,
+    ) -> Result<Vec<String>, EngineError> {
+        if self.storage.rel_login("sa").is_some() {
+            return Ok(Vec::new());
+        }
+        let mut created = Vec::new();
+        let mut sa_password: Option<&String> = None;
+        for (name, password) in config_users {
+            if name.eq_ignore_ascii_case("sa") {
+                sa_password = Some(password);
+                continue; // ensured last, as the completion marker
+            }
+            if self.storage.rel_login(name).is_some() {
+                continue; // already migrated (idempotent re-run or case-dup key)
+            }
+            self.storage.rel_create_login(
+                name,
+                crate::relstore::catalog::PrincipalDef {
+                    password_blob: crate::auth::hash_password(password),
+                    is_disabled: false,
+                },
+            )?;
+            created.push(name.clone());
+        }
+        let (password_blob, is_disabled, label) = match sa_password {
+            Some(password) => (
+                crate::auth::hash_password(password),
+                false,
+                "sa".to_string(),
+            ),
+            None => (
+                crate::auth::hash_random_password(),
+                true,
+                "sa (disabled — no password configured)".to_string(),
+            ),
+        };
+        self.storage.rel_create_login(
+            "sa",
+            crate::relstore::catalog::PrincipalDef {
+                password_blob,
+                is_disabled,
+            },
+        )?;
+        created.push(label);
+        Ok(created)
+    }
+
     /// Runs a search against an index and renders the hits.
     fn render_search(
         meta: &EngineMeta,
@@ -6647,6 +6728,158 @@ mod tests {
             out.error.is_none(),
             "the orphaned trigger name must be reusable: {:?}",
             out.error
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn create_login_persists_survives_restart_and_stays_out_of_the_object_namespace() {
+        let path = unique_temp_path("login-ddl");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE LOGIN alice WITH PASSWORD = 'S3cret!'")
+            .expect("create login");
+        // sys.server_principals shows it as a SQL login.
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT name, type, is_disabled FROM sys.server_principals WHERE name = 'alice'",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![
+                Some("alice".to_string()),
+                Some("S".to_string()),
+                Some("0".to_string())
+            ]],
+            "the login appears in sys.server_principals"
+        );
+        // It is NOT a schema object: not in sys.tables, not queryable as a table.
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT COUNT(*) AS n FROM sys.tables WHERE name = 'alice'",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".to_string())]],
+            "a login is not a table"
+        );
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "SELECT * FROM alice");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(208),
+            "a login name is not a queryable object: {:?}",
+            out.error
+        );
+        // Survives a restart (persisted in the catalog b-tree).
+        drop(engine);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let engine = Engine::new(storage).expect("replay");
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT name FROM sys.server_principals WHERE name = 'alice'",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Some("alice".to_string())]],
+            "the login survives restart"
+        );
+
+        // ALTER LOGIN ... DISABLE.
+        engine
+            .execute("ALTER LOGIN alice DISABLE")
+            .expect("disable");
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT is_disabled FROM sys.sql_logins WHERE name = 'alice'",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Some("1".to_string())]],
+            "ALTER DISABLE sets is_disabled"
+        );
+
+        // DROP LOGIN.
+        engine.execute("DROP LOGIN alice").expect("drop login");
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT COUNT(*) AS n FROM sys.server_principals WHERE name = 'alice'",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".to_string())]],
+            "DROP LOGIN removes it"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrate_logins_is_idempotent_ensures_sa_last_and_survives_config_case_dups() {
+        use std::collections::BTreeMap;
+        let path = unique_temp_path("login-migrate");
+        let engine = new_engine(&path);
+
+        // Case-variant duplicate keys and a lowercase app user; NO sa configured.
+        // The dup must NOT error the migration — the second is collapsed onto the
+        // first-seen login (names are case-insensitive) — and sa is created LAST,
+        // disabled, because no password was configured.
+        let mut users = BTreeMap::new();
+        users.insert("Admin".to_string(), "p1".to_string());
+        users.insert("admin".to_string(), "p2".to_string());
+        users.insert("app".to_string(), "app-pw".to_string());
+        let created = engine.migrate_logins(&users).expect("first migration");
+        assert!(
+            created.iter().any(|c| c.starts_with("sa (disabled")),
+            "sa is ensured disabled when unconfigured: {created:?}"
+        );
+
+        // Exactly one of the case-variant admins exists (the first-sorted, Admin),
+        // plus app and sa — the dup did not create a second principal.
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT name, is_disabled FROM sys.server_principals ORDER BY name",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("Admin".to_string()), Some("0".to_string())],
+                vec![Some("app".to_string()), Some("0".to_string())],
+                vec![Some("sa".to_string()), Some("1".to_string())],
+            ],
+            "case-dup collapsed to one login; sa present and disabled: {rows:?}"
+        );
+
+        // Idempotent: a second run is a no-op (sa exists → the whole thing skips),
+        // and it does NOT resurrect a login the admin dropped.
+        engine.execute("DROP LOGIN app").expect("drop app");
+        let again = engine.migrate_logins(&users).expect("second migration");
+        assert!(again.is_empty(), "re-run is a no-op: {again:?}");
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT COUNT(*) AS n FROM sys.server_principals WHERE name = 'app'",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".to_string())]],
+            "a dropped login is not resurrected by re-migration"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn migrate_logins_uses_the_configured_sa_password_and_enables_it() {
+        use std::collections::BTreeMap;
+        let path = unique_temp_path("login-migrate-sa");
+        let engine = new_engine(&path);
+        let mut users = BTreeMap::new();
+        users.insert("sa".to_string(), "secret".to_string());
+        engine.migrate_logins(&users).expect("migration");
+        let rec = engine.lookup_login("sa").expect("sa exists");
+        assert!(!rec.is_disabled, "configured sa is enabled");
+        assert_eq!(
+            crate::auth::verify_password(&rec.password_blob, "secret"),
+            crate::auth::VerifyOutcome::Ok,
+            "sa authenticates with its configured password"
         );
         let _ = std::fs::remove_file(path);
     }

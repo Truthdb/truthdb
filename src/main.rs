@@ -93,6 +93,26 @@ async fn main() {
             return;
         }
     };
+    // First boot migrates `[tds.auth]` config users into catalog logins (and
+    // always ensures `sa`), then config auth is dead. Runs before the engine
+    // thread is spawned — single-threaded, no session — and is a no-op once any
+    // login already exists. A sorted map gives deterministic object-id order.
+    let config_users: std::collections::BTreeMap<String, String> =
+        config.tds.auth.clone().into_iter().collect();
+    match engine.migrate_logins(&config_users) {
+        Ok(created) if !created.is_empty() => {
+            info!(
+                "Migrated {} login(s) into the catalog: {}",
+                created.len(),
+                created.join(", ")
+            );
+        }
+        Ok(_) => {}
+        Err(err) => {
+            eprintln!("Failed to migrate config logins: {err}");
+            return;
+        }
+    }
     // The engine runs on its own thread behind a message channel; the async
     // listeners talk to it through a cloneable handle.
     let (engine, engine_join) = truthdb_core::session::spawn_engine(engine);
@@ -147,7 +167,6 @@ async fn main() {
             info!("TDS encryption = \"off\": the configured certificate will not be offered");
         }
         let tds_config = truthdb_tds::TdsConfig {
-            users: config.tds.auth.clone(),
             database: config.tds.database.clone(),
             tls,
             encryption,
