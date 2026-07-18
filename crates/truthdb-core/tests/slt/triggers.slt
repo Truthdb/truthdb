@@ -73,8 +73,8 @@ CREATE VIEW v AS SELECT id FROM t
 statement error
 CREATE TRIGGER trg_bad ON v AFTER INSERT AS INSERT INTO audit SELECT id, 'x' FROM inserted
 
-# INSTEAD OF triggers are not supported.
-statement error
+# INSTEAD OF triggers fire in place of the DML.
+statement ok
 CREATE TRIGGER trg_io ON t INSTEAD OF INSERT AS INSERT INTO audit SELECT id, 'io' FROM inserted
 
 # DROP TRIGGER IF EXISTS on a missing trigger is a no-op.

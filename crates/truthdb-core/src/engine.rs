@@ -6840,6 +6840,92 @@ mod tests {
     }
 
     #[test]
+    fn instead_of_triggers_replace_the_dml() {
+        let path = unique_temp_path("instead-of");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE ilog (n INT NOT NULL PRIMARY KEY)")
+            .expect("ilog");
+
+        // INSTEAD OF INSERT: the base insert is bypassed; the body logs `inserted`.
+        engine
+            .execute("CREATE TABLE ti (id INT NOT NULL PRIMARY KEY)")
+            .expect("ti");
+        engine
+            .execute("CREATE TRIGGER trg_i ON ti INSTEAD OF INSERT AS INSERT INTO ilog SELECT id FROM inserted")
+            .expect("io insert");
+        engine.execute("INSERT INTO ti VALUES (5)").expect("insert");
+        assert_eq!(
+            sql_rows(&engine, "SELECT COUNT(*) FROM ti").1,
+            vec![vec![Some("0".into())]],
+            "INSTEAD OF INSERT bypassed the base insert"
+        );
+
+        // INSTEAD OF DELETE: base delete bypassed; body logs `deleted` (+100).
+        engine
+            .execute("CREATE TABLE td (id INT NOT NULL PRIMARY KEY)")
+            .expect("td");
+        engine
+            .execute("INSERT INTO td VALUES (7)")
+            .expect("seed td");
+        engine
+            .execute("CREATE TRIGGER trg_d ON td INSTEAD OF DELETE AS INSERT INTO ilog SELECT id + 100 FROM deleted")
+            .expect("io delete");
+        engine
+            .execute("DELETE FROM td WHERE id = 7")
+            .expect("delete");
+        assert_eq!(
+            sql_rows(&engine, "SELECT COUNT(*) FROM td").1,
+            vec![vec![Some("1".into())]],
+            "INSTEAD OF DELETE bypassed the base delete"
+        );
+
+        // INSTEAD OF UPDATE: base update bypassed; body logs `inserted` (new v).
+        engine
+            .execute("CREATE TABLE tu (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("tu");
+        engine
+            .execute("INSERT INTO tu VALUES (1, 3)")
+            .expect("seed tu");
+        engine
+            .execute("CREATE TRIGGER trg_u ON tu INSTEAD OF UPDATE AS INSERT INTO ilog SELECT v FROM inserted")
+            .expect("io update");
+        engine
+            .execute("UPDATE tu SET v = 42 WHERE id = 1")
+            .expect("update");
+        assert_eq!(
+            sql_rows(&engine, "SELECT v FROM tu").1,
+            vec![vec![Some("3".into())]],
+            "INSTEAD OF UPDATE bypassed the base update"
+        );
+
+        // Every INSTEAD OF body ran over the proposed images: 5 (ins), 42 (upd new
+        // value), 107 (del id + 100).
+        assert_eq!(
+            sql_rows(&engine, "SELECT n FROM ilog ORDER BY n").1,
+            vec![
+                vec![Some("5".into())],
+                vec![Some("42".into())],
+                vec![Some("107".into())],
+            ],
+            "the INSTEAD OF bodies ran over inserted/deleted"
+        );
+
+        // A second INSTEAD OF trigger for the same action errors 2113.
+        assert_eq!(
+            sql_error_number(
+                &engine,
+                "CREATE TRIGGER trg_i2 ON ti INSTEAD OF INSERT AS SELECT 1"
+            ),
+            2113,
+            "only one INSTEAD OF trigger per action"
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn disable_and_enable_trigger_controls_firing() {
         let path = unique_temp_path("trigger-disable");
         let engine = new_engine(&path);
