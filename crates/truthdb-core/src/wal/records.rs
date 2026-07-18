@@ -467,6 +467,17 @@ impl RelRecord {
         }
     }
 
+    /// The commit wall-clock time (millis since the Unix epoch) for a
+    /// `TXN_COMMIT` record, or `None` for other kinds or a version-1 commit
+    /// record (which carried no timestamp). Used by point-in-time restore.
+    pub fn commit_timestamp_millis(&self) -> Option<u64> {
+        if self.kind == REL_KIND_TXN_COMMIT && self.redo.len() >= 8 {
+            Some(u64::from_le_bytes(self.redo[..8].try_into().unwrap()))
+        } else {
+            None
+        }
+    }
+
     pub fn txn_end(txn_id: u64, prev_lsn: u64) -> Self {
         RelRecord {
             prev_lsn,

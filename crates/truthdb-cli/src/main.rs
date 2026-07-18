@@ -66,6 +66,11 @@ enum Command {
         /// chain order (oldest first).
         #[arg(long = "log")]
         log: Vec<std::path::PathBuf>,
+        /// Point-in-time restore: stop recovery at this wall-clock time
+        /// (milliseconds since the Unix epoch). Transactions that committed
+        /// after it are undone.
+        #[arg(long = "stopat")]
+        stopat: Option<u64>,
     },
 }
 
@@ -92,17 +97,26 @@ async fn main() -> Result<()> {
                 Err(err) => Err(anyhow::anyhow!("grow failed: {err}")),
             }
         }
-        Command::Restore { full, to, log } => {
-            match truthdb_core::storage::Storage::restore_full_with_logs(&full, &to, &log) {
+        Command::Restore {
+            full,
+            to,
+            log,
+            stopat,
+        } => {
+            match truthdb_core::storage::Storage::restore_full_with_logs(&full, &to, &log, stopat) {
                 Ok(()) => {
                     println!(
-                        "restored {} from {}{}",
+                        "restored {} from {}{}{}",
                         to.display(),
                         full.display(),
                         if log.is_empty() {
                             String::new()
                         } else {
                             format!(" + {} log archive(s)", log.len())
+                        },
+                        match stopat {
+                            Some(ts) => format!(" (stopped at {ts})"),
+                            None => String::new(),
                         }
                     );
                     Ok(())

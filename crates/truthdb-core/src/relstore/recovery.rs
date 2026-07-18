@@ -36,22 +36,55 @@ pub(crate) struct AnalysisRedoOutcome {
 }
 
 /// Analysis + redo over the recovered records (`(lsn, record)`, log order).
+///
+/// `stop_at` drives point-in-time restore. Recovery keeps a log *prefix*: the
+/// first commit (in log order) whose wall-clock timestamp is past `stop_at`
+/// marks the cut, and that commit plus every later or still-uncommitted
+/// transaction is a loser. Redo still repeats ALL history and undo rolls those
+/// losers back with CLRs, so the point-in-time state persists across a later
+/// normal reopen. Cutting by LSN — not by each commit's own timestamp — keeps
+/// the restore internally consistent even when commit timestamps run backwards
+/// across increasing LSN (a non-monotonic clock): a transaction is never kept
+/// while an earlier one it depended on is dropped. `None` recovers to the end of
+/// the log (normal open).
 pub(crate) fn analyze_and_redo(
     ctx: &mut RelCtx<'_>,
     records: &[(u64, RelRecord)],
+    stop_at: Option<u64>,
 ) -> Result<AnalysisRedoOutcome, StorageError> {
+    // The point-in-time cut: every transaction committed at or after this LSN is
+    // undone. `u64::MAX` (no stop, or a stop past every commit) keeps them all.
+    let cut_lsn = match stop_at {
+        Some(limit) => first_commit_past(records, limit)?,
+        None => u64::MAX,
+    };
+
     // Analysis: rebuild the active-transaction table.
     let mut att: HashMap<u64, u64> = HashMap::new();
     let mut catalog_root = None;
     let mut max_txn_id = 0u64;
+    // Transactions committed at or past the cut: losers whose later TXN_END must
+    // not clear them from the ATT.
+    let mut forced_losers: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for (lsn, record) in records {
         max_txn_id = max_txn_id.max(record.txn_id);
         match record.kind {
             REL_KIND_TXN_BEGIN => {
                 att.insert(record.txn_id, *lsn);
             }
-            REL_KIND_TXN_COMMIT | REL_KIND_TXN_END => {
-                att.remove(&record.txn_id);
+            REL_KIND_TXN_COMMIT => {
+                // A commit at or after the point-in-time cut does not count: keep
+                // the txn in the ATT so undo rolls it back.
+                if *lsn >= cut_lsn {
+                    forced_losers.insert(record.txn_id);
+                } else {
+                    att.remove(&record.txn_id);
+                }
+            }
+            REL_KIND_TXN_END => {
+                if !forced_losers.contains(&record.txn_id) {
+                    att.remove(&record.txn_id);
+                }
             }
             REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE | REL_KIND_PAGE_IMAGES | REL_KIND_CLR => {
                 if record.txn_id != 0 {
@@ -101,6 +134,36 @@ pub(crate) fn analyze_and_redo(
         catalog_root,
         max_txn_id,
     })
+}
+
+/// The LSN of the first commit record (lowest LSN) whose wall-clock timestamp is
+/// strictly past `limit`, or `u64::MAX` when none is. Errors if any commit record
+/// carries no timestamp (a pre-timestamp WAL entry): point-in-time restore cannot
+/// place such a commit relative to the stop point, and silently treating it as a
+/// winner would keep post-stop data.
+fn first_commit_past(records: &[(u64, RelRecord)], limit: u64) -> Result<u64, StorageError> {
+    let mut cut = u64::MAX;
+    for (lsn, record) in records {
+        if record.kind != REL_KIND_TXN_COMMIT {
+            continue;
+        }
+        match record.commit_timestamp_millis() {
+            Some(ts) => {
+                if ts > limit && *lsn < cut {
+                    cut = *lsn;
+                }
+            }
+            None => {
+                return Err(StorageError::InvalidFile(
+                    "point-in-time restore requires timestamped commit records, but the \
+                     recoverable log contains a commit without a timestamp (the backup \
+                     predates the timestamped-commit WAL format)"
+                        .to_string(),
+                ));
+            }
+        }
+    }
+    Ok(cut)
 }
 
 /// Full-image redo: replaces the page wholesale when its LSN is older —
@@ -381,4 +444,63 @@ fn heap_slot_occupied(ctx: &mut RelCtx<'_>, page_no: u64, slot: u16) -> Result<b
     let occupied = (slot as usize) < page.slot_count() && page.get(slot as usize).is_some();
     ctx.pool.unpin(frame);
     Ok(occupied)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A version-2 commit record at `lsn` carrying `ts`.
+    fn commit(lsn: u64, ts: u64) -> (u64, RelRecord) {
+        (lsn, RelRecord::txn_commit(1, 0, ts))
+    }
+
+    /// A begin record at `lsn` (no timestamp) — the cut ignores non-commits.
+    fn begin(lsn: u64) -> (u64, RelRecord) {
+        (lsn, RelRecord::txn_begin(1))
+    }
+
+    #[test]
+    fn cut_is_the_first_commit_over_the_limit() {
+        let records = [
+            begin(5),
+            commit(10, 100),
+            begin(15),
+            commit(20, 200),
+            commit(30, 300),
+        ];
+        assert_eq!(first_commit_past(&records, 150).unwrap(), 20);
+        // A limit at a commit's exact timestamp keeps that commit (strictly past).
+        assert_eq!(first_commit_past(&records, 200).unwrap(), 30);
+    }
+
+    #[test]
+    fn cut_is_the_lowest_lsn_past_the_limit_under_a_backward_clock() {
+        // The clock stepped back: LSN 20 committed at ts 100, earlier than LSN
+        // 10's ts 300. The cut must be the lowest LSN whose ts is past the limit
+        // (10), so that the later-LSN, lower-ts commit at 20 is also undone —
+        // a log prefix, never a non-suffix loser set.
+        let records = [commit(10, 300), commit(20, 100)];
+        assert_eq!(first_commit_past(&records, 100).unwrap(), 10);
+    }
+
+    #[test]
+    fn no_cut_when_every_commit_is_within_the_limit() {
+        let records = [commit(10, 100), commit(20, 200)];
+        assert_eq!(first_commit_past(&records, 500).unwrap(), u64::MAX);
+    }
+
+    #[test]
+    fn a_timestampless_commit_is_rejected() {
+        let v1_commit = RelRecord {
+            prev_lsn: 0,
+            txn_id: 1,
+            kind: REL_KIND_TXN_COMMIT,
+            flags: 0,
+            redo: Vec::new(),
+            undo: Vec::new(),
+        };
+        let records = [commit(10, 100), (20, v1_commit)];
+        assert!(first_commit_past(&records, 50).is_err());
+    }
 }
