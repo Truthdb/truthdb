@@ -2437,6 +2437,129 @@ mod tests {
     }
 
     #[test]
+    fn backup_under_concurrent_write_load_restores_to_a_consistent_prefix() {
+        use std::sync::Arc;
+        let src = unique_temp_path("bul-src");
+        let bak = unique_temp_path("bul-bak");
+        let restored = unique_temp_path("bul-restored");
+
+        let engine = Arc::new(new_engine(&src));
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        // A baseline committed BEFORE the backup starts: the restore must contain
+        // at least these 20 rows.
+        for i in 1..=20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("baseline insert");
+        }
+
+        // A writer thread commits ids 21..=80 while the backup runs, so the fuzzy
+        // page copy interleaves with live commits (online backup under load). The
+        // count is kept modest so the test stays short and does not hold io_uring
+        // resources long enough to pressure other tests running in parallel.
+        let writer = {
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                for i in 21..=80 {
+                    engine
+                        .execute(&format!("INSERT INTO t VALUES ({i})"))
+                        .expect("concurrent insert");
+                }
+            })
+        };
+        engine
+            .storage()
+            .backup_full(&bak)
+            .expect("online backup under write load");
+        writer.join().expect("writer thread");
+        drop(engine);
+
+        // The restore recovers to a single consistent LSN (backup_end). Commits
+        // are serialized in id order, so the restored ids must be a CONTIGUOUS
+        // prefix 1..=k — a gap would mean a torn page, an id past k an
+        // uncommitted write leaked in. k lies between the 20 baseline rows and
+        // the writer's max (80).
+        Storage::restore_full(&restored, &bak).expect("restore");
+        let engine2 = Engine::new(Storage::open(restored.clone()).expect("open")).expect("engine");
+        let (_, rows) = sql_rows(&engine2, "SELECT id FROM t ORDER BY id");
+        let ids: Vec<i64> = rows
+            .iter()
+            .map(|r| r[0].as_ref().unwrap().parse().unwrap())
+            .collect();
+        assert!(
+            (20..=80).contains(&ids.len()),
+            "restored count is between the baseline and the writer's max, got {}",
+            ids.len()
+        );
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(
+                *id,
+                i as i64 + 1,
+                "restored ids are a contiguous prefix (no gaps, no torn/phantom rows): {ids:?}"
+            );
+        }
+        drop(engine2);
+        for p in [src, bak, restored] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn a_failed_backup_leaves_the_database_writable_and_backuppable() {
+        let src = unique_temp_path("killmid-src");
+        let good = unique_temp_path("killmid-good");
+        let restored = unique_temp_path("killmid-restored");
+        let engine = new_engine(&src);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine.execute("INSERT INTO t VALUES (1)").expect("insert");
+
+        // A backup to a nonexistent directory fails mid-flight: the hold is armed
+        // (begin_backup succeeded), then write_backup's File::create errors. The
+        // RAII hold guard must still release, or WAL truncation freezes and writes
+        // eventually wedge.
+        assert_eq!(
+            sql_error_number(
+                &engine,
+                "BACKUP DATABASE truthdb TO DISK = '/nonexistent-truthdb-dir/b.bak'"
+            ),
+            3013
+        );
+
+        // The database is unharmed: writes still work...
+        engine
+            .execute("INSERT INTO t VALUES (2)")
+            .expect("insert after a failed backup");
+        // ...and a fresh backup to a good path succeeds — which it could not if
+        // the failed backup's hold or single-flight guard were still set.
+        let goodlit = good.to_str().unwrap().replace('\'', "''");
+        assert!(
+            sql(
+                &engine,
+                &format!("BACKUP DATABASE truthdb TO DISK = '{goodlit}'")
+            )["error"]
+                .is_null()
+        );
+        drop(engine);
+
+        // And that good backup restores the surviving rows.
+        Storage::restore_full(&restored, &good).expect("restore");
+        let engine2 = Engine::new(Storage::open(restored.clone()).expect("open")).expect("engine");
+        assert_eq!(
+            sql_rows(&engine2, "SELECT id FROM t ORDER BY id").1,
+            vec![vec![Some("1".into())], vec![Some("2".into())]],
+            "the post-failure database backs up and restores intact"
+        );
+        drop(engine2);
+        for p in [src, good, restored] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
     fn commit_records_carry_a_recent_wall_clock_timestamp() {
         use crate::storage_layout::WAL_ENTRY_TYPE_REL;
         use crate::wal::records::{REL_KIND_TXN_COMMIT, RelRecord};
