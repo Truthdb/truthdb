@@ -83,6 +83,13 @@ impl Engine {
         })
     }
 
+    /// The underlying storage handle, so a test can drive an online backup
+    /// while the engine is live.
+    #[cfg(test)]
+    pub(crate) fn storage(&self) -> &Storage {
+        &self.storage
+    }
+
     pub fn execute(&self, input: &str) -> Result<String, EngineError> {
         // Routing: the legacy ES commands all carry a `{` JSON body; that
         // shape routes to the frozen search path. Everything else is SQL.
@@ -1802,6 +1809,86 @@ mod tests {
         let (_, rows) = sql_rows(&engine, "SELECT id FROM t WHERE name = 'e'");
         assert_eq!(rows, vec![vec![Some("5".into())]]);
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn full_backup_and_offline_restore_round_trips_relational_data() {
+        let src = unique_temp_path("backup-src");
+        let bak = unique_temp_path("backup-bak");
+        let restored = unique_temp_path("backup-restored");
+
+        let engine = new_engine(&src);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))")
+            .expect("create t");
+        engine
+            .execute("CREATE INDEX ix_name ON t (name)")
+            .expect("create index");
+        // Enough rows to spread the heap and the secondary index over several
+        // B+tree pages, so the copy is more than a single catalog page.
+        for i in 1..=200 {
+            engine
+                .execute(&format!("INSERT INTO t (id, name) VALUES ({i}, 'row{i}')"))
+                .expect("insert into t");
+        }
+        engine
+            .execute("CREATE TABLE u (k INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create u");
+        engine
+            .execute("INSERT INTO u (k, v) VALUES (1, 10), (2, 20)")
+            .expect("insert into u");
+
+        let expected_t = sql_rows(&engine, "SELECT id, name FROM t ORDER BY id").1;
+
+        // Online backup while the engine is live.
+        let summary = engine
+            .storage()
+            .backup_full(&bak)
+            .expect("online full backup");
+        assert!(summary.pages_copied > 0, "the backup copied data pages");
+        assert!(
+            summary.backup_end_lsn >= summary.redo_start_lsn,
+            "the log bracket is well-formed"
+        );
+        drop(engine);
+
+        // Offline restore into a fresh file, then open it and compare.
+        Storage::restore_full(&restored, &bak).expect("offline restore");
+        let engine2 = Engine::new(Storage::open(restored.clone()).expect("open restored"))
+            .expect("engine on restored file");
+
+        assert_eq!(
+            sql_rows(&engine2, "SELECT id, name FROM t ORDER BY id").1,
+            expected_t,
+            "table t round-trips row-for-row"
+        );
+        assert_eq!(
+            sql_rows(&engine2, "SELECT k, v FROM u ORDER BY k").1,
+            vec![
+                vec![Some("1".into()), Some("10".into())],
+                vec![Some("2".into()), Some("20".into())],
+            ],
+            "table u round-trips"
+        );
+        // The secondary index round-trips: a seek by name finds the row.
+        assert_eq!(
+            sql_rows(&engine2, "SELECT id FROM t WHERE name = 'row150'").1,
+            vec![vec![Some("150".into())]],
+            "the secondary index is intact after restore"
+        );
+        // The catalog round-trips: further DML on the restored database works.
+        engine2
+            .execute("INSERT INTO u (k, v) VALUES (3, 30)")
+            .expect("insert into restored u");
+        assert_eq!(
+            sql_rows(&engine2, "SELECT v FROM u WHERE k = 3").1,
+            vec![vec![Some("30".into())]]
+        );
+        drop(engine2);
+
+        let _ = std::fs::remove_file(src);
+        let _ = std::fs::remove_file(bak);
+        let _ = std::fs::remove_file(restored);
     }
 
     /// Runs SQL expected to error and returns the SQL error message.

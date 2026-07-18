@@ -1,5 +1,6 @@
 mod allocator;
 pub mod auth;
+pub mod backup;
 pub mod client_listener;
 mod direct_io;
 pub mod dispatcher;

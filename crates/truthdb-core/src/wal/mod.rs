@@ -148,6 +148,14 @@ impl WalWriter {
         self.flushed
     }
 
+    /// Ring bytes reserved for compensation records (rollback and recovery
+    /// undo). Forward appends stop `reserve` bytes short of a full ring so undo
+    /// always has room; a backup uses this to keep the shipped log range small
+    /// enough that a restore's undo pass still fits.
+    pub fn reserve(&self) -> u64 {
+        self.reserve
+    }
+
     /// Makes the log durable at least up to and including the record that
     /// STARTS at `lsn` (page writes always happen at append time; this only
     /// issues the missing fsync). `flushed` counts covered bytes, so a
