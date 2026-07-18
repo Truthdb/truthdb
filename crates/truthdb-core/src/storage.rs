@@ -257,6 +257,11 @@ pub enum StorageError {
     /// Maps to SQL Server's 3961.
     #[error("schema of '{0}' changed under the snapshot")]
     SnapshotSchemaChange(String),
+
+    /// A full backup was requested while one is already running. Only one
+    /// backup may hold the WAL truncation gate's single backup slot at a time.
+    #[error("a backup is already in progress")]
+    BackupInProgress,
 }
 
 /// Thread-safe handle to the storage engine. All mutable state lives in a
@@ -589,11 +594,11 @@ impl Storage {
     /// there. `dst` is created; an existing file is truncated.
     pub fn backup_full(&self, dst: &Path) -> Result<crate::backup::BackupSummary, StorageError> {
         let plan = self.lock().begin_backup(true, false)?;
-        // The hold must be released on every path: a stale hold freezes WAL
-        // truncation for the life of the process.
-        let result = self.write_backup(dst, &plan);
-        self.lock().release_backup_hold();
-        result
+        // Release the hold on EVERY exit — normal return, an early `?` error out
+        // of write_backup, or an unwind — via the guard's Drop. A leaked hold
+        // permanently freezes WAL truncation and eventually wedges writes.
+        let _hold = BackupHoldGuard { storage: self };
+        self.write_backup(dst, &plan)
     }
 
     fn write_backup(
@@ -653,6 +658,19 @@ impl Storage {
             ));
         }
         let layout = layout_from_backup_header(&header);
+        // The header is only integrity-checked (xxh64), not authenticated, so a
+        // tampered-but-valid backup could carry inconsistent sizes or drive
+        // writes outside the data region. Reject a header whose regions do not
+        // tile the file exactly before creating anything (a bogus total_size
+        // would otherwise `set_len` a huge sparse file).
+        if layout.reserved_offset.checked_add(layout.reserved_size) != Some(layout.total_size)
+            || layout.data_size == 0
+        {
+            return Err(StorageError::InvalidFile(
+                "backup header region sizes are inconsistent".to_string(),
+            ));
+        }
+        let data_pages = header.data_size / PAGE_SIZE as u64;
         let mut file = StorageFile::create_from_layout(
             dst_path.to_path_buf(),
             layout,
@@ -663,17 +681,39 @@ impl Storage {
         let mut log: Option<(u64, Vec<u8>)> = None;
         while let Some((block_type, payload)) = backup.next_block()? {
             match block_type {
-                BlockType::AllocMap => runs = decode_alloc_map(&payload)?,
+                BlockType::AllocMap => {
+                    runs = decode_alloc_map(&payload)?;
+                    for &(start, count) in &runs {
+                        if start.checked_add(count).is_none_or(|end| end > data_pages) {
+                            return Err(StorageError::InvalidFile(
+                                "backup allocation run is outside the data region".to_string(),
+                            ));
+                        }
+                    }
+                }
                 BlockType::PageData => {
                     let (start, count, bytes) = decode_page_run(&payload)?;
+                    if start.checked_add(count).is_none_or(|end| end > data_pages) {
+                        return Err(StorageError::InvalidFile(
+                            "backup page run is outside the data region".to_string(),
+                        ));
+                    }
                     file.restore_pages(start, count, bytes)?;
                 }
                 BlockType::LogChunk => {
                     let (start_lsn, bytes) = decode_log_chunk(&payload)?;
-                    // One chunk today; multiple must be emitted contiguously in
-                    // LSN order so appending reconstructs the range.
+                    // One chunk today; a future split emitter must produce them
+                    // contiguously in LSN order — enforce it so a gap or a
+                    // reorder fails loudly rather than seeding a wrong range.
                     match &mut log {
-                        Some((_, acc)) => acc.extend_from_slice(bytes),
+                        Some((first_start, acc)) => {
+                            if start_lsn != *first_start + acc.len() as u64 {
+                                return Err(StorageError::InvalidFile(
+                                    "backup log chunks are not contiguous".to_string(),
+                                ));
+                            }
+                            acc.extend_from_slice(bytes);
+                        }
                         None => log = Some((start_lsn, bytes.to_vec())),
                     }
                 }
@@ -5111,18 +5151,24 @@ impl StorageFile {
 
     // --- Backup / restore (Stage 17) ---
 
-    /// Captures a backup plan under the storage lock and registers the WAL
-    /// truncation hold. The caller MUST release the hold (via
-    /// [`Self::release_backup_hold`]) on every exit path once the backup
-    /// finishes or fails.
+    /// Captures a backup plan under the storage lock, rejecting a second
+    /// concurrent backup, and registers the WAL truncation hold LAST (after all
+    /// fallible work) so a failure here leaves no stale hold. On success the
+    /// caller arms a [`BackupHoldGuard`] to release the hold on every exit.
     fn begin_backup(
         &mut self,
         checksum: bool,
         copy_only: bool,
     ) -> Result<BackupPlan, StorageError> {
         self.ensure_rel_usable()?;
+        // Single-flight: the gate has one backup hold slot. A second concurrent
+        // backup would overwrite the first's hold (and its release would clear
+        // the survivor's), leaving a backup with a wrong or absent truncation
+        // floor — a silently truncated restore. Reject it.
+        if self.truncation_gate.backup.is_some() {
+            return Err(StorageError::BackupInProgress);
+        }
         let redo_start = self.wal.head();
-        self.register_backup_hold(redo_start);
 
         // The active superblock is the checkpoint whose head is redo_start, so
         // its roots are the checkpoint-consistent state recovery redoes onto.
@@ -5153,6 +5199,11 @@ impl StorageFile {
             runs = subtract_run(runs, start, pages);
         }
 
+        // Register the hold LAST, after every fallible step above: a failure
+        // here must leave no stale hold behind (a leaked hold freezes WAL
+        // truncation for the life of the process). We are still under the same
+        // lock, so redo_start is unchanged.
+        self.register_backup_hold(redo_start);
         Ok(BackupPlan {
             layout: self.layout,
             default_collation: self.default_collation.clone(),
@@ -5185,6 +5236,7 @@ impl StorageFile {
             if checksum
                 && !crate::relstore::page::is_zero_page(slot)
                 && !crate::relstore::page::verify_checksum(slot)
+                && self.page_is_live_regular(page)?
             {
                 return Err(StorageError::InvalidFile(format!(
                     "backup aborted: data page {page} failed checksum (corrupt source page)"
@@ -5192,6 +5244,25 @@ impl StorageFile {
             }
         }
         Ok(())
+    }
+
+    /// True iff `page` is still a live, page-formatted data page — so a checksum
+    /// failure genuinely means source corruption. A page that has been freed
+    /// since the backup began, or reused as the raw (non-page-formatted)
+    /// search-snapshot extent by a between-chunk checkpoint, legitimately fails
+    /// page-checksum verification and is NOT corrupt: on restore its stale
+    /// image is irrelevant because redo frees or overwrites it.
+    fn page_is_live_regular(&mut self, page: u64) -> Result<bool, StorageError> {
+        if !self.allocator.is_allocated(page) {
+            return Ok(false); // freed since the backup began
+        }
+        if let Some(desc) = self.load_active_snapshot_descriptor()? {
+            let (start, pages) = self.descriptor_page_range(&desc)?;
+            if page >= start && page < start + pages {
+                return Ok(false); // reused as the raw snapshot extent
+            }
+        }
+        Ok(true)
     }
 
     /// Forces the log durable, captures `backup_end = tail`, and returns the raw
@@ -5203,9 +5274,18 @@ impl StorageFile {
         let backup_end = self.wal.tail();
         debug_assert!(backup_end >= redo_start);
         let len = backup_end - redo_start;
-        if len > self.layout.wal_size {
+        // Cap the shipped range so the restored ring leaves the reserve free:
+        // restore's undo pass appends its own compensation records into that
+        // reserve. Because head is pinned at redo_start for the whole backup,
+        // a rollback storm can push the tail into the reserve (forward appends
+        // stop short of it, but undo CLRs use it), which would otherwise yield
+        // a backup that fails only at restore time. Fail cleanly here instead.
+        let max_len = self.layout.wal_size.saturating_sub(self.wal.reserve());
+        if len > max_len {
             return Err(StorageError::WalFull(
-                "backup log range exceeds the WAL ring size".to_string(),
+                "backup log range fills the WAL reserve (ring under pressure); \
+                 checkpoint and retry the backup"
+                    .to_string(),
             ));
         }
         let mut out = vec![0u8; len as usize];
@@ -5943,6 +6023,19 @@ fn compute_layout(
 /// pages): bounds both the lock hold and the in-flight copy buffer.
 const BACKUP_CHUNK_PAGES: u64 = 256;
 
+/// Releases the WAL truncation hold registered by `begin_backup` when the
+/// backup ends — on every path, including an early error return or a panic
+/// unwind. A leaked hold freezes WAL truncation for the life of the process.
+struct BackupHoldGuard<'a> {
+    storage: &'a Storage,
+}
+
+impl Drop for BackupHoldGuard<'_> {
+    fn drop(&mut self) {
+        self.storage.lock().release_backup_hold();
+    }
+}
+
 /// Everything captured under the storage lock at the start of a backup, so the
 /// bulk page copy can proceed while releasing the lock between chunks.
 struct BackupPlan {
@@ -6066,6 +6159,66 @@ mod tests {
             reserved_ratio: 0.17,
             default_collation: None,
         }
+    }
+
+    #[test]
+    fn backup_is_single_flight_and_releases_its_hold() {
+        let path = unique_temp_path("backup-hold");
+        let bak = unique_temp_path("backup-hold-bak");
+        let bak2 = unique_temp_path("backup-hold-bak2");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+
+        // A second backup while a hold is set is rejected, and — critically —
+        // must NOT clear the in-flight backup's hold (the guard arms only after
+        // begin_backup succeeds, so a rejected backup touches nothing).
+        storage.lock().register_backup_hold(42);
+        assert!(matches!(
+            storage.backup_full(&bak),
+            Err(StorageError::BackupInProgress)
+        ));
+        assert_eq!(
+            storage.lock().truncation_gate.backup,
+            Some(42),
+            "a rejected backup leaves the existing hold intact"
+        );
+        storage.lock().release_backup_hold();
+
+        // A successful backup releases its own hold, so a second one succeeds.
+        storage.backup_full(&bak).expect("first backup");
+        assert_eq!(
+            storage.lock().truncation_gate.backup,
+            None,
+            "the hold is released after a successful backup"
+        );
+        storage
+            .backup_full(&bak2)
+            .expect("second backup after release");
+
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(bak);
+        let _ = std::fs::remove_file(bak2);
+    }
+
+    #[test]
+    fn a_page_freed_since_the_backup_began_is_not_treated_as_corrupt() {
+        let path = unique_temp_path("backup-freed");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        {
+            let mut file = storage.lock();
+            let page = file.allocator.allocate(1).expect("allocate a page");
+            assert!(
+                file.page_is_live_regular(page).unwrap(),
+                "a live, allocated data page is regular (a checksum failure there is real corruption)"
+            );
+            file.allocator.free(page, 1);
+            assert!(
+                !file.page_is_live_regular(page).unwrap(),
+                "a page freed since the backup began is tolerated, not flagged corrupt"
+            );
+        }
+        drop(storage);
+        let _ = std::fs::remove_file(path);
     }
 
     /// ALTER TABLE ADD survives a restart — the widened schema and the frozen
