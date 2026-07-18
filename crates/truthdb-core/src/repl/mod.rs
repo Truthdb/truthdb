@@ -7,6 +7,8 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod handshake;
+
 /// Replication protocol version. Bumped on any incompatible wire change.
 pub const REPL_PROTOCOL_VERSION: u32 = 1;
 
