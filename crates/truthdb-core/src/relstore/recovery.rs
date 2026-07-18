@@ -103,7 +103,26 @@ pub(crate) fn analyze_and_redo(
         }
     }
 
-    // Redo: repeat history in log order, gated by each page's LSN.
+    redo_records(ctx, records)?;
+
+    Ok(AnalysisRedoOutcome {
+        losers: att,
+        catalog_root,
+        max_txn_id,
+    })
+}
+
+/// The redo pass on its own: repeat history in log order, each page write gated
+/// by that page's on-disk LSN (`page_lsn >= lsn` skips). This is the resumable
+/// core of ARIES recovery — it consults no active-transaction table and appends
+/// nothing to the WAL, so it is idempotent and safe to re-run over overlapping
+/// or extending record ranges. A streaming standby applies redo this way as
+/// records arrive; analysis (loser detection) and `undo_losers` — which need the
+/// whole log and mutate the WAL — run only at final recovery / promotion.
+pub(crate) fn redo_records(
+    ctx: &mut RelCtx<'_>,
+    records: &[(u64, RelRecord)],
+) -> Result<(), StorageError> {
     for (lsn, record) in records {
         match record.kind {
             REL_KIND_PAGE_IMAGE => {
@@ -128,12 +147,7 @@ pub(crate) fn analyze_and_redo(
             _ => {}
         }
     }
-
-    Ok(AnalysisRedoOutcome {
-        losers: att,
-        catalog_root,
-        max_txn_id,
-    })
+    Ok(())
 }
 
 /// The LSN of the first commit record (lowest LSN) whose wall-clock timestamp is
