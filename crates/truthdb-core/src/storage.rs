@@ -744,6 +744,29 @@ impl Storage {
         log_paths: &[std::path::PathBuf],
         stop_at: Option<u64>,
     ) -> Result<(), StorageError> {
+        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], stop_at)
+    }
+
+    /// Offline restore of a full backup followed by raw shipped WAL ring ranges —
+    /// the physical-replication apply path (a standby seeded from a backup, fed
+    /// the primary's `read_ring_range` bytes). Each range must continue from the
+    /// current coverage (no gap, 4305); the whole recoverable range must fit the
+    /// ring. Recovers to the end of the last range on open.
+    pub fn restore_full_with_wal_ranges(
+        dst_path: &Path,
+        bak_path: &Path,
+        wal_ranges: &[(u64, Vec<u8>)],
+    ) -> Result<(), StorageError> {
+        Self::restore_full_inner(dst_path, bak_path, &[], wal_ranges, None)
+    }
+
+    fn restore_full_inner(
+        dst_path: &Path,
+        bak_path: &Path,
+        log_paths: &[std::path::PathBuf],
+        wal_ranges: &[(u64, Vec<u8>)],
+        stop_at: Option<u64>,
+    ) -> Result<(), StorageError> {
         assert_layout_invariants();
         let reader = std::io::BufReader::new(std::fs::File::open(bak_path)?);
         let (backup, header) = crate::backup::BackupReader::new(reader)?;
@@ -773,7 +796,9 @@ impl Storage {
         // The destination now exists and is ours: remove the partial file if any
         // later step fails, so a retry (which requires a fresh destination) can
         // proceed. Everything ABOVE this point errors without having created it.
-        let outcome = Self::restore_body(file, backup, &header, log_paths, dst_path, stop_at);
+        let outcome = Self::restore_body(
+            file, backup, &header, log_paths, wal_ranges, dst_path, stop_at,
+        );
         if outcome.is_err() {
             let _ = std::fs::remove_file(dst_path);
         }
@@ -781,14 +806,16 @@ impl Storage {
     }
 
     /// The part of a restore that owns the (already-created) destination: lays
-    /// down page images + the log, applies the log chain, writes the superblock,
-    /// and validates by opening (running recovery). A failure here leaves a
-    /// partial file the caller removes.
+    /// down page images + the log, applies the log chain and any raw WAL ranges,
+    /// writes the superblock, and validates by opening (running recovery). A
+    /// failure here leaves a partial file the caller removes.
+    #[allow(clippy::too_many_arguments)]
     fn restore_body(
         mut file: StorageFile,
         mut backup: crate::backup::BackupReader<std::io::BufReader<std::fs::File>>,
         header: &crate::backup::BackupHeader,
         log_paths: &[std::path::PathBuf],
+        wal_ranges: &[(u64, Vec<u8>)],
         dst_path: &Path,
         stop_at: Option<u64>,
     ) -> Result<(), StorageError> {
@@ -848,6 +875,17 @@ impl Storage {
         // gap) and the whole range must fit the ring.
         for log_path in log_paths {
             apply_log_archive(&mut file, log_path, header.redo_start_lsn, &mut tail)?;
+        }
+        // Apply raw shipped WAL ranges (physical replication) after the log
+        // chain, on the same seeded ring, extending the tail further.
+        for (from_lsn, bytes) in wal_ranges {
+            apply_wal_range(
+                &mut file,
+                *from_lsn,
+                bytes,
+                header.redo_start_lsn,
+                &mut tail,
+            )?;
         }
         // The restored superblock brackets the ring at `[redo_start, tail)`; the
         // log-backup floor is the end of the applied chain (a fresh chain).
@@ -1456,6 +1494,38 @@ impl Storage {
 
     pub(crate) fn release_read_snapshot(&self, seq: u64) {
         self.lock().version.release_snapshot(seq);
+    }
+
+    /// The durable WAL watermark: the greatest LSN fsynced to disk (group-commit
+    /// or a direct WAL sync). A replication sender may ship the ring up to here;
+    /// bytes past it are not yet durable on the primary and must not be applied
+    /// to a standby. (Test scaffolding for the offline standby-apply slice; the
+    /// replication transport slice promotes it to the sender.)
+    #[cfg(test)]
+    pub(crate) fn wal_flushed_lsn(&self) -> u64 {
+        let durable = self.gc.flushed();
+        self.lock().wal.flushed_lsn().max(durable)
+    }
+
+    /// Reads raw WAL ring bytes `[from, to)` — the physical-replication ship
+    /// primitive. A standby applies the bytes via
+    /// [`Storage::restore_full_with_wal_ranges`].
+    #[cfg(test)]
+    pub(crate) fn read_wal_range(&self, from: u64, to: u64) -> Result<Vec<u8>, StorageError> {
+        self.lock().read_ring_range(from, to)
+    }
+
+    /// The persisted replication restartpoint (the active superblock's
+    /// `applied_lsn`): the LSN up to which this file's WAL is present and
+    /// recovered.
+    #[cfg(test)]
+    pub(crate) fn applied_lsn(&self) -> u64 {
+        let guard = self.lock();
+        let active = match guard.active_superblock {
+            ActiveSuperblock::A => &guard.superblock_a,
+            ActiveSuperblock::B => &guard.superblock_b,
+        };
+        active.applied_lsn()
     }
 
     /// Atomic snapshot scan: the whole table under one storage-lock hold
@@ -5659,6 +5729,9 @@ impl StorageFile {
         // it 0 would make the on-open log-backup hold sit BELOW wal_head, which
         // `set_head` forbids (the floor can only move forward).
         base.set_last_log_backup_lsn(backup_end);
+        // The restartpoint = the end of everything laid down (full backup + any
+        // applied log chain / shipped WAL ranges), which is the restored tail.
+        base.set_applied_lsn(backup_end);
 
         let mut a = base;
         a.generation = 1;
@@ -6042,6 +6115,10 @@ impl StorageFile {
             };
             sb.set_db_options(db_options);
             sb.set_last_log_backup_lsn(last_log_backup_lsn);
+            // Re-stamp the replication restartpoint from the same default-built
+            // superblock (else a checkpoint would silently reset it to 0). On a
+            // primary this is exactly the checkpoint tail.
+            sb.set_applied_lsn(tail);
             sb.checksum = sb.compute_checksum();
             sb
         };
@@ -6459,6 +6536,47 @@ fn fsync_parent_dir(path: &Path) -> Result<(), StorageError> {
 /// range, verifies it continues from the current coverage (no gap — error 4305)
 /// and that the whole recoverable range still fits the ring, then seeds it and
 /// extends `tail`. Overlap with already-seeded log is harmless (same bytes).
+/// Applies a raw shipped WAL ring range `[from_lsn, from_lsn + bytes.len())` to a
+/// restore/standby file, extending the seeded ring. The sibling of
+/// [`apply_log_archive`] for physical replication: the bytes are the primary's
+/// own ring bytes (from `read_ring_range` at a flushed watermark), not a
+/// `TDBBAK1` archive, so there is no per-block framing to decode — the range
+/// starts and ends on WAL entry boundaries and recovery's forward scan validates
+/// it (self-identity + CRC) on the next open.
+///
+/// `from_lsn` may be `<= tail` (a re-shipped, overlapping range overwrites
+/// identical bytes — idempotent); a `from_lsn > tail` is a chain gap (4305). The
+/// covered range must fit the ring's usable size, leaving the CLR reserve free
+/// for recovery's undo, exactly as [`apply_log_archive`] caps a log chain.
+fn apply_wal_range(
+    file: &mut StorageFile,
+    from_lsn: u64,
+    bytes: &[u8],
+    head: u64,
+    tail: &mut u64,
+) -> Result<(), StorageError> {
+    if bytes.is_empty() {
+        return Ok(());
+    }
+    if from_lsn > *tail {
+        return Err(StorageError::InvalidFile(format!(
+            "WAL range gap (4305): range begins at LSN {from_lsn} but the standby has reached {tail}"
+        )));
+    }
+    let new_end = from_lsn + bytes.len() as u64;
+    let max_range = file.layout.wal_size.saturating_sub(file.wal.reserve());
+    if new_end.saturating_sub(head) > max_range {
+        return Err(StorageError::InvalidFile(
+            "the applied WAL range exceeds the ring's usable size; \
+             incremental standby restore is not yet supported"
+                .to_string(),
+        ));
+    }
+    file.seed_ring(from_lsn, bytes)?;
+    *tail = (*tail).max(new_end);
+    Ok(())
+}
+
 fn apply_log_archive(
     file: &mut StorageFile,
     path: &Path,

@@ -2225,6 +2225,85 @@ mod tests {
         }
     }
 
+    // Stage 18 slice 2: a standby seeded from a full backup, fed the primary's
+    // raw shipped WAL ring bytes (`read_wal_range`), recovers to a state that
+    // matches the primary — the physical-replication apply path, offline.
+    #[test]
+    fn standby_applies_shipped_wal_ranges_and_matches_the_primary() {
+        let src = unique_temp_path("repl-src");
+        let bak = unique_temp_path("repl-bak");
+        let standby = unique_temp_path("repl-standby");
+        let standby_idem = unique_temp_path("repl-standby-idem");
+
+        let engine = new_engine(&src);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        // Full backup captures rows 1..=20 up to `backup_end`.
+        let summary = engine.storage().backup_full(&bak).expect("full backup");
+        let backup_end = summary.backup_end_lsn;
+        // Committed changes AFTER the backup — the log a standby must catch up on.
+        for i in 21..=40 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        engine
+            .execute("UPDATE t SET v = v + 100 WHERE id <= 5")
+            .expect("update");
+        // Ship the primary's raw ring bytes `[backup_end, durable tail)`.
+        let flushed = engine.storage().wal_flushed_lsn();
+        assert!(flushed > backup_end, "there is post-backup log to ship");
+        let delta = engine
+            .storage()
+            .read_wal_range(backup_end, flushed)
+            .expect("ship the WAL range");
+        let expected = sql_rows(&engine, "SELECT id, v FROM t ORDER BY id").1;
+        drop(engine);
+
+        // Standby = the full backup + the shipped raw WAL range, recovered.
+        Storage::restore_full_with_wal_ranges(&standby, &bak, &[(backup_end, delta.clone())])
+            .expect("apply the shipped range to the standby");
+        let s = Engine::new(Storage::open(standby.clone()).expect("open")).expect("engine");
+        assert_eq!(
+            sql_rows(&s, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the standby matches the primary after applying the shipped WAL"
+        );
+        // The replication restartpoint persisted = the end of the applied range.
+        assert_eq!(
+            s.storage().applied_lsn(),
+            backup_end + delta.len() as u64,
+            "applied_lsn is the end of the applied range and survives the reopen"
+        );
+
+        // Idempotent: applying the SAME range twice yields the identical state
+        // (seed overwrites identical bytes; redo is page-LSN-gated).
+        Storage::restore_full_with_wal_ranges(
+            &standby_idem,
+            &bak,
+            &[(backup_end, delta.clone()), (backup_end, delta.clone())],
+        )
+        .expect("re-applying the same range is accepted");
+        let s2 = Engine::new(Storage::open(standby_idem.clone()).expect("open")).expect("engine");
+        assert_eq!(
+            sql_rows(&s2, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "re-applying the same range is idempotent"
+        );
+
+        drop(s);
+        drop(s2);
+        for p in [src, bak, standby, standby_idem] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     #[test]
     fn point_in_time_restore_stops_at_a_commit_timestamp() {
         use crate::storage_layout::WAL_ENTRY_TYPE_REL;
