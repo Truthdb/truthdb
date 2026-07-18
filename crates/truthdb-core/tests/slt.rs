@@ -82,7 +82,7 @@ fn run_file(path: &Path) {
     let mut ctx = TxnContext::default();
     // A real session identity, as every connected session has one: DB_NAME(),
     // sys.databases and USE read it.
-    ctx.set_session_identity("truthdb".into(), "sa".into(), 1);
+    ctx.set_session_identity("truthdb".into(), "sa".into(), 1, "dbo".into(), 0, 0);
 
     let file = path.display();
     let mut lines = text.lines().peekable();

@@ -159,10 +159,10 @@ impl Engine {
             }
             self.storage.rel_create_login(
                 name,
-                crate::relstore::catalog::PrincipalDef {
-                    password_blob: crate::auth::hash_password(password),
-                    is_disabled: false,
-                },
+                crate::relstore::catalog::PrincipalDef::login(
+                    crate::auth::hash_password(password),
+                    false,
+                ),
             )?;
             created.push(name.clone());
         }
@@ -180,13 +180,44 @@ impl Engine {
         };
         self.storage.rel_create_login(
             "sa",
-            crate::relstore::catalog::PrincipalDef {
-                password_blob,
-                is_disabled,
-            },
+            crate::relstore::catalog::PrincipalDef::login(password_blob, is_disabled),
         )?;
         created.push(label);
         Ok(created)
+    }
+
+    /// Resolves a login (its name and server principal_id) to the database user
+    /// a new session runs as, and that user's database principal_id: a member of
+    /// the sysadmin server role maps to `dbo`; otherwise the user created `FOR
+    /// LOGIN` it, if any; otherwise the login name itself with no database
+    /// principal (id 0). `login_sid` 0 is the identity-less native path.
+    pub(crate) fn resolve_session_user(&self, login: &str, login_sid: u32) -> (String, u32) {
+        if login_sid != 0
+            && self
+                .storage
+                .effective_roles(login_sid)
+                .contains(&crate::storage::SYSADMIN_ID)
+        {
+            return ("dbo".to_string(), crate::storage::DBO_ID);
+        }
+        if login_sid != 0
+            && let Some(def) = self
+                .storage
+                .rel_database_principals()
+                .into_iter()
+                .find(|d| d.principal.as_ref().and_then(|p| p.login_sid) == Some(login_sid))
+        {
+            return (def.name.clone(), def.object_id);
+        }
+        (login.to_string(), 0)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn storage_effective_roles_for_test(
+        &self,
+        id: u32,
+    ) -> std::collections::HashSet<u32> {
+        self.storage.effective_roles(id)
     }
 
     /// Runs a search against an index and renders the hits.
@@ -6834,10 +6865,12 @@ mod tests {
         );
 
         // Exactly one of the case-variant admins exists (the first-sorted, Admin),
-        // plus app and sa — the dup did not create a second principal.
+        // plus app and sa — the dup did not create a second principal. Filter to
+        // SQL logins (type 'S') so the synthesized sysadmin server role does not
+        // appear.
         let (_c, rows) = sql_rows(
             &engine,
-            "SELECT name, is_disabled FROM sys.server_principals ORDER BY name",
+            "SELECT name, is_disabled FROM sys.server_principals WHERE type = 'S' ORDER BY name",
         );
         assert_eq!(
             rows,
@@ -6880,6 +6913,343 @@ mod tests {
             crate::auth::verify_password(&rec.password_blob, "secret"),
             crate::auth::VerifyOutcome::Ok,
             "sa authenticates with its configured password"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn database_users_and_roles_persist_and_stay_out_of_the_object_namespace() {
+        let path = unique_temp_path("principals");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE LOGIN sa WITH PASSWORD = 'x'")
+            .expect("login");
+        engine
+            .execute("CREATE USER app FOR LOGIN sa")
+            .expect("user");
+        engine.execute("CREATE ROLE reporting").expect("role");
+
+        // sys.database_principals shows the fixed dbo user and db_owner role plus
+        // the created user ('S'=SQL_USER) and role ('R'=DATABASE_ROLE).
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT name, type FROM sys.database_principals \
+             WHERE name IN ('dbo','db_owner','app','reporting') ORDER BY name",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![Some("app".into()), Some("S".into())],
+                vec![Some("db_owner".into()), Some("R".into())],
+                vec![Some("dbo".into()), Some("S".into())],
+                vec![Some("reporting".into()), Some("R".into())],
+            ]
+        );
+
+        // They are not schema objects.
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT COUNT(*) AS n FROM sys.tables WHERE name IN ('app','reporting')",
+        );
+        assert_eq!(rows, vec![vec![Some("0".into())]], "not tables");
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "SELECT * FROM app");
+        assert_eq!(
+            out.error.as_ref().map(|e| e.number),
+            Some(208),
+            "a user name is not a queryable object"
+        );
+
+        // Survives restart.
+        drop(engine);
+        let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("replay");
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT name FROM sys.database_principals WHERE name = 'reporting'",
+        );
+        assert_eq!(rows, vec![vec![Some("reporting".into())]], "role survives");
+
+        // DROP.
+        engine.execute("DROP ROLE reporting").expect("drop role");
+        engine.execute("DROP USER app").expect("drop user");
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT COUNT(*) AS n FROM sys.database_principals \
+             WHERE name IN ('app','reporting')",
+        );
+        assert_eq!(rows, vec![vec![Some("0".into())]], "dropped");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn role_membership_is_transitive_and_cycle_checked() {
+        let path = unique_temp_path("membership");
+        let engine = new_engine(&path);
+        engine.execute("CREATE ROLE r1").unwrap();
+        engine.execute("CREATE ROLE r2").unwrap();
+        engine.execute("CREATE USER u").unwrap();
+        // u ∈ r1, r1 ∈ r2 (nesting).
+        engine.execute("ALTER ROLE r1 ADD MEMBER u").unwrap();
+        engine.execute("ALTER ROLE r2 ADD MEMBER r1").unwrap();
+
+        // sys.database_role_members: the two edges plus the synthesized dbo→db_owner.
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT COUNT(*) AS n FROM sys.database_role_members",
+        );
+        assert_eq!(rows, vec![vec![Some("3".into())]]);
+
+        // A cycle (r2 → r1 → r2) is refused, as is self-membership.
+        let mut ctx = TxnContext::default();
+        assert!(
+            batch(&engine, &mut ctx, "ALTER ROLE r1 ADD MEMBER r2")
+                .error
+                .is_some(),
+            "a membership cycle must be rejected"
+        );
+        assert!(
+            batch(&engine, &mut ctx, "ALTER ROLE r1 ADD MEMBER r1")
+                .error
+                .is_some(),
+            "self-membership must be rejected"
+        );
+
+        // A role with members cannot be dropped.
+        assert!(
+            batch(&engine, &mut ctx, "DROP ROLE r1").error.is_some(),
+            "a role with members cannot be dropped"
+        );
+        // Remove the members, then it drops.
+        engine.execute("ALTER ROLE r1 DROP MEMBER u").unwrap();
+        engine.execute("ALTER ROLE r2 DROP MEMBER r1").unwrap();
+        engine.execute("DROP ROLE r1").expect("now droppable");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn session_intrinsics_resolve_database_user_and_role_membership() {
+        let path = unique_temp_path("intrinsics");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE LOGIN sa WITH PASSWORD = 'x'")
+            .unwrap();
+        engine.execute("CREATE ROLE reporting").unwrap();
+        engine.execute("CREATE USER analyst").unwrap();
+        engine
+            .execute("ALTER ROLE reporting ADD MEMBER analyst")
+            .unwrap();
+
+        // Helper: read the first row of a batch's first rowset as strings.
+        fn row_cells(engine: &Engine, ctx: &mut TxnContext, sql: &str) -> Vec<Option<String>> {
+            let out = batch(engine, ctx, sql);
+            assert!(out.error.is_none(), "batch error: {:?}", out.error);
+            for result in &out.results {
+                if let StatementResult::Rows(rowset) = result {
+                    return rowset.rows[0]
+                        .iter()
+                        .map(|d| match d {
+                            Datum::Null => None,
+                            Datum::Int(v) => Some(v.to_string()),
+                            Datum::BigInt(v) => Some(v.to_string()),
+                            Datum::NVarChar(s) | Datum::VarChar(s) => Some(s.clone()),
+                            other => Some(format!("{other:?}")),
+                        })
+                        .collect();
+                }
+            }
+            panic!("no rowset: {:?}", out.results);
+        }
+
+        // A session as sa maps to the dbo user (sysadmin), a member of db_owner.
+        let sa_sid = engine.lookup_login("sa").unwrap().principal_id;
+        let (user, user_sid) = engine.resolve_session_user("sa", sa_sid);
+        assert_eq!(user, "dbo");
+        let mut ctx = TxnContext::default();
+        ctx.set_session_identity("truthdb".into(), "sa".into(), 1, user, sa_sid, user_sid);
+        let cells = row_cells(
+            &engine,
+            &mut ctx,
+            "SELECT SUSER_SNAME() a, USER_NAME() b, IS_SRVROLEMEMBER('sysadmin') c, \
+             IS_ROLEMEMBER('db_owner') d, IS_ROLEMEMBER('reporting') e, \
+             IS_ROLEMEMBER('sysadmin') f, IS_SRVROLEMEMBER('db_owner') g",
+        );
+        assert_eq!(
+            cells,
+            vec![
+                Some("sa".into()),
+                Some("dbo".into()),
+                Some("1".into()), // IS_SRVROLEMEMBER(sysadmin)
+                Some("1".into()), // IS_ROLEMEMBER(db_owner)
+                Some("0".into()), // IS_ROLEMEMBER(reporting)
+                // The role families do not cross-answer: sysadmin is a SERVER
+                // role (0 as a database role), db_owner a DATABASE role (0 as a
+                // server role).
+                Some("0".into()), // IS_ROLEMEMBER(sysadmin)
+                Some("0".into()), // IS_SRVROLEMEMBER(db_owner)
+            ],
+            "sa → dbo; server/database role namespaces are distinct"
+        );
+
+        // A session as the analyst user is a member of reporting only.
+        let analyst_sid: u32 = {
+            let (_c, rows) = sql_rows(
+                &engine,
+                "SELECT principal_id FROM sys.database_principals WHERE name = 'analyst'",
+            );
+            rows[0][0].as_ref().unwrap().parse().unwrap()
+        };
+        let mut ctx = TxnContext::default();
+        ctx.set_session_identity(
+            "truthdb".into(),
+            "analyst".into(),
+            2,
+            "analyst".into(),
+            0,
+            analyst_sid,
+        );
+        let cells = row_cells(
+            &engine,
+            &mut ctx,
+            "SELECT USER_NAME() a, IS_ROLEMEMBER('reporting') b, IS_ROLEMEMBER('db_owner') c, \
+             IS_SRVROLEMEMBER('sysadmin') d",
+        );
+        assert_eq!(
+            cells,
+            vec![
+                Some("analyst".into()),
+                Some("1".into()),
+                Some("0".into()),
+                Some("0".into()),
+            ],
+            "analyst ∈ reporting only"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sa_resolves_to_dbo_and_sysadmin_with_no_prior_security_ddl() {
+        // Regression: the membership cache must populate on the very first query
+        // even while security_version is still 0 (a fresh boot where only the sa
+        // login was created), and again after a restart resets the counter to 0.
+        let path = unique_temp_path("fresh-sa");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE LOGIN sa WITH PASSWORD = 'x'")
+            .unwrap();
+        // No CREATE USER/ROLE/ALTER ROLE has run: security_version is still 0.
+        let sa_sid = engine.lookup_login("sa").unwrap().principal_id;
+        assert_eq!(
+            engine.resolve_session_user("sa", sa_sid),
+            ("dbo".to_string(), crate::storage::DBO_ID),
+            "sa is sysadmin (→ dbo) with no prior security DDL"
+        );
+
+        // A durable role membership survives a restart (which resets the in-memory
+        // counter and cache) and is visible immediately, before any new DDL.
+        engine.execute("CREATE ROLE r").unwrap();
+        engine.execute("CREATE USER u").unwrap();
+        engine.execute("ALTER ROLE r ADD MEMBER u").unwrap();
+        let u_sid: u32 = {
+            let (_c, rows) = sql_rows(
+                &engine,
+                "SELECT principal_id FROM sys.database_principals WHERE name = 'u'",
+            );
+            rows[0][0].as_ref().unwrap().parse().unwrap()
+        };
+        drop(engine);
+        let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("replay");
+        let r_sid: u32 = {
+            let (_c, rows) = sql_rows(
+                &engine,
+                "SELECT principal_id FROM sys.database_principals WHERE name = 'r'",
+            );
+            rows[0][0].as_ref().unwrap().parse().unwrap()
+        };
+        assert!(
+            engine
+                .storage_effective_roles_for_test(u_sid)
+                .contains(&r_sid),
+            "durable membership is visible after restart with no new DDL"
+        );
+        // And sa still resolves to sysadmin/dbo post-restart.
+        let sa_sid = engine.lookup_login("sa").unwrap().principal_id;
+        assert_eq!(
+            engine.resolve_session_user("sa", sa_sid).0,
+            "dbo",
+            "sa is still sysadmin after restart"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn creating_the_sa_login_against_a_warm_cache_is_seen() {
+        // Regression: login DDL bumps the security version, so creating sa after
+        // the membership cache is already warm still makes it sysadmin.
+        let path = unique_temp_path("warm-sa");
+        let engine = new_engine(&path);
+        engine.execute("CREATE ROLE warm").unwrap(); // warms the cache at version >= 1
+        // A resolve while sa is absent warms the cache without an sa edge.
+        assert_eq!(
+            engine.resolve_session_user("sa", 999),
+            ("sa".to_string(), 0)
+        );
+        engine
+            .execute("CREATE LOGIN sa WITH PASSWORD = 'x'")
+            .unwrap();
+        let sa_sid = engine.lookup_login("sa").unwrap().principal_id;
+        assert_eq!(
+            engine.resolve_session_user("sa", sa_sid),
+            ("dbo".to_string(), crate::storage::DBO_ID),
+            "the freshly-created sa is sysadmin despite the warm cache"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_membership_change_is_visible_to_the_next_batch() {
+        // The security-version counter invalidates the membership cache: a role
+        // added between batches is reflected in the next batch's IS_ROLEMEMBER.
+        let path = unique_temp_path("membership-invalidation");
+        let engine = new_engine(&path);
+        engine.execute("CREATE ROLE auditors").unwrap();
+        engine.execute("CREATE USER clerk").unwrap();
+        let clerk_sid: u32 = {
+            let (_c, rows) = sql_rows(
+                &engine,
+                "SELECT principal_id FROM sys.database_principals WHERE name = 'clerk'",
+            );
+            rows[0][0].as_ref().unwrap().parse().unwrap()
+        };
+        let mut ctx = TxnContext::default();
+        ctx.set_session_identity(
+            "truthdb".into(),
+            "clerk".into(),
+            3,
+            "clerk".into(),
+            0,
+            clerk_sid,
+        );
+
+        let member = |engine: &Engine, ctx: &mut TxnContext| -> i64 {
+            let out = batch(engine, ctx, "SELECT IS_ROLEMEMBER('auditors')");
+            match &out.results[0] {
+                StatementResult::Rows(rowset) => match rowset.rows[0][0] {
+                    Datum::Int(v) => v as i64,
+                    Datum::BigInt(v) => v,
+                    ref other => panic!("expected an integer, got {other:?}"),
+                },
+                other => panic!("expected rows, got {other:?}"),
+            }
+        };
+
+        assert_eq!(member(&engine, &mut ctx), 0, "not a member yet");
+        engine
+            .execute("ALTER ROLE auditors ADD MEMBER clerk")
+            .unwrap();
+        assert_eq!(
+            member(&engine, &mut ctx),
+            1,
+            "the new membership is seen after the security-version bump"
         );
         let _ = std::fs::remove_file(path);
     }

@@ -45,6 +45,12 @@ pub(crate) struct RelState {
     /// but partitioned into a separate map on load so a login never enters the
     /// object namespace (name resolution, sys.tables, DROP TABLE).
     pub principals: HashMap<String, TableDef>,
+    /// Database principals — users and roles — keyed by lowercased name. A
+    /// separate map from `principals` (server logins) because a login and a user
+    /// commonly share a name (`CREATE USER alice FOR LOGIN alice`). Persisted in
+    /// the same catalog b-tree, partitioned out on load, and never in the object
+    /// namespace. Membership edges live on each row's `PrincipalDef.member_of`.
+    pub database_principals: HashMap<String, TableDef>,
     pub next_txn_id: u64,
     pub next_object_id: u32,
     /// Open explicit (multi-statement) transactions: txn id → its `BEGIN` LSN.
@@ -64,6 +70,7 @@ impl RelState {
             catalog_root: None,
             tables: HashMap::new(),
             principals: HashMap::new(),
+            database_principals: HashMap::new(),
             next_txn_id: 1,
             next_object_id: FIRST_USER_OBJECT_ID,
             active_txn_begins: std::collections::BTreeMap::new(),

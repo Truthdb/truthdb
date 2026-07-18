@@ -452,13 +452,25 @@ impl SessionManager {
         }
     }
 
-    fn open(&mut self, database: String, login: String) -> SessionId {
+    fn open(
+        &mut self,
+        database: String,
+        login: String,
+        login_sid: u32,
+        user: String,
+        user_sid: u32,
+    ) -> SessionId {
         let id = SessionId(self.next_id);
         self.next_id += 1;
         let mut session = Session::default();
-        session
-            .txn_ctx
-            .set_session_identity(database, login, id.0 as i32);
+        session.txn_ctx.set_session_identity(
+            database,
+            login,
+            id.0 as i32,
+            user,
+            login_sid,
+            user_sid,
+        );
         self.sessions.insert(id, session);
         id
     }
@@ -555,6 +567,9 @@ enum EngineCall {
     OpenSession {
         database: String,
         login: String,
+        /// The login's server principal_id (0 if none — the native path); the
+        /// worker resolves it to the database user before the session opens.
+        login_sid: u32,
         reply: oneshot::Sender<SessionId>,
     },
     /// A SQL batch on behalf of a session (TDS path): typed results. `params`
@@ -732,14 +747,16 @@ pub struct EngineHandle {
 }
 
 impl EngineHandle {
-    /// Opens a session for a connection, recording its database and login for
-    /// session intrinsics. Returns its id (or a placeholder if the engine is
+    /// Opens a session for a connection, recording its database, login, and the
+    /// login's server principal_id (for the database-user and role resolution)
+    /// for session intrinsics. Returns its id (or a placeholder if the engine is
     /// gone).
-    pub async fn open_session(&self, database: String, login: String) -> SessionId {
+    pub async fn open_session(&self, database: String, login: String, login_sid: u32) -> SessionId {
         let (reply, rx) = oneshot::channel();
         self.inbox.send(EngineCall::OpenSession {
             database,
             login,
+            login_sid,
             reply,
         });
         rx.await.unwrap_or(SessionId(0))
@@ -1237,14 +1254,19 @@ fn worker_loop(shared: &Arc<Shared>) {
             Work::Call(EngineCall::OpenSession {
                 database,
                 login,
+                login_sid,
                 reply,
             }) => {
+                // Resolve the login to its database user here (the worker has the
+                // catalog); the session records both for USER_NAME() and role
+                // membership.
+                let (user, user_sid) = shared.engine.resolve_session_user(&login, login_sid);
                 let id = shared
                     .scheduler
                     .lock()
                     .expect("scheduler poisoned")
                     .sessions
-                    .open(database, login);
+                    .open(database, login, login_sid, user, user_sid);
                 let _ = reply.send(id);
             }
             Work::Call(EngineCall::RunBatch {
@@ -2194,8 +2216,14 @@ mod tests {
         // A client that opens a transaction and goes silent without
         // disconnecting must not hold its locks forever.
         let h = start_with_idle(Some(Duration::from_millis(150)));
-        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
-        let b = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let a = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
+        let b = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -2265,7 +2293,10 @@ mod tests {
         // BEGIN and the SELECT inside the transaction say so, the COMMIT says
         // it ended — instead of the batch's final state stamped on all three.
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         let events = drain_events(h.handle.stream_batch(
             s,
             "BEGIN TRANSACTION; SELECT 1 AS one; COMMIT".into(),
@@ -2312,7 +2343,10 @@ mod tests {
         // running. The buffered path emitted nothing for a failed statement,
         // so any Columns/Rows here prove the stream is real.
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         fill(&h, s, 600).await;
         // The WHERE divides by zero at id = 600, after 599 kept rows: two full
         // 256-row chunks are already out, the partial third is dropped.
@@ -2344,7 +2378,10 @@ mod tests {
         // had already started streaming — it must be closed (StatementAborted)
         // before the CATCH's own result set opens, and no Error event follows.
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         fill(&h, s, 300).await;
         let events = drain_events(
             h.handle.stream_batch(
@@ -2380,7 +2417,10 @@ mod tests {
         // closes, the following statements run, and the error is reported at
         // the end of the batch, exactly where the buffered path put it.
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         fill(&h, s, 300).await;
         let events = drain_events(
             h.handle.stream_batch(
@@ -2421,8 +2461,14 @@ mod tests {
         // Single-worker, because with several workers a sibling holding an
         // earlier deadline snapshot can wake and sweep anyway, hiding this.
         let h = start_single_worker(Some(Duration::from_millis(150)));
-        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
-        let b = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let a = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
+        let b = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -2452,7 +2498,10 @@ mod tests {
         // The reaper must only touch *idle* sessions: a session that keeps
         // working keeps its transaction, however long it stays open.
         let h = start_with_idle(Some(Duration::from_millis(150)));
-        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let a = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -2490,7 +2539,10 @@ mod tests {
     async fn idle_reaper_can_be_disabled() {
         // With the reaper off, an idle transaction is left alone.
         let h = start_with_idle(None);
-        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let a = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -2527,7 +2579,9 @@ mod tests {
         // transaction and the sweep cannot select it. Pinned directly, with a
         // zero idle timeout so that guard is the *only* thing protecting it.
         let (engine, mut sched, path) = bare("reap-running", Some(Duration::ZERO));
-        let id = sched.sessions.open("truthdb".into(), "sa".into());
+        let id = sched
+            .sessions
+            .open("truthdb".into(), "sa".into(), 0, "dbo".into(), 0);
         {
             let ctx = &mut sched.sessions.get_mut(id).expect("session").txn_ctx;
             engine
@@ -2579,7 +2633,9 @@ mod tests {
         // reaps it. Reaping its transaction underneath it would run the batch
         // against a rolled-back transaction.
         let (engine, mut sched, path) = bare("reap-parked", Some(Duration::ZERO));
-        let id = sched.sessions.open("truthdb".into(), "sa".into());
+        let id = sched
+            .sessions
+            .open("truthdb".into(), "sa".into(), 0, "dbo".into(), 0);
         {
             let ctx = &mut sched.sessions.get_mut(id).expect("session").txn_ctx;
             engine
@@ -2625,8 +2681,12 @@ mod tests {
     #[test]
     fn review_poc_alter_procedure_reanalyzes_a_parked_exec() {
         let (engine, mut sched, path) = bare("epoch-proc-alter", None);
-        let blocker = sched.sessions.open("truthdb".into(), "sa".into());
-        let waiter = sched.sessions.open("truthdb".into(), "sa".into());
+        let blocker = sched
+            .sessions
+            .open("truthdb".into(), "sa".into(), 0, "dbo".into(), 0);
+        let waiter = sched
+            .sessions
+            .open("truthdb".into(), "sa".into(), 0, "dbo".into(), 0);
         {
             let mut ctx = crate::rel::TxnContext::default();
             engine
@@ -2738,8 +2798,14 @@ mod tests {
         // indefinitely — there is no timeout to fall back on — so a reap that
         // did not nudge would leave this batch parked forever rather than late.
         let h = start_with_idle(Some(Duration::from_millis(150)));
-        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
-        let b = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let a = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
+        let b = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -2771,7 +2837,9 @@ mod tests {
         // it precisely while every worker was busy, which is the case this
         // thread exists for.
         let (engine, mut sched, path) = bare("no-spin", Some(Duration::from_millis(50)));
-        let id = sched.sessions.open("truthdb".into(), "sa".into());
+        let id = sched
+            .sessions
+            .open("truthdb".into(), "sa".into(), 0, "dbo".into(), 0);
         let (tx, _rx) = mpsc::unbounded_channel();
         let reply = BatchSink::new(tx);
         sched.parked.push_back(Parked {
@@ -2832,7 +2900,9 @@ mod tests {
         // at all*, which no amount of load can distinguish itself from — where
         // only the maintenance thread can do it.
         let (engine, mut sched, path) = bare("maintenance", Some(Duration::from_millis(50)));
-        let id = sched.sessions.open("truthdb".into(), "sa".into());
+        let id = sched
+            .sessions
+            .open("truthdb".into(), "sa".into(), 0, "dbo".into(), 0);
         {
             let ctx = &mut sched.sessions.get_mut(id).expect("session").txn_ctx;
             engine
@@ -2897,7 +2967,9 @@ mod tests {
         // worker — so reaping it would report a conflict (1205) that never
         // existed.
         let (engine, mut sched, path) = bare("reap-grantable", None);
-        let id = sched.sessions.open("truthdb".into(), "sa".into());
+        let id = sched
+            .sessions
+            .open("truthdb".into(), "sa".into(), 0, "dbo".into(), 0);
         let (tx, _rx) = mpsc::unbounded_channel();
         let reply = BatchSink::new(tx);
         // Parked, deadline long gone, and nothing holds the lock it wants.
@@ -2937,7 +3009,10 @@ mod tests {
         // A client that comes back believing it is still in a transaction must
         // not have its statements silently autocommit.
         let h = start_with_idle(Some(Duration::from_millis(150)));
-        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let a = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -2981,7 +3056,10 @@ mod tests {
         // entry in the session's NEXT transaction and hand a dead offset to the
         // undo log — silently discarding committed work, or panicking.
         let h = start_with_idle(Some(Duration::from_millis(150)));
-        let a = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let a = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -3036,8 +3114,8 @@ mod tests {
     #[tokio::test]
     async fn writer_blocks_reader_until_commit() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
 
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
@@ -3077,8 +3155,8 @@ mod tests {
         // The Stage 12 row-lock win: two transactions updating *different* rows
         // of one table no longer serialize (Table IX + distinct Row X locks).
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(
                 a,
@@ -3111,8 +3189,8 @@ mod tests {
     #[tokio::test]
     async fn point_writers_to_the_same_row_serialize() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(
                 a,
@@ -3148,8 +3226,8 @@ mod tests {
     #[tokio::test]
     async fn read_uncommitted_sees_uncommitted_rows_without_blocking() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
 
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
@@ -3180,8 +3258,8 @@ mod tests {
     #[tokio::test]
     async fn disconnect_releases_locks_and_wakes_waiter() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
 
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
@@ -3220,8 +3298,8 @@ mod tests {
         // runner delaying the second park past the deadline would otherwise
         // turn this test's deadlock into a 1222.
         let h = start(Duration::from_secs(2));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
 
         for stmt in [
             "CREATE TABLE a (id INT NOT NULL PRIMARY KEY)",
@@ -3276,8 +3354,8 @@ mod tests {
         // must break it the instant the cycle closes, so the whole thing
         // finishes well under the timeout.
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         for stmt in [
             "CREATE TABLE a (id INT NOT NULL PRIMARY KEY)",
             "CREATE TABLE b (id INT NOT NULL PRIMARY KEY)",
@@ -3328,8 +3406,8 @@ mod tests {
         // the *free* t2 but yields to C, which is queued ahead for it. The graph
         // must model that yield edge and break the cycle under the 30 s timeout.
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let c = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let c = h.handle.open_session(String::new(), String::new(), 0).await;
         for stmt in [
             "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY)",
             "CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY)",
@@ -3379,8 +3457,8 @@ mod tests {
     #[tokio::test]
     async fn repeatable_read_holds_shared_lock_and_blocks_a_writer() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -3425,8 +3503,8 @@ mod tests {
     #[tokio::test]
     async fn read_committed_releases_shared_lock_so_a_writer_proceeds() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -3459,8 +3537,8 @@ mod tests {
     #[tokio::test]
     async fn isolation_escalation_within_a_batch_locks_the_read() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -3509,8 +3587,8 @@ mod tests {
     #[tokio::test]
     async fn holder_is_not_blocked_by_a_waiter_on_its_own_lock() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -3557,8 +3635,8 @@ mod tests {
     #[tokio::test]
     async fn autocommit_reads_run_concurrently() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
             .await
@@ -3598,7 +3676,7 @@ mod tests {
         const INITIAL: i64 = 1000;
 
         let h = start(Duration::from_secs(30));
-        let setup = h.handle.open_session(String::new(), String::new()).await;
+        let setup = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(
                 setup,
@@ -3620,7 +3698,7 @@ mod tests {
         for t in 0..TASKS {
             let handle = h.handle.clone();
             tasks.push(tokio::spawn(async move {
-                let session = handle.open_session(String::new(), String::new()).await;
+                let session = handle.open_session(String::new(), String::new(), 0).await;
                 // A deterministic per-task PRNG (an LCG) — reproducible, no dep.
                 let mut rng: u64 =
                     0x9E37_79B9_7F4A_7C15 ^ (t as u64).wrapping_mul(0x2545_F491_4F6C_DD1D);
@@ -3693,7 +3771,7 @@ mod tests {
         const TABLES: [&str; 2] = ["checking", "savings"];
 
         let h = start(Duration::from_secs(30));
-        let setup = h.handle.open_session(String::new(), String::new()).await;
+        let setup = h.handle.open_session(String::new(), String::new(), 0).await;
         for table in TABLES {
             h.handle
                 .run_batch(
@@ -3719,7 +3797,7 @@ mod tests {
         for t in 0..TASKS {
             let handle = h.handle.clone();
             tasks.push(tokio::spawn(async move {
-                let session = handle.open_session(String::new(), String::new()).await;
+                let session = handle.open_session(String::new(), String::new(), 0).await;
                 let mut rng: u64 =
                     0xDEAD_BEEF_0000_0001 ^ (t as u64).wrapping_mul(0x2545_F491_4F6C_DD1D);
                 let mut next = move || {
@@ -3793,8 +3871,8 @@ mod tests {
     #[tokio::test]
     async fn lone_waiter_is_reaped_by_timeout_when_pool_goes_idle() {
         let h = start(Duration::from_millis(300));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
 
         h.handle
             .run_batch(a, "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)".into())
@@ -3839,7 +3917,10 @@ mod tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn a_search_is_answered_while_a_large_scan_runs() {
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         fill(&h, s, 60_000).await;
         h.handle
             .run_native(
@@ -3931,7 +4012,10 @@ mod tests {
     #[tokio::test]
     async fn prepare_execute_unprepare_roundtrip() {
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         fill(&h, s, 5).await;
 
         let events = drain_events(h.handle.stream_prepared(
@@ -3986,7 +4070,10 @@ mod tests {
     #[tokio::test]
     async fn an_unknown_handle_answers_8179() {
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         let events = drain_events(h.handle.stream_prepared(
             s,
             PreparedRpc::Execute {
@@ -4009,7 +4096,10 @@ mod tests {
     #[tokio::test]
     async fn a_parse_error_at_prepare_allocates_no_handle() {
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         let events = drain_events(h.handle.stream_prepared(
             s,
             PreparedRpc::Prepare {
@@ -4042,7 +4132,10 @@ mod tests {
         // the same handle simply sees the new schema (the plan's
         // catalog_version/rebind machinery is moot by design).
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         fill(&h, s, 3).await;
         let events = drain_events(h.handle.stream_prepared(
             s,
@@ -4080,7 +4173,10 @@ mod tests {
     #[tokio::test]
     async fn prepexec_reports_the_handle_after_the_results() {
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         fill(&h, s, 4).await;
         let events = drain_events(h.handle.stream_prepared(
             s,
@@ -4132,7 +4228,10 @@ mod tests {
     #[tokio::test]
     async fn describe_first_result_set_covers_static_shapes_only() {
         let h = start(LOCK_WAIT_TIMEOUT);
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         h.handle
             .run_batch(
                 s,
@@ -4273,8 +4372,8 @@ mod tests {
     /// A harness with RCSI on and `t (id PK, v)` seeded with (1,10), (2,20).
     async fn rcsi_harness() -> (Harness, SessionId, SessionId) {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         for sql in [
             "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
             "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
@@ -4329,8 +4428,8 @@ mod tests {
         // `rcsi_enabled` gate: with the option off, the reader parks on the
         // writer's lock and can only ever see the committed value.
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(
                 a,
@@ -4586,8 +4685,8 @@ mod tests {
     #[tokio::test]
     async fn rcsi_heap_table_serves_snapshot_rows() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         for sql in [
             "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
             "CREATE TABLE hp (v INT)",
@@ -4621,7 +4720,10 @@ mod tests {
     #[tokio::test]
     async fn alter_database_rejects_wrong_names_and_open_transactions() {
         let h = start(Duration::from_secs(30));
-        let s = h.handle.open_session("truthdb".into(), "sa".into()).await;
+        let s = h
+            .handle
+            .open_session("truthdb".into(), "sa".into(), 0)
+            .await;
         let reply = h
             .handle
             .run_batch(
@@ -4704,7 +4806,7 @@ mod tests {
         // READ COMMITTED with RCSI off.
         for round in 0..5 {
             let (h, a, b) = rcsi_harness().await;
-            let c = h.handle.open_session(String::new(), String::new()).await;
+            let c = h.handle.open_session(String::new(), String::new(), 0).await;
             // Writer A holds Database IX -> the ALTER (Database X) parks.
             h.handle
                 .run_batch(a, "BEGIN TRAN; UPDATE t SET v = 55 WHERE id = 2;".into())
@@ -4712,7 +4814,7 @@ mod tests {
                 .unwrap();
             let admin = {
                 let handle = h.handle.clone();
-                let s = h.handle.open_session(String::new(), String::new()).await;
+                let s = h.handle.open_session(String::new(), String::new(), 0).await;
                 tokio::spawn(async move {
                     handle
                         .run_batch(
@@ -4892,8 +4994,8 @@ mod tests {
     /// stand alone), `t (id PK, v)` = (1,10), (2,20); session B is SNAPSHOT.
     async fn si_harness() -> (Harness, SessionId, SessionId) {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         for sql in [
             "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON",
             "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
@@ -5050,7 +5152,7 @@ mod tests {
     #[tokio::test]
     async fn snapshot_without_allow_option_is_3952_at_access() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(
                 a,
@@ -5290,7 +5392,7 @@ mod tests {
     #[tokio::test]
     async fn exec_literal_under_snapshot_without_allow_is_3952() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(
                 a,
@@ -5438,7 +5540,7 @@ mod tests {
     #[tokio::test]
     async fn autocommit_3952_leaves_the_session_usable() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
         h.handle
             .run_batch(
                 a,
@@ -5512,8 +5614,8 @@ mod tests {
     #[tokio::test]
     async fn snapshot_heap_dml_conflicts_via_rid_identities() {
         let h = start(Duration::from_secs(30));
-        let a = h.handle.open_session(String::new(), String::new()).await;
-        let b = h.handle.open_session(String::new(), String::new()).await;
+        let a = h.handle.open_session(String::new(), String::new(), 0).await;
+        let b = h.handle.open_session(String::new(), String::new(), 0).await;
         for sql in [
             "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON",
             "CREATE TABLE hp (v INT)",

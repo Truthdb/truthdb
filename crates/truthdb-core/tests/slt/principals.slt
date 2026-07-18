@@ -1,0 +1,85 @@
+# Stage 16 principals: database users, roles, cycle-checked membership, the
+# catalog views, and the session USER_NAME()/SUSER_SNAME() intrinsics. The
+# membership intrinsics (IS_ROLEMEMBER/IS_SRVROLEMEMBER) depend on the resolved
+# session principal ids and are pinned in the engine tests; the slt harness runs
+# as the sa login mapped to the dbo user.
+
+# The session's login and database user.
+query T
+SELECT SUSER_SNAME()
+----
+sa
+
+query T
+SELECT USER_NAME()
+----
+dbo
+
+# Fixed database principals exist in a fresh database.
+query TT
+SELECT name, type_desc FROM sys.database_principals WHERE name IN ('dbo', 'db_owner', 'public') ORDER BY name
+----
+db_owner DATABASE_ROLE
+dbo SQL_USER
+public DATABASE_ROLE
+
+# Create a role and a user; they are database principals, not schema objects.
+statement ok
+CREATE ROLE analysts
+
+statement ok
+CREATE USER reporter
+
+query TT
+SELECT name, type FROM sys.database_principals WHERE name IN ('analysts', 'reporter') ORDER BY name
+----
+analysts R
+reporter S
+
+query I
+SELECT COUNT(*) FROM sys.tables WHERE name IN ('analysts', 'reporter')
+----
+0
+
+# Membership: add the user to the role; the edge appears in the view (alongside
+# the synthesized dbo -> db_owner edge).
+statement ok
+ALTER ROLE analysts ADD MEMBER reporter
+
+query I
+SELECT COUNT(*) FROM sys.database_role_members
+----
+2
+
+# Self-membership is rejected.
+statement error
+ALTER ROLE analysts ADD MEMBER analysts
+
+# Nesting is allowed; a back-edge that would close a cycle is rejected.
+statement ok
+CREATE ROLE leads
+
+statement ok
+ALTER ROLE leads ADD MEMBER analysts
+
+statement error
+ALTER ROLE analysts ADD MEMBER leads
+
+# A role with members cannot be dropped until its members are removed.
+statement error
+DROP ROLE analysts
+
+statement ok
+ALTER ROLE analysts DROP MEMBER reporter
+
+statement ok
+ALTER ROLE leads DROP MEMBER analysts
+
+statement ok
+DROP ROLE analysts
+
+statement ok
+DROP ROLE leads
+
+statement ok
+DROP USER reporter
