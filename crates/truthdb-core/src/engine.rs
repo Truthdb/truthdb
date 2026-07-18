@@ -2132,6 +2132,100 @@ mod tests {
     }
 
     #[test]
+    fn restore_full_plus_log_chain_recovers_post_backup_changes() {
+        let src = unique_temp_path("restlog-src");
+        let bak = unique_temp_path("restlog-bak");
+        let trn1 = unique_temp_path("restlog-1");
+        let trn2 = unique_temp_path("restlog-2");
+        let restored = unique_temp_path("restlog-restored");
+        let restored_full_only = unique_temp_path("restlog-fullonly");
+        let restored_gap = unique_temp_path("restlog-gap");
+
+        let engine = new_engine(&src);
+        engine
+            .execute("ALTER DATABASE CURRENT SET RECOVERY FULL")
+            .expect("full");
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        // Full backup captures rows 1..=20.
+        engine.storage().backup_full(&bak).expect("full backup");
+        // Changes AFTER the full backup, then a first log backup.
+        for i in 21..=40 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let lit1 = trn1.to_str().unwrap().replace('\'', "''");
+        assert!(sql(&engine, &format!("BACKUP LOG truthdb TO DISK = '{lit1}'"))["error"].is_null());
+        // More changes, then a second (chained) log backup.
+        engine
+            .execute("UPDATE t SET v = v + 100 WHERE id <= 5")
+            .expect("update");
+        for i in 41..=50 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let lit2 = trn2.to_str().unwrap().replace('\'', "''");
+        assert!(sql(&engine, &format!("BACKUP LOG truthdb TO DISK = '{lit2}'"))["error"].is_null());
+        let expected = sql_rows(&engine, "SELECT id, v FROM t ORDER BY id").1;
+        drop(engine);
+
+        // Full + the whole log chain recovers EVERY committed change.
+        Storage::restore_full_with_logs(&restored, &bak, &[trn1.clone(), trn2.clone()])
+            .expect("restore full + log chain");
+        let engine2 = Engine::new(Storage::open(restored.clone()).expect("open")).expect("engine");
+        assert_eq!(
+            sql_rows(&engine2, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "restore + log chain recovers all post-full-backup changes"
+        );
+
+        // The full backup alone recovers only the 20 rows at its point.
+        Storage::restore_full(&restored_full_only, &bak).expect("restore full only");
+        let engine3 =
+            Engine::new(Storage::open(restored_full_only.clone()).expect("open")).expect("engine");
+        assert_eq!(
+            sql_rows(&engine3, "SELECT COUNT(*) FROM t").1,
+            vec![vec![Some("20".into())]],
+            "the full backup alone is the point-in-time it was taken"
+        );
+
+        // A gap in the chain (apply only the second log) is rejected (4305), and
+        // the partial destination is removed so a retry can reuse the path.
+        assert!(
+            Storage::restore_full_with_logs(&restored_gap, &bak, &[trn2.clone()]).is_err(),
+            "a log-chain gap is rejected"
+        );
+        assert!(
+            !restored_gap.exists(),
+            "the partial destination is cleaned up on error"
+        );
+        Storage::restore_full_with_logs(&restored_gap, &bak, &[trn1.clone(), trn2.clone()])
+            .expect("retry with the full chain to the same path succeeds after cleanup");
+
+        drop(engine2);
+        drop(engine3);
+        for p in [
+            src,
+            bak,
+            trn1,
+            trn2,
+            restored,
+            restored_full_only,
+            restored_gap,
+        ] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
     fn backup_log_requires_the_full_recovery_model() {
         let path = unique_temp_path("backuplog-simple");
         let engine = new_engine(&path);

@@ -715,11 +715,25 @@ impl Storage {
     /// `TDBBAK1` backup at `bak_path`, then opens it once to run ARIES recovery,
     /// validating that the restored file is recoverable. `dst_path` must not
     /// already exist.
+    /// Offline restore of a full backup with no log chain (recover to the full
+    /// backup's own end).
     pub fn restore_full(dst_path: &Path, bak_path: &Path) -> Result<(), StorageError> {
-        use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
+        Self::restore_full_with_logs(dst_path, bak_path, &[])
+    }
+
+    /// Offline restore of a full backup followed by an ordered chain of
+    /// `BACKUP LOG` archives (recover to the end of the last log). Each archive
+    /// must continue from where the previous coverage ended (no gap, error
+    /// 4305); the whole recoverable range must fit in the WAL ring (a longer
+    /// chain needs incremental restore, not yet supported).
+    pub fn restore_full_with_logs(
+        dst_path: &Path,
+        bak_path: &Path,
+        log_paths: &[std::path::PathBuf],
+    ) -> Result<(), StorageError> {
         assert_layout_invariants();
         let reader = std::io::BufReader::new(std::fs::File::open(bak_path)?);
-        let (mut backup, header) = crate::backup::BackupReader::new(reader)?;
+        let (backup, header) = crate::backup::BackupReader::new(reader)?;
         if header.page_size as usize != PAGE_SIZE {
             return Err(StorageError::InvalidFile(
                 "backup page size mismatch".to_string(),
@@ -738,13 +752,34 @@ impl Storage {
                 "backup header region sizes are inconsistent".to_string(),
             ));
         }
-        let data_pages = header.data_size / PAGE_SIZE as u64;
-        let mut file = StorageFile::create_from_layout(
+        let file = StorageFile::create_from_layout(
             dst_path.to_path_buf(),
             layout,
             header.default_collation.clone(),
         )?;
+        // The destination now exists and is ours: remove the partial file if any
+        // later step fails, so a retry (which requires a fresh destination) can
+        // proceed. Everything ABOVE this point errors without having created it.
+        let outcome = Self::restore_body(file, backup, &header, log_paths, dst_path);
+        if outcome.is_err() {
+            let _ = std::fs::remove_file(dst_path);
+        }
+        outcome
+    }
 
+    /// The part of a restore that owns the (already-created) destination: lays
+    /// down page images + the log, applies the log chain, writes the superblock,
+    /// and validates by opening (running recovery). A failure here leaves a
+    /// partial file the caller removes.
+    fn restore_body(
+        mut file: StorageFile,
+        mut backup: crate::backup::BackupReader<std::io::BufReader<std::fs::File>>,
+        header: &crate::backup::BackupHeader,
+        log_paths: &[std::path::PathBuf],
+        dst_path: &Path,
+    ) -> Result<(), StorageError> {
+        use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
+        let data_pages = header.data_size / PAGE_SIZE as u64;
         let mut runs: Vec<(u64, u64)> = Vec::new();
         let mut log: Option<(u64, Vec<u8>)> = None;
         while let Some((block_type, payload)) = backup.next_block()? {
@@ -790,11 +825,19 @@ impl Storage {
         }
 
         file.restore_allocator_bitmap(&runs)?;
-        let backup_end = match &log {
+        let mut tail = match &log {
             Some((start_lsn, bytes)) => file.seed_ring(*start_lsn, bytes)?,
             None => header.redo_start_lsn,
         };
-        file.restore_superblock(&header, backup_end)?;
+        // Apply the log chain in order, extending the seeded ring past the full
+        // backup's end. Each archive continues from the current coverage (no
+        // gap) and the whole range must fit the ring.
+        for log_path in log_paths {
+            apply_log_archive(&mut file, log_path, header.redo_start_lsn, &mut tail)?;
+        }
+        // The restored superblock brackets the ring at `[redo_start, tail)`; the
+        // log-backup floor is the end of the applied chain (a fresh chain).
+        file.restore_superblock(header, tail)?;
         file.sync_file()?;
         drop(file);
 
@@ -6389,6 +6432,83 @@ fn fsync_parent_dir(path: &Path) -> Result<(), StorageError> {
         .filter(|p| !p.as_os_str().is_empty())
         .unwrap_or_else(|| Path::new("."));
     std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
+}
+
+/// Applies one `BACKUP LOG` archive to a restore in progress: reads its log
+/// range, verifies it continues from the current coverage (no gap — error 4305)
+/// and that the whole recoverable range still fits the ring, then seeds it and
+/// extends `tail`. Overlap with already-seeded log is harmless (same bytes).
+fn apply_log_archive(
+    file: &mut StorageFile,
+    path: &Path,
+    head: u64,
+    tail: &mut u64,
+) -> Result<(), StorageError> {
+    use crate::backup::{BlockType, decode_log_chunk};
+    let reader = std::io::BufReader::new(std::fs::File::open(path)?);
+    let (mut r, header) = crate::backup::BackupReader::new(reader)?;
+    if !header.flags.log_backup {
+        return Err(StorageError::InvalidFile(format!(
+            "{}: --log expects a BACKUP LOG archive, but this is a full backup",
+            path.display()
+        )));
+    }
+    // Partial identity guard: a log archive whose page or ring geometry differs
+    // was taken against a differently-configured database and cannot belong to
+    // this chain. (A full database-identity match — a persisted DB uuid checked
+    // against the full backup — is future work; today the LSN-continuity check
+    // and geometry are the only cross-database guards.)
+    if header.page_size as usize != PAGE_SIZE || header.wal_size != file.layout.wal_size {
+        return Err(StorageError::InvalidFile(format!(
+            "{}: log archive geometry does not match the restored database",
+            path.display()
+        )));
+    }
+    // Concatenate the archive's (contiguous) log chunks.
+    let mut chunk: Option<(u64, Vec<u8>)> = None;
+    while let Some((block_type, payload)) = r.next_block()? {
+        if block_type == BlockType::LogChunk {
+            let (start_lsn, bytes) = decode_log_chunk(&payload)?;
+            match &mut chunk {
+                Some((first, acc)) => {
+                    if start_lsn != *first + acc.len() as u64 {
+                        return Err(StorageError::InvalidFile(
+                            "log archive chunks are not contiguous".to_string(),
+                        ));
+                    }
+                    acc.extend_from_slice(bytes);
+                }
+                None => chunk = Some((start_lsn, bytes.to_vec())),
+            }
+        }
+    }
+    let Some((start_lsn, bytes)) = chunk else {
+        return Ok(()); // an empty log backup contributes nothing
+    };
+    // Continuity: a start LATER than the current tail is a broken chain (4305).
+    if start_lsn > *tail {
+        return Err(StorageError::InvalidFile(format!(
+            "log chain gap (4305): {} begins at LSN {start_lsn} but the restore has reached {tail}",
+            path.display()
+        )));
+    }
+    let new_end = start_lsn + bytes.len() as u64;
+    // Leave the CLR reserve free: on open, ARIES undo appends compensation
+    // records for the transactions in flight at the chain end (use_reserve), so
+    // the recoverable range must fit `wal_size - reserve`, exactly as the full
+    // backup caps its own shipped log. Otherwise a legitimate long chain fills
+    // the ring and recovery's first undo append hits WalFull.
+    let max_range = file.layout.wal_size.saturating_sub(file.wal.reserve());
+    if new_end.saturating_sub(head) > max_range {
+        return Err(StorageError::InvalidFile(
+            "the full backup plus its log chain exceed the WAL ring's usable size; \
+             incremental restore is not yet supported"
+                .to_string(),
+        ));
+    }
+    file.seed_ring(start_lsn, &bytes)?;
+    *tail = (*tail).max(new_end);
     Ok(())
 }
 
