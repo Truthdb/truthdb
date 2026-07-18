@@ -337,11 +337,14 @@ impl Superblock {
     }
 
     /// Replication restartpoint: the LSN up to which this file's WAL is present
-    /// and recovered. Equal to `wal_tail` in normal operation; a replication
-    /// standby reads it to know where to resume shipping. Stored in the reserved
-    /// area (bytes 24..32; 16..24 is left for the future replication epoch) and
-    /// covered by the superblock checksum. (The reader is test-only until the
-    /// replication receiver slice consumes the restartpoint in production.)
+    /// and recovered — a standby reads it to know where to resume shipping. It is
+    /// stamped at each durable restartpoint (a checkpoint or a restore), where it
+    /// equals `wal_tail`; between restartpoints the persisted value lags the live
+    /// tail, exactly as the superblock's own `wal_tail` does. Stored in the
+    /// reserved area (bytes 24..32; 16..24 is left for the future replication
+    /// epoch) and covered by the superblock checksum. (The reader is test-only
+    /// until the replication receiver slice consumes the restartpoint in
+    /// production.)
     #[cfg(test)]
     pub fn applied_lsn(&self) -> u64 {
         u64::from_le_bytes(self.reserved[24..32].try_into().unwrap())
