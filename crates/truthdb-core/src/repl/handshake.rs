@@ -9,6 +9,11 @@
 //! fields, which binds the proof to that Hello so a captured proof cannot be
 //! replayed with different fields. TLS already prevents on-wire capture/replay,
 //! so no challenge-nonce round-trip is needed before the Hello.
+//!
+//! The whole scheme's secrecy rests on that mandatory TLS: the listener slice
+//! MUST complete the TLS accept before calling [`evaluate_hello`], never on a
+//! plaintext socket. A pre-auth rejection reveals nothing (no real epoch), and
+//! an empty shared secret is refused outright (it would otherwise fail open).
 
 use ring::hmac;
 
@@ -73,6 +78,12 @@ fn reject(primary_epoch: u64, message: &str) -> HelloAck {
 /// unauthenticated peer learns nothing about the version / cluster / epoch state
 /// (every pre-auth failure is one generic rejection).
 pub fn evaluate_hello(hello: &Hello, params: &HandshakeParams) -> HelloAck {
+    // An empty shared secret is a misconfiguration that fails OPEN — anyone could
+    // compute `compute_auth(b"", …)`. Fail closed. (Config load should also
+    // refuse to start a replication node with an empty secret.)
+    if params.shared_secret.is_empty() {
+        return reject(0, "replication handshake rejected");
+    }
     // 1. Shared-secret proof — constant-time HMAC verify, before anything else.
     let key = hmac::Key::new(hmac::HMAC_SHA256, params.shared_secret);
     let msg = auth_message(
@@ -82,7 +93,9 @@ pub fn evaluate_hello(hello: &Hello, params: &HandshakeParams) -> HelloAck {
         hello.last_received_lsn,
     );
     if hmac::verify(&key, &msg, &hello.auth).is_err() {
-        return reject(params.primary_epoch, "replication handshake rejected");
+        // Pre-auth: reveal nothing about the primary's epoch to an
+        // unauthenticated peer (0, not the real epoch).
+        return reject(0, "replication handshake rejected");
     }
     // The peer holds the shared secret; specific diagnostics are safe now.
     // 2. Protocol version.
@@ -161,6 +174,26 @@ mod tests {
         let ack = evaluate_hello(&hello, &params());
         assert!(!ack.accepted);
         assert_eq!(ack.message, "replication handshake rejected");
+        // A pre-auth rejection leaks nothing about the primary's epoch.
+        assert_eq!(ack.primary_epoch, 0);
+    }
+
+    /// An empty shared secret must fail CLOSED — otherwise anyone could compute
+    /// the proof under the empty key.
+    #[test]
+    fn an_empty_shared_secret_fails_closed() {
+        let p = HandshakeParams {
+            shared_secret: b"",
+            cluster_uuid: UUID,
+            primary_epoch: 4,
+            primary_flushed_lsn: 100_000,
+        };
+        // Even a proof computed under the empty secret is refused.
+        let auth = compute_auth(b"", 9, &UUID, 2, 50_000);
+        let hello = hello_with(9, 2, 50_000, auth);
+        let ack = evaluate_hello(&hello, &p);
+        assert!(!ack.accepted);
+        assert_eq!(ack.primary_epoch, 0);
     }
 
     /// A proof signed for one identity cannot be replayed with different fields:
