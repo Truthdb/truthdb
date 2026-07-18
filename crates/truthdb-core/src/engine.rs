@@ -1937,13 +1937,23 @@ mod tests {
         let path = unique_temp_path("backup-in-txn");
         let engine = new_engine(&path);
         // BACKUP manages its own per-chunk locking and cannot run inside an
-        // explicit transaction (226, like other DDL).
+        // explicit transaction (3021).
         assert_eq!(
             sql_error_number(
                 &engine,
                 "BEGIN TRANSACTION; BACKUP DATABASE d TO DISK = '/tmp/truthdb-never.bak'"
             ),
-            226
+            3021
+        );
+        // A side-effecting BACKUP is illegal inside a function body (156);
+        // otherwise a per-row SELECT would run a backup per row.
+        assert_eq!(
+            sql_error_number(
+                &engine,
+                "CREATE FUNCTION dbo.f() RETURNS INT AS BEGIN \
+                 BACKUP DATABASE d TO DISK = '/tmp/truthdb-never.bak'; RETURN 1 END"
+            ),
+            156
         );
         drop(engine);
         let _ = std::fs::remove_file(path);

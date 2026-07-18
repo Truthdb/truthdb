@@ -1816,6 +1816,15 @@ impl Parser {
     fn parse_backup(&mut self) -> SqlResult<Statement> {
         let start = self.peek().span;
         self.bump(); // BACKUP
+        // BACKUP is a side-effecting operation: it is illegal inside a function
+        // or table-valued-function body (a function must be side-effect-free —
+        // otherwise `SELECT dbo.f(x) FROM t` would run a full backup per row).
+        // It is permitted inside a stored procedure, matching SQL Server.
+        if self.in_function || self.in_table_function {
+            return Err(
+                SqlError::new(156, 15, 1, "Incorrect syntax near the keyword 'BACKUP'.").at(start),
+            );
+        }
         self.expect_keyword("DATABASE")?;
         let database = self.parse_name()?;
         self.expect_keyword("TO")?;

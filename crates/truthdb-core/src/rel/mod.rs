@@ -3508,7 +3508,13 @@ fn exec_statement_dispatch(
             // inside a transaction that holds locks, and it is a privileged
             // operation (gated by is_privileged_ddl above).
             if txn_ctx.in_txn() {
-                return Err(ddl_in_txn_err());
+                return Err(SqlError::new(
+                    3021,
+                    16,
+                    1,
+                    "Cannot perform a backup or restore operation within a transaction."
+                        .to_string(),
+                ));
             }
             storage
                 .backup_full_with(std::path::Path::new(path), *checksum, *copy_only)
