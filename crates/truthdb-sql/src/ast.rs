@@ -108,6 +108,17 @@ pub enum Statement {
         value: Option<Expr>,
         span: Span,
     },
+    /// `GOTO <label>` — an unconditional jump to a label in the same statement
+    /// list or an enclosing one.
+    Goto {
+        label: String,
+        span: Span,
+    },
+    /// `<label>:` — a `GOTO` target. Executed in sequence it is a no-op.
+    Label {
+        name: String,
+        span: Span,
+    },
     /// `CREATE PROCEDURE` / `ALTER PROCEDURE` — the body is stored as source
     /// text (the view posture) and re-parsed at EXEC.
     CreateProcedure(CreateProcedure),

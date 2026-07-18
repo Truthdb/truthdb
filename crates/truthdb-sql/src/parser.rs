@@ -157,7 +157,11 @@ impl Parser {
             self.nodes = 0;
             self.statement_index = statements.len();
             statements.push(self.parse_statement()?);
-            if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
+            // A label (`<name>:`) prefixes the statement that follows it, so no
+            // separator is required after it; every other statement needs `;` or
+            // end-of-batch before the next one.
+            let after_label = matches!(statements.last(), Some(Statement::Label { .. }));
+            if !after_label && !self.at_eof() && !self.check(&TokenKind::Semicolon) {
                 let token = self.peek().clone();
                 return Err(SqlError::syntax(self.token_text(&token), token.span));
             }
@@ -166,6 +170,17 @@ impl Parser {
     }
 
     fn parse_statement(&mut self) -> SqlResult<Statement> {
+        // A label `<identifier>:` at statement start (a GOTO target). At the
+        // start of a statement, an identifier immediately followed by `:` can
+        // only be a label — no statement begins that way.
+        if matches!(self.peek().kind, TokenKind::Word { .. })
+            && matches!(
+                self.tokens.get(self.pos + 1).map(|t| &t.kind),
+                Some(TokenKind::Colon)
+            )
+        {
+            return self.parse_label();
+        }
         match self.peek_keyword().as_deref() {
             Some("CREATE") => self.parse_create(),
             Some("ALTER") => self.parse_alter(),
@@ -195,6 +210,7 @@ impl Parser {
             Some("BACKUP") => self.parse_backup(),
             Some("RESTORE") => self.parse_restore(),
             Some("ENABLE") | Some("DISABLE") => self.parse_trigger_state(),
+            Some("GOTO") => self.parse_goto(),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -481,7 +497,11 @@ impl Parser {
                 break;
             }
             statements.push(self.parse_statement()?);
-            if !self.at_eof()
+            // A label prefixes the next statement, so it needs no separator after
+            // it (matching `parse_statements`).
+            let after_label = matches!(statements.last(), Some(Statement::Label { .. }));
+            if !after_label
+                && !self.at_eof()
                 && !matches!(self.peek_keyword().as_deref(), Some("END"))
                 && !self.check(&TokenKind::Semicolon)
             {
@@ -1687,8 +1707,8 @@ impl Parser {
                     return Ok(());
                 }
                 self.nodes = 0;
-                self.parse_statement()?;
-                if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
+                let after_label = matches!(self.parse_statement()?, Statement::Label { .. });
+                if !after_label && !self.at_eof() && !self.check(&TokenKind::Semicolon) {
                     let token = self.peek().clone();
                     return Err(SqlError::syntax(self.token_text(&token), token.span));
                 }
@@ -1794,8 +1814,8 @@ impl Parser {
                     return Ok(());
                 }
                 self.nodes = 0;
-                self.parse_statement()?;
-                if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
+                let after_label = matches!(self.parse_statement()?, Statement::Label { .. });
+                if !after_label && !self.at_eof() && !self.check(&TokenKind::Semicolon) {
                     let token = self.peek().clone();
                     return Err(SqlError::syntax(self.token_text(&token), token.span));
                 }
@@ -1992,6 +2012,23 @@ impl Parser {
             enable,
             span,
         })
+    }
+
+    /// `<label>:` — a GOTO target.
+    fn parse_label(&mut self) -> SqlResult<Statement> {
+        let start = self.peek().span;
+        let name = self.parse_ident()?.value;
+        self.expect(&TokenKind::Colon)?;
+        let span = start.to(self.prev_span());
+        Ok(Statement::Label { name, span })
+    }
+
+    /// `GOTO <label>`.
+    fn parse_goto(&mut self) -> SqlResult<Statement> {
+        let start = self.bump().span; // GOTO
+        let label = self.parse_ident()?.value;
+        let span = start.to(self.prev_span());
+        Ok(Statement::Goto { label, span })
     }
 
     fn parse_create_login(&mut self, start: Span, alter: bool) -> SqlResult<Statement> {
@@ -2309,8 +2346,8 @@ impl Parser {
                         return Ok(());
                     }
                     self.nodes = 0;
-                    self.parse_statement()?;
-                    if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
+                    let after_label = matches!(self.parse_statement()?, Statement::Label { .. });
+                    if !after_label && !self.at_eof() && !self.check(&TokenKind::Semicolon) {
                         let token = self.peek().clone();
                         return Err(SqlError::syntax(self.token_text(&token), token.span));
                     }
@@ -2375,8 +2412,8 @@ impl Parser {
                     return Ok(());
                 }
                 self.nodes = 0;
-                self.parse_statement()?;
-                if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
+                let after_label = matches!(self.parse_statement()?, Statement::Label { .. });
+                if !after_label && !self.at_eof() && !self.check(&TokenKind::Semicolon) {
                     let token = self.peek().clone();
                     return Err(SqlError::syntax(self.token_text(&token), token.span));
                 }

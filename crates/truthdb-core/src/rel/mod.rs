@@ -508,7 +508,9 @@ pub fn execute_batch_streamed(
     // `run_block` returns Err only when the batch must terminate (a cancel, or a
     // dooming/uncaught error outside any TRY); a non-dooming error under
     // `XACT_ABORT OFF` is recorded in `run.last_error` and the batch continues.
-    let terminating = run_block(storage, &statements, txn_ctx, &mut run, false).err();
+    let terminating = run_block(storage, &statements, txn_ctx, &mut run, false)
+        .and_then(end_of_scope)
+        .err();
     // The batch-end durability point, and the DONEs it was holding back. A
     // durability failure outranks any statement error: a lost commit is more
     // severe than an error the client asked about, and a benign continued error
@@ -1124,7 +1126,7 @@ fn run_user_procedure(
         Err(ExecError::Own(doom_per_rule(txn_ctx, error)))
     } else {
         run_block(storage, &statements, txn_ctx, run, in_try)
-            .map(|_| ())
+            .and_then(end_of_scope)
             .map_err(ExecError::Inner)
     };
     EXEC_DEPTH.with(|d| d.set(d.get() - 1));
@@ -1263,7 +1265,7 @@ fn run_user_scalar_function(
             last_error: None,
             function_return_type: Some(return_type),
         };
-        run_block(storage, &statements, &mut txn_ctx, &mut run, false).map(|_| ())
+        run_block(storage, &statements, &mut txn_ctx, &mut run, false).and_then(end_of_scope)
     };
     EXEC_DEPTH.with(|d| d.set(d.get() - 1));
     result?;
@@ -1426,7 +1428,7 @@ fn run_exec(
         // error crossing out already carries every decision: dooming, and by
         // crossing at all, termination of the whole nest.
         run_block(storage, &statements, txn_ctx, run, in_try)
-            .map(|_| ())
+            .and_then(end_of_scope)
             .map_err(ExecError::Inner)
     };
     EXEC_DEPTH.with(|d| d.set(d.get() - 1));
@@ -1605,14 +1607,58 @@ fn eval_condition(
 
 /// How a statement block ended: normally, or via a control-flow statement
 /// that must propagate to the construct that absorbs it (`WHILE` for
-/// Break/Continue, the batch — later the procedure — for Return). TRY/CATCH
-/// and plain blocks pass every non-Normal flow straight through.
-#[derive(Clone, Copy, PartialEq, Eq)]
+/// Break/Continue, the batch — later the procedure — for Return, the nearest
+/// block holding the target label for `Goto`). TRY/CATCH and plain blocks pass
+/// every non-Normal flow straight through (a `Goto` is first checked against the
+/// current block's labels, then propagated).
+#[derive(Clone, PartialEq, Eq)]
 enum Flow {
     Normal,
     Break,
     Continue,
     Return,
+    /// A `GOTO <label>` still looking for its target label.
+    Goto(String),
+}
+
+/// What `run_block`'s loop should do with a flow bubbling up from a nested
+/// construct: a `GOTO` to a label in this block jumps there; anything else
+/// propagates to the enclosing block.
+enum GotoAction {
+    /// Resume at this statement index (a resolved `GOTO`).
+    Jump(usize),
+    /// The nested construct ended normally — fall through.
+    Fall,
+    /// Return this flow to the caller (Break/Continue/Return, or a `GOTO` to a
+    /// label not defined in this block).
+    Propagate(Flow),
+}
+
+fn resolve_goto(flow: Flow, labels: &std::collections::HashMap<String, usize>) -> GotoAction {
+    match flow {
+        Flow::Normal => GotoAction::Fall,
+        Flow::Goto(label) => match labels.get(&label.to_ascii_lowercase()) {
+            Some(&target) => GotoAction::Jump(target),
+            None => GotoAction::Propagate(Flow::Goto(label)),
+        },
+        other => GotoAction::Propagate(other),
+    }
+}
+
+/// A statement list run as its own scope — a batch, or a procedure / function /
+/// trigger body — cannot be a GOTO target from outside and a GOTO cannot jump
+/// out of it. A GOTO that reaches the end of such a scope unresolved references
+/// a label defined nowhere in scope: error 133.
+fn end_of_scope(flow: Flow) -> Result<(), SqlError> {
+    match flow {
+        Flow::Goto(label) => Err(SqlError::new(
+            133,
+            15,
+            1,
+            format!("A GOTO statement references the label '{label}:' which has not been defined."),
+        )),
+        _ => Ok(()),
+    }
 }
 
 fn run_block(
@@ -1622,7 +1668,29 @@ fn run_block(
     run: &mut BatchRun<'_>,
     in_try: bool,
 ) -> Result<Flow, SqlError> {
-    for statement in statements {
+    // Label positions for GOTO. A jump sets the index to the label's position;
+    // execution resumes there (the label statement itself is a no-op). A label
+    // repeated in the same list is error 132.
+    let mut labels: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for (idx, s) in statements.iter().enumerate() {
+        if let Statement::Label { name, .. } = s
+            && labels.insert(name.to_ascii_lowercase(), idx).is_some()
+        {
+            return Err(SqlError::new(
+                132,
+                15,
+                1,
+                format!(
+                    "The label '{name}:' has already been declared. Label names must be unique \
+                     within a query batch or stored procedure."
+                ),
+            ));
+        }
+    }
+    let mut i = 0;
+    'stmts: while i < statements.len() {
+        let statement = &statements[i];
+        i += 1;
         // A TDS Attention (cancel) aborts the batch before the next statement.
         // It is never catchable — it propagates straight out, past any TRY.
         check_cancelled()?;
@@ -1690,9 +1758,13 @@ fn run_block(
         }
         match statement {
             Statement::Block { body, .. } => {
-                match run_block(storage, body, txn_ctx, run, in_try)? {
-                    Flow::Normal => {}
-                    flow => return Ok(flow),
+                match resolve_goto(run_block(storage, body, txn_ctx, run, in_try)?, &labels) {
+                    GotoAction::Jump(t) => {
+                        i = t;
+                        continue 'stmts;
+                    }
+                    GotoAction::Propagate(flow) => return Ok(flow),
+                    GotoAction::Fall => {}
                 }
                 continue;
             }
@@ -1726,9 +1798,15 @@ fn run_block(
                     else_branch.as_ref()
                 };
                 if let Some(branch) = branch {
-                    match run_block(storage, std::slice::from_ref(branch), txn_ctx, run, in_try)? {
-                        Flow::Normal => {}
-                        flow => return Ok(flow),
+                    let flow =
+                        run_block(storage, std::slice::from_ref(branch), txn_ctx, run, in_try)?;
+                    match resolve_goto(flow, &labels) {
+                        GotoAction::Jump(t) => {
+                            i = t;
+                            continue 'stmts;
+                        }
+                        GotoAction::Propagate(flow) => return Ok(flow),
+                        GotoAction::Fall => {}
                     }
                 }
                 continue;
@@ -1758,10 +1836,21 @@ fn run_block(
                     if !taken {
                         break;
                     }
-                    match run_block(storage, std::slice::from_ref(body), txn_ctx, run, in_try)? {
+                    let flow =
+                        run_block(storage, std::slice::from_ref(body), txn_ctx, run, in_try)?;
+                    match flow {
                         Flow::Normal | Flow::Continue => {}
                         Flow::Break => break,
-                        Flow::Return => return Ok(Flow::Return),
+                        // RETURN or a GOTO leaves the loop: a GOTO to a label in
+                        // this block jumps out of the WHILE to it, else propagate.
+                        other => match resolve_goto(other, &labels) {
+                            GotoAction::Jump(t) => {
+                                i = t;
+                                continue 'stmts;
+                            }
+                            GotoAction::Propagate(flow) => return Ok(flow),
+                            GotoAction::Fall => {}
+                        },
                     }
                 }
                 continue;
@@ -1854,6 +1943,17 @@ fn run_block(
                 }
                 return Ok(Flow::Return);
             }
+            // A label is a no-op when reached in sequence.
+            Statement::Label { .. } => continue,
+            // GOTO jumps to a label in this block, or propagates to an enclosing
+            // one (the batch top turns an unresolved GOTO into error 133).
+            Statement::Goto { label, .. } => match labels.get(&label.to_ascii_lowercase()) {
+                Some(&target) => {
+                    i = target;
+                    continue 'stmts;
+                }
+                None => return Ok(Flow::Goto(label.clone())),
+            },
             _ => {}
         }
         if let Statement::TryCatch {
@@ -1864,8 +1964,16 @@ fn run_block(
         {
             match run_block(storage, try_block, txn_ctx, run, true) {
                 Ok(Flow::Normal) => {}
-                // BREAK/CONTINUE/RETURN cross a TRY without running its CATCH.
-                Ok(flow) => return Ok(flow),
+                // BREAK/CONTINUE/RETURN/GOTO cross a TRY without running its
+                // CATCH; a GOTO to a label in this block jumps there.
+                Ok(flow) => match resolve_goto(flow, &labels) {
+                    GotoAction::Jump(t) => {
+                        i = t;
+                        continue 'stmts;
+                    }
+                    GotoAction::Propagate(flow) => return Ok(flow),
+                    GotoAction::Fall => {}
+                },
                 // An Attention that landed inside the TRY block is not caught.
                 Err(cancel) if cancel.number == CANCEL_ERROR => return Err(cancel),
                 // A durability failure wedged the store: no CATCH swallows a
@@ -1888,9 +1996,13 @@ fn run_block(
                     // outer CATCH (or end the batch) per `in_try`.
                     let caught = run_block(storage, catch_block, txn_ctx, run, in_try);
                     txn_ctx.pop_error();
-                    match caught? {
-                        Flow::Normal => {}
-                        flow => return Ok(flow),
+                    match resolve_goto(caught?, &labels) {
+                        GotoAction::Jump(t) => {
+                            i = t;
+                            continue 'stmts;
+                        }
+                        GotoAction::Propagate(flow) => return Ok(flow),
+                        GotoAction::Fall => {}
                     }
                 }
             }
@@ -3281,6 +3393,8 @@ fn analyze_statements_locks(
             | Statement::Break { .. }
             | Statement::Continue { .. }
             | Statement::Return { .. }
+            | Statement::Goto { .. }
+            | Statement::Label { .. }
             | Statement::BeginTransaction { .. }
             | Statement::Commit { .. }
             | Statement::Rollback { .. }
@@ -3594,7 +3708,9 @@ fn exec_statement_dispatch(
         | Statement::While { .. }
         | Statement::Break { .. }
         | Statement::Continue { .. }
-        | Statement::Return { .. } => {
+        | Statement::Return { .. }
+        | Statement::Goto { .. }
+        | Statement::Label { .. } => {
             unreachable!("control flow is executed by run_block")
         }
         // Handled in `exec_statement_streamed_inner` (severity <= 10 emits an
@@ -6557,10 +6673,11 @@ fn fire_one_trigger(
         // aborts the firing statement: SQL Server rolls back the DML and returns
         // the error. (A successful CATCH clears last_error, so a trigger that
         // handles its own error still succeeds.)
-        flow.map(|_| ()).and_then(|()| match run.last_error.take() {
-            Some(err) => Err(err),
-            None => Ok(()),
-        })
+        flow.and_then(end_of_scope)
+            .and_then(|()| match run.last_error.take() {
+                Some(err) => Err(err),
+                None => Ok(()),
+            })
     };
     FIRING_TRIGGERS.with(|f| {
         f.borrow_mut().pop();
@@ -11836,7 +11953,7 @@ fn run_multi_statement_tvf(
             // A multi-statement TVF's RETURN carries no value.
             function_return_type: None,
         };
-        run_block(storage, &statements, &mut txn_ctx, &mut run, false).map(|_| ())
+        run_block(storage, &statements, &mut txn_ctx, &mut run, false).and_then(end_of_scope)
     };
     EXEC_DEPTH.with(|d| d.set(d.get() - 1));
     result?;
