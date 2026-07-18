@@ -43,6 +43,7 @@ pub enum TokenKind {
     // Operators / punctuation.
     Comma,
     Semicolon,
+    Colon,
     LParen,
     RParen,
     Dot,
@@ -190,6 +191,10 @@ impl<'a> Lexer<'a> {
             b';' => {
                 self.pos += 1;
                 Ok(single(TokenKind::Semicolon, 1))
+            }
+            b':' => {
+                self.pos += 1;
+                Ok(single(TokenKind::Colon, 1))
             }
             b'(' => {
                 self.pos += 1;

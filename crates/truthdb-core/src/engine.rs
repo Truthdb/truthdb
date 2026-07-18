@@ -6755,6 +6755,91 @@ mod tests {
     }
 
     #[test]
+    fn goto_jumps_forward_backward_and_errors_on_missing_label() {
+        let path = unique_temp_path("goto");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (n INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+
+        // Forward GOTO skips the statement it jumps over.
+        engine
+            .execute(
+                "INSERT INTO t VALUES (1); GOTO skip; INSERT INTO t VALUES (2); \
+                 skip: INSERT INTO t VALUES (3)",
+            )
+            .expect("forward goto");
+        assert_eq!(
+            sql_rows(&engine, "SELECT n FROM t ORDER BY n").1,
+            vec![vec![Some("1".into())], vec![Some("3".into())]],
+            "forward GOTO skipped VALUES(2)"
+        );
+
+        // Backward GOTO from inside an IF drives a counting loop (10, 11, 12).
+        engine.execute("DELETE FROM t").expect("clear");
+        engine
+            .execute(
+                "DECLARE @i INT = 10; \
+                 loop: INSERT INTO t VALUES (@i); SET @i = @i + 1; IF @i <= 12 GOTO loop",
+            )
+            .expect("backward goto loop");
+        assert_eq!(
+            sql_rows(&engine, "SELECT n FROM t ORDER BY n").1,
+            vec![
+                vec![Some("10".into())],
+                vec![Some("11".into())],
+                vec![Some("12".into())],
+            ],
+            "backward GOTO from an IF looped"
+        );
+
+        // A GOTO to a label defined nowhere in scope errors 133.
+        assert_eq!(
+            sql_error_number(&engine, "GOTO nowhere"),
+            133,
+            "a GOTO to an undefined label errors 133"
+        );
+
+        // A label inside a BEGIN...END block (no semicolon after the label).
+        engine.execute("DELETE FROM t").expect("clear");
+        engine
+            .execute("BEGIN GOTO d; INSERT INTO t VALUES (7); d: INSERT INTO t VALUES (8) END")
+            .expect("label in a block");
+        assert_eq!(
+            sql_rows(&engine, "SELECT n FROM t ORDER BY n").1,
+            vec![vec![Some("8".into())]],
+            "GOTO skipped VALUES(7) inside the block"
+        );
+
+        // A label inside a stored procedure body.
+        engine.execute("DELETE FROM t").expect("clear");
+        assert!(
+            sql(
+                &engine,
+                "CREATE PROCEDURE fill AS BEGIN GOTO d; INSERT INTO t VALUES (20); d: INSERT INTO t VALUES (21) END"
+            )["error"]
+                .is_null(),
+            "a procedure body with a label creates cleanly"
+        );
+        engine.execute("EXEC fill").expect("exec proc");
+        assert_eq!(
+            sql_rows(&engine, "SELECT n FROM t ORDER BY n").1,
+            vec![vec![Some("21".into())]],
+            "GOTO inside a procedure body skipped VALUES(20)"
+        );
+
+        // A label repeated in the same list errors 132.
+        assert_eq!(
+            sql_error_number(&engine, "d: SELECT 1; d: SELECT 2"),
+            132,
+            "a duplicate label errors 132"
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn disable_and_enable_trigger_controls_firing() {
         let path = unique_temp_path("trigger-disable");
         let engine = new_engine(&path);
