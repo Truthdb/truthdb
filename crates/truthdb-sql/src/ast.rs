@@ -191,6 +191,29 @@ pub enum Statement {
         copy_only: bool,
         span: Span,
     },
+    /// `RESTORE {VERIFYONLY|HEADERONLY|FILELISTONLY|DATABASE <name>|LOG <name>}
+    /// FROM DISK = '<path>'` — the online, read-only restore verbs. Actual
+    /// `RESTORE DATABASE`/`LOG` is offline (the CLI); online it errors.
+    Restore {
+        mode: RestoreMode,
+        path: String,
+        span: Span,
+    },
+}
+
+/// The `RESTORE` verb.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestoreMode {
+    /// `RESTORE VERIFYONLY` — validate the whole backup file.
+    VerifyOnly,
+    /// `RESTORE HEADERONLY` — one row of backup metadata.
+    HeaderOnly,
+    /// `RESTORE FILELISTONLY` — one row per file in the backup.
+    FileListOnly,
+    /// `RESTORE DATABASE` — offline only (errors online).
+    Database,
+    /// `RESTORE LOG` — offline only (errors online).
+    Log,
 }
 
 /// `GRANT` / `DENY` / `REVOKE`.

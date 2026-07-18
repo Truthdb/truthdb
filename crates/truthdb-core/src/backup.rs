@@ -374,9 +374,24 @@ impl<R: Read> BackupReader<R> {
             .ok_or_else(|| corrupt("unknown block type"))?;
         let mut len_bytes = [0u8; 8];
         self.reader.read_exact(&mut len_bytes)?;
-        let len = u64::from_le_bytes(len_bytes) as usize;
-        let mut payload = vec![0u8; len];
-        self.reader.read_exact(&mut payload)?;
+        let len = u64::from_le_bytes(len_bytes);
+        // The length field is outside the per-block checksum, so a corrupt length
+        // must not drive a `vec![0u8; len]` allocation: a flipped high byte yields
+        // a length near u64::MAX and aborts or panics the process instead of
+        // surfacing as a clean corruption error. Grow the buffer only by bytes
+        // actually read; a bogus length then hits EOF and fails the length check.
+        let mut payload = Vec::new();
+        let mut buf = [0u8; 16 * 1024];
+        let mut remaining = len;
+        while remaining > 0 {
+            let want = remaining.min(buf.len() as u64) as usize;
+            let n = self.reader.read(&mut buf[..want])?;
+            if n == 0 {
+                return Err(corrupt("block truncated (corrupt backup)"));
+            }
+            payload.extend_from_slice(&buf[..n]);
+            remaining -= n as u64;
+        }
         let mut checksum_bytes = [0u8; 8];
         self.reader.read_exact(&mut checksum_bytes)?;
         let stored = u64::from_le_bytes(checksum_bytes);
@@ -386,6 +401,24 @@ impl<R: Read> BackupReader<R> {
         self.blocks += 1;
         Ok((block_type, payload))
     }
+}
+
+/// Reads a backup's header without restoring it (`RESTORE HEADERONLY` /
+/// `FILELISTONLY`). Fails if the file is not a readable `TDBBAK1` backup.
+pub fn read_header(path: &std::path::Path) -> io::Result<BackupHeader> {
+    let reader = io::BufReader::new(std::fs::File::open(path)?);
+    let (_, header) = BackupReader::new(reader)?;
+    Ok(header)
+}
+
+/// Verifies a backup end to end (`RESTORE VERIFYONLY`): the magic, the header,
+/// every block's checksum, and that the trailer's block count matches. A
+/// truncated file fails when a block read hits EOF. Returns the header.
+pub fn verify(path: &std::path::Path) -> io::Result<BackupHeader> {
+    let reader = io::BufReader::new(std::fs::File::open(path)?);
+    let (mut reader, header) = BackupReader::new(reader)?;
+    while reader.next_block()?.is_some() {}
+    Ok(header)
 }
 
 fn corrupt(message: &str) -> io::Error {

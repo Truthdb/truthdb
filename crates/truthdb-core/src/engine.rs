@@ -2303,6 +2303,140 @@ mod tests {
     }
 
     #[test]
+    fn restore_inspect_verbs_read_a_backup_without_restoring() {
+        let src = unique_temp_path("restinspect-src");
+        let bak = unique_temp_path("restinspect-bak");
+
+        let engine = new_engine(&src);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=10 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let baklit = bak.to_str().unwrap().replace('\'', "''");
+        assert!(
+            sql(
+                &engine,
+                &format!("BACKUP DATABASE truthdb TO DISK = '{baklit}'")
+            )["error"]
+                .is_null()
+        );
+
+        // HEADERONLY: exactly one metadata row; a full backup is BackupType 1.
+        let (cols, rows) = sql_rows(
+            &engine,
+            &format!("RESTORE HEADERONLY FROM DISK = '{baklit}'"),
+        );
+        assert_eq!(rows.len(), 1, "one header row");
+        assert!(cols.contains(&"BackupType".to_string()));
+        assert!(cols.contains(&"Checksum".to_string()));
+        let col = |name: &str| rows[0][cols.iter().position(|c| c == name).unwrap()].clone();
+        assert_eq!(col("BackupType"), Some("1".to_string()), "full backup");
+        assert_eq!(col("FormatVersion"), Some("1".to_string()));
+        assert_eq!(col("PageSize"), Some("4096".to_string()));
+
+        // FILELISTONLY: a data row ('D') and a log row ('L').
+        let (fcols, frows) = sql_rows(
+            &engine,
+            &format!("RESTORE FILELISTONLY FROM DISK = '{baklit}'"),
+        );
+        assert_eq!(fcols, vec!["LogicalName", "Type", "Size"]);
+        let types: Vec<Option<String>> = frows.iter().map(|r| r[1].clone()).collect();
+        assert_eq!(types, vec![Some("D".to_string()), Some("L".to_string())]);
+
+        // VERIFYONLY: a valid backup verifies with no error and opens no rowset.
+        let env = sql(
+            &engine,
+            &format!("RESTORE VERIFYONLY FROM DISK = '{baklit}'"),
+        );
+        assert!(env["error"].is_null(), "valid backup verifies: {env}");
+
+        // RESTORE DATABASE is offline-only: online it errors (3101).
+        assert_eq!(
+            sql_error_number(
+                &engine,
+                &format!("RESTORE DATABASE truthdb FROM DISK = '{baklit}'")
+            ),
+            3101
+        );
+
+        // Inside a transaction, restore is refused (3021), like BACKUP.
+        assert_eq!(
+            sql_error_number(
+                &engine,
+                &format!("BEGIN TRANSACTION; RESTORE VERIFYONLY FROM DISK = '{baklit}'")
+            ),
+            3021
+        );
+        drop(engine);
+
+        for p in [src, bak] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn restore_verifyonly_rejects_a_corrupt_or_missing_backup() {
+        let src = unique_temp_path("restverify-src");
+        let bak = unique_temp_path("restverify-bak");
+        let engine = new_engine(&src);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine.execute("INSERT INTO t VALUES (1)").expect("insert");
+        let baklit = bak.to_str().unwrap().replace('\'', "''");
+        assert!(
+            sql(
+                &engine,
+                &format!("BACKUP DATABASE truthdb TO DISK = '{baklit}'")
+            )["error"]
+                .is_null()
+        );
+
+        let pristine = std::fs::read(&bak).expect("read bak");
+        let verify = |bytes: &[u8]| {
+            std::fs::write(&bak, bytes).expect("write");
+            sql_error_number(
+                &engine,
+                &format!("RESTORE VERIFYONLY FROM DISK = '{baklit}'"),
+            )
+        };
+
+        // Flip a payload byte mid-file: it no longer matches its xxh64, so
+        // VERIFYONLY reports the restore terminating abnormally (3013).
+        let mut payload_flip = pristine.clone();
+        let mid = payload_flip.len() / 2;
+        payload_flip[mid] ^= 0xFF;
+        assert_eq!(verify(&payload_flip), 3013, "a flipped payload byte");
+
+        // Corrupt the header block's length field (its high byte, outside the
+        // checksum): recovery must report 3013, not allocate ~u64::MAX and crash.
+        let mut len_flip = pristine.clone();
+        len_flip[19] = 0xFF;
+        assert_eq!(
+            verify(&len_flip),
+            3013,
+            "a corrupt block length is not a crash"
+        );
+
+        // A missing file errors cleanly, not a panic.
+        assert_eq!(
+            sql_error_number(
+                &engine,
+                "RESTORE VERIFYONLY FROM DISK = '/nonexistent/nope.bak'"
+            ),
+            3013
+        );
+        drop(engine);
+        for p in [src, bak] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
     fn commit_records_carry_a_recent_wall_clock_timestamp() {
         use crate::storage_layout::WAL_ENTRY_TYPE_REL;
         use crate::wal::records::{REL_KIND_TXN_COMMIT, RelRecord};
