@@ -585,6 +585,25 @@ impl Storage {
         self.lock().wal_tail()
     }
 
+    /// The current WAL head (the reclaim floor) — for tests that verify the
+    /// FULL-model log-backup hold pins truncation.
+    #[cfg(test)]
+    pub(crate) fn wal_head(&self) -> u64 {
+        self.lock().wal.head()
+    }
+
+    /// The persisted log-backup floor (tests).
+    #[cfg(test)]
+    pub(crate) fn last_log_backup_lsn(&self) -> u64 {
+        self.lock().last_log_backup_lsn
+    }
+
+    /// The active FULL-model log-backup truncation hold, if any (tests).
+    #[cfg(test)]
+    pub(crate) fn log_backup_hold(&self) -> Option<u64> {
+        self.lock().truncation_gate.log_backup
+    }
+
     /// Online full backup: writes a self-describing `TDBBAK1` file at `dst`
     /// capturing the database as of a consistent recovery point.
     ///
@@ -615,6 +634,18 @@ impl Storage {
         // permanently freezes WAL truncation and eventually wedges writes.
         let _hold = BackupHoldGuard { storage: self };
         self.write_backup(dst, &plan)
+    }
+
+    /// `BACKUP LOG`: ships the FULL-model log tail to a `TDBBAK1` log archive
+    /// and advances the log-backup floor, releasing the ring it held. Requires
+    /// the FULL recovery model.
+    pub fn backup_log(
+        &self,
+        dst: &Path,
+        checksum: bool,
+        copy_only: bool,
+    ) -> Result<crate::backup::BackupSummary, StorageError> {
+        self.lock().backup_log(dst, checksum, copy_only)
     }
 
     fn write_backup(
@@ -1819,14 +1850,18 @@ struct LogTruncationGate {
     /// An in-progress full backup's `redo_start_lsn` — the log it must ship
     /// before the ring can reclaim it. `None` when no backup is running.
     backup: Option<u64>,
-    // Later: `log_backup` (FULL recovery model, Stage 17 slice 2) and
-    // `repl_slots` (Stage 18) join the same `min`.
+    /// The FULL-recovery-model log-backup floor: `last_log_backup_lsn`, the log
+    /// past which nothing has been shipped to a log archive yet. Held so a
+    /// checkpoint cannot truncate log a future `BACKUP LOG` still owes. `None`
+    /// in the SIMPLE model (log is reclaimable as soon as it is checkpointed).
+    log_backup: Option<u64>,
+    // Later: `repl_slots` (Stage 18) joins the same `min`.
 }
 
 impl LogTruncationGate {
     /// The lowest LSN any hold pins, or `None` if no hold is registered.
     fn min_hold(&self) -> Option<u64> {
-        self.backup
+        [self.backup, self.log_backup].into_iter().flatten().min()
     }
 }
 
@@ -1839,6 +1874,10 @@ struct StorageFile {
     /// Holds that keep the WAL ring from truncating log a backup (or, later, a
     /// replication slot) still needs.
     truncation_gate: LogTruncationGate,
+    /// FULL-model log-backup floor (mirrors the active superblock's
+    /// `last_log_backup_lsn`): the LSN up to which the log has been shipped to
+    /// a log archive. `0` in the SIMPLE model / before the first log backup.
+    last_log_backup_lsn: u64,
     layout: StorageLayout,
     superblock_a: Superblock,
     superblock_b: Superblock,
@@ -4448,11 +4487,14 @@ impl StorageFile {
 
         let mut version = crate::relstore::version::VersionState::default();
         version.set_options_byte(active_sb.db_options());
+        let last_log_backup_lsn = active_sb.last_log_backup_lsn();
+        let recovery_full = version.recovery_full;
         let mut storage = StorageFile {
             default_collation: header.default_collation(),
             file,
             wal,
             truncation_gate: LogTruncationGate::default(),
+            last_log_backup_lsn,
             layout,
             superblock_a,
             superblock_b,
@@ -4462,6 +4504,13 @@ impl StorageFile {
             replay_cache: scan.records,
             version,
         };
+        // Re-establish the FULL-model log-backup hold so a checkpoint cannot
+        // reclaim un-backed-up log. The floor is >= the persisted wal_head
+        // (checkpoints were already clamped to it), so it never moves the head
+        // backward.
+        if recovery_full {
+            storage.register_log_backup_hold(last_log_backup_lsn);
+        }
         storage.recover_allocator()?;
 
         // A tail below the superblock's recorded one means part of the
@@ -4559,6 +4608,7 @@ impl StorageFile {
             file,
             wal,
             truncation_gate: LogTruncationGate::default(),
+            last_log_backup_lsn: 0,
             layout,
             superblock_a,
             superblock_b,
@@ -5013,6 +5063,19 @@ impl StorageFile {
         self.truncation_gate.backup = None;
     }
 
+    /// Pins the FULL-model log-backup floor at `last_log_backup_lsn` so a
+    /// checkpoint cannot reclaim log a `BACKUP LOG` still has to ship. Set when
+    /// FULL is enabled and re-set (advanced) after each `BACKUP LOG`.
+    fn register_log_backup_hold(&mut self, last_log_backup_lsn: u64) {
+        self.truncation_gate.log_backup = Some(last_log_backup_lsn);
+    }
+
+    /// Drops the log-backup floor (recovery model set back to SIMPLE): log is
+    /// reclaimable as soon as it is checkpointed.
+    fn release_log_backup_hold(&mut self) {
+        self.truncation_gate.log_backup = None;
+    }
+
     fn ensure_rel_usable(&self) -> Result<(), StorageError> {
         if self.rel.wedged {
             return Err(StorageError::InvalidFile(
@@ -5317,11 +5380,21 @@ impl StorageFile {
                     .to_string(),
             ));
         }
+        let out = self.read_ring_range(redo_start, backup_end)?;
+        Ok((backup_end, out))
+    }
+
+    /// Reads the raw WAL ring bytes for the logical range `[start, end)`,
+    /// handling the physical wrap. The caller must have synced the log to at
+    /// least `end` first (`DirectFile` bypasses the page cache).
+    fn read_ring_range(&mut self, start: u64, end: u64) -> Result<Vec<u8>, StorageError> {
+        debug_assert!(end >= start);
+        let len = end - start;
         let mut out = vec![0u8; len as usize];
         if len > 0 {
             let wal_offset = self.layout.wal_offset;
             let wal_size = self.layout.wal_size;
-            let start_phys = redo_start % wal_size;
+            let start_phys = start % wal_size;
             let first = ((wal_size - start_phys).min(len)) as usize;
             self.wal
                 .file_mut()
@@ -5332,7 +5405,77 @@ impl StorageFile {
                     .read_exact_at(wal_offset, &mut out[first..])?;
             }
         }
-        Ok((backup_end, out))
+        Ok(out)
+    }
+
+    /// Ships the FULL-model log tail `[last_log_backup_lsn, tail)` to a
+    /// `TDBBAK1` log archive, then durably advances the marker and the hold —
+    /// copy-out strictly before truncate, so a crash after the archive write
+    /// but before the marker advance simply re-ships the (idempotent) range.
+    fn backup_log(
+        &mut self,
+        dst: &Path,
+        checksum: bool,
+        copy_only: bool,
+    ) -> Result<crate::backup::BackupSummary, StorageError> {
+        use crate::backup::{BackupFlags, BackupHeader, BackupWriter, BlockType, encode_log_chunk};
+        self.ensure_rel_usable()?;
+        if !self.version.recovery_full {
+            return Err(StorageError::InvalidConfig(
+                "BACKUP LOG requires the FULL recovery model".to_string(),
+            ));
+        }
+        self.wal.sync_all()?;
+        let start = self.last_log_backup_lsn;
+        let end = self.wal.tail();
+        debug_assert!(end >= start);
+        let log = self.read_ring_range(start, end)?;
+        let finished_at_millis = now_millis();
+
+        // A log-only archive: no page/region data — the header carries the
+        // range start in `redo_start_lsn` and the `log_backup` flag; the end is
+        // derived from the LogChunk length on read.
+        let header = BackupHeader {
+            format_version: crate::backup::FORMAT_VERSION,
+            page_size: PAGE_SIZE as u32,
+            total_size: 0,
+            wal_size: self.layout.wal_size,
+            data_size: 0,
+            metadata_size: 0,
+            allocator_size: 0,
+            snapshot_size: 0,
+            reserved_size: 0,
+            default_collation: None,
+            redo_start_lsn: start,
+            metadata_root: 0,
+            last_committed_seq: 0,
+            db_options: self.version.options_byte(),
+            finished_at_millis,
+            flags: BackupFlags {
+                checksum,
+                copy_only,
+                log_backup: true,
+            },
+        };
+        // Write the archive fully and fsync it BEFORE advancing the marker.
+        let file = std::fs::File::create(dst)?;
+        let mut writer = BackupWriter::new(file, &header)?;
+        writer.write_block(BlockType::LogChunk, &encode_log_chunk(start, &log))?;
+        writer.finish()?.sync_all()?;
+
+        // Copy-out done and durable → advance the persisted marker, then the
+        // in-memory marker and hold, so the ring may now reclaim `[start, end)`.
+        self.persist_last_log_backup_lsn(end)?;
+        self.last_log_backup_lsn = end;
+        self.register_log_backup_hold(end);
+
+        Ok(crate::backup::BackupSummary {
+            redo_start_lsn: start,
+            backup_end_lsn: end,
+            pages_copied: 0,
+            log_bytes: log.len() as u64,
+            finished_at_millis,
+        })
     }
 
     /// Lays a run of page images back at their page numbers (restore).
@@ -5448,6 +5591,19 @@ impl StorageFile {
         recovery_full: Option<bool>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        // Enabling FULL starts a fresh log chain at the current tail; the
+        // marker (and its hold) advance only via BACKUP LOG thereafter. An
+        // already-FULL ALTER, or one that disables FULL / touches only the
+        // snapshot options, leaves the marker where it was. Computed against
+        // the OLD recovery model (before `version.set_options` below) and
+        // stamped into the same durable superblock write as the option byte,
+        // so a crash never leaves FULL set with a stale/zero marker.
+        let enabling_full = recovery_full == Some(true) && !self.version.recovery_full;
+        let new_marker = if enabling_full {
+            self.wal.tail()
+        } else {
+            self.last_log_backup_lsn
+        };
         // Build the new superblocks in LOCALS and write them BEFORE mutating
         // any in-memory state: a failed write must leave the version store,
         // the option mirrors, and the cached superblocks exactly as they
@@ -5468,15 +5624,35 @@ impl StorageFile {
             }
             next
         };
+        self.commit_superblock(|sb| {
+            sb.set_db_options(byte);
+            sb.set_last_log_backup_lsn(new_marker);
+        })?;
+        self.version
+            .set_options(rcsi, allow_snapshot, recovery_full);
+        // Now that the model byte and marker are durable, sync the in-memory
+        // marker and the FULL-model log-truncation hold. FULL pins the ring at
+        // the marker; SIMPLE releases it.
+        self.last_log_backup_lsn = new_marker;
+        if self.version.recovery_full {
+            self.register_log_backup_hold(new_marker);
+        } else {
+            self.release_log_backup_hold();
+        }
+        Ok(())
+    }
+
+    /// Rebuilds both superblocks from the active slot, applies `mutate` to each,
+    /// bumps the generation, and dual-writes them durably (active slot first,
+    /// fsync between — a torn first write falls back to the other slot with the
+    /// old state). Commits the new superblocks to memory only after both are
+    /// durable. The single discipline behind every reserved-field update.
+    fn commit_superblock(&mut self, mutate: impl Fn(&mut Superblock)) -> Result<(), StorageError> {
         let generation = self
             .superblock_a
             .generation
             .max(self.superblock_b.generation)
             .saturating_add(1);
-        // The lazy active-slot rewrite leaves the backup's dynamic fields
-        // stale; both slots get the same generation here, so equalize them
-        // from the active slot (whichever wins at open must carry the
-        // freshest recovery hints).
         let (active, backup_flag) = match self.active_superblock {
             ActiveSuperblock::A => (self.superblock_a, SUPERBLOCK_ACTIVE_B),
             ActiveSuperblock::B => (self.superblock_b, SUPERBLOCK_ACTIVE_A),
@@ -5485,7 +5661,7 @@ impl StorageFile {
         let mut backup = active;
         backup.active = backup_flag;
         for sb in [&mut primary, &mut backup] {
-            sb.set_db_options(byte);
+            mutate(sb);
             sb.generation = generation;
             sb.checksum = sb.compute_checksum();
         }
@@ -5505,7 +5681,6 @@ impl StorageFile {
         self.file
             .write_all_at(backup_offset, &backup.to_le_bytes_with_checksum())?;
         self.file.sync_data()?;
-        // Durable on disk — now commit to memory.
         match self.active_superblock {
             ActiveSuperblock::A => {
                 self.superblock_a = primary;
@@ -5516,9 +5691,13 @@ impl StorageFile {
                 self.superblock_a = backup;
             }
         }
-        self.version
-            .set_options(rcsi, allow_snapshot, recovery_full);
         Ok(())
+    }
+
+    /// Durably advances the persisted log-backup floor in both superblocks —
+    /// the copy-out-before-truncate commit point for `BACKUP LOG`.
+    fn persist_last_log_backup_lsn(&mut self, lsn: u64) -> Result<(), StorageError> {
+        self.commit_superblock(|sb| sb.set_last_log_backup_lsn(lsn))
     }
 
     /// Lazily rewrites the active superblock in place (no fsync: it is a
@@ -5738,6 +5917,10 @@ impl StorageFile {
             .map(|page| self.layout.data_offset + page * PAGE_SIZE as u64)
             .unwrap_or(0);
         let db_options = self.version.options_byte();
+        // The closure builds from Superblock::default() (reserved zeroed), so
+        // the log-backup floor must be stamped back in or a checkpoint would
+        // silently reset it to 0 and drop the FULL-model hold across a restart.
+        let last_log_backup_lsn = self.last_log_backup_lsn;
         let new_sb = |active_flag: u8| -> Superblock {
             let mut sb = Superblock {
                 generation,
@@ -5751,6 +5934,7 @@ impl StorageFile {
                 ..Superblock::default()
             };
             sb.set_db_options(db_options);
+            sb.set_last_log_backup_lsn(last_log_backup_lsn);
             sb.checksum = sb.compute_checksum();
             sb
         };
@@ -6106,6 +6290,7 @@ impl BackupPlan {
             flags: crate::backup::BackupFlags {
                 checksum: self.checksum,
                 copy_only: self.copy_only,
+                log_backup: false,
             },
         }
     }

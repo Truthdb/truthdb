@@ -3288,7 +3288,8 @@ fn analyze_statements_locks(
             // BACKUP takes no batch lock: it is online and manages its own
             // per-chunk storage locking. A Database X here would serialize it
             // against every writer and defeat the fuzzy design.
-            | Statement::BackupDatabase { .. } => {}
+            | Statement::BackupDatabase { .. }
+            | Statement::BackupLog { .. } => {}
         }
     }
     // Batch-level lock escalation: if a table accumulated more than the
@@ -3524,6 +3525,43 @@ fn exec_statement_dispatch(
                         16,
                         1,
                         format!("BACKUP DATABASE is terminating abnormally. {e}"),
+                    )
+                })?;
+            Ok(StatementResult::Done)
+        }
+        Statement::BackupLog {
+            path,
+            checksum,
+            copy_only,
+            ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(SqlError::new(
+                    3021,
+                    16,
+                    1,
+                    "Cannot perform a backup or restore operation within a transaction."
+                        .to_string(),
+                ));
+            }
+            if !storage.recovery_model_full() {
+                return Err(SqlError::new(
+                    4208,
+                    16,
+                    1,
+                    "The statement BACKUP LOG is not allowed while the recovery model is SIMPLE. \
+                     Use BACKUP DATABASE or change the recovery model to FULL with ALTER DATABASE."
+                        .to_string(),
+                ));
+            }
+            storage
+                .backup_log(std::path::Path::new(path), *checksum, *copy_only)
+                .map_err(|e| {
+                    SqlError::new(
+                        3013,
+                        16,
+                        1,
+                        format!("BACKUP LOG is terminating abnormally. {e}"),
                     )
                 })?;
             Ok(StatementResult::Done)
@@ -6253,6 +6291,7 @@ fn is_privileged_ddl(stmt: &Statement) -> bool {
             | Statement::AlterRole { .. }
             | Statement::Permission(_)
             | Statement::BackupDatabase { .. }
+            | Statement::BackupLog { .. }
     )
 }
 
@@ -13392,6 +13431,15 @@ fn map_storage_err(err: StorageError, table: &str) -> SqlError {
             ),
         ),
         StorageError::InvalidConfig(msg) => SqlError::new(1701, 16, 1, msg),
+        // The WAL ring is full — under FULL recovery this is typically because
+        // un-backed-up log pins truncation (run BACKUP LOG); under SIMPLE it is
+        // an oversized active transaction. SQL Server reports 9002 either way.
+        StorageError::WalFull(msg) => SqlError::new(
+            9002,
+            17,
+            2,
+            format!("The transaction log for the database is full. {msg}"),
+        ),
         other => SqlError::new(
             3621,
             16,
