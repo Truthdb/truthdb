@@ -193,6 +193,7 @@ impl TxnContext {
             xact_state: self.xact_state(),
             last_error: self.last_error,
             nestlevel: EXEC_DEPTH.with(|d| d.get()) as i32,
+            updated_columns: current_trigger_updated_columns(),
         }
     }
 
@@ -2322,6 +2323,8 @@ struct TriggerTables {
     schema: Schema,
     inserted: Vec<Vec<Datum>>,
     deleted: Vec<Vec<Datum>>,
+    /// The 0-based indices of the columns the firing statement touched.
+    updated: Vec<usize>,
 }
 
 thread_local! {
@@ -2413,11 +2416,13 @@ thread_local! {
 }
 
 /// New (`inserted`) and old (`deleted`) row images collected during a DML that
-/// has AFTER triggers to fire.
+/// has triggers to fire, plus the indices of the columns the statement touched
+/// (its SET list, or every inserted column) for `UPDATE()`/`COLUMNS_UPDATED()`.
 #[derive(Default)]
 struct CapturedImages {
     inserted: Vec<Vec<Datum>>,
     deleted: Vec<Vec<Datum>>,
+    updated: Vec<usize>,
 }
 
 /// Records row images into the active capture, if one is armed. `f` builds the
@@ -2432,6 +2437,35 @@ fn capture_trigger_images(f: impl FnOnce() -> (Vec<Vec<Datum>>, Vec<Vec<Datum>>)
             images.deleted.extend(del);
         }
     });
+}
+
+/// Records the indices of the columns a firing UPDATE's SET list (or an INSERT's
+/// target columns) touched, for `UPDATE()`/`COLUMNS_UPDATED()`, if capture is on.
+fn capture_trigger_updated(indices: Vec<usize>) {
+    TRIGGER_CAPTURE.with(|c| {
+        if let Some(images) = c.borrow_mut().as_mut() {
+            images.updated = indices;
+        }
+    });
+}
+
+/// The columns the firing trigger's statement touched, resolved against the
+/// parent table's schema — the value behind `UPDATE()`/`COLUMNS_UPDATED()` in a
+/// trigger body. `None` outside a trigger.
+fn current_trigger_updated_columns() -> Option<truthdb_sql::eval::UpdatedColumns> {
+    CURRENT_TRIGGER_TABLES.with(|c| {
+        let borrow = c.borrow();
+        let tables = borrow.as_ref()?;
+        Some(truthdb_sql::eval::UpdatedColumns {
+            columns: tables
+                .schema
+                .columns
+                .iter()
+                .map(|col| col.name.clone())
+                .collect(),
+            touched: tables.updated.iter().copied().collect(),
+        })
+    })
 }
 
 thread_local! {
@@ -6622,6 +6656,7 @@ fn run_dml_with_triggers(
         schema,
         inserted: images.inserted,
         deleted: images.deleted,
+        updated: images.updated,
     });
     // Fire each trigger once, in creation order, even for an empty image set.
     for trig_def in &triggers {
@@ -6737,6 +6772,7 @@ fn instead_of_insert_images(
         }
         inserted.push(values);
     }
+    capture_trigger_updated((0..ncols).collect());
     Ok((inserted, Vec::new()))
 }
 
@@ -6780,6 +6816,7 @@ fn instead_of_update_images(
         old_rows.push(row);
         new_rows.push(new_row);
     }
+    capture_trigger_updated(assignments.iter().map(|(i, _)| *i).collect());
     Ok((new_rows, old_rows))
 }
 
@@ -7499,8 +7536,10 @@ fn exec_insert(
     }
 
     // Capture the new row images for an AFTER trigger's `inserted` table (only
-    // when a capture is armed — the no-trigger path clones nothing).
+    // when a capture is armed — the no-trigger path clones nothing). Every column
+    // counts as updated for an INSERT (SQL Server's UPDATE() semantics).
     capture_trigger_images(|| (rows.clone(), Vec::new()));
+    capture_trigger_updated((0..ncols).collect());
     let inserted = rows.len() as u64;
     storage
         .rel_insert_many(&def.name, rows, scope)
@@ -7935,6 +7974,7 @@ fn exec_update(
             updates.iter().map(|(_, old, _)| old.clone()).collect(),
         )
     });
+    capture_trigger_updated(assignments.iter().map(|(i, _)| *i).collect());
     let count = storage
         .rel_update_located(&def.name, updates, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
