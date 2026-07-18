@@ -2355,6 +2355,15 @@ mod tests {
             "the slot survives the restart"
         );
 
+        // An explicit drop removes a slot (a standby that deregisters).
+        engine.storage().register_repl_slot(8, l2);
+        engine.storage().drop_repl_slot(8);
+        assert_eq!(
+            engine.storage().repl_slot_lsn(8),
+            None,
+            "an explicitly dropped slot is gone"
+        );
+
         // Lagging past max_slot_retain invalidates the slot at the next checkpoint.
         engine.storage().set_max_slot_retain_bytes(64);
         for i in 31..=60 {

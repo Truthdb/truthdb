@@ -2068,6 +2068,13 @@ struct StorageFile {
     /// must then reseed. `u64::MAX` (the default) = unlimited retention: a slot
     /// holds truncation until explicitly dropped, matching the backup/log-backup
     /// holds (a deployment configures a finite cap to protect the primary).
+    ///
+    /// A meaningful finite cap must be strictly BELOW the ring's usable capacity
+    /// (`wal_size - wal.reserve()`): a pinned slot keeps the tail within that
+    /// capacity of its LSN (appends stall with `WalFull` first), so the reap
+    /// window `tail - lsn > cap` can never open at or above it — the primary
+    /// would wedge rather than shed the slot. The setter (test-only here; the
+    /// transport slice wires the real one) must reject/clamp to that bound.
     max_slot_retain_bytes: u64,
     /// FULL-model log-backup floor (mirrors the active superblock's
     /// `last_log_backup_lsn`): the LSN up to which the log has been shipped to
@@ -5302,7 +5309,11 @@ impl StorageFile {
             .retain(|_, lsn| tail.saturating_sub(*lsn) <= max);
     }
 
-    /// Registers (or resets) a replication slot at `lsn`.
+    /// Registers (or resets) a replication slot at `lsn`. `lsn` must be `>=` the
+    /// current WAL head (a standby's received LSN is always within the retained
+    /// window — the primary cannot have already truncated it); a below-head slot
+    /// would drive `set_head` below the current head, which it forbids. The
+    /// transport slice enforces this at registration.
     #[cfg(test)]
     fn register_repl_slot(&mut self, id: u32, lsn: u64) {
         self.truncation_gate.repl_slots.insert(id, lsn);
