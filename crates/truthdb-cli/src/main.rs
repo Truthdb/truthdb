@@ -52,8 +52,9 @@ enum Command {
         #[arg(long)]
         add_gib: u64,
     },
-    /// OFFLINE: restore a database file from a `TDBBAK1` full backup. The
-    /// destination must not exist and the server must not be running.
+    /// OFFLINE: restore a database file from a `TDBBAK1` full backup, optionally
+    /// followed by an ordered chain of `BACKUP LOG` archives. The destination
+    /// must not exist and the server must not be running.
     Restore {
         /// Path to the `TDBBAK1` full-backup file.
         #[arg(long)]
@@ -61,6 +62,10 @@ enum Command {
         /// Destination path for the restored database file (must not exist).
         #[arg(long)]
         to: std::path::PathBuf,
+        /// A `BACKUP LOG` archive to apply after the full backup. Repeat in
+        /// chain order (oldest first).
+        #[arg(long = "log")]
+        log: Vec<std::path::PathBuf>,
     },
 }
 
@@ -87,10 +92,19 @@ async fn main() -> Result<()> {
                 Err(err) => Err(anyhow::anyhow!("grow failed: {err}")),
             }
         }
-        Command::Restore { full, to } => {
-            match truthdb_core::storage::Storage::restore_full(&full, &to) {
+        Command::Restore { full, to, log } => {
+            match truthdb_core::storage::Storage::restore_full_with_logs(&full, &to, &log) {
                 Ok(()) => {
-                    println!("restored {} from {}", to.display(), full.display());
+                    println!(
+                        "restored {} from {}{}",
+                        to.display(),
+                        full.display(),
+                        if log.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" + {} log archive(s)", log.len())
+                        }
+                    );
                     Ok(())
                 }
                 Err(err) => Err(anyhow::anyhow!("restore failed: {err}")),
