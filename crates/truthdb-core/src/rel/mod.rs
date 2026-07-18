@@ -18,12 +18,13 @@ use truthdb_sql::ast::{
     CreateIndex, CreateLogin, CreateProcedure, CreateTable, CreateTrigger, CreateUser, CreateView,
     DataType, DatabaseOption, Declaration, Delete, DropIndex, DropTable, DropView, ExecStatement,
     Expr, ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem,
-    RaiseError, ReturnsClause, RoleMemberAction, Select, SelectItem, SetStatement, Statement,
-    TableRef, ThrowArgs, ThrowStatement, Update,
+    PermissionAction, PermissionKind, PermissionStatement, RaiseError, ReturnsClause,
+    RoleMemberAction, Select, SelectItem, SetStatement, Statement, TableRef, ThrowArgs,
+    ThrowStatement, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
-use truthdb_sql::eval::{ColumnResolver, EvalContext};
+use truthdb_sql::eval::{ColumnResolver, EvalContext, SecurityContext};
 use truthdb_sql::lexer::Span;
 use truthdb_sql::value::{SqlValue, order_key_cmp};
 use truthdb_sql::{ast, eval};
@@ -33,8 +34,8 @@ use xxhash_rust::xxh64::xxh64;
 use crate::lock::{LockMode, Resource};
 use crate::relstore::btree::ScanCursor;
 use crate::relstore::catalog::{
-    self, FunctionDef, FunctionReturns, PrincipalDef, ProcParamDef, ProcedureDef, TableDef,
-    TriggerDef,
+    self, FunctionDef, FunctionReturns, PermAction, PermissionEntry, PrincipalDef, ProcParamDef,
+    ProcedureDef, TableDef, TriggerDef,
 };
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
@@ -125,6 +126,9 @@ pub struct TxnContext {
     /// are refreshed at batch start from the membership cache, so a security DDL
     /// is seen by the next batch (SQL Server's per-batch permission caching).
     session_db_roles: std::collections::HashSet<String>,
+    /// Object-permission enforcement subject (bypass flag + the grant-matching
+    /// principal id set), refreshed at batch start alongside the role sets.
+    security: truthdb_sql::eval::SecurityContext,
     /// The last identity value inserted in this session (SQL Server scope),
     /// surfaced as `SCOPE_IDENTITY()`. Persists across statements until the next
     /// identity INSERT; unaffected by non-identity inserts.
@@ -181,6 +185,7 @@ impl TxnContext {
             user: self.user.clone(),
             server_roles: self.session_server_roles.clone(),
             db_roles: self.session_db_roles.clone(),
+            security: self.security.clone(),
             spid: self.spid,
             rowcount: self.rowcount,
             scope_identity: self.scope_identity,
@@ -254,14 +259,31 @@ impl TxnContext {
     /// `IS_ROLEMEMBER` never answer for the other's namespace. Called at batch
     /// start; a security DDL is therefore visible to the next batch.
     pub fn refresh_session_roles(&mut self, storage: &Storage) {
-        let names = |ids: std::collections::HashSet<u32>| -> std::collections::HashSet<String> {
-            ids.into_iter()
-                .filter_map(|id| storage.principal_name(id))
+        let server_role_ids = storage.effective_roles(self.login_sid);
+        let db_role_ids = storage.effective_roles(self.user_sid);
+        let names = |ids: &std::collections::HashSet<u32>| -> std::collections::HashSet<String> {
+            ids.iter()
+                .filter_map(|&id| storage.principal_name(id))
                 .map(|name| name.to_ascii_lowercase())
                 .collect()
         };
-        self.session_server_roles = names(storage.effective_roles(self.login_sid));
-        self.session_db_roles = names(storage.effective_roles(self.user_sid));
+        self.session_server_roles = names(&server_role_ids);
+        self.session_db_roles = names(&db_role_ids);
+
+        // The object-permission subject. A trusted/internal connection
+        // (login_sid 0 — the native protocol and in-process tests), a sysadmin,
+        // or dbo/db_owner bypasses every object-permission check (owns or
+        // controls the database). Otherwise a GRANT/DENY matches the database
+        // user, its effective roles, or `public`.
+        use crate::storage::{DB_OWNER_ID, DBO_ID, PUBLIC_ID, SYSADMIN_ID};
+        let bypass = self.login_sid == 0
+            || server_role_ids.contains(&SYSADMIN_ID)
+            || self.user_sid == DBO_ID
+            || db_role_ids.contains(&DB_OWNER_ID);
+        let mut principals = db_role_ids;
+        principals.insert(self.user_sid);
+        principals.insert(PUBLIC_ID);
+        self.security = truthdb_sql::eval::SecurityContext { bypass, principals };
     }
 
     /// Clears batch-scoped variables (called at the start of each batch).
@@ -805,6 +827,51 @@ thread_local! {
     /// Nesting depth of EXEC inner batches on this worker (SQL Server caps
     /// procedure nesting at 32, error 217).
     static EXEC_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+    /// Ownership-chaining depth for object-permission checks: how many OWNED
+    /// stored-object bodies (procedure, scalar UDF, multi-statement TVF, trigger)
+    /// enclose the current statement. Distinct from [`EXEC_DEPTH`] because
+    /// `sp_executesql` bumps that but does NOT chain — dynamic SQL runs in the
+    /// caller's own permission context. Permission checks fire only where this
+    /// (and `VIEW_DEPTH`) is 0.
+    static CHAIN_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// RAII guard entered when running an OWNED stored-object body (procedure,
+/// scalar UDF, multi-statement TVF, trigger): it raises the ownership-chaining
+/// depth so the body's object reads are not re-permission-checked (the caller's
+/// permission on the object suffices — single `dbo` owner).
+struct ChainGuard;
+
+impl ChainGuard {
+    fn enter() -> Self {
+        CHAIN_DEPTH.with(|d| d.set(d.get() + 1));
+        ChainGuard
+    }
+}
+
+impl Drop for ChainGuard {
+    fn drop(&mut self) {
+        CHAIN_DEPTH.with(|d| d.set(d.get().saturating_sub(1)));
+    }
+}
+
+/// RAII guard entered when running DYNAMIC SQL (`sp_executesql`): it RESETS the
+/// ownership-chaining depth to 0 for the duration, then restores it — dynamic
+/// SQL never chains, so its statements are permission-checked as the caller's
+/// own, even when the `sp_executesql` call sits inside a procedure body.
+struct DynamicScope(u32);
+
+impl DynamicScope {
+    fn enter() -> Self {
+        let saved = CHAIN_DEPTH.with(|d| d.replace(0));
+        DynamicScope(saved)
+    }
+}
+
+impl Drop for DynamicScope {
+    fn drop(&mut self) {
+        CHAIN_DEPTH.with(|d| d.set(self.0));
+    }
 }
 
 /// Runs `EXEC sp_executesql @stmt [, @params, values...]`: evaluates the
@@ -1040,6 +1107,8 @@ fn run_user_procedure(
     // A procedure called from a trigger body does NOT see the trigger's
     // inserted/deleted (they are visible only in the trigger's own statements).
     let _trigger_shadow = TriggerScope::clear();
+    // A procedure body ownership-chains: its object reads are not re-checked.
+    let _chain = ChainGuard::enter();
     let depth = EXEC_DEPTH.with(|d| {
         let v = d.get() + 1;
         d.set(v);
@@ -1115,6 +1184,8 @@ fn run_user_scalar_function(
     let FunctionReturns::Scalar { type_spec, body } = &function.returns else {
         return Err(function_not_a_table(&def.name));
     };
+    // Invoking a scalar function needs EXECUTE permission.
+    enforce_object_permission(def, &caller.security, PermAction::Execute)?;
     if arg_values.len() < function.params.len() {
         return Err(SqlError::new(
             313,
@@ -1154,6 +1225,7 @@ fn run_user_scalar_function(
     );
     txn_ctx.session_server_roles = caller.server_roles.clone();
     txn_ctx.session_db_roles = caller.db_roles.clone();
+    txn_ctx.security = caller.security.clone();
     for (param, value) in function.params.iter().zip(arg_values) {
         let column_type = ColumnType::parse(&param.type_spec)
             .map_err(|e| SqlError::message_only(245, e.to_string()))?;
@@ -1166,6 +1238,8 @@ fn run_user_scalar_function(
     let statements = truthdb_sql::parse_function_body(body)?;
     // A scalar function called from a trigger body does not see inserted/deleted.
     let _trigger_shadow = TriggerScope::clear();
+    // A function body ownership-chains: its object reads are not re-checked.
+    let _chain = ChainGuard::enter();
     let depth = EXEC_DEPTH.with(|d| {
         let v = d.get() + 1;
         d.set(v);
@@ -1217,6 +1291,8 @@ fn run_exec(
         if let Some(def) = resolve_table(storage, &exec.proc.value)
             && def.is_procedure()
         {
+            enforce_object_permission(&def, &txn_ctx.security, PermAction::Execute)
+                .map_err(|e| ExecError::Own(doom_per_rule(txn_ctx, e.at(exec.proc.span))))?;
             return run_user_procedure(storage, exec, &def, txn_ctx, run, in_try);
         }
         let error = SqlError::new(
@@ -1327,6 +1403,10 @@ fn run_exec(
     }
     // Dynamic SQL run from a trigger body does not see inserted/deleted.
     let _trigger_shadow = TriggerScope::clear();
+    // Dynamic SQL does NOT ownership-chain: reset the chaining depth so its
+    // statements are permission-checked as the caller's own, even when this
+    // sp_executesql sits inside a procedure body.
+    let _dynamic = DynamicScope::enter();
     let depth = EXEC_DEPTH.with(|d| {
         let v = d.get() + 1;
         d.set(v);
@@ -1930,7 +2010,12 @@ pub fn describe_first_result_set(storage: &Storage, tsql: &str) -> Result<RowSet
             // for an execution-path reason describe does not share.
             let mut select = select.clone();
             select.top = None;
-            let ctx = TxnContext::default();
+            let mut ctx = TxnContext::default();
+            // Describe derives column metadata without executing or reading data;
+            // it does not enforce object permissions (and its throwaway context
+            // carries no session identity), so the shared `scan_plan` must not
+            // treat it as a denied read.
+            ctx.security.bypass = true;
             match scan_plan(storage, &select, &ctx.eval_context()) {
                 Some(plan) => plan.columns,
                 None => return Err(undeterminable()),
@@ -2475,6 +2560,7 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::CreateRole { .. }
             | Statement::DropRole { .. }
             | Statement::AlterRole { .. }
+            | Statement::Permission(_)
             | Statement::Commit { .. }
     )
 }
@@ -3152,7 +3238,8 @@ fn analyze_statements_locks(
             | Statement::DropUser { .. }
             | Statement::CreateRole { .. }
             | Statement::DropRole { .. }
-            | Statement::AlterRole { .. } => {
+            | Statement::AlterRole { .. }
+            | Statement::Permission(_) => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // IF/WHILE conditions read tables through their subqueries —
@@ -3291,6 +3378,17 @@ fn exec_statement_dispatch(
     statement: &Statement,
     txn_ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
+    // DDL (schema + security) requires a privileged principal (sysadmin / dbo /
+    // db_owner / the internal channel). A restricted database user is refused
+    // before any change is made.
+    if !txn_ctx.security.bypass && is_privileged_ddl(statement) {
+        return Err(SqlError::new(
+            15247,
+            16,
+            1,
+            "User does not have permission to perform this action.".to_string(),
+        ));
+    }
     match statement {
         Statement::BeginTransaction { .. } => exec_begin(storage, txn_ctx),
         Statement::Use { database, .. } => exec_use(database, txn_ctx),
@@ -3389,6 +3487,12 @@ fn exec_statement_dispatch(
                 return Err(ddl_in_txn_err());
             }
             exec_alter_role_member(storage, name, *action, member)
+        }
+        Statement::Permission(stmt) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_permission(storage, stmt, &txn_ctx.security)
         }
         // Executed by `run_block`'s own arms; nothing routes them here.
         Statement::Block { .. }
@@ -6034,6 +6138,89 @@ fn exec_alter_role_member(
     Ok(StatementResult::Done)
 }
 
+/// Maps a parsed permission action to its catalog form.
+fn map_perm_action(action: PermissionAction) -> PermAction {
+    match action {
+        PermissionAction::Select => PermAction::Select,
+        PermissionAction::Insert => PermAction::Insert,
+        PermissionAction::Update => PermAction::Update,
+        PermissionAction::Delete => PermAction::Delete,
+        PermissionAction::Execute => PermAction::Execute,
+        PermissionAction::References => PermAction::References,
+        PermissionAction::Alter => PermAction::Alter,
+    }
+}
+
+/// `GRANT|DENY|REVOKE <actions> ON <object> TO|FROM <grantees>`. The authority to
+/// manage permissions is enforced by the DDL privilege gate in the dispatcher
+/// (a bypassing principal — sysadmin / dbo / db_owner / internal). Here we just
+/// resolve the securable and apply each (grantee, action).
+fn exec_permission(
+    storage: &Storage,
+    stmt: &PermissionStatement,
+    _sec: &SecurityContext,
+) -> Result<StatementResult, SqlError> {
+    // The securable must be a schema object (table, view, procedure, function).
+    let Some(def) = resolve_table(storage, &stmt.object.value) else {
+        return Err(SqlError::invalid_object(&stmt.object.value).at(stmt.object.span));
+    };
+    if def.is_trigger() {
+        return Err(SqlError::invalid_object(&stmt.object.value).at(stmt.object.span));
+    }
+    let object = def.name.clone(); // the canonical name = the rel.tables key
+    for grantee in &stmt.grantees {
+        let grantee_bare = strip_schema(&grantee.value);
+        for action in &stmt.actions {
+            let catalog_action = map_perm_action(*action);
+            match stmt.kind {
+                PermissionKind::Grant => {
+                    storage.rel_grant_object(&object, grantee_bare, catalog_action, false)
+                }
+                PermissionKind::Deny => {
+                    storage.rel_grant_object(&object, grantee_bare, catalog_action, true)
+                }
+                PermissionKind::Revoke => {
+                    storage.rel_revoke_object(&object, grantee_bare, catalog_action)
+                }
+            }
+            .map_err(|e| map_storage_err(e, &grantee.value).at(grantee.span))?;
+        }
+    }
+    Ok(StatementResult::Done)
+}
+
+/// Schema and security DDL a non-privileged principal may not run. (GRANT/DENY/
+/// REVOKE — `Permission` — is included: only a privileged principal manages
+/// permissions.) Fine-grained database-scoped CREATE grants and the db_ddladmin
+/// role are deferred: today any DDL requires bypass privilege.
+fn is_privileged_ddl(stmt: &Statement) -> bool {
+    matches!(
+        stmt,
+        Statement::CreateTable(_)
+            | Statement::DropTable(_)
+            | Statement::CreateView(_)
+            | Statement::DropView(_)
+            | Statement::CreateIndex(_)
+            | Statement::DropIndex(_)
+            | Statement::AlterTable(_)
+            | Statement::AlterDatabase(_)
+            | Statement::CreateProcedure(_)
+            | Statement::DropProcedure { .. }
+            | Statement::CreateFunction(_)
+            | Statement::DropFunction { .. }
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger { .. }
+            | Statement::CreateLogin(_)
+            | Statement::DropLogin { .. }
+            | Statement::CreateUser(_)
+            | Statement::DropUser { .. }
+            | Statement::CreateRole { .. }
+            | Statement::DropRole { .. }
+            | Statement::AlterRole { .. }
+            | Statement::Permission(_)
+    )
+}
+
 /// Resolves the AFTER triggers to fire for a DML on `target_name` for `event`,
 /// plus the target's definition (for the pseudo-table schema). Empty when no
 /// trigger exists anywhere (the cheap `rel_has_triggers` gate keeps the common
@@ -6164,6 +6351,8 @@ fn fire_one_trigger(
         return Ok(());
     }
     let statements = truthdb_sql::parse_procedure_body(&trigger.body)?;
+    // A trigger body ownership-chains: its object reads are not re-checked.
+    let _chain = ChainGuard::enter();
     let depth = EXEC_DEPTH.with(|d| {
         let v = d.get() + 1;
         d.set(v);
@@ -6696,6 +6885,8 @@ fn exec_insert(
     let def = resolve_table(storage, &insert.table.value)
         .ok_or_else(|| SqlError::invalid_object(&insert.table.value).at(insert.table.span))?;
     reject_dml_on_view(&def)?;
+    enforce_object_permission(&def, &eval_ctx.security, PermAction::Insert)
+        .map_err(|e| e.at(insert.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let ncols = schema.columns.len();
     let identity_col = def.identity.map(|s| s.column);
@@ -7107,6 +7298,8 @@ fn exec_update(
     let def = resolve_table(storage, &update.table.value)
         .ok_or_else(|| SqlError::invalid_object(&update.table.value).at(update.table.span))?;
     reject_dml_on_view(&def)?;
+    enforce_object_permission(&def, &eval_ctx.security, PermAction::Update)
+        .map_err(|e| e.at(update.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let resolver = SchemaScope { schema: &schema };
     let identity_col = def.identity.map(|s| s.column);
@@ -7271,6 +7464,8 @@ fn exec_delete(
     let def = resolve_table(storage, &delete.table.value)
         .ok_or_else(|| SqlError::invalid_object(&delete.table.value).at(delete.table.span))?;
     reject_dml_on_view(&def)?;
+    enforce_object_permission(&def, &eval_ctx.security, PermAction::Delete)
+        .map_err(|e| e.at(delete.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let resolver = SchemaScope { schema: &schema };
 
@@ -9343,6 +9538,10 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     if def.view_query.is_some() || def.is_procedure() || def.is_function() || def.is_trigger() {
         return None;
     }
+    // If SELECT is denied, fall back to the collecting path, which resolves the
+    // same table through `build_table_source` and raises the 229 there — keeping
+    // the check on the one path the executor uses to touch the object.
+    enforce_object_permission(&def, &eval_ctx.security, PermAction::Select).ok()?;
     let schema = def.schema().ok()?;
 
     let qualifier = alias
@@ -9590,6 +9789,7 @@ fn is_sys_view(name: &str) -> bool {
             | "sys.configurations"
             | "sys.database_principals"
             | "sys.database_role_members"
+            | "sys.database_permissions"
     )
 }
 
@@ -10993,6 +11193,56 @@ impl Drop for ViewDepthGuard {
     }
 }
 
+/// True where object-permission checks apply — not inside an OWNED stored-object
+/// body (procedure, function, TVF, view, or trigger), whose reads are covered by
+/// ownership chaining (all objects share the single `dbo` owner today), so the
+/// caller's permission on the body suffices (the grant-EXECUTE-only pattern).
+/// Dynamic SQL (`sp_executesql`) resets `CHAIN_DEPTH`, so it is checked here even
+/// when nested in a procedure — matching SQL Server, which does not chain
+/// through dynamic SQL.
+fn at_top_level() -> bool {
+    CHAIN_DEPTH.with(|d| d.get()) == 0 && VIEW_DEPTH.with(|d| d.get()) == 0
+}
+
+/// Whether `sec` permits `action` on an object with these permission entries.
+/// A matching DENY for any of the session's principals wins (DENY beats GRANT);
+/// otherwise a matching GRANT permits; otherwise denied (no implicit grant).
+fn permits(perms: &[PermissionEntry], sec: &SecurityContext, action: PermAction) -> bool {
+    let mut granted = false;
+    for entry in perms {
+        if entry.action == action && sec.principals.contains(&entry.grantee) {
+            if entry.deny {
+                return false;
+            }
+            granted = true;
+        }
+    }
+    granted
+}
+
+/// Enforces `action` on the resolved object `def`, erroring 229 if the session
+/// lacks the permission. A no-op for a bypassing session (sysadmin / dbo /
+/// internal) and inside any stored-object body (ownership chaining).
+fn enforce_object_permission(
+    def: &TableDef,
+    sec: &SecurityContext,
+    action: PermAction,
+) -> Result<(), SqlError> {
+    if sec.bypass || !at_top_level() || permits(&def.permissions, sec, action) {
+        return Ok(());
+    }
+    Err(SqlError::new(
+        229,
+        14,
+        5,
+        format!(
+            "The {} permission was denied on the object '{}', database 'truthdb', schema 'dbo'.",
+            action.name(),
+            def.name
+        ),
+    ))
+}
+
 /// Builds the row source for one base table (or `sys.*` view), stamping every
 /// column with the table's qualifier (its alias, else its name).
 fn build_table_source(
@@ -11053,6 +11303,7 @@ fn build_table_source(
         "sys.sql_logins" => sys_sql_logins(storage),
         "sys.database_principals" => sys_database_principals(storage),
         "sys.database_role_members" => sys_database_role_members(storage),
+        "sys.database_permissions" => sys_database_permissions(storage),
         "sys.parameters" => sys_parameters(storage),
         "sys.objects" => sys_objects(storage),
         "sys.sql_modules" => sys_sql_modules(storage),
@@ -11078,6 +11329,11 @@ fn build_table_source(
             if def.is_function() {
                 return Err(function_not_a_table(&def.name).at(name.span));
             }
+            // SELECT permission on the base table or view (checked here, at the
+            // top level, before a view body expands — the body's own reads are
+            // covered by ownership chaining and not re-checked).
+            enforce_object_permission(&def, &eval_ctx.security, PermAction::Select)
+                .map_err(|e| e.at(name.span))?;
             // A view: run its stored SELECT as a derived table under the view's
             // qualifier. A view over another view expands recursively — building
             // the derived source re-enters `build_table_source` for the inner
@@ -11194,6 +11450,9 @@ fn build_function_source(
         .function
         .as_ref()
         .ok_or_else(|| function_not_a_table(&def.name).at(name.span))?;
+    // A table-valued function in FROM is read like a table: SELECT permission.
+    enforce_object_permission(&def, &eval_ctx.security, PermAction::Select)
+        .map_err(|e| e.at(name.span))?;
     if args.len() < function.params.len() {
         return Err(SqlError::new(
             313,
@@ -11315,6 +11574,7 @@ fn run_multi_statement_tvf(
     );
     txn_ctx.session_server_roles = eval_ctx.server_roles.clone();
     txn_ctx.session_db_roles = eval_ctx.db_roles.clone();
+    txn_ctx.security = eval_ctx.security.clone();
     let no_outer = |_: &str| -> Option<usize> { None };
     for (param, arg) in function.params.iter().zip(args) {
         let column_type = ColumnType::parse(&param.type_spec)
@@ -11341,6 +11601,8 @@ fn run_multi_statement_tvf(
     // A multi-statement TVF called from a trigger body does not see
     // inserted/deleted.
     let _trigger_shadow = TriggerScope::clear();
+    // A multi-statement TVF body ownership-chains: reads are not re-checked.
+    let _chain = ChainGuard::enter();
     // Same nesting cap as a scalar UDF (217), decremented on every exit path.
     let depth = EXEC_DEPTH.with(|d| {
         let v = d.get() + 1;
@@ -12435,6 +12697,47 @@ fn sys_database_role_members(storage: &Storage) -> Source {
                     Datum::Int(def.object_id as i32),
                 ]);
             }
+        }
+    }
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_database_permissions(storage: &Storage) -> Source {
+    let columns = vec![
+        int_col("class"),
+        nvarchar("class_desc", 60),
+        int_col("major_id"),
+        int_col("minor_id"),
+        int_col("grantee_principal_id"),
+        nvarchar("permission_name", 128),
+        nvarchar("state", 1),
+        nvarchar("state_desc", 60),
+    ];
+    let mut rows: Vec<Vec<Datum>> = Vec::new();
+    for def in storage.rel_tables() {
+        for perm in &def.permissions {
+            let (state, state_desc) = if perm.deny {
+                ("D", "DENY")
+            } else {
+                ("G", "GRANT")
+            };
+            rows.push(vec![
+                Datum::Int(1), // class 1 = OBJECT_OR_COLUMN
+                Datum::NVarChar("OBJECT_OR_COLUMN".to_string()),
+                Datum::Int(def.object_id as i32),
+                Datum::Int(0), // minor_id 0 = the whole object (no column-level)
+                Datum::Int(perm.grantee as i32),
+                Datum::NVarChar(perm.action.name().to_string()),
+                Datum::NVarChar(state.to_string()),
+                Datum::NVarChar(state_desc.to_string()),
+            ]);
         }
     }
     let collations = vec![None; columns.len()];

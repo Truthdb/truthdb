@@ -7254,6 +7254,270 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    /// Opens a restricted (non-dbo, non-sysadmin) session context for `login`,
+    /// so object-permission checks actually bite (unlike the login_sid-0 bypass).
+    fn restricted_ctx(engine: &Engine, login: &str) -> TxnContext {
+        let login_sid = engine.lookup_login(login).unwrap().principal_id;
+        let (user, user_sid) = engine.resolve_session_user(login, login_sid);
+        let mut ctx = TxnContext::default();
+        ctx.set_session_identity("truthdb".into(), login.into(), 9, user, login_sid, user_sid);
+        ctx
+    }
+
+    fn err_num(engine: &Engine, ctx: &mut TxnContext, sql: &str) -> Option<i32> {
+        batch(engine, ctx, sql).error.as_ref().map(|e| e.number)
+    }
+
+    #[test]
+    fn object_permissions_enforce_grant_deny_revoke_and_public() {
+        let path = unique_temp_path("perms");
+        let engine = new_engine(&path);
+        // Admin (login_sid 0 → bypass) sets up objects, a restricted login/user,
+        // and a role.
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .unwrap();
+        engine.execute("INSERT INTO t VALUES (1), (2)").unwrap();
+        engine
+            .execute("CREATE LOGIN applogin WITH PASSWORD = 'x'")
+            .unwrap();
+        engine
+            .execute("CREATE USER appuser FOR LOGIN applogin")
+            .unwrap();
+        engine.execute("CREATE ROLE readers").unwrap();
+        engine
+            .execute("ALTER ROLE readers ADD MEMBER appuser")
+            .unwrap();
+
+        let mut r = restricted_ctx(&engine, "applogin");
+
+        // Ungranted: SELECT denied 229.
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), Some(229));
+        // GRANT SELECT via the role → allowed.
+        engine.execute("GRANT SELECT ON t TO readers").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), None);
+        // A direct DENY beats the role's GRANT (both entries present).
+        engine.execute("DENY SELECT ON t TO appuser").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), Some(229));
+        // REVOKE the deny → the role GRANT is effective again.
+        engine.execute("REVOKE SELECT ON t FROM appuser").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), None);
+        // REVOKE from the role → no grant → denied.
+        engine.execute("REVOKE SELECT ON t FROM readers").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), Some(229));
+
+        // GRANT to public covers every user.
+        engine.execute("GRANT SELECT ON t TO public").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM t"), None);
+
+        // INSERT/UPDATE/DELETE need their own grants.
+        assert_eq!(
+            err_num(&engine, &mut r, "INSERT INTO t VALUES (3)"),
+            Some(229)
+        );
+        engine.execute("GRANT INSERT ON t TO appuser").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "INSERT INTO t VALUES (3)"), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn execute_permission_and_ownership_chaining() {
+        let path = unique_temp_path("perms-chain");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE secret (id INT NOT NULL PRIMARY KEY)")
+            .unwrap();
+        engine.execute("INSERT INTO secret VALUES (42)").unwrap();
+        engine
+            .execute("CREATE PROCEDURE read_secret AS SELECT id FROM secret")
+            .unwrap();
+        engine
+            .execute("CREATE LOGIN applogin WITH PASSWORD = 'x'")
+            .unwrap();
+        engine
+            .execute("CREATE USER appuser FOR LOGIN applogin")
+            .unwrap();
+
+        let mut r = restricted_ctx(&engine, "applogin");
+        // No EXECUTE grant: EXEC denied.
+        assert_eq!(err_num(&engine, &mut r, "EXEC read_secret"), Some(229));
+        // GRANT EXECUTE only on the proc — NOT SELECT on the table it reads.
+        engine
+            .execute("GRANT EXECUTE ON read_secret TO appuser")
+            .unwrap();
+        // Ownership chaining: the proc runs, its body's SELECT on secret is not
+        // re-checked (same dbo owner).
+        assert_eq!(err_num(&engine, &mut r, "EXEC read_secret"), None);
+        // But a DIRECT read of the table is still denied.
+        assert_eq!(err_num(&engine, &mut r, "SELECT id FROM secret"), Some(229));
+
+        // Dynamic SQL does NOT ownership-chain: a restricted user cannot escape
+        // the check by wrapping the read (or a write) in sp_executesql.
+        assert_eq!(
+            err_num(
+                &engine,
+                &mut r,
+                "EXEC sp_executesql N'SELECT id FROM secret'"
+            ),
+            Some(229)
+        );
+        assert_eq!(
+            err_num(&engine, &mut r, "EXEC sp_executesql N'DELETE FROM secret'"),
+            Some(229)
+        );
+        assert_eq!(
+            err_num(
+                &engine,
+                &mut r,
+                "EXEC sp_executesql N'INSERT INTO secret VALUES (7)'"
+            ),
+            Some(229)
+        );
+        // A GRANT makes the dynamic read work (proving the check, not a blanket ban).
+        engine.execute("GRANT SELECT ON secret TO appuser").unwrap();
+        assert_eq!(
+            err_num(
+                &engine,
+                &mut r,
+                "EXEC sp_executesql N'SELECT id FROM secret'"
+            ),
+            None
+        );
+        engine
+            .execute("REVOKE SELECT ON secret FROM appuser")
+            .unwrap();
+
+        // Dynamic SQL nested INSIDE a procedure body still does not chain: the
+        // dynamic read is checked as the caller (DynamicScope resets the chaining
+        // depth). Grant EXECUTE on the wrapper proc but NOT SELECT on the table.
+        engine
+            .execute("CREATE PROCEDURE dyn_read AS EXEC sp_executesql N'SELECT id FROM secret'")
+            .unwrap();
+        engine
+            .execute("GRANT EXECUTE ON dyn_read TO appuser")
+            .unwrap();
+        assert_eq!(err_num(&engine, &mut r, "EXEC dyn_read"), Some(229));
+        // Granting the caller SELECT lets the nested dynamic read succeed.
+        engine.execute("GRANT SELECT ON secret TO appuser").unwrap();
+        assert_eq!(err_num(&engine, &mut r, "EXEC dyn_read"), None);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn dropping_a_grantee_scrubs_its_object_permissions() {
+        let path = unique_temp_path("perms-scrub");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .unwrap();
+        engine.execute("CREATE USER alice").unwrap();
+        engine.execute("GRANT SELECT ON t TO alice").unwrap();
+
+        let perm_count = |engine: &Engine| -> String {
+            let (_c, rows) = sql_rows(
+                engine,
+                "SELECT COUNT(*) FROM sys.database_permissions WHERE major_id = \
+                 (SELECT object_id FROM sys.tables WHERE name = 't')",
+            );
+            rows[0][0].clone().unwrap()
+        };
+        assert_eq!(perm_count(&engine), "1");
+        // Dropping the grantee removes the dangling entry (so a later object_id
+        // reuse after restart cannot re-point it at a new principal).
+        engine.execute("DROP USER alice").unwrap();
+        assert_eq!(perm_count(&engine), "0");
+        // Persisted: the scrub survives a restart.
+        drop(engine);
+        let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("replay");
+        assert_eq!(perm_count(&engine), "0");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn ddl_and_grant_require_privilege() {
+        let path = unique_temp_path("perms-ddl");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .unwrap();
+        engine
+            .execute("CREATE LOGIN applogin WITH PASSWORD = 'x'")
+            .unwrap();
+        engine
+            .execute("CREATE USER appuser FOR LOGIN applogin")
+            .unwrap();
+
+        let mut r = restricted_ctx(&engine, "applogin");
+        // A restricted user cannot run DDL...
+        assert_eq!(
+            err_num(
+                &engine,
+                &mut r,
+                "CREATE TABLE hax (id INT NOT NULL PRIMARY KEY)"
+            ),
+            Some(15247)
+        );
+        assert_eq!(err_num(&engine, &mut r, "DROP TABLE t"), Some(15247));
+        assert_eq!(err_num(&engine, &mut r, "CREATE ROLE sneaky"), Some(15247));
+        // ...and cannot grant itself permissions.
+        assert_eq!(
+            err_num(&engine, &mut r, "GRANT SELECT ON t TO appuser"),
+            Some(15247)
+        );
+        // A sysadmin (sa) session bypasses — DDL and GRANT succeed.
+        engine
+            .execute("CREATE LOGIN sa WITH PASSWORD = 'x'")
+            .unwrap();
+        let mut admin = restricted_ctx(&engine, "sa"); // sa → dbo/sysadmin → bypass
+        assert_eq!(
+            err_num(&engine, &mut admin, "GRANT SELECT ON t TO appuser"),
+            None
+        );
+        assert_eq!(
+            err_num(
+                &engine,
+                &mut admin,
+                "CREATE TABLE ok (id INT NOT NULL PRIMARY KEY)"
+            ),
+            None
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn sys_database_permissions_reflects_grants_and_survives_restart() {
+        let path = unique_temp_path("perms-catalog");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .unwrap();
+        engine.execute("CREATE USER appuser").unwrap();
+        engine.execute("GRANT SELECT ON t TO appuser").unwrap();
+        engine.execute("DENY UPDATE ON t TO appuser").unwrap();
+
+        let check = |engine: &Engine| {
+            let (_c, rows) = sql_rows(
+                engine,
+                "SELECT permission_name, state_desc FROM sys.database_permissions \
+                 WHERE major_id = (SELECT object_id FROM sys.tables WHERE name = 't') \
+                 ORDER BY permission_name",
+            );
+            assert_eq!(
+                rows,
+                vec![
+                    vec![Some("SELECT".into()), Some("GRANT".into())],
+                    vec![Some("UPDATE".into()), Some("DENY".into())],
+                ]
+            );
+        };
+        check(&engine);
+        // Survives restart (permissions ride the object's catalog row).
+        drop(engine);
+        let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("replay");
+        check(&engine);
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn showplan_names_a_table_valued_function() {
         let path = unique_temp_path("tvf-showplan");

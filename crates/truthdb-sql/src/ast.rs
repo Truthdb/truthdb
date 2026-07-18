@@ -171,6 +171,38 @@ pub enum Statement {
         member: Name,
         span: Span,
     },
+    /// `GRANT|DENY|REVOKE <actions> ON <object> TO|FROM <grantees>`.
+    Permission(PermissionStatement),
+}
+
+/// `GRANT` / `DENY` / `REVOKE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionKind {
+    Grant,
+    Deny,
+    Revoke,
+}
+
+/// An object privilege named in `GRANT`/`DENY`/`REVOKE`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PermissionAction {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Execute,
+    References,
+    Alter,
+}
+
+/// `GRANT|DENY|REVOKE <actions> ON <object> TO|FROM <grantees>`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PermissionStatement {
+    pub kind: PermissionKind,
+    pub actions: Vec<PermissionAction>,
+    pub object: Name,
+    pub grantees: Vec<Name>,
+    pub span: Span,
 }
 
 /// Whether `ALTER ROLE` adds or removes the named member.

@@ -189,6 +189,9 @@ impl Parser {
             Some("BREAK") => self.parse_break(),
             Some("CONTINUE") => self.parse_continue(),
             Some("RETURN") => self.parse_return(),
+            Some("GRANT") => self.parse_permission(PermissionKind::Grant),
+            Some("DENY") => self.parse_permission(PermissionKind::Deny),
+            Some("REVOKE") => self.parse_permission(PermissionKind::Revoke),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1961,6 +1964,58 @@ impl Parser {
             member,
             span,
         })
+    }
+
+    /// `GRANT|DENY|REVOKE <action>[, …] ON <object> TO|FROM <grantee>[, …]`.
+    /// (Column-level, `WITH GRANT OPTION`, and database-scoped grants are not
+    /// parsed here.)
+    fn parse_permission(&mut self, kind: PermissionKind) -> SqlResult<Statement> {
+        let start = self.expect_keyword(match kind {
+            PermissionKind::Grant => "GRANT",
+            PermissionKind::Deny => "DENY",
+            PermissionKind::Revoke => "REVOKE",
+        })?;
+        let mut actions = vec![self.parse_permission_action()?];
+        while self.peek().kind == TokenKind::Comma {
+            self.bump();
+            actions.push(self.parse_permission_action()?);
+        }
+        self.expect_keyword("ON")?;
+        let object = self.parse_name()?;
+        // GRANT/DENY use TO; REVOKE uses FROM.
+        match kind {
+            PermissionKind::Revoke => self.expect_keyword("FROM")?,
+            _ => self.expect_keyword("TO")?,
+        };
+        let mut grantees = vec![self.parse_name()?];
+        while self.peek().kind == TokenKind::Comma {
+            self.bump();
+            grantees.push(self.parse_name()?);
+        }
+        let span = start.to(self.prev_span());
+        Ok(Statement::Permission(PermissionStatement {
+            kind,
+            actions,
+            object,
+            grantees,
+            span,
+        }))
+    }
+
+    fn parse_permission_action(&mut self) -> SqlResult<PermissionAction> {
+        let token = self.peek().clone();
+        let action = match self.peek_keyword().as_deref() {
+            Some("SELECT") => PermissionAction::Select,
+            Some("INSERT") => PermissionAction::Insert,
+            Some("UPDATE") => PermissionAction::Update,
+            Some("DELETE") => PermissionAction::Delete,
+            Some("EXECUTE") | Some("EXEC") => PermissionAction::Execute,
+            Some("REFERENCES") => PermissionAction::References,
+            Some("ALTER") => PermissionAction::Alter,
+            _ => return Err(SqlError::syntax(self.token_text(&token), token.span)),
+        };
+        self.bump();
+        Ok(action)
     }
 
     /// Parses an optional leading `IF EXISTS`.

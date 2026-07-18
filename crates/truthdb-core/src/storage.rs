@@ -153,6 +153,7 @@ fn principal_table_def(
         function: None,
         trigger: None,
         principal: Some(principal),
+        permissions: Vec::new(),
         counter_page: None,
     }
 }
@@ -844,6 +845,32 @@ impl Storage {
 
     pub fn rel_database_principals(&self) -> Vec<TableDef> {
         self.lock().rel_database_principals()
+    }
+
+    // GRANT/DENY/REVOKE bump the security version so a per-batch security context
+    // is recomputed next batch (like membership DDL).
+    pub fn rel_grant_object(
+        &self,
+        object: &str,
+        grantee: &str,
+        action: crate::relstore::catalog::PermAction,
+        deny: bool,
+    ) -> Result<(), StorageError> {
+        self.lock()
+            .rel_grant_object(object, grantee, action, deny)?;
+        self.bump_security_version();
+        Ok(())
+    }
+
+    pub fn rel_revoke_object(
+        &self,
+        object: &str,
+        grantee: &str,
+        action: crate::relstore::catalog::PermAction,
+    ) -> Result<(), StorageError> {
+        self.lock().rel_revoke_object(object, grantee, action)?;
+        self.bump_security_version();
+        Ok(())
     }
 
     /// The name of the principal with this id — a fixed principal, a login, or a
@@ -1769,6 +1796,7 @@ impl StorageFile {
                 function: None,
                 trigger: None,
                 principal: None,
+                permissions: Vec::new(),
                 counter_page: Some(counter_page),
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1824,6 +1852,7 @@ impl StorageFile {
                 function: None,
                 trigger: None,
                 principal: None,
+                permissions: Vec::new(),
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1875,6 +1904,7 @@ impl StorageFile {
                 function: None,
                 trigger: None,
                 principal: None,
+                permissions: Vec::new(),
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1927,6 +1957,7 @@ impl StorageFile {
                 function: Some(function),
                 trigger: None,
                 principal: None,
+                permissions: Vec::new(),
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -2044,6 +2075,7 @@ impl StorageFile {
                 function: None,
                 trigger: Some(trigger),
                 principal: None,
+                permissions: Vec::new(),
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -2126,6 +2158,7 @@ impl StorageFile {
                 function: None,
                 trigger: None,
                 principal: Some(principal),
+                permissions: Vec::new(),
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -2251,11 +2284,37 @@ impl StorageFile {
             .rel
             .catalog_root
             .expect("database principals live in the catalog");
+        // Scrub the principal's object permission entries BEFORE deleting it.
+        // Object_ids can be reused after a restart (next_object_id is recomputed
+        // from the surviving max), so a dangling grantee id must never outlive
+        // its principal. These are separate WAL transactions; doing the scrub
+        // first means a crash mid-drop can leave a still-present principal with
+        // fewer grants (harmless, and a re-run finishes) but never the dangerous
+        // deleted-principal-with-dangling-grant state.
+        self.scrub_grants_for(role_id)?;
         self.rel_statement(move |ctx, txn| {
             catalog::delete_table(ctx, &mut OpMode::Txn(txn), catalog_root, def.object_id)
         })?;
         self.rel.database_principals.remove(&key);
         Ok(true)
+    }
+
+    /// Removes every object permission entry whose grantee is `grantee` (a
+    /// dropped principal), rewriting each affected object's catalog row.
+    fn scrub_grants_for(&mut self, grantee: u32) -> Result<(), StorageError> {
+        let affected: Vec<String> = self
+            .rel
+            .tables
+            .iter()
+            .filter(|(_, def)| def.permissions.iter().any(|p| p.grantee == grantee))
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in affected {
+            let mut def = self.rel.tables.get(&name).cloned().expect("just listed");
+            def.permissions.retain(|p| p.grantee != grantee);
+            self.persist_object_permissions(&name, def)?;
+        }
+        Ok(())
     }
 
     /// Adds `member` (a user or role) to `role` (a database or fixed role).
@@ -2379,6 +2438,86 @@ impl StorageFile {
             .database_principals
             .values()
             .any(|d| d.object_id == id && d.is_role())
+    }
+
+    /// GRANT or DENY an action on an object to a grantee (a database user/role or
+    /// a fixed database principal, incl. `public`). Replaces any existing entry
+    /// for the same (grantee, action) — a GRANT and a DENY of the same action to
+    /// the same grantee do not coexist. Errors on an unknown grantee or object.
+    pub fn rel_grant_object(
+        &mut self,
+        object: &str,
+        grantee: &str,
+        action: crate::relstore::catalog::PermAction,
+        deny: bool,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        let grantee_id = self.resolve_grantee_id(grantee)?;
+        let Some(mut def) = self.rel.tables.get(object).cloned() else {
+            return Err(StorageError::Constraint(format!(
+                "cannot find the object '{object}', because it does not exist or you do not have permission"
+            )));
+        };
+        def.permissions
+            .retain(|p| !(p.grantee == grantee_id && p.action == action));
+        def.permissions
+            .push(crate::relstore::catalog::PermissionEntry {
+                grantee: grantee_id,
+                action,
+                deny,
+            });
+        self.persist_object_permissions(object, def)
+    }
+
+    /// REVOKE an action on an object from a grantee — removes both the GRANT and
+    /// the DENY of that (grantee, action). Idempotent (no error if absent).
+    pub fn rel_revoke_object(
+        &mut self,
+        object: &str,
+        grantee: &str,
+        action: crate::relstore::catalog::PermAction,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        let grantee_id = self.resolve_grantee_id(grantee)?;
+        let Some(mut def) = self.rel.tables.get(object).cloned() else {
+            return Err(StorageError::Constraint(format!(
+                "cannot find the object '{object}', because it does not exist or you do not have permission"
+            )));
+        };
+        let before = def.permissions.len();
+        def.permissions
+            .retain(|p| !(p.grantee == grantee_id && p.action == action));
+        if def.permissions.len() == before {
+            return Ok(()); // nothing to revoke
+        }
+        self.persist_object_permissions(object, def)
+    }
+
+    /// Resolves a grantee NAME to a database principal_id (a stored user/role or
+    /// a fixed database principal, incl. `public`; NOT the server sysadmin role).
+    fn resolve_grantee_id(&self, grantee: &str) -> Result<u32, StorageError> {
+        self.resolve_db_principal_id(grantee).ok_or_else(|| {
+            StorageError::Constraint(format!(
+                "cannot find the principal '{grantee}', because it does not exist"
+            ))
+        })
+    }
+
+    /// Writes an object's mutated permission list back through the catalog and
+    /// the in-memory cache (one whole-row rewrite, like a role-member edit).
+    fn persist_object_permissions(
+        &mut self,
+        object: &str,
+        def: TableDef,
+    ) -> Result<(), StorageError> {
+        let catalog_root = self.rel.catalog_root.expect("objects live in the catalog");
+        let write = def.clone();
+        self.rel_statement(move |ctx, txn| {
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &write)?;
+            Ok(())
+        })?;
+        self.rel.tables.insert(object.to_string(), def);
+        Ok(())
     }
 
     /// True if any principal (login or database) is a direct member of `role_id`.
