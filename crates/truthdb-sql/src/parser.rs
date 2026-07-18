@@ -192,6 +192,7 @@ impl Parser {
             Some("GRANT") => self.parse_permission(PermissionKind::Grant),
             Some("DENY") => self.parse_permission(PermissionKind::Deny),
             Some("REVOKE") => self.parse_permission(PermissionKind::Revoke),
+            Some("BACKUP") => self.parse_backup(),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1812,6 +1813,73 @@ impl Parser {
 
     /// `CREATE|ALTER LOGIN <name> WITH PASSWORD = '<pw>'` or `ALTER LOGIN <name>
     /// {ENABLE | DISABLE}`.
+    fn parse_backup(&mut self) -> SqlResult<Statement> {
+        let start = self.peek().span;
+        self.bump(); // BACKUP
+        // BACKUP is a side-effecting operation: it is illegal inside a function
+        // or table-valued-function body (a function must be side-effect-free —
+        // otherwise `SELECT dbo.f(x) FROM t` would run a full backup per row).
+        // It is permitted inside a stored procedure, matching SQL Server.
+        if self.in_function || self.in_table_function {
+            return Err(
+                SqlError::new(156, 15, 1, "Incorrect syntax near the keyword 'BACKUP'.").at(start),
+            );
+        }
+        self.expect_keyword("DATABASE")?;
+        let database = self.parse_name()?;
+        self.expect_keyword("TO")?;
+        self.expect_keyword("DISK")?;
+        self.expect(&TokenKind::Eq)?;
+        let token = self.peek().clone();
+        let TokenKind::String(path) = &token.kind else {
+            return Err(SqlError::syntax(self.token_text(&token), token.span));
+        };
+        let path = path.clone();
+        self.bump();
+
+        // Optional `WITH` options. CHECKSUM (default on) / NO_CHECKSUM,
+        // COPY_ONLY, and INIT / NOINIT (accepted but inert — a TDBBAK1 file
+        // holds one backup, so the destination is always overwritten).
+        let mut checksum = true;
+        let mut copy_only = false;
+        if self.eat_keyword("WITH") {
+            loop {
+                match self.peek_keyword().as_deref() {
+                    Some("CHECKSUM") => {
+                        self.bump();
+                        checksum = true;
+                    }
+                    Some("NO_CHECKSUM") => {
+                        self.bump();
+                        checksum = false;
+                    }
+                    Some("COPY_ONLY") => {
+                        self.bump();
+                        copy_only = true;
+                    }
+                    Some("INIT") | Some("NOINIT") => {
+                        self.bump();
+                    }
+                    _ => {
+                        let token = self.peek().clone();
+                        return Err(SqlError::syntax(self.token_text(&token), token.span));
+                    }
+                }
+                if !self.eat(&TokenKind::Comma) {
+                    break;
+                }
+            }
+        }
+        let span = start.to(self.prev_span());
+        Ok(Statement::BackupDatabase {
+            database,
+            path,
+            checksum,
+            copy_only,
+            span,
+        })
+    }
+
     fn parse_create_login(&mut self, start: Span, alter: bool) -> SqlResult<Statement> {
         self.bump(); // LOGIN
         if self.in_procedure || self.in_function || self.in_table_function {
@@ -3552,6 +3620,52 @@ fn is_reserved(keyword: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn backup_database_parses_with_options() {
+        let stmts = Parser::parse_str(
+            "BACKUP DATABASE mydb TO DISK = '/tmp/f.bak' WITH CHECKSUM, COPY_ONLY",
+        )
+        .expect("parse");
+        assert_eq!(stmts.len(), 1);
+        match &stmts[0] {
+            Statement::BackupDatabase {
+                database,
+                path,
+                checksum,
+                copy_only,
+                ..
+            } => {
+                assert_eq!(database.value, "mydb");
+                assert_eq!(path, "/tmp/f.bak");
+                assert!(*checksum);
+                assert!(*copy_only);
+            }
+            other => panic!("expected BackupDatabase, got {other:?}"),
+        }
+
+        // A bare BACKUP defaults CHECKSUM on and COPY_ONLY off.
+        let bare = Parser::parse_str("BACKUP DATABASE d TO DISK = 'x'").expect("parse bare");
+        assert!(matches!(
+            &bare[0],
+            Statement::BackupDatabase {
+                checksum: true,
+                copy_only: false,
+                ..
+            }
+        ));
+
+        // NO_CHECKSUM turns verification off; INIT is accepted (inert).
+        let no_ck = Parser::parse_str("BACKUP DATABASE d TO DISK = 'x' WITH NO_CHECKSUM, INIT")
+            .expect("parse");
+        assert!(matches!(
+            &no_ck[0],
+            Statement::BackupDatabase {
+                checksum: false,
+                ..
+            }
+        ));
+    }
 
     #[test]
     fn deeply_nested_parens_error_not_overflow() {

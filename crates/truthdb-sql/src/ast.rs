@@ -173,6 +173,15 @@ pub enum Statement {
     },
     /// `GRANT|DENY|REVOKE <actions> ON <object> TO|FROM <grantees>`.
     Permission(PermissionStatement),
+    /// `BACKUP DATABASE <name> TO DISK = '<path>' [WITH <opt>[, ...]]` — an
+    /// online full backup to a `TDBBAK1` file.
+    BackupDatabase {
+        database: Name,
+        path: String,
+        checksum: bool,
+        copy_only: bool,
+        span: Span,
+    },
 }
 
 /// `GRANT` / `DENY` / `REVOKE`.

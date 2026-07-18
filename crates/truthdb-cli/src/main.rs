@@ -52,6 +52,16 @@ enum Command {
         #[arg(long)]
         add_gib: u64,
     },
+    /// OFFLINE: restore a database file from a `TDBBAK1` full backup. The
+    /// destination must not exist and the server must not be running.
+    Restore {
+        /// Path to the `TDBBAK1` full-backup file.
+        #[arg(long)]
+        full: std::path::PathBuf,
+        /// Destination path for the restored database file (must not exist).
+        #[arg(long)]
+        to: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -75,6 +85,15 @@ async fn main() -> Result<()> {
                     Ok(())
                 }
                 Err(err) => Err(anyhow::anyhow!("grow failed: {err}")),
+            }
+        }
+        Command::Restore { full, to } => {
+            match truthdb_core::storage::Storage::restore_full(&full, &to) {
+                Ok(()) => {
+                    println!("restored {} from {}", to.display(), full.display());
+                    Ok(())
+                }
+                Err(err) => Err(anyhow::anyhow!("restore failed: {err}")),
             }
         }
     }
