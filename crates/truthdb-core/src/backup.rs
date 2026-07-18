@@ -65,6 +65,11 @@ pub struct BackupFlags {
     pub checksum: bool,
     /// `WITH COPY_ONLY`: the backup did not disturb the log-backup chain.
     pub copy_only: bool,
+    /// This is a `BACKUP LOG` archive (log records only, no page data): the
+    /// header's `redo_start_lsn` is the archived range's start and the region
+    /// sizes / roots are unused. Restore applies its `LogChunk` on top of a
+    /// full-backup base.
+    pub log_backup: bool,
 }
 
 /// The `TDBBAK1` header: everything a restore needs to recreate the file and
@@ -120,7 +125,9 @@ impl BackupHeader {
         out.extend_from_slice(&self.last_committed_seq.to_le_bytes());
         out.extend_from_slice(&self.finished_at_millis.to_le_bytes());
         out.push(self.db_options);
-        let flag_bits = (self.flags.checksum as u8) | ((self.flags.copy_only as u8) << 1);
+        let flag_bits = (self.flags.checksum as u8)
+            | ((self.flags.copy_only as u8) << 1)
+            | ((self.flags.log_backup as u8) << 2);
         out.push(flag_bits);
         // Default collation as a length-prefixed UTF-8 string (u32 len, or
         // u32::MAX for None).
@@ -180,6 +187,7 @@ impl BackupHeader {
             flags: BackupFlags {
                 checksum: flag_bits & 1 != 0,
                 copy_only: flag_bits & 2 != 0,
+                log_backup: flag_bits & 4 != 0,
             },
         })
     }
@@ -436,6 +444,7 @@ mod tests {
             flags: BackupFlags {
                 checksum: true,
                 copy_only: false,
+                log_backup: false,
             },
         }
     }

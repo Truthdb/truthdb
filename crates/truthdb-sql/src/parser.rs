@@ -1843,7 +1843,15 @@ impl Parser {
                 SqlError::new(156, 15, 1, "Incorrect syntax near the keyword 'BACKUP'.").at(start),
             );
         }
-        self.expect_keyword("DATABASE")?;
+        let is_log = match self.peek_keyword().as_deref() {
+            Some("DATABASE") => false,
+            Some("LOG") => true,
+            _ => {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+        };
+        self.bump(); // DATABASE | LOG
         let database = self.parse_name()?;
         self.expect_keyword("TO")?;
         self.expect_keyword("DISK")?;
@@ -1889,13 +1897,23 @@ impl Parser {
             }
         }
         let span = start.to(self.prev_span());
-        Ok(Statement::BackupDatabase {
-            database,
-            path,
-            checksum,
-            copy_only,
-            span,
-        })
+        if is_log {
+            Ok(Statement::BackupLog {
+                database,
+                path,
+                checksum,
+                copy_only,
+                span,
+            })
+        } else {
+            Ok(Statement::BackupDatabase {
+                database,
+                path,
+                checksum,
+                copy_only,
+                span,
+            })
+        }
     }
 
     fn parse_create_login(&mut self, start: Span, alter: bool) -> SqlResult<Statement> {

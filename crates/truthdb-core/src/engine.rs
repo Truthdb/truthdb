@@ -2001,6 +2001,272 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[test]
+    fn backup_log_ships_the_log_advances_the_marker_and_chains() {
+        use crate::backup::{BackupReader, BlockType};
+        let src = unique_temp_path("backuplog-src");
+        let trn1 = unique_temp_path("backuplog-1");
+        let trn2 = unique_temp_path("backuplog-2");
+        let engine = new_engine(&src);
+        engine
+            .execute("ALTER DATABASE CURRENT SET RECOVERY FULL")
+            .expect("full");
+        // Enabling FULL starts the log chain at the current tail and pins it.
+        let chain_start = engine.storage().last_log_backup_lsn();
+        assert_eq!(engine.storage().log_backup_hold(), Some(chain_start));
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=20 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+
+        let read_log_archive = |path: &std::path::Path| -> (crate::backup::BackupHeader, u64) {
+            let (mut r, header) =
+                BackupReader::new(std::io::BufReader::new(std::fs::File::open(path).unwrap()))
+                    .unwrap();
+            let mut log_bytes = 0u64;
+            while let Some((bt, payload)) = r.next_block().unwrap() {
+                if bt == BlockType::LogChunk {
+                    log_bytes += payload.len().saturating_sub(8) as u64; // minus the start-LSN prefix
+                }
+            }
+            (header, log_bytes)
+        };
+
+        // First BACKUP LOG ships [chain_start, tail) and advances the marker.
+        let lit1 = trn1.to_str().unwrap().replace('\'', "''");
+        assert!(
+            sql(&engine, &format!("BACKUP LOG truthdb TO DISK = '{lit1}'"))["error"].is_null(),
+            "BACKUP LOG succeeded"
+        );
+        let marker1 = engine.storage().last_log_backup_lsn();
+        assert!(marker1 > chain_start, "the marker advanced");
+        assert_eq!(
+            engine.storage().log_backup_hold(),
+            Some(marker1),
+            "the hold moved to the new marker"
+        );
+        let (header1, bytes1) = read_log_archive(&trn1);
+        assert!(header1.flags.log_backup, "flagged as a log-only archive");
+        assert_eq!(header1.redo_start_lsn, chain_start);
+        assert_eq!(
+            chain_start + bytes1,
+            marker1,
+            "the shipped range ends at the marker"
+        );
+
+        // A second BACKUP LOG chains contiguously from the first.
+        engine
+            .execute("INSERT INTO t VALUES (99, 99)")
+            .expect("more");
+        let lit2 = trn2.to_str().unwrap().replace('\'', "''");
+        assert!(sql(&engine, &format!("BACKUP LOG truthdb TO DISK = '{lit2}'"))["error"].is_null());
+        let (header2, _) = read_log_archive(&trn2);
+        assert_eq!(
+            header2.redo_start_lsn, marker1,
+            "the second archive starts where the first ended"
+        );
+        drop(engine);
+        for p in [src, trn1, trn2] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn restoring_a_full_recovery_database_opens_and_checkpoints_cleanly() {
+        let src = unique_temp_path("restore-full-src");
+        let bak = unique_temp_path("restore-full-bak");
+        let restored = unique_temp_path("restore-full-restored");
+        let trn = unique_temp_path("restore-full-trn");
+        let engine = new_engine(&src);
+        engine
+            .execute("ALTER DATABASE CURRENT SET RECOVERY FULL")
+            .expect("full");
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=30 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let expected = sql_rows(&engine, "SELECT id, v FROM t ORDER BY id").1;
+        engine
+            .storage()
+            .backup_full(&bak)
+            .expect("full backup of a FULL-model db");
+        drop(engine);
+
+        Storage::restore_full(&restored, &bak).expect("restore");
+        let engine2 = Engine::new(Storage::open(restored.clone()).expect("open")).expect("engine");
+        assert_eq!(
+            sql_rows(&engine2, "SELECT id, v FROM t ORDER BY id").1,
+            expected
+        );
+        // The restored DB is FULL and its log-backup floor is seeded at the
+        // restore point (backup_end), so the on-open hold sits at/above wal_head.
+        assert_eq!(
+            sql_rows(&engine2, "SELECT recovery_model_desc FROM sys.databases").1,
+            vec![vec![Some("FULL".into())]]
+        );
+        assert!(
+            engine2.storage().log_backup_hold().is_some(),
+            "FULL-model hold re-registered on the restored db"
+        );
+        // A checkpoint would panic (set_head with a floor below the head) if the
+        // marker had been left at 0 — the Fix-3 regression guard.
+        engine2
+            .storage()
+            .write_checkpoint(b"cp", 1, 2, 1)
+            .expect("checkpoint on the restored db");
+        // And BACKUP LOG works on the restored (fresh) log chain.
+        let lit = trn.to_str().unwrap().replace('\'', "''");
+        assert!(sql(&engine2, &format!("BACKUP LOG truthdb TO DISK = '{lit}'"))["error"].is_null());
+        drop(engine2);
+        for p in [src, bak, restored, trn] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn backup_log_requires_the_full_recovery_model() {
+        let path = unique_temp_path("backuplog-simple");
+        let engine = new_engine(&path);
+        // SIMPLE (the default): BACKUP LOG is 4208.
+        assert_eq!(
+            sql_error_number(
+                &engine,
+                "BACKUP LOG truthdb TO DISK = '/tmp/truthdb-never.trn'"
+            ),
+            4208
+        );
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn full_recovery_holds_the_log_until_backup_log() {
+        let path = unique_temp_path("backuplog-hold");
+        let trn = unique_temp_path("backuplog-hold-trn");
+        let engine = new_engine(&path);
+        engine
+            .execute("ALTER DATABASE CURRENT SET RECOVERY FULL")
+            .expect("full");
+        let marker = engine.storage().last_log_backup_lsn();
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=50 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        // A checkpoint cannot truncate past the log-backup floor under FULL.
+        engine
+            .storage()
+            .write_checkpoint(b"cp", 1, 2, 1)
+            .expect("checkpoint");
+        assert!(
+            engine.storage().wal_head() <= marker,
+            "FULL pins the head at the log-backup floor"
+        );
+
+        // BACKUP LOG advances the floor, so a later checkpoint reclaims the log.
+        let lit = trn.to_str().unwrap().replace('\'', "''");
+        assert!(sql(&engine, &format!("BACKUP LOG truthdb TO DISK = '{lit}'"))["error"].is_null());
+        assert!(engine.storage().last_log_backup_lsn() > marker);
+        engine
+            .storage()
+            .write_checkpoint(b"cp2", 2, 3, 2)
+            .expect("checkpoint");
+        assert!(
+            engine.storage().wal_head() > marker,
+            "after BACKUP LOG the checkpoint reclaims past the old floor"
+        );
+        drop(engine);
+        for p in [path, trn] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn log_backup_marker_and_hold_survive_reopen() {
+        let path = unique_temp_path("backuplog-reopen");
+        let trn = unique_temp_path("backuplog-reopen-trn");
+        let engine = new_engine(&path);
+        engine
+            .execute("ALTER DATABASE CURRENT SET RECOVERY FULL")
+            .expect("full");
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine.execute("INSERT INTO t VALUES (1)").expect("insert");
+        let lit = trn.to_str().unwrap().replace('\'', "''");
+        assert!(sql(&engine, &format!("BACKUP LOG truthdb TO DISK = '{lit}'"))["error"].is_null());
+        let marker = engine.storage().last_log_backup_lsn();
+        drop(engine);
+
+        let engine2 = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("engine");
+        assert_eq!(
+            engine2.storage().last_log_backup_lsn(),
+            marker,
+            "the marker persisted"
+        );
+        assert_eq!(
+            engine2.storage().log_backup_hold(),
+            Some(marker),
+            "the hold re-registered on open"
+        );
+        assert_eq!(
+            sql_rows(&engine2, "SELECT recovery_model_desc FROM sys.databases").1,
+            vec![vec![Some("FULL".into())]]
+        );
+        drop(engine2);
+        for p in [path, trn] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
+    fn full_recovery_ring_full_reports_9002() {
+        let path = unique_temp_path("backuplog-9002");
+        // A small ring so the un-backed-up log fills it quickly.
+        let storage = Storage::create_with_wal_bounds(
+            path.clone(),
+            test_storage_options(),
+            128 * 1024,
+            128 * 1024,
+        )
+        .expect("create");
+        let engine = Engine::new(storage).expect("engine");
+        engine
+            .execute("ALTER DATABASE CURRENT SET RECOVERY FULL")
+            .expect("full");
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v NVARCHAR(120))")
+            .expect("create");
+        // FULL pins the head at the enable point, so with no BACKUP LOG the ring
+        // fills and a write eventually reports 9002 (log full).
+        let mut hit_9002 = false;
+        for i in 0..4000 {
+            let env = sql(
+                &engine,
+                &format!("INSERT INTO t VALUES ({i}, '{}')", "x".repeat(100)),
+            );
+            if let Some(n) = env["error"]["number"].as_i64() {
+                assert_eq!(n, 9002, "ring-full under FULL reports 9002, got {env}");
+                hit_9002 = true;
+                break;
+            }
+        }
+        assert!(hit_9002, "the ring filled and reported 9002");
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
     /// Runs SQL expected to error and returns the SQL error message.
     fn sql_error_message(engine: &Engine, text: &str) -> String {
         let env = sql(engine, text);

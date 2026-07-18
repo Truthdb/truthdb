@@ -182,6 +182,15 @@ pub enum Statement {
         copy_only: bool,
         span: Span,
     },
+    /// `BACKUP LOG <name> TO DISK = '<path>' [WITH <opt>[, ...]]` — a
+    /// transaction-log backup (FULL recovery model only).
+    BackupLog {
+        database: Name,
+        path: String,
+        checksum: bool,
+        copy_only: bool,
+        span: Span,
+    },
 }
 
 /// `GRANT` / `DENY` / `REVOKE`.

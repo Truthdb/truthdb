@@ -322,6 +322,19 @@ impl Superblock {
     pub fn set_db_options(&mut self, byte: u8) {
         self.reserved[0] = byte;
     }
+
+    /// FULL-recovery-model log-backup floor: the LSN up to which the log has
+    /// been shipped to a log archive (`0` = none). Stored in the reserved area
+    /// (bytes 8..16; byte 0 is `db_options`, 1..8 are padding) and covered by
+    /// the superblock checksum. Persisted so the log-truncation hold is
+    /// re-established on open.
+    pub fn last_log_backup_lsn(&self) -> u64 {
+        u64::from_le_bytes(self.reserved[8..16].try_into().unwrap())
+    }
+
+    pub fn set_last_log_backup_lsn(&mut self, lsn: u64) {
+        self.reserved[8..16].copy_from_slice(&lsn.to_le_bytes());
+    }
 }
 
 #[repr(C)]
