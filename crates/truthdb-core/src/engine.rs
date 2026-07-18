@@ -2226,6 +2226,54 @@ mod tests {
     }
 
     #[test]
+    fn commit_records_carry_a_recent_wall_clock_timestamp() {
+        use crate::storage_layout::WAL_ENTRY_TYPE_REL;
+        use crate::wal::records::{REL_KIND_TXN_COMMIT, RelRecord};
+        let now_ms = || {
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_millis() as u64
+        };
+        let path = unique_temp_path("commit-ts");
+        let before = now_ms();
+        {
+            let engine = new_engine(&path);
+            engine
+                .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+                .expect("create");
+            engine.execute("INSERT INTO t VALUES (1)").expect("insert"); // autocommits
+        }
+        let after = now_ms();
+
+        // Reopen so recovery's ring scan populates the replay cache; some
+        // committed transaction's record carries a v2 entry with a wall-clock
+        // timestamp in [before, after] (for point-in-time restore).
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let records = storage.replay_wal_entries().expect("replay");
+        let mut found = false;
+        for r in records {
+            if r.entry_type != WAL_ENTRY_TYPE_REL {
+                continue;
+            }
+            let rec = RelRecord::decode(&r.payload).expect("decode");
+            if rec.kind == REL_KIND_TXN_COMMIT && rec.redo.len() >= 8 {
+                assert_eq!(r.entry_version, 2, "new commit records are entry version 2");
+                let ts = u64::from_le_bytes(rec.redo[..8].try_into().unwrap());
+                if before <= ts && ts <= after {
+                    found = true;
+                }
+            }
+        }
+        assert!(
+            found,
+            "a commit record carried a timestamp in [{before}, {after}]"
+        );
+        drop(storage);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn backup_log_requires_the_full_recovery_model() {
         let path = unique_temp_path("backuplog-simple");
         let engine = new_engine(&path);

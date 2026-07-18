@@ -40,8 +40,9 @@ impl From<TypeError> for StorageError {
 }
 
 /// Version stamped in REL wal entries (entry-level, distinct from the record
-/// kinds inside).
-const REL_WAL_ENTRY_VERSION: u16 = 1;
+/// kinds inside). v2 adds a commit-record timestamp for point-in-time restore;
+/// v1 records decode unchanged (nothing gates on the version).
+const REL_WAL_ENTRY_VERSION: u16 = 2;
 
 // Fixed (built-in) principals are SYNTHESIZED at read time, never stored. Their
 // principal_ids sit in a reserved band far above any real `object_id` (which
