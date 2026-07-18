@@ -444,7 +444,16 @@ impl Storage {
 
     pub fn open(path: PathBuf) -> Result<Self, StorageError> {
         assert_layout_invariants();
-        let file = StorageFile::open_existing(path.clone())?;
+        let file = StorageFile::open_existing(path.clone(), None)?;
+        Self::with_log_writer(path, file)
+    }
+
+    /// Opens with recovery stopped at a point in time: transactions whose commit
+    /// timestamp is past `stop_at` are undone (point-in-time restore). Used by
+    /// the restore path to validate + finalize a `--stopat` recovery.
+    fn open_with_stop_at(path: PathBuf, stop_at: u64) -> Result<Self, StorageError> {
+        assert_layout_invariants();
+        let file = StorageFile::open_existing(path.clone(), Some(stop_at))?;
         Self::with_log_writer(path, file)
     }
 
@@ -719,18 +728,21 @@ impl Storage {
     /// Offline restore of a full backup with no log chain (recover to the full
     /// backup's own end).
     pub fn restore_full(dst_path: &Path, bak_path: &Path) -> Result<(), StorageError> {
-        Self::restore_full_with_logs(dst_path, bak_path, &[])
+        Self::restore_full_with_logs(dst_path, bak_path, &[], None)
     }
 
     /// Offline restore of a full backup followed by an ordered chain of
-    /// `BACKUP LOG` archives (recover to the end of the last log). Each archive
-    /// must continue from where the previous coverage ended (no gap, error
-    /// 4305); the whole recoverable range must fit in the WAL ring (a longer
-    /// chain needs incremental restore, not yet supported).
+    /// `BACKUP LOG` archives. Recovers to the end of the last log, or — when
+    /// `stop_at` is set — to that wall-clock point in time (transactions that
+    /// committed past it are undone). Each archive must continue from where the
+    /// previous coverage ended (no gap, error 4305); the whole recoverable range
+    /// must fit in the WAL ring (a longer chain needs incremental restore, not
+    /// yet supported).
     pub fn restore_full_with_logs(
         dst_path: &Path,
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
+        stop_at: Option<u64>,
     ) -> Result<(), StorageError> {
         assert_layout_invariants();
         let reader = std::io::BufReader::new(std::fs::File::open(bak_path)?);
@@ -761,7 +773,7 @@ impl Storage {
         // The destination now exists and is ours: remove the partial file if any
         // later step fails, so a retry (which requires a fresh destination) can
         // proceed. Everything ABOVE this point errors without having created it.
-        let outcome = Self::restore_body(file, backup, &header, log_paths, dst_path);
+        let outcome = Self::restore_body(file, backup, &header, log_paths, dst_path, stop_at);
         if outcome.is_err() {
             let _ = std::fs::remove_file(dst_path);
         }
@@ -778,6 +790,7 @@ impl Storage {
         header: &crate::backup::BackupHeader,
         log_paths: &[std::path::PathBuf],
         dst_path: &Path,
+        stop_at: Option<u64>,
     ) -> Result<(), StorageError> {
         use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
         let data_pages = header.data_size / PAGE_SIZE as u64;
@@ -842,10 +855,16 @@ impl Storage {
         file.sync_file()?;
         drop(file);
 
-        // Validate: opening reruns allocator recovery + ARIES relational
-        // recovery over the seeded ring, failing loudly if the restored file is
-        // not recoverable.
-        let storage = Storage::open(dst_path.to_path_buf())?;
+        // Validate + finalize: opening reruns allocator recovery + ARIES
+        // relational recovery over the seeded ring. For a point-in-time restore,
+        // recovery stops at `stop_at`, undoing later transactions with CLRs that
+        // persist the point-in-time state across a normal reopen (their undo is
+        // replayed and each undone txn is sealed with a TXN_END). Failing loudly
+        // if the restored file is not recoverable.
+        let storage = match stop_at {
+            Some(ts) => Storage::open_with_stop_at(dst_path.to_path_buf(), ts)?,
+            None => Storage::open(dst_path.to_path_buf())?,
+        };
         drop(storage);
         Ok(())
     }
@@ -4461,7 +4480,7 @@ impl StorageFile {
         Ok((def, schema))
     }
 
-    fn open_existing(path: PathBuf) -> Result<Self, StorageError> {
+    fn open_existing(path: PathBuf, stop_at: Option<u64>) -> Result<Self, StorageError> {
         let mut file = DirectFile::open_existing(path.clone())?;
         let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
         file.read_exact_at(0, &mut header_bytes)?;
@@ -4602,7 +4621,7 @@ impl StorageFile {
 
         // ARIES restart for the relational store: analysis + redo, catalog
         // reload, undo of losers with compensation logging.
-        storage.recover_rel()?;
+        storage.recover_rel(stop_at)?;
         Ok(storage)
     }
 
@@ -4721,7 +4740,7 @@ impl StorageFile {
     /// loser transactions with CLRs. The catalog is loaded between redo and
     /// undo (undo needs tree roots) and reloaded after (undo may have
     /// removed catalog rows).
-    fn recover_rel(&mut self) -> Result<(), StorageError> {
+    fn recover_rel(&mut self, stop_at: Option<u64>) -> Result<(), StorageError> {
         let records = self.rel_records()?;
         if records.is_empty() && self.rel.catalog_root.is_none() {
             return Ok(());
@@ -4729,7 +4748,7 @@ impl StorageFile {
 
         let outcome = {
             let mut ctx = self.rel_ctx();
-            rel_recovery::analyze_and_redo(&mut ctx, &records)?
+            rel_recovery::analyze_and_redo(&mut ctx, &records, stop_at)?
         };
         if let Some(root) = outcome.catalog_root {
             self.rel.catalog_root = Some(root);
