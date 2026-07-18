@@ -941,6 +941,7 @@ impl Parser {
                 self.parse_create_procedure(start, false)
             }
             Some("FUNCTION") if !unique => self.parse_create_function(start, false),
+            Some("TRIGGER") if !unique => self.parse_create_trigger(start, false),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1454,6 +1455,9 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("FUNCTION") {
             return self.parse_create_function(start, true);
         }
+        if self.peek_keyword().as_deref() == Some("TRIGGER") {
+            return self.parse_create_trigger(start, true);
+        }
         self.expect_keyword("TABLE")?;
         let table = self.parse_name()?;
         let (action, end) = match self.peek_keyword().as_deref() {
@@ -1552,6 +1556,7 @@ impl Parser {
             Some("VIEW") => self.parse_drop_view(start),
             Some("PROCEDURE") | Some("PROC") => self.parse_drop_procedure(start),
             Some("FUNCTION") => self.parse_drop_function(start),
+            Some("TRIGGER") => self.parse_drop_trigger(start),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1676,6 +1681,114 @@ impl Parser {
         };
         let name = self.parse_name()?;
         Ok(Statement::DropProcedure {
+            span: start.to(name.span),
+            name,
+            if_exists,
+        })
+    }
+
+    /// `CREATE|ALTER TRIGGER <name> ON <table> {AFTER|FOR} {INSERT|UPDATE|DELETE}
+    /// [,...] AS <body-to-end-of-batch>`. Only AFTER (its `FOR` synonym)
+    /// DML triggers are supported; `INSTEAD OF` is rejected as a syntax error.
+    fn parse_create_trigger(&mut self, start: Span, alter: bool) -> SqlResult<Statement> {
+        self.bump(); // TRIGGER
+        if self.in_procedure || self.in_function || self.in_table_function {
+            return Err(
+                SqlError::new(156, 15, 1, "Incorrect syntax near the keyword 'TRIGGER'.").at(start),
+            );
+        }
+        if self.statement_index > 0 || self.sub_depth > 0 {
+            return Err(SqlError::new(
+                111,
+                15,
+                1,
+                "'CREATE/ALTER TRIGGER' must be the first statement in a query batch.",
+            )
+            .at(start));
+        }
+        let name = self.parse_name()?;
+        self.expect_keyword("ON")?;
+        let target = self.parse_name()?;
+        // AFTER (or its FOR synonym) is the only supported timing.
+        match self.peek_keyword().as_deref() {
+            Some("AFTER") | Some("FOR") => {
+                self.bump();
+            }
+            _ => {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+        }
+        // The event list: INSERT/UPDATE/DELETE, comma-separated, at least one,
+        // deduplicated.
+        let mut events = Vec::new();
+        loop {
+            let event = match self.peek_keyword().as_deref() {
+                Some("INSERT") => TriggerEvent::Insert,
+                Some("UPDATE") => TriggerEvent::Update,
+                Some("DELETE") => TriggerEvent::Delete,
+                _ => {
+                    let token = self.peek().clone();
+                    return Err(SqlError::syntax(self.token_text(&token), token.span));
+                }
+            };
+            self.bump();
+            if !events.contains(&event) {
+                events.push(event);
+            }
+            if !self.eat(&TokenKind::Comma) {
+                break;
+            }
+        }
+        self.expect_keyword("AS")?;
+        // The body is everything to the end of the batch, stored verbatim and
+        // re-parsed per firing; parse it now (in the procedure grammar) to
+        // validate its syntax at CREATE.
+        let body_start = self.peek().span.start;
+        let body = self.src[body_start..].trim().to_string();
+        if body.is_empty() {
+            let token = self.peek().clone();
+            return Err(SqlError::syntax(self.token_text(&token), token.span));
+        }
+        self.in_procedure = true;
+        let validated = (|| -> SqlResult<()> {
+            loop {
+                while self.eat(&TokenKind::Semicolon) {}
+                if self.at_eof() {
+                    return Ok(());
+                }
+                self.nodes = 0;
+                self.parse_statement()?;
+                if !self.at_eof() && !self.check(&TokenKind::Semicolon) {
+                    let token = self.peek().clone();
+                    return Err(SqlError::syntax(self.token_text(&token), token.span));
+                }
+            }
+        })();
+        self.in_procedure = false;
+        validated?;
+        let span = start.to(self.prev_span());
+        Ok(Statement::CreateTrigger(CreateTrigger {
+            name,
+            target,
+            events,
+            body,
+            alter,
+            span,
+        }))
+    }
+
+    fn parse_drop_trigger(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // TRIGGER
+        let if_exists = if self.peek_keyword().as_deref() == Some("IF") {
+            self.bump();
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_name()?;
+        Ok(Statement::DropTrigger {
             span: start.to(name.span),
             name,
             if_exists,

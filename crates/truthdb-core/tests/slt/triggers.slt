@@ -1,0 +1,82 @@
+# AFTER triggers (Stage 15): CREATE TRIGGER ... ON t AFTER {INSERT|UPDATE|DELETE}
+# AS <body>, inserted/deleted pseudo-tables, catalog visibility, DROP TRIGGER.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)
+
+statement ok
+CREATE TABLE audit (id INT NOT NULL PRIMARY KEY, kind NVARCHAR(10))
+
+# A trigger firing on both INSERT and UPDATE, recording rows from `inserted`.
+statement ok
+CREATE TRIGGER trg_iu ON t AFTER INSERT, UPDATE AS INSERT INTO audit SELECT id, 'iu' FROM inserted WHERE id NOT IN (SELECT id FROM audit)
+
+statement ok
+INSERT INTO t VALUES (1, 10), (2, 20)
+
+query IT rowsort
+SELECT id, kind FROM audit
+----
+1 iu
+2 iu
+
+# sys.objects classifies the trigger as TR.
+query TT
+SELECT name, type FROM sys.objects WHERE name = 'trg_iu'
+----
+trg_iu TR
+
+# sys.trigger_events lists one row per event (1=INSERT, 2=UPDATE).
+query I rowsort
+SELECT te.type FROM sys.trigger_events te JOIN sys.objects o ON te.object_id = o.object_id WHERE o.name = 'trg_iu'
+----
+1
+2
+
+# sys.sql_modules carries the body.
+query I
+SELECT COUNT(*) AS n FROM sys.sql_modules m JOIN sys.objects o ON m.object_id = o.object_id WHERE o.name = 'trg_iu'
+----
+1
+
+# A 0-row DML fires the trigger once but inserts nothing (the WHERE matches no rows).
+statement ok
+UPDATE t SET v = 0 WHERE id = 999
+
+query I
+SELECT COUNT(*) AS n FROM audit
+----
+2
+
+# DROP TRIGGER: after dropping, the trigger no longer fires.
+statement ok
+DROP TRIGGER trg_iu
+
+statement ok
+INSERT INTO t VALUES (3, 30)
+
+query I
+SELECT COUNT(*) AS n FROM audit
+----
+2
+
+# The trigger is gone from the catalog.
+query I
+SELECT COUNT(*) AS n FROM sys.objects WHERE name = 'trg_iu'
+----
+0
+
+# A trigger can only target a base table.
+statement ok
+CREATE VIEW v AS SELECT id FROM t
+
+statement error
+CREATE TRIGGER trg_bad ON v AFTER INSERT AS INSERT INTO audit SELECT id, 'x' FROM inserted
+
+# INSTEAD OF triggers are not supported.
+statement error
+CREATE TRIGGER trg_io ON t INSTEAD OF INSERT AS INSERT INTO audit SELECT id, 'io' FROM inserted
+
+# DROP TRIGGER IF EXISTS on a missing trigger is a no-op.
+statement ok
+DROP TRIGGER IF EXISTS never_existed

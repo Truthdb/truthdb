@@ -15,10 +15,10 @@ mod value;
 
 use truthdb_sql::ast::{
     AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateFunction,
-    CreateIndex, CreateProcedure, CreateTable, CreateView, DataType, DatabaseOption, Declaration,
-    Delete, DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind, ForeignKey, Insert,
-    InsertSource, IsolationLevel, JoinKind, Name, OrderItem, RaiseError, ReturnsClause, Select,
-    SelectItem, SetStatement, Statement, TableRef, ThrowArgs, ThrowStatement, Update,
+    CreateIndex, CreateProcedure, CreateTable, CreateTrigger, CreateView, DataType, DatabaseOption,
+    Declaration, Delete, DropIndex, DropTable, DropView, ExecStatement, Expr, ExprKind, ForeignKey,
+    Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem, RaiseError, ReturnsClause,
+    Select, SelectItem, SetStatement, Statement, TableRef, ThrowArgs, ThrowStatement, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -32,7 +32,7 @@ use xxhash_rust::xxh64::xxh64;
 use crate::lock::{LockMode, Resource};
 use crate::relstore::btree::ScanCursor;
 use crate::relstore::catalog::{
-    self, FunctionDef, FunctionReturns, ProcParamDef, ProcedureDef, TableDef,
+    self, FunctionDef, FunctionReturns, ProcParamDef, ProcedureDef, TableDef, TriggerDef,
 };
 use crate::relstore::row::{Column, Schema};
 use crate::relstore::types::{ColumnType, Datum};
@@ -982,6 +982,9 @@ fn run_user_procedure(
     }
     txn_ctx.proc_stack.push(def.name.clone());
     txn_ctx.proc_return = None;
+    // A procedure called from a trigger body does NOT see the trigger's
+    // inserted/deleted (they are visible only in the trigger's own statements).
+    let _trigger_shadow = TriggerScope::clear();
     let depth = EXEC_DEPTH.with(|d| {
         let v = d.get() + 1;
         d.set(v);
@@ -1095,6 +1098,8 @@ fn run_user_scalar_function(
             .insert(param.name.clone(), (column_type, coerced));
     }
     let statements = truthdb_sql::parse_function_body(body)?;
+    // A scalar function called from a trigger body does not see inserted/deleted.
+    let _trigger_shadow = TriggerScope::clear();
     let depth = EXEC_DEPTH.with(|d| {
         let v = d.get() + 1;
         d.set(v);
@@ -1254,6 +1259,8 @@ fn run_exec(
         let column_type = value::infer_type(std::slice::from_ref(&value));
         txn_ctx.variables.insert(key, (column_type, value));
     }
+    // Dynamic SQL run from a trigger body does not see inserted/deleted.
+    let _trigger_shadow = TriggerScope::clear();
     let depth = EXEC_DEPTH.with(|d| {
         let v = d.get() + 1;
         d.set(v);
@@ -1352,7 +1359,12 @@ fn statement_error_ladder(
     }
     // Other statements: a non-dooming in-transaction error rolls back only
     // the statement and the batch continues; a dooming one ends the batch
-    // (only ROLLBACK is then accepted, error 3930).
+    // (only ROLLBACK is then accepted, error 3930). This must stay keyed on the
+    // ERROR (its severity / XACT_ABORT), NOT on whether the transaction is
+    // already doomed: a doomed transaction still runs a CATCH's reads and
+    // statement-terminating errors (division by zero, conversion) so the CATCH
+    // can reach `IF XACT_STATE() <> 0 ROLLBACK` — terminating the batch on those
+    // would leave the uncommittable transaction open holding its locks.
     if txn_ctx.in_txn() && !dooms {
         run.abort_open_rowset(txn_ctx.in_txn());
         run.last_error = Some(error);
@@ -2035,6 +2047,133 @@ fn arm_table_var_view(vars: &std::collections::HashMap<String, TableVar>) -> Opt
     (!vars.is_empty() || outer_armed).then(|| TableVarScope::enter(std::rc::Rc::new(vars.clone())))
 }
 
+/// The `inserted`/`deleted` pseudo-tables a firing trigger body reads: the new
+/// and old row images of the statement that fired it, with the parent table's
+/// schema. Rows are in schema order, exactly like a base-table row.
+struct TriggerTables {
+    schema: Schema,
+    inserted: Vec<Vec<Datum>>,
+    deleted: Vec<Vec<Datum>>,
+}
+
+thread_local! {
+    /// The `inserted`/`deleted` view visible to the running trigger body (like
+    /// CURRENT_TABLE_VARS for table variables — a batch runs on one thread and
+    /// the FROM-source builders carry only an EvalContext).
+    static CURRENT_TRIGGER_TABLES: std::cell::RefCell<Option<std::rc::Rc<TriggerTables>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The `inserted` or `deleted` pseudo-table rows visible to the running trigger,
+/// as a materialized source, if a trigger scope is armed and `name` is one of
+/// them. Returns `None` for any other name (falls through to catalog resolution).
+fn current_trigger_source(name: &str, qualifier: &str) -> Option<Source> {
+    let which = name.to_ascii_lowercase();
+    if which != "inserted" && which != "deleted" {
+        return None;
+    }
+    CURRENT_TRIGGER_TABLES.with(|c| {
+        let borrow = c.borrow();
+        let tables = borrow.as_ref()?;
+        let rows = if which == "inserted" {
+            tables.inserted.clone()
+        } else {
+            tables.deleted.clone()
+        };
+        let count = tables.schema.columns.len();
+        let columns = tables
+            .schema
+            .columns
+            .iter()
+            .map(|col| ResultColumn {
+                name: col.name.clone(),
+                column_type: col.column_type,
+            })
+            .collect();
+        let collations = tables
+            .schema
+            .columns
+            .iter()
+            .map(|col| col.collation.clone())
+            .collect();
+        Some(Source {
+            columns,
+            qualifiers: vec![Some(qualifier.to_string()); count],
+            collations,
+            rows: SourceRows::Materialized(rows),
+        })
+    })
+}
+
+/// Installs the `inserted`/`deleted` view for a trigger body's execution,
+/// restoring the prior installation on drop (a nested trigger's body shadows the
+/// outer's — restore rather than clear).
+struct TriggerScope {
+    prev: Option<std::rc::Rc<TriggerTables>>,
+}
+
+impl TriggerScope {
+    fn enter(tables: std::rc::Rc<TriggerTables>) -> Self {
+        let prev = CURRENT_TRIGGER_TABLES.with(|c| c.borrow_mut().replace(tables));
+        TriggerScope { prev }
+    }
+
+    /// Clears the `inserted`/`deleted` view for a stored-object body (a
+    /// procedure, function, TVF, or view called from within a trigger body):
+    /// those pseudo-tables are visible only in the trigger's OWN statements, not
+    /// in objects it calls. Restores the prior view on drop. A no-op (cheap) when
+    /// no trigger scope is armed.
+    fn clear() -> Self {
+        let prev = CURRENT_TRIGGER_TABLES.with(|c| c.borrow_mut().take());
+        TriggerScope { prev }
+    }
+}
+
+impl Drop for TriggerScope {
+    fn drop(&mut self) {
+        CURRENT_TRIGGER_TABLES.with(|c| *c.borrow_mut() = self.prev.take());
+    }
+}
+
+thread_local! {
+    /// The row images captured by the DML that is currently firing triggers, so
+    /// exec_insert/update/delete can populate `inserted`/`deleted` without a
+    /// signature change. Armed by the firing wrapper ONLY when the target table
+    /// has triggers — the common no-trigger path leaves this `None` (no clone).
+    static TRIGGER_CAPTURE: std::cell::RefCell<Option<CapturedImages>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// New (`inserted`) and old (`deleted`) row images collected during a DML that
+/// has AFTER triggers to fire.
+#[derive(Default)]
+struct CapturedImages {
+    inserted: Vec<Vec<Datum>>,
+    deleted: Vec<Vec<Datum>>,
+}
+
+/// Records row images into the active capture, if one is armed. `f` builds the
+/// (inserted, deleted) images for a statement; it runs only when capture is on,
+/// so the no-trigger path pays nothing.
+fn capture_trigger_images(f: impl FnOnce() -> (Vec<Vec<Datum>>, Vec<Vec<Datum>>)) {
+    TRIGGER_CAPTURE.with(|c| {
+        let mut borrow = c.borrow_mut();
+        if let Some(images) = borrow.as_mut() {
+            let (ins, del) = f();
+            images.inserted.extend(ins);
+            images.deleted.extend(del);
+        }
+    });
+}
+
+thread_local! {
+    /// The object_ids of triggers whose bodies are currently on the stack. With
+    /// recursive triggers OFF (the default), a trigger must not re-fire itself
+    /// (direct recursion) — a trigger on T whose body DMLs T is suppressed for
+    /// that same trigger. Nested triggers on OTHER tables are not affected.
+    static FIRING_TRIGGERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
 /// Statement-scoped snapshot registration: capture on entry, and release —
 /// pruning must not wait on a statement that errored — on every exit path.
 struct SnapshotScope<'a> {
@@ -2261,6 +2400,8 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::DropProcedure { .. }
             | Statement::CreateFunction(_)
             | Statement::DropFunction { .. }
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger { .. }
             | Statement::Commit { .. }
     )
 }
@@ -2569,7 +2710,14 @@ pub fn analyze_locks(
     // executing with no Table S. The regime lattice is finite, so
     // termination survives.
     let mut visited = std::collections::HashSet::new();
-    analyze_statements_locks(storage, &parsed, isolation, &mut visited)
+    let mut trigger_visited = std::collections::HashSet::new();
+    analyze_statements_locks(
+        storage,
+        &parsed,
+        isolation,
+        &mut visited,
+        &mut trigger_visited,
+    )
 }
 
 fn analyze_statements_locks(
@@ -2577,6 +2725,7 @@ fn analyze_statements_locks(
     parsed: &[Statement],
     isolation: Isolation,
     visited: &mut std::collections::HashSet<(String, Isolation)>,
+    trigger_visited: &mut std::collections::HashSet<(u32, Isolation)>,
 ) -> Vec<(Resource, LockMode)> {
     // Flatten TRY/CATCH so the locks a batch needs are pre-acquired for the
     // statements inside its try/catch blocks too, not just the top level.
@@ -2617,6 +2766,22 @@ fn analyze_statements_locks(
     let versioned_reads = !escalates_reads
         && (matches!(isolation, Isolation::Snapshot)
             || (matches!(isolation, Isolation::ReadCommitted) && storage.rcsi_enabled()));
+    // The isolation a fired trigger body (and any EXEC it makes) must be analyzed
+    // under: an in-line SET that raises the level locks the body's reads too, so
+    // forward a lock-based level whenever this batch locks reads — the SAME
+    // correction the EXEC path applies. Without it a trigger body under a
+    // versioned session (Snapshot / RCSI) would recompute versioned_reads=true
+    // and drop the Table S it actually reads lock-based at runtime (a dirty read,
+    // the Stage-13 seam class).
+    let nested_isolation = if reads_lock {
+        if matches!(isolation, Isolation::ReadCommitted | Isolation::Snapshot) && !escalates_reads {
+            isolation
+        } else {
+            Isolation::RepeatableRead
+        }
+    } else {
+        isolation
+    };
     let mut needs: std::collections::HashMap<Resource, LockMode> = std::collections::HashMap::new();
     let mut add = |resource: Resource, mode: LockMode| {
         needs
@@ -2687,6 +2852,17 @@ fn analyze_statements_locks(
                         add(Resource::Database, LockMode::IntentShared);
                         add(Resource::Table(oid), LockMode::Shared);
                     }
+                    // A firing AFTER-INSERT trigger's body reads/writes further
+                    // tables; hold those locks up front too (strict 2PL).
+                    add_trigger_locks(
+                        storage,
+                        def.object_id,
+                        catalog::TriggerEvent::Insert,
+                        nested_isolation,
+                        visited,
+                        trigger_visited,
+                        &mut add,
+                    );
                 }
                 // INSERT ... SELECT also reads its source tables (and any
                 // subqueries in the SELECT); lock them like a SELECT so it
@@ -2740,6 +2916,15 @@ fn analyze_statements_locks(
                         add(Resource::Database, LockMode::IntentShared);
                         add(Resource::Table(oid), LockMode::Shared);
                     }
+                    add_trigger_locks(
+                        storage,
+                        def.object_id,
+                        catalog::TriggerEvent::Update,
+                        nested_isolation,
+                        visited,
+                        trigger_visited,
+                        &mut add,
+                    );
                 }
             }
             Statement::Delete(delete) => {
@@ -2768,6 +2953,15 @@ fn analyze_statements_locks(
                         add(Resource::Database, LockMode::IntentShared);
                         add(Resource::Table(oid), LockMode::Shared);
                     }
+                    add_trigger_locks(
+                        storage,
+                        def.object_id,
+                        catalog::TriggerEvent::Delete,
+                        nested_isolation,
+                        visited,
+                        trigger_visited,
+                        &mut add,
+                    );
                 }
             }
             // DDL serializes against every active transaction via a
@@ -2811,9 +3005,13 @@ fn analyze_statements_locks(
                     if visited.insert((def.name.clone(), inner_isolation))
                         && let Ok(body) = truthdb_sql::parse_procedure_body(&procedure.body)
                     {
-                        for (resource, mode) in
-                            analyze_statements_locks(storage, &body, inner_isolation, visited)
-                        {
+                        for (resource, mode) in analyze_statements_locks(
+                            storage,
+                            &body,
+                            inner_isolation,
+                            visited,
+                            trigger_visited,
+                        ) {
                             add(resource, mode);
                         }
                     }
@@ -2854,9 +3052,13 @@ fn analyze_statements_locks(
                         isolation
                     };
                     if let Ok(parsed) = truthdb_sql::parse(&inner) {
-                        for (resource, mode) in
-                            analyze_statements_locks(storage, &parsed, inner_isolation, visited)
-                        {
+                        for (resource, mode) in analyze_statements_locks(
+                            storage,
+                            &parsed,
+                            inner_isolation,
+                            visited,
+                            trigger_visited,
+                        ) {
                             add(resource, mode);
                         }
                     }
@@ -2868,7 +3070,9 @@ fn analyze_statements_locks(
             Statement::CreateProcedure(_)
             | Statement::DropProcedure { .. }
             | Statement::CreateFunction(_)
-            | Statement::DropFunction { .. } => {
+            | Statement::DropFunction { .. }
+            | Statement::CreateTrigger(_)
+            | Statement::DropTrigger { .. } => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // IF/WHILE conditions read tables through their subqueries —
@@ -3039,6 +3243,20 @@ fn exec_statement_dispatch(
             }
             exec_drop_function(storage, name, *if_exists)
         }
+        Statement::CreateTrigger(create) => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_create_trigger(storage, create)
+        }
+        Statement::DropTrigger {
+            name, if_exists, ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(ddl_in_txn_err());
+            }
+            exec_drop_trigger(storage, name, *if_exists)
+        }
         // Executed by `run_block`'s own arms; nothing routes them here.
         Statement::Block { .. }
         | Statement::If { .. }
@@ -3119,33 +3337,64 @@ fn exec_statement_dispatch(
             exec_alter_database(storage, alter, txn_ctx)
         }
         Statement::Insert(insert) => {
-            let eval_ctx = txn_ctx.eval_context();
             // INSERT into a `@t` table variable is pure session memory (no
             // Storage, no lock, no WAL) — handled here where `&mut TxnContext`
             // is in hand, before the storage scope is taken.
             if insert.table.value.starts_with('@') {
+                let eval_ctx = txn_ctx.eval_context();
                 return exec_insert_table_var(storage, insert, txn_ctx, &eval_ctx);
             }
-            let (result, identity) = {
-                let mut scope = txn_ctx.scope();
-                exec_insert(storage, insert, &mut scope, &eval_ctx)?
+            let (target, triggers) =
+                after_triggers_for(storage, &insert.table.value, catalog::TriggerEvent::Insert);
+            let run_insert = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
+                let eval_ctx = txn_ctx.eval_context();
+                let (result, identity) = {
+                    let mut scope = txn_ctx.scope();
+                    exec_insert(storage, insert, &mut scope, &eval_ctx)?
+                };
+                // An identity INSERT updates SCOPE_IDENTITY(); a non-identity one
+                // (identity == None) leaves it unchanged.
+                if let Some(value) = identity {
+                    txn_ctx.scope_identity = Some(value);
+                }
+                Ok(result)
             };
-            // An identity INSERT updates SCOPE_IDENTITY(); a non-identity one
-            // (identity == None) leaves it unchanged.
-            if let Some(value) = identity {
-                txn_ctx.scope_identity = Some(value);
+            match target {
+                Some(target) if !triggers.is_empty() => {
+                    run_dml_with_triggers(storage, txn_ctx, &target, triggers, run_insert)
+                }
+                _ => run_insert(txn_ctx),
             }
-            Ok(result)
         }
         Statement::Update(update) => {
-            let eval_ctx = txn_ctx.eval_context();
-            let mut scope = txn_ctx.scope();
-            exec_update(storage, update, &mut scope, &eval_ctx)
+            let (target, triggers) =
+                after_triggers_for(storage, &update.table.value, catalog::TriggerEvent::Update);
+            let run_update = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
+                let eval_ctx = txn_ctx.eval_context();
+                let mut scope = txn_ctx.scope();
+                exec_update(storage, update, &mut scope, &eval_ctx)
+            };
+            match target {
+                Some(target) if !triggers.is_empty() => {
+                    run_dml_with_triggers(storage, txn_ctx, &target, triggers, run_update)
+                }
+                _ => run_update(txn_ctx),
+            }
         }
         Statement::Delete(delete) => {
-            let eval_ctx = txn_ctx.eval_context();
-            let mut scope = txn_ctx.scope();
-            exec_delete(storage, delete, &mut scope, &eval_ctx)
+            let (target, triggers) =
+                after_triggers_for(storage, &delete.table.value, catalog::TriggerEvent::Delete);
+            let run_delete = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
+                let eval_ctx = txn_ctx.eval_context();
+                let mut scope = txn_ctx.scope();
+                exec_delete(storage, delete, &mut scope, &eval_ctx)
+            };
+            match target {
+                Some(target) if !triggers.is_empty() => {
+                    run_dml_with_triggers(storage, txn_ctx, &target, triggers, run_delete)
+                }
+                _ => run_delete(txn_ctx),
+            }
         }
         Statement::Select(select) => {
             if select
@@ -4882,7 +5131,7 @@ fn exec_drop_table(storage: &Storage, drop: &DropTable) -> Result<StatementResul
     // rather than silently no-op — the review showed DROP TABLE silently
     // DESTROYING a procedure through the shared catalog path.
     if resolve_table(storage, &drop.table.value)
-        .is_some_and(|d| d.is_view() || d.is_procedure() || d.is_function())
+        .is_some_and(|d| d.is_view() || d.is_procedure() || d.is_function() || d.is_trigger())
     {
         return Err(SqlError::new(
             3701,
@@ -4919,6 +5168,26 @@ fn exec_drop_table(storage: &Storage, drop: &DropTable) -> Result<StatementResul
                         "Could not drop object '{name}' because it is referenced by a FOREIGN KEY constraint '{referencing}'."
                     ),
                 ));
+            }
+            // Cascade-drop the table's triggers — a trigger outlives its parent
+            // table nowhere in SQL Server, and an orphan would permanently block
+            // its own name (and dangle in sys.triggers).
+            if let Some(parent_oid) = resolve_table(storage, &name).map(|d| d.object_id) {
+                let orphan_triggers: Vec<String> = storage
+                    .rel_tables()
+                    .into_iter()
+                    .filter(|d| {
+                        d.trigger
+                            .as_ref()
+                            .is_some_and(|t| t.parent_object_id == parent_oid)
+                    })
+                    .map(|d| d.name)
+                    .collect();
+                for trigger_name in orphan_triggers {
+                    storage
+                        .rel_drop_table(&trigger_name)
+                        .map_err(|err| map_storage_err(err, &trigger_name))?;
+                }
             }
             storage
                 .rel_drop_table(&name)
@@ -5350,6 +5619,281 @@ fn exec_drop_function(
             ),
         )),
     }
+}
+
+/// `CREATE|ALTER TRIGGER <name> ON <table> AFTER <events> AS <body>`: registers
+/// an AFTER DML trigger as a catalog object attached to its target table.
+fn exec_create_trigger(
+    storage: &Storage,
+    create: &CreateTrigger,
+) -> Result<StatementResult, SqlError> {
+    let bare = strip_schema(&create.name.value);
+    // The target must be an existing base table (not a view/procedure/function/
+    // trigger). SQL Server 4929-class.
+    let target = resolve_table(storage, &create.target.value)
+        .ok_or_else(|| SqlError::invalid_object(&create.target.value).at(create.target.span))?;
+    if target.is_view() || target.is_procedure() || target.is_function() || target.is_trigger() {
+        return Err(SqlError::new(
+            4929,
+            16,
+            1,
+            format!(
+                "Cannot create trigger '{bare}' because its target '{}' is not a base table.",
+                target.name
+            ),
+        )
+        .at(create.target.span));
+    }
+    // Validate the body parses under the in-procedure grammar (re-parsed per
+    // firing). inserted/deleted resolve at firing time, not here.
+    truthdb_sql::parse_procedure_body(&create.body)?;
+    let events: Vec<catalog::TriggerEvent> = create
+        .events
+        .iter()
+        .map(|e| match e {
+            ast::TriggerEvent::Insert => catalog::TriggerEvent::Insert,
+            ast::TriggerEvent::Update => catalog::TriggerEvent::Update,
+            ast::TriggerEvent::Delete => catalog::TriggerEvent::Delete,
+        })
+        .collect();
+    let trigger = TriggerDef {
+        parent_object_id: target.object_id,
+        events,
+        body: create.body.clone(),
+        is_disabled: false,
+    };
+    if create.alter {
+        match resolve_table(storage, &create.name.value) {
+            Some(def) if def.is_trigger() => {
+                storage
+                    .rel_alter_trigger(&def.name, trigger)
+                    .map_err(|e| map_storage_err(e, &create.name.value))?;
+                return Ok(StatementResult::Done);
+            }
+            _ => {
+                return Err(SqlError::invalid_object(bare).at(create.name.span));
+            }
+        }
+    }
+    if resolve_table(storage, &create.name.value).is_some() {
+        return Err(SqlError::new(
+            2714,
+            16,
+            6,
+            format!("There is already an object named '{bare}' in the database."),
+        ));
+    }
+    storage
+        .rel_create_trigger(bare, trigger)
+        .map_err(|e| map_storage_err(e, &create.name.value))?;
+    Ok(StatementResult::Done)
+}
+
+fn exec_drop_trigger(
+    storage: &Storage,
+    name: &Name,
+    if_exists: bool,
+) -> Result<StatementResult, SqlError> {
+    match resolve_table(storage, &name.value) {
+        Some(def) if def.is_trigger() => {
+            storage
+                .rel_drop_table(&def.name)
+                .map_err(|e| map_storage_err(e, &def.name))?;
+            Ok(StatementResult::Done)
+        }
+        Some(_) | None if if_exists => Ok(StatementResult::Done),
+        _ => Err(SqlError::new(
+            3701,
+            11,
+            5,
+            format!(
+                "Cannot drop the trigger '{}', because it does not exist or you do not have \
+                 permission.",
+                name.value
+            ),
+        )),
+    }
+}
+
+/// Resolves the AFTER triggers to fire for a DML on `target_name` for `event`,
+/// plus the target's definition (for the pseudo-table schema). Empty when no
+/// trigger exists anywhere (the cheap `rel_has_triggers` gate keeps the common
+/// path free) or the target is not a base table.
+fn after_triggers_for(
+    storage: &Storage,
+    target_name: &str,
+    event: catalog::TriggerEvent,
+) -> (Option<TableDef>, Vec<TableDef>) {
+    if !storage.rel_has_triggers() {
+        return (None, Vec::new());
+    }
+    match resolve_table(storage, target_name) {
+        Some(def)
+            if def.trigger.is_none()
+                && def.procedure.is_none()
+                && def.function.is_none()
+                && def.view_query.is_none() =>
+        {
+            let triggers = storage.rel_triggers_for(def.object_id, event);
+            (Some(def), triggers)
+        }
+        _ => (None, Vec::new()),
+    }
+}
+
+/// Runs a DML statement (via `dml`) and fires its AFTER triggers atomically.
+/// Under autocommit an implicit transaction is opened so the DML stages rather
+/// than commits, so DML + triggers share one transaction (a trigger ROLLBACK
+/// undoes the DML) and a trigger that ends the transaction raises 3609.
+fn run_dml_with_triggers(
+    storage: &Storage,
+    txn_ctx: &mut TxnContext,
+    target_def: &TableDef,
+    triggers: Vec<TableDef>,
+    dml: impl FnOnce(&mut TxnContext) -> Result<StatementResult, SqlError>,
+) -> Result<StatementResult, SqlError> {
+    let schema = target_def
+        .schema()
+        .map_err(|e| map_storage_err(e, &target_def.name))?;
+    let implicit = !txn_ctx.in_txn();
+    if implicit {
+        exec_begin(storage, txn_ctx)?;
+    }
+    let tc_before = txn_ctx.trancount;
+    // Arm the row-image capture, run the DML (staged on the transaction), then
+    // take the captured images for the trigger bodies.
+    TRIGGER_CAPTURE.with(|c| *c.borrow_mut() = Some(CapturedImages::default()));
+    let dml_result = dml(txn_ctx);
+    let images = TRIGGER_CAPTURE
+        .with(|c| c.borrow_mut().take())
+        .unwrap_or_default();
+    let result = match dml_result {
+        Ok(r) => r,
+        Err(e) => {
+            if implicit {
+                txn_ctx.abort(storage);
+            }
+            return Err(e);
+        }
+    };
+    let tables = std::rc::Rc::new(TriggerTables {
+        schema,
+        inserted: images.inserted,
+        deleted: images.deleted,
+    });
+    // Fire each trigger once, in creation order, even for an empty image set.
+    for trig_def in &triggers {
+        let fired = fire_one_trigger(storage, txn_ctx, trig_def, &tables);
+        // A trigger body that changed @@TRANCOUNT — a ROLLBACK/COMMIT that
+        // reduced it or an unbalanced BEGIN that raised it — ENDED the
+        // transaction (3609). This is checked BEFORE the error branch so the
+        // idiomatic `ROLLBACK; RAISERROR` abort pattern does not doom a
+        // transaction the trigger already tore down (which would wedge the
+        // session doomed with no open transaction). `abort` normalizes the
+        // state; surface the trigger's own error if it raised one, else 3609.
+        if txn_ctx.trancount != tc_before {
+            txn_ctx.abort(storage);
+            return Err(fired.err().unwrap_or_else(|| {
+                SqlError::new(
+                    3609,
+                    16,
+                    1,
+                    "The transaction ended in the trigger. The batch has been aborted.",
+                )
+            }));
+        }
+        // A trigger error with the transaction still open makes it
+        // uncommittable. Roll back the IMPLICIT (autocommit) transaction opened
+        // here; DOOM the caller's EXPLICIT one (leave it open, @@TRANCOUNT
+        // intact, XACT_STATE() = -1) — SQL Server's uncommittable-transaction
+        // semantics, so a TRY/CATCH sees the doomed state and must ROLLBACK
+        // (its writes hit the 3930 guard), and an uncaught error terminates the
+        // batch (statement_error_ladder does not continue past a doomed txn).
+        // The doomed transaction's staged rows can never commit.
+        if let Err(e) = fired {
+            if implicit {
+                txn_ctx.abort(storage);
+            } else {
+                txn_ctx.doomed = true;
+            }
+            return Err(e);
+        }
+    }
+    if implicit {
+        exec_commit(storage, txn_ctx)?;
+    }
+    Ok(result)
+}
+
+/// Fires one trigger body: parses it, runs it in the firing statement's
+/// transaction (procedure posture — shared txn, fresh variable scope) with the
+/// `inserted`/`deleted` view armed, bounded by the nesting cap. Direct
+/// self-recursion is suppressed (recursive triggers OFF).
+fn fire_one_trigger(
+    storage: &Storage,
+    txn_ctx: &mut TxnContext,
+    trig_def: &TableDef,
+    tables: &std::rc::Rc<TriggerTables>,
+) -> Result<(), SqlError> {
+    let trigger = trig_def.trigger.as_ref().expect("caller passes a trigger");
+    // Recursive triggers OFF (the default) suppresses only DIRECT recursion: a
+    // trigger whose own body re-fires itself (it is the currently-executing
+    // trigger — top of the firing stack). Indirect recursion (a fires b fires a,
+    // where a is deeper in the stack, not the top) stays enabled and is bounded
+    // by the nesting cap, matching "nested triggers ON".
+    if FIRING_TRIGGERS.with(|f| f.borrow().last() == Some(&trig_def.object_id)) {
+        return Ok(());
+    }
+    let statements = truthdb_sql::parse_procedure_body(&trigger.body)?;
+    let depth = EXEC_DEPTH.with(|d| {
+        let v = d.get() + 1;
+        d.set(v);
+        v
+    });
+    if depth > 32 {
+        EXEC_DEPTH.with(|d| d.set(d.get() - 1));
+        return Err(SqlError::new(
+            217,
+            16,
+            1,
+            "Maximum stored procedure, function, trigger, or view nesting level exceeded (limit 32).",
+        ));
+    }
+    // Procedure posture: fresh variable/table-variable scope, shared transaction.
+    let outer_vars = std::mem::take(&mut txn_ctx.variables);
+    let outer_table_vars = std::mem::take(&mut txn_ctx.table_variables);
+    FIRING_TRIGGERS.with(|f| f.borrow_mut().push(trig_def.object_id));
+    let result = {
+        let _trigger_scope = TriggerScope::enter(std::rc::Rc::clone(tables));
+        let mut emitter = DiscardEmitter;
+        let mut run = BatchRun {
+            emitter: &mut emitter,
+            deferred: Vec::new(),
+            rowset_open: false,
+            durability_failed: false,
+            committed: false,
+            last_error: None,
+            function_return_type: None,
+        };
+        let flow = run_block(storage, &statements, txn_ctx, &mut run, false);
+        // An error raised in the trigger body — a terminating one (Err), or a
+        // non-terminating RAISERROR/THROW/failed-statement (severity >= 11) that
+        // run_block records in last_error and NOT caught by an inner TRY/CATCH —
+        // aborts the firing statement: SQL Server rolls back the DML and returns
+        // the error. (A successful CATCH clears last_error, so a trigger that
+        // handles its own error still succeeds.)
+        flow.map(|_| ()).and_then(|()| match run.last_error.take() {
+            Some(err) => Err(err),
+            None => Ok(()),
+        })
+    };
+    FIRING_TRIGGERS.with(|f| {
+        f.borrow_mut().pop();
+    });
+    EXEC_DEPTH.with(|d| d.set(d.get() - 1));
+    txn_ctx.variables = outer_vars;
+    txn_ctx.table_variables = outer_table_vars;
+    result
 }
 
 fn exec_drop_view(storage: &Storage, drop: &DropView) -> Result<StatementResult, SqlError> {
@@ -5960,6 +6504,9 @@ fn exec_insert(
         }
     }
 
+    // Capture the new row images for an AFTER trigger's `inserted` table (only
+    // when a capture is armed — the no-trigger path clones nothing).
+    capture_trigger_images(|| (rows.clone(), Vec::new()));
     let inserted = rows.len() as u64;
     storage
         .rel_insert_many(&def.name, rows, scope)
@@ -6381,6 +6928,15 @@ fn exec_update(
         }
     }
 
+    // Capture the old/new images for an AFTER trigger's `deleted`/`inserted`
+    // tables (a row that did not change still appears in both, as SQL Server
+    // does — every matched row is in `updates`).
+    capture_trigger_images(|| {
+        (
+            updates.iter().map(|(_, _, new)| new.clone()).collect(),
+            updates.iter().map(|(_, old, _)| old.clone()).collect(),
+        )
+    });
     let count = storage
         .rel_update_located(&def.name, updates, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
@@ -6420,6 +6976,13 @@ fn exec_delete(
         enforce_parent_fks(storage, &def, &removed, "DELETE", true)?;
     }
 
+    // Capture the deleted images for an AFTER trigger's `deleted` table.
+    capture_trigger_images(|| {
+        (
+            Vec::new(),
+            targets.iter().map(|(_, row)| row.clone()).collect(),
+        )
+    });
     let count = storage
         .rel_delete_located(&def.name, targets, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
@@ -7257,10 +7820,10 @@ fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<S
     match from {
         TableRef::Table { name, alias } => {
             let def = resolve_table(storage, &name.value)?;
-            // A view defers to its expansion; a PROCEDURE must not read as a
-            // zero-column table — bailing here routes to the collecting path,
-            // which errors 2809.
-            if def.is_view() || def.is_procedure() || def.is_function() {
+            // A view defers to its expansion; a PROCEDURE/FUNCTION/TRIGGER must
+            // not read as a zero-column table — bailing here routes to the
+            // collecting path, which errors 2809/208.
+            if def.is_view() || def.is_procedure() || def.is_function() || def.is_trigger() {
                 return None;
             }
             let qualifier = alias
@@ -8456,9 +9019,9 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     // A view is its own SELECT, expanded as a derived table — and its TableDef
     // has no columns and a `root_page` of 0, so a wildcard over it would project
     // nothing and the scan would read the catalog root instead of the view. A
-    // PROCEDURE has the same empty shape and must not stream as an empty
-    // table: the collecting path rejects it (2809).
-    if def.view_query.is_some() || def.is_procedure() || def.is_function() {
+    // PROCEDURE/FUNCTION/TRIGGER has the same empty shape and must not stream as
+    // an empty table: the collecting path rejects it (2809/208).
+    if def.view_query.is_some() || def.is_procedure() || def.is_function() || def.is_trigger() {
         return None;
     }
     let schema = def.schema().ok()?;
@@ -10150,12 +10713,21 @@ fn build_table_source(
             rows: SourceRows::Materialized(tv.rows),
         });
     }
+    // `inserted`/`deleted`: the firing trigger's pseudo-tables. Resolved before
+    // the catalog so a real table named `inserted` cannot be reached from inside
+    // a trigger body (SQL Server reserves them there too). Only matches when a
+    // trigger scope is armed; otherwise falls through to catalog resolution.
+    if let Some(source) = current_trigger_source(&name.value, &qualifier) {
+        return Ok(source);
+    }
     let base = match name.value.to_ascii_lowercase().as_str() {
         "sys.tables" => sys_tables(storage),
         "sys.databases" => sys_databases(storage, eval_ctx),
         "sys.configurations" => sys_configurations(),
         "sys.views" => sys_views(storage),
         "sys.procedures" => sys_procedures(storage),
+        "sys.triggers" => sys_triggers(storage),
+        "sys.trigger_events" => sys_trigger_events(storage),
         "sys.parameters" => sys_parameters(storage),
         "sys.objects" => sys_objects(storage),
         "sys.sql_modules" => sys_sql_modules(storage),
@@ -10170,6 +10742,11 @@ fn build_table_source(
             // A procedure is not a queryable object (SQL Server 2809).
             if def.is_procedure() {
                 return Err(procedure_not_a_table(&def.name).at(name.span));
+            }
+            // A trigger is not a queryable object either — resolving it as a base
+            // table would heap-scan its (empty) root page 0. 208 invalid object.
+            if def.is_trigger() {
+                return Err(SqlError::invalid_object(&name.value).at(name.span));
             }
             // A scalar function is not a rowset — it cannot appear in FROM.
             // (Table-valued functions, added later, expand here instead.)
@@ -10197,6 +10774,7 @@ fn build_table_source(
                 // in-statement derived table or CTE is NOT a separate scope and
                 // keeps the statement's view — only stored bodies shadow.)
                 let _table_var_scope = arm_table_var_view(&std::collections::HashMap::new());
+                let _trigger_shadow = TriggerScope::clear();
                 return build_derived_source(storage, &body, &qual, eval_ctx);
             }
             let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
@@ -10354,6 +10932,7 @@ fn build_function_source(
             // source runs under whatever scope the calling statement armed. An
             // empty view makes such a body error 1087, as SQL Server rejects it.
             let _table_var_scope = arm_table_var_view(&std::collections::HashMap::new());
+            let _trigger_shadow = TriggerScope::clear();
             build_derived_source(storage, &body, &qual, &fn_ctx)
         }
         FunctionReturns::MultiStatementTable {
@@ -10427,6 +11006,9 @@ fn run_multi_statement_tvf(
         },
     );
     let statements = truthdb_sql::parse_table_function_body(body_text)?;
+    // A multi-statement TVF called from a trigger body does not see
+    // inserted/deleted.
+    let _trigger_shadow = TriggerScope::clear();
     // Same nesting cap as a scalar UDF (217), decremented on every exit path.
     let depth = EXEC_DEPTH.with(|d| {
         let v = d.get() + 1;
@@ -11098,7 +11680,9 @@ fn sys_tables(storage: &Storage) -> Source {
         .into_iter()
         // Only base tables. (The `!is_view()` filter alone let procedures leak
         // in — a pre-existing gap — so exclude every non-table object kind.)
-        .filter(|def| !def.is_view() && !def.is_procedure() && !def.is_function())
+        .filter(|def| {
+            !def.is_view() && !def.is_procedure() && !def.is_function() && !def.is_trigger()
+        })
         .map(|def| vec![Datum::Int(def.object_id as i32), Datum::NVarChar(def.name)])
         .collect();
     let collations = vec![None; columns.len()];
@@ -11263,7 +11847,8 @@ fn sys_sql_modules(storage: &Storage) -> Source {
                         FunctionReturns::InlineTable { select_text } => select_text.clone(),
                         FunctionReturns::MultiStatementTable { body, .. } => body.clone(),
                     })
-                })?;
+                })
+                .or_else(|| def.trigger.as_ref().map(|t| t.body.clone()))?;
             Some(vec![
                 Datum::Int(def.object_id as i32),
                 Datum::NVarChar(definition),
@@ -11293,6 +11878,75 @@ fn sys_procedures(storage: &Storage) -> Source {
             ]
         })
         .collect();
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_triggers(storage: &Storage) -> Source {
+    let columns = vec![
+        nvarchar("name", 128),
+        int_col("object_id"),
+        int_col("parent_id"),
+        nvarchar("type", 2),
+        int_col("is_disabled"),
+        int_col("is_instead_of_trigger"),
+    ];
+    let rows = storage
+        .rel_tables()
+        .into_iter()
+        .filter_map(|def| {
+            let trigger = def.trigger.as_ref()?;
+            Some(vec![
+                Datum::NVarChar(def.name.clone()),
+                Datum::Int(def.object_id as i32),
+                Datum::Int(trigger.parent_object_id as i32),
+                Datum::NVarChar("TR".to_string()),
+                Datum::Int(i32::from(trigger.is_disabled)),
+                // Only AFTER triggers exist here (INSTEAD OF is not supported).
+                Datum::Int(0),
+            ])
+        })
+        .collect();
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(rows),
+    }
+}
+
+fn sys_trigger_events(storage: &Storage) -> Source {
+    let columns = vec![
+        int_col("object_id"),
+        int_col("type"),
+        nvarchar("type_desc", 128),
+    ];
+    let mut rows = Vec::new();
+    for def in storage.rel_tables() {
+        let Some(trigger) = def.trigger.as_ref() else {
+            continue;
+        };
+        for event in &trigger.events {
+            let (code, desc) = match event {
+                catalog::TriggerEvent::Insert => (1, "INSERT"),
+                catalog::TriggerEvent::Update => (2, "UPDATE"),
+                catalog::TriggerEvent::Delete => (3, "DELETE"),
+            };
+            rows.push(vec![
+                Datum::Int(def.object_id as i32),
+                Datum::Int(code),
+                Datum::NVarChar(desc.to_string()),
+            ]);
+        }
+    }
     let collations = vec![None; columns.len()];
     let qualifiers = vec![None; columns.len()];
     Source {
@@ -11401,6 +12055,8 @@ fn sys_objects(storage: &Storage) -> Source {
                 }
             } else if def.is_procedure() {
                 ("P ", "SQL_STORED_PROCEDURE")
+            } else if def.is_trigger() {
+                ("TR", "SQL_TRIGGER")
             } else if def.is_view() {
                 ("V ", "VIEW")
             } else {
@@ -11629,6 +12285,40 @@ fn read_lock_object_ids(storage: &Storage, name: &str) -> Vec<u32> {
     out
 }
 
+/// Adds the locks the AFTER-`event` trigger bodies of `parent_object_id` take,
+/// so a DML that fires them holds every lock its bodies acquire UP FRONT (strict
+/// 2PL — a trigger body reading/writing another table with no pre-acquired lock
+/// is the recurring seam-defect class). Each body is analyzed by the SAME
+/// machinery the batch uses (`analyze_statements_locks`), so its EXEC, TRY/CATCH,
+/// FK-integrity reads, subquery reads, and its own nested triggers are ALL
+/// covered — not a hand-rolled subset. Recursion (a trigger whose body DMLs a
+/// table with its own triggers) is bounded by `trigger_visited` (trigger
+/// object_ids), so a trigger cycle terminates cleanly rather than hanging
+/// analysis under the scheduler mutex.
+fn add_trigger_locks(
+    storage: &Storage,
+    parent_object_id: u32,
+    event: catalog::TriggerEvent,
+    isolation: Isolation,
+    visited: &mut std::collections::HashSet<(String, Isolation)>,
+    trigger_visited: &mut std::collections::HashSet<(u32, Isolation)>,
+    add: &mut impl FnMut(Resource, LockMode),
+) {
+    for trig in storage.rel_triggers_for(parent_object_id, event) {
+        if !trigger_visited.insert((trig.object_id, isolation)) {
+            continue;
+        }
+        let Some(t) = &trig.trigger else { continue };
+        if let Ok(statements) = truthdb_sql::parse_procedure_body(&t.body) {
+            for (resource, mode) in
+                analyze_statements_locks(storage, &statements, isolation, visited, trigger_visited)
+            {
+                add(resource, mode);
+            }
+        }
+    }
+}
+
 /// The base-table object ids the scalar functions called in a SELECT read
 /// through their bodies (deduped). Non-function names collected along the way
 /// resolve to nothing.
@@ -11752,6 +12442,9 @@ fn reject_dml_on_view(def: &TableDef) -> Result<(), SqlError> {
     if def.is_function() {
         return Err(function_not_a_table(&def.name));
     }
+    if def.is_trigger() {
+        return Err(SqlError::invalid_object(&def.name));
+    }
     if def.is_view() {
         return Err(SqlError::new(
             4406,
@@ -11801,6 +12494,9 @@ fn reject_view_as_table(def: &TableDef) -> Result<(), SqlError> {
     }
     if def.is_function() {
         return Err(function_not_a_table(&def.name));
+    }
+    if def.is_trigger() {
+        return Err(SqlError::invalid_object(&def.name));
     }
     if def.is_view() {
         return Err(SqlError::new(
