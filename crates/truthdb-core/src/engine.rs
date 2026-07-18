@@ -6399,6 +6399,119 @@ mod tests {
     }
 
     #[test]
+    fn trigger_body_read_is_locked_under_inline_isolation_escalation() {
+        use crate::lock::{LockMode, Resource};
+        use crate::rel::Isolation;
+        let path = unique_temp_path("trg-escalation");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TABLE r (id INT NOT NULL PRIMARY KEY)")
+            .expect("r");
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS SELECT id FROM r")
+            .expect("trigger");
+        let r = table_object_id(&engine, "r");
+        // A batch that escalates the isolation in-line (SET SERIALIZABLE) under a
+        // versioned session (Snapshot) must analyze the trigger body's read of r
+        // lock-based — Table S — not drop it as a versioned read. The trigger
+        // body analysis now forwards the escalation-corrected isolation.
+        let locks = engine.analyze_locks(
+            "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; INSERT INTO t VALUES (1)",
+            Isolation::Snapshot,
+        );
+        assert!(
+            locks.contains(&(Resource::Table(r), LockMode::Shared)),
+            "the trigger body's read of r must be Table-S locked under escalation: {locks:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trigger_error_rolls_back_the_dml_inside_an_explicit_transaction() {
+        let path = unique_temp_path("trg-explicit-txn");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS RAISERROR('reject', 16, 1)")
+            .expect("trigger");
+        // Inside an explicit transaction, a trigger error must roll back the
+        // firing statement — not just under autocommit.
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRANSACTION; INSERT INTO t VALUES (1); COMMIT",
+        );
+        assert!(out.error.is_some(), "the trigger error must surface");
+        let (_c, rows) = sql_rows(&engine, "SELECT COUNT(*) AS n FROM t");
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".to_string())]],
+            "the trigger error must roll back the row inside an explicit transaction"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn trigger_is_not_an_alter_or_dml_target() {
+        let path = unique_temp_path("trg-alter-target");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS INSERT INTO t SELECT 0 WHERE 1 = 0")
+            .expect("trigger");
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "ALTER TABLE trg ADD c INT");
+        assert!(out.error.is_some(), "ALTER TABLE on a trigger must error");
+        let out = batch(&engine, &mut ctx, "INSERT INTO trg VALUES (1)");
+        assert!(out.error.is_some(), "INSERT into a trigger must error");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn drop_table_cascade_drops_its_triggers() {
+        let path = unique_temp_path("trg-cascade-drop");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TABLE audit (id INT NOT NULL PRIMARY KEY)")
+            .expect("audit");
+        engine
+            .execute(
+                "CREATE TRIGGER trg ON t AFTER INSERT AS INSERT INTO audit SELECT id FROM inserted",
+            )
+            .expect("trigger");
+        engine.execute("DROP TABLE t").expect("drop t");
+        // The trigger is gone (not orphaned): its name is free to reuse.
+        let (_c, rows) = sql_rows(
+            &engine,
+            "SELECT COUNT(*) AS n FROM sys.objects WHERE name = 'trg'",
+        );
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".to_string())]],
+            "DROP TABLE must cascade-drop its triggers"
+        );
+        let mut ctx = TxnContext::default();
+        let out = batch(&engine, &mut ctx, "CREATE TABLE trg (x INT)");
+        assert!(
+            out.error.is_none(),
+            "the orphaned trigger name must be reusable: {:?}",
+            out.error
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn showplan_names_a_table_valued_function() {
         let path = unique_temp_path("tvf-showplan");
         let engine = new_engine(&path);

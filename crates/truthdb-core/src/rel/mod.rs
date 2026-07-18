@@ -2720,7 +2720,7 @@ fn analyze_statements_locks(
     parsed: &[Statement],
     isolation: Isolation,
     visited: &mut std::collections::HashSet<(String, Isolation)>,
-    trigger_visited: &mut std::collections::HashSet<u32>,
+    trigger_visited: &mut std::collections::HashSet<(u32, Isolation)>,
 ) -> Vec<(Resource, LockMode)> {
     // Flatten TRY/CATCH so the locks a batch needs are pre-acquired for the
     // statements inside its try/catch blocks too, not just the top level.
@@ -2761,6 +2761,22 @@ fn analyze_statements_locks(
     let versioned_reads = !escalates_reads
         && (matches!(isolation, Isolation::Snapshot)
             || (matches!(isolation, Isolation::ReadCommitted) && storage.rcsi_enabled()));
+    // The isolation a fired trigger body (and any EXEC it makes) must be analyzed
+    // under: an in-line SET that raises the level locks the body's reads too, so
+    // forward a lock-based level whenever this batch locks reads — the SAME
+    // correction the EXEC path applies. Without it a trigger body under a
+    // versioned session (Snapshot / RCSI) would recompute versioned_reads=true
+    // and drop the Table S it actually reads lock-based at runtime (a dirty read,
+    // the Stage-13 seam class).
+    let nested_isolation = if reads_lock {
+        if matches!(isolation, Isolation::ReadCommitted | Isolation::Snapshot) && !escalates_reads {
+            isolation
+        } else {
+            Isolation::RepeatableRead
+        }
+    } else {
+        isolation
+    };
     let mut needs: std::collections::HashMap<Resource, LockMode> = std::collections::HashMap::new();
     let mut add = |resource: Resource, mode: LockMode| {
         needs
@@ -2837,7 +2853,7 @@ fn analyze_statements_locks(
                         storage,
                         def.object_id,
                         catalog::TriggerEvent::Insert,
-                        isolation,
+                        nested_isolation,
                         visited,
                         trigger_visited,
                         &mut add,
@@ -2899,7 +2915,7 @@ fn analyze_statements_locks(
                         storage,
                         def.object_id,
                         catalog::TriggerEvent::Update,
-                        isolation,
+                        nested_isolation,
                         visited,
                         trigger_visited,
                         &mut add,
@@ -2936,7 +2952,7 @@ fn analyze_statements_locks(
                         storage,
                         def.object_id,
                         catalog::TriggerEvent::Delete,
-                        isolation,
+                        nested_isolation,
                         visited,
                         trigger_visited,
                         &mut add,
@@ -5148,6 +5164,26 @@ fn exec_drop_table(storage: &Storage, drop: &DropTable) -> Result<StatementResul
                     ),
                 ));
             }
+            // Cascade-drop the table's triggers — a trigger outlives its parent
+            // table nowhere in SQL Server, and an orphan would permanently block
+            // its own name (and dangle in sys.triggers).
+            if let Some(parent_oid) = resolve_table(storage, &name).map(|d| d.object_id) {
+                let orphan_triggers: Vec<String> = storage
+                    .rel_tables()
+                    .into_iter()
+                    .filter(|d| {
+                        d.trigger
+                            .as_ref()
+                            .is_some_and(|t| t.parent_object_id == parent_oid)
+                    })
+                    .map(|d| d.name)
+                    .collect();
+                for trigger_name in orphan_triggers {
+                    storage
+                        .rel_drop_table(&trigger_name)
+                        .map_err(|err| map_storage_err(err, &trigger_name))?;
+                }
+            }
             storage
                 .rel_drop_table(&name)
                 .map_err(|err| map_storage_err(err, &drop.table.value))?;
@@ -5743,9 +5779,12 @@ fn run_dml_with_triggers(
     // Fire each trigger once, in creation order, even for an empty image set.
     for trig_def in &triggers {
         if let Err(e) = fire_one_trigger(storage, txn_ctx, trig_def, &tables) {
-            if implicit {
-                txn_ctx.abort(storage);
-            }
+            // An unhandled trigger error rolls back the WHOLE transaction — the
+            // firing statement and everything else in it — whether the
+            // transaction is the implicit one opened here or the caller's
+            // explicit one, matching SQL Server (and the 3609 path below). The
+            // `if implicit` gate is deliberately NOT used here.
+            txn_ctx.abort(storage);
             return Err(e);
         }
         // 3609: a trigger body that changed @@TRANCOUNT — a ROLLBACK/COMMIT that
@@ -12244,11 +12283,11 @@ fn add_trigger_locks(
     event: catalog::TriggerEvent,
     isolation: Isolation,
     visited: &mut std::collections::HashSet<(String, Isolation)>,
-    trigger_visited: &mut std::collections::HashSet<u32>,
+    trigger_visited: &mut std::collections::HashSet<(u32, Isolation)>,
     add: &mut impl FnMut(Resource, LockMode),
 ) {
     for trig in storage.rel_triggers_for(parent_object_id, event) {
-        if !trigger_visited.insert(trig.object_id) {
+        if !trigger_visited.insert((trig.object_id, isolation)) {
             continue;
         }
         let Some(t) = &trig.trigger else { continue };
@@ -12385,6 +12424,9 @@ fn reject_dml_on_view(def: &TableDef) -> Result<(), SqlError> {
     if def.is_function() {
         return Err(function_not_a_table(&def.name));
     }
+    if def.is_trigger() {
+        return Err(SqlError::invalid_object(&def.name));
+    }
     if def.is_view() {
         return Err(SqlError::new(
             4406,
@@ -12434,6 +12476,9 @@ fn reject_view_as_table(def: &TableDef) -> Result<(), SqlError> {
     }
     if def.is_function() {
         return Err(function_not_a_table(&def.name));
+    }
+    if def.is_trigger() {
+        return Err(SqlError::invalid_object(&def.name));
     }
     if def.is_view() {
         return Err(SqlError::new(
