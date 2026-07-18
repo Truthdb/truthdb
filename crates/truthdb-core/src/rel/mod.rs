@@ -3791,8 +3791,8 @@ fn exec_statement_dispatch(
                 let eval_ctx = txn_ctx.eval_context();
                 return exec_insert_table_var(storage, insert, txn_ctx, &eval_ctx);
             }
-            let (target, triggers) =
-                after_triggers_for(storage, &insert.table.value, catalog::TriggerEvent::Insert);
+            let (target, after, instead_of) =
+                triggers_for(storage, &insert.table.value, catalog::TriggerEvent::Insert);
             let run_insert = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
                 let eval_ctx = txn_ctx.eval_context();
                 let (result, identity) = {
@@ -3807,40 +3807,64 @@ fn exec_statement_dispatch(
                 Ok(result)
             };
             match target {
-                Some(target) if !triggers.is_empty() => {
-                    run_dml_with_triggers(storage, txn_ctx, &target, triggers, run_insert)
+                Some(target) => {
+                    if let Some(io) = instead_of {
+                        run_instead_of(storage, txn_ctx, &target, io, |eval_ctx| {
+                            instead_of_insert_images(storage, insert, &target, eval_ctx)
+                        })
+                    } else if !after.is_empty() {
+                        run_dml_with_triggers(storage, txn_ctx, &target, after, run_insert)
+                    } else {
+                        run_insert(txn_ctx)
+                    }
                 }
-                _ => run_insert(txn_ctx),
+                None => run_insert(txn_ctx),
             }
         }
         Statement::Update(update) => {
-            let (target, triggers) =
-                after_triggers_for(storage, &update.table.value, catalog::TriggerEvent::Update);
+            let (target, after, instead_of) =
+                triggers_for(storage, &update.table.value, catalog::TriggerEvent::Update);
             let run_update = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
                 let eval_ctx = txn_ctx.eval_context();
                 let mut scope = txn_ctx.scope();
                 exec_update(storage, update, &mut scope, &eval_ctx)
             };
             match target {
-                Some(target) if !triggers.is_empty() => {
-                    run_dml_with_triggers(storage, txn_ctx, &target, triggers, run_update)
+                Some(target) => {
+                    if let Some(io) = instead_of {
+                        run_instead_of(storage, txn_ctx, &target, io, |eval_ctx| {
+                            instead_of_update_images(storage, update, &target, eval_ctx)
+                        })
+                    } else if !after.is_empty() {
+                        run_dml_with_triggers(storage, txn_ctx, &target, after, run_update)
+                    } else {
+                        run_update(txn_ctx)
+                    }
                 }
-                _ => run_update(txn_ctx),
+                None => run_update(txn_ctx),
             }
         }
         Statement::Delete(delete) => {
-            let (target, triggers) =
-                after_triggers_for(storage, &delete.table.value, catalog::TriggerEvent::Delete);
+            let (target, after, instead_of) =
+                triggers_for(storage, &delete.table.value, catalog::TriggerEvent::Delete);
             let run_delete = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
                 let eval_ctx = txn_ctx.eval_context();
                 let mut scope = txn_ctx.scope();
                 exec_delete(storage, delete, &mut scope, &eval_ctx)
             };
             match target {
-                Some(target) if !triggers.is_empty() => {
-                    run_dml_with_triggers(storage, txn_ctx, &target, triggers, run_delete)
+                Some(target) => {
+                    if let Some(io) = instead_of {
+                        run_instead_of(storage, txn_ctx, &target, io, |eval_ctx| {
+                            instead_of_delete_images(storage, delete, &target, eval_ctx)
+                        })
+                    } else if !after.is_empty() {
+                        run_dml_with_triggers(storage, txn_ctx, &target, after, run_delete)
+                    } else {
+                        run_delete(txn_ctx)
+                    }
                 }
-                _ => run_delete(txn_ctx),
+                None => run_delete(txn_ctx),
             }
         }
         Statement::Select(select) => {
@@ -6114,11 +6138,35 @@ fn exec_create_trigger(
             ast::TriggerEvent::Delete => catalog::TriggerEvent::Delete,
         })
         .collect();
+    // A table may have at most one INSTEAD OF trigger per action (SQL Server).
+    if create.instead_of {
+        for def in storage.rel_tables() {
+            if let Some(t) = &def.trigger
+                && t.is_instead_of
+                && t.parent_object_id == target.object_id
+                && !def.name.eq_ignore_ascii_case(bare)
+                && t.events.iter().any(|e| events.contains(e))
+            {
+                return Err(SqlError::new(
+                    2113,
+                    16,
+                    1,
+                    format!(
+                        "Cannot create INSTEAD OF trigger '{bare}' on table '{}' because there is \
+                         already an INSTEAD OF trigger '{}' for the same action.",
+                        target.name, def.name
+                    ),
+                )
+                .at(create.name.span));
+            }
+        }
+    }
     let trigger = TriggerDef {
         parent_object_id: target.object_id,
         events,
         body: create.body.clone(),
         is_disabled: false,
+        is_instead_of: create.instead_of,
     };
     if create.alter {
         match resolve_table(storage, &create.name.value) {
@@ -6508,13 +6556,15 @@ fn is_privileged_ddl(stmt: &Statement) -> bool {
 /// plus the target's definition (for the pseudo-table schema). Empty when no
 /// trigger exists anywhere (the cheap `rel_has_triggers` gate keeps the common
 /// path free) or the target is not a base table.
-fn after_triggers_for(
+/// The triggers on `target_name` for `event`, split into AFTER triggers (fired
+/// after the DML) and the at-most-one INSTEAD OF trigger (fired in place of it).
+fn triggers_for(
     storage: &Storage,
     target_name: &str,
     event: catalog::TriggerEvent,
-) -> (Option<TableDef>, Vec<TableDef>) {
+) -> (Option<TableDef>, Vec<TableDef>, Option<TableDef>) {
     if !storage.rel_has_triggers() {
-        return (None, Vec::new());
+        return (None, Vec::new(), None);
     }
     match resolve_table(storage, target_name) {
         Some(def)
@@ -6523,10 +6573,13 @@ fn after_triggers_for(
                 && def.function.is_none()
                 && def.view_query.is_none() =>
         {
-            let triggers = storage.rel_triggers_for(def.object_id, event);
-            (Some(def), triggers)
+            let (instead, after): (Vec<TableDef>, Vec<TableDef>) = storage
+                .rel_triggers_for(def.object_id, event)
+                .into_iter()
+                .partition(|t| t.trigger.as_ref().is_some_and(|d| d.is_instead_of));
+            (Some(def), after, instead.into_iter().next())
         }
-        _ => (None, Vec::new()),
+        _ => (None, Vec::new(), None),
     }
 }
 
@@ -6612,6 +6665,148 @@ fn run_dml_with_triggers(
         exec_commit(storage, txn_ctx)?;
     }
     Ok(result)
+}
+
+/// The `(inserted, deleted)` row images an INSTEAD OF trigger's body sees.
+type TriggerImages = (Vec<Vec<Datum>>, Vec<Vec<Datum>>);
+
+/// Fires an INSTEAD OF trigger in place of the DML: it runs the trigger body over
+/// the *proposed* `inserted`/`deleted` images (the base operation and its
+/// constraints are bypassed — the body decides what actually happens). Reuses the
+/// DML+trigger transaction/firing/error machinery with a DML step that only
+/// computes and captures the images, writing nothing.
+fn run_instead_of(
+    storage: &Storage,
+    txn_ctx: &mut TxnContext,
+    target: &TableDef,
+    trigger: TableDef,
+    images: impl FnOnce(&EvalContext) -> Result<TriggerImages, SqlError>,
+) -> Result<StatementResult, SqlError> {
+    run_dml_with_triggers(storage, txn_ctx, target, vec![trigger], |txn_ctx| {
+        let eval_ctx = txn_ctx.eval_context();
+        let (inserted, deleted) = images(&eval_ctx)?;
+        let count = inserted.len().max(deleted.len()) as u64;
+        capture_trigger_images(|| (inserted, deleted));
+        Ok(StatementResult::RowsAffected(count))
+    })
+}
+
+/// The `inserted` image an INSTEAD OF INSERT trigger sees: the proposed rows with
+/// DEFAULTs applied and the identity column left NULL (the body's own insert
+/// generates it). Constraints are not enforced here.
+fn instead_of_insert_images(
+    storage: &Storage,
+    insert: &Insert,
+    def: &TableDef,
+    eval_ctx: &EvalContext,
+) -> Result<TriggerImages, SqlError> {
+    enforce_object_permission(def, &eval_ctx.security, PermAction::Insert)
+        .map_err(|e| e.at(insert.table.span))?;
+    let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
+    let ncols = schema.columns.len();
+    let identity_col = def.identity.map(|s| s.column);
+    let target: Vec<usize> = match &insert.columns {
+        Some(names) => {
+            let mut indices = Vec::with_capacity(names.len());
+            for n in names {
+                indices.push(
+                    column_index(&schema, &n.value)
+                        .ok_or_else(|| SqlError::invalid_column(&n.value).at(n.span))?,
+                );
+            }
+            indices
+        }
+        None => (0..ncols).filter(|i| Some(*i) != identity_col).collect(),
+    };
+    let input_rows = insert_input_rows(storage, &insert.source, target.len(), eval_ctx)?;
+    let mut inserted = Vec::with_capacity(input_rows.len());
+    for input in &input_rows {
+        let mut values = vec![Datum::Null; ncols];
+        for (position, sql_value) in target.iter().zip(input) {
+            let column = &schema.columns[*position];
+            values[*position] = value::sql_to_datum(sql_value, &column.column_type, &column.name)?;
+        }
+        for (index, column) in schema.columns.iter().enumerate() {
+            if !values[index].is_null() || target.contains(&index) || Some(index) == identity_col {
+                continue;
+            }
+            if let Some(text) = def.default_for(index) {
+                let sql_value = eval_default(text, eval_ctx)?;
+                values[index] = value::sql_to_datum(&sql_value, &column.column_type, &column.name)?;
+            }
+        }
+        inserted.push(values);
+    }
+    Ok((inserted, Vec::new()))
+}
+
+/// The (`inserted` = post-update, `deleted` = pre-update) images an INSTEAD OF
+/// UPDATE trigger sees for the rows matching the WHERE clause. Constraints are
+/// not enforced here.
+fn instead_of_update_images(
+    storage: &Storage,
+    update: &Update,
+    def: &TableDef,
+    eval_ctx: &EvalContext,
+) -> Result<TriggerImages, SqlError> {
+    enforce_object_permission(def, &eval_ctx.security, PermAction::Update)
+        .map_err(|e| e.at(update.table.span))?;
+    let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
+    let resolver = SchemaScope { schema: &schema };
+    let types = schema_types(&schema);
+    let mut assignments: Vec<(usize, &Expr)> = Vec::with_capacity(update.assignments.len());
+    for a in &update.assignments {
+        let index = column_index(&schema, &a.column.value)
+            .ok_or_else(|| SqlError::invalid_column(&a.column.value).at(a.column.span))?;
+        assignments.push((index, &a.value));
+    }
+    let mut old_rows = Vec::new();
+    let mut new_rows = Vec::new();
+    for row in storage
+        .rel_scan(&def.name)
+        .map_err(|e| map_storage_err(e, &def.name))?
+    {
+        check_cancelled()?;
+        if !predicate_true(&update.where_clause, &row, &types, &resolver, eval_ctx)? {
+            continue;
+        }
+        let old_scope = row_values(&row, &types);
+        let mut new_row = row.clone();
+        for (index, expr) in &assignments {
+            let column = &schema.columns[*index];
+            let value = eval::eval(expr, &old_scope, &resolver, eval_ctx)?;
+            new_row[*index] = value::sql_to_datum(&value, &column.column_type, &column.name)?;
+        }
+        old_rows.push(row);
+        new_rows.push(new_row);
+    }
+    Ok((new_rows, old_rows))
+}
+
+/// The `deleted` image an INSTEAD OF DELETE trigger sees: the rows matching the
+/// WHERE clause (none are actually removed).
+fn instead_of_delete_images(
+    storage: &Storage,
+    delete: &Delete,
+    def: &TableDef,
+    eval_ctx: &EvalContext,
+) -> Result<TriggerImages, SqlError> {
+    enforce_object_permission(def, &eval_ctx.security, PermAction::Delete)
+        .map_err(|e| e.at(delete.table.span))?;
+    let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
+    let resolver = SchemaScope { schema: &schema };
+    let types = schema_types(&schema);
+    let mut deleted = Vec::new();
+    for row in storage
+        .rel_scan(&def.name)
+        .map_err(|e| map_storage_err(e, &def.name))?
+    {
+        check_cancelled()?;
+        if predicate_true(&delete.where_clause, &row, &types, &resolver, eval_ctx)? {
+            deleted.push(row);
+        }
+    }
+    Ok((Vec::new(), deleted))
 }
 
 /// Fires one trigger body: parses it, runs it in the firing statement's
@@ -12973,8 +13168,7 @@ fn sys_triggers(storage: &Storage) -> Source {
                 Datum::Int(trigger.parent_object_id as i32),
                 Datum::NVarChar("TR".to_string()),
                 Datum::Int(i32::from(trigger.is_disabled)),
-                // Only AFTER triggers exist here (INSTEAD OF is not supported).
-                Datum::Int(0),
+                Datum::Int(i32::from(trigger.is_instead_of)),
             ])
         })
         .collect();

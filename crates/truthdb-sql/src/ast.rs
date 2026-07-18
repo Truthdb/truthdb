@@ -305,6 +305,8 @@ pub struct CreateTrigger {
     pub target: Name,
     /// The DML events it fires on (at least one; deduplicated by the parser).
     pub events: Vec<TriggerEvent>,
+    /// `INSTEAD OF` (fires in place of the DML) rather than `AFTER`/`FOR`.
+    pub instead_of: bool,
     /// The body source text (everything after `AS`), re-parsed per firing.
     pub body: String,
     /// `ALTER TRIGGER` replaces an existing definition.

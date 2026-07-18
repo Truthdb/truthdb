@@ -282,6 +282,10 @@ pub struct TriggerDef {
     pub body: String,
     /// `DISABLE TRIGGER` sets this; a disabled trigger does not fire.
     pub is_disabled: bool,
+    /// An `INSTEAD OF` trigger fires in place of the DML (the base operation and
+    /// its constraints are bypassed); a plain `AFTER` trigger fires after it.
+    #[serde(default)]
+    pub is_instead_of: bool,
 }
 
 /// A stored procedure's catalog payload: declared parameters and body text.

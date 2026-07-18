@@ -1765,16 +1765,22 @@ impl Parser {
         let name = self.parse_name()?;
         self.expect_keyword("ON")?;
         let target = self.parse_name()?;
-        // AFTER (or its FOR synonym) is the only supported timing.
-        match self.peek_keyword().as_deref() {
+        // Timing: AFTER (its FOR synonym) or INSTEAD OF.
+        let instead_of = match self.peek_keyword().as_deref() {
             Some("AFTER") | Some("FOR") => {
                 self.bump();
+                false
+            }
+            Some("INSTEAD") => {
+                self.bump();
+                self.expect_keyword("OF")?;
+                true
             }
             _ => {
                 let token = self.peek().clone();
                 return Err(SqlError::syntax(self.token_text(&token), token.span));
             }
-        }
+        };
         // The event list: INSERT/UPDATE/DELETE, comma-separated, at least one,
         // deduplicated.
         let mut events = Vec::new();
@@ -1828,6 +1834,7 @@ impl Parser {
             name,
             target,
             events,
+            instead_of,
             body,
             alter,
             span,
