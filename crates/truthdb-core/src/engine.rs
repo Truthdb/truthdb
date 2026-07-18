@@ -2560,6 +2560,44 @@ mod tests {
     }
 
     #[test]
+    fn recovery_redo_is_idempotent_across_repeated_reopens() {
+        // Redo is the resumable core of replication (a standby applies it as
+        // records arrive): re-running it must be a no-op, gated by each page's
+        // LSN. Reopening the same database repeatedly re-runs redo over the whole
+        // log each time; the committed state must survive unchanged.
+        let path = unique_temp_path("redo-idempotent");
+        {
+            let engine = new_engine(&path);
+            engine
+                .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+                .expect("create");
+            for i in 1..=30 {
+                engine
+                    .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                    .expect("insert");
+            }
+            engine
+                .execute("UPDATE t SET v = v + 100 WHERE id <= 10")
+                .expect("update");
+        }
+        let expected = {
+            let engine = Engine::new(Storage::open(path.clone()).expect("open")).expect("engine");
+            sql_rows(&engine, "SELECT id, v FROM t ORDER BY id").1
+        };
+        // Reopen several more times: each reopen re-runs redo over the full log.
+        // The state is invariant — proving redo re-application is idempotent.
+        for _ in 0..3 {
+            let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("engine");
+            assert_eq!(
+                sql_rows(&engine, "SELECT id, v FROM t ORDER BY id").1,
+                expected,
+                "redo re-application over the whole log is a no-op"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn commit_records_carry_a_recent_wall_clock_timestamp() {
         use crate::storage_layout::WAL_ENTRY_TYPE_REL;
         use crate::wal::records::{REL_KIND_TXN_COMMIT, RelRecord};
