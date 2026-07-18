@@ -219,6 +219,48 @@ pub enum Statement {
         path: String,
         span: Span,
     },
+    /// `DECLARE <name> [SCROLL] CURSOR FOR <select>` — a static cursor over a
+    /// query's result (materialized when OPENed).
+    DeclareCursor {
+        name: Name,
+        select: Box<Select>,
+        scroll: bool,
+        span: Span,
+    },
+    /// `OPEN <name>` — executes the cursor's query and positions before the first
+    /// row.
+    OpenCursor {
+        name: Name,
+        span: Span,
+    },
+    /// `FETCH [<direction>] [FROM] <name> [INTO @v[, ...]]`.
+    FetchCursor {
+        name: Name,
+        direction: FetchDirection,
+        into: Vec<String>,
+        span: Span,
+    },
+    /// `CLOSE <name>` — releases the result set (the cursor can be re-OPENed).
+    CloseCursor {
+        name: Name,
+        span: Span,
+    },
+    /// `DEALLOCATE <name>` — removes the cursor.
+    DeallocateCursor {
+        name: Name,
+        span: Span,
+    },
+}
+
+/// A `FETCH` direction. ABSOLUTE/RELATIVE carry a row-count expression.
+#[derive(Debug, Clone, PartialEq)]
+pub enum FetchDirection {
+    Next,
+    Prior,
+    First,
+    Last,
+    Absolute(Expr),
+    Relative(Expr),
 }
 
 /// The `RESTORE` verb.

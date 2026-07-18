@@ -115,6 +115,9 @@ pub struct EvalContext {
     /// Inside a trigger body: which columns the firing UPDATE/INSERT touched,
     /// for `UPDATE(<col>)` and `COLUMNS_UPDATED()`. `None` outside a trigger.
     pub updated_columns: Option<UpdatedColumns>,
+    /// `@@FETCH_STATUS` — the result of the last cursor FETCH: 0 success, -1 past
+    /// the end / no more rows, -2 the fetched row is missing.
+    pub fetch_status: i32,
 }
 
 /// The columns a trigger's firing statement touched: the parent table's column
@@ -283,6 +286,7 @@ fn eval_global_var(name: &str, ctx: &EvalContext) -> SqlResult<SqlValue> {
             "TruthDB - 16.0.1000.6\n\tMicrosoft SQL Server 2022 compatible edition".to_string(),
         )),
         "rowcount" => Ok(SqlValue::Int(ctx.rowcount)),
+        "fetch_status" => Ok(SqlValue::Int(ctx.fetch_status as i64)),
         "error" => Ok(SqlValue::Int(ctx.last_error as i64)),
         "nestlevel" => Ok(SqlValue::Int(ctx.nestlevel as i64)),
         "identity" => Ok(SqlValue::Int(0)),

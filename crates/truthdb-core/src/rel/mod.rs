@@ -17,10 +17,10 @@ use truthdb_sql::ast::{
     AlterAction, AlterDatabase, AlterTable, CheckConstraint, ColumnDef, CreateFunction,
     CreateIndex, CreateLogin, CreateProcedure, CreateTable, CreateTrigger, CreateUser, CreateView,
     DataType, DatabaseOption, Declaration, Delete, DropIndex, DropTable, DropView, ExecStatement,
-    Expr, ExprKind, ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind, Name, OrderItem,
-    PermissionAction, PermissionKind, PermissionStatement, RaiseError, RestoreMode, ReturnsClause,
-    RoleMemberAction, Select, SelectItem, SetStatement, Statement, TableRef, ThrowArgs,
-    ThrowStatement, Update,
+    Expr, ExprKind, FetchDirection, ForeignKey, Insert, InsertSource, IsolationLevel, JoinKind,
+    Name, OrderItem, PermissionAction, PermissionKind, PermissionStatement, RaiseError,
+    RestoreMode, ReturnsClause, RoleMemberAction, Select, SelectItem, SetStatement, Statement,
+    TableRef, ThrowArgs, ThrowStatement, Update,
 };
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
@@ -103,6 +103,10 @@ pub struct TxnContext {
     /// ROLLBACK and are cleared at batch end — SQL Server table-variable
     /// semantics. Kept disjoint from `variables`; a name lives in exactly one.
     table_variables: std::collections::HashMap<String, TableVar>,
+    /// Declared cursors (name lowercased). Batch-scoped (cleared at batch end).
+    cursors: std::collections::HashMap<String, CursorState>,
+    /// `@@FETCH_STATUS`: the result of the last cursor FETCH (0 / -1 / -2).
+    fetch_status: i32,
     /// Connection identity for session intrinsics (`DB_NAME()`,
     /// `SUSER_SNAME()`, `@@SPID`), set once when the session opens.
     database: String,
@@ -194,6 +198,7 @@ impl TxnContext {
             last_error: self.last_error,
             nestlevel: EXEC_DEPTH.with(|d| d.get()) as i32,
             updated_columns: current_trigger_updated_columns(),
+            fetch_status: self.fetch_status,
         }
     }
 
@@ -291,6 +296,8 @@ impl TxnContext {
     pub fn clear_variables(&mut self) {
         self.variables.clear();
         self.table_variables.clear();
+        self.cursors.clear();
+        self.fetch_status = 0;
     }
 
     /// The final value and type of a batch variable, as a `Datum`, for the
@@ -2234,6 +2241,8 @@ fn produces_rowset(statement: &Statement) -> bool {
         Statement::Restore { mode, .. } => {
             matches!(mode, RestoreMode::HeaderOnly | RestoreMode::FileListOnly)
         }
+        // A `FETCH` without an INTO list returns the fetched row to the client.
+        Statement::FetchCursor { into, .. } => into.is_empty(),
         _ => false,
     }
 }
@@ -3447,7 +3456,15 @@ fn analyze_statements_locks(
             | Statement::BackupLog { .. }
             // RESTORE VERIFYONLY/HEADERONLY/FILELISTONLY only read a backup file;
             // they touch no database object, so they take no lock.
-            | Statement::Restore { .. } => {}
+            | Statement::Restore { .. }
+            // Cursor statements take no batch lock. OPEN executes its query,
+            // whose scans take their own per-slice storage locks (as every read
+            // does); DECLARE/FETCH/CLOSE/DEALLOCATE touch only session state.
+            | Statement::DeclareCursor { .. }
+            | Statement::OpenCursor { .. }
+            | Statement::FetchCursor { .. }
+            | Statement::CloseCursor { .. }
+            | Statement::DeallocateCursor { .. } => {}
         }
     }
     // Batch-level lock escalation: if a table accumulated more than the
@@ -3736,6 +3753,16 @@ fn exec_statement_dispatch(
             Ok(StatementResult::Done)
         }
         Statement::Restore { mode, path, .. } => exec_restore(*mode, path, txn_ctx),
+        Statement::DeclareCursor { name, select, .. } => exec_declare_cursor(txn_ctx, name, select),
+        Statement::OpenCursor { name, .. } => exec_open_cursor(storage, txn_ctx, name),
+        Statement::FetchCursor {
+            name,
+            direction,
+            into,
+            ..
+        } => exec_fetch(storage, txn_ctx, name, direction, into),
+        Statement::CloseCursor { name, .. } => exec_close_cursor(txn_ctx, name),
+        Statement::DeallocateCursor { name, .. } => exec_deallocate_cursor(txn_ctx, name),
         // Executed by `run_block`'s own arms; nothing routes them here.
         Statement::Block { .. }
         | Statement::If { .. }
@@ -4474,6 +4501,208 @@ fn exec_save(
         let savepoint = storage.rel_savepoint(txn);
         ctx.savepoints
             .insert(name.value.to_ascii_lowercase(), savepoint);
+    }
+    Ok(StatementResult::Done)
+}
+
+/// A declared cursor: its query, and — once OPENed — the materialized result and
+/// the current position (0 = before the first row; 1..=len = on a row; len+1 =
+/// after the last). Static: the rows are snapshotted at OPEN.
+struct CursorState {
+    select: Box<Select>,
+    columns: Vec<ResultColumn>,
+    rows: Vec<Vec<Datum>>,
+    position: i64,
+    open: bool,
+}
+
+fn cursor_not_declared(name: &Name) -> SqlError {
+    SqlError::new(
+        16916,
+        16,
+        1,
+        format!("A cursor with the name '{}' does not exist.", name.value),
+    )
+    .at(name.span)
+}
+
+fn cursor_not_open(name: &Name) -> SqlError {
+    SqlError::new(16917, 16, 1, "The cursor is not open.".to_string()).at(name.span)
+}
+
+fn exec_declare_cursor(
+    ctx: &mut TxnContext,
+    name: &Name,
+    select: &Select,
+) -> Result<StatementResult, SqlError> {
+    let key = name.value.to_ascii_lowercase();
+    if ctx.cursors.contains_key(&key) {
+        return Err(SqlError::new(
+            16915,
+            16,
+            1,
+            format!("The cursor name '{}' already exists.", name.value),
+        )
+        .at(name.span));
+    }
+    ctx.cursors.insert(
+        key,
+        CursorState {
+            select: Box::new(select.clone()),
+            columns: Vec::new(),
+            rows: Vec::new(),
+            position: 0,
+            open: false,
+        },
+    );
+    Ok(StatementResult::Done)
+}
+
+fn exec_open_cursor(
+    storage: &Storage,
+    ctx: &mut TxnContext,
+    name: &Name,
+) -> Result<StatementResult, SqlError> {
+    let key = name.value.to_ascii_lowercase();
+    let select = ctx
+        .cursors
+        .get(&key)
+        .ok_or_else(|| cursor_not_declared(name))?
+        .select
+        .clone();
+    let eval_ctx = ctx.eval_context();
+    let rowset = exec_select(storage, &select, &eval_ctx)?;
+    let cursor = ctx.cursors.get_mut(&key).expect("cursor declared");
+    cursor.columns = rowset.columns;
+    cursor.rows = rowset.rows;
+    cursor.position = 0;
+    cursor.open = true;
+    Ok(StatementResult::Done)
+}
+
+fn exec_close_cursor(ctx: &mut TxnContext, name: &Name) -> Result<StatementResult, SqlError> {
+    let key = name.value.to_ascii_lowercase();
+    let cursor = ctx
+        .cursors
+        .get_mut(&key)
+        .ok_or_else(|| cursor_not_declared(name))?;
+    if !cursor.open {
+        return Err(cursor_not_open(name));
+    }
+    cursor.open = false;
+    cursor.rows = Vec::new();
+    cursor.columns = Vec::new();
+    cursor.position = 0;
+    Ok(StatementResult::Done)
+}
+
+fn exec_deallocate_cursor(ctx: &mut TxnContext, name: &Name) -> Result<StatementResult, SqlError> {
+    let key = name.value.to_ascii_lowercase();
+    if ctx.cursors.remove(&key).is_none() {
+        return Err(cursor_not_declared(name));
+    }
+    Ok(StatementResult::Done)
+}
+
+fn exec_fetch(
+    storage: &Storage,
+    ctx: &mut TxnContext,
+    name: &Name,
+    direction: &FetchDirection,
+    into: &[String],
+) -> Result<StatementResult, SqlError> {
+    let _ = storage;
+    let key = name.value.to_ascii_lowercase();
+    // Evaluate an ABSOLUTE/RELATIVE offset (it may reference variables) up front.
+    let offset = match direction {
+        FetchDirection::Absolute(e) | FetchDirection::Relative(e) => {
+            let eval_ctx = ctx.eval_context();
+            Some(match eval_constant(e, &eval_ctx)? {
+                SqlValue::Int(i) => i,
+                SqlValue::Null => 0,
+                _ => {
+                    return Err(SqlError::message_only(
+                        16924,
+                        "The FETCH offset must be an integer.".to_string(),
+                    ));
+                }
+            })
+        }
+        _ => None,
+    };
+    // Compute the target 1-based position from an immutable read of the cursor.
+    let (columns, fetched, new_position, in_range) = {
+        let cursor = ctx
+            .cursors
+            .get(&key)
+            .ok_or_else(|| cursor_not_declared(name))?;
+        if !cursor.open {
+            return Err(cursor_not_open(name));
+        }
+        let n = cursor.rows.len() as i64;
+        let mut target = match direction {
+            FetchDirection::Next => cursor.position + 1,
+            FetchDirection::Prior => cursor.position - 1,
+            FetchDirection::First => 1,
+            FetchDirection::Last => n,
+            FetchDirection::Absolute(_) => offset.unwrap_or(0),
+            FetchDirection::Relative(_) => cursor.position + offset.unwrap_or(0),
+        };
+        // ABSOLUTE -1 addresses the last row, -2 the second-to-last, etc.
+        if matches!(direction, FetchDirection::Absolute(_)) && target < 0 {
+            target = n + target + 1;
+        }
+        if target >= 1 && target <= n {
+            (
+                cursor.columns.clone(),
+                Some(cursor.rows[(target - 1) as usize].clone()),
+                target,
+                true,
+            )
+        } else {
+            (cursor.columns.clone(), None, target.clamp(0, n + 1), false)
+        }
+    };
+    ctx.cursors.get_mut(&key).expect("cursor").position = new_position;
+    if !in_range {
+        // Off either end: @@FETCH_STATUS = -1, no row produced.
+        ctx.fetch_status = -1;
+        return Ok(StatementResult::Done);
+    }
+    ctx.fetch_status = 0;
+    let row = fetched.expect("row in range");
+    if into.is_empty() {
+        // No INTO: the fetched row is returned to the client as a result set.
+        return Ok(StatementResult::Rows(RowSet {
+            columns,
+            rows: vec![row],
+        }));
+    }
+    if into.len() != columns.len() {
+        return Err(SqlError::new(
+            16924,
+            16,
+            1,
+            "The number of variables declared in the INTO list must match that of selected columns."
+                .to_string(),
+        )
+        .at(name.span));
+    }
+    let types: Vec<ColumnType> = columns.iter().map(|c| c.column_type).collect();
+    for (var, (value, col_type)) in into.iter().zip(row.iter().zip(&types)) {
+        let var_type = ctx
+            .variables
+            .get(var)
+            .map(|(t, _)| *t)
+            .ok_or_else(|| undeclared_variable_err(var))?;
+        let sql_value = value::datum_to_sql(value, col_type);
+        let expr = Expr {
+            kind: ExprKind::Literal(sql_value),
+            span: name.span,
+        };
+        let eval_ctx = ctx.eval_context();
+        let coerced = coerce_variable(&expr, &var_type, var, &eval_ctx)?;
+        ctx.variables.insert(var.clone(), (var_type, coerced));
     }
     Ok(StatementResult::Done)
 }

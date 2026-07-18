@@ -1,0 +1,46 @@
+# Cursors (Stage 15.1): DECLARE/OPEN/FETCH/CLOSE/DEALLOCATE, FETCH INTO driving a
+# @@FETCH_STATUS loop, and a SCROLL direction. The engine tests carry the error
+# matrix and the other fetch directions; these pin the surface end to end.
+
+statement ok
+CREATE TABLE nums (id INT NOT NULL PRIMARY KEY, v INT)
+
+statement ok
+INSERT INTO nums VALUES (1, 10), (2, 20), (3, 30)
+
+# Forward iteration: FETCH INTO sums v under a @@FETCH_STATUS loop; the total is
+# parked in a row so the following query can read it.
+statement ok
+DECLARE @sum INT = 0;
+DECLARE @v INT;
+DECLARE c CURSOR FOR SELECT v FROM nums ORDER BY id;
+OPEN c;
+FETCH NEXT FROM c INTO @v;
+WHILE @@FETCH_STATUS = 0
+BEGIN
+  SET @sum = @sum + @v;
+  FETCH NEXT FROM c INTO @v;
+END;
+CLOSE c;
+DEALLOCATE c;
+INSERT INTO nums VALUES (99, @sum)
+
+query I
+SELECT v FROM nums WHERE id = 99
+----
+60
+
+# A SCROLL cursor: FETCH LAST addresses the final row.
+statement ok
+DECLARE @x INT;
+DECLARE c SCROLL CURSOR FOR SELECT v FROM nums WHERE id < 99 ORDER BY id;
+OPEN c;
+FETCH LAST FROM c INTO @x;
+CLOSE c;
+DEALLOCATE c;
+INSERT INTO nums VALUES (98, @x)
+
+query I
+SELECT v FROM nums WHERE id = 98
+----
+30
