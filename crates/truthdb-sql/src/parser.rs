@@ -193,6 +193,7 @@ impl Parser {
             Some("DENY") => self.parse_permission(PermissionKind::Deny),
             Some("REVOKE") => self.parse_permission(PermissionKind::Revoke),
             Some("BACKUP") => self.parse_backup(),
+            Some("RESTORE") => self.parse_restore(),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1914,6 +1915,60 @@ impl Parser {
                 span,
             })
         }
+    }
+
+    /// `RESTORE {VERIFYONLY|HEADERONLY|FILELISTONLY|DATABASE <name>|LOG <name>}
+    /// FROM DISK = '<path>'`. The three inspect verbs run online; DATABASE/LOG
+    /// parse (so the error is semantic, not a syntax error) but restore offline.
+    fn parse_restore(&mut self) -> SqlResult<Statement> {
+        let start = self.peek().span;
+        self.bump(); // RESTORE
+        // Like BACKUP, RESTORE is side-effecting/privileged and illegal inside a
+        // function or table-valued-function body.
+        if self.in_function || self.in_table_function {
+            return Err(
+                SqlError::new(156, 15, 1, "Incorrect syntax near the keyword 'RESTORE'.").at(start),
+            );
+        }
+        let mode = match self.peek_keyword().as_deref() {
+            Some("VERIFYONLY") => {
+                self.bump();
+                RestoreMode::VerifyOnly
+            }
+            Some("HEADERONLY") => {
+                self.bump();
+                RestoreMode::HeaderOnly
+            }
+            Some("FILELISTONLY") => {
+                self.bump();
+                RestoreMode::FileListOnly
+            }
+            Some("DATABASE") => {
+                self.bump();
+                let _ = self.parse_name()?;
+                RestoreMode::Database
+            }
+            Some("LOG") => {
+                self.bump();
+                let _ = self.parse_name()?;
+                RestoreMode::Log
+            }
+            _ => {
+                let token = self.peek().clone();
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            }
+        };
+        self.expect_keyword("FROM")?;
+        self.expect_keyword("DISK")?;
+        self.expect(&TokenKind::Eq)?;
+        let token = self.peek().clone();
+        let TokenKind::String(path) = &token.kind else {
+            return Err(SqlError::syntax(self.token_text(&token), token.span));
+        };
+        let path = path.clone();
+        self.bump();
+        let span = start.to(self.prev_span());
+        Ok(Statement::Restore { mode, path, span })
     }
 
     fn parse_create_login(&mut self, start: Span, alter: bool) -> SqlResult<Statement> {
