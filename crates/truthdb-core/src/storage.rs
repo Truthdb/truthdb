@@ -649,18 +649,17 @@ impl Storage {
         // pins `[start, ...)`, so no checkpoint can truncate the range we are
         // about to ship, even after we release the lock.
         let (header, start, end, log) = self.lock().begin_log_backup(checksum, copy_only)?;
+        // Release the single-flight guard on EVERY exit — an early `?` out of
+        // write_log_archive, a panic, or normal completion.
+        let _guard = LogBackupGuard { storage: self };
         // Phase 2 (UNLOCKED): write and fsync the archive — including its parent
         // directory — so concurrent DML proceeds during the copy-out (BACKUP LOG
-        // is online, like BACKUP DATABASE). On failure, release the single-flight
-        // guard without advancing the marker.
-        if let Err(e) = write_log_archive(dst, &header, start, &log) {
-            self.lock().cancel_log_backup();
-            return Err(e);
-        }
+        // is online, like BACKUP DATABASE).
+        write_log_archive(dst, &header, start, &log)?;
         // Phase 3 (locked): the archive is durable — durably advance the marker
-        // and the hold, releasing `[start, end)` for reclamation. Copy-out
-        // strictly before truncate.
-        self.lock().finish_log_backup(end)?;
+        // and the hold (unless the FULL-model state changed meanwhile), releasing
+        // `[start, end)` for reclamation. Copy-out strictly before truncate.
+        self.lock().finish_log_backup(start, end)?;
         Ok(crate::backup::BackupSummary {
             redo_start_lsn: start,
             backup_end_lsn: end,
@@ -5493,18 +5492,27 @@ impl StorageFile {
 
     /// Phase 3 of `BACKUP LOG`: the archive at `end` is durable, so durably
     /// advance the persisted marker then the in-memory marker and hold, letting
-    /// the ring reclaim `[old_marker, end)`. Clears the single-flight guard
-    /// first, so a persist failure still frees the next backup.
-    fn finish_log_backup(&mut self, end: u64) -> Result<(), StorageError> {
-        self.log_backup_in_progress = false;
+    /// the ring reclaim `[start, end)`.
+    ///
+    /// ORPHANS the backup (no marker/hold change) if the FULL-model state
+    /// changed during the unlocked archive write — a concurrent `ALTER DATABASE
+    /// SET RECOVERY SIMPLE` released the hold (and a checkpoint then advanced
+    /// the head), or a re-enable moved the marker. Re-arming the hold at `end`
+    /// in those cases could sit it below the advanced head, which `set_head`
+    /// forbids. The single-flight guard is released by `LogBackupGuard` on every
+    /// exit path, not here.
+    fn finish_log_backup(&mut self, start: u64, end: u64) -> Result<(), StorageError> {
+        if !self.version.recovery_full || self.last_log_backup_lsn != start {
+            return Ok(());
+        }
         self.persist_last_log_backup_lsn(end)?;
         self.last_log_backup_lsn = end;
         self.register_log_backup_hold(end);
         Ok(())
     }
 
-    /// Aborts an in-progress `BACKUP LOG` (the archive write failed) without
-    /// advancing the marker.
+    /// Releases the `BACKUP LOG` single-flight guard (idempotent). Called by
+    /// [`LogBackupGuard`] on every exit — error, panic, or success.
     fn cancel_log_backup(&mut self) {
         self.log_backup_in_progress = false;
     }
@@ -6290,6 +6298,19 @@ impl Drop for BackupHoldGuard<'_> {
     }
 }
 
+/// Releases the `BACKUP LOG` single-flight guard when the operation ends — on
+/// every path, including an early error return or a panic during the unlocked
+/// archive write. A leaked guard would reject every later `BACKUP LOG`.
+struct LogBackupGuard<'a> {
+    storage: &'a Storage,
+}
+
+impl Drop for LogBackupGuard<'_> {
+    fn drop(&mut self) {
+        self.storage.lock().cancel_log_backup();
+    }
+}
+
 /// Everything captured under the storage lock at the start of a backup, so the
 /// bulk page copy can proceed while releasing the lock between chunks.
 struct BackupPlan {
@@ -6485,6 +6506,58 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(bak);
         let _ = std::fs::remove_file(bak2);
+    }
+
+    #[test]
+    fn log_backup_orphans_when_recovery_flips_to_simple_mid_flight() {
+        // Reproduces the race the lock-dance opened: BACKUP LOG releases the
+        // storage lock to write its archive; a concurrent ALTER ... SET RECOVERY
+        // SIMPLE releases the log hold and a checkpoint advances the head; phase
+        // 3 must then ORPHAN the backup rather than re-arm the hold below head.
+        let path = unique_temp_path("backuplog-orphan");
+        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        storage
+            .rel_set_db_options(None, None, Some(true))
+            .expect("enable FULL");
+        for seq in 0..8 {
+            storage
+                .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, seq, b"logbytes")
+                .expect("append");
+        }
+        // Phase 1: capture the range under the lock (marker = start).
+        let (_, start, end, _log) = storage.lock().begin_log_backup(true, false).expect("begin");
+        assert!(end > start);
+        // The concurrent ALTER SET RECOVERY SIMPLE during the unlocked window.
+        storage
+            .rel_set_db_options(None, None, Some(false))
+            .expect("disable FULL");
+        assert_eq!(storage.log_backup_hold(), None, "SIMPLE released the hold");
+        // A checkpoint now advances the head to the tail (no hold pins it).
+        storage
+            .write_checkpoint(b"cp", 1, 2, 1)
+            .expect("checkpoint after SIMPLE");
+        assert!(
+            storage.wal_head() > start,
+            "the head advanced past the old marker"
+        );
+        // Phase 3: finish must orphan (recovery_full is false) — no re-arm.
+        storage
+            .lock()
+            .finish_log_backup(start, end)
+            .expect("finish orphans cleanly");
+        assert_eq!(
+            storage.log_backup_hold(),
+            None,
+            "finish did not re-arm the hold on the now-SIMPLE database"
+        );
+        // The next checkpoint must not move the head backward (would panic
+        // without the orphan guard).
+        storage
+            .write_checkpoint(b"cp2", 2, 3, 2)
+            .expect("checkpoint after orphan does not panic");
+        storage.lock().cancel_log_backup();
+        drop(storage);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
