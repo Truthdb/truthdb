@@ -1536,17 +1536,35 @@ impl Parser {
         let mut options = Vec::new();
         let mut end;
         loop {
-            let option = match self.peek_keyword().as_deref() {
-                Some("READ_COMMITTED_SNAPSHOT") => DatabaseOption::ReadCommittedSnapshot,
-                Some("ALLOW_SNAPSHOT_ISOLATION") => DatabaseOption::AllowSnapshotIsolation,
+            let (option, value) = match self.peek_keyword().as_deref() {
+                Some("READ_COMMITTED_SNAPSHOT") => {
+                    end = self.bump().span;
+                    (DatabaseOption::ReadCommittedSnapshot, self.parse_on_off()?)
+                }
+                Some("ALLOW_SNAPSHOT_ISOLATION") => {
+                    end = self.bump().span;
+                    (DatabaseOption::AllowSnapshotIsolation, self.parse_on_off()?)
+                }
+                // `SET RECOVERY {FULL | SIMPLE}` — a mode keyword, not ON/OFF.
+                Some("RECOVERY") => {
+                    self.bump();
+                    let is_full = match self.peek_keyword().as_deref() {
+                        Some("FULL") => true,
+                        Some("SIMPLE") => false,
+                        _ => {
+                            let token = self.peek().clone();
+                            return Err(SqlError::syntax(self.token_text(&token), token.span));
+                        }
+                    };
+                    end = self.bump().span;
+                    (DatabaseOption::Recovery, is_full)
+                }
                 _ => {
                     let token = self.peek().clone();
                     return Err(SqlError::syntax(self.token_text(&token), token.span));
                 }
             };
-            end = self.bump().span;
-            let on = self.parse_on_off()?;
-            options.push((option, on));
+            options.push((option, value));
             if !self.eat(&TokenKind::Comma) {
                 break;
             }
@@ -3620,6 +3638,30 @@ fn is_reserved(keyword: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn alter_database_set_recovery_parses() {
+        let full = Parser::parse_str("ALTER DATABASE CURRENT SET RECOVERY FULL").expect("parse");
+        assert!(matches!(
+            &full[0],
+            Statement::AlterDatabase(a) if a.options == vec![(DatabaseOption::Recovery, true)]
+        ));
+        let simple = Parser::parse_str("ALTER DATABASE d SET RECOVERY SIMPLE").expect("parse");
+        assert!(matches!(
+            &simple[0],
+            Statement::AlterDatabase(a) if a.options == vec![(DatabaseOption::Recovery, false)]
+        ));
+        // Only FULL/SIMPLE are supported; any other mode is a syntax error.
+        assert!(Parser::parse_str("ALTER DATABASE d SET RECOVERY BULK_LOGGED").is_err());
+        // The existing ON/OFF options still parse alongside.
+        let rcsi =
+            Parser::parse_str("ALTER DATABASE d SET READ_COMMITTED_SNAPSHOT ON").expect("parse");
+        assert!(matches!(
+            &rcsi[0],
+            Statement::AlterDatabase(a)
+                if a.options == vec![(DatabaseOption::ReadCommittedSnapshot, true)]
+        ));
+    }
 
     #[test]
     fn backup_database_parses_with_options() {

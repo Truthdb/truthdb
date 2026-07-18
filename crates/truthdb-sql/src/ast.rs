@@ -423,6 +423,9 @@ pub struct AlterDatabase {
 pub enum DatabaseOption {
     ReadCommittedSnapshot,
     AllowSnapshotIsolation,
+    /// `SET RECOVERY {FULL | SIMPLE}`. Unlike the ON/OFF options, the paired
+    /// bool carries the mode: `true` = FULL, `false` = SIMPLE.
+    Recovery,
 }
 
 #[derive(Debug, Clone, PartialEq)]

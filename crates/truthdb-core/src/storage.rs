@@ -283,6 +283,9 @@ pub struct Storage {
     /// analysis and the per-statement snapshot gate are on the hot path).
     rcsi: std::sync::atomic::AtomicBool,
     allow_snapshot: std::sync::atomic::AtomicBool,
+    /// FULL recovery model mirror (vs SIMPLE). Read without the mutex by
+    /// `sys.databases` and (later) the log-backup hold / 9002 decision.
+    recovery_full: std::sync::atomic::AtomicBool,
     /// Bumped whenever the options change: a parked batch whose lock set was
     /// analyzed under an older epoch is re-analyzed before it can be granted
     /// (its versioned-read decision may no longer match execution).
@@ -364,6 +367,7 @@ impl Storage {
         let (gc, log_writer) = GroupCommit::start(wal_fd);
         let rcsi = file.version.rcsi;
         let allow_snapshot = file.version.allow_snapshot;
+        let recovery_full = file.version.recovery_full;
         Ok(Storage {
             path,
             inner: std::sync::Mutex::new(file),
@@ -371,6 +375,7 @@ impl Storage {
             log_writer: Some(log_writer),
             rcsi: std::sync::atomic::AtomicBool::new(rcsi),
             allow_snapshot: std::sync::atomic::AtomicBool::new(allow_snapshot),
+            recovery_full: std::sync::atomic::AtomicBool::new(recovery_full),
             lock_epoch: std::sync::atomic::AtomicU64::new(0),
             security_version: std::sync::atomic::AtomicU64::new(0),
             membership: std::sync::Mutex::new(MembershipCache::default()),
@@ -1178,6 +1183,12 @@ impl Storage {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
+    /// Whether the database is in the FULL recovery model (vs SIMPLE).
+    pub(crate) fn recovery_model_full(&self) -> bool {
+        self.recovery_full
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
     /// Applies `ALTER DATABASE SET` option changes: updates the version
     /// store, persists the options in the superblocks, and refreshes the
     /// lock-free mirrors. The caller holds Database X, so no snapshot is live
@@ -1186,15 +1197,22 @@ impl Storage {
         &self,
         rcsi: Option<bool>,
         allow_snapshot: Option<bool>,
+        recovery_full: Option<bool>,
     ) -> Result<(), StorageError> {
         let mut guard = self.lock();
-        guard.set_db_options(rcsi, allow_snapshot)?;
-        let (rcsi_now, allow_now) = (guard.version.rcsi, guard.version.allow_snapshot);
+        guard.set_db_options(rcsi, allow_snapshot, recovery_full)?;
+        let (rcsi_now, allow_now, recovery_now) = (
+            guard.version.rcsi,
+            guard.version.allow_snapshot,
+            guard.version.recovery_full,
+        );
         drop(guard);
         self.rcsi
             .store(rcsi_now, std::sync::atomic::Ordering::Relaxed);
         self.allow_snapshot
             .store(allow_now, std::sync::atomic::Ordering::Relaxed);
+        self.recovery_full
+            .store(recovery_now, std::sync::atomic::Ordering::Relaxed);
         // After the mirrors, so a batch analyzed against a stale epoch is
         // always re-analyzed against the settled options.
         self.lock_epoch
@@ -5427,6 +5445,7 @@ impl StorageFile {
         &mut self,
         rcsi: Option<bool>,
         allow_snapshot: Option<bool>,
+        recovery_full: Option<bool>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
         // Build the new superblocks in LOCALS and write them BEFORE mutating
@@ -5443,6 +5462,9 @@ impl StorageFile {
             }
             if let Some(on) = allow_snapshot {
                 next = (next & !2) | ((on as u8) << 1);
+            }
+            if let Some(on) = recovery_full {
+                next = (next & !4) | ((on as u8) << 2);
             }
             next
         };
@@ -5494,7 +5516,8 @@ impl StorageFile {
                 self.superblock_a = backup;
             }
         }
-        self.version.set_options(rcsi, allow_snapshot);
+        self.version
+            .set_options(rcsi, allow_snapshot, recovery_full);
         Ok(())
     }
 
