@@ -12239,6 +12239,15 @@ fn build_join(
             kind,
             on,
         } => {
+            if matches!(kind, JoinKind::CrossApply | JoinKind::OuterApply) {
+                return build_apply(
+                    storage,
+                    left,
+                    right,
+                    matches!(kind, JoinKind::OuterApply),
+                    eval_ctx,
+                );
+            }
             let left = build_join(storage, left, eval_ctx)?;
             let right = build_join(storage, right, eval_ctx)?;
             join_sources(storage, left, right, *kind, on.as_ref(), eval_ctx)
@@ -12249,6 +12258,165 @@ fn build_join(
         TableRef::Function { name, args, alias } => {
             build_function_source(storage, name, args, alias.as_ref(), eval_ctx)
         }
+    }
+}
+
+/// `CROSS`/`OUTER APPLY`: the right side is re-evaluated once per left row,
+/// correlated to it. For each left row the right `TableRef` is rebound to that
+/// row's values (a TVF's arguments become literals; a derived table's outer
+/// column references are substituted) and built; its rows are concatenated onto
+/// the left row. CROSS APPLY drops a left row that produced none; OUTER APPLY
+/// keeps it with NULLs for the right columns.
+fn build_apply(
+    storage: &Storage,
+    left: &TableRef,
+    right: &TableRef,
+    is_outer: bool,
+    eval_ctx: &EvalContext,
+) -> Result<Source, SqlError> {
+    let left_source = build_join(storage, left, eval_ctx)?;
+    let left_types = left_source.types();
+    let left_columns = left_source.columns.clone();
+    let left_qualifiers = left_source.qualifiers.clone();
+    let left_collations = left_source.collations.clone();
+    // A resolver over the left columns so the right side's correlated references
+    // (and TVF arguments) bind to the current left row.
+    let left_scope = JoinScope {
+        columns: left_qualifiers
+            .iter()
+            .zip(&left_columns)
+            .map(|(q, c)| (q.clone(), c.name.clone()))
+            .collect(),
+        collations: left_collations.clone(),
+    };
+    let left_rows = left_source.rows.materialize(storage)?;
+
+    let build_right_for = |vals: &[SqlValue]| -> Result<Source, SqlError> {
+        let outer = |name: &str| left_scope.resolve(name);
+        let bound = substitute_outer_in_tref(storage, right, &outer, vals, eval_ctx)?;
+        build_join(storage, &bound, eval_ctx)
+    };
+
+    // (columns, qualifiers, collations) of the right source — learned from the
+    // first built right and reused for the result's shape.
+    type RightMeta = (Vec<ResultColumn>, Vec<Option<String>>, Vec<Option<String>>);
+    let mut out_rows: Vec<Vec<Datum>> = Vec::new();
+    let mut right_meta: Option<RightMeta> = None;
+    for left_row in &left_rows {
+        check_cancelled()?;
+        let vals = row_values(left_row, &left_types);
+        let right_source = build_right_for(&vals)?;
+        let right_col_count = right_source.columns.len();
+        if right_meta.is_none() {
+            right_meta = Some((
+                right_source.columns.clone(),
+                right_source.qualifiers.clone(),
+                right_source.collations.clone(),
+            ));
+        }
+        let right_rows = right_source.rows.materialize(storage)?;
+        if right_rows.is_empty() {
+            if is_outer {
+                let mut combined = left_row.clone();
+                combined.extend(std::iter::repeat_n(Datum::Null, right_col_count));
+                out_rows.push(combined);
+            }
+        } else {
+            for rr in &right_rows {
+                let mut combined = left_row.clone();
+                combined.extend(rr.iter().cloned());
+                out_rows.push(combined);
+            }
+        }
+    }
+    // With no left rows the right was never built; build it once against a NULL
+    // left row to learn its column shape (the result is still zero rows).
+    let (right_columns, right_qualifiers, right_collations) = match right_meta {
+        Some(meta) => meta,
+        None => {
+            let nulls = vec![SqlValue::Null; left_columns.len()];
+            let right_source = build_right_for(&nulls)?;
+            (
+                right_source.columns,
+                right_source.qualifiers,
+                right_source.collations,
+            )
+        }
+    };
+
+    let mut columns = left_columns;
+    columns.extend(right_columns);
+    let mut qualifiers = left_qualifiers;
+    qualifiers.extend(right_qualifiers);
+    let mut collations = left_collations;
+    collations.extend(right_collations);
+    Ok(Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(out_rows),
+    })
+}
+
+/// Rebinds a right-of-APPLY `TableRef` to one left row: a TVF's arguments are
+/// evaluated against the left row to literals; a derived table's correlated
+/// outer references are substituted; a base table is unchanged. The rebound
+/// reference builds with no remaining correlation.
+fn substitute_outer_in_tref(
+    storage: &Storage,
+    tref: &TableRef,
+    outer: &dyn Fn(&str) -> Option<usize>,
+    outer_row: &[SqlValue],
+    eval_ctx: &EvalContext,
+) -> Result<TableRef, SqlError> {
+    match tref {
+        TableRef::Table { .. } => Ok(tref.clone()),
+        TableRef::Function { name, args, alias } => {
+            let resolver = FnResolver(outer);
+            let bound_args = args
+                .iter()
+                .map(|arg| {
+                    let bound =
+                        substitute_correlated_in_expr(storage, arg, outer, outer_row, eval_ctx)?;
+                    let value = eval::eval(&bound, outer_row, &resolver, eval_ctx)?;
+                    Ok(Expr {
+                        kind: ExprKind::Literal(value),
+                        span: arg.span,
+                    })
+                })
+                .collect::<Result<Vec<_>, SqlError>>()?;
+            Ok(TableRef::Function {
+                name: name.clone(),
+                args: bound_args,
+                alias: alias.clone(),
+            })
+        }
+        TableRef::Derived { subquery, alias } => {
+            let bound = substitute_subquery_outer_refs(storage, subquery, outer, outer_row)
+                .unwrap_or_else(|| (**subquery).clone());
+            Ok(TableRef::Derived {
+                subquery: Box::new(bound),
+                alias: alias.clone(),
+            })
+        }
+        TableRef::Join {
+            left,
+            right,
+            kind,
+            on,
+        } => Ok(TableRef::Join {
+            left: Box::new(substitute_outer_in_tref(
+                storage, left, outer, outer_row, eval_ctx,
+            )?),
+            right: Box::new(substitute_outer_in_tref(
+                storage, right, outer, outer_row, eval_ctx,
+            )?),
+            kind: *kind,
+            on: on
+                .as_ref()
+                .map(|e| substitute_correlated_in_expr(storage, e, outer, outer_row, eval_ctx))
+                .transpose()?,
+        }),
     }
 }
 

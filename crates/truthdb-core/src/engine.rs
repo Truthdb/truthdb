@@ -6840,6 +6840,75 @@ mod tests {
     }
 
     #[test]
+    fn cross_and_outer_apply_correlate_the_right_side_to_each_left_row() {
+        let path = unique_temp_path("apply");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE seq (v INT NOT NULL PRIMARY KEY)")
+            .expect("seq");
+        for v in 1..=3 {
+            engine
+                .execute(&format!("INSERT INTO seq VALUES ({v})"))
+                .expect("ins seq");
+        }
+        engine
+            .execute("CREATE TABLE t (k INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine.execute("INSERT INTO t VALUES (2)").expect("t2");
+        engine.execute("INSERT INTO t VALUES (0)").expect("t0");
+        engine
+            .execute("CREATE FUNCTION dbo.upto (@n INT) RETURNS TABLE AS RETURN (SELECT v FROM seq WHERE v <= @n)")
+            .expect("tvf");
+
+        // CROSS APPLY correlates upto(t.k) to each left row and drops the k=0 row
+        // (upto(0) yields no rows).
+        assert_eq!(
+            sql_rows(
+                &engine,
+                "SELECT t.k, u.v FROM t CROSS APPLY dbo.upto(t.k) u ORDER BY t.k, u.v"
+            )
+            .1,
+            vec![
+                vec![Some("2".into()), Some("1".into())],
+                vec![Some("2".into()), Some("2".into())],
+            ],
+            "CROSS APPLY correlates and drops empty-right rows"
+        );
+
+        // OUTER APPLY keeps the k=0 row with NULL for the right columns.
+        assert_eq!(
+            sql_rows(
+                &engine,
+                "SELECT t.k, u.v FROM t OUTER APPLY dbo.upto(t.k) u ORDER BY t.k, u.v"
+            )
+            .1,
+            vec![
+                vec![Some("0".into()), None],
+                vec![Some("2".into()), Some("1".into())],
+                vec![Some("2".into()), Some("2".into())],
+            ],
+            "OUTER APPLY keeps empty-right rows with NULL"
+        );
+
+        // A correlated derived table on the right side works too.
+        assert_eq!(
+            sql_rows(
+                &engine,
+                "SELECT t.k, d.v FROM t CROSS APPLY (SELECT v FROM seq WHERE v <= t.k) d ORDER BY t.k, d.v"
+            )
+            .1,
+            vec![
+                vec![Some("2".into()), Some("1".into())],
+                vec![Some("2".into()), Some("2".into())],
+            ],
+            "CROSS APPLY over a correlated derived table"
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn update_function_reports_touched_columns_in_a_trigger() {
         let path = unique_temp_path("update-fn");
         let engine = new_engine(&path);
