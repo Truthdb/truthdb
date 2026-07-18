@@ -6497,6 +6497,77 @@ mod tests {
     }
 
     #[test]
+    fn trigger_that_rolls_back_and_errors_does_not_wedge_the_session() {
+        let path = unique_temp_path("trg-rollback-error");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TABLE other (id INT NOT NULL PRIMARY KEY)")
+            .expect("other");
+        // The idiomatic abort-in-trigger pattern: ROLLBACK then RAISERROR. The
+        // trigger ends the transaction AND errors — it must abort cleanly (3609
+        // path), not doom a torn-down transaction and leave the session wedged.
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS BEGIN ROLLBACK; RAISERROR('reject', 16, 1) END")
+            .expect("trigger");
+        let mut ctx = TxnContext::default();
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRANSACTION; INSERT INTO t VALUES (1)",
+        );
+        assert!(out.error.is_some(), "the trigger's RAISERROR must surface");
+        // The session is not wedged: a subsequent autocommit write succeeds
+        // (no leftover doomed state rejecting it with 3930).
+        let out = batch(&engine, &mut ctx, "INSERT INTO other VALUES (1)");
+        assert!(
+            out.error.is_none(),
+            "the session must not be wedged after ROLLBACK; RAISERROR: {:?}",
+            out.error
+        );
+        let (_c, rows) = sql_rows(&engine, "SELECT COUNT(*) AS n FROM other");
+        assert_eq!(
+            rows,
+            vec![vec![Some("1".to_string())]],
+            "the later write committed"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn uncaught_trigger_error_aborts_the_rest_of_the_batch() {
+        let path = unique_temp_path("trg-uncaught-abort");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TABLE other (id INT NOT NULL PRIMARY KEY)")
+            .expect("other");
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS RAISERROR('reject', 16, 1)")
+            .expect("trigger");
+        // An uncaught trigger error in an explicit transaction aborts the batch:
+        // the statement after the failing INSERT must NOT run.
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRANSACTION; INSERT INTO t VALUES (1); INSERT INTO other VALUES (2)",
+        );
+        batch(&engine, &mut ctx, "IF @@TRANCOUNT > 0 ROLLBACK");
+        let (_c, rows) = sql_rows(&engine, "SELECT COUNT(*) AS n FROM other");
+        assert_eq!(
+            rows,
+            vec![vec![Some("0".to_string())]],
+            "the batch must abort on the uncaught trigger error, not run the next INSERT"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn trigger_is_not_an_alter_or_dml_target() {
         let path = unique_temp_path("trg-alter-target");
         let engine = new_engine(&path);

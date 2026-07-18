@@ -1359,8 +1359,11 @@ fn statement_error_ladder(
     }
     // Other statements: a non-dooming in-transaction error rolls back only
     // the statement and the batch continues; a dooming one ends the batch
-    // (only ROLLBACK is then accepted, error 3930).
-    if txn_ctx.in_txn() && !dooms {
+    // (only ROLLBACK is then accepted, error 3930). A transaction ALREADY
+    // doomed (e.g. by an AFTER-trigger error, which SQL Server makes
+    // uncommittable regardless of the firing statement's severity) must not
+    // continue either — the batch ends.
+    if txn_ctx.in_txn() && !dooms && !txn_ctx.doomed {
         run.abort_open_rowset(txn_ctx.in_txn());
         run.last_error = Some(error);
         return Ok(());
@@ -5778,35 +5781,40 @@ fn run_dml_with_triggers(
     });
     // Fire each trigger once, in creation order, even for an empty image set.
     for trig_def in &triggers {
-        if let Err(e) = fire_one_trigger(storage, txn_ctx, trig_def, &tables) {
-            // A trigger error makes the transaction uncommittable. For the
-            // IMPLICIT transaction opened here (autocommit), roll it back fully —
-            // there is no caller transaction to preserve. For the caller's
-            // EXPLICIT transaction, DOOM it (leave it open with @@TRANCOUNT
-            // intact, XACT_STATE() = -1) rather than tearing it down: SQL
-            // Server's uncommittable-transaction semantics, so a TRY/CATCH sees
-            // the doomed state and must ROLLBACK — never silently autocommitting
-            // CATCH work or losing pre-statement work. The doomed transaction's
-            // staged rows (including the firing row) can never commit.
+        let fired = fire_one_trigger(storage, txn_ctx, trig_def, &tables);
+        // A trigger body that changed @@TRANCOUNT — a ROLLBACK/COMMIT that
+        // reduced it or an unbalanced BEGIN that raised it — ENDED the
+        // transaction (3609). This is checked BEFORE the error branch so the
+        // idiomatic `ROLLBACK; RAISERROR` abort pattern does not doom a
+        // transaction the trigger already tore down (which would wedge the
+        // session doomed with no open transaction). `abort` normalizes the
+        // state; surface the trigger's own error if it raised one, else 3609.
+        if txn_ctx.trancount != tc_before {
+            txn_ctx.abort(storage);
+            return Err(fired.err().unwrap_or_else(|| {
+                SqlError::new(
+                    3609,
+                    16,
+                    1,
+                    "The transaction ended in the trigger. The batch has been aborted.",
+                )
+            }));
+        }
+        // A trigger error with the transaction still open makes it
+        // uncommittable. Roll back the IMPLICIT (autocommit) transaction opened
+        // here; DOOM the caller's EXPLICIT one (leave it open, @@TRANCOUNT
+        // intact, XACT_STATE() = -1) — SQL Server's uncommittable-transaction
+        // semantics, so a TRY/CATCH sees the doomed state and must ROLLBACK
+        // (its writes hit the 3930 guard), and an uncaught error terminates the
+        // batch (statement_error_ladder does not continue past a doomed txn).
+        // The doomed transaction's staged rows can never commit.
+        if let Err(e) = fired {
             if implicit {
                 txn_ctx.abort(storage);
             } else {
                 txn_ctx.doomed = true;
             }
             return Err(e);
-        }
-        // 3609: a trigger body that changed @@TRANCOUNT — a ROLLBACK/COMMIT that
-        // reduced it, OR an unbalanced BEGIN that raised it (a leaked open txn) —
-        // ended the transaction contract; the batch is aborted. `abort`
-        // normalizes the state (rolls back and clears any leaked transaction).
-        if txn_ctx.trancount != tc_before {
-            txn_ctx.abort(storage);
-            return Err(SqlError::new(
-                3609,
-                16,
-                1,
-                "The transaction ended in the trigger. The batch has been aborted.",
-            ));
         }
     }
     if implicit {
