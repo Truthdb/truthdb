@@ -10,13 +10,35 @@
 use truthdb_sql::ast::{AggFunc, BinaryOp, Expr, ExprKind, Name, Select, SelectItem};
 use truthdb_sql::collation::CollationSensitivity;
 use truthdb_sql::error::SqlError;
-use truthdb_sql::eval::{self, EvalContext};
+use truthdb_sql::eval::{self, ColumnResolver, EvalContext};
 use truthdb_sql::value::{SqlValue, order_key_cmp};
 
 use crate::relstore::types::{ColumnType, Datum};
 
 use super::value;
 use super::{JoinScope, ResultColumn, RowSet, row_values};
+
+/// Evaluate an expression that may hold a subquery or user scalar function: fold
+/// it against `row` (its columns resolved by `resolver`) before the pure
+/// evaluator runs, mirroring the SELECT-list / WHERE rewrite. Used for GROUP BY
+/// keys and aggregate arguments, where a UDF would otherwise reach the pure
+/// evaluator and raise 195.
+fn eval_bound(
+    storage: &crate::storage::Storage,
+    expr: &Expr,
+    row: &[SqlValue],
+    resolver: &JoinScope,
+    eval_ctx: &EvalContext,
+) -> Result<SqlValue, SqlError> {
+    if crate::rel::expr_needs_binding(storage, expr) {
+        let outer = |name: &str| resolver.resolve(name);
+        let bound =
+            crate::rel::substitute_correlated_in_expr(storage, expr, &outer, row, eval_ctx)?;
+        eval::eval(&bound, row, resolver, eval_ctx)
+    } else {
+        eval::eval(expr, row, resolver, eval_ctx)
+    }
+}
 
 /// True if the query aggregates: it has a GROUP BY, a HAVING, or any aggregate
 /// in its SELECT list.
@@ -216,13 +238,13 @@ fn aggregate_partition(
     out_exprs: &[Expr],
     synth: &SynthScope,
 ) -> Result<Vec<Vec<SqlValue>>, SqlError> {
-    let groups = group_rows(select, rows, types, resolver, eval_ctx)?;
+    let groups = group_rows(storage, select, rows, types, resolver, eval_ctx)?;
     let mut out_rows: Vec<Vec<SqlValue>> = Vec::new();
     for (keys, members) in &groups {
         let mut group_row = keys.clone();
         for spec in aggs {
             group_row.push(compute_aggregate(
-                spec, rows, types, resolver, members, eval_ctx,
+                storage, spec, rows, types, resolver, members, eval_ctx,
             )?);
         }
         if let Some(having) = having {
@@ -232,13 +254,15 @@ fn aggregate_partition(
             // A reference to a non-grouped column stays unresolved and errors
             // inside the subquery, as SQL Server rejects it too.
             let bound;
-            let having = if crate::rel::expr_has_subquery(having) {
+            let having = if crate::rel::expr_needs_binding(storage, having) {
+                // A user function's args were rewritten to the synthetic group
+                // columns ($gk/$agg), which `synth` resolves; a subquery keeps its
+                // original grouping-column names, which `group_key_resolver`
+                // resolves. Both index into `group_row`, so try synth first.
+                let gkr = group_key_resolver(select, resolver);
+                let outer = |name: &str| synth.resolve(name).or_else(|| gkr(name));
                 bound = crate::rel::substitute_correlated_in_expr(
-                    storage,
-                    having,
-                    &group_key_resolver(select, resolver),
-                    &group_row,
-                    eval_ctx,
+                    storage, having, &outer, &group_row, eval_ctx,
                 )?;
                 &bound
             } else {
@@ -262,13 +286,11 @@ fn aggregate_partition(
             // A subquery here is correlated to a grouping column (the
             // rewrite left it): bind the group row, exactly as HAVING does.
             let bound;
-            let expr = if crate::rel::expr_has_subquery(expr) {
+            let expr = if crate::rel::expr_needs_binding(storage, expr) {
+                let gkr = group_key_resolver(select, resolver);
+                let outer = |name: &str| synth.resolve(name).or_else(|| gkr(name));
                 bound = crate::rel::substitute_correlated_in_expr(
-                    storage,
-                    expr,
-                    &group_key_resolver(select, resolver),
-                    &group_row,
-                    eval_ctx,
+                    storage, expr, &outer, &group_row, eval_ctx,
                 )?;
                 &bound
             } else {
@@ -305,7 +327,7 @@ fn grace_hash_aggregate(
         .map(|_| crate::relstore::spill::RowSpool::new(storage))
         .collect();
     for row in rows {
-        let key = group_key(select, row, types, resolver, eval_ctx)?;
+        let key = group_key(storage, select, row, types, resolver, eval_ctx)?;
         let index = partition_index(&key, partitions);
         spools[index]
             .write_row(row)
@@ -338,6 +360,7 @@ fn grace_hash_aggregate(
 /// in-memory `group_rows` — so case-insensitive-equal keys route to the same
 /// partition and are not split across partitions on a spilling GROUP BY.
 fn group_key(
+    storage: &crate::storage::Storage,
     select: &Select,
     row: &[Datum],
     types: &[ColumnType],
@@ -353,7 +376,7 @@ fn group_key(
     let raw = select
         .group_by
         .iter()
-        .map(|expr| eval::eval(expr, &sql_row, resolver, eval_ctx))
+        .map(|expr| eval_bound(storage, expr, &sql_row, resolver, eval_ctx))
         .collect::<Result<Vec<_>, _>>()?;
     Ok(super::hash::fold_hash_key(&raw, &key_sens))
 }
@@ -372,6 +395,7 @@ fn partition_index(key: &[SqlValue], partitions: usize) -> usize {
 /// yields one row. NULL keys group together.
 #[allow(clippy::type_complexity)]
 fn group_rows(
+    storage: &crate::storage::Storage,
     select: &Select,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
@@ -404,7 +428,7 @@ fn group_rows(
         let key = select
             .group_by
             .iter()
-            .map(|expr| eval::eval(expr, &sql_row, resolver, eval_ctx))
+            .map(|expr| eval_bound(storage, expr, &sql_row, resolver, eval_ctx))
             .collect::<Result<Vec<_>, _>>()?;
         let folded = fold_hash_key(&key, &key_sens);
         match index_of.get(&HashKey(folded.clone())) {
@@ -419,6 +443,7 @@ fn group_rows(
 }
 
 fn compute_aggregate(
+    storage: &crate::storage::Storage,
     spec: &AggSpec,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
@@ -437,7 +462,7 @@ fn compute_aggregate(
     let mut values: Vec<SqlValue> = Vec::new();
     for &index in members {
         let sql_row = row_values(&rows[index], types);
-        let value = eval::eval(arg, &sql_row, resolver, eval_ctx)?;
+        let value = eval_bound(storage, arg, &sql_row, resolver, eval_ctx)?;
         if !value.is_null() {
             values.push(value);
         }

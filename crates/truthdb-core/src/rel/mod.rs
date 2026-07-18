@@ -5050,6 +5050,7 @@ fn parse_checks(def: &TableDef) -> Result<Vec<(String, Expr)>, SqlError> {
 /// Enforces CHECK constraints against a fully-built row (schema order). A
 /// constraint passes on TRUE or UNKNOWN (NULL); FALSE is error 547.
 fn enforce_checks(
+    storage: &Storage,
     checks: &[(String, Expr)],
     row: &[SqlValue],
     resolver: &impl ColumnResolver,
@@ -5058,6 +5059,16 @@ fn enforce_checks(
     table: &str,
 ) -> Result<(), SqlError> {
     for (name, expr) in checks {
+        // A user scalar function (or subquery) in the CHECK is folded against the
+        // row before the pure evaluator runs, like the other clause positions.
+        let bound;
+        let expr = if expr_needs_binding(storage, expr) {
+            let outer = |n: &str| resolver.resolve(n);
+            bound = substitute_correlated_in_expr(storage, expr, &outer, row, eval_ctx)?;
+            &bound
+        } else {
+            expr
+        };
         match eval::eval(expr, row, resolver, eval_ctx)? {
             SqlValue::Bool(false) => {
                 return Err(SqlError::new(
@@ -6896,6 +6907,7 @@ fn alter_add_check(
     for row in &rows {
         let scope = row_values(row, &types);
         enforce_checks(
+            storage,
             &compiled,
             &scope,
             &resolver,
@@ -7082,6 +7094,7 @@ fn exec_insert(
         if !checks.is_empty() {
             let scope = row_values(&values, &check_types);
             enforce_checks(
+                storage,
                 &checks,
                 &scope,
                 &check_resolver,
@@ -7456,7 +7469,9 @@ fn exec_update(
         }
         if !checks.is_empty() {
             let scope = row_values(&new_row, &types);
-            enforce_checks(&checks, &scope, &resolver, eval_ctx, "UPDATE", &def.name)?;
+            enforce_checks(
+                storage, &checks, &scope, &resolver, eval_ctx, "UPDATE", &def.name,
+            )?;
         }
         updates.push((locator, old_values, new_row));
     }
@@ -9408,7 +9423,7 @@ fn exec_select(
                 .collect();
             dedup_rows(storage, &mut out, &out_sens)?;
         }
-        order_output(&mut out, &select.order_by, eval_ctx)?;
+        order_output(storage, &mut out, &select.order_by, eval_ctx)?;
         if let Some(top) = select.top {
             out.rows.truncate(top as usize);
         }
@@ -10204,6 +10219,7 @@ fn dedup_rows(
 /// evaluated against the output row (its columns are the resolver). Uses
 /// code-point ordering (NULLs first), stable.
 fn order_output(
+    storage: &Storage,
     rowset: &mut RowSet,
     order_by: &[OrderItem],
     eval_ctx: &EvalContext,
@@ -10234,7 +10250,7 @@ fn order_output(
                     })?;
                 sql_row[ordinal].clone()
             } else {
-                eval::eval(&item.expr, &sql_row, &scope, eval_ctx)?
+                eval_maybe_bound(storage, &item.expr, &sql_row, &scope, eval_ctx)?
             };
             key.push(value);
         }
@@ -10409,7 +10425,29 @@ fn sort_collators(
 }
 
 /// The ORDER BY key of one row.
+/// Evaluate an expression that may hold a subquery or user scalar function: fold
+/// it against `row` (its columns resolved by `resolver`) before the pure
+/// evaluator, mirroring the SELECT-list / WHERE rewrite. Lets a UDF appear in
+/// ORDER BY / join-ON / CHECK etc. rather than reaching the pure evaluator and
+/// raising 195.
+fn eval_maybe_bound(
+    storage: &Storage,
+    expr: &Expr,
+    row: &[SqlValue],
+    resolver: &impl ColumnResolver,
+    eval_ctx: &EvalContext,
+) -> Result<SqlValue, SqlError> {
+    if expr_needs_binding(storage, expr) {
+        let outer = |name: &str| resolver.resolve(name);
+        let bound = substitute_correlated_in_expr(storage, expr, &outer, row, eval_ctx)?;
+        eval::eval(&bound, row, resolver, eval_ctx)
+    } else {
+        eval::eval(expr, row, resolver, eval_ctx)
+    }
+}
+
 fn sort_key(
+    storage: &Storage,
     row: &[Datum],
     order_by: &[OrderItem],
     types: &[ColumnType],
@@ -10419,7 +10457,7 @@ fn sort_key(
     let values = row_values(row, types);
     order_by
         .iter()
-        .map(|item| eval::eval(&item.expr, &values, resolver, eval_ctx))
+        .map(|item| eval_maybe_bound(storage, &item.expr, &values, resolver, eval_ctx))
         .collect()
 }
 
@@ -10482,7 +10520,7 @@ fn order_rows_budgeted<'a>(
     let mut current_bytes = 0usize;
     for row in rows {
         check_cancelled()?;
-        let key = sort_key(&row, order_by, types, resolver, eval_ctx)?;
+        let key = sort_key(storage, &row, order_by, types, resolver, eval_ctx)?;
         current_bytes += approx_row_bytes(&row);
         current.push((key, row));
         if current_bytes >= budget {
@@ -10498,7 +10536,7 @@ fn order_rows_budgeted<'a>(
     // Sort the final partial run and merge every run.
     current.sort_by(|(a, _), (b, _)| cmp(a, b));
     merge_runs(
-        &runs, current, order_by, types, resolver, eval_ctx, &collators,
+        storage, &runs, current, order_by, types, resolver, eval_ctx, &collators,
     )
 }
 
@@ -10528,6 +10566,7 @@ fn sort_and_spill<'a>(
 /// (spilled runs hold earlier input rows than the in-memory tail).
 #[allow(clippy::too_many_arguments)]
 fn merge_runs(
+    storage: &Storage,
     runs: &[crate::relstore::spill::RowSpool<'_>],
     tail: Vec<KeyedRow>,
     order_by: &[OrderItem],
@@ -10544,7 +10583,9 @@ fn merge_runs(
     let source_count = readers.len() + 1;
     let mut heads: Vec<Option<(Vec<SqlValue>, Vec<Datum>)>> = Vec::with_capacity(source_count);
     for reader in &mut readers {
-        heads.push(read_head(reader, order_by, types, resolver, eval_ctx)?);
+        heads.push(read_head(
+            storage, reader, order_by, types, resolver, eval_ctx,
+        )?);
     }
     heads.push(tail_iter.next());
 
@@ -10572,7 +10613,14 @@ fn merge_runs(
         out.push(row);
         // Advance the chosen source.
         heads[i] = if i < readers.len() {
-            read_head(&mut readers[i], order_by, types, resolver, eval_ctx)?
+            read_head(
+                storage,
+                &mut readers[i],
+                order_by,
+                types,
+                resolver,
+                eval_ctx,
+            )?
         } else {
             tail_iter.next()
         };
@@ -10582,6 +10630,7 @@ fn merge_runs(
 
 /// Reads the next row from a spool reader and pairs it with its ORDER BY key.
 fn read_head(
+    storage: &Storage,
     reader: &mut crate::relstore::spill::RowSpoolReader,
     order_by: &[OrderItem],
     types: &[ColumnType],
@@ -10593,7 +10642,7 @@ fn read_head(
         .map_err(|e| map_storage_err(e, "<sort spill>"))?
     {
         Some(row) => {
-            let key = sort_key(&row, order_by, types, resolver, eval_ctx)?;
+            let key = sort_key(storage, &row, order_by, types, resolver, eval_ctx)?;
             Ok(Some((key, row)))
         }
         None => Ok(None),
@@ -11862,13 +11911,24 @@ fn join_sources(
     let left_nulls = vec![Datum::Null; left.columns.len()];
     let right_nulls = vec![Datum::Null; right.columns.len()];
 
+    // A subquery or user scalar function in the ON predicate is folded against
+    // the joined row before the pure evaluator runs (per candidate pair).
+    let on_needs_binding = on.is_some_and(|pred| expr_needs_binding(storage, pred));
     let concat = |l: &[Datum], r: &[Datum]| -> Vec<Datum> { l.iter().chain(r).cloned().collect() };
     let matches = |l: &[Datum], r: &[Datum]| -> Result<bool, SqlError> {
         match on {
             None => Ok(true),
             Some(pred) => {
-                let row = concat(l, r);
-                match eval::eval(pred, &row_values(&row, &types), &scope, eval_ctx)? {
+                let vals = row_values(&concat(l, r), &types);
+                let value = if on_needs_binding {
+                    let outer = |name: &str| scope.resolve(name);
+                    let bound =
+                        substitute_correlated_in_expr(storage, pred, &outer, &vals, eval_ctx)?;
+                    eval::eval(&bound, &vals, &scope, eval_ctx)?
+                } else {
+                    eval::eval(pred, &vals, &scope, eval_ctx)?
+                };
+                match value {
                     SqlValue::Bool(b) => Ok(b),
                     SqlValue::Null => Ok(false),
                     _ => Err(SqlError::new(
