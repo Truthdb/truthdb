@@ -108,6 +108,37 @@ impl PageAllocator {
         !self.is_free(page)
     }
 
+    /// The runs of persistably-allocated pages — `(start_page, count)` pairs in
+    /// ascending order, excluding the temp/spill/version-store extents that a
+    /// backup must NOT capture (they vanish on restart). This is both the set of
+    /// pages a full backup copies and the allocation map a restore lays down.
+    // `backup_full` (the next Stage 17 slice) is the consumer.
+    #[allow(dead_code)]
+    pub fn allocated_runs(&self) -> Vec<(u64, u64)> {
+        let bitmap = self.persistable_bitmap();
+        let mut runs = Vec::new();
+        let mut run_start = 0u64;
+        let mut run_len = 0u64;
+        for page in 0..self.total_pages {
+            let allocated = bitmap
+                .get((page / 8) as usize)
+                .is_some_and(|byte| byte & (1 << (page % 8) as u8) != 0);
+            if allocated {
+                if run_len == 0 {
+                    run_start = page;
+                }
+                run_len += 1;
+            } else if run_len > 0 {
+                runs.push((run_start, run_len));
+                run_len = 0;
+            }
+        }
+        if run_len > 0 {
+            runs.push((run_start, run_len));
+        }
+        runs
+    }
+
     fn scan_range(&self, from: u64, to: u64, num_pages: u64) -> Option<u64> {
         let mut run_start = from;
         let mut run_len = 0u64;
@@ -169,6 +200,28 @@ mod tests {
 
     fn allocator_with_pages(pages: u64) -> PageAllocator {
         PageAllocator::new(pages * PAGE_SIZE as u64)
+    }
+
+    #[test]
+    fn allocated_runs_lists_persistent_runs_excluding_temp_extents() {
+        let mut alloc = allocator_with_pages(1000);
+        let base = alloc.allocate(5).unwrap();
+        // Free two interior pages, splitting the run into two.
+        alloc.free(base + 2, 2);
+        assert_eq!(
+            alloc.allocated_runs(),
+            vec![(base, 2), (base + 4, 1)],
+            "the persistent allocated runs"
+        );
+        // A temp extent is allocated in the live bitmap but excluded from the
+        // persistable set, so it does not appear in the backup's runs.
+        let before = alloc.allocated_runs();
+        let _temp = alloc.allocate_temp_extent().expect("temp extent");
+        assert_eq!(
+            alloc.allocated_runs(),
+            before,
+            "temp extents are excluded from allocated_runs"
+        );
     }
 
     #[test]

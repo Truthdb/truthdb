@@ -1616,12 +1616,37 @@ pub struct SnapshotData {
     pub next_doc_id: u64,
 }
 
+/// Holds that pin the WAL ring's truncation floor below what a checkpoint would
+/// otherwise reclaim, so a subsystem that still needs a stretch of log keeps it.
+/// The floor is `min` over all active holds; the active-transaction hold (the
+/// oldest open `BEGIN` LSN) is computed separately from `active_txn_begins` and
+/// combined in [`StorageFile::checkpoint_wal_head`]. Built for Stage 17 backup
+/// and reused by Stage 18 replication slots.
+#[derive(Debug, Default)]
+struct LogTruncationGate {
+    /// An in-progress full backup's `redo_start_lsn` — the log it must ship
+    /// before the ring can reclaim it. `None` when no backup is running.
+    backup: Option<u64>,
+    // Later: `log_backup` (FULL recovery model, Stage 17 slice 2) and
+    // `repl_slots` (Stage 18) join the same `min`.
+}
+
+impl LogTruncationGate {
+    /// The lowest LSN any hold pins, or `None` if no hold is registered.
+    fn min_hold(&self) -> Option<u64> {
+        self.backup
+    }
+}
+
 struct StorageFile {
     /// Handle for data-region, superblock and descriptor I/O.
     file: DirectFile,
     /// WAL writer with its own dedicated file handle, so log writes do not
     /// serialize behind page flushes.
     wal: WalWriter,
+    /// Holds that keep the WAL ring from truncating log a backup (or, later, a
+    /// replication slot) still needs.
+    truncation_gate: LogTruncationGate,
     layout: StorageLayout,
     superblock_a: Superblock,
     superblock_b: Superblock,
@@ -4235,6 +4260,7 @@ impl StorageFile {
             default_collation: header.default_collation(),
             file,
             wal,
+            truncation_gate: LogTruncationGate::default(),
             layout,
             superblock_a,
             superblock_b,
@@ -4327,6 +4353,7 @@ impl StorageFile {
             default_collation: header.default_collation(),
             file,
             wal,
+            truncation_gate: LogTruncationGate::default(),
             layout,
             superblock_a,
             superblock_b,
@@ -4755,12 +4782,33 @@ impl StorageFile {
     /// The WAL LSN a checkpoint may truncate up to: the oldest open transaction's
     /// BEGIN LSN (so its undo records survive), or the WAL tail if none is open.
     fn checkpoint_wal_head(&self) -> u64 {
-        self.rel
-            .active_txn_begins
-            .values()
-            .min()
-            .copied()
-            .map_or(self.wal.tail(), |oldest| oldest.min(self.wal.tail()))
+        // The floor is the min over every truncation hold, clamped to the tail:
+        // the oldest open transaction's BEGIN (so its undo survives a crash), and
+        // any gate hold (an in-progress backup's redo_start_lsn, later also log
+        // backup and replication slots). A checkpoint never truncates past this.
+        let mut floor = self.wal.tail();
+        if let Some(oldest_txn) = self.rel.active_txn_begins.values().min().copied() {
+            floor = floor.min(oldest_txn);
+        }
+        if let Some(hold) = self.truncation_gate.min_hold() {
+            floor = floor.min(hold);
+        }
+        floor
+    }
+
+    /// Registers an in-progress backup's `redo_start_lsn` as a truncation hold,
+    /// so a concurrent checkpoint cannot reclaim log the backup still has to ship.
+    /// Paired with [`Self::release_backup_hold`].
+    // `backup_full` (the next Stage 17 slice) is the caller.
+    #[allow(dead_code)]
+    fn register_backup_hold(&mut self, redo_start_lsn: u64) {
+        self.truncation_gate.backup = Some(redo_start_lsn);
+    }
+
+    /// Releases the backup truncation hold (the backup finished or failed).
+    #[allow(dead_code)]
+    fn release_backup_hold(&mut self) {
+        self.truncation_gate.backup = None;
     }
 
     fn ensure_rel_usable(&self) -> Result<(), StorageError> {
