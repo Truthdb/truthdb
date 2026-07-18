@@ -353,7 +353,46 @@ impl Superblock {
     pub fn set_applied_lsn(&mut self, lsn: u64) {
         self.reserved[24..32].copy_from_slice(&lsn.to_le_bytes());
     }
+
+    /// Persisted replication slots (reserved[32..]): a `u32` count then up to
+    /// [`MAX_REPL_SLOTS`] `(id: u32, held LSN: u64)` records. Each slot holds
+    /// WAL-ring truncation at its LSN so the primary keeps the log a standby
+    /// still needs; the table is re-seeded into the truncation gate on open.
+    /// Covered by the superblock checksum. A corrupt/oversized count is clamped,
+    /// never read out of bounds.
+    pub fn repl_slots(&self) -> Vec<(u32, u64)> {
+        let count = (u32::from_le_bytes(self.reserved[32..36].try_into().unwrap()) as usize)
+            .min(MAX_REPL_SLOTS);
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = 36 + i * 12;
+            let id = u32::from_le_bytes(self.reserved[base..base + 4].try_into().unwrap());
+            let lsn = u64::from_le_bytes(self.reserved[base + 4..base + 12].try_into().unwrap());
+            out.push((id, lsn));
+        }
+        out
+    }
+
+    pub fn set_repl_slots(&mut self, slots: &[(u32, u64)]) {
+        let count = slots.len().min(MAX_REPL_SLOTS);
+        self.reserved[32..36].copy_from_slice(&(count as u32).to_le_bytes());
+        for (i, (id, lsn)) in slots.iter().take(MAX_REPL_SLOTS).enumerate() {
+            let base = 36 + i * 12;
+            self.reserved[base..base + 4].copy_from_slice(&id.to_le_bytes());
+            self.reserved[base + 4..base + 12].copy_from_slice(&lsn.to_le_bytes());
+        }
+        // Zero the trailing records so a shrink never leaves stale bytes.
+        for i in count..MAX_REPL_SLOTS {
+            let base = 36 + i * 12;
+            self.reserved[base..base + 12].copy_from_slice(&[0u8; 12]);
+        }
+    }
 }
+
+/// The maximum number of replication slots a superblock persists (bounds the
+/// reserved slot table). Eight standbys is ample for the availability-group-lite
+/// topology; a slot table of `4 + 8*12 = 100` bytes fits the reserved area.
+pub const MAX_REPL_SLOTS: usize = 8;
 
 #[repr(C)]
 #[derive(Clone, Copy, Debug, Default)]

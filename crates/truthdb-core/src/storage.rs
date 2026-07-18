@@ -1528,6 +1528,34 @@ impl Storage {
         active.applied_lsn()
     }
 
+    /// Replication-slot test scaffolding (the transport receiver slice promotes
+    /// these to the ack path). A slot holds WAL-ring truncation at its LSN.
+    #[cfg(test)]
+    pub(crate) fn register_repl_slot(&self, id: u32, lsn: u64) {
+        self.lock().register_repl_slot(id, lsn);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn advance_repl_slot(&self, id: u32, lsn: u64) {
+        self.lock().advance_repl_slot(id, lsn);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_repl_slot(&self, id: u32) {
+        self.lock().drop_repl_slot(id);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn repl_slot_lsn(&self, id: u32) -> Option<u64> {
+        self.lock().repl_slot_lsn(id)
+    }
+
+    /// Sets the slot-retention cap that the checkpoint reap enforces.
+    #[cfg(test)]
+    pub(crate) fn set_max_slot_retain_bytes(&self, bytes: u64) {
+        self.lock().max_slot_retain_bytes = bytes;
+    }
+
     /// Atomic snapshot scan: the whole table under one storage-lock hold
     /// (a versioned reader holds no table lock, so a sliced cursor could be
     /// restructured under it mid-walk), merged against the version store.
@@ -2009,13 +2037,20 @@ struct LogTruncationGate {
     /// checkpoint cannot truncate log a future `BACKUP LOG` still owes. `None`
     /// in the SIMPLE model (log is reclaimable as soon as it is checkpointed).
     log_backup: Option<u64>,
-    // Later: `repl_slots` (Stage 18) joins the same `min`.
+    /// Replication slots (id → held LSN): each pins the ring at the LSN a standby
+    /// has received, so the primary keeps log the standby still needs. Re-seeded
+    /// from the superblock on open; persisted at each checkpoint.
+    repl_slots: std::collections::BTreeMap<u32, u64>,
 }
 
 impl LogTruncationGate {
     /// The lowest LSN any hold pins, or `None` if no hold is registered.
     fn min_hold(&self) -> Option<u64> {
-        [self.backup, self.log_backup].into_iter().flatten().min()
+        [self.backup, self.log_backup]
+            .into_iter()
+            .flatten()
+            .chain(self.repl_slots.values().copied())
+            .min()
     }
 }
 
@@ -2028,6 +2063,19 @@ struct StorageFile {
     /// Holds that keep the WAL ring from truncating log a backup (or, later, a
     /// replication slot) still needs.
     truncation_gate: LogTruncationGate,
+    /// A replication slot lagging the WAL tail by more than this is invalidated
+    /// (dropped) at the next checkpoint so the ring can advance — the standby
+    /// must then reseed. `u64::MAX` (the default) = unlimited retention: a slot
+    /// holds truncation until explicitly dropped, matching the backup/log-backup
+    /// holds (a deployment configures a finite cap to protect the primary).
+    ///
+    /// A meaningful finite cap must be strictly BELOW the ring's usable capacity
+    /// (`wal_size - wal.reserve()`): a pinned slot keeps the tail within that
+    /// capacity of its LSN (appends stall with `WalFull` first), so the reap
+    /// window `tail - lsn > cap` can never open at or above it — the primary
+    /// would wedge rather than shed the slot. The setter (test-only here; the
+    /// transport slice wires the real one) must reject/clamp to that bound.
+    max_slot_retain_bytes: u64,
     /// FULL-model log-backup floor (mirrors the active superblock's
     /// `last_log_backup_lsn`): the LSN up to which the log has been shipped to
     /// a log archive. `0` in the SIMPLE model / before the first log backup.
@@ -4646,12 +4694,14 @@ impl StorageFile {
         let mut version = crate::relstore::version::VersionState::default();
         version.set_options_byte(active_sb.db_options());
         let last_log_backup_lsn = active_sb.last_log_backup_lsn();
+        let repl_slots = active_sb.repl_slots();
         let recovery_full = version.recovery_full;
         let mut storage = StorageFile {
             default_collation: header.default_collation(),
             file,
             wal,
             truncation_gate: LogTruncationGate::default(),
+            max_slot_retain_bytes: u64::MAX,
             last_log_backup_lsn,
             log_backup_in_progress: false,
             layout,
@@ -4669,6 +4719,12 @@ impl StorageFile {
         // backward.
         if recovery_full {
             storage.register_log_backup_hold(last_log_backup_lsn);
+        }
+        // Re-seed the replication slots so their truncation hold survives the
+        // restart (the persisted LSN is <= the live one — conservative, holds
+        // more log, safe: redo is idempotent).
+        for (id, lsn) in repl_slots {
+            storage.truncation_gate.repl_slots.insert(id, lsn);
         }
         storage.recover_allocator()?;
 
@@ -4767,6 +4823,7 @@ impl StorageFile {
             file,
             wal,
             truncation_gate: LogTruncationGate::default(),
+            max_slot_retain_bytes: u64::MAX,
             last_log_backup_lsn: 0,
             log_backup_in_progress: false,
             layout,
@@ -5234,6 +5291,50 @@ impl StorageFile {
     /// reclaimable as soon as it is checkpointed.
     fn release_log_backup_hold(&mut self) {
         self.truncation_gate.log_backup = None;
+    }
+
+    /// Drops any replication slot lagging the WAL tail by more than
+    /// `max_slot_retain_bytes` — it no longer pins the truncation floor, so the
+    /// ring can advance past it (the standby must reseed). Run at the start of a
+    /// checkpoint, before the floor is computed. A no-op under the default
+    /// unlimited retention.
+    fn reap_stale_slots(&mut self) {
+        if self.max_slot_retain_bytes == u64::MAX {
+            return;
+        }
+        let tail = self.wal.tail();
+        let max = self.max_slot_retain_bytes;
+        self.truncation_gate
+            .repl_slots
+            .retain(|_, lsn| tail.saturating_sub(*lsn) <= max);
+    }
+
+    /// Registers (or resets) a replication slot at `lsn`. `lsn` must be `>=` the
+    /// current WAL head (a standby's received LSN is always within the retained
+    /// window — the primary cannot have already truncated it); a below-head slot
+    /// would drive `set_head` below the current head, which it forbids. The
+    /// transport slice enforces this at registration.
+    #[cfg(test)]
+    fn register_repl_slot(&mut self, id: u32, lsn: u64) {
+        self.truncation_gate.repl_slots.insert(id, lsn);
+    }
+
+    /// Advances a slot forward to `lsn` — a slot never moves backward (a
+    /// standby's received watermark only grows).
+    #[cfg(test)]
+    fn advance_repl_slot(&mut self, id: u32, lsn: u64) {
+        let held = self.truncation_gate.repl_slots.entry(id).or_insert(lsn);
+        *held = (*held).max(lsn);
+    }
+
+    #[cfg(test)]
+    fn drop_repl_slot(&mut self, id: u32) {
+        self.truncation_gate.repl_slots.remove(&id);
+    }
+
+    #[cfg(test)]
+    fn repl_slot_lsn(&self, id: u32) -> Option<u64> {
+        self.truncation_gate.repl_slots.get(&id).copied()
     }
 
     fn ensure_rel_usable(&self) -> Result<(), StorageError> {
@@ -6081,7 +6182,10 @@ impl StorageFile {
 
         // 4. Advance the WAL head — to the tail, or clamped to the oldest open
         //    transaction's begin LSN so its undo survives (fuzzy checkpoint) —
-        //    and publish both superblocks (new active first).
+        //    and publish both superblocks (new active first). Reap over-lagging
+        //    replication slots first, so an invalidated one no longer pins the
+        //    floor and its log becomes reclaimable this checkpoint.
+        self.reap_stale_slots();
         self.wal.set_head(self.checkpoint_wal_head());
         let new_active = match self.active_superblock {
             ActiveSuperblock::A => ActiveSuperblock::B,
@@ -6101,6 +6205,15 @@ impl StorageFile {
         // the log-backup floor must be stamped back in or a checkpoint would
         // silently reset it to 0 and drop the FULL-model hold across a restart.
         let last_log_backup_lsn = self.last_log_backup_lsn;
+        // Persist the (post-reap) replication slots, so their truncation hold is
+        // re-established on the next open. Snapshotted after the reap above, so an
+        // invalidated slot is not written back.
+        let repl_slots: Vec<(u32, u64)> = self
+            .truncation_gate
+            .repl_slots
+            .iter()
+            .map(|(&id, &lsn)| (id, lsn))
+            .collect();
         let new_sb = |active_flag: u8| -> Superblock {
             let mut sb = Superblock {
                 generation,
@@ -6119,6 +6232,8 @@ impl StorageFile {
             // superblock (else a checkpoint would silently reset it to 0). On a
             // primary this is exactly the checkpoint tail.
             sb.set_applied_lsn(tail);
+            // Re-stamp the replication slot table (same checkpoint-wipe carry).
+            sb.set_repl_slots(&repl_slots);
             sb.checksum = sb.compute_checksum();
             sb
         };
