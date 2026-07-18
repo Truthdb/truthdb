@@ -2,21 +2,27 @@
 //! xxh64-checksummed blocks.
 //!
 //! Layout (in order): a [`BlockType::Header`] carrying the parameters needed to
-//! recreate the file and the LSN bracket, one [`BlockType::AllocMap`] listing
-//! every allocated page (so restore can zero-fill the allocation set before
-//! overwriting from data blocks), a sequence of [`BlockType::PageData`] runs of
-//! raw page images, a sequence of [`BlockType::LogChunk`] blocks carrying the
-//! WAL entries `[redo_start_lsn, backup_end_lsn)` verbatim, and a
+//! recreate the destination file and the recovery LSN bracket, one
+//! [`BlockType::AllocMap`] listing every allocated page run (so restore lays the
+//! allocation set back before recovery), a sequence of [`BlockType::PageData`]
+//! runs of raw page images, one or more [`BlockType::LogChunk`] blocks carrying
+//! the WAL bytes of `[redo_start_lsn, backup_end_lsn)` verbatim, and a
 //! [`BlockType::Trailer`]. Every block is framed as `type(u32) | payload_len(u64)
 //! | payload | xxh64(payload)(u64)`, so a torn or tampered block is detected on
 //! read.
 //!
-//! This module owns only the framing and header codec; `storage.rs` assembles
-//! the actual page and log data.
+//! `backup_end_lsn` is not stored in the header: it is only known after the
+//! (fuzzy) page copy finishes, so it is derived on read as
+//! `redo_start_lsn + total LogChunk bytes` — the log covers exactly that range.
+//!
+//! This module owns only the framing and the block codecs; `storage.rs`
+//! assembles the actual page and log data.
 
 use std::io::{self, Read, Write};
 
 use xxhash_rust::xxh64::xxh64;
+
+use crate::storage_layout::PAGE_SIZE;
 
 /// The magic bytes at the start of every `TDBBAK1` file.
 pub const MAGIC: &[u8; 8] = b"TDBBAK1\0";
@@ -27,11 +33,11 @@ pub const FORMAT_VERSION: u32 = 1;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[repr(u32)]
 pub enum BlockType {
-    /// The header (recreation parameters + LSN bracket). Exactly one, first.
+    /// The header (recreation parameters + redo-start LSN). Exactly one, first.
     Header = 1,
     /// The allocation map: the full set of allocated page runs.
     AllocMap = 2,
-    /// A run of raw page images (a page number followed by page bytes).
+    /// A run of raw page images (a starting page number followed by page bytes).
     PageData = 3,
     /// A chunk of WAL bytes (a starting LSN followed by the raw entries).
     LogChunk = 4,
@@ -62,25 +68,36 @@ pub struct BackupFlags {
 }
 
 /// The `TDBBAK1` header: everything a restore needs to recreate the file and
-/// bracket the embedded log. Encoded little-endian with an explicit layout so
-/// the format is stable across builds.
+/// seed recovery. Encoded little-endian with an explicit layout so the format
+/// is stable across builds.
+///
+/// The layout sizes reproduce the destination file's regions byte-for-byte (the
+/// offsets are fixed by the region order, so only the sizes travel). The roots
+/// are the source's checkpoint-consistent superblock state as of
+/// `redo_start_lsn`; recovery redoes `[redo_start_lsn, backup_end_lsn)` on top.
 #[derive(Debug, Clone, PartialEq)]
 pub struct BackupHeader {
     pub format_version: u32,
-    /// Storage sizing/layout, to recreate the destination file identically.
-    pub size_gib: u64,
-    pub wal_ratio: f64,
-    pub metadata_ratio: f64,
-    pub snapshot_ratio: f64,
-    pub allocator_ratio: f64,
-    pub reserved_ratio: f64,
-    pub default_collation: Option<String>,
     pub page_size: u32,
-    /// The recovery redo-start LSN (the checkpoint's `wal_head`); restore seeds
-    /// the ring head here and redoes forward.
+    /// Region sizes, in the file's region order; the offsets are derived.
+    pub total_size: u64,
+    pub wal_size: u64,
+    pub data_size: u64,
+    pub metadata_size: u64,
+    pub allocator_size: u64,
+    pub snapshot_size: u64,
+    pub reserved_size: u64,
+    pub default_collation: Option<String>,
+    /// The recovery redo-start LSN (the source's `wal_head`); restore seeds the
+    /// ring head here and redoes forward.
     pub redo_start_lsn: u64,
-    /// The end of the log captured in the backup; restore seeds the ring tail here.
-    pub backup_end_lsn: u64,
+    /// The catalog B+tree root as an absolute file offset (0 = none). The
+    /// restored superblock carries it so recovery starts from the right catalog.
+    pub metadata_root: u64,
+    /// The source's `last_committed_seq` at `redo_start_lsn`.
+    pub last_committed_seq: u64,
+    /// The source's database-options byte (RCSI / ALLOW_SNAPSHOT bits).
+    pub db_options: u8,
     /// Wall-clock time the backup finished, milliseconds since the Unix epoch.
     pub finished_at_millis: u64,
     pub flags: BackupFlags,
@@ -90,16 +107,19 @@ impl BackupHeader {
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         out.extend_from_slice(&self.format_version.to_le_bytes());
-        out.extend_from_slice(&self.size_gib.to_le_bytes());
-        out.extend_from_slice(&self.wal_ratio.to_le_bytes());
-        out.extend_from_slice(&self.metadata_ratio.to_le_bytes());
-        out.extend_from_slice(&self.snapshot_ratio.to_le_bytes());
-        out.extend_from_slice(&self.allocator_ratio.to_le_bytes());
-        out.extend_from_slice(&self.reserved_ratio.to_le_bytes());
         out.extend_from_slice(&self.page_size.to_le_bytes());
+        out.extend_from_slice(&self.total_size.to_le_bytes());
+        out.extend_from_slice(&self.wal_size.to_le_bytes());
+        out.extend_from_slice(&self.data_size.to_le_bytes());
+        out.extend_from_slice(&self.metadata_size.to_le_bytes());
+        out.extend_from_slice(&self.allocator_size.to_le_bytes());
+        out.extend_from_slice(&self.snapshot_size.to_le_bytes());
+        out.extend_from_slice(&self.reserved_size.to_le_bytes());
         out.extend_from_slice(&self.redo_start_lsn.to_le_bytes());
-        out.extend_from_slice(&self.backup_end_lsn.to_le_bytes());
+        out.extend_from_slice(&self.metadata_root.to_le_bytes());
+        out.extend_from_slice(&self.last_committed_seq.to_le_bytes());
         out.extend_from_slice(&self.finished_at_millis.to_le_bytes());
+        out.push(self.db_options);
         let flag_bits = (self.flags.checksum as u8) | ((self.flags.copy_only as u8) << 1);
         out.push(flag_bits);
         // Default collation as a length-prefixed UTF-8 string (u32 len, or
@@ -117,16 +137,19 @@ impl BackupHeader {
     fn decode(bytes: &[u8]) -> io::Result<Self> {
         let mut cursor = Cursor { bytes, pos: 0 };
         let format_version = cursor.u32()?;
-        let size_gib = cursor.u64()?;
-        let wal_ratio = cursor.f64()?;
-        let metadata_ratio = cursor.f64()?;
-        let snapshot_ratio = cursor.f64()?;
-        let allocator_ratio = cursor.f64()?;
-        let reserved_ratio = cursor.f64()?;
         let page_size = cursor.u32()?;
+        let total_size = cursor.u64()?;
+        let wal_size = cursor.u64()?;
+        let data_size = cursor.u64()?;
+        let metadata_size = cursor.u64()?;
+        let allocator_size = cursor.u64()?;
+        let snapshot_size = cursor.u64()?;
+        let reserved_size = cursor.u64()?;
         let redo_start_lsn = cursor.u64()?;
-        let backup_end_lsn = cursor.u64()?;
+        let metadata_root = cursor.u64()?;
+        let last_committed_seq = cursor.u64()?;
         let finished_at_millis = cursor.u64()?;
+        let db_options = cursor.u8()?;
         let flag_bits = cursor.u8()?;
         let collation_len = cursor.u32()?;
         let default_collation = if collation_len == u32::MAX {
@@ -140,16 +163,19 @@ impl BackupHeader {
         };
         Ok(BackupHeader {
             format_version,
-            size_gib,
-            wal_ratio,
-            metadata_ratio,
-            snapshot_ratio,
-            allocator_ratio,
-            reserved_ratio,
-            default_collation,
             page_size,
+            total_size,
+            wal_size,
+            data_size,
+            metadata_size,
+            allocator_size,
+            snapshot_size,
+            reserved_size,
+            default_collation,
             redo_start_lsn,
-            backup_end_lsn,
+            metadata_root,
+            last_committed_seq,
+            db_options,
             finished_at_millis,
             flags: BackupFlags {
                 checksum: flag_bits & 1 != 0,
@@ -157,6 +183,83 @@ impl BackupHeader {
             },
         })
     }
+}
+
+/// What a completed [`crate::storage::Storage::backup_full`] reports back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BackupSummary {
+    pub redo_start_lsn: u64,
+    pub backup_end_lsn: u64,
+    pub pages_copied: u64,
+    pub log_bytes: u64,
+    pub finished_at_millis: u64,
+}
+
+/// Encodes an allocation map: a `u64` run count, then `(start_page, count)`
+/// pairs.
+pub fn encode_alloc_map(runs: &[(u64, u64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + runs.len() * 16);
+    out.extend_from_slice(&(runs.len() as u64).to_le_bytes());
+    for (start, count) in runs {
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+    }
+    out
+}
+
+/// Decodes an allocation map produced by [`encode_alloc_map`].
+pub fn decode_alloc_map(payload: &[u8]) -> io::Result<Vec<(u64, u64)>> {
+    let mut cursor = Cursor {
+        bytes: payload,
+        pos: 0,
+    };
+    let count = cursor.u64()? as usize;
+    let mut runs = Vec::with_capacity(count);
+    for _ in 0..count {
+        let start = cursor.u64()?;
+        let run = cursor.u64()?;
+        runs.push((start, run));
+    }
+    Ok(runs)
+}
+
+/// Encodes a page-data run: the starting page number, then `page_bytes`
+/// (a whole number of pages).
+pub fn encode_page_run(start_page: u64, page_bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + page_bytes.len());
+    out.extend_from_slice(&start_page.to_le_bytes());
+    out.extend_from_slice(page_bytes);
+    out
+}
+
+/// Decodes a page-data run into `(start_page, page_count, page_bytes)`.
+pub fn decode_page_run(payload: &[u8]) -> io::Result<(u64, u64, &[u8])> {
+    if payload.len() < 8 {
+        return Err(corrupt("page run block too short"));
+    }
+    let start_page = u64::from_le_bytes(payload[..8].try_into().unwrap());
+    let bytes = &payload[8..];
+    if !bytes.len().is_multiple_of(PAGE_SIZE) {
+        return Err(corrupt("page run is not a whole number of pages"));
+    }
+    Ok((start_page, (bytes.len() / PAGE_SIZE) as u64, bytes))
+}
+
+/// Encodes a log chunk: the starting LSN, then the raw WAL bytes.
+pub fn encode_log_chunk(start_lsn: u64, bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + bytes.len());
+    out.extend_from_slice(&start_lsn.to_le_bytes());
+    out.extend_from_slice(bytes);
+    out
+}
+
+/// Decodes a log chunk into `(start_lsn, raw_bytes)`.
+pub fn decode_log_chunk(payload: &[u8]) -> io::Result<(u64, &[u8])> {
+    if payload.len() < 8 {
+        return Err(corrupt("log chunk block too short"));
+    }
+    let start_lsn = u64::from_le_bytes(payload[..8].try_into().unwrap());
+    Ok((start_lsn, &payload[8..]))
 }
 
 /// Writes framed, checksummed `TDBBAK1` blocks to an underlying writer.
@@ -293,7 +396,7 @@ impl Cursor<'_> {
             .pos
             .checked_add(n)
             .filter(|&e| e <= self.bytes.len())
-            .ok_or_else(|| corrupt("truncated backup header"))?;
+            .ok_or_else(|| corrupt("truncated backup block"))?;
         let slice = &self.bytes[self.pos..end];
         self.pos = end;
         Ok(slice)
@@ -307,9 +410,6 @@ impl Cursor<'_> {
     fn u64(&mut self) -> io::Result<u64> {
         Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
     }
-    fn f64(&mut self) -> io::Result<f64> {
-        Ok(f64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
 }
 
 #[cfg(test)]
@@ -319,16 +419,19 @@ mod tests {
     fn sample_header() -> BackupHeader {
         BackupHeader {
             format_version: FORMAT_VERSION,
-            size_gib: 4,
-            wal_ratio: 0.05,
-            metadata_ratio: 0.08,
-            snapshot_ratio: 0.02,
-            allocator_ratio: 0.02,
-            reserved_ratio: 0.17,
-            default_collation: Some("Finnish_Swedish_CI_AS".to_string()),
             page_size: 4096,
+            total_size: 1 << 30,
+            wal_size: 64 * 1024,
+            data_size: 512 * 1024,
+            metadata_size: 128 * 1024,
+            allocator_size: 4096,
+            snapshot_size: 8192,
+            reserved_size: 16384,
+            default_collation: Some("Finnish_Swedish_CI_AS".to_string()),
             redo_start_lsn: 12_345,
-            backup_end_lsn: 67_890,
+            metadata_root: 4096 * 40,
+            last_committed_seq: 7,
+            db_options: 0b01,
             finished_at_millis: 1_700_000_000_000,
             flags: BackupFlags {
                 checksum: true,
@@ -369,6 +472,32 @@ mod tests {
                 (BlockType::LogChunk, b"logbytes".to_vec()),
             ]
         );
+    }
+
+    #[test]
+    fn block_codecs_round_trip() {
+        let runs = vec![(0u64, 3u64), (7, 1), (100, 64)];
+        assert_eq!(decode_alloc_map(&encode_alloc_map(&runs)).unwrap(), runs);
+
+        let pages = vec![0x5au8; 2 * PAGE_SIZE];
+        let encoded_pages = encode_page_run(9, &pages);
+        let (start, count, bytes) = decode_page_run(&encoded_pages).unwrap();
+        assert_eq!((start, count), (9, 2));
+        assert_eq!(bytes, &pages[..]);
+
+        let log = b"raw-wal-entry-bytes";
+        let encoded_log = encode_log_chunk(4096, log);
+        let (lsn, bytes) = decode_log_chunk(&encoded_log).unwrap();
+        assert_eq!(lsn, 4096);
+        assert_eq!(bytes, log);
+    }
+
+    #[test]
+    fn a_partial_page_run_is_rejected() {
+        // 8-byte start prefix + 100 bytes: not a whole page.
+        let mut payload = 3u64.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0u8; 100]);
+        assert!(decode_page_run(&payload).is_err());
     }
 
     #[test]

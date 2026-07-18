@@ -575,6 +575,129 @@ impl Storage {
         self.lock().wal_tail()
     }
 
+    /// Online full backup: writes a self-describing `TDBBAK1` file at `dst`
+    /// capturing the database as of a consistent recovery point.
+    ///
+    /// The copy is fuzzy: pages are read in bounded chunks, each under the
+    /// storage lock but releasing it between chunks so writers proceed. A
+    /// truncation hold pins the WAL at `redo_start` for the duration, and the
+    /// log `[redo_start, backup_end)` is shipped into the backup. `backup_end`
+    /// is captured *after* the page copy, so it is at least the latest-change
+    /// LSN of every page copied; ARIES redo therefore heals every page image —
+    /// however stale, or with a future change already baked in — to the single
+    /// `backup_end` point on restore, then undoes the transactions in flight
+    /// there. `dst` is created; an existing file is truncated.
+    pub fn backup_full(&self, dst: &Path) -> Result<crate::backup::BackupSummary, StorageError> {
+        let plan = self.lock().begin_backup(true, false)?;
+        // The hold must be released on every path: a stale hold freezes WAL
+        // truncation for the life of the process.
+        let result = self.write_backup(dst, &plan);
+        self.lock().release_backup_hold();
+        result
+    }
+
+    fn write_backup(
+        &self,
+        dst: &Path,
+        plan: &BackupPlan,
+    ) -> Result<crate::backup::BackupSummary, StorageError> {
+        use crate::backup::{BlockType, encode_alloc_map, encode_log_chunk, encode_page_run};
+        let file = std::fs::File::create(dst)?;
+        let mut writer =
+            crate::backup::BackupWriter::new(std::io::BufWriter::new(file), &plan.header())?;
+        writer.write_block(BlockType::AllocMap, &encode_alloc_map(&plan.runs))?;
+
+        let mut pages_copied = 0u64;
+        let mut buf = vec![0u8; BACKUP_CHUNK_PAGES as usize * PAGE_SIZE];
+        for &(run_start, run_count) in &plan.runs {
+            let mut page = run_start;
+            let end = run_start + run_count;
+            while page < end {
+                let chunk = (end - page).min(BACKUP_CHUNK_PAGES);
+                let bytes = &mut buf[..chunk as usize * PAGE_SIZE];
+                self.lock()
+                    .read_pages_for_backup(page, chunk, bytes, plan.checksum)?;
+                writer.write_block(BlockType::PageData, &encode_page_run(page, bytes))?;
+                pages_copied += chunk;
+                page += chunk;
+            }
+        }
+
+        let (backup_end, log) = self.lock().ship_backup_log(plan.redo_start)?;
+        writer.write_block(
+            BlockType::LogChunk,
+            &encode_log_chunk(plan.redo_start, &log),
+        )?;
+        writer.finish()?;
+        Ok(crate::backup::BackupSummary {
+            redo_start_lsn: plan.redo_start,
+            backup_end_lsn: backup_end,
+            pages_copied,
+            log_bytes: log.len() as u64,
+            finished_at_millis: plan.finished_at_millis,
+        })
+    }
+
+    /// Offline restore: rebuilds a fresh database file at `dst_path` from the
+    /// `TDBBAK1` backup at `bak_path`, then opens it once to run ARIES recovery,
+    /// validating that the restored file is recoverable. `dst_path` must not
+    /// already exist.
+    pub fn restore_full(dst_path: &Path, bak_path: &Path) -> Result<(), StorageError> {
+        use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
+        assert_layout_invariants();
+        let reader = std::io::BufReader::new(std::fs::File::open(bak_path)?);
+        let (mut backup, header) = crate::backup::BackupReader::new(reader)?;
+        if header.page_size as usize != PAGE_SIZE {
+            return Err(StorageError::InvalidFile(
+                "backup page size mismatch".to_string(),
+            ));
+        }
+        let layout = layout_from_backup_header(&header);
+        let mut file = StorageFile::create_from_layout(
+            dst_path.to_path_buf(),
+            layout,
+            header.default_collation.clone(),
+        )?;
+
+        let mut runs: Vec<(u64, u64)> = Vec::new();
+        let mut log: Option<(u64, Vec<u8>)> = None;
+        while let Some((block_type, payload)) = backup.next_block()? {
+            match block_type {
+                BlockType::AllocMap => runs = decode_alloc_map(&payload)?,
+                BlockType::PageData => {
+                    let (start, count, bytes) = decode_page_run(&payload)?;
+                    file.restore_pages(start, count, bytes)?;
+                }
+                BlockType::LogChunk => {
+                    let (start_lsn, bytes) = decode_log_chunk(&payload)?;
+                    // One chunk today; multiple must be emitted contiguously in
+                    // LSN order so appending reconstructs the range.
+                    match &mut log {
+                        Some((_, acc)) => acc.extend_from_slice(bytes),
+                        None => log = Some((start_lsn, bytes.to_vec())),
+                    }
+                }
+                BlockType::Header | BlockType::Trailer => {}
+            }
+        }
+
+        file.restore_allocator_bitmap(&runs)?;
+        let backup_end = match &log {
+            Some((start_lsn, bytes)) => file.seed_ring(*start_lsn, bytes)?,
+            None => header.redo_start_lsn,
+        };
+        file.restore_superblock(&header, backup_end)?;
+        file.sync_file()?;
+        drop(file);
+
+        // Validate: opening reruns allocator recovery + ARIES relational
+        // recovery over the seeded ring, failing loudly if the restored file is
+        // not recoverable.
+        let storage = Storage::open(dst_path.to_path_buf())?;
+        drop(storage);
+        Ok(())
+    }
+
     /// Wedges the relational store after a durability (fsync) failure so no
     /// further op serves state the log does not back. See `ensure_rel_usable`.
     pub(crate) fn wedge(&self) {
@@ -4302,12 +4425,25 @@ impl StorageFile {
         wal_max_bytes: u64,
     ) -> Result<Self, StorageError> {
         let layout = compute_layout(opts.clone(), wal_min_bytes, wal_max_bytes)?;
+        Self::create_from_layout(path, layout, opts.default_collation)
+    }
+
+    /// Creates a fresh file with an explicit layout. The restore path
+    /// reconstructs the source's exact region sizes from the backup header
+    /// rather than recomputing them from ratios, so it lays regions back
+    /// byte-for-byte. Mirrors [`Self::create_new`] from
+    /// `validate_allocator_region` onward.
+    fn create_from_layout(
+        path: PathBuf,
+        layout: StorageLayout,
+        default_collation: Option<String>,
+    ) -> Result<Self, StorageError> {
         validate_allocator_region(&layout)?;
         let mut header = FileHeader::default();
         // Stamp the database's default collation into the file. Every character
         // column declared without an explicit COLLATE is keyed under it, so it
         // belongs to the data, not to whatever the config says at the next boot.
-        if let Some(name) = opts.default_collation.as_deref() {
+        if let Some(name) = default_collation.as_deref() {
             header
                 .set_default_collation(name)
                 .map_err(StorageError::InvalidConfig)?;
@@ -4799,14 +4935,11 @@ impl StorageFile {
     /// Registers an in-progress backup's `redo_start_lsn` as a truncation hold,
     /// so a concurrent checkpoint cannot reclaim log the backup still has to ship.
     /// Paired with [`Self::release_backup_hold`].
-    // `backup_full` (the next Stage 17 slice) is the caller.
-    #[allow(dead_code)]
     fn register_backup_hold(&mut self, redo_start_lsn: u64) {
         self.truncation_gate.backup = Some(redo_start_lsn);
     }
 
     /// Releases the backup truncation hold (the backup finished or failed).
-    #[allow(dead_code)]
     fn release_backup_hold(&mut self) {
         self.truncation_gate.backup = None;
     }
@@ -4973,6 +5106,225 @@ impl StorageFile {
         let offset = self.layout.data_offset + page * PAGE_SIZE as u64;
         self.file.read_page_into(offset, &mut frame)?;
         out.copy_from_slice(frame.as_slice());
+        Ok(())
+    }
+
+    // --- Backup / restore (Stage 17) ---
+
+    /// Captures a backup plan under the storage lock and registers the WAL
+    /// truncation hold. The caller MUST release the hold (via
+    /// [`Self::release_backup_hold`]) on every exit path once the backup
+    /// finishes or fails.
+    fn begin_backup(
+        &mut self,
+        checksum: bool,
+        copy_only: bool,
+    ) -> Result<BackupPlan, StorageError> {
+        self.ensure_rel_usable()?;
+        let redo_start = self.wal.head();
+        self.register_backup_hold(redo_start);
+
+        // The active superblock is the checkpoint whose head is redo_start, so
+        // its roots are the checkpoint-consistent state recovery redoes onto.
+        let (metadata_root, last_committed_seq, db_options) = {
+            let active = match self.active_superblock {
+                ActiveSuperblock::A => &self.superblock_a,
+                ActiveSuperblock::B => &self.superblock_b,
+            };
+            debug_assert_eq!(
+                redo_start, active.wal_head,
+                "redo_start must equal the active checkpoint's wal_head"
+            );
+            (
+                active.metadata_root,
+                active.last_committed_seq,
+                active.db_options(),
+            )
+        };
+
+        let mut runs = self.allocator.allocated_runs();
+        // The search-snapshot extent is a durable allocation (so allocated_runs
+        // includes it) but holds raw, non-page-formatted bytes. This slice does
+        // not preserve the search snapshot (Stage 19 retires it), so drop its
+        // extent from the backup rather than copy pages that would fail checksum
+        // verification and dangle unreferenced on restore.
+        if let Some(desc) = self.load_active_snapshot_descriptor()? {
+            let (start, pages) = self.descriptor_page_range(&desc)?;
+            runs = subtract_run(runs, start, pages);
+        }
+
+        Ok(BackupPlan {
+            layout: self.layout,
+            default_collation: self.default_collation.clone(),
+            redo_start,
+            metadata_root,
+            last_committed_seq,
+            db_options,
+            runs,
+            checksum,
+            copy_only,
+            finished_at_millis: now_millis(),
+        })
+    }
+
+    /// Reads `count` data pages starting at `start_page` into `out`, verifying
+    /// each page's checksum unless `checksum` is off (an all-zero page is an
+    /// unwritten allocation and always passes).
+    fn read_pages_for_backup(
+        &mut self,
+        start_page: u64,
+        count: u64,
+        out: &mut [u8],
+        checksum: bool,
+    ) -> Result<(), StorageError> {
+        debug_assert_eq!(out.len(), count as usize * PAGE_SIZE);
+        for i in 0..count as usize {
+            let page = start_page + i as u64;
+            let slot = &mut out[i * PAGE_SIZE..(i + 1) * PAGE_SIZE];
+            self.spill_read_page(page, slot)?;
+            if checksum
+                && !crate::relstore::page::is_zero_page(slot)
+                && !crate::relstore::page::verify_checksum(slot)
+            {
+                return Err(StorageError::InvalidFile(format!(
+                    "backup aborted: data page {page} failed checksum (corrupt source page)"
+                )));
+            }
+        }
+        Ok(())
+    }
+
+    /// Forces the log durable, captures `backup_end = tail`, and returns the raw
+    /// ring bytes for `[redo_start, backup_end)`. The physical copy handles the
+    /// ring wrap; the range never exceeds one ring lap (the truncation hold
+    /// keeps `tail - head <= wal_size`).
+    fn ship_backup_log(&mut self, redo_start: u64) -> Result<(u64, Vec<u8>), StorageError> {
+        self.wal.sync_all()?;
+        let backup_end = self.wal.tail();
+        debug_assert!(backup_end >= redo_start);
+        let len = backup_end - redo_start;
+        if len > self.layout.wal_size {
+            return Err(StorageError::WalFull(
+                "backup log range exceeds the WAL ring size".to_string(),
+            ));
+        }
+        let mut out = vec![0u8; len as usize];
+        if len > 0 {
+            let wal_offset = self.layout.wal_offset;
+            let wal_size = self.layout.wal_size;
+            let start_phys = redo_start % wal_size;
+            let first = ((wal_size - start_phys).min(len)) as usize;
+            self.wal
+                .file_mut()
+                .read_exact_at(wal_offset + start_phys, &mut out[..first])?;
+            if first < out.len() {
+                self.wal
+                    .file_mut()
+                    .read_exact_at(wal_offset, &mut out[first..])?;
+            }
+        }
+        Ok((backup_end, out))
+    }
+
+    /// Lays a run of page images back at their page numbers (restore).
+    fn restore_pages(
+        &mut self,
+        start_page: u64,
+        count: u64,
+        bytes: &[u8],
+    ) -> Result<(), StorageError> {
+        debug_assert_eq!(bytes.len(), count as usize * PAGE_SIZE);
+        for i in 0..count as usize {
+            let page = start_page + i as u64;
+            self.spill_write_page(page, &bytes[i * PAGE_SIZE..(i + 1) * PAGE_SIZE])?;
+        }
+        Ok(())
+    }
+
+    /// Rebuilds and persists the allocation bitmap from the shipped run list
+    /// (restore).
+    fn restore_allocator_bitmap(&mut self, runs: &[(u64, u64)]) -> Result<(), StorageError> {
+        let mut allocator = PageAllocator::new(self.layout.data_size);
+        for &(start, count) in runs {
+            allocator.mark_used(start, count);
+        }
+        let bitmap = allocator.persistable_bitmap();
+        if bitmap.len() as u64 > self.layout.allocator_size {
+            return Err(StorageError::InvalidFile(
+                "restored allocator bitmap exceeds allocator region".to_string(),
+            ));
+        }
+        self.file
+            .write_all_at(self.layout.allocator_offset, &bitmap)?;
+        self.allocator = allocator;
+        Ok(())
+    }
+
+    /// Writes the shipped WAL bytes into the ring at their physical positions,
+    /// handling the ring wrap (restore). Returns `start_lsn + bytes.len()`, the
+    /// restored `backup_end`.
+    fn seed_ring(&mut self, start_lsn: u64, bytes: &[u8]) -> Result<u64, StorageError> {
+        let wal_size = self.layout.wal_size;
+        if bytes.len() as u64 > wal_size {
+            return Err(StorageError::WalFull(
+                "restored log exceeds the WAL ring size".to_string(),
+            ));
+        }
+        if !bytes.is_empty() {
+            let wal_offset = self.layout.wal_offset;
+            let start_phys = start_lsn % wal_size;
+            let first = ((wal_size - start_phys) as usize).min(bytes.len());
+            self.file
+                .write_all_at(wal_offset + start_phys, &bytes[..first])?;
+            if first < bytes.len() {
+                self.file.write_all_at(wal_offset, &bytes[first..])?;
+            }
+        }
+        Ok(start_lsn + bytes.len() as u64)
+    }
+
+    /// Writes the restored superblock: the source's catalog root and options as
+    /// of `redo_start`, the ring bracketed at `[redo_start, backup_end)`. Slot A
+    /// is active; slot B is a valid lower-generation mirror. The search-related
+    /// roots are cleared — this slice does not restore the search snapshot.
+    fn restore_superblock(
+        &mut self,
+        header: &crate::backup::BackupHeader,
+        backup_end: u64,
+    ) -> Result<(), StorageError> {
+        let mut base = Superblock {
+            wal_head: header.redo_start_lsn,
+            wal_tail: backup_end,
+            last_committed_seq: header.last_committed_seq,
+            metadata_root: header.metadata_root,
+            ..Superblock::default()
+        };
+        base.set_db_options(header.db_options);
+
+        let mut a = base;
+        a.generation = 1;
+        a.active = SUPERBLOCK_ACTIVE_A;
+        a.checksum = a.compute_checksum();
+
+        let mut b = base;
+        b.generation = 0;
+        b.active = SUPERBLOCK_ACTIVE_B;
+        b.checksum = b.compute_checksum();
+
+        self.file.write_all_at(
+            self.layout.superblock_a_offset,
+            &a.to_le_bytes_with_checksum(),
+        )?;
+        self.file.write_all_at(
+            self.layout.superblock_b_offset,
+            &b.to_le_bytes_with_checksum(),
+        )?;
+        Ok(())
+    }
+
+    /// Fsyncs the restored file's data handle.
+    fn sync_file(&mut self) -> Result<(), StorageError> {
+        self.file.sync_data()?;
         Ok(())
     }
 
@@ -5585,6 +5937,109 @@ fn compute_layout(
         reserved_offset,
         reserved_size,
     })
+}
+
+/// Pages copied per storage-lock acquisition during a backup (1 MiB at 4 KiB
+/// pages): bounds both the lock hold and the in-flight copy buffer.
+const BACKUP_CHUNK_PAGES: u64 = 256;
+
+/// Everything captured under the storage lock at the start of a backup, so the
+/// bulk page copy can proceed while releasing the lock between chunks.
+struct BackupPlan {
+    layout: StorageLayout,
+    default_collation: Option<String>,
+    redo_start: u64,
+    metadata_root: u64,
+    last_committed_seq: u64,
+    db_options: u8,
+    runs: Vec<(u64, u64)>,
+    checksum: bool,
+    copy_only: bool,
+    finished_at_millis: u64,
+}
+
+impl BackupPlan {
+    fn header(&self) -> crate::backup::BackupHeader {
+        crate::backup::BackupHeader {
+            format_version: crate::backup::FORMAT_VERSION,
+            page_size: PAGE_SIZE as u32,
+            total_size: self.layout.total_size,
+            wal_size: self.layout.wal_size,
+            data_size: self.layout.data_size,
+            metadata_size: self.layout.metadata_size,
+            allocator_size: self.layout.allocator_size,
+            snapshot_size: self.layout.snapshot_size,
+            reserved_size: self.layout.reserved_size,
+            default_collation: self.default_collation.clone(),
+            redo_start_lsn: self.redo_start,
+            metadata_root: self.metadata_root,
+            last_committed_seq: self.last_committed_seq,
+            db_options: self.db_options,
+            finished_at_millis: self.finished_at_millis,
+            flags: crate::backup::BackupFlags {
+                checksum: self.checksum,
+                copy_only: self.copy_only,
+            },
+        }
+    }
+}
+
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Rebuilds a [`StorageLayout`] from a backup header's region sizes. The
+/// offsets follow the fixed region order (see [`compute_layout`]).
+fn layout_from_backup_header(header: &crate::backup::BackupHeader) -> StorageLayout {
+    let page = PAGE_SIZE as u64;
+    let wal_offset = page * 3;
+    let data_offset = wal_offset + header.wal_size;
+    let metadata_offset = data_offset + header.data_size;
+    let allocator_offset = metadata_offset + header.metadata_size;
+    let snapshot_offset = allocator_offset + header.allocator_size;
+    let reserved_offset = snapshot_offset + header.snapshot_size;
+    StorageLayout {
+        total_size: header.total_size,
+        header_offset: 0,
+        superblock_a_offset: page,
+        superblock_b_offset: page * 2,
+        wal_offset,
+        wal_size: header.wal_size,
+        data_offset,
+        data_size: header.data_size,
+        metadata_offset,
+        metadata_size: header.metadata_size,
+        allocator_offset,
+        allocator_size: header.allocator_size,
+        snapshot_offset,
+        snapshot_size: header.snapshot_size,
+        reserved_offset,
+        reserved_size: header.reserved_size,
+    }
+}
+
+/// Removes the page range `[start, start + len)` from a set of ascending,
+/// disjoint allocated runs, splitting a run that straddles it.
+fn subtract_run(runs: Vec<(u64, u64)>, start: u64, len: u64) -> Vec<(u64, u64)> {
+    let cut_end = start + len;
+    let mut out = Vec::with_capacity(runs.len());
+    for (run_start, run_count) in runs {
+        let run_end = run_start + run_count;
+        if run_end <= start || run_start >= cut_end {
+            out.push((run_start, run_count)); // disjoint
+            continue;
+        }
+        if run_start < start {
+            out.push((run_start, start - run_start)); // left remainder
+        }
+        if run_end > cut_end {
+            out.push((cut_end, run_end - cut_end)); // right remainder
+        }
+    }
+    out
 }
 
 #[cfg(test)]

@@ -112,8 +112,6 @@ impl PageAllocator {
     /// ascending order, excluding the temp/spill/version-store extents that a
     /// backup must NOT capture (they vanish on restart). This is both the set of
     /// pages a full backup copies and the allocation map a restore lays down.
-    // `backup_full` (the next Stage 17 slice) is the consumer.
-    #[allow(dead_code)]
     pub fn allocated_runs(&self) -> Vec<(u64, u64)> {
         let bitmap = self.persistable_bitmap();
         let mut runs = Vec::new();
