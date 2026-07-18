@@ -136,6 +136,15 @@ pub enum Statement {
         if_exists: bool,
         span: Span,
     },
+    /// `{ENABLE | DISABLE} TRIGGER {<name> | ALL} ON <table>` — flips a trigger's
+    /// disabled flag (a disabled trigger does not fire). `trigger` is `None` for
+    /// `ALL` (every trigger on the table).
+    SetTriggerState {
+        trigger: Option<Name>,
+        table: Name,
+        enable: bool,
+        span: Span,
+    },
     /// `CREATE|ALTER LOGIN <name> WITH PASSWORD = '<pw>'` or `ALTER LOGIN <name>
     /// {ENABLE | DISABLE}` — a SQL-authentication server login.
     CreateLogin(CreateLogin),
