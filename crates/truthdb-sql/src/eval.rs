@@ -112,6 +112,18 @@ pub struct EvalContext {
     pub last_error: i32,
     /// `@@NESTLEVEL` — the current procedure nesting depth (0 in a batch).
     pub nestlevel: i32,
+    /// Inside a trigger body: which columns the firing UPDATE/INSERT touched,
+    /// for `UPDATE(<col>)` and `COLUMNS_UPDATED()`. `None` outside a trigger.
+    pub updated_columns: Option<UpdatedColumns>,
+}
+
+/// The columns a trigger's firing statement touched: the parent table's column
+/// names and the 0-based indices that were set (the UPDATE `SET` list, or every
+/// inserted column for an INSERT; empty for a DELETE).
+#[derive(Clone, Debug)]
+pub struct UpdatedColumns {
+    pub columns: Vec<String>,
+    pub touched: std::collections::HashSet<usize>,
 }
 
 /// The object-permission enforcement subject for a session: whether it bypasses
@@ -450,6 +462,13 @@ fn eval_case_expr<R: ColumnResolver>(
 }
 
 #[inline(never)]
+fn trigger_function_outside_trigger() -> SqlError {
+    SqlError::message_only(
+        4101,
+        "UPDATE() and COLUMNS_UPDATED() may be used only inside a trigger body.".to_string(),
+    )
+}
+
 fn eval_call<R: ColumnResolver>(
     name: &str,
     args: &[Expr],
@@ -458,6 +477,49 @@ fn eval_call<R: ColumnResolver>(
     ctx: &EvalContext,
     depth: usize,
 ) -> SqlResult<SqlValue> {
+    // Trigger-only column-change functions. UPDATE(<col>) takes a column NAME
+    // (not a value), so it is handled before the arguments are evaluated.
+    if name.eq_ignore_ascii_case("UPDATE") {
+        let col = match args {
+            [arg] => match &arg.kind {
+                ExprKind::Column(n) => &n.value,
+                _ => {
+                    return Err(SqlError::message_only(
+                        174,
+                        "The UPDATE function requires one column-name argument.".to_string(),
+                    ));
+                }
+            },
+            _ => {
+                return Err(SqlError::message_only(
+                    174,
+                    "The UPDATE function requires one column-name argument.".to_string(),
+                ));
+            }
+        };
+        let u = ctx
+            .updated_columns
+            .as_ref()
+            .ok_or_else(trigger_function_outside_trigger)?;
+        let index = u
+            .columns
+            .iter()
+            .position(|c| c.eq_ignore_ascii_case(col))
+            .ok_or_else(|| SqlError::message_only(207, format!("Invalid column name '{col}'.")))?;
+        return Ok(SqlValue::Bool(u.touched.contains(&index)));
+    }
+    if name.eq_ignore_ascii_case("COLUMNS_UPDATED") {
+        let u = ctx
+            .updated_columns
+            .as_ref()
+            .ok_or_else(trigger_function_outside_trigger)?;
+        // A varbinary bitmask: column c (1-based) sets bit (c-1)%8 of byte (c-1)/8.
+        let mut bytes = vec![0u8; u.columns.len().div_ceil(8).max(1)];
+        for &i in &u.touched {
+            bytes[i / 8] |= 1 << (i % 8);
+        }
+        return Ok(SqlValue::Binary(bytes));
+    }
     // Session-context functions read the EvalContext, which the pure
     // functions::eval_function does not receive.
     if let Some(value) = eval_session_function(name, args) {

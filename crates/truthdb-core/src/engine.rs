@@ -6840,6 +6840,59 @@ mod tests {
     }
 
     #[test]
+    fn update_function_reports_touched_columns_in_a_trigger() {
+        let path = unique_temp_path("update-fn");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, a INT, b INT)")
+            .expect("t");
+        engine
+            .execute("CREATE TABLE tlog (which VARCHAR(20) NOT NULL PRIMARY KEY)")
+            .expect("tlog");
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER UPDATE AS IF UPDATE(a) INSERT INTO tlog VALUES ('a'); IF UPDATE(b) INSERT INTO tlog VALUES ('b')")
+            .expect("trigger");
+        engine
+            .execute("INSERT INTO t VALUES (1, 10, 20)")
+            .expect("seed");
+
+        // Update only column a: UPDATE(a) is true, UPDATE(b) is false.
+        engine
+            .execute("UPDATE t SET a = 99 WHERE id = 1")
+            .expect("update a");
+        assert_eq!(
+            sql_rows(&engine, "SELECT which FROM tlog ORDER BY which").1,
+            vec![vec![Some("a".into())]],
+            "only column a is reported updated"
+        );
+
+        // Now update column b: UPDATE(b) is true (a is not in this SET list).
+        engine
+            .execute("UPDATE t SET b = 30 WHERE id = 1")
+            .expect("update b");
+        assert_eq!(
+            sql_rows(&engine, "SELECT which FROM tlog ORDER BY which").1,
+            vec![vec![Some("a".into())], vec![Some("b".into())]],
+            "column b is now reported updated"
+        );
+
+        // Outside a trigger, UPDATE()/COLUMNS_UPDATED() error 4101.
+        assert_eq!(
+            sql_error_number(&engine, "SELECT UPDATE(a)"),
+            4101,
+            "UPDATE() outside a trigger errors"
+        );
+        assert_eq!(
+            sql_error_number(&engine, "SELECT COLUMNS_UPDATED()"),
+            4101,
+            "COLUMNS_UPDATED() outside a trigger errors"
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn instead_of_triggers_replace_the_dml() {
         let path = unique_temp_path("instead-of");
         let engine = new_engine(&path);
