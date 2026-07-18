@@ -6537,8 +6537,8 @@ mod tests {
     }
 
     #[test]
-    fn uncaught_trigger_error_aborts_the_rest_of_the_batch() {
-        let path = unique_temp_path("trg-uncaught-abort");
+    fn uncaught_trigger_error_dooms_so_later_writes_are_rejected() {
+        let path = unique_temp_path("trg-uncaught-doom");
         let engine = new_engine(&path);
         engine
             .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
@@ -6549,8 +6549,9 @@ mod tests {
         engine
             .execute("CREATE TRIGGER trg ON t AFTER INSERT AS RAISERROR('reject', 16, 1)")
             .expect("trigger");
-        // An uncaught trigger error in an explicit transaction aborts the batch:
-        // the statement after the failing INSERT must NOT run.
+        // An uncaught trigger error in an explicit transaction dooms it, so a
+        // later write in the same transaction is rejected (3930) — it cannot
+        // durably commit new work over the uncommittable transaction.
         let mut ctx = TxnContext::default();
         batch(
             &engine,
@@ -6562,7 +6563,36 @@ mod tests {
         assert_eq!(
             rows,
             vec![vec![Some("0".to_string())]],
-            "the batch must abort on the uncaught trigger error, not run the next INSERT"
+            "the doomed transaction must reject the later write, not commit it"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn doomed_transaction_catch_reaches_its_rollback_after_a_benign_error() {
+        let path = unique_temp_path("trg-catch-benign");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("t");
+        engine
+            .execute("CREATE TRIGGER trg ON t AFTER INSERT AS RAISERROR('reject', 16, 1)")
+            .expect("trigger");
+        // A trigger error dooms the explicit transaction and transfers to the
+        // CATCH. A benign statement-terminating error inside the CATCH (division
+        // by zero) must NOT abort the batch before the CATCH reaches its
+        // ROLLBACK — otherwise the uncommittable transaction is left open holding
+        // its locks (the wedge class). After the batch the transaction is closed.
+        let mut ctx = TxnContext::default();
+        batch(
+            &engine,
+            &mut ctx,
+            "BEGIN TRANSACTION; BEGIN TRY INSERT INTO t VALUES (1); END TRY \
+             BEGIN CATCH SELECT 1 / 0 AS x; IF XACT_STATE() <> 0 ROLLBACK; END CATCH",
+        );
+        assert!(
+            !ctx.has_open_transaction(),
+            "the CATCH must reach ROLLBACK despite the divide-by-zero; no wedged transaction"
         );
         let _ = std::fs::remove_file(path);
     }

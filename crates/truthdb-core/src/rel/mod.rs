@@ -1359,11 +1359,13 @@ fn statement_error_ladder(
     }
     // Other statements: a non-dooming in-transaction error rolls back only
     // the statement and the batch continues; a dooming one ends the batch
-    // (only ROLLBACK is then accepted, error 3930). A transaction ALREADY
-    // doomed (e.g. by an AFTER-trigger error, which SQL Server makes
-    // uncommittable regardless of the firing statement's severity) must not
-    // continue either — the batch ends.
-    if txn_ctx.in_txn() && !dooms && !txn_ctx.doomed {
+    // (only ROLLBACK is then accepted, error 3930). This must stay keyed on the
+    // ERROR (its severity / XACT_ABORT), NOT on whether the transaction is
+    // already doomed: a doomed transaction still runs a CATCH's reads and
+    // statement-terminating errors (division by zero, conversion) so the CATCH
+    // can reach `IF XACT_STATE() <> 0 ROLLBACK` — terminating the batch on those
+    // would leave the uncommittable transaction open holding its locks.
+    if txn_ctx.in_txn() && !dooms {
         run.abort_open_rowset(txn_ctx.in_txn());
         run.last_error = Some(error);
         return Ok(());
