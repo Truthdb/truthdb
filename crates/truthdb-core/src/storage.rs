@@ -645,7 +645,29 @@ impl Storage {
         checksum: bool,
         copy_only: bool,
     ) -> Result<crate::backup::BackupSummary, StorageError> {
-        self.lock().backup_log(dst, checksum, copy_only)
+        // Phase 1 (locked): capture the log range + header. The OLD marker still
+        // pins `[start, ...)`, so no checkpoint can truncate the range we are
+        // about to ship, even after we release the lock.
+        let (header, start, end, log) = self.lock().begin_log_backup(checksum, copy_only)?;
+        // Phase 2 (UNLOCKED): write and fsync the archive — including its parent
+        // directory — so concurrent DML proceeds during the copy-out (BACKUP LOG
+        // is online, like BACKUP DATABASE). On failure, release the single-flight
+        // guard without advancing the marker.
+        if let Err(e) = write_log_archive(dst, &header, start, &log) {
+            self.lock().cancel_log_backup();
+            return Err(e);
+        }
+        // Phase 3 (locked): the archive is durable — durably advance the marker
+        // and the hold, releasing `[start, end)` for reclamation. Copy-out
+        // strictly before truncate.
+        self.lock().finish_log_backup(end)?;
+        Ok(crate::backup::BackupSummary {
+            redo_start_lsn: start,
+            backup_end_lsn: end,
+            pages_copied: 0,
+            log_bytes: log.len() as u64,
+            finished_at_millis: header.finished_at_millis,
+        })
     }
 
     fn write_backup(
@@ -1878,6 +1900,10 @@ struct StorageFile {
     /// `last_log_backup_lsn`): the LSN up to which the log has been shipped to
     /// a log archive. `0` in the SIMPLE model / before the first log backup.
     last_log_backup_lsn: u64,
+    /// Single-flight guard: set for the duration of a `BACKUP LOG` (which
+    /// releases the storage lock while writing the archive), so a second one
+    /// cannot begin from the same marker and produce an overlapping archive.
+    log_backup_in_progress: bool,
     layout: StorageLayout,
     superblock_a: Superblock,
     superblock_b: Superblock,
@@ -4495,6 +4521,7 @@ impl StorageFile {
             wal,
             truncation_gate: LogTruncationGate::default(),
             last_log_backup_lsn,
+            log_backup_in_progress: false,
             layout,
             superblock_a,
             superblock_b,
@@ -4609,6 +4636,7 @@ impl StorageFile {
             wal,
             truncation_gate: LogTruncationGate::default(),
             last_log_backup_lsn: 0,
+            log_backup_in_progress: false,
             layout,
             superblock_a,
             superblock_b,
@@ -5408,34 +5436,37 @@ impl StorageFile {
         Ok(out)
     }
 
-    /// Ships the FULL-model log tail `[last_log_backup_lsn, tail)` to a
-    /// `TDBBAK1` log archive, then durably advances the marker and the hold —
-    /// copy-out strictly before truncate, so a crash after the archive write
-    /// but before the marker advance simply re-ships the (idempotent) range.
-    fn backup_log(
+    /// Phase 1 of `BACKUP LOG`: under the storage lock, capture the log range
+    /// `[last_log_backup_lsn, tail)` and its bytes plus the archive header. Does
+    /// NOT advance the marker or hold, so the old marker keeps pinning the range
+    /// while the caller writes the archive with the lock released. Returns
+    /// `(header, start, end, log_bytes)`. Requires the FULL recovery model.
+    fn begin_log_backup(
         &mut self,
-        dst: &Path,
         checksum: bool,
         copy_only: bool,
-    ) -> Result<crate::backup::BackupSummary, StorageError> {
-        use crate::backup::{BackupFlags, BackupHeader, BackupWriter, BlockType, encode_log_chunk};
+    ) -> Result<(crate::backup::BackupHeader, u64, u64, Vec<u8>), StorageError> {
         self.ensure_rel_usable()?;
         if !self.version.recovery_full {
             return Err(StorageError::InvalidConfig(
                 "BACKUP LOG requires the FULL recovery model".to_string(),
             ));
         }
+        if self.log_backup_in_progress {
+            return Err(StorageError::BackupInProgress);
+        }
         self.wal.sync_all()?;
         let start = self.last_log_backup_lsn;
         let end = self.wal.tail();
         debug_assert!(end >= start);
         let log = self.read_ring_range(start, end)?;
-        let finished_at_millis = now_millis();
-
-        // A log-only archive: no page/region data — the header carries the
-        // range start in `redo_start_lsn` and the `log_backup` flag; the end is
-        // derived from the LogChunk length on read.
-        let header = BackupHeader {
+        // Reserve the single-flight slot only after the fallible reads above, so
+        // a failure never strands the guard.
+        self.log_backup_in_progress = true;
+        // A log-only archive: no page/region data — the header carries the range
+        // start in `redo_start_lsn` and the `log_backup` flag; the end is derived
+        // from the LogChunk length on read.
+        let header = crate::backup::BackupHeader {
             format_version: crate::backup::FORMAT_VERSION,
             page_size: PAGE_SIZE as u32,
             total_size: 0,
@@ -5450,32 +5481,32 @@ impl StorageFile {
             metadata_root: 0,
             last_committed_seq: 0,
             db_options: self.version.options_byte(),
-            finished_at_millis,
-            flags: BackupFlags {
+            finished_at_millis: now_millis(),
+            flags: crate::backup::BackupFlags {
                 checksum,
                 copy_only,
                 log_backup: true,
             },
         };
-        // Write the archive fully and fsync it BEFORE advancing the marker.
-        let file = std::fs::File::create(dst)?;
-        let mut writer = BackupWriter::new(file, &header)?;
-        writer.write_block(BlockType::LogChunk, &encode_log_chunk(start, &log))?;
-        writer.finish()?.sync_all()?;
+        Ok((header, start, end, log))
+    }
 
-        // Copy-out done and durable → advance the persisted marker, then the
-        // in-memory marker and hold, so the ring may now reclaim `[start, end)`.
+    /// Phase 3 of `BACKUP LOG`: the archive at `end` is durable, so durably
+    /// advance the persisted marker then the in-memory marker and hold, letting
+    /// the ring reclaim `[old_marker, end)`. Clears the single-flight guard
+    /// first, so a persist failure still frees the next backup.
+    fn finish_log_backup(&mut self, end: u64) -> Result<(), StorageError> {
+        self.log_backup_in_progress = false;
         self.persist_last_log_backup_lsn(end)?;
         self.last_log_backup_lsn = end;
         self.register_log_backup_hold(end);
+        Ok(())
+    }
 
-        Ok(crate::backup::BackupSummary {
-            redo_start_lsn: start,
-            backup_end_lsn: end,
-            pages_copied: 0,
-            log_bytes: log.len() as u64,
-            finished_at_millis,
-        })
+    /// Aborts an in-progress `BACKUP LOG` (the archive write failed) without
+    /// advancing the marker.
+    fn cancel_log_backup(&mut self) {
+        self.log_backup_in_progress = false;
     }
 
     /// Lays a run of page images back at their page numbers (restore).
@@ -5552,6 +5583,11 @@ impl StorageFile {
             ..Superblock::default()
         };
         base.set_db_options(header.db_options);
+        // Seed the log-backup floor at the restore point (`backup_end`), not 0:
+        // a restored FULL-model database starts a fresh log chain here. Leaving
+        // it 0 would make the on-open log-backup hold sit BELOW wal_head, which
+        // `set_head` forbids (the floor can only move forward).
+        base.set_last_log_backup_lsn(backup_end);
 
         let mut a = base;
         a.generation = 1;
@@ -6301,6 +6337,38 @@ fn now_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
+}
+
+/// Writes a log-only `TDBBAK1` archive (one `LogChunk`) at `dst` and makes it
+/// FULLY durable — data, then the parent directory's entry — before returning.
+/// Called with the storage lock RELEASED. Directory durability matters because
+/// the caller then advances the log-backup marker, which makes the shipped log
+/// range reclaimable; if the archive's directory entry were not durable, a crash
+/// could reclaim the log while the only archive copy lost its name.
+fn write_log_archive(
+    dst: &Path,
+    header: &crate::backup::BackupHeader,
+    start: u64,
+    log: &[u8],
+) -> Result<(), StorageError> {
+    use crate::backup::{BackupWriter, BlockType, encode_log_chunk};
+    let file = std::fs::File::create(dst)?;
+    let mut writer = BackupWriter::new(file, header)?;
+    writer.write_block(BlockType::LogChunk, &encode_log_chunk(start, log))?;
+    writer.finish()?.sync_all()?;
+    fsync_parent_dir(dst)?;
+    Ok(())
+}
+
+/// Fsyncs the parent directory of `path` so a newly created file's name is
+/// durable (POSIX: `fsync` on a file does not persist its directory entry).
+fn fsync_parent_dir(path: &Path) -> Result<(), StorageError> {
+    let parent = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::File::open(parent)?.sync_all()?;
+    Ok(())
 }
 
 /// Rebuilds a [`StorageLayout`] from a backup header's region sizes. The

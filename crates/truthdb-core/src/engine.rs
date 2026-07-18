@@ -2076,6 +2076,62 @@ mod tests {
     }
 
     #[test]
+    fn restoring_a_full_recovery_database_opens_and_checkpoints_cleanly() {
+        let src = unique_temp_path("restore-full-src");
+        let bak = unique_temp_path("restore-full-bak");
+        let restored = unique_temp_path("restore-full-restored");
+        let trn = unique_temp_path("restore-full-trn");
+        let engine = new_engine(&src);
+        engine
+            .execute("ALTER DATABASE CURRENT SET RECOVERY FULL")
+            .expect("full");
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=30 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let expected = sql_rows(&engine, "SELECT id, v FROM t ORDER BY id").1;
+        engine
+            .storage()
+            .backup_full(&bak)
+            .expect("full backup of a FULL-model db");
+        drop(engine);
+
+        Storage::restore_full(&restored, &bak).expect("restore");
+        let engine2 = Engine::new(Storage::open(restored.clone()).expect("open")).expect("engine");
+        assert_eq!(
+            sql_rows(&engine2, "SELECT id, v FROM t ORDER BY id").1,
+            expected
+        );
+        // The restored DB is FULL and its log-backup floor is seeded at the
+        // restore point (backup_end), so the on-open hold sits at/above wal_head.
+        assert_eq!(
+            sql_rows(&engine2, "SELECT recovery_model_desc FROM sys.databases").1,
+            vec![vec![Some("FULL".into())]]
+        );
+        assert!(
+            engine2.storage().log_backup_hold().is_some(),
+            "FULL-model hold re-registered on the restored db"
+        );
+        // A checkpoint would panic (set_head with a floor below the head) if the
+        // marker had been left at 0 — the Fix-3 regression guard.
+        engine2
+            .storage()
+            .write_checkpoint(b"cp", 1, 2, 1)
+            .expect("checkpoint on the restored db");
+        // And BACKUP LOG works on the restored (fresh) log chain.
+        let lit = trn.to_str().unwrap().replace('\'', "''");
+        assert!(sql(&engine2, &format!("BACKUP LOG truthdb TO DISK = '{lit}'"))["error"].is_null());
+        drop(engine2);
+        for p in [src, bak, restored, trn] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    #[test]
     fn backup_log_requires_the_full_recovery_model() {
         let path = unique_temp_path("backuplog-simple");
         let engine = new_engine(&path);
