@@ -6755,6 +6755,102 @@ mod tests {
     }
 
     #[test]
+    fn user_scalar_function_works_in_all_query_clause_positions() {
+        let path = unique_temp_path("udf-clauses");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        for i in 1..=5 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        engine
+            .execute("CREATE FUNCTION dbo.dbl (@x INT) RETURNS INT AS BEGIN RETURN @x * 2 END")
+            .expect("create fn");
+
+        // ORDER BY a UDF (descending by dbl(id) == descending by id).
+        assert_eq!(
+            sql_rows(&engine, "SELECT id FROM t ORDER BY dbo.dbl(id) DESC").1,
+            vec![
+                vec![Some("5".into())],
+                vec![Some("4".into())],
+                vec![Some("3".into())],
+                vec![Some("2".into())],
+                vec![Some("1".into())],
+            ],
+            "UDF in ORDER BY"
+        );
+
+        // GROUP BY a UDF key: five distinct dbl(id) groups.
+        assert_eq!(
+            sql_rows(&engine, "SELECT COUNT(*) FROM t GROUP BY dbo.dbl(id)")
+                .1
+                .len(),
+            5,
+            "UDF in GROUP BY key"
+        );
+
+        // A UDF over an aggregate in the grouped SELECT list (dbl(count)=2 per id).
+        assert_eq!(
+            sql_rows(&engine, "SELECT dbo.dbl(COUNT(*)) FROM t GROUP BY id").1,
+            vec![vec![Some("2".into())]; 5],
+            "UDF over an aggregate in the grouped output"
+        );
+
+        // HAVING a UDF over the grouping column: dbl(id) > 6 keeps id 4 and 5.
+        assert_eq!(
+            sql_rows(
+                &engine,
+                "SELECT id FROM t GROUP BY id HAVING dbo.dbl(id) > 6 ORDER BY id"
+            )
+            .1,
+            vec![vec![Some("4".into())], vec![Some("5".into())]],
+            "UDF in HAVING"
+        );
+
+        // A UDF as an aggregate argument: SUM(dbl(id)) = 2*(1+2+3+4+5) = 30.
+        assert_eq!(
+            sql_rows(&engine, "SELECT SUM(dbo.dbl(id)) FROM t").1,
+            vec![vec![Some("30".into())]],
+            "UDF as an aggregate argument"
+        );
+
+        // A UDF in a join ON predicate: dbl(t.id) matches u.x for id 2 and 5.
+        engine
+            .execute("CREATE TABLE u (x INT NOT NULL PRIMARY KEY)")
+            .expect("create u");
+        engine.execute("INSERT INTO u VALUES (4)").expect("ins u");
+        engine.execute("INSERT INTO u VALUES (10)").expect("ins u");
+        assert_eq!(
+            sql_rows(
+                &engine,
+                "SELECT t.id FROM t JOIN u ON dbo.dbl(t.id) = u.x ORDER BY t.id"
+            )
+            .1,
+            vec![vec![Some("2".into())], vec![Some("5".into())]],
+            "UDF in join ON"
+        );
+
+        // A UDF in a CHECK constraint: dbl(v) <= 10 rejects v = 6 (dbl = 12) with 547.
+        engine
+            .execute("CREATE TABLE c (v INT CHECK (dbo.dbl(v) <= 10))")
+            .expect("create c");
+        engine
+            .execute("INSERT INTO c VALUES (5)")
+            .expect("dbl(5)=10 passes the check");
+        assert_eq!(
+            sql_error_number(&engine, "INSERT INTO c VALUES (6)"),
+            547,
+            "UDF in CHECK: dbl(6)=12 > 10 conflicts (547)"
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
     fn scalar_function_snapshot_scope_covers_body_reads() {
         // The snapshot-scope determination must recurse into a called UDF's
         // body exactly as lock analysis does: under SNAPSHOT isolation with
