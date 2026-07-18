@@ -942,6 +942,7 @@ impl Parser {
             }
             Some("FUNCTION") if !unique => self.parse_create_function(start, false),
             Some("TRIGGER") if !unique => self.parse_create_trigger(start, false),
+            Some("LOGIN") if !unique => self.parse_create_login(start, false),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1458,6 +1459,9 @@ impl Parser {
         if self.peek_keyword().as_deref() == Some("TRIGGER") {
             return self.parse_create_trigger(start, true);
         }
+        if self.peek_keyword().as_deref() == Some("LOGIN") {
+            return self.parse_create_login(start, true);
+        }
         self.expect_keyword("TABLE")?;
         let table = self.parse_name()?;
         let (action, end) = match self.peek_keyword().as_deref() {
@@ -1557,6 +1561,7 @@ impl Parser {
             Some("PROCEDURE") | Some("PROC") => self.parse_drop_procedure(start),
             Some("FUNCTION") => self.parse_drop_function(start),
             Some("TRIGGER") => self.parse_drop_trigger(start),
+            Some("LOGIN") => self.parse_drop_login(start),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1789,6 +1794,73 @@ impl Parser {
         };
         let name = self.parse_name()?;
         Ok(Statement::DropTrigger {
+            span: start.to(name.span),
+            name,
+            if_exists,
+        })
+    }
+
+    /// `CREATE|ALTER LOGIN <name> WITH PASSWORD = '<pw>'` or `ALTER LOGIN <name>
+    /// {ENABLE | DISABLE}`.
+    fn parse_create_login(&mut self, start: Span, alter: bool) -> SqlResult<Statement> {
+        self.bump(); // LOGIN
+        if self.in_procedure || self.in_function || self.in_table_function {
+            return Err(
+                SqlError::new(156, 15, 1, "Incorrect syntax near the keyword 'LOGIN'.").at(start),
+            );
+        }
+        if self.statement_index > 0 || self.sub_depth > 0 {
+            return Err(SqlError::new(
+                111,
+                15,
+                1,
+                "'CREATE/ALTER LOGIN' must be the first statement in a query batch.",
+            )
+            .at(start));
+        }
+        let name = self.parse_name()?;
+        let mut password = None;
+        let mut disable = None;
+        if alter
+            && matches!(
+                self.peek_keyword().as_deref(),
+                Some("ENABLE") | Some("DISABLE")
+            )
+        {
+            disable = Some(self.peek_keyword().as_deref() == Some("DISABLE"));
+            self.bump();
+        } else {
+            self.expect_keyword("WITH")?;
+            self.expect_keyword("PASSWORD")?;
+            self.expect(&TokenKind::Eq)?;
+            let token = self.peek().clone();
+            let TokenKind::String(pw) = &token.kind else {
+                return Err(SqlError::syntax(self.token_text(&token), token.span));
+            };
+            password = Some(pw.clone());
+            self.bump();
+        }
+        let span = start.to(self.prev_span());
+        Ok(Statement::CreateLogin(CreateLogin {
+            name,
+            password,
+            disable,
+            alter,
+            span,
+        }))
+    }
+
+    fn parse_drop_login(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // LOGIN
+        let if_exists = if self.peek_keyword().as_deref() == Some("IF") {
+            self.bump();
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_name()?;
+        Ok(Statement::DropLogin {
             span: start.to(name.span),
             name,
             if_exists,

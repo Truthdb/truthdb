@@ -17,8 +17,9 @@ pub struct Config {
 }
 
 /// TDS (SQL Server protocol) gateway settings. Disabled by default; when
-/// enabled it listens on `port` (default 1433) and authenticates against the
-/// `[tds.auth]` username→password map.
+/// enabled it listens on `port` (default 1433). Authentication is against
+/// catalog logins with salted PBKDF2 hashes, NOT this config: `[tds.auth]` only
+/// SEEDS logins into the catalog on the first boot (see [`Self::auth`]).
 #[derive(Debug, Deserialize)]
 pub struct TdsConfig {
     #[serde(default)]
@@ -33,6 +34,13 @@ pub struct TdsConfig {
     #[serde(default = "default_tds_database")]
     pub database: String,
 
+    /// First-boot seed only: `username = password` entries are hashed into
+    /// catalog logins the first time the server starts (and `sa` is always
+    /// ensured). The catalog is authoritative — this map is NEVER consulted for
+    /// authentication. Once the built-in `sa` login exists the seed is inert:
+    /// editing this map does not add, remove, or rotate a login; manage logins
+    /// with `CREATE`/`ALTER`/`DROP LOGIN`. (Dropping `sa` re-arms the seed on the
+    /// next start, recreating every configured login that is currently absent.)
     #[serde(default)]
     pub auth: HashMap<String, String>,
 

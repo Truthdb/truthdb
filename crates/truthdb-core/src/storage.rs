@@ -625,6 +625,36 @@ impl Storage {
         result
     }
 
+    // Logins do not participate in lock analysis, so — unlike table/proc DDL —
+    // they do not bump the lock-analysis epoch.
+    pub fn rel_create_login(
+        &self,
+        name: &str,
+        principal: crate::relstore::catalog::PrincipalDef,
+    ) -> Result<(), StorageError> {
+        self.lock().rel_create_login(name, principal)
+    }
+
+    pub fn rel_alter_login(
+        &self,
+        name: &str,
+        principal: crate::relstore::catalog::PrincipalDef,
+    ) -> Result<(), StorageError> {
+        self.lock().rel_alter_login(name, principal)
+    }
+
+    pub fn rel_drop_login(&self, name: &str) -> Result<bool, StorageError> {
+        self.lock().rel_drop_login(name)
+    }
+
+    pub fn rel_login(&self, name: &str) -> Option<TableDef> {
+        self.lock().rel_login(name)
+    }
+
+    pub fn rel_logins(&self) -> Vec<TableDef> {
+        self.lock().rel_logins()
+    }
+
     pub fn rel_table(&self, name: &str) -> Option<TableDef> {
         self.lock().rel_table(name)
     }
@@ -1441,6 +1471,7 @@ impl StorageFile {
                 procedure: None,
                 function: None,
                 trigger: None,
+                principal: None,
                 counter_page: Some(counter_page),
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1495,6 +1526,7 @@ impl StorageFile {
                 procedure: None,
                 function: None,
                 trigger: None,
+                principal: None,
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1545,6 +1577,7 @@ impl StorageFile {
                 procedure: Some(procedure),
                 function: None,
                 trigger: None,
+                principal: None,
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1596,6 +1629,7 @@ impl StorageFile {
                 procedure: None,
                 function: Some(function),
                 trigger: None,
+                principal: None,
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1712,6 +1746,7 @@ impl StorageFile {
                 procedure: None,
                 function: None,
                 trigger: Some(trigger),
+                principal: None,
                 counter_page: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
@@ -1749,6 +1784,114 @@ impl StorageFile {
         })?;
         self.rel.tables.insert(name.to_string(), def);
         Ok(())
+    }
+
+    /// Creates a server login: a catalog row (its own object_id, like a
+    /// procedure) carrying the hashed password, routed into the principals map
+    /// so it never enters the object namespace.
+    pub fn rel_create_login(
+        &mut self,
+        name: &str,
+        principal: crate::relstore::catalog::PrincipalDef,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        let key = name.to_ascii_lowercase();
+        if self.rel.principals.contains_key(&key) {
+            return Err(StorageError::Constraint(format!(
+                "login '{name}' already exists"
+            )));
+        }
+        if self.rel.catalog_root.is_none() {
+            let root = {
+                let mut ctx = self.rel_ctx();
+                catalog::create_catalog(&mut ctx)?
+            };
+            self.rel.catalog_root = Some(root);
+        }
+        let catalog_root = self.rel.catalog_root.expect("catalog exists");
+        let object_id = self.rel.next_object_id;
+        let login_name = name.to_string();
+        let def = self.rel_statement(move |ctx, txn| {
+            let def = TableDef {
+                object_id,
+                name: login_name,
+                columns: Vec::new(),
+                key_columns: Vec::new(),
+                root_page: 0,
+                defaults: Vec::new(),
+                collations: Vec::new(),
+                identity: None,
+                indexes: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                view_query: None,
+                procedure: None,
+                function: None,
+                trigger: None,
+                principal: Some(principal),
+                counter_page: None,
+            };
+            catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
+            Ok(def)
+        })?;
+        self.rel.next_object_id += 1;
+        self.rel.principals.insert(key, def);
+        Ok(())
+    }
+
+    /// Replaces a login's payload (`ALTER LOGIN` — new password or enable/
+    /// disable). The name (and object_id) is preserved.
+    pub fn rel_alter_login(
+        &mut self,
+        name: &str,
+        principal: crate::relstore::catalog::PrincipalDef,
+    ) -> Result<(), StorageError> {
+        self.ensure_rel_usable()?;
+        let key = name.to_ascii_lowercase();
+        let Some(existing) = self.rel.principals.get(&key) else {
+            return Err(StorageError::Constraint(format!(
+                "login '{name}' does not exist"
+            )));
+        };
+        let mut def = existing.clone();
+        def.principal = Some(principal);
+        let catalog_root = self.rel.catalog_root.expect("logins live in the catalog");
+        let write = def.clone();
+        self.rel_statement(move |ctx, txn| {
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &write)?;
+            Ok(())
+        })?;
+        self.rel.principals.insert(key, def);
+        Ok(())
+    }
+
+    /// Drops a login. Returns false if it does not exist.
+    pub fn rel_drop_login(&mut self, name: &str) -> Result<bool, StorageError> {
+        self.ensure_rel_usable()?;
+        let key = name.to_ascii_lowercase();
+        let Some(def) = self.rel.principals.get(&key).cloned() else {
+            return Ok(false);
+        };
+        let Some(catalog_root) = self.rel.catalog_root else {
+            return Ok(false);
+        };
+        self.rel_statement(move |ctx, txn| {
+            catalog::delete_table(ctx, &mut OpMode::Txn(txn), catalog_root, def.object_id)
+        })?;
+        self.rel.principals.remove(&key);
+        Ok(true)
+    }
+
+    /// A login's definition, by (case-insensitive) name.
+    pub fn rel_login(&self, name: &str) -> Option<TableDef> {
+        self.rel.principals.get(&name.to_ascii_lowercase()).cloned()
+    }
+
+    /// All logins, ordered by object id (for sys.server_principals).
+    pub fn rel_logins(&self) -> Vec<TableDef> {
+        let mut defs: Vec<TableDef> = self.rel.principals.values().cloned().collect();
+        defs.sort_by_key(|d| d.object_id);
+        defs
     }
 
     /// The table's definition (schema and layout), if it exists.
@@ -3582,8 +3725,9 @@ impl StorageFile {
             rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &roots)?;
             self.reload_catalog()?;
         }
-        // Object ids are shared by tables and their secondary indexes, so the
-        // next id must clear both (an index can outrank every table).
+        // Object ids are shared by tables, their secondary indexes, and logins
+        // (principals draw from the same counter), so the next id must clear all
+        // three — an index or a login can outrank every table.
         self.rel.next_object_id = self
             .rel
             .tables
@@ -3592,6 +3736,7 @@ impl StorageFile {
                 std::iter::once(def.object_id)
                     .chain(def.indexes.iter().map(|index| index.object_id))
             })
+            .chain(self.rel.principals.values().map(|def| def.object_id))
             .map(|object_id| object_id + 1)
             .max()
             .unwrap_or(FIRST_USER_OBJECT_ID)
@@ -3603,16 +3748,26 @@ impl StorageFile {
     fn reload_catalog(&mut self) -> Result<(), StorageError> {
         let Some(root) = self.rel.catalog_root else {
             self.rel.tables.clear();
+            self.rel.principals.clear();
             return Ok(());
         };
         let defs = {
             let mut ctx = self.rel_ctx();
             catalog::load_tables(&mut ctx, root)?
         };
-        self.rel.tables = defs
-            .into_iter()
-            .map(|def| (def.name.clone(), def))
-            .collect();
+        self.rel.tables.clear();
+        self.rel.principals.clear();
+        for def in defs {
+            if def.is_login() {
+                // Logins live in their own map, keyed case-insensitively — never
+                // in the object namespace.
+                self.rel
+                    .principals
+                    .insert(def.name.to_ascii_lowercase(), def);
+            } else {
+                self.rel.tables.insert(def.name.clone(), def);
+            }
+        }
         Ok(())
     }
 

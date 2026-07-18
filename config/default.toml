@@ -38,5 +38,11 @@ snapshot_wal_threshold = 0.7
 # tls_cert = "/etc/truthdb/tls.crt"
 # tls_key = "/etc/truthdb/tls.key"
 #
-# [tds.auth]           # username = password (send it over TLS: see encryption)
+# [tds.auth]  — FIRST-BOOT SEED ONLY. These username = password entries are
+# hashed into catalog logins the first time the server starts; the catalog is
+# then authoritative and is never consulted from this file for authentication.
+# Once the built-in sa login exists this section is inert (editing it does not
+# add, remove, or rotate a login — use CREATE/ALTER/DROP LOGIN). If no sa is set
+# here, an sa login is still created but DISABLED. Send passwords over TLS: see
+# encryption above.
 # sa = "change-me"

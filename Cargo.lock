@@ -1195,6 +1195,7 @@ dependencies = [
  "icu_locale_core",
  "io-uring",
  "libc",
+ "ring",
  "rstest",
  "serde",
  "serde_json",

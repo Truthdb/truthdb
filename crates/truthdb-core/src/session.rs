@@ -586,6 +586,13 @@ enum EngineCall {
         command: String,
         reply: oneshot::Sender<Result<String, EngineError>>,
     },
+    /// A session-less catalog read: fetch a login's credential for the TDS
+    /// handshake, which runs BEFORE any session/transaction exists. The reply
+    /// carries only the stored blob — PBKDF2 verification runs off the worker.
+    LookupLogin {
+        name: String,
+        reply: oneshot::Sender<Option<LoginRecord>>,
+    },
     CloseSession {
         session: SessionId,
     },
@@ -701,6 +708,18 @@ impl Drop for HandleToken {
     fn drop(&mut self) {
         self.0.close();
     }
+}
+
+/// A login's stored authentication data, read by the TDS handshake before any
+/// session exists. The credential is verified in the TDS task (off the worker
+/// pool) so a ~30 ms PBKDF2 does not occupy a worker thread.
+#[derive(Debug, Clone)]
+pub struct LoginRecord {
+    pub principal_id: u32,
+    /// The stored login name in its canonical casing (for `SUSER_SNAME()`).
+    pub name: String,
+    pub password_blob: String,
+    pub is_disabled: bool,
 }
 
 /// A cloneable handle to the engine's worker pool. Cheap to clone (shares the
@@ -933,6 +952,14 @@ impl EngineHandle {
         let (reply, rx) = oneshot::channel();
         self.inbox.send(EngineCall::RunNative { command, reply });
         rx.await.map_err(|_| EngineError::Unavailable)?
+    }
+
+    /// Fetches a login's stored credential for the TDS handshake. Returns
+    /// `None` if the login does not exist or the worker pool is gone.
+    pub async fn lookup_login(&self, name: String) -> Option<LoginRecord> {
+        let (reply, rx) = oneshot::channel();
+        self.inbox.send(EngineCall::LookupLogin { name, reply });
+        rx.await.ok().flatten()
     }
 
     /// Closes a session (rolling back any open transaction — later milestone).
@@ -1236,6 +1263,9 @@ fn worker_loop(shared: &Arc<Shared>) {
             }) => dispatch_rpc(shared, session, command, cancel, reply),
             Work::Call(EngineCall::RunNative { command, reply }) => {
                 let _ = reply.send(shared.engine.execute(&command));
+            }
+            Work::Call(EngineCall::LookupLogin { name, reply }) => {
+                let _ = reply.send(shared.engine.lookup_login(&name));
             }
             Work::Call(EngineCall::CloseSession { session }) => {
                 shared

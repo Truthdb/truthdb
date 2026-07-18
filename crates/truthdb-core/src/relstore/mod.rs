@@ -40,6 +40,11 @@ pub(crate) struct RelState {
     pub catalog_root: Option<u64>,
     /// Catalog cache: table name -> definition.
     pub tables: HashMap<String, TableDef>,
+    /// Server logins (principals), keyed by lowercased login name. Persisted in
+    /// the SAME catalog b-tree as `tables` (a row with `principal: Some(..)`),
+    /// but partitioned into a separate map on load so a login never enters the
+    /// object namespace (name resolution, sys.tables, DROP TABLE).
+    pub principals: HashMap<String, TableDef>,
     pub next_txn_id: u64,
     pub next_object_id: u32,
     /// Open explicit (multi-statement) transactions: txn id → its `BEGIN` LSN.
@@ -58,6 +63,7 @@ impl RelState {
             dpt: HashMap::new(),
             catalog_root: None,
             tables: HashMap::new(),
+            principals: HashMap::new(),
             next_txn_id: 1,
             next_object_id: FIRST_USER_OBJECT_ID,
             active_txn_begins: std::collections::BTreeMap::new(),

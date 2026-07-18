@@ -1,11 +1,12 @@
 //! TDS connection handler: PRELOGIN -> LOGIN7 (auth) -> SQLBatch loop.
 
-use std::collections::HashMap;
+use std::net::IpAddr;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::mpsc;
+use truthdb_core::auth;
 use truthdb_core::engine::EngineError;
 use truthdb_core::rel::ResultColumn;
 use truthdb_core::session::{BatchEvent, EngineHandle, PreparedRpc, SessionId};
@@ -17,6 +18,7 @@ use crate::packet::{
     read_message, write_message,
 };
 use crate::rpc::{self, RpcProc};
+use crate::throttle::{self, LoginThrottle};
 use crate::token;
 
 /// How many bytes of encoded rows may build up before the buffer is handed to
@@ -44,12 +46,12 @@ pub enum Encryption {
     Required,
 }
 
-/// Server-side TDS configuration: the login users, the reported database,
-/// optional TLS, and the encryption policy.
+/// Server-side TDS configuration: the reported database, optional TLS, and the
+/// encryption policy. Login credentials no longer live here — authentication is
+/// against catalog logins (see [`crate::throttle`] and `serve_connection`); the
+/// config's `[tds.auth]` users are migrated into the catalog at first boot.
 #[derive(Debug, Clone)]
 pub struct TdsConfig {
-    /// username -> password (plaintext config auth for Stage 4).
-    pub users: HashMap<String, String>,
     /// The single database name reported to clients.
     pub database: String,
     /// TLS certificate/key. When present, the server offers encryption to
@@ -67,6 +69,8 @@ pub async fn serve_connection<S>(
     mut stream: S,
     engine: EngineHandle,
     config: Arc<TdsConfig>,
+    throttle: LoginThrottle,
+    peer: IpAddr,
 ) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
@@ -123,20 +127,43 @@ where
     }
     let login = parse_login7(&login_msg.payload).map_err(|e| protocol_err(e.0))?;
 
-    if !authenticate(&config, &login.username, &login.password) {
-        let mut out = Vec::new();
-        // 18456: login failed for user.
-        token::error(
-            &mut out,
-            18456,
-            1,
-            14,
-            &format!("Login failed for user '{}'.", login.username),
-        );
-        token::done(&mut out, false, true, false, None, 0);
-        write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
-        return Ok(());
+    // Catalog-backed authentication. The throttle counts this attempt up front
+    // (atomically, so a parallel burst cannot slip past the free window) and
+    // either imposes a growing delay or, past a hard cap, refuses without
+    // checking the credential. The PBKDF2 verification then runs off both the
+    // reactor and the engine worker pool (`spawn_blocking`). Not-found, disabled
+    // and bad-password all fail identically — same wire response AND same CPU
+    // time (a dummy hash is verified when the login is absent) — so nothing
+    // reveals which usernames exist.
+    match throttle.note_attempt(&login.username, peer) {
+        throttle::Decision::Reject => {
+            deny_login(&mut stream, &login.username, packet_size).await?;
+            return Ok(());
+        }
+        throttle::Decision::Proceed(delay) => {
+            if !delay.is_zero() {
+                tokio::time::sleep(delay).await;
+            }
+        }
     }
+    let record = engine.lookup_login(login.username.clone()).await;
+    let blob = record
+        .as_ref()
+        .map(|rec| rec.password_blob.clone())
+        .unwrap_or_else(|| auth::DUMMY_BLOB.to_string());
+    let password = login.password.clone();
+    let verified = tokio::task::spawn_blocking(move || auth::verify_password(&blob, &password))
+        .await
+        .map_err(|_| protocol_err("password verification task panicked"))?;
+    let canonical_login = match &record {
+        Some(rec) if !rec.is_disabled && verified == auth::VerifyOutcome::Ok => rec.name.clone(),
+        _ => {
+            // The attempt was already counted by note_attempt above.
+            deny_login(&mut stream, &login.username, packet_size).await?;
+            return Ok(());
+        }
+    };
+    throttle.record_success(&login.username, peer);
 
     // Negotiate packet size if the client requested a valid one.
     let requested = login.packet_size as usize;
@@ -168,12 +195,32 @@ where
     // Each connection gets an engine-side session; it is closed (rolling back
     // any open transaction) whenever the connection ends, cleanly or not. The
     // database and login are recorded for session intrinsics (DB_NAME() etc.).
-    let session = engine
-        .open_session(database.clone(), login.username.clone())
-        .await;
+    let session = engine.open_session(database.clone(), canonical_login).await;
     let result = request_loop(&mut stream, &engine, session, packet_size).await;
     engine.close_session(session);
     result
+}
+
+/// Writes the single generic login-failure response: error 18456, level 14,
+/// state 1, and a DONE. Every failure kind (unknown login, wrong password,
+/// disabled, throttle lockout) uses this exact response so nothing on the wire
+/// distinguishes them — SQL Server sanitizes the state to 1 for the same reason
+/// (a client must not be able to enumerate valid usernames).
+async fn deny_login<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    username: &str,
+    packet_size: usize,
+) -> io::Result<()> {
+    let mut out = Vec::new();
+    token::error(
+        &mut out,
+        18456,
+        1,
+        14,
+        &format!("Login failed for user '{username}'."),
+    );
+    token::done(&mut out, false, true, false, None, 0);
+    write_message(stream, PKT_TABULAR_RESULT, &out, packet_size).await
 }
 
 async fn request_loop<S>(
@@ -378,13 +425,6 @@ fn isolation_set_clause(isolation: u8) -> Option<&'static str> {
         // 0 (unspecified) keeps the default.
         _ => None,
     }
-}
-
-fn authenticate(config: &TdsConfig, username: &str, password: &str) -> bool {
-    config
-        .users
-        .get(username)
-        .is_some_and(|expected| expected == password)
 }
 
 /// Waits for a cancelled batch to finish, discarding the rest of its reply.
