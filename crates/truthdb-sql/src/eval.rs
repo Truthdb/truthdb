@@ -90,6 +90,9 @@ pub struct EvalContext {
     /// `IS_ROLEMEMBER`. Separate from `server_roles` so the two role namespaces
     /// do not cross-answer.
     pub db_roles: std::collections::HashSet<String>,
+    /// Object-permission enforcement subject for this session (bypass flag +
+    /// the principal_ids a grant may match). Computed once per batch.
+    pub security: SecurityContext,
     /// The session process id — `@@SPID`.
     pub spid: i32,
     /// Rows affected/returned by the session's previous statement —
@@ -109,6 +112,17 @@ pub struct EvalContext {
     pub last_error: i32,
     /// `@@NESTLEVEL` — the current procedure nesting depth (0 in a batch).
     pub nestlevel: i32,
+}
+
+/// The object-permission enforcement subject for a session: whether it bypasses
+/// checks (a trusted/internal connection, a sysadmin, or dbo/db_owner), and the
+/// set of principal_ids a `GRANT`/`DENY` may match (the database user, its
+/// effective roles, and `public`). Computed once per batch from the session
+/// identity; read at the read/DML/EXECUTE choke points.
+#[derive(Debug, Clone, Default)]
+pub struct SecurityContext {
+    pub bypass: bool,
+    pub principals: std::collections::HashSet<u32>,
 }
 
 /// The error captured by a `CATCH` block, surfaced by the `ERROR_*()`

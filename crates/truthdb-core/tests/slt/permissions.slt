@@ -1,0 +1,53 @@
+# Stage 16 object permissions: the GRANT/DENY/REVOKE surface and the
+# sys.database_permissions catalog view. The slt harness runs as sa/dbo, which
+# bypasses enforcement, so the ENFORCEMENT behaviour (a restricted user denied a
+# read, DENY beating GRANT, ownership chaining) is pinned in the engine tests;
+# here we pin the DDL and the catalog view.
+
+statement ok
+CREATE TABLE t (id INT NOT NULL PRIMARY KEY)
+
+statement ok
+CREATE USER appuser
+
+# GRANT and DENY produce catalog rows.
+statement ok
+GRANT SELECT, INSERT ON t TO appuser
+
+statement ok
+DENY DELETE ON t TO appuser
+
+query TT
+SELECT permission_name, state_desc FROM sys.database_permissions WHERE grantee_principal_id = (SELECT principal_id FROM sys.database_principals WHERE name = 'appuser') ORDER BY permission_name
+----
+DELETE DENY
+INSERT GRANT
+SELECT GRANT
+
+# REVOKE removes an entry.
+statement ok
+REVOKE INSERT ON t FROM appuser
+
+query TT
+SELECT permission_name, state_desc FROM sys.database_permissions WHERE grantee_principal_id = (SELECT principal_id FROM sys.database_principals WHERE name = 'appuser') ORDER BY permission_name
+----
+DELETE DENY
+SELECT GRANT
+
+# GRANT to public is allowed.
+statement ok
+GRANT SELECT ON t TO public
+
+# GRANT on a non-existent object errors.
+statement error
+GRANT SELECT ON no_such_table TO appuser
+
+# GRANT to a non-existent principal errors.
+statement error
+GRANT SELECT ON t TO no_such_user
+
+statement ok
+DROP TABLE t
+
+statement ok
+DROP USER appuser

@@ -141,6 +141,50 @@ pub struct TableDef {
     /// `None` for every schema object.
     #[serde(default)]
     pub principal: Option<PrincipalDef>,
+    /// Object-level permissions (`GRANT`/`DENY` … `ON <this object>`), one entry
+    /// per (grantee, action, state). Rides the object's catalog row, so it is
+    /// WAL-durable, reloads with the object, and is dropped when the object is
+    /// dropped. Empty for a freshly created object.
+    #[serde(default)]
+    pub permissions: Vec<PermissionEntry>,
+}
+
+/// A privilege on a securable, per SQL Server's object permissions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PermAction {
+    Select,
+    Insert,
+    Update,
+    Delete,
+    Execute,
+    References,
+    Alter,
+}
+
+impl PermAction {
+    /// The SQL Server permission name (`sys.database_permissions.permission_name`).
+    pub fn name(self) -> &'static str {
+        match self {
+            PermAction::Select => "SELECT",
+            PermAction::Insert => "INSERT",
+            PermAction::Update => "UPDATE",
+            PermAction::Delete => "DELETE",
+            PermAction::Execute => "EXECUTE",
+            PermAction::References => "REFERENCES",
+            PermAction::Alter => "ALTER",
+        }
+    }
+}
+
+/// One `GRANT`/`DENY` of an action on the object to a principal. `REVOKE`
+/// removes the matching entry; a `DENY` (`deny = true`) beats a `GRANT`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PermissionEntry {
+    /// The principal_id the grant/deny is to (a user, role, or `public`).
+    pub grantee: u32,
+    pub action: PermAction,
+    /// `true` = DENY, `false` = GRANT.
+    pub deny: bool,
 }
 
 /// Which kind of principal a [`PrincipalDef`] describes. `Login` is the default
