@@ -9,6 +9,7 @@ use thiserror::Error;
 
 pub mod framing;
 pub mod handshake;
+pub mod server;
 
 /// Replication protocol version. Bumped on any incompatible wire change.
 pub const REPL_PROTOCOL_VERSION: u32 = 1;
