@@ -2404,6 +2404,19 @@ mod tests {
             "checkpoint is refused on a standby"
         );
 
+        // A standby is read-only: a local client write is rejected (it would
+        // append to the replica's own WAL and diverge it from the primary).
+        let write = sql(&standby2, "INSERT INTO t VALUES (999, 999)");
+        assert!(
+            !write["error"].is_null(),
+            "a local write on a standby is rejected: {write}"
+        );
+        assert_eq!(
+            sql_rows(&standby2, "SELECT COUNT(*) FROM t").1,
+            vec![vec![Some("25".into())]],
+            "the rejected write left the standby unchanged"
+        );
+
         drop(primary);
         drop(standby2);
         drop(r);

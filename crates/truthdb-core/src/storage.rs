@@ -4774,6 +4774,11 @@ impl StorageFile {
         // do not undo in-flight transactions, which the primary will commit and
         // whose continuation resumes above this standby's applied point.
         let redo_only = storage.active_sb().is_standby();
+        // A standby is read-only until promotion: it appends nothing to its own
+        // WAL (only the primary's log, via apply_wal_stream). Set before
+        // recover_rel — which for a standby is redo-only and never appends, so
+        // this blocks only later local writes.
+        storage.wal.set_read_only(redo_only);
         storage.recover_rel(stop_at, redo_only)?;
         Ok(storage)
     }
@@ -5871,6 +5876,16 @@ impl StorageFile {
                  must checkpoint to reclaim ring space (not yet automatic)"
                     .to_string(),
             ));
+        }
+
+        // 0. Persist the standby flag BEFORE seeding any bytes (on the first
+        //    apply). Otherwise a crash between the seed's fsync and the tail
+        //    commit would reopen as a normal database and ARIES-undo the shipped
+        //    in-flight records — the very divergence this mode prevents. Once the
+        //    flag is durable, a crash anywhere reopens redo-only.
+        if !self.active_sb().is_standby() {
+            self.commit_superblock(|sb| sb.set_standby(true))?;
+            self.wal.set_read_only(true);
         }
 
         // 1. Place the bytes in the ring and fsync BEFORE recording the advanced
