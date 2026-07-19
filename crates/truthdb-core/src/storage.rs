@@ -1509,9 +1509,12 @@ impl Storage {
     /// primary ships `read_wal_range` output at a flushed watermark).
     ///
     /// Redo only — no analysis or undo (those need the whole log and mutate the
-    /// WAL); in-flight transactions are resolved at promotion, not here. The
-    /// standby never appends its own log, so the in-memory WAL tail is left where
-    /// it is; only the persisted superblock tail advances (re-derived on reopen).
+    /// WAL); in-flight transactions are resolved at promotion, not here. So a
+    /// shipped range ending mid-transaction leaves that transaction's rows
+    /// applied but uncommitted: a plain standby `SELECT` can read them (a
+    /// read-uncommitted anomaly). Serving consistent snapshot reads at the last
+    /// applied commit is the readable-standby slice; until then a standby is a
+    /// failover target, not a query replica.
     pub fn apply_wal_stream(&self, from_lsn: u64, bytes: &[u8]) -> Result<(), StorageError> {
         self.lock().apply_wal_stream_locked(from_lsn, bytes)
     }
@@ -4766,8 +4769,12 @@ impl StorageFile {
         }
 
         // ARIES restart for the relational store: analysis + redo, catalog
-        // reload, undo of losers with compensation logging.
-        storage.recover_rel(stop_at)?;
+        // reload, undo of losers with compensation logging. A standby (one that
+        // has applied a live WAL stream) recovers REDO-ONLY — repeat history but
+        // do not undo in-flight transactions, which the primary will commit and
+        // whose continuation resumes above this standby's applied point.
+        let redo_only = storage.active_sb().is_standby();
+        storage.recover_rel(stop_at, redo_only)?;
         Ok(storage)
     }
 
@@ -4887,7 +4894,7 @@ impl StorageFile {
     /// loser transactions with CLRs. The catalog is loaded between redo and
     /// undo (undo needs tree roots) and reloaded after (undo may have
     /// removed catalog rows).
-    fn recover_rel(&mut self, stop_at: Option<u64>) -> Result<(), StorageError> {
+    fn recover_rel(&mut self, stop_at: Option<u64>, redo_only: bool) -> Result<(), StorageError> {
         let records = self.rel_records()?;
         if records.is_empty() && self.rel.catalog_root.is_none() {
             return Ok(());
@@ -4903,7 +4910,11 @@ impl StorageFile {
         self.rel.next_txn_id = outcome.max_txn_id + 1;
 
         self.reload_catalog()?;
-        if !outcome.losers.is_empty() {
+        // A standby repeats history but never undoes: an in-flight transaction at
+        // the applied tail is the primary's, to be committed (and shipped onward)
+        // or resolved at promotion — undoing it here would drop committed data
+        // that the streaming protocol never re-ships.
+        if !redo_only && !outcome.losers.is_empty() {
             let roots = self.rel.tree_roots();
             let mut ctx = self.rel_ctx();
             rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &roots)?;
@@ -5867,6 +5878,10 @@ impl StorageFile {
         //    recording an un-fsynced tail would trust torn bytes on reopen.
         self.seed_ring(from_lsn, bytes)?;
         self.file.sync_data()?;
+        // Advance the in-memory WAL tail to match the seeded ring, so `tail()` /
+        // `flushed_lsn()` (read by a backup, and by continuity above) reflect
+        // reality — a standby never appends, so nothing else would move them.
+        self.wal.resync_tail(advanced)?;
 
         // 2. Decode only the newly seeded range: a scan starting at `from_lsn`
         //    self-terminates where the stale bytes past `new_end` begin (their
@@ -5912,6 +5927,10 @@ impl StorageFile {
         self.commit_superblock(|sb| {
             sb.wal_tail = advanced;
             sb.set_applied_lsn(advanced);
+            // Mark this file a standby: its reopen must be redo-only, since the
+            // shipped range can end mid-transaction and undoing it would diverge
+            // the replica.
+            sb.set_standby(true);
         })?;
         Ok(())
     }
@@ -6126,6 +6145,19 @@ impl StorageFile {
         next_doc_id: u64,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        // A checkpoint on a standby is refused: it would advance the WAL head
+        // past the in-flight transactions the standby has applied but not
+        // resolved, discarding the undo log they need at promotion. A
+        // standby-safe checkpoint (preserving undo-ability) is designed with the
+        // standby runtime; until then a standby reclaims ring space only by
+        // promotion. The ring-fit guard in `apply_wal_stream_locked` bounds how
+        // far a standby can stream without one.
+        if self.active_sb().is_standby() {
+            return Err(StorageError::InvalidConfig(
+                "checkpoint is not supported on a replication standby (apply-only until promotion)"
+                    .to_string(),
+            ));
+        }
         if data.is_empty() {
             // An empty snapshot would produce a descriptor that
             // SnapshotDescriptor::is_valid rejects while the WAL head still
@@ -6313,6 +6345,9 @@ impl StorageFile {
         // the log-backup floor must be stamped back in or a checkpoint would
         // silently reset it to 0 and drop the FULL-model hold across a restart.
         let last_log_backup_lsn = self.last_log_backup_lsn;
+        // Carry the standby (redo-only) mode across the checkpoint (the closure
+        // builds from a default superblock that would otherwise clear it).
+        let standby = self.active_sb().is_standby();
         // Persist the (post-reap) replication slots, so their truncation hold is
         // re-established on the next open. Snapshotted after the reap above, so an
         // invalidated slot is not written back.
@@ -6342,6 +6377,7 @@ impl StorageFile {
             sb.set_applied_lsn(tail);
             // Re-stamp the replication slot table (same checkpoint-wipe carry).
             sb.set_repl_slots(&repl_slots);
+            sb.set_standby(standby);
             sb.checksum = sb.compute_checksum();
             sb
         };

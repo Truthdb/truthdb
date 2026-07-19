@@ -323,6 +323,22 @@ impl Superblock {
         self.reserved[0] = byte;
     }
 
+    /// Standby (redo-only) recovery mode, in reserved byte 1 (was padding). Set
+    /// once this file has applied a LIVE replication WAL stream. A standby's
+    /// shipped log legitimately ends mid-transaction, so its reopen must REPEAT
+    /// history (redo) WITHOUT ARIES undo: undoing an in-flight transaction the
+    /// primary later commits — and whose continuation resumes above the standby's
+    /// applied point — would permanently and silently diverge the replica.
+    /// In-flight transactions are resolved only at promotion (which clears this
+    /// and runs a full recovery).
+    pub fn is_standby(&self) -> bool {
+        self.reserved[1] != 0
+    }
+
+    pub fn set_standby(&mut self, standby: bool) {
+        self.reserved[1] = standby as u8;
+    }
+
     /// FULL-recovery-model log-backup floor: the LSN up to which the log has
     /// been shipped to a log archive (`0` = none). Stored in the reserved area
     /// (bytes 8..16; byte 0 is `db_options`, 1..8 are padding) and covered by

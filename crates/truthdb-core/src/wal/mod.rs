@@ -91,6 +91,28 @@ impl WalWriter {
         })
     }
 
+    /// Re-seats the writer at `new_tail` after a standby applied shipped log
+    /// into the ring behind the writer's back (a standby never appends, so its
+    /// in-memory tail otherwise lags the seeded ring — breaking anything that
+    /// reads `tail()`/`flushed_lsn()`, e.g. a backup or checkpoint). The ring
+    /// bytes up to `new_tail` are already durable, so this mirrors `open`: seat a
+    /// fresh buffer at `new_tail` and seed its current page from disk. `new_tail`
+    /// must not move the tail backward.
+    pub(crate) fn resync_tail(&mut self, new_tail: u64) -> Result<(), StorageError> {
+        debug_assert!(new_tail >= self.tail());
+        let mut buffer = LogBuffer::new_at(new_tail);
+        if !buffer.current_page_is_empty() {
+            let (page_start, _) = buffer.current_page();
+            let file_offset = self.ring_offset + page_start % self.ring_size;
+            let mut disk_page = AlignedPageBuf::new();
+            self.file.read_page_into(file_offset, &mut disk_page)?;
+            buffer.seed_prefix(&disk_page);
+        }
+        self.buffer = buffer;
+        self.flushed = new_tail;
+        Ok(())
+    }
+
     /// Test hook: shrink the lazy-superblock cadence so it can be exercised
     /// without appending tens of MiB.
     #[cfg(test)]
