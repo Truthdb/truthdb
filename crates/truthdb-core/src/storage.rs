@@ -28,7 +28,9 @@ use crate::storage_layout::{
     SnapshotDescriptor, Superblock, WAL_ENTRY_TYPE_REL, WAL_MAX_BYTES, WAL_MIN_BYTES, align_down,
     assert_layout_invariants,
 };
-use crate::wal::records::{REL_KIND_ALLOC_EXTENT, REL_KIND_FREE_EXTENT, RelRecord};
+use crate::wal::records::{
+    REL_KIND_ALLOC_EXTENT, REL_KIND_FREE_EXTENT, REL_KIND_SET_CATALOG_ROOT, RelRecord,
+};
 use crate::wal::{WalWriter, scan_ring};
 
 pub use crate::wal::WalRecord;
@@ -960,6 +962,13 @@ impl Storage {
         threshold: f64,
     ) -> Result<bool, StorageError> {
         let mut file = self.lock();
+        // A standby cannot checkpoint (it must keep the in-flight undo log until
+        // promotion), so the AUTOMATIC path skips gracefully — a read batch that
+        // triggers it must not fail with a checkpoint-refused error. An explicit
+        // `write_checkpoint` still errors, telling an operator it is unsupported.
+        if file.active_sb().is_standby() {
+            return Ok(false);
+        }
         // A wedged store's in-memory state is ahead of the durable log after a
         // failed fsync; checkpointing would flush and re-fsync exactly the data
         // whose durability failed (and was reported to the client as failed).
@@ -1494,6 +1503,27 @@ impl Storage {
 
     pub(crate) fn release_read_snapshot(&self, seq: u64) {
         self.lock().version.release_snapshot(seq);
+    }
+
+    /// Applies a shipped raw WAL ring range to this OPEN standby, live — without
+    /// a reopen. Under one storage-lock hold it places the bytes durably in the
+    /// ring, redoes their effects into the live buffer pool, refreshes the
+    /// catalog cache, and records the advanced tail, so the standby stays
+    /// queryable and its state matches the primary's up to `from_lsn +
+    /// bytes.len()`. Idempotent: a re-shipped overlapping range is a no-op (redo
+    /// is page-LSN-gated). The range must be contiguous with what the standby has
+    /// already applied (a gap is 4305) and start/end on entry boundaries (the
+    /// primary ships `read_wal_range` output at a flushed watermark).
+    ///
+    /// Redo only — no analysis or undo (those need the whole log and mutate the
+    /// WAL); in-flight transactions are resolved at promotion, not here. So a
+    /// shipped range ending mid-transaction leaves that transaction's rows
+    /// applied but uncommitted: a plain standby `SELECT` can read them (a
+    /// read-uncommitted anomaly). Serving consistent snapshot reads at the last
+    /// applied commit is the readable-standby slice; until then a standby is a
+    /// failover target, not a query replica.
+    pub fn apply_wal_stream(&self, from_lsn: u64, bytes: &[u8]) -> Result<(), StorageError> {
+        self.lock().apply_wal_stream_locked(from_lsn, bytes)
     }
 
     /// The durable WAL watermark: the greatest LSN fsynced to disk (group-commit
@@ -4746,8 +4776,17 @@ impl StorageFile {
         }
 
         // ARIES restart for the relational store: analysis + redo, catalog
-        // reload, undo of losers with compensation logging.
-        storage.recover_rel(stop_at)?;
+        // reload, undo of losers with compensation logging. A standby (one that
+        // has applied a live WAL stream) recovers REDO-ONLY — repeat history but
+        // do not undo in-flight transactions, which the primary will commit and
+        // whose continuation resumes above this standby's applied point.
+        let redo_only = storage.active_sb().is_standby();
+        // A standby is read-only until promotion: it appends nothing to its own
+        // WAL (only the primary's log, via apply_wal_stream). Set before
+        // recover_rel — which for a standby is redo-only and never appends, so
+        // this blocks only later local writes.
+        storage.wal.set_read_only(redo_only);
+        storage.recover_rel(stop_at, redo_only)?;
         Ok(storage)
     }
 
@@ -4867,7 +4906,7 @@ impl StorageFile {
     /// loser transactions with CLRs. The catalog is loaded between redo and
     /// undo (undo needs tree roots) and reloaded after (undo may have
     /// removed catalog rows).
-    fn recover_rel(&mut self, stop_at: Option<u64>) -> Result<(), StorageError> {
+    fn recover_rel(&mut self, stop_at: Option<u64>, redo_only: bool) -> Result<(), StorageError> {
         let records = self.rel_records()?;
         if records.is_empty() && self.rel.catalog_root.is_none() {
             return Ok(());
@@ -4883,7 +4922,11 @@ impl StorageFile {
         self.rel.next_txn_id = outcome.max_txn_id + 1;
 
         self.reload_catalog()?;
-        if !outcome.losers.is_empty() {
+        // A standby repeats history but never undoes: an in-flight transaction at
+        // the applied tail is the primary's, to be committed (and shipped onward)
+        // or resolved at promotion — undoing it here would drop committed data
+        // that the streaming protocol never re-ships.
+        if !redo_only && !outcome.losers.is_empty() {
             let roots = self.rel.tree_roots();
             let mut ctx = self.rel_ctx();
             rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &roots)?;
@@ -5808,6 +5851,112 @@ impl StorageFile {
         Ok(start_lsn + bytes.len() as u64)
     }
 
+    /// The active superblock (the authoritative in-memory copy).
+    fn active_sb(&self) -> &Superblock {
+        match self.active_superblock {
+            ActiveSuperblock::A => &self.superblock_a,
+            ActiveSuperblock::B => &self.superblock_b,
+        }
+    }
+
+    /// The live standby apply (see [`Storage::apply_wal_stream`]). Runs under the
+    /// storage lock held by the caller.
+    fn apply_wal_stream_locked(&mut self, from_lsn: u64, bytes: &[u8]) -> Result<(), StorageError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // The standby's applied tail lives in the persisted superblock — the live
+        // WalWriter tail does not advance (the standby never appends).
+        let current_tail = self.active_sb().wal_tail;
+        if from_lsn > current_tail {
+            return Err(StorageError::InvalidFile(format!(
+                "WAL stream gap (4305): range begins at LSN {from_lsn} but the standby has applied to {current_tail}"
+            )));
+        }
+        let new_end = from_lsn + bytes.len() as u64;
+        let advanced = current_tail.max(new_end);
+        let head = self.wal.head();
+        let max_range = self.layout.wal_size.saturating_sub(self.wal.reserve());
+        if advanced.saturating_sub(head) > max_range {
+            return Err(StorageError::WalFull(
+                "the applied WAL stream exceeds the standby ring's usable size; the standby \
+                 must checkpoint to reclaim ring space (not yet automatic)"
+                    .to_string(),
+            ));
+        }
+
+        // 0. Persist the standby flag BEFORE seeding any bytes (on the first
+        //    apply). Otherwise a crash between the seed's fsync and the tail
+        //    commit would reopen as a normal database and ARIES-undo the shipped
+        //    in-flight records — the very divergence this mode prevents. Once the
+        //    flag is durable, a crash anywhere reopens redo-only.
+        if !self.active_sb().is_standby() {
+            self.commit_superblock(|sb| sb.set_standby(true))?;
+            self.wal.set_read_only(true);
+        }
+
+        // 1. Place the bytes in the ring and fsync BEFORE recording the advanced
+        //    tail. A crash after this re-scans and re-redoes them (idempotent);
+        //    recording an un-fsynced tail would trust torn bytes on reopen.
+        self.seed_ring(from_lsn, bytes)?;
+        self.file.sync_data()?;
+        // Advance the in-memory WAL tail to match the seeded ring, so `tail()` /
+        // `flushed_lsn()` (read by a backup, and by continuity above) reflect
+        // reality — a standby never appends, so nothing else would move them.
+        self.wal.resync_tail(advanced)?;
+
+        // 2. Decode only the newly seeded range: a scan starting at `from_lsn`
+        //    self-terminates where the stale bytes past `new_end` begin (their
+        //    logical_ts no longer equals the cursor).
+        let scan = scan_ring(
+            self.wal.file_mut(),
+            self.layout.wal_offset,
+            self.layout.wal_size,
+            from_lsn,
+            from_lsn,
+        )?;
+        let records: Vec<(u64, RelRecord)> = scan
+            .records
+            .iter()
+            .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
+            .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
+            .collect::<Result<_, StorageError>>()?;
+
+        // A catalog-root change in the range moves the standby's catalog root
+        // (the last one wins).
+        let new_catalog_root = records
+            .iter()
+            .rev()
+            .find(|(_, record)| record.kind == REL_KIND_SET_CATALOG_ROOT)
+            .map(|(_, record)| record.decode_catalog_root())
+            .transpose()?;
+
+        // 3. Redo into the LIVE pool (page-LSN-gated, idempotent, appends
+        //    nothing), then refresh the catalog cache so standby reads see any
+        //    new tables/columns.
+        {
+            let mut ctx = self.rel_ctx();
+            rel_recovery::redo_records(&mut ctx, &records)?;
+        }
+        if let Some(root) = new_catalog_root {
+            self.rel.catalog_root = Some(root);
+        }
+        self.reload_catalog()?;
+
+        // 4. Record the advanced tail durably (light dual-write, no page flush —
+        //    the pages are recoverable from the now-durable ring). `applied_lsn`
+        //    tracks the tail for the replication restartpoint.
+        self.commit_superblock(|sb| {
+            sb.wal_tail = advanced;
+            sb.set_applied_lsn(advanced);
+            // Mark this file a standby: its reopen must be redo-only, since the
+            // shipped range can end mid-transaction and undoing it would diverge
+            // the replica.
+            sb.set_standby(true);
+        })?;
+        Ok(())
+    }
+
     /// Writes the restored superblock: the source's catalog root and options as
     /// of `redo_start`, the ring bracketed at `[redo_start, backup_end)`. Slot A
     /// is active; slot B is a valid lower-generation mirror. The search-related
@@ -6018,6 +6167,19 @@ impl StorageFile {
         next_doc_id: u64,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        // A checkpoint on a standby is refused: it would advance the WAL head
+        // past the in-flight transactions the standby has applied but not
+        // resolved, discarding the undo log they need at promotion. A
+        // standby-safe checkpoint (preserving undo-ability) is designed with the
+        // standby runtime; until then a standby reclaims ring space only by
+        // promotion. The ring-fit guard in `apply_wal_stream_locked` bounds how
+        // far a standby can stream without one.
+        if self.active_sb().is_standby() {
+            return Err(StorageError::InvalidConfig(
+                "checkpoint is not supported on a replication standby (apply-only until promotion)"
+                    .to_string(),
+            ));
+        }
         if data.is_empty() {
             // An empty snapshot would produce a descriptor that
             // SnapshotDescriptor::is_valid rejects while the WAL head still
@@ -6205,6 +6367,9 @@ impl StorageFile {
         // the log-backup floor must be stamped back in or a checkpoint would
         // silently reset it to 0 and drop the FULL-model hold across a restart.
         let last_log_backup_lsn = self.last_log_backup_lsn;
+        // Carry the standby (redo-only) mode across the checkpoint (the closure
+        // builds from a default superblock that would otherwise clear it).
+        let standby = self.active_sb().is_standby();
         // Persist the (post-reap) replication slots, so their truncation hold is
         // re-established on the next open. Snapshotted after the reap above, so an
         // invalidated slot is not written back.
@@ -6234,6 +6399,7 @@ impl StorageFile {
             sb.set_applied_lsn(tail);
             // Re-stamp the replication slot table (same checkpoint-wipe carry).
             sb.set_repl_slots(&repl_slots);
+            sb.set_standby(standby);
             sb.checksum = sb.compute_checksum();
             sb
         };

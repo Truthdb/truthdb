@@ -2304,6 +2304,229 @@ mod tests {
         }
     }
 
+    // Stage 18 slice 4d: an OPEN standby applies a shipped WAL range LIVE (no
+    // reopen) and its state matches the primary; the apply is idempotent and
+    // survives a standby restart.
+    #[test]
+    fn a_standby_applies_a_live_wal_stream_and_matches_the_primary() {
+        let primary_path = unique_temp_path("live-primary");
+        let bak = unique_temp_path("live-bak");
+        let standby_path = unique_temp_path("live-standby");
+
+        // Primary: rows 1..=10, a backup, then post-backup changes to ship.
+        let primary = new_engine(&primary_path);
+        primary
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=10 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        let backup_end = summary.backup_end_lsn;
+        for i in 11..=25 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        primary
+            .execute("UPDATE t SET v = v + 100 WHERE id <= 5")
+            .expect("update");
+        let flushed = primary.storage().wal_flushed_lsn();
+        let delta = primary
+            .storage()
+            .read_wal_range(backup_end, flushed)
+            .expect("ship the delta");
+        let expected = sql_rows(&primary, "SELECT id, v FROM t ORDER BY id").1;
+
+        // Standby: restore the backup as an OPEN engine (only the 10 backed-up
+        // rows), then apply the shipped delta LIVE — no reopen.
+        Storage::restore_full(&standby_path, &bak).expect("restore");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        assert_eq!(
+            sql_rows(&standby, "SELECT COUNT(*) FROM t").1,
+            vec![vec![Some("10".into())]],
+            "the standby starts at the backup point"
+        );
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta)
+            .expect("live apply");
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the standby matches the primary after applying the live stream (no reopen)"
+        );
+
+        // Idempotent: re-applying the same range changes nothing.
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta)
+            .expect("re-apply");
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "re-applying the same range is idempotent"
+        );
+
+        // Durable: the applied state survives a standby restart.
+        drop(standby);
+        let standby2 =
+            Engine::new(Storage::open(standby_path.clone()).expect("reopen")).expect("eng");
+        assert_eq!(
+            sql_rows(&standby2, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the live-applied state persists across a standby restart"
+        );
+
+        // A backup taken ON the standby captures the FULL applied state (the
+        // in-memory WAL tail is resynced, so the backup is not truncated to the
+        // pre-apply point).
+        let standby_bak = unique_temp_path("live-standby-bak");
+        let restored = unique_temp_path("live-standby-restored");
+        standby2
+            .storage()
+            .backup_full(&standby_bak)
+            .expect("backup on the standby");
+        Storage::restore_full(&restored, &standby_bak).expect("restore the standby backup");
+        let r = Engine::new(Storage::open(restored.clone()).expect("open")).expect("eng");
+        assert_eq!(
+            sql_rows(&r, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "a backup of the standby restores the full applied state"
+        );
+
+        // A checkpoint on a standby is refused (it reclaims ring space only at
+        // promotion, to keep the in-flight undo log).
+        assert!(
+            standby2.checkpoint().is_err(),
+            "checkpoint is refused on a standby"
+        );
+
+        // A standby is read-only: a local client write is rejected (it would
+        // append to the replica's own WAL and diverge it from the primary).
+        let write = sql(&standby2, "INSERT INTO t VALUES (999, 999)");
+        assert!(
+            !write["error"].is_null(),
+            "a local write on a standby is rejected: {write}"
+        );
+        assert_eq!(
+            sql_rows(&standby2, "SELECT COUNT(*) FROM t").1,
+            vec![vec![Some("25".into())]],
+            "the rejected write left the standby unchanged"
+        );
+
+        drop(primary);
+        drop(standby2);
+        drop(r);
+        for p in [primary_path, bak, standby_path, standby_bak, restored] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    // Stage 18 slice 4d (review fix): a shipped stream can end MID-transaction
+    // (the primary's durable watermark can land between an in-flight txn's page
+    // ops and its commit). A standby's reopen must REPEAT history (redo-only) —
+    // a full ARIES undo would roll back the in-flight rows, and since the primary
+    // commits them and resumes shipping ABOVE the standby's applied point, they
+    // would be lost forever (silent replica divergence).
+    #[test]
+    fn a_standby_reopen_is_redo_only_and_keeps_in_flight_stream_data() {
+        let primary_path = unique_temp_path("redo-primary");
+        let bak = unique_temp_path("redo-bak");
+        let standby_path = unique_temp_path("redo-standby");
+
+        let primary = new_engine(&primary_path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &primary,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+        );
+        for i in 1..=10 {
+            batch(
+                &primary,
+                &mut ctx,
+                &format!("INSERT INTO t VALUES ({i}, {i})"),
+            );
+        }
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        let backup_end = summary.backup_end_lsn;
+
+        // An explicit transaction whose inserts are made durable (fsynced) but NOT
+        // committed — the durable watermark now lands mid-transaction.
+        batch(&primary, &mut ctx, "BEGIN TRANSACTION");
+        for i in 11..=20 {
+            batch(
+                &primary,
+                &mut ctx,
+                &format!("INSERT INTO t VALUES ({i}, {i})"),
+            );
+        }
+        let mid = primary.storage().wal_flushed_lsn();
+        let delta = primary
+            .storage()
+            .read_wal_range(backup_end, mid)
+            .expect("ship the mid-transaction range");
+
+        let count = |eng: &Engine| -> String {
+            sql_rows(eng, "SELECT COUNT(*) FROM t").1[0][0]
+                .clone()
+                .unwrap_or_default()
+        };
+
+        // Standby applies the mid-transaction stream live (the in-flight rows are
+        // present via redo), then RESTARTS.
+        Storage::restore_full(&standby_path, &bak).expect("restore");
+        {
+            let standby =
+                Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+            standby
+                .storage()
+                .apply_wal_stream(backup_end, &delta)
+                .expect("apply mid-txn stream");
+            assert_eq!(
+                count(&standby),
+                "20",
+                "the in-flight rows are applied via redo"
+            );
+        }
+        // THE FIX: a standby reopen is redo-only, so the applied rows survive. A
+        // full ARIES undo here would drop the 10 in-flight rows permanently.
+        let standby =
+            Engine::new(Storage::open(standby_path.clone()).expect("reopen")).expect("eng");
+        assert_eq!(
+            count(&standby),
+            "20",
+            "redo-only reopen keeps the streamed in-flight rows"
+        );
+
+        // The primary commits and ships the continuation; the standby stays
+        // consistent with the primary.
+        batch(&primary, &mut ctx, "COMMIT TRANSACTION");
+        let after = primary.storage().wal_flushed_lsn();
+        let delta2 = primary
+            .storage()
+            .read_wal_range(mid, after)
+            .expect("ship the commit");
+        standby
+            .storage()
+            .apply_wal_stream(mid, &delta2)
+            .expect("apply the commit");
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            sql_rows(&primary, "SELECT id, v FROM t ORDER BY id").1,
+            "the standby matches the primary once the commit is shipped"
+        );
+
+        drop(primary);
+        drop(standby);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     // Stage 18 slice 3: a replication slot holds WAL-ring truncation at a
     // standby's received LSN, survives a restart, and is invalidated once it
     // lags past `max_slot_retain_bytes`.

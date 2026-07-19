@@ -54,6 +54,11 @@ pub(crate) struct WalWriter {
     /// Set when a page write failed mid-append: the in-memory tail no longer
     /// matches the disk and no further appends can be trusted.
     poisoned: bool,
+    /// A replication standby is read-only: it appends nothing to its own WAL
+    /// (it only receives the primary's log via `apply_wal_stream`). A local
+    /// write would diverge the replica and corrupt the next apply, so every
+    /// append is rejected until promotion clears this.
+    read_only: bool,
     bytes_since_superblock: u64,
     superblock_interval: u64,
 }
@@ -86,9 +91,32 @@ impl WalWriter {
             flushed: tail,
             reserve: ring_size / 4,
             poisoned: false,
+            read_only: false,
             bytes_since_superblock: 0,
             superblock_interval: SUPERBLOCK_REWRITE_INTERVAL,
         })
+    }
+
+    /// Re-seats the writer at `new_tail` after a standby applied shipped log
+    /// into the ring behind the writer's back (a standby never appends, so its
+    /// in-memory tail otherwise lags the seeded ring — breaking anything that
+    /// reads `tail()`/`flushed_lsn()`, e.g. a backup or checkpoint). The ring
+    /// bytes up to `new_tail` are already durable, so this mirrors `open`: seat a
+    /// fresh buffer at `new_tail` and seed its current page from disk. `new_tail`
+    /// must not move the tail backward.
+    pub(crate) fn resync_tail(&mut self, new_tail: u64) -> Result<(), StorageError> {
+        debug_assert!(new_tail >= self.tail());
+        let mut buffer = LogBuffer::new_at(new_tail);
+        if !buffer.current_page_is_empty() {
+            let (page_start, _) = buffer.current_page();
+            let file_offset = self.ring_offset + page_start % self.ring_size;
+            let mut disk_page = AlignedPageBuf::new();
+            self.file.read_page_into(file_offset, &mut disk_page)?;
+            buffer.seed_prefix(&disk_page);
+        }
+        self.buffer = buffer;
+        self.flushed = new_tail;
+        Ok(())
     }
 
     /// Test hook: shrink the lazy-superblock cadence so it can be exercised
@@ -96,6 +124,12 @@ impl WalWriter {
     #[cfg(test)]
     pub fn set_superblock_interval(&mut self, bytes: u64) {
         self.superblock_interval = bytes;
+    }
+
+    /// Marks the writer read-only (a replication standby) or writable again (at
+    /// promotion). While read-only every append is rejected.
+    pub(crate) fn set_read_only(&mut self, read_only: bool) {
+        self.read_only = read_only;
     }
 
     pub fn head(&self) -> u64 {
@@ -214,6 +248,12 @@ impl WalWriter {
         sync: bool,
         allow_reserve: bool,
     ) -> Result<u64, StorageError> {
+        if self.read_only {
+            return Err(StorageError::InvalidConfig(
+                "write rejected: this database is a replication standby (read-only until promotion)"
+                    .to_string(),
+            ));
+        }
         if self.poisoned {
             return Err(StorageError::InvalidFile(
                 "wal writer disabled after a failed page write; restart to recover".to_string(),
