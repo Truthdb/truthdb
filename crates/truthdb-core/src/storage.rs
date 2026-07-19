@@ -962,6 +962,13 @@ impl Storage {
         threshold: f64,
     ) -> Result<bool, StorageError> {
         let mut file = self.lock();
+        // A standby cannot checkpoint (it must keep the in-flight undo log until
+        // promotion), so the AUTOMATIC path skips gracefully — a read batch that
+        // triggers it must not fail with a checkpoint-refused error. An explicit
+        // `write_checkpoint` still errors, telling an operator it is unsupported.
+        if file.active_sb().is_standby() {
+            return Ok(false);
+        }
         // A wedged store's in-memory state is ahead of the durable log after a
         // failed fsync; checkpointing would flush and re-fsync exactly the data
         // whose durability failed (and was reported to the client as failed).
