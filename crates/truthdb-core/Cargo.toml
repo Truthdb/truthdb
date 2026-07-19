@@ -20,6 +20,14 @@ icu_locale_core = "2.0"
 # PBKDF2-HMAC-SHA256 for login password hashing. Already in the tree via rustls
 # (truthdb-tds), so this is a manifest entry only — zero new compiled crates.
 ring = "0.17"
+# Mandatory TLS for the Stage 18 replication transport. Same versions/features as
+# truthdb-tds (which cannot be depended on here — it depends on truthdb-core), so
+# the small rustls ServerConfig/ClientConfig build is duplicated in `repl::tls`.
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+rustls-pemfile = "2"
 
 [dev-dependencies]
 rstest = { workspace = true }
+# Generates a self-signed cert for the replication TLS integration tests.
+rcgen = "0.13"
