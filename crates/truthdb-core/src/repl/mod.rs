@@ -7,6 +7,7 @@
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+pub mod framing;
 pub mod handshake;
 
 /// Replication protocol version. Bumped on any incompatible wire change.
