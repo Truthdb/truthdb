@@ -28,7 +28,9 @@ use crate::storage_layout::{
     SnapshotDescriptor, Superblock, WAL_ENTRY_TYPE_REL, WAL_MAX_BYTES, WAL_MIN_BYTES, align_down,
     assert_layout_invariants,
 };
-use crate::wal::records::{REL_KIND_ALLOC_EXTENT, REL_KIND_FREE_EXTENT, RelRecord};
+use crate::wal::records::{
+    REL_KIND_ALLOC_EXTENT, REL_KIND_FREE_EXTENT, REL_KIND_SET_CATALOG_ROOT, RelRecord,
+};
 use crate::wal::{WalWriter, scan_ring};
 
 pub use crate::wal::WalRecord;
@@ -1494,6 +1496,24 @@ impl Storage {
 
     pub(crate) fn release_read_snapshot(&self, seq: u64) {
         self.lock().version.release_snapshot(seq);
+    }
+
+    /// Applies a shipped raw WAL ring range to this OPEN standby, live — without
+    /// a reopen. Under one storage-lock hold it places the bytes durably in the
+    /// ring, redoes their effects into the live buffer pool, refreshes the
+    /// catalog cache, and records the advanced tail, so the standby stays
+    /// queryable and its state matches the primary's up to `from_lsn +
+    /// bytes.len()`. Idempotent: a re-shipped overlapping range is a no-op (redo
+    /// is page-LSN-gated). The range must be contiguous with what the standby has
+    /// already applied (a gap is 4305) and start/end on entry boundaries (the
+    /// primary ships `read_wal_range` output at a flushed watermark).
+    ///
+    /// Redo only — no analysis or undo (those need the whole log and mutate the
+    /// WAL); in-flight transactions are resolved at promotion, not here. The
+    /// standby never appends its own log, so the in-memory WAL tail is left where
+    /// it is; only the persisted superblock tail advances (re-derived on reopen).
+    pub fn apply_wal_stream(&self, from_lsn: u64, bytes: &[u8]) -> Result<(), StorageError> {
+        self.lock().apply_wal_stream_locked(from_lsn, bytes)
     }
 
     /// The durable WAL watermark: the greatest LSN fsynced to disk (group-commit
@@ -5806,6 +5826,94 @@ impl StorageFile {
             }
         }
         Ok(start_lsn + bytes.len() as u64)
+    }
+
+    /// The active superblock (the authoritative in-memory copy).
+    fn active_sb(&self) -> &Superblock {
+        match self.active_superblock {
+            ActiveSuperblock::A => &self.superblock_a,
+            ActiveSuperblock::B => &self.superblock_b,
+        }
+    }
+
+    /// The live standby apply (see [`Storage::apply_wal_stream`]). Runs under the
+    /// storage lock held by the caller.
+    fn apply_wal_stream_locked(&mut self, from_lsn: u64, bytes: &[u8]) -> Result<(), StorageError> {
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        // The standby's applied tail lives in the persisted superblock — the live
+        // WalWriter tail does not advance (the standby never appends).
+        let current_tail = self.active_sb().wal_tail;
+        if from_lsn > current_tail {
+            return Err(StorageError::InvalidFile(format!(
+                "WAL stream gap (4305): range begins at LSN {from_lsn} but the standby has applied to {current_tail}"
+            )));
+        }
+        let new_end = from_lsn + bytes.len() as u64;
+        let advanced = current_tail.max(new_end);
+        let head = self.wal.head();
+        let max_range = self.layout.wal_size.saturating_sub(self.wal.reserve());
+        if advanced.saturating_sub(head) > max_range {
+            return Err(StorageError::WalFull(
+                "the applied WAL stream exceeds the standby ring's usable size; the standby \
+                 must checkpoint to reclaim ring space (not yet automatic)"
+                    .to_string(),
+            ));
+        }
+
+        // 1. Place the bytes in the ring and fsync BEFORE recording the advanced
+        //    tail. A crash after this re-scans and re-redoes them (idempotent);
+        //    recording an un-fsynced tail would trust torn bytes on reopen.
+        self.seed_ring(from_lsn, bytes)?;
+        self.file.sync_data()?;
+
+        // 2. Decode only the newly seeded range: a scan starting at `from_lsn`
+        //    self-terminates where the stale bytes past `new_end` begin (their
+        //    logical_ts no longer equals the cursor).
+        let scan = scan_ring(
+            self.wal.file_mut(),
+            self.layout.wal_offset,
+            self.layout.wal_size,
+            from_lsn,
+            from_lsn,
+        )?;
+        let records: Vec<(u64, RelRecord)> = scan
+            .records
+            .iter()
+            .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
+            .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
+            .collect::<Result<_, StorageError>>()?;
+
+        // A catalog-root change in the range moves the standby's catalog root
+        // (the last one wins).
+        let new_catalog_root = records
+            .iter()
+            .rev()
+            .find(|(_, record)| record.kind == REL_KIND_SET_CATALOG_ROOT)
+            .map(|(_, record)| record.decode_catalog_root())
+            .transpose()?;
+
+        // 3. Redo into the LIVE pool (page-LSN-gated, idempotent, appends
+        //    nothing), then refresh the catalog cache so standby reads see any
+        //    new tables/columns.
+        {
+            let mut ctx = self.rel_ctx();
+            rel_recovery::redo_records(&mut ctx, &records)?;
+        }
+        if let Some(root) = new_catalog_root {
+            self.rel.catalog_root = Some(root);
+        }
+        self.reload_catalog()?;
+
+        // 4. Record the advanced tail durably (light dual-write, no page flush —
+        //    the pages are recoverable from the now-durable ring). `applied_lsn`
+        //    tracks the tail for the replication restartpoint.
+        self.commit_superblock(|sb| {
+            sb.wal_tail = advanced;
+            sb.set_applied_lsn(advanced);
+        })?;
+        Ok(())
     }
 
     /// Writes the restored superblock: the source's catalog root and options as

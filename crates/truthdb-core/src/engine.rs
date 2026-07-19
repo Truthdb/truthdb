@@ -2304,6 +2304,89 @@ mod tests {
         }
     }
 
+    // Stage 18 slice 4d: an OPEN standby applies a shipped WAL range LIVE (no
+    // reopen) and its state matches the primary; the apply is idempotent and
+    // survives a standby restart.
+    #[test]
+    fn a_standby_applies_a_live_wal_stream_and_matches_the_primary() {
+        let primary_path = unique_temp_path("live-primary");
+        let bak = unique_temp_path("live-bak");
+        let standby_path = unique_temp_path("live-standby");
+
+        // Primary: rows 1..=10, a backup, then post-backup changes to ship.
+        let primary = new_engine(&primary_path);
+        primary
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=10 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        let backup_end = summary.backup_end_lsn;
+        for i in 11..=25 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        primary
+            .execute("UPDATE t SET v = v + 100 WHERE id <= 5")
+            .expect("update");
+        let flushed = primary.storage().wal_flushed_lsn();
+        let delta = primary
+            .storage()
+            .read_wal_range(backup_end, flushed)
+            .expect("ship the delta");
+        let expected = sql_rows(&primary, "SELECT id, v FROM t ORDER BY id").1;
+
+        // Standby: restore the backup as an OPEN engine (only the 10 backed-up
+        // rows), then apply the shipped delta LIVE — no reopen.
+        Storage::restore_full(&standby_path, &bak).expect("restore");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        assert_eq!(
+            sql_rows(&standby, "SELECT COUNT(*) FROM t").1,
+            vec![vec![Some("10".into())]],
+            "the standby starts at the backup point"
+        );
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta)
+            .expect("live apply");
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the standby matches the primary after applying the live stream (no reopen)"
+        );
+
+        // Idempotent: re-applying the same range changes nothing.
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta)
+            .expect("re-apply");
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "re-applying the same range is idempotent"
+        );
+
+        // Durable: the applied state survives a standby restart.
+        drop(standby);
+        let standby2 =
+            Engine::new(Storage::open(standby_path.clone()).expect("reopen")).expect("eng");
+        assert_eq!(
+            sql_rows(&standby2, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the live-applied state persists across a standby restart"
+        );
+
+        drop(primary);
+        drop(standby2);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     // Stage 18 slice 3: a replication slot holds WAL-ring truncation at a
     // standby's received LSN, survives a restart, and is invalidated once it
     // lags past `max_slot_retain_bytes`.
