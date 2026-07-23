@@ -45,6 +45,12 @@ toml = { workspace = true }
 directories = { workspace = true }
 tokio = { workspace = true }
 
+[dev-dependencies]
+truthdb-proto = { path = "crates/truthdb-proto", version = "0.1.0" }
+truthdb-net = { path = "crates/truthdb-net", version = "0.1.0" }
+rcgen = "0.13"
+serde_json = { workspace = true }
+
 [profile.dev.package."*"]
 opt-level = 3
 debug = false

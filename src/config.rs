@@ -476,6 +476,14 @@ impl Config {
         let default_str = include_str!("../config/default.toml");
         let mut config: Config = toml::from_str(default_str).unwrap_or_default();
 
+        // An explicit config file (tests, ad-hoc instances): applied INSTEAD
+        // of the per-user and system files, so two instances on one machine
+        // cannot bleed into each other.
+        if let Some(path) = std::env::var_os("TRUTHDB_CONFIG") {
+            apply_override_file(Path::new(&path), &mut config);
+            return config;
+        }
+
         // Per-user XDG config (dev convenience).
         if let Some(proj_dirs) = ProjectDirs::from("org", "truthdb", "truthdb") {
             let mut config_path = PathBuf::from(proj_dirs.config_dir());
