@@ -349,6 +349,13 @@ async fn start_replication(
                      `truthdb-cli restore --standby`"
                     .to_string());
             }
+            if cfg.synchronous_commit {
+                return Err(
+                    "replication.synchronous_commit applies to the primary role; \
+                     remove it from this standby's config"
+                        .to_string(),
+                );
+            }
             let server_name = cfg.server_name.clone().unwrap_or_else(|| {
                 let host = primary_addr
                     .rsplit_once(':')

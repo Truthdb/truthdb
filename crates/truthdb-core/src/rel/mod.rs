@@ -1552,13 +1552,6 @@ fn enter_condition_scopes<'a>(
         return Ok((None, None));
     }
     match txn_ctx.isolation() {
-        // A readable STANDBY snapshots condition reads too (see the statement
-        // arming above): only the last-applied-commit snapshot yields
-        // committed-state reads there.
-        _ if storage.is_standby() => {
-            run.flush(storage)?;
-            Ok((Some(SnapshotScope::enter(storage, None)), None))
-        }
         Isolation::ReadCommitted if storage.rcsi_enabled() => {
             // The snapshot is the durable commit prefix: the session's own
             // just-committed statements must be durable before capture.
@@ -1591,6 +1584,13 @@ fn enter_condition_scopes<'a>(
                 run.flush(storage)?;
                 Ok((Some(SnapshotScope::enter(storage, None)), None))
             }
+        }
+        // A readable STANDBY snapshots condition reads too (below the
+        // RCSI/SNAPSHOT arms — see the statement arming): only the
+        // last-applied-commit snapshot yields committed-state reads there.
+        _ if storage.is_standby() => {
+            run.flush(storage)?;
+            Ok((Some(SnapshotScope::enter(storage, None)), None))
         }
         _ => Ok((None, None)),
     }
@@ -2620,15 +2620,6 @@ fn exec_statement_streamed(
     // so the body cannot read the caller's @t — see arm_table_var_view.
     let _table_var_scope = arm_table_var_view(&txn_ctx.table_variables);
     match txn_ctx.isolation() {
-        // A readable STANDBY snapshots every SELECT regardless of the
-        // session's isolation: redo leaves the primary's in-flight rows on its
-        // pages, and shipped transactions hold no local locks — only the
-        // version-store snapshot (pinned at the last applied commit) yields
-        // committed-state reads.
-        _ if matches!(statement, Statement::Select(_)) && storage.is_standby() => {
-            run.flush(storage)?;
-            _stmt_scope = Some(SnapshotScope::enter(storage, None));
-        }
         Isolation::ReadCommitted
             if matches!(statement, Statement::Select(_)) && storage.rcsi_enabled() =>
         {
@@ -2665,6 +2656,18 @@ fn exec_statement_streamed(
                 run.flush(storage)?;
                 _stmt_scope = Some(SnapshotScope::enter(storage, None));
             }
+        }
+        // A readable STANDBY snapshots every table-reading statement — not
+        // just SELECTs: cursors, table-variable INSERT ... SELECT sources, and
+        // function bodies read too — regardless of the session's isolation
+        // (redo leaves the primary's in-flight rows on its pages, and shipped
+        // transactions hold no local locks; only the version-store snapshot at
+        // the last applied commit yields committed-state reads). Ordered
+        // BELOW the RCSI/SNAPSHOT arms so a SNAPSHOT session on a standby
+        // keeps its transaction-lifetime view.
+        _ if statement_reads_tables(storage, statement) && storage.is_standby() => {
+            run.flush(storage)?;
+            _stmt_scope = Some(SnapshotScope::enter(storage, None));
         }
         _ => {}
     }

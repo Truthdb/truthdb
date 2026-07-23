@@ -2944,6 +2944,118 @@ mod tests {
         }
     }
 
+    // The two review-caught wrong-results bugs, pinned: heap undo payloads
+    // are CELL bytes (a tag byte before the row — served raw they decode as
+    // garbage), and a statement rollback inside a transaction that LATER
+    // COMMITS ships CLRs with no TXN_END — un-captured, the rolled-back
+    // delete's chain head would hide a committed, physically present row.
+    #[test]
+    fn readable_standby_handles_heap_cells_and_statement_rollbacks() {
+        let primary_path = unique_temp_path("edge-primary");
+        let bak = unique_temp_path("edge-bak");
+        let standby_path = unique_temp_path("edge-standby");
+
+        let primary = new_engine(&primary_path);
+        let mut ctx = TxnContext::default();
+        // A HEAP table (no primary key) — its undo payloads are tagged cells.
+        batch(&primary, &mut ctx, "CREATE TABLE h (id INT, v INT)");
+        for i in 1..=3 {
+            batch(
+                &primary,
+                &mut ctx,
+                &format!("INSERT INTO h VALUES ({i}, {i})"),
+            );
+        }
+        // A keyed table for the savepoint flow.
+        batch(
+            &primary,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+        );
+        for i in 1..=3 {
+            batch(
+                &primary,
+                &mut ctx,
+                &format!("INSERT INTO t VALUES ({i}, {i})"),
+            );
+        }
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        let backup_end = summary.backup_end_lsn;
+
+        // In-flight heap update: the standby must serve the OLD row, decoded
+        // correctly (the tag byte stripped).
+        batch(&primary, &mut ctx, "BEGIN TRANSACTION");
+        batch(&primary, &mut ctx, "UPDATE h SET v = 999 WHERE id = 1");
+        let mid = primary.storage().wal_flushed_lsn();
+        let delta = primary
+            .storage()
+            .read_wal_range(backup_end, mid)
+            .expect("delta");
+
+        Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta)
+            .expect("apply");
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM h ORDER BY id").1,
+            vec![
+                vec![Some("1".into()), Some("1".into())],
+                vec![Some("2".into()), Some("2".into())],
+                vec![Some("3".into()), Some("3".into())],
+            ],
+            "an in-flight heap update serves the committed pre-image, decoded as a row"
+        );
+
+        // Commit the heap txn, then a mid-transaction STATEMENT rollback: a
+        // multi-row re-key that collides part-way is undone with CLRs (no
+        // TXN_END — the transaction continues and commits). Un-captured, the
+        // undone delete's chain head would hide committed row 1 forever.
+        batch(&primary, &mut ctx, "COMMIT TRANSACTION");
+        batch(&primary, &mut ctx, "INSERT INTO t VALUES (10, 10)");
+        batch(&primary, &mut ctx, "BEGIN TRANSACTION");
+        let failed = batch(&primary, &mut ctx, "UPDATE t SET id = id + 9 WHERE id <= 2");
+        assert!(
+            failed.error.is_some(),
+            "the re-key collides with row 10 and the statement rolls back"
+        );
+        batch(&primary, &mut ctx, "INSERT INTO t VALUES (4, 4)");
+        batch(&primary, &mut ctx, "COMMIT TRANSACTION");
+        assert_eq!(
+            sql_rows(&primary, "SELECT COUNT(*) FROM t").1,
+            vec![vec![Some("5".into())]],
+            "primary: rows 1,2,3,10,4 (the failed statement fully undone)"
+        );
+        let done = primary.storage().wal_flushed_lsn();
+        let delta2 = primary.storage().read_wal_range(mid, done).expect("delta2");
+        standby
+            .storage()
+            .apply_wal_stream(mid, &delta2)
+            .expect("apply2");
+        assert_eq!(
+            sql_rows(&standby, "SELECT id FROM t ORDER BY id").1,
+            sql_rows(&primary, "SELECT id FROM t ORDER BY id").1,
+            "the CLR-undone statement's rows stay visible on the standby"
+        );
+        assert_eq!(
+            sql_rows(&standby, "SELECT v FROM t WHERE id = 1").1,
+            vec![vec![Some("1".into())]],
+            "row 1 — deleted, CLR-restored, then committed — is served"
+        );
+        assert_eq!(
+            sql_rows(&standby, "SELECT v FROM h WHERE id = 1").1,
+            vec![vec![Some("999".into())]],
+            "the committed heap update is visible"
+        );
+
+        drop(primary);
+        drop(standby);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     // Stage 18.5 (D2) synchronous commit: a commit waits — after local
     // durability — for a standby acknowledgement; a timeout degrades the link
     // (NOT_SYNCHRONIZED) availability-first, and a caught-up acknowledgement
@@ -2957,7 +3069,7 @@ mod tests {
             .expect("create");
         engine
             .storage()
-            .arm_sync_commit(std::time::Duration::from_millis(250));
+            .arm_sync_commit(std::time::Duration::from_millis(500));
 
         // A healthy standby: an acker thread mirrors the durable watermark.
         let storage = engine.storage_arc();
@@ -2982,7 +3094,7 @@ mod tests {
         let t0 = std::time::Instant::now();
         engine.execute("INSERT INTO t VALUES (2)").expect("insert");
         assert!(
-            t0.elapsed() >= std::time::Duration::from_millis(250),
+            t0.elapsed() >= std::time::Duration::from_millis(500),
             "the degrading commit waited out the timeout"
         );
         assert!(
@@ -2995,7 +3107,7 @@ mod tests {
         let t1 = std::time::Instant::now();
         engine.execute("INSERT INTO t VALUES (3)").expect("insert");
         assert!(
-            t1.elapsed() < std::time::Duration::from_millis(200),
+            t1.elapsed() < std::time::Duration::from_millis(400),
             "a degraded link does not delay commits"
         );
 

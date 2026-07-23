@@ -46,6 +46,11 @@ struct SyncCommitState {
     armed: std::sync::atomic::AtomicBool,
     timeout_ms: std::sync::atomic::AtomicU64,
     degraded: std::sync::atomic::AtomicBool,
+    /// The LSN whose acknowledgement re-synchronizes a degraded link: the
+    /// target of the wait that timed out. Comparing against the LIVE durable
+    /// watermark instead would latch the degradation forever under sustained
+    /// writes — an ack always trails the live watermark by one round trip.
+    resync_target: std::sync::atomic::AtomicU64,
     acked: std::sync::Mutex<u64>,
     acked_cv: std::sync::Condvar,
 }
@@ -56,6 +61,7 @@ impl Default for SyncCommitState {
             armed: std::sync::atomic::AtomicBool::new(false),
             timeout_ms: std::sync::atomic::AtomicU64::new(0),
             degraded: std::sync::atomic::AtomicBool::new(false),
+            resync_target: std::sync::atomic::AtomicU64::new(0),
             acked: std::sync::Mutex::new(0),
             acked_cv: std::sync::Condvar::new(),
         }
@@ -71,8 +77,9 @@ impl SyncCommitState {
         self.armed.store(true, std::sync::atomic::Ordering::Release);
     }
 
-    fn publish(&self, lsn: u64, caught_up: bool) {
-        if !self.armed.load(std::sync::atomic::Ordering::Acquire) {
+    fn publish(&self, lsn: u64) {
+        use std::sync::atomic::Ordering;
+        if !self.armed.load(Ordering::Acquire) {
             return;
         }
         {
@@ -82,10 +89,12 @@ impl SyncCommitState {
             }
         }
         self.acked_cv.notify_all();
-        if caught_up
-            && self
-                .degraded
-                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        // Re-synchronize once the acknowledgement covers the wait that
+        // degraded the link — the incident point, NOT the live watermark
+        // (which a loaded primary keeps permanently ahead of any ack).
+        if self.degraded.load(Ordering::Acquire)
+            && lsn >= self.resync_target.load(Ordering::Acquire)
+            && self.degraded.swap(false, Ordering::AcqRel)
         {
             eprintln!(
                 "synchronous commit: a standby caught up (acknowledged {lsn}); the link is \
@@ -113,6 +122,7 @@ impl SyncCommitState {
             }
             let now = std::time::Instant::now();
             if now >= deadline {
+                self.resync_target.store(target, Ordering::Release);
                 if !self.degraded.swap(true, Ordering::AcqRel) {
                     eprintln!(
                         "synchronous commit: no standby acknowledged LSN {target} within \
@@ -120,6 +130,10 @@ impl SyncCommitState {
                          local durability alone until a standby catches up"
                     );
                 }
+                // Wake concurrently parked committers: the link is degraded,
+                // they must stop waiting too.
+                drop(acked);
+                self.acked_cv.notify_all();
                 return;
             }
             let (guard, _timed_out) = self
@@ -720,8 +734,7 @@ impl Storage {
     /// calls this beside the slot advance). Re-synchronizes the link when the
     /// acknowledgement has caught up to the primary's durable watermark.
     pub(crate) fn publish_sync_ack(&self, acked: u64) {
-        let caught_up = acked >= self.wal_flushed_lsn();
-        self.sync_commit.publish(acked, caught_up);
+        self.sync_commit.publish(acked);
     }
 
     /// The current WAL tail — the durability target for a batch that committed.
@@ -2613,10 +2626,14 @@ struct StorageFile {
     /// prefix, and could truncate undo of a transaction whose resolution has
     /// not shipped yet. Seeded at open from the same records recovery scans.
     standby_att: std::collections::HashMap<u64, u64>,
-    /// Readable standby: publish records per SHIPPED transaction, so an abort
-    /// (CLRs + TXN_END with no commit) can unwind its version-chain heads the
-    /// same way a local rollback would.
-    standby_published: std::collections::HashMap<u64, Vec<crate::relstore::version::PublishRecord>>,
+    /// Readable standby: per SHIPPED transaction, one stack entry per logged
+    /// op `(record LSN, publish record if the op changed a row)`. A CLR pops
+    /// every entry above its `undo_next` and unpublishes the popped row
+    /// changes — mirroring savepoint/statement rollbacks exactly, since undo
+    /// compensates ops in reverse LSN order — and a commit-less TXN_END
+    /// unwinds whatever remains.
+    standby_published:
+        std::collections::HashMap<u64, Vec<(u64, Option<crate::relstore::version::PublishRecord>)>>,
     /// Readable standby: the LSN up to which shipped changes have been folded
     /// into the version store — an overlap re-ship must not publish the same
     /// change twice (duplicate chain entries).
@@ -5504,7 +5521,7 @@ impl StorageFile {
         // replayed range.
         if redo_only {
             self.version.standby_reads = true;
-            self.standby_capture_versions(&records)?;
+            self.standby_capture_versions(&records);
             self.standby_version_floor = self.wal.tail();
         }
         // Object ids are shared by tables, their secondary indexes, and logins
@@ -5942,78 +5959,68 @@ impl StorageFile {
     /// primary's own commit path builds. Uncommitted (in-flight) writers have
     /// no commit seq, so a snapshot reader at the last-applied-commit sequence
     /// resolves past their chain heads to the pre-image — the committed state.
-    /// An aborted shipped transaction (CLRs + TXN_END, no commit) unwinds its
-    /// heads like a local rollback. The floor makes an overlap re-ship a
-    /// no-op, and structural/system records (page splits, counters, images
-    /// with no row undo) are skipped — they do not change row visibility.
-    fn standby_capture_versions(
-        &mut self,
-        records: &[(u64, RelRecord)],
-    ) -> Result<(), StorageError> {
-        use crate::relstore::version::{PendingVersion, RowChange};
+    /// CLRs pop and unpublish the compensated suffix (savepoint/statement
+    /// rollbacks inside a transaction that later commits); a commit-less
+    /// TXN_END unwinds the rest (a full abort). Heap undo payloads are CELL
+    /// bytes — decoded (tag stripped, moved rows re-homed) before publishing.
+    /// Only live TABLE objects get chains (index-maintenance undos carry the
+    /// index's object id; nothing resolves index chains, and pruning clears
+    /// them), a page freed anywhere in the range is skipped (its historical
+    /// owner is not derivable from the post-range header), and a DDL in the
+    /// range stamps every live table so an older pinned snapshot fails 3961
+    /// instead of decoding rows under the wrong schema. Per-record failures
+    /// are logged and skipped — a capture problem must not wedge the stream
+    /// (the cost is one row's pre-image, not divergence).
+    fn standby_capture_versions(&mut self, records: &[(u64, RelRecord)]) {
         use crate::wal::records::{
-            PageOpUndo, REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_OP, REL_KIND_TXN_COMMIT,
-            REL_KIND_TXN_END,
+            REL_KIND_CLR, REL_KIND_FREE_EXTENT, REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_OP,
+            REL_KIND_SET_CATALOG_ROOT, REL_KIND_TXN_COMMIT, REL_KIND_TXN_END,
         };
+        let alive: std::collections::HashSet<u32> =
+            self.rel.tables.values().map(|def| def.object_id).collect();
+        let mut freed_pages: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for (_, record) in records {
+            if record.kind == REL_KIND_FREE_EXTENT
+                && let Ok((start, pages)) = record.decode_extent_redo()
+            {
+                for page in start..start.saturating_add(pages) {
+                    freed_pages.insert(page);
+                }
+            }
+        }
+        let mut catalog_changed = false;
         for (lsn, record) in records {
             if *lsn < self.standby_version_floor {
                 continue;
             }
             match record.kind {
                 REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE if record.txn_id != 0 => {
-                    let pending = match record.decode_page_op_undo()? {
-                        PageOpUndo::TreeDeleteKey { object_id, key } => Some(PendingVersion {
-                            object_id,
-                            identity: key,
-                            change: RowChange::Insert,
-                        }),
-                        PageOpUndo::TreeInsertRow {
-                            object_id,
-                            key,
-                            row,
-                        } => Some(PendingVersion {
-                            object_id,
-                            identity: key,
-                            change: RowChange::Delete { prior: row },
-                        }),
-                        PageOpUndo::TreeUpdateRow {
-                            object_id,
-                            key,
-                            row,
-                        } => Some(PendingVersion {
-                            object_id,
-                            identity: key,
-                            change: RowChange::Update { prior: row },
-                        }),
-                        PageOpUndo::HeapDeleteSlot { page, slot } => self
-                            .heap_page_object_id(page)?
-                            .map(|object_id| PendingVersion {
-                                object_id,
-                                identity: rid_identity(crate::relstore::heap::Rid { page, slot }),
-                                change: RowChange::Insert,
-                            }),
-                        PageOpUndo::HeapInsertRow { page, slot, bytes } => self
-                            .heap_page_object_id(page)?
-                            .map(|object_id| PendingVersion {
-                                object_id,
-                                identity: rid_identity(crate::relstore::heap::Rid { page, slot }),
-                                change: RowChange::Delete { prior: bytes },
-                            }),
-                        PageOpUndo::HeapUpdateRow { page, slot, bytes } => self
-                            .heap_page_object_id(page)?
-                            .map(|object_id| PendingVersion {
-                                object_id,
-                                identity: rid_identity(crate::relstore::heap::Rid { page, slot }),
-                                change: RowChange::Update { prior: bytes },
-                            }),
-                        _ => None,
-                    };
-                    if let Some(pending) = pending {
-                        let published = self.version.publish(pending, record.txn_id);
-                        self.standby_published
-                            .entry(record.txn_id)
-                            .or_default()
-                            .push(published);
+                    let pending = self
+                        .standby_pending_version(record, &alive, &freed_pages)
+                        .unwrap_or_else(|err| {
+                            eprintln!(
+                                "standby version capture: skipping record at LSN {lsn}: {err}"
+                            );
+                            None
+                        });
+                    let published = pending.map(|p| self.version.publish(p, record.txn_id));
+                    self.standby_published
+                        .entry(record.txn_id)
+                        .or_default()
+                        .push((*lsn, published));
+                }
+                REL_KIND_CLR if record.txn_id != 0 => {
+                    // The CLR's redo opens with the `undo_next` LSN: everything
+                    // the transaction logged ABOVE it is now compensated.
+                    if record.redo.len() >= 8 {
+                        let undo_next = u64::from_le_bytes(record.redo[0..8].try_into().unwrap());
+                        if let Some(stack) = self.standby_published.get_mut(&record.txn_id) {
+                            while stack.last().is_some_and(|(l, _)| *l > undo_next) {
+                                if let Some((_, Some(rec))) = stack.pop() {
+                                    self.version.unpublish(rec, record.txn_id);
+                                }
+                            }
+                        }
                     }
                 }
                 REL_KIND_TXN_COMMIT => {
@@ -6021,19 +6028,129 @@ impl StorageFile {
                     self.standby_published.remove(&record.txn_id);
                 }
                 REL_KIND_TXN_END => {
-                    // A TXN_END without a preceding commit seals an abort: the
-                    // CLRs restored the pages, and the chain heads come off in
-                    // reverse publish order, like a local rollback.
-                    if let Some(published) = self.standby_published.remove(&record.txn_id) {
-                        for rec in published.into_iter().rev() {
-                            self.version.unpublish(rec, record.txn_id);
+                    if let Some(stack) = self.standby_published.remove(&record.txn_id) {
+                        for (_, published) in stack.into_iter().rev() {
+                            if let Some(rec) = published {
+                                self.version.unpublish(rec, record.txn_id);
+                            }
                         }
                     }
                 }
+                REL_KIND_SET_CATALOG_ROOT => catalog_changed = true,
                 _ => {}
             }
         }
-        Ok(())
+        if catalog_changed {
+            // A shipped DDL cannot wait out pinned snapshots the way the
+            // primary's Database X does; fence them instead (3961 on the next
+            // access), for every live table — conservative and correct.
+            for object_id in alive {
+                self.version.stamp_schema(object_id);
+            }
+        }
+    }
+
+    /// Builds the version-store change for one shipped row op, or `None` for
+    /// structural/system/foreign records.
+    fn standby_pending_version(
+        &mut self,
+        record: &RelRecord,
+        alive: &std::collections::HashSet<u32>,
+        freed_pages: &std::collections::HashSet<u64>,
+    ) -> Result<Option<crate::relstore::version::PendingVersion>, StorageError> {
+        use crate::relstore::version::{PendingVersion, RowChange};
+        use crate::wal::records::PageOpUndo;
+        type HeapChange = Option<(u32, Vec<u8>, Option<Vec<u8>>)>;
+        let heap_change = |this: &mut Self,
+                           page: u64,
+                           slot: u16,
+                           cell: Option<Vec<u8>>|
+         -> Result<HeapChange, StorageError> {
+            if freed_pages.contains(&page) {
+                return Ok(None);
+            }
+            let Some(object_id) = this.heap_page_object_id(page)? else {
+                return Ok(None);
+            };
+            if !alive.contains(&object_id) {
+                return Ok(None);
+            }
+            match cell {
+                None => Ok(Some((
+                    object_id,
+                    rid_identity(crate::relstore::heap::Rid { page, slot }),
+                    None,
+                ))),
+                Some(cell) => {
+                    // The undo payload is a heap CELL: strip the tag, and home
+                    // a MOVED copy's identity to the RID readers scan under.
+                    let Some((home, row)) = crate::relstore::heap::cell_row(&cell) else {
+                        return Ok(None); // a stub — a pointer, not a row
+                    };
+                    let identity =
+                        rid_identity(home.unwrap_or(crate::relstore::heap::Rid { page, slot }));
+                    Ok(Some((object_id, identity, Some(row.to_vec()))))
+                }
+            }
+        };
+        let pending =
+            match record.decode_page_op_undo()? {
+                PageOpUndo::TreeDeleteKey { object_id, key } if alive.contains(&object_id) => {
+                    Some(PendingVersion {
+                        object_id,
+                        identity: key,
+                        change: RowChange::Insert,
+                    })
+                }
+                PageOpUndo::TreeInsertRow {
+                    object_id,
+                    key,
+                    row,
+                } if alive.contains(&object_id) => Some(PendingVersion {
+                    object_id,
+                    identity: key,
+                    change: RowChange::Delete { prior: row },
+                }),
+                PageOpUndo::TreeUpdateRow {
+                    object_id,
+                    key,
+                    row,
+                } if alive.contains(&object_id) => Some(PendingVersion {
+                    object_id,
+                    identity: key,
+                    change: RowChange::Update { prior: row },
+                }),
+                PageOpUndo::HeapDeleteSlot { page, slot } => heap_change(self, page, slot, None)?
+                    .map(|(object_id, identity, _)| PendingVersion {
+                        object_id,
+                        identity,
+                        change: RowChange::Insert,
+                    }),
+                PageOpUndo::HeapInsertRow { page, slot, bytes } => {
+                    heap_change(self, page, slot, Some(bytes))?.map(|(object_id, identity, row)| {
+                        PendingVersion {
+                            object_id,
+                            identity,
+                            change: RowChange::Delete {
+                                prior: row.expect("cell decoded"),
+                            },
+                        }
+                    })
+                }
+                PageOpUndo::HeapUpdateRow { page, slot, bytes } => {
+                    heap_change(self, page, slot, Some(bytes))?.map(|(object_id, identity, row)| {
+                        PendingVersion {
+                            object_id,
+                            identity,
+                            change: RowChange::Update {
+                                prior: row.expect("cell decoded"),
+                            },
+                        }
+                    })
+                }
+                _ => None,
+            };
+        Ok(pending)
     }
 
     /// The owning object of a heap page, from its self-identifying header
@@ -6305,9 +6422,9 @@ impl StorageFile {
             if self.active_sb().is_standby() {
                 return Err(StorageError::InvalidConfig(
                     "a query on this replication standby needed spill scratch, which shares \
-                     the data region the primary's stream writes into; re-run with more \
-                     memory or run it on the primary (readable-standby spill arrives with \
-                     snapshot standby reads)"
+                     the data region the primary's stream writes into; run it on the primary \
+                     or raise the memory budget (dedicated standby scratch storage is \
+                     planned)"
                         .to_string(),
                 ));
             }
@@ -6893,7 +7010,7 @@ impl StorageFile {
         // sequence see only committed state. Same post-redo discipline: a
         // failed apply must feed the store nothing.
         self.version.standby_reads = true;
-        self.standby_capture_versions(&records)?;
+        self.standby_capture_versions(&records);
         self.standby_version_floor = advanced;
         // Track the first UNCOVERED search record (the restartpoint's search
         // floor): the seed snapshot covers seq numbers below
