@@ -5498,8 +5498,76 @@ impl StorageFile {
                 crate::storage_layout::MAX_REPL_SLOTS
             )));
         }
+        // The LSN comes off the wire (Hello.last_received_lsn) and becomes the
+        // truncation floor — which a checkpoint persists as the WAL head, the
+        // very position the next restart scans from. A mid-entry floor would
+        // make that scan read garbage and silently truncate every commit since
+        // the checkpoint. Only a verifiable ENTRY BOUNDARY may be registered;
+        // an honest standby's persisted tail always is one.
+        if !self.is_wal_entry_boundary(lsn)? {
+            return Err(StorageError::InvalidConfig(format!(
+                "replication slot {id} at LSN {lsn} is not on a WAL entry boundary: \
+                 the standby's resume state is corrupt or forged; reseed the standby \
+                 from a fresh backup"
+            )));
+        }
         self.truncation_gate.repl_slots.insert(id, lsn);
         Ok(())
+    }
+
+    /// Whether `lsn` sits on a WAL entry boundary of THIS log: the tail
+    /// itself, a position carrying a CRC-valid entry header that self-identifies
+    /// (`logical_ts == lsn`), or a ring-wrap gap start whose next lap opens
+    /// with a self-identifying valid entry. A forger cannot fabricate any of
+    /// these without controlling the actual log contents.
+    fn is_wal_entry_boundary(&mut self, lsn: u64) -> Result<bool, StorageError> {
+        let tail = self.wal.tail();
+        if lsn == tail {
+            return Ok(true);
+        }
+        if lsn > tail {
+            return Ok(false);
+        }
+        let wal_offset = self.layout.wal_offset;
+        let wal_size = self.layout.wal_size;
+        let check_entry_at =
+            |file: &mut crate::direct_io::DirectFile, pos: u64| -> Result<bool, StorageError> {
+                let ring_pos = pos % wal_size;
+                if wal_size - ring_pos < WAL_ENTRY_HEADER_SIZE as u64 {
+                    return Ok(false);
+                }
+                let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
+                file.read_exact_at(wal_offset + ring_pos, &mut header_bytes)?;
+                if header_bytes.iter().all(|b| *b == 0) {
+                    return Ok(false);
+                }
+                let header = WalEntryHeader::from_le_bytes(&header_bytes);
+                Ok(header.verify_header_crc() && header.logical_ts == pos)
+            };
+        let ring_pos = lsn % wal_size;
+        let bytes_to_lap_end = wal_size - ring_pos;
+        if bytes_to_lap_end >= WAL_ENTRY_HEADER_SIZE as u64 {
+            let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
+            self.wal
+                .file_mut()
+                .read_exact_at(wal_offset + ring_pos, &mut header_bytes)?;
+            if !header_bytes.iter().all(|b| *b == 0) {
+                let header = WalEntryHeader::from_le_bytes(&header_bytes);
+                return Ok(header.verify_header_crc() && header.logical_ts == lsn);
+            }
+        }
+        // Zeros (or no room for a header): a genuine boundary here is a wrap-gap
+        // start, provable by the next lap opening with a real entry below the
+        // tail. Mid-entry zeros cannot fake that — the jump target's entry must
+        // self-identify at exactly that position.
+        let jump = lsn + bytes_to_lap_end;
+        if jump == tail {
+            return Ok(true);
+        }
+        if jump > tail {
+            return Ok(false);
+        }
+        check_entry_at(self.wal.file_mut(), jump)
     }
 
     /// Advances a slot forward to `lsn` — a slot never moves backward (a
@@ -5637,6 +5705,22 @@ impl StorageFile {
 
     fn allocate_extent(&mut self, temp: bool) -> Result<u64, StorageError> {
         if temp {
+            // Spill scratch shares the data region and the allocator bitmap
+            // with REPLICATED extents. On a standby, an extent that is free at
+            // the applied LSN may already be allocated on the primary (its
+            // ALLOC record still in flight) — a spool there would be clobbered
+            // by the arriving redo, and the spool's raw writes would clobber
+            // replicated pages. Refuse until the readable-standby slice gives
+            // scratch its own storage.
+            if self.active_sb().is_standby() {
+                return Err(StorageError::InvalidConfig(
+                    "a query on this replication standby needed spill scratch, which shares \
+                     the data region the primary's stream writes into; re-run with more \
+                     memory or run it on the primary (readable-standby spill arrives with \
+                     snapshot standby reads)"
+                        .to_string(),
+                ));
+            }
             return self.allocator.allocate_temp_extent().ok_or_else(|| {
                 StorageError::InvalidConfig("data region full: cannot allocate extent".to_string())
             });

@@ -266,6 +266,17 @@ async fn start_replication(
     if cfg.stall_timeout_ms == 0 {
         return Err("replication.stall_timeout_ms must be greater than 0".to_string());
     }
+    // Both stall deadlines assume the peer speaks at least once per window (a
+    // caught-up pair only exchanges heartbeats + their acks): a stall window
+    // that a healthy idle link cannot meet makes every connection flap.
+    if cfg.stall_timeout_ms < cfg.heartbeat_ms.saturating_mul(2) {
+        return Err(format!(
+            "replication.stall_timeout_ms ({}) must be at least twice heartbeat_ms ({}): \
+             a caught-up standby only speaks when the primary heartbeats, so a tighter \
+             stall window tears down healthy idle connections",
+            cfg.stall_timeout_ms, cfg.heartbeat_ms
+        ));
+    }
     let secret =
         cfg.shared_secret.clone().filter(|s| !s.is_empty()).ok_or(
             "replication.shared_secret is required (non-empty) when replication is enabled",

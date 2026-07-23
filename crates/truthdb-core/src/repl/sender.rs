@@ -242,10 +242,18 @@ where
             )
             .map_err(io::Error::other)?;
             // A stalled standby (full TCP send buffer) must not be able to
-            // hang server shutdown: abandon the write when shutdown flips (the
-            // connection is being torn down anyway).
+            // hang server shutdown or hold this node id forever: abandon the
+            // write on shutdown, and fail the connection when the write itself
+            // stalls past the deadline (the ack reader cannot time it out —
+            // it is only polled between writes).
             tokio::select! {
                 written = write_repl_frame(wr, &frame) => written?,
+                _ = tokio::time::sleep(ctx.stall_timeout) => {
+                    return Err(io::Error::new(
+                        io::ErrorKind::TimedOut,
+                        format!("standby did not accept a frame within {:?}", ctx.stall_timeout),
+                    ));
+                }
                 _ = shutdown.changed() => return Ok(()),
             }
             shipped
@@ -276,6 +284,15 @@ where
                         .map_err(io::Error::other)?;
                     tokio::select! {
                         written = write_repl_frame(wr, &frame) => written?,
+                        _ = tokio::time::sleep(ctx.stall_timeout) => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::TimedOut,
+                                format!(
+                                    "standby did not accept a heartbeat within {:?}",
+                                    ctx.stall_timeout
+                                ),
+                            ));
+                        }
                         _ = shutdown.changed() => return Ok(()),
                     }
                 }

@@ -2878,6 +2878,25 @@ mod tests {
             .storage()
             .try_register_repl_slot(8, lsn)
             .expect("re-register");
+        // A mid-entry LSN off the wire is refused: it would become the
+        // checkpoint truncation floor and, at the next restart, a WAL head the
+        // scan cannot decode (entries are >= 48 bytes and 8-aligned, so
+        // `fresh - 1` is never a boundary). Fresh writes keep it above the
+        // head so the boundary check — not the head fence — is what fires.
+        for i in 11..=13 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        let fresh = engine.storage().wal_flushed_lsn();
+        let err = engine
+            .storage()
+            .try_register_repl_slot(8, fresh - 1)
+            .expect_err("a mid-entry slot LSN is refused");
+        assert!(
+            err.to_string().contains("boundary"),
+            "the error names the misalignment: {err}"
+        );
         // An ack for a never-registered (or reaped) slot must not create one.
         engine.storage().advance_repl_slot(42, lsn);
         assert_eq!(engine.storage().repl_slot_lsn(42), None);
