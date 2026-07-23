@@ -10,6 +10,10 @@ use crate::storage::{Storage, StorageError};
 const ENGINE_WAL_ENTRY_VERSION: u16 = 1;
 const ENGINE_WAL_ENTRY_TYPE: u16 = 1;
 const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
+/// A standby takes a restartpoint earlier than a primary checkpoints (0.5 vs
+/// 0.75): its reclaim is capped at the shipped undo floor, so starting earlier
+/// leaves headroom when the floor lags.
+const STANDBY_RESTARTPOINT_THRESHOLD: f64 = 0.5;
 
 type Document = Map<String, Value>;
 
@@ -421,6 +425,25 @@ impl Engine {
     /// granting them.
     pub(crate) fn lock_analysis_epoch(&self) -> u64 {
         self.storage.lock_analysis_epoch()
+    }
+
+    /// A standby's checkpoint-equivalent (see
+    /// [`Storage::standby_restartpoint`]): reclaims WAL ring space up to the
+    /// standby's own undo floor. Storage-only — the live search meta is NOT
+    /// refreshed (a standby's search reads reflect the seed until a reopen or
+    /// promotion; the restartpoint never truncates a search record the reopen
+    /// replay needs).
+    pub fn standby_restartpoint(&self) -> Result<bool, EngineError> {
+        Ok(self.storage.standby_restartpoint()?)
+    }
+
+    /// The maintenance-thread trigger: take a restartpoint once the ring is
+    /// half full. Cheap when this is not a standby or the ring is quiet.
+    pub(crate) fn standby_restartpoint_if_needed(&self) -> Result<bool, EngineError> {
+        if !self.storage.is_standby() || self.wal_usage_ratio() < STANDBY_RESTARTPOINT_THRESHOLD {
+            return Ok(false);
+        }
+        self.standby_restartpoint()
     }
 
     fn maybe_checkpoint(&self, meta: &EngineMeta) -> Result<(), EngineError> {
@@ -2610,6 +2633,377 @@ mod tests {
         let _ = listener_task.await;
         drop(standby);
         drop(primary);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    // Stage 18 (18.3 restartpoints): a standby cannot checkpoint, so the
+    // restartpoint is what reclaims its WAL ring — flush redone pages, persist
+    // the allocator, advance the head to the standby's OWN undo floor (its
+    // active-transaction table over the shipped log, plus the first search
+    // record the seed snapshot does not cover). Storage-only: no WAL append,
+    // no snapshot write (a locally allocated snapshot extent would collide
+    // with the primary's future logged allocations).
+    #[test]
+    fn a_standby_restartpoint_reclaims_the_ring_up_to_its_own_undo_floor() {
+        let primary_path = unique_temp_path("rsp-primary");
+        let bak = unique_temp_path("rsp-bak");
+        let standby_path = unique_temp_path("rsp-standby");
+
+        // A pure-relational primary (no search events, so no search floor).
+        let primary = new_engine(&primary_path);
+        primary
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=10 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        let backup_end = summary.backup_end_lsn;
+        for i in 11..=30 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let flushed = primary.storage().wal_flushed_lsn();
+        let delta = primary
+            .storage()
+            .read_wal_range(backup_end, flushed)
+            .expect("delta");
+        let expected = sql_rows(&primary, "SELECT id, v FROM t ORDER BY id").1;
+
+        // A restartpoint on the primary is a no-op (not a standby).
+        assert!(
+            !primary
+                .standby_restartpoint_if_needed()
+                .expect("primary no-op"),
+            "a primary never takes a restartpoint"
+        );
+
+        // Every shipped transaction is resolved, so the floor is the applied
+        // tail: the restartpoint reclaims the whole shipped range.
+        Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta)
+            .expect("apply");
+        let head_before = standby.storage().wal_head();
+        assert!(
+            standby.standby_restartpoint().expect("restartpoint"),
+            "the restartpoint runs"
+        );
+        assert!(standby.storage().wal_head() > head_before);
+        assert_eq!(
+            standby.storage().wal_head(),
+            standby.storage().wal_tail(),
+            "with everything resolved, the head reaches the applied tail"
+        );
+        assert!(
+            !standby.standby_restartpoint().expect("second"),
+            "nothing further to reclaim"
+        );
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "relational state intact after the restartpoint"
+        );
+
+        // Durable: reopen replays from the advanced head (pages were flushed).
+        drop(standby);
+        let standby =
+            Engine::new(Storage::open(standby_path.clone()).expect("reopen")).expect("eng");
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "state survives a reopen after the restartpoint"
+        );
+
+        // The stream continues past a restartpoint.
+        for i in 31..=40 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let flushed2 = primary.storage().wal_flushed_lsn();
+        let delta2 = primary
+            .storage()
+            .read_wal_range(flushed, flushed2)
+            .expect("delta2");
+        standby
+            .storage()
+            .apply_wal_stream(flushed, &delta2)
+            .expect("apply after restartpoint");
+        let expected = sql_rows(&primary, "SELECT id, v FROM t ORDER BY id").1;
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the stream continues cleanly after a restartpoint"
+        );
+
+        drop(primary);
+        drop(standby);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    // The restartpoint's undo floor: a shipped range ending MID-transaction
+    // leaves that transaction unresolved in the standby's own
+    // active-transaction table, and the head must stop at its BEGIN — the
+    // undo log above it is what promotion's analysis+undo will need. Once the
+    // commit ships, the floor lifts.
+    #[test]
+    fn a_standby_restartpoint_stops_at_an_unresolved_transactions_begin() {
+        let primary_path = unique_temp_path("rspf-primary");
+        let bak = unique_temp_path("rspf-bak");
+        let standby_path = unique_temp_path("rspf-standby");
+
+        let primary = new_engine(&primary_path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &primary,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+        );
+        for i in 1..=10 {
+            batch(
+                &primary,
+                &mut ctx,
+                &format!("INSERT INTO t VALUES ({i}, {i})"),
+            );
+        }
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        let backup_end = summary.backup_end_lsn;
+        let begin_area = primary.storage().wal_flushed_lsn();
+
+        // An explicit transaction, durable but uncommitted: the shipped range
+        // ends mid-transaction.
+        batch(&primary, &mut ctx, "BEGIN TRANSACTION");
+        for i in 11..=20 {
+            batch(
+                &primary,
+                &mut ctx,
+                &format!("INSERT INTO t VALUES ({i}, {i})"),
+            );
+        }
+        let mid = primary.storage().wal_flushed_lsn();
+        let delta = primary
+            .storage()
+            .read_wal_range(backup_end, mid)
+            .expect("mid-transaction range");
+
+        Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta)
+            .expect("apply mid-txn range");
+        assert!(
+            standby.standby_restartpoint().expect("restartpoint"),
+            "the resolved prefix is reclaimable"
+        );
+        let head = standby.storage().wal_head();
+        assert_eq!(
+            head, begin_area,
+            "the head advanced exactly to the unresolved transaction's BEGIN \
+             (reclaiming everything before it, retaining all of its undo log)"
+        );
+        assert!(
+            head < mid,
+            "the head stopped below the applied tail (the open transaction pins it)"
+        );
+
+        // The floor survives a reopen (the ATT is re-derived from the ring).
+        drop(standby);
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        assert!(
+            !standby.standby_restartpoint().expect("after reopen"),
+            "still pinned by the same unresolved transaction after a reopen"
+        );
+
+        // The commit ships: the floor lifts and the next restartpoint reaches
+        // the applied tail.
+        batch(&primary, &mut ctx, "COMMIT");
+        let flushed = primary.storage().wal_flushed_lsn();
+        let delta2 = primary
+            .storage()
+            .read_wal_range(mid, flushed)
+            .expect("commit range");
+        standby
+            .storage()
+            .apply_wal_stream(mid, &delta2)
+            .expect("apply commit");
+        assert!(
+            standby.standby_restartpoint().expect("after commit"),
+            "the commit lifted the floor"
+        );
+        assert_eq!(
+            standby.storage().wal_head(),
+            standby.storage().wal_tail(),
+            "everything resolved: full reclaim"
+        );
+        let expected = sql_rows(&primary, "SELECT id, v FROM t ORDER BY id").1;
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the standby matches the primary"
+        );
+
+        drop(primary);
+        drop(standby);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    // The restartpoint's search floor: the seed carries no search snapshot, so
+    // every shipped search record must stay in the ring for the reopen replay
+    // — the head clamps below the first one, and the reopened standby still
+    // serves the search state.
+    #[test]
+    fn a_standby_restartpoint_never_truncates_unsnapshotted_search_records() {
+        let primary_path = unique_temp_path("rsps-primary");
+        let bak = unique_temp_path("rsps-bak");
+        let standby_path = unique_temp_path("rsps-standby");
+
+        let primary = new_engine(&primary_path);
+        primary
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        for i in 1..=10 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        let backup_end = summary.backup_end_lsn;
+        // Post-backup: relational rows FIRST (a reclaimable prefix), then the
+        // search records (which pin the head), then more rows.
+        for i in 11..=15 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        primary
+            .execute(r#"create index products { "mappings": { "properties": { "name": { "type": "text" } } } }"#)
+            .expect("create search index");
+        primary
+            .execute(r#"insert document products { "name": "red shoes" }"#)
+            .expect("insert doc");
+        for i in 16..=20 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        let flushed = primary.storage().wal_flushed_lsn();
+        let delta = primary
+            .storage()
+            .read_wal_range(backup_end, flushed)
+            .expect("delta");
+
+        Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta)
+            .expect("apply");
+        assert!(
+            standby.standby_restartpoint().expect("restartpoint"),
+            "the pre-search prefix is reclaimable"
+        );
+        let head = standby.storage().wal_head();
+        assert!(
+            head > backup_end,
+            "the relational prefix before the search records was reclaimed"
+        );
+        assert!(
+            head < standby.storage().wal_tail(),
+            "the head stopped below the tail: the search records are retained"
+        );
+
+        // Reopen: the ring still holds every search record, so the replayed
+        // search state serves the streamed doc.
+        drop(standby);
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        let response = standby
+            .execute(r#"search products { "query": { "match": { "name": "red" } } }"#)
+            .expect("standby search after reopen");
+        let response: Value = serde_json::from_str(&response).expect("json");
+        assert_eq!(
+            response["hits"]["total"].as_u64(),
+            Some(1),
+            "the streamed search doc survives the restartpoint + reopen"
+        );
+
+        drop(primary);
+        drop(standby);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    // A FULL-recovery-model primary's backup seeds the standby with the FULL
+    // bit and a log-backup marker — but the standby must NOT hold ring
+    // truncation there (its log chain belongs to the primary; holding would
+    // cap every restartpoint at the seed point forever and run the ring
+    // full). BACKUP LOG on the standby is refused for the same reason.
+    #[test]
+    fn a_full_model_standby_still_reclaims_and_refuses_backup_log() {
+        let primary_path = unique_temp_path("rspl-primary");
+        let bak = unique_temp_path("rspl-bak");
+        let standby_path = unique_temp_path("rspl-standby");
+
+        let primary = new_engine(&primary_path);
+        primary
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        primary
+            .execute("ALTER DATABASE truthdb SET RECOVERY FULL")
+            .expect("full model");
+        for i in 1..=10 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        let backup_end = summary.backup_end_lsn;
+        for i in 11..=20 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        let flushed = primary.storage().wal_flushed_lsn();
+        let delta = primary
+            .storage()
+            .read_wal_range(backup_end, flushed)
+            .expect("delta");
+
+        Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta)
+            .expect("apply");
+        assert!(
+            standby.standby_restartpoint().expect("restartpoint"),
+            "a FULL-model standby still reclaims (no log-backup hold)"
+        );
+        assert!(
+            standby.storage().wal_head() > backup_end,
+            "the head advanced past the seeded log-backup marker"
+        );
+        let err = sql(&standby, "BACKUP LOG truthdb TO DISK = '/tmp/never.trn'");
+        assert!(
+            !err["error"].is_null(),
+            "BACKUP LOG on a standby is refused: {err}"
+        );
+
+        drop(primary);
+        drop(standby);
         for p in [primary_path, bak, standby_path] {
             let _ = std::fs::remove_file(p);
         }

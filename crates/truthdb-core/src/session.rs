@@ -1215,6 +1215,12 @@ fn maintenance_loop(shared: &Arc<Shared>) {
         // snapshot can need. Outside the scheduler lock — it takes the
         // storage lock, and nothing here depends on lock-table state.
         shared.engine.version_prune();
+        // Standby ring upkeep (Stage 18): a replication standby cannot
+        // checkpoint, so this periodic restartpoint is what reclaims its WAL
+        // ring (up to the primary-shipped undo floor). A no-op elsewhere.
+        if let Err(err) = shared.engine.standby_restartpoint_if_needed() {
+            eprintln!("standby restartpoint failed: {err}");
+        }
         // Unconditionally, not just when something was released. Workers now
         // block indefinitely on the inbox, so a nudge that should have been
         // sent and was not is a batch parked forever rather than a batch
