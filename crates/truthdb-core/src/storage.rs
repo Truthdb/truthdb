@@ -1000,6 +1000,100 @@ impl Storage {
         Ok(true)
     }
 
+    /// A standby's checkpoint-equivalent: flushes redone pages, persists the
+    /// allocator bitmap, and advances the WAL ring head to the standby's OWN
+    /// undo floor — reclaiming ring space without discarding the undo log an
+    /// eventual promotion needs, without truncating search records the seed
+    /// snapshot does not cover, and without ever appending to the (read-only)
+    /// WAL or allocating anything durable (a standby writes no search
+    /// snapshot: a locally chosen extent would collide with the primary's
+    /// future logged allocations). Everything runs under one storage-lock
+    /// hold, so no apply can interleave between the floor computation and the
+    /// head advance. Returns whether it reclaimed anything.
+    pub fn standby_restartpoint(&self) -> Result<bool, StorageError> {
+        let mut file = self.lock();
+        if !file.active_sb().is_standby() {
+            return Ok(false);
+        }
+        // The PERSISTED tail, not the live one: a failed apply leaves the live
+        // ring tail past the last fully-applied (decoded + redone + committed)
+        // range, and a restartpoint must never publish — let alone advance the
+        // head over — bytes whose redo never ran.
+        let tail = file.active_sb().wal_tail;
+        let att_floor = file.standby_att.values().min().copied().unwrap_or(tail);
+        let search_floor = file.standby_search_floor.unwrap_or(tail);
+        // `checkpoint_wal_head` folds the tail and the truncation-gate holds
+        // (a backup in progress); the standby's own local ATT there is empty.
+        let target = att_floor.min(search_floor).min(file.checkpoint_wal_head());
+        if target <= file.wal.head() {
+            return Ok(false);
+        }
+        // The same WAL-before-data discipline as a checkpoint: fsync the log,
+        // flush every dirty redone page, persist the allocator bitmap — then
+        // and only then move the head. A crash between any of these steps
+        // reopens redo-only from the OLD head over already-flushed pages
+        // (page-LSN-gated no-ops), which is consistent.
+        file.wal.sync_all()?;
+        {
+            let layout_data_offset = file.layout.data_offset;
+            let layout_data_pages = file.layout.data_size / PAGE_SIZE as u64;
+            let StorageFile {
+                rel,
+                file: dfile,
+                wal,
+                ..
+            } = &mut *file;
+            let RelState { pool, dpt, .. } = rel;
+            let mut io = PoolIo {
+                file: dfile,
+                wal,
+                data_offset: layout_data_offset,
+                data_pages: layout_data_pages,
+            };
+            pool.flush_all(&mut io)?;
+            dpt.clear();
+        }
+        let bitmap = file.allocator.persistable_bitmap();
+        if bitmap.len() as u64 > file.layout.allocator_size {
+            return Err(StorageError::InvalidFile(
+                "allocator bitmap exceeds allocator region".to_string(),
+            ));
+        }
+        let allocator_offset = file.layout.allocator_offset;
+        file.file.write_all_at(allocator_offset, &bitmap)?;
+        file.file.sync_data()?;
+        // Stamp the LIVE catalog root (exactly as a checkpoint does): records
+        // below the new head — including any applied SET_CATALOG_ROOT — are
+        // about to leave the ring, so a reopen must find the root in the
+        // superblock rather than re-deriving it from redo.
+        let metadata_root = file
+            .rel
+            .catalog_root
+            .map(|page| file.layout.data_offset + page * PAGE_SIZE as u64)
+            .unwrap_or(0);
+        file.commit_superblock(|sb| {
+            sb.wal_head = target;
+            sb.wal_tail = tail;
+            sb.metadata_root = metadata_root;
+            sb.set_applied_lsn(tail);
+            // A FULL-model seed carries the primary's frozen log-backup marker;
+            // left below the advancing head, promotion's reopen would re-arm
+            // the truncation hold BELOW the head and the first checkpoint
+            // would drive `set_head` backward into reclaimed ring space. The
+            // standby's marker is meaningless (its log chain belongs to the
+            // primary; a promoted node starts a fresh chain with a fresh full
+            // backup), so it rides the head.
+            if sb.last_log_backup_lsn() < target {
+                sb.set_last_log_backup_lsn(target);
+            }
+        })?;
+        if file.last_log_backup_lsn < target {
+            file.last_log_backup_lsn = target;
+        }
+        file.wal.set_head(target);
+        Ok(true)
+    }
+
     pub fn load_snapshot(&self) -> Result<Option<SnapshotData>, StorageError> {
         self.lock().load_snapshot()
     }
@@ -2226,6 +2320,25 @@ struct StorageFile {
     /// would wedge rather than shed the slot. The setter (test-only here; the
     /// transport slice wires the real one) must reject/clamp to that bound.
     max_slot_retain_bytes: u64,
+    /// The standby's own active-transaction table over the SHIPPED log:
+    /// txn id → BEGIN LSN, inserted as TXN_BEGIN records are applied and
+    /// removed at TXN_COMMIT/TXN_END — the same resolution rules recovery's
+    /// analysis uses. Its minimum is the restartpoint's undo floor: everything
+    /// below it is resolved, so a promotion's analysis+undo never needs log
+    /// past it. Computed HERE, at the standby's own applied position — a floor
+    /// computed on the primary describes the primary's tail, not the shipped
+    /// prefix, and could truncate undo of a transaction whose resolution has
+    /// not shipped yet. Seeded at open from the same records recovery scans.
+    standby_att: std::collections::HashMap<u64, u64>,
+    /// The first ring LSN of a search-subsystem (`entry_type == 1`) record the
+    /// seed snapshot does not cover: a restartpoint must not advance the head
+    /// past it, or a reopen's search replay would lose the event (a standby
+    /// writes no search snapshots — a locally allocated snapshot extent would
+    /// collide with the primary's future logged allocations).
+    standby_search_floor: Option<u64>,
+    /// The seed snapshot's `next_seq_no` (0 = no snapshot): search records at
+    /// or above it are NOT covered and pin `standby_search_floor`.
+    snapshot_next_seq_no: u64,
     /// FULL-model log-backup floor (mirrors the active superblock's
     /// `last_log_backup_lsn`): the LSN up to which the log has been shipped to
     /// a log archive. `0` in the SIMPLE model / before the first log backup.
@@ -4852,6 +4965,9 @@ impl StorageFile {
             wal,
             truncation_gate: LogTruncationGate::default(),
             max_slot_retain_bytes: u64::MAX,
+            standby_att: std::collections::HashMap::new(),
+            standby_search_floor: None,
+            snapshot_next_seq_no: 0,
             last_log_backup_lsn,
             log_backup_in_progress: false,
             layout,
@@ -4867,7 +4983,11 @@ impl StorageFile {
         // reclaim un-backed-up log. The floor is >= the persisted wal_head
         // (checkpoints were already clamped to it), so it never moves the head
         // backward.
-        if recovery_full {
+        // A standby skips the hold: its seeded marker is the PRIMARY's log
+        // chain (frozen at the backup point), and holding there would cap
+        // every restartpoint at the seed forever, running the ring full. The
+        // hold re-arms at promotion (a full reopen as a non-standby).
+        if recovery_full && !active_sb.is_standby() {
             storage.register_log_backup_hold(last_log_backup_lsn);
         }
         // Re-seed the replication slots so their truncation hold survives the
@@ -4875,6 +4995,33 @@ impl StorageFile {
         // more log, safe: redo is idempotent).
         for (id, lsn) in repl_slots {
             storage.truncation_gate.repl_slots.insert(id, lsn);
+        }
+        // A standby re-derives its restartpoint floors from the same records
+        // recovery is about to scan: the active-transaction table (unresolved
+        // BEGINs) and the first search record the seed snapshot does not cover.
+        if active_sb.is_standby() {
+            let descriptors = storage.read_snapshot_descriptors()?;
+            storage.snapshot_next_seq_no = live_descriptor_slot(&descriptors)
+                .and_then(|slot| descriptors[slot])
+                .map(|desc| desc.next_seq_no)
+                .unwrap_or(0);
+            let rel_records: Vec<(u64, RelRecord)> = storage
+                .replay_cache
+                .iter()
+                .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
+                .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
+                .collect::<Result<_, StorageError>>()?;
+            for (lsn, record) in &rel_records {
+                storage.standby_track_rel_record(*lsn, record);
+            }
+            storage.standby_search_floor = storage
+                .replay_cache
+                .iter()
+                .find(|record| {
+                    record.entry_type != WAL_ENTRY_TYPE_REL
+                        && record.seq_no >= storage.snapshot_next_seq_no
+                })
+                .map(|record| record.logical_ts);
         }
         storage.recover_allocator()?;
 
@@ -4983,6 +5130,9 @@ impl StorageFile {
             wal,
             truncation_gate: LogTruncationGate::default(),
             max_slot_retain_bytes: u64::MAX,
+            standby_att: std::collections::HashMap::new(),
+            standby_search_floor: None,
+            snapshot_next_seq_no: 0,
             last_log_backup_lsn: 0,
             log_backup_in_progress: false,
             layout,
@@ -5454,6 +5604,30 @@ impl StorageFile {
     /// reclaimable as soon as it is checkpointed.
     fn release_log_backup_hold(&mut self) {
         self.truncation_gate.log_backup = None;
+    }
+
+    /// Maintains the standby's active-transaction table as shipped records are
+    /// applied — the SAME begin/resolve rules recovery's analysis uses
+    /// (`analyze_and_redo`): TXN_BEGIN opens at its own LSN, TXN_COMMIT and
+    /// TXN_END resolve. A page op for a transaction whose BEGIN was not seen
+    /// cannot arise (a chunk never precedes a transaction's BEGIN — chunks
+    /// apply in order and BEGIN is its first record); the defensive
+    /// `or_insert` still clamps the floor at that record if it ever did.
+    fn standby_track_rel_record(&mut self, lsn: u64, record: &RelRecord) {
+        use crate::wal::records::{REL_KIND_TXN_BEGIN, REL_KIND_TXN_COMMIT, REL_KIND_TXN_END};
+        match record.kind {
+            REL_KIND_TXN_BEGIN => {
+                self.standby_att.insert(record.txn_id, lsn);
+            }
+            REL_KIND_TXN_COMMIT | REL_KIND_TXN_END => {
+                self.standby_att.remove(&record.txn_id);
+            }
+            _ => {
+                if record.txn_id != 0 {
+                    self.standby_att.entry(record.txn_id).or_insert(lsn);
+                }
+            }
+        }
     }
 
     /// Drops any replication slot lagging the WAL tail by more than
@@ -6032,6 +6206,13 @@ impl StorageFile {
                 "BACKUP LOG requires the FULL recovery model".to_string(),
             ));
         }
+        if self.active_sb().is_standby() {
+            return Err(StorageError::InvalidConfig(
+                "BACKUP LOG is not supported on a replication standby (its log chain \
+                 belongs to the primary); run log backups there"
+                    .to_string(),
+            ));
+        }
         if self.log_backup_in_progress {
             return Err(StorageError::BackupInProgress);
         }
@@ -6243,7 +6424,9 @@ impl StorageFile {
         // but the ALLOCATOR is only rebuilt at open — without this, an extent
         // the primary allocated after the standby opened stays free in the
         // standby's in-memory bitmap, and a spilling read on the standby could
-        // allocate scratch space over replicated pages.
+        // allocate scratch space over replicated pages. (Safe to do before the
+        // fallible redo: on failure the extra marked-used extents are merely
+        // conservative, and the re-apply re-marks them idempotently.)
         for (_, record) in &records {
             match record.kind {
                 REL_KIND_ALLOC_EXTENT => {
@@ -6278,6 +6461,29 @@ impl StorageFile {
             self.rel.catalog_root = Some(root);
         }
         self.reload_catalog()?;
+
+        // Only now — with every fallible step behind us — fold the range into
+        // the restartpoint floors. Tracking it any earlier would let a FAILED
+        // apply lift the undo floor over records whose redo never executed (a
+        // resolution in the failed chunk would mark its transaction resolved),
+        // and a restartpoint could then truncate undo a promotion still needs.
+        for (lsn, record) in &records {
+            self.standby_track_rel_record(*lsn, record);
+        }
+        // Track the first UNCOVERED search record (the restartpoint's search
+        // floor): the seed snapshot covers seq numbers below
+        // `snapshot_next_seq_no`; anything at or above must stay in the ring
+        // for the reopen replay.
+        if self.standby_search_floor.is_none() {
+            for record in &scan.records {
+                if record.entry_type != WAL_ENTRY_TYPE_REL
+                    && record.seq_no >= self.snapshot_next_seq_no
+                {
+                    self.standby_search_floor = Some(record.logical_ts);
+                    break;
+                }
+            }
+        }
 
         // 4. Record the advanced tail durably (light dual-write, no page flush —
         //    the pages are recoverable from the now-durable ring). `applied_lsn`
@@ -6507,11 +6713,8 @@ impl StorageFile {
         self.ensure_rel_usable()?;
         // A checkpoint on a standby is refused: it would advance the WAL head
         // past the in-flight transactions the standby has applied but not
-        // resolved, discarding the undo log they need at promotion. A
-        // standby-safe checkpoint (preserving undo-ability) is designed with the
-        // standby runtime; until then a standby reclaims ring space only by
-        // promotion. The ring-fit guard in `apply_wal_stream_locked` bounds how
-        // far a standby can stream without one.
+        // resolved, discarding the undo log they need at promotion. A standby
+        // reclaims ring space with `Storage::standby_restartpoint` instead.
         if self.active_sb().is_standby() {
             return Err(StorageError::InvalidConfig(
                 "checkpoint is not supported on a replication standby (apply-only until promotion)"

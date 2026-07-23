@@ -110,7 +110,7 @@ pub struct HelloAck {
 }
 
 /// Primary → standby: raw WAL ring bytes to apply at `from_lsn` (as
-/// [`crate::storage::Storage::read_wal_range`] produced them).
+/// [`crate::storage::Storage::read_wal_chunk`] produced them).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LogData {
     pub from_lsn: u64,
