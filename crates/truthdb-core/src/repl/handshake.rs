@@ -110,13 +110,25 @@ pub fn evaluate_hello(hello: &Hello, params: &HandshakeParams) -> HelloAck {
     if hello.cluster_uuid != params.cluster_uuid {
         return reject(params.primary_epoch, "cluster uuid mismatch");
     }
-    // 4. Epoch fence: a standby claiming a HIGHER epoch than ours means we are a
-    //    stale (demoted) primary — refuse to feed it; the operator resolves the
-    //    split and this node reseeds.
+    // 4. Epoch fence, BOTH directions. A standby AHEAD of us means we are a
+    //    stale (demoted) primary — refuse to feed it. A standby BEHIND us is
+    //    from an older timeline (it was seeded before a failover, or it IS the
+    //    old primary rejoining): its log may contain records the new timeline
+    //    never had, and LSNs alone cannot detect that divergence — only an
+    //    EQUAL epoch guarantees the standby's log is a prefix of ours (its
+    //    seed came from this timeline's backup and it only ever applied this
+    //    timeline's stream). Anything else must reseed.
     if hello.epoch > params.primary_epoch {
         return reject(
             params.primary_epoch,
             "this primary's epoch is behind the standby",
+        );
+    }
+    if hello.epoch < params.primary_epoch {
+        return reject(
+            params.primary_epoch,
+            "standby epoch is behind this primary (an older timeline): reseed the \
+             standby from a fresh backup",
         );
     }
     HelloAck {
@@ -159,8 +171,8 @@ mod tests {
     /// primary's epoch + durable tail.
     #[test]
     fn a_valid_hello_is_accepted() {
-        let auth = compute_auth(SECRET, 9, &UUID, 2, 50_000);
-        let hello = hello_with(9, 2, 50_000, auth);
+        let auth = compute_auth(SECRET, 9, &UUID, 4, 50_000);
+        let hello = hello_with(9, 4, 50_000, auth);
         let ack = evaluate_hello(&hello, &params());
         assert!(ack.accepted, "{}", ack.message);
         assert_eq!(ack.primary_epoch, 4);
@@ -241,11 +253,22 @@ mod tests {
     }
 
     #[test]
-    fn a_standby_at_or_below_the_primary_epoch_is_accepted() {
-        for epoch in [0u64, 4] {
+    fn only_a_standby_at_the_primary_epoch_is_accepted() {
+        // Equal epoch = same timeline = a guaranteed log prefix.
+        let auth = compute_auth(SECRET, 9, &UUID, 4, 50_000);
+        let hello = hello_with(9, 4, 50_000, auth);
+        assert!(evaluate_hello(&hello, &params()).accepted);
+        // A LOWER epoch is an older timeline — possibly diverged; reseed.
+        for epoch in [0u64, 3] {
             let auth = compute_auth(SECRET, 9, &UUID, epoch, 50_000);
             let hello = hello_with(9, epoch, 50_000, auth);
-            assert!(evaluate_hello(&hello, &params()).accepted, "epoch {epoch}");
+            let ack = evaluate_hello(&hello, &params());
+            assert!(!ack.accepted, "epoch {epoch}");
+            assert!(
+                ack.message.contains("reseed"),
+                "epoch {epoch}: {}",
+                ack.message
+            );
         }
     }
 }

@@ -27,7 +27,7 @@ use crate::storage_layout::PAGE_SIZE;
 /// The magic bytes at the start of every `TDBBAK1` file.
 pub const MAGIC: &[u8; 8] = b"TDBBAK1\0";
 /// Format version — bumped on any incompatible framing/header change.
-pub const FORMAT_VERSION: u32 = 1;
+pub const FORMAT_VERSION: u32 = 2;
 
 /// The kind of a framed block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +103,10 @@ pub struct BackupHeader {
     pub last_committed_seq: u64,
     /// The source's database-options byte (RCSI / ALLOW_SNAPSHOT bits).
     pub db_options: u8,
+    /// The source's replication epoch: a restored `--standby` seed carries its
+    /// timeline, so the handshake's equal-epoch fence can tell a same-timeline
+    /// standby (a guaranteed log prefix) from a diverged one that must reseed.
+    pub epoch: u64,
     /// Wall-clock time the backup finished, milliseconds since the Unix epoch.
     pub finished_at_millis: u64,
     pub flags: BackupFlags,
@@ -124,6 +128,7 @@ impl BackupHeader {
         out.extend_from_slice(&self.metadata_root.to_le_bytes());
         out.extend_from_slice(&self.last_committed_seq.to_le_bytes());
         out.extend_from_slice(&self.finished_at_millis.to_le_bytes());
+        out.extend_from_slice(&self.epoch.to_le_bytes());
         out.push(self.db_options);
         let flag_bits = (self.flags.checksum as u8)
             | ((self.flags.copy_only as u8) << 1)
@@ -156,6 +161,7 @@ impl BackupHeader {
         let metadata_root = cursor.u64()?;
         let last_committed_seq = cursor.u64()?;
         let finished_at_millis = cursor.u64()?;
+        let epoch = cursor.u64()?;
         let db_options = cursor.u8()?;
         let flag_bits = cursor.u8()?;
         let collation_len = cursor.u32()?;
@@ -183,6 +189,7 @@ impl BackupHeader {
             metadata_root,
             last_committed_seq,
             db_options,
+            epoch,
             finished_at_millis,
             flags: BackupFlags {
                 checksum: flag_bits & 1 != 0,
@@ -473,6 +480,7 @@ mod tests {
             metadata_root: 4096 * 40,
             last_committed_seq: 7,
             db_options: 0b01,
+            epoch: 3,
             finished_at_millis: 1_700_000_000_000,
             flags: BackupFlags {
                 checksum: true,

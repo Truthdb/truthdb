@@ -779,6 +779,102 @@ impl Storage {
         Self::restore_full_inner(dst_path, bak_path, &[], wal_ranges, None, false)
     }
 
+    /// Offline PROMOTION of a replication standby to a read-write primary
+    /// (manual failover). The server must be stopped — the advisory file lock
+    /// fails this fast if it is not. Two phases, each crash-safe:
+    ///
+    /// 1. Flip the superblocks: clear `is_standby` and bump the epoch by one,
+    ///    in a single dual-write (active slot first, fsync between — a torn
+    ///    write falls back to the still-standby backup slot and the promote is
+    ///    simply retried). The epoch bump fences the old timeline: the
+    ///    handshake accepts only EQUAL epochs, so the old primary — whose log
+    ///    may hold records this timeline never had — cannot rejoin without a
+    ///    reseed, and neither can standbys seeded before the failover.
+    /// 2. A validating [`Storage::open`]: with the standby flag gone, recovery
+    ///    runs IN FULL — redo, then undo of the shipped in-flight transactions
+    ///    (with CLRs, on the now-writable WAL). This is where "drain, finish
+    ///    redo+undo" happens; a crash mid-recovery re-runs it on the next open.
+    ///
+    /// Returns the new epoch.
+    pub fn promote(path: &Path) -> Result<u64, StorageError> {
+        let new_epoch = {
+            let mut file = DirectFile::open_existing(path.to_path_buf())?;
+            let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+            file.read_exact_at(0, &mut header_bytes)?;
+            let header = FileHeader::from_le_bytes(&header_bytes);
+            if header.magic != crate::storage_layout::FILE_MAGIC {
+                return Err(StorageError::InvalidFile("bad magic".to_string()));
+            }
+            if header.header_checksum != header.compute_checksum() {
+                return Err(StorageError::InvalidFile(
+                    "header checksum mismatch".to_string(),
+                ));
+            }
+            let mut sb_a_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
+            file.read_exact_at(header.superblock_a_offset, &mut sb_a_bytes)?;
+            let superblock_a = Superblock::from_le_bytes(&sb_a_bytes);
+            let sb_a_valid = superblock_a.checksum == superblock_a.compute_checksum();
+            let mut sb_b_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
+            file.read_exact_at(header.superblock_b_offset, &mut sb_b_bytes)?;
+            let superblock_b = Superblock::from_le_bytes(&sb_b_bytes);
+            let sb_b_valid = superblock_b.checksum == superblock_b.compute_checksum();
+            if !sb_a_valid && !sb_b_valid {
+                return Err(StorageError::InvalidFile(
+                    "both superblocks have checksum mismatch".to_string(),
+                ));
+            }
+            let active_slot = ActiveSuperblock::from_superblocks(
+                &superblock_a,
+                &superblock_b,
+                sb_a_valid,
+                sb_b_valid,
+            );
+            let (active, primary_offset, backup_flag, backup_offset) = match active_slot {
+                ActiveSuperblock::A => (
+                    superblock_a,
+                    header.superblock_a_offset,
+                    SUPERBLOCK_ACTIVE_B,
+                    header.superblock_b_offset,
+                ),
+                ActiveSuperblock::B => (
+                    superblock_b,
+                    header.superblock_b_offset,
+                    SUPERBLOCK_ACTIVE_A,
+                    header.superblock_a_offset,
+                ),
+            };
+            if !active.is_standby() {
+                return Err(StorageError::InvalidConfig(
+                    "this database is not a replication standby; nothing to promote".to_string(),
+                ));
+            }
+            let generation = superblock_a
+                .generation
+                .max(superblock_b.generation)
+                .saturating_add(1);
+            let new_epoch = active.epoch().saturating_add(1);
+            let mut primary = active;
+            let mut backup = active;
+            backup.active = backup_flag;
+            for sb in [&mut primary, &mut backup] {
+                sb.set_standby(false);
+                sb.set_epoch(new_epoch);
+                sb.generation = generation;
+                sb.checksum = sb.compute_checksum();
+            }
+            file.write_all_at(primary_offset, &primary.to_le_bytes_with_checksum())?;
+            file.sync_data()?;
+            file.write_all_at(backup_offset, &backup.to_le_bytes_with_checksum())?;
+            file.sync_data()?;
+            new_epoch
+            // The file handle (and its advisory lock) drops here.
+        };
+        // Validate + finalize: a full open runs redo AND undo (the standby flag
+        // is gone), sealing the shipped in-flight transactions with CLRs.
+        drop(Storage::open(path.to_path_buf())?);
+        Ok(new_epoch)
+    }
+
     fn restore_full_inner(
         dst_path: &Path,
         bak_path: &Path,
@@ -6009,6 +6105,7 @@ impl StorageFile {
             metadata_root,
             last_committed_seq,
             db_options,
+            epoch: self.active_sb().epoch(),
             runs,
             checksum,
             copy_only,
@@ -6242,6 +6339,7 @@ impl StorageFile {
             metadata_root: 0,
             last_committed_seq: 0,
             db_options: self.version.options_byte(),
+            epoch: self.active_sb().epoch(),
             finished_at_millis: now_millis(),
             flags: crate::backup::BackupFlags {
                 checksum,
@@ -6526,6 +6624,10 @@ impl StorageFile {
         // applied log chain / shipped WAL ranges), which is the restored tail.
         base.set_applied_lsn(backup_end);
         base.set_standby(standby);
+        // The seed carries the source's timeline: the handshake's equal-epoch
+        // fence relies on it to tell a same-timeline standby from a diverged
+        // one.
+        base.set_epoch(header.epoch);
 
         let mut a = base;
         a.generation = 1;
@@ -7285,6 +7387,7 @@ struct BackupPlan {
     metadata_root: u64,
     last_committed_seq: u64,
     db_options: u8,
+    epoch: u64,
     runs: Vec<(u64, u64)>,
     checksum: bool,
     copy_only: bool,
@@ -7308,6 +7411,7 @@ impl BackupPlan {
             metadata_root: self.metadata_root,
             last_committed_seq: self.last_committed_seq,
             db_options: self.db_options,
+            epoch: self.epoch,
             finished_at_millis: self.finished_at_millis,
             flags: crate::backup::BackupFlags {
                 checksum: self.checksum,

@@ -7320,6 +7320,24 @@ fn exec_alter_database(
         )
         .at(name.span));
     }
+    // FAILOVER (standby promotion) is offline-only, like RESTORE DATABASE: the
+    // in-flight-transaction undo and the epoch bump run against a stopped
+    // server. Checked before anything else — the pointer to the CLI is the
+    // whole answer.
+    if alter
+        .options
+        .iter()
+        .any(|(option, _)| *option == DatabaseOption::Failover)
+    {
+        return Err(SqlError::new(
+            3101,
+            16,
+            1,
+            "Exclusive access could not be obtained because the database is in use. TruthDB \
+             promotes a standby offline: stop the server and run `truthdb-cli promote`."
+                .to_string(),
+        ));
+    }
     // A SNAPSHOT transaction idle between batches holds no locks, so the
     // batch's Database X does not prove no snapshot is live. Flipping the
     // options under one would reset (or stop publishing to) the store its
@@ -7346,6 +7364,8 @@ fn exec_alter_database(
             DatabaseOption::AllowSnapshotIsolation => allow_snapshot = Some(*on),
             // For Recovery the bool is the mode: true = FULL, false = SIMPLE.
             DatabaseOption::Recovery => recovery_full = Some(*on),
+            // Returned as 3101 above, before this loop runs.
+            DatabaseOption::Failover => unreachable!("failover is rejected before options apply"),
         }
     }
     storage

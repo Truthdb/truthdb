@@ -77,6 +77,17 @@ enum Command {
         #[arg(long, conflicts_with = "stopat")]
         standby: bool,
     },
+    /// OFFLINE: promote a replication standby to a read-write primary (manual
+    /// failover). The server must be stopped. Finishes recovery (redo + undo
+    /// of in-flight shipped transactions), clears the standby mode, and bumps
+    /// the replication epoch — fencing the old timeline: the old primary (and
+    /// any standby seeded before the failover) must reseed from a fresh
+    /// backup of this node before it can follow it.
+    Promote {
+        /// Path to the standby's storage file (e.g. /var/lib/truthdb/truth.db).
+        #[arg(long)]
+        path: std::path::PathBuf,
+    },
 }
 
 #[tokio::main]
@@ -136,6 +147,17 @@ async fn main() -> Result<()> {
                 Err(err) => Err(anyhow::anyhow!("restore failed: {err}")),
             }
         }
+        Command::Promote { path } => match truthdb_core::storage::Storage::promote(&path) {
+            Ok(epoch) => {
+                println!(
+                    "promoted {} to primary (replication epoch {epoch}); reconfigure it as \
+                     role = \"primary\" and reseed any other standby from a fresh backup",
+                    path.display()
+                );
+                Ok(())
+            }
+            Err(err) => Err(anyhow::anyhow!("promote failed: {err}")),
+        },
     }
 }
 
