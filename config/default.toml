@@ -65,7 +65,11 @@ snapshot_wal_threshold = 0.7
 # tls_cert = "/etc/truthdb/repl.crt"
 # tls_key = "/etc/truthdb/repl.key"
 # heartbeat_ms = 1000
+# stall_timeout_ms = 30000    # tear down a totally silent connection (>= 2x heartbeat)
 # max_slot_retain_bytes = 0   # 0 = unlimited: a lagging standby is never dropped
+# synchronous_commit = false  # commits wait for a standby ack (availability-first)
+# sync_timeout_ms = 10000     # the sync-commit wait bound; on timeout the link
+#                             # degrades to NOT_SYNCHRONIZED and commits proceed
 #
 # Standby:
 # primary_addr = "primary.example:9624"

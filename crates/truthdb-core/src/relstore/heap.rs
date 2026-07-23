@@ -60,6 +60,17 @@ fn moved_cell(home: Rid, row: &[u8]) -> Vec<u8> {
     cell
 }
 
+/// Splits a raw heap CELL into row bytes, for consumers holding WAL undo
+/// payloads (which carry cells verbatim): `(home-rid override for a MOVED
+/// cell, row bytes)`; `None` for stubs (pointers, not rows) and unknown tags.
+pub(crate) fn cell_row(cell: &[u8]) -> Option<(Option<Rid>, &[u8])> {
+    match *cell.first()? {
+        TAG_ROW => Some((None, &cell[1..])),
+        TAG_MOVED if cell.len() >= 11 => Some((Some(parse_rid(&cell[1..11])), &cell[11..])),
+        _ => None,
+    }
+}
+
 fn parse_rid(bytes: &[u8]) -> Rid {
     Rid {
         page: u64::from_le_bytes(bytes[0..8].try_into().unwrap()),

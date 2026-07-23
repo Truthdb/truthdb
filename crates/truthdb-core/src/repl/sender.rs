@@ -189,6 +189,9 @@ where
                 };
                 if let Some(lsn) = bounded {
                     storage.advance_repl_slot(slot_id, lsn);
+                    // D2 synchronous commit: a committer may be waiting on this
+                    // acknowledgement (a no-op when sync commit is not armed).
+                    storage.publish_sync_ack(lsn);
                 }
             }
         }

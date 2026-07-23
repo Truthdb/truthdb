@@ -116,6 +116,10 @@ pub(crate) struct VersionState {
     /// FULL recovery model (vs SIMPLE, the default). Independent of the
     /// version store — it does not affect `publishing()`.
     pub recovery_full: bool,
+    /// Readable-standby mode: the replication apply mirrors shipped changes
+    /// into this store (pre-images from the WAL's undo payloads), and every
+    /// standby read resolves through it at the last-applied-commit snapshot.
+    pub standby_reads: bool,
     /// Committed transactions -> commit sequence. Entries live until no chain
     /// references them and the watermark has passed (pruned together with the
     /// chains). A transaction absent here is running or rolled back — either
@@ -144,7 +148,7 @@ impl VersionState {
     /// Whether writes must publish versions (any versioned isolation can be
     /// in use).
     pub fn publishing(&self) -> bool {
-        self.rcsi || self.allow_snapshot
+        self.rcsi || self.allow_snapshot || self.standby_reads
     }
 
     /// Applies `ALTER DATABASE` option changes. Turning the last option off
