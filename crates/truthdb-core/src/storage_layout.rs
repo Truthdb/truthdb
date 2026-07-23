@@ -352,15 +352,25 @@ impl Superblock {
         self.reserved[8..16].copy_from_slice(&lsn.to_le_bytes());
     }
 
+    /// Replication epoch: bumped once at each promotion, so a diverged old
+    /// primary's stream (a lower epoch) can be fenced off. Zero on every file
+    /// until the first failover. Stored in the reserved area (bytes 16..24)
+    /// and covered by the superblock checksum.
+    pub fn epoch(&self) -> u64 {
+        u64::from_le_bytes(self.reserved[16..24].try_into().unwrap())
+    }
+
+    pub fn set_epoch(&mut self, epoch: u64) {
+        self.reserved[16..24].copy_from_slice(&epoch.to_le_bytes());
+    }
+
     /// Replication restartpoint: the LSN up to which this file's WAL is present
     /// and recovered — a standby reads it to know where to resume shipping. It is
     /// stamped at each durable restartpoint (a checkpoint or a restore), where it
     /// equals `wal_tail`; between restartpoints the persisted value lags the live
     /// tail, exactly as the superblock's own `wal_tail` does. Stored in the
-    /// reserved area (bytes 24..32; 16..24 is left for the future replication
-    /// epoch) and covered by the superblock checksum. (The reader is test-only
-    /// until the replication receiver slice consumes the restartpoint in
-    /// production.)
+    /// reserved area (bytes 24..32) and covered by the superblock checksum.
+    /// (The reader is test-only until the monitoring slice consumes it.)
     #[cfg(test)]
     pub fn applied_lsn(&self) -> u64 {
         u64::from_le_bytes(self.reserved[24..32].try_into().unwrap())

@@ -40,6 +40,14 @@ pub(crate) struct GroupCommit {
     flushed_cv: Condvar,
     /// The log-writer waits here for a higher `requested`.
     wake_cv: Condvar,
+    /// Async mirror of `flushed` advances, so a tokio task (the replication
+    /// sender) can await new durable WAL without polling. `send_replace` from
+    /// the log-writer thread needs no runtime. The carried value is a wake-up
+    /// hint only: WAL made durable by a direct sync (rollback, checkpoint)
+    /// advances the durable watermark without passing through here, so a
+    /// subscriber must re-read `Storage::wal_flushed_lsn` after each wake and
+    /// pair the watch with a periodic tick.
+    flushed_tx: tokio::sync::watch::Sender<u64>,
 }
 
 impl GroupCommit {
@@ -56,6 +64,7 @@ impl GroupCommit {
             }),
             flushed_cv: Condvar::new(),
             wake_cv: Condvar::new(),
+            flushed_tx: tokio::sync::watch::channel(0).0,
         });
         let writer_gc = Arc::clone(&gc);
         let writer = std::thread::Builder::new()
@@ -116,6 +125,12 @@ impl GroupCommit {
             .flushed
     }
 
+    /// Subscribes to `flushed`-watermark advances (see the `flushed_tx` field
+    /// note: the value is a hint, re-read the real watermark after each wake).
+    pub(crate) fn subscribe_flushed(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.flushed_tx.subscribe()
+    }
+
     /// The number of fsyncs the log-writer has issued so far.
     #[cfg(test)]
     pub(crate) fn fsync_count(&self) -> u64 {
@@ -148,6 +163,7 @@ impl GroupCommit {
                 Ok(()) => {
                     if target > state.flushed {
                         state.flushed = target;
+                        self.flushed_tx.send_replace(target);
                     }
                     self.flushed_cv.notify_all();
                 }

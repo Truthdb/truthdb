@@ -1,5 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::RwLock;
+use std::sync::{Arc, RwLock};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -36,7 +36,7 @@ struct EngineMeta {
 /// concurrent native batch could read a relational batch's half-applied
 /// writes — which the old single-threaded actor prevented for free.
 pub struct Engine {
-    storage: Storage,
+    storage: Arc<Storage>,
     meta: RwLock<EngineMeta>,
 }
 
@@ -78,9 +78,17 @@ impl Engine {
         }
 
         Ok(Engine {
-            storage,
+            storage: Arc::new(storage),
             meta: RwLock::new(meta),
         })
+    }
+
+    /// A shared handle to the underlying storage, for subsystems that run
+    /// beside the engine's worker pool — the replication listener/sender on a
+    /// primary and the replication receiver on a standby. `Storage` is
+    /// internally synchronized, so the tasks and the workers share it safely.
+    pub fn storage_arc(&self) -> Arc<Storage> {
+        Arc::clone(&self.storage)
     }
 
     /// The underlying storage handle, so a test can drive an online backup
@@ -2425,6 +2433,188 @@ mod tests {
         }
     }
 
+    // Stage 18 slice 4c: the full transport, end to end over a real TCP+TLS
+    // socket — listener + handshake + per-standby sender on the primary,
+    // reconnecting receiver on the standby. A backup-seeded standby catches up,
+    // follows live commits (woken by the flushed watch, no polling), its
+    // FlushAcks advance the primary's slot, and a receiver restart resumes from
+    // the standby's persisted watermark.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn the_replication_transport_streams_live_writes_to_a_standby() {
+        use crate::repl::listener::{PrimaryReplContext, run_repl_listener};
+        use crate::repl::receiver::{ReceiverConfig, run_standby_receiver};
+        use crate::repl::tls::server_config_from_pem;
+        use std::sync::Arc;
+        use std::time::Duration;
+        use tokio::sync::watch;
+        use tokio_rustls::TlsAcceptor;
+
+        const SECRET: &[u8] = b"transport-secret";
+        const UUID: [u8; 16] = [7u8; 16];
+
+        let primary_path = unique_temp_path("xport-primary");
+        let bak = unique_temp_path("xport-bak");
+        let standby_path = unique_temp_path("xport-standby");
+
+        // Primary: rows 1..=10, a backup to seed the standby, then post-backup
+        // rows the transport must catch the standby up on.
+        let primary = new_engine(&primary_path);
+        primary
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=10 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        primary.storage().backup_full(&bak).expect("backup");
+        // A catch-up backlog spanning MANY sender chunks (the context below
+        // sets 512-byte chunks), so entry-boundary chunking is exercised end
+        // to end — a mid-entry cut would fail the apply's coverage check.
+        for i in 11..=120 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+
+        // The primary's replication listener on an ephemeral port.
+        let (cert_pem, key_pem) = {
+            let c = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+            (c.cert.pem(), c.key_pair.serialize_pem())
+        };
+        let acceptor = TlsAcceptor::from(
+            server_config_from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap(),
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let ctx = PrimaryReplContext {
+            shared_secret: Arc::new(SECRET.to_vec()),
+            cluster_uuid: UUID,
+            storage: primary.storage_arc(),
+            heartbeat: Duration::from_millis(200),
+            stall_timeout: Duration::from_secs(30),
+            chunk_bytes: 512,
+            active_nodes: Arc::default(),
+        };
+        let listener_task = tokio::spawn(run_repl_listener(
+            listener,
+            acceptor,
+            ctx,
+            shutdown_rx.clone(),
+        ));
+
+        // Standby: seeded with a --standby restore (stamped redo-only +
+        // read-only before its first open), opened live, then its receiver
+        // dials the primary.
+        Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        assert!(
+            standby.storage().is_standby(),
+            "a --standby restore stamps the standby mode before the first open"
+        );
+        let receiver_cfg = ReceiverConfig {
+            primary_addr: addr.to_string(),
+            server_name: "localhost".to_string(),
+            tls_ca_pem: cert_pem.as_bytes().to_vec(),
+            shared_secret: SECRET.to_vec(),
+            cluster_uuid: UUID,
+            node_id: 7,
+            reconnect_delay: Duration::from_millis(100),
+            stall_timeout: Duration::from_secs(30),
+        };
+        let (rx_shutdown_tx, rx_shutdown_rx) = watch::channel(false);
+        let receiver_task = tokio::spawn(run_standby_receiver(
+            receiver_cfg.clone(),
+            standby.storage_arc(),
+            rx_shutdown_rx,
+        ));
+
+        async fn wait_until(what: &str, mut cond: impl FnMut() -> bool) {
+            let deadline = std::time::Instant::now() + Duration::from_secs(20);
+            while !cond() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "timed out waiting for {what}"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        }
+
+        // Catch-up: the standby reaches the primary's durable watermark.
+        let target = primary.storage().wal_flushed_lsn();
+        wait_until("catch-up", || standby.storage().wal_tail() >= target).await;
+        let expected = sql_rows(&primary, "SELECT id, v FROM t ORDER BY id").1;
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the standby matches the primary after catch-up"
+        );
+
+        // Live follow: new commits arrive without any reconnect.
+        for i in 21..=30 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        primary
+            .execute("UPDATE t SET v = v + 100 WHERE id <= 5")
+            .expect("update");
+        let target = primary.storage().wal_flushed_lsn();
+        wait_until("live follow", || standby.storage().wal_tail() >= target).await;
+        let expected = sql_rows(&primary, "SELECT id, v FROM t ORDER BY id").1;
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the standby follows live commits"
+        );
+
+        // The standby's FlushAcks advance the primary's slot to its watermark,
+        // so the primary can reclaim the shipped log.
+        wait_until("slot advance", || {
+            primary.storage().repl_slot_lsn(7) == Some(target)
+        })
+        .await;
+
+        // Reconnect: stop the receiver, commit more, restart it — the stream
+        // resumes from the standby's persisted watermark (the slot held the
+        // log in between).
+        rx_shutdown_tx.send(true).unwrap();
+        let _ = receiver_task.await;
+        for i in 31..=40 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let (rx_shutdown_tx2, rx_shutdown_rx2) = watch::channel(false);
+        let receiver_task2 = tokio::spawn(run_standby_receiver(
+            receiver_cfg,
+            standby.storage_arc(),
+            rx_shutdown_rx2,
+        ));
+        let target = primary.storage().wal_flushed_lsn();
+        wait_until("resume after reconnect", || {
+            standby.storage().wal_tail() >= target
+        })
+        .await;
+        let expected = sql_rows(&primary, "SELECT id, v FROM t ORDER BY id").1;
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the standby resumes and matches after a receiver restart"
+        );
+
+        rx_shutdown_tx2.send(true).unwrap();
+        let _ = receiver_task2.await;
+        shutdown_tx.send(true).unwrap();
+        let _ = listener_task.await;
+        drop(standby);
+        drop(primary);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     // Stage 18 slice 4d (review fix): a shipped stream can end MID-transaction
     // (the primary's durable watermark can land between an in-flight txn's page
     // ops and its commit). A standby's reopen must REPEAT history (redo-only) —
@@ -2546,7 +2736,10 @@ mod tests {
         assert!(l1 > 0, "there is log to pin");
 
         // A slot pinned at l1 holds the WAL head there even as the tail advances.
-        engine.storage().register_repl_slot(7, l1);
+        engine
+            .storage()
+            .try_register_repl_slot(7, l1)
+            .expect("register");
         for i in 11..=30 {
             engine
                 .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
@@ -2579,7 +2772,10 @@ mod tests {
         );
 
         // An explicit drop removes a slot (a standby that deregisters).
-        engine.storage().register_repl_slot(8, l2);
+        engine
+            .storage()
+            .try_register_repl_slot(8, l2)
+            .expect("register");
         engine.storage().drop_repl_slot(8);
         assert_eq!(
             engine.storage().repl_slot_lsn(8),
@@ -2588,7 +2784,10 @@ mod tests {
         );
 
         // Lagging past max_slot_retain invalidates the slot at the next checkpoint.
-        engine.storage().set_max_slot_retain_bytes(64);
+        engine
+            .storage()
+            .set_max_slot_retain_bytes(64)
+            .expect("set cap");
         for i in 31..=60 {
             engine
                 .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
@@ -2605,6 +2804,131 @@ mod tests {
             "the reclaimed floor advances past the dropped slot"
         );
 
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // A replication sender wakes on the group-commit flushed watch instead of
+    // polling: a committed write advances the watch past the subscriber's last
+    // seen value, and the durable watermark it re-reads covers the commit.
+    #[test]
+    fn the_flushed_watch_wakes_on_a_committed_write() {
+        let path = unique_temp_path("repl-watch");
+        let engine = new_engine(&path);
+        let mut rx = engine.storage().subscribe_wal_flushed();
+        let before = *rx.borrow_and_update();
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine.execute("INSERT INTO t VALUES (1)").expect("insert");
+        assert!(
+            rx.has_changed().expect("sender alive"),
+            "a durable commit signals the watch"
+        );
+        let hint = *rx.borrow_and_update();
+        assert!(hint > before, "the watch value advances");
+        assert!(
+            engine.storage().wal_flushed_lsn() >= hint,
+            "the re-read watermark covers the hint"
+        );
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // Slot registration is atomically fenced against truncation: a slot below
+    // the WAL head is refused (the log it needs is gone — reseed), and the
+    // table is bounded so a slot never silently fails to persist.
+    #[test]
+    fn slot_registration_rejects_below_head_and_a_full_table() {
+        let path = unique_temp_path("repl-slot-guards");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        for i in 1..=10 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        engine.checkpoint().expect("checkpoint");
+        let head = engine.storage().wal_head();
+        assert!(head > 0, "the checkpoint truncated some log");
+        let err = engine
+            .storage()
+            .try_register_repl_slot(1, head - 1)
+            .expect_err("a below-head slot is refused");
+        assert!(
+            err.to_string().contains("reseed"),
+            "the error tells the operator to reseed: {err}"
+        );
+
+        let lsn = engine.storage().wal_flushed_lsn();
+        for id in 1..=8 {
+            engine
+                .storage()
+                .try_register_repl_slot(id, lsn)
+                .expect("register");
+        }
+        engine
+            .storage()
+            .try_register_repl_slot(9, lsn)
+            .expect_err("a ninth slot exceeds the persisted table");
+        // Re-registering an existing id is a reset, not a new slot.
+        engine
+            .storage()
+            .try_register_repl_slot(8, lsn)
+            .expect("re-register");
+        // A mid-entry LSN off the wire is refused: it would become the
+        // checkpoint truncation floor and, at the next restart, a WAL head the
+        // scan cannot decode (entries are >= 48 bytes and 8-aligned, so
+        // `fresh - 1` is never a boundary). Fresh writes keep it above the
+        // head so the boundary check — not the head fence — is what fires.
+        for i in 11..=13 {
+            engine
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        let fresh = engine.storage().wal_flushed_lsn();
+        let err = engine
+            .storage()
+            .try_register_repl_slot(8, fresh - 1)
+            .expect_err("a mid-entry slot LSN is refused");
+        assert!(
+            err.to_string().contains("boundary"),
+            "the error names the misalignment: {err}"
+        );
+        // An ack for a never-registered (or reaped) slot must not create one.
+        engine.storage().advance_repl_slot(42, lsn);
+        assert_eq!(engine.storage().repl_slot_lsn(42), None);
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    // The replication epoch persists across a checkpoint (whose superblock
+    // rebuild zeroes the reserved area — the checkpoint-wipe carry) and a
+    // restart, and the retention-cap setter refuses a cap the ring cannot
+    // honor.
+    #[test]
+    fn the_replication_epoch_persists_and_the_retain_cap_is_bounded() {
+        let path = unique_temp_path("repl-epoch");
+        let engine = new_engine(&path);
+        assert_eq!(engine.storage().epoch(), 0, "a fresh file is epoch 0");
+        engine.storage().set_epoch(5).expect("set epoch");
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine.checkpoint().expect("checkpoint");
+        drop(engine);
+        let engine = Engine::new(Storage::open(path.clone()).expect("open")).expect("engine");
+        assert_eq!(
+            engine.storage().epoch(),
+            5,
+            "the epoch survives the checkpoint and the restart"
+        );
+        engine
+            .storage()
+            .set_max_slot_retain_bytes(u64::MAX - 1)
+            .expect_err("a cap at or above the usable ring is refused");
         drop(engine);
         let _ = std::fs::remove_file(path);
     }

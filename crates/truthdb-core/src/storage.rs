@@ -25,8 +25,8 @@ use crate::relstore::version::{
 };
 use crate::storage_layout::{
     FileHeader, PAGE_SIZE, SNAPSHOT_DESCRIPTOR_SIZE, SUPERBLOCK_ACTIVE_A, SUPERBLOCK_ACTIVE_B,
-    SnapshotDescriptor, Superblock, WAL_ENTRY_TYPE_REL, WAL_MAX_BYTES, WAL_MIN_BYTES, align_down,
-    assert_layout_invariants,
+    SnapshotDescriptor, Superblock, WAL_ENTRY_HEADER_SIZE, WAL_ENTRY_TYPE_REL, WAL_MAX_BYTES,
+    WAL_MIN_BYTES, WalEntryHeader, align_down, assert_layout_invariants, wal_entry_padded_len,
 };
 use crate::wal::records::{
     REL_KIND_ALLOC_EXTENT, REL_KIND_FREE_EXTENT, REL_KIND_SET_CATALOG_ROOT, RelRecord,
@@ -746,7 +746,24 @@ impl Storage {
         log_paths: &[std::path::PathBuf],
         stop_at: Option<u64>,
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], stop_at)
+        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], stop_at, false)
+    }
+
+    /// Offline restore of a full backup (plus an optional `BACKUP LOG` chain)
+    /// as a replication STANDBY seed: the file is stamped `is_standby` before
+    /// its validating open, so recovery REPEATS history only (redo, no ARIES
+    /// undo) and the file opens read-only. A plain restore's undo would roll
+    /// back a transaction that was in flight at backup time with CLRs; if the
+    /// primary later committed it, the CLRs' page LSNs would mask the shipped
+    /// redo and the replica would silently diverge. Point-in-time restore is
+    /// meaningless for a seed (the standby must match the primary, not a past
+    /// point), so there is no `stop_at` here.
+    pub fn restore_full_standby(
+        dst_path: &Path,
+        bak_path: &Path,
+        log_paths: &[std::path::PathBuf],
+    ) -> Result<(), StorageError> {
+        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], None, true)
     }
 
     /// Offline restore of a full backup followed by raw shipped WAL ring ranges —
@@ -759,7 +776,7 @@ impl Storage {
         bak_path: &Path,
         wal_ranges: &[(u64, Vec<u8>)],
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, &[], wal_ranges, None)
+        Self::restore_full_inner(dst_path, bak_path, &[], wal_ranges, None, false)
     }
 
     fn restore_full_inner(
@@ -768,6 +785,7 @@ impl Storage {
         log_paths: &[std::path::PathBuf],
         wal_ranges: &[(u64, Vec<u8>)],
         stop_at: Option<u64>,
+        standby: bool,
     ) -> Result<(), StorageError> {
         assert_layout_invariants();
         let reader = std::io::BufReader::new(std::fs::File::open(bak_path)?);
@@ -799,7 +817,7 @@ impl Storage {
         // later step fails, so a retry (which requires a fresh destination) can
         // proceed. Everything ABOVE this point errors without having created it.
         let outcome = Self::restore_body(
-            file, backup, &header, log_paths, wal_ranges, dst_path, stop_at,
+            file, backup, &header, log_paths, wal_ranges, dst_path, stop_at, standby,
         );
         if outcome.is_err() {
             let _ = std::fs::remove_file(dst_path);
@@ -820,6 +838,7 @@ impl Storage {
         wal_ranges: &[(u64, Vec<u8>)],
         dst_path: &Path,
         stop_at: Option<u64>,
+        standby: bool,
     ) -> Result<(), StorageError> {
         use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
         let data_pages = header.data_size / PAGE_SIZE as u64;
@@ -890,8 +909,10 @@ impl Storage {
             )?;
         }
         // The restored superblock brackets the ring at `[redo_start, tail)`; the
-        // log-backup floor is the end of the applied chain (a fresh chain).
-        file.restore_superblock(header, tail)?;
+        // log-backup floor is the end of the applied chain (a fresh chain). A
+        // standby seed is stamped BEFORE the validating open, so that open is
+        // redo-only + read-only from the file's first moment.
+        file.restore_superblock(header, tail, standby)?;
         file.sync_file()?;
         drop(file);
 
@@ -1529,25 +1550,63 @@ impl Storage {
     /// The durable WAL watermark: the greatest LSN fsynced to disk (group-commit
     /// or a direct WAL sync). A replication sender may ship the ring up to here;
     /// bytes past it are not yet durable on the primary and must not be applied
-    /// to a standby. (Test scaffolding for the offline standby-apply slice; the
-    /// replication transport slice promotes it to the sender.)
-    #[cfg(test)]
+    /// to a standby.
     pub(crate) fn wal_flushed_lsn(&self) -> u64 {
         let durable = self.gc.flushed();
         self.lock().wal.flushed_lsn().max(durable)
     }
 
-    /// Reads raw WAL ring bytes `[from, to)` — the physical-replication ship
-    /// primitive. A standby applies the bytes via
-    /// [`Storage::restore_full_with_wal_ranges`].
+    /// Subscribes to group-commit durable-watermark advances so a tokio task
+    /// (the replication sender) can await new shippable WAL. The carried value
+    /// is a wake-up hint: WAL made durable by a direct sync bypasses the
+    /// channel, so re-read [`Self::wal_flushed_lsn`] after each wake and pair
+    /// the watch with a periodic tick.
+    pub(crate) fn subscribe_wal_flushed(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.gc.subscribe_flushed()
+    }
+
+    /// Reads raw WAL ring bytes `[from, to)`. Test scaffolding: the production
+    /// ship primitive is [`Self::read_wal_chunk`], which cuts on entry
+    /// boundaries and fences against the WAL head.
     #[cfg(test)]
     pub(crate) fn read_wal_range(&self, from: u64, to: u64) -> Result<Vec<u8>, StorageError> {
         self.lock().read_ring_range(from, to)
     }
 
+    /// The physical-replication ship primitive: reads one chunk of raw WAL
+    /// ring bytes starting at `from`, ending on a WAL-ENTRY BOUNDARY at most
+    /// `max_bytes` past `from` (a single oversized entry is returned whole),
+    /// and never past `to_cap`. Returns the bytes and the chunk's end LSN —
+    /// the only LSNs a sender may hand a standby, since
+    /// [`Storage::apply_wal_stream`] persists its range end as the standby's
+    /// applied tail and a mid-entry tail would make every later decode
+    /// silently fail. The head fence and the read happen under one lock hold:
+    /// if `from` is below the WAL head the log is already truncated (the
+    /// standby's slot was reaped) and shipping would return recycled
+    /// ring bytes from a newer lap — the error tells the standby to reseed.
+    pub(crate) fn read_wal_chunk(
+        &self,
+        from: u64,
+        to_cap: u64,
+        max_bytes: u64,
+    ) -> Result<(Vec<u8>, u64), StorageError> {
+        let mut guard = self.lock();
+        let head = guard.wal.head();
+        if from < head {
+            return Err(StorageError::InvalidConfig(format!(
+                "replication position {from} is behind the WAL head ({head}): the log the \
+                 standby needs was truncated (its slot lapsed); reseed the standby from a \
+                 fresh backup"
+            )));
+        }
+        let end = guard.wal_chunk_end(from, to_cap, max_bytes)?;
+        let bytes = guard.read_ring_range(from, end)?;
+        Ok((bytes, end))
+    }
+
     /// The persisted replication restartpoint (the active superblock's
     /// `applied_lsn`): the LSN up to which this file's WAL is present and
-    /// recovered.
+    /// recovered. (Test-only until the monitoring slice reads it.)
     #[cfg(test)]
     pub(crate) fn applied_lsn(&self) -> u64 {
         let guard = self.lock();
@@ -1558,14 +1617,63 @@ impl Storage {
         active.applied_lsn()
     }
 
-    /// Replication-slot test scaffolding (the transport receiver slice promotes
-    /// these to the ack path). A slot holds WAL-ring truncation at its LSN.
-    #[cfg(test)]
-    pub(crate) fn register_repl_slot(&self, id: u32, lsn: u64) {
-        self.lock().register_repl_slot(id, lsn);
+    /// The LSN a standby resumes shipping from: the PERSISTED tail (the active
+    /// superblock's), not the live one. A crash between an apply's ring fsync
+    /// and its superblock commit — or a redo-only reopen that recovered extra
+    /// durable ring bytes — leaves the live tail ahead of the persisted tail,
+    /// and the apply continuity check compares against the persisted value; a
+    /// resume from the live tail would then be a permanent 4305 gap. Resuming
+    /// from the persisted tail re-ships the overlap, which is idempotent.
+    pub(crate) fn standby_resume_lsn(&self) -> u64 {
+        let guard = self.lock();
+        let active = match guard.active_superblock {
+            ActiveSuperblock::A => &guard.superblock_a,
+            ActiveSuperblock::B => &guard.superblock_b,
+        };
+        active.wal_tail
     }
 
+    /// Whether this file is a replication standby (redo-only, read-only until
+    /// promotion).
+    pub fn is_standby(&self) -> bool {
+        let guard = self.lock();
+        let active = match guard.active_superblock {
+            ActiveSuperblock::A => &guard.superblock_a,
+            ActiveSuperblock::B => &guard.superblock_b,
+        };
+        active.is_standby()
+    }
+
+    /// The persisted replication epoch (bumped once at each promotion; zero
+    /// until the first failover). Both sides of the replication handshake
+    /// exchange it so a diverged old primary's stream can be fenced off.
+    pub(crate) fn epoch(&self) -> u64 {
+        let guard = self.lock();
+        let active = match guard.active_superblock {
+            ActiveSuperblock::A => &guard.superblock_a,
+            ActiveSuperblock::B => &guard.superblock_b,
+        };
+        active.epoch()
+    }
+
+    /// Durably sets the replication epoch (a promotion bumps it by one;
+    /// test-only until the failover slice performs promotions).
     #[cfg(test)]
+    pub(crate) fn set_epoch(&self, epoch: u64) -> Result<(), StorageError> {
+        self.lock().commit_superblock(|sb| sb.set_epoch(epoch))
+    }
+
+    /// Registers (or resets) a replication slot at `lsn`, holding WAL-ring
+    /// truncation there. Fails if `lsn` is behind the WAL head (the log the
+    /// standby needs is already truncated — it must reseed) or if the slot
+    /// table is full; the check and the insert happen under one lock hold, so
+    /// a concurrent checkpoint cannot truncate between them.
+    pub(crate) fn try_register_repl_slot(&self, id: u32, lsn: u64) -> Result<(), StorageError> {
+        self.lock().try_register_repl_slot(id, lsn)
+    }
+
+    /// Advances a slot's held LSN (never backward). A no-op if the slot does
+    /// not exist — an ack racing a reap must not resurrect a reaped slot.
     pub(crate) fn advance_repl_slot(&self, id: u32, lsn: u64) {
         self.lock().advance_repl_slot(id, lsn);
     }
@@ -1575,15 +1683,27 @@ impl Storage {
         self.lock().drop_repl_slot(id);
     }
 
+    /// A slot's held LSN. (Test-only until the monitoring slice reads it.)
     #[cfg(test)]
     pub(crate) fn repl_slot_lsn(&self, id: u32) -> Option<u64> {
         self.lock().repl_slot_lsn(id)
     }
 
-    /// Sets the slot-retention cap that the checkpoint reap enforces.
-    #[cfg(test)]
-    pub(crate) fn set_max_slot_retain_bytes(&self, bytes: u64) {
-        self.lock().max_slot_retain_bytes = bytes;
+    /// Sets the slot-retention cap that the checkpoint reap enforces. The cap
+    /// must be strictly below the ring's usable capacity (`wal_size -
+    /// reserve`): at or above it, appends hit `WalFull` before any slot lags
+    /// far enough to reap, wedging the primary behind a dead standby.
+    pub fn set_max_slot_retain_bytes(&self, bytes: u64) -> Result<(), StorageError> {
+        let mut guard = self.lock();
+        let usable = guard.layout.wal_size.saturating_sub(guard.wal.reserve());
+        if bytes >= usable {
+            return Err(StorageError::InvalidConfig(format!(
+                "max_slot_retain_bytes ({bytes}) must be below the WAL ring's usable capacity ({usable}); \
+                 a cap at or above it wedges the primary with WalFull before the slot reap can run"
+            )));
+        }
+        guard.max_slot_retain_bytes = bytes;
+        Ok(())
     }
 
     /// Atomic snapshot scan: the whole table under one storage-lock hold
@@ -5355,19 +5475,111 @@ impl StorageFile {
     /// Registers (or resets) a replication slot at `lsn`. `lsn` must be `>=` the
     /// current WAL head (a standby's received LSN is always within the retained
     /// window — the primary cannot have already truncated it); a below-head slot
-    /// would drive `set_head` below the current head, which it forbids. The
-    /// transport slice enforces this at registration.
-    #[cfg(test)]
-    fn register_repl_slot(&mut self, id: u32, lsn: u64) {
+    /// would drive `set_head` below the current head, which it forbids. Checked
+    /// here, under the storage lock, so a checkpoint cannot truncate between
+    /// the check and the insert. The table is bounded by [`MAX_REPL_SLOTS`]
+    /// (the superblock persists at most that many; a silent in-memory overflow
+    /// would lose a slot's hold across a restart).
+    fn try_register_repl_slot(&mut self, id: u32, lsn: u64) -> Result<(), StorageError> {
+        let head = self.wal.head();
+        if lsn < head {
+            return Err(StorageError::InvalidConfig(format!(
+                "replication slot {id} at LSN {lsn} is behind the WAL head ({head}): \
+                 the log the standby needs is already truncated; reseed the standby \
+                 from a fresh backup"
+            )));
+        }
+        if self.truncation_gate.repl_slots.len() >= crate::storage_layout::MAX_REPL_SLOTS
+            && !self.truncation_gate.repl_slots.contains_key(&id)
+        {
+            return Err(StorageError::InvalidConfig(format!(
+                "replication slot table is full ({} slots): drop a stale slot before \
+                 registering slot {id}",
+                crate::storage_layout::MAX_REPL_SLOTS
+            )));
+        }
+        // The LSN comes off the wire (Hello.last_received_lsn) and becomes the
+        // truncation floor — which a checkpoint persists as the WAL head, the
+        // very position the next restart scans from. A mid-entry floor would
+        // make that scan read garbage and silently truncate every commit since
+        // the checkpoint. Only a verifiable ENTRY BOUNDARY may be registered;
+        // an honest standby's persisted tail always is one.
+        if !self.is_wal_entry_boundary(lsn)? {
+            return Err(StorageError::InvalidConfig(format!(
+                "replication slot {id} at LSN {lsn} is not on a WAL entry boundary: \
+                 the standby's resume state is corrupt or forged; reseed the standby \
+                 from a fresh backup"
+            )));
+        }
         self.truncation_gate.repl_slots.insert(id, lsn);
+        Ok(())
+    }
+
+    /// Whether `lsn` sits on a WAL entry boundary of THIS log: the tail
+    /// itself, a position carrying a CRC-valid entry header that self-identifies
+    /// (`logical_ts == lsn`), or a ring-wrap gap start whose next lap opens
+    /// with a self-identifying valid entry. A forger cannot fabricate any of
+    /// these without controlling the actual log contents.
+    fn is_wal_entry_boundary(&mut self, lsn: u64) -> Result<bool, StorageError> {
+        let tail = self.wal.tail();
+        if lsn == tail {
+            return Ok(true);
+        }
+        if lsn > tail {
+            return Ok(false);
+        }
+        let wal_offset = self.layout.wal_offset;
+        let wal_size = self.layout.wal_size;
+        let check_entry_at =
+            |file: &mut crate::direct_io::DirectFile, pos: u64| -> Result<bool, StorageError> {
+                let ring_pos = pos % wal_size;
+                if wal_size - ring_pos < WAL_ENTRY_HEADER_SIZE as u64 {
+                    return Ok(false);
+                }
+                let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
+                file.read_exact_at(wal_offset + ring_pos, &mut header_bytes)?;
+                if header_bytes.iter().all(|b| *b == 0) {
+                    return Ok(false);
+                }
+                let header = WalEntryHeader::from_le_bytes(&header_bytes);
+                Ok(header.verify_header_crc() && header.logical_ts == pos)
+            };
+        let ring_pos = lsn % wal_size;
+        let bytes_to_lap_end = wal_size - ring_pos;
+        if bytes_to_lap_end >= WAL_ENTRY_HEADER_SIZE as u64 {
+            let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
+            self.wal
+                .file_mut()
+                .read_exact_at(wal_offset + ring_pos, &mut header_bytes)?;
+            if !header_bytes.iter().all(|b| *b == 0) {
+                let header = WalEntryHeader::from_le_bytes(&header_bytes);
+                return Ok(header.verify_header_crc() && header.logical_ts == lsn);
+            }
+        }
+        // Zeros (or no room for a header): a genuine boundary here is a wrap-gap
+        // start, provable by the next lap opening with a real entry below the
+        // tail. Mid-entry zeros cannot fake that — the jump target's entry must
+        // self-identify at exactly that position.
+        let jump = lsn + bytes_to_lap_end;
+        if jump == tail {
+            return Ok(true);
+        }
+        if jump > tail {
+            return Ok(false);
+        }
+        check_entry_at(self.wal.file_mut(), jump)
     }
 
     /// Advances a slot forward to `lsn` — a slot never moves backward (a
-    /// standby's received watermark only grows).
-    #[cfg(test)]
+    /// standby's received watermark only grows), never past the WAL tail (an
+    /// absurd acked LSN must not unpin log that exists), and a missing slot is
+    /// not created (an ack arriving after a reap must not resurrect the slot
+    /// without the registration checks).
     fn advance_repl_slot(&mut self, id: u32, lsn: u64) {
-        let held = self.truncation_gate.repl_slots.entry(id).or_insert(lsn);
-        *held = (*held).max(lsn);
+        let lsn = lsn.min(self.wal.tail());
+        if let Some(held) = self.truncation_gate.repl_slots.get_mut(&id) {
+            *held = (*held).max(lsn);
+        }
     }
 
     #[cfg(test)]
@@ -5493,6 +5705,22 @@ impl StorageFile {
 
     fn allocate_extent(&mut self, temp: bool) -> Result<u64, StorageError> {
         if temp {
+            // Spill scratch shares the data region and the allocator bitmap
+            // with REPLICATED extents. On a standby, an extent that is free at
+            // the applied LSN may already be allocated on the primary (its
+            // ALLOC record still in flight) — a spool there would be clobbered
+            // by the arriving redo, and the spool's raw writes would clobber
+            // replicated pages. Refuse until the readable-standby slice gives
+            // scratch its own storage.
+            if self.active_sb().is_standby() {
+                return Err(StorageError::InvalidConfig(
+                    "a query on this replication standby needed spill scratch, which shares \
+                     the data region the primary's stream writes into; re-run with more \
+                     memory or run it on the primary (readable-standby spill arrives with \
+                     snapshot standby reads)"
+                        .to_string(),
+                ));
+            }
             return self.allocator.allocate_temp_extent().ok_or_else(|| {
                 StorageError::InvalidConfig("data region full: cannot allocate extent".to_string())
             });
@@ -5712,6 +5940,82 @@ impl StorageFile {
         Ok(out)
     }
 
+    /// Walks WAL-entry headers from `from` (which must itself be an entry
+    /// boundary within the valid log) and returns the furthest ENTRY BOUNDARY
+    /// reachable within `max_bytes`, never past `to_cap`. A ring-wrap gap
+    /// (zero-fill to the lap end) is crossed together with the first entry of
+    /// the next lap, so a returned boundary is never inside or at the start of
+    /// a gap a chunk does not also bridge. If the very first step (one entry,
+    /// or gap + one entry) exceeds `max_bytes`, it is returned anyway — the
+    /// chunk must make progress, and the caller bounds the frame size.
+    fn wal_chunk_end(
+        &mut self,
+        from: u64,
+        to_cap: u64,
+        max_bytes: u64,
+    ) -> Result<u64, StorageError> {
+        let wal_offset = self.layout.wal_offset;
+        let wal_size = self.layout.wal_size;
+        let mut cursor = from;
+        let mut last_boundary = from;
+        while cursor < to_cap {
+            let ring_pos = cursor % wal_size;
+            let bytes_to_lap_end = wal_size - ring_pos;
+            // A wrap gap (too small for a header, or zero-filled): cross it as
+            // part of the next entry's step.
+            let gap_jump = if bytes_to_lap_end < WAL_ENTRY_HEADER_SIZE as u64 {
+                true
+            } else {
+                let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
+                self.wal
+                    .file_mut()
+                    .read_exact_at(wal_offset + ring_pos, &mut header_bytes)?;
+                if header_bytes.iter().all(|b| *b == 0) {
+                    true
+                } else {
+                    let header = WalEntryHeader::from_le_bytes(&header_bytes);
+                    if !header.verify_header_crc() {
+                        return Err(StorageError::InvalidFile(format!(
+                            "WAL entry header at LSN {cursor} fails its CRC inside the \
+                             durable range [{from}, {to_cap}): cannot ship the log"
+                        )));
+                    }
+                    let entry_len = wal_entry_padded_len(header.payload_len as usize) as u64;
+                    let next = cursor + entry_len;
+                    if next > to_cap {
+                        // The durable cap always sits on an entry boundary; an
+                        // entry crossing it means `from` was not a boundary.
+                        return Err(StorageError::InvalidFile(format!(
+                            "WAL entry at LSN {cursor} extends past the durable watermark \
+                             {to_cap}: misaligned ship position"
+                        )));
+                    }
+                    if next - from > max_bytes && last_boundary > from {
+                        return Ok(last_boundary);
+                    }
+                    cursor = next;
+                    last_boundary = next;
+                    continue;
+                }
+            };
+            if gap_jump {
+                // Jump to the lap end; the loop then takes the next lap's first
+                // entry before this jump can become a boundary.
+                let next = cursor + bytes_to_lap_end;
+                if next >= to_cap {
+                    // Nothing but gap remains below the cap.
+                    return Ok(last_boundary);
+                }
+                if next - from > max_bytes && last_boundary > from {
+                    return Ok(last_boundary);
+                }
+                cursor = next;
+                // NOT a boundary: fall through to read the next lap's entry.
+            }
+        }
+        Ok(last_boundary)
+    }
+
     /// Phase 1 of `BACKUP LOG`: under the storage lock, capture the log range
     /// `[last_log_backup_lsn, tail)` and its bytes plus the archive header. Does
     /// NOT advance the marker or hold, so the old marker keeps pinning the range
@@ -5915,12 +6219,44 @@ impl StorageFile {
             from_lsn,
             from_lsn,
         )?;
+        // The shipped range must decode END TO END. A short scan means the
+        // range was cut mid-entry (a misaligned sender) or carries recycled
+        // bytes from another ring lap (a lapsed slot): advancing the tail over
+        // undecoded bytes would silently skip their redo forever — the page-LSN
+        // gate then masks the loss on every future record. Fail the apply
+        // instead; the connection drops and the operator sees it.
+        if scan.tail < advanced {
+            return Err(StorageError::InvalidFile(format!(
+                "shipped WAL range [{from_lsn}, {new_end}) only decodes to {}: the range is \
+                 cut mid-entry or holds recycled bytes; refusing to apply it",
+                scan.tail
+            )));
+        }
         let records: Vec<(u64, RelRecord)> = scan
             .records
             .iter()
             .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
             .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
             .collect::<Result<_, StorageError>>()?;
+
+        // Replay allocation state: the live pool redo below writes page images,
+        // but the ALLOCATOR is only rebuilt at open — without this, an extent
+        // the primary allocated after the standby opened stays free in the
+        // standby's in-memory bitmap, and a spilling read on the standby could
+        // allocate scratch space over replicated pages.
+        for (_, record) in &records {
+            match record.kind {
+                REL_KIND_ALLOC_EXTENT => {
+                    let (start, pages) = record.decode_extent_redo()?;
+                    self.allocator.mark_used(start, pages);
+                }
+                REL_KIND_FREE_EXTENT => {
+                    let (start, pages) = record.decode_extent_redo()?;
+                    self.allocator.free(start, pages);
+                }
+                _ => {}
+            }
+        }
 
         // A catalog-root change in the range moves the standby's catalog root
         // (the last one wins).
@@ -5965,6 +6301,7 @@ impl StorageFile {
         &mut self,
         header: &crate::backup::BackupHeader,
         backup_end: u64,
+        standby: bool,
     ) -> Result<(), StorageError> {
         let mut base = Superblock {
             wal_head: header.redo_start_lsn,
@@ -5982,6 +6319,7 @@ impl StorageFile {
         // The restartpoint = the end of everything laid down (full backup + any
         // applied log chain / shipped WAL ranges), which is the restored tail.
         base.set_applied_lsn(backup_end);
+        base.set_standby(standby);
 
         let mut a = base;
         a.generation = 1;
@@ -6367,9 +6705,11 @@ impl StorageFile {
         // the log-backup floor must be stamped back in or a checkpoint would
         // silently reset it to 0 and drop the FULL-model hold across a restart.
         let last_log_backup_lsn = self.last_log_backup_lsn;
-        // Carry the standby (redo-only) mode across the checkpoint (the closure
-        // builds from a default superblock that would otherwise clear it).
+        // Carry the standby (redo-only) mode and the replication epoch across
+        // the checkpoint (the closure builds from a default superblock that
+        // would otherwise clear them).
         let standby = self.active_sb().is_standby();
+        let epoch = self.active_sb().epoch();
         // Persist the (post-reap) replication slots, so their truncation hold is
         // re-established on the next open. Snapshotted after the reap above, so an
         // invalidated slot is not written back.
@@ -6400,6 +6740,7 @@ impl StorageFile {
             // Re-stamp the replication slot table (same checkpoint-wipe carry).
             sb.set_repl_slots(&repl_slots);
             sb.set_standby(standby);
+            sb.set_epoch(epoch);
             sb.checksum = sb.compute_checksum();
             sb
         };

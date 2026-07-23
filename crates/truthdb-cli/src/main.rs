@@ -71,6 +71,11 @@ enum Command {
         /// after it are undone.
         #[arg(long = "stopat")]
         stopat: Option<u64>,
+        /// Restore as a replication STANDBY seed: recovery repeats history
+        /// only (no undo of in-flight transactions) and the file opens
+        /// read-only, ready to follow a primary. Incompatible with --stopat.
+        #[arg(long, conflicts_with = "stopat")]
+        standby: bool,
     },
 }
 
@@ -102,11 +107,17 @@ async fn main() -> Result<()> {
             to,
             log,
             stopat,
+            standby,
         } => {
-            match truthdb_core::storage::Storage::restore_full_with_logs(&full, &to, &log, stopat) {
+            let result = if standby {
+                truthdb_core::storage::Storage::restore_full_standby(&to, &full, &log)
+            } else {
+                truthdb_core::storage::Storage::restore_full_with_logs(&to, &full, &log, stopat)
+            };
+            match result {
                 Ok(()) => {
                     println!(
-                        "restored {} from {}{}{}",
+                        "restored {} from {}{}{}{}",
                         to.display(),
                         full.display(),
                         if log.is_empty() {
@@ -117,7 +128,8 @@ async fn main() -> Result<()> {
                         match stopat {
                             Some(ts) => format!(" (stopped at {ts})"),
                             None => String::new(),
-                        }
+                        },
+                        if standby { " (standby seed)" } else { "" }
                     );
                     Ok(())
                 }

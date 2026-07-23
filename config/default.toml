@@ -46,3 +46,29 @@ snapshot_wal_threshold = 0.7
 # here, an sa login is still created but DISABLED. Send passwords over TLS: see
 # encryption above.
 # sa = "change-me"
+
+# Physical replication. Disabled by default. Every member of a cluster shares
+# the same cluster_uuid and shared_secret. A primary listens on port (TLS
+# mandatory: tls_cert/tls_key) and streams WAL to standbys; a standby dials
+# primary_addr, verifies the primary against tls_ca, and applies the stream.
+# Seed a standby's database file with:  truthdb-cli restore --standby
+# [replication]
+# enabled = true
+# role = "primary"            # or "standby"
+# node_id = 1                 # unique per member (a standby's slot id)
+# cluster_uuid = "8f0e7a34-2d51-4c11-9c9e-3f6d2a7b1c05"
+# shared_secret = "change-me"
+#
+# Primary:
+# addr = "0.0.0.0"
+# port = 9624
+# tls_cert = "/etc/truthdb/repl.crt"
+# tls_key = "/etc/truthdb/repl.key"
+# heartbeat_ms = 1000
+# max_slot_retain_bytes = 0   # 0 = unlimited: a lagging standby is never dropped
+#
+# Standby:
+# primary_addr = "primary.example:9624"
+# tls_ca = "/etc/truthdb/repl.crt"   # the primary's cert (or its CA)
+# server_name = "primary.example"    # defaults to the host part of primary_addr
+# reconnect_delay_ms = 1000

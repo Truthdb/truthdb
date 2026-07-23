@@ -113,6 +113,10 @@ async fn main() {
             return;
         }
     }
+    // The replication tasks share the storage directly (it is internally
+    // synchronized); the handle must be taken before the engine moves into its
+    // worker pool.
+    let storage_arc = engine.storage_arc();
     // The engine runs on its own thread behind a message channel; the async
     // listeners talk to it through a cloneable handle.
     let (engine, engine_join) = truthdb_core::session::spawn_engine(engine);
@@ -200,6 +204,20 @@ async fn main() {
         None
     };
 
+    // Optional physical replication (Stage 18): a primary's listener + senders,
+    // or a standby's receiver.
+    let repl_task = if config.replication.enabled {
+        match start_replication(&config.replication, storage_arc, &shutdown_tx).await {
+            Ok(task) => Some(task),
+            Err(err) => {
+                eprintln!("Failed to start replication: {err}");
+                return;
+            }
+        }
+    } else {
+        None
+    };
+
     info!("Starting TruthDB...");
 
     info!("TruthDB running (waiting for stop signal)");
@@ -210,6 +228,9 @@ async fn main() {
     let _ = listener_task.await;
     if let Some(tds_task) = tds_task {
         let _ = tds_task.await;
+    }
+    if let Some(repl_task) = repl_task {
+        let _ = repl_task.await;
     }
     // Stop the engine thread and wait for it to drain/exit.
     engine.shutdown();
@@ -222,4 +243,134 @@ fn load_tds_tls(cert_path: &str, key_path: &str) -> std::io::Result<truthdb_tds:
     let cert = std::fs::read(cert_path)?;
     let key = std::fs::read(key_path)?;
     truthdb_tds::tls::TlsConfig::from_pem(&cert, &key)
+}
+
+/// Validates the replication config and spawns the role's task: a primary's
+/// TLS listener (+ per-standby senders), or a standby's reconnecting receiver.
+/// A misconfiguration is a startup error, not a degraded run.
+async fn start_replication(
+    cfg: &config::ReplicationConfig,
+    storage: std::sync::Arc<Storage>,
+    shutdown_tx: &watch::Sender<bool>,
+) -> Result<tokio::task::JoinHandle<()>, String> {
+    use truthdb_core::repl::listener::{PrimaryReplContext, run_repl_listener};
+    use truthdb_core::repl::receiver::{ReceiverConfig, run_standby_receiver};
+
+    let cluster_uuid = cfg.cluster_uuid_bytes()?;
+    if cfg.heartbeat_ms == 0 {
+        return Err("replication.heartbeat_ms must be greater than 0".to_string());
+    }
+    if cfg.reconnect_delay_ms == 0 {
+        return Err("replication.reconnect_delay_ms must be greater than 0".to_string());
+    }
+    if cfg.stall_timeout_ms == 0 {
+        return Err("replication.stall_timeout_ms must be greater than 0".to_string());
+    }
+    // Both stall deadlines assume the peer speaks at least once per window (a
+    // caught-up pair only exchanges heartbeats + their acks): a stall window
+    // that a healthy idle link cannot meet makes every connection flap.
+    if cfg.stall_timeout_ms < cfg.heartbeat_ms.saturating_mul(2) {
+        return Err(format!(
+            "replication.stall_timeout_ms ({}) must be at least twice heartbeat_ms ({}): \
+             a caught-up standby only speaks when the primary heartbeats, so a tighter \
+             stall window tears down healthy idle connections",
+            cfg.stall_timeout_ms, cfg.heartbeat_ms
+        ));
+    }
+    let secret =
+        cfg.shared_secret.clone().filter(|s| !s.is_empty()).ok_or(
+            "replication.shared_secret is required (non-empty) when replication is enabled",
+        )?;
+
+    match cfg.role {
+        config::ReplicationRole::Primary => {
+            let (cert_path, key_path) = match (&cfg.tls_cert, &cfg.tls_key) {
+                (Some(cert), Some(key)) => (cert, key),
+                _ => return Err("a replication primary needs tls_cert and tls_key".to_string()),
+            };
+            let cert = std::fs::read(cert_path)
+                .map_err(|err| format!("replication tls_cert {cert_path}: {err}"))?;
+            let key = std::fs::read(key_path)
+                .map_err(|err| format!("replication tls_key {key_path}: {err}"))?;
+            let acceptor = truthdb_core::repl::tls::acceptor_from_pem(&cert, &key)
+                .map_err(|err| format!("replication TLS: {err}"))?;
+            if cfg.max_slot_retain_bytes > 0 {
+                storage
+                    .set_max_slot_retain_bytes(cfg.max_slot_retain_bytes)
+                    .map_err(|err| err.to_string())?;
+            }
+            let listener = tokio::net::TcpListener::bind((cfg.addr.as_str(), cfg.port))
+                .await
+                .map_err(|err| format!("replication listener {}:{}: {err}", cfg.addr, cfg.port))?;
+            info!(
+                "Replication primary listening on {}:{} (node {})",
+                cfg.addr, cfg.port, cfg.node_id
+            );
+            let ctx = PrimaryReplContext {
+                shared_secret: std::sync::Arc::new(secret.into_bytes()),
+                cluster_uuid,
+                storage,
+                heartbeat: std::time::Duration::from_millis(cfg.heartbeat_ms),
+                stall_timeout: std::time::Duration::from_millis(cfg.stall_timeout_ms),
+                chunk_bytes: truthdb_core::repl::sender::DEFAULT_CHUNK_BYTES,
+                active_nodes: std::sync::Arc::default(),
+            };
+            let shutdown_rx = shutdown_tx.subscribe();
+            Ok(tokio::spawn(run_repl_listener(
+                listener,
+                acceptor,
+                ctx,
+                shutdown_rx,
+            )))
+        }
+        config::ReplicationRole::Standby => {
+            let primary_addr = cfg
+                .primary_addr
+                .clone()
+                .ok_or("a replication standby needs primary_addr")?;
+            let ca_path = cfg
+                .tls_ca
+                .as_ref()
+                .ok_or("a replication standby needs tls_ca (the certificate to trust)")?;
+            let tls_ca_pem = std::fs::read(ca_path)
+                .map_err(|err| format!("replication tls_ca {ca_path}: {err}"))?;
+            if !storage.is_standby() {
+                return Err("this database is not a standby seed; restore it with \
+                     `truthdb-cli restore --standby`"
+                    .to_string());
+            }
+            let server_name = cfg.server_name.clone().unwrap_or_else(|| {
+                let host = primary_addr
+                    .rsplit_once(':')
+                    .map(|(host, _)| host)
+                    .unwrap_or(primary_addr.as_str());
+                // A bracketed IPv6 host ("[2001:db8::1]:9624") is not a valid
+                // TLS server name with the brackets on.
+                host.strip_prefix('[')
+                    .and_then(|h| h.strip_suffix(']'))
+                    .unwrap_or(host)
+                    .to_string()
+            });
+            let receiver_cfg = ReceiverConfig {
+                primary_addr: primary_addr.clone(),
+                server_name,
+                tls_ca_pem,
+                shared_secret: secret.into_bytes(),
+                cluster_uuid,
+                node_id: cfg.node_id,
+                reconnect_delay: std::time::Duration::from_millis(cfg.reconnect_delay_ms),
+                stall_timeout: std::time::Duration::from_millis(cfg.stall_timeout_ms),
+            };
+            info!(
+                "Replication standby (node {}) following {}",
+                cfg.node_id, primary_addr
+            );
+            let shutdown_rx = shutdown_tx.subscribe();
+            Ok(tokio::spawn(run_standby_receiver(
+                receiver_cfg,
+                storage,
+                shutdown_rx,
+            )))
+        }
+    }
 }

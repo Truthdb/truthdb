@@ -1,8 +1,15 @@
 //! Stage 18 replication wire protocol: the message types and their bincode +
-//! framed codec. Pure data — no I/O; the async listener and per-standby senders
-//! (later slices) frame these over a TLS socket. Mirrors the native
-//! `truthdb-proto` codec: an 8-byte big-endian header (payload length `u32`,
-//! message type `u16`, flags `u16`) followed by the bincode payload.
+//! framed codec. Pure data — no I/O; the async listener, the per-standby
+//! senders and the standby receiver frame these over a TLS socket. Mirrors the
+//! native `truthdb-proto` codec: an 8-byte big-endian header (payload length
+//! `u32`, message type `u16`, flags `u16`) followed by the bincode payload.
+//!
+//! Message flow: the standby dials in and sends `Hello`; the primary answers
+//! `HelloAck` and, on acceptance, streams `LogData` (with `Heartbeat` when
+//! idle) while the standby acknowledges progress with `FlushAck`. A `HelloAck
+//! { accepted: false }` arriving *after* the handshake is the primary's
+//! post-handshake rejection notice (diverged timeline, slot table full, ...)
+//! — connection-fatal, with the operator fix in `message`.
 
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -10,6 +17,8 @@ use thiserror::Error;
 pub mod framing;
 pub mod handshake;
 pub mod listener;
+pub mod receiver;
+pub mod sender;
 pub mod server;
 pub mod tls;
 
