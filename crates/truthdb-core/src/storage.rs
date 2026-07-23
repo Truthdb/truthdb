@@ -1015,7 +1015,11 @@ impl Storage {
         if !file.active_sb().is_standby() {
             return Ok(false);
         }
-        let tail = file.wal.tail();
+        // The PERSISTED tail, not the live one: a failed apply leaves the live
+        // ring tail past the last fully-applied (decoded + redone + committed)
+        // range, and a restartpoint must never publish — let alone advance the
+        // head over — bytes whose redo never ran.
+        let tail = file.active_sb().wal_tail;
         let att_floor = file.standby_att.values().min().copied().unwrap_or(tail);
         let search_floor = file.standby_search_floor.unwrap_or(tail);
         // `checkpoint_wal_head` folds the tail and the truncation-gate holds
@@ -1072,7 +1076,20 @@ impl Storage {
             sb.wal_tail = tail;
             sb.metadata_root = metadata_root;
             sb.set_applied_lsn(tail);
+            // A FULL-model seed carries the primary's frozen log-backup marker;
+            // left below the advancing head, promotion's reopen would re-arm
+            // the truncation hold BELOW the head and the first checkpoint
+            // would drive `set_head` backward into reclaimed ring space. The
+            // standby's marker is meaningless (its log chain belongs to the
+            // primary; a promoted node starts a fresh chain with a fresh full
+            // backup), so it rides the head.
+            if sb.last_log_backup_lsn() < target {
+                sb.set_last_log_backup_lsn(target);
+            }
         })?;
+        if file.last_log_backup_lsn < target {
+            file.last_log_backup_lsn = target;
+        }
         file.wal.set_head(target);
         Ok(true)
     }
@@ -5589,7 +5606,6 @@ impl StorageFile {
         self.truncation_gate.log_backup = None;
     }
 
-    /// Drops any replication slot lagging the WAL tail by more than
     /// Maintains the standby's active-transaction table as shipped records are
     /// applied — the SAME begin/resolve rules recovery's analysis uses
     /// (`analyze_and_redo`): TXN_BEGIN opens at its own LSN, TXN_COMMIT and
@@ -5614,6 +5630,7 @@ impl StorageFile {
         }
     }
 
+    /// Drops any replication slot lagging the WAL tail by more than
     /// `max_slot_retain_bytes` — it no longer pins the truncation floor, so the
     /// ring can advance past it (the standby must reseed). Run at the start of a
     /// checkpoint, before the floor is computed. A no-op under the default
@@ -6407,10 +6424,10 @@ impl StorageFile {
         // but the ALLOCATOR is only rebuilt at open — without this, an extent
         // the primary allocated after the standby opened stays free in the
         // standby's in-memory bitmap, and a spilling read on the standby could
-        // allocate scratch space over replicated pages. The same pass keeps
-        // the standby's active-transaction table (the restartpoint undo floor).
-        for (lsn, record) in &records {
-            self.standby_track_rel_record(*lsn, record);
+        // allocate scratch space over replicated pages. (Safe to do before the
+        // fallible redo: on failure the extra marked-used extents are merely
+        // conservative, and the re-apply re-marks them idempotently.)
+        for (_, record) in &records {
             match record.kind {
                 REL_KIND_ALLOC_EXTENT => {
                     let (start, pages) = record.decode_extent_redo()?;
@@ -6421,20 +6438,6 @@ impl StorageFile {
                     self.allocator.free(start, pages);
                 }
                 _ => {}
-            }
-        }
-        // Track the first UNCOVERED search record (the restartpoint's search
-        // floor): the seed snapshot covers seq numbers below
-        // `snapshot_next_seq_no`; anything at or above must stay in the ring
-        // for the reopen replay.
-        if self.standby_search_floor.is_none() {
-            for record in &scan.records {
-                if record.entry_type != WAL_ENTRY_TYPE_REL
-                    && record.seq_no >= self.snapshot_next_seq_no
-                {
-                    self.standby_search_floor = Some(record.logical_ts);
-                    break;
-                }
             }
         }
 
@@ -6458,6 +6461,29 @@ impl StorageFile {
             self.rel.catalog_root = Some(root);
         }
         self.reload_catalog()?;
+
+        // Only now — with every fallible step behind us — fold the range into
+        // the restartpoint floors. Tracking it any earlier would let a FAILED
+        // apply lift the undo floor over records whose redo never executed (a
+        // resolution in the failed chunk would mark its transaction resolved),
+        // and a restartpoint could then truncate undo a promotion still needs.
+        for (lsn, record) in &records {
+            self.standby_track_rel_record(*lsn, record);
+        }
+        // Track the first UNCOVERED search record (the restartpoint's search
+        // floor): the seed snapshot covers seq numbers below
+        // `snapshot_next_seq_no`; anything at or above must stay in the ring
+        // for the reopen replay.
+        if self.standby_search_floor.is_none() {
+            for record in &scan.records {
+                if record.entry_type != WAL_ENTRY_TYPE_REL
+                    && record.seq_no >= self.snapshot_next_seq_no
+                {
+                    self.standby_search_floor = Some(record.logical_ts);
+                    break;
+                }
+            }
+        }
 
         // 4. Record the advanced tail durably (light dual-write, no page flush —
         //    the pages are recoverable from the now-durable ring). `applied_lsn`

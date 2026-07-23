@@ -2751,6 +2751,97 @@ mod tests {
         }
     }
 
+    // A FAILED apply (a cut or corrupt chunk) advances the live ring tail but
+    // not the persisted one, and folds nothing into the restartpoint floors.
+    // The restartpoint must reclaim only up to the persisted tail — the last
+    // fully decoded + redone + committed range — never over bytes whose redo
+    // did not run.
+    #[test]
+    fn a_failed_apply_never_feeds_a_restartpoint() {
+        let primary_path = unique_temp_path("rspx-primary");
+        let bak = unique_temp_path("rspx-bak");
+        let standby_path = unique_temp_path("rspx-standby");
+
+        let primary = new_engine(&primary_path);
+        primary
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
+            .expect("create");
+        for i in 1..=10 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        let backup_end = summary.backup_end_lsn;
+        for i in 11..=20 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let f1 = primary.storage().wal_flushed_lsn();
+        let delta1 = primary
+            .storage()
+            .read_wal_range(backup_end, f1)
+            .expect("delta1");
+        for i in 21..=30 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
+                .expect("insert");
+        }
+        let f2 = primary.storage().wal_flushed_lsn();
+        let delta2 = primary.storage().read_wal_range(f1, f2).expect("delta2");
+
+        Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta1)
+            .expect("apply delta1");
+
+        // A cut chunk fails the apply's coverage guard AFTER the ring bytes
+        // were seeded (the live tail moved; the persisted tail did not).
+        let cut = &delta2[..delta2.len() - 3];
+        standby
+            .storage()
+            .apply_wal_stream(f1, cut)
+            .expect_err("a cut chunk is refused");
+
+        // The restartpoint reclaims only to the persisted tail.
+        assert!(
+            standby.standby_restartpoint().expect("restartpoint"),
+            "the fully-applied prefix is reclaimable"
+        );
+        assert_eq!(
+            standby.storage().wal_head(),
+            f1,
+            "the head stops at the persisted tail, not at the failed chunk's end"
+        );
+
+        // The re-shipped full chunk applies cleanly over the cut bytes, and
+        // the next restartpoint reaches the new tail.
+        standby
+            .storage()
+            .apply_wal_stream(f1, &delta2)
+            .expect("re-apply the full chunk");
+        assert!(
+            standby.standby_restartpoint().expect("after re-apply"),
+            "the re-applied range is reclaimable"
+        );
+        assert_eq!(standby.storage().wal_head(), f2);
+        let expected = sql_rows(&primary, "SELECT id, v FROM t ORDER BY id").1;
+        assert_eq!(
+            sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
+            expected,
+            "the standby matches the primary after the recovery"
+        );
+
+        drop(primary);
+        drop(standby);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     // The restartpoint's undo floor: a shipped range ending MID-transaction
     // leaves that transaction unresolved in the standby's own
     // active-transaction table, and the head must stop at its BEGIN — the
