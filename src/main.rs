@@ -323,7 +323,6 @@ async fn start_replication(
                 heartbeat: std::time::Duration::from_millis(cfg.heartbeat_ms),
                 stall_timeout: std::time::Duration::from_millis(cfg.stall_timeout_ms),
                 chunk_bytes: truthdb_core::repl::sender::DEFAULT_CHUNK_BYTES,
-                active_nodes: std::sync::Arc::default(),
             };
             let shutdown_rx = shutdown_tx.subscribe();
             Ok(tokio::spawn(run_repl_listener(

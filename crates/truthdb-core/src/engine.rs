@@ -2518,7 +2518,6 @@ mod tests {
             heartbeat: Duration::from_millis(200),
             stall_timeout: Duration::from_secs(30),
             chunk_bytes: 512,
-            active_nodes: Arc::default(),
         };
         let listener_task = tokio::spawn(run_repl_listener(
             listener,
@@ -3048,6 +3047,91 @@ mod tests {
             vec![vec![Some("999".into())]],
             "the committed heap update is visible"
         );
+
+        drop(primary);
+        drop(standby);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    // Stage 18.6 monitoring: the replication DMVs report role, slots,
+    // connectedness, and lag on both sides of a link.
+    #[test]
+    fn replication_dmvs_report_slots_lag_and_role() {
+        let primary_path = unique_temp_path("dmv-primary");
+        let bak = unique_temp_path("dmv-bak");
+        let standby_path = unique_temp_path("dmv-standby");
+
+        let primary = new_engine(&primary_path);
+        primary
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        for i in 1..=5 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        // No slots yet: the primary reports zero replica rows.
+        assert_eq!(
+            sql_rows(&primary, "SELECT COUNT(*) FROM sys.dm_repl_replica_states").1,
+            vec![vec![Some("0".into())]],
+        );
+        assert_eq!(
+            sql_rows(&primary, "SELECT COUNT(*) FROM sys.dm_repl_slots").1[0][0],
+            Some("0".into())
+        );
+
+        // Register a slot (as the sender would) and check the reporting.
+        let held = primary.storage().wal_flushed_lsn();
+        primary
+            .storage()
+            .try_register_repl_slot(3, held)
+            .expect("slot");
+        for i in 6..=10 {
+            primary
+                .execute(&format!("INSERT INTO t VALUES ({i})"))
+                .expect("insert");
+        }
+        let (cols, rows) = sql_rows(
+            &primary,
+            "SELECT role, node_id, is_connected, lag_bytes, sync_state \
+             FROM sys.dm_repl_replica_states",
+        );
+        assert_eq!(
+            cols,
+            vec!["role", "node_id", "is_connected", "lag_bytes", "sync_state"]
+        );
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0], Some("PRIMARY".into()));
+        assert_eq!(rows[0][1], Some("3".into()));
+        assert_eq!(
+            rows[0][2],
+            Some("0".into()),
+            "no live sender (bit renders 0)"
+        );
+        let lag: i64 = rows[0][3].as_deref().unwrap().parse().expect("lag");
+        assert!(lag > 0, "the slot lags the new commits");
+        assert_eq!(rows[0][4], Some("ASYNC".into()));
+        let (_, slot_rows) = sql_rows(
+            &primary,
+            "SELECT slot_id, retained_bytes FROM sys.dm_repl_slots",
+        );
+        assert_eq!(slot_rows[0][0], Some("3".into()));
+        assert!(slot_rows[0][1].as_deref().unwrap().parse::<i64>().unwrap() > 0);
+
+        // A standby reports its own role and applied position.
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        let _ = summary;
+        let (_, srows) = sql_rows(
+            &standby,
+            "SELECT role, sync_state FROM sys.dm_repl_replica_states",
+        );
+        assert_eq!(srows.len(), 1);
+        assert_eq!(srows[0][0], Some("STANDBY".into()));
+        assert_eq!(srows[0][1], Some("NOT_APPLICABLE".into()));
 
         drop(primary);
         drop(standby);
