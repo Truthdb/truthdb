@@ -257,6 +257,15 @@ async fn start_replication(
     use truthdb_core::repl::receiver::{ReceiverConfig, run_standby_receiver};
 
     let cluster_uuid = cfg.cluster_uuid_bytes()?;
+    if cfg.heartbeat_ms == 0 {
+        return Err("replication.heartbeat_ms must be greater than 0".to_string());
+    }
+    if cfg.reconnect_delay_ms == 0 {
+        return Err("replication.reconnect_delay_ms must be greater than 0".to_string());
+    }
+    if cfg.stall_timeout_ms == 0 {
+        return Err("replication.stall_timeout_ms must be greater than 0".to_string());
+    }
     let secret =
         cfg.shared_secret.clone().filter(|s| !s.is_empty()).ok_or(
             "replication.shared_secret is required (non-empty) when replication is enabled",
@@ -291,6 +300,9 @@ async fn start_replication(
                 cluster_uuid,
                 storage,
                 heartbeat: std::time::Duration::from_millis(cfg.heartbeat_ms),
+                stall_timeout: std::time::Duration::from_millis(cfg.stall_timeout_ms),
+                chunk_bytes: truthdb_core::repl::sender::DEFAULT_CHUNK_BYTES,
+                active_nodes: std::sync::Arc::default(),
             };
             let shutdown_rx = shutdown_tx.subscribe();
             Ok(tokio::spawn(run_repl_listener(
@@ -317,10 +329,16 @@ async fn start_replication(
                     .to_string());
             }
             let server_name = cfg.server_name.clone().unwrap_or_else(|| {
-                primary_addr
+                let host = primary_addr
                     .rsplit_once(':')
-                    .map(|(host, _)| host.to_string())
-                    .unwrap_or_else(|| primary_addr.clone())
+                    .map(|(host, _)| host)
+                    .unwrap_or(primary_addr.as_str());
+                // A bracketed IPv6 host ("[2001:db8::1]:9624") is not a valid
+                // TLS server name with the brackets on.
+                host.strip_prefix('[')
+                    .and_then(|h| h.strip_suffix(']'))
+                    .unwrap_or(host)
+                    .to_string()
             });
             let receiver_cfg = ReceiverConfig {
                 primary_addr: primary_addr.clone(),
@@ -330,6 +348,7 @@ async fn start_replication(
                 cluster_uuid,
                 node_id: cfg.node_id,
                 reconnect_delay: std::time::Duration::from_millis(cfg.reconnect_delay_ms),
+                stall_timeout: std::time::Duration::from_millis(cfg.stall_timeout_ms),
             };
             info!(
                 "Replication standby (node {}) following {}",

@@ -2443,7 +2443,7 @@ mod tests {
     async fn the_replication_transport_streams_live_writes_to_a_standby() {
         use crate::repl::listener::{PrimaryReplContext, run_repl_listener};
         use crate::repl::receiver::{ReceiverConfig, run_standby_receiver};
-        use crate::repl::tls::{client_config_trusting, server_config_from_pem};
+        use crate::repl::tls::server_config_from_pem;
         use std::sync::Arc;
         use std::time::Duration;
         use tokio::sync::watch;
@@ -2468,7 +2468,10 @@ mod tests {
                 .expect("insert");
         }
         primary.storage().backup_full(&bak).expect("backup");
-        for i in 11..=20 {
+        // A catch-up backlog spanning MANY sender chunks (the context below
+        // sets 512-byte chunks), so entry-boundary chunking is exercised end
+        // to end — a mid-entry cut would fail the apply's coverage check.
+        for i in 11..=120 {
             primary
                 .execute(&format!("INSERT INTO t VALUES ({i}, {i})"))
                 .expect("insert");
@@ -2490,6 +2493,9 @@ mod tests {
             cluster_uuid: UUID,
             storage: primary.storage_arc(),
             heartbeat: Duration::from_millis(200),
+            stall_timeout: Duration::from_secs(30),
+            chunk_bytes: 512,
+            active_nodes: Arc::default(),
         };
         let listener_task = tokio::spawn(run_repl_listener(
             listener,
@@ -2515,6 +2521,7 @@ mod tests {
             cluster_uuid: UUID,
             node_id: 7,
             reconnect_delay: Duration::from_millis(100),
+            stall_timeout: Duration::from_secs(30),
         };
         let (rx_shutdown_tx, rx_shutdown_rx) = watch::channel(false);
         let receiver_task = tokio::spawn(run_standby_receiver(

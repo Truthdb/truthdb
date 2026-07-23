@@ -24,7 +24,7 @@ pub struct Config {
 /// to authenticated standbys; a `standby` dials `primary_addr` and applies the
 /// stream (its database file must be seeded with `truthdb-cli restore
 /// --standby`). Both roles need the same `cluster_uuid` and `shared_secret`.
-#[derive(Debug, Deserialize)]
+#[derive(Deserialize)]
 pub struct ReplicationConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -84,10 +84,40 @@ pub struct ReplicationConfig {
     #[serde(default = "default_replication_reconnect_ms")]
     pub reconnect_delay_ms: u64,
 
+    /// Both roles: how long the peer may stay completely silent before the
+    /// connection is presumed dead (a healthy pair exchanges heartbeats/acks).
+    #[serde(default = "default_replication_stall_ms")]
+    pub stall_timeout_ms: u64,
+
     /// Primary: drop a replication slot once it lags the WAL tail by more than
     /// this many bytes (the standby must reseed). 0 = unlimited retention.
     #[serde(default)]
     pub max_slot_retain_bytes: u64,
+}
+
+/// The shared secret must not appear in logs (`debug!(?config)` logs the whole
+/// config at startup), so Debug redacts it.
+impl std::fmt::Debug for ReplicationConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReplicationConfig")
+            .field("enabled", &self.enabled)
+            .field("role", &self.role)
+            .field("addr", &self.addr)
+            .field("port", &self.port)
+            .field("node_id", &self.node_id)
+            .field("cluster_uuid", &self.cluster_uuid)
+            .field("shared_secret", &self.shared_secret.as_ref().map(|_| "***"))
+            .field("tls_cert", &self.tls_cert)
+            .field("tls_key", &self.tls_key)
+            .field("tls_ca", &self.tls_ca)
+            .field("primary_addr", &self.primary_addr)
+            .field("server_name", &self.server_name)
+            .field("heartbeat_ms", &self.heartbeat_ms)
+            .field("reconnect_delay_ms", &self.reconnect_delay_ms)
+            .field("stall_timeout_ms", &self.stall_timeout_ms)
+            .field("max_slot_retain_bytes", &self.max_slot_retain_bytes)
+            .finish()
+    }
 }
 
 /// `[replication] role = "primary" | "standby"`.
@@ -116,6 +146,7 @@ impl Default for ReplicationConfig {
             server_name: None,
             heartbeat_ms: default_replication_heartbeat_ms(),
             reconnect_delay_ms: default_replication_reconnect_ms(),
+            stall_timeout_ms: default_replication_stall_ms(),
             max_slot_retain_bytes: 0,
         }
     }
@@ -135,6 +166,10 @@ fn default_replication_heartbeat_ms() -> u64 {
 
 fn default_replication_reconnect_ms() -> u64 {
     1000
+}
+
+fn default_replication_stall_ms() -> u64 {
+    30_000
 }
 
 impl ReplicationConfig {
@@ -498,6 +533,7 @@ struct ReplicationConfigOverride {
     server_name: Option<String>,
     heartbeat_ms: Option<u64>,
     reconnect_delay_ms: Option<u64>,
+    stall_timeout_ms: Option<u64>,
     max_slot_retain_bytes: Option<u64>,
 }
 
@@ -543,6 +579,9 @@ fn apply_replication_override(target: &mut ReplicationConfig, source: Replicatio
     }
     if let Some(reconnect_delay_ms) = source.reconnect_delay_ms {
         target.reconnect_delay_ms = reconnect_delay_ms;
+    }
+    if let Some(stall_timeout_ms) = source.stall_timeout_ms {
+        target.stall_timeout_ms = stall_timeout_ms;
     }
     if let Some(max_slot_retain_bytes) = source.max_slot_retain_bytes {
         target.max_slot_retain_bytes = max_slot_retain_bytes;

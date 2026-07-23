@@ -38,6 +38,10 @@ pub struct ReceiverConfig {
     pub node_id: u32,
     /// Delay between reconnect attempts after a connection fails.
     pub reconnect_delay: Duration,
+    /// How long the primary may stay completely silent (a healthy one
+    /// heartbeats when idle) before the connection is presumed dead and
+    /// re-dialed — a silent partition must not stall replication forever.
+    pub stall_timeout: Duration,
 }
 
 /// Runs the standby's receive loop until `shutdown` flips: connect, stream,
@@ -86,10 +90,13 @@ async fn connect_and_stream(cfg: &ReceiverConfig, storage: &Arc<Storage>) -> io:
         .map_err(|err| io::Error::new(io::ErrorKind::InvalidInput, err))?;
     let mut tls = connector.connect(domain, tcp).await?;
 
-    // Resume from the persisted tail: everything below it is applied and
-    // durable here (a standby's live tail never runs ahead of its superblock —
-    // it only advances through `apply_wal_stream`, which persists it).
-    let last_received = storage.wal_tail();
+    // Resume from the PERSISTED tail (see `standby_resume_lsn`): after a crash
+    // between an apply's ring fsync and its superblock commit, or a redo-only
+    // reopen that recovered extra durable ring bytes, the live tail runs ahead
+    // of the persisted one — and the apply continuity check compares against
+    // the persisted value, so resuming from the live tail would wedge every
+    // reconnect on a 4305 gap. The overlap re-ship is idempotent.
+    let last_received = storage.standby_resume_lsn();
     let epoch = storage.epoch();
     let hello = Hello {
         protocol_version: REPL_PROTOCOL_VERSION,
@@ -126,7 +133,7 @@ async fn connect_and_stream(cfg: &ReceiverConfig, storage: &Arc<Storage>) -> io:
         ));
     }
 
-    stream_frames(&mut tls, storage).await
+    stream_frames(&mut tls, storage, cfg.stall_timeout).await
 }
 
 async fn read_ack<S>(stream: &mut S) -> io::Result<HelloAck>
@@ -143,12 +150,22 @@ where
     frame.decode().map_err(io::Error::other)
 }
 
-async fn stream_frames<S>(stream: &mut S, storage: &Arc<Storage>) -> io::Result<()>
+async fn stream_frames<S>(stream: &mut S, storage: &Arc<Storage>, stall: Duration) -> io::Result<()>
 where
     S: AsyncRead + AsyncWrite + Unpin,
 {
     loop {
-        let frame = read_repl_frame(stream).await?;
+        // The primary heartbeats when idle; total silence past the deadline is
+        // a dead peer or a silent partition — reconnect rather than stall
+        // replication forever on a connection that will never speak again.
+        let frame = tokio::time::timeout(stall, read_repl_frame(stream))
+            .await
+            .map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!("primary sent nothing for {stall:?}"),
+                )
+            })??;
         match frame.msg_type {
             ReplMsgType::LogData => {
                 let ld: LogData = frame.decode().map_err(io::Error::other)?;
@@ -181,13 +198,15 @@ where
     }
 }
 
-/// Acknowledges the standby's current watermark. `apply_wal_stream` is durable
-/// before it returns, so received, flushed and applied coincide.
+/// Acknowledges the standby's current PERSISTED watermark (`apply_wal_stream`
+/// is durable before it returns, so received, flushed and applied coincide —
+/// and the persisted value is what a restart resumes from, which is what the
+/// primary's slot must hold log for).
 async fn ack_current<S>(stream: &mut S, storage: &Arc<Storage>) -> io::Result<()>
 where
     S: AsyncWrite + Unpin,
 {
-    let tail = storage.wal_tail();
+    let tail = storage.standby_resume_lsn();
     let ack = FlushAck {
         received_lsn: tail,
         flushed_lsn: tail,
