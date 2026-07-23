@@ -1215,12 +1215,16 @@ name = "truthdb"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "rcgen",
  "serde",
+ "serde_json",
  "tokio",
  "toml",
  "tracing",
  "tracing-subscriber",
  "truthdb-core",
+ "truthdb-net",
+ "truthdb-proto",
  "truthdb-tds",
 ]
 
