@@ -38,6 +38,14 @@ pub fn server_config_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<Arc
     Ok(Arc::new(config))
 }
 
+/// Builds the primary listener's `TlsAcceptor` from a certificate + private
+/// key PEM — the one-call form the server binary wires from its config.
+pub fn acceptor_from_pem(cert_pem: &[u8], key_pem: &[u8]) -> io::Result<tokio_rustls::TlsAcceptor> {
+    Ok(tokio_rustls::TlsAcceptor::from(server_config_from_pem(
+        cert_pem, key_pem,
+    )?))
+}
+
 /// Builds a standby's TLS `ClientConfig` that trusts exactly the given
 /// certificate(s) as roots — the primary's self-signed (or CA) cert. The standby
 /// verifies the primary against this, so a wrong endpoint fails the handshake.
