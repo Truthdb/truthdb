@@ -2814,6 +2814,203 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    // Stage 18.5 (D2) readable standby: reads resolve through the version
+    // store at the last-applied-commit snapshot — shipped in-flight changes
+    // (inserts AND updates of pre-existing rows) are invisible until their
+    // commit ships; an aborted shipped transaction unwinds; the store is
+    // rebuilt at reopen from the retained ring.
+    #[test]
+    fn a_readable_standby_serves_only_committed_state() {
+        let primary_path = unique_temp_path("read-primary");
+        let bak = unique_temp_path("read-bak");
+        let standby_path = unique_temp_path("read-standby");
+
+        let primary = new_engine(&primary_path);
+        let mut ctx = TxnContext::default();
+        batch(
+            &primary,
+            &mut ctx,
+            "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
+        );
+        for i in 1..=10 {
+            batch(
+                &primary,
+                &mut ctx,
+                &format!("INSERT INTO t VALUES ({i}, {i})"),
+            );
+        }
+        let summary = primary.storage().backup_full(&bak).expect("backup");
+        let backup_end = summary.backup_end_lsn;
+        // Committed post-backup work...
+        for i in 11..=15 {
+            batch(
+                &primary,
+                &mut ctx,
+                &format!("INSERT INTO t VALUES ({i}, {i})"),
+            );
+        }
+        // ...then an in-flight transaction: new rows AND an update of row 1.
+        batch(&primary, &mut ctx, "BEGIN TRANSACTION");
+        for i in 16..=20 {
+            batch(
+                &primary,
+                &mut ctx,
+                &format!("INSERT INTO t VALUES ({i}, {i})"),
+            );
+        }
+        batch(&primary, &mut ctx, "UPDATE t SET v = 999 WHERE id = 1");
+        let mid = primary.storage().wal_flushed_lsn();
+        let delta = primary
+            .storage()
+            .read_wal_range(backup_end, mid)
+            .expect("delta");
+
+        Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        standby
+            .storage()
+            .apply_wal_stream(backup_end, &delta)
+            .expect("apply");
+        assert_eq!(
+            sql_rows(&standby, "SELECT COUNT(*) FROM t").1,
+            vec![vec![Some("15".into())]],
+            "in-flight inserts are invisible; committed ones are visible"
+        );
+        assert_eq!(
+            sql_rows(&standby, "SELECT v FROM t WHERE id = 1").1,
+            vec![vec![Some("1".into())]],
+            "an in-flight update serves the committed pre-image"
+        );
+
+        // The store rebuilds at reopen from the retained ring.
+        drop(standby);
+        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        assert_eq!(
+            sql_rows(&standby, "SELECT v FROM t WHERE id = 1").1,
+            vec![vec![Some("1".into())]],
+            "committed-state reads survive a reopen"
+        );
+        assert_eq!(
+            sql_rows(&standby, "SELECT COUNT(*) FROM t").1,
+            vec![vec![Some("15".into())]]
+        );
+
+        // The commit ships: everything becomes visible.
+        batch(&primary, &mut ctx, "COMMIT TRANSACTION");
+        let committed = primary.storage().wal_flushed_lsn();
+        let delta2 = primary
+            .storage()
+            .read_wal_range(mid, committed)
+            .expect("commit range");
+        standby
+            .storage()
+            .apply_wal_stream(mid, &delta2)
+            .expect("apply commit");
+        assert_eq!(
+            sql_rows(&standby, "SELECT COUNT(*) FROM t").1,
+            vec![vec![Some("20".into())]],
+            "the committed transaction is visible"
+        );
+        assert_eq!(
+            sql_rows(&standby, "SELECT v FROM t WHERE id = 1").1,
+            vec![vec![Some("999".into())]],
+            "the committed update is visible"
+        );
+
+        // An aborted shipped transaction: its effects never surface, and its
+        // version chains unwind.
+        batch(&primary, &mut ctx, "BEGIN TRANSACTION");
+        batch(&primary, &mut ctx, "UPDATE t SET v = -1 WHERE id = 2");
+        batch(&primary, &mut ctx, "ROLLBACK TRANSACTION");
+        let aborted = primary.storage().wal_flushed_lsn();
+        let delta3 = primary
+            .storage()
+            .read_wal_range(committed, aborted)
+            .expect("abort range");
+        standby
+            .storage()
+            .apply_wal_stream(committed, &delta3)
+            .expect("apply abort");
+        assert_eq!(
+            sql_rows(&standby, "SELECT v FROM t WHERE id = 2").1,
+            vec![vec![Some("2".into())]],
+            "an aborted shipped transaction never surfaces"
+        );
+
+        drop(primary);
+        drop(standby);
+        for p in [primary_path, bak, standby_path] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
+    // Stage 18.5 (D2) synchronous commit: a commit waits — after local
+    // durability — for a standby acknowledgement; a timeout degrades the link
+    // (NOT_SYNCHRONIZED) availability-first, and a caught-up acknowledgement
+    // re-synchronizes it.
+    #[test]
+    fn synchronous_commit_waits_for_acks_and_degrades_on_timeout() {
+        let path = unique_temp_path("sync-commit");
+        let engine = new_engine(&path);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine
+            .storage()
+            .arm_sync_commit(std::time::Duration::from_millis(250));
+
+        // A healthy standby: an acker thread mirrors the durable watermark.
+        let storage = engine.storage_arc();
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let stop2 = std::sync::Arc::clone(&stop);
+        let acker = std::thread::spawn(move || {
+            while !stop2.load(std::sync::atomic::Ordering::Relaxed) {
+                storage.publish_sync_ack(storage.wal_flushed_lsn());
+                std::thread::sleep(std::time::Duration::from_millis(5));
+            }
+        });
+        engine.execute("INSERT INTO t VALUES (1)").expect("insert");
+        assert!(
+            !engine.storage().sync_commit_degraded(),
+            "an acked commit keeps the link synchronized"
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        acker.join().expect("acker");
+
+        // The standby goes silent: the next commit stalls out the timeout,
+        // degrades the link, and still succeeds.
+        let t0 = std::time::Instant::now();
+        engine.execute("INSERT INTO t VALUES (2)").expect("insert");
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(250),
+            "the degrading commit waited out the timeout"
+        );
+        assert!(
+            engine.storage().sync_commit_degraded(),
+            "the timed-out link is NOT_SYNCHRONIZED"
+        );
+
+        // Degraded: commits pass straight through (bounded by well under the
+        // timeout — generous margin against CI jitter).
+        let t1 = std::time::Instant::now();
+        engine.execute("INSERT INTO t VALUES (3)").expect("insert");
+        assert!(
+            t1.elapsed() < std::time::Duration::from_millis(200),
+            "a degraded link does not delay commits"
+        );
+
+        // A caught-up acknowledgement re-synchronizes.
+        engine
+            .storage()
+            .publish_sync_ack(engine.storage().wal_flushed_lsn());
+        assert!(
+            !engine.storage().sync_commit_degraded(),
+            "a caught-up standby re-synchronizes the link"
+        );
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
     // Stage 18.4 (D1 manual failover): offline promotion turns a standby into
     // a read-write primary — finish recovery (undo the shipped in-flight
     // transactions), clear the standby mode, bump the epoch. The epoch fences
@@ -3365,8 +3562,10 @@ mod tests {
                 .unwrap_or_default()
         };
 
-        // Standby applies the mid-transaction stream live (the in-flight rows are
-        // present via redo), then RESTARTS.
+        // Standby applies the mid-transaction stream live: the in-flight rows
+        // are applied PHYSICALLY via redo (proven by the post-commit equality
+        // below) but hidden from reads — a readable standby serves only
+        // committed state.
         Storage::restore_full(&standby_path, &bak).expect("restore");
         {
             let standby =
@@ -3377,8 +3576,8 @@ mod tests {
                 .expect("apply mid-txn stream");
             assert_eq!(
                 count(&standby),
-                "20",
-                "the in-flight rows are applied via redo"
+                "10",
+                "in-flight rows are applied but not visible"
             );
         }
         // THE FIX: a standby reopen is redo-only, so the applied rows survive. A
@@ -3387,8 +3586,8 @@ mod tests {
             Engine::new(Storage::open(standby_path.clone()).expect("reopen")).expect("eng");
         assert_eq!(
             count(&standby),
-            "20",
-            "redo-only reopen keeps the streamed in-flight rows"
+            "10",
+            "redo-only reopen keeps the streamed in-flight rows physically, still hidden"
         );
 
         // The primary commits and ships the continuation; the standby stays

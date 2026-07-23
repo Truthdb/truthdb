@@ -35,6 +35,102 @@ use crate::wal::{WalWriter, scan_ring};
 
 pub use crate::wal::WalRecord;
 
+/// D2 synchronous-commit coordination (primary side). Committers wait on
+/// `acked` (a standby's highest acknowledged durable LSN, published by the
+/// sender's ack reader) after their local fsync. Availability-first: a wait
+/// that exceeds the armed timeout degrades the link (`degraded = true`,
+/// logged once) and every commit passes straight through until an
+/// acknowledgement catches up to the primary's durable watermark, which
+/// re-synchronizes the link (logged once).
+struct SyncCommitState {
+    armed: std::sync::atomic::AtomicBool,
+    timeout_ms: std::sync::atomic::AtomicU64,
+    degraded: std::sync::atomic::AtomicBool,
+    acked: std::sync::Mutex<u64>,
+    acked_cv: std::sync::Condvar,
+}
+
+impl Default for SyncCommitState {
+    fn default() -> Self {
+        SyncCommitState {
+            armed: std::sync::atomic::AtomicBool::new(false),
+            timeout_ms: std::sync::atomic::AtomicU64::new(0),
+            degraded: std::sync::atomic::AtomicBool::new(false),
+            acked: std::sync::Mutex::new(0),
+            acked_cv: std::sync::Condvar::new(),
+        }
+    }
+}
+
+impl SyncCommitState {
+    fn arm(&self, timeout: std::time::Duration) {
+        self.timeout_ms.store(
+            timeout.as_millis().min(u64::MAX as u128) as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.armed.store(true, std::sync::atomic::Ordering::Release);
+    }
+
+    fn publish(&self, lsn: u64, caught_up: bool) {
+        if !self.armed.load(std::sync::atomic::Ordering::Acquire) {
+            return;
+        }
+        {
+            let mut acked = self.acked.lock().expect("sync-commit state poisoned");
+            if lsn > *acked {
+                *acked = lsn;
+            }
+        }
+        self.acked_cv.notify_all();
+        if caught_up
+            && self
+                .degraded
+                .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            eprintln!(
+                "synchronous commit: a standby caught up (acknowledged {lsn}); the link is \
+                 SYNCHRONIZED again"
+            );
+        }
+    }
+
+    /// Waits for an acknowledgement covering `target`, honoring the
+    /// availability-first timeout. Never returns an error: degradation is a
+    /// logged state change, not a commit failure.
+    fn wait_for_ack(&self, target: u64) {
+        use std::sync::atomic::Ordering;
+        if !self.armed.load(Ordering::Acquire) || self.degraded.load(Ordering::Acquire) {
+            return;
+        }
+        let timeout =
+            std::time::Duration::from_millis(self.timeout_ms.load(Ordering::Relaxed).max(1));
+        let deadline = std::time::Instant::now() + timeout;
+        let mut acked = self.acked.lock().expect("sync-commit state poisoned");
+        while *acked < target {
+            // A concurrent timeout already degraded the link: stop waiting.
+            if self.degraded.load(Ordering::Acquire) {
+                return;
+            }
+            let now = std::time::Instant::now();
+            if now >= deadline {
+                if !self.degraded.swap(true, Ordering::AcqRel) {
+                    eprintln!(
+                        "synchronous commit: no standby acknowledged LSN {target} within \
+                         {timeout:?} — the link is NOT_SYNCHRONIZED; commits proceed on \
+                         local durability alone until a standby catches up"
+                    );
+                }
+                return;
+            }
+            let (guard, _timed_out) = self
+                .acked_cv
+                .wait_timeout(acked, deadline - now)
+                .expect("sync-commit state poisoned");
+            acked = guard;
+        }
+    }
+}
+
 impl From<TypeError> for StorageError {
     fn from(err: TypeError) -> Self {
         StorageError::InvalidConfig(err.0)
@@ -279,6 +375,10 @@ pub struct Storage {
     /// Group-commit coordinator: commits register their WAL tail here and wait
     /// for the log-writer to fsync past it. Shared with the log-writer thread.
     gc: Arc<GroupCommit>,
+    /// D2 synchronous commit (primary side): when armed, a commit additionally
+    /// waits — after LOCAL durability — for a standby's `FlushAck` to cover its
+    /// target, with an availability-first timeout (see [`SyncCommitState`]).
+    sync_commit: SyncCommitState,
     /// The log-writer thread's join handle, taken in `Drop` after signalling it.
     log_writer: Option<JoinHandle<()>>,
     /// `READ_COMMITTED_SNAPSHOT` / `ALLOW_SNAPSHOT_ISOLATION` mirrors of the
@@ -375,6 +475,7 @@ impl Storage {
             path,
             inner: std::sync::Mutex::new(file),
             gc,
+            sync_commit: SyncCommitState::default(),
             log_writer: Some(log_writer),
             rcsi: std::sync::atomic::AtomicBool::new(rcsi),
             allow_snapshot: std::sync::atomic::AtomicBool::new(allow_snapshot),
@@ -587,9 +688,40 @@ impl Storage {
 
     /// Blocks until the WAL is fsync-durable up to `target` — the tail past a
     /// committed record. The executor calls this once per batch that committed,
-    /// so one log-writer fsync makes many concurrent commits durable.
+    /// so one log-writer fsync makes many concurrent commits durable. With
+    /// synchronous commit armed, the commit then also waits for a standby's
+    /// acknowledgement of `target` — unless the link is already degraded
+    /// (NOT_SYNCHRONIZED), in which case commits proceed on local durability
+    /// alone until a standby catches back up.
     pub(crate) fn ensure_durable(&self, target: u64) -> Result<(), StorageError> {
-        self.gc.ensure_durable(target)
+        self.gc.ensure_durable(target)?;
+        self.sync_commit.wait_for_ack(target);
+        Ok(())
+    }
+
+    /// Arms D2 synchronous commit: every commit waits (after local durability)
+    /// for a standby `FlushAck` at or past its target. `timeout` is the
+    /// availability-first knob: a commit that waits longer marks the link
+    /// NOT_SYNCHRONIZED and proceeds — as do all commits after it — until a
+    /// standby's acknowledgements catch back up to the durable watermark.
+    pub fn arm_sync_commit(&self, timeout: std::time::Duration) {
+        self.sync_commit.arm(timeout);
+    }
+
+    /// Whether the synchronous-commit link is degraded (NOT_SYNCHRONIZED).
+    #[cfg(test)]
+    pub(crate) fn sync_commit_degraded(&self) -> bool {
+        self.sync_commit
+            .degraded
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// Publishes a standby's acknowledged durable LSN (the sender's ack path
+    /// calls this beside the slot advance). Re-synchronizes the link when the
+    /// acknowledgement has caught up to the primary's durable watermark.
+    pub(crate) fn publish_sync_ack(&self, acked: u64) {
+        let caught_up = acked >= self.wal_flushed_lsn();
+        self.sync_commit.publish(acked, caught_up);
     }
 
     /// The current WAL tail — the durability target for a batch that committed.
@@ -2481,6 +2613,14 @@ struct StorageFile {
     /// prefix, and could truncate undo of a transaction whose resolution has
     /// not shipped yet. Seeded at open from the same records recovery scans.
     standby_att: std::collections::HashMap<u64, u64>,
+    /// Readable standby: publish records per SHIPPED transaction, so an abort
+    /// (CLRs + TXN_END with no commit) can unwind its version-chain heads the
+    /// same way a local rollback would.
+    standby_published: std::collections::HashMap<u64, Vec<crate::relstore::version::PublishRecord>>,
+    /// Readable standby: the LSN up to which shipped changes have been folded
+    /// into the version store — an overlap re-ship must not publish the same
+    /// change twice (duplicate chain entries).
+    standby_version_floor: u64,
     /// The first ring LSN of a search-subsystem (`entry_type == 1`) record the
     /// seed snapshot does not cover: a restartpoint must not advance the head
     /// past it, or a reopen's search replay would lose the event (a standby
@@ -5119,6 +5259,8 @@ impl StorageFile {
             standby_att: std::collections::HashMap::new(),
             standby_search_floor: None,
             snapshot_next_seq_no: 0,
+            standby_published: std::collections::HashMap::new(),
+            standby_version_floor: 0,
             last_log_backup_lsn,
             log_backup_in_progress: false,
             layout,
@@ -5284,6 +5426,8 @@ impl StorageFile {
             standby_att: std::collections::HashMap::new(),
             standby_search_floor: None,
             snapshot_next_seq_no: 0,
+            standby_published: std::collections::HashMap::new(),
+            standby_version_floor: 0,
             last_log_backup_lsn: 0,
             log_backup_in_progress: false,
             layout,
@@ -5352,6 +5496,16 @@ impl StorageFile {
             let mut ctx = self.rel_ctx();
             rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &roots)?;
             self.reload_catalog()?;
+        }
+        // Readable standby: rebuild the version store from the retained ring
+        // (the store is in-memory only — without this a reopen would serve the
+        // redo-applied in-flight rows raw). Runs AFTER redo, so heap pages
+        // self-identify their owner even when they were formatted within the
+        // replayed range.
+        if redo_only {
+            self.version.standby_reads = true;
+            self.standby_capture_versions(&records)?;
+            self.standby_version_floor = self.wal.tail();
         }
         // Object ids are shared by tables, their secondary indexes, and logins
         // (principals draw from the same counter), so the next id must clear all
@@ -5782,6 +5936,117 @@ impl StorageFile {
     }
 
     /// Drops any replication slot lagging the WAL tail by more than
+    /// Readable standby: mirrors a fully-redone shipped range into the version
+    /// store — the pre-image of every row change is already in the record's
+    /// UNDO payload, so `publish` + `record_commit` reproduce exactly what the
+    /// primary's own commit path builds. Uncommitted (in-flight) writers have
+    /// no commit seq, so a snapshot reader at the last-applied-commit sequence
+    /// resolves past their chain heads to the pre-image — the committed state.
+    /// An aborted shipped transaction (CLRs + TXN_END, no commit) unwinds its
+    /// heads like a local rollback. The floor makes an overlap re-ship a
+    /// no-op, and structural/system records (page splits, counters, images
+    /// with no row undo) are skipped — they do not change row visibility.
+    fn standby_capture_versions(
+        &mut self,
+        records: &[(u64, RelRecord)],
+    ) -> Result<(), StorageError> {
+        use crate::relstore::version::{PendingVersion, RowChange};
+        use crate::wal::records::{
+            PageOpUndo, REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_OP, REL_KIND_TXN_COMMIT,
+            REL_KIND_TXN_END,
+        };
+        for (lsn, record) in records {
+            if *lsn < self.standby_version_floor {
+                continue;
+            }
+            match record.kind {
+                REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE if record.txn_id != 0 => {
+                    let pending = match record.decode_page_op_undo()? {
+                        PageOpUndo::TreeDeleteKey { object_id, key } => Some(PendingVersion {
+                            object_id,
+                            identity: key,
+                            change: RowChange::Insert,
+                        }),
+                        PageOpUndo::TreeInsertRow {
+                            object_id,
+                            key,
+                            row,
+                        } => Some(PendingVersion {
+                            object_id,
+                            identity: key,
+                            change: RowChange::Delete { prior: row },
+                        }),
+                        PageOpUndo::TreeUpdateRow {
+                            object_id,
+                            key,
+                            row,
+                        } => Some(PendingVersion {
+                            object_id,
+                            identity: key,
+                            change: RowChange::Update { prior: row },
+                        }),
+                        PageOpUndo::HeapDeleteSlot { page, slot } => self
+                            .heap_page_object_id(page)?
+                            .map(|object_id| PendingVersion {
+                                object_id,
+                                identity: rid_identity(crate::relstore::heap::Rid { page, slot }),
+                                change: RowChange::Insert,
+                            }),
+                        PageOpUndo::HeapInsertRow { page, slot, bytes } => self
+                            .heap_page_object_id(page)?
+                            .map(|object_id| PendingVersion {
+                                object_id,
+                                identity: rid_identity(crate::relstore::heap::Rid { page, slot }),
+                                change: RowChange::Delete { prior: bytes },
+                            }),
+                        PageOpUndo::HeapUpdateRow { page, slot, bytes } => self
+                            .heap_page_object_id(page)?
+                            .map(|object_id| PendingVersion {
+                                object_id,
+                                identity: rid_identity(crate::relstore::heap::Rid { page, slot }),
+                                change: RowChange::Update { prior: bytes },
+                            }),
+                        _ => None,
+                    };
+                    if let Some(pending) = pending {
+                        let published = self.version.publish(pending, record.txn_id);
+                        self.standby_published
+                            .entry(record.txn_id)
+                            .or_default()
+                            .push(published);
+                    }
+                }
+                REL_KIND_TXN_COMMIT => {
+                    self.version.record_commit(record.txn_id, *lsn);
+                    self.standby_published.remove(&record.txn_id);
+                }
+                REL_KIND_TXN_END => {
+                    // A TXN_END without a preceding commit seals an abort: the
+                    // CLRs restored the pages, and the chain heads come off in
+                    // reverse publish order, like a local rollback.
+                    if let Some(published) = self.standby_published.remove(&record.txn_id) {
+                        for rec in published.into_iter().rev() {
+                            self.version.unpublish(rec, record.txn_id);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The owning object of a heap page, from its self-identifying header
+    /// (`None` for a page that is not heap-formatted — a stale undo against a
+    /// since-freed page).
+    fn heap_page_object_id(&mut self, page: u64) -> Result<Option<u32>, StorageError> {
+        let mut ctx = self.rel_ctx();
+        let frame = ctx.fetch(page)?;
+        let header = crate::relstore::page::read_header(ctx.pool.page(frame));
+        ctx.pool.unpin(frame);
+        Ok((header.page_type == crate::relstore::page::PAGE_TYPE_HEAP).then_some(header.object_id))
+    }
+
     /// `max_slot_retain_bytes` — it no longer pins the truncation floor, so the
     /// ring can advance past it (the standby must reseed). Run at the start of a
     /// checkpoint, before the floor is computed. A no-op under the default
@@ -6623,6 +6888,13 @@ impl StorageFile {
         for (lsn, record) in &records {
             self.standby_track_rel_record(*lsn, record);
         }
+        // Readable standby: mirror the range into the version store (pre-images
+        // from the undo payloads), so snapshot reads at the last-applied-commit
+        // sequence see only committed state. Same post-redo discipline: a
+        // failed apply must feed the store nothing.
+        self.version.standby_reads = true;
+        self.standby_capture_versions(&records)?;
+        self.standby_version_floor = advanced;
         // Track the first UNCOVERED search record (the restartpoint's search
         // floor): the seed snapshot covers seq numbers below
         // `snapshot_next_seq_no`; anything at or above must stay in the ring

@@ -299,6 +299,16 @@ async fn start_replication(
                     .set_max_slot_retain_bytes(cfg.max_slot_retain_bytes)
                     .map_err(|err| err.to_string())?;
             }
+            if cfg.synchronous_commit {
+                if cfg.sync_timeout_ms == 0 {
+                    return Err("replication.sync_timeout_ms must be greater than 0".to_string());
+                }
+                storage.arm_sync_commit(std::time::Duration::from_millis(cfg.sync_timeout_ms));
+                info!(
+                    "Synchronous commit armed (timeout {} ms, availability-first)",
+                    cfg.sync_timeout_ms
+                );
+            }
             let listener = tokio::net::TcpListener::bind((cfg.addr.as_str(), cfg.port))
                 .await
                 .map_err(|err| format!("replication listener {}:{}: {err}", cfg.addr, cfg.port))?;

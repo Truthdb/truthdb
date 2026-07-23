@@ -93,6 +93,18 @@ pub struct ReplicationConfig {
     /// this many bytes (the standby must reseed). 0 = unlimited retention.
     #[serde(default)]
     pub max_slot_retain_bytes: u64,
+
+    /// Primary: D2 synchronous commit — every commit waits (after local
+    /// durability) for a standby's acknowledgement. Availability-first: a
+    /// commit that waits past `sync_timeout_ms` marks the link
+    /// NOT_SYNCHRONIZED and proceeds, as do later commits, until a standby
+    /// catches back up.
+    #[serde(default)]
+    pub synchronous_commit: bool,
+
+    /// Primary: the synchronous-commit wait bound (the strictness knob).
+    #[serde(default = "default_replication_sync_timeout_ms")]
+    pub sync_timeout_ms: u64,
 }
 
 /// The shared secret must not appear in logs (`debug!(?config)` logs the whole
@@ -116,6 +128,8 @@ impl std::fmt::Debug for ReplicationConfig {
             .field("reconnect_delay_ms", &self.reconnect_delay_ms)
             .field("stall_timeout_ms", &self.stall_timeout_ms)
             .field("max_slot_retain_bytes", &self.max_slot_retain_bytes)
+            .field("synchronous_commit", &self.synchronous_commit)
+            .field("sync_timeout_ms", &self.sync_timeout_ms)
             .finish()
     }
 }
@@ -148,6 +162,8 @@ impl Default for ReplicationConfig {
             reconnect_delay_ms: default_replication_reconnect_ms(),
             stall_timeout_ms: default_replication_stall_ms(),
             max_slot_retain_bytes: 0,
+            synchronous_commit: false,
+            sync_timeout_ms: default_replication_sync_timeout_ms(),
         }
     }
 }
@@ -170,6 +186,10 @@ fn default_replication_reconnect_ms() -> u64 {
 
 fn default_replication_stall_ms() -> u64 {
     30_000
+}
+
+fn default_replication_sync_timeout_ms() -> u64 {
+    10_000
 }
 
 impl ReplicationConfig {
@@ -535,6 +555,8 @@ struct ReplicationConfigOverride {
     reconnect_delay_ms: Option<u64>,
     stall_timeout_ms: Option<u64>,
     max_slot_retain_bytes: Option<u64>,
+    synchronous_commit: Option<bool>,
+    sync_timeout_ms: Option<u64>,
 }
 
 fn apply_replication_override(target: &mut ReplicationConfig, source: ReplicationConfigOverride) {
@@ -585,6 +607,12 @@ fn apply_replication_override(target: &mut ReplicationConfig, source: Replicatio
     }
     if let Some(max_slot_retain_bytes) = source.max_slot_retain_bytes {
         target.max_slot_retain_bytes = max_slot_retain_bytes;
+    }
+    if let Some(synchronous_commit) = source.synchronous_commit {
+        target.synchronous_commit = synchronous_commit;
+    }
+    if let Some(sync_timeout_ms) = source.sync_timeout_ms {
+        target.sync_timeout_ms = sync_timeout_ms;
     }
 }
 
