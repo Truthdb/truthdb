@@ -121,13 +121,16 @@ async fn connect_and_stream(cfg: &ReceiverConfig, storage: &Arc<Storage>) -> io:
             format!("primary rejected the handshake: {}", ack.message),
         ));
     }
-    if ack.primary_epoch < epoch {
-        // A primary behind this standby's epoch is a stale timeline (e.g. an
-        // old primary that missed a failover). Following it would diverge.
+    if ack.primary_epoch != epoch {
+        // Enforce the equal-epoch fence on THIS side too: a primary behind us
+        // is a stale timeline, and one ahead of us means we are — a primary
+        // running an older build could accept a behind-epoch standby, and the
+        // standby must not stream across that divergence.
         return Err(io::Error::new(
             io::ErrorKind::InvalidData,
             format!(
-                "primary epoch {} is behind this standby's epoch {epoch}: stale primary",
+                "primary epoch {} does not match this standby's epoch {epoch}: \
+                 different timelines — reseed this standby from the primary",
                 ack.primary_epoch
             ),
         ));

@@ -810,6 +810,13 @@ impl Storage {
                     "header checksum mismatch".to_string(),
                 ));
             }
+            if header.version != crate::storage_layout::FILE_VERSION {
+                return Err(StorageError::InvalidFile(format!(
+                    "file version {} is not promotable (open it with the server once to \
+                     upgrade, then retry)",
+                    header.version
+                )));
+            }
             let mut sb_a_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
             file.read_exact_at(header.superblock_a_offset, &mut sb_a_bytes)?;
             let superblock_a = Superblock::from_le_bytes(&sb_a_bytes);
@@ -844,9 +851,51 @@ impl Storage {
                 ),
             };
             if !active.is_standby() {
-                return Err(StorageError::InvalidConfig(
-                    "this database is not a replication standby; nothing to promote".to_string(),
-                ));
+                // A crash between promote's two superblock writes leaves the
+                // ACTIVE slot promoted and the backup slot still standby: the
+                // promotion durably won (the active slot's higher generation
+                // decides), so FINISH it — rewrite the backup slot to match —
+                // rather than telling the operator their failover failed. (An
+                // in-place active-slot rewrite tearing later could otherwise
+                // fall back to the stale standby state.)
+                let backup_slot = match active_slot {
+                    ActiveSuperblock::A => superblock_b,
+                    ActiveSuperblock::B => superblock_a,
+                };
+                if backup_slot.is_standby() {
+                    let mut backup = active;
+                    backup.active = backup_flag;
+                    backup.checksum = backup.compute_checksum();
+                    file.write_all_at(backup_offset, &backup.to_le_bytes_with_checksum())?;
+                    file.sync_data()?;
+                    drop(file);
+                    drop(Storage::open(path.to_path_buf())?);
+                    return Ok(active.epoch());
+                }
+                return Err(StorageError::InvalidConfig(format!(
+                    "this database is not a replication standby; nothing to promote (if a \
+                     previous promote was interrupted, it already took effect — the current \
+                     replication epoch is {}; start the server normally)",
+                    active.epoch()
+                )));
+            }
+            // Promotion's undo appends CLRs for every shipped in-flight
+            // transaction, and undo volume is roughly the loser records'
+            // forward volume. Refuse while the retained ring exceeds half its
+            // size: below that, headroom (>= half the ring) covers the worst
+            // case (every retained byte a loser). The remedy is real — the
+            // standby restartpoints at 50% usage, so this fires only right
+            // after a large catch-up; start the standby server briefly (its
+            // maintenance thread restartpoints) and retry.
+            let occupancy = active.wal_tail.saturating_sub(active.wal_head);
+            if occupancy > header.wal_size / 2 {
+                return Err(StorageError::InvalidConfig(format!(
+                    "the standby's retained WAL ({occupancy} bytes) exceeds half its ring \
+                     ({} bytes): promotion's undo could run the ring full and leave the \
+                     file unopenable. Start the standby server briefly (it will take a \
+                     restartpoint) and retry the promote",
+                    header.wal_size
+                )));
             }
             let generation = superblock_a
                 .generation
@@ -991,7 +1040,13 @@ impl Storage {
         // backup's end. Each archive continues from the current coverage (no
         // gap) and the whole range must fit the ring.
         for log_path in log_paths {
-            apply_log_archive(&mut file, log_path, header.redo_start_lsn, &mut tail)?;
+            apply_log_archive(
+                &mut file,
+                log_path,
+                header.redo_start_lsn,
+                &mut tail,
+                header.epoch,
+            )?;
         }
         // Apply raw shipped WAL ranges (physical replication) after the log
         // chain, on the same seeded ring, extending the tail further.
@@ -6624,10 +6679,17 @@ impl StorageFile {
         // applied log chain / shipped WAL ranges), which is the restored tail.
         base.set_applied_lsn(backup_end);
         base.set_standby(standby);
-        // The seed carries the source's timeline: the handshake's equal-epoch
-        // fence relies on it to tell a same-timeline standby from a diverged
-        // one.
-        base.set_epoch(header.epoch);
+        // A STANDBY seed carries the source's timeline verbatim (the equal-epoch
+        // fence relies on it: same epoch = a guaranteed log prefix). A WRITABLE
+        // restore is a NEW timeline — its history is rewound to the restore
+        // point (with PITR, deliberately) and its future writes diverge from
+        // the original's, so it must NOT present the original's epoch to
+        // standbys that followed the original.
+        base.set_epoch(if standby {
+            header.epoch
+        } else {
+            header.epoch.saturating_add(1)
+        });
 
         let mut a = base;
         a.generation = 1;
@@ -7511,6 +7573,7 @@ fn apply_log_archive(
     path: &Path,
     head: u64,
     tail: &mut u64,
+    expected_epoch: u64,
 ) -> Result<(), StorageError> {
     use crate::backup::{BlockType, decode_log_chunk};
     let reader = std::io::BufReader::new(std::fs::File::open(path)?);
@@ -7519,6 +7582,18 @@ fn apply_log_archive(
         return Err(StorageError::InvalidFile(format!(
             "{}: --log expects a BACKUP LOG archive, but this is a full backup",
             path.display()
+        )));
+    }
+    // Timeline guard: after a failover, the old and new timelines' archives
+    // share geometry AND continuous-looking LSNs — a mixed chain would restore
+    // into a silent chimera. Only same-epoch archives may extend this chain.
+    if header.epoch != expected_epoch {
+        return Err(StorageError::InvalidFile(format!(
+            "{}: log archive is from replication epoch {} but the restore chain is \
+             epoch {expected_epoch} — a different timeline's archive cannot extend \
+             this chain",
+            path.display(),
+            header.epoch
         )));
     }
     // Partial identity guard: a log archive whose page or ring geometry differs

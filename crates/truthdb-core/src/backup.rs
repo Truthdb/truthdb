@@ -149,6 +149,15 @@ impl BackupHeader {
     fn decode(bytes: &[u8]) -> io::Result<Self> {
         let mut cursor = Cursor { bytes, pos: 0 };
         let format_version = cursor.u32()?;
+        // Checked FIRST, before any version-dependent field is read — an old
+        // file must fail with a version message, not a bogus "corrupt" one.
+        // v1 (pre-epoch) files stay readable: the epoch field is additive and
+        // a pre-epoch backup is timeline 0 by definition.
+        if format_version == 0 || format_version > FORMAT_VERSION {
+            return Err(corrupt(&format!(
+                "unsupported backup format version {format_version} (this build reads 1..={FORMAT_VERSION})"
+            )));
+        }
         let page_size = cursor.u32()?;
         let total_size = cursor.u64()?;
         let wal_size = cursor.u64()?;
@@ -161,7 +170,11 @@ impl BackupHeader {
         let metadata_root = cursor.u64()?;
         let last_committed_seq = cursor.u64()?;
         let finished_at_millis = cursor.u64()?;
-        let epoch = cursor.u64()?;
+        let epoch = if format_version >= 2 {
+            cursor.u64()?
+        } else {
+            0
+        };
         let db_options = cursor.u8()?;
         let flag_bits = cursor.u8()?;
         let collation_len = cursor.u32()?;
@@ -338,13 +351,9 @@ impl<R: Read> BackupReader<R> {
         if block_type != BlockType::Header {
             return Err(corrupt("first block is not the header"));
         }
+        // The version range is enforced inside `decode` (before any
+        // version-dependent field is read).
         let header = BackupHeader::decode(&payload)?;
-        if header.format_version != FORMAT_VERSION {
-            return Err(corrupt(&format!(
-                "unsupported backup format version {}",
-                header.format_version
-            )));
-        }
         Ok((this, header))
     }
 
@@ -463,6 +472,36 @@ impl Cursor<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A v1 (pre-epoch) header decodes with epoch 0 — the fleet's existing
+    // backups stay restorable across the format bump, and a pre-epoch backup
+    // is timeline 0 by definition. An unknown future version fails with a
+    // version message, not a bogus "corrupt" one.
+    #[test]
+    fn a_v1_header_decodes_with_epoch_zero() {
+        let header = sample_header();
+        // Re-encode by hand in the v1 layout: no epoch field, version 1.
+        let v2 = header.encode();
+        let mut v1 = Vec::new();
+        v1.extend_from_slice(&1u32.to_le_bytes());
+        v1.extend_from_slice(&v2[4..96]); // page_size ..= finished_at_millis
+        v1.extend_from_slice(&v2[104..]); // db_options onward (epoch skipped)
+        let decoded = BackupHeader::decode(&v1).expect("v1 decodes");
+        assert_eq!(decoded.format_version, 1);
+        assert_eq!(decoded.epoch, 0, "a pre-epoch backup is timeline 0");
+        assert_eq!(decoded.redo_start_lsn, header.redo_start_lsn);
+        assert_eq!(decoded.default_collation, header.default_collation);
+        assert_eq!(decoded.flags, header.flags);
+
+        let mut v3 = v2.clone();
+        v3[0..4].copy_from_slice(&99u32.to_le_bytes());
+        let err = BackupHeader::decode(&v3).expect_err("future version refused");
+        assert!(
+            err.to_string()
+                .contains("unsupported backup format version 99"),
+            "{err}"
+        );
+    }
 
     fn sample_header() -> BackupHeader {
         BackupHeader {

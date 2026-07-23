@@ -2751,6 +2751,47 @@ mod tests {
         }
     }
 
+    // A WRITABLE restore is a NEW timeline (its history rewinds and its future
+    // writes diverge), so it must not present the source's epoch to standbys
+    // that followed the source — the epoch bumps. A --standby seed stays on
+    // the source's timeline verbatim.
+    #[test]
+    fn a_writable_restore_is_a_new_timeline_a_standby_seed_is_not() {
+        let src = unique_temp_path("tl-src");
+        let bak = unique_temp_path("tl-bak");
+        let writable = unique_temp_path("tl-writable");
+        let seed = unique_temp_path("tl-seed");
+
+        let engine = new_engine(&src);
+        engine
+            .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+            .expect("create");
+        engine.execute("INSERT INTO t VALUES (1)").expect("insert");
+        engine.storage().backup_full(&bak).expect("backup");
+        drop(engine);
+
+        Storage::restore_full(&writable, &bak).expect("plain restore");
+        let restored = Engine::new(Storage::open(writable.clone()).expect("open")).expect("eng");
+        assert_eq!(
+            restored.storage().epoch(),
+            1,
+            "a writable restore bumps the epoch (new timeline)"
+        );
+        drop(restored);
+
+        Storage::restore_full_standby(&seed, &bak, &[]).expect("standby seed");
+        let standby = Engine::new(Storage::open(seed.clone()).expect("open")).expect("eng");
+        assert_eq!(
+            standby.storage().epoch(),
+            0,
+            "a standby seed carries the source's timeline"
+        );
+        drop(standby);
+        for p in [src, bak, writable, seed] {
+            let _ = std::fs::remove_file(p);
+        }
+    }
+
     // `ALTER DATABASE <name> FAILOVER` online mirrors RESTORE DATABASE: the
     // answer is the pointer at the offline CLI.
     #[test]
