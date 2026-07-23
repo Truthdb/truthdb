@@ -118,8 +118,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_valid_standby_is_accepted_over_the_wire() {
-        let auth = compute_auth(SECRET, 5, &UUID, 1, 40_000);
-        let (outcome, ack) = exchange(hello(5, 1, 40_000, auth)).await;
+        let auth = compute_auth(SECRET, 5, &UUID, 3, 40_000);
+        let (outcome, ack) = exchange(hello(5, 3, 40_000, auth)).await;
         assert!(ack.accepted, "{}", ack.message);
         assert_eq!(ack.primary_flushed_lsn, 77_000);
         assert_eq!(

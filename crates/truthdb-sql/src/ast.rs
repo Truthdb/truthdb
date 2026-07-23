@@ -522,6 +522,10 @@ pub enum DatabaseOption {
     /// `SET RECOVERY {FULL | SIMPLE}`. Unlike the ON/OFF options, the paired
     /// bool carries the mode: `true` = FULL, `false` = SIMPLE.
     Recovery,
+    /// `ALTER DATABASE <name> FAILOVER` — promotion of a replication standby.
+    /// Online it always errors pointing at the offline `truthdb-cli promote`
+    /// (the paired bool is unused).
+    Failover,
 }
 
 #[derive(Debug, Clone, PartialEq)]

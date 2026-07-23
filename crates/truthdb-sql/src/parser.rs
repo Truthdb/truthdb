@@ -1696,6 +1696,15 @@ impl Parser {
         } else {
             Some(self.parse_name()?)
         };
+        // `ALTER DATABASE <name> FAILOVER` (no SET): standby promotion.
+        if self.peek_keyword().as_deref() == Some("FAILOVER") {
+            let end = self.bump().span;
+            return Ok(Statement::AlterDatabase(AlterDatabase {
+                name,
+                options: vec![(DatabaseOption::Failover, true)],
+                span: start.to(end),
+            }));
+        }
         self.expect_keyword("SET")?;
         let mut options = Vec::new();
         let mut end;
