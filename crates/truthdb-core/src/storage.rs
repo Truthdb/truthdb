@@ -393,6 +393,9 @@ pub struct Storage {
     /// waits — after LOCAL durability — for a standby's `FlushAck` to cover its
     /// target, with an availability-first timeout (see [`SyncCommitState`]).
     sync_commit: SyncCommitState,
+    /// Node ids with a live replication sender (one connection per id; the
+    /// monitoring DMVs report connectedness from here).
+    repl_connected: std::sync::Mutex<std::collections::HashSet<u32>>,
     /// The log-writer thread's join handle, taken in `Drop` after signalling it.
     log_writer: Option<JoinHandle<()>>,
     /// `READ_COMMITTED_SNAPSHOT` / `ALLOW_SNAPSHOT_ISOLATION` mirrors of the
@@ -490,6 +493,7 @@ impl Storage {
             inner: std::sync::Mutex::new(file),
             gc,
             sync_commit: SyncCommitState::default(),
+            repl_connected: std::sync::Mutex::new(std::collections::HashSet::new()),
             log_writer: Some(log_writer),
             rcsi: std::sync::atomic::AtomicBool::new(rcsi),
             allow_snapshot: std::sync::atomic::AtomicBool::new(allow_snapshot),
@@ -744,7 +748,6 @@ impl Storage {
 
     /// The current WAL head (the reclaim floor) — for tests that verify the
     /// FULL-model log-backup hold pins truncation.
-    #[cfg(test)]
     pub(crate) fn wal_head(&self) -> u64 {
         self.lock().wal.head()
     }
@@ -1996,8 +1999,7 @@ impl Storage {
 
     /// The persisted replication restartpoint (the active superblock's
     /// `applied_lsn`): the LSN up to which this file's WAL is present and
-    /// recovered. (Test-only until the monitoring slice reads it.)
-    #[cfg(test)]
+    /// recovered.
     pub(crate) fn applied_lsn(&self) -> u64 {
         let guard = self.lock();
         let active = match guard.active_superblock {
@@ -2021,6 +2023,52 @@ impl Storage {
             ActiveSuperblock::B => &guard.superblock_b,
         };
         active.wal_tail
+    }
+
+    /// Joins the connected-standby registry (one live sender per node id).
+    /// Returns false if the id is already connected.
+    pub(crate) fn try_join_repl_node(&self, id: u32) -> bool {
+        self.repl_connected
+            .lock()
+            .expect("repl-connected set poisoned")
+            .insert(id)
+    }
+
+    /// Leaves the connected-standby registry.
+    pub(crate) fn leave_repl_node(&self, id: u32) {
+        self.repl_connected
+            .lock()
+            .expect("repl-connected set poisoned")
+            .remove(&id);
+    }
+
+    /// Node ids with a live sender (for the monitoring DMVs).
+    pub(crate) fn repl_connected_nodes(&self) -> std::collections::HashSet<u32> {
+        self.repl_connected
+            .lock()
+            .expect("repl-connected set poisoned")
+            .clone()
+    }
+
+    /// The registered replication slots `(id, held LSN)` (for the monitoring
+    /// DMVs).
+    pub(crate) fn repl_slots_snapshot(&self) -> Vec<(u32, u64)> {
+        self.lock()
+            .truncation_gate
+            .repl_slots
+            .iter()
+            .map(|(&id, &lsn)| (id, lsn))
+            .collect()
+    }
+
+    /// Synchronous-commit status: `None` when not armed, else whether the link
+    /// is currently degraded (NOT_SYNCHRONIZED).
+    pub(crate) fn sync_commit_status(&self) -> Option<bool> {
+        use std::sync::atomic::Ordering;
+        self.sync_commit
+            .armed
+            .load(Ordering::Acquire)
+            .then(|| self.sync_commit.degraded.load(Ordering::Acquire))
     }
 
     /// Whether this file is a replication standby (redo-only, read-only until

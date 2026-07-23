@@ -88,6 +88,10 @@ enum Command {
         #[arg(long)]
         path: std::path::PathBuf,
     },
+    /// ONLINE: show this server's replication state (role, slots, connected
+    /// standbys, lag, sync-commit status) by querying the `sys.dm_repl_*`
+    /// views over the native protocol.
+    ReplStatus,
 }
 
 #[tokio::main]
@@ -147,6 +151,7 @@ async fn main() -> Result<()> {
                 Err(err) => Err(anyhow::anyhow!("restore failed: {err}")),
             }
         }
+        Command::ReplStatus => repl_status(&addr).await,
         Command::Promote { path } => match truthdb_core::storage::Storage::promote(&path) {
             Ok(epoch) => {
                 println!(
@@ -159,6 +164,31 @@ async fn main() -> Result<()> {
             Err(err) => Err(anyhow::anyhow!("promote failed: {err}")),
         },
     }
+}
+
+/// Queries the replication DMVs and prints them.
+async fn repl_status(addr: &str) -> Result<()> {
+    let mut stream = TcpStream::connect(addr).await?;
+    send_hello(&mut stream).await?;
+    let mut id = 1u64;
+    for (title, query) in [
+        (
+            "replica states",
+            "SELECT * FROM sys.dm_repl_replica_states;",
+        ),
+        ("slots", "SELECT * FROM sys.dm_repl_slots;"),
+    ] {
+        let resp = send_command(&mut stream, id, query).await?;
+        id = id.wrapping_add(1);
+        println!("-- {title} --");
+        let rendered = render::render(resp.ok, &resp.message);
+        if rendered.is_empty() {
+            println!("(none)");
+        } else {
+            println!("{rendered}");
+        }
+    }
+    Ok(())
 }
 
 async fn repl(addr: &str) -> Result<()> {

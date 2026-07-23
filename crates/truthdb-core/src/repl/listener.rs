@@ -40,9 +40,6 @@ pub struct PrimaryReplContext {
     /// Target bytes per `LogData` frame during catch-up (cut on entry
     /// boundaries; see `sender::DEFAULT_CHUNK_BYTES`).
     pub chunk_bytes: u64,
-    /// Node ids with a live sender, so a second connection under the same id
-    /// is refused instead of corrupting the first's slot.
-    pub active_nodes: Arc<std::sync::Mutex<std::collections::HashSet<u32>>>,
 }
 
 impl PrimaryReplContext {
@@ -170,7 +167,6 @@ mod tests {
             heartbeat: Duration::from_secs(30),
             stall_timeout: Duration::from_secs(30),
             chunk_bytes: crate::repl::sender::DEFAULT_CHUNK_BYTES,
-            active_nodes: Arc::default(),
         };
         let server = tokio::spawn(run_repl_listener(listener, acceptor, ctx, shutdown_rx));
 

@@ -72,8 +72,9 @@ where
     // One connection per node id: a second stream under the same id would
     // reset the first's slot and its acks would advance it out from under the
     // other stream's shipping position (the shipped default node_id is the
-    // same on every node, so this is an easy misconfiguration to hit).
-    let _membership = match NodeMembership::acquire(&ctx.active_nodes, slot_id) {
+    // same on every node, so this is an easy misconfiguration to hit). The
+    // registry lives on Storage so the monitoring DMVs can report it.
+    let _membership = match NodeMembership::acquire(&storage, slot_id) {
         Some(m) => m,
         None => {
             let msg = format!(
@@ -118,20 +119,17 @@ where
     result
 }
 
-/// RAII membership in the primary's connected-node set.
+/// RAII membership in the primary's connected-node set (kept on Storage so
+/// the monitoring DMVs can report connectedness).
 struct NodeMembership {
-    nodes: Arc<Mutex<std::collections::HashSet<u32>>>,
+    storage: Arc<Storage>,
     id: u32,
 }
 
 impl NodeMembership {
-    fn acquire(nodes: &Arc<Mutex<std::collections::HashSet<u32>>>, id: u32) -> Option<Self> {
-        let mut set = nodes.lock().expect("active-node set poisoned");
-        if !set.insert(id) {
-            return None;
-        }
-        Some(NodeMembership {
-            nodes: Arc::clone(nodes),
+    fn acquire(storage: &Arc<Storage>, id: u32) -> Option<Self> {
+        storage.try_join_repl_node(id).then(|| NodeMembership {
+            storage: Arc::clone(storage),
             id,
         })
     }
@@ -139,10 +137,7 @@ impl NodeMembership {
 
 impl Drop for NodeMembership {
     fn drop(&mut self) {
-        self.nodes
-            .lock()
-            .expect("active-node set poisoned")
-            .remove(&self.id);
+        self.storage.leave_repl_node(self.id);
     }
 }
 
@@ -371,7 +366,6 @@ mod tests {
             heartbeat: Duration::from_secs(30),
             stall_timeout: Duration::from_secs(30),
             chunk_bytes: DEFAULT_CHUNK_BYTES,
-            active_nodes: Arc::default(),
         }
     }
 
@@ -481,7 +475,7 @@ mod tests {
         first.abort();
         let _ = first.await;
         // The membership guard released the id on abort, so it is reusable.
-        assert!(!ctx.active_nodes.lock().unwrap().contains(&5));
+        assert!(!ctx.storage.repl_connected_nodes().contains(&5));
         let _ = std::fs::remove_file(path);
     }
 }
