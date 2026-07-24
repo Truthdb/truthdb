@@ -1478,7 +1478,9 @@ fn dispatch_batch(
         // Parameters are values, not statements, so they never change which
         // locks the batch needs — analyse the statement text as usual.
         let epoch = shared.engine.lock_analysis_epoch();
-        let needs = shared.engine.analyze_locks(&sql, isolation);
+        let needs = shared
+            .engine
+            .analyze_locks(sched.session_db(session), &sql, isolation);
         if sched.try_acquire(session.raw(), &needs, true) {
             sched.sessions.touch(session);
             let txn_ctx = sched.take_ctx(session);
@@ -1701,6 +1703,18 @@ impl Scheduler {
             .unwrap_or_default()
     }
 
+    /// The session's current database id — the namespace its batch's lock
+    /// analysis must resolve names in (the same one execution will use). The
+    /// default database for an unknown session or one whose context is
+    /// momentarily taken (a session has at most one in-flight batch, so its
+    /// own analysis never observes the placeholder).
+    fn session_db(&self, session: SessionId) -> u32 {
+        self.sessions
+            .get(session)
+            .map(|s| s.txn_ctx.database_id())
+            .unwrap_or(crate::relstore::catalog::DEFAULT_DATABASE_ID)
+    }
+
     /// Takes a session's transaction context out for a worker to run a batch
     /// with (a `Default` placeholder is left behind; [`Self::finish`] returns
     /// the real one). A session has at most one in-flight batch and no close
@@ -1827,7 +1841,11 @@ impl Scheduler {
             // does.
             if self.parked[i].epoch != current_epoch {
                 let isolation = self.isolation(self.parked[i].session);
-                self.parked[i].needs = engine.analyze_locks(&self.parked[i].sql, isolation);
+                self.parked[i].needs = engine.analyze_locks(
+                    self.session_db(self.parked[i].session),
+                    &self.parked[i].sql,
+                    isolation,
+                );
                 self.parked[i].epoch = current_epoch;
             }
             let owner = self.parked[i].session.raw();
@@ -2710,7 +2728,11 @@ mod tests {
         ));
         // Park an EXEC analyzed against the OLD (read-only) body.
         let epoch = engine.lock_analysis_epoch();
-        let needs = engine.analyze_locks("EXEC p", crate::rel::Isolation::ReadCommitted);
+        let needs = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "EXEC p",
+            crate::rel::Isolation::ReadCommitted,
+        );
         assert!(
             !needs
                 .iter()

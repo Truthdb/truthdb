@@ -66,11 +66,16 @@ impl ColumnResolver for Vec<String> {
 /// kept small (heavy arms delegate to out-of-line helpers) so this is safe.
 const MAX_EVAL_DEPTH: usize = 500;
 
+/// The default database's id. Mirrors `truthdb-core`'s catalog constant
+/// (this crate is a dependency of truthdb-core and cannot import it); the
+/// mirror is asserted equal at truthdb-core's build.
+pub const DEFAULT_DATABASE_ID: u32 = 1;
+
 /// Session context available to expression evaluation: `@@`-variables, the
 /// batch's `@`-variables, and (in later stages) the current time /
 /// SCOPE_IDENTITY. `Default` is a no-transaction, no-variable context, used
 /// where no session is in scope.
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct EvalContext {
     pub trancount: i32,
     /// Declared batch variables (name without `@`, lowercased) to their current
@@ -79,6 +84,10 @@ pub struct EvalContext {
     pub variables: std::collections::HashMap<String, SqlValue>,
     /// The connection's current database name — `DB_NAME()`.
     pub database: String,
+    /// The connection's current database id — the namespace unqualified
+    /// object names resolve in. Never 0: the manual `Default` lands in the
+    /// default database.
+    pub database_id: u32,
     /// The authenticated login name — `SUSER_SNAME()`.
     pub login: String,
     /// The session's database user name — `USER_NAME()` (with no argument).
@@ -118,6 +127,31 @@ pub struct EvalContext {
     /// `@@FETCH_STATUS` — the result of the last cursor FETCH: 0 success, -1 past
     /// the end / no more rows, -2 the fetched row is missing.
     pub fetch_status: i32,
+}
+
+impl Default for EvalContext {
+    fn default() -> Self {
+        EvalContext {
+            trancount: 0,
+            variables: Default::default(),
+            database: String::new(),
+            database_id: DEFAULT_DATABASE_ID,
+            login: String::new(),
+            user: String::new(),
+            server_roles: Default::default(),
+            db_roles: Default::default(),
+            security: Default::default(),
+            spid: 0,
+            rowcount: 0,
+            scope_identity: None,
+            error: None,
+            xact_state: 0,
+            last_error: 0,
+            nestlevel: 0,
+            updated_columns: None,
+            fetch_status: 0,
+        }
+    }
 }
 
 /// The columns a trigger's firing statement touched: the parent table's column

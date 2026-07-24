@@ -30,7 +30,7 @@ fn eval_bound(
     resolver: &JoinScope,
     eval_ctx: &EvalContext,
 ) -> Result<SqlValue, SqlError> {
-    if crate::rel::expr_needs_binding(storage, expr) {
+    if crate::rel::expr_needs_binding(storage, eval_ctx.database_id, expr) {
         let outer = |name: &str| resolver.resolve(name);
         let bound =
             crate::rel::substitute_correlated_in_expr(storage, expr, &outer, row, eval_ctx)?;
@@ -254,7 +254,7 @@ fn aggregate_partition(
             // A reference to a non-grouped column stays unresolved and errors
             // inside the subquery, as SQL Server rejects it too.
             let bound;
-            let having = if crate::rel::expr_needs_binding(storage, having) {
+            let having = if crate::rel::expr_needs_binding(storage, eval_ctx.database_id, having) {
                 // A user function's args were rewritten to the synthetic group
                 // columns ($gk/$agg), which `synth` resolves; a subquery keeps its
                 // original grouping-column names, which `group_key_resolver`
@@ -286,7 +286,7 @@ fn aggregate_partition(
             // A subquery here is correlated to a grouping column (the
             // rewrite left it): bind the group row, exactly as HAVING does.
             let bound;
-            let expr = if crate::rel::expr_needs_binding(storage, expr) {
+            let expr = if crate::rel::expr_needs_binding(storage, eval_ctx.database_id, expr) {
                 let gkr = group_key_resolver(select, resolver);
                 let outer = |name: &str| synth.resolve(name).or_else(|| gkr(name));
                 bound = crate::rel::substitute_correlated_in_expr(

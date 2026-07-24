@@ -18,6 +18,17 @@ use crate::wal::records::RelRecord;
 pub const CATALOG_OBJECT_ID: u32 = 1;
 /// First object id handed to user tables.
 pub const FIRST_USER_OBJECT_ID: u32 = 2;
+/// The default database's id. The default database is synthesized (never
+/// stored): it always exists, cannot be dropped, and its name comes from the
+/// instance configuration. Every catalog row written before databases existed
+/// deserializes into it via `serde(default = ...)`.
+pub const DEFAULT_DATABASE_ID: u32 = 1;
+/// First database id handed to `CREATE DATABASE` (the default database is 1).
+pub const FIRST_USER_DATABASE_ID: u32 = 2;
+
+fn default_database_id() -> u32 {
+    DEFAULT_DATABASE_ID
+}
 
 /// An `IDENTITY(seed, increment)` column: which column it is (schema index),
 /// its seed/increment, and the next value to hand out (persisted so identity
@@ -147,6 +158,28 @@ pub struct TableDef {
     /// dropped. Empty for a freshly created object.
     #[serde(default)]
     pub permissions: Vec<PermissionEntry>,
+    /// The database this object belongs to. Pre-multidb catalog rows have no
+    /// field and deserialize into the default database. Meaningless (left at
+    /// the default) on server-scoped rows: logins, database principals, and
+    /// database rows themselves.
+    #[serde(default = "default_database_id")]
+    pub database_id: u32,
+    /// For a DATABASE (`CREATE DATABASE`): its id and metadata. A database is
+    /// NOT a schema object — the storage layer keeps these rows in a separate
+    /// in-memory map so they never enter the object namespace. `None` for
+    /// every other kind of row.
+    #[serde(default)]
+    pub database: Option<DatabaseDef>,
+}
+
+/// A database's catalog payload. The row's `name` is the database name; the
+/// payload carries the database id that objects reference via
+/// [`TableDef::database_id`]. Ids are allocated max+1 over stored rows
+/// (starting at [`FIRST_USER_DATABASE_ID`]) and capped at `u16::MAX` so the
+/// id fits the WAL container tag.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct DatabaseDef {
+    pub db_id: u32,
 }
 
 /// A privilege on a securable, per SQL Server's object permissions.
@@ -399,6 +432,12 @@ impl TableDef {
             self.principal.as_ref().map(|p| p.kind),
             Some(PrincipalKind::Role)
         )
+    }
+
+    /// True if this catalog entry is a database (a namespace container, not a
+    /// schema object — kept in its own map, out of the object namespace).
+    pub fn is_database(&self) -> bool {
+        self.database.is_some()
     }
 }
 

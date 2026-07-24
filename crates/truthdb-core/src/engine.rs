@@ -384,13 +384,24 @@ impl Engine {
 
     /// The table/database locks a SQL batch needs at the given isolation
     /// level (see [`crate::rel::analyze_locks`]). The session loop acquires
-    /// these before running the batch.
+    /// these before running the batch. `db_id` is the session's current
+    /// database — the same namespace execution will resolve names in; the two
+    /// derivations must agree or a batch under-locks.
     pub fn analyze_locks(
         &self,
+        db_id: u32,
         input: &str,
         isolation: crate::rel::Isolation,
     ) -> Vec<(crate::lock::Resource, crate::lock::LockMode)> {
-        crate::rel::analyze_locks(&self.storage, input, isolation)
+        crate::rel::analyze_locks(&self.storage, db_id, input, isolation)
+    }
+
+    /// Stamps the default database's name (id 1) from the instance
+    /// configuration, refusing a name a stored `CREATE DATABASE` row already
+    /// uses. Called once at startup, before any session opens.
+    pub fn set_default_database(&self, name: &str) -> Result<(), EngineError> {
+        self.storage.set_default_database_name(name)?;
+        Ok(())
     }
 
     pub fn checkpoint(&self) -> Result<(), EngineError> {
@@ -4774,6 +4785,7 @@ mod tests {
         // write-locked (Exclusive); without the Shared lock this INSERT could
         // read another transaction's uncommitted rows.
         let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "INSERT INTO t2 (v) SELECT v FROM t1",
             Isolation::ReadCommitted,
         );
@@ -4788,6 +4800,7 @@ mod tests {
 
         // A self-insert combines the read and write into a single Exclusive lock.
         let self_locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "INSERT INTO t1 (id, v) SELECT id, v FROM t1",
             Isolation::ReadCommitted,
         );
@@ -4803,6 +4816,7 @@ mod tests {
 
         // READ UNCOMMITTED takes no read lock on the source.
         let ru = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "INSERT INTO t2 (v) SELECT v FROM t1",
             Isolation::ReadUncommitted,
         );
@@ -5162,6 +5176,7 @@ mod tests {
 
         // Plain query with a nested CTE.
         let direct = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "WITH c AS (WITH d AS (SELECT z FROM secret) SELECT z FROM d) SELECT z FROM c",
             Isolation::ReadCommitted,
         );
@@ -5176,7 +5191,11 @@ mod tests {
                 "CREATE VIEW v AS WITH c AS (WITH d AS (SELECT z FROM secret) SELECT z FROM d) SELECT z FROM c",
             )
             .expect("view");
-        let via_view = engine.analyze_locks("SELECT z FROM v", Isolation::ReadCommitted);
+        let via_view = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT z FROM v",
+            Isolation::ReadCommitted,
+        );
         assert!(
             via_view.contains(&(Resource::Table(secret), LockMode::Shared)),
             "view over a nested-CTE body must lock secret: {via_view:?}"
@@ -5201,7 +5220,11 @@ mod tests {
             .expect("view");
         let base = table_object_id(&engine, "base");
 
-        let locks = engine.analyze_locks("SELECT x FROM v", Isolation::ReadCommitted);
+        let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT x FROM v",
+            Isolation::ReadCommitted,
+        );
         assert!(
             locks.contains(&(Resource::Table(base), LockMode::Shared)),
             "a view's base table (via its CTE) must be Shared-locked: {locks:?}"
@@ -5211,7 +5234,11 @@ mod tests {
         engine
             .execute("CREATE VIEW v2 AS SELECT x FROM v")
             .expect("v2");
-        let nested = engine.analyze_locks("SELECT x FROM v2", Isolation::ReadCommitted);
+        let nested = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT x FROM v2",
+            Isolation::ReadCommitted,
+        );
         assert!(
             nested.contains(&(Resource::Table(base), LockMode::Shared)),
             "a nested view must Shared-lock the base table through both views: {nested:?}"
@@ -5241,7 +5268,11 @@ mod tests {
         let base = table_object_id(&engine, "base");
         let secret = table_object_id(&engine, "secret");
 
-        let locks = engine.analyze_locks("SELECT x FROM v", Isolation::ReadCommitted);
+        let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT x FROM v",
+            Isolation::ReadCommitted,
+        );
         assert!(
             locks.contains(&(Resource::Table(base), LockMode::Shared)),
             "base must be locked: {locks:?}"
@@ -5298,6 +5329,7 @@ mod tests {
         let secret = table_object_id(&engine, "secret");
 
         let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "DECLARE @v INT; WITH c AS (SELECT x FROM secret) SELECT @v = (SELECT MAX(x) FROM c)",
             Isolation::ReadCommitted,
         );
@@ -5586,7 +5618,11 @@ mod tests {
         };
 
         // Point UPDATE: Table IX + a single Row X, no Table X.
-        let up = engine.analyze_locks("UPDATE t SET v = 9 WHERE id = 5", rc);
+        let up = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "UPDATE t SET v = 9 WHERE id = 5",
+            rc,
+        );
         assert!(up.contains(&(Resource::Table(t), LockMode::IntentExclusive)));
         assert!(
             !has_table_x(&up),
@@ -5595,17 +5631,33 @@ mod tests {
         let k5 = row_x(&up).expect("point UPDATE row lock");
 
         // Point DELETE: same row key as the UPDATE of id = 5.
-        let del = engine.analyze_locks("DELETE FROM t WHERE id = 5", rc);
+        let del = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "DELETE FROM t WHERE id = 5",
+            rc,
+        );
         assert_eq!(row_x(&del), Some(k5), "DELETE id=5 must lock the same row");
 
         // A different key → a different row resource (so the two run concurrently).
-        let up6 = engine.analyze_locks("UPDATE t SET v = 1 WHERE id = 6", rc);
+        let up6 = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "UPDATE t SET v = 1 WHERE id = 6",
+            rc,
+        );
         assert_ne!(row_x(&up6), Some(k5));
 
         // Point INSERT (literal key) row-locks; INSERT ... SELECT does not.
-        let ins = engine.analyze_locks("INSERT INTO t VALUES (7, 1)", rc);
+        let ins = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "INSERT INTO t VALUES (7, 1)",
+            rc,
+        );
         assert!(row_x(&ins).is_some() && !has_table_x(&ins));
-        let ins_sel = engine.analyze_locks("INSERT INTO t SELECT id, v FROM t", rc);
+        let ins_sel = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "INSERT INTO t SELECT id, v FROM t",
+            rc,
+        );
         assert!(has_table_x(&ins_sel) && row_x(&ins_sel).is_none());
 
         // Range / OR / partial predicates fall back to Table X.
@@ -5616,7 +5668,8 @@ mod tests {
             "UPDATE t SET id = 2 WHERE id = 5", // key change moves the row
             "DELETE FROM t WHERE id = (SELECT MAX(id) FROM t)",
         ] {
-            let locks = engine.analyze_locks(sql, rc);
+            let locks =
+                engine.analyze_locks(crate::relstore::catalog::DEFAULT_DATABASE_ID, sql, rc);
             assert!(
                 has_table_x(&locks) && row_x(&locks).is_none(),
                 "table lock for `{sql}`: {locks:?}"
@@ -5659,28 +5712,55 @@ mod tests {
 
         // Character PK vs a *string* literal row-locks; vs a *numeric* literal it
         // does not (the executor's string->number match is many-to-one).
-        let str_lit = engine.analyze_locks("UPDATE cs SET v = 1 WHERE id = '05'", rc);
+        let str_lit = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "UPDATE cs SET v = 1 WHERE id = '05'",
+            rc,
+        );
         assert!(has_row(&str_lit, cs));
-        let num_lit = engine.analyze_locks("UPDATE cs SET v = 1 WHERE id = 5", rc);
+        let num_lit = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "UPDATE cs SET v = 1 WHERE id = 5",
+            rc,
+        );
         assert!(table_x(&num_lit, cs) && !has_row(&num_lit, cs));
 
         // A table with a secondary UNIQUE index: INSERT/UPDATE keep Table X;
         // DELETE may still row-lock (a delete cannot create a duplicate).
-        let ins = engine.analyze_locks("INSERT INTO u VALUES (1, 'a@b.com')", rc);
+        let ins = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "INSERT INTO u VALUES (1, 'a@b.com')",
+            rc,
+        );
         assert!(table_x(&ins, u) && !has_row(&ins, u));
-        let upd = engine.analyze_locks("UPDATE u SET email = 'x' WHERE id = 1", rc);
+        let upd = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "UPDATE u SET email = 'x' WHERE id = 1",
+            rc,
+        );
         assert!(table_x(&upd, u) && !has_row(&upd, u));
-        let del = engine.analyze_locks("DELETE FROM u WHERE id = 1", rc);
+        let del = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "DELETE FROM u WHERE id = 1",
+            rc,
+        );
         assert!(has_row(&del, u) && !table_x(&del, u));
 
         // FLOAT PK is never row-locked (signed zero / NaN encode ambiguity).
-        let fl = engine.analyze_locks("UPDATE f SET v = 1 WHERE k = 1.0", rc);
+        let fl = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "UPDATE f SET v = 1 WHERE k = 1.0",
+            rc,
+        );
         assert!(table_x(&fl, f) && !has_row(&fl, f));
 
         // A batch that point-writes AND reads the same table must end up with an
         // exclusive table lock (the IX+S -> X combine fix), not a Shared lock.
-        let batch =
-            engine.analyze_locks("UPDATE cs SET v = 1 WHERE id = '05'; SELECT * FROM cs", rc);
+        let batch = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "UPDATE cs SET v = 1 WHERE id = '05'; SELECT * FROM cs",
+            rc,
+        );
         assert!(
             table_x(&batch, cs),
             "point-write + same-table read must hold Table X: {batch:?}"
@@ -5709,11 +5789,17 @@ mod tests {
             })
         };
         // Both key columns pinned → row lock.
-        assert!(row_x(
-            &engine.analyze_locks("UPDATE t SET v = 1 WHERE a = 1 AND b = 2", rc)
-        ));
+        assert!(row_x(&engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "UPDATE t SET v = 1 WHERE a = 1 AND b = 2",
+            rc
+        )));
         // Only one pinned → table lock.
-        let partial = engine.analyze_locks("UPDATE t SET v = 1 WHERE a = 1", rc);
+        let partial = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "UPDATE t SET v = 1 WHERE a = 1",
+            rc,
+        );
         assert!(!row_x(&partial) && partial.contains(&(Resource::Table(t), LockMode::Exclusive)));
         let _ = std::fs::remove_file(path);
     }
@@ -5737,7 +5823,11 @@ mod tests {
         // on the parent (else it could read an uncommitted parent row). The
         // child is not itself an FK parent, so its point INSERT row-locks:
         // Table IntentExclusive + a Row Exclusive on the inserted key.
-        let locks = engine.analyze_locks("INSERT INTO c VALUES (1, 1)", Isolation::ReadCommitted);
+        let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "INSERT INTO c VALUES (1, 1)",
+            Isolation::ReadCommitted,
+        );
         assert!(
             locks.contains(&(Resource::Table(c), LockMode::IntentExclusive)),
             "child IntentExclusive: {locks:?}"
@@ -5754,7 +5844,11 @@ mod tests {
             "parent Shared: {locks:?}"
         );
         // DELETE of the parent reads the child (NO ACTION check) -> child Shared.
-        let del = engine.analyze_locks("DELETE FROM p WHERE id = 1", Isolation::ReadCommitted);
+        let del = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "DELETE FROM p WHERE id = 1",
+            Isolation::ReadCommitted,
+        );
         assert!(
             del.contains(&(Resource::Table(p), LockMode::Exclusive)),
             "parent Exclusive: {del:?}"
@@ -6005,6 +6099,7 @@ mod tests {
         // A subquery over `b` inside `a`'s WHERE reads `b`, so it must take a
         // Shared lock on `b` (else it could read `b`'s uncommitted rows).
         let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SELECT id FROM a WHERE id IN (SELECT id FROM b)",
             Isolation::ReadCommitted,
         );
@@ -8634,7 +8729,11 @@ mod tests {
             "SELECT id FROM t2 WHERE dbo.secret_count() > 0",
             "IF dbo.secret_count() > 0 SELECT 1 AS n",
         ] {
-            let locks = engine.analyze_locks(sql, Isolation::ReadCommitted);
+            let locks = engine.analyze_locks(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                sql,
+                Isolation::ReadCommitted,
+            );
             assert!(
                 locks.contains(&(Resource::Table(secret), LockMode::Shared)),
                 "the function's inner-read table must be Shared-locked for `{sql}`: {locks:?}"
@@ -9227,7 +9326,11 @@ mod tests {
         let secret = table_object_id(&engine, "secret");
         // A UDF reached THROUGH a view must still have its body's table Shared-
         // locked — else the view-nested UDF reads secret unlocked under 2PL.
-        let locks = engine.analyze_locks("SELECT * FROM v", Isolation::ReadCommitted);
+        let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT * FROM v",
+            Isolation::ReadCommitted,
+        );
         assert!(
             locks.contains(&(Resource::Table(secret), LockMode::Shared)),
             "a view-nested UDF's body table must be Shared-locked: {locks:?}"
@@ -9276,7 +9379,11 @@ mod tests {
             .expect("tvf");
         let secret = table_object_id(&engine, "secret");
         // A TVF in FROM must Shared-lock the table its body reads, up front.
-        let locks = engine.analyze_locks("SELECT z FROM dbo.rows_of(1)", Isolation::ReadCommitted);
+        let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT z FROM dbo.rows_of(1)",
+            Isolation::ReadCommitted,
+        );
         assert!(
             locks.contains(&(Resource::Table(secret), LockMode::Shared)),
             "a TVF's body table must be Shared-locked: {locks:?}"
@@ -9313,7 +9420,11 @@ mod tests {
         // intent lock may still appear; only object locks are asserted absent.)
         let has_object_lock = |sql: &str| {
             engine
-                .analyze_locks(sql, Isolation::ReadCommitted)
+                .analyze_locks(
+                    crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                    sql,
+                    Isolation::ReadCommitted,
+                )
                 .iter()
                 .any(|(r, _)| matches!(r, Resource::Table(_) | Resource::Row(..)))
         };
@@ -9330,6 +9441,7 @@ mod tests {
         let base = table_object_id(&engine, "base");
         // A join of base with @t locks only base; the @t side adds nothing.
         let join_locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SELECT * FROM base AS b JOIN @t AS t ON b.id = t.id",
             Isolation::ReadCommitted,
         );
@@ -9340,6 +9452,7 @@ mod tests {
             "the @t side of a join must add no table lock beyond base's: {join_locks:?}"
         );
         let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "INSERT INTO @t SELECT id FROM base",
             Isolation::ReadCommitted,
         );
@@ -9492,7 +9605,11 @@ mod tests {
             .expect("bomb");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = engine.analyze_locks("SELECT id FROM dbo.bomb(1)", Isolation::ReadCommitted);
+            let _ = engine.analyze_locks(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "SELECT id FROM dbo.bomb(1)",
+                Isolation::ReadCommitted,
+            );
             let _ = tx.send(());
         });
         assert!(
@@ -9533,7 +9650,11 @@ mod tests {
         // Exclusive lock up front (the trigger body writes it) — else the body
         // writes unlocked under 2PL.
         let audit = table_object_id(&engine, "audit");
-        let locks = engine.analyze_locks("INSERT INTO t VALUES (9, 9)", Isolation::ReadCommitted);
+        let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "INSERT INTO t VALUES (9, 9)",
+            Isolation::ReadCommitted,
+        );
         assert!(
             locks.contains(&(Resource::Table(audit), LockMode::Exclusive)),
             "the trigger body's audit write must be X-locked up front: {locks:?}"
@@ -9677,7 +9798,11 @@ mod tests {
             .expect("trg_b");
         let (tx, rx) = std::sync::mpsc::channel();
         std::thread::spawn(move || {
-            let _ = engine.analyze_locks("INSERT INTO a VALUES (1)", Isolation::ReadCommitted);
+            let _ = engine.analyze_locks(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "INSERT INTO a VALUES (1)",
+                Isolation::ReadCommitted,
+            );
             let _ = tx.send(());
         });
         assert!(
@@ -9746,7 +9871,11 @@ mod tests {
             .expect("trigger");
         let w = table_object_id(&engine, "w");
         let parent = table_object_id(&engine, "parent");
-        let locks = engine.analyze_locks("INSERT INTO t VALUES (1)", Isolation::ReadCommitted);
+        let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "INSERT INTO t VALUES (1)",
+            Isolation::ReadCommitted,
+        );
         // The single-row proc INSERT locks w at Table-IX + Row-X; assert w is
         // locked at all (a write lock, IX or X), proving the EXEC was analyzed.
         assert!(
@@ -9912,6 +10041,7 @@ mod tests {
         // lock-based — Table S — not drop it as a versioned read. The trigger
         // body analysis now forwards the escalation-corrected isolation.
         let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; INSERT INTO t VALUES (1)",
             Isolation::Snapshot,
         );
@@ -11097,8 +11227,11 @@ mod tests {
         let secret = table_object_id(&engine, "secret");
         // The body's read of `secret` must be Shared-locked up front, just like
         // an inline TVF or a scalar UDF body — the lock seam.
-        let locks =
-            engine.analyze_locks("SELECT z FROM dbo.copy_secret()", Isolation::ReadCommitted);
+        let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT z FROM dbo.copy_secret()",
+            Isolation::ReadCommitted,
+        );
         assert!(
             locks.contains(&(Resource::Table(secret), LockMode::Shared)),
             "a multi-statement TVF's body table must be Shared-locked: {locks:?}"
@@ -14643,6 +14776,103 @@ mod tests {
             first_rowset(&out).columns
         );
         assert_eq!(first_rowset(&out).rows.len(), 5, "the view's own rows");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn fk_enforcement_and_sys_views_stay_inside_the_session_database() {
+        // The children-of-parent decision (FK NO ACTION on parent DML, the
+        // DROP TABLE 3726 guard) and the sys.* enumerations are all derived
+        // per database. A same-named parent/child pair in ANOTHER database
+        // must not leak into a default-database session.
+        let path = unique_temp_path("multidb-exec-scope");
+        let engine = new_engine(&path);
+        sql(&engine, "CREATE TABLE p (id INT PRIMARY KEY, v INT)");
+        sql(&engine, "INSERT INTO p (id, v) VALUES (1, 10)");
+
+        // Another database with its own p, plus a child c referencing it —
+        // including a row whose FK key collides with the default db's p row.
+        let storage = engine.storage_arc();
+        let hr = storage.rel_create_database("hr").expect("create hr");
+        for (name, key, fks) in [
+            ("p", vec!["id".to_string()], Vec::new()),
+            (
+                "c",
+                vec!["id".to_string()],
+                vec![crate::relstore::catalog::ForeignKeyDef {
+                    name: "fk_c_p".to_string(),
+                    columns: vec![1],
+                    parent: "p".to_string(),
+                }],
+            ),
+        ] {
+            storage
+                .rel_create_table(
+                    hr,
+                    name,
+                    vec![
+                        crate::relstore::row::Column {
+                            name: "id".to_string(),
+                            column_type: crate::relstore::types::ColumnType::Int,
+                            nullable: false,
+                            collation: None,
+                        },
+                        crate::relstore::row::Column {
+                            name: "pid".to_string(),
+                            column_type: crate::relstore::types::ColumnType::Int,
+                            nullable: false,
+                            collation: None,
+                        },
+                    ],
+                    &key,
+                    Vec::new(),
+                    None,
+                    Vec::new(),
+                    fks,
+                )
+                .expect("hr table");
+        }
+        storage
+            .rel_insert(
+                hr,
+                "p",
+                vec![
+                    crate::relstore::types::Datum::Int(1),
+                    crate::relstore::types::Datum::Int(0),
+                ],
+            )
+            .expect("hr p row");
+        storage
+            .rel_insert(
+                hr,
+                "c",
+                vec![
+                    crate::relstore::types::Datum::Int(10),
+                    crate::relstore::types::Datum::Int(1),
+                ],
+            )
+            .expect("hr c row referencing hr p id 1");
+
+        // DELETE of the default db's p row must not see hr's child (no false
+        // 547), and DROP TABLE p must not be blocked by hr's FK (no 3726).
+        let env = sql(&engine, "DELETE FROM p WHERE id = 1");
+        assert_eq!(
+            env["results"][0]["rows_affected"].as_i64(),
+            Some(1),
+            "cross-database child must not block the delete: {env}"
+        );
+        let env = sql(&engine, "DROP TABLE p");
+        assert!(
+            env["error"].is_null(),
+            "cross-database FK must not raise 3726: {env}"
+        );
+
+        // sys.* views enumerate only the session's database.
+        let (_, rows) = sql_rows(&engine, "SELECT name FROM sys.tables ORDER BY name");
+        assert!(
+            rows.iter().all(|r| r[0].as_deref() != Some("c")),
+            "hr's objects must not appear in a default-db session's sys.tables: {rows:?}"
+        );
         let _ = std::fs::remove_file(path);
     }
 }

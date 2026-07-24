@@ -76,6 +76,7 @@ fn varchar_column(name: &str, max_len: u16) -> Column {
 fn create_tree_table(storage: &mut Storage, name: &str) {
     storage
         .rel_create_table(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             name,
             vec![int_column("id", false), varchar_column("payload", 4000)],
             &["id".to_string()],
@@ -90,6 +91,7 @@ fn create_tree_table(storage: &mut Storage, name: &str) {
 fn create_heap_table(storage: &mut Storage, name: &str) {
     storage
         .rel_create_table(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             name,
             vec![int_column("id", false), varchar_column("payload", 4000)],
             &[],
@@ -107,7 +109,7 @@ fn row(id: i32, payload: &str) -> Vec<Datum> {
 
 fn scan_ids(storage: &mut Storage, table: &str) -> Vec<i32> {
     storage
-        .rel_scan(table)
+        .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, table)
         .expect("scan")
         .into_iter()
         .map(|r| match r[0] {
@@ -125,17 +127,31 @@ fn committed_statements_survive_crash_without_checkpoint() {
     create_heap_table(&mut storage, "h");
     for i in 0..20 {
         storage
-            .rel_insert("t", row(i, &format!("tree-{i}")))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, &format!("tree-{i}")),
+            )
             .expect("insert");
         storage
-            .rel_insert("h", row(i, &format!("heap-{i}")))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "h",
+                row(i, &format!("heap-{i}")),
+            )
             .expect("insert");
     }
     storage
-        .rel_delete_where("t", "id", &Datum::Int(3))
+        .rel_delete_where(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            "id",
+            &Datum::Int(3),
+        )
         .expect("delete");
     storage
         .rel_update_where(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "t",
             "id",
             &Datum::Int(4),
@@ -148,7 +164,11 @@ fn committed_statements_survive_crash_without_checkpoint() {
     let ids = scan_ids(&mut storage, "t");
     assert_eq!(ids, (0..20).filter(|i| *i != 3).collect::<Vec<_>>());
     let updated = storage
-        .rel_get("t", &[Datum::Int(4)])
+        .rel_get(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            &[Datum::Int(4)],
+        )
         .expect("get")
         .expect("row 4 exists");
     assert_eq!(updated[1], Datum::VarChar("updated".to_string()));
@@ -200,12 +220,17 @@ fn fuzzy_checkpoint_with_open_txn_then_crash_undoes_it() {
     let mut storage = create_storage(&path);
     create_tree_table(&mut storage, "t");
     storage
-        .rel_insert("t", row(1, "committed"))
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            row(1, "committed"),
+        )
         .expect("insert 1");
 
     let mut txn = storage.rel_begin().expect("begin");
     storage
         .rel_insert_many(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "t",
             vec![row(99, "uncommitted")],
             &mut TxnScope::Explicit(&mut txn),
@@ -244,6 +269,7 @@ fn fuzzy_checkpoint_then_commit_survives_crash() {
     let mut txn = storage.rel_begin().expect("begin");
     storage
         .rel_insert_many(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "t",
             vec![row(50, "before-ckpt")],
             &mut TxnScope::Explicit(&mut txn),
@@ -254,6 +280,7 @@ fn fuzzy_checkpoint_then_commit_survives_crash() {
         .expect("checkpoint with open txn");
     storage
         .rel_insert_many(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "t",
             vec![row(51, "after-ckpt")],
             &mut TxnScope::Explicit(&mut txn),
@@ -280,10 +307,18 @@ fn uncommitted_statement_is_undone_and_recovery_rerun_is_clean() {
     create_tree_table(&mut storage, "t");
     create_heap_table(&mut storage, "h");
     storage
-        .rel_insert("t", row(1, "committed"))
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            row(1, "committed"),
+        )
         .expect("insert");
     storage
-        .rel_insert("h", row(1, "committed"))
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "h",
+            row(1, "committed"),
+        )
         .expect("insert");
     // Crash mid-statement: ops durable, commit record never written.
     storage
@@ -307,7 +342,11 @@ fn uncommitted_statement_is_undone_and_recovery_rerun_is_clean() {
     assert_eq!(scan_ids(&mut storage, "h"), vec![1]);
     // The store stays fully usable.
     storage
-        .rel_insert("t", row(2, "fresh"))
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            row(2, "fresh"),
+        )
         .expect("insert after recovery");
     assert_eq!(scan_ids(&mut storage, "t"), vec![1, 2]);
     drop(storage);
@@ -320,12 +359,21 @@ fn torn_page_is_repaired_from_full_page_image() {
     let mut storage = create_storage(&path);
     create_tree_table(&mut storage, "t");
     for i in 0..5 {
-        storage.rel_insert("t", row(i, "payload")).expect("insert");
+        storage
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, "payload"),
+            )
+            .expect("insert");
     }
     // Flush dirty pages to disk without advancing the WAL head (the
     // mid-checkpoint crash window), then tear the table's root page.
     storage.rel_flush_pool_only().expect("flush");
-    let root_page = storage.rel_table("t").expect("def").root_page;
+    let root_page = storage
+        .rel_table(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
+        .expect("def")
+        .root_page;
     let offset = storage.data_page_offset(root_page);
     drop(storage);
     overwrite_bytes(&path, offset + 1000, &[0xDBu8; 2000]);
@@ -363,7 +411,11 @@ fn btree_matches_btreemap_oracle_through_splits_and_crash() {
             // Insert (duplicate key must be rejected and change nothing).
             0 | 1 => {
                 let payload = format!("{id}-{}", "x".repeat(180 + (rng.next() % 200) as usize));
-                let result = storage.rel_insert("t", row(id, &payload));
+                let result = storage.rel_insert(
+                    crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                    "t",
+                    row(id, &payload),
+                );
                 match oracle.entry(id) {
                     std::collections::btree_map::Entry::Occupied(_) => assert!(
                         matches!(result, Err(StorageError::Constraint(_))),
@@ -378,7 +430,12 @@ fn btree_matches_btreemap_oracle_through_splits_and_crash() {
             2 => {
                 let expected = oracle.remove(&id).is_some();
                 let count = storage
-                    .rel_delete_where("t", "id", &Datum::Int(id))
+                    .rel_delete_where(
+                        crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                        "t",
+                        "id",
+                        &Datum::Int(id),
+                    )
                     .expect("delete");
                 assert_eq!(count == 1, expected, "delete count diverged");
             }
@@ -386,6 +443,7 @@ fn btree_matches_btreemap_oracle_through_splits_and_crash() {
                 let payload = format!("{id}-upd-{}", "y".repeat(100 + (rng.next() % 500) as usize));
                 let count = storage
                     .rel_update_where(
+                        crate::relstore::catalog::DEFAULT_DATABASE_ID,
                         "t",
                         "id",
                         &Datum::Int(id),
@@ -402,7 +460,13 @@ fn btree_matches_btreemap_oracle_through_splits_and_crash() {
         }
         // Periodic point-lookup and checkpoint (fresh FPI epochs).
         if step % 97 == 0 {
-            let got = storage.rel_get("t", &[Datum::Int(id)]).expect("get");
+            let got = storage
+                .rel_get(
+                    crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                    "t",
+                    &[Datum::Int(id)],
+                )
+                .expect("get");
             assert_eq!(got.is_some(), oracle.contains_key(&id));
             storage
                 .write_checkpoint(b"oracle-checkpoint", 1, 2, 1)
@@ -411,7 +475,9 @@ fn btree_matches_btreemap_oracle_through_splits_and_crash() {
     }
 
     let verify = |storage: &mut Storage, oracle: &BTreeMap<i32, String>| {
-        let rows = storage.rel_scan("t").expect("scan");
+        let rows = storage
+            .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
+            .expect("scan");
         assert_eq!(rows.len(), oracle.len(), "row count diverged");
         for (row, (id, payload)) in rows.iter().zip(oracle.iter()) {
             assert_eq!(row[0], Datum::Int(*id), "scan must be in key order");
@@ -436,7 +502,13 @@ fn multi_level_splits_survive_crash() {
     // Insert in descending order to exercise inserts at position 0.
     for i in (0..300).rev() {
         let payload = format!("{i}-{}", "z".repeat(380));
-        storage.rel_insert("t", row(i, &payload)).expect("insert");
+        storage
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, &payload),
+            )
+            .expect("insert");
     }
     drop(storage); // crash: splits only exist as WAL images
 
@@ -446,7 +518,11 @@ fn multi_level_splits_survive_crash() {
     for i in 300..340 {
         let payload = format!("{i}-{}", "z".repeat(380));
         storage
-            .rel_insert("t", row(i, &payload))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, &payload),
+            )
             .expect("insert after recovery");
     }
     assert_eq!(scan_ids(&mut storage, "t"), (0..340).collect::<Vec<_>>());
@@ -462,12 +538,17 @@ fn heap_updates_move_rows_with_forwarding_stubs() {
     // Fill the first page almost completely.
     for i in 0..3 {
         storage
-            .rel_insert("h", row(i, &"a".repeat(1200)))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "h",
+                row(i, &"a".repeat(1200)),
+            )
             .expect("insert");
     }
     // Growing row 0 beyond the page's free space forces a move + stub.
     let count = storage
         .rel_update_where(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "h",
             "id",
             &Datum::Int(0),
@@ -481,7 +562,9 @@ fn heap_updates_move_rows_with_forwarding_stubs() {
     drop(storage); // crash
 
     let mut storage = Storage::open(path.clone()).expect("reopen");
-    let rows = storage.rel_scan("h").expect("scan");
+    let rows = storage
+        .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "h")
+        .expect("scan");
     let moved = rows
         .iter()
         .find(|r| r[0] == Datum::Int(0))
@@ -490,7 +573,12 @@ fn heap_updates_move_rows_with_forwarding_stubs() {
     // Deleting through the stub removes the row entirely.
     assert_eq!(
         storage
-            .rel_delete_where("h", "id", &Datum::Int(0))
+            .rel_delete_where(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "h",
+                "id",
+                &Datum::Int(0)
+            )
             .expect("delete"),
         1
     );
@@ -507,12 +595,19 @@ fn failing_statement_rolls_back_all_its_rows() {
     let mut storage = create_storage(&path);
     create_tree_table(&mut storage, "t");
     for i in 0..5 {
-        storage.rel_insert("t", row(i, "small")).expect("insert");
+        storage
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, "small"),
+            )
+            .expect("insert");
     }
     // A multi-row update where the grown rows exceed the tree cell cap: the
     // first rows update fine, then the statement fails and must roll back.
     let err = storage
         .rel_update_where(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "t",
             "payload",
             &Datum::VarChar("small".to_string()),
@@ -520,7 +615,9 @@ fn failing_statement_rolls_back_all_its_rows() {
         )
         .expect_err("oversized tree rows must fail the statement");
     assert!(matches!(err, StorageError::InvalidConfig(_)), "got: {err}");
-    let rows = storage.rel_scan("t").expect("scan");
+    let rows = storage
+        .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
+        .expect("scan");
     assert_eq!(rows.len(), 5);
     for row in &rows {
         assert_eq!(
@@ -532,7 +629,9 @@ fn failing_statement_rolls_back_all_its_rows() {
     // And the same holds across a crash (the rollback CLRs replay).
     drop(storage);
     let mut storage = Storage::open(path.clone()).expect("reopen");
-    let rows = storage.rel_scan("t").expect("scan");
+    let rows = storage
+        .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
+        .expect("scan");
     assert_eq!(rows.len(), 5);
     for row in &rows {
         assert_eq!(row[1], Datum::VarChar("small".to_string()));
@@ -546,17 +645,31 @@ fn create_table_crash_before_commit_rolls_back_catalog() {
     let path = unique_temp_path("create-table-loser");
     let mut storage = create_storage(&path);
     create_tree_table(&mut storage, "keep");
-    storage.rel_insert("keep", row(1, "x")).expect("insert");
+    storage
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "keep",
+            row(1, "x"),
+        )
+        .expect("insert");
     drop(storage);
 
     // Committed table survives; the catalog itself recovered.
     let mut storage = Storage::open(path.clone()).expect("reopen");
-    assert!(storage.rel_table("keep").is_some());
+    assert!(
+        storage
+            .rel_table(crate::relstore::catalog::DEFAULT_DATABASE_ID, "keep")
+            .is_some()
+    );
     assert_eq!(scan_ids(&mut storage, "keep"), vec![1]);
 
     // NOT NULL constraint failures roll the whole insert statement back.
     let err = storage
-        .rel_insert("keep", vec![Datum::Null, Datum::VarChar("x".to_string())])
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "keep",
+            vec![Datum::Null, Datum::VarChar("x".to_string())],
+        )
         .expect_err("null pk must fail");
     assert!(matches!(err, StorageError::Constraint(_)), "got: {err}");
     assert_eq!(scan_ids(&mut storage, "keep"), vec![1]);
@@ -571,7 +684,11 @@ fn checkpoint_persists_relational_pages_and_truncates_wal() {
     create_tree_table(&mut storage, "t");
     for i in 0..50 {
         storage
-            .rel_insert("t", row(i, &"c".repeat(200)))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, &"c".repeat(200)),
+            )
             .expect("insert");
     }
     storage
@@ -580,7 +697,11 @@ fn checkpoint_persists_relational_pages_and_truncates_wal() {
     // Post-checkpoint work lands in a fresh WAL epoch.
     for i in 50..60 {
         storage
-            .rel_insert("t", row(i, &"c".repeat(200)))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, &"c".repeat(200)),
+            )
             .expect("insert");
     }
     drop(storage);
@@ -588,7 +709,11 @@ fn checkpoint_persists_relational_pages_and_truncates_wal() {
     let mut storage = Storage::open(path.clone()).expect("reopen");
     assert_eq!(scan_ids(&mut storage, "t"), (0..60).collect::<Vec<_>>());
     // The catalog root survived via the superblock (not just the WAL).
-    assert!(storage.rel_table("t").is_some());
+    assert!(
+        storage
+            .rel_table(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
+            .is_some()
+    );
     drop(storage);
     let _ = std::fs::remove_file(path);
 }
@@ -603,12 +728,19 @@ fn mid_statement_failure_rolls_back_applied_ops() {
     let mut storage = create_storage(&path);
     create_tree_table(&mut storage, "t");
     for i in 0..5 {
-        storage.rel_insert("t", row(i, "original")).expect("insert");
+        storage
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, "original"),
+            )
+            .expect("insert");
     }
     // Let 3 update ops apply, then fail the 4th (simulated WAL failure).
     crate::relstore::ctx::FAIL_APPLY_OPS_AFTER.with(|c| c.set(Some(3)));
     let err = storage
         .rel_update_where(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "t",
             "payload",
             &Datum::VarChar("original".to_string()),
@@ -619,7 +751,9 @@ fn mid_statement_failure_rolls_back_applied_ops() {
     assert!(matches!(err, StorageError::InvalidConfig(_)), "got: {err}");
 
     let verify = |storage: &mut Storage| {
-        let rows = storage.rel_scan("t").expect("scan");
+        let rows = storage
+            .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
+            .expect("scan");
         assert_eq!(rows.len(), 5);
         for row in &rows {
             assert_eq!(
@@ -635,7 +769,11 @@ fn mid_statement_failure_rolls_back_applied_ops() {
     verify(&mut storage);
     // Store is not wedged (rollback succeeded) and stays writable.
     storage
-        .rel_insert("t", row(100, "after"))
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            row(100, "after"),
+        )
         .expect("insert after rollback");
     drop(storage);
     let _ = std::fs::remove_file(path);
@@ -651,7 +789,11 @@ fn crash_during_recovery_undo_reruns_cleanly() {
     let mut storage = create_storage(&path);
     create_tree_table(&mut storage, "t");
     storage
-        .rel_insert("t", row(1, "committed"))
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            row(1, "committed"),
+        )
         .expect("insert");
     storage
         .rel_insert_without_commit("t", row(2, "loser-a"))
@@ -676,7 +818,11 @@ fn crash_during_recovery_undo_reruns_cleanly() {
     let mut storage = Storage::open(path.clone()).expect("recovery rerun");
     assert_eq!(scan_ids(&mut storage, "t"), vec![1], "only committed data");
     storage
-        .rel_insert("t", row(2, "fresh"))
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            row(2, "fresh"),
+        )
         .expect("insert after rerun");
     assert_eq!(scan_ids(&mut storage, "t"), vec![1, 2]);
     drop(storage);
@@ -700,24 +846,36 @@ fn counter_compensation_clr_points_past_its_record() {
     let mut storage = create_storage(&path);
     create_tree_table(&mut storage, "t");
     storage
-        .rel_insert("t", row(1, "committed"))
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            row(1, "committed"),
+        )
         .expect("insert");
 
     let mut txn = storage.rel_begin().expect("begin");
     storage
         .rel_insert_many(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "t",
             vec![row(2, "rolled back")],
             &mut TxnScope::Explicit(&mut txn),
         )
         .expect("insert under txn");
     storage.rel_rollback(txn).expect("rollback");
-    assert_eq!(storage.rel_row_count("t"), Some(1), "count restored");
+    assert_eq!(
+        storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+        Some(1),
+        "count restored"
+    );
     // The record scan reads the open-time replay cache, so reopen: the ring
     // still holds the rollback's records (nothing checkpointed).
     drop(storage);
     let mut storage = Storage::open(path.clone()).expect("reopen");
-    assert_eq!(storage.rel_row_count("t"), Some(1));
+    assert_eq!(
+        storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+        Some(1)
+    );
 
     let records = storage.rel_wal_records().expect("scan");
     // The rolled-back statement's forward CounterAdd record. It may have been
@@ -783,9 +941,16 @@ fn counter_compensation_survives_a_crash_during_recovery_undo() {
     let mut storage = create_storage(&path);
     create_tree_table(&mut storage, "t");
     storage
-        .rel_insert("t", row(1, "committed"))
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            row(1, "committed"),
+        )
         .expect("insert");
-    assert_eq!(storage.rel_row_count("t"), Some(1));
+    assert_eq!(
+        storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+        Some(1)
+    );
     storage
         .rel_insert_without_commit("t", row(2, "loser"))
         .expect("loser");
@@ -805,7 +970,7 @@ fn counter_compensation_survives_a_crash_during_recovery_undo() {
     let mut storage = Storage::open(path.clone()).expect("recovery rerun");
     assert_eq!(scan_ids(&mut storage, "t"), vec![1], "loser row undone");
     assert_eq!(
-        storage.rel_row_count("t"),
+        storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
         Some(1),
         "the compensation applied exactly once across the re-run"
     );
@@ -822,6 +987,7 @@ fn heap_update_on_stub_starved_page_fails_cleanly() {
     let mut storage = create_storage(&path);
     storage
         .rel_create_table(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "h",
             vec![
                 int_column("id", false),
@@ -843,16 +1009,25 @@ fn heap_update_on_stub_starved_page_fails_cleanly() {
     // with slot) + one row with a 2-byte value (14 bytes with slot).
     for i in 0..336 {
         storage
-            .rel_insert("h", vec![Datum::Int(i), Datum::Null])
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "h",
+                vec![Datum::Int(i), Datum::Null],
+            )
             .expect("filler");
     }
     storage
-        .rel_insert("h", vec![Datum::Int(999), Datum::VarBinary(vec![7u8; 2])])
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "h",
+            vec![Datum::Int(999), Datum::VarBinary(vec![7u8; 2])],
+        )
         .expect("pad row");
 
     // Row id=0's cell is 8 bytes; a stub needs 11 and the page has 1 free.
     let err = storage
         .rel_update_where(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "h",
             "id",
             &Datum::Int(0),
@@ -862,7 +1037,9 @@ fn heap_update_on_stub_starved_page_fails_cleanly() {
     assert!(matches!(err, StorageError::Constraint(_)), "got: {err}");
 
     // Nothing changed and the store keeps working.
-    let rows = storage.rel_scan("h").expect("scan");
+    let rows = storage
+        .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "h")
+        .expect("scan");
     assert_eq!(rows.len(), 337);
     let row0 = rows.iter().find(|r| r[0] == Datum::Int(0)).expect("row 0");
     assert_eq!(row0[1], Datum::Null);
@@ -937,10 +1114,18 @@ fn batched_scan_matches_a_whole_scan_at_every_budget() {
     // Enough rows, each large, to span many pages.
     for i in 0..200 {
         storage
-            .rel_insert("t", row(i, &"x".repeat(200)))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, &"x".repeat(200)),
+            )
             .expect("insert t");
         storage
-            .rel_insert("h", row(i, &"x".repeat(200)))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "h",
+                row(i, &"x".repeat(200)),
+            )
             .expect("insert h");
     }
     for table in ["t", "h"] {
@@ -1019,6 +1204,7 @@ fn a_column_keeps_the_default_it_was_created_under() {
     .expect("create");
     storage
         .rel_create_table(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "t",
             vec![
                 Column {
@@ -1054,6 +1240,7 @@ fn no_configured_default_leaves_columns_on_the_builtin() {
     assert_eq!(storage.default_collation(), None);
     storage
         .rel_create_table(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "t",
             vec![Column {
                 nullable: false,
@@ -1107,10 +1294,18 @@ fn a_sliced_scan_reads_the_same_rows_as_a_whole_one() {
     create_heap_table(&mut storage, "h");
     for i in 0..300 {
         storage
-            .rel_insert("t", row(i, &"x".repeat(150)))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, &"x".repeat(150)),
+            )
             .expect("insert t");
         storage
-            .rel_insert("h", row(i, &"x".repeat(150)))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "h",
+                row(i, &"x".repeat(150)),
+            )
             .expect("insert h");
     }
     for table in ["t", "h"] {
@@ -1118,7 +1313,7 @@ fn a_sliced_scan_reads_the_same_rows_as_a_whole_one() {
         assert_eq!(whole.len(), 300, "{table}: precondition");
         for budget in [1, 3, 64, 299, 300, 301, 4096] {
             let sliced: Vec<i32> = storage
-                .rel_scan_sliced(table, budget)
+                .rel_scan_sliced(crate::relstore::catalog::DEFAULT_DATABASE_ID, table, budget)
                 .expect("sliced scan")
                 .iter()
                 .map(|r| match r[0] {
@@ -1162,12 +1357,18 @@ fn a_sliced_scan_takes_the_storage_lock_once_per_slice_not_once_per_table() {
     create_tree_table(&mut storage, "t");
     for i in 0..1500 {
         storage
-            .rel_insert("t", row(i, &"x".repeat(400)))
+            .rel_insert(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                row(i, &"x".repeat(400)),
+            )
             .expect("insert");
     }
 
     let before = storage.scan_slices();
-    let rows = storage.rel_scan_sliced("t", 8).expect("sliced scan");
+    let rows = storage
+        .rel_scan_sliced(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t", 8)
+        .expect("sliced scan");
     let slices = storage.scan_slices() - before;
 
     assert_eq!(rows.len(), 1500, "the scan still reads everything");
@@ -1180,11 +1381,217 @@ fn a_sliced_scan_takes_the_storage_lock_once_per_slice_not_once_per_table() {
     // takes the lock once. Without this, `slices` could be counting something
     // else entirely and the test would still pass.
     let before = storage.scan_slices();
-    storage.rel_scan("t").expect("whole scan");
+    storage
+        .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
+        .expect("whole scan");
     assert_eq!(
         storage.scan_slices() - before,
         0,
         "rel_scan is the single-hold path and takes no slices"
     );
+    let _ = std::fs::remove_file(path);
+}
+
+// ---- Multiple databases (A1: the catalog layer) ----
+
+#[test]
+fn databases_create_list_resolve_and_survive_reopen() {
+    let path = unique_temp_path("multidb-create");
+    let storage = create_storage(&path);
+
+    assert_eq!(
+        storage.rel_databases(),
+        vec![(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "truthdb".to_string()
+        )],
+        "a fresh instance has exactly the synthesized default database"
+    );
+    assert_eq!(storage.rel_create_database("hr").expect("create hr"), 2);
+    assert_eq!(
+        storage.rel_create_database("sales").expect("create sales"),
+        3
+    );
+    assert_eq!(
+        storage.rel_database_id_by_name("HR"),
+        Some(2),
+        "case-insensitive"
+    );
+    assert_eq!(storage.rel_database_id_by_name("TruthDB"), Some(1));
+    assert_eq!(storage.rel_database_id_by_name("nope"), None);
+
+    drop(storage);
+    let storage = Storage::open(path.clone()).expect("reopen");
+    assert_eq!(
+        storage.rel_databases(),
+        vec![
+            (1, "truthdb".to_string()),
+            (2, "hr".to_string()),
+            (3, "sales".to_string()),
+        ],
+        "database rows reload from the catalog"
+    );
+    // The id allocator continues past the surviving maximum.
+    assert_eq!(storage.rel_create_database("audit").expect("create"), 4);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn duplicate_database_names_are_refused_case_insensitively() {
+    let path = unique_temp_path("multidb-dup");
+    let storage = create_storage(&path);
+    storage.rel_create_database("hr").expect("create");
+    assert!(matches!(
+        storage.rel_create_database("HR"),
+        Err(StorageError::Constraint(_))
+    ));
+    assert!(
+        matches!(
+            storage.rel_create_database("TRUTHDB"),
+            Err(StorageError::Constraint(_))
+        ),
+        "the synthesized default database's name is reserved"
+    );
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn same_table_name_resolves_per_database_and_drop_database_is_scoped() {
+    let path = unique_temp_path("multidb-scope");
+    let mut storage = create_storage(&path);
+    let hr = storage.rel_create_database("hr").expect("create hr");
+
+    create_tree_table(&mut storage, "t");
+    storage
+        .rel_create_table(
+            hr,
+            "t",
+            vec![int_column("id", false), varchar_column("payload", 4000)],
+            &["id".to_string()],
+            Vec::new(),
+            None,
+            Vec::new(),
+            Vec::new(),
+        )
+        .expect("same name in another database");
+
+    storage
+        .rel_insert(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "t",
+            row(1, "default"),
+        )
+        .expect("insert default");
+    storage
+        .rel_insert(hr, "t", row(7, "hr"))
+        .expect("insert hr");
+    storage
+        .rel_insert(hr, "t", row(8, "hr2"))
+        .expect("insert hr");
+
+    assert_eq!(
+        scan_ids(&mut storage, "t"),
+        vec![1],
+        "default db sees its own rows"
+    );
+    let hr_rows = storage.rel_scan(hr, "t").expect("scan hr");
+    assert_eq!(hr_rows.len(), 2, "hr sees its own rows");
+    let (d1, d2) = (
+        storage
+            .rel_table(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
+            .expect("default t"),
+        storage.rel_table(hr, "t").expect("hr t"),
+    );
+    assert_ne!(d1.object_id, d2.object_id, "distinct objects");
+
+    assert!(storage.rel_drop_database("hr").expect("drop hr"));
+    assert!(
+        storage.rel_table(hr, "t").is_none(),
+        "hr's objects are gone"
+    );
+    assert_eq!(
+        scan_ids(&mut storage, "t"),
+        vec![1],
+        "the default database's same-named table is untouched"
+    );
+    assert_eq!(storage.rel_database_id_by_name("hr"), None);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn the_default_database_cannot_be_dropped_and_missing_drop_is_false() {
+    let path = unique_temp_path("multidb-drop-default");
+    let storage = create_storage(&path);
+    assert!(matches!(
+        storage.rel_drop_database("truthdb"),
+        Err(StorageError::Constraint(_))
+    ));
+    assert!(!storage.rel_drop_database("ghost").expect("missing drop"));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn drop_database_redo_survives_reopen() {
+    // DROP DATABASE is the first statement deleting many catalog rows in one
+    // transaction; a reopen must recover to the dropped state (redo of the
+    // committed multi-delete), and recreating the name allocates a fresh id.
+    let path = unique_temp_path("multidb-drop-reopen");
+    let mut storage = create_storage(&path);
+    let hr = storage.rel_create_database("hr").expect("create hr");
+    create_tree_table(&mut storage, "keep");
+    for name in ["a", "b", "c"] {
+        storage
+            .rel_create_table(
+                hr,
+                name,
+                vec![int_column("id", false)],
+                &["id".to_string()],
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("hr table");
+    }
+    assert!(storage.rel_drop_database("hr").expect("drop"));
+    drop(storage);
+
+    let storage = Storage::open(path.clone()).expect("reopen");
+    assert_eq!(
+        storage.rel_database_id_by_name("hr"),
+        None,
+        "drop is durable"
+    );
+    for name in ["a", "b", "c"] {
+        assert!(
+            storage.rel_table(hr, name).is_none(),
+            "objects gone after redo"
+        );
+    }
+    assert!(
+        storage
+            .rel_table(crate::relstore::catalog::DEFAULT_DATABASE_ID, "keep")
+            .is_some(),
+        "other databases untouched"
+    );
+    let recreated = storage.rel_create_database("hr").expect("recreate");
+    assert_eq!(recreated, 2, "id allocation continues from surviving max");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn configured_default_database_name_must_not_shadow_a_stored_database() {
+    let path = unique_temp_path("multidb-default-collision");
+    let storage = create_storage(&path);
+    storage.rel_create_database("prod").expect("create prod");
+    assert!(matches!(
+        storage.set_default_database_name("prod"),
+        Err(StorageError::InvalidConfig(_))
+    ));
+    storage
+        .set_default_database_name("main")
+        .expect("a fresh name is fine");
+    assert_eq!(storage.rel_database_id_by_name("main"), Some(1));
+    assert_eq!(storage.rel_database_id_by_name("truthdb"), None, "renamed");
     let _ = std::fs::remove_file(path);
 }
