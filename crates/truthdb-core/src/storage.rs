@@ -2813,6 +2813,11 @@ struct StorageFile {
     /// came from before databases existed. Stamped at engine construction;
     /// "truthdb" until then.
     default_db_name: String,
+    /// The container tag the next `rel_ctx()` carries (see
+    /// [`RelCtx::container`]): set by each attributed `rel_*` entry point to
+    /// the database its statement mutates, and to 0 by server-scoped ones
+    /// (principals). Recovery and reopen paths run with a fresh 0.
+    current_container: u16,
     /// Stage 13 version store: row-version chains for snapshot reads, plus
     /// the RCSI / ALLOW_SNAPSHOT_ISOLATION options (persisted in the
     /// superblock reserved area; the chains themselves are memory-only — no
@@ -2885,6 +2890,7 @@ impl StorageFile {
         foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         // A character column declared without an explicit COLLATE inherits the
         // database default *by name*, recorded now rather than resolved on each
         // read: the column's key bytes are that collation's sort keys, so it has
@@ -3002,6 +3008,7 @@ impl StorageFile {
         query_text: &str,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
                 "object '{name}' already exists"
@@ -3059,6 +3066,7 @@ impl StorageFile {
         procedure: crate::relstore::catalog::ProcedureDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
                 "object '{name}' already exists"
@@ -3115,6 +3123,7 @@ impl StorageFile {
         function: crate::relstore::catalog::FunctionDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
                 "object '{name}' already exists"
@@ -3170,6 +3179,7 @@ impl StorageFile {
         function: crate::relstore::catalog::FunctionDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let Some(existing) = self.rel.table(db_id, name) else {
             return Err(StorageError::Constraint(format!(
                 "function '{name}' does not exist"
@@ -3204,6 +3214,7 @@ impl StorageFile {
         procedure: crate::relstore::catalog::ProcedureDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let Some(existing) = self.rel.table(db_id, name) else {
             return Err(StorageError::Constraint(format!(
                 "procedure '{name}' does not exist"
@@ -3238,6 +3249,7 @@ impl StorageFile {
         trigger: crate::relstore::catalog::TriggerDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
                 "object '{name}' already exists"
@@ -3292,6 +3304,7 @@ impl StorageFile {
         trigger: crate::relstore::catalog::TriggerDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let Some(existing) = self.rel.table(db_id, name) else {
             return Err(StorageError::Constraint(format!(
                 "trigger '{name}' does not exist"
@@ -3323,6 +3336,7 @@ impl StorageFile {
         principal: crate::relstore::catalog::PrincipalDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = 0;
         let key = name.to_ascii_lowercase();
         if self.rel.principals.contains_key(&key) {
             return Err(StorageError::Constraint(format!(
@@ -3378,6 +3392,7 @@ impl StorageFile {
         principal: crate::relstore::catalog::PrincipalDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = 0;
         let key = name.to_ascii_lowercase();
         let Some(existing) = self.rel.principals.get(&key) else {
             return Err(StorageError::Constraint(format!(
@@ -3399,6 +3414,7 @@ impl StorageFile {
     /// Drops a login. Returns false if it does not exist.
     pub fn rel_drop_login(&mut self, name: &str) -> Result<bool, StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = 0;
         let key = name.to_ascii_lowercase();
         let Some(def) = self.rel.principals.get(&key).cloned() else {
             return Ok(false);
@@ -3434,6 +3450,7 @@ impl StorageFile {
         principal: crate::relstore::catalog::PrincipalDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = 0;
         let key = name.to_ascii_lowercase();
         if self.rel.database_principals.contains_key(&key)
             || fixed_principal_by_name(&key).is_some()
@@ -3467,6 +3484,7 @@ impl StorageFile {
     /// Returns false if no such principal exists.
     pub fn rel_drop_database_principal(&mut self, name: &str) -> Result<bool, StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = 0;
         let key = name.to_ascii_lowercase();
         let Some(def) = self.rel.database_principals.get(&key).cloned() else {
             return Ok(false);
@@ -3513,6 +3531,10 @@ impl StorageFile {
             def.permissions.retain(|p| p.grantee != grantee);
             self.persist_object_permissions(def)?;
         }
+        // The per-object rewrites latched each object's database; the caller
+        // is a server-scoped principal drop whose remaining appends must be
+        // tagged 0 — restore it.
+        self.current_container = 0;
         Ok(())
     }
 
@@ -3522,6 +3544,7 @@ impl StorageFile {
     /// edge already exists.
     pub fn rel_add_role_member(&mut self, role: &str, member: &str) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = 0;
         let role_id = self
             .resolve_db_principal_id(role)
             .ok_or_else(|| StorageError::Constraint(format!("the role '{role}' does not exist")))?;
@@ -3571,6 +3594,7 @@ impl StorageFile {
     /// only on an unknown role or member.
     pub fn rel_drop_role_member(&mut self, role: &str, member: &str) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = 0;
         let role_id = self
             .resolve_db_principal_id(role)
             .ok_or_else(|| StorageError::Constraint(format!("the role '{role}' does not exist")))?;
@@ -3652,6 +3676,7 @@ impl StorageFile {
         deny: bool,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let grantee_id = self.resolve_grantee_id(grantee)?;
         let Some(mut def) = self.rel.table(db_id, object).cloned() else {
             return Err(StorageError::Constraint(format!(
@@ -3679,6 +3704,7 @@ impl StorageFile {
         action: crate::relstore::catalog::PermAction,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let grantee_id = self.resolve_grantee_id(grantee)?;
         let Some(mut def) = self.rel.table(db_id, object).cloned() else {
             return Err(StorageError::Constraint(format!(
@@ -3707,6 +3733,7 @@ impl StorageFile {
     /// Writes an object's mutated permission list back through the catalog and
     /// the in-memory cache (one whole-row rewrite, like a role-member edit).
     fn persist_object_permissions(&mut self, def: TableDef) -> Result<(), StorageError> {
+        self.current_container = def.database_id as u16;
         let catalog_root = self.rel.catalog_root.expect("objects live in the catalog");
         let write = def.clone();
         self.rel_statement(move |ctx, txn| {
@@ -3802,6 +3829,7 @@ impl StorageFile {
     /// exist.
     pub fn rel_drop_table(&mut self, db_id: u32, name: &str) -> Result<bool, StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let Some(def) = self.rel.table(db_id, name).cloned() else {
             return Ok(false);
         };
@@ -3852,12 +3880,16 @@ impl StorageFile {
             ));
         }
         if self.rel.catalog_root.is_none() {
+            // The catalog tree itself is global (container 0) — it holds
+            // every database's rows.
+            self.current_container = 0;
             let root = {
                 let mut ctx = self.rel_ctx();
                 catalog::create_catalog(&mut ctx)?
             };
             self.rel.catalog_root = Some(root);
         }
+        self.current_container = db_id as u16;
         let catalog_root = self.rel.catalog_root.expect("catalog exists");
         let object_id = self.rel.next_object_id;
         let db_name = name.to_string();
@@ -3915,6 +3947,7 @@ impl StorageFile {
             return Ok(false);
         };
         let db_id = row.database.expect("database row").db_id;
+        self.current_container = db_id as u16;
         let objects: Vec<(u32, String)> = self
             .rel
             .tables_in(db_id)
@@ -3990,6 +4023,7 @@ impl StorageFile {
         include: Vec<usize>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let mut def = self
             .rel
             .table(db_id, table)
@@ -4076,6 +4110,7 @@ impl StorageFile {
         fill: Datum,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let mut column = column;
         // A character column without an explicit COLLATE inherits the database
         // default by name, exactly as CREATE TABLE records it.
@@ -4178,6 +4213,7 @@ impl StorageFile {
         index_name: &str,
     ) -> Result<bool, StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let Some(catalog_root) = self.rel.catalog_root else {
             return Ok(false);
         };
@@ -4401,6 +4437,7 @@ impl StorageFile {
         scope: &mut TxnScope,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let (def, schema) = self.rel_def(db_id, name)?;
         // Encode and validate every row up front (cheap failures before any
         // mutation), keeping the key alongside for tree tables. Rows with
@@ -4727,6 +4764,7 @@ impl StorageFile {
         value: &Datum,
     ) -> Result<usize, StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let (def, schema) = self.rel_def(db_id, name)?;
         let column_index = column_index(&schema, column)?;
         if def.is_tree() {
@@ -4794,6 +4832,7 @@ impl StorageFile {
         assignments: &[(String, Datum)],
     ) -> Result<usize, StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let (def, schema) = self.rel_def(db_id, name)?;
         let column_index = column_index(&schema, column)?;
         let mut set: Vec<(usize, Datum)> = Vec::new();
@@ -5051,6 +5090,7 @@ impl StorageFile {
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let (def, schema) = self.rel_def(db_id, name)?;
         let count = targets.len();
         if count == 0 {
@@ -5156,6 +5196,7 @@ impl StorageFile {
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let (def, schema) = self.rel_def(db_id, name)?;
         let count = updates.len();
         if count == 0 {
@@ -5351,6 +5392,7 @@ impl StorageFile {
         count: usize,
     ) -> Result<Option<i64>, StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let mut def = self
             .rel
             .table(db_id, name)
@@ -5391,6 +5433,7 @@ impl StorageFile {
         check_constraints: Vec<catalog::CheckDef>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let mut def = self
             .rel
             .table(db_id, name)
@@ -5418,6 +5461,7 @@ impl StorageFile {
         foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
+        self.current_container = db_id as u16;
         let mut def = self
             .rel
             .table(db_id, name)
@@ -5610,6 +5654,7 @@ impl StorageFile {
         let mut storage = StorageFile {
             default_collation: header.default_collation(),
             default_db_name: "truthdb".to_string(),
+            current_container: 0,
             file,
             wal,
             truncation_gate: LogTruncationGate::default(),
@@ -5778,6 +5823,7 @@ impl StorageFile {
         Ok(StorageFile {
             default_collation: header.default_collation(),
             default_db_name: "truthdb".to_string(),
+            current_container: 0,
             file,
             wal,
             truncation_gate: LogTruncationGate::default(),
@@ -5813,6 +5859,7 @@ impl StorageFile {
             allocator: &mut self.allocator,
             dpt: &mut self.rel.dpt,
             use_reserve: false,
+            container: self.current_container,
         }
     }
 

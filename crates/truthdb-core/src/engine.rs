@@ -15167,4 +15167,85 @@ mod tests {
         );
         let _ = std::fs::remove_file(path);
     }
+
+    #[test]
+    fn wal_page_records_carry_their_database_as_the_container_tag() {
+        use crate::wal::records::{
+            REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_IMAGES, REL_KIND_PAGE_OP, REL_KIND_TXN_BEGIN,
+            REL_KIND_TXN_COMMIT,
+        };
+        let path = unique_temp_path("multidb-wal-tag");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        assert!(
+            batch(&engine, &mut ctx, "CREATE DATABASE hr")
+                .error
+                .is_none()
+        );
+        assert!(
+            batch(
+                &engine,
+                &mut ctx,
+                "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY); INSERT INTO t1 VALUES (1); \
+                 USE hr; CREATE TABLE t2 (id INT NOT NULL PRIMARY KEY); INSERT INTO t2 VALUES (1)"
+            )
+            .error
+            .is_none()
+        );
+        // A cross-database transaction rolled back: its CLRs compensate both
+        // databases' pages under one context — they must all be tag 0.
+        assert!(
+            batch(
+                &engine,
+                &mut ctx,
+                "USE truthdb; BEGIN TRANSACTION; INSERT INTO t1 VALUES (2); \
+                 INSERT INTO hr.dbo.t2 VALUES (2); ROLLBACK TRANSACTION"
+            )
+            .error
+            .is_none()
+        );
+        // rel_wal_records reads the replay cache scanned at OPEN — reopen the
+        // file so the appended ring is visible.
+        drop(engine);
+        let storage = Storage::open(path.clone()).expect("reopen");
+        let records = storage.rel_wal_records().expect("wal records");
+        let tags: Vec<u16> = records
+            .iter()
+            .filter(|(_, r)| {
+                matches!(
+                    r.kind,
+                    REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE | REL_KIND_PAGE_IMAGES
+                )
+            })
+            .map(|(_, r)| r.flags)
+            .collect();
+        // Both databases' page traffic is present and attributed.
+        assert!(
+            tags.contains(&1),
+            "default-database pages tagged 1: {tags:?}"
+        );
+        assert!(tags.contains(&2), "hr's pages tagged 2: {tags:?}");
+        // Transaction control stays global (a transaction can span containers).
+        assert!(
+            records
+                .iter()
+                .filter(|(_, r)| matches!(r.kind, REL_KIND_TXN_BEGIN | REL_KIND_TXN_COMMIT))
+                .all(|(_, r)| r.flags == 0),
+            "txn control must stay untagged"
+        );
+        // CLRs are never tagged — a rollback can span databases, and the
+        // include-0-in-every-subscription rule is what keeps filtered copies
+        // convergent through compensation.
+        let clr_tags: Vec<u16> = records
+            .iter()
+            .filter(|(_, r)| r.kind == crate::wal::records::REL_KIND_CLR)
+            .map(|(_, r)| r.flags)
+            .collect();
+        assert!(!clr_tags.is_empty(), "the rolled-back txn produced CLRs");
+        assert!(
+            clr_tags.iter().all(|&f| f == 0),
+            "CLRs must stay untagged: {clr_tags:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
 }
