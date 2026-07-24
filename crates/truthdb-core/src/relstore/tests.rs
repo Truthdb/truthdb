@@ -1575,7 +1575,10 @@ fn drop_database_redo_survives_reopen() {
         "other databases untouched"
     );
     let recreated = storage.rel_create_database("hr").expect("recreate");
-    assert_eq!(recreated, 2, "id allocation continues from surviving max");
+    assert_eq!(
+        recreated, 3,
+        "the dropped database's id is tombstoned across reopen — never reused"
+    );
     let _ = std::fs::remove_file(path);
 }
 

@@ -846,6 +846,19 @@ impl Parser {
     /// `USE <database>`.
     fn parse_use(&mut self) -> SqlResult<Statement> {
         let start = self.expect_keyword("USE")?;
+        if self.in_procedure {
+            // SQL Server 154: a USE inside a stored body would change the
+            // caller's database context out from under the lock analysis that
+            // resolved the body's names — refused at CREATE, like SQL Server.
+            return Err(SqlError::new(
+                154,
+                15,
+                1,
+                "a USE database statement is not allowed in a procedure, function or trigger."
+                    .to_string(),
+            )
+            .at(start));
+        }
         let database = self.parse_name()?;
         let span = start.to(database.span);
         Ok(Statement::Use { database, span })

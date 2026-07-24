@@ -3822,15 +3822,27 @@ impl StorageFile {
     /// WAL container tag.
     pub fn rel_create_database(&mut self, name: &str) -> Result<u32, StorageError> {
         self.ensure_rel_usable()?;
+        // Reserved names: `sys` would defeat every `sys.`-prefix dispatch and
+        // the lock analysis skip; `dbo` would make a three-part name's schema
+        // part ambiguous; the SQL Server system names stay recognizable.
+        const RESERVED: [&str; 6] = ["sys", "dbo", "master", "model", "msdb", "tempdb"];
+        if RESERVED.iter().any(|r| r.eq_ignore_ascii_case(name)) {
+            return Err(StorageError::Constraint(format!(
+                "the database name '{name}' is reserved"
+            )));
+        }
         if self.rel_database_id_by_name(name).is_some() {
             return Err(StorageError::Constraint(format!(
                 "database '{name}' already exists"
             )));
         }
+        // max+1 over LIVE rows AND tombstones: a dropped database's id is
+        // never reallocated (see DatabaseDef::dropped).
         let db_id = self
             .rel
             .databases
             .values()
+            .chain(self.rel.dropped_databases.iter())
             .filter_map(|d| d.database.as_ref().map(|db| db.db_id))
             .max()
             .map_or(catalog::FIRST_USER_DATABASE_ID, |max| max + 1);
@@ -3870,7 +3882,10 @@ impl StorageFile {
                 permissions: Vec::new(),
                 counter_page: None,
                 database_id: catalog::DEFAULT_DATABASE_ID,
-                database: Some(catalog::DatabaseDef { db_id }),
+                database: Some(catalog::DatabaseDef {
+                    db_id,
+                    dropped: false,
+                }),
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
@@ -3906,12 +3921,19 @@ impl StorageFile {
             .map(|d| (d.object_id, d.name.clone()))
             .collect();
         let object_ids: Vec<u32> = objects.iter().map(|(id, _)| *id).collect();
-        let row_object_id = row.object_id;
+        let mut tombstone = row.clone();
+        tombstone.database = Some(catalog::DatabaseDef {
+            db_id,
+            dropped: true,
+        });
+        let write = tombstone.clone();
         self.rel_statement(move |ctx, txn| {
             for object_id in &object_ids {
                 catalog::delete_table(ctx, &mut OpMode::Txn(txn), catalog_root, *object_id)?;
             }
-            catalog::delete_table(ctx, &mut OpMode::Txn(txn), catalog_root, row_object_id)
+            // The database row becomes a TOMBSTONE (id retired forever),
+            // freeing the name while pinning the id — see DatabaseDef::dropped.
+            catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &write)
         })?;
         for (object_id, name) in objects {
             // Same fence as DROP TABLE: a snapshot whose view predates the
@@ -3920,6 +3942,7 @@ impl StorageFile {
             self.rel.uncache_table(db_id, &name);
         }
         self.rel.databases.remove(&key);
+        self.rel.dropped_databases.push(tombstone);
         Ok(true)
     }
 
@@ -5862,6 +5885,7 @@ impl StorageFile {
                     .map(|def| def.object_id),
             )
             .chain(self.rel.databases.values().map(|def| def.object_id))
+            .chain(self.rel.dropped_databases.iter().map(|def| def.object_id))
             .map(|object_id| object_id + 1)
             .max()
             .unwrap_or(FIRST_USER_OBJECT_ID)
@@ -5874,6 +5898,7 @@ impl StorageFile {
         let Some(root) = self.rel.catalog_root else {
             self.rel.tables.clear();
             self.rel.databases.clear();
+            self.rel.dropped_databases.clear();
             self.rel.principals.clear();
             self.rel.database_principals.clear();
             return Ok(());
@@ -5884,6 +5909,7 @@ impl StorageFile {
         };
         self.rel.tables.clear();
         self.rel.databases.clear();
+        self.rel.dropped_databases.clear();
         self.rel.principals.clear();
         self.rel.database_principals.clear();
         for def in defs {
@@ -5899,10 +5925,15 @@ impl StorageFile {
                     .database_principals
                     .insert(def.name.to_ascii_lowercase(), def);
             } else if def.is_database() {
-                // Databases: namespace containers, out of the object namespace.
-                self.rel
-                    .databases
-                    .insert(def.name.to_ascii_lowercase(), def);
+                // Databases: namespace containers, out of the object
+                // namespace. A tombstone (dropped) only retires its id.
+                if def.database.as_ref().is_some_and(|db| db.dropped) {
+                    self.rel.dropped_databases.push(def);
+                } else {
+                    self.rel
+                        .databases
+                        .insert(def.name.to_ascii_lowercase(), def);
+                }
             } else {
                 self.rel.cache_table(def);
             }

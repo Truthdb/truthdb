@@ -180,6 +180,13 @@ pub struct TableDef {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct DatabaseDef {
     pub db_id: u32,
+    /// `DROP DATABASE` marks the row dropped instead of deleting it: the
+    /// TOMBSTONE keeps the id from ever being reallocated (a stale session
+    /// still holding it would otherwise silently rebind into the next
+    /// database created), it is WAL-native (replicates and survives crashes
+    /// like any catalog row), and its name key is freed for reuse.
+    #[serde(default)]
+    pub dropped: bool,
 }
 
 /// A privilege on a securable, per SQL Server's object permissions.

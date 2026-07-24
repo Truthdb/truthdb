@@ -1276,21 +1276,23 @@ fn worker_loop(shared: &Arc<Shared>) {
                 // The requested database must exist (the caller answers 4060
                 // otherwise); the session records the CATALOG's spelling and
                 // the id, resolved once, here — the same derivation USE runs.
-                let Some((db_id, canonical)) = shared.engine.resolve_database(&database) else {
+                // NOT an early return: this arm runs inside the worker loop,
+                // and returning would kill the thread.
+                if let Some((db_id, canonical)) = shared.engine.resolve_database(&database) {
+                    // Resolve the login to its database user here (the worker
+                    // has the catalog); the session records both for
+                    // USER_NAME() and role membership.
+                    let (user, user_sid) = shared.engine.resolve_session_user(&login, login_sid);
+                    let id = shared
+                        .scheduler
+                        .lock()
+                        .expect("scheduler poisoned")
+                        .sessions
+                        .open(canonical.clone(), db_id, login, login_sid, user, user_sid);
+                    let _ = reply.send(Ok((id, canonical)));
+                } else {
                     let _ = reply.send(Err(()));
-                    return;
-                };
-                // Resolve the login to its database user here (the worker has the
-                // catalog); the session records both for USER_NAME() and role
-                // membership.
-                let (user, user_sid) = shared.engine.resolve_session_user(&login, login_sid);
-                let id = shared
-                    .scheduler
-                    .lock()
-                    .expect("scheduler poisoned")
-                    .sessions
-                    .open(canonical.clone(), db_id, login, login_sid, user, user_sid);
-                let _ = reply.send(Ok((id, canonical)));
+                }
             }
             Work::Call(EngineCall::RunBatch {
                 session,

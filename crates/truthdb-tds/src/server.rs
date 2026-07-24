@@ -191,7 +191,8 @@ where
         return deny_database(&mut stream, &database, packet_size).await;
     };
 
-    // Login response token stream.
+    // Login response token stream. From here on the session exists, so
+    // every exit — including a failed response write — must close it.
     let mut out = Vec::new();
     token::loginack(&mut out);
     token::envchange_database(&mut out, &database);
@@ -205,7 +206,10 @@ where
         &format!("Changed database context to '{database}'."),
     );
     token::done(&mut out, false, false, false, None, 0);
-    write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
+    if let Err(err) = write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await {
+        engine.close_session(session);
+        return Err(err);
+    }
     let result = request_loop(&mut stream, &engine, session, packet_size).await;
     engine.close_session(session);
     result
@@ -217,7 +221,7 @@ where
 /// distinguishes them — SQL Server sanitizes the state to 1 for the same reason
 /// (a client must not be able to enumerate valid usernames).
 /// Refuses a login whose requested database does not exist: SQL Server's
-/// 4060 (severity 11) followed by the login failure, then DONE.
+/// 4060 (severity 11), then DONE.
 async fn deny_database<S: AsyncWrite + Unpin>(
     stream: &mut S,
     database: &str,
@@ -235,6 +239,10 @@ async fn deny_database<S: AsyncWrite + Unpin>(
     write_message(stream, PKT_TABULAR_RESULT, &out, packet_size).await
 }
 
+/// Writes the single generic login-failure response: error 18456, level 14,
+/// state 1, and a DONE. Every failure kind (unknown login, wrong password,
+/// disabled, throttle lockout) uses this exact response so nothing on the wire
+/// distinguishes them.
 async fn deny_login<S: AsyncWrite + Unpin>(
     stream: &mut S,
     username: &str,

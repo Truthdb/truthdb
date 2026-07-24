@@ -1149,6 +1149,8 @@ fn run_user_procedure(
         truthdb_sql::parse_procedure_body(&procedure.body).map_err(|e| own(txn_ctx, e))?;
 
     // Fresh scope, SET options reverting at exit — the sp_executesql shape.
+    let outer_database = txn_ctx.database.clone();
+    let outer_database_id = txn_ctx.database_id();
     let outer_vars = std::mem::take(&mut txn_ctx.variables);
     let outer_table_vars = std::mem::take(&mut txn_ctx.table_variables);
     let outer_xact_abort = txn_ctx.xact_abort;
@@ -1158,6 +1160,10 @@ fn run_user_procedure(
     for (name, column_type, value) in bound {
         txn_ctx.variables.insert(name, (column_type, value));
     }
+    // The body's unqualified names resolve in the procedure's HOME database,
+    // not the caller's (SQL Server's rule). The body cannot USE (parser 154),
+    // so this holds for its whole extent; the caller's context returns below.
+    txn_ctx.set_current_database(database_name_of(storage, def.database_id), def.database_id);
     txn_ctx.proc_stack.push(def.name.clone());
     txn_ctx.proc_return = None;
     // A procedure called from a trigger body does NOT see the trigger's
@@ -1201,6 +1207,7 @@ fn run_user_procedure(
     txn_ctx.nocount = outer_nocount;
     txn_ctx.isolation = outer_isolation;
     txn_ctx.showplan_text = outer_showplan;
+    txn_ctx.set_current_database(outer_database, outer_database_id);
     let return_status = txn_ctx.proc_return.take().unwrap_or(0);
     if result.is_ok() {
         // OUTPUT copy-back and the return status land only when the body
@@ -1271,15 +1278,19 @@ fn run_user_scalar_function(
     // resolve inside the body. The sids are left 0 (the body reuses the caller's
     // already-computed role set rather than re-resolving membership).
     let mut txn_ctx = TxnContext::default();
+    // The body's unqualified names resolve in the FUNCTION's home database
+    // (matching collect_read_lock_ids); DB_ID/DB_NAME keep working via the
+    // caller's databases snapshot.
     txn_ctx.set_session_identity(
-        caller.database.clone(),
-        caller.database_id,
+        database_name_of(storage, def.database_id),
+        def.database_id,
         caller.login.clone(),
         caller.spid,
         caller.user.clone(),
         0,
         0,
     );
+    txn_ctx.databases_snapshot = caller.databases.clone();
     txn_ctx.session_server_roles = caller.server_roles.clone();
     txn_ctx.session_db_roles = caller.db_roles.clone();
     txn_ctx.security = caller.security.clone();
@@ -1447,6 +1458,8 @@ fn run_exec(
     // inner SET (XACT_ABORT, ISOLATION LEVEL, SHOWPLAN) must not outlive the
     // EXEC, or a post-EXEC statement would run under an isolation the up-front
     // lock analysis never saw.
+    let outer_database = txn_ctx.database.clone();
+    let outer_database_id = txn_ctx.database_id();
     let outer_vars = std::mem::take(&mut txn_ctx.variables);
     let outer_table_vars = std::mem::take(&mut txn_ctx.table_variables);
     let outer_xact_abort = txn_ctx.xact_abort;
@@ -1493,6 +1506,10 @@ fn run_exec(
     txn_ctx.nocount = outer_nocount;
     txn_ctx.isolation = outer_isolation;
     txn_ctx.showplan_text = outer_showplan;
+    // A USE inside the dynamic batch is scoped to it (SQL Server's rule):
+    // the caller's database context comes back at scope exit — and with it,
+    // agreement with the lock analysis that resolved the OUTER batch.
+    txn_ctx.set_current_database(outer_database, outer_database_id);
     result
 }
 
@@ -3088,6 +3105,43 @@ fn update_row_key_hash(def: &TableDef, update: &Update) -> Option<u64> {
     where_point_key_hash(def, &update.where_clause)
 }
 
+/// Collects the database ids every `USE` in the batch -- including one hidden
+/// in LITERAL `sp_executesql` text, whose inner statements execute under it --
+/// can switch to. Bounded like the analysis recursion; a non-literal dynamic
+/// batch contributes nothing here (its analysis arm already locks the
+/// database exclusively). Procedure bodies cannot contain USE (parser 154).
+fn collect_use_targets(
+    storage: &Storage,
+    statements: &[Statement],
+    depth: u32,
+    dbs: &mut Vec<u32>,
+) {
+    if depth > 32 {
+        return;
+    }
+    let mut flat = Vec::new();
+    flatten_statements(statements, &mut flat);
+    for statement in &flat {
+        match statement {
+            Statement::Use { database, .. } => {
+                if let Some(id) = storage.rel_database_id_by_name(&database.value)
+                    && !dbs.contains(&id)
+                {
+                    dbs.push(id);
+                }
+            }
+            Statement::Exec(exec) => {
+                if let Some(inner) = exec_literal_sql(exec)
+                    && let Ok(parsed) = truthdb_sql::parse(&inner)
+                {
+                    collect_use_targets(storage, &parsed, depth + 1, dbs);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 pub fn analyze_locks(
     storage: &Storage,
     db_id: u32,
@@ -3102,17 +3156,8 @@ pub fn analyze_locks(
     // Resolve under EVERY database context the batch can reach and take the
     // union: over-locking is safe, under-locking is the 2PL hole. (A failed
     // USE leaves the old context — also covered, it is in the set.)
-    let mut flat = Vec::new();
-    flatten_statements(&parsed, &mut flat);
     let mut dbs = vec![db_id];
-    for statement in &flat {
-        if let Statement::Use { database, .. } = statement
-            && let Some(id) = storage.rel_database_id_by_name(&database.value)
-            && !dbs.contains(&id)
-        {
-            dbs.push(id);
-        }
-    }
+    collect_use_targets(storage, &parsed, 0, &mut dbs);
     if dbs.len() > 1 {
         let mut out: Vec<(Resource, LockMode)> = Vec::new();
         for db in dbs {
@@ -3446,9 +3491,12 @@ fn analyze_statements_locks(
                     if visited.insert((def.name.clone(), inner_isolation))
                         && let Ok(body) = truthdb_sql::parse_procedure_body(&procedure.body)
                     {
+                        // The body executes in the procedure's HOME database
+                        // (run_user_procedure sets it; the body cannot USE) —
+                        // analyze it there, or the two derivations diverge.
                         for (resource, mode) in analyze_statements_locks(
                             storage,
-                            db_id,
+                            def.database_id,
                             &body,
                             inner_isolation,
                             visited,
@@ -3681,6 +3729,27 @@ fn exec_statement_dispatch(
     statement: &Statement,
     txn_ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
+    // A session whose current database was dropped errors on every statement
+    // except USE (its way out) — never silently resolving in a dead
+    // namespace. Dropped ids are tombstoned (never reallocated), so this
+    // check is exact. The per-batch snapshot makes it one Vec scan.
+    if !matches!(statement, Statement::Use { .. })
+        && !txn_ctx
+            .databases_snapshot
+            .iter()
+            .any(|(id, _)| *id == txn_ctx.database_id())
+        && !txn_ctx.databases_snapshot.is_empty()
+    {
+        return Err(SqlError::new(
+            911,
+            16,
+            1,
+            format!(
+                "Database '{}' does not exist. Make sure that the name is entered correctly.",
+                txn_ctx.database
+            ),
+        ));
+    }
     // DDL (schema + security) requires a privileged principal (sysadmin / dbo /
     // db_owner / the internal channel). A restricted database user is refused
     // before any change is made.
@@ -4299,7 +4368,13 @@ fn exec_use(
     database: &Name,
     ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
-    let Some(db_id) = storage.rel_database_id_by_name(&database.value) else {
+    // ONE catalog read: a lookup-then-list pair would race a concurrent
+    // DROP DATABASE into a panic between the two.
+    let Some((db_id, canonical)) = storage
+        .rel_databases()
+        .into_iter()
+        .find(|(_, name)| name.eq_ignore_ascii_case(&database.value))
+    else {
         return Err(SqlError::new(
             911,
             16,
@@ -4311,14 +4386,6 @@ fn exec_use(
         )
         .at(database.span));
     };
-    // Canonical casing: the ENVCHANGE and DB_NAME() report the catalog's
-    // spelling, not the client's.
-    let canonical = storage
-        .rel_databases()
-        .into_iter()
-        .find(|(id, _)| *id == db_id)
-        .map(|(_, name)| name)
-        .expect("resolved database is listed");
     ctx.set_current_database(canonical, db_id);
     Ok(StatementResult::Done)
 }
@@ -6212,13 +6279,16 @@ fn exec_drop_table(
             ),
         ));
     }
-    let name = resolve_table(storage, db_id, &drop.table.value).map(|d| d.name);
-    match name {
-        Some(name) => {
+    let resolved = resolve_table(storage, db_id, &drop.table.value);
+    match resolved {
+        Some(def) => {
+            // Everything below acts on the RESOLVED table's database — a
+            // three-part DROP TABLE names another database's table.
+            let (target_db, name, parent_oid) = (def.database_id, def.name, def.object_id);
             // A table still referenced by another table's foreign key cannot be
             // dropped (SQL Server 3726) — it would leave a dangling reference.
             if let Some(child) = storage.rel_tables().into_iter().find(|t| {
-                t.database_id == db_id
+                t.database_id == target_db
                     && !t.name.eq_ignore_ascii_case(&name)
                     && t.foreign_keys
                         .iter()
@@ -6242,25 +6312,23 @@ fn exec_drop_table(
             // Cascade-drop the table's triggers — a trigger outlives its parent
             // table nowhere in SQL Server, and an orphan would permanently block
             // its own name (and dangle in sys.triggers).
-            if let Some(parent_oid) = resolve_table(storage, db_id, &name).map(|d| d.object_id) {
-                let orphan_triggers: Vec<String> = storage
-                    .rel_tables()
-                    .into_iter()
-                    .filter(|d| {
-                        d.trigger
-                            .as_ref()
-                            .is_some_and(|t| t.parent_object_id == parent_oid)
-                    })
-                    .map(|d| d.name)
-                    .collect();
-                for trigger_name in orphan_triggers {
-                    storage
-                        .rel_drop_table(db_id, &trigger_name)
-                        .map_err(|err| map_storage_err(err, &trigger_name))?;
-                }
+            let orphan_triggers: Vec<String> = storage
+                .rel_tables()
+                .into_iter()
+                .filter(|d| {
+                    d.trigger
+                        .as_ref()
+                        .is_some_and(|t| t.parent_object_id == parent_oid)
+                })
+                .map(|d| d.name)
+                .collect();
+            for trigger_name in orphan_triggers {
+                storage
+                    .rel_drop_table(target_db, &trigger_name)
+                    .map_err(|err| map_storage_err(err, &trigger_name))?;
             }
             storage
-                .rel_drop_table(db_id, &name)
+                .rel_drop_table(target_db, &name)
                 .map_err(|err| map_storage_err(err, &drop.table.value))?;
             Ok(StatementResult::Done)
         }
@@ -7743,7 +7811,7 @@ fn exec_alter_table(
     match &alter.action {
         AlterAction::AddColumn(column) => alter_add_column(storage, &def, column, eval_ctx),
         AlterAction::AddCheck(check) => alter_add_check(storage, &def, check, eval_ctx),
-        AlterAction::AddForeignKey(fk) => alter_add_foreign_key(storage, db_id, &def, fk),
+        AlterAction::AddForeignKey(fk) => alter_add_foreign_key(storage, &def, fk),
         AlterAction::DropConstraint(name) => alter_drop_constraint(storage, &def, name),
     }
 }
@@ -7753,7 +7821,6 @@ fn exec_alter_table(
 /// referencing a missing parent is 547 and the constraint is not added.
 fn alter_add_foreign_key(
     storage: &Storage,
-    db_id: u32,
     def: &TableDef,
     fk: &ForeignKey,
 ) -> Result<StatementResult, SqlError> {
@@ -7770,7 +7837,7 @@ fn alter_add_foreign_key(
             })
             .collect()
     } else {
-        let parent = resolve_table(storage, db_id, &fk.parent.value)
+        let parent = resolve_table(storage, def.database_id, &fk.parent.value)
             .ok_or_else(|| SqlError::invalid_object(&fk.parent.value).at(fk.parent.span))?;
         let pschema = parent
             .schema()
@@ -12588,7 +12655,12 @@ fn build_table_source(
                 // keeps the statement's view — only stored bodies shadow.)
                 let _table_var_scope = arm_table_var_view(&std::collections::HashMap::new());
                 let _trigger_shadow = TriggerScope::clear();
-                return build_derived_source(storage, &body, &qual, eval_ctx);
+                // The body's unqualified names are the VIEW's database's (a
+                // cross-database view reads its own home, as SQL Server
+                // resolves it) — matching collect_read_lock_ids' analysis.
+                let mut view_ctx = eval_ctx.clone();
+                view_ctx.database_id = def.database_id;
+                return build_derived_source(storage, &body, &qual, &view_ctx);
             }
             let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
             // An index seek narrows the candidate set; the WHERE filter later
@@ -12740,6 +12812,8 @@ fn build_function_source(
             }
             let mut fn_ctx = eval_ctx.clone();
             fn_ctx.variables = variables;
+            // The body's unqualified names are the FUNCTION's database's.
+            fn_ctx.database_id = def.database_id;
             // Expand the body like a view (bounded by the shared nesting guard).
             let _guard = ViewDepthGuard::enter(&def.name)?;
             let body = parse_view_query(select_text, &def.name)?;
@@ -12759,6 +12833,7 @@ fn build_function_source(
             body,
         } => run_multi_statement_tvf(
             storage,
+            def.database_id,
             function,
             returns_var,
             columns_text,
@@ -12780,6 +12855,7 @@ fn build_function_source(
 #[allow(clippy::too_many_arguments)]
 fn run_multi_statement_tvf(
     storage: &Storage,
+    home_db_id: u32,
     function: &FunctionDef,
     returns_var: &str,
     columns_text: &str,
@@ -12798,15 +12874,18 @@ fn run_multi_statement_tvf(
     // evaluate in the CALLER's context. The sids are left 0 (the body does not
     // re-resolve membership — it reuses the caller's already-computed role set).
     let mut txn_ctx = TxnContext::default();
+    // The body's unqualified names resolve in the FUNCTION's home database;
+    // DB_ID/DB_NAME keep working via the caller's databases snapshot.
     txn_ctx.set_session_identity(
-        eval_ctx.database.clone(),
-        eval_ctx.database_id,
+        database_name_of(storage, home_db_id),
+        home_db_id,
         eval_ctx.login.clone(),
         eval_ctx.spid,
         eval_ctx.user.clone(),
         0,
         0,
     );
+    txn_ctx.databases_snapshot = eval_ctx.databases.clone();
     txn_ctx.session_server_roles = eval_ctx.server_roles.clone();
     txn_ctx.session_db_roles = eval_ctx.db_roles.clone();
     txn_ctx.security = eval_ctx.security.clone();
@@ -14902,7 +14981,15 @@ fn collect_read_lock_ids(
             }
         }
         for referenced in tables.iter().chain(funcs.iter()) {
-            collect_read_lock_ids(storage, db_id, referenced, depth + 1, out, visited);
+            // The body's unqualified names are the FUNCTION's database's.
+            collect_read_lock_ids(
+                storage,
+                def.database_id,
+                referenced,
+                depth + 1,
+                out,
+                visited,
+            );
         }
         return;
     }
@@ -14925,7 +15012,15 @@ fn collect_read_lock_ids(
     let mut funcs = Vec::new();
     collect_select_read_names(&expanded, &mut tables, &mut funcs);
     for referenced in tables.iter().chain(funcs.iter()) {
-        collect_read_lock_ids(storage, db_id, referenced, depth + 1, out, visited);
+        // The body's unqualified names are the VIEW's database's.
+        collect_read_lock_ids(
+            storage,
+            def.database_id,
+            referenced,
+            depth + 1,
+            out,
+            visited,
+        );
     }
 }
 
@@ -15049,12 +15144,25 @@ fn resolve_table(storage: &Storage, db_id: u32, name: &str) -> Option<TableDef> 
     // one- and two-part names in the session's. An unknown database or a
     // schema other than dbo resolves to nothing (208 at the call sites).
     let parts: Vec<&str> = name.split('.').collect();
-    let (target_db, bare) = match parts[..] {
+    let (target_db, bare_owned);
+    let bare: &str = match parts[..] {
+        // `[dbo].[my.table]` flattens to dbo.my.table: a leading dbo is the
+        // schema ('dbo' is a reserved database name, so this cannot shadow a
+        // real database) and the REMAINDER is one name containing dots.
+        [schema, ..] if schema.eq_ignore_ascii_case("dbo") => {
+            target_db = db_id;
+            &name[schema.len() + 1..]
+        }
         [db, schema, t] if schema.is_empty() || schema.eq_ignore_ascii_case("dbo") => {
-            (storage.rel_database_id_by_name(db)?, t)
+            target_db = storage.rel_database_id_by_name(db)?;
+            t
         }
         [_, _, _] => return None,
-        _ => (db_id, strip_schema(name)),
+        _ => {
+            target_db = db_id;
+            bare_owned = strip_schema(name);
+            bare_owned
+        }
     };
     if let Some(def) = storage.rel_table(target_db, bare) {
         return Some(def);
