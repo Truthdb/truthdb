@@ -1726,9 +1726,19 @@ impl Storage {
     }
 
     /// Stamps the default database's name (id 1) from the instance
-    /// configuration. Called once at engine construction, before sessions.
-    pub fn set_default_database_name(&self, name: &str) {
-        self.lock().default_db_name = name.to_string();
+    /// configuration. Called once at startup, before sessions. Refuses a name
+    /// a stored `CREATE DATABASE` row already uses — the default database
+    /// would otherwise shadow it (the name→id resolution checks the default
+    /// first), leaving the stored database unreachable and undroppable.
+    pub fn set_default_database_name(&self, name: &str) -> Result<(), StorageError> {
+        let mut guard = self.lock();
+        if guard.rel.databases.contains_key(&name.to_ascii_lowercase()) {
+            return Err(StorageError::InvalidConfig(format!(
+                "the configured default database name '{name}' collides with a database                  created by CREATE DATABASE; rename one of them"
+            )));
+        }
+        guard.default_db_name = name.to_string();
+        Ok(())
     }
 
     pub(crate) fn rel_create_index(

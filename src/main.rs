@@ -93,6 +93,13 @@ async fn main() {
             return;
         }
     };
+    // The default database (id 1) is named by `[tds] database` — the one
+    // source the sessions' database identity already comes from; storage's
+    // name→id resolution must agree with it.
+    if let Err(err) = engine.set_default_database(&config.tds.database) {
+        eprintln!("Failed to set the default database name: {err}");
+        return;
+    }
     // First boot migrates `[tds.auth]` config users into catalog logins (and
     // always ensures `sa`), then config auth is dead. Runs before the engine
     // thread is spawned — single-threaded, no session — and is a no-op once any

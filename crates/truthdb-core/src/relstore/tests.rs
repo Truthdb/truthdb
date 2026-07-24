@@ -1529,3 +1529,69 @@ fn the_default_database_cannot_be_dropped_and_missing_drop_is_false() {
     assert!(!storage.rel_drop_database("ghost").expect("missing drop"));
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn drop_database_redo_survives_reopen() {
+    // DROP DATABASE is the first statement deleting many catalog rows in one
+    // transaction; a reopen must recover to the dropped state (redo of the
+    // committed multi-delete), and recreating the name allocates a fresh id.
+    let path = unique_temp_path("multidb-drop-reopen");
+    let mut storage = create_storage(&path);
+    let hr = storage.rel_create_database("hr").expect("create hr");
+    create_tree_table(&mut storage, "keep");
+    for name in ["a", "b", "c"] {
+        storage
+            .rel_create_table(
+                hr,
+                name,
+                vec![int_column("id", false)],
+                &["id".to_string()],
+                Vec::new(),
+                None,
+                Vec::new(),
+                Vec::new(),
+            )
+            .expect("hr table");
+    }
+    assert!(storage.rel_drop_database("hr").expect("drop"));
+    drop(storage);
+
+    let storage = Storage::open(path.clone()).expect("reopen");
+    assert_eq!(
+        storage.rel_database_id_by_name("hr"),
+        None,
+        "drop is durable"
+    );
+    for name in ["a", "b", "c"] {
+        assert!(
+            storage.rel_table(hr, name).is_none(),
+            "objects gone after redo"
+        );
+    }
+    assert!(
+        storage
+            .rel_table(crate::relstore::catalog::DEFAULT_DATABASE_ID, "keep")
+            .is_some(),
+        "other databases untouched"
+    );
+    let recreated = storage.rel_create_database("hr").expect("recreate");
+    assert_eq!(recreated, 2, "id allocation continues from surviving max");
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn configured_default_database_name_must_not_shadow_a_stored_database() {
+    let path = unique_temp_path("multidb-default-collision");
+    let storage = create_storage(&path);
+    storage.rel_create_database("prod").expect("create prod");
+    assert!(matches!(
+        storage.set_default_database_name("prod"),
+        Err(StorageError::InvalidConfig(_))
+    ));
+    storage
+        .set_default_database_name("main")
+        .expect("a fresh name is fine");
+    assert_eq!(storage.rel_database_id_by_name("main"), Some(1));
+    assert_eq!(storage.rel_database_id_by_name("truthdb"), None, "renamed");
+    let _ = std::fs::remove_file(path);
+}

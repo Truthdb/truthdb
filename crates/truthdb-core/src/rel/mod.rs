@@ -5761,13 +5761,17 @@ fn enforce_parent_fks(
         .iter()
         .map(|k| collated_key(k, &parent_key_coll))
         .collect();
+    // Children live in the parent's database — cross-database foreign keys
+    // do not exist, and lock analysis (fk_child_object_ids) filters the same
+    // way; the two derivations must agree.
     let children: Vec<TableDef> = storage
         .rel_tables()
         .into_iter()
         .filter(|t| {
-            t.foreign_keys
-                .iter()
-                .any(|fk| fk.parent.eq_ignore_ascii_case(&parent.name))
+            t.database_id == parent.database_id
+                && t.foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent.eq_ignore_ascii_case(&parent.name))
         })
         .collect();
     for child in &children {
@@ -5988,7 +5992,8 @@ fn exec_drop_table(
             // A table still referenced by another table's foreign key cannot be
             // dropped (SQL Server 3726) — it would leave a dangling reference.
             if let Some(child) = storage.rel_tables().into_iter().find(|t| {
-                !t.name.eq_ignore_ascii_case(&name)
+                t.database_id == db_id
+                    && !t.name.eq_ignore_ascii_case(&name)
                     && t.foreign_keys
                         .iter()
                         .any(|fk| fk.parent.eq_ignore_ascii_case(&name))
@@ -12272,28 +12277,28 @@ fn build_table_source(
         return Ok(source);
     }
     let base = match name.value.to_ascii_lowercase().as_str() {
-        "sys.tables" => sys_tables(storage),
+        "sys.tables" => sys_tables(storage, eval_ctx.database_id),
         "sys.databases" => sys_databases(storage, eval_ctx),
         "sys.dm_repl_replica_states" => sys_dm_repl_replica_states(storage),
         "sys.dm_repl_slots" => sys_dm_repl_slots(storage),
         "sys.configurations" => sys_configurations(),
-        "sys.views" => sys_views(storage),
-        "sys.procedures" => sys_procedures(storage),
-        "sys.triggers" => sys_triggers(storage),
-        "sys.trigger_events" => sys_trigger_events(storage),
+        "sys.views" => sys_views(storage, eval_ctx.database_id),
+        "sys.procedures" => sys_procedures(storage, eval_ctx.database_id),
+        "sys.triggers" => sys_triggers(storage, eval_ctx.database_id),
+        "sys.trigger_events" => sys_trigger_events(storage, eval_ctx.database_id),
         "sys.server_principals" => sys_server_principals(storage),
         "sys.sql_logins" => sys_sql_logins(storage),
         "sys.database_principals" => sys_database_principals(storage),
         "sys.database_role_members" => sys_database_role_members(storage),
-        "sys.database_permissions" => sys_database_permissions(storage),
-        "sys.parameters" => sys_parameters(storage),
-        "sys.objects" => sys_objects(storage),
-        "sys.sql_modules" => sys_sql_modules(storage),
-        "sys.columns" => sys_columns(storage),
-        "sys.indexes" => sys_indexes(storage),
-        "sys.check_constraints" => sys_check_constraints(storage),
-        "sys.foreign_keys" => sys_foreign_keys(storage),
-        "sys.default_constraints" => sys_default_constraints(storage),
+        "sys.database_permissions" => sys_database_permissions(storage, eval_ctx.database_id),
+        "sys.parameters" => sys_parameters(storage, eval_ctx.database_id),
+        "sys.objects" => sys_objects(storage, eval_ctx.database_id),
+        "sys.sql_modules" => sys_sql_modules(storage, eval_ctx.database_id),
+        "sys.columns" => sys_columns(storage, eval_ctx.database_id),
+        "sys.indexes" => sys_indexes(storage, eval_ctx.database_id),
+        "sys.check_constraints" => sys_check_constraints(storage, eval_ctx.database_id),
+        "sys.foreign_keys" => sys_foreign_keys(storage, eval_ctx.database_id),
+        "sys.default_constraints" => sys_default_constraints(storage, eval_ctx.database_id),
         _ => {
             let def = resolve_table(storage, eval_ctx.database_id, &name.value)
                 .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
@@ -13565,11 +13570,12 @@ fn restore_filelist_rows(header: &crate::backup::BackupHeader) -> RowSet {
     RowSet { columns, rows }
 }
 
-fn sys_tables(storage: &Storage) -> Source {
+fn sys_tables(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![int_col("object_id"), nvarchar("name", 128)];
     let rows = storage
         .rel_tables()
         .into_iter()
+        .filter(|def| def.database_id == db_id)
         // Only base tables. (The `!is_view()` filter alone let procedures leak
         // in — a pre-existing gap — so exclude every non-table object kind.)
         .filter(|def| {
@@ -13797,7 +13803,7 @@ fn sys_configurations() -> Source {
     }
 }
 
-fn sys_views(storage: &Storage) -> Source {
+fn sys_views(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         int_col("object_id"),
         nvarchar("name", 128),
@@ -13806,6 +13812,7 @@ fn sys_views(storage: &Storage) -> Source {
     let rows = storage
         .rel_tables()
         .into_iter()
+        .filter(|def| def.database_id == db_id)
         .filter_map(|def| {
             def.view_query.map(|q| {
                 vec![
@@ -13829,11 +13836,12 @@ fn sys_views(storage: &Storage) -> Source {
 /// `sys.sql_modules`: the SQL definition of each module (currently views), keyed
 /// by `object_id`. SQL Server surfaces view/procedure/trigger text here; today
 /// only views carry a definition.
-fn sys_sql_modules(storage: &Storage) -> Source {
+fn sys_sql_modules(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![int_col("object_id"), nvarchar("definition", 4000)];
     let rows = storage
         .rel_tables()
         .into_iter()
+        .filter(|def| def.database_id == db_id)
         .filter_map(|def| {
             // Views store their SELECT; procedures and functions their body.
             let definition = def
@@ -13864,11 +13872,12 @@ fn sys_sql_modules(storage: &Storage) -> Source {
     }
 }
 
-fn sys_procedures(storage: &Storage) -> Source {
+fn sys_procedures(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![nvarchar("name", 128), int_col("object_id")];
     let rows = storage
         .rel_tables()
         .into_iter()
+        .filter(|def| def.database_id == db_id)
         .filter(|def| def.is_procedure())
         .map(|def| {
             vec![
@@ -13887,7 +13896,7 @@ fn sys_procedures(storage: &Storage) -> Source {
     }
 }
 
-fn sys_triggers(storage: &Storage) -> Source {
+fn sys_triggers(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("object_id"),
@@ -13899,6 +13908,7 @@ fn sys_triggers(storage: &Storage) -> Source {
     let rows = storage
         .rel_tables()
         .into_iter()
+        .filter(|def| def.database_id == db_id)
         .filter_map(|def| {
             let trigger = def.trigger.as_ref()?;
             Some(vec![
@@ -13921,7 +13931,7 @@ fn sys_triggers(storage: &Storage) -> Source {
     }
 }
 
-fn sys_trigger_events(storage: &Storage) -> Source {
+fn sys_trigger_events(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         int_col("object_id"),
         int_col("type"),
@@ -13929,6 +13939,9 @@ fn sys_trigger_events(storage: &Storage) -> Source {
     ];
     let mut rows = Vec::new();
     for def in storage.rel_tables() {
+        if def.database_id != db_id {
+            continue;
+        }
         let Some(trigger) = def.trigger.as_ref() else {
             continue;
         };
@@ -14113,7 +14126,7 @@ fn sys_database_role_members(storage: &Storage) -> Source {
     }
 }
 
-fn sys_database_permissions(storage: &Storage) -> Source {
+fn sys_database_permissions(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         int_col("class"),
         nvarchar("class_desc", 60),
@@ -14126,6 +14139,9 @@ fn sys_database_permissions(storage: &Storage) -> Source {
     ];
     let mut rows: Vec<Vec<Datum>> = Vec::new();
     for def in storage.rel_tables() {
+        if def.database_id != db_id {
+            continue;
+        }
         for perm in &def.permissions {
             let (state, state_desc) = if perm.deny {
                 ("D", "DENY")
@@ -14154,7 +14170,7 @@ fn sys_database_permissions(storage: &Storage) -> Source {
     }
 }
 
-fn sys_parameters(storage: &Storage) -> Source {
+fn sys_parameters(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         int_col("object_id"),
         nvarchar("name", 128),
@@ -14180,6 +14196,9 @@ fn sys_parameters(storage: &Storage) -> Source {
         ]);
     };
     for def in storage.rel_tables() {
+        if def.database_id != db_id {
+            continue;
+        }
         if let Some(procedure) = &def.procedure {
             for (index, param) in procedure.params.iter().enumerate() {
                 push_param(
@@ -14227,7 +14246,7 @@ fn sys_parameters(storage: &Storage) -> Source {
     }
 }
 
-fn sys_objects(storage: &Storage) -> Source {
+fn sys_objects(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("object_id"),
@@ -14237,6 +14256,7 @@ fn sys_objects(storage: &Storage) -> Source {
     let rows = storage
         .rel_tables()
         .into_iter()
+        .filter(|def| def.database_id == db_id)
         .map(|def| {
             // SQL Server's single-letter codes carry a trailing space; the
             // two-letter function codes fill CHAR(2) exactly.
@@ -14277,7 +14297,7 @@ fn sys_objects(storage: &Storage) -> Source {
     }
 }
 
-fn sys_columns(storage: &Storage) -> Source {
+fn sys_columns(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         int_col("object_id"),
         nvarchar("name", 128),
@@ -14291,6 +14311,9 @@ fn sys_columns(storage: &Storage) -> Source {
     ];
     let mut rows = Vec::new();
     for def in storage.rel_tables() {
+        if def.database_id != db_id {
+            continue;
+        }
         for (index, (name, type_spec, nullable)) in def.columns.iter().enumerate() {
             let collation = def
                 .collations
@@ -14319,7 +14342,7 @@ fn sys_columns(storage: &Storage) -> Source {
     }
 }
 
-fn sys_indexes(storage: &Storage) -> Source {
+fn sys_indexes(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         int_col("object_id"),
         int_col("index_id"),
@@ -14331,6 +14354,9 @@ fn sys_indexes(storage: &Storage) -> Source {
     ];
     let mut rows = Vec::new();
     for def in storage.rel_tables() {
+        if def.database_id != db_id {
+            continue;
+        }
         for index in &def.indexes {
             rows.push(vec![
                 Datum::Int(def.object_id as i32),
@@ -14350,7 +14376,7 @@ fn sys_indexes(storage: &Storage) -> Source {
     }
 }
 
-fn sys_check_constraints(storage: &Storage) -> Source {
+fn sys_check_constraints(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("parent_object_id"),
@@ -14358,6 +14384,9 @@ fn sys_check_constraints(storage: &Storage) -> Source {
     ];
     let mut rows = Vec::new();
     for def in storage.rel_tables() {
+        if def.database_id != db_id {
+            continue;
+        }
         for check in &def.check_constraints {
             rows.push(vec![
                 Datum::NVarChar(check.name.clone()),
@@ -14376,14 +14405,18 @@ fn sys_check_constraints(storage: &Storage) -> Source {
     }
 }
 
-fn sys_foreign_keys(storage: &Storage) -> Source {
+fn sys_foreign_keys(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("parent_object_id"),
         int_col("referenced_object_id"),
     ];
     // Resolve parent (referenced) table names to object ids.
-    let tables = storage.rel_tables();
+    let tables: Vec<TableDef> = storage
+        .rel_tables()
+        .into_iter()
+        .filter(|t| t.database_id == db_id)
+        .collect();
     let oid_of = |name: &str| {
         tables
             .iter()
@@ -14412,7 +14445,7 @@ fn sys_foreign_keys(storage: &Storage) -> Source {
     }
 }
 
-fn sys_default_constraints(storage: &Storage) -> Source {
+fn sys_default_constraints(storage: &Storage, db_id: u32) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("parent_object_id"),
@@ -14423,6 +14456,9 @@ fn sys_default_constraints(storage: &Storage) -> Source {
     // `DF__<table>__<column>__...`. We synthesize a stable `DF__<table>__<col>`.
     let mut rows = Vec::new();
     for def in storage.rel_tables() {
+        if def.database_id != db_id {
+            continue;
+        }
         for (index, text) in def.defaults.iter().enumerate() {
             let Some(text) = text else { continue };
             let column = &def.columns[index].0;
