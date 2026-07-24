@@ -50,6 +50,7 @@ pub fn is_builtin_function(name: &str) -> bool {
         "CONVERT",
         // Session / niladic functions (eval::eval_session_function, SERVERPROPERTY).
         "DB_NAME",
+        "DB_ID",
         "SUSER_SNAME",
         "SUSER_NAME",
         "USER_NAME",

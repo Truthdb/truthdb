@@ -1,0 +1,147 @@
+# Multiple databases (A2): CREATE/DROP DATABASE, USE, three-part names,
+# DB_ID/DB_NAME, per-database sys views. The session starts in `truthdb`.
+
+statement ok
+CREATE DATABASE hr
+
+# duplicate (1801), case-insensitively
+statement error
+CREATE DATABASE HR
+
+query TI rowsort
+SELECT name, database_id FROM sys.databases
+----
+hr 2
+truthdb 1
+
+query I
+SELECT DB_ID()
+----
+1
+
+query I
+SELECT DB_ID('hr')
+----
+2
+
+query T
+SELECT DB_NAME(2)
+----
+hr
+
+query T
+SELECT DB_NAME(99)
+----
+NULL
+
+statement ok
+USE hr
+
+query TI
+SELECT DB_NAME(), DB_ID()
+----
+hr 2
+
+statement ok
+CREATE TABLE t (id INT NOT NULL PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+USE truthdb
+
+# hr's table is invisible to this session's catalog views...
+query I
+SELECT COUNT(*) FROM sys.tables
+----
+0
+
+# ...but reachable by its three-part name,
+query I
+SELECT COUNT(*) FROM hr.dbo.t
+----
+1
+
+# The same bare name in two databases: two distinct tables.
+statement ok
+CREATE TABLE t (id INT NOT NULL PRIMARY KEY)
+
+statement ok
+INSERT INTO t VALUES (1)
+
+statement ok
+INSERT INTO t VALUES (2)
+
+query I
+SELECT COUNT(*) FROM t
+----
+2
+
+query I
+SELECT COUNT(*) FROM hr.dbo.t
+----
+1
+
+# Cross-database DML works — one shared log underneath.
+statement ok
+INSERT INTO hr.dbo.t VALUES (7)
+
+query I
+SELECT COUNT(*) FROM hr.dbo.t
+----
+2
+
+# An unknown database in a three-part name is an invalid object (208).
+statement error
+SELECT COUNT(*) FROM ghost.dbo.t
+
+statement error
+USE nosuch
+
+# A CREATE may not name a database prefix (166).
+statement error
+CREATE TABLE hr.dbo.x (id INT NOT NULL PRIMARY KEY)
+
+# CREATE DATABASE is refused inside a transaction (226).
+statement ok
+BEGIN TRANSACTION
+
+statement error
+CREATE DATABASE mid_txn
+
+statement ok
+ROLLBACK
+
+# The default database is a system database (3708)...
+statement error
+DROP DATABASE truthdb
+
+# ...and the session's current database is in use (3702).
+statement ok
+USE hr
+
+statement error
+DROP DATABASE hr
+
+statement ok
+USE truthdb
+
+statement ok
+DROP DATABASE hr
+
+# Its objects went with it.
+statement error
+SELECT COUNT(*) FROM hr.dbo.t
+
+query I
+SELECT DB_ID('hr')
+----
+NULL
+
+statement ok
+DROP DATABASE IF EXISTS ghost
+
+# Without IF EXISTS, a missing database is 3701.
+statement error
+DROP DATABASE ghost

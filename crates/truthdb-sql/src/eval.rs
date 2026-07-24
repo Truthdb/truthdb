@@ -88,6 +88,11 @@ pub struct EvalContext {
     /// object names resolve in. Never 0: the manual `Default` lands in the
     /// default database.
     pub database_id: u32,
+    /// Every database as `(id, canonical name)` — read by `DB_ID(name)` and
+    /// `DB_NAME(id)`. Snapshotted per statement by the exec layer; empty in
+    /// contexts with no storage in scope (the argument forms then answer
+    /// NULL, like USER_NAME's by-id form).
+    pub databases: Vec<(u32, String)>,
     /// The authenticated login name — `SUSER_SNAME()`.
     pub login: String,
     /// The session's database user name — `USER_NAME()` (with no argument).
@@ -136,6 +141,7 @@ impl Default for EvalContext {
             variables: Default::default(),
             database: String::new(),
             database_id: DEFAULT_DATABASE_ID,
+            databases: Vec::new(),
             login: String::new(),
             user: String::new(),
             server_roles: Default::default(),
@@ -596,6 +602,30 @@ fn eval_call<R: ColumnResolver>(
     if name.eq_ignore_ascii_case("USER_NAME") {
         return Ok(SqlValue::Null);
     }
+    // DB_NAME(id) / DB_ID(name): argument + the session's database snapshot —
+    // the SERVERPROPERTY shape. Unknown id/name is NULL, per SQL Server.
+    if name.eq_ignore_ascii_case("DB_NAME") && values.len() == 1 {
+        let id = match &values[0] {
+            SqlValue::Int(id) => *id,
+            _ => return Ok(SqlValue::Null),
+        };
+        return Ok(ctx
+            .databases
+            .iter()
+            .find(|(db, _)| *db as i64 == id)
+            .map_or(SqlValue::Null, |(_, name)| SqlValue::Str(name.clone())));
+    }
+    if name.eq_ignore_ascii_case("DB_ID") && values.len() == 1 {
+        let target = match &values[0] {
+            SqlValue::Str(name) => name,
+            _ => return Ok(SqlValue::Null),
+        };
+        return Ok(ctx
+            .databases
+            .iter()
+            .find(|(_, name)| name.eq_ignore_ascii_case(target))
+            .map_or(SqlValue::Null, |(id, _)| SqlValue::Int(*id as i64)));
+    }
     functions::eval_function(name, values)
 }
 
@@ -662,7 +692,8 @@ fn serverproperty(property: &SqlValue) -> SqlValue {
 /// `DB_NAME(id)` both report the current database.
 fn eval_session_function(name: &str, args: &[Expr]) -> Option<fn(&EvalContext) -> SqlValue> {
     match name.to_ascii_uppercase().as_str() {
-        "DB_NAME" if args.len() <= 1 => Some(|ctx| SqlValue::Str(ctx.database.clone())),
+        "DB_NAME" if args.is_empty() => Some(|ctx| SqlValue::Str(ctx.database.clone())),
+        "DB_ID" if args.is_empty() => Some(|ctx| SqlValue::Int(ctx.database_id as i64)),
         "SUSER_SNAME" | "SUSER_NAME" if args.is_empty() => {
             Some(|ctx| SqlValue::Str(ctx.login.clone()))
         }
@@ -1180,6 +1211,7 @@ mod tests {
     fn session_identity_intrinsics() {
         let ctx = EvalContext {
             database: "truthdb".to_string(),
+            databases: vec![(1, "truthdb".to_string())],
             login: "sa".to_string(),
             spid: 53,
             ..EvalContext::default()

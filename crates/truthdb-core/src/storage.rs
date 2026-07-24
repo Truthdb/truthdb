@@ -1725,6 +1725,11 @@ impl Storage {
         self.lock().rel_databases()
     }
 
+    /// The default database's (id 1) canonical name.
+    pub fn default_database_name(&self) -> String {
+        self.lock().default_db_name.clone()
+    }
+
     /// Stamps the default database's name (id 1) from the instance
     /// configuration. Called once at startup, before sessions. Refuses a name
     /// a stored `CREATE DATABASE` row already uses — the default database

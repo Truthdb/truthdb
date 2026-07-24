@@ -1,0 +1,46 @@
+[
+    CreateDatabase {
+        name: Name {
+            value: "hr",
+            quoted: false,
+            span: Span {
+                start: 16,
+                end: 18,
+            },
+        },
+        span: Span {
+            start: 0,
+            end: 18,
+        },
+    },
+    DropDatabase {
+        name: Name {
+            value: "hr",
+            quoted: false,
+            span: Span {
+                start: 34,
+                end: 36,
+            },
+        },
+        if_exists: false,
+        span: Span {
+            start: 20,
+            end: 36,
+        },
+    },
+    DropDatabase {
+        name: Name {
+            value: "staging",
+            quoted: false,
+            span: Span {
+                start: 62,
+                end: 69,
+            },
+        },
+        if_exists: true,
+        span: Span {
+            start: 38,
+            end: 69,
+        },
+    },
+]

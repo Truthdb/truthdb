@@ -128,6 +128,11 @@ pub struct TxnContext {
     /// Connection identity for session intrinsics (`DB_NAME()`,
     /// `SUSER_SNAME()`, `@@SPID`), set once when the session opens.
     database: String,
+    /// Per-batch snapshot of every database `(id, canonical name)` — read by
+    /// `DB_ID(name)`/`DB_NAME(id)`. Refreshed with the security context at
+    /// batch start (a same-batch CREATE DATABASE is visible next batch, a
+    /// documented staleness matching the per-batch security refresh).
+    databases_snapshot: Vec<(u32, String)>,
     /// The session's current database id — the namespace every unqualified
     /// object name resolves in. Sessions run in the default database until
     /// `USE` learns to switch it (the multi-database plan's A2 slice).
@@ -201,6 +206,7 @@ impl TxnContext {
     fn eval_context(&self) -> EvalContext {
         EvalContext {
             database_id: self.database_id.0,
+            databases: self.databases_snapshot.clone(),
             trancount: self.trancount as i32,
             variables: self
                 .variables
@@ -265,9 +271,11 @@ impl TxnContext {
     /// Records the connection identity used by session intrinsics. Called once
     /// when the session opens. `session_roles` is filled separately, per batch,
     /// from the membership cache (see [`Self::refresh_session_roles`]).
+    #[allow(clippy::too_many_arguments)]
     pub fn set_session_identity(
         &mut self,
         database: String,
+        database_id: u32,
         login: String,
         spid: i32,
         user: String,
@@ -275,6 +283,7 @@ impl TxnContext {
         user_sid: u32,
     ) {
         self.database = database;
+        self.database_id = CurrentDb(database_id);
         self.login = login;
         self.spid = spid;
         self.user = user;
@@ -286,6 +295,13 @@ impl TxnContext {
     /// resolve in.
     pub(crate) fn database_id(&self) -> u32 {
         self.database_id.0
+    }
+
+    /// Switches the session's current database (`USE`): the canonical name
+    /// and its id move together — they are one decision, never two.
+    pub(crate) fn set_current_database(&mut self, name: String, db_id: u32) {
+        self.database = name;
+        self.database_id = CurrentDb(db_id);
     }
 
     /// Refreshes the session's effective role NAMES from the membership cache.
@@ -304,6 +320,7 @@ impl TxnContext {
         };
         self.session_server_roles = names(&server_role_ids);
         self.session_db_roles = names(&db_role_ids);
+        self.databases_snapshot = storage.rel_databases();
 
         // The object-permission subject. A trusted/internal connection
         // (login_sid 0 — the native protocol and in-process tests), a sysadmin,
@@ -1224,7 +1241,7 @@ fn run_user_scalar_function(
         return Err(function_not_a_table(&def.name));
     };
     // Invoking a scalar function needs EXECUTE permission.
-    enforce_object_permission(def, &caller.security, PermAction::Execute)?;
+    enforce_object_permission(storage, def, &caller.security, PermAction::Execute)?;
     if arg_values.len() < function.params.len() {
         return Err(SqlError::new(
             313,
@@ -1256,6 +1273,7 @@ fn run_user_scalar_function(
     let mut txn_ctx = TxnContext::default();
     txn_ctx.set_session_identity(
         caller.database.clone(),
+        caller.database_id,
         caller.login.clone(),
         caller.spid,
         caller.user.clone(),
@@ -1330,7 +1348,7 @@ fn run_exec(
         if let Some(def) = resolve_table(storage, txn_ctx.database_id(), &exec.proc.value)
             && def.is_procedure()
         {
-            enforce_object_permission(&def, &txn_ctx.security, PermAction::Execute)
+            enforce_object_permission(storage, &def, &txn_ctx.security, PermAction::Execute)
                 .map_err(|e| ExecError::Own(doom_per_rule(txn_ctx, e.at(exec.proc.span))))?;
             return run_user_procedure(storage, exec, &def, txn_ctx, run, in_try);
         }
@@ -2087,9 +2105,9 @@ fn run_block(
                 // first, then the database-context ENVCHANGE + 5701 INFO the
                 // client (SSMS) expects, then the USE's own DONE below —
                 // SQL Server's exact order.
-                if let Statement::Use { database, .. } = statement {
+                if let Statement::Use { .. } = statement {
                     run.flush(storage)?;
-                    run.database_context(&database.value);
+                    run.database_context(&txn_ctx.database);
                 }
                 match outcome {
                     StatementOutcome::Streamed { rows } => {
@@ -2757,6 +2775,8 @@ fn statement_may_commit(statement: &Statement) -> bool {
             | Statement::DropIndex(_)
             | Statement::AlterTable(_)
             | Statement::AlterDatabase(_)
+            | Statement::CreateDatabase { .. }
+            | Statement::DropDatabase { .. }
             | Statement::Exec(_)
             | Statement::Block { .. }
             | Statement::If { .. }
@@ -3077,6 +3097,42 @@ pub fn analyze_locks(
     let Ok(parsed) = truthdb_sql::parse(sql) else {
         return Vec::new();
     };
+    // A batch that switches databases mid-stream (`USE`) executes later
+    // statements in the new context, but this analysis runs once, up front.
+    // Resolve under EVERY database context the batch can reach and take the
+    // union: over-locking is safe, under-locking is the 2PL hole. (A failed
+    // USE leaves the old context — also covered, it is in the set.)
+    let mut flat = Vec::new();
+    flatten_statements(&parsed, &mut flat);
+    let mut dbs = vec![db_id];
+    for statement in &flat {
+        if let Statement::Use { database, .. } = statement
+            && let Some(id) = storage.rel_database_id_by_name(&database.value)
+            && !dbs.contains(&id)
+        {
+            dbs.push(id);
+        }
+    }
+    if dbs.len() > 1 {
+        let mut out: Vec<(Resource, LockMode)> = Vec::new();
+        for db in dbs {
+            let mut visited = std::collections::HashSet::new();
+            let mut trigger_visited = std::collections::HashSet::new();
+            for lock in analyze_statements_locks(
+                storage,
+                db,
+                &parsed,
+                isolation,
+                &mut visited,
+                &mut trigger_visited,
+            ) {
+                if !out.contains(&lock) {
+                    out.push(lock);
+                }
+            }
+        }
+        return out;
+    }
     // The visited set terminates recursive procedures. Keyed on (procedure,
     // effective analysis regime), NOT the name alone: a body's lock
     // contribution is ISOLATION-DEPENDENT (versioned RC contributes Database
@@ -3356,7 +3412,11 @@ fn analyze_statements_locks(
             | Statement::AlterTable(_)
             // ALTER DATABASE quiesces the database: no snapshot may be live
             // and no writer mid-transaction while the options flip.
-            | Statement::AlterDatabase(_) => {
+            | Statement::AlterDatabase(_)
+            // CREATE/DROP DATABASE rewrite the catalog's database list; the
+            // same quiesce keeps every in-flight resolution coherent.
+            | Statement::CreateDatabase { .. }
+            | Statement::DropDatabase { .. } => {
                 add(Resource::Database, LockMode::Exclusive);
             }
             // EXEC sp_executesql with a LITERAL statement is analyzable up
@@ -3634,7 +3694,7 @@ fn exec_statement_dispatch(
     }
     match statement {
         Statement::BeginTransaction { .. } => exec_begin(storage, txn_ctx),
-        Statement::Use { database, .. } => exec_use(database, txn_ctx),
+        Statement::Use { database, .. } => exec_use(storage, database, txn_ctx),
         Statement::Throw(throw) => Err(exec_throw(throw, txn_ctx)),
         Statement::CreateProcedure(create) => {
             if txn_ctx.in_txn() {
@@ -3749,6 +3809,7 @@ fn exec_statement_dispatch(
             exec_permission(storage, txn_ctx.database_id(), stmt, &txn_ctx.security)
         }
         Statement::BackupDatabase {
+            database,
             path,
             checksum,
             copy_only,
@@ -3766,6 +3827,21 @@ fn exec_statement_dispatch(
                         .to_string(),
                 ));
             }
+            // Any catalog database is a valid target: a backup is
+            // instance-granular (it contains every database) — the name is
+            // validated, not scoping.
+            if storage.rel_database_id_by_name(&database.value).is_none() {
+                return Err(SqlError::new(
+                    911,
+                    16,
+                    1,
+                    format!(
+                        "Database '{}' does not exist. Make sure that the name is entered correctly.",
+                        database.value
+                    ),
+                )
+                .at(database.span));
+            }
             storage
                 .backup_full_with(std::path::Path::new(path), *checksum, *copy_only)
                 .map_err(|e| {
@@ -3779,6 +3855,7 @@ fn exec_statement_dispatch(
             Ok(StatementResult::Done)
         }
         Statement::BackupLog {
+            database,
             path,
             checksum,
             copy_only,
@@ -3792,6 +3869,18 @@ fn exec_statement_dispatch(
                     "Cannot perform a backup or restore operation within a transaction."
                         .to_string(),
                 ));
+            }
+            if storage.rel_database_id_by_name(&database.value).is_none() {
+                return Err(SqlError::new(
+                    911,
+                    16,
+                    1,
+                    format!(
+                        "Database '{}' does not exist. Make sure that the name is entered correctly.",
+                        database.value
+                    ),
+                )
+                .at(database.span));
             }
             if !storage.recovery_model_full() {
                 return Err(SqlError::new(
@@ -3906,6 +3995,30 @@ fn exec_statement_dispatch(
                 ));
             }
             exec_alter_database(storage, alter, txn_ctx)
+        }
+        Statement::CreateDatabase { name, .. } => {
+            if txn_ctx.in_txn() {
+                return Err(SqlError::new(
+                    226,
+                    16,
+                    6,
+                    "CREATE DATABASE statement not allowed within multi-statement transaction.",
+                ));
+            }
+            exec_create_database(storage, name)
+        }
+        Statement::DropDatabase {
+            name, if_exists, ..
+        } => {
+            if txn_ctx.in_txn() {
+                return Err(SqlError::new(
+                    226,
+                    16,
+                    6,
+                    "DROP DATABASE statement not allowed within multi-statement transaction.",
+                ));
+            }
+            exec_drop_database(storage, name, *if_exists, txn_ctx)
         }
         Statement::Insert(insert) => {
             // INSERT into a `@t` table variable is pure session memory (no
@@ -4181,8 +4294,12 @@ fn ddl_in_txn_err() -> SqlError {
 /// is the session's current database — the statement exists for the
 /// database-context ENVCHANGE clients (SSMS) expect back (emitted by
 /// `run_block` on success).
-fn exec_use(database: &Name, ctx: &TxnContext) -> Result<StatementResult, SqlError> {
-    if !database.value.eq_ignore_ascii_case(&ctx.database) {
+fn exec_use(
+    storage: &Storage,
+    database: &Name,
+    ctx: &mut TxnContext,
+) -> Result<StatementResult, SqlError> {
+    let Some(db_id) = storage.rel_database_id_by_name(&database.value) else {
         return Err(SqlError::new(
             911,
             16,
@@ -4193,8 +4310,88 @@ fn exec_use(database: &Name, ctx: &TxnContext) -> Result<StatementResult, SqlErr
             ),
         )
         .at(database.span));
-    }
+    };
+    // Canonical casing: the ENVCHANGE and DB_NAME() report the catalog's
+    // spelling, not the client's.
+    let canonical = storage
+        .rel_databases()
+        .into_iter()
+        .find(|(id, _)| *id == db_id)
+        .map(|(_, name)| name)
+        .expect("resolved database is listed");
+    ctx.set_current_database(canonical, db_id);
     Ok(StatementResult::Done)
+}
+
+/// `CREATE DATABASE <name>`: a new naming namespace (level 1 — one shared
+/// log and data file; nothing physical is allocated).
+fn exec_create_database(storage: &Storage, name: &Name) -> Result<StatementResult, SqlError> {
+    storage
+        .rel_create_database(&name.value)
+        .map_err(|err| match err {
+            StorageError::Constraint(msg) if msg.contains("already exists") => SqlError::new(
+                1801,
+                16,
+                3,
+                format!(
+                    "Database '{}' already exists. Choose a different database name.",
+                    name.value
+                ),
+            )
+            .at(name.span),
+            other => map_storage_err(other, &name.value),
+        })?;
+    Ok(StatementResult::Done)
+}
+
+/// `DROP DATABASE [IF EXISTS] <name>`: drops the namespace and every object
+/// in it. The session's current database (3702), the default database
+/// (3708), and — without IF EXISTS — a missing one (3701) are refused.
+fn exec_drop_database(
+    storage: &Storage,
+    name: &Name,
+    if_exists: bool,
+    ctx: &TxnContext,
+) -> Result<StatementResult, SqlError> {
+    if storage.rel_database_id_by_name(&name.value) == Some(ctx.database_id()) {
+        return Err(SqlError::new(
+            3702,
+            16,
+            4,
+            format!(
+                "Cannot drop database \"{}\" because it is currently in use.",
+                name.value
+            ),
+        )
+        .at(name.span));
+    }
+    match storage.rel_drop_database(&name.value) {
+        Ok(true) => Ok(StatementResult::Done),
+        Ok(false) if if_exists => Ok(StatementResult::Done),
+        Ok(false) => Err(SqlError::new(
+            3701,
+            16,
+            1,
+            format!(
+                "Cannot drop the database '{}', because it does not exist or you do not have permission.",
+                name.value
+            ),
+        )
+        .at(name.span)),
+        Err(StorageError::Constraint(msg)) if msg.contains("system database") => {
+            Err(SqlError::new(
+                3708,
+                16,
+                5,
+                format!(
+                    "Cannot drop the database '{}' because it is a system database.",
+                    name.value
+                ),
+            )
+            .at(name.span))
+        }
+        Err(other) => Err(map_storage_err(other, &name.value)),
+    }
 }
 
 /// `THROW`: builds the error to raise (the caller returns it — `run_block`
@@ -5008,7 +5205,7 @@ fn exec_create_table(
 ) -> Result<StatementResult, SqlError> {
     // Strip an optional `dbo.` schema prefix so the table is stored (and
     // later resolved) under its bare name.
-    let table_name = strip_schema(&create.table.value);
+    let table_name = create_object_name("CREATE TABLE", &create.table)?;
     if resolve_table(storage, db_id, table_name).is_some() {
         return Err(SqlError::new(
             2714,
@@ -5554,6 +5751,7 @@ fn parse_checks(def: &TableDef) -> Result<Vec<(String, Expr)>, SqlError> {
 
 /// Enforces CHECK constraints against a fully-built row (schema order). A
 /// constraint passes on TRUE or UNKNOWN (NULL); FALSE is error 547.
+#[allow(clippy::too_many_arguments)]
 fn enforce_checks(
     storage: &Storage,
     checks: &[(String, Expr)],
@@ -5561,6 +5759,7 @@ fn enforce_checks(
     resolver: &impl ColumnResolver,
     eval_ctx: &EvalContext,
     verb: &str,
+    database: &str,
     table: &str,
 ) -> Result<(), SqlError> {
     for (name, expr) in checks {
@@ -5581,7 +5780,7 @@ fn enforce_checks(
                     16,
                     0,
                     format!(
-                        "The {verb} statement conflicted with the CHECK constraint \"{name}\". The conflict occurred in database \"truthdb\", table \"dbo.{table}\".",
+                        "The {verb} statement conflicted with the CHECK constraint \"{name}\". The conflict occurred in database \"{database}\", table \"dbo.{table}\".",
                     ),
                 ));
             }
@@ -5649,13 +5848,25 @@ fn fk_parent_exists(
     Ok(false)
 }
 
-fn fk_child_violation(name: &str, verb: &str, parent: &str) -> SqlError {
+/// The canonical name of a database id, for error text (the default
+/// database's configured name when the id is unknown — a dropped database's
+/// error still renders).
+fn database_name_of(storage: &Storage, db_id: u32) -> String {
+    storage
+        .rel_databases()
+        .into_iter()
+        .find(|(id, _)| *id == db_id)
+        .map(|(_, name)| name)
+        .unwrap_or_else(|| storage.default_database_name())
+}
+
+fn fk_child_violation(database: &str, name: &str, verb: &str, parent: &str) -> SqlError {
     SqlError::new(
         547,
         16,
         0,
         format!(
-            "The {verb} statement conflicted with the FOREIGN KEY constraint \"{name}\". The conflict occurred in database \"truthdb\", table \"dbo.{parent}\".",
+            "The {verb} statement conflicted with the FOREIGN KEY constraint \"{name}\". The conflict occurred in database \"{database}\", table \"dbo.{parent}\".",
         ),
     )
 }
@@ -5682,7 +5893,12 @@ fn enforce_child_fks(
             continue; // NULL referencing column: not enforced
         };
         if !fk_parent_exists(storage, fk, &key, def, batch)? {
-            return Err(fk_child_violation(&fk.name, verb, &fk.parent));
+            return Err(fk_child_violation(
+                &database_name_of(storage, def.database_id),
+                &fk.name,
+                verb,
+                &fk.parent,
+            ));
         }
     }
     Ok(())
@@ -5723,13 +5939,13 @@ fn fk_collations_match(child: &TableDef, fk: &catalog::ForeignKeyDef, parent: &T
 }
 
 /// The error raised when a surviving child row references a removed parent key.
-fn reference_conflict(verb: &str, fk_name: &str, child_name: &str) -> SqlError {
+fn reference_conflict(database: &str, verb: &str, fk_name: &str, child_name: &str) -> SqlError {
     SqlError::new(
         547,
         16,
         0,
         format!(
-            "The {verb} statement conflicted with the REFERENCE constraint \"{fk_name}\". The conflict occurred in database \"truthdb\", table \"dbo.{child_name}\"."
+            "The {verb} statement conflicted with the REFERENCE constraint \"{fk_name}\". The conflict occurred in database \"{database}\", table \"dbo.{child_name}\"."
         ),
     )
 }
@@ -5818,7 +6034,12 @@ fn enforce_parent_fks(
                                 )
                                 .map_err(|e| map_storage_err(e, &child.name))?;
                             if !matches.is_empty() {
-                                return Err(reference_conflict(verb, &fk.name, &child.name));
+                                return Err(reference_conflict(
+                                    &database_name_of(storage, child.database_id),
+                                    verb,
+                                    &fk.name,
+                                    &child.name,
+                                ));
                             }
                         }
                         Err(_) => {
@@ -5849,7 +6070,12 @@ fn enforce_parent_fks(
                     continue;
                 };
                 if removed_folded.contains(&collated_key(&key, &parent_key_coll)) {
-                    return Err(reference_conflict(verb, &fk.name, &child.name));
+                    return Err(reference_conflict(
+                        &database_name_of(storage, child.database_id),
+                        verb,
+                        &fk.name,
+                        &child.name,
+                    ));
                 }
             }
         }
@@ -6070,7 +6296,7 @@ fn exec_create_view(
     db_id: u32,
     create: &CreateView,
 ) -> Result<StatementResult, SqlError> {
-    let bare = strip_schema(&create.name.value);
+    let bare = create_object_name("CREATE VIEW", &create.name)?;
     if resolve_table(storage, db_id, &create.name.value).is_some() {
         return Err(SqlError::new(
             2714,
@@ -6110,7 +6336,7 @@ fn exec_create_procedure(
     db_id: u32,
     create: &CreateProcedure,
 ) -> Result<StatementResult, SqlError> {
-    let bare = strip_schema(&create.name.value);
+    let bare = create_object_name("CREATE PROCEDURE", &create.name)?;
     // The builtin dispatcher checks `sp_executesql` BEFORE the catalog, so a
     // user procedure with that name would execute as the builtin while lock
     // ANALYSIS resolved the catalog first — an unanalyzed inner batch (the
@@ -6216,7 +6442,7 @@ fn exec_create_function(
     db_id: u32,
     create: &CreateFunction,
 ) -> Result<StatementResult, SqlError> {
-    let bare = strip_schema(&create.name.value);
+    let bare = create_object_name("CREATE FUNCTION", &create.name)?;
     let params = create
         .params
         .iter()
@@ -6480,7 +6706,7 @@ fn exec_create_trigger(
     db_id: u32,
     create: &CreateTrigger,
 ) -> Result<StatementResult, SqlError> {
-    let bare = strip_schema(&create.name.value);
+    let bare = create_object_name("CREATE TRIGGER", &create.name)?;
     // The target must be an existing base table (not a view/procedure/function/
     // trigger). SQL Server 4929-class.
     let target = resolve_table(storage, db_id, &create.target.value)
@@ -6916,6 +7142,8 @@ fn is_privileged_ddl(stmt: &Statement) -> bool {
             | Statement::DropIndex(_)
             | Statement::AlterTable(_)
             | Statement::AlterDatabase(_)
+            | Statement::CreateDatabase { .. }
+            | Statement::DropDatabase { .. }
             | Statement::CreateProcedure(_)
             | Statement::DropProcedure { .. }
             | Statement::CreateFunction(_)
@@ -7087,7 +7315,7 @@ fn instead_of_insert_images(
     def: &TableDef,
     eval_ctx: &EvalContext,
 ) -> Result<TriggerImages, SqlError> {
-    enforce_object_permission(def, &eval_ctx.security, PermAction::Insert)
+    enforce_object_permission(storage, def, &eval_ctx.security, PermAction::Insert)
         .map_err(|e| e.at(insert.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let ncols = schema.columns.len();
@@ -7137,7 +7365,7 @@ fn instead_of_update_images(
     def: &TableDef,
     eval_ctx: &EvalContext,
 ) -> Result<TriggerImages, SqlError> {
-    enforce_object_permission(def, &eval_ctx.security, PermAction::Update)
+    enforce_object_permission(storage, def, &eval_ctx.security, PermAction::Update)
         .map_err(|e| e.at(update.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let resolver = SchemaScope { schema: &schema };
@@ -7180,7 +7408,7 @@ fn instead_of_delete_images(
     def: &TableDef,
     eval_ctx: &EvalContext,
 ) -> Result<TriggerImages, SqlError> {
-    enforce_object_permission(def, &eval_ctx.security, PermAction::Delete)
+    enforce_object_permission(storage, def, &eval_ctx.security, PermAction::Delete)
         .map_err(|e| e.at(delete.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let resolver = SchemaScope { schema: &schema };
@@ -7436,7 +7664,7 @@ fn exec_alter_database(
     txn_ctx: &TxnContext,
 ) -> Result<StatementResult, SqlError> {
     if let Some(name) = &alter.name
-        && !name.value.eq_ignore_ascii_case(&txn_ctx.database)
+        && storage.rel_database_id_by_name(&name.value).is_none()
     {
         return Err(SqlError::new(
             911,
@@ -7583,6 +7811,7 @@ fn alter_add_foreign_key(
             && !fk_parent_exists(storage, &new_def, &key, def, &rows)?
         {
             return Err(fk_child_violation(
+                &database_name_of(storage, def.database_id),
                 &new_def.name,
                 "ALTER TABLE",
                 &new_def.parent,
@@ -7734,6 +7963,7 @@ fn alter_add_check(
             &resolver,
             eval_ctx,
             "ALTER TABLE",
+            &database_name_of(storage, def.database_id),
             &def.name,
         )?;
     }
@@ -7805,7 +8035,7 @@ fn exec_insert(
     let def = resolve_table(storage, eval_ctx.database_id, &insert.table.value)
         .ok_or_else(|| SqlError::invalid_object(&insert.table.value).at(insert.table.span))?;
     reject_dml_on_view(&def)?;
-    enforce_object_permission(&def, &eval_ctx.security, PermAction::Insert)
+    enforce_object_permission(storage, &def, &eval_ctx.security, PermAction::Insert)
         .map_err(|e| e.at(insert.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let ncols = schema.columns.len();
@@ -7921,6 +8151,7 @@ fn exec_insert(
                 &check_resolver,
                 eval_ctx,
                 "INSERT",
+                &database_name_of(storage, def.database_id),
                 &def.name,
             )?;
         }
@@ -8221,7 +8452,7 @@ fn exec_update(
     let def = resolve_table(storage, eval_ctx.database_id, &update.table.value)
         .ok_or_else(|| SqlError::invalid_object(&update.table.value).at(update.table.span))?;
     reject_dml_on_view(&def)?;
-    enforce_object_permission(&def, &eval_ctx.security, PermAction::Update)
+    enforce_object_permission(storage, &def, &eval_ctx.security, PermAction::Update)
         .map_err(|e| e.at(update.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let resolver = SchemaScope { schema: &schema };
@@ -8293,7 +8524,14 @@ fn exec_update(
         if !checks.is_empty() {
             let scope = row_values(&new_row, &types);
             enforce_checks(
-                storage, &checks, &scope, &resolver, eval_ctx, "UPDATE", &def.name,
+                storage,
+                &checks,
+                &scope,
+                &resolver,
+                eval_ctx,
+                "UPDATE",
+                &database_name_of(storage, def.database_id),
+                &def.name,
             )?;
         }
         updates.push((locator, old_values, new_row));
@@ -8359,7 +8597,12 @@ fn exec_update(
                 if let Some(key) = fk_key(fk, r)
                     && !post_pks.contains(&collated_key(&key, &key_coll))
                 {
-                    return Err(fk_child_violation(&fk.name, "UPDATE", &fk.parent));
+                    return Err(fk_child_violation(
+                        &database_name_of(storage, def.database_id),
+                        &fk.name,
+                        "UPDATE",
+                        &fk.parent,
+                    ));
                 }
             }
         }
@@ -8390,7 +8633,7 @@ fn exec_delete(
     let def = resolve_table(storage, eval_ctx.database_id, &delete.table.value)
         .ok_or_else(|| SqlError::invalid_object(&delete.table.value).at(delete.table.span))?;
     reject_dml_on_view(&def)?;
-    enforce_object_permission(&def, &eval_ctx.security, PermAction::Delete)
+    enforce_object_permission(storage, &def, &eval_ctx.security, PermAction::Delete)
         .map_err(|e| e.at(delete.table.span))?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
     let resolver = SchemaScope { schema: &schema };
@@ -10487,7 +10730,7 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     // If SELECT is denied, fall back to the collecting path, which resolves the
     // same table through `build_table_source` and raises the 229 there — keeping
     // the check on the one path the executor uses to touch the object.
-    enforce_object_permission(&def, &eval_ctx.security, PermAction::Select).ok()?;
+    enforce_object_permission(storage, &def, &eval_ctx.security, PermAction::Select).ok()?;
     let schema = def.schema().ok()?;
 
     let qualifier = alias
@@ -12209,6 +12452,7 @@ fn permits(perms: &[PermissionEntry], sec: &SecurityContext, action: PermAction)
 /// lacks the permission. A no-op for a bypassing session (sysadmin / dbo /
 /// internal) and inside any stored-object body (ownership chaining).
 fn enforce_object_permission(
+    storage: &Storage,
     def: &TableDef,
     sec: &SecurityContext,
     action: PermAction,
@@ -12221,9 +12465,10 @@ fn enforce_object_permission(
         14,
         5,
         format!(
-            "The {} permission was denied on the object '{}', database 'truthdb', schema 'dbo'.",
+            "The {} permission was denied on the object '{}', database '{}', schema 'dbo'.",
             action.name(),
-            def.name
+            def.name,
+            database_name_of(storage, def.database_id)
         ),
     ))
 }
@@ -12278,7 +12523,7 @@ fn build_table_source(
     }
     let base = match name.value.to_ascii_lowercase().as_str() {
         "sys.tables" => sys_tables(storage, eval_ctx.database_id),
-        "sys.databases" => sys_databases(storage, eval_ctx),
+        "sys.databases" => sys_databases(storage),
         "sys.dm_repl_replica_states" => sys_dm_repl_replica_states(storage),
         "sys.dm_repl_slots" => sys_dm_repl_slots(storage),
         "sys.configurations" => sys_configurations(),
@@ -12319,7 +12564,7 @@ fn build_table_source(
             // SELECT permission on the base table or view (checked here, at the
             // top level, before a view body expands — the body's own reads are
             // covered by ownership chaining and not re-checked).
-            enforce_object_permission(&def, &eval_ctx.security, PermAction::Select)
+            enforce_object_permission(storage, &def, &eval_ctx.security, PermAction::Select)
                 .map_err(|e| e.at(name.span))?;
             // A view: run its stored SELECT as a derived table under the view's
             // qualifier. A view over another view expands recursively — building
@@ -12440,7 +12685,7 @@ fn build_function_source(
         .as_ref()
         .ok_or_else(|| function_not_a_table(&def.name).at(name.span))?;
     // A table-valued function in FROM is read like a table: SELECT permission.
-    enforce_object_permission(&def, &eval_ctx.security, PermAction::Select)
+    enforce_object_permission(storage, &def, &eval_ctx.security, PermAction::Select)
         .map_err(|e| e.at(name.span))?;
     if args.len() < function.params.len() {
         return Err(SqlError::new(
@@ -12555,6 +12800,7 @@ fn run_multi_statement_tvf(
     let mut txn_ctx = TxnContext::default();
     txn_ctx.set_session_identity(
         eval_ctx.database.clone(),
+        eval_ctx.database_id,
         eval_ctx.login.clone(),
         eval_ctx.spid,
         eval_ctx.user.clone(),
@@ -13697,7 +13943,7 @@ fn sys_dm_repl_replica_states(storage: &Storage) -> Source {
 /// `sys.databases` (Stage 14, SSMS query-window probes): the one database
 /// this instance serves, with the columns tools actually read. The
 /// versioning flags report the live `ALTER DATABASE` options.
-fn sys_databases(storage: &Storage, eval_ctx: &EvalContext) -> Source {
+fn sys_databases(storage: &Storage) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("database_id"),
@@ -13716,25 +13962,34 @@ fn sys_databases(storage: &Storage, eval_ctx: &EvalContext) -> Source {
             column_type: ColumnType::Bit,
         },
     ];
-    let rows = vec![vec![
-        Datum::NVarChar(eval_ctx.database.clone()),
-        Datum::Int(1),
-        Datum::Int(160),
-        Datum::NVarChar("SQL_Latin1_General_CP1_CI_AS".into()),
-        Datum::NVarChar("MULTI_USER".into()),
-        Datum::NVarChar("ONLINE".into()),
-        Datum::NVarChar(
-            if storage.recovery_model_full() {
-                "FULL"
-            } else {
-                "SIMPLE"
-            }
-            .into(),
-        ),
-        Datum::Int(storage.snapshot_isolation_allowed() as i32),
-        Datum::Bit(storage.rcsi_enabled()),
-        Datum::Bit(false),
-    ]];
+    // One row per database. The option columns are instance-wide (one
+    // shared log and version store), so every row reports the same values —
+    // the documented level-1 deviation.
+    let rows = storage
+        .rel_databases()
+        .into_iter()
+        .map(|(id, name)| {
+            vec![
+                Datum::NVarChar(name),
+                Datum::Int(id as i32),
+                Datum::Int(160),
+                Datum::NVarChar("SQL_Latin1_General_CP1_CI_AS".into()),
+                Datum::NVarChar("MULTI_USER".into()),
+                Datum::NVarChar("ONLINE".into()),
+                Datum::NVarChar(
+                    if storage.recovery_model_full() {
+                        "FULL"
+                    } else {
+                        "SIMPLE"
+                    }
+                    .into(),
+                ),
+                Datum::Int(storage.snapshot_isolation_allowed() as i32),
+                Datum::Bit(storage.rcsi_enabled()),
+                Datum::Bit(false),
+            ]
+        })
+        .collect();
     let collations = vec![None; columns.len()];
     let qualifiers = vec![None; columns.len()];
     Source {
@@ -14753,15 +15008,61 @@ fn reject_view_as_table(def: &TableDef) -> Result<(), SqlError> {
     Ok(())
 }
 
+/// Validates a CREATE'd object name: one part, or `dbo.<name>`. A database
+/// prefix is refused (SQL Server 166 — CREATE resolves in the current
+/// database only) and an unknown schema is refused (2760). Returns the bare
+/// name to store.
+fn create_object_name<'a>(kind: &str, name: &'a Name) -> Result<&'a str, SqlError> {
+    // A quoted identifier (`[sys.tables]`) is one name, dots and all — the
+    // parser records quoting for the first part, and splitting it here would
+    // invent a schema the user never wrote.
+    if name.quoted {
+        return Ok(strip_schema(&name.value));
+    }
+    let parts: Vec<&str> = name.value.split('.').collect();
+    match parts[..] {
+        [bare] => Ok(bare),
+        [schema, bare] if schema.eq_ignore_ascii_case("dbo") => Ok(bare),
+        [schema, _] => Err(SqlError::new(
+            2760,
+            16,
+            1,
+            format!(
+                "The specified schema name \"{schema}\" either does not exist or you do not have permission to use it."
+            ),
+        )
+        .at(name.span)),
+        _ => Err(SqlError::new(
+            166,
+            15,
+            1,
+            format!(
+                "'{kind}' does not allow specifying the database name as a prefix to the object name."
+            ),
+        )
+        .at(name.span)),
+    }
+}
+
 fn resolve_table(storage: &Storage, db_id: u32, name: &str) -> Option<TableDef> {
-    let bare = strip_schema(name);
-    if let Some(def) = storage.rel_table(db_id, bare) {
+    // Three-part names (`db.dbo.t`, `db..t`) resolve in the named database;
+    // one- and two-part names in the session's. An unknown database or a
+    // schema other than dbo resolves to nothing (208 at the call sites).
+    let parts: Vec<&str> = name.split('.').collect();
+    let (target_db, bare) = match parts[..] {
+        [db, schema, t] if schema.is_empty() || schema.eq_ignore_ascii_case("dbo") => {
+            (storage.rel_database_id_by_name(db)?, t)
+        }
+        [_, _, _] => return None,
+        _ => (db_id, strip_schema(name)),
+    };
+    if let Some(def) = storage.rel_table(target_db, bare) {
         return Some(def);
     }
     storage
         .rel_tables()
         .into_iter()
-        .find(|d| d.database_id == db_id && d.name.eq_ignore_ascii_case(bare))
+        .find(|d| d.database_id == target_db && d.name.eq_ignore_ascii_case(bare))
 }
 
 /// Maps a storage error to a SQL Server-numbered error. PK and NULL

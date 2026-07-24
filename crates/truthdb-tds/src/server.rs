@@ -173,12 +173,25 @@ where
         packet_size = requested.min(packet::MAX_PACKET_SIZE);
     }
 
-    // Login response token stream.
+    // The requested database must exist (SQL Server 4060); an empty request
+    // falls back to the configured default. The session opens FIRST so the
+    // login response can carry the catalog's canonical spelling.
     let database = if login.database.is_empty() {
         config.database.clone()
     } else {
         login.database.clone()
     };
+    // Each connection gets an engine-side session; it is closed (rolling back
+    // any open transaction) whenever the connection ends, cleanly or not. The
+    // database and login are recorded for session intrinsics (DB_NAME() etc.).
+    let Ok((session, database)) = engine
+        .open_session(database.clone(), canonical_login, login_sid)
+        .await
+    else {
+        return deny_database(&mut stream, &database, packet_size).await;
+    };
+
+    // Login response token stream.
     let mut out = Vec::new();
     token::loginack(&mut out);
     token::envchange_database(&mut out, &database);
@@ -193,13 +206,6 @@ where
     );
     token::done(&mut out, false, false, false, None, 0);
     write_message(&mut stream, PKT_TABULAR_RESULT, &out, packet_size).await?;
-
-    // Each connection gets an engine-side session; it is closed (rolling back
-    // any open transaction) whenever the connection ends, cleanly or not. The
-    // database and login are recorded for session intrinsics (DB_NAME() etc.).
-    let session = engine
-        .open_session(database.clone(), canonical_login, login_sid)
-        .await;
     let result = request_loop(&mut stream, &engine, session, packet_size).await;
     engine.close_session(session);
     result
@@ -210,6 +216,25 @@ where
 /// disabled, throttle lockout) uses this exact response so nothing on the wire
 /// distinguishes them — SQL Server sanitizes the state to 1 for the same reason
 /// (a client must not be able to enumerate valid usernames).
+/// Refuses a login whose requested database does not exist: SQL Server's
+/// 4060 (severity 11) followed by the login failure, then DONE.
+async fn deny_database<S: AsyncWrite + Unpin>(
+    stream: &mut S,
+    database: &str,
+    packet_size: usize,
+) -> io::Result<()> {
+    let mut out = Vec::new();
+    token::error(
+        &mut out,
+        4060,
+        1,
+        11,
+        &format!("Cannot open database \"{database}\" requested by the login. The login failed."),
+    );
+    token::done(&mut out, false, true, false, None, 0);
+    write_message(stream, PKT_TABULAR_RESULT, &out, packet_size).await
+}
+
 async fn deny_login<S: AsyncWrite + Unpin>(
     stream: &mut S,
     username: &str,

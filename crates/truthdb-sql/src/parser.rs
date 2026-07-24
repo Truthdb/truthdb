@@ -1113,6 +1113,7 @@ impl Parser {
             Some("LOGIN") if !unique => self.parse_create_login(start, false),
             Some("USER") if !unique => self.parse_create_user(start),
             Some("ROLE") if !unique => self.parse_create_role(start),
+            Some("DATABASE") if !unique => self.parse_create_database(start),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -1764,6 +1765,7 @@ impl Parser {
             Some("LOGIN") => self.parse_drop_login(start),
             Some("USER") => self.parse_drop_user(start),
             Some("ROLE") => self.parse_drop_role(start),
+            Some("DATABASE") => self.parse_drop_database(start),
             _ => {
                 let token = self.peek().clone();
                 Err(SqlError::syntax(self.token_text(&token), token.span))
@@ -2235,6 +2237,46 @@ impl Parser {
             alter,
             span,
         }))
+    }
+
+    /// `CREATE DATABASE <name>` — a bare (single-part) name; SQL Server's
+    /// storage clauses (`ON`, `LOG ON`, ...) do not apply to a shared-file
+    /// instance and are not accepted.
+    fn parse_create_database(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // DATABASE
+        let name = self.parse_single_part_name()?;
+        Ok(Statement::CreateDatabase {
+            span: start.to(name.span),
+            name,
+        })
+    }
+
+    /// `DROP DATABASE [IF EXISTS] <name>`.
+    fn parse_drop_database(&mut self, start: Span) -> SqlResult<Statement> {
+        self.bump(); // DATABASE
+        let if_exists = if self.peek_keyword().as_deref() == Some("IF") {
+            self.bump();
+            self.expect_keyword("EXISTS")?;
+            true
+        } else {
+            false
+        };
+        let name = self.parse_single_part_name()?;
+        Ok(Statement::DropDatabase {
+            span: start.to(name.span),
+            name,
+            if_exists,
+        })
+    }
+
+    /// A name that must be a single identifier — a database name is never
+    /// dotted (error 170-class syntax rejection on a qualifier).
+    fn parse_single_part_name(&mut self) -> SqlResult<Name> {
+        let name = self.parse_name()?;
+        if name.value.contains('.') {
+            return Err(SqlError::syntax(&name.value, name.span));
+        }
+        Ok(name)
     }
 
     fn parse_drop_login(&mut self, start: Span) -> SqlResult<Statement> {
