@@ -3531,6 +3531,10 @@ impl StorageFile {
             def.permissions.retain(|p| p.grantee != grantee);
             self.persist_object_permissions(def)?;
         }
+        // The per-object rewrites latched each object's database; the caller
+        // is a server-scoped principal drop whose remaining appends must be
+        // tagged 0 — restore it.
+        self.current_container = 0;
         Ok(())
     }
 
@@ -3875,14 +3879,17 @@ impl StorageFile {
                 "too many databases: the database id space is exhausted".to_string(),
             ));
         }
-        self.current_container = db_id as u16;
         if self.rel.catalog_root.is_none() {
+            // The catalog tree itself is global (container 0) — it holds
+            // every database's rows.
+            self.current_container = 0;
             let root = {
                 let mut ctx = self.rel_ctx();
                 catalog::create_catalog(&mut ctx)?
             };
             self.rel.catalog_root = Some(root);
         }
+        self.current_container = db_id as u16;
         let catalog_root = self.rel.catalog_root.expect("catalog exists");
         let object_id = self.rel.next_object_id;
         let db_name = name.to_string();

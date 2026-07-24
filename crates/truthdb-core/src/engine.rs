@@ -15192,6 +15192,18 @@ mod tests {
             .error
             .is_none()
         );
+        // A cross-database transaction rolled back: its CLRs compensate both
+        // databases' pages under one context — they must all be tag 0.
+        assert!(
+            batch(
+                &engine,
+                &mut ctx,
+                "USE truthdb; BEGIN TRANSACTION; INSERT INTO t1 VALUES (2); \
+                 INSERT INTO hr.dbo.t2 VALUES (2); ROLLBACK TRANSACTION"
+            )
+            .error
+            .is_none()
+        );
         // rel_wal_records reads the replay cache scanned at OPEN — reopen the
         // file so the appended ring is visible.
         drop(engine);
@@ -15220,6 +15232,19 @@ mod tests {
                 .filter(|(_, r)| matches!(r.kind, REL_KIND_TXN_BEGIN | REL_KIND_TXN_COMMIT))
                 .all(|(_, r)| r.flags == 0),
             "txn control must stay untagged"
+        );
+        // CLRs are never tagged — a rollback can span databases, and the
+        // include-0-in-every-subscription rule is what keeps filtered copies
+        // convergent through compensation.
+        let clr_tags: Vec<u16> = records
+            .iter()
+            .filter(|(_, r)| r.kind == crate::wal::records::REL_KIND_CLR)
+            .map(|(_, r)| r.flags)
+            .collect();
+        assert!(!clr_tags.is_empty(), "the rolled-back txn produced CLRs");
+        assert!(
+            clr_tags.iter().all(|&f| f == 0),
+            "CLRs must stay untagged: {clr_tags:?}"
         );
         let _ = std::fs::remove_file(path);
     }
