@@ -47,6 +47,10 @@ pub(crate) struct RelState {
     /// `database: Some(..)`), partitioned out on load, never in the object
     /// namespace.
     pub databases: HashMap<String, TableDef>,
+    /// Dropped databases' tombstone rows (`DatabaseDef::dropped`): their ids
+    /// are retired forever, their names free. Not keyed by name — several
+    /// drops can share one.
+    pub dropped_databases: Vec<TableDef>,
     /// Server logins (principals), keyed by lowercased login name. Persisted in
     /// the SAME catalog b-tree as `tables` (a row with `principal: Some(..)`),
     /// but partitioned into a separate map on load so a login never enters the
@@ -77,6 +81,7 @@ impl RelState {
             catalog_root: None,
             tables: HashMap::new(),
             databases: HashMap::new(),
+            dropped_databases: Vec::new(),
             principals: HashMap::new(),
             database_principals: HashMap::new(),
             next_txn_id: 1,

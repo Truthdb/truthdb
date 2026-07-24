@@ -2148,3 +2148,25 @@ async fn two_uses_in_one_batch_emit_two_envchanges() {
     assert_eq!((envs, infos), (2, 2), "tokens: {tokens:?}");
     let _ = std::fs::remove_file(&path);
 }
+
+/// A login naming a database that does not exist is refused with SQL
+/// Server's 4060 (severity 11) rather than a session in a phantom database.
+#[tokio::test]
+async fn login_to_an_unknown_database_is_refused_with_4060() {
+    let path = temp_path("login-4060");
+    let engine = engine(&path);
+    let mut client = connect(engine.clone()).await;
+    client.prelogin().await;
+    client
+        .write_packet(PKT_LOGIN7, &build_login7("sa", "secret", "nosuchdb"))
+        .await;
+    let (_, payload) = client.read_message().await;
+    let tokens = parse_tokens(&payload);
+    assert!(
+        tokens
+            .iter()
+            .any(|t| matches!(t, Token::Error { number: 4060, .. })),
+        "unknown login database must be 4060: {tokens:?}"
+    );
+    let _ = std::fs::remove_file(&path);
+}

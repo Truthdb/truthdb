@@ -303,8 +303,15 @@ impl Engine {
     fn execute_sql(&self, meta: &mut EngineMeta, input: &str) -> Result<String, EngineError> {
         // The native (session-less) path has nowhere to carry an open
         // transaction across calls, so it uses a transient context and rolls
-        // back anything an unbalanced BEGIN leaves dangling.
+        // back anything an unbalanced BEGIN leaves dangling. It runs in the
+        // default database under its canonical name, so DB_NAME() and USE
+        // behave over the CLI (a USE lasts only for this command's batch —
+        // the context is transient by design).
         let mut txn_ctx = crate::rel::TxnContext::default();
+        txn_ctx.set_current_database(
+            self.storage.default_database_name(),
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+        );
         let outcome = crate::rel::execute_batch(&self.storage, input, &mut txn_ctx);
         txn_ctx.abort(&self.storage);
         self.maybe_checkpoint(meta)?;
@@ -402,6 +409,21 @@ impl Engine {
     pub fn set_default_database(&self, name: &str) -> Result<(), EngineError> {
         self.storage.set_default_database_name(name)?;
         Ok(())
+    }
+
+    /// Resolves a database name to `(id, canonical name)` — the login-time
+    /// derivation, shared with USE via the same storage lookup.
+    pub fn resolve_database(&self, name: &str) -> Option<(u32, String)> {
+        let requested = if name.is_empty() {
+            self.storage.default_database_name()
+        } else {
+            name.to_string()
+        };
+        let id = self.storage.rel_database_id_by_name(&requested)?;
+        self.storage
+            .rel_databases()
+            .into_iter()
+            .find(|(db, _)| *db == id)
     }
 
     pub fn checkpoint(&self) -> Result<(), EngineError> {
@@ -10576,7 +10598,15 @@ mod tests {
         let (user, user_sid) = engine.resolve_session_user("sa", sa_sid);
         assert_eq!(user, "dbo");
         let mut ctx = TxnContext::default();
-        ctx.set_session_identity("truthdb".into(), "sa".into(), 1, user, sa_sid, user_sid);
+        ctx.set_session_identity(
+            "truthdb".into(),
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "sa".into(),
+            1,
+            user,
+            sa_sid,
+            user_sid,
+        );
         let cells = row_cells(
             &engine,
             &mut ctx,
@@ -10612,6 +10642,7 @@ mod tests {
         let mut ctx = TxnContext::default();
         ctx.set_session_identity(
             "truthdb".into(),
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "analyst".into(),
             2,
             "analyst".into(),
@@ -10734,6 +10765,7 @@ mod tests {
         let mut ctx = TxnContext::default();
         ctx.set_session_identity(
             "truthdb".into(),
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "clerk".into(),
             3,
             "clerk".into(),
@@ -10771,7 +10803,15 @@ mod tests {
         let login_sid = engine.lookup_login(login).unwrap().principal_id;
         let (user, user_sid) = engine.resolve_session_user(login, login_sid);
         let mut ctx = TxnContext::default();
-        ctx.set_session_identity("truthdb".into(), login.into(), 9, user, login_sid, user_sid);
+        ctx.set_session_identity(
+            "truthdb".into(),
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            login.into(),
+            9,
+            user,
+            login_sid,
+            user_sid,
+        );
         ctx
     }
 
@@ -14872,6 +14912,258 @@ mod tests {
         assert!(
             rows.iter().all(|r| r[0].as_deref() != Some("c")),
             "hr's objects must not appear in a default-db session's sys.tables: {rows:?}"
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn use_switches_context_with_canonical_casing_and_db_functions_track() {
+        let path = unique_temp_path("multidb-use-canonical");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        let first_row = |out: &BatchOutcome| -> Vec<Datum> {
+            for result in &out.results {
+                if let StatementResult::Rows(rowset) = result {
+                    return rowset.rows[0].clone();
+                }
+            }
+            panic!("expected a rowset: {:?}", out.error);
+        };
+        assert!(
+            batch(&engine, &mut ctx, "CREATE DATABASE Hr")
+                .error
+                .is_none(),
+            "create"
+        );
+        // A case-variant USE lands in the catalog's spelling.
+        assert!(batch(&engine, &mut ctx, "USE HR").error.is_none(), "use");
+        let row = first_row(&batch(&engine, &mut ctx, "SELECT DB_NAME(), DB_ID()"));
+        assert_eq!(row[0], Datum::NVarChar("Hr".into()), "canonical casing");
+        assert_eq!(row[1], Datum::BigInt(2));
+        // Objects created here live here; the default database has none.
+        assert!(
+            batch(
+                &engine,
+                &mut ctx,
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)"
+            )
+            .error
+            .is_none()
+        );
+        assert!(batch(&engine, &mut ctx, "USE truthdb").error.is_none());
+        let row = first_row(&batch(&engine, &mut ctx, "SELECT COUNT(*) FROM sys.tables"));
+        assert_eq!(row[0], Datum::BigInt(0));
+        let row = first_row(&batch(&engine, &mut ctx, "SELECT COUNT(*) FROM Hr.dbo.t"));
+        assert_eq!(row[0], Datum::BigInt(0), "cross-db read");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn use_is_scoped_to_dynamic_sql_and_refused_in_stored_bodies() {
+        let path = unique_temp_path("multidb-use-scope");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        assert!(
+            batch(&engine, &mut ctx, "CREATE DATABASE hr")
+                .error
+                .is_none()
+        );
+        assert!(
+            batch(
+                &engine,
+                &mut ctx,
+                "USE hr; CREATE TABLE t (id INT NOT NULL PRIMARY KEY); USE truthdb"
+            )
+            .error
+            .is_none()
+        );
+        // A USE inside sp_executesql is scoped to the dynamic batch: the
+        // inner insert lands in hr, and the caller's context comes back.
+        let out = batch(
+            &engine,
+            &mut ctx,
+            "EXEC sp_executesql N'USE hr; INSERT INTO t VALUES (1)'",
+        );
+        assert!(out.error.is_none(), "{:?}", out.error);
+        let first_row = |out: &BatchOutcome| -> Vec<Datum> {
+            for result in &out.results {
+                if let StatementResult::Rows(rowset) = result {
+                    return rowset.rows[0].clone();
+                }
+            }
+            panic!("expected a rowset: {:?}", out.error);
+        };
+        let row = first_row(&batch(&engine, &mut ctx, "SELECT DB_NAME()"));
+        assert_eq!(
+            row[0],
+            Datum::NVarChar("truthdb".into()),
+            "the context change must not outlive the dynamic batch"
+        );
+        let row = first_row(&batch(&engine, &mut ctx, "SELECT COUNT(*) FROM hr.dbo.t"));
+        assert_eq!(row[0], Datum::BigInt(1), "the inner insert landed in hr");
+
+        // The lock-analysis union sees the USE hidden in the literal dynamic
+        // batch: the batch pre-acquires locks for hr's table (the 2PL hole
+        // the review found).
+        let locks = engine.analyze_locks(
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "EXEC sp_executesql N'USE hr; INSERT INTO t VALUES (2)'",
+            crate::rel::Isolation::ReadCommitted,
+        );
+        assert!(
+            !locks.is_empty(),
+            "a USE inside literal dynamic SQL must contribute its database's locks"
+        );
+
+        // USE is refused inside stored bodies at CREATE, like SQL Server 154.
+        let err = batch(
+            &engine,
+            &mut ctx,
+            "CREATE PROCEDURE p AS BEGIN USE hr; SELECT 1 END",
+        )
+        .error
+        .expect("USE in a procedure body must be refused");
+        assert_eq!(err.number, 154);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn a_dropped_database_errors_stale_sessions_and_never_reuses_its_id() {
+        let path = unique_temp_path("multidb-drop-stale");
+        let engine = new_engine(&path);
+        let mut stale = TxnContext::default();
+        let mut admin = TxnContext::default();
+        assert!(
+            batch(&engine, &mut admin, "CREATE DATABASE hr")
+                .error
+                .is_none()
+        );
+        assert!(batch(&engine, &mut stale, "USE hr").error.is_none());
+        assert!(
+            batch(&engine, &mut admin, "DROP DATABASE hr")
+                .error
+                .is_none()
+        );
+
+        // The stale session errors on its next statement (loud degradation)...
+        let err = batch(&engine, &mut stale, "SELECT 1")
+            .error
+            .expect("a statement in a dropped database must error");
+        assert_eq!(err.number, 911);
+        // ...but USE is its way out.
+        assert!(batch(&engine, &mut stale, "USE truthdb").error.is_none());
+        assert!(batch(&engine, &mut stale, "SELECT 1").error.is_none());
+
+        // The dropped id is tombstoned: the next CREATE DATABASE gets a fresh
+        // id, so nothing can rebind a stale context into the new database.
+        let first_row = |out: &BatchOutcome| -> Vec<Datum> {
+            for result in &out.results {
+                if let StatementResult::Rows(rowset) = result {
+                    return rowset.rows[0].clone();
+                }
+            }
+            panic!("expected a rowset: {:?}", out.error);
+        };
+        assert!(
+            batch(&engine, &mut admin, "CREATE DATABASE payroll")
+                .error
+                .is_none()
+        );
+        let row = first_row(&batch(&engine, &mut admin, "SELECT DB_ID('payroll')"));
+        assert_eq!(
+            row[0],
+            Datum::BigInt(3),
+            "hr's id 2 is retired, never reused"
+        );
+
+        // Reserved names are refused.
+        for reserved in ["sys", "dbo", "master", "model", "msdb", "tempdb"] {
+            assert!(
+                batch(&engine, &mut admin, &format!("CREATE DATABASE {reserved}"))
+                    .error
+                    .is_some(),
+                "{reserved} must be reserved"
+            );
+        }
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn three_part_drop_and_cross_database_view_resolve_in_their_home_database() {
+        let path = unique_temp_path("multidb-home");
+        let engine = new_engine(&path);
+        let mut ctx = TxnContext::default();
+        let first_row = |out: &BatchOutcome| -> Vec<Datum> {
+            for result in &out.results {
+                if let StatementResult::Rows(rowset) = result {
+                    return rowset.rows[0].clone();
+                }
+            }
+            panic!("expected a rowset: {:?}", out.error);
+        };
+        assert!(
+            batch(&engine, &mut ctx, "CREATE DATABASE hr")
+                .error
+                .is_none()
+        );
+        assert!(
+            batch(
+                &engine,
+                &mut ctx,
+                "USE hr; CREATE TABLE t (id INT NOT NULL PRIMARY KEY);                  INSERT INTO t VALUES (1); INSERT INTO t VALUES (2); INSERT INTO t VALUES (3);                  CREATE VIEW v AS SELECT id FROM t; USE truthdb"
+            )
+            .error
+            .is_none()
+        );
+        // Same-named table in the session's database, with different contents.
+        assert!(
+            batch(
+                &engine,
+                &mut ctx,
+                "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)"
+            )
+            .error
+            .is_none()
+        );
+        // A cross-database view reads its HOME database's t (3 rows), not the
+        // caller's empty one.
+        let row = first_row(&batch(&engine, &mut ctx, "SELECT COUNT(*) FROM hr.dbo.v"));
+        assert_eq!(
+            row[0],
+            Datum::BigInt(3),
+            "view body resolves in its home database"
+        );
+
+        // DROP TABLE with a three-part name drops the NAMED database's table.
+        assert!(
+            batch(&engine, &mut ctx, "DROP TABLE hr.dbo.t")
+                .error
+                .is_none()
+        );
+        let row = first_row(&batch(&engine, &mut ctx, "SELECT COUNT(*) FROM t"));
+        assert_eq!(row[0], Datum::BigInt(0), "the session's t survives");
+        assert!(
+            batch(&engine, &mut ctx, "SELECT COUNT(*) FROM hr.dbo.t")
+                .error
+                .is_some(),
+            "hr's t is gone"
+        );
+
+        // A quoted identifier containing dots is one name (regression: it must
+        // not be re-split as db.schema.object).
+        assert!(
+            batch(
+                &engine,
+                &mut ctx,
+                "CREATE TABLE [dbo].[my.table] (id INT NOT NULL PRIMARY KEY)"
+            )
+            .error
+            .is_none()
+        );
+        assert!(
+            batch(&engine, &mut ctx, "INSERT INTO [my.table] VALUES (1)")
+                .error
+                .is_none()
         );
         let _ = std::fs::remove_file(path);
     }

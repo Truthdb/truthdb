@@ -165,6 +165,19 @@ pub enum Statement {
         if_exists: bool,
         span: Span,
     },
+    /// `CREATE DATABASE <name>` — a naming namespace over the shared log and
+    /// data file (level 1 of the multiple-databases plan).
+    CreateDatabase {
+        name: Name,
+        span: Span,
+    },
+    /// `DROP DATABASE [IF EXISTS] <name>` — drops the database and every
+    /// object in it.
+    DropDatabase {
+        name: Name,
+        if_exists: bool,
+        span: Span,
+    },
     /// `CREATE USER <name> [FOR LOGIN <login>]`.
     CreateUser(CreateUser),
     /// `DROP USER [IF EXISTS] <name>`.
