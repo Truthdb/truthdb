@@ -55,6 +55,24 @@ struct TableVar {
     rows: Vec<Vec<Datum>>,
 }
 
+/// truthdb-sql cannot depend on this crate, so it mirrors the default
+/// database id; the two constants must never drift.
+const _: () = assert!(
+    truthdb_sql::eval::DEFAULT_DATABASE_ID == crate::relstore::catalog::DEFAULT_DATABASE_ID
+);
+
+/// A session's current database id. A wrapper so `TxnContext::default()`
+/// lands in the DEFAULT database (id 1), never a nonexistent id 0 — one
+/// representation of "the default database", not two.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct CurrentDb(u32);
+
+impl Default for CurrentDb {
+    fn default() -> Self {
+        CurrentDb(crate::relstore::catalog::DEFAULT_DATABASE_ID)
+    }
+}
+
 /// Per-session transaction state carried across statements/batches. Lives in
 /// the session (engine thread); autocommit statements use `Default`.
 #[derive(Default)]
@@ -110,6 +128,10 @@ pub struct TxnContext {
     /// Connection identity for session intrinsics (`DB_NAME()`,
     /// `SUSER_SNAME()`, `@@SPID`), set once when the session opens.
     database: String,
+    /// The session's current database id — the namespace every unqualified
+    /// object name resolves in. Sessions run in the default database until
+    /// `USE` learns to switch it (the multi-database plan's A2 slice).
+    database_id: CurrentDb,
     login: String,
     spid: i32,
     /// The session's database user name (`USER_NAME()`), resolved from the login
@@ -178,6 +200,7 @@ impl TxnContext {
 
     fn eval_context(&self) -> EvalContext {
         EvalContext {
+            database_id: self.database_id.0,
             trancount: self.trancount as i32,
             variables: self
                 .variables
@@ -257,6 +280,12 @@ impl TxnContext {
         self.user = user;
         self.login_sid = login_sid;
         self.user_sid = user_sid;
+    }
+
+    /// The session's current database id — the namespace unqualified names
+    /// resolve in.
+    pub(crate) fn database_id(&self) -> u32 {
+        self.database_id.0
     }
 
     /// Refreshes the session's effective role NAMES from the membership cache.
@@ -1298,7 +1327,7 @@ fn run_exec(
 ) -> Result<(), ExecError> {
     if !strip_schema(&exec.proc.value).eq_ignore_ascii_case("sp_executesql") {
         // A user procedure, if the catalog has one; 2812 otherwise.
-        if let Some(def) = resolve_table(storage, &exec.proc.value)
+        if let Some(def) = resolve_table(storage, txn_ctx.database_id(), &exec.proc.value)
             && def.is_procedure()
         {
             enforce_object_permission(&def, &txn_ctx.security, PermAction::Execute)
@@ -1548,7 +1577,9 @@ fn enter_condition_scopes<'a>(
     // those reads must observe the same snapshot as a direct read (the lock
     // analysis already resolved them), so arm the scope when the condition
     // reaches any table directly OR through a called function.
-    if tables.is_empty() && expr_function_read_ids(storage, condition).is_empty() {
+    if tables.is_empty()
+        && expr_function_read_ids(storage, txn_ctx.database_id(), condition).is_empty()
+    {
         return Ok((None, None));
     }
     match txn_ctx.isolation() {
@@ -2550,14 +2581,14 @@ impl Drop for TxnSnapshotScope {
 /// only when its FROM/subqueries name one. `SELECT 1` under SNAPSHOT must
 /// neither raise 3952 nor establish the transaction's snapshot — SQL Server
 /// defers both to the first read of an actual object.
-fn statement_reads_tables(storage: &Storage, statement: &Statement) -> bool {
+fn statement_reads_tables(storage: &Storage, db_id: u32, statement: &Statement) -> bool {
     match statement {
-        Statement::Select(select) => select_reads_tables(storage, select),
+        Statement::Select(select) => select_reads_tables(storage, db_id, select),
         // An INSERT whose TARGET is a table variable writes only session memory,
         // so — unlike a base-table INSERT — it is not itself a data access; but a
         // `SELECT` source still reads real tables and must arm the snapshot.
         Statement::Insert(insert) if insert.table.value.starts_with('@') => match &insert.source {
-            InsertSource::Select(select) => select_reads_tables(storage, select),
+            InsertSource::Select(select) => select_reads_tables(storage, db_id, select),
             _ => false,
         },
         _ => true,
@@ -2567,11 +2598,11 @@ fn statement_reads_tables(storage: &Storage, statement: &Statement) -> bool {
 /// Whether a SELECT reads any real table — directly (FROM/subqueries) or through
 /// a scalar function it calls. A `@t` table-variable source is session-local and
 /// is not counted (it neither locks nor snapshots).
-fn select_reads_tables(storage: &Storage, select: &Select) -> bool {
+fn select_reads_tables(storage: &Storage, db_id: u32, select: &Select) -> bool {
     let expanded = expand_ctes(select);
     let mut tables = Vec::new();
     collect_locked_tables(&expanded, &mut tables);
-    !tables.is_empty() || !select_function_read_ids(storage, &expanded).is_empty()
+    !tables.is_empty() || !select_function_read_ids(storage, db_id, &expanded).is_empty()
 }
 
 /// SQL Server 3952: SNAPSHOT isolation used while the database does not
@@ -2635,7 +2666,9 @@ fn exec_statement_streamed(
                 txn_ctx.txn.as_ref().map(StorageTxn::txn_id),
             ));
         }
-        Isolation::Snapshot if data_access && statement_reads_tables(storage, statement) => {
+        Isolation::Snapshot
+            if data_access && statement_reads_tables(storage, txn_ctx.database_id(), statement) =>
+        {
             if !storage.snapshot_isolation_allowed() {
                 if txn_ctx.in_txn() {
                     txn_ctx.doomed = true;
@@ -2665,7 +2698,9 @@ fn exec_statement_streamed(
         // the last applied commit yields committed-state reads). Ordered
         // BELOW the RCSI/SNAPSHOT arms so a SNAPSHOT session on a standby
         // keeps its transaction-lifetime view.
-        _ if statement_reads_tables(storage, statement) && storage.is_standby() => {
+        _ if statement_reads_tables(storage, txn_ctx.database_id(), statement)
+            && storage.is_standby() =>
+        {
             run.flush(storage)?;
             _stmt_scope = Some(SnapshotScope::enter(storage, None));
         }
@@ -2757,19 +2792,20 @@ fn statement_may_commit(statement: &Statement) -> bool {
 fn fk_parent_object_ids(storage: &Storage, def: &TableDef) -> Vec<u32> {
     def.foreign_keys
         .iter()
-        .filter_map(|fk| resolve_table(storage, &fk.parent).map(|p| p.object_id))
+        .filter_map(|fk| resolve_table(storage, def.database_id, &fk.parent).map(|p| p.object_id))
         .collect()
 }
 
 /// Object ids of the tables whose foreign keys reference `parent_name`.
-fn fk_child_object_ids(storage: &Storage, parent_name: &str) -> Vec<u32> {
+fn fk_child_object_ids(storage: &Storage, db_id: u32, parent_name: &str) -> Vec<u32> {
     storage
         .rel_tables()
         .into_iter()
         .filter(|t| {
-            t.foreign_keys
-                .iter()
-                .any(|fk| fk.parent.eq_ignore_ascii_case(parent_name))
+            t.database_id == db_id
+                && t.foreign_keys
+                    .iter()
+                    .any(|fk| fk.parent.eq_ignore_ascii_case(parent_name))
         })
         .map(|t| t.object_id)
         .collect()
@@ -2779,8 +2815,8 @@ fn fk_child_object_ids(storage: &Storage, parent_name: &str) -> Vec<u32> {
 /// FK parent. Such a table keeps table-granular write locks so an FK
 /// existence-read (Table IS on the parent) still serializes against a
 /// concurrent change to the referenced row.
-fn is_fk_parent(storage: &Storage, name: &str) -> bool {
-    !fk_child_object_ids(storage, name).is_empty()
+fn is_fk_parent(storage: &Storage, db_id: u32, name: &str) -> bool {
+    !fk_child_object_ids(storage, db_id, name).is_empty()
 }
 
 /// Above this many row-lock keys for one statement, `analyze_locks` escalates to
@@ -3034,6 +3070,7 @@ fn update_row_key_hash(def: &TableDef, update: &Update) -> Option<u64> {
 
 pub fn analyze_locks(
     storage: &Storage,
+    db_id: u32,
     sql: &str,
     isolation: Isolation,
 ) -> Vec<(Resource, LockMode)> {
@@ -3052,6 +3089,7 @@ pub fn analyze_locks(
     let mut trigger_visited = std::collections::HashSet::new();
     analyze_statements_locks(
         storage,
+        db_id,
         &parsed,
         isolation,
         &mut visited,
@@ -3061,6 +3099,7 @@ pub fn analyze_locks(
 
 fn analyze_statements_locks(
     storage: &Storage,
+    db_id: u32,
     parsed: &[Statement],
     isolation: Isolation,
     visited: &mut std::collections::HashSet<(String, Isolation)>,
@@ -3141,7 +3180,7 @@ fn analyze_statements_locks(
                 let mut tables = Vec::new();
                 collect_locked_tables(&expanded, &mut tables);
                 for name in tables {
-                    for oid in read_lock_object_ids(storage, &name.value) {
+                    for oid in read_lock_object_ids(storage, db_id, &name.value) {
                         add(Resource::Database, LockMode::IntentShared);
                         if !versioned_reads {
                             add(Resource::Table(oid), LockMode::Shared);
@@ -3151,7 +3190,7 @@ fn analyze_statements_locks(
                 // A scalar function the query calls reads tables through its
                 // body; lock those up front too (2PL), or the body would read
                 // with no lock held. read_lock_object_ids recurses the body.
-                for oid in select_function_read_ids(storage, &expanded) {
+                for oid in select_function_read_ids(storage, db_id, &expanded) {
                     add(Resource::Database, LockMode::IntentShared);
                     if !versioned_reads {
                         add(Resource::Table(oid), LockMode::Shared);
@@ -3159,7 +3198,7 @@ fn analyze_statements_locks(
                 }
             }
             Statement::Insert(insert) => {
-                if let Some(def) = resolve_table(storage, &insert.table.value) {
+                if let Some(def) = resolve_table(storage, db_id, &insert.table.value) {
                     // Row X locks on each inserted key (two inserters of
                     // different keys then run concurrently under Table IX); a
                     // heap / IDENTITY / non-literal key falls back to Table X.
@@ -3168,7 +3207,7 @@ fn analyze_statements_locks(
                     // secondary UNIQUE index likewise needs table-granular
                     // serialization (the PK Row X does not cover its key).
                     let hashes =
-                        if is_fk_parent(storage, &def.name) || has_secondary_unique_index(&def) {
+                        if is_fk_parent(storage, def.database_id, &def.name) || has_secondary_unique_index(&def) {
                             None
                         } else {
                             insert_row_key_hashes(&def, insert)
@@ -3194,6 +3233,7 @@ fn analyze_statements_locks(
                     // A firing AFTER-INSERT trigger's body reads/writes further
                     // tables; hold those locks up front too (strict 2PL).
                     add_trigger_locks(
+                        db_id,
                         storage,
                         def.object_id,
                         catalog::TriggerEvent::Insert,
@@ -3212,24 +3252,24 @@ fn analyze_statements_locks(
                     let mut tables = Vec::new();
                     collect_locked_tables(&expanded, &mut tables);
                     for name in tables {
-                        for oid in read_lock_object_ids(storage, &name.value) {
+                        for oid in read_lock_object_ids(storage, db_id, &name.value) {
                             add(Resource::Database, LockMode::IntentShared);
                             add(Resource::Table(oid), LockMode::Shared);
                         }
                     }
-                    for oid in select_function_read_ids(storage, &expanded) {
+                    for oid in select_function_read_ids(storage, db_id, &expanded) {
                         add(Resource::Database, LockMode::IntentShared);
                         add(Resource::Table(oid), LockMode::Shared);
                     }
                 }
             }
             Statement::Update(update) => {
-                if let Some(def) = resolve_table(storage, &update.table.value) {
+                if let Some(def) = resolve_table(storage, db_id, &update.table.value) {
                     // A point UPDATE (WHERE pins the whole key, no key-column
                     // write, no subquery) takes Table IX + a single Row X. An FK
                     // parent or a secondary UNIQUE index keeps Table X (see INSERT).
                     let hash =
-                        if is_fk_parent(storage, &def.name) || has_secondary_unique_index(&def) {
+                        if is_fk_parent(storage, def.database_id, &def.name) || has_secondary_unique_index(&def) {
                             None
                         } else {
                             update_row_key_hash(&def, update)
@@ -3251,11 +3291,12 @@ fn analyze_statements_locks(
                         add(Resource::Database, LockMode::IntentShared);
                         add(Resource::Table(oid), LockMode::Shared);
                     }
-                    for oid in fk_child_object_ids(storage, &def.name) {
+                    for oid in fk_child_object_ids(storage, def.database_id, &def.name) {
                         add(Resource::Database, LockMode::IntentShared);
                         add(Resource::Table(oid), LockMode::Shared);
                     }
                     add_trigger_locks(
+                        db_id,
                         storage,
                         def.object_id,
                         catalog::TriggerEvent::Update,
@@ -3267,11 +3308,11 @@ fn analyze_statements_locks(
                 }
             }
             Statement::Delete(delete) => {
-                if let Some(def) = resolve_table(storage, &delete.table.value) {
+                if let Some(def) = resolve_table(storage, db_id, &delete.table.value) {
                     // A point DELETE (WHERE pins the whole key, no subquery)
                     // takes Table IX + a single Row X. A table referenced as an
                     // FK parent keeps Table X (see INSERT).
-                    let hash = if is_fk_parent(storage, &def.name) {
+                    let hash = if is_fk_parent(storage, def.database_id, &def.name) {
                         None
                     } else {
                         where_point_key_hash(&def, &delete.where_clause)
@@ -3288,11 +3329,12 @@ fn analyze_statements_locks(
                         }
                     }
                     // DELETE reads referencing children (NO ACTION check).
-                    for oid in fk_child_object_ids(storage, &def.name) {
+                    for oid in fk_child_object_ids(storage, def.database_id, &def.name) {
                         add(Resource::Database, LockMode::IntentShared);
                         add(Resource::Table(oid), LockMode::Shared);
                     }
                     add_trigger_locks(
+                        db_id,
                         storage,
                         def.object_id,
                         catalog::TriggerEvent::Delete,
@@ -3327,7 +3369,7 @@ fn analyze_statements_locks(
                 // inner text, parsed with the IN-PROCEDURE grammar — a plain
                 // parse would reject `RETURN <value>` (178), yield no locks,
                 // and the body would run UNLOCKED (the 2PL hole class).
-                if let Some(def) = resolve_table(storage, &exec.proc.value)
+                if let Some(def) = resolve_table(storage, db_id, &exec.proc.value)
                     && let Some(procedure) = &def.procedure
                 {
                     let inner_isolation = if reads_lock {
@@ -3346,6 +3388,7 @@ fn analyze_statements_locks(
                     {
                         for (resource, mode) in analyze_statements_locks(
                             storage,
+                            db_id,
                             &body,
                             inner_isolation,
                             visited,
@@ -3393,6 +3436,7 @@ fn analyze_statements_locks(
                     if let Ok(parsed) = truthdb_sql::parse(&inner) {
                         for (resource, mode) in analyze_statements_locks(
                             storage,
+                            db_id,
                             &parsed,
                             inner_isolation,
                             visited,
@@ -3433,14 +3477,14 @@ fn analyze_statements_locks(
                 let mut tables = Vec::new();
                 collect_expr_tables(condition, &mut tables);
                 for name in tables {
-                    for oid in read_lock_object_ids(storage, &name.value) {
+                    for oid in read_lock_object_ids(storage, db_id, &name.value) {
                         add(Resource::Database, LockMode::IntentShared);
                         if !versioned_reads {
                             add(Resource::Table(oid), LockMode::Shared);
                         }
                     }
                 }
-                for oid in expr_function_read_ids(storage, condition) {
+                for oid in expr_function_read_ids(storage, db_id, condition) {
                     add(Resource::Database, LockMode::IntentShared);
                     if !versioned_reads {
                         add(Resource::Table(oid), LockMode::Shared);
@@ -3596,7 +3640,7 @@ fn exec_statement_dispatch(
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_create_procedure(storage, create)
+            exec_create_procedure(storage, txn_ctx.database_id(), create)
         }
         Statement::DropProcedure {
             name, if_exists, ..
@@ -3604,13 +3648,13 @@ fn exec_statement_dispatch(
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_drop_procedure(storage, name, *if_exists)
+            exec_drop_procedure(storage, txn_ctx.database_id(), name, *if_exists)
         }
         Statement::CreateFunction(create) => {
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_create_function(storage, create)
+            exec_create_function(storage, txn_ctx.database_id(), create)
         }
         Statement::DropFunction {
             name, if_exists, ..
@@ -3618,13 +3662,13 @@ fn exec_statement_dispatch(
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_drop_function(storage, name, *if_exists)
+            exec_drop_function(storage, txn_ctx.database_id(), name, *if_exists)
         }
         Statement::CreateTrigger(create) => {
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_create_trigger(storage, create)
+            exec_create_trigger(storage, txn_ctx.database_id(), create)
         }
         Statement::DropTrigger {
             name, if_exists, ..
@@ -3632,7 +3676,7 @@ fn exec_statement_dispatch(
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_drop_trigger(storage, name, *if_exists)
+            exec_drop_trigger(storage, txn_ctx.database_id(), name, *if_exists)
         }
         Statement::SetTriggerState {
             trigger,
@@ -3643,7 +3687,7 @@ fn exec_statement_dispatch(
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_set_trigger_state(storage, trigger, table, *enable)
+            exec_set_trigger_state(storage, txn_ctx.database_id(), trigger, table, *enable)
         }
         Statement::CreateLogin(create) => {
             if txn_ctx.in_txn() {
@@ -3702,7 +3746,7 @@ fn exec_statement_dispatch(
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_permission(storage, stmt, &txn_ctx.security)
+            exec_permission(storage, txn_ctx.database_id(), stmt, &txn_ctx.security)
         }
         Statement::BackupDatabase {
             path,
@@ -3811,44 +3855,44 @@ fn exec_statement_dispatch(
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_create_table(storage, create)
+            exec_create_table(storage, txn_ctx.database_id(), create)
         }
         Statement::DropTable(drop) => {
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_drop_table(storage, drop)
+            exec_drop_table(storage, txn_ctx.database_id(), drop)
         }
         Statement::CreateView(create) => {
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_create_view(storage, create)
+            exec_create_view(storage, txn_ctx.database_id(), create)
         }
         Statement::DropView(drop) => {
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_drop_view(storage, drop)
+            exec_drop_view(storage, txn_ctx.database_id(), drop)
         }
         Statement::CreateIndex(create) => {
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_create_index(storage, create)
+            exec_create_index(storage, txn_ctx.database_id(), create)
         }
         Statement::DropIndex(drop) => {
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
-            exec_drop_index(storage, drop)
+            exec_drop_index(storage, txn_ctx.database_id(), drop)
         }
         Statement::AlterTable(alter) => {
             if txn_ctx.in_txn() {
                 return Err(ddl_in_txn_err());
             }
             let eval_ctx = txn_ctx.eval_context();
-            exec_alter_table(storage, alter, &eval_ctx)
+            exec_alter_table(storage, txn_ctx.database_id(), alter, &eval_ctx)
         }
         Statement::AlterDatabase(alter) => {
             if txn_ctx.in_txn() {
@@ -3871,8 +3915,12 @@ fn exec_statement_dispatch(
                 let eval_ctx = txn_ctx.eval_context();
                 return exec_insert_table_var(storage, insert, txn_ctx, &eval_ctx);
             }
-            let (target, after, instead_of) =
-                triggers_for(storage, &insert.table.value, catalog::TriggerEvent::Insert);
+            let (target, after, instead_of) = triggers_for(
+                storage,
+                txn_ctx.database_id(),
+                &insert.table.value,
+                catalog::TriggerEvent::Insert,
+            );
             let run_insert = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
                 let eval_ctx = txn_ctx.eval_context();
                 let (result, identity) = {
@@ -3902,8 +3950,12 @@ fn exec_statement_dispatch(
             }
         }
         Statement::Update(update) => {
-            let (target, after, instead_of) =
-                triggers_for(storage, &update.table.value, catalog::TriggerEvent::Update);
+            let (target, after, instead_of) = triggers_for(
+                storage,
+                txn_ctx.database_id(),
+                &update.table.value,
+                catalog::TriggerEvent::Update,
+            );
             let run_update = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
                 let eval_ctx = txn_ctx.eval_context();
                 let mut scope = txn_ctx.scope();
@@ -3925,8 +3977,12 @@ fn exec_statement_dispatch(
             }
         }
         Statement::Delete(delete) => {
-            let (target, after, instead_of) =
-                triggers_for(storage, &delete.table.value, catalog::TriggerEvent::Delete);
+            let (target, after, instead_of) = triggers_for(
+                storage,
+                txn_ctx.database_id(),
+                &delete.table.value,
+                catalog::TriggerEvent::Delete,
+            );
             let run_delete = |txn_ctx: &mut TxnContext| -> Result<StatementResult, SqlError> {
                 let eval_ctx = txn_ctx.eval_context();
                 let mut scope = txn_ctx.scope();
@@ -4050,7 +4106,7 @@ fn showplan_rows(
         Some(TableRef::Table { name, .. })
             if !name.value.to_ascii_lowercase().starts_with("sys.") =>
         {
-            match resolve_table(storage, &name.value) {
+            match resolve_table(storage, eval_ctx.database_id, &name.value) {
                 Some(def) => {
                     // The scan shape carries the covering decision (it knows
                     // which columns the query reads); other shapes never
@@ -4064,7 +4120,7 @@ fn showplan_rows(
                         let row_count = if def.indexes.is_empty() || select.where_clause.is_none() {
                             None
                         } else {
-                            storage.rel_row_count(&def.name)
+                            storage.rel_row_count(def.database_id, &def.name)
                         };
                         let path = plan::choose(
                             &def,
@@ -4945,11 +5001,15 @@ fn coerce_variable(
 
 // ---- CREATE TABLE -------------------------------------------------------
 
-fn exec_create_table(storage: &Storage, create: &CreateTable) -> Result<StatementResult, SqlError> {
+fn exec_create_table(
+    storage: &Storage,
+    db_id: u32,
+    create: &CreateTable,
+) -> Result<StatementResult, SqlError> {
     // Strip an optional `dbo.` schema prefix so the table is stored (and
     // later resolved) under its bare name.
     let table_name = strip_schema(&create.table.value);
-    if resolve_table(storage, table_name).is_some() {
+    if resolve_table(storage, db_id, table_name).is_some() {
         return Err(SqlError::new(
             2714,
             16,
@@ -5077,7 +5137,8 @@ fn exec_create_table(storage: &Storage, create: &CreateTable) -> Result<Statemen
     // table's primary key and order each child column to the parent's PK.
     // Constraint names are unique across kinds, so seed with the check names.
     let check_names: Vec<String> = check_constraints.iter().map(|c| c.name.clone()).collect();
-    let foreign_keys = build_foreign_key_defs(storage, create, &columns, table_name, &check_names)?;
+    let foreign_keys =
+        build_foreign_key_defs(db_id, storage, create, &columns, table_name, &check_names)?;
 
     // UNIQUE constraints become unique indexes. Resolve their columns now (while
     // `columns` is in hand) so an invalid column errors before the table exists.
@@ -5101,6 +5162,7 @@ fn exec_create_table(storage: &Storage, create: &CreateTable) -> Result<Statemen
 
     storage
         .rel_create_table(
+            db_id,
             table_name,
             columns,
             &key_names,
@@ -5112,7 +5174,7 @@ fn exec_create_table(storage: &Storage, create: &CreateTable) -> Result<Statemen
         .map_err(|err| map_storage_err(err, table_name))?;
     for (name, cols) in unique_indexes {
         storage
-            .rel_create_index(table_name, name, cols, true, Vec::new())
+            .rel_create_index(db_id, table_name, name, cols, true, Vec::new())
             .map_err(|err| map_storage_err(err, table_name))?;
     }
     Ok(StatementResult::Done)
@@ -5123,6 +5185,7 @@ fn exec_create_table(storage: &Storage, create: &CreateTable) -> Result<Statemen
 /// already taken by the table's CHECK constraints so a FK cannot reuse one
 /// (constraint names are unique across kinds).
 fn build_foreign_key_defs(
+    db_id: u32,
     storage: &Storage,
     create: &CreateTable,
     columns: &[Column],
@@ -5160,7 +5223,7 @@ fn build_foreign_key_defs(
         let parent_pk: Vec<(String, ColumnType)> = if is_self {
             self_pk()?
         } else {
-            let parent = resolve_table(storage, &fk.parent.value)
+            let parent = resolve_table(storage, db_id, &fk.parent.value)
                 .ok_or_else(|| SqlError::invalid_object(&fk.parent.value).at(fk.parent.span))?;
             let schema = parent
                 .schema()
@@ -5504,7 +5567,7 @@ fn enforce_checks(
         // A user scalar function (or subquery) in the CHECK is folded against the
         // row before the pure evaluator runs, like the other clause positions.
         let bound;
-        let expr = if expr_needs_binding(storage, expr) {
+        let expr = if expr_needs_binding(storage, eval_ctx.database_id, expr) {
             let outer = |n: &str| resolver.resolve(n);
             bound = substitute_correlated_in_expr(storage, expr, &outer, row, eval_ctx)?;
             &bound
@@ -5561,7 +5624,7 @@ fn fk_parent_exists(
     batch: &[Vec<Datum>],
 ) -> Result<bool, SqlError> {
     if storage
-        .rel_get(&fk.parent, key)
+        .rel_get(child.database_id, &fk.parent, key)
         .map_err(|e| map_storage_err(e, &fk.parent))?
         .is_some()
     {
@@ -5738,6 +5801,7 @@ fn enforce_parent_fks(
                             let upper = crate::relstore::index::prefix_upper_bound(&lower);
                             let matches = storage
                                 .rel_index_scan(
+                                    child.database_id,
                                     &child.name,
                                     index.object_id,
                                     Some(lower),
@@ -5765,7 +5829,7 @@ fn enforce_parent_fks(
             }
             // Fallback: scan the child and compare each row's FK key.
             let child_rows = storage
-                .rel_scan(&child.name)
+                .rel_scan(child.database_id, &child.name)
                 .map_err(|e| map_storage_err(e, &child.name))?;
             for row in &child_rows {
                 // A self-referencing row that is itself being removed does not
@@ -5896,12 +5960,16 @@ fn length(n: u32, name: &str) -> Result<u16, SqlError> {
 
 // ---- DROP TABLE ---------------------------------------------------------
 
-fn exec_drop_table(storage: &Storage, drop: &DropTable) -> Result<StatementResult, SqlError> {
+fn exec_drop_table(
+    storage: &Storage,
+    db_id: u32,
+    drop: &DropTable,
+) -> Result<StatementResult, SqlError> {
     // DROP TABLE does not drop a view or a procedure (use the matching DROP).
     // The object exists but is the wrong type, so error even under IF EXISTS
     // rather than silently no-op — the review showed DROP TABLE silently
     // DESTROYING a procedure through the shared catalog path.
-    if resolve_table(storage, &drop.table.value)
+    if resolve_table(storage, db_id, &drop.table.value)
         .is_some_and(|d| d.is_view() || d.is_procedure() || d.is_function() || d.is_trigger())
     {
         return Err(SqlError::new(
@@ -5914,7 +5982,7 @@ fn exec_drop_table(storage: &Storage, drop: &DropTable) -> Result<StatementResul
             ),
         ));
     }
-    let name = resolve_table(storage, &drop.table.value).map(|d| d.name);
+    let name = resolve_table(storage, db_id, &drop.table.value).map(|d| d.name);
     match name {
         Some(name) => {
             // A table still referenced by another table's foreign key cannot be
@@ -5943,7 +6011,7 @@ fn exec_drop_table(storage: &Storage, drop: &DropTable) -> Result<StatementResul
             // Cascade-drop the table's triggers — a trigger outlives its parent
             // table nowhere in SQL Server, and an orphan would permanently block
             // its own name (and dangle in sys.triggers).
-            if let Some(parent_oid) = resolve_table(storage, &name).map(|d| d.object_id) {
+            if let Some(parent_oid) = resolve_table(storage, db_id, &name).map(|d| d.object_id) {
                 let orphan_triggers: Vec<String> = storage
                     .rel_tables()
                     .into_iter()
@@ -5956,12 +6024,12 @@ fn exec_drop_table(storage: &Storage, drop: &DropTable) -> Result<StatementResul
                     .collect();
                 for trigger_name in orphan_triggers {
                     storage
-                        .rel_drop_table(&trigger_name)
+                        .rel_drop_table(db_id, &trigger_name)
                         .map_err(|err| map_storage_err(err, &trigger_name))?;
                 }
             }
             storage
-                .rel_drop_table(&name)
+                .rel_drop_table(db_id, &name)
                 .map_err(|err| map_storage_err(err, &drop.table.value))?;
             Ok(StatementResult::Done)
         }
@@ -5992,9 +6060,13 @@ fn parse_view_query(text: &str, view_name: &str) -> Result<Select, SqlError> {
     }
 }
 
-fn exec_create_view(storage: &Storage, create: &CreateView) -> Result<StatementResult, SqlError> {
+fn exec_create_view(
+    storage: &Storage,
+    db_id: u32,
+    create: &CreateView,
+) -> Result<StatementResult, SqlError> {
     let bare = strip_schema(&create.name.value);
-    if resolve_table(storage, &create.name.value).is_some() {
+    if resolve_table(storage, db_id, &create.name.value).is_some() {
         return Err(SqlError::new(
             2714,
             16,
@@ -6007,7 +6079,7 @@ fn exec_create_view(storage: &Storage, create: &CreateView) -> Result<StatementR
     // resolution — a view over a not-yet-created table is allowed).
     parse_view_query(&create.query_text, bare)?;
     storage
-        .rel_create_view(bare, &create.query_text)
+        .rel_create_view(db_id, bare, &create.query_text)
         .map_err(|e| map_storage_err(e, &create.name.value))?;
     Ok(StatementResult::Done)
 }
@@ -6030,6 +6102,7 @@ fn constant_default(expr: &Expr) -> bool {
 
 fn exec_create_procedure(
     storage: &Storage,
+    db_id: u32,
     create: &CreateProcedure,
 ) -> Result<StatementResult, SqlError> {
     let bare = strip_schema(&create.name.value);
@@ -6080,10 +6153,10 @@ fn exec_create_procedure(
         body: create.body.clone(),
     };
     if create.alter {
-        match resolve_table(storage, &create.name.value) {
+        match resolve_table(storage, db_id, &create.name.value) {
             Some(def) if def.is_procedure() => {
                 storage
-                    .rel_alter_procedure(&def.name, procedure)
+                    .rel_alter_procedure(def.database_id, &def.name, procedure)
                     .map_err(|e| map_storage_err(e, &create.name.value))?;
                 return Ok(StatementResult::Done);
             }
@@ -6092,7 +6165,7 @@ fn exec_create_procedure(
             }
         }
     }
-    if resolve_table(storage, &create.name.value).is_some() {
+    if resolve_table(storage, db_id, &create.name.value).is_some() {
         return Err(SqlError::new(
             2714,
             16,
@@ -6101,20 +6174,21 @@ fn exec_create_procedure(
         ));
     }
     storage
-        .rel_create_procedure(bare, procedure)
+        .rel_create_procedure(db_id, bare, procedure)
         .map_err(|e| map_storage_err(e, &create.name.value))?;
     Ok(StatementResult::Done)
 }
 
 fn exec_drop_procedure(
     storage: &Storage,
+    db_id: u32,
     name: &Name,
     if_exists: bool,
 ) -> Result<StatementResult, SqlError> {
-    match resolve_table(storage, &name.value) {
+    match resolve_table(storage, db_id, &name.value) {
         Some(def) if def.is_procedure() => {
             storage
-                .rel_drop_table(&def.name)
+                .rel_drop_table(def.database_id, &def.name)
                 .map_err(|e| map_storage_err(e, &def.name))?;
             Ok(StatementResult::Done)
         }
@@ -6134,6 +6208,7 @@ fn exec_drop_procedure(
 
 fn exec_create_function(
     storage: &Storage,
+    db_id: u32,
     create: &CreateFunction,
 ) -> Result<StatementResult, SqlError> {
     let bare = strip_schema(&create.name.value);
@@ -6207,10 +6282,10 @@ fn exec_create_function(
     };
     let function = FunctionDef { params, returns };
     if create.alter {
-        match resolve_table(storage, &create.name.value) {
+        match resolve_table(storage, db_id, &create.name.value) {
             Some(def) if def.is_function() => {
                 storage
-                    .rel_alter_function(&def.name, function)
+                    .rel_alter_function(def.database_id, &def.name, function)
                     .map_err(|e| map_storage_err(e, &create.name.value))?;
                 return Ok(StatementResult::Done);
             }
@@ -6219,7 +6294,7 @@ fn exec_create_function(
             }
         }
     }
-    if resolve_table(storage, &create.name.value).is_some() {
+    if resolve_table(storage, db_id, &create.name.value).is_some() {
         return Err(SqlError::new(
             2714,
             16,
@@ -6228,7 +6303,7 @@ fn exec_create_function(
         ));
     }
     storage
-        .rel_create_function(bare, function)
+        .rel_create_function(db_id, bare, function)
         .map_err(|e| map_storage_err(e, &create.name.value))?;
     Ok(StatementResult::Done)
 }
@@ -6368,13 +6443,14 @@ fn check_multi_tvf_statement(statement: &Statement) -> Result<(), SqlError> {
 
 fn exec_drop_function(
     storage: &Storage,
+    db_id: u32,
     name: &Name,
     if_exists: bool,
 ) -> Result<StatementResult, SqlError> {
-    match resolve_table(storage, &name.value) {
+    match resolve_table(storage, db_id, &name.value) {
         Some(def) if def.is_function() => {
             storage
-                .rel_drop_table(&def.name)
+                .rel_drop_table(def.database_id, &def.name)
                 .map_err(|e| map_storage_err(e, &def.name))?;
             Ok(StatementResult::Done)
         }
@@ -6396,12 +6472,13 @@ fn exec_drop_function(
 /// an AFTER DML trigger as a catalog object attached to its target table.
 fn exec_create_trigger(
     storage: &Storage,
+    db_id: u32,
     create: &CreateTrigger,
 ) -> Result<StatementResult, SqlError> {
     let bare = strip_schema(&create.name.value);
     // The target must be an existing base table (not a view/procedure/function/
     // trigger). SQL Server 4929-class.
-    let target = resolve_table(storage, &create.target.value)
+    let target = resolve_table(storage, db_id, &create.target.value)
         .ok_or_else(|| SqlError::invalid_object(&create.target.value).at(create.target.span))?;
     if target.is_view() || target.is_procedure() || target.is_function() || target.is_trigger() {
         return Err(SqlError::new(
@@ -6458,10 +6535,10 @@ fn exec_create_trigger(
         is_instead_of: create.instead_of,
     };
     if create.alter {
-        match resolve_table(storage, &create.name.value) {
+        match resolve_table(storage, db_id, &create.name.value) {
             Some(def) if def.is_trigger() => {
                 storage
-                    .rel_alter_trigger(&def.name, trigger)
+                    .rel_alter_trigger(def.database_id, &def.name, trigger)
                     .map_err(|e| map_storage_err(e, &create.name.value))?;
                 return Ok(StatementResult::Done);
             }
@@ -6470,7 +6547,7 @@ fn exec_create_trigger(
             }
         }
     }
-    if resolve_table(storage, &create.name.value).is_some() {
+    if resolve_table(storage, db_id, &create.name.value).is_some() {
         return Err(SqlError::new(
             2714,
             16,
@@ -6479,20 +6556,21 @@ fn exec_create_trigger(
         ));
     }
     storage
-        .rel_create_trigger(bare, trigger)
+        .rel_create_trigger(db_id, bare, trigger)
         .map_err(|e| map_storage_err(e, &create.name.value))?;
     Ok(StatementResult::Done)
 }
 
 fn exec_drop_trigger(
     storage: &Storage,
+    db_id: u32,
     name: &Name,
     if_exists: bool,
 ) -> Result<StatementResult, SqlError> {
-    match resolve_table(storage, &name.value) {
+    match resolve_table(storage, db_id, &name.value) {
         Some(def) if def.is_trigger() => {
             storage
-                .rel_drop_table(&def.name)
+                .rel_drop_table(def.database_id, &def.name)
                 .map_err(|e| map_storage_err(e, &def.name))?;
             Ok(StatementResult::Done)
         }
@@ -6515,11 +6593,12 @@ fn exec_drop_trigger(
 /// in the catalog but does not fire.
 fn exec_set_trigger_state(
     storage: &Storage,
+    db_id: u32,
     trigger: &Option<Name>,
     table: &Name,
     enable: bool,
 ) -> Result<StatementResult, SqlError> {
-    let target = resolve_table(storage, &table.value)
+    let target = resolve_table(storage, db_id, &table.value)
         .ok_or_else(|| SqlError::invalid_object(&table.value).at(table.span))?;
     if target.is_view() || target.is_procedure() || target.is_function() || target.is_trigger() {
         return Err(SqlError::invalid_object(&table.value).at(table.span));
@@ -6528,12 +6607,12 @@ fn exec_set_trigger_state(
         let mut td = def.trigger.clone().expect("is_trigger");
         td.is_disabled = !enable;
         storage
-            .rel_alter_trigger(&def.name, td)
+            .rel_alter_trigger(def.database_id, &def.name, td)
             .map_err(|e| map_storage_err(e, &def.name))
     };
     match trigger {
         Some(name) => {
-            let def = resolve_table(storage, &name.value)
+            let def = resolve_table(storage, db_id, &name.value)
                 .filter(|d| d.is_trigger())
                 .filter(|d| {
                     d.trigger.as_ref().map(|t| t.parent_object_id) == Some(target.object_id)
@@ -6773,11 +6852,12 @@ fn map_perm_action(action: PermissionAction) -> PermAction {
 /// resolve the securable and apply each (grantee, action).
 fn exec_permission(
     storage: &Storage,
+    db_id: u32,
     stmt: &PermissionStatement,
     _sec: &SecurityContext,
 ) -> Result<StatementResult, SqlError> {
     // The securable must be a schema object (table, view, procedure, function).
-    let Some(def) = resolve_table(storage, &stmt.object.value) else {
+    let Some(def) = resolve_table(storage, db_id, &stmt.object.value) else {
         return Err(SqlError::invalid_object(&stmt.object.value).at(stmt.object.span));
     };
     if def.is_trigger() {
@@ -6789,15 +6869,26 @@ fn exec_permission(
         for action in &stmt.actions {
             let catalog_action = map_perm_action(*action);
             match stmt.kind {
-                PermissionKind::Grant => {
-                    storage.rel_grant_object(&object, grantee_bare, catalog_action, false)
-                }
-                PermissionKind::Deny => {
-                    storage.rel_grant_object(&object, grantee_bare, catalog_action, true)
-                }
-                PermissionKind::Revoke => {
-                    storage.rel_revoke_object(&object, grantee_bare, catalog_action)
-                }
+                PermissionKind::Grant => storage.rel_grant_object(
+                    def.database_id,
+                    &object,
+                    grantee_bare,
+                    catalog_action,
+                    false,
+                ),
+                PermissionKind::Deny => storage.rel_grant_object(
+                    def.database_id,
+                    &object,
+                    grantee_bare,
+                    catalog_action,
+                    true,
+                ),
+                PermissionKind::Revoke => storage.rel_revoke_object(
+                    def.database_id,
+                    &object,
+                    grantee_bare,
+                    catalog_action,
+                ),
             }
             .map_err(|e| map_storage_err(e, &grantee.value).at(grantee.span))?;
         }
@@ -6849,13 +6940,14 @@ fn is_privileged_ddl(stmt: &Statement) -> bool {
 /// after the DML) and the at-most-one INSTEAD OF trigger (fired in place of it).
 fn triggers_for(
     storage: &Storage,
+    db_id: u32,
     target_name: &str,
     event: catalog::TriggerEvent,
 ) -> (Option<TableDef>, Vec<TableDef>, Option<TableDef>) {
     if !storage.rel_has_triggers() {
         return (None, Vec::new(), None);
     }
-    match resolve_table(storage, target_name) {
+    match resolve_table(storage, db_id, target_name) {
         Some(def)
             if def.trigger.is_none()
                 && def.procedure.is_none()
@@ -7054,7 +7146,7 @@ fn instead_of_update_images(
     let mut old_rows = Vec::new();
     let mut new_rows = Vec::new();
     for row in storage
-        .rel_scan(&def.name)
+        .rel_scan(def.database_id, &def.name)
         .map_err(|e| map_storage_err(e, &def.name))?
     {
         check_cancelled()?;
@@ -7090,7 +7182,7 @@ fn instead_of_delete_images(
     let types = schema_types(&schema);
     let mut deleted = Vec::new();
     for row in storage
-        .rel_scan(&def.name)
+        .rel_scan(def.database_id, &def.name)
         .map_err(|e| map_storage_err(e, &def.name))?
     {
         check_cancelled()?;
@@ -7175,11 +7267,15 @@ fn fire_one_trigger(
     result
 }
 
-fn exec_drop_view(storage: &Storage, drop: &DropView) -> Result<StatementResult, SqlError> {
-    match resolve_table(storage, &drop.name.value) {
+fn exec_drop_view(
+    storage: &Storage,
+    db_id: u32,
+    drop: &DropView,
+) -> Result<StatementResult, SqlError> {
+    match resolve_table(storage, db_id, &drop.name.value) {
         Some(def) if def.is_view() => {
             storage
-                .rel_drop_table(&def.name)
+                .rel_drop_table(def.database_id, &def.name)
                 .map_err(|e| map_storage_err(e, &def.name))?;
             Ok(StatementResult::Done)
         }
@@ -7221,8 +7317,12 @@ fn max_key_column_error(column: &str, table: &str) -> SqlError {
     )
 }
 
-fn exec_create_index(storage: &Storage, create: &CreateIndex) -> Result<StatementResult, SqlError> {
-    let def = resolve_table(storage, &create.table.value)
+fn exec_create_index(
+    storage: &Storage,
+    db_id: u32,
+    create: &CreateIndex,
+) -> Result<StatementResult, SqlError> {
+    let def = resolve_table(storage, db_id, &create.table.value)
         .ok_or_else(|| SqlError::invalid_object(&create.table.value).at(create.table.span))?;
     reject_view_as_table(&def)?;
     let schema = def.schema().map_err(|e| map_storage_err(e, &def.name))?;
@@ -7272,6 +7372,7 @@ fn exec_create_index(storage: &Storage, create: &CreateIndex) -> Result<Statemen
     }
     storage
         .rel_create_index(
+            def.database_id,
             &def.name,
             create.name.value.clone(),
             columns,
@@ -7293,13 +7394,17 @@ fn index_column_missing(column: &str, table: &str) -> SqlError {
     )
 }
 
-fn exec_drop_index(storage: &Storage, drop: &DropIndex) -> Result<StatementResult, SqlError> {
+fn exec_drop_index(
+    storage: &Storage,
+    db_id: u32,
+    drop: &DropIndex,
+) -> Result<StatementResult, SqlError> {
     // Resolve the table so the index lookup is scoped to it (index names are
     // per-table; two tables may share an index name).
-    let table = resolve_table(storage, &drop.table.value)
+    let table = resolve_table(storage, db_id, &drop.table.value)
         .ok_or_else(|| SqlError::invalid_object(&drop.table.value).at(drop.table.span))?;
     let existed = storage
-        .rel_drop_index(&table.name, &drop.name.value)
+        .rel_drop_index(table.database_id, &table.name, &drop.name.value)
         .map_err(|e| map_storage_err(e, &drop.name.value))?;
     if !existed {
         return Err(SqlError::new(
@@ -7395,16 +7500,17 @@ fn exec_alter_database(
 
 fn exec_alter_table(
     storage: &Storage,
+    db_id: u32,
     alter: &AlterTable,
     eval_ctx: &EvalContext,
 ) -> Result<StatementResult, SqlError> {
-    let def = resolve_table(storage, &alter.table.value)
+    let def = resolve_table(storage, db_id, &alter.table.value)
         .ok_or_else(|| SqlError::invalid_object(&alter.table.value).at(alter.table.span))?;
     reject_view_as_table(&def)?;
     match &alter.action {
         AlterAction::AddColumn(column) => alter_add_column(storage, &def, column, eval_ctx),
         AlterAction::AddCheck(check) => alter_add_check(storage, &def, check, eval_ctx),
-        AlterAction::AddForeignKey(fk) => alter_add_foreign_key(storage, &def, fk),
+        AlterAction::AddForeignKey(fk) => alter_add_foreign_key(storage, db_id, &def, fk),
         AlterAction::DropConstraint(name) => alter_drop_constraint(storage, &def, name),
     }
 }
@@ -7414,6 +7520,7 @@ fn exec_alter_table(
 /// referencing a missing parent is 547 and the constraint is not added.
 fn alter_add_foreign_key(
     storage: &Storage,
+    db_id: u32,
     def: &TableDef,
     fk: &ForeignKey,
 ) -> Result<StatementResult, SqlError> {
@@ -7430,7 +7537,7 @@ fn alter_add_foreign_key(
             })
             .collect()
     } else {
-        let parent = resolve_table(storage, &fk.parent.value)
+        let parent = resolve_table(storage, db_id, &fk.parent.value)
             .ok_or_else(|| SqlError::invalid_object(&fk.parent.value).at(fk.parent.span))?;
         let pschema = parent
             .schema()
@@ -7464,7 +7571,7 @@ fn alter_add_foreign_key(
     // WITH CHECK: every existing child row must satisfy the new foreign key
     // (its sibling rows count for a self-reference).
     let rows = storage
-        .rel_scan(&def.name)
+        .rel_scan(def.database_id, &def.name)
         .map_err(|e| map_storage_err(e, &def.name))?;
     for row in &rows {
         if let Some(key) = fk_key(&new_def, row)
@@ -7481,7 +7588,7 @@ fn alter_add_foreign_key(
     let mut fks = def.foreign_keys.clone();
     fks.push(new_def);
     storage
-        .rel_set_foreign_keys(&def.name, fks)
+        .rel_set_foreign_keys(def.database_id, &def.name, fks)
         .map_err(|e| map_storage_err(e, &def.name))?;
     Ok(StatementResult::Done)
 }
@@ -7541,7 +7648,14 @@ fn alter_add_column(
     let has_rows = {
         let mut probe = Vec::new();
         storage
-            .rel_scan_slice(&def.name, ScanCursor::start(), 1, None, &mut probe)
+            .rel_scan_slice(
+                def.database_id,
+                &def.name,
+                ScanCursor::start(),
+                1,
+                None,
+                &mut probe,
+            )
             .map_err(|err| map_storage_err(err, &def.name))?;
         !probe.is_empty()
     };
@@ -7566,7 +7680,13 @@ fn alter_add_column(
         .at(column.span));
     }
     storage
-        .rel_alter_add_column(&def.name, bound, column.default.clone(), fill)
+        .rel_alter_add_column(
+            def.database_id,
+            &def.name,
+            bound,
+            column.default.clone(),
+            fill,
+        )
         .map_err(|err| map_storage_err(err, &def.name))?;
     Ok(StatementResult::Done)
 }
@@ -7598,7 +7718,7 @@ fn alter_add_check(
     let resolver = SchemaScope { schema: &schema };
     let types = schema_types(&schema);
     let rows = storage
-        .rel_scan(&def.name)
+        .rel_scan(def.database_id, &def.name)
         .map_err(|e| map_storage_err(e, &def.name))?;
     for row in &rows {
         let scope = row_values(row, &types);
@@ -7616,7 +7736,7 @@ fn alter_add_check(
     let mut checks = def.check_constraints.clone();
     checks.push(new_def);
     storage
-        .rel_set_check_constraints(&def.name, checks)
+        .rel_set_check_constraints(def.database_id, &def.name, checks)
         .map_err(|e| map_storage_err(e, &def.name))?;
     Ok(StatementResult::Done)
 }
@@ -7640,7 +7760,7 @@ fn alter_drop_constraint(
             .cloned()
             .collect();
         storage
-            .rel_set_check_constraints(&def.name, checks)
+            .rel_set_check_constraints(def.database_id, &def.name, checks)
             .map_err(|e| map_storage_err(e, &def.name))?;
         return Ok(StatementResult::Done);
     }
@@ -7656,7 +7776,7 @@ fn alter_drop_constraint(
             .cloned()
             .collect();
         storage
-            .rel_set_foreign_keys(&def.name, fks)
+            .rel_set_foreign_keys(def.database_id, &def.name, fks)
             .map_err(|e| map_storage_err(e, &def.name))?;
         return Ok(StatementResult::Done);
     }
@@ -7677,7 +7797,7 @@ fn exec_insert(
     scope: &mut TxnScope,
     eval_ctx: &EvalContext,
 ) -> Result<(StatementResult, Option<i64>), SqlError> {
-    let def = resolve_table(storage, &insert.table.value)
+    let def = resolve_table(storage, eval_ctx.database_id, &insert.table.value)
         .ok_or_else(|| SqlError::invalid_object(&insert.table.value).at(insert.table.span))?;
     reject_dml_on_view(&def)?;
     enforce_object_permission(&def, &eval_ctx.security, PermAction::Insert)
@@ -7741,7 +7861,7 @@ fn exec_insert(
     // consumes them (a gap), but a value is never reused (SQL Server-faithful).
     let identity_first = if identity_col.is_some() {
         storage
-            .rel_reserve_identity(&def.name, input_rows.len())
+            .rel_reserve_identity(def.database_id, &def.name, input_rows.len())
             .map_err(|e| map_storage_err(e, &def.name))?
     } else {
         None
@@ -7817,7 +7937,7 @@ fn exec_insert(
     capture_trigger_updated((0..ncols).collect());
     let inserted = rows.len() as u64;
     storage
-        .rel_insert_many(&def.name, rows, scope)
+        .rel_insert_many(def.database_id, &def.name, rows, scope)
         .map_err(|err| map_storage_err(err, &def.name))?;
     // The last identity value generated (for SCOPE_IDENTITY()): the reserved
     // first value plus the increment for each subsequent row. `None` when the
@@ -8058,10 +8178,10 @@ fn scan_located_for_dml(
 ) -> Result<Vec<(RowLocator, Vec<Datum>, bool)>, SqlError> {
     match current_snapshot() {
         Some(snap) => storage
-            .rel_scan_located_snapshot(&def.name, snap)
+            .rel_scan_located_snapshot(def.database_id, &def.name, snap)
             .map_err(|e| map_storage_err(e, &def.name)),
         None => Ok(storage
-            .rel_scan_located(&def.name)
+            .rel_scan_located(def.database_id, &def.name)
             .map_err(|e| map_storage_err(e, &def.name))?
             .into_iter()
             .map(|(locator, row)| (locator, row, false))
@@ -8093,7 +8213,7 @@ fn exec_update(
     scope: &mut TxnScope,
     eval_ctx: &EvalContext,
 ) -> Result<StatementResult, SqlError> {
-    let def = resolve_table(storage, &update.table.value)
+    let def = resolve_table(storage, eval_ctx.database_id, &update.table.value)
         .ok_or_else(|| SqlError::invalid_object(&update.table.value).at(update.table.span))?;
     reject_dml_on_view(&def)?;
     enforce_object_permission(&def, &eval_ctx.security, PermAction::Update)
@@ -8206,7 +8326,7 @@ fn exec_update(
     {
         let old_pks: Vec<Vec<Datum>> = updates.iter().map(|(_, old, _)| pk_of(&def, old)).collect();
         let mut post_rows: Vec<Vec<Datum>> = storage
-            .rel_scan(&def.name)
+            .rel_scan(def.database_id, &def.name)
             .map_err(|e| map_storage_err(e, &def.name))?
             .into_iter()
             .filter(|r| !old_pks.contains(&pk_of(&def, r)))
@@ -8251,7 +8371,7 @@ fn exec_update(
     });
     capture_trigger_updated(assignments.iter().map(|(i, _)| *i).collect());
     let count = storage
-        .rel_update_located(&def.name, updates, scope)
+        .rel_update_located(def.database_id, &def.name, updates, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
     Ok(StatementResult::RowsAffected(count as u64))
 }
@@ -8262,7 +8382,7 @@ fn exec_delete(
     scope: &mut TxnScope,
     eval_ctx: &EvalContext,
 ) -> Result<StatementResult, SqlError> {
-    let def = resolve_table(storage, &delete.table.value)
+    let def = resolve_table(storage, eval_ctx.database_id, &delete.table.value)
         .ok_or_else(|| SqlError::invalid_object(&delete.table.value).at(delete.table.span))?;
     reject_dml_on_view(&def)?;
     enforce_object_permission(&def, &eval_ctx.security, PermAction::Delete)
@@ -8299,7 +8419,7 @@ fn exec_delete(
         )
     });
     let count = storage
-        .rel_delete_located(&def.name, targets, scope)
+        .rel_delete_located(def.database_id, &def.name, targets, scope)
         .map_err(|e| map_storage_err(e, &def.name))?;
     Ok(StatementResult::RowsAffected(count as u64))
 }
@@ -8399,6 +8519,7 @@ enum SourceRows {
 /// either (the cursor's per-page object check safe-stops on a recycled
 /// page, as the B+ tree layer documents).
 struct ScanStream {
+    db_id: u32,
     table: String,
     cursor: ScanCursor,
 }
@@ -8409,7 +8530,14 @@ impl ScanStream {
         while !self.cursor.done() && slice.is_empty() {
             check_cancelled()?;
             self.cursor = storage
-                .rel_scan_slice(&self.table, self.cursor, SCAN_SLICE_ROWS, None, &mut slice)
+                .rel_scan_slice(
+                    self.db_id,
+                    &self.table,
+                    self.cursor,
+                    SCAN_SLICE_ROWS,
+                    None,
+                    &mut slice,
+                )
                 .map_err(|err| map_storage_err(err, &self.table))?;
         }
         Ok(if slice.is_empty() { None } else { Some(slice) })
@@ -8857,7 +8985,7 @@ fn rewrite_select_subqueries(
     let self_scope = select
         .from
         .as_ref()
-        .and_then(|from| from_column_names(storage, from))
+        .and_then(|from| from_column_names(storage, eval_ctx.database_id, from))
         .map(|columns| JoinScope {
             collations: Vec::new(),
             columns,
@@ -8934,7 +9062,8 @@ fn rewrite_subqueries(
     // in place — the per-row WHERE loop substitutes its outer references and runs
     // it once per outer row (`substitute_correlated_in_expr`).
     let leave_correlated = |select: &Select| {
-        correlated_scope.is_some_and(|scope| is_correlated(storage, select, scope))
+        correlated_scope
+            .is_some_and(|scope| is_correlated(storage, eval_ctx.database_id, select, scope))
     };
     let kind = match &expr.kind {
         ExprKind::Subquery(select) if leave_correlated(select) => expr.kind.clone(),
@@ -9131,10 +9260,14 @@ fn scalar_subquery_shape_err() -> SqlError {
 /// The `(qualifier, bare column name)` columns a FROM clause exposes, read from
 /// the catalog WITHOUT materializing rows. `None` if the FROM has a derived
 /// table or a view, whose output columns need binding to determine.
-fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<String>, String)>> {
+fn from_column_names(
+    storage: &Storage,
+    db_id: u32,
+    from: &TableRef,
+) -> Option<Vec<(Option<String>, String)>> {
     match from {
         TableRef::Table { name, alias } => {
-            let def = resolve_table(storage, &name.value)?;
+            let def = resolve_table(storage, db_id, &name.value)?;
             // A view defers to its expansion; a PROCEDURE/FUNCTION/TRIGGER must
             // not read as a zero-column table — bailing here routes to the
             // collecting path, which errors 2809/208.
@@ -9153,8 +9286,8 @@ fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<S
             )
         }
         TableRef::Join { left, right, .. } => {
-            let mut cols = from_column_names(storage, left)?;
-            cols.extend(from_column_names(storage, right)?);
+            let mut cols = from_column_names(storage, db_id, left)?;
+            cols.extend(from_column_names(storage, db_id, right)?);
             Some(cols)
         }
         TableRef::Derived { subquery, alias } => {
@@ -9169,7 +9302,7 @@ fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<S
                         cols.push((Some(alias.value.clone()), name));
                     }
                     SelectItem::Wildcard => {
-                        let inner = from_column_names(storage, subquery.from.as_ref()?)?;
+                        let inner = from_column_names(storage, db_id, subquery.from.as_ref()?)?;
                         cols.extend(
                             inner
                                 .into_iter()
@@ -9177,7 +9310,7 @@ fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<S
                         );
                     }
                     SelectItem::QualifiedWildcard(q) => {
-                        let inner = from_column_names(storage, subquery.from.as_ref()?)?;
+                        let inner = from_column_names(storage, db_id, subquery.from.as_ref()?)?;
                         cols.extend(
                             inner
                                 .into_iter()
@@ -9201,9 +9334,9 @@ fn from_column_names(storage: &Storage, from: &TableRef) -> Option<Vec<(Option<S
 
 /// The inner scope of a subquery (its own FROM columns), or `None` if it cannot
 /// be determined from the catalog alone.
-fn subquery_inner_scope(storage: &Storage, subquery: &Select) -> Option<JoinScope> {
+fn subquery_inner_scope(storage: &Storage, db_id: u32, subquery: &Select) -> Option<JoinScope> {
     let columns = match &subquery.from {
-        Some(from) => from_column_names(storage, from)?,
+        Some(from) => from_column_names(storage, db_id, from)?,
         None => Vec::new(),
     };
     Some(JoinScope {
@@ -9214,8 +9347,8 @@ fn subquery_inner_scope(storage: &Storage, subquery: &Select) -> Option<JoinScop
 
 /// True if `subquery` references a column that resolves in the enclosing `outer`
 /// scope but not in its own FROM — i.e. it is correlated.
-fn is_correlated(storage: &Storage, subquery: &Select, outer: &JoinScope) -> bool {
-    let Some(inner) = subquery_inner_scope(storage, subquery) else {
+fn is_correlated(storage: &Storage, db_id: u32, subquery: &Select, outer: &JoinScope) -> bool {
+    let Some(inner) = subquery_inner_scope(storage, db_id, subquery) else {
         return false;
     };
     let mut correlated = false;
@@ -9228,7 +9361,7 @@ fn is_correlated(storage: &Storage, subquery: &Select, outer: &JoinScope) -> boo
     });
     // A correlated reference may live inside a derived table's body — its own
     // clauses resolve in the derived scope, so the walk above never sees it.
-    correlated || from_has_correlated_derived(storage, subquery.from.as_ref(), outer)
+    correlated || from_has_correlated_derived(storage, db_id, subquery.from.as_ref(), outer)
 }
 
 /// Calls `f` on every column reference inside an AGGREGATE argument anywhere
@@ -9298,16 +9431,17 @@ fn select_aggregate_arg_refs(select: &Select, f: &mut impl FnMut(&Name)) {
 /// Whether any derived-table body in a FROM tree is correlated to `outer`.
 fn from_has_correlated_derived(
     storage: &Storage,
+    db_id: u32,
     from: Option<&TableRef>,
     outer: &JoinScope,
 ) -> bool {
     match from {
         None | Some(TableRef::Table { .. }) => false,
         Some(TableRef::Join { left, right, .. }) => {
-            from_has_correlated_derived(storage, Some(left), outer)
-                || from_has_correlated_derived(storage, Some(right), outer)
+            from_has_correlated_derived(storage, db_id, Some(left), outer)
+                || from_has_correlated_derived(storage, db_id, Some(right), outer)
         }
-        Some(TableRef::Derived { subquery, .. }) => is_correlated(storage, subquery, outer),
+        Some(TableRef::Derived { subquery, .. }) => is_correlated(storage, db_id, subquery, outer),
         // A TVF's literal/non-outer arguments do not correlate it to the outer
         // FROM (APPLY, with outer-referencing args, is out of scope).
         Some(TableRef::Function { .. }) => false,
@@ -9629,11 +9763,12 @@ fn map_expr_columns(expr: &Expr, f: &impl Fn(&Name) -> Option<Expr>) -> Expr {
 /// cannot be determined; the caller then runs the subquery unchanged.
 fn substitute_subquery_outer_refs(
     storage: &Storage,
+    db_id: u32,
     subquery: &Select,
     outer: &dyn Fn(&str) -> Option<usize>,
     outer_row: &[SqlValue],
 ) -> Option<Select> {
-    let inner = subquery_inner_scope(storage, subquery)?;
+    let inner = subquery_inner_scope(storage, db_id, subquery)?;
     let substitute = |name: &Name| -> Option<Expr> {
         if inner.matches_any(&name.value) {
             return None; // the subquery's own column wins (even if ambiguous)
@@ -9694,7 +9829,7 @@ fn substitute_subquery_outer_refs(
     // not in any expression above — descend and substitute there too. The
     // recursive call's own inner-scope check handles shadowing.
     if let Some(from) = out.from.as_mut() {
-        substitute_from_outer_refs(storage, from, outer, outer_row)?;
+        substitute_from_outer_refs(storage, db_id, from, outer, outer_row)?;
     }
     Some(out)
 }
@@ -9703,6 +9838,7 @@ fn substitute_subquery_outer_refs(
 /// tree. `None` when any derived body's scope cannot be determined.
 fn substitute_from_outer_refs(
     storage: &Storage,
+    db_id: u32,
     from: &mut TableRef,
     outer: &dyn Fn(&str) -> Option<usize>,
     outer_row: &[SqlValue],
@@ -9710,11 +9846,12 @@ fn substitute_from_outer_refs(
     match from {
         TableRef::Table { .. } => Some(()),
         TableRef::Join { left, right, .. } => {
-            substitute_from_outer_refs(storage, left, outer, outer_row)?;
-            substitute_from_outer_refs(storage, right, outer, outer_row)
+            substitute_from_outer_refs(storage, db_id, left, outer, outer_row)?;
+            substitute_from_outer_refs(storage, db_id, right, outer, outer_row)
         }
         TableRef::Derived { subquery, .. } => {
-            **subquery = substitute_subquery_outer_refs(storage, subquery, outer, outer_row)?;
+            **subquery =
+                substitute_subquery_outer_refs(storage, db_id, subquery, outer, outer_row)?;
             Some(())
         }
         // A TVF's body lives in the catalog (bound at expansion, not here) and
@@ -9742,7 +9879,7 @@ impl truthdb_sql::eval::ColumnResolver for FnResolver<'_> {
 /// (`dbo.f`) and bare names both resolve; a bare name that shadows a built-in
 /// takes the user function (a documented minor divergence from SQL Server, which
 /// requires schema-qualified UDF calls).
-fn resolve_scalar_function(storage: &Storage, name: &str) -> Option<TableDef> {
+fn resolve_scalar_function(storage: &Storage, db_id: u32, name: &str) -> Option<TableDef> {
     // A bare (unqualified) name that matches a built-in always binds to the
     // built-in — a same-named UDF is reached only by its schema-qualified name
     // (`dbo.abs`), as SQL Server requires. Without this a UDF named like a
@@ -9750,7 +9887,7 @@ fn resolve_scalar_function(storage: &Storage, name: &str) -> Option<TableDef> {
     if !name.contains('.') && truthdb_sql::functions::is_builtin_function(name) {
         return None;
     }
-    let def = resolve_table(storage, name)?;
+    let def = resolve_table(storage, db_id, name)?;
     match def.function.as_ref()?.returns {
         FunctionReturns::Scalar { .. } => Some(def),
         // A table-valued function is not a scalar call (it resolves in FROM).
@@ -9761,11 +9898,11 @@ fn resolve_scalar_function(storage: &Storage, name: &str) -> Option<TableDef> {
 /// True if an expression contains a call to a user-defined scalar function —
 /// which, like a subquery, cannot be evaluated by the pure eval crate and must
 /// be rewritten to a literal per row first.
-fn expr_has_user_function(storage: &Storage, expr: &Expr) -> bool {
-    let has = |e: &Expr| expr_has_user_function(storage, e);
+fn expr_has_user_function(storage: &Storage, db_id: u32, expr: &Expr) -> bool {
+    let has = |e: &Expr| expr_has_user_function(storage, db_id, e);
     match &expr.kind {
         ExprKind::Function { name, args } => {
-            resolve_scalar_function(storage, name).is_some() || args.iter().any(has)
+            resolve_scalar_function(storage, db_id, name).is_some() || args.iter().any(has)
         }
         ExprKind::Null
         | ExprKind::Int(_)
@@ -9805,8 +9942,8 @@ fn expr_has_user_function(storage: &Storage, expr: &Expr) -> bool {
 
 /// True if an expression needs the per-row storage-aware rewrite (a subquery or
 /// a user scalar function) before the pure evaluator can run on it.
-fn expr_needs_binding(storage: &Storage, expr: &Expr) -> bool {
-    expr_has_subquery(expr) || expr_has_user_function(storage, expr)
+fn expr_needs_binding(storage: &Storage, db_id: u32, expr: &Expr) -> bool {
+    expr_has_subquery(expr) || expr_has_user_function(storage, db_id, expr)
 }
 
 fn substitute_correlated_in_expr(
@@ -9819,7 +9956,8 @@ fn substitute_correlated_in_expr(
     let recur = |e: &Expr| substitute_correlated_in_expr(storage, e, outer, outer_row, eval_ctx);
     let recur_box = |e: &Expr| -> Result<Box<Expr>, SqlError> { Ok(Box::new(recur(e)?)) };
     let bind = |sq: &Select| -> Select {
-        substitute_subquery_outer_refs(storage, sq, outer, outer_row).unwrap_or_else(|| sq.clone())
+        substitute_subquery_outer_refs(storage, eval_ctx.database_id, sq, outer, outer_row)
+            .unwrap_or_else(|| sq.clone())
     };
     let kind = match &expr.kind {
         ExprKind::Subquery(sq) => {
@@ -9911,7 +10049,7 @@ fn substitute_correlated_in_expr(
             // for this row (its arguments evaluated against the row) and folds to
             // the returned value — the same rewrite-to-literal discipline
             // subqueries use, keeping scalar evaluation free of storage access.
-            if let Some(def) = resolve_scalar_function(storage, name) {
+            if let Some(def) = resolve_scalar_function(storage, eval_ctx.database_id, name) {
                 let resolver = FnResolver(outer);
                 let values = args
                     .iter()
@@ -10039,7 +10177,7 @@ fn exec_select(
     let where_correlated = select
         .where_clause
         .as_ref()
-        .is_some_and(|w| expr_needs_binding(storage, w));
+        .is_some_and(|w| expr_needs_binding(storage, eval_ctx.database_id, w));
     let mut rows: Vec<Vec<Datum>> = Vec::new();
     // One row: filter it into `rows` or drop it. Shared by both input shapes.
     let take = |row: Vec<Datum>, rows: &mut Vec<Vec<Datum>>| -> Result<(), SqlError> {
@@ -10195,6 +10333,8 @@ pub(crate) fn without_scan_path<R>(f: impl FnOnce() -> R) -> R {
 /// filtered and projected without any stage that must see the whole input
 /// first. Produced by [`scan_plan`], consumed by [`scan_select`].
 struct ScanPlan {
+    /// The base table's database — the namespace the scan reads it from.
+    db_id: u32,
     /// The base table's catalog name — what the scan reads.
     table: String,
     /// How to read it: the planner's choice, made once (see [`scan_plan`]).
@@ -10295,7 +10435,7 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     if select
         .where_clause
         .as_ref()
-        .is_some_and(|w| expr_needs_binding(storage, w))
+        .is_some_and(|w| expr_needs_binding(storage, eval_ctx.database_id, w))
     {
         return None;
     }
@@ -10330,7 +10470,7 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     if is_sys_view(&name.value) {
         return None;
     }
-    let def = resolve_table(storage, &name.value)?;
+    let def = resolve_table(storage, eval_ctx.database_id, &name.value)?;
     // A view is its own SELECT, expanded as a derived table — and its TableDef
     // has no columns and a `root_page` of 0, so a wildcard over it would project
     // nothing and the scan would read the catalog root instead of the view. A
@@ -10447,7 +10587,7 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     let row_count = if def.indexes.is_empty() || select.where_clause.is_none() {
         None
     } else {
-        storage.rel_row_count(&def.name)
+        storage.rel_row_count(def.database_id, &def.name)
     };
     let access = plan::choose(
         &def,
@@ -10489,6 +10629,7 @@ fn scan_plan(storage: &Storage, select: &Select, eval_ctx: &EvalContext) -> Opti
     };
 
     Some(ScanPlan {
+        db_id: def.database_id,
         table: def.name,
         access,
         needed,
@@ -10703,7 +10844,7 @@ fn scan_select_rows(
                 // snapshot scan reads the table atomically and merges the
                 // version store.
                 let rows = storage
-                    .rel_scan_snapshot(&plan.table, Some(&plan.needed), snapshot)
+                    .rel_scan_snapshot(plan.db_id, &plan.table, Some(&plan.needed), snapshot)
                     .map_err(|err| map_storage_err(err, &plan.table))?;
                 for row in rows {
                     if !take(row)? {
@@ -10716,6 +10857,7 @@ fn scan_select_rows(
                 'scan: while !cursor.done() {
                     cursor = storage
                         .rel_scan_slice(
+                            plan.db_id,
                             &plan.table,
                             cursor,
                             SCAN_SLICE_ROWS,
@@ -10741,6 +10883,7 @@ fn scan_select_rows(
             // each one, so the result matches a full scan.
             let rows = storage
                 .rel_index_scan(
+                    plan.db_id,
                     &plan.table,
                     *index_object_id,
                     lower.clone(),
@@ -11138,7 +11281,7 @@ fn eval_maybe_bound(
     resolver: &impl ColumnResolver,
     eval_ctx: &EvalContext,
 ) -> Result<SqlValue, SqlError> {
-    if expr_needs_binding(storage, expr) {
+    if expr_needs_binding(storage, eval_ctx.database_id, expr) {
         let outer = |name: &str| resolver.resolve(name);
         let bound = substitute_correlated_in_expr(storage, expr, &outer, row, eval_ctx)?;
         eval::eval(&bound, row, resolver, eval_ctx)
@@ -11438,7 +11581,7 @@ fn project(
                 // subquery still present here is correlated (the rewrite pass
                 // left it for the per-row bind): substitute the outer row's
                 // values in, making it uncorrelated for that row.
-                let correlated = expr_needs_binding(storage, expr);
+                let correlated = expr_needs_binding(storage, eval_ctx.database_id, expr);
                 let mut values = Vec::with_capacity(rows.len());
                 for row in &row_sql {
                     let bound;
@@ -12152,7 +12295,7 @@ fn build_table_source(
         "sys.foreign_keys" => sys_foreign_keys(storage),
         "sys.default_constraints" => sys_default_constraints(storage),
         _ => {
-            let def = resolve_table(storage, &name.value)
+            let def = resolve_table(storage, eval_ctx.database_id, &name.value)
                 .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
             // A procedure is not a queryable object (SQL Server 2809).
             if def.is_procedure() {
@@ -12205,7 +12348,7 @@ fn build_table_source(
             let row_count = if def.indexes.is_empty() || where_clause.is_none() {
                 None
             } else {
-                storage.rel_row_count(&def.name)
+                storage.rel_row_count(def.database_id, &def.name)
             };
             let rows = match plan::choose(&def, &schema, where_clause, eval_ctx, None, row_count) {
                 // A scan is handed out LAZY: the consumer pulls slices, so a
@@ -12217,10 +12360,11 @@ fn build_table_source(
                 plan::AccessPath::TableScan => match current_snapshot() {
                     Some(snapshot) => SourceRows::Materialized(
                         storage
-                            .rel_scan_snapshot(&def.name, None, snapshot)
+                            .rel_scan_snapshot(def.database_id, &def.name, None, snapshot)
                             .map_err(|err| map_storage_err(err, &def.name))?,
                     ),
                     None => SourceRows::Scan(ScanStream {
+                        db_id: def.database_id,
                         table: def.name.clone(),
                         cursor: ScanCursor::start(),
                     }),
@@ -12233,6 +12377,7 @@ fn build_table_source(
                 } => SourceRows::Materialized(
                     storage
                         .rel_index_scan(
+                            def.database_id,
                             &def.name,
                             index_object_id,
                             lower,
@@ -12283,7 +12428,7 @@ fn build_function_source(
     alias: Option<&Name>,
     eval_ctx: &EvalContext,
 ) -> Result<Source, SqlError> {
-    let def = resolve_table(storage, &name.value)
+    let def = resolve_table(storage, eval_ctx.database_id, &name.value)
         .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
     let function = def
         .function
@@ -12671,8 +12816,14 @@ fn substitute_outer_in_tref(
             })
         }
         TableRef::Derived { subquery, alias } => {
-            let bound = substitute_subquery_outer_refs(storage, subquery, outer, outer_row)
-                .unwrap_or_else(|| (**subquery).clone());
+            let bound = substitute_subquery_outer_refs(
+                storage,
+                eval_ctx.database_id,
+                subquery,
+                outer,
+                outer_row,
+            )
+            .unwrap_or_else(|| (**subquery).clone());
             Ok(TableRef::Derived {
                 subquery: Box::new(bound),
                 alias: alias.clone(),
@@ -12784,7 +12935,8 @@ fn join_sources(
 
     // A subquery or user scalar function in the ON predicate is folded against
     // the joined row before the pure evaluator runs (per candidate pair).
-    let on_needs_binding = on.is_some_and(|pred| expr_needs_binding(storage, pred));
+    let on_needs_binding =
+        on.is_some_and(|pred| expr_needs_binding(storage, eval_ctx.database_id, pred));
     let concat = |l: &[Datum], r: &[Datum]| -> Vec<Datum> { l.iter().chain(r).cloned().collect() };
     let matches = |l: &[Datum], r: &[Datum]| -> Result<bool, SqlError> {
         match on {
@@ -14323,10 +14475,10 @@ fn strip_schema(name: &str) -> &str {
 /// views take no lock. Nested views (a view over a view) are not expanded here
 /// (they error at query time), so they contribute no locks; view expansion is
 /// one level deep, matching the executor.
-fn read_lock_object_ids(storage: &Storage, name: &str) -> Vec<u32> {
+fn read_lock_object_ids(storage: &Storage, db_id: u32, name: &str) -> Vec<u32> {
     let mut out = Vec::new();
     let mut visited = std::collections::HashSet::new();
-    collect_read_lock_ids(storage, name, 0, &mut out, &mut visited);
+    collect_read_lock_ids(storage, db_id, name, 0, &mut out, &mut visited);
     out
 }
 
@@ -14340,7 +14492,9 @@ fn read_lock_object_ids(storage: &Storage, name: &str) -> Vec<u32> {
 /// table with its own triggers) is bounded by `trigger_visited` (trigger
 /// object_ids), so a trigger cycle terminates cleanly rather than hanging
 /// analysis under the scheduler mutex.
+#[allow(clippy::too_many_arguments)]
 fn add_trigger_locks(
+    db_id: u32,
     storage: &Storage,
     parent_object_id: u32,
     event: catalog::TriggerEvent,
@@ -14355,9 +14509,14 @@ fn add_trigger_locks(
         }
         let Some(t) = &trig.trigger else { continue };
         if let Ok(statements) = truthdb_sql::parse_procedure_body(&t.body) {
-            for (resource, mode) in
-                analyze_statements_locks(storage, &statements, isolation, visited, trigger_visited)
-            {
+            for (resource, mode) in analyze_statements_locks(
+                storage,
+                db_id,
+                &statements,
+                isolation,
+                visited,
+                trigger_visited,
+            ) {
                 add(resource, mode);
             }
         }
@@ -14367,28 +14526,28 @@ fn add_trigger_locks(
 /// The base-table object ids the scalar functions called in a SELECT read
 /// through their bodies (deduped). Non-function names collected along the way
 /// resolve to nothing.
-fn select_function_read_ids(storage: &Storage, select: &Select) -> Vec<u32> {
+fn select_function_read_ids(storage: &Storage, db_id: u32, select: &Select) -> Vec<u32> {
     let mut tables = Vec::new();
     let mut funcs = Vec::new();
     collect_select_read_names(select, &mut tables, &mut funcs);
     let mut out = Vec::new();
     let mut visited = std::collections::HashSet::new();
     for func in &funcs {
-        collect_read_lock_ids(storage, func, 0, &mut out, &mut visited);
+        collect_read_lock_ids(storage, db_id, func, 0, &mut out, &mut visited);
     }
     out
 }
 
 /// Like [`select_function_read_ids`] but for a bare expression (an IF/WHILE
 /// condition).
-fn expr_function_read_ids(storage: &Storage, expr: &Expr) -> Vec<u32> {
+fn expr_function_read_ids(storage: &Storage, db_id: u32, expr: &Expr) -> Vec<u32> {
     let mut tables = Vec::new();
     let mut funcs = Vec::new();
     collect_expr_read_names(expr, &mut tables, &mut funcs);
     let mut out = Vec::new();
     let mut visited = std::collections::HashSet::new();
     for func in &funcs {
-        collect_read_lock_ids(storage, func, 0, &mut out, &mut visited);
+        collect_read_lock_ids(storage, db_id, func, 0, &mut out, &mut visited);
     }
     out
 }
@@ -14398,6 +14557,7 @@ fn expr_function_read_ids(storage: &Storage, expr: &Expr) -> Vec<u32> {
 /// base tables). Bounded by [`MAX_VIEW_NESTING`] so a view cycle terminates.
 fn collect_read_lock_ids(
     storage: &Storage,
+    db_id: u32,
     name: &str,
     depth: u32,
     out: &mut Vec<u32>,
@@ -14406,7 +14566,7 @@ fn collect_read_lock_ids(
     if depth > MAX_VIEW_NESTING || name.to_ascii_lowercase().starts_with("sys.") {
         return;
     }
-    let Some(def) = resolve_table(storage, name) else {
+    let Some(def) = resolve_table(storage, db_id, name) else {
         return;
     };
     // Expand each function/view body at most once per analysis. The depth guard
@@ -14451,7 +14611,7 @@ fn collect_read_lock_ids(
             }
         }
         for referenced in tables.iter().chain(funcs.iter()) {
-            collect_read_lock_ids(storage, referenced, depth + 1, out, visited);
+            collect_read_lock_ids(storage, db_id, referenced, depth + 1, out, visited);
         }
         return;
     }
@@ -14474,7 +14634,7 @@ fn collect_read_lock_ids(
     let mut funcs = Vec::new();
     collect_select_read_names(&expanded, &mut tables, &mut funcs);
     for referenced in tables.iter().chain(funcs.iter()) {
-        collect_read_lock_ids(storage, referenced, depth + 1, out, visited);
+        collect_read_lock_ids(storage, db_id, referenced, depth + 1, out, visited);
     }
 }
 
@@ -14557,15 +14717,15 @@ fn reject_view_as_table(def: &TableDef) -> Result<(), SqlError> {
     Ok(())
 }
 
-fn resolve_table(storage: &Storage, name: &str) -> Option<TableDef> {
+fn resolve_table(storage: &Storage, db_id: u32, name: &str) -> Option<TableDef> {
     let bare = strip_schema(name);
-    if let Some(def) = storage.rel_table(bare) {
+    if let Some(def) = storage.rel_table(db_id, bare) {
         return Some(def);
     }
     storage
         .rel_tables()
         .into_iter()
-        .find(|d| d.name.eq_ignore_ascii_case(bare))
+        .find(|d| d.database_id == db_id && d.name.eq_ignore_ascii_case(bare))
 }
 
 /// Maps a storage error to a SQL Server-numbered error. PK and NULL

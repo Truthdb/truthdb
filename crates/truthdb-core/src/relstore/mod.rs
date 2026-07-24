@@ -38,8 +38,15 @@ pub(crate) struct RelState {
     /// Pages dirtied since the last checkpoint -> LSN of their first change.
     pub dpt: HashMap<u64, u64>,
     pub catalog_root: Option<u64>,
-    /// Catalog cache: table name -> definition.
-    pub tables: HashMap<String, TableDef>,
+    /// Catalog cache: database id -> (table name -> definition). Object names
+    /// are unique per database; the nested map is the namespace boundary.
+    pub tables: HashMap<u32, HashMap<String, TableDef>>,
+    /// Databases (`CREATE DATABASE` rows), keyed by lowercased database name.
+    /// The default database (id 1) is synthesized, never stored, and never in
+    /// this map. Persisted in the same catalog b-tree (a row with
+    /// `database: Some(..)`), partitioned out on load, never in the object
+    /// namespace.
+    pub databases: HashMap<String, TableDef>,
     /// Server logins (principals), keyed by lowercased login name. Persisted in
     /// the SAME catalog b-tree as `tables` (a row with `principal: Some(..)`),
     /// but partitioned into a separate map on load so a login never enters the
@@ -69,6 +76,7 @@ impl RelState {
             dpt: HashMap::new(),
             catalog_root: None,
             tables: HashMap::new(),
+            databases: HashMap::new(),
             principals: HashMap::new(),
             database_principals: HashMap::new(),
             next_txn_id: 1,
@@ -85,7 +93,7 @@ impl RelState {
         if let Some(root) = self.catalog_root {
             roots.insert(CATALOG_OBJECT_ID, root);
         }
-        for def in self.tables.values() {
+        for def in self.all_tables() {
             if def.is_tree() {
                 roots.insert(def.object_id, def.root_page);
             }
@@ -94,5 +102,44 @@ impl RelState {
             }
         }
         roots
+    }
+
+    /// The named object in the given database, if any (exact-case).
+    pub fn table(&self, db_id: u32, name: &str) -> Option<&TableDef> {
+        self.tables.get(&db_id)?.get(name)
+    }
+
+    /// True if the database holds an object with this exact-case name.
+    pub fn contains_table(&self, db_id: u32, name: &str) -> bool {
+        self.table(db_id, name).is_some()
+    }
+
+    /// Caches a definition under its own `database_id` and `name`.
+    pub fn cache_table(&mut self, def: TableDef) {
+        self.tables
+            .entry(def.database_id)
+            .or_default()
+            .insert(def.name.clone(), def);
+    }
+
+    /// Removes a cached definition; drops the database's (empty) inner map so
+    /// a dropped database leaves nothing behind.
+    pub fn uncache_table(&mut self, db_id: u32, name: &str) {
+        if let Some(inner) = self.tables.get_mut(&db_id) {
+            inner.remove(name);
+            if inner.is_empty() {
+                self.tables.remove(&db_id);
+            }
+        }
+    }
+
+    /// Every object definition across all databases.
+    pub fn all_tables(&self) -> impl Iterator<Item = &TableDef> {
+        self.tables.values().flat_map(|inner| inner.values())
+    }
+
+    /// Every object definition in one database.
+    pub fn tables_in(&self, db_id: u32) -> impl Iterator<Item = &TableDef> {
+        self.tables.get(&db_id).into_iter().flat_map(|m| m.values())
     }
 }

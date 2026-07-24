@@ -390,7 +390,12 @@ impl Engine {
         input: &str,
         isolation: crate::rel::Isolation,
     ) -> Vec<(crate::lock::Resource, crate::lock::LockMode)> {
-        crate::rel::analyze_locks(&self.storage, input, isolation)
+        crate::rel::analyze_locks(
+            &self.storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            input,
+            isolation,
+        )
     }
 
     pub fn checkpoint(&self) -> Result<(), EngineError> {

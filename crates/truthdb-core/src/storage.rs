@@ -268,6 +268,8 @@ fn principal_table_def(
         principal: Some(principal),
         permissions: Vec::new(),
         counter_page: None,
+        database_id: catalog::DEFAULT_DATABASE_ID,
+        database: None,
     }
 }
 
@@ -1428,6 +1430,7 @@ impl Storage {
     #[allow(clippy::too_many_arguments)]
     pub fn rel_create_table(
         &self,
+        db_id: u32,
         name: &str,
         columns: Vec<Column>,
         key_names: &[String],
@@ -1437,6 +1440,7 @@ impl Storage {
         foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
         self.lock().rel_create_table(
+            db_id,
             name,
             columns,
             key_names,
@@ -1447,16 +1451,22 @@ impl Storage {
         )
     }
 
-    pub fn rel_create_view(&self, name: &str, query_text: &str) -> Result<(), StorageError> {
-        self.lock().rel_create_view(name, query_text)
+    pub fn rel_create_view(
+        &self,
+        db_id: u32,
+        name: &str,
+        query_text: &str,
+    ) -> Result<(), StorageError> {
+        self.lock().rel_create_view(db_id, name, query_text)
     }
 
     pub fn rel_create_procedure(
         &self,
+        db_id: u32,
         name: &str,
         procedure: crate::relstore::catalog::ProcedureDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_create_procedure(name, procedure);
+        let result = self.lock().rel_create_procedure(db_id, name, procedure);
         // A parked batch analyzed against the OLD catalog could carry a stale
         // lock set for an EXEC of this name — same class as the option-flip
         // epoch (Stage 13): bump so the grant path re-analyzes.
@@ -1466,20 +1476,22 @@ impl Storage {
 
     pub fn rel_alter_procedure(
         &self,
+        db_id: u32,
         name: &str,
         procedure: crate::relstore::catalog::ProcedureDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_alter_procedure(name, procedure);
+        let result = self.lock().rel_alter_procedure(db_id, name, procedure);
         self.bump_lock_epoch();
         result
     }
 
     pub fn rel_create_function(
         &self,
+        db_id: u32,
         name: &str,
         function: crate::relstore::catalog::FunctionDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_create_function(name, function);
+        let result = self.lock().rel_create_function(db_id, name, function);
         // Like a procedure: a table-reading function changes which locks a batch
         // that references it must hold, so a parked batch analyzed against the
         // old catalog carries a stale lock set — bump so the grant path
@@ -1490,20 +1502,22 @@ impl Storage {
 
     pub fn rel_alter_function(
         &self,
+        db_id: u32,
         name: &str,
         function: crate::relstore::catalog::FunctionDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_alter_function(name, function);
+        let result = self.lock().rel_alter_function(db_id, name, function);
         self.bump_lock_epoch();
         result
     }
 
     pub fn rel_create_trigger(
         &self,
+        db_id: u32,
         name: &str,
         trigger: crate::relstore::catalog::TriggerDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_create_trigger(name, trigger);
+        let result = self.lock().rel_create_trigger(db_id, name, trigger);
         // A trigger changes which locks a DML statement on its parent table must
         // hold (its body reads/writes other tables), so a parked batch analyzed
         // against the old catalog carries a stale lock set — bump to re-analyze.
@@ -1513,10 +1527,11 @@ impl Storage {
 
     pub fn rel_alter_trigger(
         &self,
+        db_id: u32,
         name: &str,
         trigger: crate::relstore::catalog::TriggerDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_alter_trigger(name, trigger);
+        let result = self.lock().rel_alter_trigger(db_id, name, trigger);
         self.bump_lock_epoch();
         result
     }
@@ -1606,24 +1621,27 @@ impl Storage {
     // is recomputed next batch (like membership DDL).
     pub fn rel_grant_object(
         &self,
+        db_id: u32,
         object: &str,
         grantee: &str,
         action: crate::relstore::catalog::PermAction,
         deny: bool,
     ) -> Result<(), StorageError> {
         self.lock()
-            .rel_grant_object(object, grantee, action, deny)?;
+            .rel_grant_object(db_id, object, grantee, action, deny)?;
         self.bump_security_version();
         Ok(())
     }
 
     pub fn rel_revoke_object(
         &self,
+        db_id: u32,
         object: &str,
         grantee: &str,
         action: crate::relstore::catalog::PermAction,
     ) -> Result<(), StorageError> {
-        self.lock().rel_revoke_object(object, grantee, action)?;
+        self.lock()
+            .rel_revoke_object(db_id, object, grantee, action)?;
         self.bump_security_version();
         Ok(())
     }
@@ -1644,8 +1662,8 @@ impl Storage {
             .map(|d| d.name.clone())
     }
 
-    pub fn rel_table(&self, name: &str) -> Option<TableDef> {
-        self.lock().rel_table(name)
+    pub fn rel_table(&self, db_id: u32, name: &str) -> Option<TableDef> {
+        self.lock().rel_table(db_id, name)
     }
 
     /// The database's default collation, as stamped into the file at creation.
@@ -1677,12 +1695,45 @@ impl Storage {
         self.lock().rel_triggers_for(parent_object_id, event)
     }
 
-    pub fn rel_drop_table(&self, name: &str) -> Result<bool, StorageError> {
-        self.lock().rel_drop_table(name)
+    pub fn rel_drop_table(&self, db_id: u32, name: &str) -> Result<bool, StorageError> {
+        self.lock().rel_drop_table(db_id, name)
+    }
+
+    /// Creates a database (a naming namespace over the shared log and file);
+    /// returns its id. Bumps the lock epoch: a parked batch analyzed against
+    /// the old database list could resolve names differently.
+    pub fn rel_create_database(&self, name: &str) -> Result<u32, StorageError> {
+        let result = self.lock().rel_create_database(name);
+        self.bump_lock_epoch();
+        result
+    }
+
+    /// Drops a database and everything in it. Returns false if absent.
+    pub fn rel_drop_database(&self, name: &str) -> Result<bool, StorageError> {
+        let result = self.lock().rel_drop_database(name);
+        self.bump_lock_epoch();
+        result
+    }
+
+    /// Resolves a database name (case-insensitive) to its id.
+    pub fn rel_database_id_by_name(&self, name: &str) -> Option<u32> {
+        self.lock().rel_database_id_by_name(name)
+    }
+
+    /// Every database as `(id, canonical name)`, default database first.
+    pub fn rel_databases(&self) -> Vec<(u32, String)> {
+        self.lock().rel_databases()
+    }
+
+    /// Stamps the default database's name (id 1) from the instance
+    /// configuration. Called once at engine construction, before sessions.
+    pub fn set_default_database_name(&self, name: &str) {
+        self.lock().default_db_name = name.to_string();
     }
 
     pub(crate) fn rel_create_index(
         &self,
+        db_id: u32,
         table: &str,
         index_name: String,
         columns: Vec<(usize, bool)>,
@@ -1690,39 +1741,42 @@ impl Storage {
         include: Vec<usize>,
     ) -> Result<(), StorageError> {
         self.lock()
-            .rel_create_index(table, index_name, columns, unique, include)
+            .rel_create_index(db_id, table, index_name, columns, unique, include)
     }
 
     pub(crate) fn rel_drop_index(
         &self,
+        db_id: u32,
         table: &str,
         index_name: &str,
     ) -> Result<bool, StorageError> {
-        self.lock().rel_drop_index(table, index_name)
+        self.lock().rel_drop_index(db_id, table, index_name)
     }
 
     pub(crate) fn rel_alter_add_column(
         &self,
+        db_id: u32,
         table: &str,
         column: Column,
         default_text: Option<String>,
         fill: Datum,
     ) -> Result<(), StorageError> {
         self.lock()
-            .rel_alter_add_column(table, column, default_text, fill)
+            .rel_alter_add_column(db_id, table, column, default_text, fill)
     }
 
     /// The table's committed row count, when it has a counter page (tables
     /// created before counters existed do not — the planner then applies no
     /// tie-break). Errors degrade to `None`: the count is a statistic, never
     /// load-bearing for results.
-    pub(crate) fn rel_row_count(&self, table: &str) -> Option<u64> {
-        self.lock().rel_row_count(table)
+    pub(crate) fn rel_row_count(&self, db_id: u32, table: &str) -> Option<u64> {
+        self.lock().rel_row_count(db_id, table)
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rel_index_scan(
         &self,
+        db_id: u32,
         table: &str,
         index_object_id: u32,
         lower: Option<Vec<u8>>,
@@ -1737,6 +1791,7 @@ impl Storage {
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.lock().rel_index_scan(
+            db_id,
             table,
             index_object_id,
             lower,
@@ -2149,11 +2204,13 @@ impl Storage {
     /// restructured under it mid-walk), merged against the version store.
     pub(crate) fn rel_scan_snapshot(
         &self,
+        db_id: u32,
         name: &str,
         projection: Option<&[usize]>,
         snapshot: ReadSnapshot,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
-        self.lock().rel_scan_snapshot(name, projection, snapshot)
+        self.lock()
+            .rel_scan_snapshot(db_id, name, projection, snapshot)
     }
 
     /// Whether any read snapshot is registered (an idle SNAPSHOT transaction
@@ -2172,7 +2229,7 @@ impl Storage {
         let fallback = guard.version.durable_seq(durable);
         let watermark = guard.version.watermark(fallback);
         let alive: std::collections::HashSet<u32> =
-            guard.rel.tables.values().map(|def| def.object_id).collect();
+            guard.rel.all_tables().map(|def| def.object_id).collect();
         guard.version.prune(watermark, &alive);
     }
 
@@ -2182,34 +2239,40 @@ impl Storage {
         let guard = self.lock();
         guard
             .rel
-            .tables
-            .get(table)
+            .table(catalog::DEFAULT_DATABASE_ID, table)
             .map_or(0, |def| guard.version.chain_count(def.object_id))
     }
 
-    pub fn rel_insert(&self, name: &str, values: Vec<Datum>) -> Result<(), StorageError> {
-        self.lock().rel_insert(name, values)
+    pub fn rel_insert(
+        &self,
+        db_id: u32,
+        name: &str,
+        values: Vec<Datum>,
+    ) -> Result<(), StorageError> {
+        self.lock().rel_insert(db_id, name, values)
     }
 
     pub(crate) fn rel_insert_many(
         &self,
+        db_id: u32,
         name: &str,
         rows: Vec<Vec<Datum>>,
         scope: &mut TxnScope,
     ) -> Result<(), StorageError> {
-        self.lock().rel_insert_many(name, rows, scope)
+        self.lock().rel_insert_many(db_id, name, rows, scope)
     }
 
     pub fn rel_get(
         &self,
+        db_id: u32,
         name: &str,
         key_values: &[Datum],
     ) -> Result<Option<Vec<Datum>>, StorageError> {
-        self.lock().rel_get(name, key_values)
+        self.lock().rel_get(db_id, name, key_values)
     }
 
-    pub fn rel_scan(&self, name: &str) -> Result<Vec<Vec<Datum>>, StorageError> {
-        self.lock().rel_scan(name)
+    pub fn rel_scan(&self, db_id: u32, name: &str) -> Result<Vec<Vec<Datum>>, StorageError> {
+        self.lock().rel_scan(db_id, name)
     }
 
     /// Scans a table in bounded slices, dropping the storage lock between them,
@@ -2227,13 +2290,14 @@ impl Storage {
     /// violating row.
     pub fn rel_scan_sliced(
         &self,
+        db_id: u32,
         name: &str,
         budget: usize,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         let mut out = Vec::new();
         let mut cursor = ScanCursor::start();
         while !cursor.done() {
-            cursor = self.rel_scan_slice(name, cursor, budget, None, &mut out)?;
+            cursor = self.rel_scan_slice(db_id, name, cursor, budget, None, &mut out)?;
         }
         Ok(out)
     }
@@ -2250,6 +2314,7 @@ impl Storage {
     /// a page between slices.
     pub(crate) fn rel_scan_slice(
         &self,
+        db_id: u32,
         name: &str,
         cursor: ScanCursor,
         budget: usize,
@@ -2266,7 +2331,7 @@ impl Storage {
             );
         }
         self.lock()
-            .rel_scan_slice(name, cursor, budget, projection, out)
+            .rel_scan_slice(db_id, name, cursor, budget, projection, out)
     }
 
     /// Test hook: a table's definition + schema, for driving a batched scan.
@@ -2281,7 +2346,7 @@ impl Storage {
         ),
         StorageError,
     > {
-        self.lock().rel_def(name)
+        self.lock().rel_def(catalog::DEFAULT_DATABASE_ID, name)
     }
 
     /// Test hook: runs `f` against a page context, taking the storage lock for
@@ -2299,57 +2364,63 @@ impl Storage {
 
     pub fn rel_delete_where(
         &self,
+        db_id: u32,
         name: &str,
         column: &str,
         value: &Datum,
     ) -> Result<usize, StorageError> {
-        self.lock().rel_delete_where(name, column, value)
+        self.lock().rel_delete_where(db_id, name, column, value)
     }
 
     pub fn rel_update_where(
         &self,
+        db_id: u32,
         name: &str,
         column: &str,
         value: &Datum,
         assignments: &[(String, Datum)],
     ) -> Result<usize, StorageError> {
         self.lock()
-            .rel_update_where(name, column, value, assignments)
+            .rel_update_where(db_id, name, column, value, assignments)
     }
 
     pub(crate) fn rel_scan_located(
         &self,
+        db_id: u32,
         name: &str,
     ) -> Result<Vec<(RowLocator, Vec<Datum>)>, StorageError> {
-        self.lock().rel_scan_located(name)
+        self.lock().rel_scan_located(db_id, name)
     }
 
     /// SNAPSHOT-isolation DML target scan: snapshot rows plus a conflict mark
     /// per row whose current state a snapshot-invisible writer produced.
     pub(crate) fn rel_scan_located_snapshot(
         &self,
+        db_id: u32,
         name: &str,
         snapshot: ReadSnapshot,
     ) -> Result<Vec<(RowLocator, Vec<Datum>, bool)>, StorageError> {
-        self.lock().rel_scan_located_snapshot(name, snapshot)
+        self.lock().rel_scan_located_snapshot(db_id, name, snapshot)
     }
 
     pub(crate) fn rel_delete_located(
         &self,
+        db_id: u32,
         name: &str,
         targets: Vec<(RowLocator, Vec<Datum>)>,
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
-        self.lock().rel_delete_located(name, targets, scope)
+        self.lock().rel_delete_located(db_id, name, targets, scope)
     }
 
     pub(crate) fn rel_update_located(
         &self,
+        db_id: u32,
         name: &str,
         updates: Vec<(RowLocator, Vec<Datum>, Vec<Datum>)>,
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
-        self.lock().rel_update_located(name, updates, scope)
+        self.lock().rel_update_located(db_id, name, updates, scope)
     }
 
     pub(crate) fn rel_begin(&self) -> Result<StorageTxn, StorageError> {
@@ -2387,27 +2458,30 @@ impl Storage {
 
     pub(crate) fn rel_reserve_identity(
         &self,
+        db_id: u32,
         name: &str,
         count: usize,
     ) -> Result<Option<i64>, StorageError> {
-        self.lock().rel_reserve_identity(name, count)
+        self.lock().rel_reserve_identity(db_id, name, count)
     }
 
     pub(crate) fn rel_set_check_constraints(
         &self,
+        db_id: u32,
         name: &str,
         check_constraints: Vec<catalog::CheckDef>,
     ) -> Result<(), StorageError> {
         self.lock()
-            .rel_set_check_constraints(name, check_constraints)
+            .rel_set_check_constraints(db_id, name, check_constraints)
     }
 
     pub(crate) fn rel_set_foreign_keys(
         &self,
+        db_id: u32,
         name: &str,
         foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
-        self.lock().rel_set_foreign_keys(name, foreign_keys)
+        self.lock().rel_set_foreign_keys(db_id, name, foreign_keys)
     }
 
     #[cfg(test)]
@@ -2416,7 +2490,8 @@ impl Storage {
         name: &str,
         values: Vec<Datum>,
     ) -> Result<(), StorageError> {
-        self.lock().rel_insert_without_commit(name, values)
+        self.lock()
+            .rel_insert_without_commit(catalog::DEFAULT_DATABASE_ID, name, values)
     }
 
     #[cfg(test)]
@@ -2717,6 +2792,12 @@ struct StorageFile {
     /// this at CREATE TABLE and stored with it, so the column keeps the
     /// collation it was created under even if the default later changes.
     default_collation: Option<String>,
+    /// The DEFAULT database's name (database id 1). The default database is
+    /// synthesized — never a catalog row — and named by the instance
+    /// configuration (`[tds] database`), exactly where the session default
+    /// came from before databases existed. Stamped at engine construction;
+    /// "truthdb" until then.
+    default_db_name: String,
     /// Stage 13 version store: row-version chains for snapshot reads, plus
     /// the RCSI / ALLOW_SNAPSHOT_ISOLATION options (persisted in the
     /// superblock reserved area; the chains themselves are memory-only — no
@@ -2779,6 +2860,7 @@ impl StorageFile {
     #[allow(clippy::too_many_arguments)]
     pub fn rel_create_table(
         &mut self,
+        db_id: u32,
         name: &str,
         mut columns: Vec<Column>,
         key_names: &[String],
@@ -2807,7 +2889,7 @@ impl StorageFile {
                 }
             }
         }
-        if self.rel.tables.contains_key(name) {
+        if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
                 "table '{name}' already exists"
             )));
@@ -2879,6 +2961,8 @@ impl StorageFile {
                 principal: None,
                 permissions: Vec::new(),
                 counter_page: Some(counter_page),
+                database_id: db_id,
+                database: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
@@ -2889,16 +2973,21 @@ impl StorageFile {
         // same-named, post-DROP) new table as empty — its snapshot has no
         // history for an object that did not exist.
         self.version.stamp_schema(def.object_id);
-        self.rel.tables.insert(name.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
     /// Creates a VIEW: a catalog entry that stores its `SELECT` source text and
     /// owns no data pages. The name shares the table namespace (a view and a
     /// table cannot share a name).
-    pub fn rel_create_view(&mut self, name: &str, query_text: &str) -> Result<(), StorageError> {
+    pub fn rel_create_view(
+        &mut self,
+        db_id: u32,
+        name: &str,
+        query_text: &str,
+    ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
-        if self.rel.tables.contains_key(name) {
+        if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
                 "object '{name}' already exists"
             )));
@@ -2935,12 +3024,14 @@ impl StorageFile {
                 principal: None,
                 permissions: Vec::new(),
                 counter_page: None,
+                database_id: db_id,
+                database: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
-        self.rel.tables.insert(name.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
@@ -2948,11 +3039,12 @@ impl StorageFile {
     /// parameter list and body text (the view posture — re-parsed at EXEC).
     pub fn rel_create_procedure(
         &mut self,
+        db_id: u32,
         name: &str,
         procedure: crate::relstore::catalog::ProcedureDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
-        if self.rel.tables.contains_key(name) {
+        if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
                 "object '{name}' already exists"
             )));
@@ -2987,12 +3079,14 @@ impl StorageFile {
                 principal: None,
                 permissions: Vec::new(),
                 counter_page: None,
+                database_id: db_id,
+                database: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
-        self.rel.tables.insert(name.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
@@ -3001,11 +3095,12 @@ impl StorageFile {
     /// each call).
     pub fn rel_create_function(
         &mut self,
+        db_id: u32,
         name: &str,
         function: crate::relstore::catalog::FunctionDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
-        if self.rel.tables.contains_key(name) {
+        if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
                 "object '{name}' already exists"
             )));
@@ -3040,12 +3135,14 @@ impl StorageFile {
                 principal: None,
                 permissions: Vec::new(),
                 counter_page: None,
+                database_id: db_id,
+                database: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
-        self.rel.tables.insert(name.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
@@ -3053,11 +3150,12 @@ impl StorageFile {
     /// id is kept, the stored definition swapped.
     pub fn rel_alter_function(
         &mut self,
+        db_id: u32,
         name: &str,
         function: crate::relstore::catalog::FunctionDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
-        let Some(existing) = self.rel.tables.get(name) else {
+        let Some(existing) = self.rel.table(db_id, name) else {
             return Err(StorageError::Constraint(format!(
                 "function '{name}' does not exist"
             )));
@@ -3078,7 +3176,7 @@ impl StorageFile {
             catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &write)?;
             Ok(())
         })?;
-        self.rel.tables.insert(name.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
@@ -3086,11 +3184,12 @@ impl StorageFile {
     /// PROCEDURE`): the object id is kept, the stored text swapped.
     pub fn rel_alter_procedure(
         &mut self,
+        db_id: u32,
         name: &str,
         procedure: crate::relstore::catalog::ProcedureDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
-        let Some(existing) = self.rel.tables.get(name) else {
+        let Some(existing) = self.rel.table(db_id, name) else {
             return Err(StorageError::Constraint(format!(
                 "procedure '{name}' does not exist"
             )));
@@ -3111,7 +3210,7 @@ impl StorageFile {
             catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &write)?;
             Ok(())
         })?;
-        self.rel.tables.insert(name.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
@@ -3119,11 +3218,12 @@ impl StorageFile {
     /// whose stored form is its parent table, event set, and body text.
     pub fn rel_create_trigger(
         &mut self,
+        db_id: u32,
         name: &str,
         trigger: crate::relstore::catalog::TriggerDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
-        if self.rel.tables.contains_key(name) {
+        if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
                 "object '{name}' already exists"
             )));
@@ -3158,23 +3258,26 @@ impl StorageFile {
                 principal: None,
                 permissions: Vec::new(),
                 counter_page: None,
+                database_id: db_id,
+                database: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
-        self.rel.tables.insert(name.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
     /// Replaces a trigger's definition (`ALTER TRIGGER`).
     pub fn rel_alter_trigger(
         &mut self,
+        db_id: u32,
         name: &str,
         trigger: crate::relstore::catalog::TriggerDef,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
-        let Some(existing) = self.rel.tables.get(name) else {
+        let Some(existing) = self.rel.table(db_id, name) else {
             return Err(StorageError::Constraint(format!(
                 "trigger '{name}' does not exist"
             )));
@@ -3192,7 +3295,7 @@ impl StorageFile {
             catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &write)?;
             Ok(())
         })?;
-        self.rel.tables.insert(name.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
@@ -3241,6 +3344,8 @@ impl StorageFile {
                 principal: Some(principal),
                 permissions: Vec::new(),
                 counter_page: None,
+                database_id: catalog::DEFAULT_DATABASE_ID,
+                database: None,
             };
             catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
@@ -3383,17 +3488,15 @@ impl StorageFile {
     /// Removes every object permission entry whose grantee is `grantee` (a
     /// dropped principal), rewriting each affected object's catalog row.
     fn scrub_grants_for(&mut self, grantee: u32) -> Result<(), StorageError> {
-        let affected: Vec<String> = self
+        let affected: Vec<TableDef> = self
             .rel
-            .tables
-            .iter()
-            .filter(|(_, def)| def.permissions.iter().any(|p| p.grantee == grantee))
-            .map(|(name, _)| name.clone())
+            .all_tables()
+            .filter(|def| def.permissions.iter().any(|p| p.grantee == grantee))
+            .cloned()
             .collect();
-        for name in affected {
-            let mut def = self.rel.tables.get(&name).cloned().expect("just listed");
+        for mut def in affected {
             def.permissions.retain(|p| p.grantee != grantee);
-            self.persist_object_permissions(&name, def)?;
+            self.persist_object_permissions(def)?;
         }
         Ok(())
     }
@@ -3527,6 +3630,7 @@ impl StorageFile {
     /// the same grantee do not coexist. Errors on an unknown grantee or object.
     pub fn rel_grant_object(
         &mut self,
+        db_id: u32,
         object: &str,
         grantee: &str,
         action: crate::relstore::catalog::PermAction,
@@ -3534,7 +3638,7 @@ impl StorageFile {
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
         let grantee_id = self.resolve_grantee_id(grantee)?;
-        let Some(mut def) = self.rel.tables.get(object).cloned() else {
+        let Some(mut def) = self.rel.table(db_id, object).cloned() else {
             return Err(StorageError::Constraint(format!(
                 "cannot find the object '{object}', because it does not exist or you do not have permission"
             )));
@@ -3547,20 +3651,21 @@ impl StorageFile {
                 action,
                 deny,
             });
-        self.persist_object_permissions(object, def)
+        self.persist_object_permissions(def)
     }
 
     /// REVOKE an action on an object from a grantee — removes both the GRANT and
     /// the DENY of that (grantee, action). Idempotent (no error if absent).
     pub fn rel_revoke_object(
         &mut self,
+        db_id: u32,
         object: &str,
         grantee: &str,
         action: crate::relstore::catalog::PermAction,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
         let grantee_id = self.resolve_grantee_id(grantee)?;
-        let Some(mut def) = self.rel.tables.get(object).cloned() else {
+        let Some(mut def) = self.rel.table(db_id, object).cloned() else {
             return Err(StorageError::Constraint(format!(
                 "cannot find the object '{object}', because it does not exist or you do not have permission"
             )));
@@ -3571,7 +3676,7 @@ impl StorageFile {
         if def.permissions.len() == before {
             return Ok(()); // nothing to revoke
         }
-        self.persist_object_permissions(object, def)
+        self.persist_object_permissions(def)
     }
 
     /// Resolves a grantee NAME to a database principal_id (a stored user/role or
@@ -3586,18 +3691,14 @@ impl StorageFile {
 
     /// Writes an object's mutated permission list back through the catalog and
     /// the in-memory cache (one whole-row rewrite, like a role-member edit).
-    fn persist_object_permissions(
-        &mut self,
-        object: &str,
-        def: TableDef,
-    ) -> Result<(), StorageError> {
+    fn persist_object_permissions(&mut self, def: TableDef) -> Result<(), StorageError> {
         let catalog_root = self.rel.catalog_root.expect("objects live in the catalog");
         let write = def.clone();
         self.rel_statement(move |ctx, txn| {
             catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &write)?;
             Ok(())
         })?;
-        self.rel.tables.insert(object.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
@@ -3640,22 +3741,22 @@ impl StorageFile {
         seen
     }
 
-    /// The table's definition (schema and layout), if it exists.
-    pub fn rel_table(&self, name: &str) -> Option<TableDef> {
-        self.rel.tables.get(name).cloned()
+    /// The named object's definition in the given database, if it exists.
+    pub fn rel_table(&self, db_id: u32, name: &str) -> Option<TableDef> {
+        self.rel.table(db_id, name).cloned()
     }
 
-    /// All user table definitions, ordered by object id (for sys.tables /
-    /// sys.columns).
+    /// All user table definitions across every database, ordered by object id
+    /// (for sys.tables / sys.columns).
     pub fn rel_tables(&self) -> Vec<TableDef> {
-        let mut defs: Vec<TableDef> = self.rel.tables.values().cloned().collect();
+        let mut defs: Vec<TableDef> = self.rel.all_tables().cloned().collect();
         defs.sort_by_key(|d| d.object_id);
         defs
     }
 
     /// True if any trigger exists in the catalog (no clone).
     pub fn rel_has_triggers(&self) -> bool {
-        self.rel.tables.values().any(|d| d.is_trigger())
+        self.rel.all_tables().any(|d| d.is_trigger())
     }
 
     /// The enabled triggers attached to `parent_object_id` firing on `event`, in
@@ -3667,8 +3768,7 @@ impl StorageFile {
     ) -> Vec<TableDef> {
         let mut trigs: Vec<TableDef> = self
             .rel
-            .tables
-            .values()
+            .all_tables()
             .filter(|d| {
                 d.trigger.as_ref().is_some_and(|t| {
                     !t.is_disabled
@@ -3685,9 +3785,9 @@ impl StorageFile {
     /// Drops a table (logical: removes the catalog row; data pages leak
     /// until a later reclamation stage). Returns false if the table does not
     /// exist.
-    pub fn rel_drop_table(&mut self, name: &str) -> Result<bool, StorageError> {
+    pub fn rel_drop_table(&mut self, db_id: u32, name: &str) -> Result<bool, StorageError> {
         self.ensure_rel_usable()?;
-        let Some(def) = self.rel.tables.get(name).cloned() else {
+        let Some(def) = self.rel.table(db_id, name).cloned() else {
             return Ok(false);
         };
         let Some(catalog_root) = self.rel.catalog_root else {
@@ -3696,8 +3796,146 @@ impl StorageFile {
         self.rel_statement(move |ctx, txn| {
             catalog::delete_table(ctx, &mut OpMode::Txn(txn), catalog_root, def.object_id)
         })?;
-        self.rel.tables.remove(name);
+        self.rel.uncache_table(db_id, name);
         Ok(true)
+    }
+
+    /// Creates a database: a catalog row carrying a [`catalog::DatabaseDef`],
+    /// routed into the databases map so it never enters the object namespace.
+    /// Database ids allocate max+1 over stored rows (the synthesized default
+    /// database is id 1) and are capped at `u16::MAX` so an id always fits the
+    /// WAL container tag.
+    pub fn rel_create_database(&mut self, name: &str) -> Result<u32, StorageError> {
+        self.ensure_rel_usable()?;
+        if self.rel_database_id_by_name(name).is_some() {
+            return Err(StorageError::Constraint(format!(
+                "database '{name}' already exists"
+            )));
+        }
+        let db_id = self
+            .rel
+            .databases
+            .values()
+            .filter_map(|d| d.database.as_ref().map(|db| db.db_id))
+            .max()
+            .map_or(catalog::FIRST_USER_DATABASE_ID, |max| max + 1);
+        if db_id > u16::MAX as u32 {
+            return Err(StorageError::Constraint(
+                "too many databases: the database id space is exhausted".to_string(),
+            ));
+        }
+        if self.rel.catalog_root.is_none() {
+            let root = {
+                let mut ctx = self.rel_ctx();
+                catalog::create_catalog(&mut ctx)?
+            };
+            self.rel.catalog_root = Some(root);
+        }
+        let catalog_root = self.rel.catalog_root.expect("catalog exists");
+        let object_id = self.rel.next_object_id;
+        let db_name = name.to_string();
+        let def = self.rel_statement(move |ctx, txn| {
+            let def = TableDef {
+                object_id,
+                name: db_name,
+                columns: Vec::new(),
+                key_columns: Vec::new(),
+                root_page: 0,
+                defaults: Vec::new(),
+                collations: Vec::new(),
+                identity: None,
+                indexes: Vec::new(),
+                check_constraints: Vec::new(),
+                foreign_keys: Vec::new(),
+                view_query: None,
+                procedure: None,
+                function: None,
+                trigger: None,
+                principal: None,
+                permissions: Vec::new(),
+                counter_page: None,
+                database_id: catalog::DEFAULT_DATABASE_ID,
+                database: Some(catalog::DatabaseDef { db_id }),
+            };
+            catalog::insert_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
+            Ok(def)
+        })?;
+        self.rel.next_object_id += 1;
+        self.rel
+            .databases
+            .insert(def.name.to_ascii_lowercase(), def);
+        Ok(db_id)
+    }
+
+    /// Drops a database and every object in it, in one statement transaction
+    /// (all-or-nothing; data pages leak like `rel_drop_table`'s). The default
+    /// database is refused. Returns false if no such database exists.
+    pub fn rel_drop_database(&mut self, name: &str) -> Result<bool, StorageError> {
+        self.ensure_rel_usable()?;
+        let key = name.to_ascii_lowercase();
+        if key == self.default_db_name.to_ascii_lowercase() {
+            return Err(StorageError::Constraint(format!(
+                "cannot drop the database '{name}' because it is a system database"
+            )));
+        }
+        let Some(row) = self.rel.databases.get(&key).cloned() else {
+            return Ok(false);
+        };
+        let Some(catalog_root) = self.rel.catalog_root else {
+            return Ok(false);
+        };
+        let db_id = row.database.expect("database row").db_id;
+        let objects: Vec<(u32, String)> = self
+            .rel
+            .tables_in(db_id)
+            .map(|d| (d.object_id, d.name.clone()))
+            .collect();
+        let object_ids: Vec<u32> = objects.iter().map(|(id, _)| *id).collect();
+        let row_object_id = row.object_id;
+        self.rel_statement(move |ctx, txn| {
+            for object_id in &object_ids {
+                catalog::delete_table(ctx, &mut OpMode::Txn(txn), catalog_root, *object_id)?;
+            }
+            catalog::delete_table(ctx, &mut OpMode::Txn(txn), catalog_root, row_object_id)
+        })?;
+        for (object_id, name) in objects {
+            // Same fence as DROP TABLE: a snapshot whose view predates the
+            // drop must 3961 rather than read a same-named successor.
+            self.version.stamp_schema(object_id);
+            self.rel.uncache_table(db_id, &name);
+        }
+        self.rel.databases.remove(&key);
+        Ok(true)
+    }
+
+    /// Resolves a database NAME to its id, case-insensitively: the synthesized
+    /// default database (id 1, named by the instance configuration) or a
+    /// stored `CREATE DATABASE` row. The single name→id derivation every
+    /// consumer (USE, login, three-part names) must share.
+    pub fn rel_database_id_by_name(&self, name: &str) -> Option<u32> {
+        if name.eq_ignore_ascii_case(&self.default_db_name) {
+            return Some(catalog::DEFAULT_DATABASE_ID);
+        }
+        self.rel
+            .databases
+            .get(&name.to_ascii_lowercase())
+            .and_then(|d| d.database.as_ref())
+            .map(|db| db.db_id)
+    }
+
+    /// Every database as `(id, canonical name)`, the synthesized default
+    /// first, then stored rows by id.
+    pub fn rel_databases(&self) -> Vec<(u32, String)> {
+        let mut out = vec![(catalog::DEFAULT_DATABASE_ID, self.default_db_name.clone())];
+        let mut stored: Vec<(u32, String)> = self
+            .rel
+            .databases
+            .values()
+            .filter_map(|d| d.database.as_ref().map(|db| (db.db_id, d.name.clone())))
+            .collect();
+        stored.sort_by_key(|(id, _)| *id);
+        out.extend(stored);
+        out
     }
 
     /// Creates a secondary index over `table` and backfills it from the
@@ -3706,6 +3944,7 @@ impl StorageFile {
     /// the table's catalog row.
     pub(crate) fn rel_create_index(
         &mut self,
+        db_id: u32,
         table: &str,
         index_name: String,
         columns: Vec<(usize, bool)>,
@@ -3715,8 +3954,7 @@ impl StorageFile {
         self.ensure_rel_usable()?;
         let mut def = self
             .rel
-            .tables
-            .get(table)
+            .table(db_id, table)
             .cloned()
             .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{table}'")))?;
         if def
@@ -3734,7 +3972,7 @@ impl StorageFile {
             .ok_or_else(|| StorageError::InvalidFile("catalog root missing".to_string()))?;
         let object_id = self.rel.next_object_id;
         // Snapshot the rows to backfill (materialized before any mutation).
-        let located = self.rel_scan_located(table)?;
+        let located = self.rel_scan_located(db_id, table)?;
 
         let schema = def.schema()?;
         let updated = self.rel_statement(move |ctx, txn| {
@@ -3780,7 +4018,7 @@ impl StorageFile {
             Ok(def)
         })?;
         self.rel.next_object_id += 1;
-        self.rel.tables.insert(table.to_string(), updated);
+        self.rel.cache_table(updated);
         Ok(())
     }
 
@@ -3793,6 +4031,7 @@ impl StorageFile {
     /// by key, and heap RIDs are stable across an update.
     pub(crate) fn rel_alter_add_column(
         &mut self,
+        db_id: u32,
         table: &str,
         column: Column,
         default_text: Option<String>,
@@ -3813,8 +4052,7 @@ impl StorageFile {
         }
         let mut def = self
             .rel
-            .tables
-            .get(table)
+            .table(db_id, table)
             .cloned()
             .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{table}'")))?;
         let catalog_root = self
@@ -3823,7 +4061,7 @@ impl StorageFile {
             .ok_or_else(|| StorageError::InvalidFile("catalog root missing".to_string()))?;
         // Snapshot every row under the OLD schema (with its locator), before
         // the definition widens.
-        let located = self.rel_scan_located(table)?;
+        let located = self.rel_scan_located(db_id, table)?;
 
         // Parallel catalog arrays: `defaults`/`collations` may be shorter than
         // `columns` (serde(default) on pre-upgrade tables) — pad before push.
@@ -3882,7 +4120,7 @@ impl StorageFile {
             catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
         })?;
-        self.rel.tables.insert(table.to_string(), updated);
+        self.rel.cache_table(updated);
         // ALTER ADD re-encodes every row: version images from before it
         // cannot decode under the widened schema, so a SNAPSHOT transaction
         // whose view predates this commit gets 3961 at its next access
@@ -3897,6 +4135,7 @@ impl StorageFile {
     /// false if no such index exists on any table.
     pub(crate) fn rel_drop_index(
         &mut self,
+        db_id: u32,
         table: &str,
         index_name: &str,
     ) -> Result<bool, StorageError> {
@@ -3906,12 +4145,11 @@ impl StorageFile {
         };
         // Index names are scoped to their table, so confine the lookup there.
         // The caller passes the table's canonical name.
-        let Some((table_key, mut def)) = self
+        let Some(mut def) = self
             .rel
-            .tables
-            .iter()
-            .find(|(name, _)| name.eq_ignore_ascii_case(table))
-            .map(|(name, def)| (name.clone(), def.clone()))
+            .tables_in(db_id)
+            .find(|def| def.name.eq_ignore_ascii_case(table))
+            .cloned()
         else {
             return Ok(false);
         };
@@ -3928,7 +4166,7 @@ impl StorageFile {
             catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &def)?;
             Ok(def)
         })?;
-        self.rel.tables.insert(table_key, updated);
+        self.rel.cache_table(updated);
         Ok(true)
     }
 
@@ -3936,17 +4174,18 @@ impl StorageFile {
     /// `[lower, upper]`, then fetches each row by its locator. Returns a
     /// superset the caller re-filters with the full WHERE (so loose bounds are
     /// safe).
-    pub(crate) fn rel_row_count(&mut self, table: &str) -> Option<u64> {
+    pub(crate) fn rel_row_count(&mut self, db_id: u32, table: &str) -> Option<u64> {
         if self.ensure_rel_usable().is_err() {
             return None;
         }
-        let page = self.rel.tables.get(table)?.counter_page?;
+        let page = self.rel.table(db_id, table)?.counter_page?;
         self.rel_ctx().counter_read(page).ok()
     }
 
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rel_index_scan(
         &mut self,
+        db_id: u32,
         table: &str,
         index_object_id: u32,
         lower: Option<Vec<u8>>,
@@ -3956,7 +4195,7 @@ impl StorageFile {
         snapshot: Option<ReadSnapshot>,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(table)?;
+        let (def, schema) = self.rel_def(db_id, table)?;
         let index = def
             .indexes
             .iter()
@@ -4104,8 +4343,13 @@ impl StorageFile {
         Ok(rows)
     }
 
-    pub fn rel_insert(&mut self, name: &str, values: Vec<Datum>) -> Result<(), StorageError> {
-        self.rel_insert_many(name, vec![values], &mut TxnScope::Auto)
+    pub fn rel_insert(
+        &mut self,
+        db_id: u32,
+        name: &str,
+        values: Vec<Datum>,
+    ) -> Result<(), StorageError> {
+        self.rel_insert_many(db_id, name, vec![values], &mut TxnScope::Auto)
     }
 
     /// Inserts many rows as ONE atomic statement: all rows land or none do
@@ -4113,12 +4357,13 @@ impl StorageFile {
     /// matching T-SQL multi-row `INSERT ... VALUES` semantics).
     pub(crate) fn rel_insert_many(
         &mut self,
+        db_id: u32,
         name: &str,
         rows: Vec<Vec<Datum>>,
         scope: &mut TxnScope,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         // Encode and validate every row up front (cheap failures before any
         // mutation), keeping the key alongside for tree tables. Rows with
         // (MAX) columns encode inside the statement instead: their oversize
@@ -4236,11 +4481,12 @@ impl StorageFile {
     /// Point lookup by primary key (clustered tables only).
     pub fn rel_get(
         &mut self,
+        db_id: u32,
         name: &str,
         key_values: &[Datum],
     ) -> Result<Option<Vec<Datum>>, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         if !def.is_tree() {
             return Err(StorageError::InvalidConfig(format!(
                 "table '{name}' has no primary key"
@@ -4288,6 +4534,7 @@ impl StorageFile {
     /// once per slice instead of once for the whole table.
     pub(crate) fn rel_scan_slice(
         &mut self,
+        db_id: u32,
         name: &str,
         cursor: ScanCursor,
         budget: usize,
@@ -4295,7 +4542,7 @@ impl StorageFile {
         out: &mut Vec<Vec<Datum>>,
     ) -> Result<ScanCursor, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         let mut ctx = self.rel_ctx();
         let mut raw: Vec<Vec<u8>> = Vec::new();
         let next = if def.is_tree() {
@@ -4327,9 +4574,9 @@ impl StorageFile {
         Ok(next)
     }
 
-    pub fn rel_scan(&mut self, name: &str) -> Result<Vec<Vec<Datum>>, StorageError> {
+    pub fn rel_scan(&mut self, db_id: u32, name: &str) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         let mut ctx = self.rel_ctx();
         let raw: Vec<Vec<u8>> = if def.is_tree() {
             let tree = BTree {
@@ -4368,12 +4615,13 @@ impl StorageFile {
     /// sliced cursor could be restructured under it mid-walk.
     fn rel_scan_snapshot(
         &mut self,
+        db_id: u32,
         name: &str,
         projection: Option<&[usize]>,
         snapshot: ReadSnapshot,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         if self.version.schema_changed_after(def.object_id, snapshot) {
             return Err(StorageError::SnapshotSchemaChange(def.name));
         }
@@ -4435,12 +4683,13 @@ impl StorageFile {
     /// staging. Resolve and stage before wiring it to anything real.
     pub fn rel_delete_where(
         &mut self,
+        db_id: u32,
         name: &str,
         column: &str,
         value: &Datum,
     ) -> Result<usize, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         let column_index = column_index(&schema, column)?;
         if def.is_tree() {
             let tree = BTree {
@@ -4500,13 +4749,14 @@ impl StorageFile {
     /// immutable here (delete + insert to change a key).
     pub fn rel_update_where(
         &mut self,
+        db_id: u32,
         name: &str,
         column: &str,
         value: &Datum,
         assignments: &[(String, Datum)],
     ) -> Result<usize, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         let column_index = column_index(&schema, column)?;
         let mut set: Vec<(usize, Datum)> = Vec::new();
         for (set_name, set_value) in assignments {
@@ -4599,10 +4849,11 @@ impl StorageFile {
     /// construction (matched targets are chosen from a snapshot of the table).
     pub(crate) fn rel_scan_located(
         &mut self,
+        db_id: u32,
         name: &str,
     ) -> Result<Vec<(RowLocator, Vec<Datum>)>, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         let mut ctx = self.rel_ctx();
         let mut out = Vec::new();
         if def.is_tree() {
@@ -4660,11 +4911,12 @@ impl StorageFile {
     /// it actually targets can only be a committed-invisible change.)
     fn rel_scan_located_snapshot(
         &mut self,
+        db_id: u32,
         name: &str,
         snapshot: ReadSnapshot,
     ) -> Result<Vec<(RowLocator, Vec<Datum>, bool)>, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         if self.version.schema_changed_after(def.object_id, snapshot) {
             return Err(StorageError::SnapshotSchemaChange(def.name));
         }
@@ -4755,12 +5007,13 @@ impl StorageFile {
     /// upkeep) in one atomic statement; returns the count.
     pub(crate) fn rel_delete_located(
         &mut self,
+        db_id: u32,
         name: &str,
         targets: Vec<(RowLocator, Vec<Datum>)>,
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         let count = targets.len();
         if count == 0 {
             return Ok(0);
@@ -4859,12 +5112,13 @@ impl StorageFile {
     /// Returns the count.
     pub(crate) fn rel_update_located(
         &mut self,
+        db_id: u32,
         name: &str,
         updates: Vec<(RowLocator, Vec<Datum>, Vec<Datum>)>,
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
         self.ensure_rel_usable()?;
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         let count = updates.len();
         if count == 0 {
             return Ok(0);
@@ -5054,14 +5308,14 @@ impl StorageFile {
     /// if the table has no identity column.
     pub(crate) fn rel_reserve_identity(
         &mut self,
+        db_id: u32,
         name: &str,
         count: usize,
     ) -> Result<Option<i64>, StorageError> {
         self.ensure_rel_usable()?;
         let mut def = self
             .rel
-            .tables
-            .get(name)
+            .table(db_id, name)
             .cloned()
             .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{name}'")))?;
         let Some(mut spec) = def.identity else {
@@ -5085,7 +5339,7 @@ impl StorageFile {
             self.rel_statement(move |ctx, txn| {
                 catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &persisted)
             })?;
-            self.rel.tables.insert(name.to_string(), def);
+            self.rel.cache_table(def);
         }
         Ok(Some(first))
     }
@@ -5094,14 +5348,14 @@ impl StorageFile {
     /// and persists the mutated catalog row. Undoable within its own statement.
     pub(crate) fn rel_set_check_constraints(
         &mut self,
+        db_id: u32,
         name: &str,
         check_constraints: Vec<catalog::CheckDef>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
         let mut def = self
             .rel
-            .tables
-            .get(name)
+            .table(db_id, name)
             .cloned()
             .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{name}'")))?;
         def.check_constraints = check_constraints;
@@ -5113,7 +5367,7 @@ impl StorageFile {
         self.rel_statement(move |ctx, txn| {
             catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &persisted)
         })?;
-        self.rel.tables.insert(name.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
@@ -5121,14 +5375,14 @@ impl StorageFile {
     /// CONSTRAINT) and persists the mutated catalog row.
     pub(crate) fn rel_set_foreign_keys(
         &mut self,
+        db_id: u32,
         name: &str,
         foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
         self.ensure_rel_usable()?;
         let mut def = self
             .rel
-            .tables
-            .get(name)
+            .table(db_id, name)
             .cloned()
             .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{name}'")))?;
         def.foreign_keys = foreign_keys;
@@ -5140,7 +5394,7 @@ impl StorageFile {
         self.rel_statement(move |ctx, txn| {
             catalog::update_table(ctx, &mut OpMode::Txn(txn), catalog_root, &persisted)
         })?;
-        self.rel.tables.insert(name.to_string(), def);
+        self.rel.cache_table(def);
         Ok(())
     }
 
@@ -5149,10 +5403,11 @@ impl StorageFile {
     #[cfg(test)]
     pub(crate) fn rel_insert_without_commit(
         &mut self,
+        db_id: u32,
         name: &str,
         values: Vec<Datum>,
     ) -> Result<(), StorageError> {
-        let (def, schema) = self.rel_def(name)?;
+        let (def, schema) = self.rel_def(db_id, name)?;
         let row = encode_row(&schema, &values)?;
         let txn_id = self.rel.next_txn_id;
         self.rel.next_txn_id += 1;
@@ -5206,11 +5461,10 @@ impl StorageFile {
         self.layout.data_offset + page * PAGE_SIZE as u64
     }
 
-    fn rel_def(&self, name: &str) -> Result<(TableDef, Schema), StorageError> {
+    fn rel_def(&self, db_id: u32, name: &str) -> Result<(TableDef, Schema), StorageError> {
         let def = self
             .rel
-            .tables
-            .get(name)
+            .table(db_id, name)
             .cloned()
             .ok_or_else(|| StorageError::InvalidConfig(format!("unknown table '{name}'")))?;
         let schema = def.schema()?;
@@ -5317,6 +5571,7 @@ impl StorageFile {
         let recovery_full = version.recovery_full;
         let mut storage = StorageFile {
             default_collation: header.default_collation(),
+            default_db_name: "truthdb".to_string(),
             file,
             wal,
             truncation_gate: LogTruncationGate::default(),
@@ -5484,6 +5739,7 @@ impl StorageFile {
 
         Ok(StorageFile {
             default_collation: header.default_collation(),
+            default_db_name: "truthdb".to_string(),
             file,
             wal,
             truncation_gate: LogTruncationGate::default(),
@@ -5572,13 +5828,13 @@ impl StorageFile {
             self.standby_capture_versions(&records);
             self.standby_version_floor = self.wal.tail();
         }
-        // Object ids are shared by tables, their secondary indexes, and logins
-        // (principals draw from the same counter), so the next id must clear all
-        // three — an index or a login can outrank every table.
+        // Object ids are shared by tables, their secondary indexes, logins,
+        // database principals, and database rows (all draw from the same
+        // counter), so the next id must clear every kind — an index or a login
+        // can outrank every table.
         self.rel.next_object_id = self
             .rel
-            .tables
-            .values()
+            .all_tables()
             .flat_map(|def| {
                 std::iter::once(def.object_id)
                     .chain(def.indexes.iter().map(|index| index.object_id))
@@ -5590,6 +5846,7 @@ impl StorageFile {
                     .values()
                     .map(|def| def.object_id),
             )
+            .chain(self.rel.databases.values().map(|def| def.object_id))
             .map(|object_id| object_id + 1)
             .max()
             .unwrap_or(FIRST_USER_OBJECT_ID)
@@ -5601,6 +5858,7 @@ impl StorageFile {
     fn reload_catalog(&mut self) -> Result<(), StorageError> {
         let Some(root) = self.rel.catalog_root else {
             self.rel.tables.clear();
+            self.rel.databases.clear();
             self.rel.principals.clear();
             self.rel.database_principals.clear();
             return Ok(());
@@ -5610,6 +5868,7 @@ impl StorageFile {
             catalog::load_tables(&mut ctx, root)?
         };
         self.rel.tables.clear();
+        self.rel.databases.clear();
         self.rel.principals.clear();
         self.rel.database_principals.clear();
         for def in defs {
@@ -5624,8 +5883,13 @@ impl StorageFile {
                 self.rel
                     .database_principals
                     .insert(def.name.to_ascii_lowercase(), def);
+            } else if def.is_database() {
+                // Databases: namespace containers, out of the object namespace.
+                self.rel
+                    .databases
+                    .insert(def.name.to_ascii_lowercase(), def);
             } else {
-                self.rel.tables.insert(def.name.clone(), def);
+                self.rel.cache_table(def);
             }
         }
         Ok(())
@@ -6025,7 +6289,7 @@ impl StorageFile {
             REL_KIND_SET_CATALOG_ROOT, REL_KIND_TXN_COMMIT, REL_KIND_TXN_END,
         };
         let alive: std::collections::HashSet<u32> =
-            self.rel.tables.values().map(|def| def.object_id).collect();
+            self.rel.all_tables().map(|def| def.object_id).collect();
         let mut freed_pages: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for (_, record) in records {
             if record.kind == REL_KIND_FREE_EXTENT
@@ -8364,6 +8628,7 @@ mod tests {
         // locks the database exclusively rather than ever under-locking.
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "DECLARE @s NVARCHAR(50) = N'SELECT v FROM t'; EXEC sp_executesql @s",
             Isolation::ReadCommitted,
         );
@@ -8375,6 +8640,7 @@ mod tests {
         // Direction 1: a SET raise BEFORE the EXEC locks the inner reads.
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; EXEC sp_executesql N'SELECT v FROM t'",
             Isolation::ReadUncommitted,
         );
@@ -8389,6 +8655,7 @@ mod tests {
         // statements after it inside the same literal.
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC sp_executesql N'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT v FROM t'",
             Isolation::ReadUncommitted,
         );
@@ -8477,7 +8744,12 @@ mod tests {
             let outcome = execute_batch(&storage, sql, &mut ctx);
             assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
         }
-        let needs = crate::rel::analyze_locks(&storage, "EXEC writer 1", Isolation::ReadCommitted);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "EXEC writer 1",
+            Isolation::ReadCommitted,
+        );
         assert!(
             needs.iter().any(
                 |(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Exclusive
@@ -8487,8 +8759,12 @@ mod tests {
              terminated): {needs:?}"
         );
         // An unknown procedure contributes no locks (2812 at execution).
-        let needs =
-            crate::rel::analyze_locks(&storage, "EXEC no_such_proc", Isolation::ReadCommitted);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "EXEC no_such_proc",
+            Isolation::ReadCommitted,
+        );
         assert!(
             !needs
                 .iter()
@@ -8531,15 +8807,24 @@ mod tests {
                 .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Shared)
         };
         // Control: analyzed alone, the escalated body read-locks.
-        let needs = crate::rel::analyze_locks(&storage, "EXEC pser", Isolation::ReadCommitted);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "EXEC pser",
+            Isolation::ReadCommitted,
+        );
         assert!(
             table_s(&needs),
             "control: pser's escalated body takes Table S: {needs:?}"
         );
         // The seam: pread analyzed first under the versioned regime, then
         // pser's escalated re-entry is dropped by the visited set.
-        let needs =
-            crate::rel::analyze_locks(&storage, "EXEC pread; EXEC pser", Isolation::ReadCommitted);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "EXEC pread; EXEC pser",
+            Isolation::ReadCommitted,
+        );
         assert!(
             table_s(&needs),
             "pser still runs pread's SELECT under SERIALIZABLE — Table S \
@@ -8569,6 +8854,7 @@ mod tests {
         }
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC sp_executesql N'EXEC wtr 1'",
             Isolation::ReadCommitted,
         );
@@ -8614,6 +8900,7 @@ mod tests {
             // literal's INSERT locks must be in the analyzed set.
             let needs = crate::rel::analyze_locks(
                 &storage,
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
                 "EXEC sp_executesql N'INSERT INTO t VALUES (1)'",
                 Isolation::ReadCommitted,
             );
@@ -8647,6 +8934,7 @@ mod tests {
 
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "DECLARE @i INT = 0; WHILE @i < 3 BEGIN INSERT INTO locked_t VALUES (@i); \
              SET @i = @i + 1; END",
             Isolation::ReadCommitted,
@@ -8661,6 +8949,7 @@ mod tests {
 
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "IF EXISTS (SELECT * FROM locked_t) SELECT 1",
             Isolation::ReadCommitted,
         );
@@ -8714,7 +9003,12 @@ mod tests {
             "IF EXISTS (SELECT * FROM lv) SELECT 1",
             "IF (SELECT COUNT(*) FROM lt) = 0 SELECT 1",
         ] {
-            let needs = crate::rel::analyze_locks(&storage, sql, Isolation::ReadCommitted);
+            let needs = crate::rel::analyze_locks(
+                &storage,
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                sql,
+                Isolation::ReadCommitted,
+            );
             assert!(
                 table_s(&needs),
                 "{sql}: condition read takes Table S: {needs:?}"
@@ -8723,6 +9017,7 @@ mod tests {
         // Both IF branches analyze — an untaken ELSE's INSERT is still locked.
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "IF 1 = 2 SELECT 1 ELSE INSERT INTO lt VALUES (9)",
             Isolation::ReadCommitted,
         );
@@ -8733,6 +9028,7 @@ mod tests {
         // An EXEC literal inside a WHILE body analyzes through the Exec arm.
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "DECLARE @i INT = 0; WHILE @i < 1 BEGIN \
              EXEC sp_executesql N'INSERT INTO lt VALUES (7)'; SET @i = @i + 1; END",
             Isolation::ReadCommitted,
@@ -8765,6 +9061,7 @@ mod tests {
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "IF EXISTS (WITH x AS (SELECT id FROM lt) SELECT id FROM x) SELECT 1",
             Isolation::ReadCommitted,
         );
@@ -8800,8 +9097,12 @@ mod tests {
         };
 
         // Off: the SELECT read-locks, as ever.
-        let needs =
-            crate::rel::analyze_locks(&storage, "SELECT v FROM t", Isolation::ReadCommitted);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT v FROM t",
+            Isolation::ReadCommitted,
+        );
         assert!(
             table_s(&needs),
             "without RCSI a RC SELECT takes Table S: {needs:?}"
@@ -8815,8 +9116,12 @@ mod tests {
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
 
         // On: Database IS only — the DDL fence — and no Table S.
-        let needs =
-            crate::rel::analyze_locks(&storage, "SELECT v FROM t", Isolation::ReadCommitted);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT v FROM t",
+            Isolation::ReadCommitted,
+        );
         assert!(
             !table_s(&needs),
             "under RCSI a RC SELECT takes no Table S: {needs:?}"
@@ -8829,14 +9134,23 @@ mod tests {
         // The other levels are untouched: RR still read-locks, RU still
         // takes nothing, and a batch that raises isolation falls back to
         // locking even though the session level is RC.
-        let needs =
-            crate::rel::analyze_locks(&storage, "SELECT v FROM t", Isolation::RepeatableRead);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT v FROM t",
+            Isolation::RepeatableRead,
+        );
         assert!(table_s(&needs), "RR is not versioned: {needs:?}");
-        let needs =
-            crate::rel::analyze_locks(&storage, "SELECT v FROM t", Isolation::ReadUncommitted);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT v FROM t",
+            Isolation::ReadUncommitted,
+        );
         assert!(needs.is_empty(), "RU takes no locks at all: {needs:?}");
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT v FROM t",
             Isolation::ReadCommitted,
         );
@@ -8848,7 +9162,12 @@ mod tests {
         // SNAPSHOT isolation is versioned regardless of RCSI: Database IS
         // only, and the EXEC-literal recursion preserves the level (the
         // #120 review's collapse bug, from the other direction).
-        let needs = crate::rel::analyze_locks(&storage, "SELECT v FROM t", Isolation::Snapshot);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            "SELECT v FROM t",
+            Isolation::Snapshot,
+        );
         assert!(
             !table_s(&needs),
             "SNAPSHOT reads take no Table S: {needs:?}"
@@ -8856,6 +9175,7 @@ mod tests {
         assert!(needs.contains(&(Resource::Database, LockMode::IntentShared)));
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC sp_executesql N'SELECT v FROM t'",
             Isolation::Snapshot,
         );
@@ -8867,6 +9187,7 @@ mod tests {
         // raise, but the batch still holds the Database IS fence.
         let needs = crate::rel::analyze_locks(
             &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SET TRANSACTION ISOLATION LEVEL SNAPSHOT; SELECT v FROM t",
             Isolation::ReadUncommitted,
         );
@@ -9055,7 +9376,12 @@ mod tests {
         );
         // The pinned view still reads its consistent state through all of it.
         let rows = storage
-            .rel_scan_snapshot("t", Some(&[1]), pinned)
+            .rel_scan_snapshot(
+                crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                "t",
+                Some(&[1]),
+                pinned,
+            )
             .expect("snapshot scan");
         assert_eq!(rows.len(), 100);
         assert!(
@@ -10126,7 +10452,12 @@ mod tests {
         };
 
         // At the threshold: per-row locks (plus the table intent).
-        let needs = crate::rel::analyze_locks(&storage, &insert(1000), Isolation::ReadCommitted);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            &insert(1000),
+            Isolation::ReadCommitted,
+        );
         let rows = needs
             .iter()
             .filter(|(r, _)| matches!(r, Resource::Row(_, _)))
@@ -10144,7 +10475,12 @@ mod tests {
         // declines to enumerate 1001 row hashes and the INSERT falls back to
         // one table-exclusive lock. (Reachable since the node budget became
         // per-expression — a 1001-tuple INSERT parses now.)
-        let needs = crate::rel::analyze_locks(&storage, &insert(1001), Isolation::ReadCommitted);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            &insert(1001),
+            Isolation::ReadCommitted,
+        );
         assert!(
             needs
                 .iter()
@@ -10168,7 +10504,12 @@ mod tests {
             .map(|i| format!("DELETE FROM t WHERE id = {i}"))
             .collect();
         let over = format!("{}; {}", insert(1000), deletes.join("; "));
-        let needs = crate::rel::analyze_locks(&storage, &over, Isolation::ReadCommitted);
+        let needs = crate::rel::analyze_locks(
+            &storage,
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            &over,
+            Isolation::ReadCommitted,
+        );
         assert!(
             needs
                 .iter()
@@ -10504,24 +10845,37 @@ mod tests {
             &mut ctx,
             "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
         );
-        assert_eq!(storage.rel_row_count("t"), Some(0));
+        assert_eq!(
+            storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+            Some(0)
+        );
 
         run(
             &storage,
             &mut ctx,
             "INSERT INTO t VALUES (1, 10), (2, 20), (3, 30)",
         );
-        assert_eq!(storage.rel_row_count("t"), Some(3));
+        assert_eq!(
+            storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+            Some(3)
+        );
 
         run(&storage, &mut ctx, "DELETE FROM t WHERE id = 3");
         run(&storage, &mut ctx, "UPDATE t SET v = 99 WHERE id = 1");
-        assert_eq!(storage.rel_row_count("t"), Some(2), "delete -1, update 0");
+        assert_eq!(
+            storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+            Some(2),
+            "delete -1, update 0"
+        );
 
         // A failing multi-row statement (duplicate key on its last row) is
         // atomic: no rows land, and neither does its count.
         let dup = execute_batch(&storage, "INSERT INTO t VALUES (5, 1), (1, 1)", &mut ctx);
         assert!(dup.error.is_some(), "duplicate key must fail");
-        assert_eq!(storage.rel_row_count("t"), Some(2));
+        assert_eq!(
+            storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+            Some(2)
+        );
 
         // Transaction rollback restores the count with the rows.
         run(
@@ -10529,9 +10883,16 @@ mod tests {
             &mut ctx,
             "BEGIN TRANSACTION; INSERT INTO t VALUES (10, 1), (11, 1)",
         );
-        assert_eq!(storage.rel_row_count("t"), Some(4), "in-flight rows count");
+        assert_eq!(
+            storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+            Some(4),
+            "in-flight rows count"
+        );
         run(&storage, &mut ctx, "ROLLBACK");
-        assert_eq!(storage.rel_row_count("t"), Some(2));
+        assert_eq!(
+            storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+            Some(2)
+        );
 
         // A savepoint rollback restores exactly the statements behind it.
         run(
@@ -10540,14 +10901,17 @@ mod tests {
             "BEGIN TRANSACTION; INSERT INTO t VALUES (20, 1); SAVE TRANSACTION sp; \
              INSERT INTO t VALUES (21, 1); ROLLBACK TRANSACTION sp; COMMIT",
         );
-        assert_eq!(storage.rel_row_count("t"), Some(3));
+        assert_eq!(
+            storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+            Some(3)
+        );
 
         // Crash (no checkpoint, pool never flushed): recovery replays the ops,
         // counter page included.
         drop(storage);
         let storage = Storage::open(path.clone()).expect("reopen");
         assert_eq!(
-            storage.rel_row_count("t"),
+            storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
             Some(3),
             "count survives recovery"
         );
@@ -10579,12 +10943,16 @@ mod tests {
             &mut open_txn,
         );
         assert!(pending.error.is_none(), "{:?}", pending.error);
-        assert_eq!(storage.rel_row_count("t"), Some(5), "in-flight rows count");
+        assert_eq!(
+            storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
+            Some(5),
+            "in-flight rows count"
+        );
         drop(storage); // crash with the transaction open
 
         let storage = Storage::open(path.clone()).expect("reopen");
         assert_eq!(
-            storage.rel_row_count("t"),
+            storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
             Some(2),
             "the loser transaction's rows and count are both undone"
         );
@@ -11083,7 +11451,11 @@ mod tests {
         // `flushed` stays put — nothing fsyncs.
         for i in 0..THREADS {
             storage
-                .rel_insert("t", vec![Datum::Int(i as i32)])
+                .rel_insert(
+                    crate::relstore::catalog::DEFAULT_DATABASE_ID,
+                    "t",
+                    vec![Datum::Int(i as i32)],
+                )
                 .expect("insert");
         }
         let target = storage.wal_tail();
