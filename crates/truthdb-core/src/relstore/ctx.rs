@@ -21,7 +21,10 @@ use crate::relstore::slotted::SlottedPage;
 use crate::storage::StorageError;
 use crate::storage_layout::{PAGE_SIZE, WAL_ENTRY_TYPE_REL};
 use crate::wal::WalWriter;
-use crate::wal::records::{PageOpRedo, PageOpUndo, RelRecord};
+use crate::wal::records::{
+    PageOpRedo, PageOpUndo, REL_KIND_CLR, REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_IMAGES,
+    REL_KIND_PAGE_OP, RelRecord,
+};
 
 // v2 adds a commit-record timestamp (in the commit's `redo`) for point-in-time
 // restore. Nothing gates on the version, so v1 records decode unchanged.
@@ -166,6 +169,14 @@ pub(crate) struct RelCtx<'a> {
     /// True on undo paths (rollback, recovery): appends may use the WAL's
     /// compensation reserve, which forward statements must not touch.
     pub use_reserve: bool,
+    /// The CONTAINER TAG stamped into page-scoped records' `flags`: the
+    /// database id whose data the statement mutates (page ops on a database's
+    /// tables, its catalog-row writes), or 0 = global/unattributed
+    /// (transaction control, allocator, catalog root, recovery-built CLRs,
+    /// and every pre-tag log). The tag is a FILTERING aid for future log
+    /// subscribers, never a correctness input: consumers must treat 0 as
+    /// unfiltered and include it in every subscription.
+    pub container: u16,
 }
 
 impl RelCtx<'_> {
@@ -193,11 +204,25 @@ impl RelCtx<'_> {
     }
 
     pub fn append(&mut self, record: &RelRecord, sync: bool) -> Result<u64, StorageError> {
+        let mut payload = record.encode();
+        // Stamp the container tag into page-scoped records (the envelope's
+        // otherwise-unused `flags` at bytes 18..20 — no layout change, old
+        // logs and old builds are unaffected). Non-page kinds stay 0: a
+        // transaction can span containers, the allocator and catalog root
+        // are global.
+        if self.container != 0
+            && matches!(
+                record.kind,
+                REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE | REL_KIND_PAGE_IMAGES | REL_KIND_CLR
+            )
+        {
+            payload[18..20].copy_from_slice(&self.container.to_le_bytes());
+        }
         self.io.wal.append_entry_reserve(
             WAL_ENTRY_TYPE_REL,
             REL_WAL_ENTRY_VERSION,
             0,
-            &record.encode(),
+            &payload,
             sync,
             self.use_reserve,
         )

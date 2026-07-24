@@ -46,6 +46,14 @@ pub struct RelRecord {
     /// Owning transaction (0 = non-transactional).
     pub txn_id: u64,
     pub kind: u16,
+    /// The CONTAINER TAG (multiple-databases plan, slice B): for page-scoped
+    /// kinds (PAGE_OP, PAGE_IMAGE, PAGE_IMAGES, CLR) the database id whose
+    /// data the record mutates; 0 = global/unattributed (transaction control,
+    /// allocator, catalog root, recovery-built CLRs, and every log written
+    /// before the tag existed). Stamped at append by `RelCtx::container`; a
+    /// filtering aid for future log subscribers, never a correctness input —
+    /// consumers must treat 0 as unfiltered. Database ids are capped at
+    /// `u16::MAX` at CREATE DATABASE so every id fits.
     pub flags: u16,
     pub redo: Vec<u8>,
     pub undo: Vec<u8>,
