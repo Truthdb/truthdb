@@ -1,4 +1,4 @@
-use super::*;
+use super::prelude::*;
 
 /// A declared table variable's in-memory contents: its column schema, the key
 /// columns of its declared PRIMARY KEY (for uniqueness enforcement), the
@@ -374,4 +374,341 @@ impl TxnContext {
     pub(super) fn take_reaped(&mut self) -> bool {
         std::mem::take(&mut self.reaped)
     }
+}
+
+/// One executed statement's outcome, from [`exec_statement_streamed`].
+pub(super) enum StatementOutcome {
+    /// The statement's whole result, for the caller to emit.
+    Result(StatementResult),
+    /// A streamed `SELECT`: its columns and rows already left through the
+    /// emitter as the scan produced them; only its DONE remains.
+    Streamed { rows: u64 },
+}
+
+thread_local! {
+    /// The running statement's read snapshot (Stage 13), when its isolation
+    /// is versioned — RCSI's per-statement view. Thread-local rather than
+    /// threaded through every read path: a batch executes synchronously on
+    /// one worker thread, and every nested read of the statement (subqueries,
+    /// views, derived tables, correlated re-evaluation) shares the statement
+    /// snapshot by construction.
+    pub(super) static CURRENT_SNAPSHOT: std::cell::Cell<Option<ReadSnapshot>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// The running statement's read snapshot, if it reads versioned.
+pub(super) fn current_snapshot() -> Option<ReadSnapshot> {
+    CURRENT_SNAPSHOT.get()
+}
+
+thread_local! {
+    /// The running statement's table variables (the session's, shared read-only
+    /// for the statement). Thread-local for the same reason as CURRENT_SNAPSHOT:
+    /// a batch runs on one worker thread, and the FROM-source builders carry
+    /// only an EvalContext (a truthdb-sql type that cannot hold core `Datum`
+    /// rows), so the store cannot ride through it.
+    pub(super) static CURRENT_TABLE_VARS: std::cell::RefCell<
+        Option<std::rc::Rc<std::collections::HashMap<String, TableVar>>>,
+    > = const { std::cell::RefCell::new(None) };
+}
+
+/// The table variable `@name` visible to the running statement, cloned out for a
+/// FROM read (an in-memory rowset).
+pub(super) fn current_table_var(name: &str) -> Option<TableVar> {
+    let key = name.trim_start_matches('@').to_ascii_lowercase();
+    CURRENT_TABLE_VARS.with(|c| c.borrow().as_ref().and_then(|m| m.get(&key).cloned()))
+}
+
+/// Installs the statement's table variables for its execution, restoring the
+/// prior installation on drop (scopes can nest — a subquery or TVF body reads
+/// within the caller's — so restore rather than clear).
+pub(super) struct TableVarScope {
+    prev: Option<std::rc::Rc<std::collections::HashMap<String, TableVar>>>,
+}
+
+impl TableVarScope {
+    fn enter(vars: std::rc::Rc<std::collections::HashMap<String, TableVar>>) -> Self {
+        let prev = CURRENT_TABLE_VARS.with(|c| c.borrow_mut().replace(vars));
+        TableVarScope { prev }
+    }
+}
+
+impl Drop for TableVarScope {
+    fn drop(&mut self) {
+        CURRENT_TABLE_VARS.with(|c| *c.borrow_mut() = self.prev.take());
+    }
+}
+
+/// Installs `vars` as the table-variable read view for the returned guard's
+/// lifetime — the SINGLE arming rule shared by every path that can read a table
+/// variable: ordinary statements, IF/WHILE conditions, scalar-function RETURN
+/// expressions, and TVF bodies. Armed when `vars` is non-empty OR an outer scope
+/// is already armed. The second clause is the correctness hinge: a function,
+/// procedure, or TVF body runs with a fresh (empty) table-variable set, and it
+/// must SHADOW the caller's view — not inherit it — so its `FROM @t` resolves
+/// against its own (empty) locals and errors 1087, never the caller's rows.
+/// When neither holds (the common no-table-variable batch) it arms nothing, so
+/// the hot path pays only a thread-local read.
+pub(super) fn arm_table_var_view(
+    vars: &std::collections::HashMap<String, TableVar>,
+) -> Option<TableVarScope> {
+    let outer_armed = CURRENT_TABLE_VARS.with(|c| c.borrow().is_some());
+    (!vars.is_empty() || outer_armed).then(|| TableVarScope::enter(std::rc::Rc::new(vars.clone())))
+}
+
+/// The `inserted`/`deleted` pseudo-tables a firing trigger body reads: the new
+/// and old row images of the statement that fired it, with the parent table's
+/// schema. Rows are in schema order, exactly like a base-table row.
+pub(super) struct TriggerTables {
+    pub(super) schema: Schema,
+    pub(super) inserted: Vec<Vec<Datum>>,
+    pub(super) deleted: Vec<Vec<Datum>>,
+    /// The 0-based indices of the columns the firing statement touched.
+    pub(super) updated: Vec<usize>,
+}
+
+thread_local! {
+    /// The `inserted`/`deleted` view visible to the running trigger body (like
+    /// CURRENT_TABLE_VARS for table variables — a batch runs on one thread and
+    /// the FROM-source builders carry only an EvalContext).
+    pub(super) static CURRENT_TRIGGER_TABLES: std::cell::RefCell<Option<std::rc::Rc<TriggerTables>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// The `inserted` or `deleted` pseudo-table rows visible to the running trigger,
+/// as a materialized source, if a trigger scope is armed and `name` is one of
+/// them. Returns `None` for any other name (falls through to catalog resolution).
+pub(super) fn current_trigger_source(name: &str, qualifier: &str) -> Option<Source> {
+    let which = name.to_ascii_lowercase();
+    if which != "inserted" && which != "deleted" {
+        return None;
+    }
+    CURRENT_TRIGGER_TABLES.with(|c| {
+        let borrow = c.borrow();
+        let tables = borrow.as_ref()?;
+        let rows = if which == "inserted" {
+            tables.inserted.clone()
+        } else {
+            tables.deleted.clone()
+        };
+        let count = tables.schema.columns.len();
+        let columns = tables
+            .schema
+            .columns
+            .iter()
+            .map(|col| ResultColumn {
+                name: col.name.clone(),
+                column_type: col.column_type,
+            })
+            .collect();
+        let collations = tables
+            .schema
+            .columns
+            .iter()
+            .map(|col| col.collation.clone())
+            .collect();
+        Some(Source {
+            columns,
+            qualifiers: vec![Some(qualifier.to_string()); count],
+            collations,
+            rows: SourceRows::Materialized(rows),
+        })
+    })
+}
+
+/// Installs the `inserted`/`deleted` view for a trigger body's execution,
+/// restoring the prior installation on drop (a nested trigger's body shadows the
+/// outer's — restore rather than clear).
+pub(super) struct TriggerScope {
+    prev: Option<std::rc::Rc<TriggerTables>>,
+}
+
+impl TriggerScope {
+    pub(super) fn enter(tables: std::rc::Rc<TriggerTables>) -> Self {
+        let prev = CURRENT_TRIGGER_TABLES.with(|c| c.borrow_mut().replace(tables));
+        TriggerScope { prev }
+    }
+
+    /// Clears the `inserted`/`deleted` view for a stored-object body (a
+    /// procedure, function, TVF, or view called from within a trigger body):
+    /// those pseudo-tables are visible only in the trigger's OWN statements, not
+    /// in objects it calls. Restores the prior view on drop. A no-op (cheap) when
+    /// no trigger scope is armed.
+    pub(super) fn clear() -> Self {
+        let prev = CURRENT_TRIGGER_TABLES.with(|c| c.borrow_mut().take());
+        TriggerScope { prev }
+    }
+}
+
+impl Drop for TriggerScope {
+    fn drop(&mut self) {
+        CURRENT_TRIGGER_TABLES.with(|c| *c.borrow_mut() = self.prev.take());
+    }
+}
+
+thread_local! {
+    /// The row images captured by the DML that is currently firing triggers, so
+    /// exec_insert/update/delete can populate `inserted`/`deleted` without a
+    /// signature change. Armed by the firing wrapper ONLY when the target table
+    /// has triggers — the common no-trigger path leaves this `None` (no clone).
+    pub(super) static TRIGGER_CAPTURE: std::cell::RefCell<Option<CapturedImages>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// New (`inserted`) and old (`deleted`) row images collected during a DML that
+/// has triggers to fire, plus the indices of the columns the statement touched
+/// (its SET list, or every inserted column) for `UPDATE()`/`COLUMNS_UPDATED()`.
+#[derive(Default)]
+pub(super) struct CapturedImages {
+    pub(super) inserted: Vec<Vec<Datum>>,
+    pub(super) deleted: Vec<Vec<Datum>>,
+    pub(super) updated: Vec<usize>,
+}
+
+/// Records row images into the active capture, if one is armed. `f` builds the
+/// (inserted, deleted) images for a statement; it runs only when capture is on,
+/// so the no-trigger path pays nothing.
+pub(super) fn capture_trigger_images(f: impl FnOnce() -> (Vec<Vec<Datum>>, Vec<Vec<Datum>>)) {
+    TRIGGER_CAPTURE.with(|c| {
+        let mut borrow = c.borrow_mut();
+        if let Some(images) = borrow.as_mut() {
+            let (ins, del) = f();
+            images.inserted.extend(ins);
+            images.deleted.extend(del);
+        }
+    });
+}
+
+/// Records the indices of the columns a firing UPDATE's SET list (or an INSERT's
+/// target columns) touched, for `UPDATE()`/`COLUMNS_UPDATED()`, if capture is on.
+pub(super) fn capture_trigger_updated(indices: Vec<usize>) {
+    TRIGGER_CAPTURE.with(|c| {
+        if let Some(images) = c.borrow_mut().as_mut() {
+            images.updated = indices;
+        }
+    });
+}
+
+/// The columns the firing trigger's statement touched, resolved against the
+/// parent table's schema — the value behind `UPDATE()`/`COLUMNS_UPDATED()` in a
+/// trigger body. `None` outside a trigger.
+pub(super) fn current_trigger_updated_columns() -> Option<truthdb_sql::eval::UpdatedColumns> {
+    CURRENT_TRIGGER_TABLES.with(|c| {
+        let borrow = c.borrow();
+        let tables = borrow.as_ref()?;
+        Some(truthdb_sql::eval::UpdatedColumns {
+            columns: tables
+                .schema
+                .columns
+                .iter()
+                .map(|col| col.name.clone())
+                .collect(),
+            touched: tables.updated.iter().copied().collect(),
+        })
+    })
+}
+
+thread_local! {
+    /// The object_ids of triggers whose bodies are currently on the stack. With
+    /// recursive triggers OFF (the default), a trigger must not re-fire itself
+    /// (direct recursion) — a trigger on T whose body DMLs T is suppressed for
+    /// that same trigger. Nested triggers on OTHER tables are not affected.
+    pub(super) static FIRING_TRIGGERS: std::cell::RefCell<Vec<u32>> = const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Statement-scoped snapshot registration: capture on entry, and release —
+/// pruning must not wait on a statement that errored — on every exit path.
+pub(super) struct SnapshotScope<'a> {
+    storage: &'a Storage,
+    seq: u64,
+    /// The snapshot that was current when this scope was entered, restored on
+    /// exit. Scopes can nest — a scalar function's body statement runs under the
+    /// caller's active statement/transaction snapshot — so a nested scope must
+    /// restore the caller's snapshot on drop, not erase it.
+    prev: Option<ReadSnapshot>,
+}
+
+impl<'a> SnapshotScope<'a> {
+    pub(super) fn enter(storage: &'a Storage, own_txn: Option<u64>) -> Self {
+        let prev = CURRENT_SNAPSHOT.get();
+        let snap = storage.capture_read_snapshot(own_txn);
+        CURRENT_SNAPSHOT.set(Some(snap));
+        SnapshotScope {
+            storage,
+            seq: snap.seq,
+            prev,
+        }
+    }
+}
+
+impl Drop for SnapshotScope<'_> {
+    fn drop(&mut self) {
+        CURRENT_SNAPSHOT.set(self.prev);
+        self.storage.release_read_snapshot(self.seq);
+    }
+}
+
+/// Statement-scoped view of a TRANSACTION's snapshot (SNAPSHOT isolation):
+/// sets the thread-local for this statement and restores the prior one on exit
+/// (see [`SnapshotScope::prev`]), but the registration lives with the
+/// transaction, not the statement.
+pub(super) struct TxnSnapshotScope {
+    prev: Option<ReadSnapshot>,
+}
+
+impl TxnSnapshotScope {
+    pub(super) fn enter(snap: ReadSnapshot) -> Self {
+        let prev = CURRENT_SNAPSHOT.get();
+        CURRENT_SNAPSHOT.set(Some(snap));
+        TxnSnapshotScope { prev }
+    }
+}
+
+impl Drop for TxnSnapshotScope {
+    fn drop(&mut self) {
+        CURRENT_SNAPSHOT.set(self.prev);
+    }
+}
+
+/// Whether a statement touches any base table: DML always does; a SELECT
+/// only when its FROM/subqueries name one. `SELECT 1` under SNAPSHOT must
+/// neither raise 3952 nor establish the transaction's snapshot — SQL Server
+/// defers both to the first read of an actual object.
+pub(super) fn statement_reads_tables(storage: &Storage, db_id: u32, statement: &Statement) -> bool {
+    match statement {
+        Statement::Select(select) => select_reads_tables(storage, db_id, select),
+        // An INSERT whose TARGET is a table variable writes only session memory,
+        // so — unlike a base-table INSERT — it is not itself a data access; but a
+        // `SELECT` source still reads real tables and must arm the snapshot.
+        Statement::Insert(insert) if insert.table.value.starts_with('@') => match &insert.source {
+            InsertSource::Select(select) => select_reads_tables(storage, db_id, select),
+            _ => false,
+        },
+        _ => true,
+    }
+}
+
+/// Whether a SELECT reads any real table — directly (FROM/subqueries) or through
+/// a scalar function it calls. A `@t` table-variable source is session-local and
+/// is not counted (it neither locks nor snapshots).
+pub(super) fn select_reads_tables(storage: &Storage, db_id: u32, select: &Select) -> bool {
+    let expanded = expand_ctes(select);
+    let mut tables = Vec::new();
+    collect_locked_tables(&expanded, &mut tables);
+    !tables.is_empty() || !select_function_read_ids(storage, db_id, &expanded).is_empty()
+}
+
+/// SQL Server 3952: SNAPSHOT isolation used while the database does not
+/// allow it — raised at data access, not at SET, exactly as SQL Server does.
+pub(super) fn snapshot_not_allowed_error(database: &str) -> SqlError {
+    SqlError::new(
+        3952,
+        16,
+        1,
+        format!(
+            "Snapshot isolation transaction failed accessing database '{database}' because \
+             snapshot isolation is not allowed in this database. Use ALTER DATABASE to allow \
+             snapshot isolation."
+        ),
+    )
 }

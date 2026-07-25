@@ -1,4 +1,4 @@
-use super::*;
+use super::prelude::*;
 
 /// `sp_describe_first_result_set`: the column metadata of `tsql`'s first
 /// statement's result set, without executing it. Covers exactly the shapes

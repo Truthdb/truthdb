@@ -1,4 +1,4 @@
-use super::*;
+use super::prelude::*;
 
 /// Result of one executed statement.
 #[derive(Debug, Clone, PartialEq)]

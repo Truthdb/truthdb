@@ -1,4 +1,4 @@
-use super::*;
+use super::prelude::*;
 
 pub fn execute_batch(storage: &Storage, sql: &str, txn_ctx: &mut TxnContext) -> BatchOutcome {
     execute_batch_with_params(storage, sql, txn_ctx, &[])
@@ -255,4 +255,121 @@ impl BatchRun<'_> {
             }
         }
     }
+}
+/// Runs one statement. A plain `SELECT` the scan planner accepts streams its
+/// rows through `run` as the scan reads them — the whole point of the event
+/// stream: the client sees rows while the scan runs, and the statement's peak
+/// memory is one chunk, not the result. Everything else executes exactly as
+/// before and returns its materialized result.
+pub(super) fn exec_statement_streamed(
+    storage: &Storage,
+    statement: &Statement,
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun<'_>,
+) -> Result<StatementOutcome, SqlError> {
+    // Versioned reads (Stage 13). RCSI: a SELECT under READ COMMITTED with
+    // the option on reads a per-statement snapshot instead of blocking on
+    // writers' locks (DML and the reads inside it stay lock-based —
+    // conservative versus SQL Server; the write locks subsume what
+    // versioning would relax). SNAPSHOT isolation: every data-access
+    // statement shares the transaction's snapshot, captured at its first
+    // data access; outside a transaction each statement is its own.
+    let data_access = matches!(
+        statement,
+        Statement::Select(_) | Statement::Insert(_) | Statement::Update(_) | Statement::Delete(_)
+    );
+    let mut _stmt_scope = None;
+    let mut _txn_scope = None;
+    // Make the running context's table variables visible to this statement's
+    // FROM reads. The clone is the statement's read view; INSERT/UPDATE write
+    // the real store on TxnContext. Inside a function/procedure body (fresh,
+    // empty table variables) this shadows the caller's view with an empty one,
+    // so the body cannot read the caller's @t — see arm_table_var_view.
+    let _table_var_scope = arm_table_var_view(&txn_ctx.table_variables);
+    match txn_ctx.isolation() {
+        Isolation::ReadCommitted
+            if matches!(statement, Statement::Select(_)) && storage.rcsi_enabled() =>
+        {
+            // The snapshot is the durable commit prefix, so the session's
+            // own just-committed statements must be fsync-durable before
+            // capture or the statement would not see them. Rowset-producing
+            // SELECTs already flushed in `run_block`; this covers assignment
+            // SELECTs (and then no-ops when nothing committed since the
+            // last durability point).
+            run.flush(storage)?;
+            _stmt_scope = Some(SnapshotScope::enter(
+                storage,
+                txn_ctx.txn.as_ref().map(StorageTxn::txn_id),
+            ));
+        }
+        Isolation::Snapshot
+            if data_access && statement_reads_tables(storage, txn_ctx.database_id(), statement) =>
+        {
+            if !storage.snapshot_isolation_allowed() {
+                if txn_ctx.in_txn() {
+                    txn_ctx.doomed = true;
+                }
+                return Err(snapshot_not_allowed_error(&txn_ctx.database));
+            }
+            if txn_ctx.in_txn() {
+                if txn_ctx.txn_snapshot.is_none() {
+                    // First data access establishes the transaction's view.
+                    run.flush(storage)?;
+                    let own = txn_ctx.txn.as_ref().map(StorageTxn::txn_id);
+                    txn_ctx.txn_snapshot = Some(storage.capture_read_snapshot(own));
+                }
+                _txn_scope = txn_ctx.txn_snapshot.map(TxnSnapshotScope::enter);
+            } else {
+                // Autocommit: the statement is its own transaction, so its
+                // snapshot is statement-scoped, like RCSI's.
+                run.flush(storage)?;
+                _stmt_scope = Some(SnapshotScope::enter(storage, None));
+            }
+        }
+        // A readable STANDBY snapshots every table-reading statement — not
+        // just SELECTs: cursors, table-variable INSERT ... SELECT sources, and
+        // function bodies read too — regardless of the session's isolation
+        // (redo leaves the primary's in-flight rows on its pages, and shipped
+        // transactions hold no local locks; only the version-store snapshot at
+        // the last applied commit yields committed-state reads). Ordered
+        // BELOW the RCSI/SNAPSHOT arms so a SNAPSHOT session on a standby
+        // keeps its transaction-lifetime view.
+        _ if statement_reads_tables(storage, txn_ctx.database_id(), statement)
+            && storage.is_standby() =>
+        {
+            run.flush(storage)?;
+            _stmt_scope = Some(SnapshotScope::enter(storage, None));
+        }
+        _ => {}
+    }
+    exec_statement_streamed_inner(storage, statement, txn_ctx, run)
+}
+
+pub(super) fn exec_statement_streamed_inner(
+    storage: &Storage,
+    statement: &Statement,
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun<'_>,
+) -> Result<StatementOutcome, SqlError> {
+    if let Statement::RaiseError(raise) = statement {
+        return exec_raiserror(raise, txn_ctx, run);
+    }
+    // The streamed shape: a plain SELECT — no SHOWPLAN (its rows are the plan's,
+    // not the table's), no assignment (routed to exec_select_assign) — that
+    // `scan_plan` accepts. A doomed transaction still allows reads, so the gate
+    // needs no doomed check for a SELECT.
+    if let Statement::Select(select) = statement
+        && !txn_ctx.showplan_text
+        && !select
+            .items
+            .iter()
+            .any(|i| matches!(i, SelectItem::Assign { .. }))
+    {
+        let eval_ctx = txn_ctx.eval_context();
+        if let Some(plan) = scan_plan(storage, select, &eval_ctx) {
+            let rows = scan_select_streamed(storage, &plan, select, &eval_ctx, run)?;
+            return Ok(StatementOutcome::Streamed { rows });
+        }
+    }
+    exec_statement(storage, statement, txn_ctx).map(StatementOutcome::Result)
 }
