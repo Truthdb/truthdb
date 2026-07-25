@@ -15,8 +15,13 @@ use truthdb_sql::value::{SqlValue, order_key_cmp};
 
 use crate::relstore::types::{ColumnType, Datum};
 
+use super::api::{ResultColumn, RowSet};
+use super::helpers::map_storage_err;
+use super::query::{
+    JoinScope, approx_row_bytes, expr_needs_binding, row_values, sort_budget,
+    substitute_correlated_in_expr,
+};
 use super::value;
-use super::{JoinScope, ResultColumn, RowSet, row_values};
 
 /// Evaluate an expression that may hold a subquery or user scalar function: fold
 /// it against `row` (its columns resolved by `resolver`) before the pure
@@ -30,10 +35,9 @@ fn eval_bound(
     resolver: &JoinScope,
     eval_ctx: &EvalContext,
 ) -> Result<SqlValue, SqlError> {
-    if crate::rel::expr_needs_binding(storage, eval_ctx.database_id, expr) {
+    if expr_needs_binding(storage, eval_ctx.database_id, expr) {
         let outer = |name: &str| resolver.resolve(name);
-        let bound =
-            crate::rel::substitute_correlated_in_expr(storage, expr, &outer, row, eval_ctx)?;
+        let bound = substitute_correlated_in_expr(storage, expr, &outer, row, eval_ctx)?;
         eval::eval(&bound, row, resolver, eval_ctx)
     } else {
         eval::eval(expr, row, resolver, eval_ctx)
@@ -196,8 +200,8 @@ pub fn execute(
     // partition the rows by group-key hash (so every member of a group lands in
     // one partition) to temp extents, then aggregate each partition in bounded
     // memory. Without GROUP BY (one group) or within budget, aggregate directly.
-    let budget = super::sort_budget();
-    let input_bytes: usize = rows.iter().map(|r| super::approx_row_bytes(r)).sum();
+    let budget = sort_budget();
+    let input_bytes: usize = rows.iter().map(|r| approx_row_bytes(r)).sum();
     let out_rows = if select.group_by.is_empty() || input_bytes <= budget {
         aggregate_partition(
             storage, select, rows, types, resolver, eval_ctx, &aggs, &having, &out_exprs, &synth,
@@ -254,16 +258,15 @@ fn aggregate_partition(
             // A reference to a non-grouped column stays unresolved and errors
             // inside the subquery, as SQL Server rejects it too.
             let bound;
-            let having = if crate::rel::expr_needs_binding(storage, eval_ctx.database_id, having) {
+            let having = if expr_needs_binding(storage, eval_ctx.database_id, having) {
                 // A user function's args were rewritten to the synthetic group
                 // columns ($gk/$agg), which `synth` resolves; a subquery keeps its
                 // original grouping-column names, which `group_key_resolver`
                 // resolves. Both index into `group_row`, so try synth first.
                 let gkr = group_key_resolver(select, resolver);
                 let outer = |name: &str| synth.resolve(name).or_else(|| gkr(name));
-                bound = crate::rel::substitute_correlated_in_expr(
-                    storage, having, &outer, &group_row, eval_ctx,
-                )?;
+                bound =
+                    substitute_correlated_in_expr(storage, having, &outer, &group_row, eval_ctx)?;
                 &bound
             } else {
                 having
@@ -286,12 +289,10 @@ fn aggregate_partition(
             // A subquery here is correlated to a grouping column (the
             // rewrite left it): bind the group row, exactly as HAVING does.
             let bound;
-            let expr = if crate::rel::expr_needs_binding(storage, eval_ctx.database_id, expr) {
+            let expr = if expr_needs_binding(storage, eval_ctx.database_id, expr) {
                 let gkr = group_key_resolver(select, resolver);
                 let outer = |name: &str| synth.resolve(name).or_else(|| gkr(name));
-                bound = crate::rel::substitute_correlated_in_expr(
-                    storage, expr, &outer, &group_row, eval_ctx,
-                )?;
+                bound = substitute_correlated_in_expr(storage, expr, &outer, &group_row, eval_ctx)?;
                 &bound
             } else {
                 expr
@@ -331,20 +332,20 @@ fn grace_hash_aggregate(
         let index = partition_index(&key, partitions);
         spools[index]
             .write_row(row)
-            .map_err(|e| super::map_storage_err(e, "<agg spill>"))?;
+            .map_err(|e| map_storage_err(e, "<agg spill>"))?;
     }
     let mut out_rows: Vec<Vec<SqlValue>> = Vec::new();
     for spool in &mut spools {
         spool
             .finish_writing()
-            .map_err(|e| super::map_storage_err(e, "<agg spill>"))?;
+            .map_err(|e| map_storage_err(e, "<agg spill>"))?;
     }
     for spool in &spools {
         let mut part_rows: Vec<Vec<Datum>> = Vec::with_capacity(spool.row_count() as usize);
         let mut reader = spool.reader();
         while let Some(row) = reader
             .next_row()
-            .map_err(|e| super::map_storage_err(e, "<agg spill>"))?
+            .map_err(|e| map_storage_err(e, "<agg spill>"))?
         {
             part_rows.push(row);
         }
