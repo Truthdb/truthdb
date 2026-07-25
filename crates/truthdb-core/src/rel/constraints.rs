@@ -1,5 +1,9 @@
 use super::prelude::*;
 
+/// Collects and validates a table's FOREIGN KEY constraints (column-level, then
+/// table-level), assigning a name to unnamed ones. `check_names` are the names
+/// already taken by the table's CHECK constraints so a FK cannot reuse one
+/// (constraint names are unique across kinds).
 pub(super) fn build_foreign_key_defs(
     db_id: u32,
     storage: &Storage,

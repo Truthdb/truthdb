@@ -181,10 +181,6 @@ pub(super) fn exec_create_table(
     Ok(StatementResult::Done)
 }
 
-/// Collects and validates a table's FOREIGN KEY constraints (column-level, then
-/// table-level), assigning a name to unnamed ones. `check_names` are the names
-/// already taken by the table's CHECK constraints so a FK cannot reuse one
-/// (constraint names are unique across kinds).
 // ---- DROP TABLE ---------------------------------------------------------
 
 pub(super) fn exec_drop_table(

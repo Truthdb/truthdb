@@ -38,15 +38,10 @@ pub use context::{Isolation, TxnContext};
 pub use describe::describe_first_result_set;
 #[cfg(test)]
 pub use dispatch::execute;
-use helpers::map_storage_err;
 pub use helpers::{SqlStatement, render_cell};
 pub use lock_analysis::analyze_locks;
 pub(crate) use query::decl_names;
 pub use query::{CancelScope, check_cancelled};
-use query::{
-    JoinScope, approx_row_bytes, expr_needs_binding, row_values, sort_budget,
-    substitute_correlated_in_expr,
-};
 #[cfg(test)]
 pub(crate) use query::{
     clear_test_cancel, set_test_cancel, set_test_sort_budget, without_scan_path,
