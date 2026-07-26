@@ -1,7 +1,7 @@
 //! TDS server token-stream builders (MS-TDS 2.2.7): LOGINACK, ENVCHANGE,
 //! INFO, ERROR, COLMETADATA, ROW, DONE. All strings are UCS-2LE.
 
-use truthdb_core::relational::ResultColumn;
+use truthdb_core::engine::ResultColumn;
 use truthdb_core::relstore::types::Datum;
 
 use crate::typeinfo;
