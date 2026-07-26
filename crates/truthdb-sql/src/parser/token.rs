@@ -177,3 +177,31 @@ impl Parser {
         }
     }
 }
+
+/// Reserved words that may not be used as bare identifiers.
+pub(super) fn is_reserved(keyword: &str) -> bool {
+    matches!(
+        keyword,
+        "SELECT"
+            | "FROM"
+            | "WHERE"
+            | "INSERT"
+            | "INTO"
+            | "VALUES"
+            | "CREATE"
+            | "TABLE"
+            | "DROP"
+            | "PRIMARY"
+            | "KEY"
+            | "AND"
+            | "OR"
+            | "NOT"
+            | "NULL"
+            | "IS"
+            | "ORDER"
+            | "BY"
+            | "TOP"
+            | "GROUP"
+            | "HAVING"
+    )
+}
