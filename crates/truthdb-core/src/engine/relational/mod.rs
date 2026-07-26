@@ -26,6 +26,7 @@ mod plan;
 mod prelude;
 mod procedural;
 mod query;
+mod restore;
 mod sys_views;
 mod transaction;
 mod triggers;

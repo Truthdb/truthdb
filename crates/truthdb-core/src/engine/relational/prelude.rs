@@ -3,7 +3,7 @@
 pub(super) use super::{
     aggregate, api::*, batch::*, cancel::*, collation, constraints::*, context::*, ddl::*,
     describe::*, dispatch::*, dml::*, hash, helpers::*, lock_analysis::*, parameters::*, plan,
-    procedural::*, query::*, sys_views::*, transaction::*, triggers::*, value,
+    procedural::*, query::*, restore::*, sys_views::*, transaction::*, triggers::*, value,
 };
 
 pub(super) use truthdb_sql::ast::{
