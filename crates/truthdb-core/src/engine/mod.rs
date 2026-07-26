@@ -30,8 +30,6 @@ use search::{
     Command, ENGINE_WAL_ENTRY_TYPE, ENGINE_WAL_ENTRY_VERSION, EngineMeta, EngineState, SearchQuery,
     WalEvent, decode_snapshot, parse_command, render_json,
 };
-#[cfg(test)]
-use search::{Document, FieldType, IndexState};
 
 const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
 /// A standby takes a restartpoint earlier than a primary checkpoints (0.5 vs
@@ -592,5 +590,7 @@ fn render_sql_outcome(outcome: &crate::engine::BatchOutcome) -> String {
     json!({ "kind": "sql", "results": rendered, "error": error }).to_string()
 }
 
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;

@@ -3,6 +3,8 @@
 mod command;
 mod index;
 mod persistence;
+#[cfg(test)]
+mod tests;
 
 pub use command::CommandError;
 pub(super) use command::{Command, parse_command, render_json};
