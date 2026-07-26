@@ -1893,43 +1893,6 @@ pub(super) struct ScanPlan {
     pub(super) covering: bool,
 }
 
-/// The parameter names of a declaration list (`@p1 int, @p2 nvarchar(10)`),
-/// in order: the first token of each top-level comma-separated entry.
-/// `sp_execute` values arrive unnamed on the wire; these names bind them.
-pub(crate) fn decl_names(decls: &str) -> Vec<String> {
-    let mut names = Vec::new();
-    let mut depth = 0usize;
-    let mut in_quote = false;
-    let mut entry = String::new();
-    for ch in decls.chars().chain(std::iter::once(',')) {
-        match ch {
-            // A quoted default value (`@p varchar(10) = 'a,b'`) may contain
-            // commas and parens; none of them separate declarations. A
-            // doubled '' escape toggles twice, landing back where it was.
-            '\'' => {
-                in_quote = !in_quote;
-                entry.push(ch);
-            }
-            '(' if !in_quote => {
-                depth += 1;
-                entry.push(ch);
-            }
-            ')' if !in_quote => {
-                depth = depth.saturating_sub(1);
-                entry.push(ch);
-            }
-            ',' if !in_quote && depth == 0 => {
-                if let Some(name) = entry.split_whitespace().next() {
-                    names.push(name.to_string());
-                }
-                entry.clear();
-            }
-            _ => entry.push(ch),
-        }
-    }
-    names
-}
-
 /// Recognises the shape [`scan_select`] can run, or `None` for everything else
 /// — which then takes the collecting path unchanged.
 ///
@@ -2678,74 +2641,6 @@ pub(super) fn sort_budget() -> usize {
 #[cfg(test)]
 pub(crate) fn set_test_sort_budget(budget: Option<usize>) {
     TEST_SORT_BUDGET.with(|cell| cell.set(budget));
-}
-
-thread_local! {
-    /// The cancellation flag for the batch running on this worker thread — set by
-    /// the connection task when a TDS Attention (cancel) arrives. Executor loops
-    /// poll it via [`check_cancelled`] so a running statement can be aborted.
-    static CANCEL_FLAG: std::cell::RefCell<Option<std::sync::Arc<std::sync::atomic::AtomicBool>>> =
-        const { std::cell::RefCell::new(None) };
-}
-
-/// Binds a cancellation flag to the current thread for one batch, clearing it on
-/// drop so a later batch on the same pooled worker never sees a stale flag.
-pub struct CancelScope;
-
-impl CancelScope {
-    pub fn enter(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) -> CancelScope {
-        CANCEL_FLAG.with(|c| *c.borrow_mut() = Some(flag));
-        CancelScope
-    }
-}
-
-impl Drop for CancelScope {
-    fn drop(&mut self) {
-        CANCEL_FLAG.with(|c| *c.borrow_mut() = None);
-    }
-}
-
-/// True if the batch on this thread has been asked to cancel (Attention).
-pub(super) fn is_cancelled() -> bool {
-    CANCEL_FLAG.with(|c| {
-        c.borrow()
-            .as_ref()
-            .is_some_and(|f| f.load(std::sync::atomic::Ordering::Relaxed))
-    })
-}
-
-/// Errors if the current batch has been cancelled (TDS Attention). Executor
-/// loops call this periodically so a long statement aborts mid-flight. The
-/// client is answered with a `DONE(attention)`, not this error — it is an
-/// internal marker the batch driver recognises to stop without dooming the txn.
-pub fn check_cancelled() -> Result<(), SqlError> {
-    if is_cancelled() {
-        Err(SqlError::message_only(
-            CANCEL_ERROR,
-            "The query was canceled.",
-        ))
-    } else {
-        Ok(())
-    }
-}
-
-/// The error number [`check_cancelled`] raises. The batch driver keys on this
-/// (not the raw cancel flag) so a concurrent Attention can't suppress the
-/// `XACT_ABORT`/severity dooming of an *unrelated* statement failure.
-pub(super) const CANCEL_ERROR: i32 = 3617;
-
-/// Sets the current thread's cancel flag (test helper — execution runs on the
-/// calling thread in tests, so this simulates an Attention).
-#[cfg(test)]
-pub(crate) fn set_test_cancel(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
-    CANCEL_FLAG.with(|c| *c.borrow_mut() = Some(flag));
-}
-
-/// Clears the current thread's cancel flag (test helper — reset before other
-/// tests reuse the thread).
-#[cfg(test)]
-pub(crate) fn clear_test_cancel() {
-    CANCEL_FLAG.with(|c| *c.borrow_mut() = None);
 }
 
 /// The ORDER BY comparator for one pair of pre-evaluated key tuples: per item,
