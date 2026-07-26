@@ -7,7 +7,7 @@ pub mod dispatcher;
 pub mod engine;
 mod group_commit;
 pub mod lock;
-pub mod rel;
+pub mod relational;
 pub mod relstore;
 pub mod repl;
 pub mod session;

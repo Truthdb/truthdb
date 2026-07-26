@@ -307,12 +307,12 @@ impl Engine {
         // default database under its canonical name, so DB_NAME() and USE
         // behave over the CLI (a USE lasts only for this command's batch —
         // the context is transient by design).
-        let mut txn_ctx = crate::rel::TxnContext::default();
+        let mut txn_ctx = crate::relational::TxnContext::default();
         txn_ctx.set_current_database(
             self.storage.default_database_name(),
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
         );
-        let outcome = crate::rel::execute_batch(&self.storage, input, &mut txn_ctx);
+        let outcome = crate::relational::execute_batch(&self.storage, input, &mut txn_ctx);
         txn_ctx.abort(&self.storage);
         self.maybe_checkpoint(meta)?;
         Ok(render_sql_outcome(&outcome))
@@ -327,20 +327,20 @@ impl Engine {
     pub fn sql_batch(
         &self,
         input: &str,
-        txn_ctx: &mut crate::rel::TxnContext,
-    ) -> Result<crate::rel::BatchOutcome, EngineError> {
+        txn_ctx: &mut crate::relational::TxnContext,
+    ) -> Result<crate::relational::BatchOutcome, EngineError> {
         self.sql_batch_with_params(input, txn_ctx, &[])
     }
 
     /// Runs a SQL batch with `sp_executesql` parameters seeded as batch
-    /// variables (see [`crate::rel::execute_batch_with_params`]).
+    /// variables (see [`crate::relational::execute_batch_with_params`]).
     pub fn sql_batch_with_params(
         &self,
         input: &str,
-        txn_ctx: &mut crate::rel::TxnContext,
-        params: &[crate::rel::RpcParam],
-    ) -> Result<crate::rel::BatchOutcome, EngineError> {
-        let mut collector = crate::rel::Collector::default();
+        txn_ctx: &mut crate::relational::TxnContext,
+        params: &[crate::relational::RpcParam],
+    ) -> Result<crate::relational::BatchOutcome, EngineError> {
+        let mut collector = crate::relational::Collector::default();
         let error = self.sql_batch_streamed(input, txn_ctx, params, &mut collector)?;
         Ok(collector.into_outcome(error))
     }
@@ -350,47 +350,52 @@ impl Engine {
     pub fn describe_first_result_set(
         &self,
         tsql: &str,
-    ) -> Result<crate::rel::RowSet, truthdb_sql::error::SqlError> {
+    ) -> Result<crate::relational::RowSet, truthdb_sql::error::SqlError> {
         let _meta = self.meta.read().expect("engine meta poisoned");
-        crate::rel::describe_first_result_set(&self.storage, tsql)
+        crate::relational::describe_first_result_set(&self.storage, tsql)
     }
 
     /// Like [`Self::sql_batch_with_params`], but each statement's result
     /// leaves through `emitter` as it is produced (see
-    /// [`crate::rel::execute_batch_streamed`]). Returns the batch's terminal
+    /// [`crate::relational::execute_batch_streamed`]). Returns the batch's terminal
     /// error, which the caller reports after the statement events.
     pub fn sql_batch_streamed(
         &self,
         input: &str,
-        txn_ctx: &mut crate::rel::TxnContext,
-        params: &[crate::rel::RpcParam],
-        emitter: &mut dyn crate::rel::BatchEmitter,
+        txn_ctx: &mut crate::relational::TxnContext,
+        params: &[crate::relational::RpcParam],
+        emitter: &mut dyn crate::relational::BatchEmitter,
     ) -> Result<Option<truthdb_sql::error::SqlError>, EngineError> {
         // Hold the execution gate shared for the whole batch: concurrent
         // relational batches run together, but a native writer is excluded (see
         // [`Engine`]). The guard also gives the checkpointer its `meta` read.
         let meta = self.meta.read().expect("engine meta poisoned");
-        let error =
-            crate::rel::execute_batch_streamed(&self.storage, input, txn_ctx, params, emitter);
+        let error = crate::relational::execute_batch_streamed(
+            &self.storage,
+            input,
+            txn_ctx,
+            params,
+            emitter,
+        );
         self.maybe_checkpoint(&meta)?;
         Ok(error)
     }
 
     /// Rolls back and discards a session's open transaction (connection
     /// teardown). No-op when the session has no transaction.
-    pub fn abort_session_txn(&self, txn_ctx: &mut crate::rel::TxnContext) {
+    pub fn abort_session_txn(&self, txn_ctx: &mut crate::relational::TxnContext) {
         txn_ctx.abort(&self.storage);
     }
 
     /// Rolls back a transaction the idle reaper is reclaiming. Unlike
     /// [`Self::abort_session_txn`] the session lives on, so the rollback is
     /// recorded and reported to its next batch.
-    pub fn abort_idle_session_txn(&self, txn_ctx: &mut crate::rel::TxnContext) {
+    pub fn abort_idle_session_txn(&self, txn_ctx: &mut crate::relational::TxnContext) {
         txn_ctx.abort_idle(&self.storage);
     }
 
     /// The table/database locks a SQL batch needs at the given isolation
-    /// level (see [`crate::rel::analyze_locks`]). The session loop acquires
+    /// level (see [`crate::relational::analyze_locks`]). The session loop acquires
     /// these before running the batch. `db_id` is the session's current
     /// database — the same namespace execution will resolve names in; the two
     /// derivations must agree or a batch under-locks.
@@ -398,9 +403,9 @@ impl Engine {
         &self,
         db_id: u32,
         input: &str,
-        isolation: crate::rel::Isolation,
+        isolation: crate::relational::Isolation,
     ) -> Vec<(crate::lock::Resource, crate::lock::LockMode)> {
-        crate::rel::analyze_locks(&self.storage, db_id, input, isolation)
+        crate::relational::analyze_locks(&self.storage, db_id, input, isolation)
     }
 
     /// Stamps the default database's name (id 1) from the instance
@@ -1203,8 +1208,8 @@ fn value_type_name(value: &Value) -> &'static str {
 /// Renders a SQL batch outcome (statement results + an optional trailing
 /// error) as the `{"kind":"sql",...}` envelope the CLI turns into aligned
 /// tables, `(N rows affected)` lines, and `Msg <n>` errors.
-fn render_sql_outcome(outcome: &crate::rel::BatchOutcome) -> String {
-    use crate::rel::StatementResult;
+fn render_sql_outcome(outcome: &crate::relational::BatchOutcome) -> String {
+    use crate::relational::StatementResult;
     let rendered: Vec<Value> = outcome
         .results
         .iter()
@@ -1219,7 +1224,8 @@ fn render_sql_outcome(outcome: &crate::rel::BatchOutcome) -> String {
                             row.iter()
                                 .zip(&rowset.columns)
                                 .map(|(datum, column)| {
-                                    match crate::rel::render_cell(datum, &column.column_type) {
+                                    match crate::relational::render_cell(datum, &column.column_type)
+                                    {
                                         Some(text) => Value::String(text),
                                         None => Value::Null,
                                     }
@@ -4791,7 +4797,7 @@ mod tests {
     #[test]
     fn insert_select_locks_source_table_shared() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("insert-select-locks");
         let engine = new_engine(&path);
         engine
@@ -5188,7 +5194,7 @@ mod tests {
         // must still Shared-lock the base table the inner CTE reads — directly
         // and through a view — or it dirty-reads under READ COMMITTED.
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("nested-cte-locks");
         let engine = new_engine(&path);
         engine
@@ -5231,7 +5237,7 @@ mod tests {
         // dirty read under READ COMMITTED), including a base table the view body
         // reaches only through its own CTE.
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("view-locks");
         let engine = new_engine(&path);
         engine
@@ -5275,7 +5281,7 @@ mod tests {
         // EXISTS is the only expression position the parser lets a subquery start
         // with WITH, so it is the nested-CTE-in-expression case for locks.
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("view-exists-cte-locks");
         let engine = new_engine(&path);
         engine
@@ -5342,7 +5348,7 @@ mod tests {
         // must still lock the real base table, or the read could dirty-read a
         // concurrent uncommitted write under READ COMMITTED.
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("assign-cte-locks");
         let engine = new_engine(&path);
         engine
@@ -5388,9 +5394,9 @@ mod tests {
         let (_, reference) = sql_rows(&engine, query);
 
         // Forced spill: a 300-byte budget makes almost every row its own run.
-        crate::rel::set_test_sort_budget(Some(300));
+        crate::relational::set_test_sort_budget(Some(300));
         let (_, spilled) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(None);
+        crate::relational::set_test_sort_budget(None);
 
         assert_eq!(reference.len(), 600);
         assert_eq!(
@@ -5440,9 +5446,9 @@ mod tests {
         let query = "SELECT l.v, r.w FROM l JOIN r ON l.k = r.k AND r.w > 100 ORDER BY l.v, r.w";
 
         let (_, reference) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(Some(500));
+        crate::relational::set_test_sort_budget(Some(500));
         let (_, spilled) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(None);
+        crate::relational::set_test_sort_budget(None);
 
         assert!(!reference.is_empty());
         assert_eq!(
@@ -5485,9 +5491,9 @@ mod tests {
             let query =
                 format!("SELECT l.v, r.w FROM l {kind} JOIN r ON l.k = r.k ORDER BY l.v, r.w");
             let (_, reference) = sql_rows(&engine, &query);
-            crate::rel::set_test_sort_budget(Some(500));
+            crate::relational::set_test_sort_budget(Some(500));
             let (_, spilled) = sql_rows(&engine, &query);
-            crate::rel::set_test_sort_budget(None);
+            crate::relational::set_test_sort_budget(None);
             assert!(!reference.is_empty(), "{kind}: reference empty");
             assert_eq!(
                 spilled, reference,
@@ -5520,9 +5526,9 @@ mod tests {
         let query = "SELECT DISTINCT a, b FROM t ORDER BY a, b";
 
         let (_, reference) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(Some(400));
+        crate::relational::set_test_sort_budget(Some(400));
         let (_, spilled) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(None);
+        crate::relational::set_test_sort_budget(None);
 
         assert!(!reference.is_empty());
         assert_eq!(
@@ -5556,9 +5562,9 @@ mod tests {
         let query = "SELECT grp, SUM(amt), COUNT(*), COUNT(DISTINCT amt) FROM t GROUP BY grp HAVING COUNT(*) > 2 ORDER BY grp";
 
         let (_, reference) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(Some(400));
+        crate::relational::set_test_sort_budget(Some(400));
         let (_, spilled) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(None);
+        crate::relational::set_test_sort_budget(None);
 
         assert!(!reference.is_empty());
         assert_eq!(
@@ -5605,9 +5611,9 @@ mod tests {
             "join+sort should return 40 rows in memory"
         );
         // Each joined source row is ~3.9 KB (> 3900) — forced to spill.
-        crate::rel::set_test_sort_budget(Some(300));
+        crate::relational::set_test_sort_budget(Some(300));
         let (_, rows) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(None);
+        crate::relational::set_test_sort_budget(None);
         assert_eq!(
             rows, reference,
             "spilled wide-join sort must match in-memory"
@@ -5620,7 +5626,7 @@ mod tests {
     #[test]
     fn row_locks_for_point_operations() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("row-locks");
         let engine = new_engine(&path);
         engine
@@ -5703,7 +5709,7 @@ mod tests {
     #[test]
     fn row_lock_safety_guards() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("row-lock-guards");
         let engine = new_engine(&path);
         // Character PK, a table with a secondary UNIQUE index, and a FLOAT PK.
@@ -5797,7 +5803,7 @@ mod tests {
     #[test]
     fn row_locks_require_full_composite_key() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("row-locks-composite");
         let engine = new_engine(&path);
         engine
@@ -5829,7 +5835,7 @@ mod tests {
     #[test]
     fn foreign_key_insert_locks_parent_shared() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("fk-locks");
         let engine = new_engine(&path);
         engine
@@ -6107,7 +6113,7 @@ mod tests {
     #[test]
     fn subquery_locks_referenced_tables_shared() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("subquery-locks");
         let engine = new_engine(&path);
         engine
@@ -6738,7 +6744,7 @@ mod tests {
 
     // ---- explicit transactions (Stage 6, M2) ---------------------------
 
-    use crate::rel::{BatchOutcome, StatementResult, TxnContext};
+    use crate::relational::{BatchOutcome, StatementResult, TxnContext};
     use crate::relstore::types::Datum;
 
     /// Runs a SQL batch through the session path with a persistent transaction
@@ -8726,7 +8732,7 @@ mod tests {
     #[test]
     fn scalar_function_body_tables_locked_up_front() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("udf-lock-seam");
         let engine = new_engine(&path);
         engine
@@ -9327,7 +9333,7 @@ mod tests {
     #[test]
     fn scalar_function_in_view_body_is_lock_analyzed() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("udf-view-lock");
         let engine = new_engine(&path);
         engine
@@ -9387,7 +9393,7 @@ mod tests {
     #[test]
     fn inline_tvf_body_tables_locked_and_snapshotted() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("tvf-seam");
         let engine = new_engine(&path);
         engine
@@ -9431,7 +9437,7 @@ mod tests {
     #[test]
     fn table_variable_access_takes_no_table_locks() {
         use crate::lock::Resource;
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("tablevar-nolocks");
         let engine = new_engine(&path);
         engine
@@ -9608,7 +9614,7 @@ mod tests {
 
     #[test]
     fn recursive_function_lock_analysis_terminates() {
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("udf-recursion-bomb");
         let engine = new_engine(&path);
         engine
@@ -9644,7 +9650,7 @@ mod tests {
     #[test]
     fn after_insert_trigger_fires_reading_inserted() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("trg-insert");
         let engine = new_engine(&path);
         engine
@@ -9795,7 +9801,7 @@ mod tests {
 
     #[test]
     fn trigger_cycle_lock_analysis_terminates() {
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("trg-cycle");
         let engine = new_engine(&path);
         engine
@@ -9866,7 +9872,7 @@ mod tests {
     #[test]
     fn trigger_body_exec_and_fk_reads_are_locked_up_front() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("trg-exec-fk-locks");
         let engine = new_engine(&path);
         engine
@@ -10045,7 +10051,7 @@ mod tests {
     #[test]
     fn trigger_body_read_is_locked_under_inline_isolation_escalation() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("trg-escalation");
         let engine = new_engine(&path);
         engine
@@ -11252,7 +11258,7 @@ mod tests {
     #[test]
     fn multi_statement_tvf_body_reads_are_locked_and_snapshotted() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::Isolation;
+        use crate::relational::Isolation;
         let path = unique_temp_path("multi-tvf-seam");
         let engine = new_engine(&path);
         engine
@@ -11416,7 +11422,7 @@ mod tests {
         let engine = new_engine(&path);
         let mut ctx = TxnContext::default();
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-        crate::rel::set_test_cancel(flag.clone());
+        crate::relational::set_test_cancel(flag.clone());
         let setter = {
             let flag = flag.clone();
             std::thread::spawn(move || {
@@ -11429,7 +11435,7 @@ mod tests {
             &mut ctx,
             "DECLARE @i INT = 0; WHILE 1 = 1 SET @i = @i + 1",
         );
-        crate::rel::clear_test_cancel();
+        crate::relational::clear_test_cancel();
         setter.join().expect("setter thread");
         assert_eq!(
             out.error.as_ref().map(|e| e.number),
@@ -12586,10 +12592,10 @@ mod tests {
         }
         // Simulate an Attention arriving: raise the cancel flag for this thread.
         let flag = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        crate::rel::set_test_cancel(flag);
+        crate::relational::set_test_cancel(flag);
         let env = sql(&engine, "SELECT id FROM t");
         // Clear before asserting so a panic can't leak the flag to another test.
-        crate::rel::clear_test_cancel();
+        crate::relational::clear_test_cancel();
         assert_eq!(
             env["error"]["number"], 3617,
             "a cancelled batch aborts instead of returning rows: {env}"
@@ -14065,9 +14071,9 @@ mod tests {
         }
         let query = "SELECT k, COUNT(*), COUNT(v), SUM(v), MIN(v), MAX(v), AVG(v)                      FROM t GROUP BY k ORDER BY k";
         let (_, in_memory) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(Some(400));
+        crate::relational::set_test_sort_budget(Some(400));
         let (_, spilled) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(None);
+        crate::relational::set_test_sort_budget(None);
         assert_eq!(spilled, in_memory, "spill path changes all-NULL groups");
         assert_eq!(
             in_memory[0],
@@ -14109,9 +14115,9 @@ mod tests {
             vec![vec![Some("200".into())]],
             "in-memory: one case-insensitive group of 200"
         );
-        crate::rel::set_test_sort_budget(Some(400));
+        crate::relational::set_test_sort_budget(Some(400));
         let (_, spilled) = sql_rows(&engine, query);
-        crate::rel::set_test_sort_budget(None);
+        crate::relational::set_test_sort_budget(None);
         assert_eq!(
             spilled, reference,
             "spilled GROUP BY must fold case like the in-memory path (one group)"
@@ -14271,7 +14277,7 @@ mod tests {
     // ---- Stage 6: the row-at-a-time single-table scan ------------------------
 
     /// The first rowset in an outcome.
-    fn first_rowset(outcome: &BatchOutcome) -> &crate::rel::RowSet {
+    fn first_rowset(outcome: &BatchOutcome) -> &crate::relational::RowSet {
         for result in &outcome.results {
             if let StatementResult::Rows(rowset) = result {
                 return rowset;
@@ -14415,7 +14421,8 @@ mod tests {
                 "{query} did not take the scan path, so comparing it proves nothing"
             );
             let before = engine.storage.scan_selects();
-            let collected = crate::rel::without_scan_path(|| batch(&engine, &mut ctx, query));
+            let collected =
+                crate::relational::without_scan_path(|| batch(&engine, &mut ctx, query));
             assert_eq!(
                 engine.storage.scan_selects(),
                 before,
@@ -14529,7 +14536,7 @@ mod tests {
 
         // The counter reports the whole row when nothing prunes, so the numbers
         // above are a pruned width and not a stuck reading.
-        crate::rel::without_scan_path(|| batch(&engine, &mut ctx, "SELECT id FROM w"));
+        crate::relational::without_scan_path(|| batch(&engine, &mut ctx, "SELECT id FROM w"));
         assert_eq!(
             engine.storage.last_scan_width(),
             usize::MAX,
@@ -14630,7 +14637,8 @@ mod tests {
             "SELECT amount, cs FROM tc WHERE ci = 'match'",
         ] {
             let streamed = batch(&engine, &mut ctx, query);
-            let collected = crate::rel::without_scan_path(|| batch(&engine, &mut ctx, query));
+            let collected =
+                crate::relational::without_scan_path(|| batch(&engine, &mut ctx, query));
             assert_eq!(
                 first_rowset(&streamed),
                 first_rowset(&collected),
@@ -15008,7 +15016,7 @@ mod tests {
         let locks = engine.analyze_locks(
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC sp_executesql N'USE hr; INSERT INTO t VALUES (2)'",
-            crate::rel::Isolation::ReadCommitted,
+            crate::relational::Isolation::ReadCommitted,
         );
         assert!(
             !locks.is_empty(),

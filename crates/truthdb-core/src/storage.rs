@@ -558,7 +558,7 @@ impl Storage {
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Counts one row-at-a-time SELECT (called by `rel::scan_select`).
+    /// Counts one row-at-a-time SELECT (called by `relational::scan_select`).
     #[cfg(test)]
     pub(crate) fn count_scan_select(&self) {
         self.scan_selects
@@ -8642,7 +8642,7 @@ mod tests {
     /// whole ALTER back: old schema, old rows, fully readable.
     #[test]
     fn alter_add_column_is_durable_and_atomic() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("alter-add");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -8705,7 +8705,7 @@ mod tests {
     #[test]
     fn exec_lock_analysis_never_under_locks() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::{Isolation, TxnContext, execute_batch};
+        use crate::relational::{Isolation, TxnContext, execute_batch};
 
         let path = unique_temp_path("exec-locks");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -8719,7 +8719,7 @@ mod tests {
 
         // A variable statement text is unknowable before it runs: the batch
         // locks the database exclusively rather than ever under-locking.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "DECLARE @s NVARCHAR(50) = N'SELECT v FROM t'; EXEC sp_executesql @s",
@@ -8731,7 +8731,7 @@ mod tests {
         );
 
         // Direction 1: a SET raise BEFORE the EXEC locks the inner reads.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; EXEC sp_executesql N'SELECT v FROM t'",
@@ -8746,7 +8746,7 @@ mod tests {
 
         // Direction 2 (intra-EXEC): a SET raise INSIDE the literal locks the
         // statements after it inside the same literal.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC sp_executesql N'SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT v FROM t'",
@@ -8768,7 +8768,7 @@ mod tests {
     /// scratch — must carry them forward rather than silently resetting them.
     #[test]
     fn db_options_persist_across_reopen_and_checkpoint() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
 
         let path = unique_temp_path("db-options");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -8824,7 +8824,7 @@ mod tests {
     #[test]
     fn analyze_locks_covers_procedure_bodies() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::{Isolation, TxnContext, execute_batch};
+        use crate::relational::{Isolation, TxnContext, execute_batch};
 
         let path = unique_temp_path("proc-locks");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -8837,7 +8837,7 @@ mod tests {
             let outcome = execute_batch(&storage, sql, &mut ctx);
             assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
         }
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC writer 1",
@@ -8852,7 +8852,7 @@ mod tests {
              terminated): {needs:?}"
         );
         // An unknown procedure contributes no locks (2812 at execution).
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC no_such_proc",
@@ -8879,7 +8879,7 @@ mod tests {
     #[test]
     fn review_poc_analyze_locks_procedure_reanalyzed_under_escalated_isolation() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::{Isolation, TxnContext, execute_batch};
+        use crate::relational::{Isolation, TxnContext, execute_batch};
 
         let path = unique_temp_path("proc-visited-isolation");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -8900,7 +8900,7 @@ mod tests {
                 .any(|(r, m)| matches!(r, Resource::Table(_)) && *m == LockMode::Shared)
         };
         // Control: analyzed alone, the escalated body read-locks.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC pser",
@@ -8912,7 +8912,7 @@ mod tests {
         );
         // The seam: pread analyzed first under the versioned regime, then
         // pser's escalated re-entry is dropped by the visited set.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC pread; EXEC pser",
@@ -8933,7 +8933,7 @@ mod tests {
     #[test]
     fn review_poc_analyze_locks_procedure_via_dynamic_sql() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::{Isolation, TxnContext, execute_batch};
+        use crate::relational::{Isolation, TxnContext, execute_batch};
 
         let path = unique_temp_path("proc-dyn-locks");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -8945,7 +8945,7 @@ mod tests {
             let outcome = execute_batch(&storage, sql, &mut ctx);
             assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
         }
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC sp_executesql N'EXEC wtr 1'",
@@ -8971,7 +8971,7 @@ mod tests {
     #[test]
     fn review_poc_user_procedure_named_sp_executesql_cannot_shadow_builtin() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::{Isolation, TxnContext, execute_batch};
+        use crate::relational::{Isolation, TxnContext, execute_batch};
 
         let path = unique_temp_path("proc-spexec-shadow");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -8991,7 +8991,7 @@ mod tests {
             // The shadow exists: analysis and execution must still agree.
             // Execution runs the BUILTIN (its name check comes first), so the
             // literal's INSERT locks must be in the analyzed set.
-            let needs = crate::rel::analyze_locks(
+            let needs = crate::relational::analyze_locks(
                 &storage,
                 crate::relstore::catalog::DEFAULT_DATABASE_ID,
                 "EXEC sp_executesql N'INSERT INTO t VALUES (1)'",
@@ -9013,7 +9013,7 @@ mod tests {
     #[test]
     fn analyze_locks_descends_control_flow() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::{Isolation, TxnContext, execute_batch};
+        use crate::relational::{Isolation, TxnContext, execute_batch};
 
         let path = unique_temp_path("flow-locks");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -9025,7 +9025,7 @@ mod tests {
         );
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
 
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "DECLARE @i INT = 0; WHILE @i < 3 BEGIN INSERT INTO locked_t VALUES (@i); \
@@ -9040,7 +9040,7 @@ mod tests {
             "the WHILE body's INSERT locks its table: {needs:?}"
         );
 
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "IF EXISTS (SELECT * FROM locked_t) SELECT 1",
@@ -9065,7 +9065,7 @@ mod tests {
     #[test]
     fn cf_review_analyze_locks_condition_shapes() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::{Isolation, TxnContext, execute_batch};
+        use crate::relational::{Isolation, TxnContext, execute_batch};
 
         let path = unique_temp_path("cf-flow-lock-shapes");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -9096,7 +9096,7 @@ mod tests {
             "IF EXISTS (SELECT * FROM lv) SELECT 1",
             "IF (SELECT COUNT(*) FROM lt) = 0 SELECT 1",
         ] {
-            let needs = crate::rel::analyze_locks(
+            let needs = crate::relational::analyze_locks(
                 &storage,
                 crate::relstore::catalog::DEFAULT_DATABASE_ID,
                 sql,
@@ -9108,7 +9108,7 @@ mod tests {
             );
         }
         // Both IF branches analyze — an untaken ELSE's INSERT is still locked.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "IF 1 = 2 SELECT 1 ELSE INSERT INTO lt VALUES (9)",
@@ -9119,7 +9119,7 @@ mod tests {
             "the ELSE branch's INSERT locks its table: {needs:?}"
         );
         // An EXEC literal inside a WHILE body analyzes through the Exec arm.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "DECLARE @i INT = 0; WHILE @i < 1 BEGIN \
@@ -9141,7 +9141,7 @@ mod tests {
     #[test]
     fn cf_review_analyze_locks_condition_cte() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::{Isolation, TxnContext, execute_batch};
+        use crate::relational::{Isolation, TxnContext, execute_batch};
 
         let path = unique_temp_path("cf-flow-lock-cte");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -9152,7 +9152,7 @@ mod tests {
             &mut ctx,
         );
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "IF EXISTS (WITH x AS (SELECT id FROM lt) SELECT id FROM x) SELECT 1",
@@ -9171,7 +9171,7 @@ mod tests {
     #[test]
     fn analyze_locks_drops_table_s_under_rcsi() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::{Isolation, TxnContext, execute_batch};
+        use crate::relational::{Isolation, TxnContext, execute_batch};
 
         let path = unique_temp_path("rcsi-locks");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -9190,7 +9190,7 @@ mod tests {
         };
 
         // Off: the SELECT read-locks, as ever.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SELECT v FROM t",
@@ -9209,7 +9209,7 @@ mod tests {
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
 
         // On: Database IS only — the DDL fence — and no Table S.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SELECT v FROM t",
@@ -9227,21 +9227,21 @@ mod tests {
         // The other levels are untouched: RR still read-locks, RU still
         // takes nothing, and a batch that raises isolation falls back to
         // locking even though the session level is RC.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SELECT v FROM t",
             Isolation::RepeatableRead,
         );
         assert!(table_s(&needs), "RR is not versioned: {needs:?}");
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SELECT v FROM t",
             Isolation::ReadUncommitted,
         );
         assert!(needs.is_empty(), "RU takes no locks at all: {needs:?}");
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SET TRANSACTION ISOLATION LEVEL SERIALIZABLE; SELECT v FROM t",
@@ -9255,7 +9255,7 @@ mod tests {
         // SNAPSHOT isolation is versioned regardless of RCSI: Database IS
         // only, and the EXEC-literal recursion preserves the level (the
         // #120 review's collapse bug, from the other direction).
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SELECT v FROM t",
@@ -9266,7 +9266,7 @@ mod tests {
             "SNAPSHOT reads take no Table S: {needs:?}"
         );
         assert!(needs.contains(&(Resource::Database, LockMode::IntentShared)));
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC sp_executesql N'SELECT v FROM t'",
@@ -9278,7 +9278,7 @@ mod tests {
         );
         // ...and a SET SNAPSHOT inside a batch is not a lock-escalating
         // raise, but the batch still holds the Database IS fence.
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "SET TRANSACTION ISOLATION LEVEL SNAPSHOT; SELECT v FROM t",
@@ -9298,7 +9298,7 @@ mod tests {
     /// path itself via the covering-scan counter.
     #[test]
     fn covering_seek_serves_the_snapshot_image() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("rcsi-covering");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -9367,7 +9367,7 @@ mod tests {
     /// committed transactions once no snapshot is live.
     #[test]
     fn rollback_unpublishes_and_prune_drops_settled_history() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
 
         let path = unique_temp_path("rcsi-prune");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -9427,7 +9427,7 @@ mod tests {
     /// maintenance prune drop everything.
     #[test]
     fn version_cleanup_under_load_pins_then_drops_history() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
 
         let path = unique_temp_path("cleanup-load");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -9502,7 +9502,7 @@ mod tests {
     /// rolled the transaction back, the same prune must drop it.
     #[test]
     fn a_3960_abort_releases_the_snapshot_registration() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
 
         let path = unique_temp_path("si-3960-release");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -9572,8 +9572,10 @@ mod tests {
     /// update of it recovers to the committed value.
     #[test]
     fn ten_mib_value_round_trips_and_survives_a_crash() {
-        use crate::rel::RpcParam;
-        use crate::rel::{StatementResult, TxnContext, execute_batch, execute_batch_with_params};
+        use crate::relational::RpcParam;
+        use crate::relational::{
+            StatementResult, TxnContext, execute_batch, execute_batch_with_params,
+        };
 
         let path = unique_temp_path("max-10mib");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -9646,7 +9648,7 @@ mod tests {
     /// bytes; chains are immutable and never freed, so the ref stays valid).
     #[test]
     fn rcsi_reads_the_old_big_value_through_the_image_reference() {
-        use crate::rel::{
+        use crate::relational::{
             RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
         };
 
@@ -9719,7 +9721,7 @@ mod tests {
     /// heap row must stay visible to the open snapshot.
     #[test]
     fn heap_rcsi_reads_old_big_value_through_preimage() {
-        use crate::rel::{
+        use crate::relational::{
             RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
         };
 
@@ -9806,7 +9808,7 @@ mod tests {
     /// read through the stub), and keep its overflow value.
     #[test]
     fn moved_heap_row_versions_and_resolves_through_the_stub() {
-        use crate::rel::{
+        use crate::relational::{
             RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
         };
 
@@ -9908,7 +9910,7 @@ mod tests {
     /// do not land, the store stays usable, and recovery after a kill agrees.
     #[test]
     fn failed_statement_after_spill_rolls_back_cleanly() {
-        use crate::rel::{
+        use crate::relational::{
             RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
         };
 
@@ -9985,7 +9987,7 @@ mod tests {
     /// fail CLEANLY, leaving the table intact and the store usable.
     #[test]
     fn alter_add_column_respills_max_values() {
-        use crate::rel::{
+        use crate::relational::{
             RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
         };
 
@@ -10075,7 +10077,7 @@ mod tests {
     /// reopen.
     #[test]
     fn max_codec_edges_round_trip() {
-        use crate::rel::{
+        use crate::relational::{
             RpcParam, StatementResult, TxnContext, execute_batch, execute_batch_with_params,
         };
 
@@ -10136,7 +10138,7 @@ mod tests {
     /// (the re-run shape an interrupted grow needs).
     #[test]
     fn offline_grow_extends_the_data_region() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("grow");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -10214,7 +10216,7 @@ mod tests {
     /// bitmap exactly as it would have.
     #[test]
     fn grow_with_pending_wal_recovers_cleanly() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("grow-wal");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -10278,7 +10280,7 @@ mod tests {
     /// writing it back afterwards.
     #[test]
     fn grow_crash_before_header_stamp_is_recoverable() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("grow-crash");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -10402,7 +10404,7 @@ mod tests {
     /// skips the bitmap copy.
     #[test]
     fn grow_preserves_the_persisted_allocator_bitmap() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("grow-bitmap");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -10472,7 +10474,7 @@ mod tests {
     /// empty.
     #[test]
     fn rcsi_survives_a_crash_with_clean_recovery() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("rcsi-crash");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -10527,7 +10529,7 @@ mod tests {
     #[test]
     fn row_locks_escalate_past_the_threshold() {
         use crate::lock::{LockMode, Resource};
-        use crate::rel::{Isolation, TxnContext, execute_batch};
+        use crate::relational::{Isolation, TxnContext, execute_batch};
 
         let path = unique_temp_path("escalation");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -10545,7 +10547,7 @@ mod tests {
         };
 
         // At the threshold: per-row locks (plus the table intent).
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             &insert(1000),
@@ -10568,7 +10570,7 @@ mod tests {
         // declines to enumerate 1001 row hashes and the INSERT falls back to
         // one table-exclusive lock. (Reachable since the node budget became
         // per-expression — a 1001-tuple INSERT parses now.)
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             &insert(1001),
@@ -10597,7 +10599,7 @@ mod tests {
             .map(|i| format!("DELETE FROM t WHERE id = {i}"))
             .collect();
         let over = format!("{}; {}", insert(1000), deletes.join("; "));
-        let needs = crate::rel::analyze_locks(
+        let needs = crate::relational::analyze_locks(
             &storage,
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             &over,
@@ -10628,7 +10630,7 @@ mod tests {
     /// `SET XACT_ABORT ON` must not doom the outer batch's transaction.
     #[test]
     fn exec_scope_restores_variables_and_set_options() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("exec-scope");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -10710,7 +10712,7 @@ mod tests {
     /// exactly what a table scan returns, original case and NULLs included.
     #[test]
     fn a_covering_seek_answers_from_the_index_alone_and_matches_a_scan() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("include-covering");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -10724,7 +10726,7 @@ mod tests {
         );
         assert!(setup.error.is_none(), "{:?}", setup.error);
 
-        let rows_of = |outcome: &crate::rel::BatchOutcome| match &outcome.results[0] {
+        let rows_of = |outcome: &crate::relational::BatchOutcome| match &outcome.results[0] {
             StatementResult::Rows(rowset) => rowset.rows.clone(),
             other => panic!("expected rows, got {other:?}"),
         };
@@ -10767,7 +10769,7 @@ mod tests {
     /// per scanned input.
     #[test]
     fn a_filtered_aggregate_streams_its_input_instead_of_materializing() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("stream-input");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -10872,7 +10874,7 @@ mod tests {
     /// the same result as the in-memory join.
     #[test]
     fn a_spilling_join_streams_its_probe_side_into_partitions() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch, set_test_sort_budget};
+        use crate::relational::{StatementResult, TxnContext, execute_batch, set_test_sort_budget};
 
         let path = unique_temp_path("grace-probe-stream");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -10923,7 +10925,7 @@ mod tests {
     /// without counter-specific recovery code.
     #[test]
     fn row_counts_track_dml_transactions_and_recovery() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
 
         let path = unique_temp_path("row-count");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -11017,7 +11019,7 @@ mod tests {
     /// and so is their count.
     #[test]
     fn an_uncommitted_transactions_rows_are_uncounted_after_crash() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
 
         let path = unique_temp_path("row-count-crash");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -11060,7 +11062,7 @@ mod tests {
     /// since it reads less than the table either way.
     #[test]
     fn a_tiny_table_scans_until_it_grows_into_its_seek() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("row-count-tiebreak");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -11126,7 +11128,7 @@ mod tests {
     /// UNIQUE seek (one row plus one lookup beats a covering scan).
     #[test]
     fn a_covering_index_wins_the_tie_against_an_older_plain_index() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
 
         let path = unique_temp_path("include-tiebreak");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -11162,7 +11164,7 @@ mod tests {
     /// INCLUDE list alike; a duplicate INCLUDE column reports 1909.
     #[test]
     fn create_index_errors_carry_sql_server_numbers() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
 
         let path = unique_temp_path("include-errors");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -11197,7 +11199,7 @@ mod tests {
     /// (the include list rides the catalog; the leaf format rides the pages).
     #[test]
     fn included_values_survive_update_delete_and_restart() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("include-restart");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -11251,7 +11253,7 @@ mod tests {
     /// SHOWPLAN tells the two apart: covering has no Key Lookup line.
     #[test]
     fn a_non_covering_read_on_an_include_index_still_finds_rows() {
-        use crate::rel::{StatementResult, TxnContext, execute_batch};
+        use crate::relational::{StatementResult, TxnContext, execute_batch};
 
         let path = unique_temp_path("include-fallback");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -11326,7 +11328,7 @@ mod tests {
     /// can never act on an acknowledgment a crash then silently revokes.
     #[test]
     fn a_commit_acknowledgement_never_precedes_its_fsync() {
-        use crate::rel::{
+        use crate::relational::{
             BatchEmitter, ResultColumn, TxnContext, execute_batch, execute_batch_streamed,
         };
         use crate::relstore::types::Datum;
@@ -11352,7 +11354,7 @@ mod tests {
                 &mut self,
                 _count: Option<u64>,
                 _in_transaction: bool,
-                _command: crate::rel::DoneCommand,
+                _command: crate::relational::DoneCommand,
             ) {
                 self.note("done");
             }
@@ -11411,7 +11413,7 @@ mod tests {
     /// than on "some DONE acknowledges a commit".
     #[test]
     fn an_identity_value_never_streams_before_its_reservation_fsync() {
-        use crate::rel::{
+        use crate::relational::{
             BatchEmitter, ResultColumn, TxnContext, execute_batch, execute_batch_streamed,
         };
         use crate::relstore::types::Datum;
@@ -11436,7 +11438,7 @@ mod tests {
                 &mut self,
                 _count: Option<u64>,
                 _in_transaction: bool,
-                _command: crate::rel::DoneCommand,
+                _command: crate::relational::DoneCommand,
             ) {
                 self.note("done");
             }
@@ -11491,7 +11493,7 @@ mod tests {
     /// deferred to that durability point rather than each buying an fsync.
     #[test]
     fn a_write_only_batch_still_fsyncs_once() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
 
         let path = unique_temp_path("stream-one-fsync");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
@@ -11525,7 +11527,7 @@ mod tests {
     /// committer waits on the same tail, so exactly one fsync serves them all.
     #[test]
     fn group_commit_coalesces_many_commits_into_one_fsync() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
         use std::sync::Arc;
 
         const THREADS: usize = 16;
@@ -11588,7 +11590,7 @@ mod tests {
     /// a still-open transaction), so a crash would revert and reuse the value.
     #[test]
     fn identity_reservation_is_made_durable_even_inside_a_transaction() {
-        use crate::rel::{TxnContext, execute_batch};
+        use crate::relational::{TxnContext, execute_batch};
 
         let path = unique_temp_path("identity-durable");
         let storage = Storage::create(path.clone(), test_storage_options()).expect("create");

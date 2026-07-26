@@ -306,7 +306,9 @@ fn string_value(datum: &Datum) -> Option<String> {
         Datum::VarChar(s) | Datum::NVarChar(s) => Some(s.clone()),
         Datum::Null => None,
         // Any other datum reaching a string column is rendered as text.
-        other => truthdb_core::rel::render_cell(other, &ColumnType::NVarChar { max_len: 4000 }),
+        other => {
+            truthdb_core::relational::render_cell(other, &ColumnType::NVarChar { max_len: 4000 })
+        }
     }
 }
 

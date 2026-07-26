@@ -13,7 +13,7 @@
 //! could only release by having its own work processed, and while workers exist
 //! to do that, a batch that parked mid-execution could not be restarted
 //! cleanly. Instead a batch acquires *all* the table/database locks it needs up
-//! front (see [`crate::rel::analyze_locks`]) before running any statement, so a
+//! front (see [`crate::relational::analyze_locks`]) before running any statement, so a
 //! running batch never blocks on a lock. If a lock conflicts, the whole
 //! [`EngineCall::RunBatch`] is *parked* — its reply deferred — and the worker
 //! moves on. Releasing locks (commit / rollback / disconnect) makes parked
@@ -48,7 +48,9 @@ use truthdb_sql::error::SqlError;
 
 use crate::engine::{Engine, EngineError};
 use crate::lock::{LockManager, LockMode, Resource};
-use crate::rel::{BatchOutcome, Isolation, ResultColumn, RowSet, StatementResult, TxnContext};
+use crate::relational::{
+    BatchOutcome, Isolation, ResultColumn, RowSet, StatementResult, TxnContext,
+};
 use crate::relstore::types::Datum;
 
 /// How long a batch may wait on a lock before it is treated as a deadlock
@@ -104,7 +106,7 @@ pub enum BatchEvent {
         /// (`DONE_INXACT`).
         in_transaction: bool,
         /// The DONE's `CurCmd` class — mssql-jdbc drops the count without it.
-        command: crate::rel::DoneCommand,
+        command: crate::relational::DoneCommand,
     },
     /// Ends a statement that failed after its result set had begun streaming:
     /// closes the set (with a clean DONE — an error-flagged DONE without an
@@ -156,12 +158,12 @@ pub enum PreparedRpc {
     },
     Execute {
         handle: i32,
-        values: Vec<crate::rel::RpcParam>,
+        values: Vec<crate::relational::RpcParam>,
     },
     PrepExec {
         decls: String,
         stmt: String,
-        values: Vec<crate::rel::RpcParam>,
+        values: Vec<crate::relational::RpcParam>,
     },
     Unprepare {
         handle: i32,
@@ -230,7 +232,7 @@ impl BatchSink {
 
     /// Sends a finished outcome as events — the reply of a batch that never
     /// ran (the parked deadlock victim) and the tests' shorthand. A batch that
-    /// runs streams through the [`crate::rel::BatchEmitter`] impl below
+    /// runs streams through the [`crate::relational::BatchEmitter`] impl below
     /// instead, stamping each DONE with its own statement's state; here every
     /// DONE carries the one final state, which is all an error-only reply has.
     fn send_outcome(&self, outcome: BatchOutcome, in_transaction: bool) {
@@ -240,12 +242,12 @@ impl BatchSink {
                 StatementResult::RowsAffected(n) => self.send(BatchEvent::StatementDone {
                     count: Some(n),
                     in_transaction,
-                    command: crate::rel::DoneCommand::Other,
+                    command: crate::relational::DoneCommand::Other,
                 }),
                 StatementResult::Done => self.send(BatchEvent::StatementDone {
                     count: None,
                     in_transaction,
-                    command: crate::rel::DoneCommand::Other,
+                    command: crate::relational::DoneCommand::Other,
                 }),
             };
             if !sent {
@@ -282,7 +284,7 @@ impl BatchSink {
         self.send(BatchEvent::StatementDone {
             count: Some(count),
             in_transaction,
-            command: crate::rel::DoneCommand::Select,
+            command: crate::relational::DoneCommand::Select,
         })
     }
 
@@ -304,7 +306,7 @@ impl BatchSink {
 /// the wire while the batch still executes. Send failures mean the client is
 /// gone; the batch still runs to completion (its effects do not depend on
 /// anyone listening) and the disconnect path's cancel flag stops it early.
-impl crate::rel::BatchEmitter for BatchSink {
+impl crate::relational::BatchEmitter for BatchSink {
     fn columns(&mut self, columns: Vec<ResultColumn>) {
         self.send(BatchEvent::Columns(columns));
     }
@@ -317,7 +319,7 @@ impl crate::rel::BatchEmitter for BatchSink {
         &mut self,
         count: Option<u64>,
         in_transaction: bool,
-        command: crate::rel::DoneCommand,
+        command: crate::relational::DoneCommand,
     ) {
         self.send(BatchEvent::StatementDone {
             count,
@@ -583,7 +585,7 @@ enum EngineCall {
     RunBatch {
         session: SessionId,
         sql: String,
-        params: Vec<crate::rel::RpcParam>,
+        params: Vec<crate::relational::RpcParam>,
         /// For an RPC-by-name call of a user procedure: the OUTPUT parameters
         /// and return-status variable to read back off the context once the
         /// synthesized `EXEC` batch completes. `None` for an ordinary batch.
@@ -788,7 +790,7 @@ impl EngineHandle {
         &self,
         session: SessionId,
         sql: String,
-        params: Vec<crate::rel::RpcParam>,
+        params: Vec<crate::relational::RpcParam>,
     ) -> Result<BatchReply, EngineError> {
         self.run_rpc_cancellable(session, sql, params, Arc::new(AtomicBool::new(false)))
             .await
@@ -817,7 +819,7 @@ impl EngineHandle {
         &self,
         session: SessionId,
         sql: String,
-        params: Vec<crate::rel::RpcParam>,
+        params: Vec<crate::relational::RpcParam>,
         cancel: Arc<AtomicBool>,
     ) -> Result<BatchReply, EngineError> {
         let mut events = self.stream_rpc(session, sql, String::new(), params, cancel);
@@ -850,7 +852,7 @@ impl EngineHandle {
         session: SessionId,
         sql: String,
         decls: String,
-        params: Vec<crate::rel::RpcParam>,
+        params: Vec<crate::relational::RpcParam>,
         cancel: Arc<AtomicBool>,
     ) -> mpsc::UnboundedReceiver<BatchEvent> {
         let (tx, rx) = mpsc::unbounded_channel();
@@ -896,7 +898,7 @@ impl EngineHandle {
         &self,
         session: SessionId,
         name: String,
-        params: Vec<crate::rel::RpcParam>,
+        params: Vec<crate::relational::RpcParam>,
         outputs: Vec<bool>,
         cancel: Arc<AtomicBool>,
     ) -> mpsc::UnboundedReceiver<BatchEvent> {
@@ -906,7 +908,7 @@ impl EngineHandle {
         let status_var = "__truthdb_rc".to_string();
         let mut sql = format!("EXEC @{status_var} = [{}]", name.replace(']', "]]"));
         let mut output_vars = Vec::new();
-        let mut seeded: Vec<crate::rel::RpcParam> = Vec::with_capacity(params.len() + 1);
+        let mut seeded: Vec<crate::relational::RpcParam> = Vec::with_capacity(params.len() + 1);
         for (index, mut param) in params.into_iter().enumerate() {
             let sep = if index == 0 { " " } else { ", " };
             let is_output = outputs.get(index).copied().unwrap_or(false);
@@ -935,7 +937,7 @@ impl EngineHandle {
         // an Int only on completion, so a still-NULL read means it aborted (see
         // read_proc_tail). Seeding it also satisfies `EXEC @rc =`'s declared-var
         // requirement (137).
-        seeded.push(crate::rel::RpcParam {
+        seeded.push(crate::relational::RpcParam {
             name: format!("@{status_var}"),
             column_type: crate::relstore::types::ColumnType::Int,
             value: Datum::Null,
@@ -1147,7 +1149,7 @@ const _: fn() = || {
 struct Runnable {
     session: SessionId,
     sql: String,
-    params: Vec<crate::rel::RpcParam>,
+    params: Vec<crate::relational::RpcParam>,
     proc_tail: Option<ProcRpcTail>,
     cancel: Arc<AtomicBool>,
     reply: BatchSink,
@@ -1396,7 +1398,7 @@ fn dispatch_rpc(
                 reply.send(BatchEvent::StatementDone {
                     count: Some(count),
                     in_transaction,
-                    command: crate::rel::DoneCommand::Select,
+                    command: crate::relational::DoneCommand::Select,
                 });
                 reply.send(BatchEvent::Complete { in_transaction });
             }
@@ -1451,9 +1453,9 @@ fn dispatch_rpc(
 /// variable needs its name. A value that already has a name keeps it.
 fn bind_decl_names(
     decls: &str,
-    mut values: Vec<crate::rel::RpcParam>,
-) -> Result<Vec<crate::rel::RpcParam>, SqlError> {
-    let names = crate::rel::decl_names(decls);
+    mut values: Vec<crate::relational::RpcParam>,
+) -> Result<Vec<crate::relational::RpcParam>, SqlError> {
+    let names = crate::relational::decl_names(decls);
     // An unnamed value with no declaration to name it is SQL Server's 8144.
     // (Fewer values than declarations is legal — a declared parameter the
     // statement never reads goes unmissed, and one it does read errors when
@@ -1486,7 +1488,7 @@ fn dispatch_batch(
     shared: &Arc<Shared>,
     session: SessionId,
     sql: String,
-    params: Vec<crate::rel::RpcParam>,
+    params: Vec<crate::relational::RpcParam>,
     proc_tail: Option<ProcRpcTail>,
     cancel: Arc<AtomicBool>,
     reply: BatchSink,
@@ -1553,7 +1555,7 @@ fn run_and_finish(shared: &Arc<Shared>, work: Runnable) {
     } = work;
     // Bind the cancel flag to this worker thread for the batch, so the executor's
     // `check_cancelled` polls see a TDS Attention; the guard clears it on return.
-    let _cancel_guard = crate::rel::CancelScope::enter(cancel);
+    let _cancel_guard = crate::relational::CancelScope::enter(cancel);
     // Statement events stream out *while the batch runs* — the executor emits
     // each result as it is produced, and the send never blocks, so a client
     // that reads slowly delays neither this worker nor the locks it holds.
@@ -1648,7 +1650,7 @@ fn drain_ready(shared: &Arc<Shared>) {
 struct Parked {
     session: SessionId,
     sql: String,
-    params: Vec<crate::rel::RpcParam>,
+    params: Vec<crate::relational::RpcParam>,
     proc_tail: Option<ProcRpcTail>,
     cancel: Arc<AtomicBool>,
     reply: BatchSink,
@@ -2128,7 +2130,7 @@ fn lock_timeout_error() -> SqlError {
 mod tests {
     use super::*;
     use crate::engine::Engine;
-    use crate::rel::StatementResult;
+    use crate::relational::StatementResult;
     use crate::relstore::types::Datum;
     use crate::storage::{Storage, StorageOptions};
     use std::collections::{HashMap, HashSet};
@@ -2771,7 +2773,7 @@ mod tests {
             0,
         );
         {
-            let mut ctx = crate::rel::TxnContext::default();
+            let mut ctx = crate::relational::TxnContext::default();
             engine
                 .sql_batch("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)", &mut ctx)
                 .expect("create table");
@@ -2790,7 +2792,7 @@ mod tests {
         let needs = engine.analyze_locks(
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
             "EXEC p",
-            crate::rel::Isolation::ReadCommitted,
+            crate::relational::Isolation::ReadCommitted,
         );
         assert!(
             !needs
@@ -2812,7 +2814,7 @@ mod tests {
         });
         // The body is replaced while the batch is parked.
         {
-            let mut ctx = crate::rel::TxnContext::default();
+            let mut ctx = crate::relational::TxnContext::default();
             engine
                 .sql_batch("ALTER PROCEDURE p AS INSERT INTO t VALUES (1)", &mut ctx)
                 .expect("alter proc");
@@ -4259,8 +4261,8 @@ mod tests {
         })
     }
 
-    fn int_param(value: i32) -> crate::rel::RpcParam {
-        crate::rel::RpcParam {
+    fn int_param(value: i32) -> crate::relational::RpcParam {
+        crate::relational::RpcParam {
             name: String::new(),
             column_type: crate::relstore::types::ColumnType::Int,
             value: Datum::Int(value),
@@ -4605,15 +4607,15 @@ mod tests {
     #[test]
     fn decl_names_splits_top_level_commas_only() {
         assert_eq!(
-            crate::rel::decl_names("@p1 int, @p2 nvarchar(10), @p3 decimal(10,2)"),
+            crate::relational::decl_names("@p1 int, @p2 nvarchar(10), @p3 decimal(10,2)"),
             ["@p1", "@p2", "@p3"]
         );
-        assert_eq!(crate::rel::decl_names(""), Vec::<String>::new());
-        assert_eq!(crate::rel::decl_names("@a int"), ["@a"]);
+        assert_eq!(crate::relational::decl_names(""), Vec::<String>::new());
+        assert_eq!(crate::relational::decl_names("@a int"), ["@a"]);
         // A quoted default may contain commas and parens; a doubled ''
         // escape stays inside the string.
         assert_eq!(
-            crate::rel::decl_names(
+            crate::relational::decl_names(
                 "@p1 varchar(10) = 'a,b', @p2 int, @p3 varchar(5) = 'it''s, ok'"
             ),
             ["@p1", "@p2", "@p3"]

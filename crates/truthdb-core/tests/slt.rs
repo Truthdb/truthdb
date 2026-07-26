@@ -14,7 +14,7 @@
 use std::path::{Path, PathBuf};
 
 use truthdb_core::engine::Engine;
-use truthdb_core::rel::{StatementResult, TxnContext};
+use truthdb_core::relational::{StatementResult, TxnContext};
 use truthdb_core::relstore::types::Datum;
 use truthdb_core::storage::{Storage, StorageOptions};
 
