@@ -166,4 +166,14 @@ impl Parser {
             other => format!("{other:?}"),
         }
     }
+
+    /// Consumes `keyword` if it is next; returns whether it did.
+    pub(super) fn eat_keyword(&mut self, keyword: &str) -> bool {
+        if self.peek_keyword().as_deref() == Some(keyword) {
+            self.bump();
+            true
+        } else {
+            false
+        }
+    }
 }
