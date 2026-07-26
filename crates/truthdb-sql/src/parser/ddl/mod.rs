@@ -1,6 +1,8 @@
 use super::*;
 
+mod routines;
 mod schema;
+mod security;
 
 impl Parser {
     // ---- CREATE TABLE ---------------------------------------------------
