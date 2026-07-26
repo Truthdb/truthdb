@@ -8,7 +8,7 @@ use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::mpsc;
 use truthdb_core::auth;
 use truthdb_core::engine::EngineError;
-use truthdb_core::rel::ResultColumn;
+use truthdb_core::engine::ResultColumn;
 use truthdb_core::session::{BatchEvent, EngineHandle, PreparedRpc, SessionId};
 
 use crate::login::{self, parse_login7};
@@ -875,8 +875,8 @@ struct PendingDone {
 }
 
 /// The DONE `CurCmd` value for a statement's command class.
-fn curcmd_of(command: truthdb_core::rel::DoneCommand) -> u16 {
-    use truthdb_core::rel::DoneCommand;
+fn curcmd_of(command: truthdb_core::engine::DoneCommand) -> u16 {
+    use truthdb_core::engine::DoneCommand;
     match command {
         DoneCommand::Select => token::CMD_SELECT,
         DoneCommand::Insert => token::CMD_INSERT,
@@ -1007,7 +1007,7 @@ impl BatchRender {
                 // Severity >= 20 kills the connection, as SQL Server does:
                 // the reply still finishes (error + final DONE) and then the
                 // connection loop closes the stream.
-                if error.level >= truthdb_core::rel::FATAL_SEVERITY {
+                if error.level >= truthdb_core::engine::FATAL_SEVERITY {
                     self.fatal = true;
                 }
             }
@@ -1269,7 +1269,7 @@ pub async fn read_raw_message<R: AsyncRead + Unpin>(reader: &mut R) -> io::Resul
 mod render_tests {
     use super::*;
     use crate::packet::{MIN_PACKET_SIZE, read_message};
-    use truthdb_core::rel::{BatchOutcome, ResultColumn, RowSet, StatementResult};
+    use truthdb_core::engine::{BatchOutcome, ResultColumn, RowSet, StatementResult};
     use truthdb_core::relstore::types::{ColumnType, Datum};
     use truthdb_sql::error::SqlError;
 
@@ -1380,7 +1380,7 @@ mod render_tests {
                     tx.send(BatchEvent::StatementDone {
                         count: Some(rowset.rows.len() as u64),
                         in_transaction: in_xact,
-                        command: truthdb_core::rel::DoneCommand::Select,
+                        command: truthdb_core::engine::DoneCommand::Select,
                     })
                     .unwrap();
                 }
@@ -1388,14 +1388,14 @@ mod render_tests {
                     .send(BatchEvent::StatementDone {
                         count: Some(*n),
                         in_transaction: in_xact,
-                        command: truthdb_core::rel::DoneCommand::Other,
+                        command: truthdb_core::engine::DoneCommand::Other,
                     })
                     .unwrap(),
                 StatementResult::Done => tx
                     .send(BatchEvent::StatementDone {
                         count: None,
                         in_transaction: in_xact,
-                        command: truthdb_core::rel::DoneCommand::Other,
+                        command: truthdb_core::engine::DoneCommand::Other,
                     })
                     .unwrap(),
             }
@@ -1420,7 +1420,7 @@ mod render_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
-            command: truthdb_core::rel::DoneCommand::Other,
+            command: truthdb_core::engine::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::PreparedHandle(7)).unwrap();
@@ -1443,7 +1443,7 @@ mod render_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(3),
             in_transaction: false,
-            command: truthdb_core::rel::DoneCommand::Other,
+            command: truthdb_core::engine::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::Complete {
@@ -1511,7 +1511,7 @@ mod render_tests {
             tx.send(BatchEvent::StatementDone {
                 count,
                 in_transaction,
-                command: truthdb_core::rel::DoneCommand::Other,
+                command: truthdb_core::engine::DoneCommand::Other,
             })
             .unwrap();
         }
@@ -1549,7 +1549,7 @@ mod render_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
-            command: truthdb_core::rel::DoneCommand::Other,
+            command: truthdb_core::engine::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::Complete {
@@ -1858,7 +1858,7 @@ mod render_tests {
 mod attention_tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
-    use truthdb_core::rel::ResultColumn;
+    use truthdb_core::engine::ResultColumn;
     use truthdb_core::relstore::types::{ColumnType, Datum};
 
     /// An Attention header-only packet.
@@ -1946,7 +1946,7 @@ mod attention_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
-            command: truthdb_core::rel::DoneCommand::Other,
+            command: truthdb_core::engine::DoneCommand::Other,
         })
         .unwrap();
         tx.send(BatchEvent::Complete {
@@ -1997,7 +1997,7 @@ mod attention_tests {
         tx.send(BatchEvent::StatementDone {
             count: Some(1),
             in_transaction: false,
-            command: truthdb_core::rel::DoneCommand::Other,
+            command: truthdb_core::engine::DoneCommand::Other,
         })
         .unwrap();
         drop(tx);
