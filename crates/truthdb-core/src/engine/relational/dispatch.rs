@@ -4,6 +4,7 @@ use super::prelude::*;
 /// the first error (discarding earlier results). Kept for tests; the server
 /// uses [`execute_batch`].
 #[cfg(test)]
+#[allow(dead_code)]
 pub fn execute(storage: &Storage, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
     let mut txn_ctx = TxnContext::default();
     let outcome = execute_batch(storage, sql, &mut txn_ctx);

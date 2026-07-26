@@ -33,7 +33,9 @@ pub use api::{
     BatchEmitter, BatchOutcome, Collector, DoneCommand, FATAL_SEVERITY, ResultColumn, RowSet,
     RpcParam, StatementResult,
 };
-pub use batch::{execute_batch, execute_batch_streamed, execute_batch_with_params};
+#[cfg(test)]
+pub use batch::execute_batch_with_params;
+pub use batch::{execute_batch, execute_batch_streamed};
 pub use context::{Isolation, TxnContext};
 pub use describe::describe_first_result_set;
 #[cfg(test)]
