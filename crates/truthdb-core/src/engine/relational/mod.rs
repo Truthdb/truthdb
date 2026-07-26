@@ -10,6 +10,7 @@
 mod aggregate;
 mod api;
 mod batch;
+mod cancel;
 pub mod collation;
 mod constraints;
 mod context;
@@ -20,6 +21,7 @@ mod dml;
 mod hash;
 mod helpers;
 mod lock_analysis;
+mod parameters;
 mod plan;
 mod prelude;
 mod procedural;
@@ -36,18 +38,18 @@ pub use api::{
 #[cfg(test)]
 pub use batch::execute_batch_with_params;
 pub use batch::{execute_batch, execute_batch_streamed};
+pub use cancel::{CancelScope, check_cancelled};
+#[cfg(test)]
+pub(crate) use cancel::{clear_test_cancel, set_test_cancel};
 pub use context::{Isolation, TxnContext};
 pub use describe::describe_first_result_set;
 #[cfg(test)]
 pub use dispatch::execute;
 pub use helpers::{SqlStatement, render_cell};
 pub use lock_analysis::analyze_locks;
-pub(crate) use query::decl_names;
-pub use query::{CancelScope, check_cancelled};
+pub(crate) use parameters::decl_names;
 #[cfg(test)]
-pub(crate) use query::{
-    clear_test_cancel, set_test_cancel, set_test_sort_budget, without_scan_path,
-};
+pub(crate) use query::{set_test_sort_budget, without_scan_path};
 
 #[cfg(test)]
 mod tests;
