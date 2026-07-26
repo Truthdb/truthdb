@@ -48,3 +48,6 @@ pub use query::{CancelScope, check_cancelled};
 pub(crate) use query::{
     clear_test_cancel, set_test_cancel, set_test_sort_budget, without_scan_path,
 };
+
+#[cfg(test)]
+mod tests;
