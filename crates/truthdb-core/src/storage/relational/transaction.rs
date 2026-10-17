@@ -30,11 +30,12 @@ impl Storage {
         recovery_full: Option<bool>,
     ) -> Result<(), StorageError> {
         let mut guard = self.lock();
-        guard.set_db_options(rcsi, allow_snapshot, recovery_full)?;
+        let mut rel = guard.rel();
+        rel.set_db_options(rcsi, allow_snapshot, recovery_full)?;
         let (rcsi_now, allow_now, recovery_now) = (
-            guard.eng.version.rcsi,
-            guard.eng.version.allow_snapshot,
-            guard.recovery_full,
+            rel.version.rcsi,
+            rel.version.allow_snapshot,
+            rel.core.recovery_full,
         );
         drop(guard);
         self.rcsi
@@ -71,11 +72,12 @@ impl Storage {
     pub(crate) fn capture_read_snapshot(&self, own_txn: Option<u64>) -> ReadSnapshot {
         let durable = self.gc.flushed();
         let mut guard = self.lock();
+        let mut rel = guard.rel();
         // Whichever watermark is ahead: the group-commit fsync or a direct
         // WAL sync (rollbacks, checkpoints) — both are durability floors.
-        let durable = durable.max(guard.wal.flushed_lsn());
-        let seq = guard.eng.version.durable_seq(durable);
-        guard.eng.version.register_snapshot(seq);
+        let durable = durable.max(rel.core.wal.flushed_lsn());
+        let seq = rel.version.durable_seq(durable);
+        rel.version.register_snapshot(seq);
         ReadSnapshot { seq, own_txn }
     }
 
@@ -95,27 +97,23 @@ impl Storage {
     pub(crate) fn version_prune(&self) {
         let durable = self.gc.flushed();
         let mut guard = self.lock();
-        let durable = durable.max(guard.wal.flushed_lsn());
-        let fallback = guard.eng.version.durable_seq(durable);
-        let watermark = guard.eng.version.watermark(fallback);
-        let alive: std::collections::HashSet<u32> = guard
-            .eng
-            .rel
-            .all_tables()
-            .map(|def| def.object_id)
-            .collect();
-        guard.eng.version.prune(watermark, &alive);
+        let mut rel = guard.rel();
+        let durable = durable.max(rel.core.wal.flushed_lsn());
+        let fallback = rel.version.durable_seq(durable);
+        let watermark = rel.version.watermark(fallback);
+        let alive: std::collections::HashSet<u32> =
+            rel.rel.all_tables().map(|def| def.object_id).collect();
+        rel.version.prune(watermark, &alive);
     }
 
     /// Test observability: version chains held for `table`.
     #[cfg(test)]
     pub(crate) fn version_chain_count(&self, table: &str) -> usize {
-        let guard = self.lock();
-        guard
-            .eng
-            .rel
+        let mut guard = self.lock();
+        let mut rel = guard.rel();
+        rel.rel
             .table(catalog::DEFAULT_DATABASE_ID, table)
-            .map_or(0, |def| guard.eng.version.chain_count(def.object_id))
+            .map_or(0, |def| rel.version.chain_count(def.object_id))
     }
 
     pub(crate) fn rel_begin(&self) -> Result<StorageTxn, StorageError> {
@@ -200,6 +198,32 @@ impl Storage {
 }
 
 impl RelFile<'_> {
+    /// Applies `ALTER DATABASE SET` option changes. The new byte is built and
+    /// persisted BEFORE any in-memory state changes: a failed write must leave
+    /// the version store, the option mirrors, and the cached superblocks
+    /// exactly as they were (a half-applied OFF would otherwise stop
+    /// publishing while readers still take the versioned path — silent dirty
+    /// reads), and a later lazy active-slot rewrite must not leak the failed
+    /// ALTER's options to disk.
+    pub(in crate::storage) fn set_db_options(
+        &mut self,
+        rcsi: Option<bool>,
+        allow_snapshot: Option<bool>,
+        recovery_full: Option<bool>,
+    ) -> Result<(), StorageError> {
+        self.core.ensure_rel_usable()?;
+        let mut bits = self.version.options_byte();
+        if let Some(on) = rcsi {
+            bits = (bits & !1) | (on as u8);
+        }
+        if let Some(on) = allow_snapshot {
+            bits = (bits & !2) | ((on as u8) << 1);
+        }
+        self.core.commit_db_options(bits, recovery_full)?;
+        self.version.set_options(rcsi, allow_snapshot);
+        Ok(())
+    }
+
     /// Opens a multi-statement transaction (`BEGIN TRAN`).
     pub(crate) fn rel_begin(&mut self) -> Result<StorageTxn, StorageError> {
         self.core.ensure_rel_usable()?;
@@ -436,7 +460,7 @@ impl RelFile<'_> {
                     Err(err) => (Err(err), true),
                 }
             }
-            Err(err) => match rel_recovery::rollback(&mut ctx, txn, &TreeRoots(&roots)) {
+            Err(err) => match rel_recovery::rollback(&mut ctx, txn, &TreeRoots(roots)) {
                 Ok(()) => {
                     let _ = ctx.io.wal.sync_all();
                     (Err(err), false)
@@ -489,7 +513,7 @@ impl RelFile<'_> {
                             &mut ctx,
                             &mut stx.txn,
                             savepoint,
-                            &TreeRoots(&roots),
+                            &TreeRoots(roots),
                         ) {
                             Ok(()) => (Err(err), false),
                             // A half-undone statement the WAL cannot explain:
@@ -579,7 +603,7 @@ impl RelFile<'_> {
         let roots = stx.roots;
         let result = {
             let mut ctx = self.rel_ctx();
-            match rel_recovery::rollback(&mut ctx, stx.txn, &TreeRoots(&roots)) {
+            match rel_recovery::rollback(&mut ctx, stx.txn, &TreeRoots(roots)) {
                 Ok(()) => {
                     let _ = ctx.io.wal.sync_all();
                     Ok(())
@@ -618,7 +642,7 @@ impl RelFile<'_> {
         let roots = stx.roots.clone();
         let result = {
             let mut ctx = self.rel_ctx();
-            match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &TreeRoots(&roots)) {
+            match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &TreeRoots(roots)) {
                 Ok(()) => {
                     let _ = ctx.io.wal.sync_all();
                     Ok(())

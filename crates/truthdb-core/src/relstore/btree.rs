@@ -827,9 +827,9 @@ fn split_overflow() -> StorageError {
 /// Tree roots by object id, captured where the undo starts (BEGIN for a
 /// multi-statement transaction, statement start, or before recovery undo):
 /// resolves each logical undo to its tree.
-pub(crate) struct TreeRoots<'a>(pub(crate) &'a HashMap<u32, u64>);
+pub(crate) struct TreeRoots(pub(crate) HashMap<u32, u64>);
 
-impl LogicalUndo for TreeRoots<'_> {
+impl LogicalUndo for TreeRoots {
     fn undo(
         &self,
         ctx: &mut RelCtx<'_>,

@@ -18,6 +18,7 @@ use crate::relstore::index::{self, Locator};
 use crate::relstore::key::encode_key;
 use crate::relstore::overflow::{self, OVERFLOW_INLINE_MAX};
 use crate::relstore::recovery as rel_recovery;
+use crate::relstore::recovery::LogicalUndo;
 use crate::relstore::row::{Column, Schema, decode_row, decode_row_projected, encode_row};
 use crate::relstore::types::{ColumnType, Datum};
 use crate::relstore::version::{
@@ -40,12 +41,15 @@ mod backup_restore;
 mod checkpoint;
 mod durability;
 mod lifecycle;
+mod participant;
+mod recovery;
 mod relational;
 mod replication;
 
 #[cfg(test)]
 use lifecycle::compute_layout;
 use lifecycle::live_descriptor_slot;
+use participant::EngineParticipant;
 #[allow(unused_imports)]
 pub(crate) use relational::security::{
     DB_DATAREADER_ID, DB_DATAWRITER_ID, DB_DDLADMIN_ID, DB_OWNER_ID, DBO_ID, FIXED_PRINCIPAL_BASE,
@@ -389,13 +393,13 @@ struct StorageFile {
     default_collation: Option<String>,
 }
 
-/// What the storage mutex guards: the core file next to the relational
+/// What the storage mutex guards: the core file next to the page-structured
 /// engine's in-memory state. One mutex, so a statement's page changes and its
 /// version publishing (and a checkpoint's flush and catalog-root stamp) stay
 /// one critical section. Derefs to the core file.
 struct Locked {
     core: StorageFile,
-    eng: RelEngine,
+    eng: Box<dyn EngineParticipant>,
 }
 
 impl std::ops::Deref for Locked {
@@ -463,7 +467,11 @@ impl Locked {
     fn rel(&mut self) -> RelFile<'_> {
         RelFile {
             core: &mut self.core,
-            eng: &mut self.eng,
+            eng: self
+                .eng
+                .as_any_mut()
+                .downcast_mut::<RelEngine>()
+                .expect("the storage engine is the relational engine"),
         }
     }
 }

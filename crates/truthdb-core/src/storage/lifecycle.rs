@@ -197,11 +197,11 @@ impl Storage {
 
     /// Wraps an opened/created [`StorageFile`] in a `Storage`, spawning the
     /// group-commit log-writer over a duplicated WAL fd.
-    pub(super) fn with_log_writer(path: PathBuf, file: Locked) -> Result<Self, StorageError> {
+    pub(super) fn with_log_writer(path: PathBuf, mut file: Locked) -> Result<Self, StorageError> {
         let wal_fd = file.try_clone_wal_fd()?;
         let (gc, log_writer) = GroupCommit::start(wal_fd);
-        let rcsi = file.eng.version.rcsi;
-        let allow_snapshot = file.eng.version.allow_snapshot;
+        let rcsi = file.rel().version.rcsi;
+        let allow_snapshot = file.rel().version.allow_snapshot;
         let recovery_full = file.core.recovery_full;
         Ok(Storage {
             path,
@@ -365,7 +365,7 @@ impl Storage {
         let core = StorageFile::create_new(path.clone(), opts, wal_min_bytes, wal_max_bytes)?;
         let file = Locked {
             core,
-            eng: RelEngine::new(),
+            eng: Box::new(RelEngine::new()),
         };
         Self::with_log_writer(path, file)
     }
@@ -469,7 +469,7 @@ impl StorageFile {
         let recorded_tail = active_sb.wal_tail;
 
         // The catalog root is stored as an absolute file offset (0 = none).
-        let mut eng = RelEngine::new();
+        let mut metadata_root = None;
         if active_sb.metadata_root != 0 {
             if active_sb.metadata_root < layout.data_offset
                 || active_sb.metadata_root >= layout.data_offset + layout.data_size
@@ -478,11 +478,11 @@ impl StorageFile {
                     "catalog root outside the data region".to_string(),
                 ));
             }
-            eng.rel.catalog_root =
-                Some((active_sb.metadata_root - layout.data_offset) / PAGE_SIZE as u64);
+            metadata_root = Some((active_sb.metadata_root - layout.data_offset) / PAGE_SIZE as u64);
         }
 
-        eng.version.set_options_byte(active_sb.db_options());
+        let mut eng: Box<dyn EngineParticipant> = Box::new(RelEngine::new());
+        eng.open(metadata_root, active_sb.db_options());
         let last_log_backup_lsn = active_sb.last_log_backup_lsn();
         let repl_slots = active_sb.repl_slots();
         let recovery_full = active_sb.db_options() & 4 != 0;
@@ -578,10 +578,10 @@ impl StorageFile {
         let redo_only = storage.active_sb().is_standby();
         // A standby is read-only until promotion: it appends nothing to its own
         // WAL (only the primary's log, via apply_wal_stream). Set before
-        // recover_rel — which for a standby is redo-only and never appends, so
+        // recovery — which for a standby is redo-only and never appends, so
         // this blocks only later local writes.
         storage.wal.set_read_only(redo_only);
-        storage.rel().recover_rel(stop_at, redo_only)?;
+        storage.recover(stop_at, redo_only)?;
         Ok(storage)
     }
 

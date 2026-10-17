@@ -7,66 +7,48 @@ impl Storage {
     pub(crate) fn rel_wal_records(
         &self,
     ) -> Result<Vec<(u64, crate::wal::records::RelRecord)>, StorageError> {
-        self.lock().rel().rel_records()
+        self.lock().rel_records()
     }
 }
 
-impl RelFile<'_> {
-    /// Decodes the relational records (with their LSNs) from the recovery
-    /// scan.
-    pub(in crate::storage) fn rel_records(&self) -> Result<Vec<(u64, RelRecord)>, StorageError> {
-        self.core
-            .replay_cache
-            .iter()
-            .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
-            .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
-            .collect()
+impl EngineParticipant for RelEngine {
+    fn open(&mut self, metadata_root: Option<u64>, db_options: u8) {
+        self.rel.catalog_root = metadata_root;
+        self.version.set_options_byte(db_options);
     }
 
-    /// ARIES restart: analysis + redo (repeating history), then undo of
-    /// loser transactions with CLRs. The catalog is loaded between redo and
-    /// undo (undo needs tree roots) and reloaded after (undo may have
-    /// removed catalog rows).
-    pub(in crate::storage) fn recover_rel(
+    fn metadata_root(&self) -> Option<u64> {
+        self.rel.catalog_root
+    }
+
+    fn set_metadata_root(&mut self, page: u64) {
+        self.rel.catalog_root = Some(page);
+    }
+
+    fn options_byte(&self) -> u8 {
+        self.version.options_byte()
+    }
+
+    fn reload(&mut self, core: &mut StorageFile) -> Result<(), StorageError> {
+        RelFile { core, eng: self }.reload_catalog()
+    }
+
+    fn recovery_undo(&self) -> Box<dyn LogicalUndo> {
+        Box::new(TreeRoots(self.rel.tree_roots()))
+    }
+
+    fn capture_standby(
         &mut self,
-        stop_at: Option<u64>,
-        redo_only: bool,
-    ) -> Result<(), StorageError> {
-        let records = self.rel_records()?;
-        if records.is_empty() && self.rel.catalog_root.is_none() {
-            return Ok(());
-        }
+        core: &mut StorageFile,
+        records: &[(u64, RelRecord)],
+        floor: u64,
+    ) {
+        self.version.standby_reads = true;
+        RelFile { core, eng: self }.standby_capture_versions(records);
+        self.standby_version_floor = floor;
+    }
 
-        let outcome = {
-            let mut ctx = self.rel_ctx();
-            rel_recovery::analyze_and_redo(&mut ctx, &records, stop_at)?
-        };
-        if let Some(root) = outcome.catalog_root {
-            self.rel.catalog_root = Some(root);
-        }
-        self.core.pages.next_txn_id = outcome.max_txn_id + 1;
-
-        self.reload_catalog()?;
-        // A standby repeats history but never undoes: an in-flight transaction at
-        // the applied tail is the primary's, to be committed (and shipped onward)
-        // or resolved at promotion — undoing it here would drop committed data
-        // that the streaming protocol never re-ships.
-        if !redo_only && !outcome.losers.is_empty() {
-            let roots = self.rel.tree_roots();
-            let mut ctx = self.rel_ctx();
-            rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &TreeRoots(&roots))?;
-            self.reload_catalog()?;
-        }
-        // Readable standby: rebuild the version store from the retained ring
-        // (the store is in-memory only — without this a reopen would serve the
-        // redo-applied in-flight rows raw). Runs AFTER redo, so heap pages
-        // self-identify their owner even when they were formatted within the
-        // replayed range.
-        if redo_only {
-            self.version.standby_reads = true;
-            self.standby_capture_versions(&records);
-            self.standby_version_floor = self.core.wal.tail();
-        }
+    fn finish_recovery(&mut self) {
         // Object ids are shared by tables, their secondary indexes, logins,
         // database principals, and database rows (all draw from the same
         // counter), so the next id must clear every kind — an index or a login
@@ -91,10 +73,14 @@ impl RelFile<'_> {
             .max()
             .unwrap_or(FIRST_USER_OBJECT_ID)
             .max(FIRST_USER_OBJECT_ID);
-        self.core.wal.sync_all()?;
-        Ok(())
     }
 
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+impl RelFile<'_> {
     pub(in crate::storage) fn reload_catalog(&mut self) -> Result<(), StorageError> {
         let Some(root) = self.rel.catalog_root else {
             self.rel.tables.clear();

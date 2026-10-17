@@ -39,17 +39,13 @@ impl Storage {
     /// first), leaving the stored database unreachable and undroppable.
     pub fn set_default_database_name(&self, name: &str) -> Result<(), StorageError> {
         let mut guard = self.lock();
-        if guard
-            .eng
-            .rel
-            .databases
-            .contains_key(&name.to_ascii_lowercase())
-        {
+        let mut rel = guard.rel();
+        if rel.rel.databases.contains_key(&name.to_ascii_lowercase()) {
             return Err(StorageError::InvalidConfig(format!(
                 "the configured default database name '{name}' collides with a database                  created by CREATE DATABASE; rename one of them"
             )));
         }
-        guard.eng.default_db_name = name.to_string();
+        rel.default_db_name = name.to_string();
         Ok(())
     }
 }

@@ -385,14 +385,13 @@ impl Locked {
         //    nothing), then refresh the catalog cache so standby reads see any
         //    new tables/columns.
         {
-            let mut rel = self.rel();
-            let mut ctx = rel.rel_ctx();
+            let mut ctx = self.core.page_ctx(0);
             rel_recovery::redo_records(&mut ctx, &records)?;
         }
         if let Some(root) = new_catalog_root {
-            self.eng.rel.catalog_root = Some(root);
+            self.eng.set_metadata_root(root);
         }
-        self.rel().reload_catalog()?;
+        self.eng.reload(&mut self.core)?;
 
         // Only now — with every fallible step behind us — fold the range into
         // the restartpoint floors. Tracking it any earlier would let a FAILED
@@ -406,9 +405,7 @@ impl Locked {
         // from the undo payloads), so snapshot reads at the last-applied-commit
         // sequence see only committed state. Same post-redo discipline: a
         // failed apply must feed the store nothing.
-        self.eng.version.standby_reads = true;
-        self.rel().standby_capture_versions(&records);
-        self.eng.standby_version_floor = advanced;
+        self.eng.capture_standby(&mut self.core, &records, advanced);
         // Track the first UNCOVERED search record (the restartpoint's search
         // floor): the seed snapshot covers seq numbers below
         // `snapshot_next_seq_no`; anything at or above must stay in the ring

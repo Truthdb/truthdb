@@ -225,8 +225,7 @@ impl Storage {
         // superblock rather than re-deriving it from redo.
         let metadata_root = file
             .eng
-            .rel
-            .catalog_root
+            .metadata_root()
             .map(|page| file.layout.data_offset + page * PAGE_SIZE as u64)
             .unwrap_or(0);
         file.commit_superblock(|sb| {

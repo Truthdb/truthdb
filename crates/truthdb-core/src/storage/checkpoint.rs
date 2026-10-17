@@ -51,6 +51,50 @@ impl Storage {
 }
 
 impl StorageFile {
+    /// Persists a new database-options byte durably in both superblocks
+    /// (generation-bumped, active slot first with an fsync between — a torn
+    /// first write falls back to the backup with the old options, and the
+    /// un-acknowledged ALTER is simply lost): `engine_bits` are the engine's
+    /// bits, `recovery_full` (when set) the new recovery model. Only after the
+    /// write succeeds are the in-memory model, log-backup marker and hold
+    /// updated, so a failed write leaves them exactly as they were.
+    pub(super) fn commit_db_options(
+        &mut self,
+        engine_bits: u8,
+        recovery_full: Option<bool>,
+    ) -> Result<(), StorageError> {
+        // Enabling FULL starts a fresh log chain at the current tail; the
+        // marker (and its hold) advance only via BACKUP LOG thereafter. An
+        // already-FULL ALTER, or one that disables FULL / touches only the
+        // snapshot options, leaves the marker where it was. Computed against
+        // the OLD recovery model and stamped into the same durable superblock
+        // write as the option byte, so a crash never leaves FULL set with a
+        // stale/zero marker.
+        let enabling_full = recovery_full == Some(true) && !self.recovery_full;
+        let new_marker = if enabling_full {
+            self.wal.tail()
+        } else {
+            self.last_log_backup_lsn
+        };
+        let full = recovery_full.unwrap_or(self.recovery_full);
+        let byte = engine_bits | ((full as u8) << 2);
+        self.commit_superblock(|sb| {
+            sb.set_db_options(byte);
+            sb.set_last_log_backup_lsn(new_marker);
+        })?;
+        self.recovery_full = full;
+        // Now that the model byte and marker are durable, sync the in-memory
+        // marker and the FULL-model log-truncation hold. FULL pins the ring at
+        // the marker; SIMPLE releases it.
+        self.last_log_backup_lsn = new_marker;
+        if self.recovery_full {
+            self.register_log_backup_hold(new_marker);
+        } else {
+            self.release_log_backup_hold();
+        }
+        Ok(())
+    }
+
     /// The WAL LSN a checkpoint may truncate up to: the oldest open transaction's
     /// BEGIN LSN (so its undo records survive), or the WAL tail if none is open.
     pub(super) fn checkpoint_wal_head(&self) -> u64 {
@@ -70,74 +114,10 @@ impl StorageFile {
 }
 
 impl Locked {
-    /// The superblock's database-options byte: the version store's bits
-    /// (RCSI, ALLOW_SNAPSHOT_ISOLATION) and the core's recovery-model bit.
+    /// The superblock's database-options byte: the engine's bits and the
+    /// core's recovery-model bit.
     pub(super) fn db_options_byte(&self) -> u8 {
-        self.eng.version.options_byte() | ((self.core.recovery_full as u8) << 2)
-    }
-
-    /// Applies `ALTER DATABASE SET` option changes and persists them durably
-    /// in both superblocks (generation-bumped, active slot first with an
-    /// fsync between — a torn first write falls back to the backup with the
-    /// old options, and the un-acknowledged ALTER is simply lost).
-    pub(super) fn set_db_options(
-        &mut self,
-        rcsi: Option<bool>,
-        allow_snapshot: Option<bool>,
-        recovery_full: Option<bool>,
-    ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
-        // Enabling FULL starts a fresh log chain at the current tail; the
-        // marker (and its hold) advance only via BACKUP LOG thereafter. An
-        // already-FULL ALTER, or one that disables FULL / touches only the
-        // snapshot options, leaves the marker where it was. Computed against
-        // the OLD recovery model (before `version.set_options` below) and
-        // stamped into the same durable superblock write as the option byte,
-        // so a crash never leaves FULL set with a stale/zero marker.
-        let enabling_full = recovery_full == Some(true) && !self.core.recovery_full;
-        let new_marker = if enabling_full {
-            self.core.wal.tail()
-        } else {
-            self.core.last_log_backup_lsn
-        };
-        // Build the new superblocks in LOCALS and write them BEFORE mutating
-        // any in-memory state: a failed write must leave the version store,
-        // the option mirrors, and the cached superblocks exactly as they
-        // were (a half-applied OFF would otherwise stop publishing while
-        // readers still take the versioned path — silent dirty reads), and
-        // a later lazy active-slot rewrite must not leak the failed ALTER's
-        // options to disk.
-        let byte = {
-            let mut next = self.db_options_byte();
-            if let Some(on) = rcsi {
-                next = (next & !1) | (on as u8);
-            }
-            if let Some(on) = allow_snapshot {
-                next = (next & !2) | ((on as u8) << 1);
-            }
-            if let Some(on) = recovery_full {
-                next = (next & !4) | ((on as u8) << 2);
-            }
-            next
-        };
-        self.commit_superblock(|sb| {
-            sb.set_db_options(byte);
-            sb.set_last_log_backup_lsn(new_marker);
-        })?;
-        self.eng.version.set_options(rcsi, allow_snapshot);
-        if let Some(on) = recovery_full {
-            self.core.recovery_full = on;
-        }
-        // Now that the model byte and marker are durable, sync the in-memory
-        // marker and the FULL-model log-truncation hold. FULL pins the ring at
-        // the marker; SIMPLE releases it.
-        self.core.last_log_backup_lsn = new_marker;
-        if self.core.recovery_full {
-            self.register_log_backup_hold(new_marker);
-        } else {
-            self.release_log_backup_hold();
-        }
-        Ok(())
+        self.eng.options_byte() | ((self.core.recovery_full as u8) << 2)
     }
 
     pub(super) fn write_checkpoint(
@@ -343,8 +323,7 @@ impl Locked {
         // Catalog root as an absolute file offset (0 = none).
         let metadata_root = self
             .eng
-            .rel
-            .catalog_root
+            .metadata_root()
             .map(|page| self.core.layout.data_offset + page * PAGE_SIZE as u64)
             .unwrap_or(0);
         let db_options = self.db_options_byte();

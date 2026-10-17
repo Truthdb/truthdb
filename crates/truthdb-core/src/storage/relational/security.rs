@@ -238,13 +238,12 @@ impl Storage {
         if let Some(fixed) = fixed_principal_by_id(id) {
             return Some(fixed.name.to_string());
         }
-        let guard = self.lock();
-        guard
-            .eng
-            .rel
+        let mut guard = self.lock();
+        let rel = guard.rel();
+        rel.rel
             .principals
             .values()
-            .chain(guard.eng.rel.database_principals.values())
+            .chain(rel.rel.database_principals.values())
             .find(|d| d.object_id == id)
             .map(|d| d.name.clone())
     }
@@ -315,14 +314,14 @@ impl Storage {
     pub(in crate::storage) fn collect_membership_edges(
         &self,
     ) -> std::collections::HashMap<u32, Vec<u32>> {
-        let guard = self.lock();
+        let mut guard = self.lock();
+        let rel = guard.rel();
         let mut edges: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
-        for def in guard
-            .eng
+        for def in rel
             .rel
             .principals
             .values()
-            .chain(guard.eng.rel.database_principals.values())
+            .chain(rel.rel.database_principals.values())
         {
             if let Some(principal) = &def.principal
                 && !principal.member_of.is_empty()
@@ -335,7 +334,7 @@ impl Storage {
         }
         // Synthesized bootstrap: whichever login is `sa` is a member of the
         // sysadmin server role, and the dbo user is a member of db_owner.
-        if let Some(sa) = guard.eng.rel.principals.get("sa") {
+        if let Some(sa) = rel.rel.principals.get("sa") {
             edges.entry(sa.object_id).or_default().push(SYSADMIN_ID);
         }
         edges.entry(DBO_ID).or_default().push(DB_OWNER_ID);
