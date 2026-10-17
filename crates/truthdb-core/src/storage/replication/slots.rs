@@ -56,6 +56,7 @@ impl Storage {
 }
 
 impl StorageFile {
+    /// Drops any replication slot lagging the WAL tail by more than
     /// `max_slot_retain_bytes` — it no longer pins the truncation floor, so the
     /// ring can advance past it (the standby must reseed). Run at the start of a
     /// checkpoint, before the floor is computed. A no-op under the default
