@@ -184,6 +184,12 @@ impl std::fmt::Display for TypeError {
     }
 }
 
+impl From<TypeError> for crate::storage::StorageError {
+    fn from(err: TypeError) -> Self {
+        crate::storage::StorageError::InvalidConfig(err.0)
+    }
+}
+
 /// A storage-level value. Integer-backed temporal types carry their T-SQL
 /// tick encodings directly.
 #[derive(Debug, Clone, PartialEq)]

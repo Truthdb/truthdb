@@ -19,7 +19,7 @@ use crate::relstore::key::encode_key;
 use crate::relstore::overflow::{self, OVERFLOW_INLINE_MAX};
 use crate::relstore::recovery as rel_recovery;
 use crate::relstore::row::{Column, Schema, decode_row, decode_row_projected, encode_row};
-use crate::relstore::types::{ColumnType, Datum, TypeError};
+use crate::relstore::types::{ColumnType, Datum};
 use crate::relstore::version::{
     PendingVersion, ReadSnapshot, Resolved, RowChange, decode_rid_identity, rid_identity,
 };
@@ -53,12 +53,6 @@ pub(crate) use relational::security::{
     fixed_principal_by_name,
 };
 use replication::SyncCommitState;
-
-impl From<TypeError> for StorageError {
-    fn from(err: TypeError) -> Self {
-        StorageError::InvalidConfig(err.0)
-    }
-}
 
 /// Version stamped in REL wal entries (entry-level, distinct from the record
 /// kinds inside). v2 adds a commit-record timestamp for point-in-time restore;

@@ -1,7 +1,6 @@
 mod relational;
 mod search;
 
-pub(crate) use relational::collation;
 #[cfg(test)]
 pub(crate) use relational::execute_batch_with_params;
 pub use relational::{

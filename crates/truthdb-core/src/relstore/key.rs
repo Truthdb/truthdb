@@ -52,7 +52,7 @@ pub fn encode_datum_collated(
     };
     out.push(VALUE_MARKER);
     encode_escaped(
-        &crate::engine::collation::cached(collation).sort_key(text),
+        &truthdb_sql::collation::cached(collation).sort_key(text),
         out,
     );
     Ok(())
