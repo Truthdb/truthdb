@@ -1,7 +1,6 @@
 use super::super::*;
 
 impl RelFile<'_> {
-    /// Drops any replication slot lagging the WAL tail by more than
     /// Readable standby: mirrors a fully-redone shipped range into the version
     /// store — the pre-image of every row change is already in the record's
     /// UNDO payload, so `publish` + `record_commit` reproduce exactly what the
