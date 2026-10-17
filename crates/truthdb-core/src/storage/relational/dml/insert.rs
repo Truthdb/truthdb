@@ -7,7 +7,7 @@ impl Storage {
         name: &str,
         values: Vec<Datum>,
     ) -> Result<(), StorageError> {
-        self.lock().rel_insert(db_id, name, values)
+        self.lock().rel().rel_insert(db_id, name, values)
     }
 
     pub(crate) fn rel_insert_many(
@@ -17,11 +17,11 @@ impl Storage {
         rows: Vec<Vec<Datum>>,
         scope: &mut TxnScope,
     ) -> Result<(), StorageError> {
-        self.lock().rel_insert_many(db_id, name, rows, scope)
+        self.lock().rel().rel_insert_many(db_id, name, rows, scope)
     }
 }
 
-impl StorageFile {
+impl RelFile<'_> {
     pub fn rel_insert(
         &mut self,
         db_id: u32,
@@ -41,7 +41,7 @@ impl StorageFile {
         rows: Vec<Vec<Datum>>,
         scope: &mut TxnScope,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let (def, schema) = self.rel_def(db_id, name)?;
         // Encode and validate every row up front (cheap failures before any

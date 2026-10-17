@@ -264,7 +264,9 @@ impl StorageFile {
         }
         Ok(start_lsn + bytes.len() as u64)
     }
+}
 
+impl Locked {
     /// The live standby apply (see [`Storage::apply_wal_stream`]). Runs under the
     /// storage lock held by the caller.
     pub(in crate::storage) fn apply_wal_stream_locked(
@@ -285,8 +287,12 @@ impl StorageFile {
         }
         let new_end = from_lsn + bytes.len() as u64;
         let advanced = current_tail.max(new_end);
-        let head = self.wal.head();
-        let max_range = self.layout.wal_size.saturating_sub(self.wal.reserve());
+        let head = self.core.wal.head();
+        let max_range = self
+            .core
+            .layout
+            .wal_size
+            .saturating_sub(self.core.wal.reserve());
         if advanced.saturating_sub(head) > max_range {
             return Err(StorageError::WalFull(
                 "the applied WAL stream exceeds the standby ring's usable size; the standby \
@@ -302,26 +308,26 @@ impl StorageFile {
         //    flag is durable, a crash anywhere reopens redo-only.
         if !self.active_sb().is_standby() {
             self.commit_superblock(|sb| sb.set_standby(true))?;
-            self.wal.set_read_only(true);
+            self.core.wal.set_read_only(true);
         }
 
         // 1. Place the bytes in the ring and fsync BEFORE recording the advanced
         //    tail. A crash after this re-scans and re-redoes them (idempotent);
         //    recording an un-fsynced tail would trust torn bytes on reopen.
         self.seed_ring(from_lsn, bytes)?;
-        self.file.sync_data()?;
+        self.core.file.sync_data()?;
         // Advance the in-memory WAL tail to match the seeded ring, so `tail()` /
         // `flushed_lsn()` (read by a backup, and by continuity above) reflect
         // reality — a standby never appends, so nothing else would move them.
-        self.wal.resync_tail(advanced)?;
+        self.core.wal.resync_tail(advanced)?;
 
         // 2. Decode only the newly seeded range: a scan starting at `from_lsn`
         //    self-terminates where the stale bytes past `new_end` begin (their
         //    logical_ts no longer equals the cursor).
         let scan = scan_ring(
-            self.wal.file_mut(),
-            self.layout.wal_offset,
-            self.layout.wal_size,
+            self.core.wal.file_mut(),
+            self.core.layout.wal_offset,
+            self.core.layout.wal_size,
             from_lsn,
             from_lsn,
         )?;
@@ -356,11 +362,11 @@ impl StorageFile {
             match record.kind {
                 REL_KIND_ALLOC_EXTENT => {
                     let (start, pages) = record.decode_extent_redo()?;
-                    self.allocator.mark_used(start, pages);
+                    self.core.allocator.mark_used(start, pages);
                 }
                 REL_KIND_FREE_EXTENT => {
                     let (start, pages) = record.decode_extent_redo()?;
-                    self.allocator.free(start, pages);
+                    self.core.allocator.free(start, pages);
                 }
                 _ => {}
             }
@@ -379,13 +385,14 @@ impl StorageFile {
         //    nothing), then refresh the catalog cache so standby reads see any
         //    new tables/columns.
         {
-            let mut ctx = self.rel_ctx();
+            let mut rel = self.rel();
+            let mut ctx = rel.rel_ctx();
             rel_recovery::redo_records(&mut ctx, &records)?;
         }
         if let Some(root) = new_catalog_root {
-            self.rel.catalog_root = Some(root);
+            self.eng.rel.catalog_root = Some(root);
         }
-        self.reload_catalog()?;
+        self.rel().reload_catalog()?;
 
         // Only now — with every fallible step behind us — fold the range into
         // the restartpoint floors. Tracking it any earlier would let a FAILED
@@ -399,19 +406,19 @@ impl StorageFile {
         // from the undo payloads), so snapshot reads at the last-applied-commit
         // sequence see only committed state. Same post-redo discipline: a
         // failed apply must feed the store nothing.
-        self.version.standby_reads = true;
-        self.standby_capture_versions(&records);
-        self.standby_version_floor = advanced;
+        self.eng.version.standby_reads = true;
+        self.rel().standby_capture_versions(&records);
+        self.eng.standby_version_floor = advanced;
         // Track the first UNCOVERED search record (the restartpoint's search
         // floor): the seed snapshot covers seq numbers below
         // `snapshot_next_seq_no`; anything at or above must stay in the ring
         // for the reopen replay.
-        if self.standby_search_floor.is_none() {
+        if self.core.standby_search_floor.is_none() {
             for record in &scan.records {
                 if record.entry_type != WAL_ENTRY_TYPE_REL
-                    && record.seq_no >= self.snapshot_next_seq_no
+                    && record.seq_no >= self.core.snapshot_next_seq_no
                 {
-                    self.standby_search_floor = Some(record.logical_ts);
+                    self.core.standby_search_floor = Some(record.logical_ts);
                     break;
                 }
             }

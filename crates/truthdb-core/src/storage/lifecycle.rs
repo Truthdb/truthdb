@@ -191,18 +191,18 @@ pub(super) fn compute_layout(
 use super::*;
 
 impl Storage {
-    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, StorageFile> {
+    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, Locked> {
         self.inner.lock().expect("storage mutex poisoned")
     }
 
     /// Wraps an opened/created [`StorageFile`] in a `Storage`, spawning the
     /// group-commit log-writer over a duplicated WAL fd.
-    pub(super) fn with_log_writer(path: PathBuf, file: StorageFile) -> Result<Self, StorageError> {
+    pub(super) fn with_log_writer(path: PathBuf, file: Locked) -> Result<Self, StorageError> {
         let wal_fd = file.try_clone_wal_fd()?;
         let (gc, log_writer) = GroupCommit::start(wal_fd);
-        let rcsi = file.version.rcsi;
-        let allow_snapshot = file.version.allow_snapshot;
-        let recovery_full = file.version.recovery_full;
+        let rcsi = file.eng.version.rcsi;
+        let allow_snapshot = file.eng.version.allow_snapshot;
+        let recovery_full = file.eng.version.recovery_full;
         Ok(Storage {
             path,
             inner: std::sync::Mutex::new(file),
@@ -362,7 +362,11 @@ impl Storage {
     ) -> Result<Self, StorageError> {
         assert_layout_invariants();
         opts.validate()?;
-        let file = StorageFile::create_new(path.clone(), opts, wal_min_bytes, wal_max_bytes)?;
+        let core = StorageFile::create_new(path.clone(), opts, wal_min_bytes, wal_max_bytes)?;
+        let file = Locked {
+            core,
+            eng: RelEngine::new(),
+        };
         Self::with_log_writer(path, file)
     }
 
@@ -382,7 +386,10 @@ impl StorageFile {
         Ok(self.wal.try_clone_file()?)
     }
 
-    pub(super) fn open_existing(path: PathBuf, stop_at: Option<u64>) -> Result<Self, StorageError> {
+    pub(super) fn open_existing(
+        path: PathBuf,
+        stop_at: Option<u64>,
+    ) -> Result<Locked, StorageError> {
         let mut file = DirectFile::open_existing(path.clone())?;
         let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
         file.read_exact_at(0, &mut header_bytes)?;
@@ -462,7 +469,7 @@ impl StorageFile {
         let recorded_tail = active_sb.wal_tail;
 
         // The catalog root is stored as an absolute file offset (0 = none).
-        let mut rel = RelState::new();
+        let mut eng = RelEngine::new();
         if active_sb.metadata_root != 0 {
             if active_sb.metadata_root < layout.data_offset
                 || active_sb.metadata_root >= layout.data_offset + layout.data_size
@@ -471,19 +478,16 @@ impl StorageFile {
                     "catalog root outside the data region".to_string(),
                 ));
             }
-            rel.catalog_root =
+            eng.rel.catalog_root =
                 Some((active_sb.metadata_root - layout.data_offset) / PAGE_SIZE as u64);
         }
 
-        let mut version = crate::relstore::version::VersionState::default();
-        version.set_options_byte(active_sb.db_options());
+        eng.version.set_options_byte(active_sb.db_options());
         let last_log_backup_lsn = active_sb.last_log_backup_lsn();
         let repl_slots = active_sb.repl_slots();
-        let recovery_full = version.recovery_full;
-        let mut storage = StorageFile {
+        let recovery_full = eng.version.recovery_full;
+        let core = StorageFile {
             default_collation: header.default_collation(),
-            default_db_name: "truthdb".to_string(),
-            current_container: 0,
             file,
             wal,
             truncation_gate: LogTruncationGate::default(),
@@ -491,8 +495,6 @@ impl StorageFile {
             standby_att: std::collections::HashMap::new(),
             standby_search_floor: None,
             snapshot_next_seq_no: 0,
-            standby_published: std::collections::HashMap::new(),
-            standby_version_floor: 0,
             last_log_backup_lsn,
             log_backup_in_progress: false,
             layout,
@@ -501,10 +503,9 @@ impl StorageFile {
             active_superblock,
             allocator: PageAllocator::new(layout.data_size),
             pages: PageState::new(DEFAULT_CAPACITY_BYTES),
-            rel,
             replay_cache: scan.records,
-            version,
         };
+        let mut storage = Locked { core, eng };
         // Re-establish the FULL-model log-backup hold so a checkpoint cannot
         // reclaim un-backed-up log. The floor is >= the persisted wal_head
         // (checkpoints were already clamped to it), so it never moves the head
@@ -579,7 +580,7 @@ impl StorageFile {
         // recover_rel — which for a standby is redo-only and never appends, so
         // this blocks only later local writes.
         storage.wal.set_read_only(redo_only);
-        storage.recover_rel(stop_at, redo_only)?;
+        storage.rel().recover_rel(stop_at, redo_only)?;
         Ok(storage)
     }
 
@@ -652,8 +653,6 @@ impl StorageFile {
 
         Ok(StorageFile {
             default_collation: header.default_collation(),
-            default_db_name: "truthdb".to_string(),
-            current_container: 0,
             file,
             wal,
             truncation_gate: LogTruncationGate::default(),
@@ -661,8 +660,6 @@ impl StorageFile {
             standby_att: std::collections::HashMap::new(),
             standby_search_floor: None,
             snapshot_next_seq_no: 0,
-            standby_published: std::collections::HashMap::new(),
-            standby_version_floor: 0,
             last_log_backup_lsn: 0,
             log_backup_in_progress: false,
             layout,
@@ -671,9 +668,7 @@ impl StorageFile {
             active_superblock: ActiveSuperblock::A,
             allocator: PageAllocator::new(layout.data_size),
             pages: PageState::new(DEFAULT_CAPACITY_BYTES),
-            rel: RelState::new(),
             replay_cache: Vec::new(),
-            version: crate::relstore::version::VersionState::default(),
         })
     }
 

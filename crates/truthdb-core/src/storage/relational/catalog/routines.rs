@@ -7,7 +7,10 @@ impl Storage {
         name: &str,
         procedure: crate::relstore::catalog::ProcedureDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_create_procedure(db_id, name, procedure);
+        let result = self
+            .lock()
+            .rel()
+            .rel_create_procedure(db_id, name, procedure);
         // A parked batch analyzed against the OLD catalog could carry a stale
         // lock set for an EXEC of this name — same class as the option-flip
         // epoch (Stage 13): bump so the grant path re-analyzes.
@@ -21,7 +24,10 @@ impl Storage {
         name: &str,
         procedure: crate::relstore::catalog::ProcedureDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_alter_procedure(db_id, name, procedure);
+        let result = self
+            .lock()
+            .rel()
+            .rel_alter_procedure(db_id, name, procedure);
         self.bump_lock_epoch();
         result
     }
@@ -32,7 +38,7 @@ impl Storage {
         name: &str,
         function: crate::relstore::catalog::FunctionDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_create_function(db_id, name, function);
+        let result = self.lock().rel().rel_create_function(db_id, name, function);
         // Like a procedure: a table-reading function changes which locks a batch
         // that references it must hold, so a parked batch analyzed against the
         // old catalog carries a stale lock set — bump so the grant path
@@ -47,7 +53,7 @@ impl Storage {
         name: &str,
         function: crate::relstore::catalog::FunctionDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_alter_function(db_id, name, function);
+        let result = self.lock().rel().rel_alter_function(db_id, name, function);
         self.bump_lock_epoch();
         result
     }
@@ -58,7 +64,7 @@ impl Storage {
         name: &str,
         trigger: crate::relstore::catalog::TriggerDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_create_trigger(db_id, name, trigger);
+        let result = self.lock().rel().rel_create_trigger(db_id, name, trigger);
         // A trigger changes which locks a DML statement on its parent table must
         // hold (its body reads/writes other tables), so a parked batch analyzed
         // against the old catalog carries a stale lock set — bump to re-analyze.
@@ -72,7 +78,7 @@ impl Storage {
         name: &str,
         trigger: crate::relstore::catalog::TriggerDef,
     ) -> Result<(), StorageError> {
-        let result = self.lock().rel_alter_trigger(db_id, name, trigger);
+        let result = self.lock().rel().rel_alter_trigger(db_id, name, trigger);
         self.bump_lock_epoch();
         result
     }
@@ -80,7 +86,7 @@ impl Storage {
     /// True if any trigger exists in the catalog — a cheap no-clone check that
     /// keeps the common no-trigger DML path off the firing machinery.
     pub fn rel_has_triggers(&self) -> bool {
-        self.lock().rel_has_triggers()
+        self.lock().rel().rel_has_triggers()
     }
 
     /// The enabled triggers attached to `parent_object_id` that fire on `event`,
@@ -90,18 +96,18 @@ impl Storage {
         parent_object_id: u32,
         event: crate::relstore::catalog::TriggerEvent,
     ) -> Vec<TableDef> {
-        self.lock().rel_triggers_for(parent_object_id, event)
+        self.lock().rel().rel_triggers_for(parent_object_id, event)
     }
 }
 
-impl StorageFile {
+impl RelFile<'_> {
     pub fn rel_create_procedure(
         &mut self,
         db_id: u32,
         name: &str,
         procedure: crate::relstore::catalog::ProcedureDef,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
@@ -158,7 +164,7 @@ impl StorageFile {
         name: &str,
         function: crate::relstore::catalog::FunctionDef,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
@@ -214,7 +220,7 @@ impl StorageFile {
         name: &str,
         function: crate::relstore::catalog::FunctionDef,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let Some(existing) = self.rel.table(db_id, name) else {
             return Err(StorageError::Constraint(format!(
@@ -249,7 +255,7 @@ impl StorageFile {
         name: &str,
         procedure: crate::relstore::catalog::ProcedureDef,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let Some(existing) = self.rel.table(db_id, name) else {
             return Err(StorageError::Constraint(format!(
@@ -284,7 +290,7 @@ impl StorageFile {
         name: &str,
         trigger: crate::relstore::catalog::TriggerDef,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
@@ -339,7 +345,7 @@ impl StorageFile {
         name: &str,
         trigger: crate::relstore::catalog::TriggerDef,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let Some(existing) = self.rel.table(db_id, name) else {
             return Err(StorageError::Constraint(format!(

@@ -199,7 +199,7 @@ impl Storage {
                 file: dfile,
                 wal,
                 ..
-            } = &mut *file;
+            } = &mut file.core;
             let PageState { pool, dpt, .. } = pages;
             let mut io = PoolIo {
                 file: dfile,
@@ -224,6 +224,7 @@ impl Storage {
         // about to leave the ring, so a reopen must find the root in the
         // superblock rather than re-deriving it from redo.
         let metadata_root = file
+            .eng
             .rel
             .catalog_root
             .map(|page| file.layout.data_offset + page * PAGE_SIZE as u64)

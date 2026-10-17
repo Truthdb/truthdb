@@ -32,9 +32,9 @@ impl Storage {
         let mut guard = self.lock();
         guard.set_db_options(rcsi, allow_snapshot, recovery_full)?;
         let (rcsi_now, allow_now, recovery_now) = (
-            guard.version.rcsi,
-            guard.version.allow_snapshot,
-            guard.version.recovery_full,
+            guard.eng.version.rcsi,
+            guard.eng.version.allow_snapshot,
+            guard.eng.version.recovery_full,
         );
         drop(guard);
         self.rcsi
@@ -74,20 +74,20 @@ impl Storage {
         // Whichever watermark is ahead: the group-commit fsync or a direct
         // WAL sync (rollbacks, checkpoints) — both are durability floors.
         let durable = durable.max(guard.wal.flushed_lsn());
-        let seq = guard.version.durable_seq(durable);
-        guard.version.register_snapshot(seq);
+        let seq = guard.eng.version.durable_seq(durable);
+        guard.eng.version.register_snapshot(seq);
         ReadSnapshot { seq, own_txn }
     }
 
     pub(crate) fn release_read_snapshot(&self, seq: u64) {
-        self.lock().version.release_snapshot(seq);
+        self.lock().rel().version.release_snapshot(seq);
     }
 
     /// Whether any read snapshot is registered (an idle SNAPSHOT transaction
     /// between batches — running batches are excluded by the caller's
     /// Database X). `ALTER DATABASE` option flips refuse while one lives.
     pub(crate) fn has_registered_snapshots(&self) -> bool {
-        self.lock().version.has_snapshots()
+        self.lock().rel().version.has_snapshots()
     }
 
     /// Drops version history no live snapshot can need (runs on the
@@ -96,11 +96,15 @@ impl Storage {
         let durable = self.gc.flushed();
         let mut guard = self.lock();
         let durable = durable.max(guard.wal.flushed_lsn());
-        let fallback = guard.version.durable_seq(durable);
-        let watermark = guard.version.watermark(fallback);
-        let alive: std::collections::HashSet<u32> =
-            guard.rel.all_tables().map(|def| def.object_id).collect();
-        guard.version.prune(watermark, &alive);
+        let fallback = guard.eng.version.durable_seq(durable);
+        let watermark = guard.eng.version.watermark(fallback);
+        let alive: std::collections::HashSet<u32> = guard
+            .eng
+            .rel
+            .all_tables()
+            .map(|def| def.object_id)
+            .collect();
+        guard.eng.version.prune(watermark, &alive);
     }
 
     /// Test observability: version chains held for `table`.
@@ -108,21 +112,22 @@ impl Storage {
     pub(crate) fn version_chain_count(&self, table: &str) -> usize {
         let guard = self.lock();
         guard
+            .eng
             .rel
             .table(catalog::DEFAULT_DATABASE_ID, table)
-            .map_or(0, |def| guard.version.chain_count(def.object_id))
+            .map_or(0, |def| guard.eng.version.chain_count(def.object_id))
     }
 
     pub(crate) fn rel_begin(&self) -> Result<StorageTxn, StorageError> {
-        self.lock().rel_begin()
+        self.lock().rel().rel_begin()
     }
 
     pub(crate) fn rel_commit(&self, txn: StorageTxn) -> Result<(), StorageError> {
-        self.lock().rel_commit(txn)
+        self.lock().rel().rel_commit(txn)
     }
 
     pub(crate) fn rel_rollback(&self, txn: StorageTxn) -> Result<(), StorageError> {
-        self.lock().rel_rollback(txn)
+        self.lock().rel().rel_rollback(txn)
     }
 
     /// Captures a savepoint in a caller-held transaction (`SAVE TRANSACTION`).
@@ -138,12 +143,12 @@ impl Storage {
         txn: &mut StorageTxn,
         savepoint: crate::relstore::ctx::Savepoint,
     ) -> Result<(), StorageError> {
-        self.lock().rollback_txn_to(txn, savepoint)
+        self.lock().rel().rollback_txn_to(txn, savepoint)
     }
 
     #[cfg(test)]
     pub(crate) fn has_active_transactions(&self) -> bool {
-        self.lock().has_active_transactions()
+        self.lock().rel().has_active_transactions()
     }
 
     pub(crate) fn rel_reserve_identity(
@@ -152,7 +157,7 @@ impl Storage {
         name: &str,
         count: usize,
     ) -> Result<Option<i64>, StorageError> {
-        self.lock().rel_reserve_identity(db_id, name, count)
+        self.lock().rel().rel_reserve_identity(db_id, name, count)
     }
 
     pub(crate) fn rel_set_check_constraints(
@@ -162,6 +167,7 @@ impl Storage {
         check_constraints: Vec<catalog::CheckDef>,
     ) -> Result<(), StorageError> {
         self.lock()
+            .rel()
             .rel_set_check_constraints(db_id, name, check_constraints)
     }
 
@@ -171,7 +177,9 @@ impl Storage {
         name: &str,
         foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
-        self.lock().rel_set_foreign_keys(db_id, name, foreign_keys)
+        self.lock()
+            .rel()
+            .rel_set_foreign_keys(db_id, name, foreign_keys)
     }
 
     #[cfg(test)]
@@ -181,31 +189,32 @@ impl Storage {
         values: Vec<Datum>,
     ) -> Result<(), StorageError> {
         self.lock()
+            .rel()
             .rel_insert_without_commit(catalog::DEFAULT_DATABASE_ID, name, values)
     }
 
     #[cfg(test)]
     pub(crate) fn rel_flush_pool_only(&self) -> Result<(), StorageError> {
-        self.lock().rel_flush_pool_only()
+        self.lock().rel().rel_flush_pool_only()
     }
 }
 
-impl StorageFile {
+impl RelFile<'_> {
     /// Opens a multi-statement transaction (`BEGIN TRAN`).
     pub(crate) fn rel_begin(&mut self) -> Result<StorageTxn, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.begin_txn()
     }
 
     /// Commits a caller-held transaction.
     pub(crate) fn rel_commit(&mut self, txn: StorageTxn) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.commit_txn(txn)
     }
 
     /// Rolls back a caller-held transaction.
     pub(crate) fn rel_rollback(&mut self, txn: StorageTxn) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.rollback_txn(txn)
     }
 
@@ -220,7 +229,7 @@ impl StorageFile {
         name: &str,
         count: usize,
     ) -> Result<Option<i64>, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let mut def = self
             .rel
@@ -261,7 +270,7 @@ impl StorageFile {
         name: &str,
         check_constraints: Vec<catalog::CheckDef>,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let mut def = self
             .rel
@@ -289,7 +298,7 @@ impl StorageFile {
         name: &str,
         foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let mut def = self
             .rel
@@ -320,8 +329,8 @@ impl StorageFile {
     ) -> Result<(), StorageError> {
         let (def, schema) = self.rel_def(db_id, name)?;
         let row = encode_row(&schema, &values)?;
-        let txn_id = self.pages.next_txn_id;
-        self.pages.next_txn_id += 1;
+        let txn_id = self.core.pages.next_txn_id;
+        self.core.pages.next_txn_id += 1;
         let mut ctx = self.rel_ctx();
         let mut txn = ctx.begin(txn_id)?;
         if def.is_tree() {
@@ -353,16 +362,16 @@ impl StorageFile {
     /// possible but their FPIs are still in the log).
     #[cfg(test)]
     pub(crate) fn rel_flush_pool_only(&mut self) -> Result<(), StorageError> {
-        self.wal.sync_all()?;
-        let PageState { pool, .. } = &mut self.pages;
+        self.core.wal.sync_all()?;
+        let PageState { pool, .. } = &mut self.core.pages;
         let mut io = PoolIo {
-            file: &mut self.file,
-            wal: &mut self.wal,
-            data_offset: self.layout.data_offset,
-            data_pages: self.layout.data_size / PAGE_SIZE as u64,
+            file: &mut self.core.file,
+            wal: &mut self.core.wal,
+            data_offset: self.core.layout.data_offset,
+            data_pages: self.core.layout.data_size / PAGE_SIZE as u64,
         };
         pool.flush_all(&mut io)?;
-        self.file.sync_data()?;
+        self.core.file.sync_data()?;
         Ok(())
     }
 
@@ -383,17 +392,17 @@ impl StorageFile {
     /// Builds the relational execution context over this file's parts.
     pub(in crate::storage) fn rel_ctx(&mut self) -> RelCtx<'_> {
         RelCtx {
-            pool: &mut self.pages.pool,
+            pool: &mut self.core.pages.pool,
             io: PoolIo {
-                file: &mut self.file,
-                wal: &mut self.wal,
-                data_offset: self.layout.data_offset,
-                data_pages: self.layout.data_size / PAGE_SIZE as u64,
+                file: &mut self.core.file,
+                wal: &mut self.core.wal,
+                data_offset: self.core.layout.data_offset,
+                data_pages: self.core.layout.data_size / PAGE_SIZE as u64,
             },
-            allocator: &mut self.allocator,
-            dpt: &mut self.pages.dpt,
+            allocator: &mut self.core.allocator,
+            dpt: &mut self.core.pages.dpt,
             use_reserve: false,
-            container: self.current_container,
+            container: self.eng.current_container,
         }
     }
 
@@ -403,8 +412,8 @@ impl StorageFile {
         &mut self,
         f: impl FnOnce(&mut RelCtx<'_>, &mut TxnLink) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
-        let txn_id = self.pages.next_txn_id;
-        self.pages.next_txn_id += 1;
+        let txn_id = self.core.pages.next_txn_id;
+        self.core.pages.next_txn_id += 1;
         let roots = self.rel.tree_roots();
         let mut ctx = self.rel_ctx();
         let mut txn = ctx.begin(txn_id)?;
@@ -440,7 +449,7 @@ impl StorageFile {
         };
         let _ = ctx;
         if wedged {
-            self.pages.wedged = true;
+            self.core.pages.wedged = true;
         }
         if let Some((pending, commit_lsn)) = publish {
             for version in pending {
@@ -492,7 +501,7 @@ impl StorageFile {
                 };
                 let _ = ctx;
                 if wedged {
-                    self.pages.wedged = true;
+                    self.core.pages.wedged = true;
                 }
                 // Publish the successful statement's versions inside this
                 // mutex hold (atomic with its page mutations, as far as any
@@ -516,15 +525,16 @@ impl StorageFile {
     /// Opens a multi-statement transaction (BEGIN TRAN), snapshotting tree roots
     /// for a later rollback.
     pub(in crate::storage) fn begin_txn(&mut self) -> Result<StorageTxn, StorageError> {
-        let txn_id = self.pages.next_txn_id;
-        self.pages.next_txn_id += 1;
+        let txn_id = self.core.pages.next_txn_id;
+        self.core.pages.next_txn_id += 1;
         let roots = self.rel.tree_roots();
         let mut ctx = self.rel_ctx();
         let txn = ctx.begin(txn_id)?;
         // Track the transaction's BEGIN LSN so a checkpoint clamps the WAL head
         // to the oldest open transaction, preserving its undo records for crash
         // rollback (its uncommitted pages may still be flushed under steal).
-        self.pages
+        self.core
+            .pages
             .active_txn_begins
             .insert(txn.txn_id, txn.last_lsn);
         Ok(StorageTxn { txn, roots })
@@ -534,7 +544,7 @@ impl StorageFile {
     /// store, as for autocommit commits.
     pub(in crate::storage) fn commit_txn(&mut self, stx: StorageTxn) -> Result<(), StorageError> {
         // The transaction is ending (the `StorageTxn` is consumed either way).
-        self.pages.active_txn_begins.remove(&stx.txn.txn_id);
+        self.core.pages.active_txn_begins.remove(&stx.txn.txn_id);
         let txn_id = stx.txn.txn_id;
         debug_assert!(
             stx.txn.pending_versions.is_empty(),
@@ -552,7 +562,7 @@ impl StorageFile {
                 Ok(())
             }
             Err(err) => {
-                self.pages.wedged = true;
+                self.core.pages.wedged = true;
                 Err(err)
             }
         }
@@ -563,7 +573,7 @@ impl StorageFile {
         &mut self,
         mut stx: StorageTxn,
     ) -> Result<(), StorageError> {
-        self.pages.active_txn_begins.remove(&stx.txn.txn_id);
+        self.core.pages.active_txn_begins.remove(&stx.txn.txn_id);
         let txn_id = stx.txn.txn_id;
         let published = std::mem::take(&mut stx.txn.published_versions);
         let roots = stx.roots;
@@ -585,7 +595,7 @@ impl StorageFile {
             self.version.unpublish(record, txn_id);
         }
         if result.is_err() {
-            self.pages.wedged = true;
+            self.core.pages.wedged = true;
         }
         result
     }
@@ -598,7 +608,7 @@ impl StorageFile {
         stx: &mut StorageTxn,
         savepoint: crate::relstore::ctx::Savepoint,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         let txn_id = stx.txn.txn_id;
         let published = stx.txn.published_versions.split_off(
             savepoint
@@ -620,7 +630,7 @@ impl StorageFile {
             self.version.unpublish(record, txn_id);
         }
         if result.is_err() {
-            self.pages.wedged = true;
+            self.core.pages.wedged = true;
         }
         result
     }
@@ -628,6 +638,6 @@ impl StorageFile {
     /// Whether any explicit transaction is open.
     #[cfg(test)]
     pub(in crate::storage) fn has_active_transactions(&self) -> bool {
-        !self.pages.active_txn_begins.is_empty()
+        !self.core.pages.active_txn_begins.is_empty()
     }
 }

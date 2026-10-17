@@ -8,7 +8,9 @@ impl Storage {
         column: &str,
         value: &Datum,
     ) -> Result<usize, StorageError> {
-        self.lock().rel_delete_where(db_id, name, column, value)
+        self.lock()
+            .rel()
+            .rel_delete_where(db_id, name, column, value)
     }
 
     pub fn rel_update_where(
@@ -20,6 +22,7 @@ impl Storage {
         assignments: &[(String, Datum)],
     ) -> Result<usize, StorageError> {
         self.lock()
+            .rel()
             .rel_update_where(db_id, name, column, value, assignments)
     }
 
@@ -28,7 +31,7 @@ impl Storage {
         db_id: u32,
         name: &str,
     ) -> Result<Vec<(RowLocator, Vec<Datum>)>, StorageError> {
-        self.lock().rel_scan_located(db_id, name)
+        self.lock().rel().rel_scan_located(db_id, name)
     }
 
     /// SNAPSHOT-isolation DML target scan: snapshot rows plus a conflict mark
@@ -39,7 +42,9 @@ impl Storage {
         name: &str,
         snapshot: ReadSnapshot,
     ) -> Result<Vec<(RowLocator, Vec<Datum>, bool)>, StorageError> {
-        self.lock().rel_scan_located_snapshot(db_id, name, snapshot)
+        self.lock()
+            .rel()
+            .rel_scan_located_snapshot(db_id, name, snapshot)
     }
 
     pub(crate) fn rel_delete_located(
@@ -49,7 +54,9 @@ impl Storage {
         targets: Vec<(RowLocator, Vec<Datum>)>,
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
-        self.lock().rel_delete_located(db_id, name, targets, scope)
+        self.lock()
+            .rel()
+            .rel_delete_located(db_id, name, targets, scope)
     }
 
     pub(crate) fn rel_update_located(
@@ -59,11 +66,13 @@ impl Storage {
         updates: Vec<(RowLocator, Vec<Datum>, Vec<Datum>)>,
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
-        self.lock().rel_update_located(db_id, name, updates, scope)
+        self.lock()
+            .rel()
+            .rel_update_located(db_id, name, updates, scope)
     }
 }
 
-impl StorageFile {
+impl RelFile<'_> {
     /// Deletes every row where `column = value`; returns the count. Targets
     /// are materialized before any mutation (Halloween avoidance).
     ///
@@ -77,7 +86,7 @@ impl StorageFile {
         column: &str,
         value: &Datum,
     ) -> Result<usize, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let (def, schema) = self.rel_def(db_id, name)?;
         let column_index = column_index(&schema, column)?;
@@ -145,7 +154,7 @@ impl StorageFile {
         value: &Datum,
         assignments: &[(String, Datum)],
     ) -> Result<usize, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let (def, schema) = self.rel_def(db_id, name)?;
         let column_index = column_index(&schema, column)?;
@@ -243,7 +252,7 @@ impl StorageFile {
         db_id: u32,
         name: &str,
     ) -> Result<Vec<(RowLocator, Vec<Datum>)>, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(db_id, name)?;
         let mut ctx = self.rel_ctx();
         let mut out = Vec::new();
@@ -306,7 +315,7 @@ impl StorageFile {
         name: &str,
         snapshot: ReadSnapshot,
     ) -> Result<Vec<(RowLocator, Vec<Datum>, bool)>, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(db_id, name)?;
         if self.version.schema_changed_after(def.object_id, snapshot) {
             return Err(StorageError::SnapshotSchemaChange(def.name));
@@ -403,7 +412,7 @@ impl StorageFile {
         targets: Vec<(RowLocator, Vec<Datum>)>,
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let (def, schema) = self.rel_def(db_id, name)?;
         let count = targets.len();
@@ -509,7 +518,7 @@ impl StorageFile {
         updates: Vec<(RowLocator, Vec<Datum>, Vec<Datum>)>,
         scope: &mut TxnScope,
     ) -> Result<usize, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let (def, schema) = self.rel_def(db_id, name)?;
         let count = updates.len();

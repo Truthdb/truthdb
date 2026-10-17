@@ -1,6 +1,6 @@
 use super::*;
 
-impl StorageFile {
+impl RelFile<'_> {
     /// Spills every (MAX) value above the inline threshold to an overflow
     /// chain, replacing the datum with a reference. Runs inside statement
     /// closures, before the row is encoded; chain pages are WAL-imaged, so

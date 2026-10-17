@@ -67,7 +67,9 @@ impl StorageFile {
         }
         floor
     }
+}
 
+impl Locked {
     /// Applies `ALTER DATABASE SET` option changes and persists them durably
     /// in both superblocks (generation-bumped, active slot first with an
     /// fsync between — a torn first write falls back to the backup with the
@@ -86,11 +88,11 @@ impl StorageFile {
         // the OLD recovery model (before `version.set_options` below) and
         // stamped into the same durable superblock write as the option byte,
         // so a crash never leaves FULL set with a stale/zero marker.
-        let enabling_full = recovery_full == Some(true) && !self.version.recovery_full;
+        let enabling_full = recovery_full == Some(true) && !self.eng.version.recovery_full;
         let new_marker = if enabling_full {
-            self.wal.tail()
+            self.core.wal.tail()
         } else {
-            self.last_log_backup_lsn
+            self.core.last_log_backup_lsn
         };
         // Build the new superblocks in LOCALS and write them BEFORE mutating
         // any in-memory state: a failed write must leave the version store,
@@ -100,7 +102,7 @@ impl StorageFile {
         // a later lazy active-slot rewrite must not leak the failed ALTER's
         // options to disk.
         let byte = {
-            let mut next = self.version.options_byte();
+            let mut next = self.eng.version.options_byte();
             if let Some(on) = rcsi {
                 next = (next & !1) | (on as u8);
             }
@@ -116,13 +118,14 @@ impl StorageFile {
             sb.set_db_options(byte);
             sb.set_last_log_backup_lsn(new_marker);
         })?;
-        self.version
+        self.eng
+            .version
             .set_options(rcsi, allow_snapshot, recovery_full);
         // Now that the model byte and marker are durable, sync the in-memory
         // marker and the FULL-model log-truncation hold. FULL pins the ring at
         // the marker; SIMPLE releases it.
-        self.last_log_backup_lsn = new_marker;
-        if self.version.recovery_full {
+        self.core.last_log_backup_lsn = new_marker;
+        if self.eng.version.recovery_full {
             self.register_log_backup_hold(new_marker);
         } else {
             self.release_log_backup_hold();
@@ -167,9 +170,10 @@ impl StorageFile {
         let descriptors = self.read_snapshot_descriptors()?;
         let previous = live_descriptor_slot(&descriptors).and_then(|slot| descriptors[slot]);
         let generation = self
+            .core
             .superblock_a
             .generation
-            .max(self.superblock_b.generation)
+            .max(self.core.superblock_b.generation)
             .max(
                 descriptors
                     .iter()
@@ -182,20 +186,20 @@ impl StorageFile {
 
         // The snapshot is an ordinary allocator extent now; the old snapshot
         // stays allocated (and readable) until the new one is durable.
-        let alloc_start = self.allocator.allocate(num_pages).ok_or_else(|| {
+        let alloc_start = self.core.allocator.allocate(num_pages).ok_or_else(|| {
             StorageError::InvalidConfig(
                 "cannot allocate contiguous pages for checkpoint".to_string(),
             )
         })?;
-        let data_write_offset = self.layout.data_offset + alloc_start * page;
+        let data_write_offset = self.core.layout.data_offset + alloc_start * page;
 
         // Phase 1a — snapshot pages + fsync. A failure here may roll the
         // allocation back: nothing references the extent yet.
         let write_data = self
             .write_data_pages(data_write_offset, data)
-            .and_then(|()| self.file.sync_data().map_err(StorageError::from));
+            .and_then(|()| self.core.file.sync_data().map_err(StorageError::from));
         if let Err(err) = write_data {
-            self.allocator.free(alloc_start, num_pages);
+            self.core.allocator.free(alloc_start, num_pages);
             return Err(err);
         }
 
@@ -225,7 +229,9 @@ impl StorageFile {
             data_write_offset,
         )
     }
+}
 
+impl StorageFile {
     /// Writes the new snapshot descriptor into the slot not currently live
     /// and fsyncs it. Once durable, its higher generation makes the new
     /// snapshot authoritative.
@@ -262,7 +268,9 @@ impl StorageFile {
         self.file.sync_data()?;
         Ok(desc_offset)
     }
+}
 
+impl Locked {
     /// Checkpoint phase 2: reclaim the previous snapshot, persist the
     /// allocator bitmap, advance the WAL head and publish both superblocks.
     pub(super) fn finish_checkpoint(
@@ -278,14 +286,14 @@ impl StorageFile {
         // page starts a fresh FPI epoch. Flushing an *uncommitted* page is safe
         // (ARIES steal) because the WAL head is clamped below to the oldest open
         // transaction's begin LSN, so its undo records survive to roll it back.
-        self.wal.sync_all()?;
+        self.core.wal.sync_all()?;
         {
-            let PageState { pool, dpt, .. } = &mut self.pages;
+            let PageState { pool, dpt, .. } = &mut self.core.pages;
             let mut io = PoolIo {
-                file: &mut self.file,
-                wal: &mut self.wal,
-                data_offset: self.layout.data_offset,
-                data_pages: self.layout.data_size / PAGE_SIZE as u64,
+                file: &mut self.core.file,
+                wal: &mut self.core.wal,
+                data_offset: self.core.layout.data_offset,
+                data_pages: self.core.layout.data_size / PAGE_SIZE as u64,
             };
             pool.flush_all(&mut io)?;
             dpt.clear();
@@ -298,17 +306,18 @@ impl StorageFile {
         //    reclaimed before their effects are persisted anywhere.
         if let Some(prev) = &previous {
             let (start, pages) = self.descriptor_page_range(prev)?;
-            self.allocator.free(start, pages);
+            self.core.allocator.free(start, pages);
         }
-        let bitmap = self.allocator.persistable_bitmap();
-        if bitmap.len() as u64 > self.layout.allocator_size {
+        let bitmap = self.core.allocator.persistable_bitmap();
+        if bitmap.len() as u64 > self.core.layout.allocator_size {
             return Err(StorageError::InvalidFile(
                 "allocator bitmap exceeds allocator region".to_string(),
             ));
         }
-        self.file
-            .write_all_at(self.layout.allocator_offset, &bitmap)?;
-        self.file.sync_data()?;
+        self.core
+            .file
+            .write_all_at(self.core.layout.allocator_offset, &bitmap)?;
+        self.core.file.sync_data()?;
 
         // 4. Advance the WAL head — to the tail, or clamped to the oldest open
         //    transaction's begin LSN so its undo survives (fuzzy checkpoint) —
@@ -316,25 +325,26 @@ impl StorageFile {
         //    replication slots first, so an invalidated one no longer pins the
         //    floor and its log becomes reclaimable this checkpoint.
         self.reap_stale_slots();
-        self.wal.set_head(self.checkpoint_wal_head());
-        let new_active = match self.active_superblock {
+        self.core.wal.set_head(self.checkpoint_wal_head());
+        let new_active = match self.core.active_superblock {
             ActiveSuperblock::A => ActiveSuperblock::B,
             ActiveSuperblock::B => ActiveSuperblock::A,
         };
-        self.active_superblock = new_active;
+        self.core.active_superblock = new_active;
 
-        let (head, tail) = (self.wal.head(), self.wal.tail());
+        let (head, tail) = (self.core.wal.head(), self.core.wal.tail());
         // Catalog root as an absolute file offset (0 = none).
         let metadata_root = self
+            .eng
             .rel
             .catalog_root
-            .map(|page| self.layout.data_offset + page * PAGE_SIZE as u64)
+            .map(|page| self.core.layout.data_offset + page * PAGE_SIZE as u64)
             .unwrap_or(0);
-        let db_options = self.version.options_byte();
+        let db_options = self.eng.version.options_byte();
         // The closure builds from Superblock::default() (reserved zeroed), so
         // the log-backup floor must be stamped back in or a checkpoint would
         // silently reset it to 0 and drop the FULL-model hold across a restart.
-        let last_log_backup_lsn = self.last_log_backup_lsn;
+        let last_log_backup_lsn = self.core.last_log_backup_lsn;
         // Carry the standby (redo-only) mode and the replication epoch across
         // the checkpoint (the closure builds from a default superblock that
         // would otherwise clear them).
@@ -344,6 +354,7 @@ impl StorageFile {
         // re-established on the next open. Snapshotted after the reap above, so an
         // invalidated slot is not written back.
         let repl_slots: Vec<(u32, u64)> = self
+            .core
             .truncation_gate
             .repl_slots
             .iter()
@@ -374,29 +385,31 @@ impl StorageFile {
             sb.checksum = sb.compute_checksum();
             sb
         };
-        self.superblock_a = new_sb(SUPERBLOCK_ACTIVE_A);
-        self.superblock_b = new_sb(SUPERBLOCK_ACTIVE_B);
+        self.core.superblock_a = new_sb(SUPERBLOCK_ACTIVE_A);
+        self.core.superblock_b = new_sb(SUPERBLOCK_ACTIVE_B);
 
         let (primary_offset, primary_sb, backup_offset, backup_sb) = match new_active {
             ActiveSuperblock::A => (
-                self.layout.superblock_a_offset,
-                self.superblock_a,
-                self.layout.superblock_b_offset,
-                self.superblock_b,
+                self.core.layout.superblock_a_offset,
+                self.core.superblock_a,
+                self.core.layout.superblock_b_offset,
+                self.core.superblock_b,
             ),
             ActiveSuperblock::B => (
-                self.layout.superblock_b_offset,
-                self.superblock_b,
-                self.layout.superblock_a_offset,
-                self.superblock_a,
+                self.core.layout.superblock_b_offset,
+                self.core.superblock_b,
+                self.core.layout.superblock_a_offset,
+                self.core.superblock_a,
             ),
         };
-        self.file
+        self.core
+            .file
             .write_all_at(primary_offset, &primary_sb.to_le_bytes_with_checksum())?;
-        self.file.sync_data()?;
-        self.file
+        self.core.file.sync_data()?;
+        self.core
+            .file
             .write_all_at(backup_offset, &backup_sb.to_le_bytes_with_checksum())?;
-        self.file.sync_data()?;
+        self.core.file.sync_data()?;
 
         Ok(())
     }

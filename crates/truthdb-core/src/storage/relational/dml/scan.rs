@@ -12,6 +12,7 @@ impl Storage {
         snapshot: ReadSnapshot,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
         self.lock()
+            .rel()
             .rel_scan_snapshot(db_id, name, projection, snapshot)
     }
 
@@ -21,11 +22,11 @@ impl Storage {
         name: &str,
         key_values: &[Datum],
     ) -> Result<Option<Vec<Datum>>, StorageError> {
-        self.lock().rel_get(db_id, name, key_values)
+        self.lock().rel().rel_get(db_id, name, key_values)
     }
 
     pub fn rel_scan(&self, db_id: u32, name: &str) -> Result<Vec<Vec<Datum>>, StorageError> {
-        self.lock().rel_scan(db_id, name)
+        self.lock().rel().rel_scan(db_id, name)
     }
 
     /// Scans a table in bounded slices, dropping the storage lock between them,
@@ -84,6 +85,7 @@ impl Storage {
             );
         }
         self.lock()
+            .rel()
             .rel_scan_slice(db_id, name, cursor, budget, projection, out)
     }
 
@@ -99,7 +101,9 @@ impl Storage {
         ),
         StorageError,
     > {
-        self.lock().rel_def(catalog::DEFAULT_DATABASE_ID, name)
+        self.lock()
+            .rel()
+            .rel_def(catalog::DEFAULT_DATABASE_ID, name)
     }
 
     /// Test hook: runs `f` against a page context, taking the storage lock for
@@ -111,12 +115,13 @@ impl Storage {
         f: impl FnOnce(&mut crate::relstore::ctx::RelCtx<'_>) -> R,
     ) -> R {
         let mut guard = self.lock();
-        let mut ctx = guard.rel_ctx();
+        let mut rel = guard.rel();
+        let mut ctx = rel.rel_ctx();
         f(&mut ctx)
     }
 }
 
-impl StorageFile {
+impl RelFile<'_> {
     /// Point lookup by primary key (clustered tables only).
     pub fn rel_get(
         &mut self,
@@ -124,7 +129,7 @@ impl StorageFile {
         name: &str,
         key_values: &[Datum],
     ) -> Result<Option<Vec<Datum>>, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(db_id, name)?;
         if !def.is_tree() {
             return Err(StorageError::InvalidConfig(format!(
@@ -180,7 +185,7 @@ impl StorageFile {
         projection: Option<&[usize]>,
         out: &mut Vec<Vec<Datum>>,
     ) -> Result<ScanCursor, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(db_id, name)?;
         let mut ctx = self.rel_ctx();
         let mut raw: Vec<Vec<u8>> = Vec::new();
@@ -214,7 +219,7 @@ impl StorageFile {
     }
 
     pub fn rel_scan(&mut self, db_id: u32, name: &str) -> Result<Vec<Vec<Datum>>, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(db_id, name)?;
         let mut ctx = self.rel_ctx();
         let raw: Vec<Vec<u8>> = if def.is_tree() {
@@ -259,7 +264,7 @@ impl StorageFile {
         projection: Option<&[usize]>,
         snapshot: ReadSnapshot,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(db_id, name)?;
         if self.version.schema_changed_after(def.object_id, snapshot) {
             return Err(StorageError::SnapshotSchemaChange(def.name));

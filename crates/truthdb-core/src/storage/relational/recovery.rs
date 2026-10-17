@@ -7,15 +7,16 @@ impl Storage {
     pub(crate) fn rel_wal_records(
         &self,
     ) -> Result<Vec<(u64, crate::wal::records::RelRecord)>, StorageError> {
-        self.lock().rel_records()
+        self.lock().rel().rel_records()
     }
 }
 
-impl StorageFile {
+impl RelFile<'_> {
     /// Decodes the relational records (with their LSNs) from the recovery
     /// scan.
     pub(in crate::storage) fn rel_records(&self) -> Result<Vec<(u64, RelRecord)>, StorageError> {
-        self.replay_cache
+        self.core
+            .replay_cache
             .iter()
             .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
             .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
@@ -43,7 +44,7 @@ impl StorageFile {
         if let Some(root) = outcome.catalog_root {
             self.rel.catalog_root = Some(root);
         }
-        self.pages.next_txn_id = outcome.max_txn_id + 1;
+        self.core.pages.next_txn_id = outcome.max_txn_id + 1;
 
         self.reload_catalog()?;
         // A standby repeats history but never undoes: an in-flight transaction at
@@ -64,7 +65,7 @@ impl StorageFile {
         if redo_only {
             self.version.standby_reads = true;
             self.standby_capture_versions(&records);
-            self.standby_version_floor = self.wal.tail();
+            self.standby_version_floor = self.core.wal.tail();
         }
         // Object ids are shared by tables, their secondary indexes, logins,
         // database principals, and database rows (all draw from the same
@@ -90,7 +91,7 @@ impl StorageFile {
             .max()
             .unwrap_or(FIRST_USER_OBJECT_ID)
             .max(FIRST_USER_OBJECT_ID);
-        self.wal.sync_all()?;
+        self.core.wal.sync_all()?;
         Ok(())
     }
 

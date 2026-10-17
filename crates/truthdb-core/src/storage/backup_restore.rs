@@ -801,7 +801,9 @@ impl StorageFile {
         let out = self.read_ring_range(redo_start, backup_end)?;
         Ok((backup_end, out))
     }
+}
 
+impl Locked {
     /// Phase 1 of `BACKUP LOG`: under the storage lock, capture the log range
     /// `[last_log_backup_lsn, tail)` and its bytes plus the archive header. Does
     /// NOT advance the marker or hold, so the old marker keeps pinning the range
@@ -813,7 +815,7 @@ impl StorageFile {
         copy_only: bool,
     ) -> Result<(crate::backup::BackupHeader, u64, u64, Vec<u8>), StorageError> {
         self.ensure_rel_usable()?;
-        if !self.version.recovery_full {
+        if !self.eng.version.recovery_full {
             return Err(StorageError::InvalidConfig(
                 "BACKUP LOG requires the FULL recovery model".to_string(),
             ));
@@ -825,17 +827,17 @@ impl StorageFile {
                     .to_string(),
             ));
         }
-        if self.log_backup_in_progress {
+        if self.core.log_backup_in_progress {
             return Err(StorageError::BackupInProgress);
         }
-        self.wal.sync_all()?;
-        let start = self.last_log_backup_lsn;
-        let end = self.wal.tail();
+        self.core.wal.sync_all()?;
+        let start = self.core.last_log_backup_lsn;
+        let end = self.core.wal.tail();
         debug_assert!(end >= start);
         let log = self.read_ring_range(start, end)?;
         // Reserve the single-flight slot only after the fallible reads above, so
         // a failure never strands the guard.
-        self.log_backup_in_progress = true;
+        self.core.log_backup_in_progress = true;
         // A log-only archive: no page/region data — the header carries the range
         // start in `redo_start_lsn` and the `log_backup` flag; the end is derived
         // from the LogChunk length on read.
@@ -843,7 +845,7 @@ impl StorageFile {
             format_version: crate::backup::FORMAT_VERSION,
             page_size: PAGE_SIZE as u32,
             total_size: 0,
-            wal_size: self.layout.wal_size,
+            wal_size: self.core.layout.wal_size,
             data_size: 0,
             metadata_size: 0,
             allocator_size: 0,
@@ -853,7 +855,7 @@ impl StorageFile {
             redo_start_lsn: start,
             metadata_root: 0,
             last_committed_seq: 0,
-            db_options: self.version.options_byte(),
+            db_options: self.eng.version.options_byte(),
             epoch: self.active_sb().epoch(),
             finished_at_millis: now_millis(),
             flags: crate::backup::BackupFlags {
@@ -877,15 +879,17 @@ impl StorageFile {
     /// forbids. The single-flight guard is released by `LogBackupGuard` on every
     /// exit path, not here.
     pub(super) fn finish_log_backup(&mut self, start: u64, end: u64) -> Result<(), StorageError> {
-        if !self.version.recovery_full || self.last_log_backup_lsn != start {
+        if !self.eng.version.recovery_full || self.core.last_log_backup_lsn != start {
             return Ok(());
         }
         self.persist_last_log_backup_lsn(end)?;
-        self.last_log_backup_lsn = end;
+        self.core.last_log_backup_lsn = end;
         self.register_log_backup_hold(end);
         Ok(())
     }
+}
 
+impl StorageFile {
     /// Releases the `BACKUP LOG` single-flight guard (idempotent). Called by
     /// [`LogBackupGuard`] on every exit — error, panic, or success.
     pub(super) fn cancel_log_backup(&mut self) {

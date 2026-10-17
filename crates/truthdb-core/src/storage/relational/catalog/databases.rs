@@ -5,31 +5,31 @@ impl Storage {
     /// returns its id. Bumps the lock epoch: a parked batch analyzed against
     /// the old database list could resolve names differently.
     pub fn rel_create_database(&self, name: &str) -> Result<u32, StorageError> {
-        let result = self.lock().rel_create_database(name);
+        let result = self.lock().rel().rel_create_database(name);
         self.bump_lock_epoch();
         result
     }
 
     /// Drops a database and everything in it. Returns false if absent.
     pub fn rel_drop_database(&self, name: &str) -> Result<bool, StorageError> {
-        let result = self.lock().rel_drop_database(name);
+        let result = self.lock().rel().rel_drop_database(name);
         self.bump_lock_epoch();
         result
     }
 
     /// Resolves a database name (case-insensitive) to its id.
     pub fn rel_database_id_by_name(&self, name: &str) -> Option<u32> {
-        self.lock().rel_database_id_by_name(name)
+        self.lock().rel().rel_database_id_by_name(name)
     }
 
     /// Every database as `(id, canonical name)`, default database first.
     pub fn rel_databases(&self) -> Vec<(u32, String)> {
-        self.lock().rel_databases()
+        self.lock().rel().rel_databases()
     }
 
     /// The default database's (id 1) canonical name.
     pub fn default_database_name(&self) -> String {
-        self.lock().default_db_name.clone()
+        self.lock().rel().default_db_name.clone()
     }
 
     /// Stamps the default database's name (id 1) from the instance
@@ -39,24 +39,29 @@ impl Storage {
     /// first), leaving the stored database unreachable and undroppable.
     pub fn set_default_database_name(&self, name: &str) -> Result<(), StorageError> {
         let mut guard = self.lock();
-        if guard.rel.databases.contains_key(&name.to_ascii_lowercase()) {
+        if guard
+            .eng
+            .rel
+            .databases
+            .contains_key(&name.to_ascii_lowercase())
+        {
             return Err(StorageError::InvalidConfig(format!(
                 "the configured default database name '{name}' collides with a database                  created by CREATE DATABASE; rename one of them"
             )));
         }
-        guard.default_db_name = name.to_string();
+        guard.eng.default_db_name = name.to_string();
         Ok(())
     }
 }
 
-impl StorageFile {
+impl RelFile<'_> {
     /// Creates a database: a catalog row carrying a [`catalog::DatabaseDef`],
     /// routed into the databases map so it never enters the object namespace.
     /// Database ids allocate max+1 over stored rows (the synthesized default
     /// database is id 1) and are capped at `u16::MAX` so an id always fits the
     /// WAL container tag.
     pub fn rel_create_database(&mut self, name: &str) -> Result<u32, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         // Reserved names: `sys` would defeat every `sys.`-prefix dispatch and
         // the lock analysis skip; `dbo` would make a three-part name's schema
         // part ambiguous; the SQL Server system names stay recognizable.
@@ -140,7 +145,7 @@ impl StorageFile {
     /// (all-or-nothing; data pages leak like `rel_drop_table`'s). The default
     /// database is refused. Returns false if no such database exists.
     pub fn rel_drop_database(&mut self, name: &str) -> Result<bool, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         let key = name.to_ascii_lowercase();
         if key == self.default_db_name.to_ascii_lowercase() {
             return Err(StorageError::Constraint(format!(

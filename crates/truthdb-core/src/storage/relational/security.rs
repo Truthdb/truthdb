@@ -128,7 +128,7 @@ impl Storage {
         name: &str,
         principal: crate::relstore::catalog::PrincipalDef,
     ) -> Result<(), StorageError> {
-        self.lock().rel_create_login(name, principal)?;
+        self.lock().rel().rel_create_login(name, principal)?;
         self.bump_security_version();
         Ok(())
     }
@@ -138,13 +138,13 @@ impl Storage {
         name: &str,
         principal: crate::relstore::catalog::PrincipalDef,
     ) -> Result<(), StorageError> {
-        self.lock().rel_alter_login(name, principal)?;
+        self.lock().rel().rel_alter_login(name, principal)?;
         self.bump_security_version();
         Ok(())
     }
 
     pub fn rel_drop_login(&self, name: &str) -> Result<bool, StorageError> {
-        let dropped = self.lock().rel_drop_login(name)?;
+        let dropped = self.lock().rel().rel_drop_login(name)?;
         if dropped {
             self.bump_security_version();
         }
@@ -152,11 +152,11 @@ impl Storage {
     }
 
     pub fn rel_login(&self, name: &str) -> Option<TableDef> {
-        self.lock().rel_login(name)
+        self.lock().rel().rel_login(name)
     }
 
     pub fn rel_logins(&self) -> Vec<TableDef> {
-        self.lock().rel_logins()
+        self.lock().rel().rel_logins()
     }
 
     // Database-principal / role DDL bumps the security version (invalidating the
@@ -166,13 +166,15 @@ impl Storage {
         name: &str,
         principal: crate::relstore::catalog::PrincipalDef,
     ) -> Result<(), StorageError> {
-        self.lock().rel_create_database_principal(name, principal)?;
+        self.lock()
+            .rel()
+            .rel_create_database_principal(name, principal)?;
         self.bump_security_version();
         Ok(())
     }
 
     pub fn rel_drop_database_principal(&self, name: &str) -> Result<bool, StorageError> {
-        let dropped = self.lock().rel_drop_database_principal(name)?;
+        let dropped = self.lock().rel().rel_drop_database_principal(name)?;
         if dropped {
             self.bump_security_version();
         }
@@ -180,23 +182,23 @@ impl Storage {
     }
 
     pub fn rel_add_role_member(&self, role: &str, member: &str) -> Result<(), StorageError> {
-        self.lock().rel_add_role_member(role, member)?;
+        self.lock().rel().rel_add_role_member(role, member)?;
         self.bump_security_version();
         Ok(())
     }
 
     pub fn rel_drop_role_member(&self, role: &str, member: &str) -> Result<(), StorageError> {
-        self.lock().rel_drop_role_member(role, member)?;
+        self.lock().rel().rel_drop_role_member(role, member)?;
         self.bump_security_version();
         Ok(())
     }
 
     pub fn rel_database_principal(&self, name: &str) -> Option<TableDef> {
-        self.lock().rel_database_principal(name)
+        self.lock().rel().rel_database_principal(name)
     }
 
     pub fn rel_database_principals(&self) -> Vec<TableDef> {
-        self.lock().rel_database_principals()
+        self.lock().rel().rel_database_principals()
     }
 
     // GRANT/DENY/REVOKE bump the security version so a per-batch security context
@@ -210,6 +212,7 @@ impl Storage {
         deny: bool,
     ) -> Result<(), StorageError> {
         self.lock()
+            .rel()
             .rel_grant_object(db_id, object, grantee, action, deny)?;
         self.bump_security_version();
         Ok(())
@@ -223,6 +226,7 @@ impl Storage {
         action: crate::relstore::catalog::PermAction,
     ) -> Result<(), StorageError> {
         self.lock()
+            .rel()
             .rel_revoke_object(db_id, object, grantee, action)?;
         self.bump_security_version();
         Ok(())
@@ -236,10 +240,11 @@ impl Storage {
         }
         let guard = self.lock();
         guard
+            .eng
             .rel
             .principals
             .values()
-            .chain(guard.rel.database_principals.values())
+            .chain(guard.eng.rel.database_principals.values())
             .find(|d| d.object_id == id)
             .map(|d| d.name.clone())
     }
@@ -313,10 +318,11 @@ impl Storage {
         let guard = self.lock();
         let mut edges: std::collections::HashMap<u32, Vec<u32>> = std::collections::HashMap::new();
         for def in guard
+            .eng
             .rel
             .principals
             .values()
-            .chain(guard.rel.database_principals.values())
+            .chain(guard.eng.rel.database_principals.values())
         {
             if let Some(principal) = &def.principal
                 && !principal.member_of.is_empty()
@@ -329,7 +335,7 @@ impl Storage {
         }
         // Synthesized bootstrap: whichever login is `sa` is a member of the
         // sysadmin server role, and the dbo user is a member of db_owner.
-        if let Some(sa) = guard.rel.principals.get("sa") {
+        if let Some(sa) = guard.eng.rel.principals.get("sa") {
             edges.entry(sa.object_id).or_default().push(SYSADMIN_ID);
         }
         edges.entry(DBO_ID).or_default().push(DB_OWNER_ID);
@@ -337,7 +343,7 @@ impl Storage {
     }
 }
 
-impl StorageFile {
+impl RelFile<'_> {
     /// Creates a server login: a catalog row (its own object_id, like a
     /// procedure) carrying the hashed password, routed into the principals map
     /// so it never enters the object namespace.
@@ -346,7 +352,7 @@ impl StorageFile {
         name: &str,
         principal: crate::relstore::catalog::PrincipalDef,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = 0;
         let key = name.to_ascii_lowercase();
         if self.rel.principals.contains_key(&key) {
@@ -402,7 +408,7 @@ impl StorageFile {
         name: &str,
         principal: crate::relstore::catalog::PrincipalDef,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = 0;
         let key = name.to_ascii_lowercase();
         let Some(existing) = self.rel.principals.get(&key) else {
@@ -424,7 +430,7 @@ impl StorageFile {
 
     /// Drops a login. Returns false if it does not exist.
     pub fn rel_drop_login(&mut self, name: &str) -> Result<bool, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = 0;
         let key = name.to_ascii_lowercase();
         let Some(def) = self.rel.principals.get(&key).cloned() else {
@@ -460,7 +466,7 @@ impl StorageFile {
         name: &str,
         principal: crate::relstore::catalog::PrincipalDef,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = 0;
         let key = name.to_ascii_lowercase();
         if self.rel.database_principals.contains_key(&key)
@@ -494,7 +500,7 @@ impl StorageFile {
     /// (dropping it would dangle their `member_of` edges — SQL Server 15144).
     /// Returns false if no such principal exists.
     pub fn rel_drop_database_principal(&mut self, name: &str) -> Result<bool, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = 0;
         let key = name.to_ascii_lowercase();
         let Some(def) = self.rel.database_principals.get(&key).cloned() else {
@@ -557,7 +563,7 @@ impl StorageFile {
     /// any addition that would close a cycle in the role graph. Idempotent if the
     /// edge already exists.
     pub fn rel_add_role_member(&mut self, role: &str, member: &str) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = 0;
         let role_id = self
             .resolve_db_principal_id(role)
@@ -607,7 +613,7 @@ impl StorageFile {
     /// Removes `member` from `role`. Idempotent (no error if not a member); errors
     /// only on an unknown role or member.
     pub fn rel_drop_role_member(&mut self, role: &str, member: &str) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = 0;
         let role_id = self
             .resolve_db_principal_id(role)
@@ -689,7 +695,7 @@ impl StorageFile {
         action: crate::relstore::catalog::PermAction,
         deny: bool,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let grantee_id = self.resolve_grantee_id(grantee)?;
         let Some(mut def) = self.rel.table(db_id, object).cloned() else {
@@ -717,7 +723,7 @@ impl StorageFile {
         grantee: &str,
         action: crate::relstore::catalog::PermAction,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let grantee_id = self.resolve_grantee_id(grantee)?;
         let Some(mut def) = self.rel.table(db_id, object).cloned() else {

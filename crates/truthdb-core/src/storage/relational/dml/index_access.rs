@@ -67,7 +67,7 @@ impl Storage {
             self.covering_scans
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.lock().rel_index_scan(
+        self.lock().rel().rel_index_scan(
             db_id,
             table,
             index_object_id,
@@ -80,7 +80,7 @@ impl Storage {
     }
 }
 
-impl StorageFile {
+impl RelFile<'_> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn rel_index_scan(
         &mut self,
@@ -93,7 +93,7 @@ impl StorageFile {
         covering: bool,
         snapshot: Option<ReadSnapshot>,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         let (def, schema) = self.rel_def(db_id, table)?;
         let index = def
             .indexes

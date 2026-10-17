@@ -11,6 +11,7 @@ impl Storage {
         include: Vec<usize>,
     ) -> Result<(), StorageError> {
         self.lock()
+            .rel()
             .rel_create_index(db_id, table, index_name, columns, unique, include)
     }
 
@@ -20,7 +21,7 @@ impl Storage {
         table: &str,
         index_name: &str,
     ) -> Result<bool, StorageError> {
-        self.lock().rel_drop_index(db_id, table, index_name)
+        self.lock().rel().rel_drop_index(db_id, table, index_name)
     }
 
     pub(crate) fn rel_alter_add_column(
@@ -32,11 +33,12 @@ impl Storage {
         fill: Datum,
     ) -> Result<(), StorageError> {
         self.lock()
+            .rel()
             .rel_alter_add_column(db_id, table, column, default_text, fill)
     }
 }
 
-impl StorageFile {
+impl RelFile<'_> {
     /// Creates a secondary index over `table` and backfills it from the
     /// current rows (blocking build). A duplicate on a UNIQUE index during the
     /// build fails the whole statement (error 2601). The index is persisted in
@@ -50,7 +52,7 @@ impl StorageFile {
         unique: bool,
         include: Vec<usize>,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let mut def = self
             .rel
@@ -137,7 +139,7 @@ impl StorageFile {
         default_text: Option<String>,
         fill: Datum,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let mut column = column;
         // A character column without an explicit COLLATE inherits the database
@@ -149,7 +151,7 @@ impl StorageFile {
                     | crate::relstore::types::ColumnType::NVarChar { .. }
             )
         {
-            column.collation = self.default_collation.clone();
+            column.collation = self.core.default_collation.clone();
         }
         let mut def = self
             .rel
@@ -240,7 +242,7 @@ impl StorageFile {
         table: &str,
         index_name: &str,
     ) -> Result<bool, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let Some(catalog_root) = self.rel.catalog_root else {
             return Ok(false);

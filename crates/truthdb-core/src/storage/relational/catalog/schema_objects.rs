@@ -13,7 +13,7 @@ impl Storage {
         check_constraints: Vec<catalog::CheckDef>,
         foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
-        self.lock().rel_create_table(
+        self.lock().rel().rel_create_table(
             db_id,
             name,
             columns,
@@ -31,11 +31,11 @@ impl Storage {
         name: &str,
         query_text: &str,
     ) -> Result<(), StorageError> {
-        self.lock().rel_create_view(db_id, name, query_text)
+        self.lock().rel().rel_create_view(db_id, name, query_text)
     }
 
     pub fn rel_table(&self, db_id: u32, name: &str) -> Option<TableDef> {
-        self.lock().rel_table(db_id, name)
+        self.lock().rel().rel_table(db_id, name)
     }
 
     /// The database's default collation, as stamped into the file at creation.
@@ -48,11 +48,11 @@ impl Storage {
     }
 
     pub fn rel_tables(&self) -> Vec<TableDef> {
-        self.lock().rel_tables()
+        self.lock().rel().rel_tables()
     }
 
     pub fn rel_drop_table(&self, db_id: u32, name: &str) -> Result<bool, StorageError> {
-        self.lock().rel_drop_table(db_id, name)
+        self.lock().rel().rel_drop_table(db_id, name)
     }
 
     /// The table's committed row count, when it has a counter page (tables
@@ -60,10 +60,10 @@ impl Storage {
     /// tie-break). Errors degrade to `None`: the count is a statistic, never
     /// load-bearing for results.
     pub(crate) fn rel_row_count(&self, db_id: u32, table: &str) -> Option<u64> {
-        self.lock().rel_row_count(db_id, table)
+        self.lock().rel().rel_row_count(db_id, table)
     }
 }
-impl StorageFile {
+impl RelFile<'_> {
     /// Creates a table: with `key_names` it becomes a clustered B+ tree on
     /// those columns, without it a heap.
     #[allow(clippy::too_many_arguments)]
@@ -78,7 +78,7 @@ impl StorageFile {
         check_constraints: Vec<catalog::CheckDef>,
         foreign_keys: Vec<catalog::ForeignKeyDef>,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         // A character column declared without an explicit COLLATE inherits the
         // database default *by name*, recorded now rather than resolved on each
@@ -86,7 +86,7 @@ impl StorageFile {
         // to keep the collation it was created under. Resolved here, at the one
         // point every CREATE TABLE passes through, so the SQL path and the
         // native path cannot disagree.
-        if let Some(default) = self.default_collation.clone() {
+        if let Some(default) = self.core.default_collation.clone() {
             for column in &mut columns {
                 if column.collation.is_none()
                     && matches!(
@@ -196,7 +196,7 @@ impl StorageFile {
         name: &str,
         query_text: &str,
     ) -> Result<(), StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         if self.rel.contains_table(db_id, name) {
             return Err(StorageError::Constraint(format!(
@@ -266,7 +266,7 @@ impl StorageFile {
     /// until a later reclamation stage). Returns false if the table does not
     /// exist.
     pub fn rel_drop_table(&mut self, db_id: u32, name: &str) -> Result<bool, StorageError> {
-        self.ensure_rel_usable()?;
+        self.core.ensure_rel_usable()?;
         self.current_container = db_id as u16;
         let Some(def) = self.rel.table(db_id, name).cloned() else {
             return Ok(false);
@@ -286,7 +286,7 @@ impl StorageFile {
     /// superset the caller re-filters with the full WHERE (so loose bounds are
     /// safe).
     pub(crate) fn rel_row_count(&mut self, db_id: u32, table: &str) -> Option<u64> {
-        if self.ensure_rel_usable().is_err() {
+        if self.core.ensure_rel_usable().is_err() {
             return None;
         }
         let page = self.rel.table(db_id, table)?.counter_page?;

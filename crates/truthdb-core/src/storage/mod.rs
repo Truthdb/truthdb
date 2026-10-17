@@ -173,7 +173,7 @@ pub enum StorageError {
 /// mutex so [`Storage::path`] can hand back a borrow.
 pub struct Storage {
     path: PathBuf,
-    inner: std::sync::Mutex<StorageFile>,
+    inner: std::sync::Mutex<Locked>,
     /// Group-commit coordinator: commits register their WAL tail here and wait
     /// for the log-writer to fsync past it. Shared with the log-writer thread.
     gc: Arc<GroupCommit>,
@@ -353,18 +353,6 @@ struct StorageFile {
     /// prefix, and could truncate undo of a transaction whose resolution has
     /// not shipped yet. Seeded at open from the same records recovery scans.
     standby_att: std::collections::HashMap<u64, u64>,
-    /// Readable standby: per SHIPPED transaction, one stack entry per logged
-    /// op `(record LSN, publish record if the op changed a row)`. A CLR pops
-    /// every entry above its `undo_next` and unpublishes the popped row
-    /// changes — mirroring savepoint/statement rollbacks exactly, since undo
-    /// compensates ops in reverse LSN order — and a commit-less TXN_END
-    /// unwinds whatever remains.
-    standby_published:
-        std::collections::HashMap<u64, Vec<(u64, Option<crate::relstore::version::PublishRecord>)>>,
-    /// Readable standby: the LSN up to which shipped changes have been folded
-    /// into the version store — an overlap re-ship must not publish the same
-    /// change twice (duplicate chain entries).
-    standby_version_floor: u64,
     /// The first ring LSN of a search-subsystem (`entry_type == 1`) record the
     /// seed snapshot does not cover: a restartpoint must not advance the head
     /// past it, or a reopen's search replay would lose the event (a standby
@@ -389,8 +377,6 @@ struct StorageFile {
     allocator: PageAllocator,
     /// Buffer pool, dirty-page table and transaction counters.
     pages: PageState,
-    /// Relational store state (catalog cache).
-    rel: RelState,
     /// WAL records recovered at open, waiting for the engine to replay them.
     replay_cache: Vec<WalRecord>,
     /// The database's default collation, read from the file header at open. A
@@ -398,6 +384,46 @@ struct StorageFile {
     /// this at CREATE TABLE and stored with it, so the column keeps the
     /// collation it was created under even if the default later changes.
     default_collation: Option<String>,
+}
+
+/// What the storage mutex guards: the core file next to the relational
+/// engine's in-memory state. One mutex, so a statement's page changes and its
+/// version publishing (and a checkpoint's flush and catalog-root stamp) stay
+/// one critical section. Derefs to the core file.
+struct Locked {
+    core: StorageFile,
+    eng: RelEngine,
+}
+
+impl std::ops::Deref for Locked {
+    type Target = StorageFile;
+    fn deref(&self) -> &StorageFile {
+        &self.core
+    }
+}
+
+impl std::ops::DerefMut for Locked {
+    fn deref_mut(&mut self) -> &mut StorageFile {
+        &mut self.core
+    }
+}
+
+/// The relational engine's in-memory state held under the storage mutex.
+struct RelEngine {
+    /// Relational store state (catalog cache).
+    rel: RelState,
+    /// Readable standby: per SHIPPED transaction, one stack entry per logged
+    /// op `(record LSN, publish record if the op changed a row)`. A CLR pops
+    /// every entry above its `undo_next` and unpublishes the popped row
+    /// changes — mirroring savepoint/statement rollbacks exactly, since undo
+    /// compensates ops in reverse LSN order — and a commit-less TXN_END
+    /// unwinds whatever remains.
+    standby_published:
+        std::collections::HashMap<u64, Vec<(u64, Option<crate::relstore::version::PublishRecord>)>>,
+    /// Readable standby: the LSN up to which shipped changes have been folded
+    /// into the version store — an overlap re-ship must not publish the same
+    /// change twice (duplicate chain entries).
+    standby_version_floor: u64,
     /// The DEFAULT database's name (database id 1). The default database is
     /// synthesized — never a catalog row — and named by the instance
     /// configuration (`[tds] database`), exactly where the session default
@@ -414,6 +440,50 @@ struct StorageFile {
     /// superblock reserved area; the chains themselves are memory-only — no
     /// snapshot survives a restart, so neither must they).
     version: crate::relstore::version::VersionState,
+}
+
+impl RelEngine {
+    fn new() -> Self {
+        RelEngine {
+            rel: RelState::new(),
+            standby_published: std::collections::HashMap::new(),
+            standby_version_floor: 0,
+            default_db_name: "truthdb".to_string(),
+            current_container: 0,
+            version: crate::relstore::version::VersionState::default(),
+        }
+    }
+}
+
+impl Locked {
+    /// The relational view of the locked storage.
+    fn rel(&mut self) -> RelFile<'_> {
+        RelFile {
+            core: &mut self.core,
+            eng: &mut self.eng,
+        }
+    }
+}
+
+/// A relational operation's view of the locked storage: the engine state
+/// (through deref) and the core file (`core`), borrowed disjointly so a
+/// relational context can hold both at once.
+struct RelFile<'a> {
+    core: &'a mut StorageFile,
+    eng: &'a mut RelEngine,
+}
+
+impl std::ops::Deref for RelFile<'_> {
+    type Target = RelEngine;
+    fn deref(&self) -> &RelEngine {
+        self.eng
+    }
+}
+
+impl std::ops::DerefMut for RelFile<'_> {
+    fn deref_mut(&mut self) -> &mut RelEngine {
+        self.eng
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

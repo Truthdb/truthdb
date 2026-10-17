@@ -24,7 +24,9 @@ impl StorageFile {
             }
         }
     }
+}
 
+impl RelFile<'_> {
     /// Drops any replication slot lagging the WAL tail by more than
     /// Readable standby: mirrors a fully-redone shipped range into the version
     /// store — the pre-image of every row change is already in the record's
@@ -50,7 +52,7 @@ impl StorageFile {
             REL_KIND_SET_CATALOG_ROOT, REL_KIND_TXN_COMMIT, REL_KIND_TXN_END,
         };
         let alive: std::collections::HashSet<u32> =
-            self.rel.all_tables().map(|def| def.object_id).collect();
+            self.eng.rel.all_tables().map(|def| def.object_id).collect();
         let mut freed_pages: std::collections::HashSet<u64> = std::collections::HashSet::new();
         for (_, record) in records {
             if record.kind == REL_KIND_FREE_EXTENT
@@ -63,7 +65,7 @@ impl StorageFile {
         }
         let mut catalog_changed = false;
         for (lsn, record) in records {
-            if *lsn < self.standby_version_floor {
+            if *lsn < self.eng.standby_version_floor {
                 continue;
             }
             match record.kind {
@@ -76,8 +78,9 @@ impl StorageFile {
                             );
                             None
                         });
-                    let published = pending.map(|p| self.version.publish(p, record.txn_id));
-                    self.standby_published
+                    let published = pending.map(|p| self.eng.version.publish(p, record.txn_id));
+                    self.eng
+                        .standby_published
                         .entry(record.txn_id)
                         .or_default()
                         .push((*lsn, published));
@@ -87,24 +90,24 @@ impl StorageFile {
                     // the transaction logged ABOVE it is now compensated.
                     if record.redo.len() >= 8 {
                         let undo_next = u64::from_le_bytes(record.redo[0..8].try_into().unwrap());
-                        if let Some(stack) = self.standby_published.get_mut(&record.txn_id) {
+                        if let Some(stack) = self.eng.standby_published.get_mut(&record.txn_id) {
                             while stack.last().is_some_and(|(l, _)| *l > undo_next) {
                                 if let Some((_, Some(rec))) = stack.pop() {
-                                    self.version.unpublish(rec, record.txn_id);
+                                    self.eng.version.unpublish(rec, record.txn_id);
                                 }
                             }
                         }
                     }
                 }
                 REL_KIND_TXN_COMMIT => {
-                    self.version.record_commit(record.txn_id, *lsn);
-                    self.standby_published.remove(&record.txn_id);
+                    self.eng.version.record_commit(record.txn_id, *lsn);
+                    self.eng.standby_published.remove(&record.txn_id);
                 }
                 REL_KIND_TXN_END => {
-                    if let Some(stack) = self.standby_published.remove(&record.txn_id) {
+                    if let Some(stack) = self.eng.standby_published.remove(&record.txn_id) {
                         for (_, published) in stack.into_iter().rev() {
                             if let Some(rec) = published {
-                                self.version.unpublish(rec, record.txn_id);
+                                self.eng.version.unpublish(rec, record.txn_id);
                             }
                         }
                     }
@@ -118,7 +121,7 @@ impl StorageFile {
             // primary's Database X does; fence them instead (3961 on the next
             // access), for every live table — conservative and correct.
             for object_id in alive {
-                self.version.stamp_schema(object_id);
+                self.eng.version.stamp_schema(object_id);
             }
         }
     }
