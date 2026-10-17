@@ -171,7 +171,8 @@ fn v1_fixture_upgrades_in_place_and_preserves_state() {
     let events = vec![(6u64, vec![1u8; 100]), (7u64, vec![2u8; 50])];
     write_v1_fixture(&path, &events, Some((snapshot_data, 5, 8, 3)));
 
-    let mut storage = Storage::open(path.clone()).expect("open v1 file");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("open v1 file");
 
     // Snapshot survives the upgrade.
     let snapshot = storage
@@ -216,7 +217,8 @@ fn v1_fixture_upgrades_in_place_and_preserves_state() {
     assert_eq!(header.version, FILE_VERSION);
     assert_eq!(header.header_checksum, header.compute_checksum());
 
-    let mut storage = Storage::open(path.clone()).expect("reopen upgraded");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("reopen upgraded");
     let snapshot = storage
         .load_snapshot()
         .expect("load")
@@ -248,7 +250,8 @@ fn torn_tail_is_stopped_at_and_healed_by_whole_page_flush() {
     overwrite_bytes(&path, layout.wal_offset + entry_a_len, &[0x5Au8; 200]);
 
     // Recovery must stop at the garbage and keep A.
-    let mut storage = Storage::open(path.clone()).expect("reopen after tear");
+    let mut storage = Storage::open(path.clone(), super::super::relational::rel_engine)
+        .expect("reopen after tear");
     let records = storage.replay_wal_entries().expect("replay");
     assert_eq!(records.len(), 1, "only entry A must survive the torn tail");
     assert_eq!(records[0].payload, payload_a);
@@ -259,7 +262,8 @@ fn torn_tail_is_stopped_at_and_healed_by_whole_page_flush() {
     append_search_entry(&mut storage, 2, &payload_b);
     drop(storage);
 
-    let mut storage = Storage::open(path.clone()).expect("reopen after heal");
+    let mut storage = Storage::open(path.clone(), super::super::relational::rel_engine)
+        .expect("reopen after heal");
     let records = storage.replay_wal_entries().expect("replay");
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].payload, payload_a);
@@ -297,7 +301,8 @@ fn superblock_is_lazy_and_forward_scan_recovers_past_it() {
 
     // Recovery scans forward past the stale superblock tail and finds
     // every entry.
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("reopen");
     let records = storage.replay_wal_entries().expect("replay");
     assert_eq!(records.len(), 4, "forward scan must recover all entries");
     for (record, payload) in records.iter().zip(&payloads) {
@@ -331,7 +336,8 @@ fn wal_wraps_after_checkpoint_and_recovers_across_the_lap() {
     }
     drop(storage); // crash
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("reopen");
     let snapshot = storage
         .load_snapshot()
         .expect("load")
@@ -384,7 +390,8 @@ fn extent_alloc_free_replays_from_wal() {
     assert_ne!(durable, temp);
     drop(storage); // crash: bitmap never persisted, only the WAL knows
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("reopen");
     assert!(
         storage.is_page_allocated(durable),
         "logged alloc must replay"
@@ -397,7 +404,8 @@ fn extent_alloc_free_replays_from_wal() {
     storage.free_extent(durable).expect("free extent");
     drop(storage); // crash again
 
-    let mut storage = Storage::open(path.clone()).expect("reopen after free");
+    let mut storage = Storage::open(path.clone(), super::super::relational::rel_engine)
+        .expect("reopen after free");
     assert!(
         !storage.is_page_allocated(durable),
         "logged free must replay"
@@ -411,7 +419,8 @@ fn extent_alloc_free_replays_from_wal() {
         .expect("checkpoint");
     drop(storage);
 
-    let mut storage = Storage::open(path.clone()).expect("reopen after checkpoint");
+    let mut storage = Storage::open(path.clone(), super::super::relational::rel_engine)
+        .expect("reopen after checkpoint");
     assert!(
         storage.replay_wal_entries().expect("replay").is_empty(),
         "wal reclaimed"
@@ -457,7 +466,8 @@ fn tail_page_flush_never_overwrites_live_head_entries() {
     assert!(matches!(err, StorageError::WalFull(_)), "got: {err}");
     drop(storage); // crash
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("reopen");
     let records = storage.replay_wal_entries().expect("replay");
     assert_eq!(records.len(), 15, "every acked entry must survive");
     for (record, payload) in records.iter().zip(&acked) {
@@ -484,7 +494,8 @@ fn checkpoint_after_superblock_publish_crash_mints_higher_generation() {
     let sb_a = read_bytes(&path, layout.superblock_a_offset, SUPERBLOCK_SIZE);
     let sb_b = read_bytes(&path, layout.superblock_b_offset, SUPERBLOCK_SIZE);
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("reopen");
     storage.write_checkpoint(b"two", 2, 3, 1).expect("cp 2");
     drop(storage);
 
@@ -493,7 +504,8 @@ fn checkpoint_after_superblock_publish_crash_mints_higher_generation() {
     overwrite_bytes(&path, layout.superblock_a_offset, &sb_a);
     overwrite_bytes(&path, layout.superblock_b_offset, &sb_b);
 
-    let mut storage = Storage::open(path.clone()).expect("reopen in crash window");
+    let mut storage = Storage::open(path.clone(), super::super::relational::rel_engine)
+        .expect("reopen in crash window");
     let snapshot = storage.load_snapshot().expect("load").expect("snapshot");
     assert_eq!(snapshot.data, b"two", "newest descriptor must win");
 
@@ -501,7 +513,8 @@ fn checkpoint_after_superblock_publish_crash_mints_higher_generation() {
     storage.write_checkpoint(b"three", 3, 4, 1).expect("cp 3");
     drop(storage);
 
-    let mut storage = Storage::open(path.clone()).expect("final reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("final reopen");
     let snapshot = storage.load_snapshot().expect("load").expect("snapshot");
     assert_eq!(snapshot.data, b"three");
     // Allocator agrees with the snapshot choice: the live extent is
@@ -537,7 +550,8 @@ fn wrap_gap_without_next_lap_entry_rewinds_tail() {
     let entry_len = wal_entry_padded_len(8000);
     overwrite_bytes(&path, layout.wal_offset, &vec![0u8; entry_len]);
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("reopen");
     let records = storage.replay_wal_entries().expect("replay");
     assert_eq!(records.len(), 3, "the lost wrap entry must not replay");
     for (record, payload) in records.iter().zip(&post[..3]) {
@@ -548,7 +562,8 @@ fn wrap_gap_without_next_lap_entry_rewinds_tail() {
     // survives another crash.
     append_search_entry(&mut storage, 9, b"after-rewind");
     drop(storage);
-    let mut storage = Storage::open(path.clone()).expect("second reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("second reopen");
     let records = storage.replay_wal_entries().expect("replay");
     assert_eq!(records.len(), 4);
     assert_eq!(records[3].payload, b"after-rewind");
@@ -579,7 +594,8 @@ fn torn_active_superblock_falls_back_and_forward_scan_recovers() {
         &[0xEEu8; SUPERBLOCK_SIZE],
     );
 
-    let mut storage = Storage::open(path.clone()).expect("reopen on backup superblock");
+    let mut storage = Storage::open(path.clone(), super::super::relational::rel_engine)
+        .expect("reopen on backup superblock");
     let records = storage.replay_wal_entries().expect("replay");
     assert_eq!(records.len(), 4, "forward scan from the stale superblock");
     for (record, payload) in records.iter().zip(&payloads) {
@@ -607,7 +623,8 @@ fn trusted_region_corruption_truncates_and_persists_corrected_tail() {
     // Corrupt entry 2, inside the superblock-trusted region.
     overwrite_bytes(&path, layout.wal_offset + entry_len + 8, &[0xDDu8; 32]);
 
-    let mut storage = Storage::open(path.clone()).expect("reopen after corruption");
+    let mut storage = Storage::open(path.clone(), super::super::relational::rel_engine)
+        .expect("reopen after corruption");
     let records = storage.replay_wal_entries().expect("replay");
     assert_eq!(records.len(), 1, "log truncates at the corrupt entry");
     assert_eq!(records[0].payload, vec![1u8; 100]);
@@ -622,11 +639,13 @@ fn trusted_region_corruption_truncates_and_persists_corrected_tail() {
 
     // New history: append a differently-sized entry and crash. Recovery
     // must see [entry 1, new entry] and never resurrect old entries 3/4.
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("reopen");
     storage.replay_wal_entries().expect("drain");
     append_search_entry(&mut storage, 2, &[9u8; 60]);
     drop(storage);
-    let mut storage = Storage::open(path.clone()).expect("final reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("final reopen");
     let records = storage.replay_wal_entries().expect("replay");
     assert_eq!(records.len(), 2);
     assert_eq!(records[0].payload, vec![1u8; 100]);
@@ -705,7 +724,8 @@ fn upgraded_v1_file_survives_active_superblock_loss() {
     let layout = write_v1_fixture(&path, &events, None);
 
     // First open performs the upgrade.
-    let mut storage = Storage::open(path.clone()).expect("upgrade open");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("upgrade open");
     assert_eq!(storage.replay_wal_entries().expect("replay").len(), 2);
     drop(storage);
 
@@ -716,7 +736,8 @@ fn upgraded_v1_file_survives_active_superblock_loss() {
         layout.superblock_a_offset,
         &[0xEEu8; SUPERBLOCK_SIZE],
     );
-    let mut storage = Storage::open(path.clone()).expect("reopen on backup");
+    let mut storage = Storage::open(path.clone(), super::super::relational::rel_engine)
+        .expect("reopen on backup");
     let records = storage.replay_wal_entries().expect("replay");
     assert_eq!(records.len(), 2, "v1 entries must survive the fallback");
     assert_eq!(records[0].payload, vec![5u8; 80]);
@@ -751,7 +772,8 @@ fn successive_checkpoints_recycle_snapshot_extents() {
     }
     drop(storage);
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage =
+        Storage::open(path.clone(), super::super::relational::rel_engine).expect("reopen");
     let snapshot = storage.load_snapshot().expect("load").expect("snapshot");
     assert_eq!(snapshot.data, b"second-snapshot");
     assert!(!storage.is_page_allocated(first_start));

@@ -234,7 +234,7 @@ async fn two_process_replication_exit_harness() {
         resp["error"].is_null(),
         "online backup over the wire: {resp}"
     );
-    truthdb_core::storage::Storage::restore_full_standby(&standby_db, &bak, &[])
+    truthdb_core::storage::RelStorage::restore_full_standby(&standby_db, &bak, &[])
         .expect("standby seed");
 
     let mut standby = Server::spawn(&standby_cfg, dir.join("standby.log"));
@@ -277,13 +277,13 @@ async fn two_process_replication_exit_harness() {
     .await;
     assert!(resp["error"].is_null(), "{resp}");
     let old_epoch_db = dir.join("old-epoch.db");
-    truthdb_core::storage::Storage::restore_full_standby(&old_epoch_db, &old_bak, &[])
+    truthdb_core::storage::RelStorage::restore_full_standby(&old_epoch_db, &old_bak, &[])
         .expect("old-epoch seed");
 
     // ---- Primary dies; the standby is promoted and serves writes. ----------
     primary.kill();
     standby.kill(); // promote is offline
-    let epoch = truthdb_core::storage::Storage::promote(&standby_db).expect("promote");
+    let epoch = truthdb_core::storage::RelStorage::promote(&standby_db).expect("promote");
     assert_eq!(epoch, 1, "first failover");
 
     // The promoted node restarts as the new primary — with synchronous commit
@@ -358,7 +358,7 @@ async fn two_process_replication_exit_harness() {
     .await;
     assert!(resp["error"].is_null(), "{resp}");
     let new_standby_db = dir.join("new-standby.db");
-    truthdb_core::storage::Storage::restore_full_standby(&new_standby_db, &new_bak, &[])
+    truthdb_core::storage::RelStorage::restore_full_standby(&new_standby_db, &new_bak, &[])
         .expect("new seed");
     let new_standby_cfg = dir.join("new-standby.toml");
     write_config(&new_standby_cfg, &new_standby_db, fence_net, &standby_repl);

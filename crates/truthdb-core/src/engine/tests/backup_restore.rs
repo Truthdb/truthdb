@@ -44,7 +44,7 @@ fn full_backup_and_offline_restore_round_trips_relational_data() {
     drop(engine);
 
     // Offline restore into a fresh file, then open it and compare.
-    crate::storage::Storage::restore_full(&restored, &bak).expect("offline restore");
+    crate::storage::RelStorage::restore_full(&restored, &bak).expect("offline restore");
     let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open restored"))
         .expect("engine on restored file");
 
@@ -108,7 +108,7 @@ fn backup_database_statement_backs_up_and_restores() {
     assert!(env["error"].is_null(), "BACKUP DATABASE failed: {env}");
     drop(engine);
 
-    crate::storage::Storage::restore_full(&restored, &bak).expect("restore");
+    crate::storage::RelStorage::restore_full(&restored, &bak).expect("restore");
     let engine2 =
         Engine::new(RelStorage::open(restored.clone()).expect("open restored")).expect("engine");
     assert_eq!(
@@ -290,7 +290,7 @@ fn restoring_a_full_recovery_database_opens_and_checkpoints_cleanly() {
         .expect("full backup of a FULL-model db");
     drop(engine);
 
-    crate::storage::Storage::restore_full(&restored, &bak).expect("restore");
+    crate::storage::RelStorage::restore_full(&restored, &bak).expect("restore");
     let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("engine");
     assert_eq!(
         sql_rows(&engine2, "SELECT id, v FROM t ORDER BY id").1,
@@ -368,7 +368,7 @@ fn restore_full_plus_log_chain_recovers_post_backup_changes() {
     drop(engine);
 
     // Full + the whole log chain recovers EVERY committed change.
-    crate::storage::Storage::restore_full_with_logs(
+    crate::storage::RelStorage::restore_full_with_logs(
         &restored,
         &bak,
         &[trn1.clone(), trn2.clone()],
@@ -383,7 +383,7 @@ fn restore_full_plus_log_chain_recovers_post_backup_changes() {
     );
 
     // The full backup alone recovers only the 20 rows at its point.
-    crate::storage::Storage::restore_full(&restored_full_only, &bak).expect("restore full only");
+    crate::storage::RelStorage::restore_full(&restored_full_only, &bak).expect("restore full only");
     let engine3 =
         Engine::new(RelStorage::open(restored_full_only.clone()).expect("open")).expect("engine");
     assert_eq!(
@@ -395,15 +395,20 @@ fn restore_full_plus_log_chain_recovers_post_backup_changes() {
     // A gap in the chain (apply only the second log) is rejected (4305), and
     // the partial destination is removed so a retry can reuse the path.
     assert!(
-        crate::storage::Storage::restore_full_with_logs(&restored_gap, &bak, &[trn2.clone()], None)
-            .is_err(),
+        crate::storage::RelStorage::restore_full_with_logs(
+            &restored_gap,
+            &bak,
+            &[trn2.clone()],
+            None
+        )
+        .is_err(),
         "a log-chain gap is rejected"
     );
     assert!(
         !restored_gap.exists(),
         "the partial destination is cleaned up on error"
     );
-    crate::storage::Storage::restore_full_with_logs(
+    crate::storage::RelStorage::restore_full_with_logs(
         &restored_gap,
         &bak,
         &[trn1.clone(), trn2.clone()],
@@ -476,7 +481,7 @@ fn point_in_time_restore_stops_at_a_commit_timestamp() {
     );
 
     // Point-in-time restore of the full backup, stopping after insert-1.
-    crate::storage::Storage::restore_full_with_logs(&restored, &bak, &[], Some(stop_at))
+    crate::storage::RelStorage::restore_full_with_logs(&restored, &bak, &[], Some(stop_at))
         .expect("pitr restore");
     let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("engine");
     assert_eq!(
@@ -681,7 +686,7 @@ fn backup_under_concurrent_write_load_restores_to_a_consistent_prefix() {
     // prefix 1..=k — a gap would mean a torn page, an id past k an
     // uncommitted write leaked in. k lies between the 20 baseline rows and
     // the writer's max (80).
-    crate::storage::Storage::restore_full(&restored, &bak).expect("restore");
+    crate::storage::RelStorage::restore_full(&restored, &bak).expect("restore");
     let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("engine");
     let (_, rows) = sql_rows(&engine2, "SELECT id FROM t ORDER BY id");
     let ids: Vec<i64> = rows
@@ -746,7 +751,7 @@ fn a_failed_backup_leaves_the_database_writable_and_backuppable() {
     drop(engine);
 
     // And that good backup restores the surviving rows.
-    crate::storage::Storage::restore_full(&restored, &good).expect("restore");
+    crate::storage::RelStorage::restore_full(&restored, &good).expect("restore");
     let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("engine");
     assert_eq!(
         sql_rows(&engine2, "SELECT id FROM t ORDER BY id").1,

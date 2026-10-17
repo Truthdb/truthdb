@@ -15,7 +15,7 @@ fn a_writable_restore_is_a_new_timeline_a_standby_seed_is_not() {
     engine.storage().backup_full(&bak).expect("backup");
     drop(engine);
 
-    crate::storage::Storage::restore_full(&writable, &bak).expect("plain restore");
+    crate::storage::RelStorage::restore_full(&writable, &bak).expect("plain restore");
     let restored = Engine::new(RelStorage::open(writable.clone()).expect("open")).expect("eng");
     assert_eq!(
         restored.storage().epoch(),
@@ -24,7 +24,7 @@ fn a_writable_restore_is_a_new_timeline_a_standby_seed_is_not() {
     );
     drop(restored);
 
-    crate::storage::Storage::restore_full_standby(&seed, &bak, &[]).expect("standby seed");
+    crate::storage::RelStorage::restore_full_standby(&seed, &bak, &[]).expect("standby seed");
     let standby = Engine::new(RelStorage::open(seed.clone()).expect("open")).expect("eng");
     assert_eq!(
         standby.storage().epoch(),
@@ -113,7 +113,7 @@ fn promotion_finishes_recovery_bumps_the_epoch_and_fences_the_old_timeline() {
         .read_wal_range(backup_end, mid)
         .expect("delta");
 
-    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+    crate::storage::RelStorage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
     let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
@@ -122,7 +122,7 @@ fn promotion_finishes_recovery_bumps_the_epoch_and_fences_the_old_timeline() {
 
     // A running server holds the advisory lock: promote refuses.
     assert!(
-        crate::storage::Storage::promote(&standby_path).is_err(),
+        crate::storage::RelStorage::promote(&standby_path).is_err(),
         "promote refuses a file a live server holds"
     );
     drop(standby);
@@ -130,13 +130,13 @@ fn promotion_finishes_recovery_bumps_the_epoch_and_fences_the_old_timeline() {
     // A non-standby cannot be promoted.
     drop(primary);
     let err =
-        crate::storage::Storage::promote(&primary_path).expect_err("primary is not a standby");
+        crate::storage::RelStorage::promote(&primary_path).expect_err("primary is not a standby");
     assert!(
         err.to_string().contains("not a replication standby"),
         "{err}"
     );
 
-    let epoch = crate::storage::Storage::promote(&standby_path).expect("promote");
+    let epoch = crate::storage::RelStorage::promote(&standby_path).expect("promote");
     assert_eq!(epoch, 1, "the first failover bumps epoch 0 -> 1");
 
     let promoted = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
@@ -182,7 +182,8 @@ fn promotion_finishes_recovery_bumps_the_epoch_and_fences_the_old_timeline() {
         .storage()
         .backup_full(&reseed_bak)
         .expect("backup of the promoted node");
-    crate::storage::Storage::restore_full_standby(&reseed_path, &reseed_bak, &[]).expect("reseed");
+    crate::storage::RelStorage::restore_full_standby(&reseed_path, &reseed_bak, &[])
+        .expect("reseed");
     let reseeded = Engine::new(RelStorage::open(reseed_path.clone()).expect("open")).expect("eng");
     assert_eq!(
         reseeded.storage().epoch(),

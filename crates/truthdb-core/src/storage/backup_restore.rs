@@ -421,8 +421,12 @@ impl Storage {
     /// already exist.
     /// Offline restore of a full backup with no log chain (recover to the full
     /// backup's own end).
-    pub fn restore_full(dst_path: &Path, bak_path: &Path) -> Result<(), StorageError> {
-        Self::restore_full_with_logs(dst_path, bak_path, &[], None)
+    pub(super) fn restore_full(
+        dst_path: &Path,
+        bak_path: &Path,
+        engine: EngineFactory,
+    ) -> Result<(), StorageError> {
+        Self::restore_full_with_logs(dst_path, bak_path, &[], None, engine)
     }
 
     /// Offline restore of a full backup followed by an ordered chain of
@@ -432,13 +436,14 @@ impl Storage {
     /// previous coverage ended (no gap, error 4305); the whole recoverable range
     /// must fit in the WAL ring (a longer chain needs incremental restore, not
     /// yet supported).
-    pub fn restore_full_with_logs(
+    pub(super) fn restore_full_with_logs(
         dst_path: &Path,
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
         stop_at: Option<u64>,
+        engine: EngineFactory,
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], stop_at, false)
+        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], stop_at, false, engine)
     }
 
     /// Offline restore of a full backup (plus an optional `BACKUP LOG` chain)
@@ -450,12 +455,13 @@ impl Storage {
     /// redo and the replica would silently diverge. Point-in-time restore is
     /// meaningless for a seed (the standby must match the primary, not a past
     /// point), so there is no `stop_at` here.
-    pub fn restore_full_standby(
+    pub(super) fn restore_full_standby(
         dst_path: &Path,
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
+        engine: EngineFactory,
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], None, true)
+        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], None, true, engine)
     }
 
     /// Offline restore of a full backup followed by raw shipped WAL ring ranges —
@@ -463,12 +469,13 @@ impl Storage {
     /// the primary's `read_ring_range` bytes). Each range must continue from the
     /// current coverage (no gap, 4305); the whole recoverable range must fit the
     /// ring. Recovers to the end of the last range on open.
-    pub fn restore_full_with_wal_ranges(
+    pub(super) fn restore_full_with_wal_ranges(
         dst_path: &Path,
         bak_path: &Path,
         wal_ranges: &[(u64, Vec<u8>)],
+        engine: EngineFactory,
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, &[], wal_ranges, None, false)
+        Self::restore_full_inner(dst_path, bak_path, &[], wal_ranges, None, false, engine)
     }
 
     pub(super) fn restore_full_inner(
@@ -478,6 +485,7 @@ impl Storage {
         wal_ranges: &[(u64, Vec<u8>)],
         stop_at: Option<u64>,
         standby: bool,
+        engine: EngineFactory,
     ) -> Result<(), StorageError> {
         assert_layout_invariants();
         let reader = std::io::BufReader::new(std::fs::File::open(bak_path)?);
@@ -509,7 +517,7 @@ impl Storage {
         // later step fails, so a retry (which requires a fresh destination) can
         // proceed. Everything ABOVE this point errors without having created it.
         let outcome = Self::restore_body(
-            file, backup, &header, log_paths, wal_ranges, dst_path, stop_at, standby,
+            file, backup, &header, log_paths, wal_ranges, dst_path, stop_at, standby, engine,
         );
         if outcome.is_err() {
             let _ = std::fs::remove_file(dst_path);
@@ -531,6 +539,7 @@ impl Storage {
         dst_path: &Path,
         stop_at: Option<u64>,
         standby: bool,
+        engine: EngineFactory,
     ) -> Result<(), StorageError> {
         use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
         let data_pages = header.data_size / PAGE_SIZE as u64;
@@ -621,8 +630,8 @@ impl Storage {
         // replayed and each undone txn is sealed with a TXN_END). Failing loudly
         // if the restored file is not recoverable.
         let storage = match stop_at {
-            Some(ts) => Storage::open_with_stop_at(dst_path.to_path_buf(), ts)?,
-            None => Storage::open(dst_path.to_path_buf())?,
+            Some(ts) => Storage::open_with_stop_at(dst_path.to_path_buf(), ts, engine)?,
+            None => Storage::open(dst_path.to_path_buf(), engine)?,
         };
         drop(storage);
         Ok(())

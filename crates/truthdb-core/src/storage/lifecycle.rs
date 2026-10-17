@@ -210,18 +210,22 @@ impl Storage {
         })
     }
 
-    pub fn open(path: PathBuf) -> Result<Self, StorageError> {
+    pub(super) fn open(path: PathBuf, engine: EngineFactory) -> Result<Self, StorageError> {
         assert_layout_invariants();
-        let file = StorageFile::open_existing(path.clone(), None)?;
+        let file = StorageFile::open_existing(path.clone(), None, engine())?;
         Self::with_log_writer(path, file)
     }
 
     /// Opens with recovery stopped at a point in time: transactions whose commit
     /// timestamp is past `stop_at` are undone (point-in-time restore). Used by
     /// the restore path to validate + finalize a `--stopat` recovery.
-    pub(super) fn open_with_stop_at(path: PathBuf, stop_at: u64) -> Result<Self, StorageError> {
+    pub(super) fn open_with_stop_at(
+        path: PathBuf,
+        stop_at: u64,
+        engine: EngineFactory,
+    ) -> Result<Self, StorageError> {
         assert_layout_invariants();
-        let file = StorageFile::open_existing(path.clone(), Some(stop_at))?;
+        let file = StorageFile::open_existing(path.clone(), Some(stop_at), engine())?;
         Self::with_log_writer(path, file)
     }
 
@@ -329,24 +333,29 @@ impl Storage {
         Ok(new_data_pages)
     }
 
-    pub fn create(path: PathBuf, opts: StorageOptions) -> Result<Self, StorageError> {
-        Self::create_with_wal_bounds(path, opts, WAL_MIN_BYTES, WAL_MAX_BYTES)
+    pub(super) fn create(
+        path: PathBuf,
+        opts: StorageOptions,
+        engine: EngineFactory,
+    ) -> Result<Self, StorageError> {
+        Self::create_with_wal_bounds(path, opts, WAL_MIN_BYTES, WAL_MAX_BYTES, engine)
     }
 
     /// Test hook: create with custom WAL ring bounds so ring-wrap paths can
     /// be exercised without writing hundreds of MiB.
-    pub(crate) fn create_with_wal_bounds(
+    pub(super) fn create_with_wal_bounds(
         path: PathBuf,
         opts: StorageOptions,
         wal_min_bytes: u64,
         wal_max_bytes: u64,
+        engine: EngineFactory,
     ) -> Result<Self, StorageError> {
         assert_layout_invariants();
         opts.validate()?;
         let core = StorageFile::create_new(path.clone(), opts, wal_min_bytes, wal_max_bytes)?;
         let file = Locked {
             core,
-            eng: Box::new(RelEngine::new()),
+            eng: engine(),
         };
         Self::with_log_writer(path, file)
     }
@@ -370,6 +379,7 @@ impl StorageFile {
     pub(super) fn open_existing(
         path: PathBuf,
         stop_at: Option<u64>,
+        mut eng: Box<dyn EngineParticipant>,
     ) -> Result<Locked, StorageError> {
         let mut file = DirectFile::open_existing(path.clone())?;
         let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
@@ -462,7 +472,6 @@ impl StorageFile {
             metadata_root = Some((active_sb.metadata_root - layout.data_offset) / PAGE_SIZE as u64);
         }
 
-        let mut eng: Box<dyn EngineParticipant> = Box::new(RelEngine::new());
         eng.open(metadata_root, active_sb.db_options());
         let last_log_backup_lsn = active_sb.last_log_backup_lsn();
         let repl_slots = active_sb.repl_slots();

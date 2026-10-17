@@ -29,7 +29,10 @@ impl Storage {
     ///    redo+undo" happens; a crash mid-recovery re-runs it on the next open.
     ///
     /// Returns the new epoch.
-    pub fn promote(path: &Path) -> Result<u64, StorageError> {
+    pub(in crate::storage) fn promote(
+        path: &Path,
+        engine: EngineFactory,
+    ) -> Result<u64, StorageError> {
         let new_epoch = {
             let mut file = DirectFile::open_existing(path.to_path_buf())?;
             let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
@@ -102,7 +105,7 @@ impl Storage {
                     file.write_all_at(backup_offset, &backup.to_le_bytes_with_checksum())?;
                     file.sync_data()?;
                     drop(file);
-                    drop(Storage::open(path.to_path_buf())?);
+                    drop(Storage::open(path.to_path_buf(), engine)?);
                     return Ok(active.epoch());
                 }
                 return Err(StorageError::InvalidConfig(format!(
@@ -153,7 +156,7 @@ impl Storage {
         };
         // Validate + finalize: a full open runs redo AND undo (the standby flag
         // is gone), sealing the shipped in-flight transactions with CLRs.
-        drop(Storage::open(path.to_path_buf())?);
+        drop(Storage::open(path.to_path_buf(), engine)?);
         Ok(new_epoch)
     }
 

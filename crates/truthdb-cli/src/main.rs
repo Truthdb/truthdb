@@ -125,9 +125,9 @@ async fn main() -> Result<()> {
             standby,
         } => {
             let result = if standby {
-                truthdb_core::storage::Storage::restore_full_standby(&to, &full, &log)
+                truthdb_core::storage::RelStorage::restore_full_standby(&to, &full, &log)
             } else {
-                truthdb_core::storage::Storage::restore_full_with_logs(&to, &full, &log, stopat)
+                truthdb_core::storage::RelStorage::restore_full_with_logs(&to, &full, &log, stopat)
             };
             match result {
                 Ok(()) => {
@@ -152,7 +152,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::ReplStatus => repl_status(&addr).await,
-        Command::Promote { path } => match truthdb_core::storage::Storage::promote(&path) {
+        Command::Promote { path } => match truthdb_core::storage::RelStorage::promote(&path) {
             Ok(epoch) => {
                 println!(
                     "promoted {} to primary (replication epoch {epoch}); reconfigure it as \

@@ -350,14 +350,14 @@ mod tests {
     use super::*;
     use crate::storage::StorageOptions;
 
-    fn temp_storage(label: &str) -> Storage {
+    fn temp_storage(label: &str) -> crate::storage::RelStorage {
         let mut path = std::env::temp_dir();
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
         path.push(format!("truthdb-spill-{label}-{nanos}.db"));
-        Storage::create_with_wal_bounds(
+        crate::storage::RelStorage::create_with_wal_bounds(
             path,
             StorageOptions {
                 size_gib: 1,

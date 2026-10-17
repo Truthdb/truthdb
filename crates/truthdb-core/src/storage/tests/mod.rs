@@ -46,6 +46,7 @@ fn create_small(path: &Path) -> Storage {
         test_storage_options(),
         TEST_WAL_BYTES,
         TEST_WAL_BYTES,
+        super::relational::rel_engine,
     )
     .expect("create storage")
 }

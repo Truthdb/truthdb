@@ -129,7 +129,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let storage = Storage::create(
+        let storage = crate::storage::RelStorage::create(
             path.clone(),
             StorageOptions {
                 size_gib: 1,
@@ -142,7 +142,7 @@ mod tests {
             },
         )
         .unwrap();
-        (Arc::new(storage), path)
+        (storage.core_arc(), path)
     }
 
     /// Spins up the listener on an ephemeral port with a self-signed cert and a

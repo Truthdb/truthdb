@@ -46,7 +46,7 @@ fn a_readable_standby_serves_only_committed_state() {
         .read_wal_range(backup_end, mid)
         .expect("delta");
 
-    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
+    crate::storage::RelStorage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
     let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
@@ -173,7 +173,7 @@ fn readable_standby_handles_heap_cells_and_statement_rollbacks() {
         .read_wal_range(backup_end, mid)
         .expect("delta");
 
-    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
+    crate::storage::RelStorage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
     let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
@@ -304,7 +304,7 @@ fn replication_dmvs_report_slots_lag_and_role() {
 
     // A standby reports its own role and applied position.
     let summary = primary.storage().backup_full(&bak).expect("backup");
-    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
+    crate::storage::RelStorage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
     let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     let _ = summary;
     let (_, srows) = sql_rows(

@@ -342,7 +342,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let storage = Storage::create(
+        let storage = crate::storage::RelStorage::create(
             path.clone(),
             StorageOptions {
                 size_gib: 1,
@@ -355,7 +355,7 @@ mod tests {
             },
         )
         .unwrap();
-        (Arc::new(storage), path)
+        (storage.core_arc(), path)
     }
 
     fn test_ctx(storage: Arc<Storage>) -> PrimaryReplContext {

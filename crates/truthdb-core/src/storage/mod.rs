@@ -49,7 +49,7 @@ mod replication;
 #[cfg(test)]
 use lifecycle::compute_layout;
 use lifecycle::live_descriptor_slot;
-use participant::EngineParticipant;
+use participant::{EngineFactory, EngineParticipant};
 #[allow(unused_imports)]
 pub(crate) use relational::security::{
     DB_DATAREADER_ID, DB_DATAWRITER_ID, DB_DDLADMIN_ID, DB_OWNER_ID, DBO_ID, FIXED_PRINCIPAL_BASE,

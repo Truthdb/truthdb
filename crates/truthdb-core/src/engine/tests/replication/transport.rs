@@ -42,7 +42,7 @@ fn standby_applies_shipped_wal_ranges_and_matches_the_primary() {
     drop(engine);
 
     // Standby = the full backup + the shipped raw WAL range, recovered.
-    crate::storage::Storage::restore_full_with_wal_ranges(
+    crate::storage::RelStorage::restore_full_with_wal_ranges(
         &standby,
         &bak,
         &[(backup_end, delta.clone())],
@@ -63,7 +63,7 @@ fn standby_applies_shipped_wal_ranges_and_matches_the_primary() {
 
     // Idempotent: applying the SAME range twice yields the identical state
     // (seed overwrites identical bytes; redo is page-LSN-gated).
-    crate::storage::Storage::restore_full_with_wal_ranges(
+    crate::storage::RelStorage::restore_full_with_wal_ranges(
         &standby_idem,
         &bak,
         &[(backup_end, delta.clone()), (backup_end, delta.clone())],
@@ -121,7 +121,7 @@ fn a_standby_applies_a_live_wal_stream_and_matches_the_primary() {
 
     // Standby: restore the backup as an OPEN engine (only the 10 backed-up
     // rows), then apply the shipped delta LIVE — no reopen.
-    crate::storage::Storage::restore_full(&standby_path, &bak).expect("restore");
+    crate::storage::RelStorage::restore_full(&standby_path, &bak).expect("restore");
     let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     assert_eq!(
         sql_rows(&standby, "SELECT COUNT(*) FROM t").1,
@@ -168,7 +168,7 @@ fn a_standby_applies_a_live_wal_stream_and_matches_the_primary() {
         .storage()
         .backup_full(&standby_bak)
         .expect("backup on the standby");
-    crate::storage::Storage::restore_full(&restored, &standby_bak)
+    crate::storage::RelStorage::restore_full(&restored, &standby_bak)
         .expect("restore the standby backup");
     let r = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("eng");
     assert_eq!(
@@ -277,7 +277,7 @@ async fn the_replication_transport_streams_live_writes_to_a_standby() {
     // Standby: seeded with a --standby restore (stamped redo-only +
     // read-only before its first open), opened live, then its receiver
     // dials the primary.
-    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+    crate::storage::RelStorage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
     let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     assert!(
         standby.storage().is_standby(),
