@@ -1253,7 +1253,6 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
- "truthdb-core",
  "truthdb-net",
  "truthdb-proto",
  "truthdb-relational",
@@ -1274,13 +1273,9 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
- "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
- "truthdb-net",
- "truthdb-proto",
- "truthdb-sql",
  "xxhash-rust",
 ]
 
@@ -1289,7 +1284,6 @@ name = "truthdb-engine"
 version = "0.1.0"
 dependencies = [
  "rcgen",
- "rstest",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
@@ -1324,10 +1318,8 @@ name = "truthdb-relational"
 version = "0.1.0"
 dependencies = [
  "ring",
- "rstest",
  "serde",
  "serde_json",
- "thiserror 2.0.18",
  "truthdb-core",
  "truthdb-sql",
  "xxhash-rust",
@@ -1360,7 +1352,6 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "truthdb-core",
  "truthdb-engine",
  "truthdb-relational",
  "truthdb-sql",

@@ -5,20 +5,16 @@ edition = "2024"
 
 [dependencies]
 tokio = { workspace = true }
-truthdb-proto = { workspace = true }
-truthdb-net = { workspace = true }
-truthdb-sql = { workspace = true }
 thiserror = { workspace = true }
 xxhash-rust = { workspace = true }
 serde = { workspace = true }
-serde_json = { workspace = true }
 bincode = { workspace = true }
 libc = { workspace = true }
 io-uring = { workspace = true }
 icu_collator = { version = "2.2", features = ["compiled_data", "unstable"] }
 icu_locale_core = "2.0"
-# PBKDF2-HMAC-SHA256 for login password hashing. Already in the tree via rustls
-# (truthdb-tds), so this is a manifest entry only — zero new compiled crates.
+# HMAC-SHA256 for the replication handshake. Already in the tree via rustls,
+# so this is a manifest entry only — zero new compiled crates.
 ring = "0.17"
 # Mandatory TLS for the Stage 18 replication transport. Same versions/features as
 # truthdb-tds (which cannot be depended on here — it depends on truthdb-core), so
