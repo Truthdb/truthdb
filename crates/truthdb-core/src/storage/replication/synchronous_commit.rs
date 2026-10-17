@@ -136,7 +136,7 @@ impl Storage {
 
     /// Synchronous-commit status: `None` when not armed, else whether the link
     /// is currently degraded (NOT_SYNCHRONIZED).
-    pub(crate) fn sync_commit_status(&self) -> Option<bool> {
+    pub fn sync_commit_status(&self) -> Option<bool> {
         use std::sync::atomic::Ordering;
         self.sync_commit
             .armed

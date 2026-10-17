@@ -9,9 +9,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use truthdb_core::storage::{RelStorage, StorageOptions};
 use truthdb_engine::engine::Engine;
 use truthdb_engine::session::{EngineHandle, spawn_engine};
+use truthdb_relational::storage::{RelStorage, StorageOptions};
 use truthdb_tds::LoginThrottle;
 use truthdb_tds::server::{TdsConfig, serve_connection};
 

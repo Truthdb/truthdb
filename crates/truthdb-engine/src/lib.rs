@@ -9,4 +9,6 @@ pub mod session;
 // Core modules under their old `crate::` paths, so the moved engine and
 // session code (and its tests) keep resolving them unchanged.
 #[allow(unused_imports)]
-use truthdb_core::{auth, backup, lock, relstore, repl, storage, storage_layout, wal};
+use truthdb_core::{backup, repl, storage_layout, wal};
+#[allow(unused_imports)]
+use truthdb_relational::{auth, lock, relstore, storage};

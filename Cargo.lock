@@ -1226,6 +1226,7 @@ dependencies = [
  "truthdb-engine",
  "truthdb-net",
  "truthdb-proto",
+ "truthdb-relational",
  "truthdb-tds",
 ]
 
@@ -1255,6 +1256,7 @@ dependencies = [
  "truthdb-core",
  "truthdb-net",
  "truthdb-proto",
+ "truthdb-relational",
 ]
 
 [[package]]
@@ -1295,6 +1297,7 @@ dependencies = [
  "truthdb-core",
  "truthdb-net",
  "truthdb-proto",
+ "truthdb-relational",
  "truthdb-search",
  "truthdb-sql",
 ]
@@ -1314,6 +1317,20 @@ dependencies = [
  "bincode",
  "serde",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "truthdb-relational"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "rstest",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "truthdb-core",
+ "truthdb-sql",
+ "xxhash-rust",
 ]
 
 [[package]]
@@ -1345,6 +1362,7 @@ dependencies = [
  "tracing",
  "truthdb-core",
  "truthdb-engine",
+ "truthdb-relational",
  "truthdb-sql",
 ]
 

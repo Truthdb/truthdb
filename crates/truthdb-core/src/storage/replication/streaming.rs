@@ -125,7 +125,7 @@ impl Storage {
     }
 
     /// Node ids with a live sender (for the monitoring DMVs).
-    pub(crate) fn repl_connected_nodes(&self) -> std::collections::HashSet<u32> {
+    pub fn repl_connected_nodes(&self) -> std::collections::HashSet<u32> {
         self.repl_connected
             .lock()
             .expect("repl-connected set poisoned")

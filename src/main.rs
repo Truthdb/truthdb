@@ -4,9 +4,9 @@ compile_error!("TruthDB must be built for Linux targets. Use Docker or a Linux e
 use tokio::sync::watch;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
-use truthdb_core::storage::{RelStorage, Storage};
 use truthdb_engine::client_listener::ClientListener;
 use truthdb_engine::engine::Engine;
+use truthdb_relational::storage::{RelStorage, Storage};
 mod config;
 use config::Config;
 
@@ -58,7 +58,7 @@ async fn main() {
         config.storage.size_gib
     );
 
-    let storage_opts = truthdb_core::storage::StorageOptions {
+    let storage_opts = truthdb_relational::storage::StorageOptions {
         size_gib: config.storage.size_gib,
         wal_ratio: config.storage.wal_ratio,
         metadata_ratio: config.storage.metadata_ratio,

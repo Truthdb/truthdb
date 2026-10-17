@@ -3,7 +3,7 @@ use super::super::*;
 impl Storage {
     /// The registered replication slots `(id, held LSN)` (for the monitoring
     /// DMVs).
-    pub(crate) fn repl_slots_snapshot(&self) -> Vec<(u32, u64)> {
+    pub fn repl_slots_snapshot(&self) -> Vec<(u32, u64)> {
         self.lock()
             .truncation_gate
             .repl_slots

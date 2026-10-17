@@ -1,0 +1,22 @@
+[package]
+name = "truthdb-relational"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+truthdb-core = { workspace = true }
+truthdb-sql = { workspace = true }
+thiserror = { workspace = true }
+xxhash-rust = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# PBKDF2-HMAC-SHA256 for login password hashing.
+ring = "0.17"
+
+[features]
+# Test-only hooks for the engine crate's tests (never enabled in a build).
+test-hooks = ["truthdb-core/test-hooks"]
+
+[dev-dependencies]
+truthdb-core = { workspace = true, features = ["test-hooks"] }
+rstest = { workspace = true }

@@ -1,8 +1,8 @@
 //! TDS server token-stream builders (MS-TDS 2.2.7): LOGINACK, ENVCHANGE,
 //! INFO, ERROR, COLMETADATA, ROW, DONE. All strings are UCS-2LE.
 
-use truthdb_core::engine::ResultColumn;
-use truthdb_core::relstore::types::Datum;
+use truthdb_relational::engine::ResultColumn;
+use truthdb_relational::relstore::types::Datum;
 
 use crate::typeinfo;
 
@@ -214,7 +214,7 @@ pub fn return_value(
     out: &mut Vec<u8>,
     ordinal: u16,
     name: &str,
-    column_type: &truthdb_core::relstore::types::ColumnType,
+    column_type: &truthdb_relational::relstore::types::ColumnType,
     value: &Datum,
 ) {
     out.push(TOKEN_RETURNVALUE);
@@ -343,7 +343,7 @@ pub fn done_attention(out: &mut Vec<u8>) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use truthdb_core::relstore::types::ColumnType;
+    use truthdb_relational::relstore::types::ColumnType;
 
     #[test]
     fn loginack_shape() {

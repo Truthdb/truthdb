@@ -233,7 +233,7 @@ fn redo_page_op(ctx: &mut RelCtx<'_>, lsn: u64, redo: &PageOpRedo) -> Result<(),
 /// Applies the logical (tree) undos recovery cannot apply physically. The
 /// storage engine that owns the trees implements it; recovery hands it each
 /// `PageOpUndo::Tree*` record's object id and undo.
-pub(crate) trait LogicalUndo {
+pub trait LogicalUndo {
     fn undo(
         &self,
         ctx: &mut RelCtx<'_>,
@@ -408,7 +408,7 @@ pub(crate) fn undo_one(
 /// correctly: each compensation CLR's `undo_next` points before the undone op, so
 /// recovery's undo skips it (never double-undoing). The undo-log suffix is
 /// dropped, so a later full rollback unwinds only the surviving prefix.
-pub(crate) fn rollback_to(
+pub fn rollback_to(
     ctx: &mut RelCtx<'_>,
     txn: &mut TxnLink,
     savepoint: crate::relstore::ctx::Savepoint,
@@ -432,7 +432,7 @@ pub(crate) fn rollback_to(
 
 /// Rolls back a live transaction (statement failure) using its in-memory
 /// undo log; same CLR discipline as recovery undo.
-pub(crate) fn rollback(
+pub fn rollback(
     ctx: &mut RelCtx<'_>,
     mut txn: TxnLink,
     logical: &dyn LogicalUndo,

@@ -105,7 +105,7 @@ async fn main() -> Result<()> {
     match cli.command.unwrap_or(Command::Repl) {
         Command::Repl => repl(&addr).await,
         Command::Grow { path, add_gib } => {
-            match truthdb_core::storage::Storage::grow_data_region(&path, add_gib) {
+            match truthdb_relational::storage::Storage::grow_data_region(&path, add_gib) {
                 Ok(data_pages) => {
                     println!(
                         "grew {} by {add_gib} GiB: data region now {data_pages} pages ({} GiB)",
@@ -125,9 +125,11 @@ async fn main() -> Result<()> {
             standby,
         } => {
             let result = if standby {
-                truthdb_core::storage::RelStorage::restore_full_standby(&to, &full, &log)
+                truthdb_relational::storage::RelStorage::restore_full_standby(&to, &full, &log)
             } else {
-                truthdb_core::storage::RelStorage::restore_full_with_logs(&to, &full, &log, stopat)
+                truthdb_relational::storage::RelStorage::restore_full_with_logs(
+                    &to, &full, &log, stopat,
+                )
             };
             match result {
                 Ok(()) => {
@@ -152,17 +154,19 @@ async fn main() -> Result<()> {
             }
         }
         Command::ReplStatus => repl_status(&addr).await,
-        Command::Promote { path } => match truthdb_core::storage::RelStorage::promote(&path) {
-            Ok(epoch) => {
-                println!(
-                    "promoted {} to primary (replication epoch {epoch}); reconfigure it as \
+        Command::Promote { path } => {
+            match truthdb_relational::storage::RelStorage::promote(&path) {
+                Ok(epoch) => {
+                    println!(
+                        "promoted {} to primary (replication epoch {epoch}); reconfigure it as \
                      role = \"primary\" and reseed any other standby from a fresh backup",
-                    path.display()
-                );
-                Ok(())
+                        path.display()
+                    );
+                    Ok(())
+                }
+                Err(err) => Err(anyhow::anyhow!("promote failed: {err}")),
             }
-            Err(err) => Err(anyhow::anyhow!("promote failed: {err}")),
-        },
+        }
     }
 }
 

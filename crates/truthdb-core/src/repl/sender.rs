@@ -342,7 +342,7 @@ mod tests {
                 .unwrap()
                 .as_nanos()
         ));
-        let storage = crate::storage::RelStorage::create(
+        let storage = crate::storage::Storage::create(
             path.clone(),
             StorageOptions {
                 size_gib: 1,
@@ -353,9 +353,10 @@ mod tests {
                 reserved_ratio: 0.17,
                 default_collation: None,
             },
+            crate::storage::tests::no_engine,
         )
         .unwrap();
-        (storage.core_arc(), path)
+        (std::sync::Arc::new(storage), path)
     }
 
     fn test_ctx(storage: Arc<Storage>) -> PrimaryReplContext {

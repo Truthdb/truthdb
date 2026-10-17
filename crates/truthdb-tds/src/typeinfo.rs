@@ -3,7 +3,7 @@
 //! BIGVARCHR, and BIGVARBINARY — one per storage column type. Nullable ("N")
 //! variants make a NULL always representable via a zero (or 0xFFFF) length.
 
-use truthdb_core::relstore::types::{ColumnType, Datum};
+use truthdb_relational::relstore::types::{ColumnType, Datum};
 
 // Type tokens.
 const INTN: u8 = 0x26;
@@ -306,7 +306,9 @@ fn string_value(datum: &Datum) -> Option<String> {
         Datum::VarChar(s) | Datum::NVarChar(s) => Some(s.clone()),
         Datum::Null => None,
         // Any other datum reaching a string column is rendered as text.
-        other => truthdb_core::engine::render_cell(other, &ColumnType::NVarChar { max_len: 4000 }),
+        other => {
+            truthdb_relational::engine::render_cell(other, &ColumnType::NVarChar { max_len: 4000 })
+        }
     }
 }
 

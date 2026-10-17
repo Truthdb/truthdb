@@ -10,9 +10,9 @@ use crate::storage::{StorageError, StorageFile};
 use crate::wal::records::RelRecord;
 
 /// Builds a fresh engine for an open, create or validating reopen.
-pub(super) type EngineFactory = fn() -> Box<dyn EngineParticipant>;
+pub type EngineFactory = fn() -> Box<dyn EngineParticipant>;
 
-pub(super) trait EngineParticipant: std::any::Any + Send {
+pub trait EngineParticipant: std::any::Any + Send {
     /// Open, before recovery: the superblock's catalog root (a data-region
     /// page number, already range-checked) and its database-options byte.
     fn open(&mut self, metadata_root: Option<u64>, db_options: u8);

@@ -6,6 +6,7 @@ description = "TruthDB TDS (Tabular Data Stream) gateway: a plaintext SQL Server
 license = "MIT"
 
 [dependencies]
+truthdb-relational = { path = "../truthdb-relational", version = "0.1.0" }
 tokio = { workspace = true }
 tracing = { workspace = true }
 truthdb-core = { path = "../truthdb-core", version = "0.1.0" }

@@ -387,7 +387,7 @@ impl RelFile<'_> {
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn rel_flush_pool_only(&mut self) -> Result<(), StorageError> {
         self.core.wal.sync_all()?;
-        let PageState { pool, .. } = &mut self.core.pages;
+        let crate::relstore::ctx::PageState { pool, .. } = &mut self.core.pages;
         let mut io = PoolIo {
             file: &mut self.core.file,
             wal: &mut self.core.wal,

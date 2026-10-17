@@ -1,4 +1,4 @@
-pub use truthdb_core::engine::*;
+pub use truthdb_relational::engine::*;
 pub use truthdb_search::{
     Command, CommandError, ENGINE_WAL_ENTRY_TYPE, ENGINE_WAL_ENTRY_VERSION, EngineMeta,
     EngineState, SearchError, SearchQuery, WalEvent, decode_snapshot, parse_command, render_json,
@@ -12,7 +12,7 @@ use std::sync::{Arc, RwLock};
 use serde_json::{Value, json};
 
 use thiserror::Error;
-use truthdb_core::storage::{RelStorage, StorageError};
+use truthdb_relational::storage::{RelStorage, StorageError};
 
 const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
 /// A standby takes a restartpoint earlier than a primary checkpoints (0.5 vs

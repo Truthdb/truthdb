@@ -1,5 +1,6 @@
 mod catalog;
 mod dml;
+mod readable_standby;
 mod recovery;
 pub mod security;
 mod transaction;

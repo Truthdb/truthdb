@@ -421,7 +421,7 @@ impl Storage {
     /// already exist.
     /// Offline restore of a full backup with no log chain (recover to the full
     /// backup's own end).
-    pub(super) fn restore_full(
+    pub fn restore_full(
         dst_path: &Path,
         bak_path: &Path,
         engine: EngineFactory,
@@ -436,7 +436,7 @@ impl Storage {
     /// previous coverage ended (no gap, error 4305); the whole recoverable range
     /// must fit in the WAL ring (a longer chain needs incremental restore, not
     /// yet supported).
-    pub(super) fn restore_full_with_logs(
+    pub fn restore_full_with_logs(
         dst_path: &Path,
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
@@ -455,7 +455,7 @@ impl Storage {
     /// redo and the replica would silently diverge. Point-in-time restore is
     /// meaningless for a seed (the standby must match the primary, not a past
     /// point), so there is no `stop_at` here.
-    pub(super) fn restore_full_standby(
+    pub fn restore_full_standby(
         dst_path: &Path,
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
@@ -469,7 +469,7 @@ impl Storage {
     /// the primary's `read_ring_range` bytes). Each range must continue from the
     /// current coverage (no gap, 4305); the whole recoverable range must fit the
     /// ring. Recovers to the end of the last range on open.
-    pub(super) fn restore_full_with_wal_ranges(
+    pub fn restore_full_with_wal_ranges(
         dst_path: &Path,
         bak_path: &Path,
         wal_ranges: &[(u64, Vec<u8>)],
@@ -642,12 +642,12 @@ impl StorageFile {
     /// Registers an in-progress backup's `redo_start_lsn` as a truncation hold,
     /// so a concurrent checkpoint cannot reclaim log the backup still has to ship.
     /// Paired with [`Self::release_backup_hold`].
-    pub(super) fn register_backup_hold(&mut self, redo_start_lsn: u64) {
+    pub fn register_backup_hold(&mut self, redo_start_lsn: u64) {
         self.truncation_gate.backup = Some(redo_start_lsn);
     }
 
     /// Releases the backup truncation hold (the backup finished or failed).
-    pub(super) fn release_backup_hold(&mut self) {
+    pub fn release_backup_hold(&mut self) {
         self.truncation_gate.backup = None;
     }
 
@@ -768,7 +768,7 @@ impl StorageFile {
     /// search-snapshot extent by a between-chunk checkpoint, legitimately fails
     /// page-checksum verification and is NOT corrupt: on restore its stale
     /// image is irrelevant because redo frees or overwrites it.
-    pub(super) fn page_is_live_regular(&mut self, page: u64) -> Result<bool, StorageError> {
+    pub fn page_is_live_regular(&mut self, page: u64) -> Result<bool, StorageError> {
         if !self.allocator.is_allocated(page) {
             return Ok(false); // freed since the backup began
         }
@@ -818,7 +818,7 @@ impl Locked {
     /// NOT advance the marker or hold, so the old marker keeps pinning the range
     /// while the caller writes the archive with the lock released. Returns
     /// `(header, start, end, log_bytes)`. Requires the FULL recovery model.
-    pub(super) fn begin_log_backup(
+    pub fn begin_log_backup(
         &mut self,
         checksum: bool,
         copy_only: bool,
@@ -887,7 +887,7 @@ impl Locked {
     /// in those cases could sit it below the advanced head, which `set_head`
     /// forbids. The single-flight guard is released by `LogBackupGuard` on every
     /// exit path, not here.
-    pub(super) fn finish_log_backup(&mut self, start: u64, end: u64) -> Result<(), StorageError> {
+    pub fn finish_log_backup(&mut self, start: u64, end: u64) -> Result<(), StorageError> {
         if !self.core.recovery_full || self.core.last_log_backup_lsn != start {
             return Ok(());
         }
@@ -901,7 +901,7 @@ impl Locked {
 impl StorageFile {
     /// Releases the `BACKUP LOG` single-flight guard (idempotent). Called by
     /// [`LogBackupGuard`] on every exit — error, panic, or success.
-    pub(super) fn cancel_log_backup(&mut self) {
+    pub fn cancel_log_backup(&mut self) {
         self.log_backup_in_progress = false;
     }
 

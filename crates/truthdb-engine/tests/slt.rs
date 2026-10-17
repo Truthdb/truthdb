@@ -13,10 +13,10 @@
 
 use std::path::{Path, PathBuf};
 
-use truthdb_core::engine::{StatementResult, TxnContext};
-use truthdb_core::relstore::types::Datum;
-use truthdb_core::storage::{RelStorage, StorageOptions};
 use truthdb_engine::engine::Engine;
+use truthdb_relational::engine::{StatementResult, TxnContext};
+use truthdb_relational::relstore::types::Datum;
+use truthdb_relational::storage::{RelStorage, StorageOptions};
 
 fn temp_path(label: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -84,7 +84,7 @@ fn run_file(path: &Path) {
     // sys.databases and USE read it.
     ctx.set_session_identity(
         "truthdb".into(),
-        truthdb_core::relstore::catalog::DEFAULT_DATABASE_ID,
+        truthdb_relational::relstore::catalog::DEFAULT_DATABASE_ID,
         "sa".into(),
         1,
         "dbo".into(),

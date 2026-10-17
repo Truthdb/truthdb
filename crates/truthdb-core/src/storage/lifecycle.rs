@@ -191,7 +191,7 @@ pub(super) fn compute_layout(
 use super::*;
 
 impl Storage {
-    pub(super) fn lock(&self) -> std::sync::MutexGuard<'_, Locked> {
+    pub fn lock(&self) -> std::sync::MutexGuard<'_, Locked> {
         self.inner.lock().expect("storage mutex poisoned")
     }
 
@@ -210,7 +210,7 @@ impl Storage {
         })
     }
 
-    pub(super) fn open(path: PathBuf, engine: EngineFactory) -> Result<Self, StorageError> {
+    pub fn open(path: PathBuf, engine: EngineFactory) -> Result<Self, StorageError> {
         assert_layout_invariants();
         let file = StorageFile::open_existing(path.clone(), None, engine())?;
         Self::with_log_writer(path, file)
@@ -333,7 +333,7 @@ impl Storage {
         Ok(new_data_pages)
     }
 
-    pub(super) fn create(
+    pub fn create(
         path: PathBuf,
         opts: StorageOptions,
         engine: EngineFactory,
@@ -343,7 +343,7 @@ impl Storage {
 
     /// Test hook: create with custom WAL ring bounds so ring-wrap paths can
     /// be exercised without writing hundreds of MiB.
-    pub(super) fn create_with_wal_bounds(
+    pub fn create_with_wal_bounds(
         path: PathBuf,
         opts: StorageOptions,
         wal_min_bytes: u64,

@@ -1,7 +1,7 @@
 use super::*;
 use crate::packet::{MIN_PACKET_SIZE, read_message};
-use truthdb_core::engine::{BatchOutcome, ResultColumn, RowSet, StatementResult};
-use truthdb_core::relstore::types::{ColumnType, Datum};
+use truthdb_relational::engine::{BatchOutcome, ResultColumn, RowSet, StatementResult};
+use truthdb_relational::relstore::types::{ColumnType, Datum};
 use truthdb_sql::error::SqlError;
 
 /// The pre-streaming renderer, verbatim. Do not "fix" this to agree with
@@ -111,7 +111,7 @@ fn events_for(outcome: &BatchOutcome, in_xact: bool) -> mpsc::UnboundedReceiver<
                 tx.send(BatchEvent::StatementDone {
                     count: Some(rowset.rows.len() as u64),
                     in_transaction: in_xact,
-                    command: truthdb_core::engine::DoneCommand::Select,
+                    command: truthdb_relational::engine::DoneCommand::Select,
                 })
                 .unwrap();
             }
@@ -119,14 +119,14 @@ fn events_for(outcome: &BatchOutcome, in_xact: bool) -> mpsc::UnboundedReceiver<
                 .send(BatchEvent::StatementDone {
                     count: Some(*n),
                     in_transaction: in_xact,
-                    command: truthdb_core::engine::DoneCommand::Other,
+                    command: truthdb_relational::engine::DoneCommand::Other,
                 })
                 .unwrap(),
             StatementResult::Done => tx
                 .send(BatchEvent::StatementDone {
                     count: None,
                     in_transaction: in_xact,
-                    command: truthdb_core::engine::DoneCommand::Other,
+                    command: truthdb_relational::engine::DoneCommand::Other,
                 })
                 .unwrap(),
         }
@@ -151,7 +151,7 @@ async fn a_prepared_handle_renders_as_a_returnvalue_token() {
     tx.send(BatchEvent::StatementDone {
         count: Some(1),
         in_transaction: false,
-        command: truthdb_core::engine::DoneCommand::Other,
+        command: truthdb_relational::engine::DoneCommand::Other,
     })
     .unwrap();
     tx.send(BatchEvent::PreparedHandle(7)).unwrap();
@@ -174,7 +174,7 @@ async fn a_prepared_handle_renders_as_a_returnvalue_token() {
     tx.send(BatchEvent::StatementDone {
         count: Some(3),
         in_transaction: false,
-        command: truthdb_core::engine::DoneCommand::Other,
+        command: truthdb_relational::engine::DoneCommand::Other,
     })
     .unwrap();
     tx.send(BatchEvent::Complete {
@@ -242,7 +242,7 @@ async fn done_inxact_is_per_statement() {
         tx.send(BatchEvent::StatementDone {
             count,
             in_transaction,
-            command: truthdb_core::engine::DoneCommand::Other,
+            command: truthdb_relational::engine::DoneCommand::Other,
         })
         .unwrap();
     }
@@ -280,7 +280,7 @@ async fn an_aborted_statement_closes_its_rowset_with_a_clean_done() {
     tx.send(BatchEvent::StatementDone {
         count: Some(1),
         in_transaction: false,
-        command: truthdb_core::engine::DoneCommand::Other,
+        command: truthdb_relational::engine::DoneCommand::Other,
     })
     .unwrap();
     tx.send(BatchEvent::Complete {

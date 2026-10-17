@@ -1,10 +1,7 @@
-mod allocator;
-pub mod auth;
+pub mod allocator;
 pub mod backup;
 mod direct_io;
-pub mod engine;
-mod group_commit;
-pub mod lock;
+pub mod group_commit;
 pub mod relstore;
 pub mod repl;
 pub mod storage;

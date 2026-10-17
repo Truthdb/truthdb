@@ -58,7 +58,7 @@ impl StorageFile {
     /// bits, `recovery_full` (when set) the new recovery model. Only after the
     /// write succeeds are the in-memory model, log-backup marker and hold
     /// updated, so a failed write leaves them exactly as they were.
-    pub(super) fn commit_db_options(
+    pub fn commit_db_options(
         &mut self,
         engine_bits: u8,
         recovery_full: Option<bool>,

@@ -29,10 +29,7 @@ impl Storage {
     ///    redo+undo" happens; a crash mid-recovery re-runs it on the next open.
     ///
     /// Returns the new epoch.
-    pub(in crate::storage) fn promote(
-        path: &Path,
-        engine: EngineFactory,
-    ) -> Result<u64, StorageError> {
+    pub fn promote(path: &Path, engine: EngineFactory) -> Result<u64, StorageError> {
         let new_epoch = {
             let mut file = DirectFile::open_existing(path.to_path_buf())?;
             let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];

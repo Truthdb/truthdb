@@ -3,7 +3,7 @@ use super::*;
 impl StorageFile {
     /// Decodes the page-structured (REL) records, with their LSNs, from the
     /// recovery scan.
-    pub(in crate::storage) fn rel_records(&self) -> Result<Vec<(u64, RelRecord)>, StorageError> {
+    pub fn rel_records(&self) -> Result<Vec<(u64, RelRecord)>, StorageError> {
         self.replay_cache
             .iter()
             .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
