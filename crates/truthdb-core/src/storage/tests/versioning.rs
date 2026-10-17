@@ -8,7 +8,7 @@ fn covering_seek_serves_the_snapshot_image() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("rcsi-covering");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut writer = TxnContext::default();
     let mut fill = String::from("INSERT INTO c VALUES ");
     for i in 1..=25 {
@@ -68,7 +68,7 @@ fn rollback_unpublishes_and_prune_drops_settled_history() {
     use crate::engine::{TxnContext, execute_batch};
 
     let path = unique_temp_path("rcsi-prune");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
@@ -128,7 +128,7 @@ fn version_cleanup_under_load_pins_then_drops_history() {
     use crate::engine::{TxnContext, execute_batch};
 
     let path = unique_temp_path("cleanup-load");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let mut seed = String::from("INSERT INTO t VALUES ");
     for i in 0..100 {
@@ -203,7 +203,7 @@ fn a_3960_abort_releases_the_snapshot_registration() {
     use crate::engine::{TxnContext, execute_batch};
 
     let path = unique_temp_path("si-3960-release");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut setup = TxnContext::default();
     for sql in [
         "ALTER DATABASE CURRENT SET ALLOW_SNAPSHOT_ISOLATION ON",
@@ -274,7 +274,7 @@ fn ten_mib_value_round_trips_and_survives_a_crash() {
     use crate::engine::{StatementResult, TxnContext, execute_batch, execute_batch_with_params};
 
     let path = unique_temp_path("max-10mib");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE big (id INT NOT NULL PRIMARY KEY, body NVARCHAR(MAX))",
@@ -298,7 +298,7 @@ fn ten_mib_value_round_trips_and_survives_a_crash() {
     );
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
 
-    let fetch = |storage: &Storage, ctx: &mut TxnContext| -> String {
+    let fetch = |storage: &RelStorage, ctx: &mut TxnContext| -> String {
         let outcome = execute_batch(storage, "SELECT body FROM big WHERE id = 1", ctx);
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         match &outcome.results[0] {
@@ -326,7 +326,7 @@ fn ten_mib_value_round_trips_and_survives_a_crash() {
     let _ = ctx;
     drop(storage);
 
-    let storage = Storage::open(path.clone()).expect("recovery");
+    let storage = RelStorage::open(path.clone()).expect("recovery");
     let mut ctx = TxnContext::default();
     let recovered = fetch(&storage, &mut ctx);
     assert_eq!(recovered.len(), big.len(), "length after recovery");
@@ -349,7 +349,7 @@ fn rcsi_reads_the_old_big_value_through_the_image_reference() {
     };
 
     let path = unique_temp_path("max-rcsi");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut writer = TxnContext::default();
     let big_old: String = "old-value".repeat(20_000); // ~180 KB
     let big_new: String = "new-value".repeat(20_000);
@@ -422,7 +422,7 @@ fn heap_rcsi_reads_old_big_value_through_preimage() {
     };
 
     let path = unique_temp_path("review-heap-rcsi");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut writer = TxnContext::default();
     let big_old: String = "old-heap".repeat(10_000); // 80k chars -> chain
     let big_new: String = "new-heap".repeat(10_000);
@@ -509,7 +509,7 @@ fn moved_heap_row_versions_and_resolves_through_the_stub() {
     };
 
     let path = unique_temp_path("review-heap-moved");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut writer = TxnContext::default();
     let big_old: String = "moved-old".repeat(5_000); // 45k chars -> chain
     let big_new: String = "moved-new".repeat(5_000);
@@ -611,7 +611,7 @@ fn failed_statement_after_spill_rolls_back_cleanly() {
     };
 
     let path = unique_temp_path("review-spill-fail");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE sf (id INT NOT NULL PRIMARY KEY, body NVARCHAR(MAX))",
@@ -662,7 +662,7 @@ fn failed_statement_after_spill_rolls_back_cleanly() {
     // Kill and reopen: recovery replays the leaked chain's images and
     // the committed rows; the value survives.
     drop(storage);
-    let storage = Storage::open(path.clone()).expect("recovery");
+    let storage = RelStorage::open(path.clone()).expect("recovery");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(&storage, "SELECT body FROM sf WHERE id = 1", &mut ctx);
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
@@ -688,7 +688,7 @@ fn alter_add_column_respills_max_values() {
     };
 
     let path = unique_temp_path("review-alter-max");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
 
     // Case A: a 300-byte chain value fits back inline; ALTER succeeds.
@@ -751,7 +751,7 @@ fn alter_add_column_respills_max_values() {
     // durable with the ALTER's statement).
     drop(ctx);
     drop(storage);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(&storage, "SELECT body FROM bmax WHERE id = 1", &mut ctx);
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
@@ -778,7 +778,7 @@ fn max_codec_edges_round_trip() {
     };
 
     let path = unique_temp_path("review-max-edges");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let at_threshold = "t".repeat(256); // inline boundary
     let over_threshold = "u".repeat(257); // first chained length
@@ -806,7 +806,7 @@ fn max_codec_edges_round_trip() {
     );
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
 
-    let check = |storage: &Storage, ctx: &mut TxnContext| {
+    let check = |storage: &RelStorage, ctx: &mut TxnContext| {
         let outcome = execute_batch(storage, "SELECT v, b FROM edges ORDER BY id", ctx);
         assert!(outcome.error.is_none(), "{:?}", outcome.error);
         match &outcome.results[0] {
@@ -822,7 +822,7 @@ fn max_codec_edges_round_trip() {
     };
     check(&storage, &mut ctx);
     drop(storage);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let mut ctx = TxnContext::default();
     check(&storage, &mut ctx);
     drop(storage);

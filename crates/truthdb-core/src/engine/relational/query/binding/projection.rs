@@ -159,7 +159,7 @@ pub(in crate::engine::relational) fn map_expr_columns(
 /// correlated subquery uncorrelated for that row. `None` if the inner scope
 /// cannot be determined; the caller then runs the subquery unchanged.
 pub(in crate::engine::relational) fn substitute_subquery_outer_refs(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     subquery: &Select,
     outer: &dyn Fn(&str) -> Option<usize>,
@@ -234,7 +234,7 @@ pub(in crate::engine::relational) fn substitute_subquery_outer_refs(
 /// Substitutes outer references inside every derived-table body of a FROM
 /// tree. `None` when any derived body's scope cannot be determined.
 pub(in crate::engine::relational) fn substitute_from_outer_refs(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     from: &mut TableRef,
     outer: &dyn Fn(&str) -> Option<usize>,

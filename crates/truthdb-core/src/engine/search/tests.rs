@@ -31,7 +31,7 @@ fn parses_multiline_create_index_command() {
 #[test]
 fn create_insert_search_and_replay() {
     let path = unique_temp_path("basic-search");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("storage create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("storage create");
     let engine = Engine::new(storage).expect("engine create");
 
     engine
@@ -99,7 +99,7 @@ fn create_insert_search_and_replay() {
 
     drop(engine);
 
-    let storage = Storage::open(path.clone()).expect("storage reopen");
+    let storage = RelStorage::open(path.clone()).expect("storage reopen");
     let engine = Engine::new(storage).expect("engine replay");
     let response = engine
         .execute(
@@ -136,7 +136,7 @@ fn create_insert_search_and_replay() {
 #[test]
 fn checkpoint_with_documents_survives_restart() {
     let path = unique_temp_path("checkpoint-roundtrip");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("storage create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("storage create");
     let engine = Engine::new(storage).expect("engine create");
     engine
         .execute(
@@ -159,7 +159,7 @@ fn checkpoint_with_documents_survives_restart() {
         .expect("insert 3");
     drop(engine);
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("engine restart after checkpoint");
     let response = engine
         .execute(r#"search notes { "query": { "match": { "body": "doc" } } }"#)
@@ -185,7 +185,7 @@ fn checkpoint_with_documents_survives_restart() {
 fn replay_skips_events_already_covered_by_snapshot() {
     let path = unique_temp_path("covered-replay");
     let mut storage =
-        Storage::create(path.clone(), test_storage_options()).expect("storage create");
+        RelStorage::create(path.clone(), test_storage_options()).expect("storage create");
 
     // Snapshot state: index "notes" with one document, next_seq_no = 3.
     let mut mappings = BTreeMap::new();
@@ -227,7 +227,7 @@ fn replay_skips_events_already_covered_by_snapshot() {
     }
     drop(storage);
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("open must skip covered events");
     let response = engine
         .execute(r#"search notes { "query": { "match": { "body": "covered" } } }"#)

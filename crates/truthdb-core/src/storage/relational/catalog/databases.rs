@@ -1,6 +1,6 @@
 use super::super::super::*;
 
-impl Storage {
+impl RelStorage {
     /// Creates a database (a naming namespace over the shared log and file);
     /// returns its id. Bumps the lock epoch: a parked batch analyzed against
     /// the old database list could resolve names differently.

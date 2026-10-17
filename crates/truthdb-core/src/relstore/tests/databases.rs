@@ -27,7 +27,7 @@ fn databases_create_list_resolve_and_survive_reopen() {
     assert_eq!(storage.rel_database_id_by_name("nope"), None);
 
     drop(storage);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     assert_eq!(
         storage.rel_databases(),
         vec![
@@ -162,7 +162,7 @@ fn drop_database_redo_survives_reopen() {
     assert!(storage.rel_drop_database("hr").expect("drop"));
     drop(storage);
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     assert_eq!(
         storage.rel_database_id_by_name("hr"),
         None,

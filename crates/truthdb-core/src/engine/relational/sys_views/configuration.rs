@@ -3,7 +3,7 @@ use super::*;
 /// `sys.databases` (Stage 14, SSMS query-window probes): the one database
 /// this instance serves, with the columns tools actually read. The
 /// versioning flags report the live `ALTER DATABASE` options.
-pub(in crate::engine::relational) fn sys_databases(storage: &Storage) -> Source {
+pub(in crate::engine::relational) fn sys_databases(storage: &RelStorage) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("database_id"),

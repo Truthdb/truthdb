@@ -7,7 +7,7 @@ use super::super::prelude::*;
 /// `EXEC @rc =`, and copies OUTPUT parameters back — both only when the body
 /// completes (SQL Server skips them when execution aborts).
 pub(in crate::engine::relational) fn run_user_procedure(
-    storage: &Storage,
+    storage: &RelStorage,
     exec: &ExecStatement,
     def: &TableDef,
     txn_ctx: &mut TxnContext,
@@ -280,7 +280,7 @@ pub(in crate::engine::relational) fn run_user_procedure(
 /// path), which is exactly the SQL Server posture: a function error aborts the
 /// statement that called it.
 pub(in crate::engine::relational) fn run_user_scalar_function(
-    storage: &Storage,
+    storage: &RelStorage,
     def: &TableDef,
     arg_values: &[SqlValue],
     caller: &EvalContext,

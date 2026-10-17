@@ -8,7 +8,7 @@ fn offline_grow_extends_the_data_region() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("grow");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE g (id INT NOT NULL PRIMARY KEY, v NVARCHAR(MAX))",
@@ -21,14 +21,14 @@ fn offline_grow_extends_the_data_region() {
     drop(ctx);
     drop(storage);
 
-    let new_pages = Storage::grow_data_region(&path, 1).expect("grow");
+    let new_pages = crate::storage::Storage::grow_data_region(&path, 1).expect("grow");
     assert_eq!(
         new_pages,
         old_pages + (1u64 << 30) / PAGE_SIZE as u64,
         "one GiB of new data pages"
     );
 
-    let storage = Storage::open(path.clone()).expect("reopen after grow");
+    let storage = RelStorage::open(path.clone()).expect("reopen after grow");
     assert_eq!(
         storage.lock().layout.data_size / PAGE_SIZE as u64,
         new_pages
@@ -48,9 +48,9 @@ fn offline_grow_extends_the_data_region() {
     drop(storage);
 
     // Growing again works (the re-run an interrupted grow performs).
-    let newer = Storage::grow_data_region(&path, 1).expect("second grow");
+    let newer = crate::storage::Storage::grow_data_region(&path, 1).expect("second grow");
     assert_eq!(newer, new_pages + (1u64 << 30) / PAGE_SIZE as u64);
-    let storage = Storage::open(path.clone()).expect("reopen after second grow");
+    let storage = RelStorage::open(path.clone()).expect("reopen after second grow");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(&storage, "SELECT COUNT(*) FROM g", &mut ctx);
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
@@ -66,14 +66,14 @@ fn grow_refuses_below_the_safe_minimum() {
     // 4 GiB file: the tail regions span ~1.16 GiB, so +1 GiB is unsafe.
     let mut opts = test_storage_options();
     opts.size_gib = 4;
-    let storage = Storage::create(path.clone(), opts).expect("create");
+    let storage = RelStorage::create(path.clone(), opts).expect("create");
     drop(storage);
-    let err = Storage::grow_data_region(&path, 1).expect_err("must refuse");
+    let err = crate::storage::Storage::grow_data_region(&path, 1).expect_err("must refuse");
     assert!(
         err.to_string().contains("safe minimum"),
         "names the floor: {err}"
     );
-    let storage = Storage::open(path.clone()).expect("file untouched");
+    let storage = RelStorage::open(path.clone()).expect("file untouched");
     drop(storage);
     let _ = std::fs::remove_file(&path);
 }
@@ -86,7 +86,7 @@ fn grow_with_pending_wal_recovers_cleanly() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("grow-wal");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE g (id INT NOT NULL PRIMARY KEY, v INT)",
@@ -105,8 +105,8 @@ fn grow_with_pending_wal_recovers_cleanly() {
     drop(ctx);
     drop(storage);
 
-    Storage::grow_data_region(&path, 1).expect("grow with pending WAL");
-    let storage = Storage::open(path.clone()).expect("recovery after grow");
+    crate::storage::Storage::grow_data_region(&path, 1).expect("grow with pending WAL");
+    let storage = RelStorage::open(path.clone()).expect("recovery after grow");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(&storage, "SELECT v FROM g WHERE id = 1", &mut ctx);
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
@@ -126,16 +126,17 @@ fn grow_with_pending_wal_recovers_cleanly() {
 #[test]
 fn grow_refuses_while_the_store_is_open() {
     let path = unique_temp_path("grow-flock");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
-    let err = Storage::grow_data_region(&path, 2).expect_err("must refuse while open");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
+    let err =
+        crate::storage::Storage::grow_data_region(&path, 2).expect_err("must refuse while open");
     assert!(
         err.to_string()
             .contains("locked by another TruthDB process"),
         "names the lock: {err}"
     );
     drop(storage);
-    Storage::grow_data_region(&path, 2).expect("grow after close");
-    let storage = Storage::open(path.clone()).expect("reopen");
+    crate::storage::Storage::grow_data_region(&path, 2).expect("grow after close");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     drop(storage);
     let _ = std::fs::remove_file(&path);
 }
@@ -150,7 +151,7 @@ fn grow_crash_before_header_stamp_is_recoverable() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("grow-crash");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE g (id INT NOT NULL PRIMARY KEY, v INT)",
@@ -176,13 +177,13 @@ fn grow_crash_before_header_stamp_is_recoverable() {
     };
 
     let old_pages = {
-        let storage = Storage::open(path.clone()).expect("preflight open");
+        let storage = RelStorage::open(path.clone()).expect("preflight open");
         let pages = storage.lock().layout.data_size / PAGE_SIZE as u64;
         drop(storage);
         pages
     };
 
-    Storage::grow_data_region(&path, 1).expect("grow");
+    crate::storage::Storage::grow_data_region(&path, 1).expect("grow");
 
     // Crash simulation: the extension writes are durable, the header
     // stamp is not.
@@ -197,7 +198,7 @@ fn grow_crash_before_header_stamp_is_recoverable() {
     }
 
     // The old layout must be fully valid: data readable, snapshot loads.
-    let storage = Storage::open(path.clone()).expect("open under the OLD header");
+    let storage = RelStorage::open(path.clone()).expect("open under the OLD header");
     assert_eq!(
         storage.lock().layout.data_size / PAGE_SIZE as u64,
         old_pages,
@@ -221,9 +222,9 @@ fn grow_crash_before_header_stamp_is_recoverable() {
     drop(storage);
 
     // Re-running the grow completes it.
-    let new_pages = Storage::grow_data_region(&path, 1).expect("re-run grow");
+    let new_pages = crate::storage::Storage::grow_data_region(&path, 1).expect("re-run grow");
     assert_eq!(new_pages, old_pages + (1u64 << 30) / PAGE_SIZE as u64);
-    let storage = Storage::open(path.clone()).expect("open after completed grow");
+    let storage = RelStorage::open(path.clone()).expect("open after completed grow");
     assert_eq!(
         storage.lock().layout.data_size / PAGE_SIZE as u64,
         new_pages
@@ -246,15 +247,15 @@ fn grow_crash_before_header_stamp_is_recoverable() {
 #[test]
 fn grow_preserves_the_checkpointed_snapshot() {
     let path = unique_temp_path("grow-snap");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     storage
         .write_checkpoint(b"survives-the-move", 1, 2, 1)
         .expect("checkpoint");
     drop(storage);
 
-    Storage::grow_data_region(&path, 1).expect("grow");
+    crate::storage::Storage::grow_data_region(&path, 1).expect("grow");
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let snap = storage
         .load_snapshot()
         .expect("load")
@@ -274,7 +275,7 @@ fn grow_preserves_the_persisted_allocator_bitmap() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("grow-bitmap");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE t1 (id INT NOT NULL PRIMARY KEY, v NVARCHAR(60))",
@@ -291,11 +292,11 @@ fn grow_preserves_the_persisted_allocator_bitmap() {
         .expect("checkpoint");
     drop(storage);
 
-    Storage::grow_data_region(&path, 1).expect("grow");
+    crate::storage::Storage::grow_data_region(&path, 1).expect("grow");
 
     // Reopen and allocate heavily; with a lost bitmap these allocations
     // land on t1's pages.
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(
         &storage,
@@ -344,7 +345,7 @@ fn rcsi_survives_a_crash_with_clean_recovery() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("rcsi-crash");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "ALTER DATABASE CURRENT SET READ_COMMITTED_SNAPSHOT ON",
@@ -366,7 +367,7 @@ fn rcsi_survives_a_crash_with_clean_recovery() {
     let _ = ctx;
     drop(storage);
 
-    let storage = Storage::open(path.clone()).expect("recovery");
+    let storage = RelStorage::open(path.clone()).expect("recovery");
     assert!(storage.rcsi_enabled());
     assert_eq!(
         storage.version_chain_count("t"),
@@ -399,7 +400,7 @@ fn row_locks_escalate_past_the_threshold() {
     use crate::lock::{LockMode, Resource};
 
     let path = unique_temp_path("escalation");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(
         &storage,
@@ -500,7 +501,7 @@ fn exec_scope_restores_variables_and_set_options() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("exec-scope");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(
         &storage,

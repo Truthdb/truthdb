@@ -23,7 +23,7 @@ use std::sync::{Arc, RwLock};
 use serde_json::{Value, json};
 use thiserror::Error;
 
-use crate::storage::{Storage, StorageError};
+use crate::storage::{RelStorage, StorageError};
 pub use search::CommandError;
 use search::{
     Command, ENGINE_WAL_ENTRY_TYPE, ENGINE_WAL_ENTRY_VERSION, EngineMeta, EngineState, SearchQuery,
@@ -49,12 +49,12 @@ const STANDBY_RESTARTPOINT_THRESHOLD: f64 = 0.5;
 /// concurrent native batch could read a relational batch's half-applied
 /// writes — which the old single-threaded actor prevented for free.
 pub struct Engine {
-    storage: Arc<Storage>,
+    storage: Arc<RelStorage>,
     meta: RwLock<EngineMeta>,
 }
 
 impl Engine {
-    pub fn new(storage: Storage) -> Result<Self, EngineError> {
+    pub fn new(storage: RelStorage) -> Result<Self, EngineError> {
         let mut meta = EngineMeta {
             state: EngineState::default(),
             next_seq_no: 1,
@@ -100,14 +100,14 @@ impl Engine {
     /// beside the engine's worker pool — the replication listener/sender on a
     /// primary and the replication receiver on a standby. `Storage` is
     /// internally synchronized, so the tasks and the workers share it safely.
-    pub fn storage_arc(&self) -> Arc<Storage> {
+    pub fn storage_arc(&self) -> Arc<RelStorage> {
         Arc::clone(&self.storage)
     }
 
     /// The underlying storage handle, so a test can drive an online backup
     /// while the engine is live.
     #[cfg(test)]
-    pub(crate) fn storage(&self) -> &Storage {
+    pub(crate) fn storage(&self) -> &RelStorage {
         &self.storage
     }
 
@@ -531,7 +531,7 @@ pub enum EngineError {
     Command(#[from] CommandError),
 
     #[error("storage error: {0}")]
-    Storage(#[from] StorageError),
+    RelStorage(#[from] StorageError),
 
     #[error("{0}")]
     Replay(String),

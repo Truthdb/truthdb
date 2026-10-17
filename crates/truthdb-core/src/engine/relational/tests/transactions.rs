@@ -26,7 +26,7 @@ fn txn_commit_is_durable_across_restart() {
 
     // Reopen: the committed rows must survive ARIES recovery.
     drop(engine);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("replay");
     let mut ctx = TxnContext::default();
     let out = batch(&engine, &mut ctx, "SELECT id FROM t ORDER BY id");
@@ -287,7 +287,7 @@ fn txn_uncommitted_explicit_txn_is_undone_after_crash() {
 
     // Recovery on reopen redoes history then undoes the loser (A): row 99
     // is gone, the committed row 1 survives.
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("replay");
     let out = batch(
         &engine,
@@ -339,7 +339,7 @@ fn txn_statement_rollback_then_crash_recovers_cleanly() {
 
     // Recovery undoes A entirely (10 and 11 gone); the compensated duplicate is
     // skipped via its CLR chain (no double-undo / corruption); row 1 survives.
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("replay");
     let out = batch(
         &engine,
@@ -477,7 +477,7 @@ fn save_transaction_rollback_then_crash_recovers_cleanly() {
     drop(ctx_a);
     drop(engine);
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("replay");
     let out = batch(
         &engine,

@@ -24,13 +24,13 @@ fn recovery_redo_is_idempotent_across_repeated_reopens() {
             .expect("update");
     }
     let expected = {
-        let engine = Engine::new(Storage::open(path.clone()).expect("open")).expect("engine");
+        let engine = Engine::new(RelStorage::open(path.clone()).expect("open")).expect("engine");
         sql_rows(&engine, "SELECT id, v FROM t ORDER BY id").1
     };
     // Reopen several more times: each reopen re-runs redo over the full log.
     // The state is invariant — proving redo re-application is idempotent.
     for _ in 0..3 {
-        let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("engine");
+        let engine = Engine::new(RelStorage::open(path.clone()).expect("reopen")).expect("engine");
         assert_eq!(
             sql_rows(&engine, "SELECT id, v FROM t ORDER BY id").1,
             expected,
@@ -64,7 +64,7 @@ fn commit_records_carry_a_recent_wall_clock_timestamp() {
     // Reopen so recovery's ring scan populates the replay cache; some
     // committed transaction's record carries a v2 entry with a wall-clock
     // timestamp in [before, after] (for point-in-time restore).
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let records = storage.replay_wal_entries().expect("replay");
     let mut found = false;
     for r in records {
@@ -91,7 +91,7 @@ fn commit_records_carry_a_recent_wall_clock_timestamp() {
 fn full_recovery_ring_full_reports_9002() {
     let path = unique_temp_path("backuplog-9002");
     // A small ring so the un-backed-up log fills it quickly.
-    let storage = Storage::create_with_wal_bounds(
+    let storage = RelStorage::create_with_wal_bounds(
         path.clone(),
         test_storage_options(),
         128 * 1024,

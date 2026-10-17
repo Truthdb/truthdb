@@ -1,7 +1,7 @@
 use super::super::prelude::*;
 
 pub(in crate::engine::relational) fn run_exec(
-    storage: &Storage,
+    storage: &RelStorage,
     exec: &ExecStatement,
     txn_ctx: &mut TxnContext,
     run: &mut BatchRun<'_>,

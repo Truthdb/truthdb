@@ -2,7 +2,7 @@ use super::super::prelude::*;
 use super::binding::FnResolver;
 
 pub(in crate::engine::relational) fn build_source(
-    storage: &Storage,
+    storage: &RelStorage,
     from: Option<&TableRef>,
     where_clause: &Option<Expr>,
     eval_ctx: &EvalContext,
@@ -14,7 +14,7 @@ pub(in crate::engine::relational) fn build_source(
 }
 
 pub(in crate::engine::relational) fn build_source_inner(
-    storage: &Storage,
+    storage: &RelStorage,
     from: Option<&TableRef>,
     where_clause: &Option<Expr>,
     eval_ctx: &EvalContext,
@@ -107,7 +107,7 @@ pub(in crate::engine::relational) fn permits(
 /// lacks the permission. A no-op for a bypassing session (sysadmin / dbo /
 /// internal) and inside any stored-object body (ownership chaining).
 pub(in crate::engine::relational) fn enforce_object_permission(
-    storage: &Storage,
+    storage: &RelStorage,
     def: &TableDef,
     sec: &SecurityContext,
     action: PermAction,
@@ -131,7 +131,7 @@ pub(in crate::engine::relational) fn enforce_object_permission(
 /// Builds the row source for one base table (or `sys.*` view), stamping every
 /// column with the table's qualifier (its alias, else its name).
 pub(in crate::engine::relational) fn build_table_source(
-    storage: &Storage,
+    storage: &RelStorage,
     name: &Name,
     alias: Option<&Name>,
     where_clause: &Option<Expr>,
@@ -332,7 +332,7 @@ pub(in crate::engine::relational) fn build_table_source(
 /// and statement_reads_tables); the body reads under the caller's ambient
 /// snapshot on this thread. Recursion is bounded by the shared view-depth guard.
 pub(in crate::engine::relational) fn build_function_source(
-    storage: &Storage,
+    storage: &RelStorage,
     name: &Name,
     args: &[Expr],
     alias: Option<&Name>,
@@ -442,7 +442,7 @@ pub(in crate::engine::relational) fn build_function_source(
 /// its statements populate; the accumulated rows are the function's result.
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine::relational) fn run_multi_statement_tvf(
-    storage: &Storage,
+    storage: &RelStorage,
     home_db_id: u32,
     function: &FunctionDef,
     returns_var: &str,
@@ -567,7 +567,7 @@ pub(in crate::engine::relational) fn run_multi_statement_tvf(
 /// Recursively builds a join tree's combined row source (base tables scan
 /// fully).
 pub(in crate::engine::relational) fn build_join(
-    storage: &Storage,
+    storage: &RelStorage,
     tref: &TableRef,
     eval_ctx: &EvalContext,
 ) -> Result<Source, SqlError> {
@@ -610,7 +610,7 @@ pub(in crate::engine::relational) fn build_join(
 /// the left row. CROSS APPLY drops a left row that produced none; OUTER APPLY
 /// keeps it with NULLs for the right columns.
 pub(in crate::engine::relational) fn build_apply(
-    storage: &Storage,
+    storage: &RelStorage,
     left: &TableRef,
     right: &TableRef,
     is_outer: bool,
@@ -705,7 +705,7 @@ pub(in crate::engine::relational) fn build_apply(
 /// outer references are substituted; a base table is unchanged. The rebound
 /// reference builds with no remaining correlation.
 pub(in crate::engine::relational) fn substitute_outer_in_tref(
-    storage: &Storage,
+    storage: &RelStorage,
     tref: &TableRef,
     outer: &dyn Fn(&str) -> Option<usize>,
     outer_row: &[SqlValue],
@@ -772,7 +772,7 @@ pub(in crate::engine::relational) fn substitute_outer_in_tref(
 /// every output column with the derived-table alias. Every column must be named
 /// (8155) and names must be unique within the derived table (8156).
 pub(in crate::engine::relational) fn build_derived_source(
-    storage: &Storage,
+    storage: &RelStorage,
     subquery: &Select,
     alias: &Name,
     eval_ctx: &EvalContext,

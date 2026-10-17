@@ -3,7 +3,7 @@ use super::prelude::*;
 // ---- INSERT -------------------------------------------------------------
 
 pub(super) fn exec_insert(
-    storage: &Storage,
+    storage: &RelStorage,
     insert: &Insert,
     scope: &mut TxnScope,
     eval_ctx: &EvalContext,
@@ -168,7 +168,7 @@ pub(super) fn exec_insert(
 /// declared column coercion, NOT NULL, and PRIMARY KEY uniqueness, all in memory
 /// so a ROLLBACK leaves the rows intact (SQL Server table-variable semantics).
 pub(super) fn exec_insert_table_var(
-    storage: &Storage,
+    storage: &RelStorage,
     insert: &Insert,
     ctx: &mut TxnContext,
     eval_ctx: &EvalContext,
@@ -293,7 +293,7 @@ pub(super) fn must_declare_table_var(name: &str) -> SqlError {
 /// `SELECT` is executed and its rows converted. Rejects an arity mismatch
 /// against the target column count (110 for VALUES, 120/121 for SELECT).
 pub(super) fn insert_input_rows(
-    storage: &Storage,
+    storage: &RelStorage,
     source: &InsertSource,
     target_len: usize,
     eval_ctx: &EvalContext,
@@ -385,7 +385,7 @@ pub(super) fn identity_datum(column_type: &ColumnType, v: i64) -> Result<Datum, 
 /// current state was changed or deleted by a writer the snapshot cannot see.
 /// Targeting a marked row is SQL Server's 3960 update conflict.
 pub(super) fn scan_located_for_dml(
-    storage: &Storage,
+    storage: &RelStorage,
     def: &TableDef,
 ) -> Result<Vec<(RowLocator, Vec<Datum>, bool)>, SqlError> {
     match current_snapshot() {
@@ -420,7 +420,7 @@ pub(super) fn update_conflict_error(table: &str, database: &str) -> SqlError {
 }
 
 pub(super) fn exec_update(
-    storage: &Storage,
+    storage: &RelStorage,
     update: &Update,
     scope: &mut TxnScope,
     eval_ctx: &EvalContext,
@@ -601,7 +601,7 @@ pub(super) fn exec_update(
 }
 
 pub(super) fn exec_delete(
-    storage: &Storage,
+    storage: &RelStorage,
     delete: &Delete,
     scope: &mut TxnScope,
     eval_ctx: &EvalContext,

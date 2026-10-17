@@ -3,7 +3,7 @@ use super::prelude::*;
 /// `CREATE|ALTER TRIGGER <name> ON <table> AFTER <events> AS <body>`: registers
 /// an AFTER DML trigger as a catalog object attached to its target table.
 pub(super) fn exec_create_trigger(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     create: &CreateTrigger,
 ) -> Result<StatementResult, SqlError> {
@@ -94,7 +94,7 @@ pub(super) fn exec_create_trigger(
 }
 
 pub(super) fn exec_drop_trigger(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     name: &Name,
     if_exists: bool,
@@ -124,7 +124,7 @@ pub(super) fn exec_drop_trigger(
 /// flag on one trigger (or every trigger on the table). A disabled trigger stays
 /// in the catalog but does not fire.
 pub(super) fn exec_set_trigger_state(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     trigger: &Option<Name>,
     table: &Name,
@@ -191,7 +191,7 @@ pub(super) fn exec_set_trigger_state(
 /// The triggers on `target_name` for `event`, split into AFTER triggers (fired
 /// after the DML) and the at-most-one INSTEAD OF trigger (fired in place of it).
 pub(super) fn triggers_for(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     target_name: &str,
     event: catalog::TriggerEvent,
@@ -221,7 +221,7 @@ pub(super) fn triggers_for(
 /// than commits, so DML + triggers share one transaction (a trigger ROLLBACK
 /// undoes the DML) and a trigger that ends the transaction raises 3609.
 pub(super) fn run_dml_with_triggers(
-    storage: &Storage,
+    storage: &RelStorage,
     txn_ctx: &mut TxnContext,
     target_def: &TableDef,
     triggers: Vec<TableDef>,
@@ -310,7 +310,7 @@ pub(super) type TriggerImages = (Vec<Vec<Datum>>, Vec<Vec<Datum>>);
 /// DML+trigger transaction/firing/error machinery with a DML step that only
 /// computes and captures the images, writing nothing.
 pub(super) fn run_instead_of(
-    storage: &Storage,
+    storage: &RelStorage,
     txn_ctx: &mut TxnContext,
     target: &TableDef,
     trigger: TableDef,
@@ -329,7 +329,7 @@ pub(super) fn run_instead_of(
 /// DEFAULTs applied and the identity column left NULL (the body's own insert
 /// generates it). Constraints are not enforced here.
 pub(super) fn instead_of_insert_images(
-    storage: &Storage,
+    storage: &RelStorage,
     insert: &Insert,
     def: &TableDef,
     eval_ctx: &EvalContext,
@@ -379,7 +379,7 @@ pub(super) fn instead_of_insert_images(
 /// UPDATE trigger sees for the rows matching the WHERE clause. Constraints are
 /// not enforced here.
 pub(super) fn instead_of_update_images(
-    storage: &Storage,
+    storage: &RelStorage,
     update: &Update,
     def: &TableDef,
     eval_ctx: &EvalContext,
@@ -422,7 +422,7 @@ pub(super) fn instead_of_update_images(
 /// The `deleted` image an INSTEAD OF DELETE trigger sees: the rows matching the
 /// WHERE clause (none are actually removed).
 pub(super) fn instead_of_delete_images(
-    storage: &Storage,
+    storage: &RelStorage,
     delete: &Delete,
     def: &TableDef,
     eval_ctx: &EvalContext,
@@ -450,7 +450,7 @@ pub(super) fn instead_of_delete_images(
 /// `inserted`/`deleted` view armed, bounded by the nesting cap. Direct
 /// self-recursion is suppressed (recursive triggers OFF).
 pub(super) fn fire_one_trigger(
-    storage: &Storage,
+    storage: &RelStorage,
     txn_ctx: &mut TxnContext,
     trig_def: &TableDef,
     tables: &std::rc::Rc<TriggerTables>,

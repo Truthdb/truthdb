@@ -46,8 +46,8 @@ fn a_readable_standby_serves_only_committed_state() {
         .read_wal_range(backup_end, mid)
         .expect("delta");
 
-    Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
         .apply_wal_stream(backup_end, &delta)
@@ -65,7 +65,7 @@ fn a_readable_standby_serves_only_committed_state() {
 
     // The store rebuilds at reopen from the retained ring.
     drop(standby);
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     assert_eq!(
         sql_rows(&standby, "SELECT v FROM t WHERE id = 1").1,
         vec![vec![Some("1".into())]],
@@ -173,8 +173,8 @@ fn readable_standby_handles_heap_cells_and_statement_rollbacks() {
         .read_wal_range(backup_end, mid)
         .expect("delta");
 
-    Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
         .apply_wal_stream(backup_end, &delta)
@@ -304,8 +304,8 @@ fn replication_dmvs_report_slots_lag_and_role() {
 
     // A standby reports its own role and applied position.
     let summary = primary.storage().backup_full(&bak).expect("backup");
-    Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("seed");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     let _ = summary;
     let (_, srows) = sql_rows(
         &standby,

@@ -117,7 +117,7 @@ fn principal_table_def(
 
 use super::super::*;
 
-impl Storage {
+impl RelStorage {
     // Logins do not participate in lock analysis, so — unlike table/proc DDL —
     // they do not bump the lock-analysis epoch. They DO bump the security
     // version: which login is named `sa` decides the synthesized sa→sysadmin

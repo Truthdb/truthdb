@@ -60,7 +60,7 @@ pub(in crate::engine::relational) fn end_of_scope(flow: Flow) -> Result<(), SqlE
 }
 
 pub(in crate::engine::relational) fn run_block(
-    storage: &Storage,
+    storage: &RelStorage,
     statements: &[Statement],
     txn_ctx: &mut TxnContext,
     run: &mut BatchRun<'_>,

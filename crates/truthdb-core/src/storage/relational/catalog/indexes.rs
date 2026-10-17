@@ -1,6 +1,6 @@
 use super::super::super::*;
 
-impl Storage {
+impl RelStorage {
     pub(crate) fn rel_create_index(
         &self,
         db_id: u32,

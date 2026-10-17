@@ -8,7 +8,7 @@ use crate::engine::*;
 #[test]
 fn mixed_search_and_relational_wal_replays_in_order() {
     let path = unique_temp_path("mixed-wal");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("storage create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("storage create");
     let engine = Engine::new(storage).expect("engine create");
 
     engine
@@ -32,7 +32,7 @@ fn mixed_search_and_relational_wal_replays_in_order() {
     }
     drop(engine); // crash: everything lives in the shared WAL only
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("recover both subsystems");
 
     let response = engine
@@ -60,7 +60,7 @@ fn mixed_search_and_relational_wal_replays_in_order() {
 fn engine_replay_ignores_relational_wal_records() {
     let path = unique_temp_path("rel-coexistence");
     let mut storage =
-        Storage::create(path.clone(), test_storage_options()).expect("storage create");
+        RelStorage::create(path.clone(), test_storage_options()).expect("storage create");
     // Relational records land in the same ring before and between search
     // events; search replay must skip them.
     let extent = storage.allocate_extent(false).expect("extent");
@@ -79,7 +79,7 @@ fn engine_replay_ignores_relational_wal_records() {
         .expect("insert");
     drop(engine);
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("engine replay with rel records");
     let response = engine
         .execute(r#"search notes { "query": { "match": { "body": "coexistence" } } }"#)

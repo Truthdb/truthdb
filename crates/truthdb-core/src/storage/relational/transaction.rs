@@ -1,6 +1,6 @@
 use super::super::*;
 
-impl Storage {
+impl RelStorage {
     /// Whether `READ_COMMITTED_SNAPSHOT` is on (readable without the storage
     /// mutex — checked per statement and during lock analysis).
     pub(crate) fn rcsi_enabled(&self) -> bool {

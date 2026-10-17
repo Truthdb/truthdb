@@ -37,7 +37,7 @@ fn procedure_ddl_round_trips_and_survives_reopen() {
 
     // The definition survives a reopen; DROP removes it.
     let engine = {
-        let storage = Storage::open(path.clone()).expect("reopen");
+        let storage = RelStorage::open(path.clone()).expect("reopen");
         Engine::new(storage).expect("engine")
     };
     let mut ctx = TxnContext::default();

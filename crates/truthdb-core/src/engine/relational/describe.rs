@@ -14,7 +14,7 @@ use super::prelude::*;
 /// unresolvable variable as a non-seekable predicate and falls back to the
 /// scan, and output columns come from the table schema either way — pinned by
 /// the parameterized-describe test.
-pub fn describe_first_result_set(storage: &Storage, tsql: &str) -> Result<RowSet, SqlError> {
+pub fn describe_first_result_set(storage: &RelStorage, tsql: &str) -> Result<RowSet, SqlError> {
     let undeterminable = || {
         SqlError::new(
             11514,

@@ -1,6 +1,6 @@
 use super::*;
 
-impl Storage {
+impl RelStorage {
     pub fn rel_insert(
         &self,
         db_id: u32,

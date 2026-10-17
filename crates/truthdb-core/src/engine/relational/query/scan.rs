@@ -74,7 +74,7 @@ pub(in crate::engine::relational) struct ScanPlan {
 /// *less* than a scan, and reading the whole table to filter it down would
 /// trade the planner's work for this one's.
 pub(in crate::engine::relational) fn scan_plan(
-    storage: &Storage,
+    storage: &RelStorage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Option<ScanPlan> {
@@ -427,7 +427,7 @@ pub(in crate::engine::relational) fn is_sys_view(name: &str) -> bool {
 /// zero, an overflow) now goes unraised — which is SQL Server's behaviour, whose
 /// Top operator likewise stops asking its child for rows.
 pub(in crate::engine::relational) fn scan_select(
-    storage: &Storage,
+    storage: &RelStorage,
     plan: &ScanPlan,
     select: &Select,
     eval_ctx: &EvalContext,
@@ -453,7 +453,7 @@ pub(in crate::engine::relational) const STREAM_CHUNK_ROWS: usize = 256;
 /// full chunks already emitted stand — the caller closes the set (see
 /// [`BatchRun::abort_open_rowset`]) — and the partial chunk is dropped.
 pub(in crate::engine::relational) fn scan_select_streamed(
-    storage: &Storage,
+    storage: &RelStorage,
     plan: &ScanPlan,
     select: &Select,
     eval_ctx: &EvalContext,
@@ -478,7 +478,7 @@ pub(in crate::engine::relational) fn scan_select_streamed(
 /// executions of the scan shape ride this walk: [`scan_select`] collects into
 /// a `RowSet`, [`scan_select_streamed`] emits chunks as slices are read.
 pub(in crate::engine::relational) fn scan_select_rows(
-    storage: &Storage,
+    storage: &RelStorage,
     plan: &ScanPlan,
     select: &Select,
     eval_ctx: &EvalContext,

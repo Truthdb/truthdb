@@ -3,7 +3,7 @@ use super::*;
 // ---- batched scans (ScanCursor) -------------------------------------------
 
 /// Walks a table in slices of `budget` rows, as a streaming reader would.
-fn scan_batched_ids(storage: &mut Storage, table: &str, budget: usize) -> Vec<i32> {
+fn scan_batched_ids(storage: &mut RelStorage, table: &str, budget: usize) -> Vec<i32> {
     use crate::relstore::btree::{BTree, ScanCursor};
     use crate::relstore::heap::Heap;
     let (def, schema) = storage.rel_def_for_test(table).expect("def");
@@ -174,7 +174,7 @@ fn a_sliced_scan_takes_the_storage_lock_once_per_slice_not_once_per_table() {
     // hoisted the guard out of the loop — the exact regression this guards, and
     // an easy one to write — takes the count to zero and fails here.
     let path = unique_temp_path("scan-sliced-lock");
-    let mut storage = Storage::create_with_wal_bounds(
+    let mut storage = RelStorage::create_with_wal_bounds(
         path.clone(),
         storage_options(),
         64 * 1024 * 1024,

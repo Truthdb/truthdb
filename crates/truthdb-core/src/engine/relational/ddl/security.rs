@@ -1,7 +1,7 @@
 use super::super::prelude::*;
 
 pub(in crate::engine::relational) fn exec_create_login(
-    storage: &Storage,
+    storage: &RelStorage,
     create: &CreateLogin,
 ) -> Result<StatementResult, SqlError> {
     let bare = strip_schema(&create.name.value);
@@ -56,7 +56,7 @@ pub(in crate::engine::relational) fn exec_create_login(
 }
 
 pub(in crate::engine::relational) fn exec_drop_login(
-    storage: &Storage,
+    storage: &RelStorage,
     name: &Name,
     if_exists: bool,
 ) -> Result<StatementResult, SqlError> {
@@ -81,7 +81,7 @@ pub(in crate::engine::relational) fn exec_drop_login(
 /// `CREATE USER <name> [FOR LOGIN <login>]`. A database principal in its own
 /// namespace (out of the object namespace), optionally mapped to a login.
 pub(in crate::engine::relational) fn exec_create_user(
-    storage: &Storage,
+    storage: &RelStorage,
     create: &CreateUser,
 ) -> Result<StatementResult, SqlError> {
     let bare = strip_schema(&create.name.value);
@@ -120,7 +120,7 @@ pub(in crate::engine::relational) fn exec_create_user(
 
 /// `CREATE ROLE <name>`.
 pub(in crate::engine::relational) fn exec_create_role(
-    storage: &Storage,
+    storage: &RelStorage,
     name: &Name,
 ) -> Result<StatementResult, SqlError> {
     let bare = strip_schema(&name.value);
@@ -145,7 +145,7 @@ pub(in crate::engine::relational) fn exec_create_role(
 /// a mismatch (DROP USER on a role, or vice versa) reports not-found for the
 /// requested kind, as SQL Server does.
 pub(in crate::engine::relational) fn exec_drop_database_principal(
-    storage: &Storage,
+    storage: &RelStorage,
     name: &Name,
     if_exists: bool,
     expect_role: bool,
@@ -175,7 +175,7 @@ pub(in crate::engine::relational) fn exec_drop_database_principal(
 
 /// `ALTER ROLE <role> ADD|DROP MEMBER <member>`.
 pub(in crate::engine::relational) fn exec_alter_role_member(
-    storage: &Storage,
+    storage: &RelStorage,
     role: &Name,
     action: RoleMemberAction,
     member: &Name,
@@ -208,7 +208,7 @@ pub(in crate::engine::relational) fn map_perm_action(action: PermissionAction) -
 /// (a bypassing principal — sysadmin / dbo / db_owner / internal). Here we just
 /// resolve the securable and apply each (grantee, action).
 pub(in crate::engine::relational) fn exec_permission(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     stmt: &PermissionStatement,
     _sec: &SecurityContext,

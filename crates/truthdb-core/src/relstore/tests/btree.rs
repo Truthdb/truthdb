@@ -90,7 +90,7 @@ fn btree_matches_btreemap_oracle_through_splits_and_crash() {
         }
     }
 
-    let verify = |storage: &mut Storage, oracle: &BTreeMap<i32, String>| {
+    let verify = |storage: &mut RelStorage, oracle: &BTreeMap<i32, String>| {
         let rows = storage
             .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
             .expect("scan");
@@ -103,7 +103,7 @@ fn btree_matches_btreemap_oracle_through_splits_and_crash() {
     verify(&mut storage, &oracle);
     drop(storage); // crash without a final checkpoint
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     verify(&mut storage, &oracle);
     drop(storage);
     let _ = std::fs::remove_file(path);
@@ -128,7 +128,7 @@ fn multi_level_splits_survive_crash() {
     }
     drop(storage); // crash: splits only exist as WAL images
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     assert_eq!(scan_ids(&mut storage, "t"), (0..300).collect::<Vec<_>>());
     // The recovered tree keeps working (routing, further splits).
     for i in 300..340 {

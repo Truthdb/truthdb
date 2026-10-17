@@ -197,12 +197,9 @@ impl Storage {
 
     /// Wraps an opened/created [`StorageFile`] in a `Storage`, spawning the
     /// group-commit log-writer over a duplicated WAL fd.
-    pub(super) fn with_log_writer(path: PathBuf, mut file: Locked) -> Result<Self, StorageError> {
+    pub(super) fn with_log_writer(path: PathBuf, file: Locked) -> Result<Self, StorageError> {
         let wal_fd = file.try_clone_wal_fd()?;
         let (gc, log_writer) = GroupCommit::start(wal_fd);
-        let rcsi = file.rel().version.rcsi;
-        let allow_snapshot = file.rel().version.allow_snapshot;
-        let recovery_full = file.core.recovery_full;
         Ok(Storage {
             path,
             inner: std::sync::Mutex::new(file),
@@ -210,22 +207,6 @@ impl Storage {
             sync_commit: SyncCommitState::default(),
             repl_connected: std::sync::Mutex::new(std::collections::HashSet::new()),
             log_writer: Some(log_writer),
-            rcsi: std::sync::atomic::AtomicBool::new(rcsi),
-            allow_snapshot: std::sync::atomic::AtomicBool::new(allow_snapshot),
-            recovery_full: std::sync::atomic::AtomicBool::new(recovery_full),
-            lock_epoch: std::sync::atomic::AtomicU64::new(0),
-            security_version: std::sync::atomic::AtomicU64::new(0),
-            membership: std::sync::Mutex::new(MembershipCache::default()),
-            #[cfg(test)]
-            scan_slices: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            scan_selects: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            covering_scans: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            scan_materializations: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
-            last_scan_width: std::sync::atomic::AtomicUsize::new(usize::MAX),
         })
     }
 

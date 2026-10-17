@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::engine::relational) fn sys_server_principals(storage: &Storage) -> Source {
+pub(in crate::engine::relational) fn sys_server_principals(storage: &RelStorage) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("principal_id"),
@@ -46,7 +46,7 @@ pub(in crate::engine::relational) fn sys_server_principals(storage: &Storage) ->
     }
 }
 
-pub(in crate::engine::relational) fn sys_sql_logins(storage: &Storage) -> Source {
+pub(in crate::engine::relational) fn sys_sql_logins(storage: &RelStorage) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("principal_id"),
@@ -74,7 +74,7 @@ pub(in crate::engine::relational) fn sys_sql_logins(storage: &Storage) -> Source
     }
 }
 
-pub(in crate::engine::relational) fn sys_database_principals(storage: &Storage) -> Source {
+pub(in crate::engine::relational) fn sys_database_principals(storage: &RelStorage) -> Source {
     use crate::relstore::catalog::PrincipalKind;
     let columns = vec![
         nvarchar("name", 128),
@@ -129,7 +129,7 @@ pub(in crate::engine::relational) fn sys_database_principals(storage: &Storage) 
     }
 }
 
-pub(in crate::engine::relational) fn sys_database_role_members(storage: &Storage) -> Source {
+pub(in crate::engine::relational) fn sys_database_role_members(storage: &RelStorage) -> Source {
     let columns = vec![int_col("role_principal_id"), int_col("member_principal_id")];
     let mut rows: Vec<Vec<Datum>> = Vec::new();
     // Synthesized: the dbo user is a member of db_owner.
@@ -159,7 +159,7 @@ pub(in crate::engine::relational) fn sys_database_role_members(storage: &Storage
 }
 
 pub(in crate::engine::relational) fn sys_database_permissions(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
 ) -> Source {
     let columns = vec![

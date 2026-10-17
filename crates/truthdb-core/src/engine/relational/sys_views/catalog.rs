@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::engine::relational) fn sys_tables(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_tables(storage: &RelStorage, db_id: u32) -> Source {
     let columns = vec![int_col("object_id"), nvarchar("name", 128)];
     let rows = storage
         .rel_tables()
@@ -23,7 +23,7 @@ pub(in crate::engine::relational) fn sys_tables(storage: &Storage, db_id: u32) -
     }
 }
 
-pub(in crate::engine::relational) fn sys_parameters(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_parameters(storage: &RelStorage, db_id: u32) -> Source {
     let columns = vec![
         int_col("object_id"),
         nvarchar("name", 128),
@@ -99,7 +99,7 @@ pub(in crate::engine::relational) fn sys_parameters(storage: &Storage, db_id: u3
     }
 }
 
-pub(in crate::engine::relational) fn sys_objects(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_objects(storage: &RelStorage, db_id: u32) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("object_id"),
@@ -150,7 +150,7 @@ pub(in crate::engine::relational) fn sys_objects(storage: &Storage, db_id: u32) 
     }
 }
 
-pub(in crate::engine::relational) fn sys_columns(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_columns(storage: &RelStorage, db_id: u32) -> Source {
     let columns = vec![
         int_col("object_id"),
         nvarchar("name", 128),
@@ -195,7 +195,7 @@ pub(in crate::engine::relational) fn sys_columns(storage: &Storage, db_id: u32) 
     }
 }
 
-pub(in crate::engine::relational) fn sys_indexes(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_indexes(storage: &RelStorage, db_id: u32) -> Source {
     let columns = vec![
         int_col("object_id"),
         int_col("index_id"),
@@ -230,7 +230,7 @@ pub(in crate::engine::relational) fn sys_indexes(storage: &Storage, db_id: u32) 
 }
 
 pub(in crate::engine::relational) fn sys_check_constraints(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
 ) -> Source {
     let columns = vec![
@@ -261,7 +261,7 @@ pub(in crate::engine::relational) fn sys_check_constraints(
     }
 }
 
-pub(in crate::engine::relational) fn sys_foreign_keys(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_foreign_keys(storage: &RelStorage, db_id: u32) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("parent_object_id"),
@@ -302,7 +302,7 @@ pub(in crate::engine::relational) fn sys_foreign_keys(storage: &Storage, db_id: 
 }
 
 pub(in crate::engine::relational) fn sys_default_constraints(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
 ) -> Source {
     let columns = vec![

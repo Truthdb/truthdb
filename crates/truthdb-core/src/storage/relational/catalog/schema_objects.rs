@@ -1,6 +1,6 @@
 use super::super::super::*;
 
-impl Storage {
+impl RelStorage {
     #[allow(clippy::too_many_arguments)]
     pub fn rel_create_table(
         &self,

@@ -1,6 +1,6 @@
 use super::*;
 
-pub(in crate::engine::relational) fn sys_views(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_views(storage: &RelStorage, db_id: u32) -> Source {
     let columns = vec![
         int_col("object_id"),
         nvarchar("name", 128),
@@ -33,7 +33,7 @@ pub(in crate::engine::relational) fn sys_views(storage: &Storage, db_id: u32) ->
 /// `sys.sql_modules`: the SQL definition of each module (currently views), keyed
 /// by `object_id`. SQL Server surfaces view/procedure/trigger text here; today
 /// only views carry a definition.
-pub(in crate::engine::relational) fn sys_sql_modules(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_sql_modules(storage: &RelStorage, db_id: u32) -> Source {
     let columns = vec![int_col("object_id"), nvarchar("definition", 4000)];
     let rows = storage
         .rel_tables()
@@ -69,7 +69,7 @@ pub(in crate::engine::relational) fn sys_sql_modules(storage: &Storage, db_id: u
     }
 }
 
-pub(in crate::engine::relational) fn sys_procedures(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_procedures(storage: &RelStorage, db_id: u32) -> Source {
     let columns = vec![nvarchar("name", 128), int_col("object_id")];
     let rows = storage
         .rel_tables()
@@ -93,7 +93,7 @@ pub(in crate::engine::relational) fn sys_procedures(storage: &Storage, db_id: u3
     }
 }
 
-pub(in crate::engine::relational) fn sys_triggers(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_triggers(storage: &RelStorage, db_id: u32) -> Source {
     let columns = vec![
         nvarchar("name", 128),
         int_col("object_id"),
@@ -128,7 +128,10 @@ pub(in crate::engine::relational) fn sys_triggers(storage: &Storage, db_id: u32)
     }
 }
 
-pub(in crate::engine::relational) fn sys_trigger_events(storage: &Storage, db_id: u32) -> Source {
+pub(in crate::engine::relational) fn sys_trigger_events(
+    storage: &RelStorage,
+    db_id: u32,
+) -> Source {
     let columns = vec![
         int_col("object_id"),
         int_col("type"),

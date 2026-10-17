@@ -31,7 +31,7 @@ fn heap_updates_move_rows_with_forwarding_stubs() {
     assert_eq!(ids, vec![0, 1, 2], "moved row appears exactly once");
     drop(storage); // crash
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     let rows = storage
         .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "h")
         .expect("scan");

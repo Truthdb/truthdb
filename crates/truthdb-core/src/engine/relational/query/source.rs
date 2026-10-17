@@ -45,7 +45,7 @@ pub(in crate::engine::relational) struct ScanStream {
 impl ScanStream {
     pub(super) fn next_slice(
         &mut self,
-        storage: &Storage,
+        storage: &RelStorage,
     ) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
         let mut slice = Vec::new();
         while !self.cursor.done() && slice.is_empty() {
@@ -76,7 +76,7 @@ pub(in crate::engine::relational) struct MaterializedSource {
 }
 
 impl MaterializedSource {
-    pub(super) fn from(source: Source, storage: &Storage) -> Result<Self, SqlError> {
+    pub(super) fn from(source: Source, storage: &RelStorage) -> Result<Self, SqlError> {
         let Source {
             columns,
             collations,
@@ -97,7 +97,7 @@ impl SourceRows {
     /// materialized source hands everything in one batch.
     pub(super) fn next_slice(
         &mut self,
-        storage: &Storage,
+        storage: &RelStorage,
     ) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
         match self {
             SourceRows::Materialized(rows) => {
@@ -113,7 +113,7 @@ impl SourceRows {
 
     /// The whole input, for consumers that need it at once. A scan drains its
     /// remaining slices; a materialized source hands its rows over as-is.
-    pub(super) fn materialize(self, storage: &Storage) -> Result<Vec<Vec<Datum>>, SqlError> {
+    pub(super) fn materialize(self, storage: &RelStorage) -> Result<Vec<Vec<Datum>>, SqlError> {
         match self {
             SourceRows::Materialized(rows) => Ok(rows),
             SourceRows::Scan(mut stream) => {

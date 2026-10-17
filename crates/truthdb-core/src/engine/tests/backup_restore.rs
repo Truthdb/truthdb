@@ -44,8 +44,8 @@ fn full_backup_and_offline_restore_round_trips_relational_data() {
     drop(engine);
 
     // Offline restore into a fresh file, then open it and compare.
-    Storage::restore_full(&restored, &bak).expect("offline restore");
-    let engine2 = Engine::new(Storage::open(restored.clone()).expect("open restored"))
+    crate::storage::Storage::restore_full(&restored, &bak).expect("offline restore");
+    let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open restored"))
         .expect("engine on restored file");
 
     assert_eq!(
@@ -108,9 +108,9 @@ fn backup_database_statement_backs_up_and_restores() {
     assert!(env["error"].is_null(), "BACKUP DATABASE failed: {env}");
     drop(engine);
 
-    Storage::restore_full(&restored, &bak).expect("restore");
+    crate::storage::Storage::restore_full(&restored, &bak).expect("restore");
     let engine2 =
-        Engine::new(Storage::open(restored.clone()).expect("open restored")).expect("engine");
+        Engine::new(RelStorage::open(restored.clone()).expect("open restored")).expect("engine");
     assert_eq!(
         sql_rows(&engine2, "SELECT id, name FROM t ORDER BY id").1,
         expected,
@@ -172,7 +172,7 @@ fn recovery_model_sets_persists_and_reports() {
     drop(engine);
 
     // FULL persists across a reopen (the set is itself durable).
-    let engine2 = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("engine");
+    let engine2 = Engine::new(RelStorage::open(path.clone()).expect("reopen")).expect("engine");
     assert_eq!(model(&engine2), vec![vec![Some("FULL".into())]]);
     assert_eq!(
         sql_rows(
@@ -290,8 +290,8 @@ fn restoring_a_full_recovery_database_opens_and_checkpoints_cleanly() {
         .expect("full backup of a FULL-model db");
     drop(engine);
 
-    Storage::restore_full(&restored, &bak).expect("restore");
-    let engine2 = Engine::new(Storage::open(restored.clone()).expect("open")).expect("engine");
+    crate::storage::Storage::restore_full(&restored, &bak).expect("restore");
+    let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("engine");
     assert_eq!(
         sql_rows(&engine2, "SELECT id, v FROM t ORDER BY id").1,
         expected
@@ -368,9 +368,14 @@ fn restore_full_plus_log_chain_recovers_post_backup_changes() {
     drop(engine);
 
     // Full + the whole log chain recovers EVERY committed change.
-    Storage::restore_full_with_logs(&restored, &bak, &[trn1.clone(), trn2.clone()], None)
-        .expect("restore full + log chain");
-    let engine2 = Engine::new(Storage::open(restored.clone()).expect("open")).expect("engine");
+    crate::storage::Storage::restore_full_with_logs(
+        &restored,
+        &bak,
+        &[trn1.clone(), trn2.clone()],
+        None,
+    )
+    .expect("restore full + log chain");
+    let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("engine");
     assert_eq!(
         sql_rows(&engine2, "SELECT id, v FROM t ORDER BY id").1,
         expected,
@@ -378,9 +383,9 @@ fn restore_full_plus_log_chain_recovers_post_backup_changes() {
     );
 
     // The full backup alone recovers only the 20 rows at its point.
-    Storage::restore_full(&restored_full_only, &bak).expect("restore full only");
+    crate::storage::Storage::restore_full(&restored_full_only, &bak).expect("restore full only");
     let engine3 =
-        Engine::new(Storage::open(restored_full_only.clone()).expect("open")).expect("engine");
+        Engine::new(RelStorage::open(restored_full_only.clone()).expect("open")).expect("engine");
     assert_eq!(
         sql_rows(&engine3, "SELECT COUNT(*) FROM t").1,
         vec![vec![Some("20".into())]],
@@ -390,15 +395,21 @@ fn restore_full_plus_log_chain_recovers_post_backup_changes() {
     // A gap in the chain (apply only the second log) is rejected (4305), and
     // the partial destination is removed so a retry can reuse the path.
     assert!(
-        Storage::restore_full_with_logs(&restored_gap, &bak, &[trn2.clone()], None).is_err(),
+        crate::storage::Storage::restore_full_with_logs(&restored_gap, &bak, &[trn2.clone()], None)
+            .is_err(),
         "a log-chain gap is rejected"
     );
     assert!(
         !restored_gap.exists(),
         "the partial destination is cleaned up on error"
     );
-    Storage::restore_full_with_logs(&restored_gap, &bak, &[trn1.clone(), trn2.clone()], None)
-        .expect("retry with the full chain to the same path succeeds after cleanup");
+    crate::storage::Storage::restore_full_with_logs(
+        &restored_gap,
+        &bak,
+        &[trn1.clone(), trn2.clone()],
+        None,
+    )
+    .expect("retry with the full chain to the same path succeeds after cleanup");
 
     drop(engine2);
     drop(engine3);
@@ -442,7 +453,7 @@ fn point_in_time_restore_stops_at_a_commit_timestamp() {
     // read the commit timestamps in LSN order: create, insert-1, insert-2,
     // insert-3. Stopping at insert-1's timestamp must keep row 1 (ts == stop
     // is not "after") and undo rows 2 and 3 (ts > stop).
-    let storage = Storage::open(src.clone()).expect("reopen src");
+    let storage = RelStorage::open(src.clone()).expect("reopen src");
     let mut commit_ts: Vec<u64> = Vec::new();
     for r in storage.replay_wal_entries().expect("replay") {
         if r.entry_type != WAL_ENTRY_TYPE_REL {
@@ -465,8 +476,9 @@ fn point_in_time_restore_stops_at_a_commit_timestamp() {
     );
 
     // Point-in-time restore of the full backup, stopping after insert-1.
-    Storage::restore_full_with_logs(&restored, &bak, &[], Some(stop_at)).expect("pitr restore");
-    let engine2 = Engine::new(Storage::open(restored.clone()).expect("open")).expect("engine");
+    crate::storage::Storage::restore_full_with_logs(&restored, &bak, &[], Some(stop_at))
+        .expect("pitr restore");
+    let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("engine");
     assert_eq!(
         sql_rows(&engine2, "SELECT id FROM t ORDER BY id").1,
         vec![vec![Some("1".into())]],
@@ -477,7 +489,7 @@ fn point_in_time_restore_stops_at_a_commit_timestamp() {
     // The undo persists: a plain reopen (no stop point) still shows only
     // row 1 — the losers were rolled back durably via CLRs, not re-derived
     // from stop_at.
-    let engine3 = Engine::new(Storage::open(restored.clone()).expect("reopen")).expect("engine");
+    let engine3 = Engine::new(RelStorage::open(restored.clone()).expect("reopen")).expect("engine");
     assert_eq!(
         sql_rows(&engine3, "SELECT id FROM t ORDER BY id").1,
         vec![vec![Some("1".into())]],
@@ -669,8 +681,8 @@ fn backup_under_concurrent_write_load_restores_to_a_consistent_prefix() {
     // prefix 1..=k — a gap would mean a torn page, an id past k an
     // uncommitted write leaked in. k lies between the 20 baseline rows and
     // the writer's max (80).
-    Storage::restore_full(&restored, &bak).expect("restore");
-    let engine2 = Engine::new(Storage::open(restored.clone()).expect("open")).expect("engine");
+    crate::storage::Storage::restore_full(&restored, &bak).expect("restore");
+    let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("engine");
     let (_, rows) = sql_rows(&engine2, "SELECT id FROM t ORDER BY id");
     let ids: Vec<i64> = rows
         .iter()
@@ -734,8 +746,8 @@ fn a_failed_backup_leaves_the_database_writable_and_backuppable() {
     drop(engine);
 
     // And that good backup restores the surviving rows.
-    Storage::restore_full(&restored, &good).expect("restore");
-    let engine2 = Engine::new(Storage::open(restored.clone()).expect("open")).expect("engine");
+    crate::storage::Storage::restore_full(&restored, &good).expect("restore");
+    let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("engine");
     assert_eq!(
         sql_rows(&engine2, "SELECT id FROM t ORDER BY id").1,
         vec![vec![Some("1".into())], vec![Some("2".into())]],
@@ -824,7 +836,7 @@ fn log_backup_marker_and_hold_survive_reopen() {
     let marker = engine.storage().last_log_backup_lsn();
     drop(engine);
 
-    let engine2 = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("engine");
+    let engine2 = Engine::new(RelStorage::open(path.clone()).expect("reopen")).expect("engine");
     assert_eq!(
         engine2.storage().last_log_backup_lsn(),
         marker,

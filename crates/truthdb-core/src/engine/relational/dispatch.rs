@@ -5,7 +5,7 @@ use super::prelude::*;
 /// uses [`execute_batch`].
 #[cfg(test)]
 #[allow(dead_code)]
-pub fn execute(storage: &Storage, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
+pub fn execute(storage: &RelStorage, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
     let mut txn_ctx = TxnContext::default();
     let outcome = execute_batch(storage, sql, &mut txn_ctx);
     match outcome.error {
@@ -24,7 +24,7 @@ impl TxnContext {
 }
 
 pub(super) fn exec_statement(
-    storage: &Storage,
+    storage: &RelStorage,
     statement: &Statement,
     txn_ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
@@ -55,7 +55,7 @@ pub(super) fn exec_statement(
 }
 
 pub(super) fn exec_statement_dispatch(
-    storage: &Storage,
+    storage: &RelStorage,
     statement: &Statement,
     txn_ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
@@ -609,7 +609,7 @@ pub(super) fn flatten_statements<'a>(statements: &'a [Statement], out: &mut Vec<
 /// Builds a one-column `SHOWPLAN_TEXT` rowset describing a SELECT's access
 /// path, without executing it.
 pub(super) fn showplan_rows(
-    storage: &Storage,
+    storage: &RelStorage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {

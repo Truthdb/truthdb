@@ -9,7 +9,7 @@ use super::*;
 /// are supported; a correlated one references an outer column and fails to
 /// resolve when executed independently.
 pub(in crate::engine::relational) fn rewrite_select_subqueries(
-    storage: &Storage,
+    storage: &RelStorage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<Select, SqlError> {
@@ -80,18 +80,18 @@ pub(in crate::engine::relational) fn rewrite_select_subqueries(
 /// result: a scalar `(SELECT ...)` -> a literal, `EXISTS (...)` -> a boolean,
 /// `expr IN (SELECT ...)` -> an `InList` of the subquery's values.
 pub(in crate::engine::relational) fn rewrite_subqueries(
-    storage: &Storage,
+    storage: &RelStorage,
     expr: &Expr,
     eval_ctx: &EvalContext,
     correlated_scope: Option<&JoinScope>,
 ) -> Result<Expr, SqlError> {
     let recur =
-        |storage: &Storage, e: &Expr| rewrite_subqueries(storage, e, eval_ctx, correlated_scope);
-    let recur_box = |storage: &Storage, e: &Expr| -> Result<Box<Expr>, SqlError> {
+        |storage: &RelStorage, e: &Expr| rewrite_subqueries(storage, e, eval_ctx, correlated_scope);
+    let recur_box = |storage: &RelStorage, e: &Expr| -> Result<Box<Expr>, SqlError> {
         Ok(Box::new(recur(storage, e)?))
     };
     let recur_opt =
-        |storage: &Storage, e: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, SqlError> {
+        |storage: &RelStorage, e: &Option<Box<Expr>>| -> Result<Option<Box<Expr>>, SqlError> {
             e.as_ref().map(|e| recur_box(storage, e)).transpose()
         };
     // A subquery correlated with the enclosing query (`correlated_scope`) is left
@@ -230,7 +230,7 @@ pub(in crate::engine::relational) fn rewrite_subqueries(
 /// for 1 row, error 512 for more than 1 row; error 116 if it is not exactly one
 /// column wide.
 pub(in crate::engine::relational) fn eval_scalar_subquery(
-    storage: &Storage,
+    storage: &RelStorage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<SqlValue, SqlError> {
@@ -256,7 +256,7 @@ pub(in crate::engine::relational) fn eval_scalar_subquery(
 /// Evaluates an `IN (SELECT ...)` subquery to its list of values (one column,
 /// else error 116).
 pub(in crate::engine::relational) fn eval_in_subquery(
-    storage: &Storage,
+    storage: &RelStorage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<Vec<SqlValue>, SqlError> {

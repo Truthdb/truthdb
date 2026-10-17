@@ -1,7 +1,7 @@
 use super::super::prelude::*;
 
 pub(in crate::engine::relational) fn exec_create_procedure(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     create: &CreateProcedure,
 ) -> Result<StatementResult, SqlError> {
@@ -80,7 +80,7 @@ pub(in crate::engine::relational) fn exec_create_procedure(
 }
 
 pub(in crate::engine::relational) fn exec_drop_procedure(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     name: &Name,
     if_exists: bool,
@@ -107,7 +107,7 @@ pub(in crate::engine::relational) fn exec_drop_procedure(
 }
 
 pub(in crate::engine::relational) fn exec_create_function(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     create: &CreateFunction,
 ) -> Result<StatementResult, SqlError> {
@@ -352,7 +352,7 @@ pub(in crate::engine::relational) fn check_multi_tvf_statement(
 }
 
 pub(in crate::engine::relational) fn exec_drop_function(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     name: &Name,
     if_exists: bool,

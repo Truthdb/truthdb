@@ -23,7 +23,7 @@ pub(in crate::engine::relational) fn where_keeps(
 }
 
 pub(in crate::engine::relational) fn exec_select(
-    storage: &Storage,
+    storage: &RelStorage,
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Result<RowSet, SqlError> {
@@ -207,7 +207,7 @@ pub(in crate::engine::relational) fn exec_select(
 /// rather than evaluated against the pre-statement snapshot, which would give a
 /// result that silently differs from SQL Server's per-row assignment.
 pub(in crate::engine::relational) fn exec_select_assign(
-    storage: &Storage,
+    storage: &RelStorage,
     select: &Select,
     txn_ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
@@ -284,7 +284,7 @@ pub(in crate::engine::relational) fn exec_select_assign(
 /// Removes duplicate output rows (SELECT DISTINCT), keeping first occurrence.
 /// NULLs are equal to each other (`Datum` equality), matching SQL Server.
 pub(in crate::engine::relational) fn dedup_rows(
-    storage: &Storage,
+    storage: &RelStorage,
     rowset: &mut RowSet,
     sensitivities: &[CollationSensitivity],
 ) -> Result<(), SqlError> {
@@ -358,7 +358,7 @@ pub(in crate::engine::relational) fn dedup_rows(
 /// evaluated against the output row (its columns are the resolver). Uses
 /// code-point ordering (NULLs first), stable.
 pub(in crate::engine::relational) fn order_output(
-    storage: &Storage,
+    storage: &RelStorage,
     rowset: &mut RowSet,
     order_by: &[OrderItem],
     eval_ctx: &EvalContext,
@@ -412,7 +412,7 @@ pub(in crate::engine::relational) fn order_output(
 }
 
 pub(in crate::engine::relational) fn project(
-    storage: &Storage,
+    storage: &RelStorage,
     items: &[SelectItem],
     source_columns: &[ResultColumn],
     rows: &[Vec<Datum>],

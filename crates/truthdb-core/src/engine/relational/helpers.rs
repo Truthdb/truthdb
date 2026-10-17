@@ -31,7 +31,7 @@ pub(super) fn strip_schema(name: &str) -> &str {
 /// views take no lock. Nested views (a view over a view) are not expanded here
 /// (they error at query time), so they contribute no locks; view expansion is
 /// one level deep, matching the executor.
-pub(super) fn read_lock_object_ids(storage: &Storage, db_id: u32, name: &str) -> Vec<u32> {
+pub(super) fn read_lock_object_ids(storage: &RelStorage, db_id: u32, name: &str) -> Vec<u32> {
     let mut out = Vec::new();
     let mut visited = std::collections::HashSet::new();
     collect_read_lock_ids(storage, db_id, name, 0, &mut out, &mut visited);
@@ -51,7 +51,7 @@ pub(super) fn read_lock_object_ids(storage: &Storage, db_id: u32, name: &str) ->
 #[allow(clippy::too_many_arguments)]
 pub(super) fn add_trigger_locks(
     db_id: u32,
-    storage: &Storage,
+    storage: &RelStorage,
     parent_object_id: u32,
     event: catalog::TriggerEvent,
     isolation: Isolation,
@@ -82,7 +82,11 @@ pub(super) fn add_trigger_locks(
 /// The base-table object ids the scalar functions called in a SELECT read
 /// through their bodies (deduped). Non-function names collected along the way
 /// resolve to nothing.
-pub(super) fn select_function_read_ids(storage: &Storage, db_id: u32, select: &Select) -> Vec<u32> {
+pub(super) fn select_function_read_ids(
+    storage: &RelStorage,
+    db_id: u32,
+    select: &Select,
+) -> Vec<u32> {
     let mut tables = Vec::new();
     let mut funcs = Vec::new();
     collect_select_read_names(select, &mut tables, &mut funcs);
@@ -96,7 +100,7 @@ pub(super) fn select_function_read_ids(storage: &Storage, db_id: u32, select: &S
 
 /// Like [`select_function_read_ids`] but for a bare expression (an IF/WHILE
 /// condition).
-pub(super) fn expr_function_read_ids(storage: &Storage, db_id: u32, expr: &Expr) -> Vec<u32> {
+pub(super) fn expr_function_read_ids(storage: &RelStorage, db_id: u32, expr: &Expr) -> Vec<u32> {
     let mut tables = Vec::new();
     let mut funcs = Vec::new();
     collect_expr_read_names(expr, &mut tables, &mut funcs);
@@ -112,7 +116,7 @@ pub(super) fn expr_function_read_ids(storage: &Storage, db_id: u32, expr: &Expr)
 /// recursing through nested views (so a view over a view locks the inner view's
 /// base tables). Bounded by [`MAX_VIEW_NESTING`] so a view cycle terminates.
 pub(super) fn collect_read_lock_ids(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     name: &str,
     depth: u32,
@@ -325,7 +329,7 @@ pub(super) fn create_object_name<'a>(kind: &str, name: &'a Name) -> Result<&'a s
     }
 }
 
-pub(super) fn resolve_table(storage: &Storage, db_id: u32, name: &str) -> Option<TableDef> {
+pub(super) fn resolve_table(storage: &RelStorage, db_id: u32, name: &str) -> Option<TableDef> {
     // Three-part names (`db.dbo.t`, `db..t`) resolve in the named database;
     // one- and two-part names in the session's. An unknown database or a
     // schema other than dbo resolves to nothing (208 at the call sites).

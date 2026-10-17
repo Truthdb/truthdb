@@ -2,7 +2,7 @@ use super::*;
 use crate::engine::Engine;
 use crate::engine::StatementResult;
 use crate::relstore::types::Datum;
-use crate::storage::{Storage, StorageOptions};
+use crate::storage::{RelStorage, StorageOptions};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
@@ -50,7 +50,7 @@ impl Drop for Harness {
 
 fn start(timeout: Duration) -> Harness {
     let path = unique_temp_path("engine");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let engine = Engine::new(storage).expect("engine");
     let (handle, _join) = spawn_engine_with_timeout(engine, timeout);
     Harness { handle, path }
@@ -62,7 +62,7 @@ fn start(timeout: Duration) -> Harness {
 /// masking a wait that is too long.
 fn start_single_worker(idle: Option<Duration>) -> Harness {
     let path = unique_temp_path("engine-1worker");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let engine = Engine::new(storage).expect("engine");
     let (handle, _join) = spawn_engine_pool(engine, LOCK_WAIT_TIMEOUT, idle, 1);
     Harness { handle, path }
@@ -72,7 +72,7 @@ fn start_single_worker(idle: Option<Duration>) -> Harness {
 /// when `None`), so the reaper is testable without a real 10 min wait.
 fn start_with_idle(idle: Option<Duration>) -> Harness {
     let path = unique_temp_path("engine-idle");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let engine = Engine::new(storage).expect("engine");
     let (handle, _join) = spawn_engine_with_idle_timeout(engine, idle);
     Harness { handle, path }
@@ -157,7 +157,7 @@ async fn fill(h: &Harness, s: SessionId, n: usize) {
 /// instead of racing real timers.
 fn bare(label: &str, idle: Option<Duration>) -> (Engine, Scheduler, PathBuf) {
     let path = unique_temp_path(label);
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let engine = Engine::new(storage).expect("engine");
     (engine, Scheduler::new(LOCK_WAIT_TIMEOUT, idle), path)
 }

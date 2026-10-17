@@ -1,6 +1,6 @@
 use super::*;
 
-impl Storage {
+impl RelStorage {
     /// Scan slices this store has read.
     #[cfg(test)]
     pub(crate) fn scan_slices(&self) -> usize {

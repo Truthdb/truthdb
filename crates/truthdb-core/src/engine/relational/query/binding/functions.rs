@@ -22,7 +22,7 @@ impl truthdb_sql::eval::ColumnResolver for FnResolver<'_> {
 /// takes the user function (a documented minor divergence from SQL Server, which
 /// requires schema-qualified UDF calls).
 pub(in crate::engine::relational) fn resolve_scalar_function(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     name: &str,
 ) -> Option<TableDef> {
@@ -45,7 +45,7 @@ pub(in crate::engine::relational) fn resolve_scalar_function(
 /// which, like a subquery, cannot be evaluated by the pure eval crate and must
 /// be rewritten to a literal per row first.
 pub(in crate::engine::relational) fn expr_has_user_function(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     expr: &Expr,
 ) -> bool {
@@ -93,7 +93,7 @@ pub(in crate::engine::relational) fn expr_has_user_function(
 /// True if an expression needs the per-row storage-aware rewrite (a subquery or
 /// a user scalar function) before the pure evaluator can run on it.
 pub(in crate::engine::relational) fn expr_needs_binding(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     expr: &Expr,
 ) -> bool {
@@ -101,7 +101,7 @@ pub(in crate::engine::relational) fn expr_needs_binding(
 }
 
 pub(in crate::engine::relational) fn substitute_correlated_in_expr(
-    storage: &Storage,
+    storage: &RelStorage,
     expr: &Expr,
     outer: &dyn Fn(&str) -> Option<usize>,
     outer_row: &[SqlValue],

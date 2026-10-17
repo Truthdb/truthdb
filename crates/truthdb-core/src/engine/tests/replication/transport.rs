@@ -42,9 +42,13 @@ fn standby_applies_shipped_wal_ranges_and_matches_the_primary() {
     drop(engine);
 
     // Standby = the full backup + the shipped raw WAL range, recovered.
-    Storage::restore_full_with_wal_ranges(&standby, &bak, &[(backup_end, delta.clone())])
-        .expect("apply the shipped range to the standby");
-    let s = Engine::new(Storage::open(standby.clone()).expect("open")).expect("engine");
+    crate::storage::Storage::restore_full_with_wal_ranges(
+        &standby,
+        &bak,
+        &[(backup_end, delta.clone())],
+    )
+    .expect("apply the shipped range to the standby");
+    let s = Engine::new(RelStorage::open(standby.clone()).expect("open")).expect("engine");
     assert_eq!(
         sql_rows(&s, "SELECT id, v FROM t ORDER BY id").1,
         expected,
@@ -59,13 +63,13 @@ fn standby_applies_shipped_wal_ranges_and_matches_the_primary() {
 
     // Idempotent: applying the SAME range twice yields the identical state
     // (seed overwrites identical bytes; redo is page-LSN-gated).
-    Storage::restore_full_with_wal_ranges(
+    crate::storage::Storage::restore_full_with_wal_ranges(
         &standby_idem,
         &bak,
         &[(backup_end, delta.clone()), (backup_end, delta.clone())],
     )
     .expect("re-applying the same range is accepted");
-    let s2 = Engine::new(Storage::open(standby_idem.clone()).expect("open")).expect("engine");
+    let s2 = Engine::new(RelStorage::open(standby_idem.clone()).expect("open")).expect("engine");
     assert_eq!(
         sql_rows(&s2, "SELECT id, v FROM t ORDER BY id").1,
         expected,
@@ -117,8 +121,8 @@ fn a_standby_applies_a_live_wal_stream_and_matches_the_primary() {
 
     // Standby: restore the backup as an OPEN engine (only the 10 backed-up
     // rows), then apply the shipped delta LIVE — no reopen.
-    Storage::restore_full(&standby_path, &bak).expect("restore");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full(&standby_path, &bak).expect("restore");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     assert_eq!(
         sql_rows(&standby, "SELECT COUNT(*) FROM t").1,
         vec![vec![Some("10".into())]],
@@ -147,7 +151,8 @@ fn a_standby_applies_a_live_wal_stream_and_matches_the_primary() {
 
     // Durable: the applied state survives a standby restart.
     drop(standby);
-    let standby2 = Engine::new(Storage::open(standby_path.clone()).expect("reopen")).expect("eng");
+    let standby2 =
+        Engine::new(RelStorage::open(standby_path.clone()).expect("reopen")).expect("eng");
     assert_eq!(
         sql_rows(&standby2, "SELECT id, v FROM t ORDER BY id").1,
         expected,
@@ -163,8 +168,9 @@ fn a_standby_applies_a_live_wal_stream_and_matches_the_primary() {
         .storage()
         .backup_full(&standby_bak)
         .expect("backup on the standby");
-    Storage::restore_full(&restored, &standby_bak).expect("restore the standby backup");
-    let r = Engine::new(Storage::open(restored.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full(&restored, &standby_bak)
+        .expect("restore the standby backup");
+    let r = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("eng");
     assert_eq!(
         sql_rows(&r, "SELECT id, v FROM t ORDER BY id").1,
         expected,
@@ -256,7 +262,7 @@ async fn the_replication_transport_streams_live_writes_to_a_standby() {
     let ctx = PrimaryReplContext {
         shared_secret: Arc::new(SECRET.to_vec()),
         cluster_uuid: UUID,
-        storage: primary.storage_arc(),
+        storage: primary.storage_arc().core_arc(),
         heartbeat: Duration::from_millis(200),
         stall_timeout: Duration::from_secs(30),
         chunk_bytes: 512,
@@ -271,8 +277,8 @@ async fn the_replication_transport_streams_live_writes_to_a_standby() {
     // Standby: seeded with a --standby restore (stamped redo-only +
     // read-only before its first open), opened live, then its receiver
     // dials the primary.
-    Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     assert!(
         standby.storage().is_standby(),
         "a --standby restore stamps the standby mode before the first open"
@@ -290,7 +296,7 @@ async fn the_replication_transport_streams_live_writes_to_a_standby() {
     let (rx_shutdown_tx, rx_shutdown_rx) = watch::channel(false);
     let receiver_task = tokio::spawn(run_standby_receiver(
         receiver_cfg.clone(),
-        standby.storage_arc(),
+        standby.storage_arc().core_arc(),
         rx_shutdown_rx,
     ));
 
@@ -353,7 +359,7 @@ async fn the_replication_transport_streams_live_writes_to_a_standby() {
     let (rx_shutdown_tx2, rx_shutdown_rx2) = watch::channel(false);
     let receiver_task2 = tokio::spawn(run_standby_receiver(
         receiver_cfg,
-        standby.storage_arc(),
+        standby.storage_arc().core_arc(),
         rx_shutdown_rx2,
     ));
     let target = primary.storage().wal_flushed_lsn();

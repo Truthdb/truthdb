@@ -13,7 +13,7 @@ fn a_commit_acknowledgement_never_precedes_its_fsync() {
 
     /// Logs each emitted event alongside the fsync count at that moment.
     struct Probe<'a> {
-        storage: &'a Storage,
+        storage: &'a RelStorage,
         log: Vec<(&'static str, u64)>,
     }
     impl Probe<'_> {
@@ -42,7 +42,7 @@ fn a_commit_acknowledgement_never_precedes_its_fsync() {
     }
 
     let path = unique_temp_path("stream-durability");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut setup = TxnContext::default();
     let create = execute_batch(&storage, "CREATE TABLE t (v INT NOT NULL)", &mut setup);
     assert!(create.error.is_none(), "create table: {:?}", create.error);
@@ -97,7 +97,7 @@ fn an_identity_value_never_streams_before_its_reservation_fsync() {
     use crate::relstore::types::Datum;
 
     struct Probe<'a> {
-        storage: &'a Storage,
+        storage: &'a RelStorage,
         log: Vec<(&'static str, u64)>,
     }
     impl Probe<'_> {
@@ -126,7 +126,7 @@ fn an_identity_value_never_streams_before_its_reservation_fsync() {
     }
 
     let path = unique_temp_path("stream-identity");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut setup = TxnContext::default();
     let create = execute_batch(
         &storage,
@@ -174,7 +174,7 @@ fn a_write_only_batch_still_fsyncs_once() {
     use crate::engine::{TxnContext, execute_batch};
 
     let path = unique_temp_path("stream-one-fsync");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut setup = TxnContext::default();
     let create = execute_batch(&storage, "CREATE TABLE t (v INT NOT NULL)", &mut setup);
     assert!(create.error.is_none(), "create table: {:?}", create.error);
@@ -211,7 +211,8 @@ fn group_commit_coalesces_many_commits_into_one_fsync() {
     const THREADS: usize = 16;
 
     let path = unique_temp_path("group-commit");
-    let storage = Arc::new(Storage::create(path.clone(), test_storage_options()).expect("create"));
+    let storage =
+        Arc::new(RelStorage::create(path.clone(), test_storage_options()).expect("create"));
 
     let mut setup = TxnContext::default();
     let create = execute_batch(&storage, "CREATE TABLE t (v INT NOT NULL)", &mut setup);
@@ -270,7 +271,7 @@ fn identity_reservation_is_made_durable_even_inside_a_transaction() {
     use crate::engine::{TxnContext, execute_batch};
 
     let path = unique_temp_path("identity-durable");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
 
     let mut ctx = TxnContext::default();
     let create = execute_batch(

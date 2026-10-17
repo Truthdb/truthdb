@@ -16,7 +16,7 @@ use super::*;
 /// the catalog WITHOUT materializing rows. `None` if the FROM has a derived
 /// table or a view, whose output columns need binding to determine.
 pub(in crate::engine::relational) fn from_column_names(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     from: &TableRef,
 ) -> Option<Vec<(Option<String>, String)>> {
@@ -90,7 +90,7 @@ pub(in crate::engine::relational) fn from_column_names(
 /// The inner scope of a subquery (its own FROM columns), or `None` if it cannot
 /// be determined from the catalog alone.
 pub(in crate::engine::relational) fn subquery_inner_scope(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     subquery: &Select,
 ) -> Option<JoinScope> {
@@ -107,7 +107,7 @@ pub(in crate::engine::relational) fn subquery_inner_scope(
 /// True if `subquery` references a column that resolves in the enclosing `outer`
 /// scope but not in its own FROM — i.e. it is correlated.
 pub(in crate::engine::relational) fn is_correlated(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     subquery: &Select,
     outer: &JoinScope,
@@ -197,7 +197,7 @@ pub(in crate::engine::relational) fn select_aggregate_arg_refs(
 
 /// Whether any derived-table body in a FROM tree is correlated to `outer`.
 pub(in crate::engine::relational) fn from_has_correlated_derived(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     from: Option<&TableRef>,
     outer: &JoinScope,

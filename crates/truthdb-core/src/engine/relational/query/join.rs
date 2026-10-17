@@ -6,7 +6,7 @@ use super::super::prelude::*;
 /// memory budget. The ON predicate (absent for CROSS) is evaluated against the
 /// concatenated row; outer joins emit NULL-extended rows for unmatched sides.
 pub(in crate::engine::relational) fn join_sources(
-    storage: &Storage,
+    storage: &RelStorage,
     left: Source,
     right: Source,
     kind: JoinKind,
@@ -255,7 +255,7 @@ pub(in crate::engine::relational) fn flatten_and<'a>(expr: &'a Expr, out: &mut V
 /// (immaterial — a spilling join is not order-sensitive).
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine::relational) fn grace_hash_join(
-    storage: &Storage,
+    storage: &RelStorage,
     mut probe_rows: SourceRows,
     build: &MaterializedSource,
     build_left: bool,
@@ -388,7 +388,7 @@ pub(in crate::engine::relational) fn matches_oriented(
 /// via [`grace_hash_join`].
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine::relational) fn hash_join(
-    storage: &Storage,
+    storage: &RelStorage,
     probe: Source,
     build: &MaterializedSource,
     build_left: bool,

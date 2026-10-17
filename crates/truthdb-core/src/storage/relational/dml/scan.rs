@@ -1,6 +1,6 @@
 use super::*;
 
-impl Storage {
+impl RelStorage {
     /// Atomic snapshot scan: the whole table under one storage-lock hold
     /// (a versioned reader holds no table lock, so a sliced cursor could be
     /// restructured under it mid-walk), merged against the version store.

@@ -267,7 +267,7 @@ impl TxnContext {
     /// are DATABASE roles — kept in separate sets so `IS_SRVROLEMEMBER` and
     /// `IS_ROLEMEMBER` never answer for the other's namespace. Called at batch
     /// start; a security DDL is therefore visible to the next batch.
-    pub fn refresh_session_roles(&mut self, storage: &Storage) {
+    pub fn refresh_session_roles(&mut self, storage: &RelStorage) {
         let server_role_ids = storage.effective_roles(self.login_sid);
         let db_role_ids = storage.effective_roles(self.user_sid);
         let names = |ids: &std::collections::HashSet<u32>| -> std::collections::HashSet<String> {
@@ -344,7 +344,7 @@ impl TxnContext {
     /// instead of erroring 3908 — and hand a dead transaction's offset to
     /// `rel_rollback_to`, which either truncates the new transaction's undo log
     /// (silently discarding committed work) or panics on `split_off`.
-    pub fn abort(&mut self, storage: &Storage) {
+    pub fn abort(&mut self, storage: &RelStorage) {
         if let Some(txn) = self.txn.take() {
             let _ = storage.rel_rollback(txn);
         }
@@ -357,7 +357,7 @@ impl TxnContext {
     /// Releases the SNAPSHOT transaction's registered read view, if any —
     /// called on every transaction-ending path (a leaked registration pins
     /// the version store's prune watermark forever).
-    pub(super) fn release_txn_snapshot(&mut self, storage: &Storage) {
+    pub(super) fn release_txn_snapshot(&mut self, storage: &RelStorage) {
         if let Some(snap) = self.txn_snapshot.take() {
             storage.release_read_snapshot(snap.seq);
         }
@@ -365,7 +365,7 @@ impl TxnContext {
 
     /// Rolls back this session's transaction because it sat idle too long, and
     /// records that it happened so the session's next batch can say so.
-    pub fn abort_idle(&mut self, storage: &Storage) {
+    pub fn abort_idle(&mut self, storage: &RelStorage) {
         self.abort(storage);
         self.reaped = true;
     }
@@ -619,7 +619,7 @@ thread_local! {
 /// Statement-scoped snapshot registration: capture on entry, and release —
 /// pruning must not wait on a statement that errored — on every exit path.
 pub(super) struct SnapshotScope<'a> {
-    storage: &'a Storage,
+    storage: &'a RelStorage,
     seq: u64,
     /// The snapshot that was current when this scope was entered, restored on
     /// exit. Scopes can nest — a scalar function's body statement runs under the
@@ -629,7 +629,7 @@ pub(super) struct SnapshotScope<'a> {
 }
 
 impl<'a> SnapshotScope<'a> {
-    pub(super) fn enter(storage: &'a Storage, own_txn: Option<u64>) -> Self {
+    pub(super) fn enter(storage: &'a RelStorage, own_txn: Option<u64>) -> Self {
         let prev = CURRENT_SNAPSHOT.get();
         let snap = storage.capture_read_snapshot(own_txn);
         CURRENT_SNAPSHOT.set(Some(snap));
@@ -674,7 +674,11 @@ impl Drop for TxnSnapshotScope {
 /// only when its FROM/subqueries name one. `SELECT 1` under SNAPSHOT must
 /// neither raise 3952 nor establish the transaction's snapshot — SQL Server
 /// defers both to the first read of an actual object.
-pub(super) fn statement_reads_tables(storage: &Storage, db_id: u32, statement: &Statement) -> bool {
+pub(super) fn statement_reads_tables(
+    storage: &RelStorage,
+    db_id: u32,
+    statement: &Statement,
+) -> bool {
     match statement {
         Statement::Select(select) => select_reads_tables(storage, db_id, select),
         // An INSERT whose TARGET is a table variable writes only session memory,
@@ -691,7 +695,7 @@ pub(super) fn statement_reads_tables(storage: &Storage, db_id: u32, statement: &
 /// Whether a SELECT reads any real table — directly (FROM/subqueries) or through
 /// a scalar function it calls. A `@t` table-variable source is session-local and
 /// is not counted (it neither locks nor snapshots).
-pub(super) fn select_reads_tables(storage: &Storage, db_id: u32, select: &Select) -> bool {
+pub(super) fn select_reads_tables(storage: &RelStorage, db_id: u32, select: &Select) -> bool {
     let expanded = expand_ctes(select);
     let mut tables = Vec::new();
     collect_locked_tables(&expanded, &mut tables);

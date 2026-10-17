@@ -44,7 +44,7 @@ fn replication_slots_hold_truncation_persist_and_reap() {
 
     // The slot's hold survives a restart (re-seeded from the superblock).
     drop(engine);
-    let engine = Engine::new(Storage::open(path.clone()).expect("open")).expect("engine");
+    let engine = Engine::new(RelStorage::open(path.clone()).expect("open")).expect("engine");
     assert_eq!(
         engine.storage().repl_slot_lsn(7),
         Some(l2),

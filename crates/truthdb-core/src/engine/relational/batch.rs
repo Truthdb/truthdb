@@ -1,6 +1,6 @@
 use super::prelude::*;
 
-pub fn execute_batch(storage: &Storage, sql: &str, txn_ctx: &mut TxnContext) -> BatchOutcome {
+pub fn execute_batch(storage: &RelStorage, sql: &str, txn_ctx: &mut TxnContext) -> BatchOutcome {
     execute_batch_with_params(storage, sql, txn_ctx, &[])
 }
 
@@ -9,7 +9,7 @@ pub fn execute_batch(storage: &Storage, sql: &str, txn_ctx: &mut TxnContext) -> 
 /// already-typed values, never re-rendered into the SQL text, so a parameter
 /// value can never alter the statement's structure (no injection surface).
 pub fn execute_batch_with_params(
-    storage: &Storage,
+    storage: &RelStorage,
     sql: &str,
     txn_ctx: &mut TxnContext,
     params: &[RpcParam],
@@ -37,7 +37,7 @@ pub fn execute_batch_with_params(
 /// as before), so a batch of writes with nothing to stream between them still
 /// costs one fsync.
 pub fn execute_batch_streamed(
-    storage: &Storage,
+    storage: &RelStorage,
     sql: &str,
     txn_ctx: &mut TxnContext,
     params: &[RpcParam],
@@ -206,7 +206,7 @@ impl BatchRun<'_> {
     /// reissued after a crash. On a durability failure the DONEs the batch
     /// can no longer stand behind are dropped and the batch terminates (see
     /// [`Self::make_durable`]).
-    pub(super) fn flush(&mut self, storage: &Storage) -> Result<(), SqlError> {
+    pub(super) fn flush(&mut self, storage: &RelStorage) -> Result<(), SqlError> {
         if self.committed {
             self.committed = false;
             if let Some(error) = self.make_durable(storage) {
@@ -225,7 +225,7 @@ impl BatchRun<'_> {
     /// hidden mini-commit (an identity reservation, even inside an open
     /// transaction or under a statement that then failed) is never missed —
     /// then the remaining DONEs. Returns the durability error, if any.
-    pub(super) fn finish(&mut self, storage: &Storage) -> Option<SqlError> {
+    pub(super) fn finish(&mut self, storage: &RelStorage) -> Option<SqlError> {
         if self.committed {
             self.committed = false;
             if let Some(error) = self.make_durable(storage) {
@@ -244,7 +244,7 @@ impl BatchRun<'_> {
     /// now ahead of the log, so no further op may serve it — and drops the
     /// deferred DONEs, which would otherwise acknowledge commits a restart is
     /// about to undo.
-    pub(super) fn make_durable(&mut self, storage: &Storage) -> Option<SqlError> {
+    pub(super) fn make_durable(&mut self, storage: &RelStorage) -> Option<SqlError> {
         match storage.ensure_durable(storage.wal_tail()) {
             Ok(()) => None,
             Err(err) => {
@@ -262,7 +262,7 @@ impl BatchRun<'_> {
 /// memory is one chunk, not the result. Everything else executes exactly as
 /// before and returns its materialized result.
 pub(super) fn exec_statement_streamed(
-    storage: &Storage,
+    storage: &RelStorage,
     statement: &Statement,
     txn_ctx: &mut TxnContext,
     run: &mut BatchRun<'_>,
@@ -346,7 +346,7 @@ pub(super) fn exec_statement_streamed(
 }
 
 pub(super) fn exec_statement_streamed_inner(
-    storage: &Storage,
+    storage: &RelStorage,
     statement: &Statement,
     txn_ctx: &mut TxnContext,
     run: &mut BatchRun<'_>,

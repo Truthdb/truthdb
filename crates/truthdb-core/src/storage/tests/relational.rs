@@ -8,7 +8,7 @@ fn alter_add_column_is_durable_and_atomic() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("alter-add");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, name NVARCHAR(20))",
@@ -21,7 +21,7 @@ fn alter_add_column_is_durable_and_atomic() {
     drop(storage);
 
     // Reopen: the widened schema and the frozen fill survived.
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(&storage, "SELECT id, score FROM t ORDER BY id", &mut ctx);
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
@@ -71,7 +71,7 @@ fn exec_lock_analysis_never_under_locks() {
     use crate::lock::{LockMode, Resource};
 
     let path = unique_temp_path("exec-locks");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(
         &storage,
@@ -134,7 +134,7 @@ fn db_options_persist_across_reopen_and_checkpoint() {
     use crate::engine::{TxnContext, execute_batch};
 
     let path = unique_temp_path("db-options");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     assert!(!storage.rcsi_enabled());
     assert!(!storage.snapshot_isolation_allowed());
     let mut ctx = TxnContext::default();
@@ -148,7 +148,7 @@ fn db_options_persist_across_reopen_and_checkpoint() {
     assert!(storage.snapshot_isolation_allowed());
     drop(storage);
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     assert!(storage.rcsi_enabled(), "RCSI survives a restart");
     assert!(storage.snapshot_isolation_allowed());
 
@@ -165,7 +165,7 @@ fn db_options_persist_across_reopen_and_checkpoint() {
         .write_checkpoint(b"cp", 1, 2, 1)
         .expect("checkpoint");
     drop(storage);
-    let storage = Storage::open(path.clone()).expect("reopen after checkpoint");
+    let storage = RelStorage::open(path.clone()).expect("reopen after checkpoint");
     assert!(
         storage.rcsi_enabled(),
         "the checkpoint must not reset the option"
@@ -190,7 +190,7 @@ fn analyze_locks_covers_procedure_bodies() {
     use crate::lock::{LockMode, Resource};
 
     let path = unique_temp_path("proc-locks");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE plt (id INT NOT NULL PRIMARY KEY)",
@@ -245,7 +245,7 @@ fn review_poc_analyze_locks_procedure_reanalyzed_under_escalated_isolation() {
     use crate::lock::{LockMode, Resource};
 
     let path = unique_temp_path("proc-visited-isolation");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)",
@@ -299,7 +299,7 @@ fn review_poc_analyze_locks_procedure_via_dynamic_sql() {
     use crate::lock::{LockMode, Resource};
 
     let path = unique_temp_path("proc-dyn-locks");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE t (id INT NOT NULL PRIMARY KEY)",
@@ -337,7 +337,7 @@ fn review_poc_user_procedure_named_sp_executesql_cannot_shadow_builtin() {
     use crate::lock::{LockMode, Resource};
 
     let path = unique_temp_path("proc-spexec-shadow");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(
         &storage,
@@ -379,7 +379,7 @@ fn analyze_locks_descends_control_flow() {
     use crate::lock::{LockMode, Resource};
 
     let path = unique_temp_path("flow-locks");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(
         &storage,
@@ -431,7 +431,7 @@ fn cf_review_analyze_locks_condition_shapes() {
     use crate::lock::{LockMode, Resource};
 
     let path = unique_temp_path("cf-flow-lock-shapes");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     for sql in [
         "CREATE TABLE lt (id INT NOT NULL PRIMARY KEY)",
@@ -507,7 +507,7 @@ fn cf_review_analyze_locks_condition_cte() {
     use crate::lock::{LockMode, Resource};
 
     let path = unique_temp_path("cf-flow-lock-cte");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(
         &storage,
@@ -537,7 +537,7 @@ fn analyze_locks_drops_table_s_under_rcsi() {
     use crate::lock::{LockMode, Resource};
 
     let path = unique_temp_path("rcsi-locks");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(
         &storage,

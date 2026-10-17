@@ -190,6 +190,12 @@ pub struct Storage {
     repl_connected: std::sync::Mutex<std::collections::HashSet<u32>>,
     /// The log-writer thread's join handle, taken in `Drop` after signalling it.
     log_writer: Option<JoinHandle<()>>,
+}
+
+/// The relational engine's handle on storage: the shared core plus the
+/// relational state read without the storage mutex. Derefs to the core.
+pub struct RelStorage {
+    core: Arc<Storage>,
     /// `READ_COMMITTED_SNAPSHOT` / `ALLOW_SNAPSHOT_ISOLATION` mirrors of the
     /// version store's options, readable without the storage mutex (lock
     /// analysis and the per-statement snapshot gate are on the hot path).
@@ -233,11 +239,19 @@ pub struct Storage {
     last_scan_width: std::sync::atomic::AtomicUsize,
 }
 
+impl std::ops::Deref for RelStorage {
+    type Target = Storage;
+    fn deref(&self) -> &Storage {
+        &self.core
+    }
+}
+
 // The point of the mutex: `Storage` is shareable across worker threads. Assert
 // it at compile time so a future non-`Send` field is caught here.
 const _: fn() = || {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<Storage>();
+    assert_send_sync::<RelStorage>();
 };
 
 impl Drop for Storage {

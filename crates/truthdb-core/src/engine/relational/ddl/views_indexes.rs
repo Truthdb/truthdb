@@ -18,7 +18,7 @@ pub(in crate::engine::relational) fn parse_view_query(
 }
 
 pub(in crate::engine::relational) fn exec_create_view(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     create: &CreateView,
 ) -> Result<StatementResult, SqlError> {
@@ -58,7 +58,7 @@ pub(in crate::engine::relational) fn constant_default(expr: &Expr) -> bool {
 }
 
 pub(in crate::engine::relational) fn exec_drop_view(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     drop: &DropView,
 ) -> Result<StatementResult, SqlError> {
@@ -108,7 +108,7 @@ pub(in crate::engine::relational) fn max_key_column_error(column: &str, table: &
 }
 
 pub(in crate::engine::relational) fn exec_create_index(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     create: &CreateIndex,
 ) -> Result<StatementResult, SqlError> {
@@ -185,7 +185,7 @@ pub(in crate::engine::relational) fn index_column_missing(column: &str, table: &
 }
 
 pub(in crate::engine::relational) fn exec_drop_index(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     drop: &DropIndex,
 ) -> Result<StatementResult, SqlError> {

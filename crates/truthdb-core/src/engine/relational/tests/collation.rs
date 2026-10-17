@@ -195,7 +195,7 @@ fn collation_ci_folded_keys_survive_restart() {
             .expect("index");
     }
     // Reopen: the folded index keys on disk must still seek case-insensitively.
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("engine");
     let plan = plan_lines(&engine, "SELECT id FROM t WHERE name = 'hello'");
     assert!(plan.iter().any(|l| l.contains("Index Seek")), "{plan:?}");

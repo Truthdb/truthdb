@@ -41,7 +41,7 @@ fn committed_statements_survive_crash_without_checkpoint() {
         .expect("update");
     drop(storage); // crash: nothing checkpointed, pool never flushed
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     let ids = scan_ids(&mut storage, "t");
     assert_eq!(ids, (0..20).filter(|i| *i != 3).collect::<Vec<_>>());
     let updated = storage
@@ -127,7 +127,7 @@ fn fuzzy_checkpoint_with_open_txn_then_crash_undoes_it() {
     drop(txn); // crash before commit
     drop(storage);
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     assert_eq!(
         scan_ids(&mut storage, "t"),
         vec![1],
@@ -171,7 +171,7 @@ fn fuzzy_checkpoint_then_commit_survives_crash() {
 
     drop(storage); // crash after commit
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     assert_eq!(
         scan_ids(&mut storage, "t"),
         vec![50, 51],
@@ -211,14 +211,14 @@ fn uncommitted_statement_is_undone_and_recovery_rerun_is_clean() {
     drop(storage);
 
     // First recovery: losers undone via CLRs.
-    let mut storage = Storage::open(path.clone()).expect("reopen with losers");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen with losers");
     assert_eq!(scan_ids(&mut storage, "t"), vec![1], "loser insert undone");
     assert_eq!(scan_ids(&mut storage, "h"), vec![1], "loser insert undone");
     drop(storage); // crash again before any checkpoint: CLRs replay
 
     // Second recovery re-runs redo over the CLRs (idempotence) and must not
     // resurrect or double-undo anything.
-    let mut storage = Storage::open(path.clone()).expect("reopen after recovery crash");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen after recovery crash");
     assert_eq!(scan_ids(&mut storage, "t"), vec![1]);
     assert_eq!(scan_ids(&mut storage, "h"), vec![1]);
     // The store stays fully usable.
@@ -259,7 +259,7 @@ fn torn_page_is_repaired_from_full_page_image() {
     drop(storage);
     overwrite_bytes(&path, offset + 1000, &[0xDBu8; 2000]);
 
-    let mut storage = Storage::open(path.clone()).expect("reopen after tear");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen after tear");
     assert_eq!(scan_ids(&mut storage, "t"), vec![0, 1, 2, 3, 4]);
     drop(storage);
     let _ = std::fs::remove_file(path);
@@ -304,7 +304,7 @@ fn failing_statement_rolls_back_all_its_rows() {
     }
     // And the same holds across a crash (the rollback CLRs replay).
     drop(storage);
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     let rows = storage
         .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
         .expect("scan");
@@ -331,7 +331,7 @@ fn create_table_crash_before_commit_rolls_back_catalog() {
     drop(storage);
 
     // Committed table survives; the catalog itself recovered.
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     assert!(
         storage
             .rel_table(crate::relstore::catalog::DEFAULT_DATABASE_ID, "keep")
@@ -382,7 +382,7 @@ fn checkpoint_persists_relational_pages_and_truncates_wal() {
     }
     drop(storage);
 
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     assert_eq!(scan_ids(&mut storage, "t"), (0..60).collect::<Vec<_>>());
     // The catalog root survived via the superblock (not just the WAL).
     assert!(
@@ -426,7 +426,7 @@ fn mid_statement_failure_rolls_back_applied_ops() {
     crate::relstore::ctx::FAIL_APPLY_OPS_AFTER.with(|c| c.set(None));
     assert!(matches!(err, StorageError::InvalidConfig(_)), "got: {err}");
 
-    let verify = |storage: &mut Storage| {
+    let verify = |storage: &mut RelStorage| {
         let rows = storage
             .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t")
             .expect("scan");
@@ -441,7 +441,7 @@ fn mid_statement_failure_rolls_back_applied_ops() {
     };
     verify(&mut storage);
     drop(storage); // crash: the rollback CLRs must replay
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     verify(&mut storage);
     // Store is not wedged (rollback succeeded) and stays writable.
     storage
@@ -481,7 +481,7 @@ fn crash_during_recovery_undo_reruns_cleanly() {
 
     // Recovery undoes the higher-LSN loser first; fail on the second's op.
     crate::relstore::ctx::FAIL_APPLY_OPS_AFTER.with(|c| c.set(Some(1)));
-    let result = Storage::open(path.clone());
+    let result = RelStorage::open(path.clone());
     crate::relstore::ctx::FAIL_APPLY_OPS_AFTER.with(|c| c.set(None));
     assert!(
         result.is_err(),
@@ -491,7 +491,7 @@ fn crash_during_recovery_undo_reruns_cleanly() {
 
     // Re-run: the first loser's durable CLRs replay (no double-undo), the
     // second loser is undone now.
-    let mut storage = Storage::open(path.clone()).expect("recovery rerun");
+    let mut storage = RelStorage::open(path.clone()).expect("recovery rerun");
     assert_eq!(scan_ids(&mut storage, "t"), vec![1], "only committed data");
     storage
         .rel_insert(
@@ -547,7 +547,7 @@ fn counter_compensation_clr_points_past_its_record() {
     // The record scan reads the open-time replay cache, so reopen: the ring
     // still holds the rollback's records (nothing checkpointed).
     drop(storage);
-    let mut storage = Storage::open(path.clone()).expect("reopen");
+    let mut storage = RelStorage::open(path.clone()).expect("reopen");
     assert_eq!(
         storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
         Some(1)
@@ -635,7 +635,7 @@ fn counter_compensation_survives_a_crash_during_recovery_undo() {
     // Recovery undoes the loser LIFO: the counter compensation lands first,
     // then the injected fault aborts recovery on the row op behind it.
     crate::relstore::ctx::FAIL_APPLY_OPS_AFTER.with(|c| c.set(Some(1)));
-    let result = Storage::open(path.clone());
+    let result = RelStorage::open(path.clone());
     crate::relstore::ctx::FAIL_APPLY_OPS_AFTER.with(|c| c.set(None));
     assert!(
         result.is_err(),
@@ -643,7 +643,7 @@ fn counter_compensation_survives_a_crash_during_recovery_undo() {
     );
     drop(result);
 
-    let mut storage = Storage::open(path.clone()).expect("recovery rerun");
+    let mut storage = RelStorage::open(path.clone()).expect("recovery rerun");
     assert_eq!(scan_ids(&mut storage, "t"), vec![1], "loser row undone");
     assert_eq!(
         storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),

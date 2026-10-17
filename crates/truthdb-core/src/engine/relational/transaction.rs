@@ -7,7 +7,7 @@ use super::prelude::*;
 /// database-context ENVCHANGE clients (SSMS) expect back (emitted by
 /// `run_block` on success).
 pub(super) fn exec_use(
-    storage: &Storage,
+    storage: &RelStorage,
     database: &Name,
     ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
@@ -36,7 +36,7 @@ pub(super) fn exec_use(
 /// `CREATE DATABASE <name>`: a new naming namespace (level 1 — one shared
 /// log and data file; nothing physical is allocated).
 pub(super) fn exec_create_database(
-    storage: &Storage,
+    storage: &RelStorage,
     name: &Name,
 ) -> Result<StatementResult, SqlError> {
     storage
@@ -61,7 +61,7 @@ pub(super) fn exec_create_database(
 /// in it. The session's current database (3702), the default database
 /// (3708), and — without IF EXISTS — a missing one (3701) are refused.
 pub(super) fn exec_drop_database(
-    storage: &Storage,
+    storage: &RelStorage,
     name: &Name,
     if_exists: bool,
     ctx: &TxnContext,
@@ -385,7 +385,7 @@ pub(super) fn format_raiserror(format: &str, args: &[SqlValue]) -> Result<String
 }
 
 pub(super) fn exec_begin(
-    storage: &Storage,
+    storage: &RelStorage,
     ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
     if ctx.txn.is_none() {
@@ -397,7 +397,7 @@ pub(super) fn exec_begin(
 }
 
 pub(super) fn exec_commit(
-    storage: &Storage,
+    storage: &RelStorage,
     ctx: &mut TxnContext,
 ) -> Result<StatementResult, SqlError> {
     if ctx.trancount == 0 {
@@ -424,7 +424,7 @@ pub(super) fn exec_commit(
 }
 
 pub(super) fn exec_rollback(
-    storage: &Storage,
+    storage: &RelStorage,
     ctx: &mut TxnContext,
     name: Option<&Name>,
 ) -> Result<StatementResult, SqlError> {
@@ -487,7 +487,7 @@ pub(super) fn exec_rollback(
 /// save, so it is a no-op). Re-saving an existing name overwrites it, as in
 /// SQL Server.
 pub(super) fn exec_save(
-    storage: &Storage,
+    storage: &RelStorage,
     ctx: &mut TxnContext,
     name: &Name,
 ) -> Result<StatementResult, SqlError> {
@@ -553,7 +553,7 @@ pub(super) fn exec_declare_cursor(
 }
 
 pub(super) fn exec_open_cursor(
-    storage: &Storage,
+    storage: &RelStorage,
     ctx: &mut TxnContext,
     name: &Name,
 ) -> Result<StatementResult, SqlError> {
@@ -609,7 +609,7 @@ pub(super) fn exec_deallocate_cursor(
 }
 
 pub(super) fn exec_fetch(
-    storage: &Storage,
+    storage: &RelStorage,
     ctx: &mut TxnContext,
     name: &Name,
     direction: &FetchDirection,

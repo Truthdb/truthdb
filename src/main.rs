@@ -6,7 +6,7 @@ use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
 use truthdb_core::client_listener::ClientListener;
 use truthdb_core::engine::Engine;
-use truthdb_core::storage::Storage;
+use truthdb_core::storage::{RelStorage, Storage};
 mod config;
 use config::Config;
 
@@ -69,7 +69,7 @@ async fn main() {
     };
 
     let storage = if storage_path.exists() {
-        match Storage::open(storage_path) {
+        match RelStorage::open(storage_path) {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to open storage: {err}");
@@ -77,7 +77,7 @@ async fn main() {
             }
         }
     } else {
-        match Storage::create(storage_path, storage_opts) {
+        match RelStorage::create(storage_path, storage_opts) {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to create storage: {err}");
@@ -123,7 +123,7 @@ async fn main() {
     // The replication tasks share the storage directly (it is internally
     // synchronized); the handle must be taken before the engine moves into its
     // worker pool.
-    let storage_arc = engine.storage_arc();
+    let storage_arc = engine.storage_arc().core_arc();
     // The engine runs on its own thread behind a message channel; the async
     // listeners talk to it through a cloneable handle.
     let (engine, engine_join) = truthdb_core::session::spawn_engine(engine);

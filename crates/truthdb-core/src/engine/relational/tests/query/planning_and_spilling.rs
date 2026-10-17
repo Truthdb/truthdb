@@ -129,7 +129,7 @@ fn view_definition_survives_restart() {
     // A view lives in the persisted catalog, so it must be queryable after
     // the engine is reopened.
     let path = unique_temp_path("view-persist");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("storage create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("storage create");
     let engine = Engine::new(storage).expect("engine create");
     engine
         .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY, v INT)")
@@ -142,7 +142,7 @@ fn view_definition_survives_restart() {
         .expect("view");
     drop(engine);
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("engine restart");
     let out = engine.execute("SELECT id FROM hi").expect("query view");
     assert!(out.contains('2'), "view query after restart: {out}");

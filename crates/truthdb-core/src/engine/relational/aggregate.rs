@@ -29,7 +29,7 @@ use super::value;
 /// keys and aggregate arguments, where a UDF would otherwise reach the pure
 /// evaluator and raise 195.
 fn eval_bound(
-    storage: &crate::storage::Storage,
+    storage: &crate::storage::RelStorage,
     expr: &Expr,
     row: &[SqlValue],
     resolver: &JoinScope,
@@ -143,7 +143,7 @@ struct AggSpec {
 /// Runs the grouped query over the (already WHERE-filtered) source rows and
 /// returns the projected output rows (before DISTINCT/ORDER BY/TOP).
 pub fn execute(
-    storage: &crate::storage::Storage,
+    storage: &crate::storage::RelStorage,
     select: &Select,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
@@ -231,7 +231,7 @@ pub fn execute(
 /// grace-hash partition.
 #[allow(clippy::too_many_arguments)]
 fn aggregate_partition(
-    storage: &crate::storage::Storage,
+    storage: &crate::storage::RelStorage,
     select: &Select,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
@@ -310,7 +310,7 @@ fn aggregate_partition(
 /// re-partitioned; a first cut, documented.)
 #[allow(clippy::too_many_arguments)]
 fn grace_hash_aggregate(
-    storage: &crate::storage::Storage,
+    storage: &crate::storage::RelStorage,
     select: &Select,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
@@ -361,7 +361,7 @@ fn grace_hash_aggregate(
 /// in-memory `group_rows` — so case-insensitive-equal keys route to the same
 /// partition and are not split across partitions on a spilling GROUP BY.
 fn group_key(
-    storage: &crate::storage::Storage,
+    storage: &crate::storage::RelStorage,
     select: &Select,
     row: &[Datum],
     types: &[ColumnType],
@@ -396,7 +396,7 @@ fn partition_index(key: &[SqlValue], partitions: usize) -> usize {
 /// yields one row. NULL keys group together.
 #[allow(clippy::type_complexity)]
 fn group_rows(
-    storage: &crate::storage::Storage,
+    storage: &crate::storage::RelStorage,
     select: &Select,
     rows: &[Vec<Datum>],
     types: &[ColumnType],
@@ -444,7 +444,7 @@ fn group_rows(
 }
 
 fn compute_aggregate(
-    storage: &crate::storage::Storage,
+    storage: &crate::storage::RelStorage,
     spec: &AggSpec,
     rows: &[Vec<Datum>],
     types: &[ColumnType],

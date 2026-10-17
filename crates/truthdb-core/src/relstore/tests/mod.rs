@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 
 use crate::relstore::row::Column;
 use crate::relstore::types::{ColumnType, Datum};
-use crate::storage::{Storage, StorageError, StorageOptions};
+use crate::storage::{RelStorage, StorageError, StorageOptions};
 
 /// Room for FPIs and split images without checkpoints in most tests.
 const REL_TEST_WAL_BYTES: u64 = 8 * 1024 * 1024;
@@ -35,8 +35,8 @@ fn unique_temp_path(label: &str) -> PathBuf {
     path
 }
 
-fn create_storage(path: &Path) -> Storage {
-    Storage::create_with_wal_bounds(
+fn create_storage(path: &Path) -> RelStorage {
+    RelStorage::create_with_wal_bounds(
         path.to_path_buf(),
         storage_options(),
         REL_TEST_WAL_BYTES,
@@ -73,7 +73,7 @@ fn varchar_column(name: &str, max_len: u16) -> Column {
     }
 }
 
-fn create_tree_table(storage: &mut Storage, name: &str) {
+fn create_tree_table(storage: &mut RelStorage, name: &str) {
     storage
         .rel_create_table(
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
@@ -88,7 +88,7 @@ fn create_tree_table(storage: &mut Storage, name: &str) {
         .expect("create tree table");
 }
 
-fn create_heap_table(storage: &mut Storage, name: &str) {
+fn create_heap_table(storage: &mut RelStorage, name: &str) {
     storage
         .rel_create_table(
             crate::relstore::catalog::DEFAULT_DATABASE_ID,
@@ -107,7 +107,7 @@ fn row(id: i32, payload: &str) -> Vec<Datum> {
     vec![Datum::Int(id), Datum::VarChar(payload.to_string())]
 }
 
-fn scan_ids(storage: &mut Storage, table: &str) -> Vec<i32> {
+fn scan_ids(storage: &mut RelStorage, table: &str) -> Vec<i32> {
     storage
         .rel_scan(crate::relstore::catalog::DEFAULT_DATABASE_ID, table)
         .expect("scan")

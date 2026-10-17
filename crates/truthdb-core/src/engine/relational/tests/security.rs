@@ -41,7 +41,7 @@ fn create_login_persists_survives_restart_and_stays_out_of_the_object_namespace(
     );
     // Survives a restart (persisted in the catalog b-tree).
     drop(engine);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("replay");
     let (_c, rows) = sql_rows(
         &engine,
@@ -199,7 +199,7 @@ fn database_users_and_roles_persist_and_stay_out_of_the_object_namespace() {
 
     // Survives restart.
     drop(engine);
-    let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("replay");
+    let engine = Engine::new(RelStorage::open(path.clone()).expect("reopen")).expect("replay");
     let (_c, rows) = sql_rows(
         &engine,
         "SELECT name FROM sys.database_principals WHERE name = 'reporting'",
@@ -403,7 +403,7 @@ fn sa_resolves_to_dbo_and_sysadmin_with_no_prior_security_ddl() {
         rows[0][0].as_ref().unwrap().parse().unwrap()
     };
     drop(engine);
-    let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("replay");
+    let engine = Engine::new(RelStorage::open(path.clone()).expect("reopen")).expect("replay");
     let r_sid: u32 = {
         let (_c, rows) = sql_rows(
             &engine,
@@ -683,7 +683,7 @@ fn dropping_a_grantee_scrubs_its_object_permissions() {
     assert_eq!(perm_count(&engine), "0");
     // Persisted: the scrub survives a restart.
     drop(engine);
-    let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("replay");
+    let engine = Engine::new(RelStorage::open(path.clone()).expect("reopen")).expect("replay");
     assert_eq!(perm_count(&engine), "0");
     let _ = std::fs::remove_file(path);
 }
@@ -779,7 +779,7 @@ fn config_migration_upgrades_an_existing_pre_stage16_catalog() {
 
     // Reopen under the new build and run first-boot migration with config
     // users — the existing catalog is upgraded in place.
-    let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("replay");
+    let engine = Engine::new(RelStorage::open(path.clone()).expect("reopen")).expect("replay");
     let mut users = BTreeMap::new();
     users.insert("sa".to_string(), "secret".to_string());
     users.insert("app".to_string(), "app-pw".to_string());
@@ -875,7 +875,7 @@ fn sys_database_permissions_reflects_grants_and_survives_restart() {
     check(&engine);
     // Survives restart (permissions ride the object's catalog row).
     drop(engine);
-    let engine = Engine::new(Storage::open(path.clone()).expect("reopen")).expect("replay");
+    let engine = Engine::new(RelStorage::open(path.clone()).expect("reopen")).expect("replay");
     check(&engine);
     let _ = std::fs::remove_file(path);
 }

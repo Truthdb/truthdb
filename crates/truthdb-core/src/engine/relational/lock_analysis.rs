@@ -53,7 +53,7 @@ pub(super) fn statement_may_commit(statement: &Statement) -> bool {
 /// `sys.*` views and unresolved tables take no lock (catalog reads are
 /// unlocked; missing tables error at execution).
 /// Object ids of the parent tables a table's foreign keys reference.
-pub(super) fn fk_parent_object_ids(storage: &Storage, def: &TableDef) -> Vec<u32> {
+pub(super) fn fk_parent_object_ids(storage: &RelStorage, def: &TableDef) -> Vec<u32> {
     def.foreign_keys
         .iter()
         .filter_map(|fk| resolve_table(storage, def.database_id, &fk.parent).map(|p| p.object_id))
@@ -61,7 +61,7 @@ pub(super) fn fk_parent_object_ids(storage: &Storage, def: &TableDef) -> Vec<u32
 }
 
 /// Object ids of the tables whose foreign keys reference `parent_name`.
-pub(super) fn fk_child_object_ids(storage: &Storage, db_id: u32, parent_name: &str) -> Vec<u32> {
+pub(super) fn fk_child_object_ids(storage: &RelStorage, db_id: u32, parent_name: &str) -> Vec<u32> {
     storage
         .rel_tables()
         .into_iter()
@@ -79,7 +79,7 @@ pub(super) fn fk_child_object_ids(storage: &Storage, db_id: u32, parent_name: &s
 /// FK parent. Such a table keeps table-granular write locks so an FK
 /// existence-read (Table IS on the parent) still serializes against a
 /// concurrent change to the referenced row.
-pub(super) fn is_fk_parent(storage: &Storage, db_id: u32, name: &str) -> bool {
+pub(super) fn is_fk_parent(storage: &RelStorage, db_id: u32, name: &str) -> bool {
     !fk_child_object_ids(storage, db_id, name).is_empty()
 }
 
@@ -342,7 +342,7 @@ pub(super) fn update_row_key_hash(def: &TableDef, update: &Update) -> Option<u64
 /// batch contributes nothing here (its analysis arm already locks the
 /// database exclusively). Procedure bodies cannot contain USE (parser 154).
 pub(super) fn collect_use_targets(
-    storage: &Storage,
+    storage: &RelStorage,
     statements: &[Statement],
     depth: u32,
     dbs: &mut Vec<u32>,
@@ -374,7 +374,7 @@ pub(super) fn collect_use_targets(
 }
 
 pub fn analyze_locks(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     sql: &str,
     isolation: Isolation,
@@ -430,7 +430,7 @@ pub fn analyze_locks(
 }
 
 pub(super) fn analyze_statements_locks(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     parsed: &[Statement],
     isolation: Isolation,

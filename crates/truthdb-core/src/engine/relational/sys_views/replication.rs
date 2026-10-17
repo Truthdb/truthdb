@@ -4,7 +4,7 @@ use super::*;
 /// `sys.dm_repl_slots` (Stage 18): the primary's replication slots and the
 /// WAL-ring positions they pin. Empty on a standby (and on a primary with no
 /// standby ever connected).
-pub(in crate::engine::relational) fn sys_dm_repl_slots(storage: &Storage) -> Source {
+pub(in crate::engine::relational) fn sys_dm_repl_slots(storage: &RelStorage) -> Source {
     let columns = vec![
         int_col("slot_id"),
         bigint_col("held_lsn"),
@@ -40,7 +40,7 @@ pub(in crate::engine::relational) fn sys_dm_repl_slots(storage: &Storage) -> Sou
 /// `sys.dm_repl_replica_states` (Stage 18): this node's replication role and,
 /// on a primary, one row per replication slot with its connection and lag
 /// state; on a standby, one row describing its own applied position.
-pub(in crate::engine::relational) fn sys_dm_repl_replica_states(storage: &Storage) -> Source {
+pub(in crate::engine::relational) fn sys_dm_repl_replica_states(storage: &RelStorage) -> Source {
     let columns = vec![
         nvarchar("role", 20),
         int_col("node_id"),

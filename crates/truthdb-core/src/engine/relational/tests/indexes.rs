@@ -180,7 +180,7 @@ fn sql_index_survives_restart() {
     engine.execute("CREATE INDEX ix_a ON t (a)").expect("index");
 
     drop(engine);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("replay");
     // The index is still usable after recovery.
     let plan = plan_lines(&engine, "SELECT id FROM t WHERE a = 20");

@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 use serde_json::Value;
 
 use super::{BatchOutcome, Engine, TxnContext};
-use crate::storage::{Storage, StorageOptions};
+use crate::storage::{RelStorage, StorageOptions};
 
 pub(in crate::engine) fn test_storage_options() -> StorageOptions {
     StorageOptions {
@@ -90,7 +90,7 @@ pub(in crate::engine) fn sql_rows(
 }
 
 pub(in crate::engine) fn new_engine(path: &Path) -> Engine {
-    let storage = Storage::create(path.to_path_buf(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.to_path_buf(), test_storage_options()).expect("create");
     Engine::new(storage).expect("engine")
 }
 

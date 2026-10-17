@@ -33,4 +33,4 @@ pub(super) use crate::relstore::catalog::{
 pub(super) use crate::relstore::row::{Column, Schema};
 pub(super) use crate::relstore::types::{ColumnType, Datum};
 pub(super) use crate::relstore::version::ReadSnapshot;
-pub(super) use crate::storage::{RowLocator, Storage, StorageError, StorageTxn, TxnScope};
+pub(super) use crate::storage::{RelStorage, RowLocator, StorageError, StorageTxn, TxnScope};

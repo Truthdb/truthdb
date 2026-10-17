@@ -6,7 +6,7 @@ use super::super::prelude::*;
 /// ALLOW_SNAPSHOT_ISOLATION {ON|OFF}`. The batch's Database X lock has
 /// quiesced the store: no snapshot is live, no writer is mid-transaction.
 pub(in crate::engine::relational) fn exec_alter_database(
-    storage: &Storage,
+    storage: &RelStorage,
     alter: &AlterDatabase,
     txn_ctx: &TxnContext,
 ) -> Result<StatementResult, SqlError> {
@@ -79,7 +79,7 @@ pub(in crate::engine::relational) fn exec_alter_database(
 }
 
 pub(in crate::engine::relational) fn exec_alter_table(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     alter: &AlterTable,
     eval_ctx: &EvalContext,
@@ -99,7 +99,7 @@ pub(in crate::engine::relational) fn exec_alter_table(
 /// Validates the constraint and every existing row (WITH CHECK): a child row
 /// referencing a missing parent is 547 and the constraint is not added.
 pub(in crate::engine::relational) fn alter_add_foreign_key(
-    storage: &Storage,
+    storage: &RelStorage,
     def: &TableDef,
     fk: &ForeignKey,
 ) -> Result<StatementResult, SqlError> {
@@ -182,7 +182,7 @@ pub(in crate::engine::relational) fn alter_add_foreign_key(
 /// once now (SQL Server freezes it the same way); later INSERTs evaluate the
 /// live default text per row like any other column.
 pub(in crate::engine::relational) fn alter_add_column(
-    storage: &Storage,
+    storage: &RelStorage,
     def: &catalog::TableDef,
     column: &ColumnDef,
     eval_ctx: &EvalContext,
@@ -275,7 +275,7 @@ pub(in crate::engine::relational) fn alter_add_column(
 /// constraint against every existing row (SQL Server's default WITH CHECK); a
 /// violating row is error 547 and the constraint is not added.
 pub(in crate::engine::relational) fn alter_add_check(
-    storage: &Storage,
+    storage: &RelStorage,
     def: &TableDef,
     check: &CheckConstraint,
     eval_ctx: &EvalContext,
@@ -325,7 +325,7 @@ pub(in crate::engine::relational) fn alter_add_check(
 /// `ALTER TABLE ... DROP CONSTRAINT name`. Removes a CHECK or FOREIGN KEY
 /// constraint by name (case-insensitive); an unknown name is error 3728.
 pub(in crate::engine::relational) fn alter_drop_constraint(
-    storage: &Storage,
+    storage: &RelStorage,
     def: &TableDef,
     name: &Name,
 ) -> Result<StatementResult, SqlError> {

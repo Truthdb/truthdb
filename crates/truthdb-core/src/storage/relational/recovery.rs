@@ -1,6 +1,6 @@
 use super::super::*;
 
-impl Storage {
+impl RelStorage {
     /// Test hook: the relational WAL records currently recoverable from the
     /// ring, exactly as restart's analysis would see them.
     #[cfg(test)]

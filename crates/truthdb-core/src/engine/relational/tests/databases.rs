@@ -291,7 +291,7 @@ fn wal_page_records_carry_their_database_as_the_container_tag() {
     // rel_wal_records reads the replay cache scanned at OPEN — reopen the
     // file so the appended ring is visible.
     drop(engine);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let records = storage.rel_wal_records().expect("wal records");
     let tags: Vec<u16> = records
         .iter()

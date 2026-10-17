@@ -419,7 +419,7 @@ fn both_ways_of_shutting_the_pool_down_stop_every_thread() {
     // one of them noticed.
     for explicit in [true, false] {
         let path = unique_temp_path("shutdown");
-        let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+        let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
         let engine = Engine::new(storage).expect("engine");
         let (handle, join) = spawn_engine(engine);
         if explicit {

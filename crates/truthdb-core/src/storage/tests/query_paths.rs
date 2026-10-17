@@ -8,7 +8,7 @@ fn a_covering_seek_answers_from_the_index_alone_and_matches_a_scan() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("include-covering");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let setup = execute_batch(
         &storage,
@@ -65,7 +65,7 @@ fn a_filtered_aggregate_streams_its_input_instead_of_materializing() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("stream-input");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let setup = execute_batch(
         &storage,
@@ -170,7 +170,7 @@ fn a_spilling_join_streams_its_probe_side_into_partitions() {
     use crate::engine::{StatementResult, TxnContext, execute_batch, set_test_sort_budget};
 
     let path = unique_temp_path("grace-probe-stream");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let setup = execute_batch(
         &storage,
@@ -221,9 +221,9 @@ fn row_counts_track_dml_transactions_and_recovery() {
     use crate::engine::{TxnContext, execute_batch};
 
     let path = unique_temp_path("row-count");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
-    let run = |storage: &Storage, ctx: &mut TxnContext, sql: &str| {
+    let run = |storage: &RelStorage, ctx: &mut TxnContext, sql: &str| {
         let outcome = execute_batch(storage, sql, ctx);
         assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
     };
@@ -297,7 +297,7 @@ fn row_counts_track_dml_transactions_and_recovery() {
     // Crash (no checkpoint, pool never flushed): recovery replays the ops,
     // counter page included.
     drop(storage);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     assert_eq!(
         storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
         Some(3),
@@ -315,7 +315,7 @@ fn an_uncommitted_transactions_rows_are_uncounted_after_crash() {
     use crate::engine::{TxnContext, execute_batch};
 
     let path = unique_temp_path("row-count-crash");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let setup = execute_batch(
         &storage,
@@ -338,7 +338,7 @@ fn an_uncommitted_transactions_rows_are_uncounted_after_crash() {
     );
     drop(storage); // crash with the transaction open
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     assert_eq!(
         storage.rel_row_count(crate::relstore::catalog::DEFAULT_DATABASE_ID, "t"),
         Some(2),
@@ -358,14 +358,14 @@ fn a_tiny_table_scans_until_it_grows_into_its_seek() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("row-count-tiebreak");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
-    let run = |storage: &Storage, ctx: &mut TxnContext, sql: &str| {
+    let run = |storage: &RelStorage, ctx: &mut TxnContext, sql: &str| {
         let outcome = execute_batch(storage, sql, ctx);
         assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
         outcome
     };
-    let plan_of = |storage: &Storage, ctx: &mut TxnContext, sql: &str| -> String {
+    let plan_of = |storage: &RelStorage, ctx: &mut TxnContext, sql: &str| -> String {
         let outcome = run(storage, ctx, &format!("SET SHOWPLAN_TEXT ON; {sql}"));
         let mut ctx2 = TxnContext::default();
         let _ = execute_batch(storage, "SET SHOWPLAN_TEXT OFF", &mut ctx2);
@@ -424,7 +424,7 @@ fn a_covering_index_wins_the_tie_against_an_older_plain_index() {
     use crate::engine::{TxnContext, execute_batch};
 
     let path = unique_temp_path("include-tiebreak");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     // The plain index is created FIRST, so a first-wins tie keeps it.
     let setup = execute_batch(
@@ -460,7 +460,7 @@ fn create_index_errors_carry_sql_server_numbers() {
     use crate::engine::{TxnContext, execute_batch};
 
     let path = unique_temp_path("include-errors");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let setup = execute_batch(
         &storage,
@@ -495,7 +495,7 @@ fn included_values_survive_update_delete_and_restart() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("include-restart");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let setup = execute_batch(
         &storage,
@@ -509,7 +509,7 @@ fn included_values_survive_update_delete_and_restart() {
     assert!(setup.error.is_none(), "{:?}", setup.error);
     drop(storage);
 
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(
         &storage,
@@ -549,7 +549,7 @@ fn a_non_covering_read_on_an_include_index_still_finds_rows() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
 
     let path = unique_temp_path("include-fallback");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     let mut ctx = TxnContext::default();
     let setup = execute_batch(
         &storage,

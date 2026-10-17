@@ -40,8 +40,8 @@ fn a_standby_restartpoint_reclaims_the_ring_up_to_its_own_undo_floor() {
 
     // Every shipped transaction is resolved, so the floor is the applied
     // tail: the restartpoint reclaims the whole shipped range.
-    Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
         .apply_wal_stream(backup_end, &delta)
@@ -69,7 +69,8 @@ fn a_standby_restartpoint_reclaims_the_ring_up_to_its_own_undo_floor() {
 
     // Durable: reopen replays from the advanced head (pages were flushed).
     drop(standby);
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("reopen")).expect("eng");
+    let standby =
+        Engine::new(RelStorage::open(standby_path.clone()).expect("reopen")).expect("eng");
     assert_eq!(
         sql_rows(&standby, "SELECT id, v FROM t ORDER BY id").1,
         expected,
@@ -144,8 +145,8 @@ fn a_failed_apply_never_feeds_a_restartpoint() {
     let f2 = primary.storage().wal_flushed_lsn();
     let delta2 = primary.storage().read_wal_range(f1, f2).expect("delta2");
 
-    Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
         .apply_wal_stream(backup_end, &delta1)
@@ -240,8 +241,8 @@ fn a_standby_restartpoint_stops_at_an_unresolved_transactions_begin() {
         .read_wal_range(backup_end, mid)
         .expect("mid-transaction range");
 
-    Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
         .apply_wal_stream(backup_end, &delta)
@@ -263,7 +264,7 @@ fn a_standby_restartpoint_stops_at_an_unresolved_transactions_begin() {
 
     // The floor survives a reopen (the ATT is re-derived from the ring).
     drop(standby);
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     assert!(
         !standby.standby_restartpoint().expect("after reopen"),
         "still pinned by the same unresolved transaction after a reopen"
@@ -349,8 +350,8 @@ fn a_standby_restartpoint_never_truncates_unsnapshotted_search_records() {
         .read_wal_range(backup_end, flushed)
         .expect("delta");
 
-    Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
         .apply_wal_stream(backup_end, &delta)
@@ -372,7 +373,7 @@ fn a_standby_restartpoint_never_truncates_unsnapshotted_search_records() {
     // Reopen: the ring still holds every search record, so the replayed
     // search state serves the streamed doc.
     drop(standby);
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     let response = standby
         .execute(r#"search products { "query": { "match": { "name": "red" } } }"#)
         .expect("standby search after reopen");
@@ -426,8 +427,8 @@ fn a_full_model_standby_still_reclaims_and_refuses_backup_log() {
         .read_wal_range(backup_end, flushed)
         .expect("delta");
 
-    Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
         .apply_wal_stream(backup_end, &delta)
@@ -508,9 +509,10 @@ fn a_standby_reopen_is_redo_only_and_keeps_in_flight_stream_data() {
     // are applied PHYSICALLY via redo (proven by the post-commit equality
     // below) but hidden from reads — a readable standby serves only
     // committed state.
-    Storage::restore_full(&standby_path, &bak).expect("restore");
+    crate::storage::Storage::restore_full(&standby_path, &bak).expect("restore");
     {
-        let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+        let standby =
+            Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
         standby
             .storage()
             .apply_wal_stream(backup_end, &delta)
@@ -523,7 +525,8 @@ fn a_standby_reopen_is_redo_only_and_keeps_in_flight_stream_data() {
     }
     // THE FIX: a standby reopen is redo-only, so the applied rows survive. A
     // full ARIES undo here would drop the 10 in-flight rows permanently.
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("reopen")).expect("eng");
+    let standby =
+        Engine::new(RelStorage::open(standby_path.clone()).expect("reopen")).expect("eng");
     assert_eq!(
         count(&standby),
         "10",

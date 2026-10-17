@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use truthdb_core::engine::Engine;
 use truthdb_core::engine::{StatementResult, TxnContext};
 use truthdb_core::relstore::types::Datum;
-use truthdb_core::storage::{Storage, StorageOptions};
+use truthdb_core::storage::{RelStorage, StorageOptions};
 
 fn temp_path(label: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
@@ -30,7 +30,7 @@ fn new_engine(path: &Path) -> Engine {
         reserved_ratio: 0.17,
         default_collation: None,
     };
-    let storage = Storage::create(path.to_path_buf(), opts).expect("create storage");
+    let storage = RelStorage::create(path.to_path_buf(), opts).expect("create storage");
     Engine::new(storage).expect("engine")
 }
 

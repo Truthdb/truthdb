@@ -901,7 +901,7 @@ fn trigger_writes_are_fully_undone_after_a_crash() {
     // Recovery undoes the loser A entirely — the whole statement, DML AND
     // its trigger's write, is atomic: t=99 is gone and the trigger's
     // audit=99 is gone; the separately-committed audit=1 survives.
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("replay");
     let out_t = batch(
         &engine,

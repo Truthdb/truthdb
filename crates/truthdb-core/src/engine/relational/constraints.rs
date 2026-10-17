@@ -6,7 +6,7 @@ use super::prelude::*;
 /// (constraint names are unique across kinds).
 pub(super) fn build_foreign_key_defs(
     db_id: u32,
-    storage: &Storage,
+    storage: &RelStorage,
     create: &CreateTable,
     columns: &[Column],
     table_name: &str,
@@ -376,7 +376,7 @@ pub(super) fn parse_checks(def: &TableDef) -> Result<Vec<(String, Expr)>, SqlErr
 /// constraint passes on TRUE or UNKNOWN (NULL); FALSE is error 547.
 #[allow(clippy::too_many_arguments)]
 pub(super) fn enforce_checks(
-    storage: &Storage,
+    storage: &RelStorage,
     checks: &[(String, Expr)],
     row: &[SqlValue],
     resolver: &impl ColumnResolver,
@@ -439,7 +439,7 @@ pub(super) fn fk_key(fk: &catalog::ForeignKeyDef, row: &[Datum]) -> Option<Vec<D
 /// a committed parent row, or, for a self-reference, a sibling row in `batch`
 /// (whose PK columns are `child.key_columns`).
 pub(super) fn fk_parent_exists(
-    storage: &Storage,
+    storage: &RelStorage,
     fk: &catalog::ForeignKeyDef,
     key: &[Datum],
     child: &TableDef,
@@ -474,7 +474,7 @@ pub(super) fn fk_parent_exists(
 /// The canonical name of a database id, for error text (the default
 /// database's configured name when the id is unknown — a dropped database's
 /// error still renders).
-pub(super) fn database_name_of(storage: &Storage, db_id: u32) -> String {
+pub(super) fn database_name_of(storage: &RelStorage, db_id: u32) -> String {
     storage
         .rel_databases()
         .into_iter()
@@ -501,7 +501,7 @@ pub(super) fn fk_child_violation(database: &str, name: &str, verb: &str, parent:
 /// foreign keys (an UPDATE validates those against its post-update snapshot,
 /// since a pre-mutation probe would see stale rows).
 pub(super) fn enforce_child_fks(
-    storage: &Storage,
+    storage: &RelStorage,
     def: &TableDef,
     row: &[Datum],
     batch: &[Vec<Datum>],
@@ -588,7 +588,7 @@ pub(super) fn reference_conflict(
 /// the FK columns, each removed key is probed by an index seek; otherwise the
 /// child is scanned.
 pub(super) fn enforce_parent_fks(
-    storage: &Storage,
+    storage: &RelStorage,
     parent: &TableDef,
     removed_keys: &[Vec<Datum>],
     verb: &str,

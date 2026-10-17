@@ -15,8 +15,8 @@ fn a_writable_restore_is_a_new_timeline_a_standby_seed_is_not() {
     engine.storage().backup_full(&bak).expect("backup");
     drop(engine);
 
-    Storage::restore_full(&writable, &bak).expect("plain restore");
-    let restored = Engine::new(Storage::open(writable.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full(&writable, &bak).expect("plain restore");
+    let restored = Engine::new(RelStorage::open(writable.clone()).expect("open")).expect("eng");
     assert_eq!(
         restored.storage().epoch(),
         1,
@@ -24,8 +24,8 @@ fn a_writable_restore_is_a_new_timeline_a_standby_seed_is_not() {
     );
     drop(restored);
 
-    Storage::restore_full_standby(&seed, &bak, &[]).expect("standby seed");
-    let standby = Engine::new(Storage::open(seed.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&seed, &bak, &[]).expect("standby seed");
+    let standby = Engine::new(RelStorage::open(seed.clone()).expect("open")).expect("eng");
     assert_eq!(
         standby.storage().epoch(),
         0,
@@ -113,8 +113,8 @@ fn promotion_finishes_recovery_bumps_the_epoch_and_fences_the_old_timeline() {
         .read_wal_range(backup_end, mid)
         .expect("delta");
 
-    Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
-    let standby = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&standby_path, &bak, &[]).expect("restore");
+    let standby = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     standby
         .storage()
         .apply_wal_stream(backup_end, &delta)
@@ -122,23 +122,24 @@ fn promotion_finishes_recovery_bumps_the_epoch_and_fences_the_old_timeline() {
 
     // A running server holds the advisory lock: promote refuses.
     assert!(
-        Storage::promote(&standby_path).is_err(),
+        crate::storage::Storage::promote(&standby_path).is_err(),
         "promote refuses a file a live server holds"
     );
     drop(standby);
 
     // A non-standby cannot be promoted.
     drop(primary);
-    let err = Storage::promote(&primary_path).expect_err("primary is not a standby");
+    let err =
+        crate::storage::Storage::promote(&primary_path).expect_err("primary is not a standby");
     assert!(
         err.to_string().contains("not a replication standby"),
         "{err}"
     );
 
-    let epoch = Storage::promote(&standby_path).expect("promote");
+    let epoch = crate::storage::Storage::promote(&standby_path).expect("promote");
     assert_eq!(epoch, 1, "the first failover bumps epoch 0 -> 1");
 
-    let promoted = Engine::new(Storage::open(standby_path.clone()).expect("open")).expect("eng");
+    let promoted = Engine::new(RelStorage::open(standby_path.clone()).expect("open")).expect("eng");
     assert!(
         !promoted.storage().is_standby(),
         "the promoted node is a normal primary"
@@ -181,8 +182,8 @@ fn promotion_finishes_recovery_bumps_the_epoch_and_fences_the_old_timeline() {
         .storage()
         .backup_full(&reseed_bak)
         .expect("backup of the promoted node");
-    Storage::restore_full_standby(&reseed_path, &reseed_bak, &[]).expect("reseed");
-    let reseeded = Engine::new(Storage::open(reseed_path.clone()).expect("open")).expect("eng");
+    crate::storage::Storage::restore_full_standby(&reseed_path, &reseed_bak, &[]).expect("reseed");
+    let reseeded = Engine::new(RelStorage::open(reseed_path.clone()).expect("open")).expect("eng");
     assert_eq!(
         reseeded.storage().epoch(),
         1,
@@ -225,7 +226,7 @@ fn the_replication_epoch_persists_and_the_retain_cap_is_bounded() {
         .expect("create");
     engine.checkpoint().expect("checkpoint");
     drop(engine);
-    let engine = Engine::new(Storage::open(path.clone()).expect("open")).expect("engine");
+    let engine = Engine::new(RelStorage::open(path.clone()).expect("open")).expect("engine");
     assert_eq!(
         engine.storage().epoch(),
         5,

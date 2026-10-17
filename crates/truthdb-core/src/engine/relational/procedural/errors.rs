@@ -88,7 +88,7 @@ pub(in crate::engine::relational) fn statement_error_ladder(
 /// assumes versioned reads and drops Table S) — a live dirty read, the
 /// Stage 13 seam class, caught by the control-flow review.
 pub(in crate::engine::relational) fn enter_condition_scopes<'a>(
-    storage: &'a Storage,
+    storage: &'a RelStorage,
     condition: &Expr,
     txn_ctx: &mut TxnContext,
     run: &mut BatchRun<'_>,
@@ -154,7 +154,7 @@ pub(in crate::engine::relational) fn enter_condition_scopes<'a>(
 /// residual expression evaluates against the session context. T-SQL
 /// three-valued: TRUE runs the branch; FALSE and NULL (UNKNOWN) do not.
 pub(in crate::engine::relational) fn eval_condition(
-    storage: &Storage,
+    storage: &RelStorage,
     condition: &Expr,
     txn_ctx: &TxnContext,
 ) -> Result<bool, SqlError> {

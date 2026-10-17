@@ -27,7 +27,7 @@ fn sql_create_insert_select_survive_restart() {
     drop(engine);
 
     // Restart: schema + rows recovered.
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("engine");
     let (_, rows) = sql_rows(&engine, "SELECT name FROM products WHERE price IS NULL");
     assert_eq!(rows, vec![vec![Some("Sockar".into())]]);
@@ -182,7 +182,7 @@ fn sql_identity_assigns_and_survives_restart() {
     drop(engine);
 
     // Restart: the counter continues from 5, never reusing 3.
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("engine");
     engine
         .execute("INSERT INTO t (name) VALUES ('e')")
@@ -250,7 +250,7 @@ fn sql_check_constraints_enforced_on_insert_and_update() {
 
     // The constraint survives a restart and still fires.
     drop(engine);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("engine");
     assert_eq!(
         sql_error_number(&engine, "INSERT INTO items VALUES (5, -9, 10)"),
@@ -488,7 +488,7 @@ fn sql_alter_table_add_drop_check() {
         .execute("ALTER TABLE t ADD CONSTRAINT ck_id CHECK (id > 0)")
         .expect("add ck_id");
     drop(engine);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("engine");
     let (_, rows) = sql_rows(
         &engine,
@@ -558,7 +558,7 @@ fn sql_foreign_key_child_and_parent_enforcement() {
 
     // The constraint is enforced again after a restart.
     drop(engine);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("engine");
     assert_eq!(
         sql_error_number(&engine, "INSERT INTO child VALUES (20, 7)"),
@@ -700,7 +700,7 @@ fn sql_foreign_key_alter_drop_and_catalog() {
     // DROP CONSTRAINT removes enforcement; the FK survives a restart until
     // then. Confirm durability first.
     drop(engine);
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     let engine = Engine::new(storage).expect("engine");
     assert_eq!(
         sql_error_number(&engine, "INSERT INTO c VALUES (13, 55)"),

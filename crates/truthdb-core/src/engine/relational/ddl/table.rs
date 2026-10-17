@@ -3,7 +3,7 @@ use super::super::prelude::*;
 // ---- CREATE TABLE -------------------------------------------------------
 
 pub(in crate::engine::relational) fn exec_create_table(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     create: &CreateTable,
 ) -> Result<StatementResult, SqlError> {
@@ -184,7 +184,7 @@ pub(in crate::engine::relational) fn exec_create_table(
 // ---- DROP TABLE ---------------------------------------------------------
 
 pub(in crate::engine::relational) fn exec_drop_table(
-    storage: &Storage,
+    storage: &RelStorage,
     db_id: u32,
     drop: &DropTable,
 ) -> Result<StatementResult, SqlError> {

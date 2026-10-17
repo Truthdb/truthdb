@@ -1,6 +1,6 @@
 use super::*;
 
-impl Storage {
+impl RelStorage {
     pub fn rel_delete_where(
         &self,
         db_id: u32,

@@ -13,7 +13,7 @@ fn the_database_default_collation_survives_a_reopen() {
     // belongs to the file, not to the config of whoever opens it next.
     let path = unique_temp_path("default-collation");
     {
-        let storage = Storage::create_with_wal_bounds(
+        let storage = RelStorage::create_with_wal_bounds(
             path.clone(),
             storage_options_with_collation("Finnish_Swedish_CI_AS"),
             REL_TEST_WAL_BYTES,
@@ -25,7 +25,7 @@ fn the_database_default_collation_survives_a_reopen() {
             Some("Finnish_Swedish_CI_AS")
         );
     }
-    let storage = Storage::open(path.clone()).expect("reopen");
+    let storage = RelStorage::open(path.clone()).expect("reopen");
     assert_eq!(
         storage.default_collation().as_deref(),
         Some("Finnish_Swedish_CI_AS"),
@@ -39,7 +39,7 @@ fn a_column_keeps_the_default_it_was_created_under() {
     // The column stores the collation by name at CREATE TABLE. A database
     // created later with a different default must not re-key this one.
     let path = unique_temp_path("default-collation-column");
-    let mut storage = Storage::create_with_wal_bounds(
+    let mut storage = RelStorage::create_with_wal_bounds(
         path.clone(),
         storage_options_with_collation("Finnish_Swedish_CI_AS"),
         REL_TEST_WAL_BYTES,
@@ -110,7 +110,7 @@ fn a_collation_name_too_long_for_the_header_is_refused() {
     // Better to refuse than to stamp a truncated name and key columns under a
     // collation nobody asked for.
     let path = unique_temp_path("default-collation-long");
-    let result = Storage::create_with_wal_bounds(
+    let result = RelStorage::create_with_wal_bounds(
         path.clone(),
         storage_options_with_collation(&"x".repeat(9000)),
         REL_TEST_WAL_BYTES,

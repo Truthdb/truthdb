@@ -5,7 +5,7 @@ fn backup_is_single_flight_and_releases_its_hold() {
     let path = unique_temp_path("backup-hold");
     let bak = unique_temp_path("backup-hold-bak");
     let bak2 = unique_temp_path("backup-hold-bak2");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
 
     // A second backup while a hold is set is rejected, and — critically —
     // must NOT clear the in-flight backup's hold (the guard arms only after
@@ -46,7 +46,7 @@ fn log_backup_orphans_when_recovery_flips_to_simple_mid_flight() {
     // SIMPLE releases the log hold and a checkpoint advances the head; phase
     // 3 must then ORPHAN the backup rather than re-arm the hold below head.
     let path = unique_temp_path("backuplog-orphan");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     storage
         .rel_set_db_options(None, None, Some(true))
         .expect("enable FULL");
@@ -94,7 +94,7 @@ fn log_backup_orphans_when_recovery_flips_to_simple_mid_flight() {
 #[test]
 fn a_page_freed_since_the_backup_began_is_not_treated_as_corrupt() {
     let path = unique_temp_path("backup-freed");
-    let storage = Storage::create(path.clone(), test_storage_options()).expect("create");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     {
         let mut file = storage.lock();
         let page = file.allocator.allocate(1).expect("allocate a page");

@@ -91,7 +91,7 @@ pub(in crate::engine::relational) fn sort_collators(
 /// ORDER BY / join-ON / CHECK etc. rather than reaching the pure evaluator and
 /// raising 195.
 pub(in crate::engine::relational) fn eval_maybe_bound(
-    storage: &Storage,
+    storage: &RelStorage,
     expr: &Expr,
     row: &[SqlValue],
     resolver: &impl ColumnResolver,
@@ -107,7 +107,7 @@ pub(in crate::engine::relational) fn eval_maybe_bound(
 }
 
 pub(in crate::engine::relational) fn sort_key(
-    storage: &Storage,
+    storage: &RelStorage,
     row: &[Datum],
     order_by: &[OrderItem],
     types: &[ColumnType],
@@ -139,7 +139,7 @@ pub(in crate::engine::relational) fn approx_row_bytes(row: &[Datum]) -> usize {
 /// sorted runs to temp extents and k-way merges them (external merge sort),
 /// bounding the sort's working memory instead of erroring or doubling memory.
 pub(in crate::engine::relational) fn order_rows(
-    storage: &Storage,
+    storage: &RelStorage,
     rows: Vec<Vec<Datum>>,
     order_by: &[OrderItem],
     types: &[ColumnType],
@@ -161,7 +161,7 @@ pub(in crate::engine::relational) fn order_rows(
 
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine::relational) fn order_rows_budgeted<'a>(
-    storage: &'a Storage,
+    storage: &'a RelStorage,
     rows: Vec<Vec<Datum>>,
     order_by: &[OrderItem],
     types: &[ColumnType],
@@ -203,7 +203,7 @@ pub(in crate::engine::relational) fn order_rows_budgeted<'a>(
 /// Stably sorts `run` in place and writes its rows (in sorted order) to a fresh
 /// `RowSpool`, clearing `run`.
 pub(in crate::engine::relational) fn sort_and_spill<'a>(
-    storage: &'a Storage,
+    storage: &'a RelStorage,
     run: &mut Vec<KeyedRow>,
     cmp: &impl Fn(&Vec<SqlValue>, &Vec<SqlValue>) -> std::cmp::Ordering,
 ) -> Result<crate::relstore::spill::RowSpool<'a>, SqlError> {
@@ -226,7 +226,7 @@ pub(in crate::engine::relational) fn sort_and_spill<'a>(
 /// (spilled runs hold earlier input rows than the in-memory tail).
 #[allow(clippy::too_many_arguments)]
 pub(in crate::engine::relational) fn merge_runs(
-    storage: &Storage,
+    storage: &RelStorage,
     runs: &[crate::relstore::spill::RowSpool<'_>],
     tail: Vec<KeyedRow>,
     order_by: &[OrderItem],
@@ -290,7 +290,7 @@ pub(in crate::engine::relational) fn merge_runs(
 
 /// Reads the next row from a spool reader and pairs it with its ORDER BY key.
 pub(in crate::engine::relational) fn read_head(
-    storage: &Storage,
+    storage: &RelStorage,
     reader: &mut crate::relstore::spill::RowSpoolReader,
     order_by: &[OrderItem],
     types: &[ColumnType],
