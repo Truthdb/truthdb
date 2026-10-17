@@ -14,6 +14,12 @@ impl Storage {
         Ok(())
     }
 
+    /// The group-commit durable watermark (direct WAL syncs are tracked by
+    /// [`StorageFile::wal_flushed`]).
+    pub fn group_commit_flushed(&self) -> u64 {
+        self.gc.flushed()
+    }
+
     /// Wedges the relational store after a durability (fsync) failure so no
     /// further op serves state the log does not back. See `ensure_rel_usable`.
     pub fn wedge(&self) {

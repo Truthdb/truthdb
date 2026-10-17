@@ -2,7 +2,7 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 
 use super::*;
-use crate::storage_layout::{FILE_HEADER_SIZE, WAL_ENTRY_TYPE_RECORD};
+use crate::storage_layout::{FILE_HEADER_SIZE, PAGE_SIZE, WAL_ENTRY_TYPE_RECORD};
 
 /// Small ring so wrap/full paths are cheap to reach.
 const TEST_WAL_BYTES: u64 = 64 * 1024;

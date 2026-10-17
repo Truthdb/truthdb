@@ -16,7 +16,7 @@ fn backup_is_single_flight_and_releases_its_hold() {
         Err(StorageError::BackupInProgress)
     ));
     assert_eq!(
-        storage.lock().truncation_gate.backup,
+        storage.lock().backup_hold(),
         Some(42),
         "a rejected backup leaves the existing hold intact"
     );
@@ -25,7 +25,7 @@ fn backup_is_single_flight_and_releases_its_hold() {
     // A successful backup releases its own hold, so a second one succeeds.
     storage.backup_full(&bak).expect("first backup");
     assert_eq!(
-        storage.lock().truncation_gate.backup,
+        storage.lock().backup_hold(),
         None,
         "the hold is released after a successful backup"
     );
@@ -97,12 +97,12 @@ fn a_page_freed_since_the_backup_began_is_not_treated_as_corrupt() {
     let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
     {
         let mut file = storage.lock();
-        let page = file.allocator.allocate(1).expect("allocate a page");
+        let page = file.allocator_mut().allocate(1).expect("allocate a page");
         assert!(
             file.page_is_live_regular(page).unwrap(),
             "a live, allocated data page is regular (a checksum failure there is real corruption)"
         );
-        file.allocator.free(page, 1);
+        file.allocator_mut().free(page, 1);
         assert!(
             !file.page_is_live_regular(page).unwrap(),
             "a page freed since the backup began is tolerated, not flagged corrupt"

@@ -35,7 +35,7 @@ impl RelStorage {
         let (rcsi_now, allow_now, recovery_now) = (
             rel.version.rcsi,
             rel.version.allow_snapshot,
-            rel.core.recovery_full,
+            rel.core.recovery_full(),
         );
         drop(guard);
         self.rcsi
@@ -70,12 +70,12 @@ impl RelStorage {
     /// versions the snapshot may still need; the caller MUST pair this with
     /// [`Self::release_read_snapshot`].
     pub(crate) fn capture_read_snapshot(&self, own_txn: Option<u64>) -> ReadSnapshot {
-        let durable = self.gc.flushed();
+        let durable = self.group_commit_flushed();
         let mut guard = self.lock();
         let mut rel = guard.rel();
         // Whichever watermark is ahead: the group-commit fsync or a direct
         // WAL sync (rollbacks, checkpoints) — both are durability floors.
-        let durable = durable.max(rel.core.wal.flushed_lsn());
+        let durable = durable.max(rel.core.wal_flushed());
         let seq = rel.version.durable_seq(durable);
         rel.version.register_snapshot(seq);
         ReadSnapshot { seq, own_txn }
@@ -95,10 +95,10 @@ impl RelStorage {
     /// Drops version history no live snapshot can need (runs on the
     /// maintenance thread; cheap when nothing is versioned).
     pub fn version_prune(&self) {
-        let durable = self.gc.flushed();
+        let durable = self.group_commit_flushed();
         let mut guard = self.lock();
         let mut rel = guard.rel();
-        let durable = durable.max(rel.core.wal.flushed_lsn());
+        let durable = durable.max(rel.core.wal_flushed());
         let fallback = rel.version.durable_seq(durable);
         let watermark = rel.version.watermark(fallback);
         let alive: std::collections::HashSet<u32> =
@@ -353,8 +353,7 @@ impl RelFile<'_> {
     ) -> Result<(), StorageError> {
         let (def, schema) = self.rel_def(db_id, name)?;
         let row = encode_row(&schema, &values)?;
-        let txn_id = self.core.pages.next_txn_id;
-        self.core.pages.next_txn_id += 1;
+        let txn_id = self.core.alloc_txn_id();
         let mut ctx = self.rel_ctx();
         let mut txn = ctx.begin(txn_id)?;
         if def.is_tree() {
@@ -386,17 +385,7 @@ impl RelFile<'_> {
     /// possible but their FPIs are still in the log).
     #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn rel_flush_pool_only(&mut self) -> Result<(), StorageError> {
-        self.core.wal.sync_all()?;
-        let crate::relstore::ctx::PageState { pool, .. } = &mut self.core.pages;
-        let mut io = PoolIo {
-            file: &mut self.core.file,
-            wal: &mut self.core.wal,
-            data_offset: self.core.layout.data_offset,
-            data_pages: self.core.layout.data_size / PAGE_SIZE as u64,
-        };
-        pool.flush_all(&mut io)?;
-        self.core.file.sync_data()?;
-        Ok(())
+        self.core.flush_pool_only()
     }
 
     pub(in crate::storage) fn rel_def(
@@ -415,19 +404,7 @@ impl RelFile<'_> {
 
     /// Builds the relational execution context over this file's parts.
     pub(in crate::storage) fn rel_ctx(&mut self) -> RelCtx<'_> {
-        RelCtx {
-            pool: &mut self.core.pages.pool,
-            io: PoolIo {
-                file: &mut self.core.file,
-                wal: &mut self.core.wal,
-                data_offset: self.core.layout.data_offset,
-                data_pages: self.core.layout.data_size / PAGE_SIZE as u64,
-            },
-            allocator: &mut self.core.allocator,
-            dpt: &mut self.core.pages.dpt,
-            use_reserve: false,
-            container: self.eng.current_container,
-        }
+        self.core.page_ctx(self.eng.current_container)
     }
 
     /// Runs one autocommit relational statement: begin, ops, commit (force
@@ -436,8 +413,7 @@ impl RelFile<'_> {
         &mut self,
         f: impl FnOnce(&mut RelCtx<'_>, &mut RelTxn) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
-        let txn_id = self.core.pages.next_txn_id;
-        self.core.pages.next_txn_id += 1;
+        let txn_id = self.core.alloc_txn_id();
         let roots = self.rel.tree_roots();
         let mut ctx = self.rel_ctx();
         let mut txn = RelTxn::new(ctx.begin(txn_id)?);
@@ -473,7 +449,7 @@ impl RelFile<'_> {
         };
         let _ = ctx;
         if wedged {
-            self.core.pages.wedged = true;
+            self.core.set_wedged();
         }
         if let Some((pending, commit_lsn)) = publish {
             for version in pending {
@@ -525,7 +501,7 @@ impl RelFile<'_> {
                 };
                 let _ = ctx;
                 if wedged {
-                    self.core.pages.wedged = true;
+                    self.core.set_wedged();
                 }
                 // Publish the successful statement's versions inside this
                 // mutex hold (atomic with its page mutations, as far as any
@@ -549,18 +525,14 @@ impl RelFile<'_> {
     /// Opens a multi-statement transaction (BEGIN TRAN), snapshotting tree roots
     /// for a later rollback.
     pub(in crate::storage) fn begin_txn(&mut self) -> Result<StorageTxn, StorageError> {
-        let txn_id = self.core.pages.next_txn_id;
-        self.core.pages.next_txn_id += 1;
+        let txn_id = self.core.alloc_txn_id();
         let roots = self.rel.tree_roots();
         let mut ctx = self.rel_ctx();
         let txn = RelTxn::new(ctx.begin(txn_id)?);
         // Track the transaction's BEGIN LSN so a checkpoint clamps the WAL head
         // to the oldest open transaction, preserving its undo records for crash
         // rollback (its uncommitted pages may still be flushed under steal).
-        self.core
-            .pages
-            .active_txn_begins
-            .insert(txn.txn_id, txn.last_lsn);
+        self.core.register_active_txn(txn.txn_id, txn.last_lsn);
         Ok(StorageTxn { txn, roots })
     }
 
@@ -568,7 +540,7 @@ impl RelFile<'_> {
     /// store, as for autocommit commits.
     pub(in crate::storage) fn commit_txn(&mut self, stx: StorageTxn) -> Result<(), StorageError> {
         // The transaction is ending (the `StorageTxn` is consumed either way).
-        self.core.pages.active_txn_begins.remove(&stx.txn.txn_id);
+        self.core.end_active_txn(stx.txn.txn_id);
         let txn_id = stx.txn.txn_id;
         debug_assert!(
             stx.txn.pending_versions.is_empty(),
@@ -586,7 +558,7 @@ impl RelFile<'_> {
                 Ok(())
             }
             Err(err) => {
-                self.core.pages.wedged = true;
+                self.core.set_wedged();
                 Err(err)
             }
         }
@@ -597,7 +569,7 @@ impl RelFile<'_> {
         &mut self,
         mut stx: StorageTxn,
     ) -> Result<(), StorageError> {
-        self.core.pages.active_txn_begins.remove(&stx.txn.txn_id);
+        self.core.end_active_txn(stx.txn.txn_id);
         let txn_id = stx.txn.txn_id;
         let published = std::mem::take(&mut stx.txn.published_versions);
         let roots = stx.roots;
@@ -619,7 +591,7 @@ impl RelFile<'_> {
             self.version.unpublish(record, txn_id);
         }
         if result.is_err() {
-            self.core.pages.wedged = true;
+            self.core.set_wedged();
         }
         result
     }
@@ -659,7 +631,7 @@ impl RelFile<'_> {
             self.version.unpublish(record, txn_id);
         }
         if result.is_err() {
-            self.core.pages.wedged = true;
+            self.core.set_wedged();
         }
         result
     }
@@ -667,6 +639,6 @@ impl RelFile<'_> {
     /// Whether any explicit transaction is open.
     #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::storage) fn has_active_transactions(&self) -> bool {
-        !self.core.pages.active_txn_begins.is_empty()
+        self.core.has_active_txns()
     }
 }

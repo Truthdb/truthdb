@@ -18,7 +18,7 @@ impl RelStorage {
     fn from_core(core: Storage) -> Self {
         let (rcsi, allow_snapshot, recovery_full) = {
             let mut guard = core.lock();
-            let recovery_full = guard.recovery_full;
+            let recovery_full = guard.recovery_full();
             let rel = guard.rel();
             (rel.version.rcsi, rel.version.allow_snapshot, recovery_full)
         };

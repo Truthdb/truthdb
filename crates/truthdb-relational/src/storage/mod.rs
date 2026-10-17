@@ -12,7 +12,7 @@ use std::sync::Arc;
 use crate::relstore::RelState;
 use crate::relstore::btree::{BTree, ScanCursor, TreeInsert, TreeRoots};
 use crate::relstore::catalog::{self, FIRST_USER_OBJECT_ID, IndexDef, TableDef};
-use crate::relstore::ctx::{OpMode, PoolIo, RelCtx, TxnLink};
+use crate::relstore::ctx::{OpMode, RelCtx, TxnLink};
 use crate::relstore::heap::{Heap, Rid};
 use crate::relstore::index::{self, Locator};
 use crate::relstore::key::encode_key;
@@ -24,7 +24,6 @@ use crate::relstore::types::{ColumnType, Datum};
 use crate::relstore::version::{
     PendingVersion, ReadSnapshot, Resolved, RowChange, decode_rid_identity, rid_identity,
 };
-use crate::storage_layout::PAGE_SIZE;
 use crate::wal::records::RelRecord;
 
 mod relational;
@@ -254,10 +253,10 @@ pub(crate) trait LockedRel {
 
 impl LockedRel for Locked {
     fn rel(&mut self) -> RelFile<'_> {
+        let (core, eng) = self.parts();
         RelFile {
-            core: &mut self.core,
-            eng: self
-                .eng
+            core,
+            eng: eng
                 .as_any_mut()
                 .downcast_mut::<RelEngine>()
                 .expect("the storage engine is the relational engine"),
