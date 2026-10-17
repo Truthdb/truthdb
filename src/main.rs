@@ -4,9 +4,9 @@ compile_error!("TruthDB must be built for Linux targets. Use Docker or a Linux e
 use tokio::sync::watch;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
-use truthdb_core::client_listener::ClientListener;
-use truthdb_core::engine::Engine;
 use truthdb_core::storage::{RelStorage, Storage};
+use truthdb_engine::client_listener::ClientListener;
+use truthdb_engine::engine::Engine;
 mod config;
 use config::Config;
 
@@ -126,7 +126,7 @@ async fn main() {
     let storage_arc = engine.storage_arc().core_arc();
     // The engine runs on its own thread behind a message channel; the async
     // listeners talk to it through a cloneable handle.
-    let (engine, engine_join) = truthdb_core::session::spawn_engine(engine);
+    let (engine, engine_join) = truthdb_engine::session::spawn_engine(engine);
 
     let client_listener =
         match ClientListener::new(&config.network.addr, config.network.port, engine.clone()) {

@@ -75,7 +75,7 @@ impl RelStorage {
         projection: Option<&[usize]>,
         out: &mut Vec<Vec<Datum>>,
     ) -> Result<ScanCursor, StorageError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         {
             self.scan_slices
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -90,7 +90,7 @@ impl RelStorage {
     }
 
     /// Test hook: a table's definition + schema, for driving a batched scan.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn rel_def_for_test(
         &self,
         name: &str,
@@ -109,7 +109,7 @@ impl RelStorage {
     /// Test hook: runs `f` against a page context, taking the storage lock for
     /// that call only — the shape a batched scan uses, one acquisition per
     /// slice rather than one across the whole table.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn with_rel_ctx_for_test<R>(
         &self,
         f: impl FnOnce(&mut crate::relstore::ctx::RelCtx<'_>) -> R,

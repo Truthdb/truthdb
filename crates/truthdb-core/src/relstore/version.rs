@@ -523,7 +523,7 @@ impl VersionState {
     }
 
     /// Test observability: chains held for one table.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn chain_count(&self, object_id: u32) -> usize {
         self.tables.get(&object_id).map_or(0, HashMap::len)
     }

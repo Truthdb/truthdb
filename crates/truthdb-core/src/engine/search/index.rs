@@ -5,15 +5,15 @@ use serde_json::{Map, Value};
 
 use super::super::{CommandError, EngineError};
 
-pub(in crate::engine) type Document = Map<String, Value>;
+pub type Document = Map<String, Value>;
 
 #[derive(Debug, Default, Serialize, Deserialize)]
-pub(in crate::engine) struct EngineState {
-    pub(in crate::engine) indices: BTreeMap<String, IndexState>,
+pub struct EngineState {
+    pub indices: BTreeMap<String, IndexState>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub(in crate::engine) struct IndexState {
+pub struct IndexState {
     mappings: BTreeMap<String, FieldType>,
     documents: BTreeMap<String, Document>,
     #[serde(skip)]
@@ -23,7 +23,7 @@ pub(in crate::engine) struct IndexState {
 }
 
 impl IndexState {
-    pub(in crate::engine) fn new(mappings: BTreeMap<String, FieldType>) -> Self {
+    pub fn new(mappings: BTreeMap<String, FieldType>) -> Self {
         IndexState {
             mappings,
             documents: BTreeMap::new(),
@@ -32,7 +32,7 @@ impl IndexState {
         }
     }
 
-    pub(in crate::engine) fn rebuild_postings(&mut self) -> Result<(), EngineError> {
+    pub fn rebuild_postings(&mut self) -> Result<(), EngineError> {
         self.text_postings.clear();
         self.exact_postings.clear();
         let doc_ids: Vec<String> = self.documents.keys().cloned().collect();
@@ -43,10 +43,7 @@ impl IndexState {
         Ok(())
     }
 
-    pub(in crate::engine) fn validate_document(
-        &self,
-        document: &Document,
-    ) -> Result<(), EngineError> {
+    pub fn validate_document(&self, document: &Document) -> Result<(), EngineError> {
         for (field, value) in document {
             let field_type = self
                 .mappings
@@ -57,11 +54,7 @@ impl IndexState {
         Ok(())
     }
 
-    pub(in crate::engine) fn insert_document(
-        &mut self,
-        id: &str,
-        document: &Document,
-    ) -> Result<(), EngineError> {
+    pub fn insert_document(&mut self, id: &str, document: &Document) -> Result<(), EngineError> {
         if self.documents.contains_key(id) {
             return Err(EngineError::Replay(format!(
                 "wal attempted to insert duplicate document id '{id}'"
@@ -107,10 +100,7 @@ impl IndexState {
         Ok(())
     }
 
-    pub(in crate::engine) fn search(
-        &self,
-        query: &SearchQuery,
-    ) -> Result<Vec<SearchHit>, EngineError> {
+    pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>, EngineError> {
         let scores = self.evaluate_query(query)?;
         let mut hits = scores
             .into_iter()
@@ -245,7 +235,7 @@ impl IndexState {
     }
 }
 #[derive(Debug, Clone)]
-pub(in crate::engine) enum SearchQuery {
+pub enum SearchQuery {
     Match {
         field: String,
         query: String,
@@ -261,7 +251,7 @@ pub(in crate::engine) enum SearchQuery {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub(in crate::engine) enum FieldType {
+pub enum FieldType {
     #[serde(rename = "text")]
     Text,
     #[serde(rename = "keyword")]
@@ -309,7 +299,7 @@ impl std::fmt::Display for FieldType {
 }
 
 #[derive(Debug, Serialize)]
-pub(in crate::engine) struct SearchHit {
+pub struct SearchHit {
     #[serde(rename = "_id")]
     id: String,
     #[serde(rename = "_score")]
@@ -356,7 +346,7 @@ fn tokenize(text: &str) -> Vec<String> {
         .collect()
 }
 
-pub(in crate::engine) fn value_type_name(value: &Value) -> &'static str {
+pub fn value_type_name(value: &Value) -> &'static str {
     match value {
         Value::Null => "null",
         Value::Bool(_) => "bool",

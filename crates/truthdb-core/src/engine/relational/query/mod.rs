@@ -18,7 +18,7 @@ pub(super) use scan::*;
 pub(super) use sort::*;
 pub(super) use source::*;
 
-#[cfg(test)]
-pub(crate) use scan::without_scan_path;
-#[cfg(test)]
-pub(crate) use sort::set_test_sort_budget;
+#[cfg(any(test, feature = "test-hooks"))]
+pub use scan::without_scan_path;
+#[cfg(any(test, feature = "test-hooks"))]
+pub use sort::set_test_sort_budget;

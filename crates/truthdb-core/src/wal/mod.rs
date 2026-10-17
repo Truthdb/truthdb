@@ -121,7 +121,7 @@ impl WalWriter {
 
     /// Test hook: shrink the lazy-superblock cadence so it can be exercised
     /// without appending tens of MiB.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn set_superblock_interval(&mut self, bytes: u64) {
         self.superblock_interval = bytes;
     }

@@ -25,7 +25,7 @@ impl Storage {
         self.lock().is_page_allocated(page)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn data_page_offset(&self, page: u64) -> u64 {
         self.lock().data_page_offset(page)
     }
@@ -39,7 +39,7 @@ impl StorageFile {
     }
 
     /// Test hook: the absolute file offset of a data-region page.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn data_page_offset(&self, page: u64) -> u64 {
         self.layout.data_offset + page * PAGE_SIZE as u64
     }

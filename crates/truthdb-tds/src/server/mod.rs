@@ -9,7 +9,7 @@ use tokio::sync::mpsc;
 use truthdb_core::auth;
 use truthdb_core::engine::EngineError;
 use truthdb_core::engine::ResultColumn;
-use truthdb_core::session::{BatchEvent, EngineHandle, PreparedRpc, SessionId};
+use truthdb_engine::session::{BatchEvent, EngineHandle, PreparedRpc, SessionId};
 
 use crate::login::{self, parse_login7};
 use crate::packet::{

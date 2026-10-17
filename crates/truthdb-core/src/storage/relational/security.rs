@@ -2,18 +2,18 @@
 // principal_ids sit in a reserved band far above any real `object_id` (which
 // starts at FIRST_USER_OBJECT_ID=2 and increments by one), so they can never
 // collide with a created table, index, login, user, or role.
-pub(crate) const FIXED_PRINCIPAL_BASE: u32 = 0x7000_0000;
-pub(crate) const DBO_ID: u32 = FIXED_PRINCIPAL_BASE; // the dbo database user
-pub(crate) const SYSADMIN_ID: u32 = FIXED_PRINCIPAL_BASE + 1; // server role, bypass-all
-pub(crate) const DB_OWNER_ID: u32 = FIXED_PRINCIPAL_BASE + 2;
-pub(crate) const DB_DATAREADER_ID: u32 = FIXED_PRINCIPAL_BASE + 3;
-pub(crate) const DB_DATAWRITER_ID: u32 = FIXED_PRINCIPAL_BASE + 4;
-pub(crate) const DB_DDLADMIN_ID: u32 = FIXED_PRINCIPAL_BASE + 5;
-pub(crate) const PUBLIC_ID: u32 = FIXED_PRINCIPAL_BASE + 6; // every user is a member
+pub const FIXED_PRINCIPAL_BASE: u32 = 0x7000_0000;
+pub const DBO_ID: u32 = FIXED_PRINCIPAL_BASE; // the dbo database user
+pub const SYSADMIN_ID: u32 = FIXED_PRINCIPAL_BASE + 1; // server role, bypass-all
+pub const DB_OWNER_ID: u32 = FIXED_PRINCIPAL_BASE + 2;
+pub const DB_DATAREADER_ID: u32 = FIXED_PRINCIPAL_BASE + 3;
+pub const DB_DATAWRITER_ID: u32 = FIXED_PRINCIPAL_BASE + 4;
+pub const DB_DDLADMIN_ID: u32 = FIXED_PRINCIPAL_BASE + 5;
+pub const PUBLIC_ID: u32 = FIXED_PRINCIPAL_BASE + 6; // every user is a member
 
 /// A built-in principal, synthesized (not stored) into `sys.database_principals`,
 /// name resolution for membership DDL, and the membership edge set.
-pub(crate) struct FixedPrincipal {
+pub struct FixedPrincipal {
     pub id: u32,
     pub name: &'static str,
     pub kind: crate::relstore::catalog::PrincipalKind,
@@ -25,7 +25,7 @@ pub(crate) struct FixedPrincipal {
 /// The built-in principals: the dbo user, the sysadmin server role, and the
 /// fixed database roles. `public` is implicit (every database principal belongs
 /// to it) and is listed so it appears in the catalog view.
-pub(crate) const FIXED_PRINCIPALS: &[FixedPrincipal] = {
+pub const FIXED_PRINCIPALS: &[FixedPrincipal] = {
     use crate::relstore::catalog::PrincipalKind::{Role, User};
     &[
         FixedPrincipal {
@@ -74,14 +74,14 @@ pub(crate) const FIXED_PRINCIPALS: &[FixedPrincipal] = {
 };
 
 /// The fixed principal with this (case-insensitive) name, if any.
-pub(crate) fn fixed_principal_by_name(name: &str) -> Option<&'static FixedPrincipal> {
+pub fn fixed_principal_by_name(name: &str) -> Option<&'static FixedPrincipal> {
     FIXED_PRINCIPALS
         .iter()
         .find(|p| p.name.eq_ignore_ascii_case(name))
 }
 
 /// The fixed principal with this id, if any.
-pub(crate) fn fixed_principal_by_id(id: u32) -> Option<&'static FixedPrincipal> {
+pub fn fixed_principal_by_id(id: u32) -> Option<&'static FixedPrincipal> {
     FIXED_PRINCIPALS.iter().find(|p| p.id == id)
 }
 
@@ -267,7 +267,7 @@ impl RelStorage {
     /// belongs to, memoized and invalidated by [`Self::security_version`]. Does
     /// NOT include the principal itself. Cycle-safe (visited-set DFS), so a role
     /// graph that somehow contains a cycle terminates rather than hanging.
-    pub(crate) fn effective_roles(&self, principal_id: u32) -> std::collections::HashSet<u32> {
+    pub fn effective_roles(&self, principal_id: u32) -> std::collections::HashSet<u32> {
         let version = self.security_version();
         // Fast path: a cache hit under the current version needs only the
         // membership lock.

@@ -251,13 +251,13 @@ impl TxnContext {
 
     /// The session's current database id — the namespace unqualified names
     /// resolve in.
-    pub(crate) fn database_id(&self) -> u32 {
+    pub fn database_id(&self) -> u32 {
         self.database_id.0
     }
 
     /// Switches the session's current database (`USE`): the canonical name
     /// and its id move together — they are one decision, never two.
-    pub(crate) fn set_current_database(&mut self, name: String, db_id: u32) {
+    pub fn set_current_database(&mut self, name: String, db_id: u32) {
         self.database = name;
         self.database_id = CurrentDb(db_id);
     }

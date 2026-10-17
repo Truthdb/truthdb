@@ -171,7 +171,7 @@ pub(crate) enum LogMode<'t> {
     System,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     /// Test fault injection: `Some(n)` makes the (n+1)-th apply_op fail
     /// after syncing the log — prior appends stay durable, simulating a
@@ -292,7 +292,7 @@ impl RelCtx<'_> {
     /// append fails, the in-memory page is restored from its pre-image: a
     /// mutation without a durable record must never survive in the pool.
     pub fn apply_op(&mut self, mode: LogMode<'_>, redo: PageOpRedo) -> Result<u64, StorageError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         {
             let fire = FAIL_APPLY_OPS_AFTER.with(|c| match c.get() {
                 Some(0) => {

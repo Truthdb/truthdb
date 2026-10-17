@@ -3,8 +3,8 @@ use super::super::*;
 impl RelStorage {
     /// Test hook: the relational WAL records currently recoverable from the
     /// ring, exactly as restart's analysis would see them.
-    #[cfg(test)]
-    pub(crate) fn rel_wal_records(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn rel_wal_records(
         &self,
     ) -> Result<Vec<(u64, crate::wal::records::RelRecord)>, StorageError> {
         self.lock().rel_records()

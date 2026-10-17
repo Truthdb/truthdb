@@ -7,7 +7,7 @@ pub(in crate::engine::relational) const SORT_MEMORY_BUDGET: usize = 64 * 1024 * 
 /// A row paired with its evaluated ORDER BY key, as carried through the sort.
 pub(in crate::engine::relational) type KeyedRow = (Vec<SqlValue>, Vec<Datum>);
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     /// Test-only override that forces the external-sort spill path on small
     /// inputs (execution runs on the calling thread in tests).
@@ -16,7 +16,7 @@ thread_local! {
 
 /// The active sort memory budget (overridable in tests).
 pub(in crate::engine::relational) fn sort_budget() -> usize {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     if let Some(budget) = TEST_SORT_BUDGET.with(std::cell::Cell::get) {
         return budget;
     }
@@ -24,8 +24,8 @@ pub(in crate::engine::relational) fn sort_budget() -> usize {
 }
 
 /// Forces (or clears) the sort spill budget for the current test thread.
-#[cfg(test)]
-pub(crate) fn set_test_sort_budget(budget: Option<usize>) {
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn set_test_sort_budget(budget: Option<usize>) {
     TEST_SORT_BUDGET.with(|cell| cell.set(budget));
 }
 

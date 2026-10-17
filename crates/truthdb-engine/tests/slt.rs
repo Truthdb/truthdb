@@ -13,10 +13,10 @@
 
 use std::path::{Path, PathBuf};
 
-use truthdb_core::engine::Engine;
 use truthdb_core::engine::{StatementResult, TxnContext};
 use truthdb_core::relstore::types::Datum;
 use truthdb_core::storage::{RelStorage, StorageOptions};
+use truthdb_engine::engine::Engine;
 
 fn temp_path(label: &str) -> PathBuf {
     let mut path = std::env::temp_dir();

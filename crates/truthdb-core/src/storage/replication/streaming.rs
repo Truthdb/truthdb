@@ -26,7 +26,7 @@ impl Storage {
     /// or a direct WAL sync). A replication sender may ship the ring up to here;
     /// bytes past it are not yet durable on the primary and must not be applied
     /// to a standby.
-    pub(crate) fn wal_flushed_lsn(&self) -> u64 {
+    pub fn wal_flushed_lsn(&self) -> u64 {
         let durable = self.gc.flushed();
         self.lock().wal.flushed_lsn().max(durable)
     }
@@ -36,15 +36,15 @@ impl Storage {
     /// is a wake-up hint: WAL made durable by a direct sync bypasses the
     /// channel, so re-read [`Self::wal_flushed_lsn`] after each wake and pair
     /// the watch with a periodic tick.
-    pub(crate) fn subscribe_wal_flushed(&self) -> tokio::sync::watch::Receiver<u64> {
+    pub fn subscribe_wal_flushed(&self) -> tokio::sync::watch::Receiver<u64> {
         self.gc.subscribe_flushed()
     }
 
     /// Reads raw WAL ring bytes `[from, to)`. Test scaffolding: the production
     /// ship primitive is [`Self::read_wal_chunk`], which cuts on entry
     /// boundaries and fences against the WAL head.
-    #[cfg(test)]
-    pub(crate) fn read_wal_range(&self, from: u64, to: u64) -> Result<Vec<u8>, StorageError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn read_wal_range(&self, from: u64, to: u64) -> Result<Vec<u8>, StorageError> {
         self.lock().read_ring_range(from, to)
     }
 
@@ -82,7 +82,7 @@ impl Storage {
     /// The persisted replication restartpoint (the active superblock's
     /// `applied_lsn`): the LSN up to which this file's WAL is present and
     /// recovered.
-    pub(crate) fn applied_lsn(&self) -> u64 {
+    pub fn applied_lsn(&self) -> u64 {
         let guard = self.lock();
         let active = match guard.active_superblock {
             ActiveSuperblock::A => &guard.superblock_a,

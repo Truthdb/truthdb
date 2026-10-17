@@ -5,20 +5,20 @@ use serde::{Deserialize, Serialize};
 use super::super::{CommandError, EngineError};
 use super::index::{Document, EngineState, FieldType, IndexState};
 
-pub(in crate::engine) const ENGINE_WAL_ENTRY_VERSION: u16 = 1;
-pub(in crate::engine) const ENGINE_WAL_ENTRY_TYPE: u16 = 1;
+pub const ENGINE_WAL_ENTRY_VERSION: u16 = 1;
+pub const ENGINE_WAL_ENTRY_TYPE: u16 = 1;
 /// The engine's search-subsystem state, mutated only on the native path
 /// ([`Engine::execute`]) and read by the checkpointer. Guarded by
 /// [`Engine::meta`], a `RwLock` that doubles as the execution gate that keeps
 /// the two paths from observing each other's torn state (see [`Engine`]).
-pub(in crate::engine) struct EngineMeta {
-    pub(in crate::engine) state: EngineState,
-    pub(in crate::engine) next_seq_no: u64,
-    pub(in crate::engine) next_doc_id: u64,
+pub struct EngineMeta {
+    pub state: EngineState,
+    pub next_seq_no: u64,
+    pub next_doc_id: u64,
 }
 
 impl EngineMeta {
-    pub(in crate::engine) fn apply_event(&mut self, event: &WalEvent) -> Result<(), EngineError> {
+    pub fn apply_event(&mut self, event: &WalEvent) -> Result<(), EngineError> {
         match event {
             WalEvent::CreateIndex { name, mappings } => {
                 if self.state.indices.contains_key(name) {
@@ -46,7 +46,7 @@ impl EngineMeta {
         Ok(())
     }
 
-    pub(in crate::engine) fn validate_create_index(
+    pub fn validate_create_index(
         &self,
         name: &str,
         mappings: &BTreeMap<String, FieldType>,
@@ -63,7 +63,7 @@ impl EngineMeta {
         Ok(())
     }
 
-    pub(in crate::engine) fn validate_insert_document(
+    pub fn validate_insert_document(
         &self,
         index: &str,
         document: &Document,
@@ -78,7 +78,7 @@ impl EngineMeta {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub(in crate::engine) enum WalEvent {
+pub enum WalEvent {
     CreateIndex {
         name: String,
         mappings: BTreeMap<String, FieldType>,
@@ -93,7 +93,7 @@ pub(in crate::engine) enum WalEvent {
 /// bincode for snapshots written by older versions. Legacy bincode snapshots
 /// can only have been document-free (bincode cannot deserialize
 /// `serde_json::Value`, so document-bearing ones were never loadable).
-pub(in crate::engine) fn decode_snapshot(data: &[u8]) -> Result<EngineState, EngineError> {
+pub fn decode_snapshot(data: &[u8]) -> Result<EngineState, EngineError> {
     match serde_json::from_slice(data) {
         Ok(state) => Ok(state),
         Err(json_err) => bincode::deserialize(data).map_err(|bincode_err| {

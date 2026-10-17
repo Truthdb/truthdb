@@ -1,0 +1,19 @@
+[package]
+name = "truthdb-engine"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+truthdb-core = { workspace = true }
+truthdb-proto = { workspace = true }
+truthdb-net = { workspace = true }
+truthdb-sql = { workspace = true }
+tokio = { workspace = true }
+thiserror = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+truthdb-core = { workspace = true, features = ["test-hooks"] }
+rstest = { workspace = true }
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }

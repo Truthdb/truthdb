@@ -1,5 +1,4 @@
-use super::super::test_support::{test_storage_options, unique_temp_path};
-use super::super::*;
+use super::test_support::{test_storage_options, unique_temp_path};
 use super::*;
 
 #[test]

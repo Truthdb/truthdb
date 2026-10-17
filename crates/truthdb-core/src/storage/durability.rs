@@ -20,7 +20,7 @@ impl Storage {
         self.lock().wedge();
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn group_commit_fsyncs(&self) -> u64 {
         self.gc.fsync_count()
     }

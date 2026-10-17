@@ -1,7 +1,7 @@
 /// The parameter names of a declaration list (`@p1 int, @p2 nvarchar(10)`),
 /// in order: the first token of each top-level comma-separated entry.
 /// `sp_execute` values arrive unnamed on the wire; these names bind them.
-pub(crate) fn decl_names(decls: &str) -> Vec<String> {
+pub fn decl_names(decls: &str) -> Vec<String> {
     let mut names = Vec::new();
     let mut depth = 0usize;
     let mut in_quote = false;

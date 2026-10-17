@@ -1,6 +1,6 @@
 use super::super::prelude::*;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     /// Test hook: makes [`scan_plan`] decline everything, so a test can run one
     /// query down both paths and compare. Thread-local, not a `static`: a batch
@@ -10,7 +10,7 @@ thread_local! {
     static FORCE_COLLECTING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub(in crate::engine::relational) fn force_collecting() -> bool {
     FORCE_COLLECTING.with(|c| c.get())
 }
@@ -18,8 +18,8 @@ pub(in crate::engine::relational) fn force_collecting() -> bool {
 /// Runs `f` with [`scan_select`]'s path disabled, so `f`'s queries take the
 /// collecting path. Restores on drop, so a panicking `f` cannot leave the flag
 /// set for the next test to run on this thread.
-#[cfg(test)]
-pub(crate) fn without_scan_path<R>(f: impl FnOnce() -> R) -> R {
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn without_scan_path<R>(f: impl FnOnce() -> R) -> R {
     struct Restore;
     impl Drop for Restore {
         fn drop(&mut self) {
@@ -78,7 +78,7 @@ pub(in crate::engine::relational) fn scan_plan(
     select: &Select,
     eval_ctx: &EvalContext,
 ) -> Option<ScanPlan> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     if force_collecting() {
         return None;
     }
@@ -484,7 +484,7 @@ pub(in crate::engine::relational) fn scan_select_rows(
     eval_ctx: &EvalContext,
     sink: &mut dyn FnMut(Vec<Datum>),
 ) -> Result<u64, SqlError> {
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     storage.count_scan_select();
     let types = &plan.types;
     let mut kept: u64 = 0;

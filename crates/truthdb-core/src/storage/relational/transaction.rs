@@ -61,7 +61,7 @@ impl RelStorage {
 
     /// The lock-analysis epoch: parked batches analyzed under an older value
     /// are re-analyzed before grant (see the scheduler).
-    pub(crate) fn lock_analysis_epoch(&self) -> u64 {
+    pub fn lock_analysis_epoch(&self) -> u64 {
         self.lock_epoch.load(std::sync::atomic::Ordering::Acquire)
     }
 
@@ -94,7 +94,7 @@ impl RelStorage {
 
     /// Drops version history no live snapshot can need (runs on the
     /// maintenance thread; cheap when nothing is versioned).
-    pub(crate) fn version_prune(&self) {
+    pub fn version_prune(&self) {
         let durable = self.gc.flushed();
         let mut guard = self.lock();
         let mut rel = guard.rel();
@@ -107,7 +107,7 @@ impl RelStorage {
     }
 
     /// Test observability: version chains held for `table`.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn version_chain_count(&self, table: &str) -> usize {
         let mut guard = self.lock();
         let mut rel = guard.rel();
@@ -144,7 +144,7 @@ impl RelStorage {
         self.lock().rel().rollback_txn_to(txn, savepoint)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn has_active_transactions(&self) -> bool {
         self.lock().rel().has_active_transactions()
     }
@@ -180,7 +180,7 @@ impl RelStorage {
             .rel_set_foreign_keys(db_id, name, foreign_keys)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn rel_insert_without_commit(
         &self,
         name: &str,
@@ -191,7 +191,7 @@ impl RelStorage {
             .rel_insert_without_commit(catalog::DEFAULT_DATABASE_ID, name, values)
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn rel_flush_pool_only(&self) -> Result<(), StorageError> {
         self.lock().rel().rel_flush_pool_only()
     }
@@ -344,7 +344,7 @@ impl RelFile<'_> {
 
     /// Test hook: run an insert's ops durably but never commit — the state a
     /// crash mid-statement leaves behind (loser transaction for recovery).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn rel_insert_without_commit(
         &mut self,
         db_id: u32,
@@ -384,7 +384,7 @@ impl RelFile<'_> {
     /// Test hook: flush dirty relational pages to disk WITHOUT advancing the
     /// WAL head (the mid-checkpoint crash window where torn pages are
     /// possible but their FPIs are still in the log).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn rel_flush_pool_only(&mut self) -> Result<(), StorageError> {
         self.core.wal.sync_all()?;
         let PageState { pool, .. } = &mut self.core.pages;
@@ -665,7 +665,7 @@ impl RelFile<'_> {
     }
 
     /// Whether any explicit transaction is open.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::storage) fn has_active_transactions(&self) -> bool {
         !self.core.pages.active_txn_begins.is_empty()
     }

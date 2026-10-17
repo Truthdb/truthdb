@@ -1,15 +1,12 @@
 mod allocator;
 pub mod auth;
 pub mod backup;
-pub mod client_listener;
 mod direct_io;
-pub mod dispatcher;
 pub mod engine;
 mod group_commit;
 pub mod lock;
 pub mod relstore;
 pub mod repl;
-pub mod session;
 pub mod storage;
-mod storage_layout;
+pub mod storage_layout;
 pub mod wal;

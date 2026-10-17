@@ -8,6 +8,7 @@ license = "MIT"
 [workspace]
 members = [
     "crates/truthdb-core",
+    "crates/truthdb-engine",
     "crates/truthdb-cli",
     "crates/truthdb-bench",
     "crates/truthdb-proto",
@@ -27,6 +28,8 @@ bincode = "1.3.3"
 toml = "0.8"
 directories = "5.0"
 tokio = { version = "1.39.0", features = ["full"] }
+truthdb-core = { path = "crates/truthdb-core", version = "0.1.0" }
+truthdb-engine = { path = "crates/truthdb-engine", version = "0.1.0" }
 truthdb-proto = { path = "crates/truthdb-proto", version = "0.1.0" }
 truthdb-net = { path = "crates/truthdb-net", version = "0.1.0" }
 truthdb-sql = { path = "crates/truthdb-sql", version = "0.1.0" }
@@ -37,6 +40,7 @@ io-uring = "0.7"
 
 [dependencies]
 truthdb-core = { path = "crates/truthdb-core", version = "0.1.0" }
+truthdb-engine = { path = "crates/truthdb-engine", version = "0.1.0" }
 truthdb-tds = { path = "crates/truthdb-tds", version = "0.1.0" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }

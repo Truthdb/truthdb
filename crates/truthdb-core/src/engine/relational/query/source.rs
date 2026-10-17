@@ -117,7 +117,7 @@ impl SourceRows {
         match self {
             SourceRows::Materialized(rows) => Ok(rows),
             SourceRows::Scan(mut stream) => {
-                #[cfg(test)]
+                #[cfg(any(test, feature = "test-hooks"))]
                 storage.count_scan_materialization();
                 let mut rows = Vec::new();
                 while let Some(mut slice) = stream.next_slice(storage)? {

@@ -132,7 +132,7 @@ impl GroupCommit {
     }
 
     /// The number of fsyncs the log-writer has issued so far.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn fsync_count(&self) -> u64 {
         self.state
             .lock()

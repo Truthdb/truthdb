@@ -1,7 +1,7 @@
 mod catalog;
 mod dml;
 mod recovery;
-pub(super) mod security;
+pub mod security;
 mod transaction;
 
 use super::*;
@@ -29,15 +29,15 @@ impl RelStorage {
             lock_epoch: std::sync::atomic::AtomicU64::new(0),
             security_version: std::sync::atomic::AtomicU64::new(0),
             membership: std::sync::Mutex::new(MembershipCache::default()),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             scan_slices: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             scan_selects: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             covering_scans: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             scan_materializations: std::sync::atomic::AtomicUsize::new(0),
-            #[cfg(test)]
+            #[cfg(any(test, feature = "test-hooks"))]
             last_scan_width: std::sync::atomic::AtomicUsize::new(usize::MAX),
         }
     }
@@ -51,8 +51,8 @@ impl RelStorage {
     }
 
     /// Test hook: create with custom WAL ring bounds.
-    #[cfg(test)]
-    pub(crate) fn create_with_wal_bounds(
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn create_with_wal_bounds(
         path: PathBuf,
         opts: StorageOptions,
         wal_min_bytes: u64,

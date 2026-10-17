@@ -36,21 +36,18 @@ pub use api::{
     BatchEmitter, BatchOutcome, Collector, DoneCommand, FATAL_SEVERITY, ResultColumn, RowSet,
     RpcParam, StatementResult,
 };
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub use batch::execute_batch_with_params;
 pub use batch::{execute_batch, execute_batch_streamed};
 pub use cancel::{CancelScope, check_cancelled};
-#[cfg(test)]
-pub(crate) use cancel::{clear_test_cancel, set_test_cancel};
+#[cfg(any(test, feature = "test-hooks"))]
+pub use cancel::{clear_test_cancel, set_test_cancel};
 pub use context::{Isolation, TxnContext};
 pub use describe::describe_first_result_set;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 pub use dispatch::execute;
 pub use helpers::{SqlStatement, render_cell};
 pub use lock_analysis::analyze_locks;
-pub(crate) use parameters::decl_names;
-#[cfg(test)]
-pub(crate) use query::{set_test_sort_budget, without_scan_path};
-
-#[cfg(test)]
-mod tests;
+pub use parameters::decl_names;
+#[cfg(any(test, feature = "test-hooks"))]
+pub use query::{set_test_sort_budget, without_scan_path};

@@ -7,7 +7,7 @@ use super::super::EngineError;
 use super::index::{Document, FieldType, SearchQuery, value_type_name};
 
 #[derive(Debug, Clone)]
-pub(in crate::engine) enum Command {
+pub enum Command {
     CreateIndex {
         name: String,
         mappings: BTreeMap<String, FieldType>,
@@ -51,7 +51,7 @@ pub enum CommandError {
 /// ES command (a `{`-bodied create index / insert document / search) — the
 /// caller then routes it to the SQL engine. `Ok(Some(_))` is a well-formed
 /// ES command; `Err` is a malformed one.
-pub(in crate::engine) fn parse_command(input: &str) -> Result<Option<Command>, CommandError> {
+pub fn parse_command(input: &str) -> Result<Option<Command>, CommandError> {
     let trimmed = input.trim();
     if trimmed.is_empty() {
         return Err(CommandError::InvalidCommand(
@@ -250,7 +250,7 @@ fn as_object<'a>(value: &'a Value, label: &str) -> Result<&'a Document, CommandE
     })
 }
 
-pub(in crate::engine) fn render_json(value: &Value) -> Result<String, EngineError> {
+pub fn render_json(value: &Value) -> Result<String, EngineError> {
     serde_json::to_string_pretty(value)
         .map_err(|err| EngineError::Replay(format!("failed to render json response: {err}")))
 }

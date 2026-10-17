@@ -3,7 +3,7 @@ use super::prelude::*;
 /// Parses and executes a SQL batch, returning one result per statement, or
 /// the first error (discarding earlier results). Kept for tests; the server
 /// uses [`execute_batch`].
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 #[allow(dead_code)]
 pub fn execute(storage: &RelStorage, sql: &str) -> Result<Vec<StatementResult>, SqlError> {
     let mut txn_ctx = TxnContext::default();

@@ -46,12 +46,12 @@ mod recovery;
 mod relational;
 mod replication;
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 use lifecycle::compute_layout;
 use lifecycle::live_descriptor_slot;
 use participant::{EngineFactory, EngineParticipant};
 #[allow(unused_imports)]
-pub(crate) use relational::security::{
+pub use relational::security::{
     DB_DATAREADER_ID, DB_DATAWRITER_ID, DB_DDLADMIN_ID, DB_OWNER_ID, DBO_ID, FIXED_PRINCIPAL_BASE,
     FIXED_PRINCIPALS, FixedPrincipal, PUBLIC_ID, SYSADMIN_ID, fixed_principal_by_id,
     fixed_principal_by_name,
@@ -221,21 +221,21 @@ pub struct RelStorage {
     /// reading the table and discarding the rest. On the instance and not in a
     /// `static`: the suite runs in parallel in one binary, so a static would
     /// count every other test's scans as well as this one's.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     scan_slices: std::sync::atomic::AtomicUsize,
     /// Times a SELECT took the row-at-a-time path, so a test comparing it with
     /// the collecting path can prove it actually ran — an A/B whose two sides
     /// are the same code agrees with itself. Per-instance for the same reason.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     scan_selects: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     covering_scans: std::sync::atomic::AtomicUsize,
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     scan_materializations: std::sync::atomic::AtomicUsize,
     /// Columns the last scan slice asked for (`usize::MAX` = the whole row), so
     /// a test can prove the planner pruned the projection. The rows returned are
     /// identical either way, so nothing else can see the difference.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     last_scan_width: std::sync::atomic::AtomicUsize,
 }
 

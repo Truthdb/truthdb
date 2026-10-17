@@ -187,7 +187,7 @@ impl BufferPool {
     }
 
     /// Whether a page is currently cached (test hook).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub fn contains(&self, page_no: u64) -> bool {
         self.table.contains_key(&page_no)
     }

@@ -2,19 +2,19 @@ use super::*;
 
 impl RelStorage {
     /// Scan slices this store has read.
-    #[cfg(test)]
-    pub(crate) fn scan_slices(&self) -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn scan_slices(&self) -> usize {
         self.scan_slices.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// SELECTs this store has answered on the row-at-a-time path.
-    #[cfg(test)]
-    pub(crate) fn scan_selects(&self) -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn scan_selects(&self) -> usize {
         self.scan_selects.load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Index scans answered from the leaves alone (covering, no base lookup).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn covering_scans(&self) -> usize {
         self.covering_scans
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -23,28 +23,28 @@ impl RelStorage {
     /// Lazily-scanned sources drained WHOLE (`SourceRows::materialize` on a
     /// scan): what the join operators do, and what the streamed input path
     /// must NOT do.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn scan_materializations(&self) -> usize {
         self.scan_materializations
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Counts one whole-scan drain (called by `SourceRows::materialize`).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn count_scan_materialization(&self) {
         self.scan_materializations
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Columns the last scan slice decoded per row (`usize::MAX` = every one).
-    #[cfg(test)]
-    pub(crate) fn last_scan_width(&self) -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn last_scan_width(&self) -> usize {
         self.last_scan_width
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
     /// Counts one row-at-a-time SELECT (called by `relational::scan_select`).
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn count_scan_select(&self) {
         self.scan_selects
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -62,7 +62,7 @@ impl RelStorage {
         covering: bool,
         snapshot: Option<ReadSnapshot>,
     ) -> Result<Vec<Vec<Datum>>, StorageError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         if covering {
             self.covering_scans
                 .fetch_add(1, std::sync::atomic::Ordering::Relaxed);

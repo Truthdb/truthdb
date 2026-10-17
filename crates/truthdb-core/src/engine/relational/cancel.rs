@@ -56,14 +56,14 @@ pub(super) const CANCEL_ERROR: i32 = 3617;
 
 /// Sets the current thread's cancel flag (test helper — execution runs on the
 /// calling thread in tests, so this simulates an Attention).
-#[cfg(test)]
-pub(crate) fn set_test_cancel(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn set_test_cancel(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
     CANCEL_FLAG.with(|c| *c.borrow_mut() = Some(flag));
 }
 
 /// Clears the current thread's cancel flag (test helper — reset before other
 /// tests reuse the thread).
-#[cfg(test)]
-pub(crate) fn clear_test_cancel() {
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn clear_test_cancel() {
     CANCEL_FLAG.with(|c| *c.borrow_mut() = None);
 }

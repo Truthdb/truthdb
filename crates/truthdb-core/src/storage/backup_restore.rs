@@ -297,14 +297,14 @@ use super::*;
 
 impl Storage {
     /// The persisted log-backup floor (tests).
-    #[cfg(test)]
-    pub(crate) fn last_log_backup_lsn(&self) -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn last_log_backup_lsn(&self) -> u64 {
         self.lock().last_log_backup_lsn
     }
 
     /// The active FULL-model log-backup truncation hold, if any (tests).
-    #[cfg(test)]
-    pub(crate) fn log_backup_hold(&self) -> Option<u64> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn log_backup_hold(&self) -> Option<u64> {
         self.lock().truncation_gate.log_backup
     }
 

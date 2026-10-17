@@ -1223,6 +1223,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "truthdb-core",
+ "truthdb-engine",
  "truthdb-net",
  "truthdb-proto",
  "truthdb-tds",
@@ -1282,6 +1283,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "truthdb-engine"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
+ "rstest",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "truthdb-core",
+ "truthdb-net",
+ "truthdb-proto",
+ "truthdb-sql",
+]
+
+[[package]]
 name = "truthdb-net"
 version = "0.1.0"
 dependencies = [
@@ -1316,6 +1333,7 @@ dependencies = [
  "tokio-rustls",
  "tracing",
  "truthdb-core",
+ "truthdb-engine",
  "truthdb-sql",
 ]
 

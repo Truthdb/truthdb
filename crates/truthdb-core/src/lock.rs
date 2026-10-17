@@ -186,7 +186,7 @@ impl LockManager {
     }
 
     /// True if `owner` holds no locks at all.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     fn holds_nothing(&self, owner: u64) -> bool {
         self.grants
             .values()
