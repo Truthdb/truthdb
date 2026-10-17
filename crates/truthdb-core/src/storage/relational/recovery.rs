@@ -43,7 +43,7 @@ impl StorageFile {
         if let Some(root) = outcome.catalog_root {
             self.rel.catalog_root = Some(root);
         }
-        self.rel.next_txn_id = outcome.max_txn_id + 1;
+        self.pages.next_txn_id = outcome.max_txn_id + 1;
 
         self.reload_catalog()?;
         // A standby repeats history but never undoes: an in-flight transaction at

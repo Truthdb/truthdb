@@ -38,7 +38,7 @@ impl Storage {
         // A wedged store's in-memory state is ahead of the durable log after a
         // failed fsync; checkpointing would flush and re-fsync exactly the data
         // whose durability failed (and was reported to the client as failed).
-        if file.rel.wedged || file.wal_usage_ratio() < threshold {
+        if file.pages.wedged || file.wal_usage_ratio() < threshold {
             return Ok(false);
         }
         file.write_checkpoint(data, checkpoint_seq, next_seq_no, next_doc_id)?;
@@ -59,7 +59,7 @@ impl StorageFile {
         // any gate hold (an in-progress backup's redo_start_lsn, later also log
         // backup and replication slots). A checkpoint never truncates past this.
         let mut floor = self.wal.tail();
-        if let Some(oldest_txn) = self.rel.active_txn_begins.values().min().copied() {
+        if let Some(oldest_txn) = self.pages.active_txn_begins.values().min().copied() {
             floor = floor.min(oldest_txn);
         }
         if let Some(hold) = self.truncation_gate.min_hold() {
@@ -280,7 +280,7 @@ impl StorageFile {
         // transaction's begin LSN, so its undo records survive to roll it back.
         self.wal.sync_all()?;
         {
-            let RelState { pool, dpt, .. } = &mut self.rel;
+            let PageState { pool, dpt, .. } = &mut self.pages;
             let mut io = PoolIo {
                 file: &mut self.file,
                 wal: &mut self.wal,

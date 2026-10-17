@@ -12,7 +12,7 @@ use crate::relstore::RelState;
 use crate::relstore::btree::{BTree, ScanCursor, TreeInsert, TreeRoots};
 use crate::relstore::buffer_pool::DEFAULT_CAPACITY_BYTES;
 use crate::relstore::catalog::{self, FIRST_USER_OBJECT_ID, IndexDef, TableDef};
-use crate::relstore::ctx::{OpMode, PoolIo, RelCtx, TxnLink};
+use crate::relstore::ctx::{OpMode, PageState, PoolIo, RelCtx, TxnLink};
 use crate::relstore::heap::{Heap, Rid};
 use crate::relstore::index::{self, Locator};
 use crate::relstore::key::encode_key;
@@ -387,7 +387,9 @@ struct StorageFile {
     superblock_b: Superblock,
     active_superblock: ActiveSuperblock,
     allocator: PageAllocator,
-    /// Relational store state (buffer pool, dirty-page table, catalog cache).
+    /// Buffer pool, dirty-page table and transaction counters.
+    pages: PageState,
+    /// Relational store state (catalog cache).
     rel: RelState,
     /// WAL records recovered at open, waiting for the engine to replay them.
     replay_cache: Vec<WalRecord>,

@@ -195,12 +195,12 @@ impl Storage {
             let layout_data_offset = file.layout.data_offset;
             let layout_data_pages = file.layout.data_size / PAGE_SIZE as u64;
             let StorageFile {
-                rel,
+                pages,
                 file: dfile,
                 wal,
                 ..
             } = &mut *file;
-            let RelState { pool, dpt, .. } = rel;
+            let PageState { pool, dpt, .. } = pages;
             let mut io = PoolIo {
                 file: dfile,
                 wal,

@@ -320,8 +320,8 @@ impl StorageFile {
     ) -> Result<(), StorageError> {
         let (def, schema) = self.rel_def(db_id, name)?;
         let row = encode_row(&schema, &values)?;
-        let txn_id = self.rel.next_txn_id;
-        self.rel.next_txn_id += 1;
+        let txn_id = self.pages.next_txn_id;
+        self.pages.next_txn_id += 1;
         let mut ctx = self.rel_ctx();
         let mut txn = ctx.begin(txn_id)?;
         if def.is_tree() {
@@ -354,7 +354,7 @@ impl StorageFile {
     #[cfg(test)]
     pub(crate) fn rel_flush_pool_only(&mut self) -> Result<(), StorageError> {
         self.wal.sync_all()?;
-        let RelState { pool, .. } = &mut self.rel;
+        let PageState { pool, .. } = &mut self.pages;
         let mut io = PoolIo {
             file: &mut self.file,
             wal: &mut self.wal,
@@ -383,7 +383,7 @@ impl StorageFile {
     /// Builds the relational execution context over this file's parts.
     pub(in crate::storage) fn rel_ctx(&mut self) -> RelCtx<'_> {
         RelCtx {
-            pool: &mut self.rel.pool,
+            pool: &mut self.pages.pool,
             io: PoolIo {
                 file: &mut self.file,
                 wal: &mut self.wal,
@@ -391,7 +391,7 @@ impl StorageFile {
                 data_pages: self.layout.data_size / PAGE_SIZE as u64,
             },
             allocator: &mut self.allocator,
-            dpt: &mut self.rel.dpt,
+            dpt: &mut self.pages.dpt,
             use_reserve: false,
             container: self.current_container,
         }
@@ -403,8 +403,8 @@ impl StorageFile {
         &mut self,
         f: impl FnOnce(&mut RelCtx<'_>, &mut TxnLink) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
-        let txn_id = self.rel.next_txn_id;
-        self.rel.next_txn_id += 1;
+        let txn_id = self.pages.next_txn_id;
+        self.pages.next_txn_id += 1;
         let roots = self.rel.tree_roots();
         let mut ctx = self.rel_ctx();
         let mut txn = ctx.begin(txn_id)?;
@@ -440,7 +440,7 @@ impl StorageFile {
         };
         let _ = ctx;
         if wedged {
-            self.rel.wedged = true;
+            self.pages.wedged = true;
         }
         if let Some((pending, commit_lsn)) = publish {
             for version in pending {
@@ -492,7 +492,7 @@ impl StorageFile {
                 };
                 let _ = ctx;
                 if wedged {
-                    self.rel.wedged = true;
+                    self.pages.wedged = true;
                 }
                 // Publish the successful statement's versions inside this
                 // mutex hold (atomic with its page mutations, as far as any
@@ -516,15 +516,17 @@ impl StorageFile {
     /// Opens a multi-statement transaction (BEGIN TRAN), snapshotting tree roots
     /// for a later rollback.
     pub(in crate::storage) fn begin_txn(&mut self) -> Result<StorageTxn, StorageError> {
-        let txn_id = self.rel.next_txn_id;
-        self.rel.next_txn_id += 1;
+        let txn_id = self.pages.next_txn_id;
+        self.pages.next_txn_id += 1;
         let roots = self.rel.tree_roots();
         let mut ctx = self.rel_ctx();
         let txn = ctx.begin(txn_id)?;
         // Track the transaction's BEGIN LSN so a checkpoint clamps the WAL head
         // to the oldest open transaction, preserving its undo records for crash
         // rollback (its uncommitted pages may still be flushed under steal).
-        self.rel.active_txn_begins.insert(txn.txn_id, txn.last_lsn);
+        self.pages
+            .active_txn_begins
+            .insert(txn.txn_id, txn.last_lsn);
         Ok(StorageTxn { txn, roots })
     }
 
@@ -532,7 +534,7 @@ impl StorageFile {
     /// store, as for autocommit commits.
     pub(in crate::storage) fn commit_txn(&mut self, stx: StorageTxn) -> Result<(), StorageError> {
         // The transaction is ending (the `StorageTxn` is consumed either way).
-        self.rel.active_txn_begins.remove(&stx.txn.txn_id);
+        self.pages.active_txn_begins.remove(&stx.txn.txn_id);
         let txn_id = stx.txn.txn_id;
         debug_assert!(
             stx.txn.pending_versions.is_empty(),
@@ -550,7 +552,7 @@ impl StorageFile {
                 Ok(())
             }
             Err(err) => {
-                self.rel.wedged = true;
+                self.pages.wedged = true;
                 Err(err)
             }
         }
@@ -561,7 +563,7 @@ impl StorageFile {
         &mut self,
         mut stx: StorageTxn,
     ) -> Result<(), StorageError> {
-        self.rel.active_txn_begins.remove(&stx.txn.txn_id);
+        self.pages.active_txn_begins.remove(&stx.txn.txn_id);
         let txn_id = stx.txn.txn_id;
         let published = std::mem::take(&mut stx.txn.published_versions);
         let roots = stx.roots;
@@ -583,7 +585,7 @@ impl StorageFile {
             self.version.unpublish(record, txn_id);
         }
         if result.is_err() {
-            self.rel.wedged = true;
+            self.pages.wedged = true;
         }
         result
     }
@@ -618,7 +620,7 @@ impl StorageFile {
             self.version.unpublish(record, txn_id);
         }
         if result.is_err() {
-            self.rel.wedged = true;
+            self.pages.wedged = true;
         }
         result
     }
@@ -626,6 +628,6 @@ impl StorageFile {
     /// Whether any explicit transaction is open.
     #[cfg(test)]
     pub(in crate::storage) fn has_active_transactions(&self) -> bool {
-        !self.rel.active_txn_begins.is_empty()
+        !self.pages.active_txn_begins.is_empty()
     }
 }

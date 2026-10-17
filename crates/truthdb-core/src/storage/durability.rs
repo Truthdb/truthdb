@@ -57,7 +57,7 @@ impl StorageFile {
     }
 
     pub(super) fn ensure_rel_usable(&self) -> Result<(), StorageError> {
-        if self.rel.wedged {
+        if self.pages.wedged {
             return Err(StorageError::InvalidFile(
                 "relational store wedged after a failed commit/rollback; restart to recover from the log"
                     .to_string(),
@@ -72,7 +72,7 @@ impl StorageFile {
     /// `rel_statement`/`commit_txn` never fired) but never became durable — the
     /// in-memory state is now ahead of the log and must not be served.
     pub(super) fn wedge(&mut self) {
-        self.rel.wedged = true;
+        self.pages.wedged = true;
     }
 
     pub(super) fn append_wal_entry(

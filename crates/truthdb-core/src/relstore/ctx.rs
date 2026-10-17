@@ -70,6 +70,39 @@ impl PoolBackend for PoolIo<'_> {
     }
 }
 
+/// Page and transaction state the log's commit and recovery protocol owns:
+/// the buffer pool, the dirty-page table, the transaction-id counter, the
+/// open explicit transactions, and the wedge flag.
+pub(crate) struct PageState {
+    pub pool: BufferPool,
+    /// Set when a commit or rollback could not be logged: the pool may hold
+    /// state the WAL cannot explain, so all relational work — and above all
+    /// checkpoints, which would make that state durable and unrecoverable —
+    /// is refused until a restart replays the log.
+    pub wedged: bool,
+    /// Pages dirtied since the last checkpoint -> LSN of their first change.
+    pub dpt: HashMap<u64, u64>,
+    pub next_txn_id: u64,
+    /// Open explicit (multi-statement) transactions: txn id → its `BEGIN` LSN.
+    /// A (fuzzy) checkpoint may run while these are open — it flushes their
+    /// (uncommitted) pages under the steal policy — but must clamp the WAL head
+    /// to the *oldest* begin LSN here so their undo records survive for crash
+    /// rollback. Autocommit statements never leave one open across calls.
+    pub active_txn_begins: std::collections::BTreeMap<u64, u64>,
+}
+
+impl PageState {
+    pub fn new(pool_capacity_bytes: u64) -> Self {
+        PageState {
+            pool: BufferPool::new(pool_capacity_bytes),
+            wedged: false,
+            dpt: HashMap::new(),
+            next_txn_id: 1,
+            active_txn_begins: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
 /// An active (statement-scoped, autocommit) transaction: the WAL chain tail
 /// and an in-memory undo log so statement rollback never re-reads the ring.
 pub(crate) struct TxnLink {

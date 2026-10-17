@@ -462,7 +462,7 @@ impl StorageFile {
         let recorded_tail = active_sb.wal_tail;
 
         // The catalog root is stored as an absolute file offset (0 = none).
-        let mut rel = RelState::new(DEFAULT_CAPACITY_BYTES);
+        let mut rel = RelState::new();
         if active_sb.metadata_root != 0 {
             if active_sb.metadata_root < layout.data_offset
                 || active_sb.metadata_root >= layout.data_offset + layout.data_size
@@ -500,6 +500,7 @@ impl StorageFile {
             superblock_b,
             active_superblock,
             allocator: PageAllocator::new(layout.data_size),
+            pages: PageState::new(DEFAULT_CAPACITY_BYTES),
             rel,
             replay_cache: scan.records,
             version,
@@ -669,7 +670,8 @@ impl StorageFile {
             superblock_b,
             active_superblock: ActiveSuperblock::A,
             allocator: PageAllocator::new(layout.data_size),
-            rel: RelState::new(DEFAULT_CAPACITY_BYTES),
+            pages: PageState::new(DEFAULT_CAPACITY_BYTES),
+            rel: RelState::new(),
             replay_cache: Vec::new(),
             version: crate::relstore::version::VersionState::default(),
         })
