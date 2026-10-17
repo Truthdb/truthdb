@@ -44,7 +44,7 @@ impl RelStorage {
     /// it, so a column keeps the collation it was created under even if a later
     /// database is created with a different default.
     pub fn default_collation(&self) -> Option<String> {
-        self.lock().default_collation.clone()
+        self.lock().default_collation()
     }
 
     pub fn rel_tables(&self) -> Vec<TableDef> {
@@ -86,7 +86,7 @@ impl RelFile<'_> {
         // to keep the collation it was created under. Resolved here, at the one
         // point every CREATE TABLE passes through, so the SQL path and the
         // native path cannot disagree.
-        if let Some(default) = self.core.default_collation.clone() {
+        if let Some(default) = self.core.default_collation() {
             for column in &mut columns {
                 if column.collation.is_none()
                     && matches!(

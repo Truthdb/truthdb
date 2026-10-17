@@ -17,7 +17,7 @@ fn offline_grow_extends_the_data_region() {
         let outcome = execute_batch(&storage, sql, &mut ctx);
         assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
     }
-    let old_pages = storage.lock().layout.data_size / PAGE_SIZE as u64;
+    let old_pages = storage.lock().data_pages();
     drop(ctx);
     drop(storage);
 
@@ -29,10 +29,7 @@ fn offline_grow_extends_the_data_region() {
     );
 
     let storage = RelStorage::open(path.clone()).expect("reopen after grow");
-    assert_eq!(
-        storage.lock().layout.data_size / PAGE_SIZE as u64,
-        new_pages
-    );
+    assert_eq!(storage.lock().data_pages(), new_pages);
     let mut ctx = TxnContext::default();
     let outcome = execute_batch(&storage, "SELECT v FROM g WHERE id = 1", &mut ctx);
     assert!(outcome.error.is_none(), "{:?}", outcome.error);
@@ -178,7 +175,7 @@ fn grow_crash_before_header_stamp_is_recoverable() {
 
     let old_pages = {
         let storage = RelStorage::open(path.clone()).expect("preflight open");
-        let pages = storage.lock().layout.data_size / PAGE_SIZE as u64;
+        let pages = storage.lock().data_pages();
         drop(storage);
         pages
     };
@@ -200,7 +197,7 @@ fn grow_crash_before_header_stamp_is_recoverable() {
     // The old layout must be fully valid: data readable, snapshot loads.
     let storage = RelStorage::open(path.clone()).expect("open under the OLD header");
     assert_eq!(
-        storage.lock().layout.data_size / PAGE_SIZE as u64,
+        storage.lock().data_pages(),
         old_pages,
         "still the old layout"
     );
@@ -225,10 +222,7 @@ fn grow_crash_before_header_stamp_is_recoverable() {
     let new_pages = crate::storage::Storage::grow_data_region(&path, 1).expect("re-run grow");
     assert_eq!(new_pages, old_pages + (1u64 << 30) / PAGE_SIZE as u64);
     let storage = RelStorage::open(path.clone()).expect("open after completed grow");
-    assert_eq!(
-        storage.lock().layout.data_size / PAGE_SIZE as u64,
-        new_pages
-    );
+    assert_eq!(storage.lock().data_pages(), new_pages);
     let snap = storage
         .load_snapshot()
         .expect("load snapshot after grow")

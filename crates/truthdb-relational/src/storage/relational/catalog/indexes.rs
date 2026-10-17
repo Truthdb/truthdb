@@ -151,7 +151,7 @@ impl RelFile<'_> {
                     | crate::relstore::types::ColumnType::NVarChar { .. }
             )
         {
-            column.collation = self.core.default_collation.clone();
+            column.collation = self.core.default_collation();
         }
         let mut def = self
             .rel

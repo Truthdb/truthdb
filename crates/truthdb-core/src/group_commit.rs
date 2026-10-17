@@ -34,7 +34,7 @@ struct State {
     fsyncs: u64,
 }
 
-pub struct GroupCommit {
+pub(crate) struct GroupCommit {
     state: Mutex<State>,
     /// Committers wait here for `flushed` to reach their target.
     flushed_cv: Condvar,

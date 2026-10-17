@@ -145,7 +145,7 @@ pub struct Storage {
     inner: std::sync::Mutex<Locked>,
     /// Group-commit coordinator: commits register their WAL tail here and wait
     /// for the log-writer to fsync past it. Shared with the log-writer thread.
-    pub gc: Arc<GroupCommit>,
+    gc: Arc<GroupCommit>,
     /// D2 synchronous commit (primary side): when armed, a commit additionally
     /// waits — after LOCAL durability — for a standby's `FlushAck` to cover its
     /// target, with an availability-first timeout (see [`SyncCommitState`]).
@@ -190,10 +190,10 @@ pub struct SnapshotData {
 /// combined in [`StorageFile::checkpoint_wal_head`]. Built for Stage 17 backup
 /// and reused by Stage 18 replication slots.
 #[derive(Debug, Default)]
-pub struct LogTruncationGate {
+struct LogTruncationGate {
     /// An in-progress full backup's `redo_start_lsn` — the log it must ship
     /// before the ring can reclaim it. `None` when no backup is running.
-    pub backup: Option<u64>,
+    backup: Option<u64>,
     /// The FULL-recovery-model log-backup floor: `last_log_backup_lsn`, the log
     /// past which nothing has been shipped to a log archive yet. Held so a
     /// checkpoint cannot truncate log a future `BACKUP LOG` still owes. `None`
@@ -218,13 +218,13 @@ impl LogTruncationGate {
 
 pub struct StorageFile {
     /// Handle for data-region, superblock and descriptor I/O.
-    pub file: DirectFile,
+    file: DirectFile,
     /// WAL writer with its own dedicated file handle, so log writes do not
     /// serialize behind page flushes.
-    pub wal: WalWriter,
+    wal: WalWriter,
     /// Holds that keep the WAL ring from truncating log a backup (or, later, a
     /// replication slot) still needs.
-    pub truncation_gate: LogTruncationGate,
+    truncation_gate: LogTruncationGate,
     /// A replication slot lagging the WAL tail by more than this is invalidated
     /// (dropped) at the next checkpoint so the ring can advance — the standby
     /// must then reseed. `u64::MAX` (the default) = unlimited retention: a slot
@@ -267,21 +267,21 @@ pub struct StorageFile {
     log_backup_in_progress: bool,
     /// FULL recovery model (vs SIMPLE, the default): bit 2 of the
     /// superblock's database-options byte. Drives the log-backup hold.
-    pub recovery_full: bool,
-    pub layout: StorageLayout,
+    recovery_full: bool,
+    layout: StorageLayout,
     superblock_a: Superblock,
     superblock_b: Superblock,
     active_superblock: ActiveSuperblock,
-    pub allocator: PageAllocator,
+    allocator: PageAllocator,
     /// Buffer pool, dirty-page table and transaction counters.
-    pub pages: PageState,
+    pages: PageState,
     /// WAL records recovered at open, waiting for the engine to replay them.
     replay_cache: Vec<WalRecord>,
     /// The database's default collation, read from the file header at open. A
     /// character column declared without an explicit `COLLATE` is resolved to
     /// this at CREATE TABLE and stored with it, so the column keeps the
     /// collation it was created under even if the default later changes.
-    pub default_collation: Option<String>,
+    default_collation: Option<String>,
 }
 
 /// What the storage mutex guards: the core file next to the page-structured
@@ -289,8 +289,8 @@ pub struct StorageFile {
 /// version publishing (and a checkpoint's flush and catalog-root stamp) stay
 /// one critical section. Derefs to the core file.
 pub struct Locked {
-    pub core: StorageFile,
-    pub eng: Box<dyn EngineParticipant>,
+    core: StorageFile,
+    eng: Box<dyn EngineParticipant>,
 }
 
 impl std::ops::Deref for Locked {

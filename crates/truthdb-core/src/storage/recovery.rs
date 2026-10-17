@@ -13,7 +13,7 @@ impl StorageFile {
 
     /// A page context over this file's pool, WAL and allocator. `container`
     /// is the tag stamped into forward page-scoped records it appends.
-    pub(in crate::storage) fn page_ctx(&mut self, container: u16) -> RelCtx<'_> {
+    pub fn page_ctx(&mut self, container: u16) -> RelCtx<'_> {
         RelCtx {
             pool: &mut self.pages.pool,
             io: PoolIo {
