@@ -15,8 +15,11 @@
 //! performed in memory, then logged as full-page images of every touched
 //! page (redo is idempotent by page LSN), never undone.
 
+use std::collections::HashMap;
+
 use crate::relstore::ctx::{LogMode, OpMode, RelCtx};
 use crate::relstore::page::{self, PAGE_TYPE_TREE};
+use crate::relstore::recovery::LogicalUndo;
 use crate::relstore::slotted::{NO_PAGE, SlottedPage, SlottedRead};
 use crate::storage::StorageError;
 use crate::storage_layout::PAGE_SIZE;
@@ -819,6 +822,26 @@ impl BTree {
 
 fn split_overflow() -> StorageError {
     StorageError::InvalidFile("page overflow during split (cell size invariant broken)".to_string())
+}
+
+/// Tree roots by object id, captured where the undo starts (BEGIN for a
+/// multi-statement transaction, statement start, or before recovery undo):
+/// resolves each logical undo to its tree.
+pub(crate) struct TreeRoots<'a>(pub(crate) &'a HashMap<u32, u64>);
+
+impl LogicalUndo for TreeRoots<'_> {
+    fn undo(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        mode: &mut OpMode<'_>,
+        object_id: u32,
+        undo: &PageOpUndo,
+    ) -> Result<(), StorageError> {
+        let root = *self.0.get(&object_id).ok_or_else(|| {
+            StorageError::InvalidFile(format!("undo references unknown tree object {object_id}"))
+        })?;
+        apply_tree_undo(ctx, mode, &BTree { object_id, root }, undo)
+    }
 }
 
 /// Applies a logical tree undo as compensation. Ops are tolerant of partial

@@ -15,7 +15,6 @@
 
 use std::collections::HashMap;
 
-use crate::relstore::btree::{BTree, apply_tree_undo};
 use crate::relstore::ctx::{OpMode, RelCtx, TxnLink, apply_redo_to_page};
 use crate::relstore::page;
 use crate::relstore::slotted::SlottedRead;
@@ -231,14 +230,26 @@ fn redo_page_op(ctx: &mut RelCtx<'_>, lsn: u64, redo: &PageOpRedo) -> Result<(),
     Ok(())
 }
 
+/// Applies the logical (tree) undos recovery cannot apply physically. The
+/// storage engine that owns the trees implements it; recovery hands it each
+/// `PageOpUndo::Tree*` record's object id and undo.
+pub(crate) trait LogicalUndo {
+    fn undo(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        mode: &mut OpMode<'_>,
+        object_id: u32,
+        undo: &PageOpUndo,
+    ) -> Result<(), StorageError>;
+}
+
 /// Undoes every loser transaction, logging CLRs, ending each with a TXN_END.
-/// `tree_roots` maps object ids to their (stable) root pages for logical
-/// tree undos.
+/// `logical` applies the tree undos.
 pub(crate) fn undo_losers(
     ctx: &mut RelCtx<'_>,
     records: &[(u64, RelRecord)],
     losers: &HashMap<u64, u64>,
-    tree_roots: &HashMap<u32, u64>,
+    logical: &dyn LogicalUndo,
 ) -> Result<(), StorageError> {
     // Undo may append CLRs into a ring that a forward statement filled:
     // compensation records are allowed into the WAL's reserve.
@@ -286,7 +297,7 @@ pub(crate) fn undo_losers(
             REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE => {
                 let undo = record.decode_page_op_undo()?;
                 let (_, link) = active.get_mut(&txn_id).expect("active loser");
-                undo_one(ctx, link, &undo, cursor, record.prev_lsn, tree_roots)?;
+                undo_one(ctx, link, &undo, cursor, record.prev_lsn, logical)?;
                 record.prev_lsn
             }
             REL_KIND_TXN_BEGIN => 0,
@@ -311,7 +322,7 @@ pub(crate) fn undo_one(
     undo: &PageOpUndo,
     record_lsn: u64,
     record_prev: u64,
-    tree_roots: &HashMap<u32, u64>,
+    logical: &dyn LogicalUndo,
 ) -> Result<(), StorageError> {
     {
         // In-group CLRs point AT the record (`record_lsn`): the group re-runs
@@ -336,16 +347,7 @@ pub(crate) fn undo_one(
             PageOpUndo::TreeDeleteKey { object_id, .. }
             | PageOpUndo::TreeInsertRow { object_id, .. }
             | PageOpUndo::TreeUpdateRow { object_id, .. } => {
-                let root = *tree_roots.get(object_id).ok_or_else(|| {
-                    StorageError::InvalidFile(format!(
-                        "undo references unknown tree object {object_id}"
-                    ))
-                })?;
-                let tree = BTree {
-                    object_id: *object_id,
-                    root,
-                };
-                apply_tree_undo(ctx, &mut mode, &tree, undo)?;
+                logical.undo(ctx, &mut mode, *object_id, undo)?;
             }
             PageOpUndo::CounterAdd { page, delta } => {
                 // The inverse delta was baked in when the undo record was
@@ -412,7 +414,7 @@ pub(crate) fn rollback_to(
     ctx: &mut RelCtx<'_>,
     txn: &mut TxnLink,
     savepoint: crate::relstore::ctx::Savepoint,
-    tree_roots: &HashMap<u32, u64>,
+    logical: &dyn LogicalUndo,
 ) -> Result<(), StorageError> {
     ctx.use_reserve = true;
     // Detach the suffix (work done after the savepoint) and undo it tail-first.
@@ -425,7 +427,7 @@ pub(crate) fn rollback_to(
         } else {
             suffix[index - 1].0
         };
-        undo_one(ctx, txn, undo, *lsn, prev, tree_roots)?;
+        undo_one(ctx, txn, undo, *lsn, prev, logical)?;
     }
     Ok(())
 }
@@ -435,7 +437,7 @@ pub(crate) fn rollback_to(
 pub(crate) fn rollback(
     ctx: &mut RelCtx<'_>,
     mut txn: TxnLink,
-    tree_roots: &HashMap<u32, u64>,
+    logical: &dyn LogicalUndo,
 ) -> Result<(), StorageError> {
     ctx.use_reserve = true;
     let entries: Vec<(u64, PageOpUndo)> = std::mem::take(&mut txn.undo_log);
@@ -446,7 +448,7 @@ pub(crate) fn rollback(
         } else {
             entries[index - 1].0
         };
-        undo_one(ctx, &mut txn, undo, *lsn, prev, tree_roots)?;
+        undo_one(ctx, &mut txn, undo, *lsn, prev, logical)?;
     }
     ctx.append(&RelRecord::txn_end(txn.txn_id, txn.last_lsn), false)?;
     Ok(())

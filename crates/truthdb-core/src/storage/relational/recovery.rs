@@ -53,7 +53,7 @@ impl StorageFile {
         if !redo_only && !outcome.losers.is_empty() {
             let roots = self.rel.tree_roots();
             let mut ctx = self.rel_ctx();
-            rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &roots)?;
+            rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &TreeRoots(&roots))?;
             self.reload_catalog()?;
         }
         // Readable standby: rebuild the version store from the retained ring

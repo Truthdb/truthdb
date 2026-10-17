@@ -427,7 +427,7 @@ impl StorageFile {
                     Err(err) => (Err(err), true),
                 }
             }
-            Err(err) => match rel_recovery::rollback(&mut ctx, txn, &roots) {
+            Err(err) => match rel_recovery::rollback(&mut ctx, txn, &TreeRoots(&roots)) {
                 Ok(()) => {
                     let _ = ctx.io.wal.sync_all();
                     (Err(err), false)
@@ -476,7 +476,12 @@ impl StorageFile {
                     Err(err) => {
                         // The failed statement's staged versions die with it.
                         stx.txn.pending_versions.clear();
-                        match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &roots) {
+                        match rel_recovery::rollback_to(
+                            &mut ctx,
+                            &mut stx.txn,
+                            savepoint,
+                            &TreeRoots(&roots),
+                        ) {
                             Ok(()) => (Err(err), false),
                             // A half-undone statement the WAL cannot explain:
                             // wedge the engine (a checkpoint would make it
@@ -562,7 +567,7 @@ impl StorageFile {
         let roots = stx.roots;
         let result = {
             let mut ctx = self.rel_ctx();
-            match rel_recovery::rollback(&mut ctx, stx.txn, &roots) {
+            match rel_recovery::rollback(&mut ctx, stx.txn, &TreeRoots(&roots)) {
                 Ok(()) => {
                     let _ = ctx.io.wal.sync_all();
                     Ok(())
@@ -601,7 +606,7 @@ impl StorageFile {
         let roots = stx.roots.clone();
         let result = {
             let mut ctx = self.rel_ctx();
-            match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &roots) {
+            match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &TreeRoots(&roots)) {
                 Ok(()) => {
                     let _ = ctx.io.wal.sync_all();
                     Ok(())

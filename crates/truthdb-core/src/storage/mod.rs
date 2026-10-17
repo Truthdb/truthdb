@@ -9,7 +9,7 @@ use crate::allocator::{EXTENT_PAGES, PageAllocator};
 use crate::direct_io::{AlignedPageBuf, DirectFile};
 use crate::group_commit::GroupCommit;
 use crate::relstore::RelState;
-use crate::relstore::btree::{BTree, ScanCursor, TreeInsert};
+use crate::relstore::btree::{BTree, ScanCursor, TreeInsert, TreeRoots};
 use crate::relstore::buffer_pool::DEFAULT_CAPACITY_BYTES;
 use crate::relstore::catalog::{self, FIRST_USER_OBJECT_ID, IndexDef, TableDef};
 use crate::relstore::ctx::{OpMode, PoolIo, RelCtx, TxnLink};
