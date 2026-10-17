@@ -1,7 +1,7 @@
 use super::*;
 use tokio::io::AsyncWriteExt;
-use truthdb_core::engine::ResultColumn;
-use truthdb_core::relstore::types::{ColumnType, Datum};
+use truthdb_relational::engine::ResultColumn;
+use truthdb_relational::relstore::types::{ColumnType, Datum};
 
 /// An Attention header-only packet.
 const ATTN: [u8; 8] = [PKT_ATTENTION, 0x01, 0x00, 0x08, 0, 0, 0, 0];
@@ -88,7 +88,7 @@ async fn no_attention_renders_the_batch_normally() {
     tx.send(BatchEvent::StatementDone {
         count: Some(1),
         in_transaction: false,
-        command: truthdb_core::engine::DoneCommand::Other,
+        command: truthdb_relational::engine::DoneCommand::Other,
     })
     .unwrap();
     tx.send(BatchEvent::Complete {
@@ -139,7 +139,7 @@ async fn a_reply_that_ends_without_a_terminal_event_is_a_clean_error() {
     tx.send(BatchEvent::StatementDone {
         count: Some(1),
         in_transaction: false,
-        command: truthdb_core::engine::DoneCommand::Other,
+        command: truthdb_relational::engine::DoneCommand::Other,
     })
     .unwrap();
     drop(tx);

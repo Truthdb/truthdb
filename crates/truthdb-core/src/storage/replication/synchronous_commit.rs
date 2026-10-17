@@ -120,8 +120,8 @@ impl Storage {
     }
 
     /// Whether the synchronous-commit link is degraded (NOT_SYNCHRONIZED).
-    #[cfg(test)]
-    pub(crate) fn sync_commit_degraded(&self) -> bool {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn sync_commit_degraded(&self) -> bool {
         self.sync_commit
             .degraded
             .load(std::sync::atomic::Ordering::Acquire)
@@ -130,13 +130,13 @@ impl Storage {
     /// Publishes a standby's acknowledged durable LSN (the sender's ack path
     /// calls this beside the slot advance). Re-synchronizes the link when the
     /// acknowledgement has caught up to the primary's durable watermark.
-    pub(crate) fn publish_sync_ack(&self, acked: u64) {
+    pub fn publish_sync_ack(&self, acked: u64) {
         self.sync_commit.publish(acked);
     }
 
     /// Synchronous-commit status: `None` when not armed, else whether the link
     /// is currently degraded (NOT_SYNCHRONIZED).
-    pub(crate) fn sync_commit_status(&self) -> Option<bool> {
+    pub fn sync_commit_status(&self) -> Option<bool> {
         use std::sync::atomic::Ordering;
         self.sync_commit
             .armed

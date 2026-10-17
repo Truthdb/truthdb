@@ -34,7 +34,7 @@ struct State {
     fsyncs: u64,
 }
 
-pub(crate) struct GroupCommit {
+pub struct GroupCommit {
     state: Mutex<State>,
     /// Committers wait here for `flushed` to reach their target.
     flushed_cv: Condvar,
@@ -118,7 +118,7 @@ impl GroupCommit {
     /// The durable watermark: the highest WAL tail known fsync-durable. The
     /// version store's snapshot capture reads this to bound visibility to the
     /// durable commit prefix.
-    pub(crate) fn flushed(&self) -> u64 {
+    pub fn flushed(&self) -> u64 {
         self.state
             .lock()
             .expect("group-commit state poisoned")
@@ -132,7 +132,7 @@ impl GroupCommit {
     }
 
     /// The number of fsyncs the log-writer has issued so far.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn fsync_count(&self) -> u64 {
         self.state
             .lock()

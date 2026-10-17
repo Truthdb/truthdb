@@ -1223,8 +1223,10 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "truthdb-core",
+ "truthdb-engine",
  "truthdb-net",
  "truthdb-proto",
+ "truthdb-relational",
  "truthdb-tds",
 ]
 
@@ -1251,9 +1253,9 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "toml",
- "truthdb-core",
  "truthdb-net",
  "truthdb-proto",
+ "truthdb-relational",
 ]
 
 [[package]]
@@ -1271,14 +1273,27 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-rustls",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "truthdb-engine"
+version = "0.1.0"
+dependencies = [
+ "rcgen",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
  "tokio-rustls",
+ "truthdb-core",
  "truthdb-net",
  "truthdb-proto",
+ "truthdb-relational",
+ "truthdb-search",
  "truthdb-sql",
- "xxhash-rust",
 ]
 
 [[package]]
@@ -1299,6 +1314,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "truthdb-relational"
+version = "0.1.0"
+dependencies = [
+ "ring",
+ "serde",
+ "serde_json",
+ "truthdb-core",
+ "truthdb-sql",
+ "xxhash-rust",
+]
+
+[[package]]
+name = "truthdb-search"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+]
+
+[[package]]
 name = "truthdb-sql"
 version = "0.1.0"
 dependencies = [
@@ -1315,7 +1352,8 @@ dependencies = [
  "tokio",
  "tokio-rustls",
  "tracing",
- "truthdb-core",
+ "truthdb-engine",
+ "truthdb-relational",
  "truthdb-sql",
 ]
 

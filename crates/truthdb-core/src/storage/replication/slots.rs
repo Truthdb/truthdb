@@ -3,7 +3,7 @@ use super::super::*;
 impl Storage {
     /// The registered replication slots `(id, held LSN)` (for the monitoring
     /// DMVs).
-    pub(crate) fn repl_slots_snapshot(&self) -> Vec<(u32, u64)> {
+    pub fn repl_slots_snapshot(&self) -> Vec<(u32, u64)> {
         self.lock()
             .truncation_gate
             .repl_slots
@@ -16,24 +16,24 @@ impl Storage {
     /// standby needs is already truncated — it must reseed) or if the slot
     /// table is full; the check and the insert happen under one lock hold, so
     /// a concurrent checkpoint cannot truncate between them.
-    pub(crate) fn try_register_repl_slot(&self, id: u32, lsn: u64) -> Result<(), StorageError> {
+    pub fn try_register_repl_slot(&self, id: u32, lsn: u64) -> Result<(), StorageError> {
         self.lock().try_register_repl_slot(id, lsn)
     }
 
     /// Advances a slot's held LSN (never backward). A no-op if the slot does
     /// not exist — an ack racing a reap must not resurrect a reaped slot.
-    pub(crate) fn advance_repl_slot(&self, id: u32, lsn: u64) {
+    pub fn advance_repl_slot(&self, id: u32, lsn: u64) {
         self.lock().advance_repl_slot(id, lsn);
     }
 
-    #[cfg(test)]
-    pub(crate) fn drop_repl_slot(&self, id: u32) {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn drop_repl_slot(&self, id: u32) {
         self.lock().drop_repl_slot(id);
     }
 
     /// A slot's held LSN. (Test-only until the monitoring slice reads it.)
-    #[cfg(test)]
-    pub(crate) fn repl_slot_lsn(&self, id: u32) -> Option<u64> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn repl_slot_lsn(&self, id: u32) -> Option<u64> {
         self.lock().repl_slot_lsn(id)
     }
 
@@ -188,12 +188,12 @@ impl StorageFile {
         }
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::storage) fn drop_repl_slot(&mut self, id: u32) {
         self.truncation_gate.repl_slots.remove(&id);
     }
 
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(in crate::storage) fn repl_slot_lsn(&self, id: u32) -> Option<u64> {
         self.truncation_gate.repl_slots.get(&id).copied()
     }

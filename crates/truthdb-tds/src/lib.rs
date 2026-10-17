@@ -22,7 +22,7 @@ use std::sync::Arc;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::watch;
 use tracing::{debug, error, info};
-use truthdb_core::session::EngineHandle;
+use truthdb_engine::session::EngineHandle;
 
 pub use server::{Encryption, TdsConfig, serve_connection};
 pub use throttle::LoginThrottle;

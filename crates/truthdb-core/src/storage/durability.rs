@@ -8,7 +8,7 @@ impl Storage {
     /// acknowledgement of `target` — unless the link is already degraded
     /// (NOT_SYNCHRONIZED), in which case commits proceed on local durability
     /// alone until a standby catches back up.
-    pub(crate) fn ensure_durable(&self, target: u64) -> Result<(), StorageError> {
+    pub fn ensure_durable(&self, target: u64) -> Result<(), StorageError> {
         self.gc.ensure_durable(target)?;
         self.sync_commit.wait_for_ack(target);
         Ok(())
@@ -16,12 +16,12 @@ impl Storage {
 
     /// Wedges the relational store after a durability (fsync) failure so no
     /// further op serves state the log does not back. See `ensure_rel_usable`.
-    pub(crate) fn wedge(&self) {
+    pub fn wedge(&self) {
         self.lock().wedge();
     }
 
-    #[cfg(test)]
-    pub(crate) fn group_commit_fsyncs(&self) -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn group_commit_fsyncs(&self) -> u64 {
         self.gc.fsync_count()
     }
 
@@ -56,8 +56,8 @@ impl StorageFile {
         self.wal.usage_ratio()
     }
 
-    pub(super) fn ensure_rel_usable(&self) -> Result<(), StorageError> {
-        if self.rel.wedged {
+    pub fn ensure_rel_usable(&self) -> Result<(), StorageError> {
+        if self.pages.wedged {
             return Err(StorageError::InvalidFile(
                 "relational store wedged after a failed commit/rollback; restart to recover from the log"
                     .to_string(),
@@ -72,7 +72,7 @@ impl StorageFile {
     /// `rel_statement`/`commit_txn` never fired) but never became durable — the
     /// in-memory state is now ahead of the log and must not be served.
     pub(super) fn wedge(&mut self) {
-        self.rel.wedged = true;
+        self.pages.wedged = true;
     }
 
     pub(super) fn append_wal_entry(

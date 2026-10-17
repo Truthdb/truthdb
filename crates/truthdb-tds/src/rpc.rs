@@ -13,8 +13,8 @@
 
 use std::io;
 
-use truthdb_core::engine::RpcParam;
-use truthdb_core::relstore::types::{ColumnType, Datum};
+use truthdb_relational::engine::RpcParam;
+use truthdb_relational::relstore::types::{ColumnType, Datum};
 
 // Data type tokens (MS-TDS 2.2.5.4) — the variable/nullable forms drivers send
 // for parameters, plus DATE/DATETIME2/GUID/DECIMAL.

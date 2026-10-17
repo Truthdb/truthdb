@@ -6,10 +6,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::mpsc;
-use truthdb_core::auth;
-use truthdb_core::engine::EngineError;
-use truthdb_core::engine::ResultColumn;
-use truthdb_core::session::{BatchEvent, EngineHandle, PreparedRpc, SessionId};
+use truthdb_engine::engine::EngineError;
+use truthdb_engine::session::{BatchEvent, EngineHandle, PreparedRpc, SessionId};
+use truthdb_relational::auth;
+use truthdb_relational::engine::ResultColumn;
 
 use crate::login::{self, parse_login7};
 use crate::packet::{

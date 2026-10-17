@@ -2,13 +2,13 @@ use super::super::*;
 
 impl Storage {
     /// The current WAL tail — the durability target for a batch that committed.
-    pub(crate) fn wal_tail(&self) -> u64 {
+    pub fn wal_tail(&self) -> u64 {
         self.lock().wal_tail()
     }
 
     /// The current WAL head (the reclaim floor) — for tests that verify the
     /// FULL-model log-backup hold pins truncation.
-    pub(crate) fn wal_head(&self) -> u64 {
+    pub fn wal_head(&self) -> u64 {
         self.lock().wal.head()
     }
 
@@ -29,7 +29,7 @@ impl Storage {
     ///    redo+undo" happens; a crash mid-recovery re-runs it on the next open.
     ///
     /// Returns the new epoch.
-    pub fn promote(path: &Path) -> Result<u64, StorageError> {
+    pub fn promote(path: &Path, engine: EngineFactory) -> Result<u64, StorageError> {
         let new_epoch = {
             let mut file = DirectFile::open_existing(path.to_path_buf())?;
             let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
@@ -102,7 +102,7 @@ impl Storage {
                     file.write_all_at(backup_offset, &backup.to_le_bytes_with_checksum())?;
                     file.sync_data()?;
                     drop(file);
-                    drop(Storage::open(path.to_path_buf())?);
+                    drop(Storage::open(path.to_path_buf(), engine)?);
                     return Ok(active.epoch());
                 }
                 return Err(StorageError::InvalidConfig(format!(
@@ -153,7 +153,7 @@ impl Storage {
         };
         // Validate + finalize: a full open runs redo AND undo (the standby flag
         // is gone), sealing the shipped in-flight transactions with CLRs.
-        drop(Storage::open(path.to_path_buf())?);
+        drop(Storage::open(path.to_path_buf(), engine)?);
         Ok(new_epoch)
     }
 
@@ -195,12 +195,12 @@ impl Storage {
             let layout_data_offset = file.layout.data_offset;
             let layout_data_pages = file.layout.data_size / PAGE_SIZE as u64;
             let StorageFile {
-                rel,
+                pages,
                 file: dfile,
                 wal,
                 ..
-            } = &mut *file;
-            let RelState { pool, dpt, .. } = rel;
+            } = &mut file.core;
+            let PageState { pool, dpt, .. } = pages;
             let mut io = PoolIo {
                 file: dfile,
                 wal,
@@ -224,8 +224,8 @@ impl Storage {
         // about to leave the ring, so a reopen must find the root in the
         // superblock rather than re-deriving it from redo.
         let metadata_root = file
-            .rel
-            .catalog_root
+            .eng
+            .metadata_root()
             .map(|page| file.layout.data_offset + page * PAGE_SIZE as u64)
             .unwrap_or(0);
         file.commit_superblock(|sb| {
@@ -264,7 +264,7 @@ impl Storage {
     /// The persisted replication epoch (bumped once at each promotion; zero
     /// until the first failover). Both sides of the replication handshake
     /// exchange it so a diverged old primary's stream can be fenced off.
-    pub(crate) fn epoch(&self) -> u64 {
+    pub fn epoch(&self) -> u64 {
         let guard = self.lock();
         let active = match guard.active_superblock {
             ActiveSuperblock::A => &guard.superblock_a,
@@ -275,8 +275,8 @@ impl Storage {
 
     /// Durably sets the replication epoch (a promotion bumps it by one;
     /// test-only until the failover slice performs promotions).
-    #[cfg(test)]
-    pub(crate) fn set_epoch(&self, epoch: u64) -> Result<(), StorageError> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn set_epoch(&self, epoch: u64) -> Result<(), StorageError> {
         self.lock().commit_superblock(|sb| sb.set_epoch(epoch))
     }
 }

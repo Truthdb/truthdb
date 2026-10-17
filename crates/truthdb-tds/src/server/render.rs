@@ -369,8 +369,8 @@ struct BatchRender {
     return_values: Vec<(
         u16,
         String,
-        truthdb_core::relstore::types::ColumnType,
-        truthdb_core::relstore::types::Datum,
+        truthdb_relational::relstore::types::ColumnType,
+        truthdb_relational::relstore::types::Datum,
     )>,
     /// More replies follow this one in the same response (a multi-RPC
     /// request): the final DONEPROC keeps `DONE_MORE` instead of `DONE_FINAL`.
@@ -387,8 +387,8 @@ struct PendingDone {
 }
 
 /// The DONE `CurCmd` value for a statement's command class.
-fn curcmd_of(command: truthdb_core::engine::DoneCommand) -> u16 {
-    use truthdb_core::engine::DoneCommand;
+fn curcmd_of(command: truthdb_relational::engine::DoneCommand) -> u16 {
+    use truthdb_relational::engine::DoneCommand;
     match command {
         DoneCommand::Select => token::CMD_SELECT,
         DoneCommand::Insert => token::CMD_INSERT,
@@ -519,7 +519,7 @@ impl BatchRender {
                 // Severity >= 20 kills the connection, as SQL Server does:
                 // the reply still finishes (error + final DONE) and then the
                 // connection loop closes the stream.
-                if error.level >= truthdb_core::engine::FATAL_SEVERITY {
+                if error.level >= truthdb_relational::engine::FATAL_SEVERITY {
                     self.fatal = true;
                 }
             }

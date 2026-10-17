@@ -30,7 +30,7 @@ use crate::wal::records::{
 const REL_WAL_ENTRY_VERSION: u16 = 2;
 
 /// Raw page I/O + WAL watermark for the buffer pool, over the data region.
-pub(crate) struct PoolIo<'a> {
+pub struct PoolIo<'a> {
     pub file: &'a mut DirectFile,
     pub wal: &'a mut WalWriter,
     pub data_offset: u64,
@@ -70,31 +70,54 @@ impl PoolBackend for PoolIo<'_> {
     }
 }
 
+/// Page and transaction state the log's commit and recovery protocol owns:
+/// the buffer pool, the dirty-page table, the transaction-id counter, the
+/// open explicit transactions, and the wedge flag.
+pub struct PageState {
+    pub pool: BufferPool,
+    /// Set when a commit or rollback could not be logged: the pool may hold
+    /// state the WAL cannot explain, so all relational work — and above all
+    /// checkpoints, which would make that state durable and unrecoverable —
+    /// is refused until a restart replays the log.
+    pub wedged: bool,
+    /// Pages dirtied since the last checkpoint -> LSN of their first change.
+    pub dpt: HashMap<u64, u64>,
+    pub next_txn_id: u64,
+    /// Open explicit (multi-statement) transactions: txn id → its `BEGIN` LSN.
+    /// A (fuzzy) checkpoint may run while these are open — it flushes their
+    /// (uncommitted) pages under the steal policy — but must clamp the WAL head
+    /// to the *oldest* begin LSN here so their undo records survive for crash
+    /// rollback. Autocommit statements never leave one open across calls.
+    pub active_txn_begins: std::collections::BTreeMap<u64, u64>,
+}
+
+impl PageState {
+    pub fn new(pool_capacity_bytes: u64) -> Self {
+        PageState {
+            pool: BufferPool::new(pool_capacity_bytes),
+            wedged: false,
+            dpt: HashMap::new(),
+            next_txn_id: 1,
+            active_txn_begins: std::collections::BTreeMap::new(),
+        }
+    }
+}
+
 /// An active (statement-scoped, autocommit) transaction: the WAL chain tail
 /// and an in-memory undo log so statement rollback never re-reads the ring.
-pub(crate) struct TxnLink {
+pub struct TxnLink {
     pub txn_id: u64,
     pub last_lsn: u64,
     pub undo_log: Vec<(u64, PageOpUndo)>,
-    /// Row versions staged by the running statement (Stage 13), published to
-    /// the version store when the statement succeeds and discarded when it
-    /// rolls back. Empty unless a versioned isolation is enabled.
-    pub pending_versions: Vec<crate::relstore::version::PendingVersion>,
-    /// Versions this transaction has published, so a rollback (full or to a
-    /// savepoint) can reverse the publications exactly.
-    pub published_versions: Vec<crate::relstore::version::PublishRecord>,
 }
 
 /// A marker in a live transaction's log to which a later partial rollback can
 /// return, undoing only the work done since (statement-level atomicity). Captures
 /// the undo-log length and the WAL chain tail at capture time.
 #[derive(Clone, Copy)]
-pub(crate) struct Savepoint {
+pub struct Savepoint {
     pub undo_len: usize,
     pub last_lsn: u64,
-    /// Published-version count at capture, so a partial rollback unpublishes
-    /// exactly the versions of the statements it undoes.
-    pub published_len: usize,
 }
 
 impl TxnLink {
@@ -103,7 +126,6 @@ impl TxnLink {
         Savepoint {
             undo_len: self.undo_log.len(),
             last_lsn: self.last_lsn,
-            published_len: self.published_versions.len(),
         }
     }
 }
@@ -112,7 +134,7 @@ impl TxnLink {
 /// forward transaction record (with undo) or as a compensation record
 /// during rollback/recovery-undo. Structural changes (splits, new pages)
 /// are always system records regardless.
-pub(crate) enum OpMode<'t> {
+pub enum OpMode<'t> {
     Txn(&'t mut TxnLink),
     Clr {
         txn: &'t mut TxnLink,
@@ -135,7 +157,7 @@ impl OpMode<'_> {
 }
 
 /// How a page mutation is logged.
-pub(crate) enum LogMode<'t> {
+pub enum LogMode<'t> {
     /// User-transaction record with an undo action.
     Txn(&'t mut TxnLink, PageOpUndo),
     /// Compensation record during rollback/recovery-undo: `undo_next` points
@@ -149,16 +171,16 @@ pub(crate) enum LogMode<'t> {
     System,
 }
 
-#[cfg(test)]
+#[cfg(any(test, feature = "test-hooks"))]
 thread_local! {
     /// Test fault injection: `Some(n)` makes the (n+1)-th apply_op fail
     /// after syncing the log — prior appends stay durable, simulating a
     /// crash at that exact point (including inside recovery undo).
-    pub(crate) static FAIL_APPLY_OPS_AFTER: std::cell::Cell<Option<u32>> =
+    pub static FAIL_APPLY_OPS_AFTER: std::cell::Cell<Option<u32>> =
         const { std::cell::Cell::new(None) };
 }
 
-pub(crate) struct RelCtx<'a> {
+pub struct RelCtx<'a> {
     pub pool: &'a mut BufferPool,
     pub io: PoolIo<'a>,
     pub allocator: &'a mut PageAllocator,
@@ -239,8 +261,6 @@ impl RelCtx<'_> {
             txn_id,
             last_lsn: lsn,
             undo_log: Vec::new(),
-            pending_versions: Vec::new(),
-            published_versions: Vec::new(),
         })
     }
 
@@ -272,7 +292,7 @@ impl RelCtx<'_> {
     /// append fails, the in-memory page is restored from its pre-image: a
     /// mutation without a durable record must never survive in the pool.
     pub fn apply_op(&mut self, mode: LogMode<'_>, redo: PageOpRedo) -> Result<u64, StorageError> {
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         {
             let fire = FAIL_APPLY_OPS_AFTER.with(|c| match c.get() {
                 Some(0) => {

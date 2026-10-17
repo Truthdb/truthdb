@@ -12,12 +12,12 @@ impl Storage {
     /// Writes one raw page (`PAGE_SIZE` bytes) to a data-region page — used by
     /// the spill spool over temp extents. Bypasses the buffer pool and the WAL
     /// (spill pages are query-scratch, never recovered).
-    pub(crate) fn spill_write_page(&self, page: u64, data: &[u8]) -> Result<(), StorageError> {
+    pub fn spill_write_page(&self, page: u64, data: &[u8]) -> Result<(), StorageError> {
         self.lock().spill_write_page(page, data)
     }
 
     /// Reads one raw data-region page (`PAGE_SIZE` bytes) into `out`.
-    pub(crate) fn spill_read_page(&self, page: u64, out: &mut [u8]) -> Result<(), StorageError> {
+    pub fn spill_read_page(&self, page: u64, out: &mut [u8]) -> Result<(), StorageError> {
         self.lock().spill_read_page(page, out)
     }
 
@@ -25,8 +25,8 @@ impl Storage {
         self.lock().is_page_allocated(page)
     }
 
-    #[cfg(test)]
-    pub(crate) fn data_page_offset(&self, page: u64) -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn data_page_offset(&self, page: u64) -> u64 {
         self.lock().data_page_offset(page)
     }
 }
@@ -39,7 +39,7 @@ impl StorageFile {
     }
 
     /// Test hook: the absolute file offset of a data-region page.
-    #[cfg(test)]
+    #[cfg(any(test, feature = "test-hooks"))]
     pub(crate) fn data_page_offset(&self, page: u64) -> u64 {
         self.layout.data_offset + page * PAGE_SIZE as u64
     }

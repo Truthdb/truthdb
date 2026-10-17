@@ -4,9 +4,9 @@ compile_error!("TruthDB must be built for Linux targets. Use Docker or a Linux e
 use tokio::sync::watch;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
-use truthdb_core::client_listener::ClientListener;
-use truthdb_core::engine::Engine;
-use truthdb_core::storage::Storage;
+use truthdb_engine::client_listener::ClientListener;
+use truthdb_engine::engine::Engine;
+use truthdb_relational::storage::{RelStorage, Storage};
 mod config;
 use config::Config;
 
@@ -58,7 +58,7 @@ async fn main() {
         config.storage.size_gib
     );
 
-    let storage_opts = truthdb_core::storage::StorageOptions {
+    let storage_opts = truthdb_relational::storage::StorageOptions {
         size_gib: config.storage.size_gib,
         wal_ratio: config.storage.wal_ratio,
         metadata_ratio: config.storage.metadata_ratio,
@@ -69,7 +69,7 @@ async fn main() {
     };
 
     let storage = if storage_path.exists() {
-        match Storage::open(storage_path) {
+        match RelStorage::open(storage_path) {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to open storage: {err}");
@@ -77,7 +77,7 @@ async fn main() {
             }
         }
     } else {
-        match Storage::create(storage_path, storage_opts) {
+        match RelStorage::create(storage_path, storage_opts) {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to create storage: {err}");
@@ -123,10 +123,10 @@ async fn main() {
     // The replication tasks share the storage directly (it is internally
     // synchronized); the handle must be taken before the engine moves into its
     // worker pool.
-    let storage_arc = engine.storage_arc();
+    let storage_arc = engine.storage_arc().core_arc();
     // The engine runs on its own thread behind a message channel; the async
     // listeners talk to it through a cloneable handle.
-    let (engine, engine_join) = truthdb_core::session::spawn_engine(engine);
+    let (engine, engine_join) = truthdb_engine::session::spawn_engine(engine);
 
     let client_listener =
         match ClientListener::new(&config.network.addr, config.network.port, engine.clone()) {

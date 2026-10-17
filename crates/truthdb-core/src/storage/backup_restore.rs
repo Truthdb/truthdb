@@ -297,14 +297,14 @@ use super::*;
 
 impl Storage {
     /// The persisted log-backup floor (tests).
-    #[cfg(test)]
-    pub(crate) fn last_log_backup_lsn(&self) -> u64 {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn last_log_backup_lsn(&self) -> u64 {
         self.lock().last_log_backup_lsn
     }
 
     /// The active FULL-model log-backup truncation hold, if any (tests).
-    #[cfg(test)]
-    pub(crate) fn log_backup_hold(&self) -> Option<u64> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn log_backup_hold(&self) -> Option<u64> {
         self.lock().truncation_gate.log_backup
     }
 
@@ -421,8 +421,12 @@ impl Storage {
     /// already exist.
     /// Offline restore of a full backup with no log chain (recover to the full
     /// backup's own end).
-    pub fn restore_full(dst_path: &Path, bak_path: &Path) -> Result<(), StorageError> {
-        Self::restore_full_with_logs(dst_path, bak_path, &[], None)
+    pub fn restore_full(
+        dst_path: &Path,
+        bak_path: &Path,
+        engine: EngineFactory,
+    ) -> Result<(), StorageError> {
+        Self::restore_full_with_logs(dst_path, bak_path, &[], None, engine)
     }
 
     /// Offline restore of a full backup followed by an ordered chain of
@@ -437,8 +441,9 @@ impl Storage {
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
         stop_at: Option<u64>,
+        engine: EngineFactory,
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], stop_at, false)
+        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], stop_at, false, engine)
     }
 
     /// Offline restore of a full backup (plus an optional `BACKUP LOG` chain)
@@ -454,8 +459,9 @@ impl Storage {
         dst_path: &Path,
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
+        engine: EngineFactory,
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], None, true)
+        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], None, true, engine)
     }
 
     /// Offline restore of a full backup followed by raw shipped WAL ring ranges —
@@ -467,8 +473,9 @@ impl Storage {
         dst_path: &Path,
         bak_path: &Path,
         wal_ranges: &[(u64, Vec<u8>)],
+        engine: EngineFactory,
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, &[], wal_ranges, None, false)
+        Self::restore_full_inner(dst_path, bak_path, &[], wal_ranges, None, false, engine)
     }
 
     pub(super) fn restore_full_inner(
@@ -478,6 +485,7 @@ impl Storage {
         wal_ranges: &[(u64, Vec<u8>)],
         stop_at: Option<u64>,
         standby: bool,
+        engine: EngineFactory,
     ) -> Result<(), StorageError> {
         assert_layout_invariants();
         let reader = std::io::BufReader::new(std::fs::File::open(bak_path)?);
@@ -509,7 +517,7 @@ impl Storage {
         // later step fails, so a retry (which requires a fresh destination) can
         // proceed. Everything ABOVE this point errors without having created it.
         let outcome = Self::restore_body(
-            file, backup, &header, log_paths, wal_ranges, dst_path, stop_at, standby,
+            file, backup, &header, log_paths, wal_ranges, dst_path, stop_at, standby, engine,
         );
         if outcome.is_err() {
             let _ = std::fs::remove_file(dst_path);
@@ -531,6 +539,7 @@ impl Storage {
         dst_path: &Path,
         stop_at: Option<u64>,
         standby: bool,
+        engine: EngineFactory,
     ) -> Result<(), StorageError> {
         use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
         let data_pages = header.data_size / PAGE_SIZE as u64;
@@ -621,8 +630,8 @@ impl Storage {
         // replayed and each undone txn is sealed with a TXN_END). Failing loudly
         // if the restored file is not recoverable.
         let storage = match stop_at {
-            Some(ts) => Storage::open_with_stop_at(dst_path.to_path_buf(), ts)?,
-            None => Storage::open(dst_path.to_path_buf())?,
+            Some(ts) => Storage::open_with_stop_at(dst_path.to_path_buf(), ts, engine)?,
+            None => Storage::open(dst_path.to_path_buf(), engine)?,
         };
         drop(storage);
         Ok(())
@@ -633,12 +642,12 @@ impl StorageFile {
     /// Registers an in-progress backup's `redo_start_lsn` as a truncation hold,
     /// so a concurrent checkpoint cannot reclaim log the backup still has to ship.
     /// Paired with [`Self::release_backup_hold`].
-    pub(super) fn register_backup_hold(&mut self, redo_start_lsn: u64) {
+    pub fn register_backup_hold(&mut self, redo_start_lsn: u64) {
         self.truncation_gate.backup = Some(redo_start_lsn);
     }
 
     /// Releases the backup truncation hold (the backup finished or failed).
-    pub(super) fn release_backup_hold(&mut self) {
+    pub fn release_backup_hold(&mut self) {
         self.truncation_gate.backup = None;
     }
 
@@ -759,7 +768,7 @@ impl StorageFile {
     /// search-snapshot extent by a between-chunk checkpoint, legitimately fails
     /// page-checksum verification and is NOT corrupt: on restore its stale
     /// image is irrelevant because redo frees or overwrites it.
-    pub(super) fn page_is_live_regular(&mut self, page: u64) -> Result<bool, StorageError> {
+    pub fn page_is_live_regular(&mut self, page: u64) -> Result<bool, StorageError> {
         if !self.allocator.is_allocated(page) {
             return Ok(false); // freed since the backup began
         }
@@ -801,19 +810,21 @@ impl StorageFile {
         let out = self.read_ring_range(redo_start, backup_end)?;
         Ok((backup_end, out))
     }
+}
 
+impl Locked {
     /// Phase 1 of `BACKUP LOG`: under the storage lock, capture the log range
     /// `[last_log_backup_lsn, tail)` and its bytes plus the archive header. Does
     /// NOT advance the marker or hold, so the old marker keeps pinning the range
     /// while the caller writes the archive with the lock released. Returns
     /// `(header, start, end, log_bytes)`. Requires the FULL recovery model.
-    pub(super) fn begin_log_backup(
+    pub fn begin_log_backup(
         &mut self,
         checksum: bool,
         copy_only: bool,
     ) -> Result<(crate::backup::BackupHeader, u64, u64, Vec<u8>), StorageError> {
         self.ensure_rel_usable()?;
-        if !self.version.recovery_full {
+        if !self.core.recovery_full {
             return Err(StorageError::InvalidConfig(
                 "BACKUP LOG requires the FULL recovery model".to_string(),
             ));
@@ -825,17 +836,17 @@ impl StorageFile {
                     .to_string(),
             ));
         }
-        if self.log_backup_in_progress {
+        if self.core.log_backup_in_progress {
             return Err(StorageError::BackupInProgress);
         }
-        self.wal.sync_all()?;
-        let start = self.last_log_backup_lsn;
-        let end = self.wal.tail();
+        self.core.wal.sync_all()?;
+        let start = self.core.last_log_backup_lsn;
+        let end = self.core.wal.tail();
         debug_assert!(end >= start);
         let log = self.read_ring_range(start, end)?;
         // Reserve the single-flight slot only after the fallible reads above, so
         // a failure never strands the guard.
-        self.log_backup_in_progress = true;
+        self.core.log_backup_in_progress = true;
         // A log-only archive: no page/region data — the header carries the range
         // start in `redo_start_lsn` and the `log_backup` flag; the end is derived
         // from the LogChunk length on read.
@@ -843,7 +854,7 @@ impl StorageFile {
             format_version: crate::backup::FORMAT_VERSION,
             page_size: PAGE_SIZE as u32,
             total_size: 0,
-            wal_size: self.layout.wal_size,
+            wal_size: self.core.layout.wal_size,
             data_size: 0,
             metadata_size: 0,
             allocator_size: 0,
@@ -853,7 +864,7 @@ impl StorageFile {
             redo_start_lsn: start,
             metadata_root: 0,
             last_committed_seq: 0,
-            db_options: self.version.options_byte(),
+            db_options: self.db_options_byte(),
             epoch: self.active_sb().epoch(),
             finished_at_millis: now_millis(),
             flags: crate::backup::BackupFlags {
@@ -876,19 +887,21 @@ impl StorageFile {
     /// in those cases could sit it below the advanced head, which `set_head`
     /// forbids. The single-flight guard is released by `LogBackupGuard` on every
     /// exit path, not here.
-    pub(super) fn finish_log_backup(&mut self, start: u64, end: u64) -> Result<(), StorageError> {
-        if !self.version.recovery_full || self.last_log_backup_lsn != start {
+    pub fn finish_log_backup(&mut self, start: u64, end: u64) -> Result<(), StorageError> {
+        if !self.core.recovery_full || self.core.last_log_backup_lsn != start {
             return Ok(());
         }
         self.persist_last_log_backup_lsn(end)?;
-        self.last_log_backup_lsn = end;
+        self.core.last_log_backup_lsn = end;
         self.register_log_backup_hold(end);
         Ok(())
     }
+}
 
+impl StorageFile {
     /// Releases the `BACKUP LOG` single-flight guard (idempotent). Called by
     /// [`LogBackupGuard`] on every exit — error, panic, or success.
-    pub(super) fn cancel_log_backup(&mut self) {
+    pub fn cancel_log_backup(&mut self) {
         self.log_backup_in_progress = false;
     }
 

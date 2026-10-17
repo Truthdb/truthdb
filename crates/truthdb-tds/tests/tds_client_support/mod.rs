@@ -9,9 +9,9 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::sync::Arc;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt, DuplexStream};
-use truthdb_core::engine::Engine;
-use truthdb_core::session::{EngineHandle, spawn_engine};
-use truthdb_core::storage::{Storage, StorageOptions};
+use truthdb_engine::engine::Engine;
+use truthdb_engine::session::{EngineHandle, spawn_engine};
+use truthdb_relational::storage::{RelStorage, StorageOptions};
 use truthdb_tds::LoginThrottle;
 use truthdb_tds::server::{TdsConfig, serve_connection};
 
@@ -44,7 +44,7 @@ fn engine(path: &std::path::Path) -> EngineHandle {
         reserved_ratio: 0.17,
         default_collation: None,
     };
-    let storage = Storage::create(path.to_path_buf(), opts).expect("storage");
+    let storage = RelStorage::create(path.to_path_buf(), opts).expect("storage");
     // Seed the login the tests authenticate as (sa/secret) into the catalog
     // before the engine thread starts — auth is catalog-backed now, not from
     // config. The JoinHandle is dropped; the engine thread exits when the last
