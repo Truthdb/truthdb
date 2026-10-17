@@ -531,7 +531,7 @@ pub enum EngineError {
     Command(#[from] CommandError),
 
     #[error("storage error: {0}")]
-    RelStorage(#[from] StorageError),
+    Storage(#[from] StorageError),
 
     #[error("{0}")]
     Replay(String),
