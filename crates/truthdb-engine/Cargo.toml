@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 truthdb-core = { workspace = true }
+truthdb-search = { workspace = true }
 truthdb-proto = { workspace = true }
 truthdb-net = { workspace = true }
 truthdb-sql = { workspace = true }

@@ -9,6 +9,7 @@ license = "MIT"
 members = [
     "crates/truthdb-core",
     "crates/truthdb-engine",
+    "crates/truthdb-search",
     "crates/truthdb-cli",
     "crates/truthdb-bench",
     "crates/truthdb-proto",
@@ -30,6 +31,7 @@ directories = "5.0"
 tokio = { version = "1.39.0", features = ["full"] }
 truthdb-core = { path = "crates/truthdb-core", version = "0.1.0" }
 truthdb-engine = { path = "crates/truthdb-engine", version = "0.1.0" }
+truthdb-search = { path = "crates/truthdb-search", version = "0.1.0" }
 truthdb-proto = { path = "crates/truthdb-proto", version = "0.1.0" }
 truthdb-net = { path = "crates/truthdb-net", version = "0.1.0" }
 truthdb-sql = { path = "crates/truthdb-sql", version = "0.1.0" }

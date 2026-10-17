@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use serde_json::Value;
 use thiserror::Error;
 
-use super::super::EngineError;
+use super::SearchError;
 use super::index::{Document, FieldType, SearchQuery, value_type_name};
 
 #[derive(Debug, Clone)]
@@ -250,7 +250,7 @@ fn as_object<'a>(value: &'a Value, label: &str) -> Result<&'a Document, CommandE
     })
 }
 
-pub fn render_json(value: &Value) -> Result<String, EngineError> {
+pub fn render_json(value: &Value) -> Result<String, SearchError> {
     serde_json::to_string_pretty(value)
-        .map_err(|err| EngineError::Replay(format!("failed to render json response: {err}")))
+        .map_err(|err| SearchError::Replay(format!("failed to render json response: {err}")))
 }

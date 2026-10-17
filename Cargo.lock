@@ -1295,6 +1295,7 @@ dependencies = [
  "truthdb-core",
  "truthdb-net",
  "truthdb-proto",
+ "truthdb-search",
  "truthdb-sql",
 ]
 
@@ -1312,6 +1313,16 @@ version = "0.1.0"
 dependencies = [
  "bincode",
  "serde",
+ "thiserror 2.0.18",
+]
+
+[[package]]
+name = "truthdb-search"
+version = "0.1.0"
+dependencies = [
+ "bincode",
+ "serde",
+ "serde_json",
  "thiserror 2.0.18",
 ]
 

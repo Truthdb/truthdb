@@ -1,11 +1,18 @@
 pub use truthdb_core::engine::*;
+pub use truthdb_search::{
+    Command, CommandError, ENGINE_WAL_ENTRY_TYPE, ENGINE_WAL_ENTRY_VERSION, EngineMeta,
+    EngineState, SearchError, SearchQuery, WalEvent, decode_snapshot, parse_command, render_json,
+};
+#[cfg(test)]
+pub use truthdb_search::{Document, FieldType, IndexState};
 
 use std::collections::BTreeMap;
 use std::sync::{Arc, RwLock};
 
 use serde_json::{Value, json};
 
-use truthdb_core::storage::RelStorage;
+use thiserror::Error;
+use truthdb_core::storage::{RelStorage, StorageError};
 
 const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
 /// A standby takes a restartpoint earlier than a primary checkpoints (0.5 vs
@@ -243,6 +250,7 @@ impl Engine {
                 "hits": hits,
             }
         }))
+        .map_err(EngineError::from)
     }
 
     fn execute_es(&self, meta: &mut EngineMeta, command: Command) -> Result<String, EngineError> {
@@ -260,6 +268,7 @@ impl Engine {
                     "acknowledged": true,
                     "index": name,
                 }))
+                .map_err(EngineError::from)
             }
             Command::InsertDocument { index, document } => {
                 meta.validate_insert_document(&index, &document)?;
@@ -277,6 +286,7 @@ impl Engine {
                     "_index": index,
                     "result": "created",
                 }))
+                .map_err(EngineError::from)
             }
             Command::Search { index, query } => Self::render_search(meta, &index, &query),
         }
@@ -499,6 +509,30 @@ impl Engine {
         )?;
         meta.next_seq_no = meta.next_seq_no.saturating_add(1);
         Ok(())
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum EngineError {
+    #[error("{0}")]
+    Command(#[from] CommandError),
+
+    #[error("storage error: {0}")]
+    Storage(#[from] StorageError),
+
+    #[error("{0}")]
+    Replay(String),
+
+    #[error("engine is shutting down")]
+    Unavailable,
+}
+
+impl From<SearchError> for EngineError {
+    fn from(err: SearchError) -> Self {
+        match err {
+            SearchError::Command(err) => EngineError::Command(err),
+            SearchError::Replay(message) => EngineError::Replay(message),
+        }
     }
 }
 

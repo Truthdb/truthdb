@@ -2,8 +2,8 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-use super::super::{CommandError, EngineError};
 use super::index::{Document, EngineState, FieldType, IndexState};
+use super::{CommandError, SearchError};
 
 pub const ENGINE_WAL_ENTRY_VERSION: u16 = 1;
 pub const ENGINE_WAL_ENTRY_TYPE: u16 = 1;
@@ -18,11 +18,11 @@ pub struct EngineMeta {
 }
 
 impl EngineMeta {
-    pub fn apply_event(&mut self, event: &WalEvent) -> Result<(), EngineError> {
+    pub fn apply_event(&mut self, event: &WalEvent) -> Result<(), SearchError> {
         match event {
             WalEvent::CreateIndex { name, mappings } => {
                 if self.state.indices.contains_key(name) {
-                    return Err(EngineError::Replay(format!(
+                    return Err(SearchError::Replay(format!(
                         "wal attempted to recreate existing index '{name}'"
                     )));
                 }
@@ -35,7 +35,7 @@ impl EngineMeta {
                 document,
             } => {
                 let index_state = self.state.indices.get_mut(index).ok_or_else(|| {
-                    EngineError::Replay(format!("wal references unknown index '{index}'"))
+                    SearchError::Replay(format!("wal references unknown index '{index}'"))
                 })?;
                 index_state.insert_document(id, document)?;
                 self.next_doc_id = self
@@ -50,7 +50,7 @@ impl EngineMeta {
         &self,
         name: &str,
         mappings: &BTreeMap<String, FieldType>,
-    ) -> Result<(), EngineError> {
+    ) -> Result<(), SearchError> {
         if self.state.indices.contains_key(name) {
             return Err(CommandError::IndexAlreadyExists(name.to_string()).into());
         }
@@ -67,7 +67,7 @@ impl EngineMeta {
         &self,
         index: &str,
         document: &Document,
-    ) -> Result<(), EngineError> {
+    ) -> Result<(), SearchError> {
         let index_state = self
             .state
             .indices
@@ -93,11 +93,11 @@ pub enum WalEvent {
 /// bincode for snapshots written by older versions. Legacy bincode snapshots
 /// can only have been document-free (bincode cannot deserialize
 /// `serde_json::Value`, so document-bearing ones were never loadable).
-pub fn decode_snapshot(data: &[u8]) -> Result<EngineState, EngineError> {
+pub fn decode_snapshot(data: &[u8]) -> Result<EngineState, SearchError> {
     match serde_json::from_slice(data) {
         Ok(state) => Ok(state),
         Err(json_err) => bincode::deserialize(data).map_err(|bincode_err| {
-            EngineError::Replay(format!(
+            SearchError::Replay(format!(
                 "failed to decode snapshot: as json: {json_err}; as legacy bincode: {bincode_err}"
             ))
         }),

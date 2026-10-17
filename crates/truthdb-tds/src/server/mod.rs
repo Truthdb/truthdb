@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::io::{self, AsyncRead, AsyncReadExt, AsyncWrite};
 use tokio::sync::mpsc;
 use truthdb_core::auth;
-use truthdb_core::engine::EngineError;
 use truthdb_core::engine::ResultColumn;
+use truthdb_engine::engine::EngineError;
 use truthdb_engine::session::{BatchEvent, EngineHandle, PreparedRpc, SessionId};
 
 use crate::login::{self, parse_login7};

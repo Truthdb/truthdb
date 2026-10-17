@@ -3,7 +3,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use super::super::{CommandError, EngineError};
+use super::{CommandError, SearchError};
 
 pub type Document = Map<String, Value>;
 
@@ -32,7 +32,7 @@ impl IndexState {
         }
     }
 
-    pub fn rebuild_postings(&mut self) -> Result<(), EngineError> {
+    pub fn rebuild_postings(&mut self) -> Result<(), SearchError> {
         self.text_postings.clear();
         self.exact_postings.clear();
         let doc_ids: Vec<String> = self.documents.keys().cloned().collect();
@@ -43,7 +43,7 @@ impl IndexState {
         Ok(())
     }
 
-    pub fn validate_document(&self, document: &Document) -> Result<(), EngineError> {
+    pub fn validate_document(&self, document: &Document) -> Result<(), SearchError> {
         for (field, value) in document {
             let field_type = self
                 .mappings
@@ -54,9 +54,9 @@ impl IndexState {
         Ok(())
     }
 
-    pub fn insert_document(&mut self, id: &str, document: &Document) -> Result<(), EngineError> {
+    pub fn insert_document(&mut self, id: &str, document: &Document) -> Result<(), SearchError> {
         if self.documents.contains_key(id) {
-            return Err(EngineError::Replay(format!(
+            return Err(SearchError::Replay(format!(
                 "wal attempted to insert duplicate document id '{id}'"
             )));
         }
@@ -66,7 +66,7 @@ impl IndexState {
         Ok(())
     }
 
-    fn index_document(&mut self, id: &str, document: &Document) -> Result<(), EngineError> {
+    fn index_document(&mut self, id: &str, document: &Document) -> Result<(), SearchError> {
         for (field, value) in document {
             let Some(field_type) = self.mappings.get(field) else {
                 continue;
@@ -100,7 +100,7 @@ impl IndexState {
         Ok(())
     }
 
-    pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>, EngineError> {
+    pub fn search(&self, query: &SearchQuery) -> Result<Vec<SearchHit>, SearchError> {
         let scores = self.evaluate_query(query)?;
         let mut hits = scores
             .into_iter()
@@ -122,7 +122,7 @@ impl IndexState {
         Ok(hits)
     }
 
-    fn evaluate_query(&self, query: &SearchQuery) -> Result<BTreeMap<String, f64>, EngineError> {
+    fn evaluate_query(&self, query: &SearchQuery) -> Result<BTreeMap<String, f64>, SearchError> {
         match query {
             SearchQuery::Match { field, query } => self.evaluate_match_query(field, query),
             SearchQuery::Term { field, value } => self.evaluate_term_query(field, value),
@@ -134,7 +134,7 @@ impl IndexState {
         &self,
         field: &str,
         query: &str,
-    ) -> Result<BTreeMap<String, f64>, EngineError> {
+    ) -> Result<BTreeMap<String, f64>, SearchError> {
         self.require_field_type(field, FieldType::Text)?;
         let Some(postings) = self.text_postings.get(field) else {
             return Ok(BTreeMap::new());
@@ -155,7 +155,7 @@ impl IndexState {
         &self,
         field: &str,
         value: &Value,
-    ) -> Result<BTreeMap<String, f64>, EngineError> {
+    ) -> Result<BTreeMap<String, f64>, SearchError> {
         let field_type = self.field_type(field)?;
         let term = exact_term_key(field, field_type, value)?;
         let Some(postings) = self.exact_postings.get(field) else {
@@ -176,7 +176,7 @@ impl IndexState {
         &self,
         must: &[SearchQuery],
         filter: &[SearchQuery],
-    ) -> Result<BTreeMap<String, f64>, EngineError> {
+    ) -> Result<BTreeMap<String, f64>, SearchError> {
         if must.is_empty() && filter.is_empty() {
             return Err(CommandError::InvalidCommand(
                 "bool query must contain at least one must or filter clause".to_string(),
@@ -216,14 +216,14 @@ impl IndexState {
         Ok(scores)
     }
 
-    fn field_type(&self, field: &str) -> Result<FieldType, EngineError> {
+    fn field_type(&self, field: &str) -> Result<FieldType, SearchError> {
         self.mappings
             .get(field)
             .copied()
             .ok_or_else(|| CommandError::UnknownField(field.to_string()).into())
     }
 
-    fn require_field_type(&self, field: &str, expected: FieldType) -> Result<(), EngineError> {
+    fn require_field_type(&self, field: &str, expected: FieldType) -> Result<(), SearchError> {
         let actual = self.field_type(field)?;
         if actual != expected {
             return Err(CommandError::InvalidCommand(format!(
@@ -261,7 +261,7 @@ pub enum FieldType {
 }
 
 impl FieldType {
-    fn validate_value(self, field: &str, value: &Value) -> Result<(), EngineError> {
+    fn validate_value(self, field: &str, value: &Value) -> Result<(), SearchError> {
         match self {
             FieldType::Text | FieldType::Keyword => {
                 if value.as_str().is_none() {
@@ -311,7 +311,7 @@ fn exact_term_key(
     field: &str,
     field_type: FieldType,
     value: &Value,
-) -> Result<String, EngineError> {
+) -> Result<String, SearchError> {
     match field_type {
         FieldType::Keyword => value.as_str().map(ToString::to_string).ok_or_else(|| {
             CommandError::InvalidFieldType {
