@@ -202,7 +202,7 @@ impl Storage {
         let (gc, log_writer) = GroupCommit::start(wal_fd);
         let rcsi = file.eng.version.rcsi;
         let allow_snapshot = file.eng.version.allow_snapshot;
-        let recovery_full = file.eng.version.recovery_full;
+        let recovery_full = file.core.recovery_full;
         Ok(Storage {
             path,
             inner: std::sync::Mutex::new(file),
@@ -485,7 +485,7 @@ impl StorageFile {
         eng.version.set_options_byte(active_sb.db_options());
         let last_log_backup_lsn = active_sb.last_log_backup_lsn();
         let repl_slots = active_sb.repl_slots();
-        let recovery_full = eng.version.recovery_full;
+        let recovery_full = active_sb.db_options() & 4 != 0;
         let core = StorageFile {
             default_collation: header.default_collation(),
             file,
@@ -497,6 +497,7 @@ impl StorageFile {
             snapshot_next_seq_no: 0,
             last_log_backup_lsn,
             log_backup_in_progress: false,
+            recovery_full,
             layout,
             superblock_a,
             superblock_b,
@@ -662,6 +663,7 @@ impl StorageFile {
             snapshot_next_seq_no: 0,
             last_log_backup_lsn: 0,
             log_backup_in_progress: false,
+            recovery_full: false,
             layout,
             superblock_a,
             superblock_b,

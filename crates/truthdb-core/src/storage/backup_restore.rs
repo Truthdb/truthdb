@@ -815,7 +815,7 @@ impl Locked {
         copy_only: bool,
     ) -> Result<(crate::backup::BackupHeader, u64, u64, Vec<u8>), StorageError> {
         self.ensure_rel_usable()?;
-        if !self.eng.version.recovery_full {
+        if !self.core.recovery_full {
             return Err(StorageError::InvalidConfig(
                 "BACKUP LOG requires the FULL recovery model".to_string(),
             ));
@@ -855,7 +855,7 @@ impl Locked {
             redo_start_lsn: start,
             metadata_root: 0,
             last_committed_seq: 0,
-            db_options: self.eng.version.options_byte(),
+            db_options: self.db_options_byte(),
             epoch: self.active_sb().epoch(),
             finished_at_millis: now_millis(),
             flags: crate::backup::BackupFlags {
@@ -879,7 +879,7 @@ impl Locked {
     /// forbids. The single-flight guard is released by `LogBackupGuard` on every
     /// exit path, not here.
     pub(super) fn finish_log_backup(&mut self, start: u64, end: u64) -> Result<(), StorageError> {
-        if !self.eng.version.recovery_full || self.core.last_log_backup_lsn != start {
+        if !self.core.recovery_full || self.core.last_log_backup_lsn != start {
             return Ok(());
         }
         self.persist_last_log_backup_lsn(end)?;

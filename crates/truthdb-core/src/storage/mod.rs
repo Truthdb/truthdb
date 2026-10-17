@@ -370,6 +370,9 @@ struct StorageFile {
     /// releases the storage lock while writing the archive), so a second one
     /// cannot begin from the same marker and produce an overlapping archive.
     log_backup_in_progress: bool,
+    /// FULL recovery model (vs SIMPLE, the default): bit 2 of the
+    /// superblock's database-options byte. Drives the log-backup hold.
+    recovery_full: bool,
     layout: StorageLayout,
     superblock_a: Superblock,
     superblock_b: Superblock,

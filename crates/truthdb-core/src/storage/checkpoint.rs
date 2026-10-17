@@ -70,6 +70,12 @@ impl StorageFile {
 }
 
 impl Locked {
+    /// The superblock's database-options byte: the version store's bits
+    /// (RCSI, ALLOW_SNAPSHOT_ISOLATION) and the core's recovery-model bit.
+    pub(super) fn db_options_byte(&self) -> u8 {
+        self.eng.version.options_byte() | ((self.core.recovery_full as u8) << 2)
+    }
+
     /// Applies `ALTER DATABASE SET` option changes and persists them durably
     /// in both superblocks (generation-bumped, active slot first with an
     /// fsync between — a torn first write falls back to the backup with the
@@ -88,7 +94,7 @@ impl Locked {
         // the OLD recovery model (before `version.set_options` below) and
         // stamped into the same durable superblock write as the option byte,
         // so a crash never leaves FULL set with a stale/zero marker.
-        let enabling_full = recovery_full == Some(true) && !self.eng.version.recovery_full;
+        let enabling_full = recovery_full == Some(true) && !self.core.recovery_full;
         let new_marker = if enabling_full {
             self.core.wal.tail()
         } else {
@@ -102,7 +108,7 @@ impl Locked {
         // a later lazy active-slot rewrite must not leak the failed ALTER's
         // options to disk.
         let byte = {
-            let mut next = self.eng.version.options_byte();
+            let mut next = self.db_options_byte();
             if let Some(on) = rcsi {
                 next = (next & !1) | (on as u8);
             }
@@ -118,14 +124,15 @@ impl Locked {
             sb.set_db_options(byte);
             sb.set_last_log_backup_lsn(new_marker);
         })?;
-        self.eng
-            .version
-            .set_options(rcsi, allow_snapshot, recovery_full);
+        self.eng.version.set_options(rcsi, allow_snapshot);
+        if let Some(on) = recovery_full {
+            self.core.recovery_full = on;
+        }
         // Now that the model byte and marker are durable, sync the in-memory
         // marker and the FULL-model log-truncation hold. FULL pins the ring at
         // the marker; SIMPLE releases it.
         self.core.last_log_backup_lsn = new_marker;
-        if self.eng.version.recovery_full {
+        if self.core.recovery_full {
             self.register_log_backup_hold(new_marker);
         } else {
             self.release_log_backup_hold();
@@ -340,7 +347,7 @@ impl Locked {
             .catalog_root
             .map(|page| self.core.layout.data_offset + page * PAGE_SIZE as u64)
             .unwrap_or(0);
-        let db_options = self.eng.version.options_byte();
+        let db_options = self.db_options_byte();
         // The closure builds from Superblock::default() (reserved zeroed), so
         // the log-backup floor must be stamped back in or a checkpoint would
         // silently reset it to 0 and drop the FULL-model hold across a restart.

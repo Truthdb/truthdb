@@ -113,9 +113,6 @@ pub(crate) struct VersionState {
     /// Database options (mirrored to the superblock's reserved area).
     pub rcsi: bool,
     pub allow_snapshot: bool,
-    /// FULL recovery model (vs SIMPLE, the default). Independent of the
-    /// version store — it does not affect `publishing()`.
-    pub recovery_full: bool,
     /// Readable-standby mode: the replication apply mirrors shipped changes
     /// into this store (pre-images from the WAL's undo payloads), and every
     /// standby read resolves through it at the last-applied-commit snapshot.
@@ -154,20 +151,12 @@ impl VersionState {
     /// Applies `ALTER DATABASE` option changes. Turning the last option off
     /// resets the store: the ALTER holds Database X, so no snapshot can be
     /// live and no chain can be needed again.
-    pub fn set_options(
-        &mut self,
-        rcsi: Option<bool>,
-        allow_snapshot: Option<bool>,
-        recovery_full: Option<bool>,
-    ) {
+    pub fn set_options(&mut self, rcsi: Option<bool>, allow_snapshot: Option<bool>) {
         if let Some(on) = rcsi {
             self.rcsi = on;
         }
         if let Some(on) = allow_snapshot {
             self.allow_snapshot = on;
-        }
-        if let Some(on) = recovery_full {
-            self.recovery_full = on;
         }
         if !self.publishing() {
             debug_assert!(self.snapshots.is_empty());
@@ -197,16 +186,16 @@ impl VersionState {
             .is_some_and(|&seq| seq > snap.seq)
     }
 
-    /// The option bits as persisted in the superblock reserved area: bit 0 =
-    /// RCSI, bit 1 = ALLOW_SNAPSHOT_ISOLATION, bit 2 = FULL recovery model.
+    /// The version-store option bits of the superblock's database-options
+    /// byte: bit 0 = RCSI, bit 1 = ALLOW_SNAPSHOT_ISOLATION. Bit 2 (the
+    /// recovery model) is the storage core's.
     pub fn options_byte(&self) -> u8 {
-        (self.rcsi as u8) | ((self.allow_snapshot as u8) << 1) | ((self.recovery_full as u8) << 2)
+        (self.rcsi as u8) | ((self.allow_snapshot as u8) << 1)
     }
 
     pub fn set_options_byte(&mut self, byte: u8) {
         self.rcsi = byte & 1 != 0;
         self.allow_snapshot = byte & 2 != 0;
-        self.recovery_full = byte & 4 != 0;
     }
 
     /// Records a commit, assigning its sequence. Called under the storage
@@ -565,7 +554,7 @@ mod tests {
 
     fn on() -> VersionState {
         let mut v = VersionState::default();
-        v.set_options(Some(true), None, None);
+        v.set_options(Some(true), None);
         v
     }
 
@@ -833,7 +822,7 @@ mod tests {
             10,
         );
         v.record_commit(10, 100);
-        v.set_options(Some(false), None, None);
+        v.set_options(Some(false), None);
         assert!(!v.publishing());
         assert_eq!(v.chain_count(OID), 0);
         assert_eq!(v.options_byte(), 0);

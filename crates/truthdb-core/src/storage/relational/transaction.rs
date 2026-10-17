@@ -34,7 +34,7 @@ impl Storage {
         let (rcsi_now, allow_now, recovery_now) = (
             guard.eng.version.rcsi,
             guard.eng.version.allow_snapshot,
-            guard.eng.version.recovery_full,
+            guard.recovery_full,
         );
         drop(guard);
         self.rcsi
