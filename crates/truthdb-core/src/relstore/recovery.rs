@@ -269,8 +269,6 @@ pub(crate) fn undo_losers(
                         txn_id,
                         last_lsn,
                         undo_log: Vec::new(),
-                        pending_versions: Vec::new(),
-                        published_versions: Vec::new(),
                     },
                 ),
             )

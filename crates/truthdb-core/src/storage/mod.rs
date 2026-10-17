@@ -263,7 +263,7 @@ pub(crate) enum RowLocator {
 /// plus the tree-root snapshot taken at BEGIN (used to re-descend trees during
 /// rollback).
 pub(crate) struct StorageTxn {
-    txn: TxnLink,
+    txn: RelTxn,
     roots: std::collections::HashMap<u32, u64>,
 }
 
@@ -272,6 +272,66 @@ impl StorageTxn {
     /// visibility of its own uncommitted writes.
     pub(crate) fn txn_id(&self) -> u64 {
         self.txn.txn_id
+    }
+}
+
+/// A running relational transaction: the log's WAL/undo chain plus the row
+/// versions it stages and publishes (Stage 13). Derefs to the chain.
+pub(crate) struct RelTxn {
+    link: TxnLink,
+    /// Row versions staged by the running statement, published to the
+    /// version store when the statement succeeds and discarded when it rolls
+    /// back. Empty unless a versioned isolation is enabled.
+    pending_versions: Vec<PendingVersion>,
+    /// Versions this transaction has published, so a rollback (full or to a
+    /// savepoint) can reverse the publications exactly.
+    published_versions: Vec<crate::relstore::version::PublishRecord>,
+}
+
+impl RelTxn {
+    fn new(link: TxnLink) -> Self {
+        RelTxn {
+            link,
+            pending_versions: Vec::new(),
+            published_versions: Vec::new(),
+        }
+    }
+
+    /// Captures a savepoint at the current point in this transaction.
+    fn savepoint(&self) -> RelSavepoint {
+        RelSavepoint {
+            link: self.link.savepoint(),
+            published_len: self.published_versions.len(),
+        }
+    }
+}
+
+impl std::ops::Deref for RelTxn {
+    type Target = TxnLink;
+    fn deref(&self) -> &TxnLink {
+        &self.link
+    }
+}
+
+impl std::ops::DerefMut for RelTxn {
+    fn deref_mut(&mut self) -> &mut TxnLink {
+        &mut self.link
+    }
+}
+
+/// A relational savepoint: the log's undo marker plus the published-version
+/// count at capture, so a partial rollback unpublishes exactly the versions of
+/// the statements it undoes.
+#[derive(Clone, Copy)]
+pub(crate) struct RelSavepoint {
+    link: crate::relstore::ctx::Savepoint,
+    published_len: usize,
+}
+
+impl RelSavepoint {
+    /// The undo-log length at capture: a later savepoint has a longer one.
+    pub(crate) fn undo_len(&self) -> usize {
+        self.link.undo_len
     }
 }
 

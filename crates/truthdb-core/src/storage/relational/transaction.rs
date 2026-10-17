@@ -129,7 +129,7 @@ impl Storage {
     }
 
     /// Captures a savepoint in a caller-held transaction (`SAVE TRANSACTION`).
-    pub(crate) fn rel_savepoint(&self, txn: &StorageTxn) -> crate::relstore::ctx::Savepoint {
+    pub(crate) fn rel_savepoint(&self, txn: &StorageTxn) -> RelSavepoint {
         txn.txn.savepoint()
     }
 
@@ -139,7 +139,7 @@ impl Storage {
     pub(crate) fn rel_rollback_to(
         &self,
         txn: &mut StorageTxn,
-        savepoint: crate::relstore::ctx::Savepoint,
+        savepoint: RelSavepoint,
     ) -> Result<(), StorageError> {
         self.lock().rel().rollback_txn_to(txn, savepoint)
     }
@@ -434,13 +434,13 @@ impl RelFile<'_> {
     /// log); statement failure rolls back through the in-memory undo log.
     pub(in crate::storage) fn rel_statement<T>(
         &mut self,
-        f: impl FnOnce(&mut RelCtx<'_>, &mut TxnLink) -> Result<T, StorageError>,
+        f: impl FnOnce(&mut RelCtx<'_>, &mut RelTxn) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
         let txn_id = self.core.pages.next_txn_id;
         self.core.pages.next_txn_id += 1;
         let roots = self.rel.tree_roots();
         let mut ctx = self.rel_ctx();
-        let mut txn = ctx.begin(txn_id)?;
+        let mut txn = RelTxn::new(ctx.begin(txn_id)?);
         // Staged versions publish only on a successful commit — and inside
         // this same mutex hold, so no reader can see pages and version
         // chains disagree. A statement error discards them with `txn`.
@@ -448,7 +448,7 @@ impl RelFile<'_> {
         let (result, wedged) = match f(&mut ctx, &mut txn) {
             Ok(value) => {
                 let pending = std::mem::take(&mut txn.pending_versions);
-                match ctx.commit(txn) {
+                match ctx.commit(txn.link) {
                     Ok(commit_lsn) => {
                         publish = Some((pending, commit_lsn));
                         (Ok(value), false)
@@ -460,7 +460,7 @@ impl RelFile<'_> {
                     Err(err) => (Err(err), true),
                 }
             }
-            Err(err) => match rel_recovery::rollback(&mut ctx, txn, &TreeRoots(roots)) {
+            Err(err) => match rel_recovery::rollback(&mut ctx, txn.link, &TreeRoots(roots)) {
                 Ok(()) => {
                     let _ = ctx.io.wal.sync_all();
                     (Err(err), false)
@@ -496,7 +496,7 @@ impl RelFile<'_> {
     pub(in crate::storage) fn rel_statement_scoped<T>(
         &mut self,
         scope: &mut TxnScope,
-        f: impl FnOnce(&mut RelCtx<'_>, &mut TxnLink) -> Result<T, StorageError>,
+        f: impl FnOnce(&mut RelCtx<'_>, &mut RelTxn) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
         match scope {
             TxnScope::Auto => self.rel_statement(f),
@@ -512,7 +512,7 @@ impl RelFile<'_> {
                         match rel_recovery::rollback_to(
                             &mut ctx,
                             &mut stx.txn,
-                            savepoint,
+                            savepoint.link,
                             &TreeRoots(roots),
                         ) {
                             Ok(()) => (Err(err), false),
@@ -553,7 +553,7 @@ impl RelFile<'_> {
         self.core.pages.next_txn_id += 1;
         let roots = self.rel.tree_roots();
         let mut ctx = self.rel_ctx();
-        let txn = ctx.begin(txn_id)?;
+        let txn = RelTxn::new(ctx.begin(txn_id)?);
         // Track the transaction's BEGIN LSN so a checkpoint clamps the WAL head
         // to the oldest open transaction, preserving its undo records for crash
         // rollback (its uncommitted pages may still be flushed under steal).
@@ -576,7 +576,7 @@ impl RelFile<'_> {
         );
         let commit = {
             let mut ctx = self.rel_ctx();
-            ctx.commit(stx.txn)
+            ctx.commit(stx.txn.link)
         };
         match commit {
             Ok(commit_lsn) => {
@@ -603,7 +603,7 @@ impl RelFile<'_> {
         let roots = stx.roots;
         let result = {
             let mut ctx = self.rel_ctx();
-            match rel_recovery::rollback(&mut ctx, stx.txn, &TreeRoots(roots)) {
+            match rel_recovery::rollback(&mut ctx, stx.txn.link, &TreeRoots(roots)) {
                 Ok(()) => {
                     let _ = ctx.io.wal.sync_all();
                     Ok(())
@@ -630,7 +630,7 @@ impl RelFile<'_> {
     pub(in crate::storage) fn rollback_txn_to(
         &mut self,
         stx: &mut StorageTxn,
-        savepoint: crate::relstore::ctx::Savepoint,
+        savepoint: RelSavepoint,
     ) -> Result<(), StorageError> {
         self.core.ensure_rel_usable()?;
         let txn_id = stx.txn.txn_id;
@@ -642,7 +642,12 @@ impl RelFile<'_> {
         let roots = stx.roots.clone();
         let result = {
             let mut ctx = self.rel_ctx();
-            match rel_recovery::rollback_to(&mut ctx, &mut stx.txn, savepoint, &TreeRoots(roots)) {
+            match rel_recovery::rollback_to(
+                &mut ctx,
+                &mut stx.txn,
+                savepoint.link,
+                &TreeRoots(roots),
+            ) {
                 Ok(()) => {
                     let _ = ctx.io.wal.sync_all();
                     Ok(())

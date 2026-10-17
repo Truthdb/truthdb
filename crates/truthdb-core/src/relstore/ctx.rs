@@ -109,13 +109,6 @@ pub(crate) struct TxnLink {
     pub txn_id: u64,
     pub last_lsn: u64,
     pub undo_log: Vec<(u64, PageOpUndo)>,
-    /// Row versions staged by the running statement (Stage 13), published to
-    /// the version store when the statement succeeds and discarded when it
-    /// rolls back. Empty unless a versioned isolation is enabled.
-    pub pending_versions: Vec<crate::relstore::version::PendingVersion>,
-    /// Versions this transaction has published, so a rollback (full or to a
-    /// savepoint) can reverse the publications exactly.
-    pub published_versions: Vec<crate::relstore::version::PublishRecord>,
 }
 
 /// A marker in a live transaction's log to which a later partial rollback can
@@ -125,9 +118,6 @@ pub(crate) struct TxnLink {
 pub(crate) struct Savepoint {
     pub undo_len: usize,
     pub last_lsn: u64,
-    /// Published-version count at capture, so a partial rollback unpublishes
-    /// exactly the versions of the statements it undoes.
-    pub published_len: usize,
 }
 
 impl TxnLink {
@@ -136,7 +126,6 @@ impl TxnLink {
         Savepoint {
             undo_len: self.undo_log.len(),
             last_lsn: self.last_lsn,
-            published_len: self.published_versions.len(),
         }
     }
 }
@@ -272,8 +261,6 @@ impl RelCtx<'_> {
             txn_id,
             last_lsn: lsn,
             undo_log: Vec::new(),
-            pending_versions: Vec::new(),
-            published_versions: Vec::new(),
         })
     }
 

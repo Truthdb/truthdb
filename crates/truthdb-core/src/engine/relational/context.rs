@@ -125,7 +125,7 @@ pub struct TxnContext {
     /// Named savepoints in the current transaction (`SAVE TRANSACTION <name>`,
     /// lowercased) → the point to which `ROLLBACK TRANSACTION <name>` returns.
     /// Cleared when the transaction ends.
-    pub(super) savepoints: std::collections::HashMap<String, crate::relstore::ctx::Savepoint>,
+    pub(super) savepoints: std::collections::HashMap<String, crate::storage::RelSavepoint>,
     /// Errors caught by the currently-executing `CATCH` blocks (a stack, so
     /// nested `TRY`/`CATCH` restore the outer error on exit). `ERROR_*()` read
     /// the top; empty outside any `CATCH` block.

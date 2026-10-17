@@ -462,7 +462,7 @@ pub(super) fn exec_rollback(
         // Savepoints taken after this one are invalidated — their undo-log suffix
         // was just discarded (the target savepoint itself remains re-usable).
         ctx.savepoints
-            .retain(|_, sp| sp.undo_len <= savepoint.undo_len);
+            .retain(|_, sp| sp.undo_len() <= savepoint.undo_len());
         return Ok(StatementResult::Done);
     }
     // ROLLBACK (whole transaction), regardless of nesting. Reset the session's
