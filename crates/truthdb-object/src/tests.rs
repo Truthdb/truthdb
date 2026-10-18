@@ -437,3 +437,44 @@ fn a_wedged_store_refuses_every_object_operation() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn access_keys_are_created_looked_up_listed_and_dropped_durably() {
+    let path = temp_path("keys");
+    let storage = create(&path);
+    {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        assert_eq!(file.access_key_secret("A").unwrap(), None, "no keys yet");
+        file.transaction(|tx| tx.create_access_key("A", "secret-a"))
+            .unwrap();
+        file.transaction(|tx| tx.create_access_key("B", "secret-b"))
+            .unwrap();
+        let dup = file
+            .transaction(|tx| tx.create_access_key("A", "other"))
+            .unwrap_err();
+        assert!(dup.to_string().contains("already exists"), "{dup}");
+        assert!(
+            file.transaction(|tx| tx.create_access_key("", "x"))
+                .is_err(),
+            "an empty id is refused"
+        );
+    }
+    drop(storage); // crash
+
+    let storage = open(&path);
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    assert_eq!(
+        file.access_key_secret("A").unwrap().as_deref(),
+        Some("secret-a")
+    );
+    assert_eq!(file.access_key_ids().unwrap(), vec!["A", "B"]);
+    file.transaction(|tx| tx.drop_access_key("A")).unwrap();
+    assert!(file.transaction(|tx| tx.drop_access_key("A")).is_err());
+    assert_eq!(file.access_key_secret("A").unwrap(), None);
+    assert_eq!(file.access_key_ids().unwrap(), vec!["B"]);
+    drop(guard);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

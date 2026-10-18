@@ -8,7 +8,7 @@ use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
 use crate::codec::{self, BodyState, SegmentRow};
-use crate::{ObjFile, ObjTxn};
+use crate::{GC_TREE, ObjFile, ObjTxn, STAGING_TREE};
 
 /// What one garbage-collection pass freed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -26,13 +26,13 @@ impl ObjFile<'_> {
         abandon_after_ms: u64,
     ) -> Result<GcOutcome, StorageError> {
         let mut outcome = GcOutcome::default();
-        let Some(trees) = self.existing_trees()? else {
-            return Ok(outcome);
-        };
         for (queue, upper) in [
-            (trees.gc(), now_ms),
-            (trees.staging(), now_ms.saturating_sub(abandon_after_ms)),
+            (GC_TREE, now_ms),
+            (STAGING_TREE, now_ms.saturating_sub(abandon_after_ms)),
         ] {
+            let Some(queue) = self.existing_tree(queue)? else {
+                continue;
+            };
             let due = {
                 let mut ctx = self.core.page_ctx(0);
                 queue.scan_range(&mut ctx, None, Some(&codec::timed_key(upper, u64::MAX)))?

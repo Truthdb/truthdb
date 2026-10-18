@@ -20,6 +20,46 @@ const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
 /// leaves headroom when the floor lags.
 const STANDBY_RESTARTPOINT_THRESHOLD: f64 = 0.5;
 
+/// A native-protocol S3 administration command (`s3 create access key`,
+/// `s3 drop access key <id>`, `s3 list access keys`).
+enum S3Admin {
+    CreateAccessKey,
+    DropAccessKey(String),
+    ListAccessKeys,
+}
+
+fn parse_s3_admin(input: &str) -> Option<S3Admin> {
+    let words: Vec<&str> = input.split_whitespace().collect();
+    let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
+    let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
+    match lower.as_slice() {
+        ["s3", "create", "access", "key"] => Some(S3Admin::CreateAccessKey),
+        ["s3", "drop", "access", "key", _] => Some(S3Admin::DropAccessKey(words[4].to_string())),
+        ["s3", "list", "access", "keys"] => Some(S3Admin::ListAccessKeys),
+        _ => None,
+    }
+}
+
+const ACCESS_KEY_ID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
+const SECRET_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+/// `len` characters drawn uniformly from `alphabet` (32 or 64 symbols, so a
+/// random byte maps without bias) by the system's secure random generator.
+fn random_text(len: usize, alphabet: &[u8]) -> Result<String, EngineError> {
+    use ring::rand::SecureRandom;
+    debug_assert!(alphabet.len() == 32 || alphabet.len() == 64);
+    let mut bytes = vec![0u8; len];
+    ring::rand::SystemRandom::new()
+        .fill(&mut bytes)
+        .map_err(|_| {
+            EngineError::Storage(std::io::Error::other("the system random generator failed").into())
+        })?;
+    Ok(bytes
+        .iter()
+        .map(|byte| alphabet[*byte as usize % alphabet.len()] as char)
+        .collect())
+}
+
 /// Object writes checkpoint at half the ring: a segment record is about 1 MiB,
 /// and writes may only fill the ring up to its compensation reserve (a
 /// quarter), so waiting for [`WAL_CHECKPOINT_THRESHOLD`] would run it full.
@@ -105,6 +145,9 @@ impl Engine {
     }
 
     pub fn execute(&self, input: &str) -> Result<String, EngineError> {
+        if let Some(command) = parse_s3_admin(input) {
+            return self.execute_s3_admin(command);
+        }
         // Routing: the legacy ES commands all carry a `{` JSON body; that
         // shape routes to the frozen search path. Everything else is SQL.
         match parse_command(input)? {
@@ -482,6 +525,27 @@ impl Engine {
             return Ok(false);
         }
         self.standby_restartpoint()
+    }
+
+    /// The S3 API's access-key administration over the native protocol.
+    fn execute_s3_admin(&self, command: S3Admin) -> Result<String, EngineError> {
+        let rendered = match command {
+            S3Admin::CreateAccessKey => {
+                let id = format!("TDB{}", random_text(17, ACCESS_KEY_ID_ALPHABET)?);
+                let secret = random_text(40, SECRET_ALPHABET)?;
+                self.object(|file| file.transaction(|tx| tx.create_access_key(&id, &secret)))?;
+                json!({ "access_key_id": id, "secret_access_key": secret })
+            }
+            S3Admin::DropAccessKey(id) => {
+                self.object(|file| file.transaction(|tx| tx.drop_access_key(&id)))?;
+                json!({ "dropped": id })
+            }
+            S3Admin::ListAccessKeys => {
+                let ids = self.object(|file| file.access_key_ids())?;
+                json!({ "access_keys": ids })
+            }
+        };
+        render_json(&rendered).map_err(EngineError::from)
     }
 
     /// Runs one object-engine operation under the storage lock, then takes a

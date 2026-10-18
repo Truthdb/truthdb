@@ -8,6 +8,7 @@ truthdb-core = { workspace = true }
 truthdb-relational = { workspace = true }
 truthdb-search = { workspace = true }
 truthdb-object = { workspace = true }
+ring = "0.17"
 truthdb-proto = { workspace = true }
 truthdb-net = { workspace = true }
 truthdb-sql = { workspace = true }

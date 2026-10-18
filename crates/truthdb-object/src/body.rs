@@ -14,7 +14,7 @@ use truthdb_core::relstore::page::{BLOB_PAGE_DATA, BLOB_RECORD_MAX_PAGES};
 use truthdb_core::storage::{Storage, StorageError};
 
 use crate::codec::{self, BodyRow, BodyState, SegmentRow};
-use crate::{BODY_PAGES_OBJECT, ObjFile, ObjTxn, next_body_id};
+use crate::{BODIES_TREE, BODY_PAGES_OBJECT, ObjFile, ObjTxn, SEGMENTS_TREE, next_body_id};
 
 /// Bytes per segment: one blob record's worth of pages. Every segment but a
 /// body's last is exactly this long, so an offset maps straight to a segment.
@@ -218,9 +218,11 @@ impl ObjFile<'_> {
 
     /// The sealed body's length and digest.
     pub fn body_info(&mut self, body: u64) -> Result<BodyInfo, StorageError> {
-        let trees = self.existing_trees()?.ok_or_else(|| no_body(body))?;
+        let bodies = self
+            .existing_tree(BODIES_TREE)?
+            .ok_or_else(|| no_body(body))?;
         let mut ctx = self.core.page_ctx(0);
-        let row = load_body(&mut ctx, &trees.bodies(), body)?;
+        let row = load_body(&mut ctx, &bodies, body)?;
         if row.state != BodyState::Sealed {
             return Err(invalid(format!("body {body} is still being written")));
         }
@@ -240,10 +242,14 @@ impl ObjFile<'_> {
         offset: u64,
         out: &mut [u8],
     ) -> Result<(), StorageError> {
-        let trees = self.existing_trees()?.ok_or_else(|| no_body(body))?;
-        let segments = trees.segments();
+        let bodies = self
+            .existing_tree(BODIES_TREE)?
+            .ok_or_else(|| no_body(body))?;
+        let segments = self
+            .existing_tree(SEGMENTS_TREE)?
+            .ok_or_else(|| no_body(body))?;
         let mut ctx = self.core.page_ctx(0);
-        let row = load_body(&mut ctx, &trees.bodies(), body)?;
+        let row = load_body(&mut ctx, &bodies, body)?;
         if row.state != BodyState::Sealed {
             return Err(invalid(format!("body {body} is still being written")));
         }
@@ -311,8 +317,10 @@ impl<'s> BodyLease<'s> {
     pub fn take(storage: &'s Storage, body: u64) -> Result<Self, StorageError> {
         let mut guard = storage.lock();
         let file = ObjFile::new(&mut guard);
-        let trees = file.existing_trees()?.ok_or_else(|| no_body(body))?;
-        let row = load_body(&mut file.core.page_ctx(0), &trees.bodies(), body)?;
+        let bodies = file
+            .existing_tree(BODIES_TREE)?
+            .ok_or_else(|| no_body(body))?;
+        let row = load_body(&mut file.core.page_ctx(0), &bodies, body)?;
         if row.state != BodyState::Sealed || row.refcount == 0 {
             return Err(invalid(format!("body {body} is not live")));
         }

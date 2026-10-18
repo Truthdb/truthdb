@@ -1168,6 +1168,7 @@ name = "truthdb-engine"
 version = "0.1.0"
 dependencies = [
  "rcgen",
+ "ring",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",

@@ -127,3 +127,36 @@ fn an_object_operation_runs_on_a_worker() {
     join.join().expect("pool exits");
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn access_keys_are_administered_over_the_native_protocol() {
+    let path = unique_temp_path("objects-keys");
+    let engine = new_engine(&path);
+    let created: serde_json::Value =
+        serde_json::from_str(&engine.execute("S3 Create Access Key").expect("create")).unwrap();
+    let id = created["access_key_id"].as_str().expect("id").to_string();
+    let secret = created["secret_access_key"].as_str().expect("secret");
+    assert_eq!(id.len(), 20);
+    assert!(id.starts_with("TDB"));
+    assert_eq!(secret.len(), 40);
+    assert_eq!(
+        engine
+            .object(|file| file.access_key_secret(&id))
+            .expect("lookup")
+            .as_deref(),
+        Some(secret)
+    );
+
+    let listed: serde_json::Value =
+        serde_json::from_str(&engine.execute("s3 list access keys").expect("list")).unwrap();
+    assert_eq!(listed["access_keys"], serde_json::json!([id]));
+    engine
+        .execute(&format!("s3 drop access key {id}"))
+        .expect("drop");
+    let listed: serde_json::Value =
+        serde_json::from_str(&engine.execute("s3 list access keys").expect("list")).unwrap();
+    assert_eq!(listed["access_keys"], serde_json::json!([]));
+    assert!(engine.execute(&format!("s3 drop access key {id}")).is_err());
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
