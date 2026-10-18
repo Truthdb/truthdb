@@ -5,7 +5,7 @@
 use base64::Engine as _;
 use bytes::Bytes;
 use hyper::{Response, StatusCode};
-use truthdb_object::ListAfter;
+use truthdb_object::{ListAfter, VersionSel};
 
 use crate::error::{S3Error, escape};
 use crate::objects::object_error;
@@ -199,6 +199,156 @@ pub async fn list_objects(
         ));
     }
     xml.push_str("</ListBucketResult>");
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(full(Bytes::from(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{xml}"
+        ))))
+        .expect("a valid response"))
+}
+
+/// ListObjectVersions (`GET ?versions`): every version and delete marker,
+/// newest first within a key, paged by key and version-id markers.
+pub async fn list_versions(
+    state: &S3State,
+    bucket: String,
+    query: &str,
+) -> Result<Response<Body>, S3Error> {
+    let params = query_params(query);
+    let prefix = param(&params, "prefix").unwrap_or("").to_string();
+    let delimiter = param(&params, "delimiter").map(str::to_string);
+    let max_keys = match param(&params, "max-keys") {
+        Some(value) => value
+            .parse::<usize>()
+            .map_err(|_| S3Error::new(400, "InvalidArgument", "max-keys must be a number"))?
+            .min(MAX_KEYS),
+        None => MAX_KEYS,
+    };
+    let url_encoding = match param(&params, "encoding-type") {
+        None => false,
+        Some("url") => true,
+        Some(_) => {
+            return Err(S3Error::new(
+                400,
+                "InvalidArgument",
+                "Invalid Encoding Method specified in Request",
+            ));
+        }
+    };
+    let key_marker = param(&params, "key-marker").map(str::to_string);
+    let version_marker = param(&params, "version-id-marker").map(str::to_string);
+    let version_marker = match (&key_marker, version_marker.as_deref()) {
+        (_, None | Some("")) => None,
+        (None, Some(_)) => {
+            return Err(S3Error::new(
+                400,
+                "InvalidArgument",
+                "A version-id marker cannot be specified without a key marker.",
+            ));
+        }
+        (Some(_), Some("null")) => Some(None),
+        (Some(_), Some(id)) => Some(Some(id.parse::<u64>().map_err(|_| {
+            S3Error::new(400, "InvalidArgument", "Invalid version id specified")
+        })?)),
+    };
+
+    let (bucket_name, list_prefix, list_delimiter, marker) = (
+        bucket.clone(),
+        prefix.clone(),
+        delimiter.clone(),
+        key_marker.clone(),
+    );
+    let listing = state
+        .engine
+        .run_object(move |file| {
+            // A `null` marker names the key's null version, by its number.
+            let version = match version_marker {
+                Some(None) => {
+                    let key = marker.as_deref().expect("checked above");
+                    file.object_version(&bucket_name, key, VersionSel::Null)?
+                        .ok()
+                        .map(|info| info.version)
+                }
+                Some(Some(version)) => Some(version),
+                None => None,
+            };
+            let after = match (marker.as_deref(), version) {
+                (Some(key), Some(version)) => Some(ListAfter::Version(key, version)),
+                (Some(key), None) => Some(ListAfter::Key(key)),
+                (None, _) => None,
+            };
+            file.list_versions(
+                &bucket_name,
+                &list_prefix,
+                list_delimiter.as_deref(),
+                after,
+                max_keys,
+            )
+        })
+        .await
+        .map_err(|err| S3Error::internal(err.to_string()))?
+        .map_err(|err| object_error(err, &bucket, ""))?;
+
+    let encode = |text: &str| {
+        if url_encoding {
+            crate::sigv4::encode_key(text)
+        } else {
+            escape(text)
+        }
+    };
+    let mut xml = format!(
+        "<ListVersionsResult xmlns=\"{XMLNS}\"><Name>{}</Name><Prefix>{}</Prefix><KeyMarker>{}</KeyMarker><VersionIdMarker>{}</VersionIdMarker><MaxKeys>{max_keys}</MaxKeys><IsTruncated>{}</IsTruncated>",
+        escape(&bucket),
+        encode(&prefix),
+        encode(key_marker.as_deref().unwrap_or("")),
+        escape(param(&params, "version-id-marker").unwrap_or("")),
+        listing.truncated
+    );
+    if let Some(delimiter) = &delimiter {
+        xml.push_str(&format!("<Delimiter>{}</Delimiter>", encode(delimiter)));
+    }
+    if url_encoding {
+        xml.push_str("<EncodingType>url</EncodingType>");
+    }
+    if listing.truncated
+        && let Some((last, _)) = &listing.last
+    {
+        xml.push_str(&format!("<NextKeyMarker>{}</NextKeyMarker>", encode(last)));
+        if let (Some(_), Some(object)) = (listing.last_version, listing.objects.last()) {
+            xml.push_str(&format!(
+                "<NextVersionIdMarker>{}</NextVersionIdMarker>",
+                crate::delete::version_id(object.info.version, object.info.null_version)
+            ));
+        }
+    }
+    let owner = "<Owner><ID>truthdb</ID><DisplayName>truthdb</DisplayName></Owner>";
+    for object in &listing.objects {
+        let info = &object.info;
+        let common = format!(
+            "<Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified>",
+            encode(&object.key),
+            crate::delete::version_id(info.version, info.null_version),
+            object.latest,
+            crate::time::iso8601(info.mtime_ms)
+        );
+        if info.delete_marker {
+            xml.push_str(&format!("<DeleteMarker>{common}{owner}</DeleteMarker>"));
+        } else {
+            xml.push_str(&format!(
+                "<Version>{common}<ETag>{}</ETag><Size>{}</Size>{owner}<StorageClass>STANDARD</StorageClass></Version>",
+                escape(&info.etag()),
+                info.size
+            ));
+        }
+    }
+    for common in &listing.common_prefixes {
+        xml.push_str(&format!(
+            "<CommonPrefixes><Prefix>{}</Prefix></CommonPrefixes>",
+            encode(common)
+        ));
+    }
+    xml.push_str("</ListVersionsResult>");
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/xml")

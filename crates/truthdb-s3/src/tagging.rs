@@ -8,11 +8,13 @@ use hyper::header::HeaderMap;
 use hyper::{Request, Response, StatusCode};
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use truthdb_object::ObjectError;
+use truthdb_object::{ObjectError, VersionSel};
 
 use crate::error::{S3Error, escape};
 use crate::multipart::xml;
-use crate::objects::{object, object_error, version_sel};
+use crate::objects::{
+    add_header, object, object_error, version_header, version_sel, versioning_of,
+};
 use crate::server::{Authenticated, Body, S3State, full, read_body};
 
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -186,13 +188,30 @@ pub async fn put_tagging(
     let which = version_sel(request.uri().query().unwrap_or(""))?;
     let body = read_body(request, auth, 64 * 1024).await?;
     let tags = parse_tagging(&body)?;
+    set_tags(state, bucket, key, which, tags, StatusCode::OK).await
+}
+
+/// Replaces the tags and answers with `status` and the version changed.
+async fn set_tags(
+    state: &S3State,
+    bucket: String,
+    key: String,
+    which: VersionSel,
+    tags: Vec<(String, String)>,
+    status: StatusCode,
+) -> Result<Response<Body>, S3Error> {
     let (tag_bucket, tag_key) = (bucket.clone(), key.clone());
-    object(state, move |file| {
-        file.transaction(|tx| tx.set_tags(&tag_bucket, &tag_key, which, tags))
+    let (changed, versioning) = object(state, move |file| {
+        let changed = file.transaction(|tx| tx.set_tags(&tag_bucket, &tag_key, which, tags))?;
+        Ok((changed, versioning_of(file, &tag_bucket)?))
     })
-    .await?
-    .map_err(|err| object_error(err, &bucket, &key))?;
-    Ok(empty(StatusCode::OK))
+    .await?;
+    let (version, null_version) = changed.map_err(|err| object_error(err, &bucket, &key))?;
+    let mut response = empty(status);
+    if let Some(version) = version_header(versioning, version, null_version) {
+        add_header(&mut response, "x-amz-version-id", version);
+    }
+    Ok(response)
 }
 
 pub async fn delete_tagging(
@@ -202,13 +221,15 @@ pub async fn delete_tagging(
     key: String,
 ) -> Result<Response<Body>, S3Error> {
     let which = version_sel(request.uri().query().unwrap_or(""))?;
-    let (tag_bucket, tag_key) = (bucket.clone(), key.clone());
-    object(state, move |file| {
-        file.transaction(|tx| tx.set_tags(&tag_bucket, &tag_key, which, Vec::new()))
-    })
-    .await?
-    .map_err(|err| object_error(err, &bucket, &key))?;
-    Ok(empty(StatusCode::NO_CONTENT))
+    set_tags(
+        state,
+        bucket,
+        key,
+        which,
+        Vec::new(),
+        StatusCode::NO_CONTENT,
+    )
+    .await
 }
 
 pub async fn get_tagging(
@@ -219,11 +240,12 @@ pub async fn get_tagging(
 ) -> Result<Response<Body>, S3Error> {
     let which = version_sel(request.uri().query().unwrap_or(""))?;
     let (tag_bucket, tag_key) = (bucket.clone(), key.clone());
-    let info = object(state, move |file| {
-        file.head_object(&tag_bucket, &tag_key, which)
+    let (found, versioning) = object(state, move |file| {
+        let found = file.head_object(&tag_bucket, &tag_key, which)?;
+        Ok((found, versioning_of(file, &tag_bucket)?))
     })
-    .await?
-    .map_err(|err| object_error(err, &bucket, &key))?;
+    .await?;
+    let info = found.map_err(|err| object_error(err, &bucket, &key))?;
     if info.delete_marker {
         return Err(object_error(ObjectError::DeleteMarker, &bucket, &key));
     }
@@ -239,9 +261,13 @@ pub async fn get_tagging(
             )
         })
         .collect();
-    Ok(xml(format!(
+    let mut response = xml(format!(
         "<Tagging xmlns=\"{XMLNS}\"><TagSet>{tags}</TagSet></Tagging>"
-    )))
+    ));
+    if let Some(version) = version_header(versioning, info.version, info.null_version) {
+        add_header(&mut response, "x-amz-version-id", version);
+    }
+    Ok(response)
 }
 
 #[cfg(test)]

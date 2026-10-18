@@ -1062,3 +1062,136 @@ fn objects_are_tagged_at_put_and_by_the_tagging_api() {
         "the body is untouched"
     );
 }
+
+#[test]
+fn versioned_buckets_keep_versions_markers_and_null_versions() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_with(port, method, path, query, &[], body, &key, Some(&secret))
+    };
+    let tag_all = |xml: &str, tag: &str| -> Vec<String> {
+        xml.split(&format!("<{tag}>"))
+            .skip(1)
+            .filter_map(|rest| rest.split(&format!("</{tag}>")).next())
+            .map(str::to_string)
+            .collect()
+    };
+    let versioning = |status: &str| {
+        call(
+            "PUT",
+            "/vers",
+            "versioning",
+            format!("<VersioningConfiguration><Status>{status}</Status></VersioningConfiguration>")
+                .as_bytes(),
+        )
+        .1
+    };
+    assert_eq!(call("PUT", "/vers", "", b"").1.0, 200);
+    let (_, (_, xml)) = call("GET", "/vers", "versioning", b"");
+    assert!(!xml.contains("<Status>"), "{xml}");
+    // An unversioned bucket sends no version ids.
+    let (head, _) = call("PUT", "/vers/k", "", b"zero");
+    assert_eq!(response_header(&head, "x-amz-version-id"), None);
+    assert_eq!(versioning("Sideways").0, 400);
+    assert_eq!(versioning("Enabled").0, 200);
+    let (_, (_, xml)) = call("GET", "/vers", "versioning", b"");
+    assert!(xml.contains("<Status>Enabled</Status>"), "{xml}");
+
+    let put = |body: &[u8]| {
+        let (head, (status, _)) = call("PUT", "/vers/k", "", body);
+        assert_eq!(status, 200);
+        response_header(&head, "x-amz-version-id").expect("a version id")
+    };
+    let v1 = put(b"one");
+    let v2 = put(b"two");
+    assert_ne!(v1, v2);
+    assert_eq!(call("GET", "/vers/k", "", b"").1, (200, "two".to_string()));
+    assert_eq!(
+        call("GET", "/vers/k", &format!("versionId={v1}"), b"").1,
+        (200, "one".to_string())
+    );
+    assert_eq!(
+        call("GET", "/vers/k", "versionId=null", b"").1,
+        (200, "zero".to_string()),
+        "the version written before versioning is the null version"
+    );
+
+    // A delete adds a marker: the key is gone, its versions are not.
+    let (head, (status, _)) = call("DELETE", "/vers/k", "", b"");
+    assert_eq!(status, 204);
+    assert_eq!(
+        response_header(&head, "x-amz-delete-marker").as_deref(),
+        Some("true")
+    );
+    let marker = response_header(&head, "x-amz-version-id").expect("the marker's id");
+    let (head, (status, xml)) = call("GET", "/vers/k", "", b"");
+    assert_eq!(status, 404, "{xml}");
+    assert!(xml.contains("NoSuchKey"), "{xml}");
+    assert_eq!(
+        response_header(&head, "x-amz-delete-marker").as_deref(),
+        Some("true")
+    );
+    let (_, (status, xml)) = call("GET", "/vers/k", &format!("versionId={marker}"), b"");
+    assert_eq!(status, 405, "{xml}");
+    let (_, (_, xml)) = call("GET", "/vers", "versions", b"");
+    assert_eq!(
+        tag_all(&xml, "VersionId"),
+        [marker.clone(), v2.clone(), v1.clone(), "null".to_string()]
+    );
+    assert_eq!(
+        tag_all(&xml, "IsLatest"),
+        ["true", "false", "false", "false"]
+    );
+    assert_eq!(tag_all(&xml, "DeleteMarker").len(), 1, "{xml}");
+
+    // Paging one at a time walks every version.
+    let mut seen = Vec::new();
+    let mut query = "versions&max-keys=1".to_string();
+    loop {
+        let (_, (_, xml)) = call("GET", "/vers", &query, b"");
+        seen.extend(tag_all(&xml, "VersionId"));
+        if !xml.contains("<IsTruncated>true</IsTruncated>") {
+            break;
+        }
+        let key_marker = tag_all(&xml, "NextKeyMarker").remove(0);
+        let version_marker = tag_all(&xml, "NextVersionIdMarker").remove(0);
+        query = format!(
+            "key-marker={key_marker}&max-keys=1&version-id-marker={version_marker}&versions"
+        );
+    }
+    assert_eq!(
+        seen,
+        [marker.clone(), v2.clone(), v1.clone(), "null".to_string()]
+    );
+
+    // Removing the marker brings the object back.
+    let (head, (status, _)) = call("DELETE", "/vers/k", &format!("versionId={marker}"), b"");
+    assert_eq!(status, 204);
+    assert_eq!(
+        response_header(&head, "x-amz-delete-marker").as_deref(),
+        Some("true")
+    );
+    assert_eq!(call("GET", "/vers/k", "", b"").1, (200, "two".to_string()));
+
+    // Suspended: a PUT replaces the null version and keeps the others.
+    assert_eq!(versioning("Suspended").0, 200);
+    let (head, _) = call("PUT", "/vers/k", "", b"suspended");
+    assert_eq!(
+        response_header(&head, "x-amz-version-id").as_deref(),
+        Some("null")
+    );
+    let (_, (_, xml)) = call("GET", "/vers", "versions", b"");
+    assert_eq!(
+        tag_all(&xml, "VersionId"),
+        ["null", v2.as_str(), v1.as_str()]
+    );
+    assert_eq!(
+        call("GET", "/vers/k", "versionId=null", b"").1,
+        (200, "suspended".to_string())
+    );
+
+    // Sub-resources that are not implemented are refused, not misrouted.
+    assert_eq!(call("PUT", "/vers", "tagging", b"").1.0, 501);
+    assert_eq!(call("GET", "/vers/k", "acl", b"").1.0, 501);
+}

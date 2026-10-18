@@ -1133,3 +1133,105 @@ fn tags_are_set_replaced_and_cleared_per_version() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn versions_list_newest_first_with_markers_and_resume_mid_key() {
+    use crate::{ListAfter, ObjectAttrs, Versioning};
+    let path = temp_path("versions");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("bkt", now())?.unwrap();
+            tx.set_versioning("bkt", Versioning::Enabled)
+        })
+        .unwrap()
+        .unwrap();
+    let put = |key: &str| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .unwrap()
+            .unwrap()
+            .version
+    };
+    let a1 = put("a");
+    let a2 = put("a");
+    let marker = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("bkt", "a", None, now(), 0))
+        .unwrap()
+        .unwrap()
+        .version
+        .unwrap();
+    let b1 = put("b");
+    let d1 = put("dir/x");
+    put("dir/y");
+    let list = |delimiter: Option<&str>, after: Option<ListAfter<'_>>, max: usize| {
+        ObjFile::new(&mut storage.lock())
+            .list_versions("bkt", "", delimiter, after, max)
+            .unwrap()
+            .unwrap()
+    };
+    let all = list(None, None, 100);
+    let rows: Vec<(&str, u64, bool, bool)> = all
+        .objects
+        .iter()
+        .map(|o| {
+            (
+                o.key.as_str(),
+                o.info.version,
+                o.latest,
+                o.info.delete_marker,
+            )
+        })
+        .collect();
+    assert_eq!(
+        rows[..4],
+        [
+            ("a", marker, true, true),
+            ("a", a2, false, false),
+            ("a", a1, false, false),
+            ("b", b1, true, false),
+        ]
+    );
+    assert_eq!(rows.len(), 6);
+    // The plain listing leaves out the deleted key.
+    let current = ObjFile::new(&mut storage.lock())
+        .list_objects("bkt", "", None, None, 100)
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        current
+            .objects
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect::<Vec<_>>(),
+        ["b", "dir/x", "dir/y"]
+    );
+
+    // Paging two at a time resumes inside a key's versions.
+    let page = list(None, None, 2);
+    assert!(page.truncated);
+    assert_eq!(page.last_version, Some(a2));
+    let next = list(None, Some(ListAfter::Version("a", a2)), 2);
+    assert_eq!(
+        next.objects
+            .iter()
+            .map(|o| (o.info.version, o.latest))
+            .collect::<Vec<_>>(),
+        [(a1, false), (b1, true)]
+    );
+    // A page that ends on a common prefix hands it back as the marker; the
+    // next page does not list it again.
+    let page = list(Some("/"), Some(ListAfter::Key("b")), 1);
+    assert_eq!(page.common_prefixes, ["dir/"]);
+    assert_eq!(page.last, Some(("dir/".to_string(), true)));
+    let next = list(Some("/"), Some(ListAfter::Key("dir/")), 10);
+    assert!(next.objects.is_empty() && next.common_prefixes.is_empty());
+    assert!(!next.truncated);
+    let resumed = list(None, Some(ListAfter::Key("dir/")), 10);
+    assert_eq!(resumed.objects.first().map(|o| o.info.version), Some(d1));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

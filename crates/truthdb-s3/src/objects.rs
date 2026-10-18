@@ -14,8 +14,10 @@ use hyper::header::HeaderMap;
 use hyper::{Request, Response, StatusCode};
 use md5::{Digest, Md5};
 use tokio::sync::mpsc;
+use truthdb_core::storage::StorageError;
 use truthdb_object::{
     ObjFile, ObjectAttrs, ObjectError, ObjectInfo, SEGMENT_BYTES, SealedBody, VersionSel,
+    Versioning,
 };
 
 use crate::error::S3Error;
@@ -239,8 +241,8 @@ pub async fn put_object(
     }
     let sealed = receive_body(state, request, auth).await?;
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
-    let info = object(state, move |file| {
-        file.transaction(|tx| {
+    let (stored, versioning) = object(state, move |file| {
+        let stored = file.transaction(|tx| {
             tx.put_object(
                 &bucket_name,
                 &key_name,
@@ -249,15 +251,18 @@ pub async fn put_object(
                 now_ms(),
                 DROP_GRACE_MS,
             )
-        })
+        })?;
+        Ok((stored, versioning_of(file, &bucket_name)?))
     })
-    .await?
-    .map_err(|err| object_error(err, &bucket, &key))?;
-    Ok(Response::builder()
+    .await?;
+    let info = stored.map_err(|err| object_error(err, &bucket, &key))?;
+    let mut response = Response::builder()
         .status(StatusCode::OK)
-        .header("etag", info.etag())
-        .body(full(Bytes::new()))
-        .expect("a valid response"))
+        .header("etag", info.etag());
+    if let Some(version) = version_header(versioning, info.version, info.null_version) {
+        response = response.header("x-amz-version-id", version);
+    }
+    Ok(response.body(full(Bytes::new())).expect("a valid response"))
 }
 
 /// A response body fed by a channel: the reader task pushes chunks as it
@@ -374,8 +379,13 @@ pub fn precondition(headers: &HeaderMap, prefix: &str, info: &ObjectInfo) -> Opt
 fn object_headers(
     builder: hyper::http::response::Builder,
     info: &ObjectInfo,
+    versioning: Versioning,
 ) -> hyper::http::response::Builder {
     let attrs = &info.attrs;
+    let mut builder = builder;
+    if let Some(version) = version_header(versioning, info.version, info.null_version) {
+        builder = builder.header("x-amz-version-id", version);
+    }
     let mut builder = builder
         .header("etag", info.etag())
         .header("last-modified", http_date(info.mtime_ms))
@@ -407,6 +417,27 @@ fn object_headers(
     builder
 }
 
+/// The bucket's versioning state (`Unversioned` once the bucket is gone).
+pub fn versioning_of(file: &mut ObjFile<'_>, bucket: &str) -> Result<Versioning, StorageError> {
+    Ok(file
+        .bucket(bucket)?
+        .map_or(Versioning::Unversioned, |info| info.versioning))
+}
+
+/// The `x-amz-version-id` a response about this version carries: none in a
+/// bucket that never had versioning, as in S3.
+pub fn version_header(versioning: Versioning, version: u64, null_version: bool) -> Option<String> {
+    (versioning != Versioning::Unversioned)
+        .then(|| crate::delete::version_id(version, null_version))
+}
+
+/// Adds a header to a built response.
+pub fn add_header(response: &mut Response<Body>, name: &'static str, value: String) {
+    response
+        .headers_mut()
+        .insert(name, value.parse().expect("a version id is a valid header"));
+}
+
 /// The version a request names: `?versionId=` or the latest.
 pub fn version_sel(query: &str) -> Result<VersionSel, S3Error> {
     for pair in query.split('&') {
@@ -434,17 +465,36 @@ pub async fn get_object(
     // Resolve and lease in one lock hold, so the body cannot be collected
     // between the lookup and the lease.
     let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-    let info = object(state, move |file| {
-        let found = file.head_object(&lookup_bucket, &lookup_key, which)?;
+    let (found, versioning) = object(state, move |file| {
+        let found = file.object_version(&lookup_bucket, &lookup_key, which)?;
         if let Ok(info) = &found
             && !head_only
+            && !info.delete_marker
         {
             file.take_lease(info.body)?;
         }
-        Ok(found)
+        Ok((found, versioning_of(file, &lookup_bucket)?))
     })
-    .await?
-    .map_err(|err| object_error(err, &bucket, &key))?;
+    .await?;
+    let info = found.map_err(|err| object_error(err, &bucket, &key))?;
+    if info.delete_marker {
+        // The newest version is a delete marker: the key is gone. A marker
+        // named by its version id cannot be read.
+        let err = if which == VersionSel::Latest {
+            object_error(ObjectError::NoSuchKey, &bucket, &key)
+        } else {
+            S3Error::new(
+                405,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.",
+            )
+            .with_header("last-modified", http_date(info.mtime_ms))
+        };
+        return Err(err.with_header("x-amz-delete-marker", "true").with_header(
+            "x-amz-version-id",
+            crate::delete::version_id(info.version, info.null_version),
+        ));
+    }
     let release = |state: &S3State| {
         let engine = state.engine.clone();
         let body = info.body;
@@ -462,9 +512,11 @@ pub async fn get_object(
         if !head_only {
             release(state).await;
         }
-        return Ok(object_headers(Response::builder().status(status), &info)
-            .body(full(Bytes::new()))
-            .expect("a valid response"));
+        return Ok(
+            object_headers(Response::builder().status(status), &info, versioning)
+                .body(full(Bytes::new()))
+                .expect("a valid response"),
+        );
     }
     let range = match header(headers, "range") {
         Some(value) => match parse_range(&value, info.size) {
@@ -486,7 +538,7 @@ pub async fn get_object(
         Some((first, last)) => (StatusCode::PARTIAL_CONTENT, first, last - first + 1),
         None => (StatusCode::OK, 0, info.size),
     };
-    let mut builder = object_headers(Response::builder().status(status), &info)
+    let mut builder = object_headers(Response::builder().status(status), &info, versioning)
         .header("content-length", len.to_string());
     if let Some((first, last)) = range {
         builder = builder.header(

@@ -131,9 +131,13 @@ async fn handle(state: &S3State, request: Request<Incoming>) -> Response<Body> {
 }
 
 pub fn error_response(err: &S3Error, resource: &str) -> Response<Body> {
-    Response::builder()
+    let mut builder = Response::builder()
         .status(StatusCode::from_u16(err.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
-        .header("content-type", "application/xml")
+        .header("content-type", "application/xml");
+    for (name, value) in &err.headers {
+        builder = builder.header(*name, value);
+    }
+    builder
         .body(full(err.to_xml(resource)))
         .expect("a valid response")
 }

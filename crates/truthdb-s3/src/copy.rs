@@ -14,8 +14,8 @@ use crate::error::{S3Error, escape};
 use crate::listing::query_params;
 use crate::multipart::{check_upload, part_number, upload_error, upload_id, xml};
 use crate::objects::{
-    DROP_GRACE_MS, MAX_PUT_BYTES, header, metadata_from, now_ms, object, object_error,
-    precondition, version_sel,
+    DROP_GRACE_MS, MAX_PUT_BYTES, add_header, header, metadata_from, now_ms, object, object_error,
+    precondition, version_header, version_sel, versioning_of,
 };
 use crate::server::Body;
 use crate::server::S3State;
@@ -137,25 +137,48 @@ pub async fn copy_object(
         } else {
             source.attrs.tags.clone()
         };
-        Ok(file
-            .transaction(|tx| {
-                tx.copy_object(
-                    &dst_bucket,
-                    &dst_key,
-                    &source,
-                    &attrs,
-                    now_ms(),
-                    DROP_GRACE_MS,
-                )
-            })?
-            .map_err(|err| object_error(err, &dst_bucket, &dst_key)))
+        let copied = file.transaction(|tx| {
+            tx.copy_object(
+                &dst_bucket,
+                &dst_key,
+                &source,
+                &attrs,
+                now_ms(),
+                DROP_GRACE_MS,
+            )
+        })?;
+        let copied = match copied {
+            Ok(copied) => copied,
+            Err(err) => return Ok(Err(object_error(err, &dst_bucket, &dst_key))),
+        };
+        let mut versions = Vec::new();
+        if let Some(version) = version_header(
+            versioning_of(file, &src_bucket)?,
+            source.version,
+            source.null_version,
+        ) {
+            versions.push(("x-amz-copy-source-version-id", version));
+        }
+        if let Some(version) = version_header(
+            versioning_of(file, &dst_bucket)?,
+            copied.version,
+            copied.null_version,
+        ) {
+            versions.push(("x-amz-version-id", version));
+        }
+        Ok(Ok((copied, versions)))
     })
     .await??;
-    Ok(xml(format!(
+    let (info, versions) = info;
+    let mut response = xml(format!(
         "<CopyObjectResult xmlns=\"{XMLNS}\"><ETag>{}</ETag><LastModified>{}</LastModified></CopyObjectResult>",
         escape(&info.etag()),
         iso8601(info.mtime_ms)
-    )))
+    ));
+    for (name, version) in versions {
+        add_header(&mut response, name, version);
+    }
+    Ok(response)
 }
 
 /// `x-amz-copy-source-range: bytes=first-last`, inside a source of `size`:
@@ -222,15 +245,21 @@ pub async fn upload_part_copy(
     })
     .await
     .map_err(|err| S3Error::internal(err.to_string()))??;
+    let (part, source_version) = part;
     let etag: String = part.md5.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(xml(format!(
+    let mut response = xml(format!(
         "<CopyPartResult xmlns=\"{XMLNS}\"><ETag>&quot;{etag}&quot;</ETag><LastModified>{}</LastModified></CopyPartResult>",
         iso8601(now_ms())
-    )))
+    ));
+    if let Some(version) = source_version {
+        add_header(&mut response, "x-amz-copy-source-version-id", version);
+    }
+    Ok(response)
 }
 
 /// Stores part `number` of `upload` from the copy source: shared, or with its
-/// bytes copied under a lease released before returning.
+/// bytes copied under a lease released before returning. Returns the part and
+/// the source's `x-amz-copy-source-version-id`.
 async fn copy_part(
     state: &S3State,
     upload: u64,
@@ -239,13 +268,18 @@ async fn copy_part(
     headers: HeaderMap,
     bucket: String,
     key: String,
-) -> Result<BodyInfo, S3Error> {
+) -> Result<(BodyInfo, Option<String>), S3Error> {
     let (part_bucket, part_key) = (bucket.clone(), key.clone());
-    let step = object(state, move |file| {
+    let (step, source_version) = object(state, move |file| {
         let source = match resolve_source(file, &src_bucket, &src_key, which, &headers)? {
             Ok(source) => source,
             Err(err) => return Ok(Err(err)),
         };
+        let source_version = version_header(
+            versioning_of(file, &src_bucket)?,
+            source.version,
+            source.null_version,
+        );
         let span = match header(&headers, "x-amz-copy-source-range") {
             Some(range) => match copy_range(&range, source.size) {
                 Ok(span) => Some(span),
@@ -258,7 +292,7 @@ async fn copy_part(
                 .transaction(|tx| {
                     tx.upload_part_shared(upload, number, source.body, now_ms(), DROP_GRACE_MS)
                 })?
-                .map(PartSource::Shared)
+                .map(|part| (PartSource::Shared(part), source_version))
                 .map_err(|err| upload_error(err, &part_bucket, &part_key)));
         }
         let (first, len) = span.unwrap_or((0, source.size));
@@ -273,11 +307,14 @@ async fn copy_part(
         }
         // The lease keeps the bytes while they are copied outside the lock.
         file.take_lease(source.body)?;
-        Ok(Ok(PartSource::Leased {
-            body: source.body,
-            first,
-            len,
-        }))
+        Ok(Ok((
+            PartSource::Leased {
+                body: source.body,
+                first,
+                len,
+            },
+            source_version,
+        )))
     })
     .await??;
     let part = match step {
@@ -299,7 +336,7 @@ async fn copy_part(
             .map_err(|err| upload_error(err, &bucket, &key))?
         }
     };
-    Ok(part)
+    Ok((part, source_version))
 }
 
 /// Copies `len` bytes of the leased `body` from `first` into a new staging
