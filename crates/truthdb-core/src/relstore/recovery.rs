@@ -15,15 +15,16 @@
 
 use std::collections::HashMap;
 
+use crate::relstore::buffer_pool::PoolBackend;
 use crate::relstore::ctx::{OpMode, RelCtx, TxnLink, apply_redo_to_page};
 use crate::relstore::page;
 use crate::relstore::slotted::SlottedRead;
 use crate::storage::StorageError;
 use crate::wal::records::{
-    PageOpRedo, PageOpUndo, REL_KIND_ALLOC_EXTENT, REL_KIND_CLR, REL_KIND_CLR_FREE_EXTENT,
-    REL_KIND_FREE_EXTENT, REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_IMAGES, REL_KIND_PAGE_OP,
-    REL_KIND_SET_CATALOG_ROOT, REL_KIND_SET_ENGINE_ROOT, REL_KIND_TXN_BEGIN, REL_KIND_TXN_COMMIT,
-    REL_KIND_TXN_END, RelRecord,
+    PageOpRedo, PageOpUndo, REL_KIND_ALLOC_EXTENT, REL_KIND_BLOB_PAGES, REL_KIND_CLR,
+    REL_KIND_CLR_FREE_EXTENT, REL_KIND_FREE_EXTENT, REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_IMAGES,
+    REL_KIND_PAGE_OP, REL_KIND_SET_CATALOG_ROOT, REL_KIND_SET_ENGINE_ROOT, REL_KIND_TXN_BEGIN,
+    REL_KIND_TXN_COMMIT, REL_KIND_TXN_END, RelRecord,
 };
 
 pub(crate) struct AnalysisRedoOutcome {
@@ -63,6 +64,7 @@ pub(crate) fn analyze_and_redo(
             | REL_KIND_PAGE_IMAGES
             | REL_KIND_CLR
             | REL_KIND_CLR_FREE_EXTENT
+            | REL_KIND_BLOB_PAGES
             | REL_KIND_ALLOC_EXTENT
             | REL_KIND_FREE_EXTENT => {
                 // Extent records with a transaction belong to its chain; the
@@ -128,8 +130,28 @@ pub(crate) fn redo_records(
                     redo_page_op(ctx, *lsn, &redo)?;
                 }
             }
+            REL_KIND_BLOB_PAGES => redo_blob_pages(ctx, *lsn, record)?,
             _ => {}
         }
+    }
+    Ok(())
+}
+
+/// Redoes a BLOB_PAGES record straight on disk (blob pages never enter the
+/// buffer pool): a page is rewritten unless the one on disk is intact and at
+/// least as new as the record — which also keeps a newer blob's page when the
+/// extent was freed and reused since.
+fn redo_blob_pages(ctx: &mut RelCtx<'_>, lsn: u64, record: &RelRecord) -> Result<(), StorageError> {
+    let (object_id, start_page, data) = record.decode_blob_pages()?;
+    for (index, chunk) in data.chunks(page::BLOB_PAGE_DATA).enumerate() {
+        let page_no = start_page + index as u64;
+        let mut on_disk = crate::direct_io::AlignedPageBuf::new();
+        ctx.io.read_page(page_no, &mut on_disk)?;
+        if page::verify_checksum(on_disk.as_slice()) && page::page_lsn(on_disk.as_slice()) >= lsn {
+            continue;
+        }
+        let image = crate::relstore::ctx::blob_page_image(lsn, object_id, page_no, chunk);
+        ctx.io.write_page(page_no, &image)?;
     }
     Ok(())
 }

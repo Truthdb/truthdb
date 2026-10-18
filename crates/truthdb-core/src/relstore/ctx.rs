@@ -339,6 +339,56 @@ impl RelCtx<'_> {
         Ok(start_page)
     }
 
+    /// Writes a blob's body pages (`data` split into `BLOB_PAGE_DATA`-byte
+    /// pages from `start_page`, the last one zero-padded) inside `txn`, over
+    /// pages the transaction allocated. The record is forced to disk first
+    /// (write-ahead), then each page goes straight to the data file — never
+    /// through the buffer pool, so a large body does not flush the pool's hot
+    /// pages. Returns the record's LSN, which every page carries.
+    pub fn write_blob_pages(
+        &mut self,
+        txn: &mut TxnLink,
+        object_id: u32,
+        start_page: u64,
+        data: &[u8],
+    ) -> Result<u64, StorageError> {
+        let record = RelRecord::blob_pages(txn.txn_id, txn.last_lsn, object_id, start_page, data);
+        let lsn = self.append(&record, true)?;
+        txn.last_lsn = lsn;
+        for (index, chunk) in data.chunks(page::BLOB_PAGE_DATA).enumerate() {
+            let page_no = start_page + index as u64;
+            let image = blob_page_image(lsn, object_id, page_no, chunk);
+            self.io.write_page(page_no, &image)?;
+        }
+        Ok(lsn)
+    }
+
+    /// Reads one blob page into `out` (`BLOB_PAGE_DATA` bytes) and returns its
+    /// header. A page that fails its checksum, is not a blob page, or claims
+    /// another page number is an error: the caller compares the header's
+    /// object id and LSN with what it expects, since a freed extent can be
+    /// reused.
+    pub fn read_blob_page(
+        &mut self,
+        page_no: u64,
+        out: &mut [u8],
+    ) -> Result<PageHeader, StorageError> {
+        let mut frame = AlignedPageBuf::new();
+        self.io.read_page(page_no, &mut frame)?;
+        let bytes = frame.as_slice();
+        let header = page::read_header(bytes);
+        if !page::verify_checksum(bytes)
+            || header.page_type != page::PAGE_TYPE_BLOB
+            || header.page_no != page_no
+        {
+            return Err(StorageError::InvalidFile(format!(
+                "page {page_no} is not a valid blob page"
+            )));
+        }
+        out.copy_from_slice(&bytes[page::PAGE_HEADER_SIZE..]);
+        Ok(header)
+    }
+
     /// Frees an extent inside `txn`. The pages stay allocated until the
     /// transaction commits, and are never freed if it does not. The same
     /// locking rule as [`Self::allocate_extent_in_txn`] applies.
@@ -614,4 +664,30 @@ pub(crate) fn apply_redo_to_page(
             Ok(())
         }
     }
+}
+
+/// A whole blob page as it goes to disk: header (stamped with `lsn`), the
+/// body bytes, zero padding, checksum. Shared by the write path and redo so
+/// both produce identical pages.
+pub(crate) fn blob_page_image(
+    lsn: u64,
+    object_id: u32,
+    page_no: u64,
+    chunk: &[u8],
+) -> AlignedPageBuf {
+    let mut image = AlignedPageBuf::new();
+    let bytes = image.as_mut_slice();
+    page::write_header(
+        bytes,
+        &PageHeader {
+            page_lsn: lsn,
+            page_type: page::PAGE_TYPE_BLOB,
+            flags: 0,
+            object_id,
+            page_no,
+        },
+    );
+    bytes[page::PAGE_HEADER_SIZE..page::PAGE_HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
+    page::stamp_checksum(bytes);
+    image
 }
