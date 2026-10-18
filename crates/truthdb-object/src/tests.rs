@@ -1315,3 +1315,61 @@ fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
+    use crate::buckets::BucketRow;
+    use crate::{ObjectAttrs, Versioning};
+    let path = temp_path("deleted-folder");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("bkt", now())?.unwrap();
+            let row = BucketRow {
+                created_ms: now(),
+                versioning: Versioning::Enabled,
+            };
+            tx.trees
+                .buckets()
+                .update(tx.ctx, &mut OpMode::Txn(tx.txn), b"bkt", &row.encode())?;
+            Ok(())
+        })
+        .unwrap();
+    for key in ["dir/x", "dir/y", "e"] {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .unwrap()
+            .unwrap();
+    }
+    let list = || {
+        ObjFile::new(&mut storage.lock())
+            .list_objects("bkt", "", Some("/"), None, 1000)
+            .unwrap()
+            .unwrap()
+    };
+    // One live key keeps the folder; delete markers on both remove it.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("bkt", "dir/x", None, now(), 0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(list().common_prefixes, ["dir/"]);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("bkt", "dir/y", None, now(), 0))
+        .unwrap()
+        .unwrap();
+    let listing = list();
+    assert!(listing.common_prefixes.is_empty(), "{listing:?}");
+    assert_eq!(
+        listing
+            .objects
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect::<Vec<_>>(),
+        ["e"]
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
