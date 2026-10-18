@@ -315,10 +315,11 @@ pub async fn list_versions(
         && let Some((last, _)) = &listing.last
     {
         xml.push_str(&format!("<NextKeyMarker>{}</NextKeyMarker>", encode(last)));
-        if let (Some(_), Some(object)) = (listing.last_version, listing.objects.last()) {
+        // The version's number even for a null version: the next page
+        // resumes by position, whatever happens to that version meanwhile.
+        if let Some(version) = listing.last_version {
             xml.push_str(&format!(
-                "<NextVersionIdMarker>{}</NextVersionIdMarker>",
-                crate::delete::version_id(object.info.version, object.info.null_version)
+                "<NextVersionIdMarker>{version}</NextVersionIdMarker>"
             ));
         }
     }

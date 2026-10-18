@@ -496,3 +496,34 @@ fn location_constraint(body: &[u8]) -> Result<Option<String>, S3Error> {
     }
     Ok(constraint)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_bucket_bodies_parse_or_are_malformed() {
+        assert_eq!(location_constraint(b"").unwrap(), None);
+        assert_eq!(
+            location_constraint(
+                b"<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint> eu-west-1 </LocationConstraint></CreateBucketConfiguration>"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("eu-west-1")
+        );
+        for bad in [
+            &b"<CreateBucketConfiguration>"[..],
+            b"</LocationConstraint>",
+            b"<a><b></a></b>",
+        ] {
+            let err = location_constraint(bad).unwrap_err();
+            assert_eq!(
+                err.code,
+                "MalformedXML",
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
+}

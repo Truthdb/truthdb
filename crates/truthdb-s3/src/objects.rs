@@ -525,13 +525,16 @@ async fn read_object(
     let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
     let (found, versioning) = object(state, move |file| {
         let found = file.object_version(&lookup_bucket, &lookup_key, which)?;
+        // Everything that can fail comes before the lease: a failure after
+        // it would leave the lease held with no one to release it.
+        let versioning = versioning_of(file, &lookup_bucket)?;
         if let Ok(info) = &found
             && !head_only
             && !info.delete_marker
         {
             file.take_lease(info.body)?;
         }
-        Ok((found, versioning_of(file, &lookup_bucket)?))
+        Ok((found, versioning))
     })
     .await?;
     let info = found.map_err(|err| object_error(err, &bucket, &key))?;
