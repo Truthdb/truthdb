@@ -505,3 +505,61 @@ fn a_collection_pass_stops_at_its_limit_and_says_so() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn buckets_are_created_listed_and_deleted_only_when_empty() {
+    use crate::{BucketError, Versioning};
+    let path = temp_path("buckets");
+    let storage = create(&path);
+    let in_tx = |op: &dyn Fn(
+        &mut crate::ObjTxn<'_, '_>,
+    ) -> Result<Result<(), BucketError>, StorageError>| {
+        ObjFile::new(&mut storage.lock()).transaction(op).unwrap()
+    };
+    assert_eq!(in_tx(&|tx| tx.create_bucket("alpha", 5)), Ok(()));
+    assert_eq!(in_tx(&|tx| tx.create_bucket("beta", 6)), Ok(()));
+    assert_eq!(
+        in_tx(&|tx| tx.create_bucket("alpha", 7)),
+        Err(BucketError::AlreadyOwnedByYou)
+    );
+    assert!(matches!(
+        in_tx(&|tx| tx.create_bucket("Bad_Name", 7)),
+        Err(BucketError::InvalidName(_))
+    ));
+    assert_eq!(
+        in_tx(&|tx| tx.delete_bucket("gamma")),
+        Err(BucketError::NoSuchBucket)
+    );
+    // An object key under "alpha" (the objects tree's layout: bucket, 0, ...).
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            let objects = tx.trees.objects();
+            objects.insert_unique(
+                tx.ctx,
+                &mut truthdb_core::relstore::ctx::OpMode::Txn(tx.txn),
+                b"alpha\0key",
+                b"row",
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        in_tx(&|tx| tx.delete_bucket("alpha")),
+        Err(BucketError::NotEmpty)
+    );
+    assert_eq!(in_tx(&|tx| tx.delete_bucket("beta")), Ok(()));
+    drop(storage);
+
+    let storage = open(&path);
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    let buckets = file.list_buckets().unwrap();
+    assert_eq!(buckets.len(), 1);
+    assert_eq!(buckets[0].name, "alpha");
+    assert_eq!(buckets[0].created_ms, 5);
+    assert_eq!(buckets[0].versioning, Versioning::Unversioned);
+    assert!(file.bucket("beta").unwrap().is_none());
+    drop(guard);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

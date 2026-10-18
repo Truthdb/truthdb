@@ -479,6 +479,17 @@ impl BTree {
         lower: Option<&[u8]>,
         upper: Option<&[u8]>,
     ) -> Result<Vec<KeyRow>, StorageError> {
+        self.scan_range_limit(ctx, lower, upper, usize::MAX)
+    }
+
+    /// [`Self::scan_range`], stopping after `limit` rows.
+    pub fn scan_range_limit(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        lower: Option<&[u8]>,
+        upper: Option<&[u8]>,
+        limit: usize,
+    ) -> Result<Vec<KeyRow>, StorageError> {
         // Leaf and start index for the lower bound.
         let (mut page_no, mut start) = match lower {
             Some(key) => {
@@ -502,9 +513,7 @@ impl BTree {
             for index in start..page.slot_count() {
                 let cell = page.get(index).expect("tree pages have no tombstones");
                 let key = cell_key(cell);
-                if let Some(upper) = upper
-                    && key > upper
-                {
+                if out.len() == limit || upper.is_some_and(|upper| key > upper) {
                     ctx.pool.unpin(frame);
                     return Ok(out);
                 }

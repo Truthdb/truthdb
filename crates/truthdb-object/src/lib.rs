@@ -12,6 +12,7 @@
 //! `RelCtx::allocate_extent_in_txn`).
 
 mod body;
+mod buckets;
 mod codec;
 mod credentials;
 mod gc;
@@ -30,6 +31,7 @@ use truthdb_core::storage::{
 use truthdb_core::wal::records::RelRecord;
 
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
+pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use gc::GcOutcome;
 
 /// The object engine's id on the shared log (its root lives in the
@@ -48,6 +50,10 @@ const GC_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 3;
 const STAGING_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 4;
 /// Access key id -> secret: the S3 API's credentials.
 const CREDENTIALS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 5;
+/// Bucket name -> [`buckets::BucketRow`].
+const BUCKETS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 6;
+/// (bucket, object key, version) -> the version (see `keys`).
+const OBJECTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 7;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -167,6 +173,8 @@ pub(crate) struct Trees {
     gc: u64,
     staging: u64,
     credentials: u64,
+    buckets: u64,
+    objects: u64,
 }
 
 impl Trees {
@@ -189,6 +197,18 @@ impl Trees {
         BTree {
             object_id: GC_TREE,
             root: self.gc,
+        }
+    }
+    pub fn buckets(&self) -> BTree {
+        BTree {
+            object_id: BUCKETS_TREE,
+            root: self.buckets,
+        }
+    }
+    pub fn objects(&self) -> BTree {
+        BTree {
+            object_id: OBJECTS_TREE,
+            root: self.objects,
         }
     }
     pub fn credentials(&self) -> BTree {
@@ -250,6 +270,8 @@ impl<'a> ObjFile<'a> {
             gc: self.tree(GC_TREE)?.root,
             staging: self.tree(STAGING_TREE)?.root,
             credentials: self.tree(CREDENTIALS_TREE)?.root,
+            buckets: self.tree(BUCKETS_TREE)?.root,
+            objects: self.tree(OBJECTS_TREE)?.root,
         };
         self.in_txn(|ctx, txn| body(&mut ObjTxn { ctx, txn, trees }))
     }
