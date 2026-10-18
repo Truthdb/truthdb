@@ -218,6 +218,13 @@ impl<'a> ObjFile<'a> {
         ObjFile { core, eng }
     }
 
+    /// [`Self::new`], or `None` when the storage was opened without the
+    /// object engine.
+    pub fn try_new(locked: &'a mut Locked) -> Option<Self> {
+        let (core, eng) = locked.try_engine_parts::<ObjEngine>()?;
+        Some(ObjFile { core, eng })
+    }
+
     /// Runs `body` as one transaction over the engine's trees (created the
     /// first time): committed and forced to disk when it succeeds, rolled back
     /// when it fails.

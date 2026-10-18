@@ -77,7 +77,7 @@ async fn main() -> ExitCode {
     };
 
     let storage = if storage_path.exists() {
-        match RelStorage::open(storage_path) {
+        match RelStorage::open_with(storage_path, truthdb_engine::database_engines) {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to open storage: {err}");
@@ -85,7 +85,8 @@ async fn main() -> ExitCode {
             }
         }
     } else {
-        match RelStorage::create(storage_path, storage_opts) {
+        match RelStorage::create_with(storage_path, storage_opts, truthdb_engine::database_engines)
+        {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to create storage: {err}");

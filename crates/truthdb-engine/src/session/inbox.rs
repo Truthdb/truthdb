@@ -68,6 +68,11 @@ pub(super) enum EngineCall {
         command: String,
         reply: oneshot::Sender<Result<String, EngineError>>,
     },
+    /// An object-engine operation: the closure runs it against the engine and
+    /// sends its own reply.
+    RunObject {
+        op: Box<dyn FnOnce(&crate::engine::Engine) + Send>,
+    },
     /// A session-less catalog read: fetch a login's credential for the TDS
     /// handshake, which runs BEFORE any session/transaction exists. The reply
     /// carries only the stored blob — PBKDF2 verification runs off the worker.

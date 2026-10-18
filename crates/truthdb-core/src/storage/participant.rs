@@ -167,17 +167,22 @@ impl crate::storage::Locked {
     /// # Panics
     /// If no engine of type `T` was opened with this storage.
     pub fn engine_parts<T: EngineParticipant>(&mut self) -> (&mut StorageFile, &mut T) {
+        self.try_engine_parts::<T>().unwrap_or_else(|| {
+            panic!(
+                "storage was opened without engine {}",
+                std::any::type_name::<T>()
+            )
+        })
+    }
+
+    /// [`Self::engine_parts`], or `None` when no engine of type `T` was opened
+    /// with this storage.
+    pub fn try_engine_parts<T: EngineParticipant>(&mut self) -> Option<(&mut StorageFile, &mut T)> {
         let eng = self
             .engines
             .iter_mut()
-            .find_map(|eng| eng.as_any_mut().downcast_mut::<T>())
-            .unwrap_or_else(|| {
-                panic!(
-                    "storage was opened without engine {}",
-                    std::any::type_name::<T>()
-                )
-            });
-        (&mut self.core, eng)
+            .find_map(|eng| eng.as_any_mut().downcast_mut::<T>())?;
+        Some((&mut self.core, eng))
     }
 }
 

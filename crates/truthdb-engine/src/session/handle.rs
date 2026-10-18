@@ -239,6 +239,26 @@ impl EngineHandle {
         rx.await.map_err(|_| EngineError::Unavailable)?
     }
 
+    /// Runs an object-engine operation on a worker (it takes the storage lock
+    /// and does disk I/O, which must stay off the async reactor).
+    pub async fn run_object<T, F>(&self, op: F) -> Result<T, EngineError>
+    where
+        T: Send + 'static,
+        F: FnOnce(
+                &mut truthdb_object::ObjFile<'_>,
+            ) -> Result<T, truthdb_core::storage::StorageError>
+            + Send
+            + 'static,
+    {
+        let (reply, rx) = oneshot::channel();
+        self.inbox.send(EngineCall::RunObject {
+            op: Box::new(move |engine| {
+                let _ = reply.send(engine.object(op));
+            }),
+        });
+        rx.await.map_err(|_| EngineError::Unavailable)?
+    }
+
     /// Fetches a login's stored credential for the TDS handshake. Returns
     /// `None` if the login does not exist or the worker pool is gone.
     pub async fn lookup_login(&self, name: String) -> Option<LoginRecord> {
