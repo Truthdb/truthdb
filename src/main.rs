@@ -1,6 +1,8 @@
 #[cfg(not(target_os = "linux"))]
 compile_error!("TruthDB must be built for Linux targets. Use Docker or a Linux environment.");
 
+use std::process::ExitCode;
+
 use tokio::sync::watch;
 use tracing::{debug, info};
 use tracing_subscriber::EnvFilter;
@@ -34,7 +36,7 @@ async fn wait_for_shutdown_signal() {
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> ExitCode {
     // Emit tracing logs to stdout/stderr. Under systemd, these show up in journald.
     // Override levels with RUST_LOG, e.g. RUST_LOG=debug.
     tracing_subscriber::fmt()
@@ -73,7 +75,7 @@ async fn main() {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to open storage: {err}");
-                return;
+                return ExitCode::FAILURE;
             }
         }
     } else {
@@ -81,7 +83,7 @@ async fn main() {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to create storage: {err}");
-                return;
+                return ExitCode::FAILURE;
             }
         }
     };
@@ -90,7 +92,7 @@ async fn main() {
         Ok(engine) => engine,
         Err(err) => {
             eprintln!("Failed to initialize engine: {err}");
-            return;
+            return ExitCode::FAILURE;
         }
     };
     // The default database (id 1) is named by `[tds] database` — the one
@@ -98,7 +100,7 @@ async fn main() {
     // name→id resolution must agree with it.
     if let Err(err) = engine.set_default_database(&config.tds.database) {
         eprintln!("Failed to set the default database name: {err}");
-        return;
+        return ExitCode::FAILURE;
     }
     // First boot migrates `[tds.auth]` config users into catalog logins (and
     // always ensures `sa`), then config auth is dead. Runs before the engine
@@ -117,7 +119,7 @@ async fn main() {
         Ok(_) => {}
         Err(err) => {
             eprintln!("Failed to migrate config logins: {err}");
-            return;
+            return ExitCode::FAILURE;
         }
     }
     // The replication tasks share the storage directly (it is internally
@@ -133,7 +135,7 @@ async fn main() {
             Ok(client_listener) => client_listener,
             Err(err) => {
                 eprintln!("Failed to initialize server: {err}");
-                return;
+                return ExitCode::FAILURE;
             }
         };
 
@@ -154,13 +156,13 @@ async fn main() {
                 }
                 Err(err) => {
                     eprintln!("Failed to load TDS TLS certificate/key: {err}");
-                    return;
+                    return ExitCode::FAILURE;
                 }
             },
             (None, None) => None,
             _ => {
                 eprintln!("TDS TLS needs both tls_cert and tls_key");
-                return;
+                return ExitCode::FAILURE;
             }
         };
         let encryption = match config.tds.encryption {
@@ -172,7 +174,7 @@ async fn main() {
         // would be refused. Say so at startup rather than at each client.
         if encryption == truthdb_tds::Encryption::Required && tls.is_none() {
             eprintln!("TDS encryption = \"required\" needs tls_cert and tls_key");
-            return;
+            return ExitCode::FAILURE;
         }
         if encryption == truthdb_tds::Encryption::Off && tls.is_some() {
             info!("TDS encryption = \"off\": the configured certificate will not be offered");
@@ -204,7 +206,7 @@ async fn main() {
             }
             Err(err) => {
                 eprintln!("Failed to start TDS gateway: {err}");
-                None
+                return ExitCode::FAILURE;
             }
         }
     } else {
@@ -218,7 +220,7 @@ async fn main() {
             Ok(task) => Some(task),
             Err(err) => {
                 eprintln!("Failed to start replication: {err}");
-                return;
+                return ExitCode::FAILURE;
             }
         }
     } else {
@@ -243,6 +245,7 @@ async fn main() {
     engine.shutdown();
     let _ = tokio::task::spawn_blocking(move || engine_join.join()).await;
     info!("TruthDB exiting");
+    ExitCode::SUCCESS
 }
 
 /// Loads a PEM certificate chain and private key into a TDS TLS config.
