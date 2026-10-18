@@ -25,7 +25,7 @@ use crate::sigv4;
 const MAX_SKEW_SECS: u64 = 15 * 60;
 /// The headers that carry a full-body checksum (not x-amz-checksum-type,
 /// -mode or -algorithm, which describe one).
-const CHECKSUM_HEADERS: [&str; 5] = [
+pub(crate) const CHECKSUM_HEADERS: [&str; 5] = [
     "x-amz-checksum-crc32",
     "x-amz-checksum-crc32c",
     "x-amz-checksum-crc64nvme",
