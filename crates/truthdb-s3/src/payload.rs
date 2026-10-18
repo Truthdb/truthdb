@@ -22,7 +22,7 @@ pub enum Framing {
     /// `aws-chunked`, each chunk signed in a chain seeded by the request's
     /// own signature.
     SignedChunks {
-        key: hmac::Key,
+        key: Box<hmac::Key>,
         amz_date: String,
         scope: String,
         previous: String,
@@ -306,14 +306,14 @@ impl PayloadDecoder {
                 self.decoded
             )));
         }
-        if let (Framing::Sha256(expected), Some(context)) = (&self.framing, self.sha256) {
-            if sigv4::hex(context.finish().as_ref()) != *expected {
-                return Err(S3Error::new(
-                    400,
-                    "XAmzContentSHA256Mismatch",
-                    "The provided 'x-amz-content-sha256' header does not match what was computed.",
-                ));
-            }
+        if let (Framing::Sha256(expected), Some(context)) = (&self.framing, self.sha256)
+            && sigv4::hex(context.finish().as_ref()) != *expected
+        {
+            return Err(S3Error::new(
+                400,
+                "XAmzContentSHA256Mismatch",
+                "The provided 'x-amz-content-sha256' header does not match what was computed.",
+            ));
         }
         if let Some((name, checksum, expected)) = self.checksum {
             let expected = expected
@@ -350,7 +350,7 @@ mod tests {
             service: "s3".to_string(),
         };
         Framing::SignedChunks {
-            key: sigv4::signing_key(SECRET, &credential),
+            key: Box::new(sigv4::signing_key(SECRET, &credential)),
             amz_date: "20130524T000000Z".to_string(),
             scope: credential.scope(),
             previous: "4f232c4386841ef735655705268965c44a0e4690baa4adea153f7db9fa80a0a9"

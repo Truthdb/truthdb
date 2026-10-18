@@ -51,6 +51,7 @@ truthdb-relational = { path = "crates/truthdb-relational", version = "0.1.0" }
 truthdb-core = { path = "crates/truthdb-core", version = "0.1.0" }
 truthdb-engine = { path = "crates/truthdb-engine", version = "0.1.0" }
 truthdb-tds = { path = "crates/truthdb-tds", version = "0.1.0" }
+truthdb-s3 = { path = "crates/truthdb-s3", version = "0.1.0" }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 serde = { workspace = true }

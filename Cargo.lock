@@ -1219,6 +1219,7 @@ dependencies = [
  "truthdb-net",
  "truthdb-proto",
  "truthdb-relational",
+ "truthdb-s3",
  "truthdb-tds",
 ]
 

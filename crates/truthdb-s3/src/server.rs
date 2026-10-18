@@ -207,7 +207,7 @@ pub async fn authenticate(
     let framing = match payload_hash.as_str() {
         sigv4::UNSIGNED_PAYLOAD => Framing::Unsigned,
         sigv4::STREAMING_PAYLOAD => Framing::SignedChunks {
-            key,
+            key: Box::new(key),
             amz_date: amz_date.to_string(),
             scope,
             previous: auth.signature.clone(),

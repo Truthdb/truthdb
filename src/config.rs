@@ -18,6 +18,58 @@ pub struct Config {
 
     #[serde(default)]
     pub replication: ReplicationConfig,
+
+    #[serde(default)]
+    pub s3: S3Config,
+}
+
+/// The S3-compatible HTTP API. Disabled by default. Requests are signed with
+/// AWS SigV4 against access keys created with `s3 create access key` (native
+/// protocol); `tls_cert`/`tls_key` serve it over HTTPS.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct S3Config {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_addr")]
+    pub addr: String,
+
+    #[serde(default = "default_s3_port")]
+    pub port: u16,
+
+    /// The region clients sign for (`--region` / `AWS_REGION`).
+    #[serde(default = "default_s3_region")]
+    pub region: String,
+
+    /// PEM certificate chain path — enables HTTPS when set (with `tls_key`).
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+
+    /// PEM private key path (paired with `tls_cert`).
+    #[serde(default)]
+    pub tls_key: Option<String>,
+}
+
+impl Default for S3Config {
+    fn default() -> Self {
+        S3Config {
+            enabled: false,
+            addr: default_addr(),
+            port: default_s3_port(),
+            region: default_s3_region(),
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+}
+
+fn default_s3_port() -> u16 {
+    9000
+}
+
+fn default_s3_region() -> String {
+    "us-east-1".to_string()
 }
 
 /// Physical replication (Stage 18). Disabled by default. A `primary` runs the
@@ -572,6 +624,22 @@ mod tests {
         let path = write(&dir, "a.toml", "[tds]\nencryption = \"required\"\n");
         let config = load_layers(&[path]).unwrap();
         assert_eq!(config.tds.encryption, Encryption::Required);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_sets_s3() {
+        let dir = test_dir("s3");
+        let path = write(
+            &dir,
+            "a.toml",
+            "[s3]\nenabled = true\nport = 9100\nregion = \"eu-north-1\"\n",
+        );
+        let config = load_layers(&[path]).unwrap();
+        assert!(config.s3.enabled);
+        assert_eq!(config.s3.port, 9100);
+        assert_eq!(config.s3.region, "eu-north-1");
+        assert_eq!(config.s3.tls_cert, None);
         fs::remove_dir_all(&dir).ok();
     }
 
