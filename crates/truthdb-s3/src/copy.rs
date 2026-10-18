@@ -8,7 +8,7 @@ use hyper::header::HeaderMap;
 use hyper::{Request, Response};
 use md5::{Digest, Md5};
 use truthdb_core::storage::StorageError;
-use truthdb_object::{ObjFile, ObjectInfo, SEGMENT_BYTES, SealedBody, VersionSel};
+use truthdb_object::{BodyInfo, ObjFile, ObjectInfo, SEGMENT_BYTES, SealedBody, VersionSel};
 
 use crate::error::{S3Error, escape};
 use crate::listing::query_params;
@@ -165,7 +165,7 @@ fn copy_range(value: &str, size: u64) -> Result<(u64, u64), S3Error> {
 /// What the lookup of an UploadPartCopy decided.
 enum PartSource {
     /// The part shares the source's body: done.
-    Shared(truthdb_object::BodyInfo),
+    Shared(BodyInfo),
     /// The source body is leased; copy `len` bytes from `first`.
     Leased { body: u64, first: u64, len: u64 },
 }
@@ -182,6 +182,45 @@ pub async fn upload_part_copy(
     let number = part_number(&params, &bucket, &key)?;
     check_upload(state, upload, &bucket, &key).await?;
     let (src_bucket, src_key, which) = copy_source(&headers)?;
+    // The copy runs in its own task: a client that disconnects drops this
+    // handler, and the task still releases the lease it takes on the source.
+    let task_state = S3State {
+        engine: state.engine.clone(),
+        region: state.region.clone(),
+    };
+    let part = tokio::spawn(async move {
+        let state = &task_state;
+        copy_part(
+            state,
+            upload,
+            number,
+            (src_bucket, src_key, which),
+            headers,
+            bucket,
+            key,
+        )
+        .await
+    })
+    .await
+    .map_err(|err| S3Error::internal(err.to_string()))??;
+    let etag: String = part.md5.iter().map(|b| format!("{b:02x}")).collect();
+    Ok(xml(format!(
+        "<CopyPartResult xmlns=\"{XMLNS}\"><ETag>&quot;{etag}&quot;</ETag><LastModified>{}</LastModified></CopyPartResult>",
+        iso8601(now_ms())
+    )))
+}
+
+/// Stores part `number` of `upload` from the copy source: shared, or with its
+/// bytes copied under a lease released before returning.
+async fn copy_part(
+    state: &S3State,
+    upload: u64,
+    number: u32,
+    (src_bucket, src_key, which): (String, String, VersionSel),
+    headers: HeaderMap,
+    bucket: String,
+    key: String,
+) -> Result<BodyInfo, S3Error> {
     let (part_bucket, part_key) = (bucket.clone(), key.clone());
     let step = object(state, move |file| {
         let source = match resolve_source(file, &src_bucket, &src_key, which, &headers)? {
@@ -241,11 +280,7 @@ pub async fn upload_part_copy(
             .map_err(|err| upload_error(err, &bucket, &key))?
         }
     };
-    let etag: String = part.md5.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(xml(format!(
-        "<CopyPartResult xmlns=\"{XMLNS}\"><ETag>&quot;{etag}&quot;</ETag><LastModified>{}</LastModified></CopyPartResult>",
-        iso8601(now_ms())
-    )))
+    Ok(part)
 }
 
 /// Copies `len` bytes of the leased `body` from `first` into a new staging
