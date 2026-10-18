@@ -38,6 +38,10 @@ pub const REL_KIND_SET_CATALOG_ROOT: u16 = 9;
 /// structure change land in ONE WAL entry, so a crash either keeps the whole
 /// change or none of it.
 pub const REL_KIND_PAGE_IMAGES: u16 = 10;
+/// Redo-only: the root page of an engine other than the relational one
+/// (engine id + page number in redo payload). The relational catalog root
+/// keeps its own `SET_CATALOG_ROOT` record.
+pub const REL_KIND_SET_ENGINE_ROOT: u16 = 11;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelRecord {
@@ -625,6 +629,20 @@ impl RelRecord {
         }
     }
 
+    pub fn set_engine_root(engine_id: u32, page: u64) -> Self {
+        let mut redo = Vec::new();
+        redo.extend_from_slice(&engine_id.to_le_bytes());
+        put_u64(&mut redo, page);
+        RelRecord {
+            prev_lsn: 0,
+            txn_id: 0,
+            kind: REL_KIND_SET_ENGINE_ROOT,
+            flags: 0,
+            redo,
+            undo: Vec::new(),
+        }
+    }
+
     pub fn decode_page_op_redo(&self) -> Result<PageOpRedo, StorageError> {
         debug_assert_eq!(self.kind, REL_KIND_PAGE_OP);
         let mut cursor = Cursor {
@@ -681,6 +699,20 @@ impl RelRecord {
             ));
         }
         Ok(u64::from_le_bytes(self.redo[0..8].try_into().unwrap()))
+    }
+
+    /// Decodes a SET_ENGINE_ROOT redo into `(engine_id, page)`.
+    pub fn decode_engine_root(&self) -> Result<(u32, u64), StorageError> {
+        debug_assert_eq!(self.kind, REL_KIND_SET_ENGINE_ROOT);
+        if self.redo.len() != 12 {
+            return Err(StorageError::InvalidFile(
+                "engine root record has wrong size".to_string(),
+            ));
+        }
+        Ok((
+            u32::from_le_bytes(self.redo[0..4].try_into().unwrap()),
+            u64::from_le_bytes(self.redo[4..12].try_into().unwrap()),
+        ))
     }
 }
 
@@ -860,6 +892,7 @@ mod tests {
             RelRecord::txn_commit(7, 123, 1_700_000_000_000),
             RelRecord::txn_end(7, 456),
             RelRecord::set_catalog_root(99),
+            RelRecord::set_engine_root(2, 77),
         ] {
             let decoded = RelRecord::decode(&record.encode()).expect("decode");
             assert_eq!(decoded, record);
@@ -877,6 +910,12 @@ mod tests {
                 .decode_catalog_root()
                 .expect("root"),
             99
+        );
+        assert_eq!(
+            RelRecord::set_engine_root(2, 77)
+                .decode_engine_root()
+                .expect("engine root"),
+            (2, 77)
         );
     }
 

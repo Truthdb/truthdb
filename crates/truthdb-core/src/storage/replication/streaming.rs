@@ -372,14 +372,20 @@ impl Locked {
             }
         }
 
-        // A catalog-root change in the range moves the standby's catalog root
-        // (the last one wins).
-        let new_catalog_root = records
-            .iter()
-            .rev()
-            .find(|(_, record)| record.kind == REL_KIND_SET_CATALOG_ROOT)
-            .map(|(_, record)| record.decode_catalog_root())
-            .transpose()?;
+        // A root change in the range moves the standby's catalog root or
+        // another engine's root (the last one per engine wins).
+        let mut new_catalog_root = None;
+        let mut new_engine_roots = std::collections::HashMap::new();
+        for (_, record) in &records {
+            match record.kind {
+                REL_KIND_SET_CATALOG_ROOT => new_catalog_root = Some(record.decode_catalog_root()?),
+                REL_KIND_SET_ENGINE_ROOT => {
+                    let (engine_id, root) = record.decode_engine_root()?;
+                    new_engine_roots.insert(engine_id, root);
+                }
+                _ => {}
+            }
+        }
 
         // 3. Redo into the LIVE pool (page-LSN-gated, idempotent, appends
         //    nothing), then refresh the catalog cache so standby reads see any
@@ -388,10 +394,8 @@ impl Locked {
             let mut ctx = self.core.page_ctx(0);
             rel_recovery::redo_records(&mut ctx, &records)?;
         }
-        if let Some(root) = new_catalog_root {
-            self.eng.set_metadata_root(root);
-        }
-        self.eng.reload(&mut self.core)?;
+        self.apply_root_moves(new_catalog_root, &new_engine_roots)?;
+        self.reload_engines()?;
 
         // Only now — with every fallible step behind us — fold the range into
         // the restartpoint floors. Tracking it any earlier would let a FAILED
@@ -405,7 +409,7 @@ impl Locked {
         // from the undo payloads), so snapshot reads at the last-applied-commit
         // sequence see only committed state. Same post-redo discipline: a
         // failed apply must feed the store nothing.
-        self.eng.capture_standby(&mut self.core, &records, advanced);
+        self.capture_standby_engines(&records, advanced);
         // Track the first UNCOVERED search record (the restartpoint's search
         // floor): the seed snapshot covers seq numbers below
         // `snapshot_next_seq_no`; anything at or above must stay in the ring

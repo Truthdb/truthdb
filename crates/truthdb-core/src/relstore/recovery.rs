@@ -22,7 +22,7 @@ use crate::storage::StorageError;
 use crate::wal::records::{
     PageOpRedo, PageOpUndo, REL_KIND_ALLOC_EXTENT, REL_KIND_CLR, REL_KIND_FREE_EXTENT,
     REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_IMAGES, REL_KIND_PAGE_OP, REL_KIND_SET_CATALOG_ROOT,
-    REL_KIND_TXN_BEGIN, REL_KIND_TXN_COMMIT, REL_KIND_TXN_END, RelRecord,
+    REL_KIND_SET_ENGINE_ROOT, REL_KIND_TXN_BEGIN, REL_KIND_TXN_COMMIT, REL_KIND_TXN_END, RelRecord,
 };
 
 pub(crate) struct AnalysisRedoOutcome {
@@ -30,6 +30,8 @@ pub(crate) struct AnalysisRedoOutcome {
     pub losers: HashMap<u64, u64>,
     /// Catalog root from the newest SET_CATALOG_ROOT record, if any.
     pub catalog_root: Option<u64>,
+    /// Every other engine's root from its newest SET_ENGINE_ROOT record.
+    pub engine_roots: HashMap<u32, u64>,
     /// Highest transaction id seen (0 when none).
     pub max_txn_id: u64,
 }
@@ -61,6 +63,7 @@ pub(crate) fn analyze_and_redo(
     // Analysis: rebuild the active-transaction table.
     let mut att: HashMap<u64, u64> = HashMap::new();
     let mut catalog_root = None;
+    let mut engine_roots = HashMap::new();
     let mut max_txn_id = 0u64;
     // Transactions committed at or past the cut: losers whose later TXN_END must
     // not clear them from the ATT.
@@ -93,6 +96,10 @@ pub(crate) fn analyze_and_redo(
             REL_KIND_SET_CATALOG_ROOT => {
                 catalog_root = Some(record.decode_catalog_root()?);
             }
+            REL_KIND_SET_ENGINE_ROOT => {
+                let (engine_id, root) = record.decode_engine_root()?;
+                engine_roots.insert(engine_id, root);
+            }
             REL_KIND_ALLOC_EXTENT | REL_KIND_FREE_EXTENT => {}
             other => {
                 return Err(StorageError::InvalidFile(format!(
@@ -107,6 +114,7 @@ pub(crate) fn analyze_and_redo(
     Ok(AnalysisRedoOutcome {
         losers: att,
         catalog_root,
+        engine_roots,
         max_txn_id,
     })
 }

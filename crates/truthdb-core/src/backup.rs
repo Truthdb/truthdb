@@ -27,7 +27,7 @@ use crate::storage_layout::PAGE_SIZE;
 /// The magic bytes at the start of every `TDBBAK1` file.
 pub const MAGIC: &[u8; 8] = b"TDBBAK1\0";
 /// Format version — bumped on any incompatible framing/header change.
-pub const FORMAT_VERSION: u32 = 2;
+pub const FORMAT_VERSION: u32 = 3;
 
 /// The kind of a framed block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -99,6 +99,9 @@ pub struct BackupHeader {
     /// The catalog B+tree root as an absolute file offset (0 = none). The
     /// restored superblock carries it so recovery starts from the right catalog.
     pub metadata_root: u64,
+    /// Every other engine's root as `(engine id, absolute file offset)`, carried
+    /// into the restored superblock the same way (v3; empty before).
+    pub engine_roots: Vec<(u32, u64)>,
     /// The source's `last_committed_seq` at `redo_start_lsn`.
     pub last_committed_seq: u64,
     /// The source's database-options byte (RCSI / ALLOW_SNAPSHOT bits).
@@ -142,6 +145,11 @@ impl BackupHeader {
                 out.extend_from_slice(collation.as_bytes());
             }
             None => out.extend_from_slice(&u32::MAX.to_le_bytes()),
+        }
+        out.extend_from_slice(&(self.engine_roots.len() as u32).to_le_bytes());
+        for (engine_id, root) in &self.engine_roots {
+            out.extend_from_slice(&engine_id.to_le_bytes());
+            out.extend_from_slice(&root.to_le_bytes());
         }
         out
     }
@@ -187,6 +195,16 @@ impl BackupHeader {
                     .map_err(|e| corrupt(&format!("collation not UTF-8: {e}")))?,
             )
         };
+        let mut engine_roots = Vec::new();
+        if format_version >= 3 {
+            let count = cursor.u32()?;
+            if count as usize > crate::storage_layout::MAX_ENGINE_ROOTS {
+                return Err(corrupt(&format!("{count} engine roots in backup header")));
+            }
+            for _ in 0..count {
+                engine_roots.push((cursor.u32()?, cursor.u64()?));
+            }
+        }
         Ok(BackupHeader {
             format_version,
             page_size,
@@ -200,6 +218,7 @@ impl BackupHeader {
             default_collation,
             redo_start_lsn,
             metadata_root,
+            engine_roots,
             last_committed_seq,
             db_options,
             epoch,
@@ -503,6 +522,26 @@ mod tests {
         );
     }
 
+    // A v2 header (before engine roots) decodes with no engine roots, so
+    // existing backups stay restorable.
+    #[test]
+    fn a_v2_header_decodes_without_engine_roots() {
+        let header = BackupHeader {
+            engine_roots: Vec::new(),
+            ..sample_header()
+        };
+        let mut v2 = header.encode();
+        v2.truncate(v2.len() - 4); // drop the (empty) engine-roots count
+        v2[0..4].copy_from_slice(&2u32.to_le_bytes());
+        let decoded = BackupHeader::decode(&v2).expect("v2 decodes");
+        assert_eq!(decoded.format_version, 2);
+        assert!(decoded.engine_roots.is_empty());
+        assert_eq!(decoded.default_collation, header.default_collation);
+
+        let v3 = BackupHeader::decode(&sample_header().encode()).expect("v3 decodes");
+        assert_eq!(v3.engine_roots, vec![(1, 4096 * 41)]);
+    }
+
     fn sample_header() -> BackupHeader {
         BackupHeader {
             format_version: FORMAT_VERSION,
@@ -517,6 +556,7 @@ mod tests {
             default_collation: Some("Finnish_Swedish_CI_AS".to_string()),
             redo_start_lsn: 12_345,
             metadata_root: 4096 * 40,
+            engine_roots: vec![(1, 4096 * 41)],
             last_committed_seq: 7,
             db_options: 0b01,
             epoch: 3,

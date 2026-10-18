@@ -411,7 +411,44 @@ impl Superblock {
             self.reserved[base..base + 12].copy_from_slice(&[0u8; 12]);
         }
     }
+
+    /// Root pages of the engines other than the relational one
+    /// (reserved[132..], right after the replication slot table): a `u32` count
+    /// then up to [`MAX_ENGINE_ROOTS`] `(engine id: u32, root: u64)` records, the
+    /// root as an absolute file offset like `metadata_root`. Covered by the
+    /// superblock checksum. A corrupt/oversized count is clamped, never read out
+    /// of bounds.
+    pub fn engine_roots(&self) -> Vec<(u32, u64)> {
+        let count = (u32::from_le_bytes(self.reserved[132..136].try_into().unwrap()) as usize)
+            .min(MAX_ENGINE_ROOTS);
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let base = 136 + i * 12;
+            let id = u32::from_le_bytes(self.reserved[base..base + 4].try_into().unwrap());
+            let root = u64::from_le_bytes(self.reserved[base + 4..base + 12].try_into().unwrap());
+            out.push((id, root));
+        }
+        out
+    }
+
+    pub fn set_engine_roots(&mut self, roots: &[(u32, u64)]) {
+        let count = roots.len().min(MAX_ENGINE_ROOTS);
+        self.reserved[132..136].copy_from_slice(&(count as u32).to_le_bytes());
+        for (i, (id, root)) in roots.iter().take(MAX_ENGINE_ROOTS).enumerate() {
+            let base = 136 + i * 12;
+            self.reserved[base..base + 4].copy_from_slice(&id.to_le_bytes());
+            self.reserved[base + 4..base + 12].copy_from_slice(&root.to_le_bytes());
+        }
+        for i in count..MAX_ENGINE_ROOTS {
+            let base = 136 + i * 12;
+            self.reserved[base..base + 12].copy_from_slice(&[0u8; 12]);
+        }
+    }
 }
+
+/// The maximum number of non-relational engine roots a superblock persists
+/// (`4 + 8*12 = 100` bytes of the reserved area).
+pub const MAX_ENGINE_ROOTS: usize = 8;
 
 /// The maximum number of replication slots a superblock persists (bounds the
 /// reserved slot table). Eight standbys is ample for the availability-group-lite
@@ -725,6 +762,20 @@ mod tests {
     #[test]
     fn superblock_is_one_page() {
         assert_eq!(size_of::<Superblock>(), SUPERBLOCK_SIZE);
+    }
+
+    #[test]
+    fn engine_roots_round_trip_beside_repl_slots() {
+        let mut sb = Superblock::default();
+        sb.set_repl_slots(&[(1, 10), (2, 20)]);
+        sb.set_engine_roots(&[(1, 4096 * 50), (7, 4096 * 60)]);
+        let sb = Superblock::from_le_bytes(&sb.to_le_bytes_with_checksum());
+        assert_eq!(sb.repl_slots(), vec![(1, 10), (2, 20)]);
+        assert_eq!(sb.engine_roots(), vec![(1, 4096 * 50), (7, 4096 * 60)]);
+        let mut sb = sb;
+        sb.set_engine_roots(&[(1, 4096 * 50)]);
+        assert_eq!(sb.engine_roots(), vec![(1, 4096 * 50)]);
+        assert_eq!(&sb.reserved[148..160], &[0u8; 12]);
     }
 
     #[test]

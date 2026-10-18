@@ -17,7 +17,8 @@ use crate::storage_layout::{
     WAL_MIN_BYTES, WalEntryHeader, align_down, assert_layout_invariants, wal_entry_padded_len,
 };
 use crate::wal::records::{
-    REL_KIND_ALLOC_EXTENT, REL_KIND_FREE_EXTENT, REL_KIND_SET_CATALOG_ROOT, RelRecord,
+    REL_KIND_ALLOC_EXTENT, REL_KIND_FREE_EXTENT, REL_KIND_SET_CATALOG_ROOT,
+    REL_KIND_SET_ENGINE_ROOT, RelRecord,
 };
 use crate::wal::{WalWriter, scan_ring};
 
@@ -35,7 +36,10 @@ mod replication;
 #[cfg(test)]
 use lifecycle::compute_layout;
 use lifecycle::live_descriptor_slot;
-pub use participant::{EngineFactory, EngineParticipant};
+pub use participant::{
+    CATALOG_ENGINE_ID, EngineFactory, EngineParticipant, FIRST_ENGINE_OBJECT_ID,
+};
+use participant::{RoutedUndo, validate_engines};
 use replication::SyncCommitState;
 
 /// Version stamped in REL wal entries (entry-level, distinct from the record
@@ -290,7 +294,7 @@ pub struct StorageFile {
 /// one critical section. Derefs to the core file.
 pub struct Locked {
     core: StorageFile,
-    eng: Box<dyn EngineParticipant>,
+    engines: Vec<Box<dyn EngineParticipant>>,
 }
 
 impl std::ops::Deref for Locked {
