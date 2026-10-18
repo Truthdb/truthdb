@@ -80,6 +80,10 @@ const OBJECT_GC_SWEEP_LIMIT: u64 = 512;
 /// garbage collection reclaims it.
 const OBJECT_ABANDON_AFTER_MS: u64 = 60 * 60 * 1000;
 
+/// A multipart upload left open this long is abandoned: garbage collection
+/// aborts it, releasing its parts (as an S3 lifecycle rule would).
+const OBJECT_UPLOAD_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
 /// The database engine, shared across the worker pool as `Arc<Engine>`.
 ///
 /// All methods take `&self`: [`Storage`] is internally synchronized, and the
@@ -607,6 +611,19 @@ impl Engine {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
+        // Abandoned multipart uploads, a batch per sweep: aborting releases
+        // their parts, which the collection below then frees.
+        let expired = self.object(|file| {
+            file.expired_uploads(
+                now_ms.saturating_sub(OBJECT_UPLOAD_EXPIRY_MS),
+                OBJECT_GC_BATCH as usize,
+            )
+        })?;
+        for upload in expired {
+            // Gone meanwhile (completed or aborted) is fine.
+            let _ =
+                self.object(|file| file.transaction(|tx| tx.abort_upload(upload, now_ms, 0)))?;
+        }
         // A few bodies per storage-lock hold (each is a forced transaction),
         // so a large backlog never blocks other work for long, and a bounded
         // number per sweep, so the sweep's other duties still run on time.

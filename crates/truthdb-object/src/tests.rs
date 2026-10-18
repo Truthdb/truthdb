@@ -1204,3 +1204,37 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn uploads_past_their_age_are_found_oldest_first() {
+    use crate::ObjectAttrs;
+    let path = temp_path("expired-uploads");
+    let storage = create(&path);
+    let start = |at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_bucket("bkt", now()).ok();
+                tx.create_upload("bkt", "k", &ObjectAttrs::default(), at)
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let old = start(1_000);
+    let older_still_running = start(2_000);
+    let fresh = start(9_000);
+    let expired = |before: u64, max: usize| {
+        ObjFile::new(&mut storage.lock())
+            .expired_uploads(before, max)
+            .unwrap()
+    };
+    assert_eq!(expired(5_000, 10), [old, older_still_running]);
+    assert_eq!(expired(5_000, 1), [old], "at most `max`");
+    assert_eq!(expired(500, 10), Vec::<u64>::new());
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.abort_upload(old, now(), 0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired(10_000, 10), [older_still_running, fresh]);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
