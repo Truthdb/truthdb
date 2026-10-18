@@ -323,21 +323,32 @@ impl ObjTxn<'_, '_> {
 
     /// Removes the key's versions that `wanted` picks: each row, its
     /// attributes and its body's reference. Returns the removed versions'
-    /// numbers.
+    /// numbers. With `only`, reads that version's row alone instead of every
+    /// version of the key.
     fn remove_versions(
         &mut self,
         bucket: &str,
         key: &str,
+        only: Option<u64>,
         now_ms: u64,
         grace_ms: u64,
         mut wanted: impl FnMut(u64, &VersionRow) -> bool,
     ) -> Result<Vec<u64>, StorageError> {
         let objects = self.trees.objects();
-        let prefix = key_prefix(bucket, key);
-        let mut upper = prefix.clone();
-        upper.extend_from_slice(&[0xFF; 8]);
+        let (lower, upper) = match only {
+            Some(version) => {
+                let row_key = version_key(bucket, key, version);
+                (row_key.clone(), row_key)
+            }
+            None => {
+                let prefix = key_prefix(bucket, key);
+                let mut upper = prefix.clone();
+                upper.extend_from_slice(&[0xFF; 8]);
+                (prefix, upper)
+            }
+        };
         let mut removed = Vec::new();
-        for (row_key, row) in objects.scan_range(self.ctx, Some(&prefix), Some(&upper))? {
+        for (row_key, row) in objects.scan_range(self.ctx, Some(&lower), Some(&upper))? {
             let row = VersionRow::decode(&row)?;
             let version = version_from_key(&row_key)?;
             if !wanted(version, &row) {
@@ -370,7 +381,7 @@ impl ObjTxn<'_, '_> {
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<(), StorageError> {
-        self.remove_versions(bucket, key, now_ms, grace_ms, |_, row| {
+        self.remove_versions(bucket, key, None, now_ms, grace_ms, |_, row| {
             row.flags & FLAG_NULL_VERSION != 0
         })?;
         Ok(())
@@ -443,9 +454,13 @@ impl ObjTxn<'_, '_> {
                 }
             },
             Some(sel) => {
+                let only = match sel {
+                    VersionSel::Seq(seq) => Some(seq),
+                    _ => None,
+                };
                 let mut marker = false;
                 let removed =
-                    self.remove_versions(bucket, key, now_ms, grace_ms, |version, row| {
+                    self.remove_versions(bucket, key, only, now_ms, grace_ms, |version, row| {
                         let hit = match sel {
                             VersionSel::Null => row.flags & FLAG_NULL_VERSION != 0,
                             VersionSel::Seq(seq) => seq == version,
