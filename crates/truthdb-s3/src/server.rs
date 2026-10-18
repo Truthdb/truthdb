@@ -143,12 +143,8 @@ pub fn full(text: impl Into<Bytes>) -> Body {
 }
 
 async fn route(state: &S3State, request: Request<Incoming>) -> Result<Response<Body>, S3Error> {
-    let _auth = authenticate(state, &request).await?;
-    Err(S3Error::not_implemented(format!(
-        "{} {} is not implemented yet",
-        request.method(),
-        request.uri().path()
-    )))
+    let auth = authenticate(state, &request).await?;
+    crate::api::dispatch(state, request, auth).await
 }
 
 fn header<'r>(request: &'r Request<Incoming>, name: &str) -> Option<&'r str> {

@@ -146,19 +146,33 @@ fn amz_now() -> String {
     )
 }
 
-/// Sends a signed GET (signing with `secret`, or unsigned when `None`) and
-/// returns the status and body.
-fn get(port: u16, path: &str, key: &str, secret: Option<&str>) -> (u16, String) {
+/// Sends a request with `body`, signed with `secret` (unsigned when `None`),
+/// and returns the status and body.
+fn send(
+    port: u16,
+    method: &str,
+    path: &str,
+    query: &str,
+    body: &[u8],
+    key: &str,
+    secret: Option<&str>,
+) -> (u16, String) {
     let amz_date = amz_now();
     let host = format!("127.0.0.1:{port}");
-    let payload = sigv4::sha256_hex(b"");
+    let payload = sigv4::sha256_hex(body);
     let headers = vec![
         ("host".to_string(), host.clone()),
         ("x-amz-content-sha256".to_string(), payload.clone()),
         ("x-amz-date".to_string(), amz_date.clone()),
     ];
+    let target = if query.is_empty() {
+        path.to_string()
+    } else {
+        format!("{path}?{query}")
+    };
     let mut request = format!(
-        "GET {path} HTTP/1.1\r\nHost: {host}\r\nx-amz-content-sha256: {payload}\r\nx-amz-date: {amz_date}\r\nConnection: close\r\n"
+        "{method} {target} HTTP/1.1\r\nHost: {host}\r\nx-amz-content-sha256: {payload}\r\nx-amz-date: {amz_date}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
     );
     if let Some(secret) = secret {
         let credential = sigv4::Credential {
@@ -173,7 +187,7 @@ fn get(port: u16, path: &str, key: &str, secret: Option<&str>) -> (u16, String) 
             "x-amz-date".to_string(),
         ];
         let canonical =
-            sigv4::canonical_request("GET", path, "", &headers, &signed, &payload).unwrap();
+            sigv4::canonical_request(method, path, query, &headers, &signed, &payload).unwrap();
         let signature = sigv4::sign(
             &sigv4::signing_key(secret, &credential),
             &sigv4::string_to_sign(&amz_date, &credential.scope(), &canonical),
@@ -193,6 +207,7 @@ fn get(port: u16, path: &str, key: &str, secret: Option<&str>) -> (u16, String) 
         }
     };
     stream.write_all(request.as_bytes()).expect("send");
+    stream.write_all(body).expect("send body");
     let mut response = String::new();
     stream.read_to_string(&mut response).expect("read");
     let status = response
@@ -207,8 +222,12 @@ fn get(port: u16, path: &str, key: &str, secret: Option<&str>) -> (u16, String) 
     (status, body)
 }
 
-#[test]
-fn requests_are_authenticated_with_sigv4_against_native_access_keys() {
+fn get(port: u16, path: &str, key: &str, secret: Option<&str>) -> (u16, String) {
+    send(port, "GET", path, "", b"", key, secret)
+}
+
+/// A server plus an access key on it.
+fn server_with_key() -> (Server, String, String) {
     let server = start_server();
     let created = native(server.native_port, "s3 create access key");
     let key = created["access_key_id"].as_str().expect("id").to_string();
@@ -216,6 +235,12 @@ fn requests_are_authenticated_with_sigv4_against_native_access_keys() {
         .as_str()
         .expect("secret")
         .to_string();
+    (server, key, secret)
+}
+
+#[test]
+fn requests_are_authenticated_with_sigv4_against_native_access_keys() {
+    let (server, key, secret) = server_with_key();
 
     // A correctly signed request passes authentication and reaches a route
     // that does not exist yet.
@@ -237,4 +262,54 @@ fn requests_are_authenticated_with_sigv4_against_native_access_keys() {
     let (status, body) = get(server.s3_port, "/bucket/key", &key, None);
     assert_eq!(status, 403, "{body}");
     assert!(body.contains("<Code>AccessDenied</Code>"), "{body}");
+}
+
+#[test]
+fn buckets_are_created_listed_located_headed_and_deleted() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str| {
+        send(port, method, path, query, b"", &key, Some(&secret))
+    };
+
+    assert_eq!(call("PUT", "/alpha", "").0, 200);
+    // us-east-1 answers success when the owner creates a bucket again.
+    let (status, body) = call("PUT", "/alpha", "");
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = send(
+        port,
+        "PUT",
+        "/gamma",
+        "",
+        b"<CreateBucketConfiguration><LocationConstraint>",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("MalformedXML"), "{body}");
+    let (status, body) = call("PUT", "/Not_Valid", "");
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("InvalidBucketName"), "{body}");
+    assert_eq!(call("PUT", "/beta", "").0, 200);
+
+    let (status, body) = call("GET", "/", "");
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("<Name>alpha</Name>") && body.contains("<Name>beta</Name>"),
+        "{body}"
+    );
+    assert!(body.contains("<CreationDate>"), "{body}");
+
+    assert_eq!(call("HEAD", "/alpha", "").0, 200);
+    assert_eq!(call("HEAD", "/gamma", "").0, 404);
+    let (status, body) = call("GET", "/alpha", "location");
+    assert_eq!(status, 200, "{body}");
+    assert!(body.contains("<LocationConstraint"), "{body}");
+
+    assert_eq!(call("DELETE", "/beta", "").0, 204);
+    let (status, body) = call("DELETE", "/beta", "");
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains("NoSuchBucket"), "{body}");
+    let (_, body) = call("GET", "/", "");
+    assert!(!body.contains("<Name>beta</Name>"), "{body}");
 }
