@@ -4,6 +4,8 @@
 use bytes::Bytes;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
+use quick_xml::Reader;
+use quick_xml::events::Event;
 use truthdb_object::{BucketError, BucketInfo, ObjFile};
 
 use crate::error::{S3Error, escape};
@@ -204,8 +206,7 @@ async fn create_bucket(
     bucket: String,
 ) -> Result<Response<Body>, S3Error> {
     let body = read_body(request, auth, 64 * 1024).await?;
-    let body = String::from_utf8_lossy(&body);
-    if let Some(constraint) = element_text(&body, "LocationConstraint")
+    if let Some(constraint) = location_constraint(&body)?
         && !constraint.is_empty()
         && constraint != state.region
     {
@@ -220,11 +221,16 @@ async fn create_bucket(
     }
     let name = bucket.clone();
     let now = now_ms();
-    object(state, move |file| {
+    match object(state, move |file| {
         file.transaction(|tx| tx.create_bucket(&name, now))
     })
     .await?
-    .map_err(|err| bucket_error(err, &bucket))?;
+    {
+        Ok(()) => {}
+        // us-east-1 answers success when the owner creates the bucket again.
+        Err(BucketError::AlreadyOwnedByYou) if state.region == "us-east-1" => {}
+        Err(err) => return Err(bucket_error(err, &bucket)),
+    }
     Ok(Response::builder()
         .status(StatusCode::OK)
         .header("location", format!("/{bucket}"))
@@ -278,10 +284,76 @@ async fn bucket_location(state: &S3State, bucket: String) -> Result<Response<Bod
     ))
 }
 
-/// The text of the first `<name>` element in `xml`, if any.
-fn element_text<'x>(xml: &'x str, name: &str) -> Option<&'x str> {
-    let open = format!("<{name}>");
-    let start = xml.find(&open)? + open.len();
-    let end = xml[start..].find(&format!("</{name}>"))? + start;
-    Some(xml[start..end].trim())
+/// The `<LocationConstraint>` of a CreateBucket body, which must be
+/// well-formed XML when present.
+fn location_constraint(body: &[u8]) -> Result<Option<String>, S3Error> {
+    let malformed = || {
+        S3Error::new(
+            400,
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema.",
+        )
+    };
+    let mut reader = Reader::from_reader(body);
+    let mut in_constraint = false;
+    let mut constraint = None;
+    let mut depth = 0usize;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf).map_err(|_| malformed())? {
+            Event::Start(element) => {
+                depth += 1;
+                in_constraint = element.local_name().as_ref() == b"LocationConstraint";
+                if in_constraint && constraint.is_none() {
+                    constraint = Some(String::new());
+                }
+            }
+            Event::End(_) => {
+                depth -= 1;
+                in_constraint = false;
+            }
+            Event::Text(text) if in_constraint => {
+                let text = text.unescape().map_err(|_| malformed())?;
+                if let Some(constraint) = &mut constraint {
+                    constraint.push_str(text.trim());
+                }
+            }
+            Event::Eof if depth == 0 => break,
+            Event::Eof => return Err(malformed()),
+            _ => {}
+        }
+        buf.clear();
+    }
+    Ok(constraint)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_bucket_bodies_parse_or_are_malformed() {
+        assert_eq!(location_constraint(b"").unwrap(), None);
+        assert_eq!(
+            location_constraint(
+                b"<CreateBucketConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LocationConstraint> eu-west-1 </LocationConstraint></CreateBucketConfiguration>"
+            )
+            .unwrap()
+            .as_deref(),
+            Some("eu-west-1")
+        );
+        for bad in [
+            &b"<CreateBucketConfiguration>"[..],
+            b"</LocationConstraint>",
+            b"<a><b></a></b>",
+        ] {
+            let err = location_constraint(bad).unwrap_err();
+            assert_eq!(
+                err.code,
+                "MalformedXML",
+                "{:?}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+    }
 }
