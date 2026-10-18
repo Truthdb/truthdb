@@ -11,11 +11,6 @@ metadata_ratio = 0.08
 snapshot_ratio = 0.02
 allocator_ratio = 0.02
 reserved_ratio = 0.17
-group_sync_batches = 32
-group_sync_ms = 5
-backpressure_timeout_ms = 50
-snapshot_min_interval_ms = 1000
-snapshot_wal_threshold = 0.7
 # The database's default collation: what a character column declared without an
 # explicit COLLATE gets. Applied when the database file is created and stamped
 # into it — an existing file keeps the collation it was created with, since its

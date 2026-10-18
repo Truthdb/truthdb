@@ -321,21 +321,6 @@ pub struct StorageConfig {
     #[serde(default = "default_storage_reserved_ratio")]
     pub reserved_ratio: f64,
 
-    #[serde(default = "default_storage_group_sync_batches")]
-    pub group_sync_batches: u32,
-
-    #[serde(default = "default_storage_group_sync_ms")]
-    pub group_sync_ms: u64,
-
-    #[serde(default = "default_storage_backpressure_timeout_ms")]
-    pub backpressure_timeout_ms: u64,
-
-    #[serde(default = "default_storage_snapshot_min_interval_ms")]
-    pub snapshot_min_interval_ms: u64,
-
-    #[serde(default = "default_storage_snapshot_wal_threshold")]
-    pub snapshot_wal_threshold: f64,
-
     /// The database's default collation: what a character column declared
     /// without an explicit COLLATE gets. Applied when the database file is
     /// created and stamped into it; an existing file keeps the collation it was
@@ -380,26 +365,6 @@ fn default_storage_reserved_ratio() -> f64 {
     0.17
 }
 
-fn default_storage_group_sync_batches() -> u32 {
-    32
-}
-
-fn default_storage_group_sync_ms() -> u64 {
-    5
-}
-
-fn default_storage_backpressure_timeout_ms() -> u64 {
-    50
-}
-
-fn default_storage_snapshot_min_interval_ms() -> u64 {
-    1000
-}
-
-fn default_storage_snapshot_wal_threshold() -> f64 {
-    0.7
-}
-
 impl Default for NetworkConfig {
     fn default() -> Self {
         NetworkConfig {
@@ -419,11 +384,6 @@ impl Default for StorageConfig {
             snapshot_ratio: default_storage_snapshot_ratio(),
             allocator_ratio: default_storage_allocator_ratio(),
             reserved_ratio: default_storage_reserved_ratio(),
-            group_sync_batches: default_storage_group_sync_batches(),
-            group_sync_ms: default_storage_group_sync_ms(),
-            backpressure_timeout_ms: default_storage_backpressure_timeout_ms(),
-            snapshot_min_interval_ms: default_storage_snapshot_min_interval_ms(),
-            snapshot_wal_threshold: default_storage_snapshot_wal_threshold(),
             default_collation: None,
         }
     }
@@ -674,11 +634,6 @@ struct StorageConfigOverride {
     snapshot_ratio: Option<f64>,
     allocator_ratio: Option<f64>,
     reserved_ratio: Option<f64>,
-    group_sync_batches: Option<u32>,
-    group_sync_ms: Option<u64>,
-    backpressure_timeout_ms: Option<u64>,
-    snapshot_min_interval_ms: Option<u64>,
-    snapshot_wal_threshold: Option<f64>,
 }
 
 fn apply_network_override(target: &mut NetworkConfig, source: NetworkConfigOverride) {
@@ -711,21 +666,6 @@ fn apply_storage_override(target: &mut StorageConfig, source: StorageConfigOverr
     }
     if let Some(reserved_ratio) = source.reserved_ratio {
         target.reserved_ratio = reserved_ratio;
-    }
-    if let Some(group_sync_batches) = source.group_sync_batches {
-        target.group_sync_batches = group_sync_batches;
-    }
-    if let Some(group_sync_ms) = source.group_sync_ms {
-        target.group_sync_ms = group_sync_ms;
-    }
-    if let Some(backpressure_timeout_ms) = source.backpressure_timeout_ms {
-        target.backpressure_timeout_ms = backpressure_timeout_ms;
-    }
-    if let Some(snapshot_min_interval_ms) = source.snapshot_min_interval_ms {
-        target.snapshot_min_interval_ms = snapshot_min_interval_ms;
-    }
-    if let Some(snapshot_wal_threshold) = source.snapshot_wal_threshold {
-        target.snapshot_wal_threshold = snapshot_wal_threshold;
     }
 }
 
