@@ -1,6 +1,11 @@
 //! The S3 API's access keys: an access key id and its secret. The secret is
 //! stored as given, because request signing (SigV4) needs it back, not a
 //! hash of it.
+//!
+//! So the secret is in plaintext wherever the database's pages and log go:
+//! the data file, the WAL, every standby the WAL ships to, and full and log
+//! backups (all copied verbatim). A restore to a point before
+//! `s3 drop access key` brings the dropped key back as valid.
 
 use truthdb_core::relstore::btree::TreeInsert;
 use truthdb_core::relstore::ctx::OpMode;
