@@ -33,6 +33,40 @@ fn target(raw_path: &str) -> Result<Target, S3Error> {
     })
 }
 
+/// Sub-resources of buckets and objects that are not implemented: refused,
+/// rather than taken for the plain operation on the same path (a bucket GET
+/// would list objects, an object GET would return its body).
+const UNIMPLEMENTED: &[&str] = &[
+    "accelerate",
+    "acl",
+    "analytics",
+    "attributes",
+    "cors",
+    "encryption",
+    "intelligent-tiering",
+    "inventory",
+    "legal-hold",
+    "lifecycle",
+    "logging",
+    "metrics",
+    "notification",
+    "object-lock",
+    "ownershipControls",
+    "policy",
+    "policyStatus",
+    "publicAccessBlock",
+    "replication",
+    "requestPayment",
+    "restore",
+    "retention",
+    "select",
+    "tagging",
+    "torrent",
+    "versioning",
+    "versions",
+    "website",
+];
+
 /// The query's parameter names (sub-resources such as `location`).
 fn has_param(request: &Request<Incoming>, name: &str) -> bool {
     request
@@ -110,12 +144,28 @@ pub async fn dispatch(
 ) -> Result<Response<Body>, S3Error> {
     let method = request.method().clone();
     match (target(request.uri().path())?, method) {
+        _ if UNIMPLEMENTED.iter().any(|name| has_param(&request, name)) => {
+            Err(S3Error::not_implemented(format!(
+                "{} {}?{} is not implemented",
+                request.method(),
+                request.uri().path(),
+                request.uri().query().unwrap_or("")
+            )))
+        }
         (Target::Service, Method::GET) => list_buckets(state).await,
         (Target::Bucket(bucket), Method::PUT) => create_bucket(state, request, auth, bucket).await,
         (Target::Bucket(bucket), Method::DELETE) => delete_bucket(state, bucket).await,
         (Target::Bucket(bucket), Method::HEAD) => head_bucket(state, bucket).await,
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "location") => {
             bucket_location(state, bucket).await
+        }
+        // GetObject of one part of a multipart object is not implemented.
+        (Target::Object(..), Method::GET | Method::HEAD)
+            if has_param(&request, "partNumber") && !has_param(&request, "uploadId") =>
+        {
+            Err(S3Error::not_implemented(
+                "GetObject by partNumber is not implemented",
+            ))
         }
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "uploads") => {
             crate::multipart::list_uploads(state, request, bucket).await
