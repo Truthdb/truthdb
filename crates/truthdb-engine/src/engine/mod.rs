@@ -21,7 +21,10 @@ const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
 const STANDBY_RESTARTPOINT_THRESHOLD: f64 = 0.5;
 
 /// A native-protocol S3 administration command (`s3 create access key`,
-/// `s3 drop access key <id>`, `s3 list access keys`).
+/// `s3 drop access key <id>`, `s3 list access keys`). Like everything on the
+/// native protocol, it runs with full privileges and no authentication:
+/// whoever can reach the native port can mint, list and drop S3 credentials
+/// (and the new secret is returned in cleartext over that connection).
 enum S3Admin {
     CreateAccessKey,
     DropAccessKey(String),
