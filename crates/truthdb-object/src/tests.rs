@@ -1051,3 +1051,85 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn tags_are_set_replaced_and_cleared_per_version() {
+    use crate::{ObjectAttrs, ObjectError, VersionSel};
+    let path = temp_path("tags");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .unwrap()
+        .unwrap();
+    let put = |key: &str, attrs: &ObjectAttrs| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_object("bkt", key, &sealed, attrs, now(), 0))
+            .unwrap()
+            .unwrap()
+    };
+    let set = |key: &str, which, tags: &[(&str, &str)]| {
+        let tags = tags
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.set_tags("bkt", key, which, tags))
+            .unwrap()
+    };
+    let head = |key: &str| {
+        ObjFile::new(&mut storage.lock())
+            .head_object("bkt", key, VersionSel::Latest)
+            .unwrap()
+            .unwrap()
+            .attrs
+    };
+    let typed = ObjectAttrs {
+        content_type: Some("text/plain".to_string()),
+        tags: vec![("a".to_string(), "1".to_string())],
+        ..ObjectAttrs::default()
+    };
+    let plain = put("plain", &ObjectAttrs::default());
+    put("typed", &typed);
+    assert_eq!(head("typed"), typed, "tags given at PUT are kept");
+
+    // Tags on a version without attributes, then cleared again.
+    set("plain", VersionSel::Seq(plain.version), &[("x", "y")]).unwrap();
+    assert_eq!(head("plain").tags, [("x".to_string(), "y".to_string())]);
+    set("plain", VersionSel::Latest, &[]).unwrap();
+    assert_eq!(head("plain"), ObjectAttrs::default());
+    // Replacing the tags keeps the other attributes.
+    set("typed", VersionSel::Latest, &[("b", "2")]).unwrap();
+    assert_eq!(
+        head("typed"),
+        ObjectAttrs {
+            tags: vec![("b".to_string(), "2".to_string())],
+            ..typed.clone()
+        }
+    );
+    assert_eq!(
+        set("missing", VersionSel::Latest, &[]),
+        Err(ObjectError::NoSuchKey)
+    );
+    assert_eq!(
+        set("plain", VersionSel::Seq(999), &[]),
+        Err(ObjectError::NoSuchVersion)
+    );
+    drop(storage);
+
+    // The tags survive a crash.
+    let storage = open(&path);
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .head_object("bkt", "typed", VersionSel::Latest)
+            .unwrap()
+            .unwrap()
+            .attrs
+            .tags,
+        [("b".to_string(), "2".to_string())]
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

@@ -959,3 +959,99 @@ fn objects_and_parts_are_copied() {
     assert_eq!(status, 400, "{xml}");
     assert!(xml.contains("InvalidArgument"), "{xml}");
 }
+
+#[test]
+fn objects_are_tagged_at_put_and_by_the_tagging_api() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    assert_eq!(call("PUT", "/tagged", "", &[], b"").1.0, 200);
+    let (_, (status, body)) = call(
+        "PUT",
+        "/tagged/obj",
+        "",
+        &[("x-amz-tagging", "team=blue+sky&empty=")],
+        b"data",
+    );
+    assert_eq!(status, 200, "{body}");
+    let (head, (status, _)) = call("HEAD", "/tagged/obj", "", &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, "x-amz-tagging-count").as_deref(),
+        Some("2")
+    );
+    let (_, (status, xml)) = call("GET", "/tagged/obj", "tagging", &[], b"");
+    assert_eq!(status, 200, "{xml}");
+    assert!(
+        xml.contains("<Tag><Key>team</Key><Value>blue sky</Value></Tag><Tag><Key>empty</Key><Value></Value></Tag>"),
+        "{xml}"
+    );
+
+    let set = |body: &str| call("PUT", "/tagged/obj", "tagging", &[], body.as_bytes()).1;
+    assert_eq!(
+        set("<Tagging><TagSet><Tag><Key>k&amp;1</Key><Value>v</Value></Tag></TagSet></Tagging>").0,
+        200
+    );
+    let (_, (_, xml)) = call("GET", "/tagged/obj", "tagging", &[], b"");
+    assert!(xml.contains("<Key>k&amp;1</Key><Value>v</Value>"), "{xml}");
+    let (status, xml) = set(
+        "<Tagging><TagSet><Tag><Key>a</Key><Value>1</Value></Tag><Tag><Key>a</Key><Value>2</Value></Tag></TagSet></Tagging>",
+    );
+    assert_eq!(status, 400, "{xml}");
+    assert!(xml.contains("InvalidTag"), "{xml}");
+    let (status, xml) = set("<Tagging><TagSet>");
+    assert_eq!(status, 400, "{xml}");
+    assert!(xml.contains("MalformedXML"), "{xml}");
+    let (status, xml) = call(
+        "PUT",
+        "/tagged/none",
+        "tagging",
+        &[],
+        b"<Tagging><TagSet></TagSet></Tagging>",
+    )
+    .1;
+    assert_eq!(status, 404, "{xml}");
+    assert!(xml.contains("NoSuchKey"), "{xml}");
+
+    // A copy keeps the tags unless told to replace them.
+    let (_, (status, _)) = call(
+        "PUT",
+        "/tagged/kept",
+        "",
+        &[("x-amz-copy-source", "/tagged/obj")],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let (_, (_, xml)) = call("GET", "/tagged/kept", "tagging", &[], b"");
+    assert!(xml.contains("<Key>k&amp;1</Key>"), "{xml}");
+    let (_, (status, _)) = call(
+        "PUT",
+        "/tagged/replaced",
+        "",
+        &[
+            ("x-amz-copy-source", "/tagged/obj"),
+            ("x-amz-tagging-directive", "REPLACE"),
+            ("x-amz-tagging", "new=1"),
+        ],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let (_, (_, xml)) = call("GET", "/tagged/replaced", "tagging", &[], b"");
+    assert!(
+        xml.contains("<TagSet><Tag><Key>new</Key><Value>1</Value></Tag></TagSet>"),
+        "{xml}"
+    );
+
+    assert_eq!(call("DELETE", "/tagged/obj", "tagging", &[], b"").1.0, 204);
+    let (_, (_, xml)) = call("GET", "/tagged/obj", "tagging", &[], b"");
+    assert!(xml.contains("<TagSet></TagSet>"), "{xml}");
+    let (head, _) = call("HEAD", "/tagged/obj", "", &[], b"");
+    assert_eq!(response_header(&head, "x-amz-tagging-count"), None);
+    assert_eq!(
+        call("GET", "/tagged/obj", "", &[], b"").1,
+        (200, "data".to_string()),
+        "the body is untouched"
+    );
+}

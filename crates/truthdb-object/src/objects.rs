@@ -5,8 +5,8 @@
 //! (system headers and user metadata), which live in the attrs tree in
 //! chunks small enough for a tree cell.
 
-use truthdb_core::relstore::btree::TreeInsert;
-use truthdb_core::relstore::ctx::OpMode;
+use truthdb_core::relstore::btree::{BTree, TreeInsert};
+use truthdb_core::relstore::ctx::{OpMode, RelCtx};
 use truthdb_core::storage::StorageError;
 
 use crate::body::SealedBody;
@@ -22,8 +22,8 @@ pub const MAX_KEY_BYTES: usize = 1024;
 /// Attribute bytes per attrs-tree row.
 const ATTRS_CHUNK: usize = 1500;
 
-/// An object's headers: the system ones S3 stores and returns, and user
-/// metadata (`x-amz-meta-*`, names lowercased without the prefix).
+/// An object's headers: the system ones S3 stores and returns, user metadata
+/// (`x-amz-meta-*`, names lowercased without the prefix), and its tags.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ObjectAttrs {
     pub content_type: Option<String>,
@@ -33,6 +33,7 @@ pub struct ObjectAttrs {
     pub content_language: Option<String>,
     pub expires: Option<String>,
     pub user: Vec<(String, String)>,
+    pub tags: Vec<(String, String)>,
 }
 
 impl ObjectAttrs {
@@ -40,7 +41,8 @@ impl ObjectAttrs {
         *self == ObjectAttrs::default()
     }
 
-    /// `[tag u8][len u16][bytes]` per field; user metadata as name and value.
+    /// `[tag u8][len u16][bytes]` per field; user metadata and tags as name
+    /// and value.
     pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut field = |tag: u8, value: &str| {
@@ -63,6 +65,10 @@ impl ObjectAttrs {
         for (name, value) in &self.user {
             field(7, name);
             field(8, value);
+        }
+        for (name, value) in &self.tags {
+            field(9, name);
+            field(10, value);
         }
         out
     }
@@ -92,6 +98,10 @@ impl ObjectAttrs {
                 7 => pending_name = Some(value),
                 8 => attrs
                     .user
+                    .push((pending_name.take().ok_or_else(corrupt)?, value)),
+                9 => pending_name = Some(value),
+                10 => attrs
+                    .tags
                     .push((pending_name.take().ok_or_else(corrupt)?, value)),
                 _ => return Err(corrupt()),
             }
@@ -160,6 +170,8 @@ pub enum ObjectError {
     NoSuchBucket,
     NoSuchKey,
     NoSuchVersion,
+    /// The version named is a delete marker, which the operation cannot act on.
+    DeleteMarker,
     InvalidKey(&'static str),
 }
 
@@ -251,6 +263,50 @@ fn attrs_key(version: u64, chunk: u16) -> [u8; 10] {
     key[..8].copy_from_slice(&version.to_be_bytes());
     key[8..].copy_from_slice(&chunk.to_be_bytes());
     key
+}
+
+/// The version of `key` that `which` picks (a delete marker included), as
+/// its row key, number and row.
+fn find_version(
+    ctx: &mut RelCtx<'_>,
+    objects: &BTree,
+    bucket: &str,
+    key: &str,
+    which: VersionSel,
+) -> Result<Option<(Vec<u8>, u64, VersionRow)>, StorageError> {
+    let prefix = key_prefix(bucket, key);
+    let mut upper = prefix.clone();
+    upper.extend_from_slice(&[0xFF; 8]);
+    for (row_key, row) in objects.scan_range(ctx, Some(&prefix), Some(&upper))? {
+        let version = version_from_key(&row_key)?;
+        let row = VersionRow::decode(&row)?;
+        let wanted = match which {
+            VersionSel::Latest => true,
+            VersionSel::Null => row.flags & FLAG_NULL_VERSION != 0,
+            VersionSel::Seq(seq) => seq == version,
+        };
+        if wanted {
+            return Ok(Some((row_key, version, row)));
+        }
+    }
+    Ok(None)
+}
+
+/// A version's attributes, from its chunks in the attrs tree.
+fn read_attrs(
+    ctx: &mut RelCtx<'_>,
+    attrs_tree: &BTree,
+    version: u64,
+) -> Result<ObjectAttrs, StorageError> {
+    let mut bytes = Vec::new();
+    for (_, chunk) in attrs_tree.scan_range(
+        ctx,
+        Some(&attrs_key(version, 0)),
+        Some(&attrs_key(version, u16::MAX)),
+    )? {
+        bytes.extend_from_slice(&chunk);
+    }
+    ObjectAttrs::decode(&bytes)
 }
 
 impl ObjTxn<'_, '_> {
@@ -375,15 +431,7 @@ impl ObjTxn<'_, '_> {
         )?;
         debug_assert_eq!(inserted, TreeInsert::Inserted);
         if has_attrs {
-            let attrs_tree = self.trees.attrs();
-            for (index, chunk) in attrs.encode().chunks(ATTRS_CHUNK).enumerate() {
-                attrs_tree.insert_unique(
-                    self.ctx,
-                    &mut OpMode::Txn(self.txn),
-                    &attrs_key(version, index as u16),
-                    chunk,
-                )?;
-            }
+            self.write_attrs(version, attrs)?;
         }
         Ok(ObjectInfo {
             version,
@@ -396,6 +444,84 @@ impl ObjTxn<'_, '_> {
             mtime_ms: now_ms,
             attrs: attrs.clone(),
         })
+    }
+
+    fn write_attrs(&mut self, version: u64, attrs: &ObjectAttrs) -> Result<(), StorageError> {
+        let attrs_tree = self.trees.attrs();
+        for (index, chunk) in attrs.encode().chunks(ATTRS_CHUNK).enumerate() {
+            attrs_tree.insert_unique(
+                self.ctx,
+                &mut OpMode::Txn(self.txn),
+                &attrs_key(version, index as u16),
+                chunk,
+            )?;
+        }
+        Ok(())
+    }
+
+    fn remove_attrs(&mut self, version: u64) -> Result<(), StorageError> {
+        let attrs_tree = self.trees.attrs();
+        for (row_key, _) in attrs_tree.scan_range(
+            self.ctx,
+            Some(&attrs_key(version, 0)),
+            Some(&attrs_key(version, u16::MAX)),
+        )? {
+            attrs_tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
+        }
+        Ok(())
+    }
+
+    /// Replaces the tags of the version `which` picks (S3 PutObjectTagging;
+    /// an empty set is DeleteObjectTagging). A delete marker has no tags to
+    /// set.
+    pub fn set_tags(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        which: VersionSel,
+        tags: Vec<(String, String)>,
+    ) -> Result<Result<(), ObjectError>, StorageError> {
+        if let Err(err) = validate_key(key) {
+            return Ok(Err(err));
+        }
+        if self.bucket_row(bucket)?.is_none() {
+            return Ok(Err(ObjectError::NoSuchBucket));
+        }
+        let objects = self.trees.objects();
+        let Some((row_key, version, mut row)) =
+            find_version(self.ctx, &objects, bucket, key, which)?
+        else {
+            return Ok(Err(match which {
+                VersionSel::Latest => ObjectError::NoSuchKey,
+                _ => ObjectError::NoSuchVersion,
+            }));
+        };
+        if row.flags & FLAG_DELETE_MARKER != 0 {
+            return Ok(Err(match which {
+                VersionSel::Latest => ObjectError::NoSuchKey,
+                _ => ObjectError::DeleteMarker,
+            }));
+        }
+        let mut attrs = if row.flags & FLAG_HAS_ATTRS != 0 {
+            let attrs = read_attrs(self.ctx, &self.trees.attrs(), version)?;
+            self.remove_attrs(version)?;
+            attrs
+        } else {
+            ObjectAttrs::default()
+        };
+        attrs.tags = tags;
+        row.flags &= !FLAG_HAS_ATTRS;
+        if !attrs.is_empty() {
+            self.write_attrs(version, &attrs)?;
+            row.flags |= FLAG_HAS_ATTRS;
+        }
+        objects.update(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &row_key,
+            &row.encode(),
+        )?;
+        Ok(Ok(()))
     }
 
     /// Removes the key's versions that `wanted` picks: each row, its
@@ -422,14 +548,7 @@ impl ObjTxn<'_, '_> {
             }
             objects.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
             if row.flags & FLAG_HAS_ATTRS != 0 {
-                let attrs_tree = self.trees.attrs();
-                for (attrs_row_key, _) in attrs_tree.scan_range(
-                    self.ctx,
-                    Some(&attrs_key(version, 0)),
-                    Some(&attrs_key(version, u16::MAX)),
-                )? {
-                    attrs_tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &attrs_row_key)?;
-                }
+                self.remove_attrs(version)?;
             }
             if row.flags & FLAG_DELETE_MARKER == 0 {
                 self.drop_ref(row.body, now_ms, grace_ms)?;
@@ -570,25 +689,7 @@ impl ObjFile<'_> {
             return Ok(Err(ObjectError::NoSuchKey));
         };
         let mut ctx = self.core.page_ctx(0);
-        let prefix = key_prefix(bucket, key);
-        let mut upper = prefix.clone();
-        upper.extend_from_slice(&[0xFF; 8]);
-        let rows = objects.scan_range(&mut ctx, Some(&prefix), Some(&upper))?;
-        let mut found = None;
-        for (row_key, row) in &rows {
-            let version = version_from_key(row_key)?;
-            let row = VersionRow::decode(row)?;
-            let wanted = match which {
-                VersionSel::Latest => true,
-                VersionSel::Null => row.flags & FLAG_NULL_VERSION != 0,
-                VersionSel::Seq(seq) => seq == version,
-            };
-            if wanted {
-                found = Some((version, row));
-                break;
-            }
-        }
-        let Some((version, row)) = found else {
+        let Some((_, version, row)) = find_version(&mut ctx, &objects, bucket, key, which)? else {
             return Ok(Err(match which {
                 VersionSel::Latest => ObjectError::NoSuchKey,
                 _ => ObjectError::NoSuchVersion,
@@ -598,17 +699,7 @@ impl ObjFile<'_> {
             return Ok(Err(ObjectError::NoSuchKey));
         }
         let attrs = match (row.flags & FLAG_HAS_ATTRS != 0, attrs_tree) {
-            (true, Some(attrs_tree)) => {
-                let mut bytes = Vec::new();
-                for (_, chunk) in attrs_tree.scan_range(
-                    &mut ctx,
-                    Some(&attrs_key(version, 0)),
-                    Some(&attrs_key(version, u16::MAX)),
-                )? {
-                    bytes.extend_from_slice(&chunk);
-                }
-                ObjectAttrs::decode(&bytes)?
-            }
+            (true, Some(attrs_tree)) => read_attrs(&mut ctx, &attrs_tree, version)?,
             _ => ObjectAttrs::default(),
         };
         Ok(Ok(ObjectInfo {
@@ -642,6 +733,7 @@ mod tests {
                 ("a".to_string(), "1".to_string()),
                 ("b".to_string(), "two".to_string()),
             ],
+            tags: vec![("project".to_string(), "blue sky".to_string())],
         };
         assert_eq!(ObjectAttrs::decode(&attrs.encode()).unwrap(), attrs);
         assert!(ObjectAttrs::default().is_empty());

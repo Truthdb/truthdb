@@ -131,6 +131,15 @@ pub async fn dispatch(
         (Target::Object(bucket, key), Method::POST) if has_param(&request, "uploadId") => {
             crate::multipart::complete_upload(state, request, auth, bucket, key).await
         }
+        (Target::Object(bucket, key), Method::PUT) if has_param(&request, "tagging") => {
+            crate::tagging::put_tagging(state, request, auth, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::GET) if has_param(&request, "tagging") => {
+            crate::tagging::get_tagging(state, request, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::DELETE) if has_param(&request, "tagging") => {
+            crate::tagging::delete_tagging(state, request, bucket, key).await
+        }
         (Target::Object(bucket, key), Method::PUT)
             if has_param(&request, "uploadId")
                 && request.headers().contains_key("x-amz-copy-source") =>
