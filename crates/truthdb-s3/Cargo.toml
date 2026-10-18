@@ -1,0 +1,20 @@
+[package]
+name = "truthdb-s3"
+version = "0.1.0"
+edition = "2024"
+description = "TruthDB's S3-compatible HTTP API over the object engine."
+
+[dependencies]
+truthdb-core = { workspace = true }
+truthdb-engine = { workspace = true }
+truthdb-object = { workspace = true }
+ring = "0.17"
+percent-encoding = "2.3.2"
+base64 = "0.22.1"
+crc32fast = "1.5.1"
+hyper = { version = "1.11.1", features = ["server", "http1"] }
+hyper-util = { version = "0.1.21", features = ["tokio"] }
+http-body-util = "0.1.5"
+bytes = "1.12.1"
+tokio = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
