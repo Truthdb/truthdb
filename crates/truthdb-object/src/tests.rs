@@ -1370,6 +1370,21 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
             .collect::<Vec<_>>(),
         ["e"]
     );
+    // A version named by number is removed alone.
+    let version = listing.objects[0].info.version;
+    let delete_version = || {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.delete_object("bkt", "e", Some(crate::VersionSel::Seq(version)), now(), 0)
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let removed = delete_version();
+    assert_eq!(removed.version, Some(version));
+    assert!(!removed.delete_marker);
+    assert_eq!(delete_version().version, None, "nothing left to remove");
+    assert!(list().objects.is_empty());
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

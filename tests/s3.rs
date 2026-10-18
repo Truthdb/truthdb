@@ -675,9 +675,26 @@ fn objects_are_deleted_one_by_one_and_in_batches() {
         b"<Delete><Object><Key>b&amp;c</Key></Object><Object><Key>d</Key></Object></Delete>";
     let (status, body) = call("POST", "/del", "delete", &[], batch);
     assert_eq!(status, 400, "an integrity header is required: {body}");
+    let (status, body) = call(
+        "POST",
+        "/del",
+        "delete",
+        &[("x-amz-checksum-algorithm", "CRC32")],
+        batch,
+    );
+    assert_eq!(status, 400, "naming an algorithm is not a checksum: {body}");
     use base64::Engine as _;
     use md5::Digest;
     let digest = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(batch));
+    let (status, body) = call(
+        "POST",
+        "/nobucket",
+        "delete",
+        &[("content-md5", &digest)],
+        batch,
+    );
+    assert_eq!(status, 404, "a missing bucket fails the request: {body}");
+    assert!(body.contains("NoSuchBucket"), "{body}");
     let (status, body) = call("POST", "/del", "delete", &[("content-md5", &digest)], batch);
     assert_eq!(status, 200, "{body}");
     assert!(
