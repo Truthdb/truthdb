@@ -140,26 +140,36 @@ pub(crate) fn redo_records(
 
 /// Every free in `records` that takes effect, as `(start_page, end_page,
 /// lsn)`: plain and compensation frees, and transactional frees whose
-/// transaction commits within the records.
+/// transaction commits. Walked in log order, holding each transactional free
+/// until its own commit (and dropping it at its transaction's end) exactly
+/// like the allocator replay: transaction ids repeat across restarts, so a
+/// commit elsewhere in the log under the same id says nothing.
 fn effective_frees(records: &[(u64, RelRecord)]) -> Result<Vec<(u64, u64, u64)>, StorageError> {
-    let committed: std::collections::HashSet<u64> = records
-        .iter()
-        .filter(|(_, record)| record.kind == REL_KIND_TXN_COMMIT)
-        .map(|(_, record)| record.txn_id)
-        .collect();
+    let mut pending: HashMap<u64, Vec<(u64, u64, u64)>> = HashMap::new();
     let mut frees = Vec::new();
     for (lsn, record) in records {
-        let extent = match record.kind {
-            REL_KIND_FREE_EXTENT if record.txn_id == 0 || committed.contains(&record.txn_id) => {
-                record.decode_extent_redo()?
+        match record.kind {
+            REL_KIND_FREE_EXTENT => {
+                let (start, pages) = record.decode_extent_redo()?;
+                let free = (start, start + pages, *lsn);
+                if record.txn_id == 0 {
+                    frees.push(free);
+                } else {
+                    pending.entry(record.txn_id).or_default().push(free);
+                }
             }
             REL_KIND_CLR_FREE_EXTENT => {
                 let (_, start, pages) = record.decode_clr_free_extent()?;
-                (start, pages)
+                frees.push((start, start + pages, *lsn));
             }
-            _ => continue,
-        };
-        frees.push((extent.0, extent.0 + extent.1, *lsn));
+            REL_KIND_TXN_COMMIT => {
+                frees.extend(pending.remove(&record.txn_id).unwrap_or_default());
+            }
+            REL_KIND_TXN_END => {
+                pending.remove(&record.txn_id);
+            }
+            _ => {}
+        }
     }
     Ok(frees)
 }

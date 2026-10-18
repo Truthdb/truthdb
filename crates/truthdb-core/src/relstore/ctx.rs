@@ -358,10 +358,13 @@ impl RelCtx<'_> {
         data: &[u8],
     ) -> Result<u64, StorageError> {
         let pages = data.len().div_ceil(page::BLOB_PAGE_DATA);
+        let end_page = start_page.checked_add(pages as u64);
         if pages == 0
             || pages > page::BLOB_RECORD_MAX_PAGES
-            || (start_page..start_page + pages as u64)
-                .any(|page| page >= self.io.data_pages || !self.allocator.is_allocated(page))
+            || end_page.is_none_or(|end| {
+                (start_page..end)
+                    .any(|page| page >= self.io.data_pages || !self.allocator.is_allocated(page))
+            })
         {
             return Err(StorageError::InvalidConfig(format!(
                 "blob write of {} bytes at page {start_page} is empty, too large, or not on \

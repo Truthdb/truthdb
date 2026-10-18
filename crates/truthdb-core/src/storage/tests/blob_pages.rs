@@ -271,3 +271,61 @@ fn a_blob_write_that_redo_could_not_apply_is_refused_before_it_is_logged() {
     Storage::open(path.clone(), no_engine).expect("nothing unreplayable was logged");
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_rolled_back_free_does_not_borrow_a_reused_txn_ids_commit() {
+    let path = unique_temp_path("blob-txnid-src");
+    let bak = unique_temp_path("blob-txnid-bak");
+    let log1 = unique_temp_path("blob-txnid-log1");
+    let log2 = unique_temp_path("blob-txnid-log2");
+    let dst = unique_temp_path("blob-txnid-dst");
+    let storage = create_small(&path);
+    set_full(&storage);
+    storage.backup_full(&bak).expect("full backup");
+    let data = body(9);
+    let start = committed_blob(&storage, &data);
+    let ((), txn) = in_txn(&storage, |ctx, txn| {
+        ctx.free_extent_in_txn(txn, start, PAGES).expect("free")
+    });
+    let rolled_back_id = txn.txn_id;
+    {
+        let mut guard = storage.lock();
+        let mut ctx = guard.page_ctx(0);
+        crate::relstore::recovery::rollback(&mut ctx, txn, &NoLogicalUndo).expect("rollback");
+        drop(ctx);
+        guard.wal_sync_all().expect("sync");
+    }
+    storage
+        .backup_log(&log1, true, false)
+        .expect("log backup 1");
+    storage
+        .write_checkpoint(b"state", 1, 2, 1)
+        .expect("checkpoint");
+    drop(storage);
+
+    // After the checkpoint the ring holds no transaction: ids start over.
+    let storage = Storage::open(path.clone(), no_engine).expect("reopen");
+    loop {
+        let ((), txn) = in_txn(&storage, |_, _| ());
+        let id = txn.txn_id;
+        commit(&storage, txn);
+        if id == rolled_back_id {
+            break;
+        }
+        assert!(id < rolled_back_id, "ids started over after the reopen");
+    }
+    assert_eq!(read_blob(&storage, start, data.len()), data);
+    storage
+        .backup_log(&log2, true, false)
+        .expect("log backup 2");
+    drop(storage);
+
+    Storage::restore_full_with_logs(&dst, &bak, &[log1.clone(), log2.clone()], None, no_engine)
+        .expect("restore");
+    let restored = Storage::open(dst.clone(), no_engine).expect("open restored");
+    assert_eq!(read_blob(&restored, start, data.len()), data);
+    drop(restored);
+    for p in [&path, &bak, &log1, &log2, &dst] {
+        std::fs::remove_file(p).ok();
+    }
+}
