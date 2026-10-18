@@ -46,6 +46,12 @@ pub const REL_KIND_SET_ENGINE_ROOT: u16 = 11;
 /// the undo cursor past the allocation in one record (redo = undo_next LSN +
 /// extent). Never undone itself.
 pub const REL_KIND_CLR_FREE_EXTENT: u16 = 12;
+/// Body pages of an object engine's blob, in a transaction's chain: redo =
+/// first page + owning object id + body bytes (`BLOB_PAGE_DATA` per page, the
+/// last page zero-padded). Redo rewrites a page only when the one on disk is
+/// torn or older than the record. Never undone: the extent's allocation undo
+/// frees the pages.
+pub const REL_KIND_BLOB_PAGES: u16 = 13;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelRecord {
@@ -462,6 +468,40 @@ impl RelRecord {
             redo,
             undo: Vec::new(),
         }
+    }
+
+    pub fn blob_pages(
+        txn_id: u64,
+        prev_lsn: u64,
+        object_id: u32,
+        start_page: u64,
+        data: &[u8],
+    ) -> Self {
+        let mut redo = Vec::with_capacity(12 + data.len());
+        put_u64(&mut redo, start_page);
+        put_u32(&mut redo, object_id);
+        redo.extend_from_slice(data);
+        RelRecord {
+            prev_lsn,
+            txn_id,
+            kind: REL_KIND_BLOB_PAGES,
+            flags: 0,
+            redo,
+            undo: Vec::new(),
+        }
+    }
+
+    /// Decodes a BLOB_PAGES redo into `(object_id, start_page, data)`.
+    pub fn decode_blob_pages(&self) -> Result<(u32, u64, &[u8]), StorageError> {
+        debug_assert_eq!(self.kind, REL_KIND_BLOB_PAGES);
+        if self.redo.len() <= 12 {
+            return Err(StorageError::InvalidFile(
+                "blob pages record has no data".to_string(),
+            ));
+        }
+        let start_page = u64::from_le_bytes(self.redo[0..8].try_into().unwrap());
+        let object_id = u32::from_le_bytes(self.redo[8..12].try_into().unwrap());
+        Ok((object_id, start_page, &self.redo[12..]))
     }
 
     /// Decodes a CLR_FREE_EXTENT redo into `(undo_next, start_page, num_pages)`.
@@ -968,6 +1008,19 @@ mod tests {
         let clr = RelRecord::clr_noop(3, 700, 0);
         let decoded = RelRecord::decode(&clr.encode()).expect("decode");
         assert_eq!(decoded.decode_clr().expect("clr"), (0, None));
+    }
+
+    #[test]
+    fn blob_pages_record_round_trips() {
+        let data: Vec<u8> = (0..5000u32).map(|i| i as u8).collect();
+        let record = RelRecord::blob_pages(9, 400, 0xF000_0002, 128, &data);
+        let decoded = RelRecord::decode(&record.encode()).expect("decode");
+        assert_eq!(decoded, record);
+        let (object_id, start, body) = decoded.decode_blob_pages().expect("blob");
+        assert_eq!(
+            (object_id, start, body),
+            (0xF000_0002, 128, data.as_slice())
+        );
     }
 
     #[test]

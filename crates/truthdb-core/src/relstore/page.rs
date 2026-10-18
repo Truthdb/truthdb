@@ -29,6 +29,16 @@ pub const PAGE_TYPE_COUNTER: u16 = 3;
 /// Overflow chain page for (MAX)-class values (Stage 14): immutable once
 /// written, `[header | next_page u64 | len u16 | data]`.
 pub const PAGE_TYPE_OVERFLOW: u16 = 4;
+/// Object body page: `[header | data]`, written whole straight to the data
+/// file (never through the buffer pool) by a `BLOB_PAGES` record. Immutable
+/// until its extent is freed.
+pub const PAGE_TYPE_BLOB: u16 = 5;
+/// Body bytes one blob page carries.
+pub const BLOB_PAGE_DATA: usize = PAGE_SIZE - PAGE_HEADER_SIZE;
+/// Most pages one `BLOB_PAGES` record carries (about 1 MiB of body): a record
+/// is one WAL entry, which replication ships whole, so a body larger than this
+/// is written as several records.
+pub const BLOB_RECORD_MAX_PAGES: usize = 256;
 /// Byte offset of the row count on a counter page (right after the header).
 pub const COUNTER_OFFSET: usize = PAGE_HEADER_SIZE;
 

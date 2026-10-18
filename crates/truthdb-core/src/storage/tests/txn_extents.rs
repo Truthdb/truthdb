@@ -6,10 +6,10 @@
 use super::*;
 use crate::relstore::ctx::TxnLink;
 
-const PAGES: u64 = 8;
+pub(super) const PAGES: u64 = 8;
 
 /// Runs `body` inside a fresh transaction under the storage lock.
-fn in_txn<T>(
+pub(super) fn in_txn<T>(
     storage: &Storage,
     body: impl FnOnce(&mut RelCtx<'_>, &mut TxnLink) -> T,
 ) -> (T, TxnLink) {
@@ -21,7 +21,7 @@ fn in_txn<T>(
     (out, txn)
 }
 
-fn commit(storage: &Storage, txn: TxnLink) {
+pub(super) fn commit(storage: &Storage, txn: TxnLink) {
     let mut guard = storage.lock();
     guard.page_ctx(0).commit(txn).expect("commit");
     guard.wal_sync_all().expect("sync");
@@ -205,7 +205,7 @@ fn now_millis() -> u64 {
 }
 
 /// FULL recovery model, so log backups can carry the stop point.
-fn set_full(storage: &Storage) {
+pub(super) fn set_full(storage: &Storage) {
     storage
         .lock()
         .commit_db_options(0, Some(true))

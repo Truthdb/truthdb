@@ -44,6 +44,7 @@ fn create_small(path: &Path) -> Storage {
     .expect("create storage")
 }
 
+mod blob_pages;
 mod engines;
 mod recovery;
 mod txn_extents;
