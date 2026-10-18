@@ -364,11 +364,12 @@ impl ObjFile<'_> {
         let Some(buckets) = self.existing_tree(BUCKETS_TREE)? else {
             return Ok(Err(ObjectError::NoSuchBucket));
         };
-        let mut ctx = self.core.page_ctx(0);
-        if buckets.get(&mut ctx, bucket.as_bytes())?.is_none() {
+        if buckets
+            .get(&mut self.core.page_ctx(0), bucket.as_bytes())?
+            .is_none()
+        {
             return Ok(Err(ObjectError::NoSuchBucket));
         }
-        drop(ctx);
         let (Some(objects), attrs_tree) = (
             self.existing_tree(OBJECTS_TREE)?,
             self.existing_tree(ATTRS_TREE)?,
