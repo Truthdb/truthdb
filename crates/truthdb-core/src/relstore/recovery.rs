@@ -109,6 +109,7 @@ pub(crate) fn redo_records(
     ctx: &mut RelCtx<'_>,
     records: &[(u64, RelRecord)],
 ) -> Result<(), StorageError> {
+    let frees = effective_frees(records)?;
     for (lsn, record) in records {
         match record.kind {
             REL_KIND_PAGE_IMAGE => {
@@ -130,21 +131,61 @@ pub(crate) fn redo_records(
                     redo_page_op(ctx, *lsn, &redo)?;
                 }
             }
-            REL_KIND_BLOB_PAGES => redo_blob_pages(ctx, *lsn, record)?,
+            REL_KIND_BLOB_PAGES => redo_blob_pages(ctx, *lsn, record, &frees)?,
             _ => {}
         }
     }
     Ok(())
 }
 
+/// Every free in `records` that takes effect, as `(start_page, end_page,
+/// lsn)`: plain and compensation frees, and transactional frees whose
+/// transaction commits within the records.
+fn effective_frees(records: &[(u64, RelRecord)]) -> Result<Vec<(u64, u64, u64)>, StorageError> {
+    let committed: std::collections::HashSet<u64> = records
+        .iter()
+        .filter(|(_, record)| record.kind == REL_KIND_TXN_COMMIT)
+        .map(|(_, record)| record.txn_id)
+        .collect();
+    let mut frees = Vec::new();
+    for (lsn, record) in records {
+        let extent = match record.kind {
+            REL_KIND_FREE_EXTENT if record.txn_id == 0 || committed.contains(&record.txn_id) => {
+                record.decode_extent_redo()?
+            }
+            REL_KIND_CLR_FREE_EXTENT => {
+                let (_, start, pages) = record.decode_clr_free_extent()?;
+                (start, pages)
+            }
+            _ => continue,
+        };
+        frees.push((extent.0, extent.0 + extent.1, *lsn));
+    }
+    Ok(frees)
+}
+
 /// Redoes a BLOB_PAGES record straight on disk (blob pages never enter the
 /// buffer pool): a page is rewritten unless the one on disk is intact and at
 /// least as new as the record — which also keeps a newer blob's page when the
-/// extent was freed and reused since.
-fn redo_blob_pages(ctx: &mut RelCtx<'_>, lsn: u64, record: &RelRecord) -> Result<(), StorageError> {
+/// extent was freed and reused since. A page a later record frees for good
+/// (`frees`) is skipped: the extent may since hold something without page
+/// headers (the search snapshot), which the checksum test would take for a
+/// torn page.
+fn redo_blob_pages(
+    ctx: &mut RelCtx<'_>,
+    lsn: u64,
+    record: &RelRecord,
+    frees: &[(u64, u64, u64)],
+) -> Result<(), StorageError> {
     let (object_id, start_page, data) = record.decode_blob_pages()?;
     for (index, chunk) in data.chunks(page::BLOB_PAGE_DATA).enumerate() {
         let page_no = start_page + index as u64;
+        if frees
+            .iter()
+            .any(|&(start, end, free_lsn)| free_lsn > lsn && (start..end).contains(&page_no))
+        {
+            continue;
+        }
         let mut on_disk = crate::direct_io::AlignedPageBuf::new();
         ctx.io.read_page(page_no, &mut on_disk)?;
         if page::verify_checksum(on_disk.as_slice()) && page::page_lsn(on_disk.as_slice()) >= lsn {

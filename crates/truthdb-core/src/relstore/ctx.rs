@@ -345,6 +345,11 @@ impl RelCtx<'_> {
     /// (write-ahead), then each page goes straight to the data file — never
     /// through the buffer pool, so a large body does not flush the pool's hot
     /// pages. Returns the record's LSN, which every page carries.
+    ///
+    /// `data` must be non-empty, at most `BLOB_RECORD_MAX_PAGES` pages, and
+    /// land on allocated pages: a durable record that redo cannot apply would
+    /// stop the database from opening. If a page write fails after the record
+    /// is durable, the caller rolls the transaction back.
     pub fn write_blob_pages(
         &mut self,
         txn: &mut TxnLink,
@@ -352,6 +357,18 @@ impl RelCtx<'_> {
         start_page: u64,
         data: &[u8],
     ) -> Result<u64, StorageError> {
+        let pages = data.len().div_ceil(page::BLOB_PAGE_DATA);
+        if pages == 0
+            || pages > page::BLOB_RECORD_MAX_PAGES
+            || (start_page..start_page + pages as u64)
+                .any(|page| page >= self.io.data_pages || !self.allocator.is_allocated(page))
+        {
+            return Err(StorageError::InvalidConfig(format!(
+                "blob write of {} bytes at page {start_page} is empty, too large, or not on \
+                 allocated pages",
+                data.len()
+            )));
+        }
         let record = RelRecord::blob_pages(txn.txn_id, txn.last_lsn, object_id, start_page, data);
         let lsn = self.append(&record, true)?;
         txn.last_lsn = lsn;

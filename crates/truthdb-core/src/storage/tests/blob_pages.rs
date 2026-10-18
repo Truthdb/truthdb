@@ -202,3 +202,72 @@ fn a_blob_written_after_the_full_backup_restores_from_the_log() {
         std::fs::remove_file(p).ok();
     }
 }
+
+#[test]
+fn redo_of_a_freed_blob_leaves_the_search_snapshot_that_reused_its_pages() {
+    let path = unique_temp_path("blob-snapshot");
+    let storage = create_small(&path);
+    let data = body(7);
+    let start = committed_blob(&storage, &data);
+    let ((), txn) = in_txn(&storage, |ctx, txn| {
+        ctx.free_extent_in_txn(txn, start, PAGES).expect("free")
+    });
+    commit(&storage, txn);
+    drop(storage);
+
+    // Reopen so the next-fit cursor starts over, hold the log so the blob's
+    // record stays in the ring, and let a checkpoint place the snapshot.
+    let storage = Storage::open(path.clone(), no_engine).expect("reopen");
+    {
+        let mut guard = storage.lock();
+        let head = guard.wal.head();
+        guard.register_backup_hold(head);
+    }
+    storage
+        .write_checkpoint(b"search-snapshot", 1, 2, 1)
+        .expect("checkpoint");
+    assert!(
+        storage.lock().is_page_allocated(start),
+        "the snapshot took the freed pages"
+    );
+    drop(storage); // crash: the blob's record is still in the log
+
+    let storage = Storage::open(path.clone(), no_engine).expect("reopen");
+    let snapshot = storage
+        .load_snapshot()
+        .expect("the snapshot survives redo")
+        .expect("a snapshot");
+    assert_eq!(snapshot.data, b"search-snapshot");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_blob_write_that_redo_could_not_apply_is_refused_before_it_is_logged() {
+    let path = unique_temp_path("blob-validate");
+    let storage = create_small(&path);
+    let (start, mut txn) = in_txn(&storage, |ctx, txn| {
+        ctx.allocate_extent_in_txn(txn, PAGES).expect("allocate")
+    });
+    let too_large = vec![0u8; (crate::relstore::page::BLOB_RECORD_MAX_PAGES + 1) * BLOB_PAGE_DATA];
+    {
+        let mut guard = storage.lock();
+        let data_pages = guard.data_pages();
+        let mut ctx = guard.page_ctx(0);
+        for (start_page, data) in [
+            (start, &[][..]),
+            (start, &too_large[..]),
+            (start + PAGES - 1, &body(8)[..]),
+            (data_pages - 1, &body(8)[..]),
+        ] {
+            let err = ctx
+                .write_blob_pages(&mut txn, OBJECT, start_page, data)
+                .expect_err("refused");
+            assert!(err.to_string().contains("blob write"), "{err}");
+        }
+    }
+    commit(&storage, txn);
+    drop(storage);
+    Storage::open(path.clone(), no_engine).expect("nothing unreplayable was logged");
+    std::fs::remove_file(&path).ok();
+}
