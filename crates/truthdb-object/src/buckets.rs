@@ -146,6 +146,28 @@ impl ObjTxn<'_, '_> {
         })
     }
 
+    /// Sets the bucket's versioning (S3 PutBucketVersioning) to `Enabled` or
+    /// `Suspended`: a bucket that had versioning never returns to
+    /// unversioned.
+    pub fn set_versioning(
+        &mut self,
+        name: &str,
+        versioning: Versioning,
+    ) -> Result<Result<(), BucketError>, StorageError> {
+        debug_assert_ne!(versioning, Versioning::Unversioned);
+        let Some(mut row) = self.bucket_row(name)? else {
+            return Ok(Err(BucketError::NoSuchBucket));
+        };
+        row.versioning = versioning;
+        self.trees.buckets().update(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            name.as_bytes(),
+            &row.encode(),
+        )?;
+        Ok(Ok(()))
+    }
+
     pub fn delete_bucket(&mut self, name: &str) -> Result<Result<(), BucketError>, StorageError> {
         let buckets = self.trees.buckets();
         if buckets.get(self.ctx, name.as_bytes())?.is_none() {

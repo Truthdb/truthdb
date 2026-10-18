@@ -485,15 +485,15 @@ impl ObjTxn<'_, '_> {
     }
 
     /// Replaces the tags of the version `which` picks (S3 PutObjectTagging;
-    /// an empty set is DeleteObjectTagging). A delete marker has no tags to
-    /// set.
+    /// an empty set is DeleteObjectTagging) and returns that version's number
+    /// and whether it is the null version. A delete marker has no tags to set.
     pub fn set_tags(
         &mut self,
         bucket: &str,
         key: &str,
         which: VersionSel,
         tags: Vec<(String, String)>,
-    ) -> Result<Result<(), ObjectError>, StorageError> {
+    ) -> Result<Result<(u64, bool), ObjectError>, StorageError> {
         if let Err(err) = validate_key(key) {
             return Ok(Err(err));
         }
@@ -534,7 +534,7 @@ impl ObjTxn<'_, '_> {
             &row_key,
             &row.encode(),
         )?;
-        Ok(Ok(()))
+        Ok(Ok((version, row.flags & FLAG_NULL_VERSION != 0)))
     }
 
     /// Removes the key's versions that `wanted` picks: each row, its
@@ -691,8 +691,25 @@ impl ObjTxn<'_, '_> {
 }
 
 impl ObjFile<'_> {
-    /// A version of `key` and its attributes.
+    /// A version of `key` and its attributes; `NoSuchKey` when the key's
+    /// newest version is a delete marker.
     pub fn head_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        which: VersionSel,
+    ) -> Result<Result<ObjectInfo, ObjectError>, StorageError> {
+        Ok(match self.object_version(bucket, key, which)? {
+            Ok(info) if which == VersionSel::Latest && info.delete_marker => {
+                Err(ObjectError::NoSuchKey)
+            }
+            found => found,
+        })
+    }
+
+    /// [`Self::head_object`], but a newest version that is a delete marker
+    /// is returned as one (S3 GET and HEAD report it).
+    pub fn object_version(
         &mut self,
         bucket: &str,
         key: &str,
@@ -723,9 +740,6 @@ impl ObjFile<'_> {
                 _ => ObjectError::NoSuchVersion,
             }));
         };
-        if which == VersionSel::Latest && row.flags & FLAG_DELETE_MARKER != 0 {
-            return Ok(Err(ObjectError::NoSuchKey));
-        }
         let attrs = match (row.flags & FLAG_HAS_ATTRS != 0, attrs_tree) {
             (true, Some(attrs_tree)) => read_attrs(&mut ctx, &attrs_tree, version)?,
             _ => ObjectAttrs::default(),

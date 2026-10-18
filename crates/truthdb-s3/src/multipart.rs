@@ -10,7 +10,10 @@ use truthdb_object::{UploadError, UploadInfo};
 
 use crate::error::{S3Error, escape};
 use crate::listing::query_params;
-use crate::objects::{DROP_GRACE_MS, attrs_from, now_ms, object, object_error, receive_body};
+use crate::objects::{
+    DROP_GRACE_MS, add_header, attrs_from, now_ms, object, object_error, receive_body,
+    version_header, versioning_of,
+};
 use crate::server::{Authenticated, Body, S3State, full, read_body};
 
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -308,19 +311,26 @@ pub async fn complete_upload(
     check_upload(state, upload, &bucket, &key).await?;
     let body = read_body(request, auth, MAX_COMPLETE_BODY).await?;
     let listed = parse_complete(&body)?;
-    let info = object(state, move |file| {
-        file.transaction(|tx| tx.complete_upload(upload, &listed, now_ms(), DROP_GRACE_MS))
+    let bucket_name = bucket.clone();
+    let (completed, versioning) = object(state, move |file| {
+        let completed =
+            file.transaction(|tx| tx.complete_upload(upload, &listed, now_ms(), DROP_GRACE_MS))?;
+        Ok((completed, versioning_of(file, &bucket_name)?))
     })
-    .await?
-    .map_err(|err| upload_error(err, &bucket, &key))?;
-    Ok(xml(format!(
+    .await?;
+    let info = completed.map_err(|err| upload_error(err, &bucket, &key))?;
+    let mut response = xml(format!(
         "<CompleteMultipartUploadResult xmlns=\"{XMLNS}\"><Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",
         escape(&bucket),
         escape(&key),
         escape(&bucket),
         escape(&key),
         escape(&info.etag())
-    )))
+    ));
+    if let Some(version) = version_header(versioning, info.version, info.null_version) {
+        add_header(&mut response, "x-amz-version-id", version);
+    }
+    Ok(response)
 }
 
 pub async fn abort_upload(

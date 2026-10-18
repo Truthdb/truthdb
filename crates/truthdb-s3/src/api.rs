@@ -6,7 +6,7 @@ use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use truthdb_object::{BucketError, BucketInfo, ObjFile};
+use truthdb_object::{BucketError, BucketInfo, ObjFile, Versioning};
 
 use crate::error::{S3Error, escape};
 use crate::server::{Authenticated, Body, S3State, full, read_body};
@@ -61,8 +61,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "retention",
     "select",
     "torrent",
-    "versioning",
-    "versions",
     "website",
 ];
 
@@ -155,6 +153,16 @@ pub async fn dispatch(
             "bucket tagging is not implemented",
         )),
         (Target::Service, Method::GET) => list_buckets(state).await,
+        (Target::Bucket(bucket), Method::PUT) if has_param(&request, "versioning") => {
+            put_versioning(state, request, auth, bucket).await
+        }
+        (Target::Bucket(bucket), Method::GET) if has_param(&request, "versioning") => {
+            get_versioning(state, bucket).await
+        }
+        (Target::Bucket(bucket), Method::GET) if has_param(&request, "versions") => {
+            let query = request.uri().query().unwrap_or("").to_string();
+            crate::listing::list_versions(state, bucket, &query).await
+        }
         (Target::Bucket(bucket), Method::PUT) => create_bucket(state, request, auth, bucket).await,
         (Target::Bucket(bucket), Method::DELETE) => delete_bucket(state, bucket).await,
         (Target::Bucket(bucket), Method::HEAD) => head_bucket(state, bucket).await,
@@ -343,6 +351,116 @@ async fn bucket_location(state: &S3State, bucket: String) -> Result<Response<Bod
             escape(region)
         ),
     ))
+}
+
+async fn put_versioning(
+    state: &S3State,
+    request: Request<Incoming>,
+    auth: Authenticated,
+    bucket: String,
+) -> Result<Response<Body>, S3Error> {
+    let body = read_body(request, auth, 64 * 1024).await?;
+    let versioning = parse_versioning(&body)?;
+    let name = bucket.clone();
+    object(state, move |file| {
+        file.transaction(|tx| tx.set_versioning(&name, versioning))
+    })
+    .await?
+    .map_err(|err| bucket_error(err, &bucket))?;
+    Ok(empty(StatusCode::OK))
+}
+
+async fn get_versioning(state: &S3State, bucket: String) -> Result<Response<Body>, S3Error> {
+    let name = bucket.clone();
+    let Some(info) = object(state, move |file| file.bucket(&name)).await? else {
+        return Err(bucket_error(BucketError::NoSuchBucket, &bucket));
+    };
+    let status = match info.versioning {
+        Versioning::Unversioned => "",
+        Versioning::Enabled => "<Status>Enabled</Status>",
+        Versioning::Suspended => "<Status>Suspended</Status>",
+    };
+    Ok(xml(
+        StatusCode::OK,
+        format!("<VersioningConfiguration xmlns=\"{XMLNS}\">{status}</VersioningConfiguration>"),
+    ))
+}
+
+/// The state a PutBucketVersioning body sets: one `<VersioningConfiguration>`
+/// with a `<Status>` of `Enabled` or `Suspended` (and MFA delete, which is
+/// not supported, left disabled).
+fn parse_versioning(body: &[u8]) -> Result<Versioning, S3Error> {
+    let malformed = || {
+        S3Error::new(
+            400,
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema.",
+        )
+    };
+    let mut reader = Reader::from_reader(body);
+    let mut path: Vec<Vec<u8>> = Vec::new();
+    let mut seen_root = false;
+    let (mut status, mut mfa_delete): (Option<String>, Option<String>) = (None, None);
+    let mut buf = Vec::new();
+    loop {
+        let event = reader.read_event_into(&mut buf).map_err(|_| malformed())?;
+        let (start, end) = match &event {
+            Event::Start(element) => (Some(element.local_name().as_ref().to_vec()), None),
+            Event::Empty(element) => {
+                let name = element.local_name().as_ref().to_vec();
+                (Some(name.clone()), Some(name))
+            }
+            Event::End(element) => (None, Some(element.local_name().as_ref().to_vec())),
+            _ => (None, None),
+        };
+        if let Some(name) = start {
+            let allowed = match (path.last().map(Vec::as_slice), name.as_slice()) {
+                (None, b"VersioningConfiguration") => !std::mem::replace(&mut seen_root, true),
+                (Some(b"VersioningConfiguration"), b"Status") => {
+                    status.replace(String::new()).is_none()
+                }
+                (Some(b"VersioningConfiguration"), b"MfaDelete") => {
+                    mfa_delete.replace(String::new()).is_none()
+                }
+                _ => false,
+            };
+            if !allowed {
+                return Err(malformed());
+            }
+            path.push(name);
+        }
+        if end.is_some() {
+            path.pop();
+        }
+        if let Event::Text(text) = &event {
+            let text = text.unescape().map_err(|_| malformed())?;
+            match path.last().map(Vec::as_slice) {
+                Some(b"Status") => status.get_or_insert_default().push_str(text.trim()),
+                Some(b"MfaDelete") => mfa_delete.get_or_insert_default().push_str(text.trim()),
+                _ if text.trim().is_empty() => {}
+                _ => return Err(malformed()),
+            }
+        }
+        if matches!(event, Event::Eof) {
+            if !path.is_empty() || !seen_root {
+                return Err(malformed());
+            }
+            break;
+        }
+        buf.clear();
+    }
+    match mfa_delete.as_deref() {
+        None | Some("Disabled") => {}
+        Some("Enabled") => {
+            return Err(S3Error::not_implemented("MFA delete is not supported"));
+        }
+        Some(_) => return Err(malformed()),
+    }
+    match status.as_deref() {
+        Some("Enabled") => Ok(Versioning::Enabled),
+        Some("Suspended") => Ok(Versioning::Suspended),
+        _ => Err(malformed()),
+    }
 }
 
 /// The `<LocationConstraint>` of a CreateBucket body, which must be

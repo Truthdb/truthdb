@@ -7,6 +7,8 @@ pub struct S3Error {
     pub status: u16,
     pub code: &'static str,
     pub message: String,
+    /// Headers the error response carries besides the XML body.
+    pub headers: Vec<(&'static str, String)>,
 }
 
 impl S3Error {
@@ -15,7 +17,13 @@ impl S3Error {
             status,
             code,
             message: message.into(),
+            headers: Vec::new(),
         }
+    }
+
+    pub fn with_header(mut self, name: &'static str, value: impl Into<String>) -> Self {
+        self.headers.push((name, value.into()));
+        self
     }
 
     pub fn access_denied(message: impl Into<String>) -> Self {
