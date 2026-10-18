@@ -13,6 +13,7 @@
 
 mod body;
 mod codec;
+mod credentials;
 mod gc;
 
 #[cfg(test)]
@@ -45,6 +46,8 @@ const SEGMENTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 2;
 const GC_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 3;
 /// (created time, body id) -> (): bodies still being written.
 const STAGING_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 4;
+/// Access key id -> secret: the S3 API's credentials.
+const CREDENTIALS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 5;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -163,6 +166,7 @@ pub(crate) struct Trees {
     segments: u64,
     gc: u64,
     staging: u64,
+    credentials: u64,
 }
 
 impl Trees {
@@ -185,6 +189,12 @@ impl Trees {
         BTree {
             object_id: GC_TREE,
             root: self.gc,
+        }
+    }
+    pub fn credentials(&self) -> BTree {
+        BTree {
+            object_id: CREDENTIALS_TREE,
+            root: self.credentials,
         }
     }
     pub fn staging(&self) -> BTree {
@@ -239,27 +249,23 @@ impl<'a> ObjFile<'a> {
             segments: self.tree(SEGMENTS_TREE)?.root,
             gc: self.tree(GC_TREE)?.root,
             staging: self.tree(STAGING_TREE)?.root,
+            credentials: self.tree(CREDENTIALS_TREE)?.root,
         };
         self.in_txn(|ctx, txn| body(&mut ObjTxn { ctx, txn, trees }))
     }
 
-    /// The engine's trees if they all exist, for reads: a read never creates
-    /// anything (a standby's log is read-only). Fails on a wedged store, whose
-    /// pool may hold changes the log does not back.
-    pub(crate) fn existing_trees(&self) -> Result<Option<Trees>, StorageError> {
+    /// The tree with this object id if it exists, for reads: a read never
+    /// creates anything (a standby's log is read-only), and asks only for the
+    /// trees it needs (a tree added by a later release is missing from older
+    /// files). Fails on a wedged store, whose pool may hold changes the log
+    /// does not back.
+    pub(crate) fn existing_tree(&self, object_id: u32) -> Result<Option<BTree>, StorageError> {
         self.core.ensure_rel_usable()?;
-        Ok(self.existing_trees_unchecked())
-    }
-
-    fn existing_trees_unchecked(&self) -> Option<Trees> {
-        let tree = |object_id: u32| self.eng.trees.get(&object_id).copied();
-        Some(Trees {
-            meta: self.eng.root?,
-            bodies: tree(BODIES_TREE)?,
-            segments: tree(SEGMENTS_TREE)?,
-            gc: tree(GC_TREE)?,
-            staging: tree(STAGING_TREE)?,
-        })
+        Ok(self
+            .eng
+            .trees
+            .get(&object_id)
+            .map(|&root| BTree { object_id, root }))
     }
 
     /// The tree with this object id, creating it the first time.
