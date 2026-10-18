@@ -13,7 +13,7 @@ use truthdb_core::relstore::ctx::{OpMode, RelCtx};
 use truthdb_core::relstore::page::{BLOB_PAGE_DATA, BLOB_RECORD_MAX_PAGES};
 use truthdb_core::storage::{Storage, StorageError};
 
-use crate::codec::{self, BodyRow, BodyState, SegmentRow};
+use crate::codec::{self, BodyRow, BodyState, ChildRow, SegmentRow};
 use crate::{BODIES_TREE, BODY_PAGES_OBJECT, ObjFile, ObjTxn, SEGMENTS_TREE, next_body_id};
 
 /// Bytes per segment: one blob record's worth of pages. Every segment but a
@@ -171,7 +171,7 @@ impl ObjTxn<'_, '_> {
     /// Adds a reference to a sealed body (a copy sharing it).
     pub fn add_ref(&mut self, body: u64) -> Result<(), StorageError> {
         let mut row = self.load_body(body)?;
-        if row.state != BodyState::Sealed || row.refcount == 0 {
+        if !row.state.is_sealed() || row.refcount == 0 {
             return Err(invalid(format!("body {body} is not live")));
         }
         row.refcount += 1;
@@ -182,7 +182,7 @@ impl ObjTxn<'_, '_> {
     /// due after `grace_ms`.
     pub fn drop_ref(&mut self, body: u64, now_ms: u64, grace_ms: u64) -> Result<(), StorageError> {
         let mut row = self.load_body(body)?;
-        if row.state != BodyState::Sealed || row.refcount == 0 {
+        if !row.state.is_sealed() || row.refcount == 0 {
             return Err(invalid(format!("body {body} is not live")));
         }
         row.refcount -= 1;
@@ -197,6 +197,52 @@ impl ObjTxn<'_, '_> {
             )?;
         }
         Ok(())
+    }
+}
+
+impl ObjTxn<'_, '_> {
+    /// Makes a composite body of `children` (sealed bodies, in order, each
+    /// handing its one reference to the composite), with `md5` as its digest
+    /// and one reference of its own.
+    pub(crate) fn compose_body(
+        &mut self,
+        children: &[(u64, u64)],
+        md5: [u8; 16],
+        now_ms: u64,
+    ) -> Result<u64, StorageError> {
+        let body = next_body_id(self)?;
+        let segments = self.trees.segments();
+        let mut offset = 0u64;
+        for (index, (child, len)) in children.iter().enumerate() {
+            segments.insert_unique(
+                self.ctx,
+                &mut OpMode::Txn(self.txn),
+                &codec::segment_key(body, index as u64),
+                &ChildRow {
+                    child: *child,
+                    offset,
+                    len: *len,
+                }
+                .encode(),
+            )?;
+            offset += len;
+        }
+        let row = BodyRow {
+            state: BodyState::Composite,
+            refcount: 1,
+            len: offset,
+            segments: children.len() as u64,
+            touched_ms: now_ms,
+            md5,
+        };
+        let bodies = self.trees.bodies();
+        bodies.insert_unique(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &codec::body_key(body),
+            &row.encode(),
+        )?;
+        Ok(body)
     }
 }
 
@@ -223,7 +269,7 @@ impl ObjFile<'_> {
             .ok_or_else(|| no_body(body))?;
         let mut ctx = self.core.page_ctx(0);
         let row = load_body(&mut ctx, &bodies, body)?;
-        if row.state != BodyState::Sealed {
+        if !row.state.is_sealed() {
             return Err(invalid(format!("body {body} is still being written")));
         }
         Ok(BodyInfo {
@@ -250,7 +296,7 @@ impl ObjFile<'_> {
             .ok_or_else(|| no_body(body))?;
         let mut ctx = self.core.page_ctx(0);
         let row = load_body(&mut ctx, &bodies, body)?;
-        if row.state != BodyState::Sealed {
+        if !row.state.is_sealed() {
             return Err(invalid(format!("body {body} is still being written")));
         }
         if offset
@@ -263,32 +309,115 @@ impl ObjFile<'_> {
                 row.len
             )));
         }
-        let mut page = vec![0u8; BLOB_PAGE_DATA];
-        let mut done = 0usize;
-        while done < out.len() {
-            let at = offset + done as u64;
-            let index = at / SEGMENT_BYTES as u64;
-            let in_segment = (at % SEGMENT_BYTES as u64) as usize;
-            let segment = segments
-                .get(&mut ctx, &codec::segment_key(body, index))?
-                .ok_or_else(|| {
-                    StorageError::InvalidFile(format!("body {body} lost segment {index}"))
-                })?;
-            let segment = SegmentRow::decode(&segment)?;
-            let page_no = segment.start_page + (in_segment / BLOB_PAGE_DATA) as u64;
-            let header = ctx.read_blob_page(page_no, &mut page)?;
-            if header.object_id != BODY_PAGES_OBJECT || header.page_lsn != segment.lsn {
-                return Err(StorageError::InvalidFile(format!(
-                    "page {page_no} of body {body} was overwritten"
-                )));
+        if row.state == BodyState::Composite {
+            // Each part is a plain body: read the slice of each that overlaps.
+            let mut done = 0usize;
+            for child in composite_children(&mut ctx, &segments, body)? {
+                let end = offset + out.len() as u64;
+                let (start, stop) = (
+                    child.offset.max(offset),
+                    (child.offset + child.len).min(end),
+                );
+                if start >= stop {
+                    continue;
+                }
+                let child_row = load_body(&mut ctx, &bodies, child.child)?;
+                let span = (stop - start) as usize;
+                read_plain(
+                    &mut ctx,
+                    &segments,
+                    child.child,
+                    &child_row,
+                    start - child.offset,
+                    &mut out[done..done + span],
+                )?;
+                done += span;
             }
-            let in_page = in_segment % BLOB_PAGE_DATA;
-            let take = (BLOB_PAGE_DATA - in_page).min(out.len() - done);
-            out[done..done + take].copy_from_slice(&page[in_page..in_page + take]);
-            done += take;
+            return Ok(());
         }
-        Ok(())
+        read_plain(&mut ctx, &segments, body, &row, offset, out)
     }
+
+    /// A body's bytes as plain bodies: itself, or a composite's parts, as
+    /// `(body, offset in the whole, length)`.
+    pub fn body_layout(&mut self, body: u64) -> Result<Vec<(u64, u64, u64)>, StorageError> {
+        let bodies = self
+            .existing_tree(BODIES_TREE)?
+            .ok_or_else(|| no_body(body))?;
+        let segments = self
+            .existing_tree(SEGMENTS_TREE)?
+            .ok_or_else(|| no_body(body))?;
+        let mut ctx = self.core.page_ctx(0);
+        let row = load_body(&mut ctx, &bodies, body)?;
+        Ok(if row.state == BodyState::Composite {
+            composite_children(&mut ctx, &segments, body)?
+                .into_iter()
+                .map(|child| (child.child, child.offset, child.len))
+                .collect()
+        } else {
+            vec![(body, 0, row.len)]
+        })
+    }
+}
+
+/// A composite body's children in order.
+pub(crate) fn composite_children(
+    ctx: &mut RelCtx<'_>,
+    segments: &BTree,
+    body: u64,
+) -> Result<Vec<ChildRow>, StorageError> {
+    segments
+        .scan_range(
+            ctx,
+            Some(&codec::segment_key(body, 0)),
+            Some(&codec::segment_key(body, u64::MAX)),
+        )?
+        .into_iter()
+        .map(|(_, row)| ChildRow::decode(&row))
+        .collect()
+}
+
+/// Reads a plain (segmented) body's bytes. Each page's header must name the
+/// body pages and carry the LSN of the record that wrote its segment:
+/// anything else is a page reused since.
+fn read_plain(
+    ctx: &mut RelCtx<'_>,
+    segments: &BTree,
+    body: u64,
+    row: &BodyRow,
+    offset: u64,
+    out: &mut [u8],
+) -> Result<(), StorageError> {
+    if !row.state.is_sealed() || row.state == BodyState::Composite {
+        return Err(StorageError::InvalidFile(format!(
+            "body {body} is not a plain sealed body"
+        )));
+    }
+    let mut page = vec![0u8; BLOB_PAGE_DATA];
+    let mut done = 0usize;
+    while done < out.len() {
+        let at = offset + done as u64;
+        let index = at / SEGMENT_BYTES as u64;
+        let in_segment = (at % SEGMENT_BYTES as u64) as usize;
+        let segment = segments
+            .get(ctx, &codec::segment_key(body, index))?
+            .ok_or_else(|| {
+                StorageError::InvalidFile(format!("body {body} lost segment {index}"))
+            })?;
+        let segment = SegmentRow::decode(&segment)?;
+        let page_no = segment.start_page + (in_segment / BLOB_PAGE_DATA) as u64;
+        let header = ctx.read_blob_page(page_no, &mut page)?;
+        if header.object_id != BODY_PAGES_OBJECT || header.page_lsn != segment.lsn {
+            return Err(StorageError::InvalidFile(format!(
+                "page {page_no} of body {body} was overwritten"
+            )));
+        }
+        let in_page = in_segment % BLOB_PAGE_DATA;
+        let take = (BLOB_PAGE_DATA - in_page).min(out.len() - done);
+        out[done..done + take].copy_from_slice(&page[in_page..in_page + take]);
+        done += take;
+    }
+    Ok(())
 }
 
 pub(crate) fn load_body(
@@ -334,7 +463,7 @@ impl ObjFile<'_> {
             .existing_tree(BODIES_TREE)?
             .ok_or_else(|| no_body(body))?;
         let row = load_body(&mut self.core.page_ctx(0), &bodies, body)?;
-        if row.state != BodyState::Sealed || row.refcount == 0 {
+        if !row.state.is_sealed() || row.refcount == 0 {
             return Err(invalid(format!("body {body} is not live")));
         }
         *self.eng.leases.entry(body).or_default() += 1;

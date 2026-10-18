@@ -7,8 +7,13 @@ use truthdb_core::relstore::btree::BTree;
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
-use crate::codec::{self, BodyState, SegmentRow};
+use crate::codec::{self, BodyState, ChildRow, SegmentRow};
 use crate::{GC_TREE, ObjFile, ObjTxn, STAGING_TREE};
+
+/// Segment rows (page runs, or a composite's parts) one pass works through
+/// before it stops after the body at hand: one huge body is one transaction,
+/// but a pass of several is not one lock hold of unbounded length.
+const PASS_ROW_BUDGET: u64 = 4096;
 
 /// What one garbage-collection pass freed.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
@@ -32,6 +37,7 @@ impl ObjFile<'_> {
         limit: u64,
     ) -> Result<GcOutcome, StorageError> {
         let mut outcome = GcOutcome::default();
+        let mut rows = 0;
         for (queue, upper) in [
             (GC_TREE, now_ms),
             (STAGING_TREE, now_ms.saturating_sub(abandon_after_ms)),
@@ -48,12 +54,14 @@ impl ObjFile<'_> {
                 if self.eng.leases.contains_key(&body) {
                     continue;
                 }
-                if outcome.bodies == limit {
+                if outcome.bodies == limit || rows >= PASS_ROW_BUDGET {
                     outcome.more = true;
                     return Ok(outcome);
                 }
-                outcome.pages += self.transaction(|tx| tx.free_body(&queue, &key, body))?;
+                let (pages, body_rows) = self.transaction(|tx| tx.free_body(&queue, &key, body))?;
+                outcome.pages += pages;
                 outcome.bodies += 1;
+                rows += body_rows;
             }
         }
         Ok(outcome)
@@ -62,10 +70,15 @@ impl ObjFile<'_> {
 
 impl ObjTxn<'_, '_> {
     /// Frees one body's extents and deletes its rows and its row `key` in
-    /// `queue`. Returns the pages freed.
-    fn free_body(&mut self, queue: &BTree, key: &[u8], body: u64) -> Result<u64, StorageError> {
+    /// `queue`. Returns the pages freed and the segment rows worked through.
+    fn free_body(
+        &mut self,
+        queue: &BTree,
+        key: &[u8],
+        body: u64,
+    ) -> Result<(u64, u64), StorageError> {
         let row = crate::body::load_body(self.ctx, &self.trees.bodies(), body)?;
-        if row.state == BodyState::Sealed && row.refcount != 0 {
+        if row.state.is_sealed() && row.refcount != 0 {
             return Err(StorageError::InvalidFile(format!(
                 "body {body} is queued for collection but still referenced"
             )));
@@ -77,16 +90,23 @@ impl ObjTxn<'_, '_> {
             Some(&codec::segment_key(body, u64::MAX)),
         )?;
         let mut pages = 0;
+        let worked = rows.len() as u64;
         for (segment_key, segment) in rows {
-            let segment = SegmentRow::decode(&segment)?;
-            self.ctx
-                .free_extent_in_txn(self.txn, segment.start_page, segment.pages as u64)?;
+            if row.state == BodyState::Composite {
+                // A composite owns its parts' references, not pages.
+                let child = ChildRow::decode(&segment)?;
+                self.drop_ref(child.child, 0, 0)?;
+            } else {
+                let segment = SegmentRow::decode(&segment)?;
+                self.ctx
+                    .free_extent_in_txn(self.txn, segment.start_page, segment.pages as u64)?;
+                pages += segment.pages as u64;
+            }
             segments.delete(self.ctx, &mut OpMode::Txn(self.txn), &segment_key)?;
-            pages += segment.pages as u64;
         }
         let bodies = self.trees.bodies();
         bodies.delete(self.ctx, &mut OpMode::Txn(self.txn), &codec::body_key(body))?;
         queue.delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
-        Ok(pages)
+        Ok((pages, worked))
     }
 }

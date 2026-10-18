@@ -36,12 +36,12 @@ pub struct ObjectAttrs {
 }
 
 impl ObjectAttrs {
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         *self == ObjectAttrs::default()
     }
 
     /// `[tag u8][len u16][bytes]` per field; user metadata as name and value.
-    fn encode(&self) -> Vec<u8> {
+    pub(crate) fn encode(&self) -> Vec<u8> {
         let mut out = Vec::new();
         let mut field = |tag: u8, value: &str| {
             out.push(tag);
@@ -67,7 +67,7 @@ impl ObjectAttrs {
         out
     }
 
-    fn decode(mut bytes: &[u8]) -> Result<Self, StorageError> {
+    pub(crate) fn decode(mut bytes: &[u8]) -> Result<Self, StorageError> {
         let corrupt = || StorageError::InvalidFile("corrupt object attributes".to_string());
         let mut attrs = ObjectAttrs::default();
         let mut pending_name = None;
@@ -135,6 +135,14 @@ impl ObjectInfo {
             format!("\"{hex}-{}\"", self.parts)
         }
     }
+}
+
+/// The body side of a new version.
+pub(crate) struct NewVersion {
+    pub body: u64,
+    pub size: u64,
+    pub md5: [u8; 16],
+    pub parts: u16,
 }
 
 /// What a DeleteObject did: the version it removed or the delete marker it
@@ -246,7 +254,7 @@ fn attrs_key(version: u64, chunk: u16) -> [u8; 10] {
 }
 
 impl ObjTxn<'_, '_> {
-    fn bucket_row(&mut self, bucket: &str) -> Result<Option<BucketRow>, StorageError> {
+    pub(crate) fn bucket_row(&mut self, bucket: &str) -> Result<Option<BucketRow>, StorageError> {
         self.trees
             .buckets()
             .get(self.ctx, bucket.as_bytes())?
@@ -274,17 +282,47 @@ impl ObjTxn<'_, '_> {
             return Ok(Err(ObjectError::NoSuchBucket));
         };
         let sealed = body.seal_in(self)?;
-        let null_version = bucket_row.versioning != Versioning::Enabled;
+        let info = self.insert_version(
+            bucket,
+            key,
+            bucket_row.versioning,
+            NewVersion {
+                body: sealed.body,
+                size: sealed.len,
+                md5: sealed.md5,
+                parts: 0,
+            },
+            attrs,
+            now_ms,
+            grace_ms,
+        )?;
+        Ok(Ok(info))
+    }
+
+    /// Writes a version of `key` holding `version.body`'s one reference and,
+    /// unless versioning is enabled, replaces the key's null version.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_version(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        versioning: Versioning,
+        new: NewVersion,
+        attrs: &ObjectAttrs,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<ObjectInfo, StorageError> {
+        let null_version = versioning != Versioning::Enabled;
         if null_version {
             self.remove_null_version(bucket, key, now_ms, grace_ms)?;
         }
         let version = next_counter(self, NEXT_VERSION_KEY)?;
         let has_attrs = !attrs.is_empty();
         let row = VersionRow {
-            body: sealed.body,
-            size: sealed.len,
-            md5: sealed.md5,
-            parts: 0,
+            body: new.body,
+            size: new.size,
+            md5: new.md5,
+            parts: new.parts,
             mtime_ms: now_ms,
             flags: if null_version { FLAG_NULL_VERSION } else { 0 }
                 | if has_attrs { FLAG_HAS_ATTRS } else { 0 },
@@ -308,17 +346,17 @@ impl ObjTxn<'_, '_> {
                 )?;
             }
         }
-        Ok(Ok(ObjectInfo {
+        Ok(ObjectInfo {
             version,
             null_version,
             delete_marker: false,
-            body: sealed.body,
-            size: sealed.len,
-            md5: sealed.md5,
-            parts: 0,
+            body: new.body,
+            size: new.size,
+            md5: new.md5,
+            parts: new.parts,
             mtime_ms: now_ms,
             attrs: attrs.clone(),
-        }))
+        })
     }
 
     /// Removes the key's versions that `wanted` picks: each row, its

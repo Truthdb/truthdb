@@ -13,11 +13,20 @@ pub(crate) fn u64_le(bytes: &[u8]) -> Result<u64, StorageError> {
     ))
 }
 
-/// Whether a body is still being written or complete.
+/// Whether a body is still being written, complete, or complete and made of
+/// other bodies (a multipart upload's parts, in order).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum BodyState {
     Staging,
     Sealed,
+    Composite,
+}
+
+impl BodyState {
+    /// Complete: readable and reference-counted.
+    pub fn is_sealed(self) -> bool {
+        self != BodyState::Staging
+    }
 }
 
 /// A body: its length, segment count, reference count and MD5.
@@ -37,6 +46,7 @@ impl BodyRow {
         out.push(match self.state {
             BodyState::Staging => 0,
             BodyState::Sealed => 1,
+            BodyState::Composite => 2,
         });
         out.extend_from_slice(&self.refcount.to_le_bytes());
         out.extend_from_slice(&self.len.to_le_bytes());
@@ -55,6 +65,7 @@ impl BodyRow {
             state: match bytes[0] {
                 0 => BodyState::Staging,
                 1 => BodyState::Sealed,
+                2 => BodyState::Composite,
                 _ => return Err(corrupt("body state")),
             },
             refcount: u32::from_le_bytes(bytes[1..5].try_into().unwrap()),
@@ -96,6 +107,37 @@ impl SegmentRow {
             pages: u32::from_le_bytes(bytes[8..12].try_into().unwrap()),
             len: u32::from_le_bytes(bytes[12..16].try_into().unwrap()),
             lsn: u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
+        })
+    }
+}
+
+/// One child of a composite body: the child body and where its bytes start
+/// in the composite. Stored in the segments tree under the composite.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChildRow {
+    pub child: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl ChildRow {
+    pub fn encode(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(24);
+        out.extend_from_slice(&self.child.to_le_bytes());
+        out.extend_from_slice(&self.offset.to_le_bytes());
+        out.extend_from_slice(&self.len.to_le_bytes());
+        out
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+        if bytes.len() != 24 {
+            return Err(corrupt("child row"));
+        }
+        let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
+        Ok(ChildRow {
+            child: u64_at(0),
+            offset: u64_at(8),
+            len: u64_at(16),
         })
     }
 }

@@ -804,6 +804,167 @@ fn a_deleted_object_is_gone_and_its_body_collected() {
 }
 
 #[test]
+fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
+    use crate::{MIN_PART_BYTES, ObjectAttrs, UploadError, VersionSel};
+    let path = temp_path("multipart");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .unwrap()
+        .unwrap();
+    let attrs = ObjectAttrs {
+        content_type: Some("video/mp4".to_string()),
+        ..ObjectAttrs::default()
+    };
+    let upload = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_upload("bkt", "movie.mp4", &attrs, now()))
+        .unwrap()
+        .unwrap();
+    let send_part = |number: u32, data: &[u8]| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, data, now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        let result = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.upload_part(upload, number, &sealed, now(), 0))
+            .unwrap();
+        // The log is small in these tests: checkpoint between parts.
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+        result
+    };
+    let big = MIN_PART_BYTES as usize;
+    let part1 = bytes(1, big);
+    let part2 = bytes(2, big + 3);
+    let part3 = bytes(3, 1000);
+    let md5_1 = send_part(1, &part1).unwrap().md5;
+    let _replaced = send_part(2, &bytes(9, 10)).unwrap();
+    let md5_2 = send_part(2, &part2).unwrap().md5;
+    let md5_3 = send_part(3, &part3).unwrap().md5;
+    let md5_4 = send_part(4, &bytes(4, 10)).unwrap().md5;
+    assert_eq!(send_part(0, b"x"), Err(UploadError::InvalidPartNumber));
+
+    let complete = |listed: &[(u32, [u8; 16])]| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.complete_upload(upload, listed, now(), 0))
+            .unwrap()
+    };
+    assert_eq!(
+        complete(&[(2, md5_2), (1, md5_1)]),
+        Err(UploadError::InvalidPartOrder)
+    );
+    assert_eq!(
+        complete(&[(1, md5_2), (3, md5_3)]),
+        Err(UploadError::InvalidPart(1))
+    );
+    assert_eq!(
+        complete(&[(3, md5_3), (4, md5_4)]),
+        Err(UploadError::EntityTooSmall(3)),
+        "a part under 5 MiB that is not last"
+    );
+    let (parts, truncated) = ObjFile::new(&mut storage.lock())
+        .list_parts(upload, 0, 2)
+        .unwrap();
+    assert_eq!(parts.iter().map(|p| p.number).collect::<Vec<_>>(), [1, 2]);
+    assert!(truncated);
+
+    let object = complete(&[(1, md5_1), (2, md5_2), (3, md5_3)]).unwrap();
+    assert_eq!(object.parts, 3);
+    assert!(object.etag().ends_with("-3\""), "{}", object.etag());
+    let whole: Vec<u8> = [part1.clone(), part2.clone(), part3.clone()].concat();
+    assert_eq!(object.size, whole.len() as u64);
+    assert_eq!(read(&storage, object.body, 0, whole.len()).unwrap(), whole);
+    let across = big as u64 - 5;
+    assert_eq!(
+        read(&storage, object.body, across, 10).unwrap(),
+        whole[across as usize..across as usize + 10],
+        "a read across a part boundary"
+    );
+    let head = ObjFile::new(&mut storage.lock())
+        .head_object("bkt", "movie.mp4", VersionSel::Latest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(head.attrs.content_type.as_deref(), Some("video/mp4"));
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .upload(upload)
+            .unwrap()
+            .is_none()
+    );
+    // The replaced part 2 and the unlisted part 4 are collected.
+    let freed = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now(), ABANDON, u64::MAX)
+        .unwrap();
+    assert_eq!(freed.bodies, 2);
+
+    // An aborted upload releases its parts.
+    let aborted = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_upload("bkt", "other", &ObjectAttrs::default(), now()))
+        .unwrap()
+        .unwrap();
+    let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+    writer.write(&storage, b"part", now()).unwrap();
+    let sealed = writer.finish(&storage, now()).unwrap();
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.upload_part(aborted, 1, &sealed, now(), 0))
+        .unwrap()
+        .unwrap();
+    let (listed, _) = ObjFile::new(&mut storage.lock())
+        .list_uploads("bkt", "", None, 10)
+        .unwrap();
+    assert_eq!(
+        listed.iter().map(|u| u.key.as_str()).collect::<Vec<_>>(),
+        ["other"]
+    );
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.abort_upload(aborted, now(), 0))
+        .unwrap()
+        .unwrap();
+    let freed = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now(), ABANDON, u64::MAX)
+        .unwrap();
+    assert_eq!(freed.bodies, 1);
+
+    // An open upload keeps its bucket until it is aborted.
+    use crate::BucketError;
+    let pending = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("upl", now())?.unwrap();
+            tx.create_upload("upl", "k", &ObjectAttrs::default(), now())
+        })
+        .unwrap()
+        .unwrap();
+    let delete_bucket = || {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_bucket("upl"))
+            .unwrap()
+    };
+    assert_eq!(delete_bucket(), Err(BucketError::NotEmpty));
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.abort_upload(pending, now(), 0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(delete_bucket(), Ok(()));
+    drop(storage);
+
+    // The composite survives a crash and its parts go when it does.
+    let storage = open(&path);
+    assert_eq!(read(&storage, object.body, 0, whole.len()).unwrap(), whole);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("bkt", "movie.mp4", None, now(), 0))
+        .unwrap()
+        .unwrap();
+    let collect = || {
+        ObjFile::new(&mut storage.lock())
+            .collect_garbage(now(), ABANDON, u64::MAX)
+            .unwrap()
+            .bodies
+    };
+    assert_eq!(collect(), 1, "the composite, which releases its parts");
+    assert_eq!(collect(), 3, "then its three parts");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
     use crate::buckets::BucketRow;
     use crate::{ListAfter, ObjectAttrs, Versioning};
@@ -931,6 +1092,40 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
     assert!(!removed.delete_marker);
     assert_eq!(delete_version().version, None, "nothing left to remove");
     assert!(list().objects.is_empty());
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn uploads_past_their_age_are_found_oldest_first() {
+    use crate::ObjectAttrs;
+    let path = temp_path("expired-uploads");
+    let storage = create(&path);
+    let start = |at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_bucket("bkt", now()).ok();
+                tx.create_upload("bkt", "k", &ObjectAttrs::default(), at)
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let old = start(1_000);
+    let older_still_running = start(2_000);
+    let fresh = start(9_000);
+    let expired = |before: u64, max: usize| {
+        ObjFile::new(&mut storage.lock())
+            .expired_uploads(before, max)
+            .unwrap()
+    };
+    assert_eq!(expired(5_000, 10), [old, older_still_running]);
+    assert_eq!(expired(5_000, 1), [old], "at most `max`");
+    assert_eq!(expired(500, 10), Vec::<u64>::new());
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.abort_upload(old, now(), 0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(expired(10_000, 10), [older_still_running, fresh]);
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
