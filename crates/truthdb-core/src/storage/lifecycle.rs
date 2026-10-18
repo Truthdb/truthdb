@@ -212,20 +212,7 @@ impl Storage {
 
     pub fn open(path: PathBuf, engine: EngineFactory) -> Result<Self, StorageError> {
         assert_layout_invariants();
-        let file = StorageFile::open_existing(path.clone(), None, engine())?;
-        Self::with_log_writer(path, file)
-    }
-
-    /// Opens with recovery stopped at a point in time: transactions whose commit
-    /// timestamp is past `stop_at` are undone (point-in-time restore). Used by
-    /// the restore path to validate + finalize a `--stopat` recovery.
-    pub(super) fn open_with_stop_at(
-        path: PathBuf,
-        stop_at: u64,
-        engine: EngineFactory,
-    ) -> Result<Self, StorageError> {
-        assert_layout_invariants();
-        let file = StorageFile::open_existing(path.clone(), Some(stop_at), engine())?;
+        let file = StorageFile::open_existing(path.clone(), engine())?;
         Self::with_log_writer(path, file)
     }
 
@@ -377,7 +364,6 @@ impl StorageFile {
 
     pub(super) fn open_existing(
         path: PathBuf,
-        stop_at: Option<u64>,
         mut engines: Vec<Box<dyn EngineParticipant>>,
     ) -> Result<Locked, StorageError> {
         validate_engines(&engines)?;
@@ -443,40 +429,13 @@ impl StorageFile {
         // Recover the true WAL tail: trust the superblock's tail as a lower
         // bound and scan forward (CRC + LSN self-identity) past it.
         let mut log_file = DirectFile::open_existing_unlocked(path.clone())?;
-        let mut scan = scan_ring(
+        let scan = scan_ring(
             &mut log_file,
             layout.wal_offset,
             layout.wal_size,
             active_sb.wal_head,
             active_sb.wal_tail,
         )?;
-        // Point-in-time restore: the log ends just before the first commit
-        // whose timestamp is past `stop_at`, exactly as if the database had
-        // crashed there. Everything from the cut on is erased from the ring,
-        // so redo never repeats it (later records may reuse space the kept
-        // state still owns) and no later open finds it again; restart undo
-        // then rolls back the transactions still open at the cut.
-        if let Some(limit) = stop_at {
-            let rel_records: Vec<(u64, RelRecord)> = scan
-                .records
-                .iter()
-                .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
-                .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
-                .collect::<Result<_, StorageError>>()?;
-            let cut = rel_recovery::first_commit_past(&rel_records, limit)?;
-            if cut < scan.tail {
-                crate::wal::zero_ring_range(
-                    &mut log_file,
-                    layout.wal_offset,
-                    layout.wal_size,
-                    cut,
-                    scan.tail,
-                )?;
-                log_file.sync_data()?;
-                scan.records.retain(|record| record.logical_ts < cut);
-                scan.tail = cut;
-            }
-        }
         let wal = WalWriter::open(
             log_file,
             layout.wal_offset,

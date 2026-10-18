@@ -376,27 +376,10 @@ pub(crate) struct ScanResult {
     pub tail: u64,
 }
 
-/// Scans the ring from `head`, collecting valid entries.
-///
-/// Entries starting before `trusted_tail` (the superblock's recorded tail)
-/// are validated by CRC alone. Past it, the scan continues while entries
-/// verify **and** carry `logical_ts == position`, which both detects torn
-/// tails and rejects stale entries from earlier ring laps. A run of zero
-/// bytes is interpreted as a ring-wrap gap: the scan skips to the next lap
-/// and continues if a valid entry sits there, otherwise the log ends before
-/// the gap.
-///
-/// Residual hazard (accepted): if media corruption destroys an entry inside
-/// the trusted region, the log is truncated there and new entries overwrite
-/// the old suffix. An old-history entry that sits at exactly the position
-/// the new history reaches passes the LSN self-identity check and would be
-/// resurrected — distinguishing histories at the same position would need
-/// timeline identifiers (out of scope for Stage 1; this only follows an
-/// already-violated durability assumption).
 /// Zeroes the ring bytes `[from, to)` (logical LSNs, lap-aware), so a
 /// forward scan stops at `from`: an all-zero header reads as a wrap gap, and
-/// the bytes after it in this lap are zero too. Point-in-time restore cuts
-/// the log this way.
+/// the bytes after it are zero too (on every lap the range touches), so the
+/// scan ends at `from`. Point-in-time restore cuts the log this way.
 pub(crate) fn zero_ring_range(
     file: &mut DirectFile,
     ring_offset: u64,
@@ -419,6 +402,23 @@ pub(crate) fn zero_ring_range(
     Ok(())
 }
 
+/// Scans the ring from `head`, collecting valid entries.
+///
+/// Entries starting before `trusted_tail` (the superblock's recorded tail)
+/// are validated by CRC alone. Past it, the scan continues while entries
+/// verify **and** carry `logical_ts == position`, which both detects torn
+/// tails and rejects stale entries from earlier ring laps. A run of zero
+/// bytes is interpreted as a ring-wrap gap: the scan skips to the next lap
+/// and continues if a valid entry sits there, otherwise the log ends before
+/// the gap.
+///
+/// Residual hazard (accepted): if media corruption destroys an entry inside
+/// the trusted region, the log is truncated there and new entries overwrite
+/// the old suffix. An old-history entry that sits at exactly the position
+/// the new history reaches passes the LSN self-identity check and would be
+/// resurrected — distinguishing histories at the same position would need
+/// timeline identifiers (out of scope for Stage 1; this only follows an
+/// already-violated durability assumption).
 pub(crate) fn scan_ring(
     file: &mut DirectFile,
     ring_offset: u64,

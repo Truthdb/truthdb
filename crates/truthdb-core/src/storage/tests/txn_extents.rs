@@ -197,62 +197,84 @@ fn a_free_lands_only_when_its_transaction_commits() {
     std::fs::remove_file(&path).ok();
 }
 
+fn now_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
+/// FULL recovery model, so log backups can carry the stop point.
+fn set_full(storage: &Storage) {
+    storage
+        .lock()
+        .commit_db_options(0, Some(true))
+        .expect("recovery full");
+}
+
+/// Restores `bak` plus `log` to `dst`, stopping at `stop_at`.
+fn restore_at(dst: &Path, bak: &Path, log: &Path, stop_at: u64) -> Result<(), StorageError> {
+    Storage::restore_full_with_logs(dst, bak, &[log.to_path_buf()], Some(stop_at), no_engine)
+}
+
 #[test]
 fn a_point_in_time_cut_keeps_frees_committed_after_it() {
     let path = unique_temp_path("txn-extents-pitr");
+    let bak = unique_temp_path("txn-extents-pitr-bak");
+    let log = unique_temp_path("txn-extents-pitr-log");
+    let dst = unique_temp_path("txn-extents-pitr-dst");
     let storage = create_small(&path);
+    set_full(&storage);
     let before = committed_extent(&storage);
     let after = committed_extent(&storage);
+    storage.backup_full(&bak).expect("full backup");
 
     let ((), txn) = in_txn(&storage, |ctx, txn| {
         ctx.free_extent_in_txn(txn, before, PAGES).expect("free")
     });
     commit(&storage, txn);
     std::thread::sleep(std::time::Duration::from_millis(5));
-    let stop_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
+    let stop_at = now_millis();
     std::thread::sleep(std::time::Duration::from_millis(5));
     let ((), txn) = in_txn(&storage, |ctx, txn| {
         ctx.free_extent_in_txn(txn, after, PAGES).expect("free")
     });
     commit(&storage, txn);
+    storage.backup_log(&log, true, false).expect("log backup");
     drop(storage);
 
-    let storage = Storage::open_with_stop_at(path.clone(), stop_at, no_engine).expect("cut");
-    assert!(
-        free(&storage, before),
-        "a free committed before the cut lands"
-    );
-    assert!(
-        allocated(&storage, after),
-        "a free committed after the cut does not"
-    );
-    drop(storage);
-
-    let storage = Storage::open(path.clone(), no_engine).expect("normal reopen");
-    assert!(free(&storage, before));
-    assert!(
-        allocated(&storage, after),
-        "the cut-off free does not come back on a normal reopen"
-    );
-    drop(storage);
-    std::fs::remove_file(&path).ok();
+    restore_at(&dst, &bak, &log, stop_at).expect("point-in-time restore");
+    for open in ["restored", "reopened"] {
+        let storage = Storage::open(dst.clone(), no_engine).expect("open");
+        assert!(
+            free(&storage, before),
+            "{open}: a free committed before the cut lands"
+        );
+        assert!(
+            allocated(&storage, after),
+            "{open}: a free committed after the cut does not"
+        );
+        drop(storage);
+    }
+    for p in [&path, &bak, &log, &dst] {
+        std::fs::remove_file(p).ok();
+    }
 }
 
 #[test]
 fn space_freed_and_reused_after_the_cut_stays_with_its_owner_at_the_cut() {
     let path = unique_temp_path("txn-extents-pitr-reuse");
+    let bak = unique_temp_path("txn-extents-pitr-reuse-bak");
+    let log = unique_temp_path("txn-extents-pitr-reuse-log");
+    let dst = unique_temp_path("txn-extents-pitr-reuse-dst");
     let storage = create_small(&path);
+    set_full(&storage);
     let owned = committed_extent(&storage);
+    storage.backup_full(&bak).expect("full backup");
     drop(storage);
     // Reopen so the next-fit cursor starts over and hands out `owned` again.
     let storage = Storage::open(path.clone(), no_engine).expect("reopen");
-    let stop_at = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
+    let stop_at = now_millis();
     std::thread::sleep(std::time::Duration::from_millis(5));
     let ((), txn) = in_txn(&storage, |ctx, txn| {
         ctx.free_extent_in_txn(txn, owned, PAGES).expect("free")
@@ -265,14 +287,12 @@ fn space_freed_and_reused_after_the_cut_stays_with_its_owner_at_the_cut() {
     });
     commit(&storage, txn);
     assert_eq!(reused, owned, "the freed extent was reused after the cut");
+    storage.backup_log(&log, true, false).expect("log backup");
     drop(storage);
 
-    for open in ["cut", "normal reopen"] {
-        let storage = if open == "cut" {
-            Storage::open_with_stop_at(path.clone(), stop_at, no_engine).expect("cut")
-        } else {
-            Storage::open(path.clone(), no_engine).expect("normal reopen")
-        };
+    restore_at(&dst, &bak, &log, stop_at).expect("point-in-time restore");
+    for open in ["restored", "reopened"] {
+        let storage = Storage::open(dst.clone(), no_engine).expect("open");
         assert!(
             allocated(&storage, owned),
             "{open}: the extent still belongs to its first owner"
@@ -283,7 +303,36 @@ fn space_freed_and_reused_after_the_cut_stays_with_its_owner_at_the_cut() {
         );
         drop(storage);
     }
-    std::fs::remove_file(&path).ok();
+    for p in [&path, &bak, &log, &dst] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+#[test]
+fn a_stop_point_inside_the_full_backup_is_refused() {
+    let path = unique_temp_path("txn-extents-pitr-early");
+    let bak = unique_temp_path("txn-extents-pitr-early-bak");
+    let log = unique_temp_path("txn-extents-pitr-early-log");
+    let dst = unique_temp_path("txn-extents-pitr-early-dst");
+    let storage = create_small(&path);
+    set_full(&storage);
+    let stop_at = now_millis();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    committed_extent(&storage);
+    // The full backup's log (and so its page images) covers that commit.
+    storage.backup_full(&bak).expect("full backup");
+    storage.backup_log(&log, true, false).expect("log backup");
+    drop(storage);
+
+    let err = restore_at(&dst, &bak, &log, stop_at).expect_err("refused");
+    assert!(
+        err.to_string().contains("before the full backup finished"),
+        "unexpected error: {err}"
+    );
+    assert!(!dst.exists(), "the refused restore leaves no file behind");
+    for p in [&path, &bak, &log] {
+        std::fs::remove_file(p).ok();
+    }
 }
 
 #[test]
