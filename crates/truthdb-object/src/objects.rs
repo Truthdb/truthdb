@@ -179,7 +179,7 @@ fn version_key(bucket: &str, key: &str, version: u64) -> Vec<u8> {
     out
 }
 
-fn version_from_key(row_key: &[u8]) -> Result<u64, StorageError> {
+pub(crate) fn version_from_key(row_key: &[u8]) -> Result<u64, StorageError> {
     let tail = row_key
         .len()
         .checked_sub(8)
@@ -461,4 +461,20 @@ mod tests {
         assert!(version_key("b", "a/b", 1) < version_key("b", "ab", 1));
         assert_eq!(version_from_key(&version_key("b", "k", 77)).unwrap(), 77);
     }
+}
+
+/// A version row as listed (no attributes: a listing does not return them).
+pub(crate) fn decode_version(version: u64, row: &[u8]) -> Result<ObjectInfo, StorageError> {
+    let row = VersionRow::decode(row)?;
+    Ok(ObjectInfo {
+        version,
+        null_version: row.flags & FLAG_NULL_VERSION != 0,
+        delete_marker: row.flags & FLAG_DELETE_MARKER != 0,
+        body: row.body,
+        size: row.size,
+        md5: row.md5,
+        parts: row.parts,
+        mtime_ms: row.mtime_ms,
+        attrs: ObjectAttrs::default(),
+    })
 }

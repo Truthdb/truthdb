@@ -115,6 +115,10 @@ pub async fn dispatch(
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "location") => {
             bucket_location(state, bucket).await
         }
+        (Target::Bucket(bucket), Method::GET) => {
+            let query = request.uri().query().unwrap_or("").to_string();
+            crate::listing::list_objects(state, bucket, &query).await
+        }
         (Target::Object(bucket, key), Method::PUT) => {
             crate::objects::put_object(state, request, auth, bucket, key).await
         }
