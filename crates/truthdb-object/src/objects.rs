@@ -277,7 +277,20 @@ fn find_version(
     let prefix = key_prefix(bucket, key);
     let mut upper = prefix.clone();
     upper.extend_from_slice(&[0xFF; 8]);
-    for (row_key, row) in objects.scan_range(ctx, Some(&prefix), Some(&upper))? {
+    // Only the null version needs a scan: the newest is the first row, and a
+    // numbered version has its own key.
+    let rows = match which {
+        VersionSel::Latest => objects.scan_range_limit(ctx, Some(&prefix), Some(&upper), 1)?,
+        VersionSel::Seq(seq) => {
+            let row_key = version_key(bucket, key, seq);
+            match objects.get(ctx, &row_key)? {
+                Some(row) => vec![(row_key, row)],
+                None => Vec::new(),
+            }
+        }
+        VersionSel::Null => objects.scan_range(ctx, Some(&prefix), Some(&upper))?,
+    };
+    for (row_key, row) in rows {
         let version = version_from_key(&row_key)?;
         let row = VersionRow::decode(&row)?;
         let wanted = match which {
