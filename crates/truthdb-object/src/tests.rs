@@ -742,6 +742,68 @@ fn listings_follow_key_order_prefixes_delimiters_and_pages() {
 }
 
 #[test]
+fn a_deleted_object_is_gone_and_its_body_collected() {
+    use crate::{Deleted, ObjectAttrs, ObjectError, VersionSel};
+    let path = temp_path("delete");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .unwrap()
+        .unwrap();
+    let put = |key: &str| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .unwrap()
+            .unwrap()
+    };
+    let delete = |key: &str, which| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_object("bkt", key, which, now(), 0))
+            .unwrap()
+    };
+    put("one");
+    put("two");
+    assert_eq!(delete("one", None), Ok(Deleted::default()));
+    assert_eq!(
+        delete("one", None),
+        Ok(Deleted::default()),
+        "deleting again succeeds"
+    );
+    let removed = delete("two", Some(VersionSel::Null)).unwrap();
+    assert!(removed.version.is_some() && removed.null_version);
+    for key in ["one", "two"] {
+        assert_eq!(
+            ObjFile::new(&mut storage.lock())
+                .head_object("bkt", key, VersionSel::Latest)
+                .unwrap(),
+            Err(ObjectError::NoSuchKey)
+        );
+    }
+    let freed = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now(), ABANDON, u64::MAX)
+        .unwrap();
+    assert_eq!(freed.bodies, 2, "both bodies were collected");
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_object("nope", "k", None, now(), 0))
+            .unwrap(),
+        Err(ObjectError::NoSuchBucket)
+    );
+    // The bucket is empty again, so it can be deleted.
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_bucket("bkt"))
+            .unwrap(),
+        Ok(())
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
     use crate::buckets::BucketRow;
     use crate::{ListAfter, ObjectAttrs, Versioning};
@@ -796,6 +858,79 @@ fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
         page = list(Some(ListAfter::Key(&last)));
     }
     assert_eq!(keys, ["a", "k", "z"]);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
+    use crate::buckets::BucketRow;
+    use crate::{ObjectAttrs, Versioning};
+    let path = temp_path("deleted-folder");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("bkt", now())?.unwrap();
+            let row = BucketRow {
+                created_ms: now(),
+                versioning: Versioning::Enabled,
+            };
+            tx.trees
+                .buckets()
+                .update(tx.ctx, &mut OpMode::Txn(tx.txn), b"bkt", &row.encode())?;
+            Ok(())
+        })
+        .unwrap();
+    for key in ["dir/x", "dir/y", "e"] {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .unwrap()
+            .unwrap();
+    }
+    let list = || {
+        ObjFile::new(&mut storage.lock())
+            .list_objects("bkt", "", Some("/"), None, 1000)
+            .unwrap()
+            .unwrap()
+    };
+    // One live key keeps the folder; delete markers on both remove it.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("bkt", "dir/x", None, now(), 0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(list().common_prefixes, ["dir/"]);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("bkt", "dir/y", None, now(), 0))
+        .unwrap()
+        .unwrap();
+    let listing = list();
+    assert!(listing.common_prefixes.is_empty(), "{listing:?}");
+    assert_eq!(
+        listing
+            .objects
+            .iter()
+            .map(|o| o.key.as_str())
+            .collect::<Vec<_>>(),
+        ["e"]
+    );
+    // A version named by number is removed alone.
+    let version = listing.objects[0].info.version;
+    let delete_version = || {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.delete_object("bkt", "e", Some(crate::VersionSel::Seq(version)), now(), 0)
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let removed = delete_version();
+    assert_eq!(removed.version, Some(version));
+    assert!(!removed.delete_marker);
+    assert_eq!(delete_version().version, None, "nothing left to remove");
+    assert!(list().objects.is_empty());
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

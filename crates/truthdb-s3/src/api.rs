@@ -162,6 +162,9 @@ pub async fn dispatch(
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "location") => {
             bucket_location(state, bucket).await
         }
+        (Target::Bucket(bucket), Method::POST) if has_param(&request, "delete") => {
+            crate::delete::delete_objects(state, request, auth, bucket).await
+        }
         (Target::Bucket(bucket), Method::GET) => {
             let query = request.uri().query().unwrap_or("").to_string();
             crate::listing::list_objects(state, bucket, &query).await
@@ -174,6 +177,9 @@ pub async fn dispatch(
         }
         (Target::Object(bucket, key), Method::HEAD) => {
             crate::objects::get_object(state, request, bucket, key, true).await
+        }
+        (Target::Object(bucket, key), Method::DELETE) => {
+            crate::delete::delete_object(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), method) => Err(S3Error::not_implemented(format!(
             "{method} on object {key} in {bucket} is not implemented yet"

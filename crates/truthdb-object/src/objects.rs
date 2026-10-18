@@ -137,6 +137,15 @@ impl ObjectInfo {
     }
 }
 
+/// What a DeleteObject did: the version it removed or the delete marker it
+/// added (`version` is `None` when there was nothing to remove).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Deleted {
+    pub version: Option<u64>,
+    pub null_version: bool,
+    pub delete_marker: bool,
+}
+
 /// Why an object operation was refused (the storage itself worked).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ObjectError {
@@ -312,25 +321,39 @@ impl ObjTxn<'_, '_> {
         }))
     }
 
-    /// Removes the key's null version, if any: its row, its attributes and
-    /// its body's reference.
-    fn remove_null_version(
+    /// Removes the key's versions that `wanted` picks: each row, its
+    /// attributes and its body's reference. Returns the removed versions'
+    /// numbers. With `only`, reads that version's row alone instead of every
+    /// version of the key.
+    fn remove_versions(
         &mut self,
         bucket: &str,
         key: &str,
+        only: Option<u64>,
         now_ms: u64,
         grace_ms: u64,
-    ) -> Result<(), StorageError> {
+        mut wanted: impl FnMut(u64, &VersionRow) -> bool,
+    ) -> Result<Vec<u64>, StorageError> {
         let objects = self.trees.objects();
-        let prefix = key_prefix(bucket, key);
-        let mut upper = prefix.clone();
-        upper.extend_from_slice(&[0xFF; 8]);
-        for (row_key, row) in objects.scan_range(self.ctx, Some(&prefix), Some(&upper))? {
+        let (lower, upper) = match only {
+            Some(version) => {
+                let row_key = version_key(bucket, key, version);
+                (row_key.clone(), row_key)
+            }
+            None => {
+                let prefix = key_prefix(bucket, key);
+                let mut upper = prefix.clone();
+                upper.extend_from_slice(&[0xFF; 8]);
+                (prefix, upper)
+            }
+        };
+        let mut removed = Vec::new();
+        for (row_key, row) in objects.scan_range(self.ctx, Some(&lower), Some(&upper))? {
             let row = VersionRow::decode(&row)?;
-            if row.flags & FLAG_NULL_VERSION == 0 {
+            let version = version_from_key(&row_key)?;
+            if !wanted(version, &row) {
                 continue;
             }
-            let version = version_from_key(&row_key)?;
             objects.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
             if row.flags & FLAG_HAS_ATTRS != 0 {
                 let attrs_tree = self.trees.attrs();
@@ -345,8 +368,116 @@ impl ObjTxn<'_, '_> {
             if row.flags & FLAG_DELETE_MARKER == 0 {
                 self.drop_ref(row.body, now_ms, grace_ms)?;
             }
+            removed.push(version);
         }
+        Ok(removed)
+    }
+
+    /// Removes the key's null version, if any.
+    fn remove_null_version(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<(), StorageError> {
+        self.remove_versions(bucket, key, None, now_ms, grace_ms, |_, row| {
+            row.flags & FLAG_NULL_VERSION != 0
+        })?;
         Ok(())
+    }
+
+    /// Adds a delete marker as the key's newest version.
+    fn add_delete_marker(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        null_version: bool,
+        now_ms: u64,
+    ) -> Result<u64, StorageError> {
+        let version = next_counter(self, NEXT_VERSION_KEY)?;
+        let row = VersionRow {
+            body: 0,
+            size: 0,
+            md5: [0; 16],
+            parts: 0,
+            mtime_ms: now_ms,
+            flags: FLAG_DELETE_MARKER | if null_version { FLAG_NULL_VERSION } else { 0 },
+        };
+        let objects = self.trees.objects();
+        objects.insert_unique(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &version_key(bucket, key, version),
+            &row.encode(),
+        )?;
+        Ok(version)
+    }
+
+    /// Deletes `key` (S3 DeleteObject). With a version, removes that version
+    /// for good. Without one: an unversioned bucket removes the key; a
+    /// versioned bucket adds a delete marker; a suspended bucket replaces the
+    /// null version with a null delete marker. Deleting what is not there
+    /// succeeds, as in S3.
+    pub fn delete_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        which: Option<VersionSel>,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<Result<Deleted, ObjectError>, StorageError> {
+        if let Err(err) = validate_key(key) {
+            return Ok(Err(err));
+        }
+        let Some(bucket_row) = self.bucket_row(bucket)? else {
+            return Ok(Err(ObjectError::NoSuchBucket));
+        };
+        Ok(Ok(match which {
+            Some(VersionSel::Latest) | None => match bucket_row.versioning {
+                Versioning::Unversioned => {
+                    self.remove_null_version(bucket, key, now_ms, grace_ms)?;
+                    Deleted::default()
+                }
+                Versioning::Enabled => Deleted {
+                    version: Some(self.add_delete_marker(bucket, key, false, now_ms)?),
+                    null_version: false,
+                    delete_marker: true,
+                },
+                Versioning::Suspended => {
+                    self.remove_null_version(bucket, key, now_ms, grace_ms)?;
+                    Deleted {
+                        version: Some(self.add_delete_marker(bucket, key, true, now_ms)?),
+                        null_version: true,
+                        delete_marker: true,
+                    }
+                }
+            },
+            Some(sel) => {
+                let only = match sel {
+                    VersionSel::Seq(seq) => Some(seq),
+                    _ => None,
+                };
+                let mut marker = false;
+                let removed =
+                    self.remove_versions(bucket, key, only, now_ms, grace_ms, |version, row| {
+                        let hit = match sel {
+                            VersionSel::Null => row.flags & FLAG_NULL_VERSION != 0,
+                            VersionSel::Seq(seq) => seq == version,
+                            VersionSel::Latest => unreachable!("handled above"),
+                        };
+                        if hit {
+                            marker = row.flags & FLAG_DELETE_MARKER != 0;
+                        }
+                        hit
+                    })?;
+                Deleted {
+                    version: removed.first().copied(),
+                    null_version: sel == VersionSel::Null,
+                    delete_marker: marker && !removed.is_empty(),
+                }
+            }
+        }))
     }
 }
 

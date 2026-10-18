@@ -1215,6 +1215,7 @@ dependencies = [
 name = "truthdb"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "directories",
  "md-5",
  "rcgen",

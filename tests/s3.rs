@@ -650,3 +650,60 @@ fn listings_page_through_keys_and_common_prefixes() {
     let (status, xml) = call("GET", "/nope", "list-type=2", b"");
     assert_eq!(status, 404, "{xml}");
 }
+
+#[test]
+fn objects_are_deleted_one_by_one_and_in_batches() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret)).1
+    };
+    assert_eq!(call("PUT", "/del", "", &[], b"").0, 200);
+    for name in ["a", "b&c", "d"] {
+        let path = format!("/del/{}", name.replace('&', "%26"));
+        assert_eq!(call("PUT", &path, "", &[], b"x").0, 200);
+    }
+    assert_eq!(call("DELETE", "/del/a", "", &[], b"").0, 204);
+    assert_eq!(
+        call("DELETE", "/del/a", "", &[], b"").0,
+        204,
+        "deleting again succeeds"
+    );
+    assert_eq!(call("GET", "/del/a", "", &[], b"").0, 404);
+
+    let batch =
+        b"<Delete><Object><Key>b&amp;c</Key></Object><Object><Key>d</Key></Object></Delete>";
+    let (status, body) = call("POST", "/del", "delete", &[], batch);
+    assert_eq!(status, 400, "an integrity header is required: {body}");
+    let (status, body) = call(
+        "POST",
+        "/del",
+        "delete",
+        &[("x-amz-checksum-algorithm", "CRC32")],
+        batch,
+    );
+    assert_eq!(status, 400, "naming an algorithm is not a checksum: {body}");
+    use base64::Engine as _;
+    use md5::Digest;
+    let digest = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(batch));
+    let (status, body) = call(
+        "POST",
+        "/nobucket",
+        "delete",
+        &[("content-md5", &digest)],
+        batch,
+    );
+    assert_eq!(status, 404, "a missing bucket fails the request: {body}");
+    assert!(body.contains("NoSuchBucket"), "{body}");
+    let (status, body) = call("POST", "/del", "delete", &[("content-md5", &digest)], batch);
+    assert_eq!(status, 200, "{body}");
+    assert!(
+        body.contains("<Deleted><Key>b&amp;c</Key></Deleted>") && body.contains("<Key>d</Key>"),
+        "{body}"
+    );
+    assert_eq!(
+        call("DELETE", "/del", "", &[], b"").0,
+        204,
+        "the bucket is empty"
+    );
+}
