@@ -51,6 +51,11 @@ pub fn object_error(err: ObjectError, bucket: &str, key: &str) -> S3Error {
             "NoSuchVersion",
             "The specified version does not exist.",
         ),
+        ObjectError::DeleteMarker => S3Error::new(
+            405,
+            "MethodNotAllowed",
+            "The specified method is not allowed against this resource.",
+        ),
         ObjectError::InvalidKey(why) => S3Error::new(400, "InvalidArgument", why),
     }
 }
@@ -81,8 +86,16 @@ pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-/// The system headers and user metadata a PUT stores.
+/// The system headers, user metadata and tags a PUT stores.
 pub fn attrs_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
+    Ok(ObjectAttrs {
+        tags: crate::tagging::tags_from(headers)?,
+        ..metadata_from(headers)?
+    })
+}
+
+/// The system headers and user metadata a PUT stores (no tags).
+pub fn metadata_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
     // S3's limit on a PUT's headers; it also keeps every stored attribute
     // within the 64 KiB its encoding allows.
     let header_bytes: usize = headers
@@ -133,6 +146,7 @@ pub fn attrs_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
         content_language: header(headers, "content-language"),
         expires: header(headers, "expires"),
         user,
+        tags: Vec::new(),
     })
 }
 
@@ -423,6 +437,9 @@ fn object_headers(
     }
     for (name, value) in &attrs.user {
         builder = builder.header(format!("x-amz-meta-{name}"), value);
+    }
+    if !attrs.tags.is_empty() {
+        builder = builder.header("x-amz-tagging-count", attrs.tags.len().to_string());
     }
     builder
 }

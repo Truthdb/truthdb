@@ -14,8 +14,8 @@ use crate::error::{S3Error, escape};
 use crate::listing::query_params;
 use crate::multipart::{check_upload, part_number, upload_error, upload_id, xml};
 use crate::objects::{
-    DROP_GRACE_MS, MAX_PUT_BYTES, attrs_from, header, now_ms, object, object_error, precondition,
-    version_sel,
+    DROP_GRACE_MS, MAX_PUT_BYTES, header, metadata_from, now_ms, object, object_error,
+    precondition, version_sel,
 };
 use crate::server::Body;
 use crate::server::S3State;
@@ -76,6 +76,19 @@ fn resolve_source(
     Ok(Ok(source))
 }
 
+/// Whether a copy's `COPY`/`REPLACE` directive header says `REPLACE`.
+fn replaces(headers: &HeaderMap, name: &str, what: &str) -> Result<bool, S3Error> {
+    match header(headers, name).as_deref() {
+        None | Some("COPY") => Ok(false),
+        Some("REPLACE") => Ok(true),
+        Some(_) => Err(S3Error::new(
+            400,
+            "InvalidArgument",
+            format!("Unknown {what} directive."),
+        )),
+    }
+}
+
 pub async fn copy_object(
     state: &S3State,
     request: Request<Incoming>,
@@ -84,21 +97,18 @@ pub async fn copy_object(
 ) -> Result<Response<Body>, S3Error> {
     let headers = request.headers().clone();
     let (src_bucket, src_key, which) = copy_source(&headers)?;
-    let replace = match header(&headers, "x-amz-metadata-directive").as_deref() {
-        None | Some("COPY") => false,
-        Some("REPLACE") => true,
-        Some(_) => {
-            return Err(S3Error::new(
-                400,
-                "InvalidArgument",
-                "Unknown metadata directive.",
-            ));
-        }
-    };
-    let new_attrs = if replace {
-        Some(attrs_from(&headers)?)
+    let replace = replaces(&headers, "x-amz-metadata-directive", "metadata")?;
+    let replace_tags = replaces(&headers, "x-amz-tagging-directive", "tagging")?;
+    // Only what a directive replaces is read from the request.
+    let new_metadata = if replace {
+        metadata_from(&headers)?
     } else {
-        None
+        Default::default()
+    };
+    let new_tags = if replace_tags {
+        crate::tagging::tags_from(&headers)?
+    } else {
+        Vec::new()
     };
     let (dst_bucket, dst_key) = (bucket, key);
     // Resolve and copy in one lock hold: the source cannot change between.
@@ -117,7 +127,16 @@ pub async fn copy_object(
                 )));
             }
         }
-        let attrs = new_attrs.unwrap_or_else(|| source.attrs.clone());
+        let mut attrs = if replace {
+            new_metadata
+        } else {
+            source.attrs.clone()
+        };
+        attrs.tags = if replace_tags {
+            new_tags
+        } else {
+            source.attrs.tags.clone()
+        };
         Ok(file
             .transaction(|tx| {
                 tx.copy_object(

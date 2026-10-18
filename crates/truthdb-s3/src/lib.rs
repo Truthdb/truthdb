@@ -11,4 +11,5 @@ pub mod objects;
 pub mod payload;
 pub mod server;
 pub mod sigv4;
+pub mod tagging;
 pub mod time;

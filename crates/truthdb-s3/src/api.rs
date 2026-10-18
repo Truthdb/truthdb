@@ -60,7 +60,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "restore",
     "retention",
     "select",
-    "tagging",
     "torrent",
     "versioning",
     "versions",
@@ -152,6 +151,9 @@ pub async fn dispatch(
                 request.uri().query().unwrap_or("")
             )))
         }
+        (Target::Bucket(_), _) if has_param(&request, "tagging") => Err(S3Error::not_implemented(
+            "bucket tagging is not implemented",
+        )),
         (Target::Service, Method::GET) => list_buckets(state).await,
         (Target::Bucket(bucket), Method::PUT) => create_bucket(state, request, auth, bucket).await,
         (Target::Bucket(bucket), Method::DELETE) => delete_bucket(state, bucket).await,
@@ -182,6 +184,15 @@ pub async fn dispatch(
         }
         (Target::Object(bucket, key), Method::POST) if has_param(&request, "uploadId") => {
             crate::multipart::complete_upload(state, request, auth, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::PUT) if has_param(&request, "tagging") => {
+            crate::tagging::put_tagging(state, request, auth, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::GET) if has_param(&request, "tagging") => {
+            crate::tagging::get_tagging(state, request, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::DELETE) if has_param(&request, "tagging") => {
+            crate::tagging::delete_tagging(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), Method::PUT)
             if has_param(&request, "uploadId")
