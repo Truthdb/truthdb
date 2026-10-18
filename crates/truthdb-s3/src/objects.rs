@@ -24,6 +24,8 @@ use crate::server::{Authenticated, Body, S3State, full};
 
 /// Largest single PUT (S3's limit).
 pub(crate) const MAX_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+/// Largest total of a PUT's header names and values (S3's limit).
+const MAX_HEADER_BYTES: usize = 8 * 1024;
 /// Largest total of user metadata names and values (S3's limit).
 const MAX_USER_METADATA: usize = 2 * 1024;
 /// Bytes a GET reads per engine call.
@@ -81,6 +83,19 @@ pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// The system headers and user metadata a PUT stores.
 pub fn attrs_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
+    // S3's limit on a PUT's headers; it also keeps every stored attribute
+    // within the 64 KiB its encoding allows.
+    let header_bytes: usize = headers
+        .iter()
+        .map(|(name, value)| name.as_str().len() + value.len())
+        .sum();
+    if header_bytes > MAX_HEADER_BYTES {
+        return Err(S3Error::new(
+            400,
+            "RequestHeaderSectionTooLarge",
+            "Your request header section exceeds the maximum allowed size.",
+        ));
+    }
     let mut user = Vec::new();
     let mut user_bytes = 0;
     for (name, value) in headers {
@@ -142,10 +157,36 @@ pub async fn receive_body(
             "Your proposed upload exceeds the maximum allowed object size.",
         )
     };
-    if length.is_some_and(|length| length > MAX_PUT_BYTES) {
+    let Some(length) = length else {
+        return Err(S3Error::new(
+            411,
+            "MissingContentLength",
+            "You must provide the Content-Length HTTP header.",
+        ));
+    };
+    if length > MAX_PUT_BYTES {
         return Err(too_large());
     }
-    let content_md5 = header(&headers, "content-md5");
+    // Content-MD5 must be the base64 of 16 bytes: checked before the body.
+    let content_md5: Option<[u8; 16]> = match header(&headers, "content-md5") {
+        None => None,
+        Some(value) => {
+            use base64::Engine as _;
+            Some(
+                base64::engine::general_purpose::STANDARD
+                    .decode(value.trim())
+                    .ok()
+                    .and_then(|bytes| bytes.try_into().ok())
+                    .ok_or_else(|| {
+                        S3Error::new(
+                            400,
+                            "InvalidDigest",
+                            "The Content-MD5 you specified was invalid.",
+                        )
+                    })?,
+            )
+        }
+    };
     let now = now_ms();
     let body_id = object(state, move |file| file.begin_body(now)).await?;
     let mut decoder = PayloadDecoder::new(auth.framing, auth.checksum)?;
@@ -182,14 +223,10 @@ pub async fn receive_body(
     }
     decoder.finish(declared)?;
     let digest: [u8; 16] = md5.finalize().into();
-    if let Some(expected) = content_md5 {
-        use base64::Engine as _;
-        let ours = base64::engine::general_purpose::STANDARD.encode(digest);
-        if ours != expected.trim() {
-            return Err(S3Error::bad_digest(
-                "The Content-MD5 you specified did not match what we received.",
-            ));
-        }
+    if content_md5.is_some_and(|expected| expected != digest) {
+        return Err(S3Error::bad_digest(
+            "The Content-MD5 you specified did not match what we received.",
+        ));
     }
     if !segment.is_empty() {
         let now = now_ms();
@@ -413,7 +450,28 @@ pub async fn get_object(
     head_only: bool,
 ) -> Result<Response<Body>, S3Error> {
     let which = version_sel(request.uri().query().unwrap_or(""))?;
-    let headers = request.headers();
+    let headers = request.headers().clone();
+    // The read runs in its own task: a client that disconnects drops this
+    // handler, and the task still releases the lease it takes.
+    let task_state = S3State {
+        engine: state.engine.clone(),
+        region: state.region.clone(),
+    };
+    tokio::spawn(
+        async move { read_object(&task_state, &headers, bucket, key, which, head_only).await },
+    )
+    .await
+    .map_err(|err| S3Error::internal(err.to_string()))?
+}
+
+async fn read_object(
+    state: &S3State,
+    headers: &HeaderMap,
+    bucket: String,
+    key: String,
+    which: VersionSel,
+    head_only: bool,
+) -> Result<Response<Body>, S3Error> {
     // Resolve and lease in one lock hold, so the body cannot be collected
     // between the lookup and the lease.
     let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
@@ -444,6 +502,13 @@ pub async fn get_object(
     if let Some(status) = precondition(headers, "", &info) {
         if !head_only {
             release(state).await;
+        }
+        if status == StatusCode::PRECONDITION_FAILED {
+            return Err(S3Error::new(
+                412,
+                "PreconditionFailed",
+                "At least one of the pre-conditions you specified did not hold",
+            ));
         }
         return Ok(object_headers(Response::builder().status(status), &info)
             .body(full(Bytes::new()))

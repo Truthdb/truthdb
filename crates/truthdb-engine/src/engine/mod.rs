@@ -576,10 +576,15 @@ impl Engine {
             }
         };
         // Also after a failure: an operation that ran the ring full must not
-        // leave it full for every writer until the next maintenance sweep.
+        // leave it full for every writer until the next maintenance sweep. A
+        // failed checkpoint does not undo the operation (it committed, or
+        // holds what it took, such as a read lease), so the operation's result
+        // stands; the next operation or sweep tries again.
         if !self.storage.is_standby() {
             let meta = self.meta.read().expect("engine meta poisoned");
-            self.checkpoint_at(&meta, OBJECT_CHECKPOINT_THRESHOLD)?;
+            if let Err(err) = self.checkpoint_at(&meta, OBJECT_CHECKPOINT_THRESHOLD) {
+                eprintln!("object checkpoint failed: {err}");
+            }
         }
         Ok(out?)
     }
