@@ -53,30 +53,30 @@ impl ScanCursor {
         self.page == Some(NO_PAGE)
     }
 
-    pub(crate) fn at(page: u64, slot: usize) -> Self {
+    pub fn at(page: u64, slot: usize) -> Self {
         ScanCursor {
             page: Some(page),
             slot,
         }
     }
 
-    pub(crate) fn finished() -> Self {
+    pub fn finished() -> Self {
         ScanCursor {
             page: Some(NO_PAGE),
             slot: 0,
         }
     }
 
-    pub(crate) fn page(&self) -> Option<u64> {
+    pub fn page(&self) -> Option<u64> {
         self.page
     }
 
-    pub(crate) fn slot(&self) -> usize {
+    pub fn slot(&self) -> usize {
         self.slot
     }
 }
 
-pub(crate) struct BTree {
+pub struct BTree {
     pub object_id: u32,
     pub root: u64,
 }
@@ -827,7 +827,7 @@ fn split_overflow() -> StorageError {
 /// Tree roots by object id, captured where the undo starts (BEGIN for a
 /// multi-statement transaction, statement start, or before recovery undo):
 /// resolves each logical undo to its tree.
-pub(crate) struct TreeRoots(pub(crate) HashMap<u32, u64>);
+pub struct TreeRoots(pub HashMap<u32, u64>);
 
 impl LogicalUndo for TreeRoots {
     fn undo(
@@ -847,7 +847,7 @@ impl LogicalUndo for TreeRoots {
 /// Applies a logical tree undo as compensation. Ops are tolerant of partial
 /// prior application (a crash between the CLRs of one undone record replays
 /// the whole undo, so each piece must be a no-op when already done).
-pub(crate) fn apply_tree_undo(
+pub fn apply_tree_undo(
     ctx: &mut RelCtx<'_>,
     mode: &mut OpMode<'_>,
     tree: &BTree,

@@ -4,9 +4,8 @@
 //! `Storage`'s `rel_*` methods and temporary debug commands; the SQL layer
 //! (Stage 3+) replaces the command surface, not the storage.
 
-pub use truthdb_core::relstore::{buffer_pool, ctx, page, recovery, slotted};
+pub use truthdb_core::relstore::{btree, buffer_pool, ctx, page, recovery, slotted};
 
-pub mod btree;
 pub mod catalog;
 pub mod heap;
 pub mod index;
