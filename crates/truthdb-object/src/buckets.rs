@@ -1,6 +1,6 @@
 //! Buckets: one flat namespace of names (AWS general-purpose naming rules),
 //! each with its creation time and versioning state. A bucket is deleted only
-//! when it holds no object key.
+//! when it holds no object key and no multipart upload.
 
 use truthdb_core::relstore::btree::TreeInsert;
 use truthdb_core::relstore::ctx::OpMode;
@@ -151,13 +151,16 @@ impl ObjTxn<'_, '_> {
         if buckets.get(self.ctx, name.as_bytes())?.is_none() {
             return Ok(Err(BucketError::NoSuchBucket));
         }
+        // Object versions and multipart uploads both key on the bucket name
+        // first: either one keeps the bucket.
         let (lower, upper) = bucket_object_range(name);
-        let objects = self.trees.objects();
-        if !objects
-            .scan_range_limit(self.ctx, Some(&lower), Some(&upper), 1)?
-            .is_empty()
-        {
-            return Ok(Err(BucketError::NotEmpty));
+        for tree in [self.trees.objects(), self.trees.upload_index()] {
+            if !tree
+                .scan_range_limit(self.ctx, Some(&lower), Some(&upper), 1)?
+                .is_empty()
+            {
+                return Ok(Err(BucketError::NotEmpty));
+            }
         }
         buckets.delete(self.ctx, &mut OpMode::Txn(self.txn), name.as_bytes())?;
         Ok(Ok(()))
