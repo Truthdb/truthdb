@@ -24,7 +24,11 @@ pub(in crate::engine::relational) fn sys_databases(storage: &RelStorage) -> Sour
     ];
     // One row per database. The option columns are instance-wide (one
     // shared log and version store), so every row reports the same values —
-    // the documented level-1 deviation.
+    // the documented level-1 deviation. The collation is the default stamped
+    // into the file, shared by every database in it.
+    let collation = storage
+        .default_collation()
+        .unwrap_or_else(|| collation::DEFAULT_COLLATION.to_string());
     let rows = storage
         .rel_databases()
         .into_iter()
@@ -33,7 +37,7 @@ pub(in crate::engine::relational) fn sys_databases(storage: &RelStorage) -> Sour
                 Datum::NVarChar(name),
                 Datum::Int(id as i32),
                 Datum::Int(160),
-                Datum::NVarChar("SQL_Latin1_General_CP1_CI_AS".into()),
+                Datum::NVarChar(collation.clone()),
                 Datum::NVarChar("MULTI_USER".into()),
                 Datum::NVarChar("ONLINE".into()),
                 Datum::NVarChar(

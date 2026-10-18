@@ -85,7 +85,7 @@ pub(super) fn eval_call<R: ColumnResolver>(
                 "The SERVERPROPERTY function requires 1 argument(s).".to_string(),
             ));
         }
-        return Ok(serverproperty(&values[0]));
+        return Ok(serverproperty(&values[0], ctx));
     }
     // Role-membership intrinsics read an argument (the role name) AND the session
     // context (its effective role set) — like SERVERPROPERTY, they fit neither
@@ -166,7 +166,7 @@ fn is_rolemember(
 /// `SERVERPROPERTY(<name>)` — the SSMS query-window probes. Unknown
 /// properties return NULL, exactly as SQL Server does; the version strings
 /// agree with `@@VERSION` and the LOGINACK bytes.
-fn serverproperty(property: &SqlValue) -> SqlValue {
+fn serverproperty(property: &SqlValue, ctx: &EvalContext) -> SqlValue {
     let SqlValue::Str(property) = property else {
         return SqlValue::Null;
     };
@@ -180,7 +180,7 @@ fn serverproperty(property: &SqlValue) -> SqlValue {
         "servername" | "machinename" => SqlValue::Str("TruthDB".to_string()),
         // Default instance: no instance name.
         "instancename" => SqlValue::Null,
-        "collation" => SqlValue::Str("SQL_Latin1_General_CP1_CI_AS".to_string()),
+        "collation" => SqlValue::Str(ctx.collation.clone()),
         "isintegratedsecurityonly" | "isclustered" | "ishadrenabled" | "issingleuser" => {
             SqlValue::Int(0)
         }

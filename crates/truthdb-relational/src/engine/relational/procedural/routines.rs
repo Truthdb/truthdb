@@ -334,6 +334,7 @@ pub(in crate::engine::relational) fn run_user_scalar_function(
         0,
     );
     txn_ctx.databases_snapshot = caller.databases.clone();
+    txn_ctx.default_collation = Some(caller.collation.clone());
     txn_ctx.session_server_roles = caller.server_roles.clone();
     txn_ctx.session_db_roles = caller.db_roles.clone();
     txn_ctx.security = caller.security.clone();
