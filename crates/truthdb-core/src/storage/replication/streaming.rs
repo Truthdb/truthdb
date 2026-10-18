@@ -358,10 +358,15 @@ impl Locked {
         // allocate scratch space over replicated pages. (Safe to do before the
         // fallible redo: on failure the extra marked-used extents are merely
         // conservative, and the re-apply re-marks them idempotently.)
+        // Records below the applied tail were replayed when they first
+        // arrived; replaying a re-shipped overlap again would re-free pages
+        // reallocated since, or leave a stale pending free behind.
         let core = &mut self.core;
         for (lsn, record) in &records {
-            core.standby_pending_frees
-                .replay(&mut core.allocator, *lsn, record, u64::MAX)?;
+            if *lsn >= current_tail {
+                core.standby_pending_frees
+                    .replay(&mut core.allocator, record)?;
+            }
         }
 
         // A root change in the range moves the standby's catalog root or

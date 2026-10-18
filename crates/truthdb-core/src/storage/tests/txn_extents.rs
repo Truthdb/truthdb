@@ -230,6 +230,87 @@ fn a_point_in_time_cut_keeps_frees_committed_after_it() {
         "a free committed after the cut does not"
     );
     drop(storage);
+
+    let storage = Storage::open(path.clone(), no_engine).expect("normal reopen");
+    assert!(free(&storage, before));
+    assert!(
+        allocated(&storage, after),
+        "the cut-off free does not come back on a normal reopen"
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn space_freed_and_reused_after_the_cut_stays_with_its_owner_at_the_cut() {
+    let path = unique_temp_path("txn-extents-pitr-reuse");
+    let storage = create_small(&path);
+    let owned = committed_extent(&storage);
+    drop(storage);
+    // Reopen so the next-fit cursor starts over and hands out `owned` again.
+    let storage = Storage::open(path.clone(), no_engine).expect("reopen");
+    let stop_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let ((), txn) = in_txn(&storage, |ctx, txn| {
+        ctx.free_extent_in_txn(txn, owned, PAGES).expect("free")
+    });
+    commit(&storage, txn);
+    // A later transaction takes the freed pages and the free pages after them.
+    let (reused, txn) = in_txn(&storage, |ctx, txn| {
+        ctx.allocate_extent_in_txn(txn, 2 * PAGES)
+            .expect("allocate")
+    });
+    commit(&storage, txn);
+    assert_eq!(reused, owned, "the freed extent was reused after the cut");
+    drop(storage);
+
+    for open in ["cut", "normal reopen"] {
+        let storage = if open == "cut" {
+            Storage::open_with_stop_at(path.clone(), stop_at, no_engine).expect("cut")
+        } else {
+            Storage::open(path.clone(), no_engine).expect("normal reopen")
+        };
+        assert!(
+            allocated(&storage, owned),
+            "{open}: the extent still belongs to its first owner"
+        );
+        assert!(
+            free(&storage, owned + PAGES),
+            "{open}: the later allocation is gone"
+        );
+        drop(storage);
+    }
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_savepoint_rollback_cannot_take_back_a_later_free() {
+    let path = unique_temp_path("txn-extents-savepoint");
+    let storage = create_small(&path);
+    let extent = committed_extent(&storage);
+    let (savepoint, mut txn) = in_txn(&storage, |_, txn| txn.savepoint());
+    {
+        let mut guard = storage.lock();
+        let mut ctx = guard.page_ctx(0);
+        ctx.free_extent_in_txn(&mut txn, extent, PAGES)
+            .expect("free");
+        let err =
+            crate::relstore::recovery::rollback_to(&mut ctx, &mut txn, savepoint, &NoLogicalUndo)
+                .expect_err("the partial rollback is refused");
+        assert!(
+            err.to_string().contains("savepoint"),
+            "unexpected error: {err}"
+        );
+        crate::relstore::recovery::rollback(&mut ctx, txn, &NoLogicalUndo).expect("rollback");
+    }
+    assert!(
+        allocated(&storage, extent),
+        "the whole rollback drops the free"
+    );
+    drop(storage);
     std::fs::remove_file(&path).ok();
 }
 

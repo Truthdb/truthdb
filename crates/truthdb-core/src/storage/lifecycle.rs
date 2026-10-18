@@ -443,13 +443,40 @@ impl StorageFile {
         // Recover the true WAL tail: trust the superblock's tail as a lower
         // bound and scan forward (CRC + LSN self-identity) past it.
         let mut log_file = DirectFile::open_existing_unlocked(path.clone())?;
-        let scan = scan_ring(
+        let mut scan = scan_ring(
             &mut log_file,
             layout.wal_offset,
             layout.wal_size,
             active_sb.wal_head,
             active_sb.wal_tail,
         )?;
+        // Point-in-time restore: the log ends just before the first commit
+        // whose timestamp is past `stop_at`, exactly as if the database had
+        // crashed there. Everything from the cut on is erased from the ring,
+        // so redo never repeats it (later records may reuse space the kept
+        // state still owns) and no later open finds it again; restart undo
+        // then rolls back the transactions still open at the cut.
+        if let Some(limit) = stop_at {
+            let rel_records: Vec<(u64, RelRecord)> = scan
+                .records
+                .iter()
+                .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
+                .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
+                .collect::<Result<_, StorageError>>()?;
+            let cut = rel_recovery::first_commit_past(&rel_records, limit)?;
+            if cut < scan.tail {
+                crate::wal::zero_ring_range(
+                    &mut log_file,
+                    layout.wal_offset,
+                    layout.wal_size,
+                    cut,
+                    scan.tail,
+                )?;
+                log_file.sync_data()?;
+                scan.records.retain(|record| record.logical_ts < cut);
+                scan.tail = cut;
+            }
+        }
         let wal = WalWriter::open(
             log_file,
             layout.wal_offset,
@@ -558,7 +585,7 @@ impl StorageFile {
                 })
                 .map(|record| record.logical_ts);
         }
-        storage.recover_allocator(stop_at)?;
+        storage.recover_allocator()?;
 
         // A tail below the superblock's recorded one means part of the
         // trusted region was lost (media corruption, or a v1 file whose
@@ -588,7 +615,7 @@ impl StorageFile {
         // recovery — which for a standby is redo-only and never appends, so
         // this blocks only later local writes.
         storage.wal.set_read_only(redo_only);
-        storage.recover(stop_at, redo_only)?;
+        storage.recover(redo_only)?;
         Ok(storage)
     }
 

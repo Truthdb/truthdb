@@ -53,12 +53,10 @@ impl StorageFile {
     ///    replayed WAL record;
     /// 2. replay logged alloc/free extents (all idempotent bit operations);
     ///    a free logged inside a transaction lands at that transaction's
-    ///    commit, and not at all when it never committed or committed at or
-    ///    past the point-in-time cut (`stop_at`), where restart undo makes it
-    ///    a loser;
+    ///    commit, and not at all when it never committed;
     /// 3. mark the live snapshot's extent allocated last, healing the crash
     ///    window where the descriptor was written but the bitmap was not.
-    pub(super) fn recover_allocator(&mut self, stop_at: Option<u64>) -> Result<(), StorageError> {
+    pub(super) fn recover_allocator(&mut self) -> Result<(), StorageError> {
         let bitmap_len = (self.layout.data_size / PAGE_SIZE as u64).div_ceil(8) as usize;
         let mut bitmap = vec![0u8; bitmap_len];
         self.file
@@ -75,14 +73,9 @@ impl StorageFile {
             }
         }
 
-        let rel_records = self.rel_records()?;
-        let cut_lsn = match stop_at {
-            Some(limit) => rel_recovery::first_commit_past(&rel_records, limit)?,
-            None => u64::MAX,
-        };
         let mut pending_frees = PendingFrees::default();
-        for (lsn, record) in &rel_records {
-            pending_frees.replay(&mut self.allocator, *lsn, record, cut_lsn)?;
+        for (_, record) in &self.rel_records()? {
+            pending_frees.replay(&mut self.allocator, record)?;
         }
         // A standby's in-flight transactions commit in a later shipped range:
         // their frees wait there. (A primary's leftovers are restart losers,
@@ -231,14 +224,11 @@ impl StorageFile {
 pub(super) struct PendingFrees(std::collections::HashMap<u64, Vec<(u64, u64)>>);
 
 impl PendingFrees {
-    /// Replays one record's allocator effect. Commits at or past `cut_lsn` do
-    /// not count (point-in-time restore undoes them).
+    /// Replays one record's allocator effect.
     pub(super) fn replay(
         &mut self,
         allocator: &mut PageAllocator,
-        lsn: u64,
         record: &RelRecord,
-        cut_lsn: u64,
     ) -> Result<(), StorageError> {
         match record.kind {
             REL_KIND_ALLOC_EXTENT => {
@@ -258,9 +248,7 @@ impl PendingFrees {
                 allocator.free(start, pages);
             }
             REL_KIND_TXN_COMMIT => {
-                if let Some(extents) = self.0.remove(&record.txn_id)
-                    && lsn < cut_lsn
-                {
+                if let Some(extents) = self.0.remove(&record.txn_id) {
                     for (start, pages) in extents {
                         allocator.free(start, pages);
                     }

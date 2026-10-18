@@ -35,11 +35,7 @@ impl Locked {
     /// loser transactions with CLRs. The engine reloads its caches between
     /// redo and undo (undo needs tree roots) and after (undo may have removed
     /// catalog rows).
-    pub(in crate::storage) fn recover(
-        &mut self,
-        stop_at: Option<u64>,
-        redo_only: bool,
-    ) -> Result<(), StorageError> {
+    pub(in crate::storage) fn recover(&mut self, redo_only: bool) -> Result<(), StorageError> {
         let records = self.core.rel_records()?;
         if records.is_empty() && !self.any_engine_root() {
             return Ok(());
@@ -47,7 +43,7 @@ impl Locked {
 
         let outcome = {
             let mut ctx = self.core.page_ctx(0);
-            rel_recovery::analyze_and_redo(&mut ctx, &records, stop_at)?
+            rel_recovery::analyze_and_redo(&mut ctx, &records)?
         };
         self.apply_root_moves(outcome.catalog_root, &outcome.engine_roots)?;
         self.core.pages.next_txn_id = outcome.max_txn_id + 1;

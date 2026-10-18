@@ -122,6 +122,10 @@ pub struct TxnLink {
 pub struct Savepoint {
     pub undo_len: usize,
     pub last_lsn: u64,
+    /// How many extent frees the transaction had logged: a partial rollback
+    /// cannot take back a free logged after the savepoint (see
+    /// [`crate::relstore::recovery::rollback_to`]).
+    pub pending_frees_len: usize,
 }
 
 impl TxnLink {
@@ -130,6 +134,7 @@ impl TxnLink {
         Savepoint {
             undo_len: self.undo_log.len(),
             last_lsn: self.last_lsn,
+            pending_frees_len: self.pending_frees.len(),
         }
     }
 }
@@ -301,6 +306,11 @@ impl RelCtx<'_> {
     /// undone (the extent freed) if the transaction rolls back or loses at
     /// restart. For pages no structural change outside the transaction can
     /// reach — a B+ tree split, which is never undone, must not use this.
+    ///
+    /// The caller holds the storage lock for the whole transaction (or
+    /// registers it as an active transaction): a checkpoint between this
+    /// record and the commit would otherwise reclaim the log restart undo
+    /// needs.
     pub fn allocate_extent_in_txn(
         &mut self,
         txn: &mut TxnLink,
@@ -330,7 +340,8 @@ impl RelCtx<'_> {
     }
 
     /// Frees an extent inside `txn`. The pages stay allocated until the
-    /// transaction commits, and are never freed if it does not.
+    /// transaction commits, and are never freed if it does not. The same
+    /// locking rule as [`Self::allocate_extent_in_txn`] applies.
     pub fn free_extent_in_txn(
         &mut self,
         txn: &mut TxnLink,
