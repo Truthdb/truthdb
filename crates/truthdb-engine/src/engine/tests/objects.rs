@@ -148,8 +148,12 @@ fn access_keys_are_administered_over_the_native_protocol() {
     );
 
     let listed: serde_json::Value =
-        serde_json::from_str(&engine.execute("s3 list access keys").expect("list")).unwrap();
-    assert_eq!(listed["access_keys"], serde_json::json!([id]));
+        serde_json::from_str(&engine.execute("s3 list access keys;").expect("list")).unwrap();
+    assert_eq!(
+        listed["access_keys"],
+        serde_json::json!([id]),
+        "a trailing ';' is fine"
+    );
     engine
         .execute(&format!("s3 drop access key {id}"))
         .expect("drop");

@@ -29,6 +29,8 @@ enum S3Admin {
 }
 
 fn parse_s3_admin(input: &str) -> Option<S3Admin> {
+    // The CLI ends every command with `;`.
+    let input = input.trim().trim_end_matches(';');
     let words: Vec<&str> = input.split_whitespace().collect();
     let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
     let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
