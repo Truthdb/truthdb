@@ -172,9 +172,21 @@ jobs:
           done
           gh release upload "$TAG" debs/*.deb --clobber --repo "$GITHUB_REPOSITORY"
 
+      # A short-lived token from the org-owned GitHub App installed on
+      # Truthdb/apt only (Contents: write, what repository_dispatch needs), so
+      # the release does not depend on anyone's personal token.
+      - name: Get a token for Truthdb/apt
+        id: apt-app
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.APT_PUBLISH_APP_CLIENT_ID }}
+          private-key: ${{ secrets.APT_PUBLISH_APP_PRIVATE_KEY }}
+          owner: Truthdb
+          repositories: apt
+
       - name: Dispatch publish to Truthdb/apt
         env:
-          GH_TOKEN: ${{ secrets.APT_REPO_DISPATCH_TOKEN }}
+          GH_TOKEN: ${{ steps.apt-app.outputs.token }}
         run: |
           set -euo pipefail
           gh api -X POST repos/Truthdb/apt/dispatches \
