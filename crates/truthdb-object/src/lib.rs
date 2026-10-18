@@ -16,6 +16,7 @@ mod buckets;
 mod codec;
 mod credentials;
 mod gc;
+mod listing;
 mod objects;
 
 #[cfg(test)]
@@ -34,6 +35,7 @@ use truthdb_core::wal::records::RelRecord;
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use gc::GcOutcome;
+pub use listing::{ListAfter, ListedObject, Listing};
 pub use objects::{ObjectAttrs, ObjectError, ObjectInfo, VersionSel};
 
 /// The object engine's id on the shared log (its root lives in the

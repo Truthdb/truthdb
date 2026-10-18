@@ -651,3 +651,151 @@ fn an_object_is_put_overwritten_and_read_back_with_its_attributes() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn listings_follow_key_order_prefixes_delimiters_and_pages() {
+    use crate::{ListAfter, Listing, ObjectAttrs};
+    let path = temp_path("listing");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .unwrap()
+        .unwrap();
+    let keys = [
+        "a", "a/b", "a/c", "b/x/1", "b/x/2", "b/y", "c", "ca", "d/", "d/e",
+    ];
+    for key in keys.iter().chain(["a/b"].iter()) {
+        // "a/b" twice: an overwrite lists once.
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .unwrap()
+            .unwrap();
+    }
+    let list = |prefix: &str,
+                delimiter: Option<&str>,
+                after: Option<ListAfter<'_>>,
+                max: usize|
+     -> Listing {
+        ObjFile::new(&mut storage.lock())
+            .list_objects("bkt", prefix, delimiter, after, max)
+            .unwrap()
+            .unwrap()
+    };
+    let names = |listing: &Listing| -> Vec<String> {
+        listing.objects.iter().map(|o| o.key.clone()).collect()
+    };
+
+    let all = list("", None, None, 1000);
+    assert_eq!(names(&all), keys);
+    assert!(!all.truncated);
+
+    // Pages of 3, resuming after each page's last key.
+    let mut paged = Vec::new();
+    let mut after: Option<String> = None;
+    loop {
+        let page = list("", None, after.as_deref().map(ListAfter::Key), 3);
+        paged.extend(names(&page));
+        if !page.truncated {
+            break;
+        }
+        after = page.last.map(|(key, _)| key);
+    }
+    assert_eq!(paged, keys);
+
+    let top = list("", Some("/"), None, 1000);
+    assert_eq!(names(&top), ["a", "c", "ca"]);
+    assert_eq!(top.common_prefixes, ["a/", "b/", "d/"]);
+
+    let b = list("b/", Some("/"), None, 1000);
+    assert_eq!(names(&b), ["b/y"]);
+    assert_eq!(b.common_prefixes, ["b/x/"]);
+
+    // A page that ends on a common prefix resumes past every key under it.
+    let first = list("", Some("/"), None, 2);
+    assert_eq!(
+        (names(&first), first.common_prefixes.clone()),
+        (vec!["a".to_string()], vec!["a/".to_string()])
+    );
+    assert!(first.truncated);
+    assert_eq!(first.last, Some(("a/".to_string(), true)));
+    let second = list("", Some("/"), Some(ListAfter::CommonPrefix("a/")), 2);
+    assert_eq!(second.common_prefixes, ["b/"]);
+    assert_eq!(names(&second), ["c"]);
+
+    // A client's start-after is a plain key.
+    assert_eq!(
+        names(&list("", None, Some(ListAfter::Key("b/x/1")), 2)),
+        ["b/x/2", "b/y"]
+    );
+    assert_eq!(names(&list("zzz", None, None, 10)), Vec::<String>::new());
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .list_objects("nope", "", None, None, 10)
+            .unwrap()
+            .is_err()
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
+    use crate::buckets::BucketRow;
+    use crate::{ListAfter, ObjectAttrs, Versioning};
+    let path = temp_path("many-versions");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("bkt", now())?.unwrap();
+            // Versioning on, through the row (the API to set it comes later).
+            let row = BucketRow {
+                created_ms: now(),
+                versioning: Versioning::Enabled,
+            };
+            tx.trees
+                .buckets()
+                .update(tx.ctx, &mut OpMode::Txn(tx.txn), b"bkt", &row.encode())?;
+            Ok(())
+        })
+        .unwrap();
+    let put = |key: &str| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .unwrap()
+            .unwrap();
+    };
+    put("a");
+    // More versions than a scan batch, and than a call's row budget.
+    for _ in 0..40 {
+        put("k");
+    }
+    put("z");
+    let list = |after: Option<ListAfter<'_>>| {
+        ObjFile::new(&mut storage.lock())
+            .list_objects("bkt", "", None, after, 1000)
+            .unwrap()
+            .unwrap()
+    };
+    let mut keys = Vec::new();
+    let mut page = list(None);
+    loop {
+        keys.extend(page.objects.iter().map(|o| o.key.clone()));
+        if !page.truncated {
+            break;
+        }
+        let (last, _) = page
+            .last
+            .clone()
+            .expect("a truncated page says where it ends");
+        page = list(Some(ListAfter::Key(&last)));
+    }
+    assert_eq!(keys, ["a", "k", "z"]);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

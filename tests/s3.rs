@@ -584,3 +584,69 @@ fn a_signed_chunked_upload_is_verified_chunk_by_chunk() {
         "a refused upload leaves no object"
     );
 }
+
+#[test]
+fn listings_page_through_keys_and_common_prefixes() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send(port, method, path, query, body, &key, Some(&secret))
+    };
+    assert_eq!(call("PUT", "/lst", "", b"").0, 200);
+    for name in ["a", "a/b", "a/c", "b/x/1", "b/y", "c"] {
+        assert_eq!(
+            call("PUT", &format!("/lst/{name}"), "", name.as_bytes()).0,
+            200
+        );
+    }
+    // A sub-resource that is not implemented is refused, not answered with
+    // a listing or an object body.
+    for (path, query) in [("/lst", "versions"), ("/lst", "acl"), ("/lst/a", "acl")] {
+        let (status, body) = call("GET", path, query, b"");
+        assert_eq!(status, 501, "{path}?{query}: {body}");
+    }
+    let keys_of = |xml: &str| -> Vec<String> {
+        xml.split("<Key>")
+            .skip(1)
+            .map(|rest| rest.split("</Key>").next().unwrap().to_string())
+            .collect()
+    };
+    let prefixes_of = |xml: &str| -> Vec<String> {
+        xml.split("<CommonPrefixes><Prefix>")
+            .skip(1)
+            .map(|rest| rest.split("</Prefix>").next().unwrap().to_string())
+            .collect()
+    };
+
+    let (status, xml) = call("GET", "/lst", "list-type=2", b"");
+    assert_eq!(status, 200, "{xml}");
+    assert_eq!(keys_of(&xml), ["a", "a/b", "a/c", "b/x/1", "b/y", "c"]);
+
+    let (_, xml) = call("GET", "/lst", "delimiter=%2F&list-type=2", b"");
+    assert_eq!(keys_of(&xml), ["a", "c"]);
+    assert_eq!(prefixes_of(&xml), ["a/", "b/"]);
+
+    // Pages of two, following NextContinuationToken.
+    let mut seen = Vec::new();
+    let mut query = "list-type=2&max-keys=2".to_string();
+    loop {
+        let (status, xml) = call("GET", "/lst", &query, b"");
+        assert_eq!(status, 200, "{xml}");
+        seen.extend(keys_of(&xml));
+        let Some(next) = xml
+            .split("<NextContinuationToken>")
+            .nth(1)
+            .map(|rest| rest.split('<').next().unwrap().to_string())
+        else {
+            assert!(xml.contains("<IsTruncated>false</IsTruncated>"), "{xml}");
+            break;
+        };
+        query = format!("continuation-token={next}&list-type=2&max-keys=2");
+    }
+    assert_eq!(seen, ["a", "a/b", "a/c", "b/x/1", "b/y", "c"]);
+
+    let (_, xml) = call("GET", "/lst", "marker=b%2Fx%2F1", b"");
+    assert_eq!(keys_of(&xml), ["b/y", "c"], "v1 resumes after its marker");
+    let (status, xml) = call("GET", "/nope", "list-type=2", b"");
+    assert_eq!(status, 404, "{xml}");
+}
