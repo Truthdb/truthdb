@@ -175,11 +175,20 @@ fn send_with(
     let amz_date = amz_now();
     let host = format!("127.0.0.1:{port}");
     let payload = sigv4::sha256_hex(body);
-    let headers = vec![
+    // Extra headers are signed too (SigV4 lists signed headers sorted), except
+    // the ones named `unsigned-<name>`, sent as `<name>` without a signature.
+    let mut headers = vec![
         ("host".to_string(), host.clone()),
         ("x-amz-content-sha256".to_string(), payload.clone()),
         ("x-amz-date".to_string(), amz_date.clone()),
     ];
+    headers.extend(
+        extra
+            .iter()
+            .filter(|(name, _)| !name.starts_with("unsigned-"))
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
+    headers.sort();
     let target = if query.is_empty() {
         path.to_string()
     } else {
@@ -190,6 +199,7 @@ fn send_with(
         body.len()
     );
     for (name, value) in extra {
+        let name = name.strip_prefix("unsigned-").unwrap_or(name);
         request.push_str(&format!("{name}: {value}\r\n"));
     }
     if let Some(secret) = secret {
@@ -199,11 +209,7 @@ fn send_with(
             region: "us-east-1".to_string(),
             service: "s3".to_string(),
         };
-        let signed = vec![
-            "host".to_string(),
-            "x-amz-content-sha256".to_string(),
-            "x-amz-date".to_string(),
-        ];
+        let signed: Vec<String> = headers.iter().map(|(name, _)| name.clone()).collect();
         let canonical =
             sigv4::canonical_request(method, path, query, &headers, &signed, &payload).unwrap();
         let signature = sigv4::sign(
@@ -211,8 +217,9 @@ fn send_with(
             &sigv4::string_to_sign(&amz_date, &credential.scope(), &canonical),
         );
         request.push_str(&format!(
-            "Authorization: AWS4-HMAC-SHA256 Credential={key}/{}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}\r\n",
-            credential.scope()
+            "Authorization: AWS4-HMAC-SHA256 Credential={key}/{}, SignedHeaders={}, Signature={signature}\r\n",
+            credential.scope(),
+            signed.join(";")
         ));
     }
     request.push_str("\r\n");
@@ -272,6 +279,22 @@ fn requests_are_authenticated_with_sigv4_against_native_access_keys() {
     assert!(
         body.contains("<Code>SignatureDoesNotMatch</Code>"),
         "{body}"
+    );
+
+    let (_, (status, body)) = send_with(
+        server.s3_port,
+        "GET",
+        "/bucket/key",
+        "",
+        &[("unsigned-x-amz-meta-sneaky", "1")],
+        b"",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(
+        body.contains("must be signed"),
+        "an unsigned x-amz-* header: {body}"
     );
 
     let (status, body) = get(server.s3_port, "/bucket/key", "TDBNOSUCHKEY", Some(&secret));

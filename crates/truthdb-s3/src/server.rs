@@ -23,6 +23,20 @@ use crate::sigv4;
 
 /// How far a request's `x-amz-date` may be from the server's clock.
 const MAX_SKEW_SECS: u64 = 15 * 60;
+/// The headers that carry a full-body checksum (not x-amz-checksum-type,
+/// -mode or -algorithm, which describe one).
+const CHECKSUM_HEADERS: [&str; 5] = [
+    "x-amz-checksum-crc32",
+    "x-amz-checksum-crc32c",
+    "x-amz-checksum-crc64nvme",
+    "x-amz-checksum-sha1",
+    "x-amz-checksum-sha256",
+];
+/// Connections served at once; more wait in the accept queue.
+const MAX_CONNECTIONS: usize = 1024;
+/// How long a client may take to send its request head, or its TLS
+/// handshake.
+const HEAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 pub type Body = BoxBody<Bytes, Infallible>;
 
@@ -48,11 +62,25 @@ pub async fn serve(
     tls: Option<tokio_rustls::TlsAcceptor>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
+        let slot = tokio::select! {
+            slot = Arc::clone(&slots).acquire_owned() => slot.expect("the semaphore is never closed"),
+            _ = shutdown.changed() => {
+                if *shutdown.borrow() {
+                    return;
+                }
+                continue;
+            }
+        };
         let stream = tokio::select! {
             accepted = listener.accept() => match accepted {
                 Ok((stream, _)) => stream,
-                Err(_) => continue,
+                Err(_) => {
+                    // Out of descriptors, say: back off instead of spinning.
+                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                    continue;
+                }
             },
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
@@ -66,12 +94,15 @@ pub async fn serve(
         tokio::spawn(async move {
             match tls {
                 Some(acceptor) => {
-                    if let Ok(stream) = acceptor.accept(stream).await {
+                    if let Ok(Ok(stream)) =
+                        tokio::time::timeout(HEAD_TIMEOUT, acceptor.accept(stream)).await
+                    {
                         serve_connection(stream, state).await;
                     }
                 }
                 None => serve_connection(stream, state).await,
             }
+            drop(slot);
         });
     }
 }
@@ -85,6 +116,8 @@ where
         async move { Ok::<_, Infallible>(handle(&state, request).await) }
     });
     let _ = http1::Builder::new()
+        .timer(hyper_util::rt::TokioTimer::new())
+        .header_read_timeout(HEAD_TIMEOUT)
         .serve_connection(TokioIo::new(io), service)
         .await;
 }
@@ -161,6 +194,23 @@ pub async fn authenticate(
         .ok_or_else(|| S3Error::invalid_request("the request has no x-amz-content-sha256"))?
         .to_string();
 
+    // As AWS requires: the host and every x-amz-* header present are signed,
+    // so none of them can be changed in transit or the request replayed
+    // against another endpoint.
+    for name in request
+        .headers()
+        .keys()
+        .map(|name| name.as_str())
+        .filter(|name| *name == "host" || name.starts_with("x-amz-"))
+        .chain(["host", "x-amz-date", "x-amz-content-sha256"])
+    {
+        if !auth.signed_headers.iter().any(|signed| signed == name) {
+            return Err(S3Error::access_denied(format!(
+                "the {name} header must be signed"
+            )));
+        }
+    }
+
     let access_key = auth.credential.access_key.clone();
     let secret = state
         .engine
@@ -223,10 +273,7 @@ pub async fn authenticate(
         None => request
             .headers()
             .iter()
-            .find(|(name, _)| {
-                name.as_str().starts_with("x-amz-checksum-")
-                    && name.as_str() != "x-amz-checksum-algorithm"
-            })
+            .find(|(name, _)| CHECKSUM_HEADERS.contains(&name.as_str()))
             .map(|(name, value)| {
                 (
                     name.as_str().to_string(),
