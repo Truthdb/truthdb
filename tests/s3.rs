@@ -157,14 +157,38 @@ fn send(
     key: &str,
     secret: Option<&str>,
 ) -> (u16, String) {
+    send_with(port, method, path, query, &[], body, key, secret).1
+}
+
+/// [`send`] with extra (unsigned) headers; returns the response headers too.
+#[allow(clippy::too_many_arguments)]
+fn send_with(
+    port: u16,
+    method: &str,
+    path: &str,
+    query: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+    key: &str,
+    secret: Option<&str>,
+) -> (String, (u16, String)) {
     let amz_date = amz_now();
     let host = format!("127.0.0.1:{port}");
     let payload = sigv4::sha256_hex(body);
-    let headers = vec![
+    // Extra headers are signed too (SigV4 lists signed headers sorted), except
+    // the ones named `unsigned-<name>`, sent as `<name>` without a signature.
+    let mut headers = vec![
         ("host".to_string(), host.clone()),
         ("x-amz-content-sha256".to_string(), payload.clone()),
         ("x-amz-date".to_string(), amz_date.clone()),
     ];
+    headers.extend(
+        extra
+            .iter()
+            .filter(|(name, _)| !name.starts_with("unsigned-"))
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
+    headers.sort();
     let target = if query.is_empty() {
         path.to_string()
     } else {
@@ -174,6 +198,10 @@ fn send(
         "{method} {target} HTTP/1.1\r\nHost: {host}\r\nx-amz-content-sha256: {payload}\r\nx-amz-date: {amz_date}\r\nContent-Length: {}\r\nConnection: close\r\n",
         body.len()
     );
+    for (name, value) in extra {
+        let name = name.strip_prefix("unsigned-").unwrap_or(name);
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
     if let Some(secret) = secret {
         let credential = sigv4::Credential {
             access_key: key.to_string(),
@@ -181,11 +209,7 @@ fn send(
             region: "us-east-1".to_string(),
             service: "s3".to_string(),
         };
-        let signed = vec![
-            "host".to_string(),
-            "x-amz-content-sha256".to_string(),
-            "x-amz-date".to_string(),
-        ];
+        let signed: Vec<String> = headers.iter().map(|(name, _)| name.clone()).collect();
         let canonical =
             sigv4::canonical_request(method, path, query, &headers, &signed, &payload).unwrap();
         let signature = sigv4::sign(
@@ -193,8 +217,9 @@ fn send(
             &sigv4::string_to_sign(&amz_date, &credential.scope(), &canonical),
         );
         request.push_str(&format!(
-            "Authorization: AWS4-HMAC-SHA256 Credential={key}/{}, SignedHeaders=host;x-amz-content-sha256;x-amz-date, Signature={signature}\r\n",
-            credential.scope()
+            "Authorization: AWS4-HMAC-SHA256 Credential={key}/{}, SignedHeaders={}, Signature={signature}\r\n",
+            credential.scope(),
+            signed.join(";")
         ));
     }
     request.push_str("\r\n");
@@ -208,18 +233,19 @@ fn send(
     };
     stream.write_all(request.as_bytes()).expect("send");
     stream.write_all(body).expect("send body");
-    let mut response = String::new();
-    stream.read_to_string(&mut response).expect("read");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read");
+    let response = latin1(&raw);
     let status = response
         .split_whitespace()
         .nth(1)
         .and_then(|code| code.parse().ok())
         .expect("status line");
-    let body = response
+    let (head, body) = response
         .split_once("\r\n\r\n")
-        .map(|(_, body)| body.to_string())
+        .map(|(head, body)| (head.to_string(), body.to_string()))
         .unwrap_or_default();
-    (status, body)
+    (head, (status, body))
 }
 
 fn get(port: u16, path: &str, key: &str, secret: Option<&str>) -> (u16, String) {
@@ -242,17 +268,33 @@ fn server_with_key() -> (Server, String, String) {
 fn requests_are_authenticated_with_sigv4_against_native_access_keys() {
     let (server, key, secret) = server_with_key();
 
-    // A correctly signed request passes authentication and reaches a route
-    // that does not exist yet.
+    // A correctly signed request passes authentication and reaches the
+    // operation (here: a bucket that does not exist).
     let (status, body) = get(server.s3_port, "/bucket/key", &key, Some(&secret));
-    assert_eq!(status, 501, "{body}");
-    assert!(body.contains("<Code>NotImplemented</Code>"), "{body}");
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains("<Code>NoSuchBucket</Code>"), "{body}");
 
     let (status, body) = get(server.s3_port, "/bucket/key", &key, Some("wrong-secret"));
     assert_eq!(status, 403, "{body}");
     assert!(
         body.contains("<Code>SignatureDoesNotMatch</Code>"),
         "{body}"
+    );
+
+    let (_, (status, body)) = send_with(
+        server.s3_port,
+        "GET",
+        "/bucket/key",
+        "",
+        &[("unsigned-x-amz-meta-sneaky", "1")],
+        b"",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 403, "{body}");
+    assert!(
+        body.contains("must be signed"),
+        "an unsigned x-amz-* header: {body}"
     );
 
     let (status, body) = get(server.s3_port, "/bucket/key", "TDBNOSUCHKEY", Some(&secret));
@@ -312,4 +354,233 @@ fn buckets_are_created_listed_located_headed_and_deleted() {
     assert!(body.contains("NoSuchBucket"), "{body}");
     let (_, body) = call("GET", "/", "");
     assert!(!body.contains("<Name>beta</Name>"), "{body}");
+}
+
+/// A response header's value (case-insensitive name).
+fn response_header(head: &str, name: &str) -> Option<String> {
+    head.lines().find_map(|line| {
+        let (key, value) = line.split_once(':')?;
+        key.trim()
+            .eq_ignore_ascii_case(name)
+            .then(|| value.trim().to_string())
+    })
+}
+
+#[test]
+fn objects_are_put_read_by_range_and_conditionally_and_overwritten() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, "", extra, body, &key, Some(&secret))
+    };
+    assert_eq!(call("PUT", "/objs", &[], b"").1.0, 200);
+
+    let data: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    let (head, (status, body)) = call(
+        "PUT",
+        "/objs/dir/a.bin",
+        &[("content-type", "text/x-test"), ("x-amz-meta-owner", "me")],
+        &data,
+    );
+    assert_eq!(status, 200, "{body}");
+    let etag = response_header(&head, "etag").expect("etag");
+    assert_eq!(etag, format!("\"{}\"", md5_hex(&data)));
+
+    let (head, (status, body)) = call("GET", "/objs/dir/a.bin", &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(body.as_bytes(), latin1(&data).as_bytes());
+    assert_eq!(
+        response_header(&head, "content-type").as_deref(),
+        Some("text/x-test")
+    );
+    assert_eq!(
+        response_header(&head, "x-amz-meta-owner").as_deref(),
+        Some("me")
+    );
+
+    let (head, (status, _)) = call("HEAD", "/objs/dir/a.bin", &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, "content-length").as_deref(),
+        Some("300000")
+    );
+
+    let (head, (status, body)) = call("GET", "/objs/dir/a.bin", &[("range", "bytes=10-19")], b"");
+    assert_eq!(status, 206);
+    assert_eq!(body.as_bytes(), latin1(&data[10..20]).as_bytes());
+    assert_eq!(
+        response_header(&head, "content-range").as_deref(),
+        Some("bytes 10-19/300000")
+    );
+    assert_eq!(
+        call("GET", "/objs/dir/a.bin", &[("range", "bytes=400000-")], b"")
+            .1
+            .0,
+        416
+    );
+    assert_eq!(
+        call("GET", "/objs/dir/a.bin", &[("if-none-match", &etag)], b"")
+            .1
+            .0,
+        304
+    );
+    let (status, body) = call("GET", "/objs/dir/a.bin", &[("if-match", "\"nope\"")], b"").1;
+    assert_eq!(status, 412, "{body}");
+    assert!(body.contains("PreconditionFailed"), "{body}");
+
+    assert_eq!(call("PUT", "/objs/dir/a.bin", &[], b"v2").1.0, 200);
+    assert_eq!(call("GET", "/objs/dir/a.bin", &[], b"").1.1, "v2");
+    let (status, body) = call("GET", "/objs/missing", &[], b"").1;
+    assert_eq!(status, 404, "{body}");
+    assert!(body.contains("NoSuchKey"), "{body}");
+    let (status, body) = call(
+        "PUT",
+        "/objs/k",
+        &[("content-md5", "AAAAAAAAAAAAAAAAAAAAAA==")],
+        b"x",
+    )
+    .1;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("BadDigest"), "{body}");
+    let (status, body) = call("PUT", "/objs/k", &[("content-md5", "not-a-digest")], b"x").1;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("InvalidDigest"), "{body}");
+    // An attribute too long to store is refused with the header section.
+    let long = "t".repeat(70_000);
+    let (status, body) = call("PUT", "/objs/k", &[("content-type", &long)], b"x").1;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("RequestHeaderSectionTooLarge"), "{body}");
+    assert_eq!(call("GET", "/objs/k", &[], b"").1.0, 404);
+}
+
+/// Bytes as the test's String bodies carry them (one char per byte).
+fn latin1(bytes: &[u8]) -> String {
+    bytes.iter().map(|&b| b as char).collect::<String>()
+}
+
+fn md5_hex(bytes: &[u8]) -> String {
+    use md5::Digest;
+    md5::Md5::digest(bytes)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
+}
+
+/// PUTs `data` as a signed aws-chunked body (`chunk` bytes per chunk);
+/// `tamper` flips a byte of the first chunk after signing.
+fn put_chunked(
+    port: u16,
+    path: &str,
+    data: &[u8],
+    chunk: usize,
+    key: &str,
+    secret: &str,
+    tamper: bool,
+) -> (u16, String) {
+    let amz_date = amz_now();
+    let host = format!("127.0.0.1:{port}");
+    let credential = sigv4::Credential {
+        access_key: key.to_string(),
+        date: amz_date[..8].to_string(),
+        region: "us-east-1".to_string(),
+        service: "s3".to_string(),
+    };
+    let signing_key = sigv4::signing_key(secret, &credential);
+    let scope = credential.scope();
+    // Frame the body first: its length is a signed header.
+    let pieces: Vec<&[u8]> = data.chunks(chunk).chain(std::iter::once(&[][..])).collect();
+    let encoded_len: usize = pieces
+        .iter()
+        .map(|piece| format!("{:x};chunk-signature=", piece.len()).len() + 64 + 2 + piece.len() + 2)
+        .sum();
+    let decoded = data.len().to_string();
+    let content_length = encoded_len.to_string();
+    let headers = vec![
+        ("content-encoding".to_string(), "aws-chunked".to_string()),
+        ("content-length".to_string(), content_length.clone()),
+        ("host".to_string(), host.clone()),
+        (
+            "x-amz-content-sha256".to_string(),
+            sigv4::STREAMING_PAYLOAD.to_string(),
+        ),
+        ("x-amz-date".to_string(), amz_date.clone()),
+        ("x-amz-decoded-content-length".to_string(), decoded.clone()),
+    ];
+    let signed: Vec<String> = headers.iter().map(|(name, _)| name.clone()).collect();
+    let canonical =
+        sigv4::canonical_request("PUT", path, "", &headers, &signed, sigv4::STREAMING_PAYLOAD)
+            .unwrap();
+    let seed = sigv4::sign(
+        &signing_key,
+        &sigv4::string_to_sign(&amz_date, &scope, &canonical),
+    );
+    let mut body = Vec::new();
+    let mut previous = seed.clone();
+    for piece in &pieces {
+        let signature = sigv4::sign(
+            &signing_key,
+            &sigv4::chunk_string_to_sign(&amz_date, &scope, &previous, piece),
+        );
+        body.extend_from_slice(
+            format!("{:x};chunk-signature={signature}\r\n", piece.len()).as_bytes(),
+        );
+        body.extend_from_slice(piece);
+        body.extend_from_slice(b"\r\n");
+        previous = signature;
+    }
+    assert_eq!(body.len(), encoded_len);
+    if tamper {
+        let at = body.iter().position(|&b| b == b'\n').unwrap() + 1;
+        body[at] ^= 1;
+    }
+    let mut request = format!("PUT {path} HTTP/1.1\r\nConnection: close\r\n");
+    for (name, value) in &headers {
+        request.push_str(&format!("{name}: {value}\r\n"));
+    }
+    request.push_str(&format!(
+        "Authorization: AWS4-HMAC-SHA256 Credential={key}/{scope}, SignedHeaders={}, Signature={seed}\r\n\r\n",
+        signed.join(";")
+    ));
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("send");
+    stream.write_all(&body).expect("send body");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read");
+    let response = latin1(&raw);
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    let body = response
+        .split_once("\r\n\r\n")
+        .map(|(_, body)| body.to_string())
+        .unwrap_or_default();
+    (status, body)
+}
+
+#[test]
+fn a_signed_chunked_upload_is_verified_chunk_by_chunk() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    assert_eq!(
+        send(port, "PUT", "/chunks", "", b"", &key, Some(&secret)).0,
+        200
+    );
+    let data: Vec<u8> = (0..200_000u32).map(|i| (i % 249) as u8).collect();
+
+    let (status, body) = put_chunked(port, "/chunks/obj", &data, 65_536, &key, &secret, false);
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = send(port, "GET", "/chunks/obj", "", b"", &key, Some(&secret));
+    assert_eq!(status, 200);
+    assert_eq!(body, latin1(&data));
+
+    let (status, body) = put_chunked(port, "/chunks/bad", &data, 65_536, &key, &secret, true);
+    assert_eq!(status, 403, "{body}");
+    assert!(body.contains("SignatureDoesNotMatch"), "{body}");
+    assert_eq!(
+        send(port, "GET", "/chunks/bad", "", b"", &key, Some(&secret)).0,
+        404,
+        "a refused upload leaves no object"
+    );
 }

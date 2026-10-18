@@ -1216,6 +1216,7 @@ name = "truthdb"
 version = "0.1.0"
 dependencies = [
  "directories",
+ "md-5",
  "rcgen",
  "serde",
  "serde_json",
@@ -1341,9 +1342,12 @@ dependencies = [
  "base64",
  "bytes",
  "crc32fast",
+ "http-body",
  "http-body-util",
+ "httpdate",
  "hyper",
  "hyper-util",
+ "md-5",
  "percent-encoding",
  "quick-xml",
  "ring",

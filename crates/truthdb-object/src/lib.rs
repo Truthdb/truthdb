@@ -16,6 +16,7 @@ mod buckets;
 mod codec;
 mod credentials;
 mod gc;
+mod objects;
 
 #[cfg(test)]
 mod tests;
@@ -33,6 +34,7 @@ use truthdb_core::wal::records::RelRecord;
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use gc::GcOutcome;
+pub use objects::{ObjectAttrs, ObjectError, ObjectInfo, VersionSel};
 
 /// The object engine's id on the shared log (its root lives in the
 /// superblock's engine-roots table).
@@ -52,9 +54,10 @@ const STAGING_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 4;
 const CREDENTIALS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 5;
 /// Bucket name -> [`buckets::BucketRow`].
 const BUCKETS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 6;
-/// (bucket, object key, version) -> the version: keys are the bucket name,
-/// a 0 byte, then the object key (see `buckets::bucket_object_range`).
+/// (bucket, object key, version) -> the version (see `objects`).
 const OBJECTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 7;
+/// (version, chunk) -> a slice of the version's encoded attributes.
+const ATTRS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 8;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -65,6 +68,8 @@ const OBJECT_ID_SPAN: u32 = 0x1000;
 
 /// META key of the next body id to hand out.
 const NEXT_BODY_KEY: &[u8] = b"next_body";
+/// META key of the next object version number to hand out.
+const NEXT_VERSION_KEY: &[u8] = b"next_version";
 
 /// The object engine's in-memory state under the storage lock.
 #[derive(Default)]
@@ -176,6 +181,7 @@ pub(crate) struct Trees {
     credentials: u64,
     buckets: u64,
     objects: u64,
+    attrs: u64,
 }
 
 impl Trees {
@@ -210,6 +216,12 @@ impl Trees {
         BTree {
             object_id: OBJECTS_TREE,
             root: self.objects,
+        }
+    }
+    pub fn attrs(&self) -> BTree {
+        BTree {
+            object_id: ATTRS_TREE,
+            root: self.attrs,
         }
     }
     pub fn credentials(&self) -> BTree {
@@ -273,6 +285,7 @@ impl<'a> ObjFile<'a> {
             credentials: self.tree(CREDENTIALS_TREE)?.root,
             buckets: self.tree(BUCKETS_TREE)?.root,
             objects: self.tree(OBJECTS_TREE)?.root,
+            attrs: self.tree(ATTRS_TREE)?.root,
         };
         self.in_txn(|ctx, txn| body(&mut ObjTxn { ctx, txn, trees }))
     }
@@ -379,19 +392,25 @@ impl<'a> ObjFile<'a> {
 /// Hands out the next body id from the directory tree's counter
 /// (transactional: a rolled-back body's id is handed out again).
 fn next_body_id(tx: &mut ObjTxn<'_, '_>) -> Result<u64, StorageError> {
+    next_counter(tx, NEXT_BODY_KEY)
+}
+
+/// Hands out the next value of the directory tree's counter `key`, starting
+/// at 1 (transactional).
+pub(crate) fn next_counter(tx: &mut ObjTxn<'_, '_>, key: &[u8]) -> Result<u64, StorageError> {
     let meta = tx.trees.meta();
     let current = meta
-        .get(tx.ctx, NEXT_BODY_KEY)?
+        .get(tx.ctx, key)?
         .map(|row| codec::u64_le(&row))
         .transpose()?;
     let next = current.unwrap_or(1);
     let row = (next + 1).to_le_bytes();
     match current {
         Some(_) => {
-            meta.update(tx.ctx, &mut OpMode::Txn(tx.txn), NEXT_BODY_KEY, &row)?;
+            meta.update(tx.ctx, &mut OpMode::Txn(tx.txn), key, &row)?;
         }
         None => {
-            meta.insert_unique(tx.ctx, &mut OpMode::Txn(tx.txn), NEXT_BODY_KEY, &row)?;
+            meta.insert_unique(tx.ctx, &mut OpMode::Txn(tx.txn), key, &row)?;
         }
     }
     Ok(next)

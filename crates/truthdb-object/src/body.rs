@@ -311,32 +311,41 @@ pub struct BodyLease<'s> {
 }
 
 impl<'s> BodyLease<'s> {
-    /// Leases a live (sealed, referenced) body. The body is checked under the
-    /// same lock hold that takes the lease, so it cannot be collected between
-    /// the check and the lease.
+    /// Leases a live (sealed, referenced) body (see [`ObjFile::take_lease`]).
     pub fn take(storage: &'s Storage, body: u64) -> Result<Self, StorageError> {
-        let mut guard = storage.lock();
-        let file = ObjFile::new(&mut guard);
-        let bodies = file
-            .existing_tree(BODIES_TREE)?
-            .ok_or_else(|| no_body(body))?;
-        let row = load_body(&mut file.core.page_ctx(0), &bodies, body)?;
-        if row.state != BodyState::Sealed || row.refcount == 0 {
-            return Err(invalid(format!("body {body} is not live")));
-        }
-        *file.eng.leases.entry(body).or_default() += 1;
+        ObjFile::new(&mut storage.lock()).take_lease(body)?;
         Ok(BodyLease { storage, body })
     }
 }
 
 impl Drop for BodyLease<'_> {
     fn drop(&mut self) {
-        let mut guard = self.storage.lock();
-        let leases = &mut ObjFile::new(&mut guard).eng.leases;
-        if let Some(count) = leases.get_mut(&self.body) {
+        ObjFile::new(&mut self.storage.lock()).release_lease(self.body);
+    }
+}
+
+impl ObjFile<'_> {
+    /// Leases a live (sealed, referenced) body: garbage collection leaves it
+    /// alone until the matching [`Self::release_lease`]. The body is checked
+    /// under the same lock hold that takes the lease, so it cannot be
+    /// collected between the check and the lease.
+    pub fn take_lease(&mut self, body: u64) -> Result<(), StorageError> {
+        let bodies = self
+            .existing_tree(BODIES_TREE)?
+            .ok_or_else(|| no_body(body))?;
+        let row = load_body(&mut self.core.page_ctx(0), &bodies, body)?;
+        if row.state != BodyState::Sealed || row.refcount == 0 {
+            return Err(invalid(format!("body {body} is not live")));
+        }
+        *self.eng.leases.entry(body).or_default() += 1;
+        Ok(())
+    }
+
+    pub fn release_lease(&mut self, body: u64) {
+        if let Some(count) = self.eng.leases.get_mut(&body) {
             *count -= 1;
             if *count == 0 {
-                leases.remove(&self.body);
+                self.eng.leases.remove(&body);
             }
         }
     }

@@ -3,6 +3,7 @@
 
 pub mod api;
 pub mod error;
+pub mod objects;
 pub mod payload;
 pub mod server;
 pub mod sigv4;
