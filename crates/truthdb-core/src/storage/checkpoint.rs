@@ -117,7 +117,10 @@ impl Locked {
     /// The superblock's database-options byte: the engine's bits and the
     /// core's recovery-model bit.
     pub(super) fn db_options_byte(&self) -> u8 {
-        self.eng.options_byte() | ((self.core.recovery_full as u8) << 2)
+        self.engines
+            .iter()
+            .fold(0, |bits, eng| bits | eng.options_byte())
+            | ((self.core.recovery_full as u8) << 2)
     }
 
     pub(super) fn write_checkpoint(
@@ -320,12 +323,10 @@ impl Locked {
         self.core.active_superblock = new_active;
 
         let (head, tail) = (self.core.wal.head(), self.core.wal.tail());
-        // Catalog root as an absolute file offset (0 = none).
-        let metadata_root = self
-            .eng
-            .metadata_root()
-            .map(|page| self.core.layout.data_offset + page * PAGE_SIZE as u64)
-            .unwrap_or(0);
+        // Catalog root as an absolute file offset (0 = none), and every other
+        // engine's root.
+        let metadata_root = self.catalog_root_offset();
+        let engine_roots = self.engine_root_offsets();
         let db_options = self.db_options_byte();
         // The closure builds from Superblock::default() (reserved zeroed), so
         // the log-backup floor must be stamped back in or a checkpoint would
@@ -366,6 +367,7 @@ impl Locked {
             sb.set_applied_lsn(tail);
             // Re-stamp the replication slot table (same checkpoint-wipe carry).
             sb.set_repl_slots(&repl_slots);
+            sb.set_engine_roots(&engine_roots);
             sb.set_standby(standby);
             sb.set_epoch(epoch);
             sb.checksum = sb.compute_checksum();

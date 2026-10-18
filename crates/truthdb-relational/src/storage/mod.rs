@@ -253,14 +253,8 @@ pub(crate) trait LockedRel {
 
 impl LockedRel for Locked {
     fn rel(&mut self) -> RelFile<'_> {
-        let (core, eng) = self.parts();
-        RelFile {
-            core,
-            eng: eng
-                .as_any_mut()
-                .downcast_mut::<RelEngine>()
-                .expect("the storage engine is the relational engine"),
-        }
+        let (core, eng) = self.engine_parts::<RelEngine>();
+        RelFile { core, eng }
     }
 }
 

@@ -8,8 +8,8 @@ mod transaction;
 use super::*;
 
 /// The engine every relational open, create and validating reopen recovers with.
-pub(in crate::storage) fn rel_engine() -> Box<dyn EngineParticipant> {
-    Box::new(RelEngine::new())
+pub(in crate::storage) fn rel_engine() -> Vec<Box<dyn EngineParticipant>> {
+    vec![Box::new(RelEngine::new())]
 }
 
 impl RelStorage {

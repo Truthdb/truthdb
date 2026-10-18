@@ -12,6 +12,14 @@ impl RelStorage {
 }
 
 impl EngineParticipant for RelEngine {
+    fn engine_id(&self) -> u32 {
+        CATALOG_ENGINE_ID
+    }
+
+    fn owns_object(&self, object_id: u32) -> bool {
+        object_id < FIRST_ENGINE_OBJECT_ID
+    }
+
     fn open(&mut self, metadata_root: Option<u64>, db_options: u8) {
         self.rel.catalog_root = metadata_root;
         self.version.set_options_byte(db_options);

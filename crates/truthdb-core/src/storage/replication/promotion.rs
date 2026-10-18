@@ -219,19 +219,17 @@ impl Storage {
         let allocator_offset = file.layout.allocator_offset;
         file.file.write_all_at(allocator_offset, &bitmap)?;
         file.file.sync_data()?;
-        // Stamp the LIVE catalog root (exactly as a checkpoint does): records
+        // Stamp the LIVE catalog and engine roots (exactly as a checkpoint does): records
         // below the new head — including any applied SET_CATALOG_ROOT — are
         // about to leave the ring, so a reopen must find the root in the
         // superblock rather than re-deriving it from redo.
-        let metadata_root = file
-            .eng
-            .metadata_root()
-            .map(|page| file.layout.data_offset + page * PAGE_SIZE as u64)
-            .unwrap_or(0);
+        let metadata_root = file.catalog_root_offset();
+        let engine_roots = file.engine_root_offsets();
         file.commit_superblock(|sb| {
             sb.wal_head = target;
             sb.wal_tail = tail;
             sb.metadata_root = metadata_root;
+            sb.set_engine_roots(&engine_roots);
             sb.set_applied_lsn(tail);
             // A FULL-model seed carries the primary's frozen log-backup marker;
             // left below the advancing head, promotion's reopen would re-arm

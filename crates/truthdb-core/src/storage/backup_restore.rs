@@ -35,6 +35,7 @@ struct BackupPlan {
     default_collation: Option<String>,
     redo_start: u64,
     metadata_root: u64,
+    engine_roots: Vec<(u32, u64)>,
     last_committed_seq: u64,
     db_options: u8,
     epoch: u64,
@@ -59,6 +60,7 @@ impl BackupPlan {
             default_collation: self.default_collation.clone(),
             redo_start_lsn: self.redo_start,
             metadata_root: self.metadata_root,
+            engine_roots: self.engine_roots.clone(),
             last_committed_seq: self.last_committed_seq,
             db_options: self.db_options,
             epoch: self.epoch,
@@ -687,7 +689,7 @@ impl StorageFile {
 
         // The active superblock is the checkpoint whose head is redo_start, so
         // its roots are the checkpoint-consistent state recovery redoes onto.
-        let (metadata_root, last_committed_seq, db_options) = {
+        let (metadata_root, engine_roots, last_committed_seq, db_options) = {
             let active = match self.active_superblock {
                 ActiveSuperblock::A => &self.superblock_a,
                 ActiveSuperblock::B => &self.superblock_b,
@@ -698,6 +700,7 @@ impl StorageFile {
             );
             (
                 active.metadata_root,
+                active.engine_roots(),
                 active.last_committed_seq,
                 active.db_options(),
             )
@@ -724,6 +727,7 @@ impl StorageFile {
             default_collation: self.default_collation.clone(),
             redo_start,
             metadata_root,
+            engine_roots,
             last_committed_seq,
             db_options,
             epoch: self.active_sb().epoch(),
@@ -863,6 +867,7 @@ impl Locked {
             default_collation: None,
             redo_start_lsn: start,
             metadata_root: 0,
+            engine_roots: Vec::new(),
             last_committed_seq: 0,
             db_options: self.db_options_byte(),
             epoch: self.active_sb().epoch(),
@@ -942,9 +947,10 @@ impl StorageFile {
         Ok(())
     }
 
-    /// Writes the restored superblock: the source's catalog root and options as
-    /// of `redo_start`, the ring bracketed at `[redo_start, backup_end)`. Slot A
-    /// is active; slot B is a valid lower-generation mirror. The search-related
+    /// Writes the restored superblock: the source's catalog and engine roots and
+    /// options as of `redo_start`, the ring bracketed at `[redo_start,
+    /// backup_end)`. Slot A is active; slot B is a valid lower-generation
+    /// mirror. The search-related
     /// roots are cleared — this slice does not restore the search snapshot.
     pub(super) fn restore_superblock(
         &mut self,
@@ -960,6 +966,7 @@ impl StorageFile {
             ..Superblock::default()
         };
         base.set_db_options(header.db_options);
+        base.set_engine_roots(&header.engine_roots);
         // Seed the log-backup floor at the restore point (`backup_end`), not 0:
         // a restored FULL-model database starts a fresh log chain here. Leaving
         // it 0 would make the on-open log-backup hold sit BELOW wal_head, which

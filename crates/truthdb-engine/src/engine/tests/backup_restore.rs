@@ -540,7 +540,7 @@ fn restore_inspect_verbs_read_a_backup_without_restoring() {
     assert!(cols.contains(&"Checksum".to_string()));
     let col = |name: &str| rows[0][cols.iter().position(|c| c == name).unwrap()].clone();
     assert_eq!(col("BackupType"), Some("1".to_string()), "full backup");
-    assert_eq!(col("FormatVersion"), Some("2".to_string()));
+    assert_eq!(col("FormatVersion"), Some("3".to_string()));
     assert_eq!(col("PageSize"), Some("4096".to_string()));
 
     // FILELISTONLY: a data row ('D') and a log row ('L').
