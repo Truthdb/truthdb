@@ -12,6 +12,10 @@ use crate::sigv4;
 
 /// The longest chunk header or trailer line accepted.
 const MAX_LINE: usize = 4096;
+/// The largest chunk accepted: a signed chunk is held whole until its
+/// signature checks out, so its declared size must not be the client's to
+/// choose freely (SDKs send 64 KiB to a few MiB).
+const MAX_CHUNK: usize = 16 * 1024 * 1024;
 
 /// How the body is framed and signed (from `x-amz-content-sha256`).
 pub enum Framing {
@@ -218,6 +222,9 @@ impl PayloadDecoder {
                 let (size, extension) = line.split_once(';').unwrap_or((line, ""));
                 let size = usize::from_str_radix(size.trim(), 16)
                     .map_err(|_| malformed("a chunk size is not hex"))?;
+                if size > MAX_CHUNK {
+                    return Err(malformed("a chunk is larger than 16 MiB"));
+                }
                 self.chunk_signature = match &self.framing {
                     Framing::SignedChunks { .. } => extension
                         .strip_prefix("chunk-signature=")
@@ -386,6 +393,15 @@ mod tests {
             let out = decode(decoder, &documented_body(), piece).unwrap();
             assert_eq!(out, vec![b'a'; 66560], "piece size {piece}");
         }
+    }
+
+    #[test]
+    fn a_chunk_declaring_more_than_16_mib_is_refused_up_front() {
+        let mut decoder = PayloadDecoder::new(signed_framing(), None).unwrap();
+        let err = decoder
+            .feed(b"1000001;chunk-signature=00\r\n", &mut Vec::new())
+            .unwrap_err();
+        assert_eq!(err.code, "IncompleteBody");
     }
 
     #[test]

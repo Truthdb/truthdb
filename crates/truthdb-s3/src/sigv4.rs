@@ -125,7 +125,7 @@ pub fn canonical_query(raw_query: &str) -> String {
         .map(|pair| {
             let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
             let encode = |part: &str| {
-                let decoded = percent_decode_str(&part.replace('+', "%20")).collect::<Vec<u8>>();
+                let decoded = percent_decode_str(part).collect::<Vec<u8>>();
                 percent_encoding::percent_encode(&decoded, ENCODE).to_string()
             };
             (encode(name), encode(value))
