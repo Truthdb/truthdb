@@ -374,7 +374,7 @@ fn object_headers(
 }
 
 /// The version a request names: `?versionId=` or the latest.
-fn version_sel(query: &str) -> Result<VersionSel, S3Error> {
+pub fn version_sel(query: &str) -> Result<VersionSel, S3Error> {
     for pair in query.split('&') {
         if let Some(value) = pair.strip_prefix("versionId=") {
             return Ok(match value {

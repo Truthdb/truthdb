@@ -1,0 +1,254 @@
+//! DeleteObject and DeleteObjects (`POST ?delete`, up to 1000 keys).
+
+use bytes::Bytes;
+use hyper::body::Incoming;
+use hyper::{Request, Response, StatusCode};
+use quick_xml::Reader;
+use quick_xml::events::Event;
+use truthdb_object::{Deleted, VersionSel};
+
+use crate::error::{S3Error, escape};
+use crate::objects::{object_error, version_sel};
+use crate::server::{Authenticated, Body, S3State, full, read_body};
+
+const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
+/// Keys one DeleteObjects request may name (S3's limit).
+const MAX_KEYS: usize = 1000;
+/// Largest DeleteObjects request body read.
+const MAX_BODY: usize = 4 * 1024 * 1024;
+/// How long a deleted object's body outlives it (readers that resolved it
+/// just before the delete may still be reading).
+const DROP_GRACE_MS: u64 = 15 * 60 * 1000;
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// A version id as S3 writes it.
+pub fn version_id(version: u64, null_version: bool) -> String {
+    if null_version {
+        "null".to_string()
+    } else {
+        version.to_string()
+    }
+}
+
+async fn delete_one(
+    state: &S3State,
+    bucket: &str,
+    key: &str,
+    which: Option<VersionSel>,
+) -> Result<Deleted, S3Error> {
+    let (bucket_name, key_name) = (bucket.to_string(), key.to_string());
+    state
+        .engine
+        .run_object(move |file| {
+            file.transaction(|tx| {
+                tx.delete_object(&bucket_name, &key_name, which, now_ms(), DROP_GRACE_MS)
+            })
+        })
+        .await
+        .map_err(|err| S3Error::internal(err.to_string()))?
+        .map_err(|err| object_error(err, bucket, key))
+}
+
+pub async fn delete_object(
+    state: &S3State,
+    request: Request<Incoming>,
+    bucket: String,
+    key: String,
+) -> Result<Response<Body>, S3Error> {
+    let which = match version_sel(request.uri().query().unwrap_or(""))? {
+        VersionSel::Latest => None,
+        sel => Some(sel),
+    };
+    let deleted = delete_one(state, &bucket, &key, which).await?;
+    let mut response = Response::builder().status(StatusCode::NO_CONTENT);
+    if let Some(version) = deleted.version {
+        response = response.header(
+            "x-amz-version-id",
+            version_id(version, deleted.null_version),
+        );
+    }
+    if deleted.delete_marker {
+        response = response.header("x-amz-delete-marker", "true");
+    }
+    Ok(response.body(full(Bytes::new())).expect("a valid response"))
+}
+
+/// One `<Object>` of a DeleteObjects request.
+struct ToDelete {
+    key: String,
+    version: Option<String>,
+}
+
+fn parse_delete(xml: &[u8]) -> Result<(bool, Vec<ToDelete>), S3Error> {
+    let malformed = || {
+        S3Error::new(
+            400,
+            "MalformedXML",
+            "The XML you provided was not well-formed or did not validate against our published schema.",
+        )
+    };
+    let mut reader = Reader::from_reader(xml);
+    let mut quiet = false;
+    let mut objects = Vec::new();
+    let mut path: Vec<Vec<u8>> = Vec::new();
+    let mut current: Option<ToDelete> = None;
+    let mut buf = Vec::new();
+    loop {
+        match reader.read_event_into(&mut buf).map_err(|_| malformed())? {
+            Event::Start(element) => {
+                let name = element.local_name().as_ref().to_vec();
+                if name == b"Object" {
+                    current = Some(ToDelete {
+                        key: String::new(),
+                        version: None,
+                    });
+                }
+                path.push(name);
+            }
+            Event::End(element) => {
+                if element.local_name().as_ref() == b"Object" {
+                    let object = current.take().ok_or_else(malformed)?;
+                    if object.key.is_empty() {
+                        return Err(malformed());
+                    }
+                    objects.push(object);
+                }
+                path.pop();
+            }
+            Event::Text(text) => {
+                let text = text.unescape().map_err(|_| malformed())?.into_owned();
+                match (path.last().map(Vec::as_slice), current.as_mut()) {
+                    (Some(b"Key"), Some(object)) => object.key.push_str(&text),
+                    (Some(b"VersionId"), Some(object)) => object.version = Some(text),
+                    (Some(b"Quiet"), None) => quiet = text.trim().eq_ignore_ascii_case("true"),
+                    _ => {}
+                }
+            }
+            Event::Eof => break,
+            _ => {}
+        }
+        buf.clear();
+    }
+    if objects.is_empty() || objects.len() > MAX_KEYS {
+        return Err(malformed());
+    }
+    Ok((quiet, objects))
+}
+
+pub async fn delete_objects(
+    state: &S3State,
+    request: Request<Incoming>,
+    auth: Authenticated,
+    bucket: String,
+) -> Result<Response<Body>, S3Error> {
+    // S3 requires an integrity check on the request body here.
+    let has_digest = request.headers().contains_key("content-md5")
+        || request
+            .headers()
+            .keys()
+            .any(|name| name.as_str().starts_with("x-amz-checksum-"))
+        || request.headers().contains_key("x-amz-trailer");
+    if !has_digest {
+        return Err(S3Error::invalid_request(
+            "Missing required header for this request: Content-MD5",
+        ));
+    }
+    let content_md5 = request
+        .headers()
+        .get("content-md5")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let body = read_body(request, auth, MAX_BODY).await?;
+    if let Some(expected) = content_md5 {
+        use base64::Engine as _;
+        use md5::Digest;
+        let ours = base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(&body));
+        if ours != expected.trim() {
+            return Err(S3Error::bad_digest(
+                "The Content-MD5 you specified did not match what we received.",
+            ));
+        }
+    }
+    let (quiet, objects) = parse_delete(&body)?;
+    let mut xml = format!("<DeleteResult xmlns=\"{XMLNS}\">");
+    for object in objects {
+        let which = match object.version.as_deref() {
+            None => None,
+            Some("null") => Some(VersionSel::Null),
+            Some(text) => match text.parse() {
+                Ok(seq) => Some(VersionSel::Seq(seq)),
+                Err(_) => {
+                    xml.push_str(&format!(
+                        "<Error><Key>{}</Key><VersionId>{}</VersionId><Code>NoSuchVersion</Code><Message>The specified version does not exist.</Message></Error>",
+                        escape(&object.key),
+                        escape(text)
+                    ));
+                    continue;
+                }
+            },
+        };
+        match delete_one(state, &bucket, &object.key, which).await {
+            Ok(deleted) => {
+                if quiet {
+                    continue;
+                }
+                xml.push_str(&format!("<Deleted><Key>{}</Key>", escape(&object.key)));
+                if let Some(version) = &object.version {
+                    xml.push_str(&format!("<VersionId>{}</VersionId>", escape(version)));
+                }
+                if deleted.delete_marker {
+                    xml.push_str("<DeleteMarker>true</DeleteMarker>");
+                    if let Some(version) = deleted.version {
+                        xml.push_str(&format!(
+                            "<DeleteMarkerVersionId>{}</DeleteMarkerVersionId>",
+                            version_id(version, deleted.null_version)
+                        ));
+                    }
+                }
+                xml.push_str("</Deleted>");
+            }
+            Err(err) => xml.push_str(&format!(
+                "<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>",
+                escape(&object.key),
+                err.code,
+                escape(&err.message)
+            )),
+        }
+    }
+    xml.push_str("</DeleteResult>");
+    Ok(Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/xml")
+        .body(full(format!(
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{xml}"
+        )))
+        .expect("a valid response"))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn delete_requests_parse_keys_versions_and_quiet() {
+        let (quiet, objects) = parse_delete(
+            br#"<?xml version="1.0"?><Delete xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Quiet>true</Quiet><Object><Key>a &amp; b.txt</Key></Object><Object><Key>c</Key><VersionId>7</VersionId></Object></Delete>"#,
+        )
+        .unwrap();
+        assert!(quiet);
+        assert_eq!(objects.len(), 2);
+        assert_eq!(objects[0].key, "a & b.txt");
+        assert_eq!(objects[1].version.as_deref(), Some("7"));
+        assert!(parse_delete(b"<Delete></Delete>").is_err(), "no objects");
+        assert!(
+            parse_delete(b"<Delete><Object><VersionId>1</VersionId></Object></Delete>").is_err(),
+            "an object without a key"
+        );
+    }
+}

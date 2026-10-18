@@ -740,3 +740,65 @@ fn listings_follow_key_order_prefixes_delimiters_and_pages() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_deleted_object_is_gone_and_its_body_collected() {
+    use crate::{Deleted, ObjectAttrs, ObjectError, VersionSel};
+    let path = temp_path("delete");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .unwrap()
+        .unwrap();
+    let put = |key: &str| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .unwrap()
+            .unwrap()
+    };
+    let delete = |key: &str, which| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_object("bkt", key, which, now(), 0))
+            .unwrap()
+    };
+    put("one");
+    put("two");
+    assert_eq!(delete("one", None), Ok(Deleted::default()));
+    assert_eq!(
+        delete("one", None),
+        Ok(Deleted::default()),
+        "deleting again succeeds"
+    );
+    let removed = delete("two", Some(VersionSel::Null)).unwrap();
+    assert!(removed.version.is_some() && removed.null_version);
+    for key in ["one", "two"] {
+        assert_eq!(
+            ObjFile::new(&mut storage.lock())
+                .head_object("bkt", key, VersionSel::Latest)
+                .unwrap(),
+            Err(ObjectError::NoSuchKey)
+        );
+    }
+    let freed = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now(), ABANDON, u64::MAX)
+        .unwrap();
+    assert_eq!(freed.bodies, 2, "both bodies were collected");
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_object("nope", "k", None, now(), 0))
+            .unwrap(),
+        Err(ObjectError::NoSuchBucket)
+    );
+    // The bucket is empty again, so it can be deleted.
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_bucket("bkt"))
+            .unwrap(),
+        Ok(())
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
