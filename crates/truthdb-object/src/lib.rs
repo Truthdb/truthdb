@@ -18,6 +18,7 @@ mod credentials;
 mod gc;
 mod listing;
 mod objects;
+mod uploads;
 
 #[cfg(test)]
 mod tests;
@@ -37,6 +38,7 @@ pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use gc::GcOutcome;
 pub use listing::{ListAfter, ListedObject, Listing};
 pub use objects::{Deleted, ObjectAttrs, ObjectError, ObjectInfo, VersionSel};
+pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
 
 /// The object engine's id on the shared log (its root lives in the
 /// superblock's engine-roots table).
@@ -58,8 +60,15 @@ const CREDENTIALS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 5;
 const BUCKETS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 6;
 /// (bucket, object key, version) -> the version (see `objects`).
 const OBJECTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 7;
-/// (version, chunk) -> a slice of the version's encoded attributes.
+/// (version, chunk) -> a slice of the version's encoded attributes (and
+/// (1, upload, chunk) -> an upload's).
 const ATTRS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 8;
+/// Upload id -> the upload's bucket, key and start time.
+const UPLOADS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 9;
+/// (bucket, 0, key, 0, upload) -> (): uploads in listing order.
+const UPLOAD_INDEX_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 10;
+/// (upload, part number) -> the part.
+const PARTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 11;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -72,6 +81,8 @@ const OBJECT_ID_SPAN: u32 = 0x1000;
 const NEXT_BODY_KEY: &[u8] = b"next_body";
 /// META key of the next object version number to hand out.
 const NEXT_VERSION_KEY: &[u8] = b"next_version";
+/// META key of the next multipart upload id to hand out.
+const NEXT_UPLOAD_KEY: &[u8] = b"next_upload";
 
 /// The object engine's in-memory state under the storage lock.
 #[derive(Default)]
@@ -184,6 +195,9 @@ pub(crate) struct Trees {
     buckets: u64,
     objects: u64,
     attrs: u64,
+    uploads: u64,
+    upload_index: u64,
+    parts: u64,
 }
 
 impl Trees {
@@ -218,6 +232,24 @@ impl Trees {
         BTree {
             object_id: OBJECTS_TREE,
             root: self.objects,
+        }
+    }
+    pub fn uploads(&self) -> BTree {
+        BTree {
+            object_id: UPLOADS_TREE,
+            root: self.uploads,
+        }
+    }
+    pub fn upload_index(&self) -> BTree {
+        BTree {
+            object_id: UPLOAD_INDEX_TREE,
+            root: self.upload_index,
+        }
+    }
+    pub fn parts(&self) -> BTree {
+        BTree {
+            object_id: PARTS_TREE,
+            root: self.parts,
         }
     }
     pub fn attrs(&self) -> BTree {
@@ -288,6 +320,9 @@ impl<'a> ObjFile<'a> {
             buckets: self.tree(BUCKETS_TREE)?.root,
             objects: self.tree(OBJECTS_TREE)?.root,
             attrs: self.tree(ATTRS_TREE)?.root,
+            uploads: self.tree(UPLOADS_TREE)?.root,
+            upload_index: self.tree(UPLOAD_INDEX_TREE)?.root,
+            parts: self.tree(PARTS_TREE)?.root,
         };
         self.in_txn(|ctx, txn| body(&mut ObjTxn { ctx, txn, trees }))
     }

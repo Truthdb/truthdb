@@ -7,7 +7,7 @@ use truthdb_core::relstore::btree::BTree;
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
-use crate::codec::{self, BodyState, SegmentRow};
+use crate::codec::{self, BodyState, ChildRow, SegmentRow};
 use crate::{GC_TREE, ObjFile, ObjTxn, STAGING_TREE};
 
 /// What one garbage-collection pass freed.
@@ -65,7 +65,7 @@ impl ObjTxn<'_, '_> {
     /// `queue`. Returns the pages freed.
     fn free_body(&mut self, queue: &BTree, key: &[u8], body: u64) -> Result<u64, StorageError> {
         let row = crate::body::load_body(self.ctx, &self.trees.bodies(), body)?;
-        if row.state == BodyState::Sealed && row.refcount != 0 {
+        if row.state.is_sealed() && row.refcount != 0 {
             return Err(StorageError::InvalidFile(format!(
                 "body {body} is queued for collection but still referenced"
             )));
@@ -78,11 +78,17 @@ impl ObjTxn<'_, '_> {
         )?;
         let mut pages = 0;
         for (segment_key, segment) in rows {
-            let segment = SegmentRow::decode(&segment)?;
-            self.ctx
-                .free_extent_in_txn(self.txn, segment.start_page, segment.pages as u64)?;
+            if row.state == BodyState::Composite {
+                // A composite owns its parts' references, not pages.
+                let child = ChildRow::decode(&segment)?;
+                self.drop_ref(child.child, 0, 0)?;
+            } else {
+                let segment = SegmentRow::decode(&segment)?;
+                self.ctx
+                    .free_extent_in_txn(self.txn, segment.start_page, segment.pages as u64)?;
+                pages += segment.pages as u64;
+            }
             segments.delete(self.ctx, &mut OpMode::Txn(self.txn), &segment_key)?;
-            pages += segment.pages as u64;
         }
         let bodies = self.trees.bodies();
         bodies.delete(self.ctx, &mut OpMode::Txn(self.txn), &codec::body_key(body))?;
