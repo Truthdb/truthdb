@@ -563,3 +563,91 @@ fn buckets_are_created_listed_and_deleted_only_when_empty() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn an_object_is_put_overwritten_and_read_back_with_its_attributes() {
+    use crate::{ObjectAttrs, ObjectError, VersionSel};
+    let path = temp_path("objects");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .unwrap()
+        .unwrap();
+    let put_version = |data: &[u8], content_type: &str| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, data, now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        let attrs = ObjectAttrs {
+            content_type: Some(content_type.to_string()),
+            user: vec![("owner".to_string(), "me".to_string())],
+            ..ObjectAttrs::default()
+        };
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_object("bkt", "dir/key.txt", &sealed, &attrs, now(), 0))
+            .unwrap()
+            .unwrap()
+    };
+    let first = put_version(b"first", "text/plain");
+    let second = put_version(b"second!", "application/json");
+    assert!(second.version > first.version);
+    assert!(
+        second.null_version,
+        "an unversioned bucket writes null versions"
+    );
+
+    let head = |which| {
+        ObjFile::new(&mut storage.lock())
+            .head_object("bkt", "dir/key.txt", which)
+            .unwrap()
+    };
+    let latest = head(VersionSel::Latest).unwrap();
+    assert_eq!(latest.size, 7);
+    assert_eq!(
+        latest.attrs.content_type.as_deref(),
+        Some("application/json")
+    );
+    assert_eq!(
+        latest.attrs.user,
+        vec![("owner".to_string(), "me".to_string())]
+    );
+    assert_eq!(read(&storage, latest.body, 0, 7).unwrap(), b"second!");
+    assert_eq!(
+        head(VersionSel::Seq(first.version)),
+        Err(ObjectError::NoSuchVersion),
+        "the overwrite replaced the null version"
+    );
+    let freed = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now(), ABANDON, u64::MAX)
+        .unwrap();
+    assert_eq!(freed.bodies, 1, "the first body was collected");
+
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .head_object("nope", "k", VersionSel::Latest)
+            .unwrap(),
+        Err(ObjectError::NoSuchBucket)
+    );
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .head_object("bkt", "missing", VersionSel::Latest)
+            .unwrap(),
+        Err(ObjectError::NoSuchKey)
+    );
+    assert!(matches!(
+        ObjFile::new(&mut storage.lock())
+            .head_object("bkt", "a\0b", VersionSel::Latest)
+            .unwrap(),
+        Err(ObjectError::InvalidKey(_))
+    ));
+    drop(storage);
+
+    let storage = open(&path);
+    let latest = ObjFile::new(&mut storage.lock())
+        .head_object("bkt", "dir/key.txt", VersionSel::Latest)
+        .unwrap()
+        .unwrap();
+    assert_eq!(latest.version, second.version);
+    assert_eq!(read(&storage, latest.body, 0, 7).unwrap(), b"second!");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

@@ -115,6 +115,15 @@ pub async fn dispatch(
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "location") => {
             bucket_location(state, bucket).await
         }
+        (Target::Object(bucket, key), Method::PUT) => {
+            crate::objects::put_object(state, request, auth, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::GET) => {
+            crate::objects::get_object(state, request, bucket, key, false).await
+        }
+        (Target::Object(bucket, key), Method::HEAD) => {
+            crate::objects::get_object(state, request, bucket, key, true).await
+        }
         (Target::Object(bucket, key), method) => Err(S3Error::not_implemented(format!(
             "{method} on object {key} in {bucket} is not implemented yet"
         ))),

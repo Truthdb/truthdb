@@ -33,8 +33,8 @@ use truthdb_core::wal::records::RelRecord;
 
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
-pub use objects::{ObjectAttrs, ObjectError, ObjectInfo, VersionSel};
 pub use gc::GcOutcome;
+pub use objects::{ObjectAttrs, ObjectError, ObjectInfo, VersionSel};
 
 /// The object engine's id on the shared log (its root lives in the
 /// superblock's engine-roots table).
@@ -397,7 +397,7 @@ fn next_body_id(tx: &mut ObjTxn<'_, '_>) -> Result<u64, StorageError> {
 
 /// Hands out the next value of the directory tree's counter `key`, starting
 /// at 1 (transactional).
-fn next_counter(tx: &mut ObjTxn<'_, '_>, key: &[u8]) -> Result<u64, StorageError> {
+pub(crate) fn next_counter(tx: &mut ObjTxn<'_, '_>, key: &[u8]) -> Result<u64, StorageError> {
     let meta = tx.trees.meta();
     let current = meta
         .get(tx.ctx, key)?
