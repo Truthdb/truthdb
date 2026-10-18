@@ -424,12 +424,9 @@ fn objects_are_put_read_by_range_and_conditionally_and_overwritten() {
             .0,
         304
     );
-    assert_eq!(
-        call("GET", "/objs/dir/a.bin", &[("if-match", "\"nope\"")], b"")
-            .1
-            .0,
-        412
-    );
+    let (status, body) = call("GET", "/objs/dir/a.bin", &[("if-match", "\"nope\"")], b"").1;
+    assert_eq!(status, 412, "{body}");
+    assert!(body.contains("PreconditionFailed"), "{body}");
 
     assert_eq!(call("PUT", "/objs/dir/a.bin", &[], b"v2").1.0, 200);
     assert_eq!(call("GET", "/objs/dir/a.bin", &[], b"").1.1, "v2");
@@ -445,6 +442,15 @@ fn objects_are_put_read_by_range_and_conditionally_and_overwritten() {
     .1;
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("BadDigest"), "{body}");
+    let (status, body) = call("PUT", "/objs/k", &[("content-md5", "not-a-digest")], b"x").1;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("InvalidDigest"), "{body}");
+    // An attribute too long to store is refused with the header section.
+    let long = "t".repeat(70_000);
+    let (status, body) = call("PUT", "/objs/k", &[("content-type", &long)], b"x").1;
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("RequestHeaderSectionTooLarge"), "{body}");
+    assert_eq!(call("GET", "/objs/k", &[], b"").1.0, 404);
 }
 
 /// Bytes as the test's String bodies carry them (one char per byte).
