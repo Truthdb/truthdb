@@ -169,6 +169,15 @@ pub async fn dispatch(
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "location") => {
             bucket_location(state, bucket).await
         }
+        // Copies (CopyObject, UploadPartCopy) are not implemented yet:
+        // refused, rather than stored as an empty object or part.
+        (Target::Object(..), Method::PUT)
+            if request.headers().contains_key("x-amz-copy-source") =>
+        {
+            Err(S3Error::not_implemented(
+                "copying objects is not implemented yet",
+            ))
+        }
         // GetObject of one part of a multipart object is not implemented.
         (Target::Object(..), Method::GET | Method::HEAD)
             if has_param(&request, "partNumber") && !has_param(&request, "uploadId") =>

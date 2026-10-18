@@ -59,6 +59,11 @@ pub(crate) fn upload_error(err: UploadError, bucket: &str, key: &str) -> S3Error
             "EntityTooSmall",
             format!("Part {number} is smaller than the minimum allowed size of 5 MiB."),
         ),
+        UploadError::EntityTooLarge => S3Error::new(
+            400,
+            "EntityTooLarge",
+            "Your proposed upload exceeds the maximum allowed object size.",
+        ),
     }
 }
 
@@ -187,7 +192,10 @@ pub async fn list_parts(
     Ok(xml(body))
 }
 
-/// The `(PartNumber, ETag)` list of a CompleteMultipartUpload body.
+/// The `(PartNumber, ETag)` list of a CompleteMultipartUpload body: one
+/// `<CompleteMultipartUpload>` of `<Part>`s, each with one `<PartNumber>` and
+/// one `<ETag>` (the 32 hex digits of its MD5, quoted or not), and optionally
+/// the part's checksum, which the part itself was verified against.
 fn parse_complete(body: &[u8]) -> Result<Vec<(u32, [u8; 16])>, S3Error> {
     let malformed = || {
         S3Error::new(
@@ -198,41 +206,90 @@ fn parse_complete(body: &[u8]) -> Result<Vec<(u32, [u8; 16])>, S3Error> {
     };
     let mut reader = Reader::from_reader(body);
     let mut path: Vec<Vec<u8>> = Vec::new();
-    let (mut number, mut etag): (Option<u32>, Option<String>) = (None, None);
+    let mut seen_root = false;
+    let (mut number, mut etag): (Option<String>, Option<String>) = (None, None);
     let mut parts = Vec::new();
     let mut buf = Vec::new();
     loop {
-        match reader.read_event_into(&mut buf).map_err(|_| malformed())? {
-            Event::Start(element) => path.push(element.local_name().as_ref().to_vec()),
-            Event::End(element) => {
-                if element.local_name().as_ref() == b"Part" {
-                    let (Some(n), Some(tag)) = (number.take(), etag.take()) else {
-                        return Err(malformed());
-                    };
-                    let hex = tag.trim().trim_matches('"');
-                    let md5: Vec<u8> = (0..hex.len())
-                        .step_by(2)
-                        .filter_map(|at| u8::from_str_radix(hex.get(at..at + 2)?, 16).ok())
-                        .collect();
-                    let md5: [u8; 16] = md5
-                        .try_into()
-                        .map_err(|_| upload_error(UploadError::InvalidPart(n), "", ""))?;
-                    parts.push((n, md5));
-                }
-                path.pop();
+        let event = reader.read_event_into(&mut buf).map_err(|_| malformed())?;
+        // An empty element is its start and its end.
+        let (start, end) = match &event {
+            Event::Start(element) => (Some(element.local_name().as_ref().to_vec()), None),
+            Event::Empty(element) => {
+                let name = element.local_name().as_ref().to_vec();
+                (Some(name.clone()), Some(name))
             }
-            Event::Text(text) => {
-                let text = text.unescape().map_err(|_| malformed())?;
-                match path.last().map(Vec::as_slice) {
-                    Some(b"PartNumber") => {
-                        number = Some(text.trim().parse().map_err(|_| malformed())?)
-                    }
-                    Some(b"ETag") => etag = Some(text.into_owned()),
-                    _ => {}
+            Event::End(element) => (None, Some(element.local_name().as_ref().to_vec())),
+            _ => (None, None),
+        };
+        if let Some(name) = start {
+            let allowed = match (path.last().map(Vec::as_slice), name.as_slice()) {
+                (None, b"CompleteMultipartUpload") => !std::mem::replace(&mut seen_root, true),
+                (Some(b"CompleteMultipartUpload"), b"Part") => {
+                    (number, etag) = (None, None);
+                    true
                 }
+                (Some(b"Part"), b"PartNumber") => number.replace(String::new()).is_none(),
+                (Some(b"Part"), b"ETag") => etag.replace(String::new()).is_none(),
+                (
+                    Some(b"Part"),
+                    b"ChecksumCRC32" | b"ChecksumCRC32C" | b"ChecksumCRC64NVME" | b"ChecksumSHA1"
+                    | b"ChecksumSHA256",
+                ) => true,
+                _ => false,
+            };
+            if !allowed {
+                return Err(malformed());
             }
-            Event::Eof => break,
-            _ => {}
+            path.push(name);
+        }
+        if let Some(name) = end {
+            if name == b"Part" {
+                let (Some(number), Some(etag)) = (number.take(), etag.take()) else {
+                    return Err(malformed());
+                };
+                let number: u32 = number.trim().parse().map_err(|_| malformed())?;
+                let hex = etag.trim().trim_matches('"');
+                let md5: Option<[u8; 16]> = (hex.len() == 32)
+                    .then(|| {
+                        (0..16)
+                            .map(|at| u8::from_str_radix(&hex[at * 2..at * 2 + 2], 16).ok())
+                            .collect::<Option<Vec<u8>>>()
+                    })
+                    .flatten()
+                    .and_then(|bytes| bytes.try_into().ok());
+                let md5 =
+                    md5.ok_or_else(|| upload_error(UploadError::InvalidPart(number), "", ""))?;
+                parts.push((number, md5));
+            }
+            path.pop();
+        }
+        let text = match &event {
+            Event::Text(text) => Some(text.unescape().map_err(|_| malformed())?.into_owned()),
+            Event::CData(text) => Some(
+                std::str::from_utf8(text)
+                    .map_err(|_| malformed())?
+                    .to_string(),
+            ),
+            _ => None,
+        };
+        if let Some(text) = text {
+            match path.last().map(Vec::as_slice) {
+                Some(b"PartNumber") => number.get_or_insert_default().push_str(&text),
+                Some(b"ETag") => etag.get_or_insert_default().push_str(&text),
+                Some(
+                    b"ChecksumCRC32" | b"ChecksumCRC32C" | b"ChecksumCRC64NVME" | b"ChecksumSHA1"
+                    | b"ChecksumSHA256",
+                ) => {}
+                _ if text.trim().is_empty() => {}
+                _ => return Err(malformed()),
+            }
+        }
+        if matches!(event, Event::Eof) {
+            if !path.is_empty() || !seen_root {
+                return Err(malformed());
+            }
+            break;
         }
         buf.clear();
     }
@@ -377,6 +434,31 @@ mod tests {
         assert!(
             parse_complete(b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>\"xyz\"</ETag></Part></CompleteMultipartUpload>").is_err(),
             "an ETag that is not an MD5"
+        );
+        // A part's checksum may be listed; CDATA is read.
+        let parts = parse_complete(
+            b"<CompleteMultipartUpload><Part><PartNumber>3</PartNumber><ChecksumCRC32>AAAAAA==</ChecksumCRC32><ETag><![CDATA[0123456789abcdef0123456789abcdef]]></ETag></Part></CompleteMultipartUpload>",
+        )
+        .unwrap();
+        assert_eq!(parts[0].0, 3);
+        const PART: &str =
+            "<Part><PartNumber>1</PartNumber><ETag>0123456789abcdef0123456789abcdef</ETag></Part>";
+        for bad in [
+            format!("<CompleteMultipartUpload>{PART}"),
+            format!("<Garbage>{PART}</Garbage>"),
+            format!("<CompleteMultipartUpload>{PART}</CompleteMultipartUpload><CompleteMultipartUpload>{PART}</CompleteMultipartUpload>"),
+            "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><PartNumber>2</PartNumber><ETag>0123456789abcdef0123456789abcdef</ETag></Part></CompleteMultipartUpload>".to_string(),
+            format!("<CompleteMultipartUpload><PartNumber>1</PartNumber>{PART}</CompleteMultipartUpload>"),
+        ] {
+            assert_eq!(
+                parse_complete(bad.as_bytes()).err().map(|err| err.code),
+                Some("MalformedXML"),
+                "{bad}"
+            );
+        }
+        assert!(
+            parse_complete(b"<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>0123456789abcdef0123456789abcdefzz</ETag></Part></CompleteMultipartUpload>").is_err(),
+            "trailing junk after the MD5"
         );
     }
 }
