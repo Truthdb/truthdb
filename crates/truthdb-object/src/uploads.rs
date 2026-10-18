@@ -1,8 +1,10 @@
 //! Multipart uploads: an upload is created for a bucket and key, takes parts
 //! (each a sealed body, numbered 1..=10000, replaceable), and is completed
 //! into one object whose body is a composite of the listed parts in order
-//! (no bytes are copied) or aborted (its parts released). S3 keeps an
-//! unfinished upload until it is completed or aborted.
+//! (no bytes are copied) or aborted (its parts released). An unfinished
+//! upload stays until it is completed or aborted, or until the engine's
+//! garbage collection aborts it after 7 days (as an S3 lifecycle rule
+//! would).
 
 use md5::{Digest, Md5};
 use truthdb_core::relstore::btree::TreeInsert;
@@ -16,6 +18,9 @@ use crate::{
     NEXT_UPLOAD_KEY, ObjFile, ObjTxn, ObjectAttrs, ObjectError, ObjectInfo, PARTS_TREE,
     UPLOAD_INDEX_TREE, UPLOADS_TREE, next_counter,
 };
+
+/// Largest object a multipart upload completes into (S3's limit).
+pub const MAX_OBJECT_BYTES: u64 = 5 * 1024 * 1024 * 1024 * 1024;
 
 /// Highest part number (S3's limit).
 pub const MAX_PART_NUMBER: u32 = 10_000;
@@ -37,6 +42,8 @@ pub enum UploadError {
     InvalidPartOrder,
     /// A part other than the last is under 5 MiB.
     EntityTooSmall(u32),
+    /// The parts add up to more than 5 TiB.
+    EntityTooLarge,
 }
 
 /// An upload as listed.
@@ -415,10 +422,17 @@ impl ObjTxn<'_, '_> {
             }
             chosen.push(part);
         }
+        if chosen.iter().map(|part| part.size).sum::<u64>() > MAX_OBJECT_BYTES {
+            return Ok(Err(UploadError::EntityTooLarge));
+        }
         let attrs = self.upload_attrs(upload)?;
         let all = self.remove_upload(&info)?;
         for part in &all {
-            if !chosen.iter().any(|c| c.number == part.number) {
+            // `chosen` is in ascending part order (checked above).
+            if chosen
+                .binary_search_by_key(&part.number, |chosen| chosen.number)
+                .is_err()
+            {
                 self.drop_ref(part.body, now_ms, grace_ms)?;
             }
         }
