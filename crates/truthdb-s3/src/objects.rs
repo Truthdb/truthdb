@@ -14,7 +14,9 @@ use hyper::header::HeaderMap;
 use hyper::{Request, Response, StatusCode};
 use md5::{Digest, Md5};
 use tokio::sync::mpsc;
-use truthdb_object::{ObjFile, ObjectAttrs, ObjectError, ObjectInfo, SEGMENT_BYTES, VersionSel};
+use truthdb_object::{
+    ObjFile, ObjectAttrs, ObjectError, ObjectInfo, SEGMENT_BYTES, SealedBody, VersionSel,
+};
 
 use crate::error::S3Error;
 use crate::payload::PayloadDecoder;
@@ -28,7 +30,7 @@ const MAX_USER_METADATA: usize = 2 * 1024;
 const READ_CHUNK: usize = 1024 * 1024;
 /// How long a dropped object's body outlives it before collection: readers
 /// that resolved the old version just before the overwrite may still read it.
-const DROP_GRACE_MS: u64 = 15 * 60 * 1000;
+pub const DROP_GRACE_MS: u64 = 15 * 60 * 1000;
 
 pub fn object_error(err: ObjectError, bucket: &str, key: &str) -> S3Error {
     match err {
@@ -51,7 +53,7 @@ pub fn object_error(err: ObjectError, bucket: &str, key: &str) -> S3Error {
     }
 }
 
-async fn object<T, F>(state: &S3State, op: F) -> Result<T, S3Error>
+pub async fn object<T, F>(state: &S3State, op: F) -> Result<T, S3Error>
 where
     T: Send + 'static,
     F: FnOnce(&mut ObjFile<'_>) -> Result<T, truthdb_core::storage::StorageError> + Send + 'static,
@@ -63,7 +65,7 @@ where
         .map_err(|err| S3Error::internal(err.to_string()))
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -78,7 +80,7 @@ fn header(headers: &HeaderMap, name: &str) -> Option<String> {
 }
 
 /// The system headers and user metadata a PUT stores.
-fn attrs_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
+pub fn attrs_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
     let mut user = Vec::new();
     let mut user_bytes = 0;
     for (name, value) in headers {
@@ -119,39 +121,31 @@ fn attrs_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
     })
 }
 
-pub async fn put_object(
+/// Receives a request body into a new staging body, verifying its framing,
+/// signatures, checksum and Content-MD5 as it streams, and returns it ready
+/// to seal (its last segment written). Bodies over 5 GiB are refused. A body
+/// left behind by a failure stays staging and garbage collection reclaims it.
+pub async fn receive_body(
     state: &S3State,
     request: Request<Incoming>,
     auth: Authenticated,
-    bucket: String,
-    key: String,
-) -> Result<Response<Body>, S3Error> {
+) -> Result<SealedBody, S3Error> {
     let headers = request.headers().clone();
-    let attrs = attrs_from(&headers)?;
     let declared: Option<u64> =
         header(&headers, "x-amz-decoded-content-length").and_then(|value| value.parse().ok());
     let length: Option<u64> = declared
         .or_else(|| header(&headers, "content-length").and_then(|value| value.parse().ok()));
-    if length.is_some_and(|length| length > MAX_PUT_BYTES) {
-        return Err(S3Error::new(
+    let too_large = || {
+        S3Error::new(
             400,
             "EntityTooLarge",
             "Your proposed upload exceeds the maximum allowed object size.",
-        ));
+        )
+    };
+    if length.is_some_and(|length| length > MAX_PUT_BYTES) {
+        return Err(too_large());
     }
     let content_md5 = header(&headers, "content-md5");
-    // Fail before writing anything when the bucket or key is wrong.
-    {
-        let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-        let check = object(state, move |file| {
-            file.head_object(&lookup_bucket, &lookup_key, VersionSel::Latest)
-        })
-        .await?;
-        if let Err(err @ (ObjectError::NoSuchBucket | ObjectError::InvalidKey(_))) = check {
-            return Err(object_error(err, &bucket, &key));
-        }
-    }
-
     let now = now_ms();
     let body_id = object(state, move |file| file.begin_body(now)).await?;
     let mut decoder = PayloadDecoder::new(auth.framing, auth.checksum)?;
@@ -167,11 +161,7 @@ pub async fn put_object(
         decoded.clear();
         decoder.feed(&data, &mut decoded)?;
         if decoder.decoded_len() > MAX_PUT_BYTES {
-            return Err(S3Error::new(
-                400,
-                "EntityTooLarge",
-                "Your proposed upload exceeds the maximum allowed object size.",
-            ));
+            return Err(too_large());
         }
         md5.update(&decoded);
         let mut rest = decoded.as_slice();
@@ -201,16 +191,41 @@ pub async fn put_object(
             ));
         }
     }
+    if !segment.is_empty() {
+        let now = now_ms();
+        object(state, move |file| {
+            file.append_segment(body_id, &segment, now)
+        })
+        .await?;
+    }
+    Ok(SealedBody {
+        body: body_id,
+        md5: digest,
+    })
+}
 
+pub async fn put_object(
+    state: &S3State,
+    request: Request<Incoming>,
+    auth: Authenticated,
+    bucket: String,
+    key: String,
+) -> Result<Response<Body>, S3Error> {
+    let attrs = attrs_from(request.headers())?;
+    // Fail before writing anything when the bucket or key is wrong.
+    {
+        let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
+        let check = object(state, move |file| {
+            file.head_object(&lookup_bucket, &lookup_key, VersionSel::Latest)
+        })
+        .await?;
+        if let Err(err @ (ObjectError::NoSuchBucket | ObjectError::InvalidKey(_))) = check {
+            return Err(object_error(err, &bucket, &key));
+        }
+    }
+    let sealed = receive_body(state, request, auth).await?;
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let info = object(state, move |file| {
-        if !segment.is_empty() {
-            file.append_segment(body_id, &segment, now_ms())?;
-        }
-        let sealed = truthdb_object::SealedBody {
-            body: body_id,
-            md5: digest,
-        };
         file.transaction(|tx| {
             tx.put_object(
                 &bucket_name,
@@ -467,15 +482,31 @@ pub async fn get_object(
     let (tx, rx) = mpsc::channel(4);
     let engine = state.engine.clone();
     let body = info.body;
+    // The body as plain parts (one, or a multipart object's parts), resolved
+    // once: each read then goes straight to the part holding its bytes.
+    let layout = match object(state, move |file| file.body_layout(body)).await {
+        Ok(layout) => layout,
+        Err(err) => {
+            release(state).await;
+            return Err(err);
+        }
+    };
     tokio::spawn(async move {
         let mut offset = first;
         let end = first + len;
         while offset < end {
-            let take = ((end - offset) as usize).min(READ_CHUNK);
+            let Some(&(part, part_start, part_len)) = layout
+                .iter()
+                .find(|(_, start, len)| offset >= *start && offset < start + len)
+            else {
+                break;
+            };
+            let take = ((end.min(part_start + part_len) - offset) as usize).min(READ_CHUNK);
+            let at = offset - part_start;
             let chunk = engine
                 .run_object(move |file| {
                     let mut out = vec![0u8; take];
-                    file.read_body(body, offset, &mut out)?;
+                    file.read_body(part, at, &mut out)?;
                     Ok(out)
                 })
                 .await;

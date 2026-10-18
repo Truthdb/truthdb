@@ -667,3 +667,117 @@ fn objects_are_deleted_one_by_one_and_in_batches() {
         "the bucket is empty"
     );
 }
+
+#[test]
+fn a_multipart_upload_completes_lists_and_aborts() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_with(port, method, path, query, &[], body, &key, Some(&secret))
+    };
+    let tag_of = |xml: &str, tag: &str| -> String {
+        xml.split(&format!("<{tag}>"))
+            .nth(1)
+            .and_then(|rest| rest.split(&format!("</{tag}>")).next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    assert_eq!(call("PUT", "/mpu", "", b"").1.0, 200);
+    let (_, (status, xml)) = call("POST", "/mpu/big.bin", "uploads", b"");
+    assert_eq!(status, 200, "{xml}");
+    let upload = tag_of(&xml, "UploadId");
+
+    let part1 = vec![b'a'; 5 * 1024 * 1024];
+    let part2 = b"tail".to_vec();
+    let mut etags = Vec::new();
+    for (number, data) in [(1, &part1), (2, &part2)] {
+        let (head, (status, body)) = call(
+            "PUT",
+            "/mpu/big.bin",
+            &format!("partNumber={number}&uploadId={upload}"),
+            data,
+        );
+        assert_eq!(status, 200, "{body}");
+        etags.push(response_header(&head, "etag").expect("etag"));
+    }
+    let (_, (_, xml)) = call("GET", "/mpu/big.bin", &format!("uploadId={upload}"), b"");
+    assert!(
+        xml.contains("<PartNumber>1</PartNumber>") && xml.contains("<Size>4</Size>"),
+        "{xml}"
+    );
+    let (_, (_, xml)) = call("GET", "/mpu", "uploads", b"");
+    assert!(xml.contains("<Key>big.bin</Key>"), "{xml}");
+
+    let complete = |parts: &[(u32, &str)]| {
+        let mut body = String::from("<CompleteMultipartUpload>");
+        for (number, etag) in parts {
+            body.push_str(&format!(
+                "<Part><PartNumber>{number}</PartNumber><ETag>{etag}</ETag></Part>"
+            ));
+        }
+        body.push_str("</CompleteMultipartUpload>");
+        call(
+            "POST",
+            "/mpu/big.bin",
+            &format!("uploadId={upload}"),
+            body.as_bytes(),
+        )
+    };
+    let (_, (status, xml)) = complete(&[(2, &etags[1]), (1, &etags[0])]);
+    assert_eq!(status, 400, "{xml}");
+    assert!(xml.contains("InvalidPartOrder"), "{xml}");
+    let (_, (status, xml)) = complete(&[(1, &etags[0]), (2, &etags[1])]);
+    assert_eq!(status, 200, "{xml}");
+    let expected_etag = {
+        use md5::Digest;
+        let mut joined = Vec::new();
+        joined.extend_from_slice(&md5::Md5::digest(&part1));
+        joined.extend_from_slice(&md5::Md5::digest(&part2));
+        format!("\"{}-2\"", md5_hex(&joined))
+    };
+    assert_eq!(tag_of(&xml, "ETag").replace("&quot;", "\""), expected_etag);
+
+    let (head, (status, body)) = call("GET", "/mpu/big.bin", "", b"");
+    assert_eq!(status, 200);
+    assert_eq!(body.len(), part1.len() + 4);
+    assert!(body.ends_with("aaaatail"));
+    assert_eq!(
+        response_header(&head, "etag").as_deref(),
+        Some(expected_etag.as_str())
+    );
+
+    // A small part that is not the last is refused; abort releases the upload.
+    let (_, (_, xml)) = call("POST", "/mpu/small", "uploads", b"");
+    let small = tag_of(&xml, "UploadId");
+    let mut small_etags = Vec::new();
+    for number in [1, 2] {
+        let (head, _) = call(
+            "PUT",
+            "/mpu/small",
+            &format!("partNumber={number}&uploadId={small}"),
+            b"tiny",
+        );
+        small_etags.push(response_header(&head, "etag").expect("etag"));
+    }
+    let body = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        small_etags[0], small_etags[1]
+    );
+    let (_, (status, xml)) = call(
+        "POST",
+        "/mpu/small",
+        &format!("uploadId={small}"),
+        body.as_bytes(),
+    );
+    assert_eq!(status, 400, "{xml}");
+    assert!(xml.contains("EntityTooSmall"), "{xml}");
+    assert_eq!(
+        call("DELETE", "/mpu/small", &format!("uploadId={small}"), b"")
+            .1
+            .0,
+        204
+    );
+    let (_, (status, xml)) = call("DELETE", "/mpu/small", &format!("uploadId={small}"), b"");
+    assert_eq!(status, 404, "{xml}");
+    assert!(xml.contains("NoSuchUpload"), "{xml}");
+}

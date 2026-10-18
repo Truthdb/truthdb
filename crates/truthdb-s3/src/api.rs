@@ -115,12 +115,30 @@ pub async fn dispatch(
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "location") => {
             bucket_location(state, bucket).await
         }
+        (Target::Bucket(bucket), Method::GET) if has_param(&request, "uploads") => {
+            crate::multipart::list_uploads(state, request, bucket).await
+        }
         (Target::Bucket(bucket), Method::POST) if has_param(&request, "delete") => {
             crate::delete::delete_objects(state, request, auth, bucket).await
         }
         (Target::Bucket(bucket), Method::GET) => {
             let query = request.uri().query().unwrap_or("").to_string();
             crate::listing::list_objects(state, bucket, &query).await
+        }
+        (Target::Object(bucket, key), Method::POST) if has_param(&request, "uploads") => {
+            crate::multipart::create_upload(state, request, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::POST) if has_param(&request, "uploadId") => {
+            crate::multipart::complete_upload(state, request, auth, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::PUT) if has_param(&request, "uploadId") => {
+            crate::multipart::upload_part(state, request, auth, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::GET) if has_param(&request, "uploadId") => {
+            crate::multipart::list_parts(state, request, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::DELETE) if has_param(&request, "uploadId") => {
+            crate::multipart::abort_upload(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), Method::PUT) => {
             crate::objects::put_object(state, request, auth, bucket, key).await

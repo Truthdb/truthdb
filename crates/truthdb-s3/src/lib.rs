@@ -5,6 +5,7 @@ pub mod api;
 pub mod delete;
 pub mod error;
 pub mod listing;
+pub mod multipart;
 pub mod objects;
 pub mod payload;
 pub mod server;
