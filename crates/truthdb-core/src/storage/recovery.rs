@@ -41,7 +41,7 @@ impl Locked {
         redo_only: bool,
     ) -> Result<(), StorageError> {
         let records = self.core.rel_records()?;
-        if records.is_empty() && self.eng.metadata_root().is_none() {
+        if records.is_empty() && !self.any_engine_root() {
             return Ok(());
         }
 
@@ -49,21 +49,21 @@ impl Locked {
             let mut ctx = self.core.page_ctx(0);
             rel_recovery::analyze_and_redo(&mut ctx, &records, stop_at)?
         };
-        if let Some(root) = outcome.catalog_root {
-            self.eng.set_metadata_root(root);
-        }
+        self.apply_root_moves(outcome.catalog_root, &outcome.engine_roots)?;
         self.core.pages.next_txn_id = outcome.max_txn_id + 1;
 
-        self.eng.reload(&mut self.core)?;
+        self.reload_engines()?;
         // A standby repeats history but never undoes: an in-flight transaction at
         // the applied tail is the primary's, to be committed (and shipped onward)
         // or resolved at promotion — undoing it here would drop committed data
         // that the streaming protocol never re-ships.
         if !redo_only && !outcome.losers.is_empty() {
-            let undo = self.eng.recovery_undo();
-            let mut ctx = self.core.page_ctx(0);
-            rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &*undo)?;
-            self.eng.reload(&mut self.core)?;
+            {
+                let undo = RoutedUndo::new(&self.engines);
+                let mut ctx = self.core.page_ctx(0);
+                rel_recovery::undo_losers(&mut ctx, &records, &outcome.losers, &undo)?;
+            }
+            self.reload_engines()?;
         }
         // Readable standby: rebuild the read state from the retained ring
         // (it is in-memory only — without this a reopen would serve the
@@ -72,9 +72,11 @@ impl Locked {
         // replayed range.
         if redo_only {
             let floor = self.core.wal.tail();
-            self.eng.capture_standby(&mut self.core, &records, floor);
+            self.capture_standby_engines(&records, floor);
         }
-        self.eng.finish_recovery();
+        for eng in &mut self.engines {
+            eng.finish_recovery();
+        }
         self.core.wal.sync_all()?;
         Ok(())
     }

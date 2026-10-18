@@ -44,6 +44,7 @@ fn create_small(path: &Path) -> Storage {
     .expect("create storage")
 }
 
+mod engines;
 mod recovery;
 
 /// The log alone, with no page-structured engine above it: these tests
@@ -67,6 +68,12 @@ impl LogicalUndo for NoLogicalUndo {
 }
 
 impl EngineParticipant for NoEngine {
+    fn engine_id(&self) -> u32 {
+        CATALOG_ENGINE_ID
+    }
+    fn owns_object(&self, _object_id: u32) -> bool {
+        false
+    }
     fn open(&mut self, _metadata_root: Option<u64>, _db_options: u8) {}
     fn metadata_root(&self) -> Option<u64> {
         None
@@ -94,6 +101,6 @@ impl EngineParticipant for NoEngine {
     }
 }
 
-pub(crate) fn no_engine() -> Box<dyn EngineParticipant> {
-    Box::new(NoEngine)
+pub(crate) fn no_engine() -> Vec<Box<dyn EngineParticipant>> {
+    vec![Box::new(NoEngine)]
 }

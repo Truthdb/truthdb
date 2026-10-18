@@ -355,7 +355,7 @@ impl Storage {
         let core = StorageFile::create_new(path.clone(), opts, wal_min_bytes, wal_max_bytes)?;
         let file = Locked {
             core,
-            eng: engine(),
+            engines: engine(),
         };
         Self::with_log_writer(path, file)
     }
@@ -379,7 +379,7 @@ impl StorageFile {
     pub(super) fn open_existing(
         path: PathBuf,
         stop_at: Option<u64>,
-        mut eng: Box<dyn EngineParticipant>,
+        mut engines: Vec<Box<dyn EngineParticipant>>,
     ) -> Result<Locked, StorageError> {
         let mut file = DirectFile::open_existing(path.clone())?;
         let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
@@ -459,20 +459,36 @@ impl StorageFile {
         )?;
         let recorded_tail = active_sb.wal_tail;
 
-        // The catalog root is stored as an absolute file offset (0 = none).
-        let mut metadata_root = None;
-        if active_sb.metadata_root != 0 {
-            if active_sb.metadata_root < layout.data_offset
-                || active_sb.metadata_root >= layout.data_offset + layout.data_size
-            {
+        // Every root is stored as an absolute file offset (0 = none): the
+        // catalog engine's in `metadata_root`, every other engine's in the
+        // engine-roots table.
+        let root_page = |offset: u64| -> Result<Option<u64>, StorageError> {
+            if offset == 0 {
+                return Ok(None);
+            }
+            if offset < layout.data_offset || offset >= layout.data_offset + layout.data_size {
                 return Err(StorageError::InvalidFile(
-                    "catalog root outside the data region".to_string(),
+                    "engine root outside the data region".to_string(),
                 ));
             }
-            metadata_root = Some((active_sb.metadata_root - layout.data_offset) / PAGE_SIZE as u64);
+            Ok(Some((offset - layout.data_offset) / PAGE_SIZE as u64))
+        };
+        let mut roots = std::collections::HashMap::new();
+        roots.insert(CATALOG_ENGINE_ID, root_page(active_sb.metadata_root)?);
+        for (engine_id, offset) in active_sb.engine_roots() {
+            if engine_id == CATALOG_ENGINE_ID
+                || !engines.iter().any(|eng| eng.engine_id() == engine_id)
+            {
+                return Err(StorageError::InvalidFile(format!(
+                    "the file holds engine {engine_id}, which this build does not run"
+                )));
+            }
+            roots.insert(engine_id, root_page(offset)?);
         }
-
-        eng.open(metadata_root, active_sb.db_options());
+        for eng in &mut engines {
+            let root = roots.get(&eng.engine_id()).copied().flatten();
+            eng.open(root, active_sb.db_options());
+        }
         let last_log_backup_lsn = active_sb.last_log_backup_lsn();
         let repl_slots = active_sb.repl_slots();
         let recovery_full = active_sb.db_options() & 4 != 0;
@@ -496,7 +512,7 @@ impl StorageFile {
             pages: PageState::new(DEFAULT_CAPACITY_BYTES),
             replay_cache: scan.records,
         };
-        let mut storage = Locked { core, eng };
+        let mut storage = Locked { core, engines };
         // Re-establish the FULL-model log-backup hold so a checkpoint cannot
         // reclaim un-backed-up log. The floor is >= the persisted wal_head
         // (checkpoints were already clamped to it), so it never moves the head
