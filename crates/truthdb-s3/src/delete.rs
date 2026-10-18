@@ -5,7 +5,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use truthdb_object::{Deleted, VersionSel};
+use truthdb_object::{Deleted, ObjectError, VersionSel};
 
 use crate::error::{S3Error, escape};
 use crate::objects::{object_error, version_sel};
@@ -94,50 +94,96 @@ fn parse_delete(xml: &[u8]) -> Result<(bool, Vec<ToDelete>), S3Error> {
         )
     };
     let mut reader = Reader::from_reader(xml);
-    let mut quiet = false;
+    let mut quiet: Option<String> = None;
+    let mut seen_root = false;
     let mut objects = Vec::new();
     let mut path: Vec<Vec<u8>> = Vec::new();
-    let mut current: Option<ToDelete> = None;
+    let (mut key, mut version): (Option<String>, Option<String>) = (None, None);
     let mut buf = Vec::new();
     loop {
-        match reader.read_event_into(&mut buf).map_err(|_| malformed())? {
-            Event::Start(element) => {
+        let event = reader.read_event_into(&mut buf).map_err(|_| malformed())?;
+        // An empty element is its start and its end.
+        let (start, end) = match &event {
+            Event::Start(element) => (Some(element.local_name().as_ref().to_vec()), None),
+            Event::Empty(element) => {
                 let name = element.local_name().as_ref().to_vec();
-                if name == b"Object" {
-                    current = Some(ToDelete {
-                        key: String::new(),
-                        version: None,
-                    });
-                }
-                path.push(name);
+                (Some(name.clone()), Some(name))
             }
-            Event::End(element) => {
-                if element.local_name().as_ref() == b"Object" {
-                    let object = current.take().ok_or_else(malformed)?;
-                    if object.key.is_empty() {
-                        return Err(malformed());
-                    }
-                    objects.push(object);
+            Event::End(element) => (None, Some(element.local_name().as_ref().to_vec())),
+            _ => (None, None),
+        };
+        if let Some(name) = start {
+            let allowed = match (path.last().map(Vec::as_slice), name.as_slice()) {
+                (None, b"Delete") => !std::mem::replace(&mut seen_root, true),
+                (Some(b"Delete"), b"Quiet") => quiet.replace(String::new()).is_none(),
+                (Some(b"Delete"), b"Object") => {
+                    (key, version) = (None, None);
+                    true
                 }
-                path.pop();
-            }
-            Event::Text(text) => {
-                let text = text.unescape().map_err(|_| malformed())?.into_owned();
-                match (path.last().map(Vec::as_slice), current.as_mut()) {
-                    (Some(b"Key"), Some(object)) => object.key.push_str(&text),
-                    (Some(b"VersionId"), Some(object)) => object.version = Some(text),
-                    (Some(b"Quiet"), None) => quiet = text.trim().eq_ignore_ascii_case("true"),
-                    _ => {}
+                (Some(b"Object"), b"Key") => key.replace(String::new()).is_none(),
+                (Some(b"Object"), b"VersionId") => version.replace(String::new()).is_none(),
+                // Conditional deletes are not implemented: refused rather
+                // than ignored.
+                (Some(b"Object"), b"ETag" | b"LastModifiedTime" | b"Size") => {
+                    return Err(S3Error::not_implemented(
+                        "conditional deletes in DeleteObjects are not implemented",
+                    ));
                 }
+                _ => false,
+            };
+            if !allowed {
+                return Err(malformed());
             }
-            Event::Eof => break,
-            _ => {}
+            path.push(name);
+        }
+        if let Some(name) = end {
+            if name == b"Object" {
+                let key = key
+                    .take()
+                    .filter(|key| !key.is_empty())
+                    .ok_or_else(malformed)?;
+                objects.push(ToDelete {
+                    key,
+                    version: version.take(),
+                });
+            }
+            path.pop();
+        }
+        let text = match &event {
+            Event::Text(text) => Some(text.unescape().map_err(|_| malformed())?.into_owned()),
+            Event::CData(text) => Some(
+                std::str::from_utf8(text)
+                    .map_err(|_| malformed())?
+                    .to_string(),
+            ),
+            _ => None,
+        };
+        if let Some(text) = text {
+            match path.last().map(Vec::as_slice) {
+                Some(b"Key") => key.get_or_insert_default().push_str(&text),
+                Some(b"VersionId") => version.get_or_insert_default().push_str(&text),
+                Some(b"Quiet") => quiet.get_or_insert_default().push_str(&text),
+                _ if text.trim().is_empty() => {}
+                _ => return Err(malformed()),
+            }
+        }
+        if matches!(event, Event::Eof) {
+            if !path.is_empty() || !seen_root {
+                return Err(malformed());
+            }
+            break;
         }
         buf.clear();
     }
     if objects.is_empty() || objects.len() > MAX_KEYS {
         return Err(malformed());
     }
+    let quiet = match quiet.as_deref().map(str::trim) {
+        None => false,
+        Some(value) if value.eq_ignore_ascii_case("true") => true,
+        Some(value) if value.eq_ignore_ascii_case("false") => false,
+        Some(_) => return Err(malformed()),
+    };
     Ok((quiet, objects))
 }
 
@@ -152,7 +198,7 @@ pub async fn delete_objects(
         || request
             .headers()
             .keys()
-            .any(|name| name.as_str().starts_with("x-amz-checksum-"))
+            .any(|name| crate::server::CHECKSUM_HEADERS.contains(&name.as_str()))
         || request.headers().contains_key("x-amz-trailer");
     if !has_digest {
         return Err(S3Error::invalid_request(
@@ -176,6 +222,17 @@ pub async fn delete_objects(
         }
     }
     let (quiet, objects) = parse_delete(&body)?;
+    // A missing bucket fails the request, not each key.
+    let name = bucket.clone();
+    if state
+        .engine
+        .run_object(move |file| file.bucket(&name))
+        .await
+        .map_err(|err| S3Error::internal(err.to_string()))?
+        .is_none()
+    {
+        return Err(object_error(ObjectError::NoSuchBucket, &bucket, ""));
+    }
     let mut xml = format!("<DeleteResult xmlns=\"{XMLNS}\">");
     for object in objects {
         let which = match object.version.as_deref() {
@@ -213,12 +270,17 @@ pub async fn delete_objects(
                 }
                 xml.push_str("</Deleted>");
             }
-            Err(err) => xml.push_str(&format!(
-                "<Error><Key>{}</Key><Code>{}</Code><Message>{}</Message></Error>",
-                escape(&object.key),
-                err.code,
-                escape(&err.message)
-            )),
+            Err(err) => {
+                xml.push_str(&format!("<Error><Key>{}</Key>", escape(&object.key)));
+                if let Some(version) = &object.version {
+                    xml.push_str(&format!("<VersionId>{}</VersionId>", escape(version)));
+                }
+                xml.push_str(&format!(
+                    "<Code>{}</Code><Message>{}</Message></Error>",
+                    err.code,
+                    escape(&err.message)
+                ));
+            }
         }
     }
     xml.push_str("</DeleteResult>");
@@ -249,6 +311,30 @@ mod tests {
         assert!(
             parse_delete(b"<Delete><Object><VersionId>1</VersionId></Object></Delete>").is_err(),
             "an object without a key"
+        );
+        let (_, objects) =
+            parse_delete(b"<Delete><Object><Key>x<![CDATA[y&z]]></Key></Object></Delete>").unwrap();
+        assert_eq!(objects[0].key, "xy&z");
+        for bad in [
+            &b"<Delete><Object><Key>a</Key></Object><Object><Key>b</Key>"[..],
+            b"<Foo><Object><Key>a</Key></Object></Foo>",
+            b"<Delete><Object><Key>a</Key></Object></Delete><Delete><Object><Key>b</Key></Object></Delete>",
+            b"<Delete><Object><Key>a</Key><Key>b</Key></Object></Delete>",
+            b"<Delete><Object><Key>a</Key></Object><Key>z</Key></Delete>",
+            b"<Delete><Quiet>maybe</Quiet><Object><Key>a</Key></Object></Delete>",
+        ] {
+            assert_eq!(
+                parse_delete(bad).err().map(|err| err.code),
+                Some("MalformedXML"),
+                "{}",
+                String::from_utf8_lossy(bad)
+            );
+        }
+        assert_eq!(
+            parse_delete(b"<Delete><Object><Key>a</Key><ETag>x</ETag></Object></Delete>")
+                .err()
+                .map(|err| err.code),
+            Some("NotImplemented")
         );
     }
 }
