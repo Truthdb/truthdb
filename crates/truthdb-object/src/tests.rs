@@ -1256,3 +1256,62 @@ fn versions_list_newest_first_with_markers_and_resume_mid_key() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
+    use crate::buckets::BucketRow;
+    use crate::{ListAfter, ObjectAttrs, Versioning};
+    let path = temp_path("many-versions");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("bkt", now())?.unwrap();
+            // Versioning on, through the row (the API to set it comes later).
+            let row = BucketRow {
+                created_ms: now(),
+                versioning: Versioning::Enabled,
+            };
+            tx.trees
+                .buckets()
+                .update(tx.ctx, &mut OpMode::Txn(tx.txn), b"bkt", &row.encode())?;
+            Ok(())
+        })
+        .unwrap();
+    let put = |key: &str| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .unwrap()
+            .unwrap();
+    };
+    put("a");
+    // More versions than a scan batch, and than a call's row budget.
+    for _ in 0..40 {
+        put("k");
+    }
+    put("z");
+    let list = |after: Option<ListAfter<'_>>| {
+        ObjFile::new(&mut storage.lock())
+            .list_objects("bkt", "", None, after, 1000)
+            .unwrap()
+            .unwrap()
+    };
+    let mut keys = Vec::new();
+    let mut page = list(None);
+    loop {
+        keys.extend(page.objects.iter().map(|o| o.key.clone()));
+        if !page.truncated {
+            break;
+        }
+        let (last, _) = page
+            .last
+            .clone()
+            .expect("a truncated page says where it ends");
+        page = list(Some(ListAfter::Key(&last)));
+    }
+    assert_eq!(keys, ["a", "k", "z"]);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

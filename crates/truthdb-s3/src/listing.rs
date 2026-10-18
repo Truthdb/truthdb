@@ -174,10 +174,10 @@ pub async fn list_objects(
             "<Marker>{}</Marker>",
             encode(param(&params, "marker").unwrap_or(""))
         ));
-        // v1 returns NextMarker only with a delimiter; without one a client
-        // resumes after the last key it received.
+        // S3 returns NextMarker only with a delimiter, and a client without
+        // one resumes after the last key it received. A page here can end on
+        // a deleted key that is not in it, so NextMarker is always sent.
         if listing.truncated
-            && delimiter.is_some()
             && let Some((last, _)) = &listing.last
         {
             xml.push_str(&format!("<NextMarker>{}</NextMarker>", encode(last)));

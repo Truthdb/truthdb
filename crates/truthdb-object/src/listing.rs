@@ -12,6 +12,10 @@ use crate::{BUCKETS_TREE, OBJECTS_TREE, ObjFile, ObjectError};
 /// Rows the scan reads per tree lookup (tiny under test, so resuming across
 /// batches is exercised).
 const SCAN_BATCH: usize = if cfg!(test) { 3 } else { 1024 };
+/// Rows one call reads at most before it hands back a truncated page (deleted
+/// keys and older versions are read but not listed, so a page can take any
+/// number of rows to fill).
+const ROW_BUDGET: usize = if cfg!(test) { 30 } else { 16 * 1024 };
 
 /// A listed object.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,13 +150,26 @@ impl ObjFile<'_> {
         }
 
         let mut entries = 0usize;
+        let mut rows_read = 0usize;
         // The key of the row read last: the rows after it that share it are
         // its older versions.
         let mut last_key: Option<Vec<u8>> = match after {
             Some(ListAfter::Version(key, _)) => Some(key.as_bytes().to_vec()),
             _ => None,
         };
+        // Where an object listing cut short by the row budget resumes: the
+        // last key read, or the common prefix just folded. (A version listing
+        // lists every row it reads, so max_keys bounds it.)
+        let mut resume_at: Option<(String, bool)> = None;
         'scan: loop {
+            if !versions
+                && rows_read >= ROW_BUDGET
+                && let Some(at) = resume_at.take()
+            {
+                listing.truncated = true;
+                listing.last = Some(at);
+                break;
+            }
             let rows = objects.scan_range_limit(
                 &mut self.core.page_ctx(0),
                 Some(&lower),
@@ -162,18 +179,29 @@ impl ObjFile<'_> {
             let exhausted = rows.len() < SCAN_BATCH;
             let mut next_lower = None;
             for (row_key, row) in rows {
+                rows_read += 1;
+                // The next batch resumes past the last row read, whatever it
+                // was (an older version of a key can fill a whole batch).
+                next_lower = Some(row_key.clone());
                 // `bucket, 0, key, 0, version`
                 let key_bytes = &row_key[bucket_prefix.len()..row_key.len() - 9];
                 let latest = last_key.as_deref() != Some(key_bytes);
                 if !latest && !versions {
-                    continue; // an older version of the key just listed
+                    continue; // an older version of the key just read
                 }
                 last_key = Some(key_bytes.to_vec());
-                next_lower = Some(row_key.clone());
                 let key = std::str::from_utf8(key_bytes)
                     .map_err(|_| StorageError::InvalidFile("corrupt object key".to_string()))?;
                 if !key.starts_with(prefix) {
                     break 'scan;
+                }
+                resume_at = Some((key.to_string(), false));
+                // In an object listing the newest version decides: a key whose
+                // newest version is a delete marker is left out, and makes no
+                // common prefix.
+                let info = crate::objects::decode_version(version_from_key(&row_key)?, &row)?;
+                if info.delete_marker && !versions {
+                    continue;
                 }
                 let entry = match delimiter
                     .and_then(|d| key[prefix.len()..].find(d).map(|at| (d, at)))
@@ -191,18 +219,11 @@ impl ObjFile<'_> {
                         }
                         Entry::Prefix(common.to_string())
                     }
-                    None => {
-                        let info =
-                            crate::objects::decode_version(version_from_key(&row_key)?, &row)?;
-                        if info.delete_marker && !versions {
-                            continue;
-                        }
-                        Entry::Object(Box::new(ListedObject {
-                            key: key.to_string(),
-                            info,
-                            latest,
-                        }))
-                    }
+                    None => Entry::Object(Box::new(ListedObject {
+                        key: key.to_string(),
+                        info,
+                        latest,
+                    })),
                 };
                 if entries == max_keys {
                     listing.truncated = true;
@@ -220,6 +241,7 @@ impl ObjFile<'_> {
                         let skip = past_prefix(&full(&common));
                         listing.last = Some((common.clone(), true));
                         listing.last_version = None;
+                        resume_at = Some((common.clone(), true));
                         listing.common_prefixes.push(common);
                         lower = skip;
                         continue 'scan;
@@ -229,8 +251,8 @@ impl ObjFile<'_> {
             if exhausted {
                 break;
             }
-            // Resume past the last row read (an older version of the same key
-            // is skipped by `last_key`).
+            // Resume past the last row read (older versions of the same key
+            // are skipped by `last_key`).
             let Some(mut resume) = next_lower else { break };
             resume.push(0);
             lower = resume;
