@@ -20,9 +20,10 @@ use crate::relstore::page;
 use crate::relstore::slotted::SlottedRead;
 use crate::storage::StorageError;
 use crate::wal::records::{
-    PageOpRedo, PageOpUndo, REL_KIND_ALLOC_EXTENT, REL_KIND_CLR, REL_KIND_FREE_EXTENT,
-    REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_IMAGES, REL_KIND_PAGE_OP, REL_KIND_SET_CATALOG_ROOT,
-    REL_KIND_SET_ENGINE_ROOT, REL_KIND_TXN_BEGIN, REL_KIND_TXN_COMMIT, REL_KIND_TXN_END, RelRecord,
+    PageOpRedo, PageOpUndo, REL_KIND_ALLOC_EXTENT, REL_KIND_CLR, REL_KIND_CLR_FREE_EXTENT,
+    REL_KIND_FREE_EXTENT, REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_IMAGES, REL_KIND_PAGE_OP,
+    REL_KIND_SET_CATALOG_ROOT, REL_KIND_SET_ENGINE_ROOT, REL_KIND_TXN_BEGIN, REL_KIND_TXN_COMMIT,
+    REL_KIND_TXN_END, RelRecord,
 };
 
 pub(crate) struct AnalysisRedoOutcome {
@@ -88,7 +89,15 @@ pub(crate) fn analyze_and_redo(
                     att.remove(&record.txn_id);
                 }
             }
-            REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE | REL_KIND_PAGE_IMAGES | REL_KIND_CLR => {
+            REL_KIND_PAGE_OP
+            | REL_KIND_PAGE_IMAGE
+            | REL_KIND_PAGE_IMAGES
+            | REL_KIND_CLR
+            | REL_KIND_CLR_FREE_EXTENT
+            | REL_KIND_ALLOC_EXTENT
+            | REL_KIND_FREE_EXTENT => {
+                // Extent records with a transaction belong to its chain; the
+                // plain (txn 0) ones are allocator bookkeeping only.
                 if record.txn_id != 0 {
                     att.insert(record.txn_id, *lsn);
                 }
@@ -100,7 +109,6 @@ pub(crate) fn analyze_and_redo(
                 let (engine_id, root) = record.decode_engine_root()?;
                 engine_roots.insert(engine_id, root);
             }
-            REL_KIND_ALLOC_EXTENT | REL_KIND_FREE_EXTENT => {}
             other => {
                 return Err(StorageError::InvalidFile(format!(
                     "unknown rel record kind {other} during analysis"
@@ -162,7 +170,10 @@ pub(crate) fn redo_records(
 /// carries no timestamp (a pre-timestamp WAL entry): point-in-time restore cannot
 /// place such a commit relative to the stop point, and silently treating it as a
 /// winner would keep post-stop data.
-fn first_commit_past(records: &[(u64, RelRecord)], limit: u64) -> Result<u64, StorageError> {
+pub(crate) fn first_commit_past(
+    records: &[(u64, RelRecord)],
+    limit: u64,
+) -> Result<u64, StorageError> {
     let mut cut = u64::MAX;
     for (lsn, record) in records {
         if record.kind != REL_KIND_TXN_COMMIT {
@@ -277,6 +288,7 @@ pub(crate) fn undo_losers(
                         txn_id,
                         last_lsn,
                         undo_log: Vec::new(),
+                        pending_frees: Vec::new(),
                     },
                 ),
             )
@@ -300,7 +312,8 @@ pub(crate) fn undo_losers(
         })?;
         let next_cursor = match record.kind {
             REL_KIND_CLR => record.decode_clr()?.0,
-            REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE => {
+            REL_KIND_CLR_FREE_EXTENT => record.decode_clr_free_extent()?.0,
+            REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE | REL_KIND_ALLOC_EXTENT => {
                 let undo = record.decode_page_op_undo()?;
                 let (_, link) = active.get_mut(&txn_id).expect("active loser");
                 undo_one(ctx, link, &undo, cursor, record.prev_lsn, logical)?;
@@ -341,7 +354,7 @@ pub(crate) fn undo_one(
         // (textbook ARIES): a re-run resumes at `record_prev` and can never
         // revisit it.
         let undo_next = match undo {
-            PageOpUndo::CounterAdd { .. } => record_prev,
+            PageOpUndo::CounterAdd { .. } | PageOpUndo::FreeExtent { .. } => record_prev,
             _ => record_lsn,
         };
         let mut mode = OpMode::Clr {
@@ -367,6 +380,23 @@ pub(crate) fn undo_one(
                         delta: *delta,
                     },
                 )?;
+            }
+            PageOpUndo::FreeExtent {
+                start_page,
+                num_pages,
+            } => {
+                // Like the counter: one record that frees AND moves the cursor
+                // past the allocation, so a crash can never free it twice
+                // (the second free could take back pages reallocated since).
+                let clr = RelRecord::clr_free_extent(
+                    link.txn_id,
+                    link.last_lsn,
+                    undo_next,
+                    *start_page,
+                    *num_pages,
+                );
+                link.last_lsn = ctx.append(&clr, false)?;
+                ctx.allocator.free(*start_page, *num_pages);
             }
             PageOpUndo::HeapDeleteSlot { page, slot } => {
                 if heap_slot_occupied(ctx, *page, *slot)? {

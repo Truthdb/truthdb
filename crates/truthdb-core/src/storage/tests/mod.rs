@@ -46,6 +46,7 @@ fn create_small(path: &Path) -> Storage {
 
 mod engines;
 mod recovery;
+mod txn_extents;
 
 /// The log alone, with no page-structured engine above it: these tests
 /// exercise the WAL ring, checkpoints, the allocator and backups.

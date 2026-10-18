@@ -52,9 +52,13 @@ impl StorageFile {
     ///    belongs to the checkpoint that superseded it, which precedes every
     ///    replayed WAL record;
     /// 2. replay logged alloc/free extents (all idempotent bit operations);
+    ///    a free logged inside a transaction lands at that transaction's
+    ///    commit, and not at all when it never committed or committed at or
+    ///    past the point-in-time cut (`stop_at`), where restart undo makes it
+    ///    a loser;
     /// 3. mark the live snapshot's extent allocated last, healing the crash
     ///    window where the descriptor was written but the bitmap was not.
-    pub(super) fn recover_allocator(&mut self) -> Result<(), StorageError> {
+    pub(super) fn recover_allocator(&mut self, stop_at: Option<u64>) -> Result<(), StorageError> {
         let bitmap_len = (self.layout.data_size / PAGE_SIZE as u64).div_ceil(8) as usize;
         let mut bitmap = vec![0u8; bitmap_len];
         self.file
@@ -71,26 +75,20 @@ impl StorageFile {
             }
         }
 
-        let rel_records: Vec<RelRecord> = self
-            .replay_cache
-            .iter()
-            .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
-            .map(|record| RelRecord::decode(&record.payload))
-            .collect::<Result<_, _>>()?;
-        for record in rel_records {
-            match record.kind {
-                REL_KIND_ALLOC_EXTENT => {
-                    let (start, pages) = record.decode_extent_redo()?;
-                    self.allocator.mark_used(start, pages);
-                }
-                REL_KIND_FREE_EXTENT => {
-                    let (start, pages) = record.decode_extent_redo()?;
-                    self.allocator.free(start, pages);
-                }
-                // Transaction/page records are ARIES recovery's business
-                // (recover_rel); the allocator only replays extent state.
-                _ => {}
-            }
+        let rel_records = self.rel_records()?;
+        let cut_lsn = match stop_at {
+            Some(limit) => rel_recovery::first_commit_past(&rel_records, limit)?,
+            None => u64::MAX,
+        };
+        let mut pending_frees = PendingFrees::default();
+        for (lsn, record) in &rel_records {
+            pending_frees.replay(&mut self.allocator, *lsn, record, cut_lsn)?;
+        }
+        // A standby's in-flight transactions commit in a later shipped range:
+        // their frees wait there. (A primary's leftovers are restart losers,
+        // which never commit.)
+        if self.active_sb().is_standby() {
+            self.standby_pending_frees = pending_frees;
         }
 
         if let Some(live) = live_slot.and_then(|slot| descriptors[slot]) {
@@ -221,6 +219,60 @@ impl StorageFile {
         if !frames.is_empty() {
             let refs: Vec<&AlignedPageBuf> = frames.iter().collect();
             self.file.write_pages_from(batch_start, &refs)?;
+        }
+        Ok(())
+    }
+}
+
+/// Frees logged inside transactions, held per transaction until its commit
+/// record is replayed. Shared by the open-time allocator rebuild and the
+/// standby's live apply, so both land a transactional free at the same point.
+#[derive(Default)]
+pub(super) struct PendingFrees(std::collections::HashMap<u64, Vec<(u64, u64)>>);
+
+impl PendingFrees {
+    /// Replays one record's allocator effect. Commits at or past `cut_lsn` do
+    /// not count (point-in-time restore undoes them).
+    pub(super) fn replay(
+        &mut self,
+        allocator: &mut PageAllocator,
+        lsn: u64,
+        record: &RelRecord,
+        cut_lsn: u64,
+    ) -> Result<(), StorageError> {
+        match record.kind {
+            REL_KIND_ALLOC_EXTENT => {
+                let (start, pages) = record.decode_extent_redo()?;
+                allocator.mark_used(start, pages);
+            }
+            REL_KIND_FREE_EXTENT if record.txn_id != 0 => {
+                let extent = record.decode_extent_redo()?;
+                self.0.entry(record.txn_id).or_default().push(extent);
+            }
+            REL_KIND_FREE_EXTENT => {
+                let (start, pages) = record.decode_extent_redo()?;
+                allocator.free(start, pages);
+            }
+            REL_KIND_CLR_FREE_EXTENT => {
+                let (_, start, pages) = record.decode_clr_free_extent()?;
+                allocator.free(start, pages);
+            }
+            REL_KIND_TXN_COMMIT => {
+                if let Some(extents) = self.0.remove(&record.txn_id)
+                    && lsn < cut_lsn
+                {
+                    for (start, pages) in extents {
+                        allocator.free(start, pages);
+                    }
+                }
+            }
+            REL_KIND_TXN_END => {
+                // Rolled back (a commit already took its frees): never freed.
+                self.0.remove(&record.txn_id);
+            }
+            // Transaction/page records are ARIES recovery's business; the
+            // allocator only replays extent state.
+            _ => {}
         }
         Ok(())
     }

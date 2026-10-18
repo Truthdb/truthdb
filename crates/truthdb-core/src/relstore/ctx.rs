@@ -109,6 +109,10 @@ pub struct TxnLink {
     pub txn_id: u64,
     pub last_lsn: u64,
     pub undo_log: Vec<(u64, PageOpUndo)>,
+    /// Extents freed inside this transaction, `(start_page, num_pages)`:
+    /// returned to the allocator only once the commit record is appended, so
+    /// a rollback never has to take back pages someone else allocated.
+    pub pending_frees: Vec<(u64, u64)>,
 }
 
 /// A marker in a live transaction's log to which a later partial rollback can
@@ -261,6 +265,7 @@ impl RelCtx<'_> {
             txn_id,
             last_lsn: lsn,
             undo_log: Vec::new(),
+            pending_frees: Vec::new(),
         })
     }
 
@@ -284,7 +289,58 @@ impl RelCtx<'_> {
             false,
         )?;
         let _ = self.append(&RelRecord::txn_end(txn.txn_id, commit_lsn), false);
+        // Any later allocation of these pages is logged after the commit
+        // record, so a crash that keeps it keeps the commit too.
+        for (start_page, num_pages) in txn.pending_frees {
+            self.allocator.free(start_page, num_pages);
+        }
         Ok(commit_lsn)
+    }
+
+    /// Allocates `num_pages` contiguous pages inside `txn`: the allocation is
+    /// undone (the extent freed) if the transaction rolls back or loses at
+    /// restart. For pages no structural change outside the transaction can
+    /// reach — a B+ tree split, which is never undone, must not use this.
+    pub fn allocate_extent_in_txn(
+        &mut self,
+        txn: &mut TxnLink,
+        num_pages: u64,
+    ) -> Result<u64, StorageError> {
+        let start_page = self
+            .allocator
+            .allocate(num_pages)
+            .ok_or_else(|| StorageError::InvalidConfig("data region full".to_string()))?;
+        let record = RelRecord::alloc_extent_txn(txn.txn_id, txn.last_lsn, start_page, num_pages);
+        let lsn = match self.append(&record, false) {
+            Ok(lsn) => lsn,
+            Err(err) => {
+                self.allocator.free(start_page, num_pages);
+                return Err(err);
+            }
+        };
+        txn.last_lsn = lsn;
+        txn.undo_log.push((
+            lsn,
+            PageOpUndo::FreeExtent {
+                start_page,
+                num_pages,
+            },
+        ));
+        Ok(start_page)
+    }
+
+    /// Frees an extent inside `txn`. The pages stay allocated until the
+    /// transaction commits, and are never freed if it does not.
+    pub fn free_extent_in_txn(
+        &mut self,
+        txn: &mut TxnLink,
+        start_page: u64,
+        num_pages: u64,
+    ) -> Result<(), StorageError> {
+        let record = RelRecord::free_extent_txn(txn.txn_id, txn.last_lsn, start_page, num_pages);
+        txn.last_lsn = self.append(&record, false)?;
+        txn.pending_frees.push((start_page, num_pages));
+        Ok(())
     }
 
     /// Applies a physiological op to its page and logs it. Callers must have

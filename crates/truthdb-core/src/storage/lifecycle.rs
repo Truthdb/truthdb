@@ -511,6 +511,7 @@ impl StorageFile {
             allocator: PageAllocator::new(layout.data_size),
             pages: PageState::new(DEFAULT_CAPACITY_BYTES),
             replay_cache: scan.records,
+            standby_pending_frees: Default::default(),
         };
         let mut storage = Locked { core, engines };
         // Re-establish the FULL-model log-backup hold so a checkpoint cannot
@@ -557,7 +558,7 @@ impl StorageFile {
                 })
                 .map(|record| record.logical_ts);
         }
-        storage.recover_allocator()?;
+        storage.recover_allocator(stop_at)?;
 
         // A tail below the superblock's recorded one means part of the
         // trusted region was lost (media corruption, or a v1 file whose
@@ -677,6 +678,7 @@ impl StorageFile {
             allocator: PageAllocator::new(layout.data_size),
             pages: PageState::new(DEFAULT_CAPACITY_BYTES),
             replay_cache: Vec::new(),
+            standby_pending_frees: Default::default(),
         })
     }
 
