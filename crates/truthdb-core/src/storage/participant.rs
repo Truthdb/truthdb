@@ -225,6 +225,11 @@ impl crate::storage::Locked {
         catalog_root: Option<u64>,
         engine_roots: &std::collections::HashMap<u32, u64>,
     ) -> Result<(), StorageError> {
+        // Refuse an unknown engine before moving any root, so a failed apply
+        // leaves every root where it was.
+        for &engine_id in engine_roots.keys() {
+            self.engine_by_id(engine_id)?;
+        }
         if let Some(root) = catalog_root {
             self.engine_by_id(CATALOG_ENGINE_ID)?
                 .set_metadata_root(root);

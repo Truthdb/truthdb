@@ -293,3 +293,104 @@ fn a_factory_without_one_catalog_engine_or_with_shared_ids_is_refused() {
     );
     std::fs::remove_file(&path).ok();
 }
+
+/// A catalog engine that remembers its root, so a test can see it move.
+struct RootedCatalog {
+    root: Option<u64>,
+}
+
+impl EngineParticipant for RootedCatalog {
+    fn engine_id(&self) -> u32 {
+        CATALOG_ENGINE_ID
+    }
+    fn owns_object(&self, object_id: u32) -> bool {
+        object_id < FIRST_ENGINE_OBJECT_ID
+    }
+    fn open(&mut self, metadata_root: Option<u64>, _db_options: u8) {
+        self.root = metadata_root;
+    }
+    fn metadata_root(&self) -> Option<u64> {
+        self.root
+    }
+    fn set_metadata_root(&mut self, page: u64) {
+        self.root = Some(page);
+    }
+    fn options_byte(&self) -> u8 {
+        0
+    }
+    fn reload(&mut self, _core: &mut StorageFile) -> Result<(), StorageError> {
+        Ok(())
+    }
+    fn recovery_undo(&self) -> Box<dyn LogicalUndo> {
+        Box::new(NoLogicalUndo)
+    }
+    fn capture_standby(
+        &mut self,
+        _core: &mut StorageFile,
+        _records: &[(u64, RelRecord)],
+        _floor: u64,
+    ) {
+    }
+    fn finish_recovery(&mut self) {}
+    fn as_any_mut(&mut self) -> &mut dyn std::any::Any {
+        self
+    }
+}
+
+#[test]
+fn a_standby_without_the_engine_refuses_the_range_and_moves_no_root() {
+    fn rooted_two() -> Vec<Box<dyn EngineParticipant>> {
+        vec![
+            Box::new(RootedCatalog { root: None }),
+            Box::new(SecondEngine { root: None }),
+        ]
+    }
+    fn rooted_only() -> Vec<Box<dyn EngineParticipant>> {
+        vec![Box::new(RootedCatalog { root: None })]
+    }
+    let path = unique_temp_path("engines-half-src");
+    let bak = unique_temp_path("engines-half-bak");
+    let seed = unique_temp_path("engines-half-seed");
+    let primary = Storage::create_with_wal_bounds(
+        path.clone(),
+        test_storage_options(),
+        TEST_WAL_BYTES,
+        TEST_WAL_BYTES,
+        rooted_two,
+    )
+    .expect("create");
+    let summary = primary.backup_full(&bak).expect("backup");
+    {
+        let mut guard = primary.lock();
+        let mut ctx = guard.page_ctx(0);
+        let catalog = ctx.allocate_page(0).expect("allocate");
+        ctx.append(&RelRecord::set_catalog_root(catalog), false)
+            .expect("log catalog root");
+    }
+    set_second_root(&primary);
+    let delta = primary
+        .read_wal_range(summary.backup_end_lsn, primary.wal_flushed_lsn())
+        .expect("ship");
+
+    Storage::restore_full_standby(&seed, &bak, &[], rooted_only).expect("standby seed");
+    let standby = Storage::open(seed.clone(), rooted_only).expect("open standby");
+    let err = standby
+        .apply_wal_stream(summary.backup_end_lsn, &delta)
+        .expect_err("the standby cannot place the second engine's root");
+    assert!(
+        err.to_string().contains("holds engine 1"),
+        "unexpected error: {err}"
+    );
+    let mut guard = standby.lock();
+    assert_eq!(
+        guard.engine_parts::<RootedCatalog>().1.root,
+        None,
+        "the failed apply moved no root"
+    );
+    drop(guard);
+    drop(standby);
+    drop(primary);
+    for p in [&path, &bak, &seed] {
+        std::fs::remove_file(p).ok();
+    }
+}
