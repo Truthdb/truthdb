@@ -9,7 +9,7 @@ use truthdb_core::storage::{
 use truthdb_core::wal::records::{PageOpUndo, RelRecord};
 
 use crate::body::SEGMENT_BYTES;
-use crate::{BodyWriter, ObjEngine, ObjFile};
+use crate::{BodyLease, BodyWriter, ObjEngine, ObjFile};
 
 const RING: u64 = 8 * 1024 * 1024;
 const GRACE: u64 = 1_000;
@@ -116,9 +116,12 @@ fn bytes(seed: u8, len: usize) -> Vec<u8> {
 fn put(storage: &Storage, data: &[u8], now_ms: u64) -> u64 {
     let mut writer = BodyWriter::begin(storage, now_ms).expect("begin");
     for chunk in data.chunks(300_000) {
-        writer.write(storage, chunk).expect("write");
+        writer.write(storage, chunk, now_ms).expect("write");
     }
-    let info = writer.finish(storage).expect("finish");
+    let sealed = writer.finish(storage, now_ms).expect("finish");
+    let info = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| sealed.seal_in(tx))
+        .expect("seal");
     assert_eq!(info.len, data.len() as u64);
     assert_eq!(info.md5, <[u8; 16]>::from(Md5::digest(data)));
     info.body
@@ -188,34 +191,25 @@ fn a_dropped_body_is_freed_after_its_grace_unless_leased() {
     let with_body = allocated_pages(&storage);
     assert!(with_body > baseline);
 
+    let collect = |at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .collect_garbage(at, ABANDON)
+            .unwrap()
+            .bodies
+    };
+    let in_tx = |op: &dyn Fn(&mut crate::ObjTxn<'_, '_>) -> Result<(), StorageError>| {
+        ObjFile::new(&mut storage.lock()).transaction(op).unwrap()
+    };
+    in_tx(&|tx| tx.add_ref(body));
+    in_tx(&|tx| tx.drop_ref(body, now(), GRACE));
+    assert_eq!(collect(now() + 2 * GRACE), 0, "still referenced");
+    in_tx(&|tx| tx.drop_ref(body, now(), GRACE));
+    assert_eq!(collect(now()), 0, "not due yet");
     {
-        let mut guard = storage.lock();
-        let mut file = ObjFile::new(&mut guard);
-        file.add_ref(body).unwrap();
-        file.drop_ref(body, now(), GRACE).unwrap();
-        assert_eq!(
-            file.collect_garbage(now() + 2 * GRACE, ABANDON)
-                .unwrap()
-                .bodies,
-            0,
-            "still referenced"
-        );
-        file.drop_ref(body, now(), GRACE).unwrap();
-        assert_eq!(
-            file.collect_garbage(now(), ABANDON).unwrap().bodies,
-            0,
-            "not due yet"
-        );
-        file.take_lease(body);
-        assert_eq!(
-            file.collect_garbage(now() + GRACE, ABANDON).unwrap().bodies,
-            0,
-            "leased"
-        );
-        file.release_lease(body);
-        let freed = file.collect_garbage(now() + GRACE, ABANDON).unwrap();
-        assert_eq!(freed.bodies, 1);
+        let _lease = BodyLease::take(&storage, body);
+        assert_eq!(collect(now() + GRACE), 0, "leased");
     }
+    assert_eq!(collect(now() + GRACE), 1, "the lease dropped");
     let after = allocated_pages(&storage);
     drop(storage);
     let storage = open(&path);
@@ -239,7 +233,7 @@ fn a_body_abandoned_mid_write_is_collected_after_a_crash() {
     let before = allocated_pages(&storage);
     let mut writer = BodyWriter::begin(&storage, now()).unwrap();
     writer
-        .write(&storage, &bytes(4, SEGMENT_BYTES + 10))
+        .write(&storage, &bytes(4, SEGMENT_BYTES + 10), now())
         .unwrap();
     let abandoned = writer.body();
     drop(writer);
@@ -272,7 +266,7 @@ fn a_segment_that_fails_midway_rolls_back_its_pages() {
     // The segment row's insert is the first page op after the pages are
     // allocated and written: fail it.
     FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(Some(0)));
-    let err = ObjFile::new(&mut storage.lock()).append_segment(body, &bytes(5, 5000));
+    let err = ObjFile::new(&mut storage.lock()).append_segment(body, &bytes(5, 5000), now());
     FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(None));
     assert!(err.is_err());
     assert_eq!(
@@ -283,8 +277,8 @@ fn a_segment_that_fails_midway_rolls_back_its_pages() {
     {
         let mut guard = storage.lock();
         let mut file = ObjFile::new(&mut guard);
-        file.append_segment(body, &bytes(5, 5000)).unwrap();
-        file.seal_body(body, [0; 16]).unwrap();
+        file.append_segment(body, &bytes(5, 5000), now()).unwrap();
+        file.transaction(|tx| tx.seal_body(body, [0; 16])).unwrap();
     }
     assert_eq!(read(&storage, body, 0, 5000).unwrap(), bytes(5, 5000));
     drop(storage);
@@ -327,4 +321,83 @@ fn a_body_ships_to_a_standby_and_restores_from_a_log_backup() {
     for p in [&path, &bak, &log, &seed, &dst] {
         std::fs::remove_file(p).ok();
     }
+}
+
+#[test]
+fn a_slow_upload_that_keeps_writing_is_not_taken_for_abandoned() {
+    let path = temp_path("slow");
+    let storage = create(&path);
+    let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+    // The last segment lands just before the abandon age runs out.
+    writer
+        .write(&storage, &bytes(7, SEGMENT_BYTES), now() + ABANDON - 1)
+        .unwrap();
+    let freed = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now() + ABANDON, ABANDON)
+        .unwrap();
+    assert_eq!(freed.bodies, 0, "touched recently");
+    let sealed = writer.finish(&storage, now() + ABANDON).unwrap();
+    let body = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| sealed.seal_in(tx))
+        .unwrap()
+        .body;
+    assert_eq!(read(&storage, body, 0, 10).unwrap(), bytes(7, 10));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_writer_refuses_further_use_after_an_error() {
+    let path = temp_path("poison");
+    let storage = create(&path);
+    put(&storage, &bytes(8, 10), now());
+    let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+    FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(Some(0)));
+    let err = writer.write(&storage, &bytes(8, SEGMENT_BYTES), now());
+    FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(None));
+    assert!(err.is_err());
+    let again = writer.write(&storage, &bytes(8, 10), now()).unwrap_err();
+    assert!(again.to_string().contains("failed earlier"), "{again}");
+    assert!(writer.finish(&storage, now()).is_err());
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_read_on_a_store_the_engine_never_wrote_changes_nothing() {
+    let path = temp_path("read-only");
+    let storage = create(&path);
+    let tail = storage.wal_flushed_lsn();
+    let err = read(&storage, 1, 0, 1).unwrap_err();
+    assert!(err.to_string().contains("no body 1"), "{err}");
+    assert!(ObjFile::new(&mut storage.lock()).body_info(1).is_err());
+    let freed = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now(), ABANDON)
+        .unwrap();
+    assert_eq!(freed.bodies, 0);
+    assert_eq!(storage.wal_flushed_lsn(), tail, "nothing was logged");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_seal_rolls_back_with_the_transaction_it_joined() {
+    let path = temp_path("seal-rollback");
+    let storage = create(&path);
+    let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+    writer.write(&storage, &bytes(9, 100), now()).unwrap();
+    let sealed = writer.finish(&storage, now()).unwrap();
+    let err = ObjFile::new(&mut storage.lock()).transaction(|tx| {
+        sealed.seal_in(tx)?;
+        Err::<(), _>(StorageError::InvalidConfig("the object row failed".into()))
+    });
+    assert!(err.is_err());
+    let info = ObjFile::new(&mut storage.lock()).body_info(sealed.body);
+    assert!(info.is_err(), "the body is still staging");
+    let freed = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now() + ABANDON, ABANDON)
+        .unwrap();
+    assert_eq!(freed.bodies, 1, "and is collected as abandoned");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
 }

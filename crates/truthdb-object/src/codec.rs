@@ -27,7 +27,7 @@ pub(crate) struct BodyRow {
     pub refcount: u32,
     pub len: u64,
     pub segments: u64,
-    pub created_ms: u64,
+    pub touched_ms: u64,
     pub md5: [u8; 16],
 }
 
@@ -41,7 +41,7 @@ impl BodyRow {
         out.extend_from_slice(&self.refcount.to_le_bytes());
         out.extend_from_slice(&self.len.to_le_bytes());
         out.extend_from_slice(&self.segments.to_le_bytes());
-        out.extend_from_slice(&self.created_ms.to_le_bytes());
+        out.extend_from_slice(&self.touched_ms.to_le_bytes());
         out.extend_from_slice(&self.md5);
         out
     }
@@ -60,7 +60,7 @@ impl BodyRow {
             refcount: u32::from_le_bytes(bytes[1..5].try_into().unwrap()),
             len: u64_at(5),
             segments: u64_at(13),
-            created_ms: u64_at(21),
+            touched_ms: u64_at(21),
             md5: bytes[29..45].try_into().unwrap(),
         })
     }
@@ -137,7 +137,7 @@ mod tests {
             refcount: 3,
             len: 1 << 40,
             segments: 7,
-            created_ms: 1_700_000_000_000,
+            touched_ms: 1_700_000_000_000,
             md5: [9; 16],
         };
         assert_eq!(BodyRow::decode(&body.encode()).unwrap(), body);

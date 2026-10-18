@@ -3,18 +3,18 @@
 //! writes them (one `BLOB_PAGES` record) and records the segment. Nothing holds
 //! a transaction open across a whole body, so a large upload never pins the
 //! log. A body is *staging* until sealed; a sealed body is reference-counted
-//! and goes to the garbage queue when its last reference is dropped.
+//! and goes to the garbage queue when its last reference is dropped. Sealing
+//! and reference changes run inside the caller's [`ObjTxn`], so they commit
+//! together with whatever row points at the body.
 
 use md5::{Digest, Md5};
-use truthdb_core::relstore::btree::TreeInsert;
+use truthdb_core::relstore::btree::{BTree, TreeInsert};
 use truthdb_core::relstore::ctx::{OpMode, RelCtx};
 use truthdb_core::relstore::page::{BLOB_PAGE_DATA, BLOB_RECORD_MAX_PAGES};
 use truthdb_core::storage::{Storage, StorageError};
 
 use crate::codec::{self, BodyRow, BodyState, SegmentRow};
-use crate::{
-    BODIES_TREE, BODY_PAGES_OBJECT, GC_TREE, ObjFile, SEGMENTS_TREE, STAGING_TREE, next_body_id,
-};
+use crate::{BODY_PAGES_OBJECT, ObjFile, ObjTxn, next_body_id};
 
 /// Bytes per segment: one blob record's worth of pages. Every segment but a
 /// body's last is exactly this long, so an offset maps straight to a segment.
@@ -32,122 +32,195 @@ fn invalid(message: String) -> StorageError {
     StorageError::InvalidConfig(message)
 }
 
-impl ObjFile<'_> {
+fn no_body(body: u64) -> StorageError {
+    invalid(format!("no body {body}"))
+}
+
+impl ObjTxn<'_, '_> {
+    fn load_body(&mut self, body: u64) -> Result<BodyRow, StorageError> {
+        load_body(self.ctx, &self.trees.bodies(), body)
+    }
+
+    fn store_body(&mut self, body: u64, row: &BodyRow) -> Result<(), StorageError> {
+        let bodies = self.trees.bodies();
+        bodies.update(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &codec::body_key(body),
+            &row.encode(),
+        )?;
+        Ok(())
+    }
+
     /// Starts a staging body and returns its id.
     pub fn begin_body(&mut self, now_ms: u64) -> Result<u64, StorageError> {
-        let meta = self.meta()?;
-        let bodies = self.tree(BODIES_TREE)?;
-        let staging = self.tree(STAGING_TREE)?;
-        self.in_txn(|ctx, txn| {
-            let body = next_body_id(ctx, txn, &meta)?;
-            let row = BodyRow {
-                state: BodyState::Staging,
-                refcount: 0,
-                len: 0,
-                segments: 0,
-                created_ms: now_ms,
-                md5: [0; 16],
-            };
-            bodies.insert_unique(
-                ctx,
-                &mut OpMode::Txn(txn),
-                &codec::body_key(body),
-                &row.encode(),
-            )?;
-            staging.insert_unique(
-                ctx,
-                &mut OpMode::Txn(txn),
-                &codec::timed_key(now_ms, body),
-                &[],
-            )?;
-            Ok(body)
-        })
+        let body = next_body_id(self)?;
+        let row = BodyRow {
+            state: BodyState::Staging,
+            refcount: 0,
+            len: 0,
+            segments: 0,
+            touched_ms: now_ms,
+            md5: [0; 16],
+        };
+        let (bodies, staging) = (self.trees.bodies(), self.trees.staging());
+        let inserted = bodies.insert_unique(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &codec::body_key(body),
+            &row.encode(),
+        )?;
+        if inserted != TreeInsert::Inserted {
+            return Err(StorageError::InvalidFile(format!(
+                "body id {body} handed out twice"
+            )));
+        }
+        staging.insert_unique(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &codec::timed_key(now_ms, body),
+            &[],
+        )?;
+        Ok(body)
     }
 
     /// Appends the next segment (`data`, at most [`SEGMENT_BYTES`]) to a staging
-    /// body. Every segment but the last must be exactly `SEGMENT_BYTES`.
-    pub fn append_segment(&mut self, body: u64, data: &[u8]) -> Result<(), StorageError> {
+    /// body and marks it touched at `now_ms`, so garbage collection does not
+    /// take a slow upload for an abandoned one. Every segment but the last must
+    /// be exactly `SEGMENT_BYTES`.
+    pub fn append_segment(
+        &mut self,
+        body: u64,
+        data: &[u8],
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
         if data.is_empty() || data.len() > SEGMENT_BYTES {
             return Err(invalid(format!(
                 "a body segment is 1..={SEGMENT_BYTES} bytes, got {}",
                 data.len()
             )));
         }
-        let bodies = self.tree(BODIES_TREE)?;
-        let segments = self.tree(SEGMENTS_TREE)?;
-        self.in_txn(|ctx, txn| {
-            let mut row = load_body(ctx, &bodies, body)?;
-            if row.state != BodyState::Staging {
-                return Err(invalid(format!("body {body} is sealed")));
-            }
-            if row.len != row.segments * SEGMENT_BYTES as u64 {
-                return Err(invalid(format!(
-                    "body {body} already has its short last segment"
-                )));
-            }
-            let pages = data.len().div_ceil(BLOB_PAGE_DATA) as u64;
-            let start_page = ctx.allocate_extent_in_txn(txn, pages)?;
-            let lsn = ctx.write_blob_pages(txn, BODY_PAGES_OBJECT, start_page, data)?;
-            let segment = SegmentRow {
-                start_page,
-                pages: pages as u32,
-                len: data.len() as u32,
-                lsn,
-            };
-            segments.insert_unique(
-                ctx,
-                &mut OpMode::Txn(txn),
-                &codec::segment_key(body, row.segments),
-                &segment.encode(),
-            )?;
-            row.len += data.len() as u64;
-            row.segments += 1;
-            bodies.update(
-                ctx,
-                &mut OpMode::Txn(txn),
-                &codec::body_key(body),
-                &row.encode(),
-            )?;
-            Ok(())
+        let mut row = self.load_body(body)?;
+        if row.state != BodyState::Staging {
+            return Err(invalid(format!("body {body} is sealed")));
+        }
+        if row.len != row.segments * SEGMENT_BYTES as u64 {
+            return Err(invalid(format!(
+                "body {body} already has its short last segment"
+            )));
+        }
+        let pages = data.len().div_ceil(BLOB_PAGE_DATA) as u64;
+        let start_page = self.ctx.allocate_extent_in_txn(self.txn, pages)?;
+        let lsn = self
+            .ctx
+            .write_blob_pages(self.txn, BODY_PAGES_OBJECT, start_page, data)?;
+        let segment = SegmentRow {
+            start_page,
+            pages: pages as u32,
+            len: data.len() as u32,
+            lsn,
+        };
+        let (segments, staging) = (self.trees.segments(), self.trees.staging());
+        segments.insert_unique(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &codec::segment_key(body, row.segments),
+            &segment.encode(),
+        )?;
+        staging.delete(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &codec::timed_key(row.touched_ms, body),
+        )?;
+        staging.insert_unique(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &codec::timed_key(now_ms, body),
+            &[],
+        )?;
+        row.len += data.len() as u64;
+        row.segments += 1;
+        row.touched_ms = now_ms;
+        self.store_body(body, &row)
+    }
+
+    /// Seals a staging body with its digest and one reference: the reference
+    /// held by whatever row the caller writes in this same transaction.
+    pub fn seal_body(&mut self, body: u64, md5: [u8; 16]) -> Result<BodyInfo, StorageError> {
+        let mut row = self.load_body(body)?;
+        if row.state != BodyState::Staging {
+            return Err(invalid(format!("body {body} is already sealed")));
+        }
+        let staging = self.trees.staging();
+        staging.delete(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &codec::timed_key(row.touched_ms, body),
+        )?;
+        row.state = BodyState::Sealed;
+        row.refcount = 1;
+        row.md5 = md5;
+        self.store_body(body, &row)?;
+        Ok(BodyInfo {
+            body,
+            len: row.len,
+            md5,
         })
     }
 
-    /// Seals a staging body with its digest and one reference.
-    pub fn seal_body(&mut self, body: u64, md5: [u8; 16]) -> Result<BodyInfo, StorageError> {
-        let bodies = self.tree(BODIES_TREE)?;
-        let staging = self.tree(STAGING_TREE)?;
-        self.in_txn(|ctx, txn| {
-            let mut row = load_body(ctx, &bodies, body)?;
-            if row.state != BodyState::Staging {
-                return Err(invalid(format!("body {body} is already sealed")));
-            }
-            staging.delete(
-                ctx,
-                &mut OpMode::Txn(txn),
-                &codec::timed_key(row.created_ms, body),
+    /// Adds a reference to a sealed body (a copy sharing it).
+    pub fn add_ref(&mut self, body: u64) -> Result<(), StorageError> {
+        let mut row = self.load_body(body)?;
+        if row.state != BodyState::Sealed || row.refcount == 0 {
+            return Err(invalid(format!("body {body} is not live")));
+        }
+        row.refcount += 1;
+        self.store_body(body, &row)
+    }
+
+    /// Drops a reference; the last one queues the body for garbage collection,
+    /// due after `grace_ms`.
+    pub fn drop_ref(&mut self, body: u64, now_ms: u64, grace_ms: u64) -> Result<(), StorageError> {
+        let mut row = self.load_body(body)?;
+        if row.state != BodyState::Sealed || row.refcount == 0 {
+            return Err(invalid(format!("body {body} is not live")));
+        }
+        row.refcount -= 1;
+        self.store_body(body, &row)?;
+        if row.refcount == 0 {
+            let gc = self.trees.gc();
+            gc.insert_unique(
+                self.ctx,
+                &mut OpMode::Txn(self.txn),
+                &codec::timed_key(now_ms.saturating_add(grace_ms), body),
+                &[],
             )?;
-            row.state = BodyState::Sealed;
-            row.refcount = 1;
-            row.md5 = md5;
-            bodies.update(
-                ctx,
-                &mut OpMode::Txn(txn),
-                &codec::body_key(body),
-                &row.encode(),
-            )?;
-            Ok(BodyInfo {
-                body,
-                len: row.len,
-                md5,
-            })
-        })
+        }
+        Ok(())
+    }
+}
+
+impl ObjFile<'_> {
+    /// Starts a staging body in its own transaction.
+    pub fn begin_body(&mut self, now_ms: u64) -> Result<u64, StorageError> {
+        self.transaction(|tx| tx.begin_body(now_ms))
+    }
+
+    /// Appends one segment in its own transaction.
+    pub fn append_segment(
+        &mut self,
+        body: u64,
+        data: &[u8],
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        self.transaction(|tx| tx.append_segment(body, data, now_ms))
     }
 
     /// The sealed body's length and digest.
     pub fn body_info(&mut self, body: u64) -> Result<BodyInfo, StorageError> {
-        let bodies = self.tree(BODIES_TREE)?;
+        let trees = self.existing_trees().ok_or_else(|| no_body(body))?;
         let mut ctx = self.core.page_ctx(0);
-        let row = load_body(&mut ctx, &bodies, body)?;
+        let row = load_body(&mut ctx, &trees.bodies(), body)?;
         if row.state != BodyState::Sealed {
             return Err(invalid(format!("body {body} is still being written")));
         }
@@ -167,10 +240,10 @@ impl ObjFile<'_> {
         offset: u64,
         out: &mut [u8],
     ) -> Result<(), StorageError> {
-        let bodies = self.tree(BODIES_TREE)?;
-        let segments = self.tree(SEGMENTS_TREE)?;
+        let trees = self.existing_trees().ok_or_else(|| no_body(body))?;
+        let segments = trees.segments();
         let mut ctx = self.core.page_ctx(0);
-        let row = load_body(&mut ctx, &bodies, body)?;
+        let row = load_body(&mut ctx, &trees.bodies(), body)?;
         if row.state != BodyState::Sealed {
             return Err(invalid(format!("body {body} is still being written")));
         }
@@ -210,89 +283,57 @@ impl ObjFile<'_> {
         }
         Ok(())
     }
+}
 
-    /// Adds a reference to a sealed body (a copy sharing it).
-    pub fn add_ref(&mut self, body: u64) -> Result<(), StorageError> {
-        let bodies = self.tree(BODIES_TREE)?;
-        self.in_txn(|ctx, txn| {
-            let mut row = load_body(ctx, &bodies, body)?;
-            if row.state != BodyState::Sealed || row.refcount == 0 {
-                return Err(invalid(format!("body {body} is not live")));
-            }
-            row.refcount += 1;
-            bodies.update(
-                ctx,
-                &mut OpMode::Txn(txn),
-                &codec::body_key(body),
-                &row.encode(),
-            )?;
-            Ok(())
-        })
+pub(crate) fn load_body(
+    ctx: &mut RelCtx<'_>,
+    bodies: &BTree,
+    body: u64,
+) -> Result<BodyRow, StorageError> {
+    let row = bodies
+        .get(ctx, &codec::body_key(body))?
+        .ok_or_else(|| no_body(body))?;
+    BodyRow::decode(&row)
+}
+
+/// A reader's hold on a body: garbage collection leaves the body alone until
+/// the lease drops.
+pub struct BodyLease<'s> {
+    storage: &'s Storage,
+    body: u64,
+}
+
+impl<'s> BodyLease<'s> {
+    pub fn take(storage: &'s Storage, body: u64) -> Self {
+        let mut guard = storage.lock();
+        *ObjFile::new(&mut guard).eng.leases.entry(body).or_default() += 1;
+        BodyLease { storage, body }
     }
+}
 
-    /// Drops a reference; the last one queues the body for garbage collection,
-    /// due after `grace_ms`.
-    pub fn drop_ref(&mut self, body: u64, now_ms: u64, grace_ms: u64) -> Result<(), StorageError> {
-        let bodies = self.tree(BODIES_TREE)?;
-        let gc = self.tree(GC_TREE)?;
-        self.in_txn(|ctx, txn| {
-            let mut row = load_body(ctx, &bodies, body)?;
-            if row.state != BodyState::Sealed || row.refcount == 0 {
-                return Err(invalid(format!("body {body} is not live")));
-            }
-            row.refcount -= 1;
-            bodies.update(
-                ctx,
-                &mut OpMode::Txn(txn),
-                &codec::body_key(body),
-                &row.encode(),
-            )?;
-            if row.refcount == 0 {
-                let inserted = gc.insert_unique(
-                    ctx,
-                    &mut OpMode::Txn(txn),
-                    &codec::timed_key(now_ms.saturating_add(grace_ms), body),
-                    &[],
-                )?;
-                debug_assert_eq!(inserted, TreeInsert::Inserted);
-            }
-            Ok(())
-        })
-    }
-
-    /// Takes a read lease: garbage collection leaves the body alone until the
-    /// matching [`Self::release_lease`].
-    pub fn take_lease(&mut self, body: u64) {
-        *self.eng.leases.entry(body).or_default() += 1;
-    }
-
-    pub fn release_lease(&mut self, body: u64) {
-        if let Some(count) = self.eng.leases.get_mut(&body) {
+impl Drop for BodyLease<'_> {
+    fn drop(&mut self) {
+        let mut guard = self.storage.lock();
+        let leases = &mut ObjFile::new(&mut guard).eng.leases;
+        if let Some(count) = leases.get_mut(&self.body) {
             *count -= 1;
             if *count == 0 {
-                self.eng.leases.remove(&body);
+                leases.remove(&self.body);
             }
         }
     }
 }
 
-pub(crate) fn load_body(
-    ctx: &mut RelCtx<'_>,
-    bodies: &truthdb_core::relstore::btree::BTree,
-    body: u64,
-) -> Result<BodyRow, StorageError> {
-    let row = bodies
-        .get(ctx, &codec::body_key(body))?
-        .ok_or_else(|| invalid(format!("no body {body}")))?;
-    BodyRow::decode(&row)
-}
-
-/// Streams a body into the store segment by segment, computing its MD5, and
-/// seals it on [`Self::finish`]. Takes the storage lock once per segment.
+/// Streams a body into the store segment by segment, computing its MD5. Each
+/// segment commits on its own; the body is sealed by [`SealedBody::seal_in`]
+/// inside the transaction that records the row referencing it. After any
+/// error the writer refuses further use: the body is abandoned, and garbage
+/// collection reclaims it.
 pub struct BodyWriter {
     body: u64,
     buffer: Vec<u8>,
     md5: Md5,
+    failed: bool,
 }
 
 impl BodyWriter {
@@ -302,6 +343,7 @@ impl BodyWriter {
             body,
             buffer: Vec::with_capacity(SEGMENT_BYTES),
             md5: Md5::new(),
+            failed: false,
         })
     }
 
@@ -309,27 +351,65 @@ impl BodyWriter {
         self.body
     }
 
-    pub fn write(&mut self, storage: &Storage, mut bytes: &[u8]) -> Result<(), StorageError> {
+    fn check(&self) -> Result<(), StorageError> {
+        if self.failed {
+            return Err(invalid(format!(
+                "the writer of body {} failed earlier; start a new body",
+                self.body
+            )));
+        }
+        Ok(())
+    }
+
+    pub fn write(
+        &mut self,
+        storage: &Storage,
+        mut bytes: &[u8],
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        self.check()?;
         self.md5.update(bytes);
         while !bytes.is_empty() {
             let take = (SEGMENT_BYTES - self.buffer.len()).min(bytes.len());
             self.buffer.extend_from_slice(&bytes[..take]);
             bytes = &bytes[take..];
             if self.buffer.len() == SEGMENT_BYTES {
-                ObjFile::new(&mut storage.lock()).append_segment(self.body, &self.buffer)?;
+                let written = ObjFile::new(&mut storage.lock()).append_segment(
+                    self.body,
+                    &self.buffer,
+                    now_ms,
+                );
+                self.failed = written.is_err();
+                written?;
                 self.buffer.clear();
             }
         }
         Ok(())
     }
 
-    /// Writes the last partial segment and seals the body.
-    pub fn finish(self, storage: &Storage) -> Result<BodyInfo, StorageError> {
-        let mut guard = storage.lock();
-        let mut file = ObjFile::new(&mut guard);
+    /// Writes the last partial segment (its own transaction) and returns the
+    /// body ready to seal.
+    pub fn finish(self, storage: &Storage, now_ms: u64) -> Result<SealedBody, StorageError> {
+        self.check()?;
         if !self.buffer.is_empty() {
-            file.append_segment(self.body, &self.buffer)?;
+            ObjFile::new(&mut storage.lock()).append_segment(self.body, &self.buffer, now_ms)?;
         }
-        file.seal_body(self.body, self.md5.finalize().into())
+        Ok(SealedBody {
+            body: self.body,
+            md5: self.md5.finalize().into(),
+        })
+    }
+}
+
+/// A body whose bytes are all written, to be sealed inside the transaction
+/// that records the row referencing it.
+pub struct SealedBody {
+    pub body: u64,
+    pub md5: [u8; 16],
+}
+
+impl SealedBody {
+    pub fn seal_in(&self, tx: &mut ObjTxn<'_, '_>) -> Result<BodyInfo, StorageError> {
+        tx.seal_body(self.body, self.md5)
     }
 }

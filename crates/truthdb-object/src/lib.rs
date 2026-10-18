@@ -28,7 +28,7 @@ use truthdb_core::storage::{
 };
 use truthdb_core::wal::records::RelRecord;
 
-pub use body::{BodyInfo, BodyWriter};
+pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use gc::GcOutcome;
 
 /// The object engine's id on the shared log (its root lives in the
@@ -48,6 +48,10 @@ const STAGING_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 4;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
+
+/// The object ids this engine owns start at `FIRST_ENGINE_OBJECT_ID`; the
+/// range after them is left for other engines.
+const OBJECT_ID_SPAN: u32 = 0x1000;
 
 /// META key of the next body id to hand out.
 const NEXT_BODY_KEY: &[u8] = b"next_body";
@@ -77,7 +81,7 @@ impl EngineParticipant for ObjEngine {
     }
 
     fn owns_object(&self, object_id: u32) -> bool {
-        object_id >= FIRST_ENGINE_OBJECT_ID
+        (FIRST_ENGINE_OBJECT_ID..FIRST_ENGINE_OBJECT_ID + OBJECT_ID_SPAN).contains(&object_id)
     }
 
     fn open(&mut self, metadata_root: Option<u64>, _db_options: u8) {
@@ -150,6 +154,55 @@ fn meta_tree(root: u64) -> BTree {
     }
 }
 
+/// The root pages of the trees an object transaction works on, resolved
+/// before it begins.
+#[derive(Clone, Copy)]
+pub(crate) struct Trees {
+    meta: u64,
+    bodies: u64,
+    segments: u64,
+    gc: u64,
+    staging: u64,
+}
+
+impl Trees {
+    pub fn meta(&self) -> BTree {
+        meta_tree(self.meta)
+    }
+    pub fn bodies(&self) -> BTree {
+        BTree {
+            object_id: BODIES_TREE,
+            root: self.bodies,
+        }
+    }
+    pub fn segments(&self) -> BTree {
+        BTree {
+            object_id: SEGMENTS_TREE,
+            root: self.segments,
+        }
+    }
+    pub fn gc(&self) -> BTree {
+        BTree {
+            object_id: GC_TREE,
+            root: self.gc,
+        }
+    }
+    pub fn staging(&self) -> BTree {
+        BTree {
+            object_id: STAGING_TREE,
+            root: self.staging,
+        }
+    }
+}
+
+/// One object-engine transaction in progress: the operations on it commit or
+/// roll back together (see [`ObjFile::transaction`]).
+pub struct ObjTxn<'t, 'c> {
+    pub(crate) ctx: &'t mut RelCtx<'c>,
+    pub(crate) txn: &'t mut TxnLink,
+    pub(crate) trees: Trees,
+}
+
 /// The object engine's view of the locked storage: the core file and the
 /// engine state, borrowed disjointly.
 pub struct ObjFile<'a> {
@@ -165,8 +218,37 @@ impl<'a> ObjFile<'a> {
         ObjFile { core, eng }
     }
 
-    /// The tree with this object id, creating the directory tree and the
-    /// tree itself the first time.
+    /// Runs `body` as one transaction over the engine's trees (created the
+    /// first time): committed and forced to disk when it succeeds, rolled back
+    /// when it fails.
+    pub fn transaction<T>(
+        &mut self,
+        body: impl FnOnce(&mut ObjTxn<'_, '_>) -> Result<T, StorageError>,
+    ) -> Result<T, StorageError> {
+        let trees = Trees {
+            meta: self.meta()?.root,
+            bodies: self.tree(BODIES_TREE)?.root,
+            segments: self.tree(SEGMENTS_TREE)?.root,
+            gc: self.tree(GC_TREE)?.root,
+            staging: self.tree(STAGING_TREE)?.root,
+        };
+        self.in_txn(|ctx, txn| body(&mut ObjTxn { ctx, txn, trees }))
+    }
+
+    /// The engine's trees if they all exist, for reads: a read never creates
+    /// anything (a standby's log is read-only).
+    pub(crate) fn existing_trees(&self) -> Option<Trees> {
+        let tree = |object_id: u32| self.eng.trees.get(&object_id).copied();
+        Some(Trees {
+            meta: self.eng.root?,
+            bodies: tree(BODIES_TREE)?,
+            segments: tree(SEGMENTS_TREE)?,
+            gc: tree(GC_TREE)?,
+            staging: tree(STAGING_TREE)?,
+        })
+    }
+
+    /// The tree with this object id, creating it the first time.
     fn tree(&mut self, object_id: u32) -> Result<BTree, StorageError> {
         if let Some(&root) = self.eng.trees.get(&object_id) {
             return Ok(BTree { object_id, root });
@@ -204,23 +286,32 @@ impl<'a> ObjFile<'a> {
     }
 
     /// Runs `body` as one transaction: committed (and forced to disk) when it
-    /// succeeds, rolled back when it fails.
+    /// succeeds, rolled back when it fails. When the commit or the rollback
+    /// cannot be logged, or the log cannot be forced, the store is wedged: the
+    /// pool may hold changes the log cannot explain, and nothing may build on
+    /// them (or checkpoint them) before a restart.
     fn in_txn<T>(
         &mut self,
         body: impl FnOnce(&mut RelCtx<'_>, &mut TxnLink) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
         let roots = self.eng.tree_roots();
         let txn_id = self.core.alloc_txn_id();
-        let mut rollback_failed = false;
+        let mut wedge = false;
         let outcome = {
             let mut ctx = self.core.page_ctx(0);
             let mut txn = ctx.begin(txn_id)?;
             match body(&mut ctx, &mut txn) {
-                Ok(value) => ctx.commit(txn).map(|_| value),
+                Ok(value) => match ctx.commit(txn) {
+                    Ok(_) => Ok(value),
+                    Err(err) => {
+                        wedge = true;
+                        Err(err)
+                    }
+                },
                 Err(err) => match rollback(&mut ctx, txn, &roots) {
                     Ok(()) => Err(err),
                     Err(rollback_err) => {
-                        rollback_failed = true;
+                        wedge = true;
                         Err(StorageError::InvalidFile(format!(
                             "{err}; and the rollback failed: {rollback_err}"
                         )))
@@ -228,35 +319,35 @@ impl<'a> ObjFile<'a> {
                 },
             }
         };
-        if rollback_failed {
-            // The pool may hold changes the log cannot explain.
+        let outcome = outcome.and_then(|value| {
+            self.core
+                .wal_sync_all()
+                .map(|()| value)
+                .inspect_err(|_| wedge = true)
+        });
+        if wedge {
             self.core.set_wedged();
         }
-        let value = outcome?;
-        self.core.wal_sync_all()?;
-        Ok(value)
+        outcome
     }
 }
 
 /// Hands out the next body id from the directory tree's counter
 /// (transactional: a rolled-back body's id is handed out again).
-fn next_body_id(
-    ctx: &mut RelCtx<'_>,
-    txn: &mut TxnLink,
-    meta: &BTree,
-) -> Result<u64, StorageError> {
+fn next_body_id(tx: &mut ObjTxn<'_, '_>) -> Result<u64, StorageError> {
+    let meta = tx.trees.meta();
     let current = meta
-        .get(ctx, NEXT_BODY_KEY)?
+        .get(tx.ctx, NEXT_BODY_KEY)?
         .map(|row| codec::u64_le(&row))
         .transpose()?;
     let next = current.unwrap_or(1);
     let row = (next + 1).to_le_bytes();
     match current {
         Some(_) => {
-            meta.update(ctx, &mut OpMode::Txn(txn), NEXT_BODY_KEY, &row)?;
+            meta.update(tx.ctx, &mut OpMode::Txn(tx.txn), NEXT_BODY_KEY, &row)?;
         }
         None => {
-            meta.insert_unique(ctx, &mut OpMode::Txn(txn), NEXT_BODY_KEY, &row)?;
+            meta.insert_unique(tx.ctx, &mut OpMode::Txn(tx.txn), NEXT_BODY_KEY, &row)?;
         }
     }
     Ok(next)
