@@ -18,3 +18,4 @@ http-body-util = "0.1.5"
 bytes = "1.12.1"
 tokio = { workspace = true }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+quick-xml = "0.37.5"

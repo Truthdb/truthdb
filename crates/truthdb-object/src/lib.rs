@@ -52,7 +52,8 @@ const STAGING_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 4;
 const CREDENTIALS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 5;
 /// Bucket name -> [`buckets::BucketRow`].
 const BUCKETS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 6;
-/// (bucket, object key, version) -> the version (see `keys`).
+/// (bucket, object key, version) -> the version: keys are the bucket name,
+/// a 0 byte, then the object key (see `buckets::bucket_object_range`).
 const OBJECTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 7;
 
 /// The object id stamped into every body page's header. Not a tree.
