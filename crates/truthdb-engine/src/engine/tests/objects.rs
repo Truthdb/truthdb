@@ -160,3 +160,59 @@ fn access_keys_are_administered_over_the_native_protocol() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn the_maintenance_collection_drains_a_backlog_in_batches() {
+    let path = unique_temp_path("objects-gc-backlog");
+    let engine = new_engine(&path);
+    let bodies: Vec<u64> = (0..20).map(|i| put(&engine, &bytes(i, 10))).collect();
+    for body in &bodies {
+        engine
+            .object(|file| file.transaction(|tx| tx.drop_ref(*body, 0, 0)))
+            .expect("drop");
+    }
+    engine.object_gc().expect("collect");
+    for body in bodies {
+        assert!(
+            engine.object(|file| file.body_info(body)).is_err(),
+            "{body} freed"
+        );
+    }
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_failed_object_operation_still_checkpoints() {
+    let path = unique_temp_path("objects-failed-checkpoint");
+    let storage = RelStorage::create_with_wal_bounds_with(
+        path.clone(),
+        test_storage_options(),
+        8 * 1024 * 1024,
+        8 * 1024 * 1024,
+        crate::database_engines,
+    )
+    .expect("create");
+    let engine = Engine::new(storage).expect("engine");
+    let body = engine.object(|file| file.begin_body(1)).expect("begin");
+    let segment = bytes(4, SEGMENT_BYTES);
+    // One call writing segment after segment runs the ring full and fails.
+    let err = engine
+        .object(|file| {
+            for _ in 0..12 {
+                file.append_segment(body, &segment, 1)?;
+            }
+            Ok(())
+        })
+        .expect_err("the ring ran full");
+    assert!(err.to_string().contains("full"), "{err}");
+    assert!(
+        engine.wal_usage_ratio() < 0.5,
+        "the failure still took a checkpoint"
+    );
+    engine
+        .object(|file| file.append_segment(body, &segment, 1))
+        .expect("the next write fits");
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}

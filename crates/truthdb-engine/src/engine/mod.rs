@@ -65,6 +65,12 @@ fn random_text(len: usize, alphabet: &[u8]) -> Result<String, EngineError> {
 /// quarter), so waiting for [`WAL_CHECKPOINT_THRESHOLD`] would run it full.
 const OBJECT_CHECKPOINT_THRESHOLD: f64 = 0.5;
 
+/// Object bodies garbage collection frees per storage-lock hold.
+const OBJECT_GC_BATCH: u64 = 8;
+
+/// Object bodies one maintenance sweep frees at most.
+const OBJECT_GC_SWEEP_LIMIT: u64 = 512;
+
 /// A staging object body untouched for this long is an abandoned upload, and
 /// garbage collection reclaims it.
 const OBJECT_ABANDON_AFTER_MS: u64 = 60 * 60 * 1000;
@@ -557,18 +563,20 @@ impl Engine {
         let out = {
             let core = self.storage.core_arc();
             let mut guard = core.lock();
-            let mut file = truthdb_object::ObjFile::try_new(&mut guard).ok_or_else(|| {
-                StorageError::InvalidConfig(
+            match truthdb_object::ObjFile::try_new(&mut guard) {
+                Some(mut file) => op(&mut file),
+                None => Err(StorageError::InvalidConfig(
                     "this database does not run the object engine".to_string(),
-                )
-            })?;
-            op(&mut file)?
+                )),
+            }
         };
+        // Also after a failure: an operation that ran the ring full must not
+        // leave it full for every writer until the next maintenance sweep.
         if !self.storage.is_standby() {
             let meta = self.meta.read().expect("engine meta poisoned");
             self.checkpoint_at(&meta, OBJECT_CHECKPOINT_THRESHOLD)?;
         }
-        Ok(out)
+        Ok(out?)
     }
 
     /// Whether this database runs the object engine.
@@ -589,8 +597,19 @@ impl Engine {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_millis() as u64)
             .unwrap_or(0);
-        self.object(|file| file.collect_garbage(now_ms, OBJECT_ABANDON_AFTER_MS))?;
-        Ok(())
+        // A few bodies per storage-lock hold (each is a forced transaction),
+        // so a large backlog never blocks other work for long, and a bounded
+        // number per sweep, so the sweep's other duties still run on time.
+        let mut freed = 0;
+        loop {
+            let outcome = self.object(|file| {
+                file.collect_garbage(now_ms, OBJECT_ABANDON_AFTER_MS, OBJECT_GC_BATCH)
+            })?;
+            freed += outcome.bodies;
+            if !outcome.more || freed >= OBJECT_GC_SWEEP_LIMIT {
+                return Ok(());
+            }
+        }
     }
 
     fn maybe_checkpoint(&self, meta: &EngineMeta) -> Result<(), EngineError> {
