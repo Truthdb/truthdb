@@ -601,7 +601,7 @@ fn listings_page_through_keys_and_common_prefixes() {
     }
     // A sub-resource that is not implemented is refused, not answered with
     // a listing or an object body.
-    for (path, query) in [("/lst", "versions"), ("/lst", "acl"), ("/lst/a", "acl")] {
+    for (path, query) in [("/lst", "policy"), ("/lst", "acl"), ("/lst/a", "acl")] {
         let (status, body) = call("GET", path, query, b"");
         assert_eq!(status, 501, "{path}?{query}: {body}");
     }
