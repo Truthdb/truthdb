@@ -90,7 +90,12 @@ pub(in crate::engine) fn sql_rows(
 }
 
 pub(in crate::engine) fn new_engine(path: &Path) -> Engine {
-    let storage = RelStorage::create(path.to_path_buf(), test_storage_options()).expect("create");
+    let storage = RelStorage::create_with(
+        path.to_path_buf(),
+        test_storage_options(),
+        crate::database_engines,
+    )
+    .expect("create");
     Engine::new(storage).expect("engine")
 }
 

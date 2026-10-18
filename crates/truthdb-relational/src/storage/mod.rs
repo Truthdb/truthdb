@@ -27,6 +27,7 @@ use crate::relstore::version::{
 use crate::wal::records::RelRecord;
 
 mod relational;
+pub use relational::relational_participant;
 #[cfg(test)]
 mod tests;
 

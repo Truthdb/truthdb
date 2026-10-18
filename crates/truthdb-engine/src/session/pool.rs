@@ -243,6 +243,10 @@ pub(super) fn maintenance_loop(shared: &Arc<Shared>) {
         if let Err(err) = shared.engine.standby_restartpoint_if_needed() {
             eprintln!("standby restartpoint failed: {err}");
         }
+        // Object bodies nothing references any more, and abandoned uploads.
+        if let Err(err) = shared.engine.object_gc() {
+            eprintln!("object garbage collection failed: {err}");
+        }
         // Unconditionally, not just when something was released. Workers now
         // block indefinitely on the inbox, so a nudge that should have been
         // sent and was not is a batch parked forever rather than a batch
@@ -323,6 +327,7 @@ pub(super) fn worker_loop(shared: &Arc<Shared>) {
             Work::Call(EngineCall::RunNative { command, reply }) => {
                 let _ = reply.send(shared.engine.execute(&command));
             }
+            Work::Call(EngineCall::RunObject { op }) => op(&shared.engine),
             Work::Call(EngineCall::LookupLogin { name, reply }) => {
                 let _ = reply.send(shared.engine.lookup_login(&name));
             }

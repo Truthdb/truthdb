@@ -7,6 +7,7 @@ license = "MIT"
 
 [dependencies]
 truthdb-relational = { path = "../truthdb-relational", version = "0.1.0" }
+truthdb-engine = { path = "../truthdb-engine", version = "0.1.0" }
 clap = { version = "4.5.53", features = ["derive", "env"] }
 anyhow = "1.0.100"
 serde = { workspace = true }

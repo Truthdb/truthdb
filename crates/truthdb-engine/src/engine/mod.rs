@@ -20,6 +20,15 @@ const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
 /// leaves headroom when the floor lags.
 const STANDBY_RESTARTPOINT_THRESHOLD: f64 = 0.5;
 
+/// Object writes checkpoint at half the ring: a segment record is about 1 MiB,
+/// and writes may only fill the ring up to its compensation reserve (a
+/// quarter), so waiting for [`WAL_CHECKPOINT_THRESHOLD`] would run it full.
+const OBJECT_CHECKPOINT_THRESHOLD: f64 = 0.5;
+
+/// A staging object body untouched for this long is an abandoned upload, and
+/// garbage collection reclaims it.
+const OBJECT_ABANDON_AFTER_MS: u64 = 60 * 60 * 1000;
+
 /// The database engine, shared across the worker pool as `Arc<Engine>`.
 ///
 /// All methods take `&self`: [`Storage`] is internally synchronized, and the
@@ -475,13 +484,63 @@ impl Engine {
         self.standby_restartpoint()
     }
 
+    /// Runs one object-engine operation under the storage lock, then takes a
+    /// checkpoint if the log is filling (object bodies fill it fast).
+    pub fn object<T>(
+        &self,
+        op: impl FnOnce(&mut truthdb_object::ObjFile<'_>) -> Result<T, StorageError>,
+    ) -> Result<T, EngineError> {
+        let out = {
+            let core = self.storage.core_arc();
+            let mut guard = core.lock();
+            let mut file = truthdb_object::ObjFile::try_new(&mut guard).ok_or_else(|| {
+                StorageError::InvalidConfig(
+                    "this database does not run the object engine".to_string(),
+                )
+            })?;
+            op(&mut file)?
+        };
+        if !self.storage.is_standby() {
+            let meta = self.meta.read().expect("engine meta poisoned");
+            self.checkpoint_at(&meta, OBJECT_CHECKPOINT_THRESHOLD)?;
+        }
+        Ok(out)
+    }
+
+    /// Whether this database runs the object engine.
+    fn runs_objects(&self) -> bool {
+        let core = self.storage.core_arc();
+        let mut guard = core.lock();
+        truthdb_object::ObjFile::try_new(&mut guard).is_some()
+    }
+
+    /// The maintenance-thread garbage collection of object bodies: frees
+    /// unreferenced bodies whose grace is up and abandoned uploads. A standby
+    /// never collects (its log is the primary's).
+    pub(crate) fn object_gc(&self) -> Result<(), EngineError> {
+        if self.storage.is_standby() || !self.runs_objects() {
+            return Ok(());
+        }
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        self.object(|file| file.collect_garbage(now_ms, OBJECT_ABANDON_AFTER_MS))?;
+        Ok(())
+    }
+
     fn maybe_checkpoint(&self, meta: &EngineMeta) -> Result<(), EngineError> {
+        self.checkpoint_at(meta, WAL_CHECKPOINT_THRESHOLD)
+    }
+
+    /// Takes a checkpoint once the ring is `threshold` full.
+    fn checkpoint_at(&self, meta: &EngineMeta, threshold: f64) -> Result<(), EngineError> {
         // A (fuzzy) checkpoint flushes dirty pages and truncates the WAL head to
         // the oldest open transaction's begin LSN, so it may run with open
         // transactions (their undo survives). The decision is (re-)made under the
         // storage lock in `checkpoint_if_wal_full`; this bare pre-check just
         // avoids serializing state on every batch below the WAL threshold.
-        if self.wal_usage_ratio() < WAL_CHECKPOINT_THRESHOLD {
+        if self.wal_usage_ratio() < threshold {
             return Ok(());
         }
         let data = serde_json::to_vec(&meta.state)
@@ -492,7 +551,7 @@ impl Engine {
             checkpoint_seq,
             meta.next_seq_no,
             meta.next_doc_id,
-            WAL_CHECKPOINT_THRESHOLD,
+            threshold,
         )?;
         Ok(())
     }
