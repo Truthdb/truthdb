@@ -49,7 +49,13 @@ async fn main() -> ExitCode {
         .init();
 
     // Load layered config: embedded default, then OS-standard config file if present
-    let config = Config::load();
+    let config = match Config::load() {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!("Invalid config: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     debug!(?config, "Loaded config");
     let storage_path = config.storage.resolved_path();
     info!(

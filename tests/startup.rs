@@ -90,3 +90,40 @@ fn tds_bind_failure_exits_non_zero() {
     drop(taken);
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+#[test]
+fn invalid_config_exits_non_zero() {
+    let dir = test_dir("config");
+    let config = format!(
+        "[network]\naddr = \"127.0.0.1\"\nport = {}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n\
+         [tds]\nencrytion = \"required\"\n",
+        free_port(),
+        dir.join("truth.db").display()
+    );
+    let (status, output) = run_server(&dir, &config);
+    assert!(!status.success(), "exit {status}:\n{output}");
+    assert!(output.contains("Invalid config"), "{output}");
+    assert!(output.contains("encrytion"), "{output}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+#[test]
+fn tds_encryption_from_config_file_is_applied() {
+    // `required` without a certificate is refused at startup, which is only
+    // reachable if the file's `encryption` setting reaches the server.
+    let dir = test_dir("encryption");
+    let config = format!(
+        "[network]\naddr = \"127.0.0.1\"\nport = {}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n\
+         [tds]\nenabled = true\naddr = \"127.0.0.1\"\nport = {}\nencryption = \"required\"\n",
+        free_port(),
+        dir.join("truth.db").display(),
+        free_port()
+    );
+    let (status, output) = run_server(&dir, &config);
+    assert!(!status.success(), "exit {status}:\n{output}");
+    assert!(
+        output.contains("encryption = \"required\" needs tls_cert"),
+        "{output}"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}

@@ -5,6 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub network: NetworkConfig,
@@ -25,6 +26,7 @@ pub struct Config {
 /// stream (its database file must be seeded with `truthdb-cli restore
 /// --standby`). Both roles need the same `cluster_uuid` and `shared_secret`.
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ReplicationConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -218,6 +220,7 @@ impl ReplicationConfig {
 /// catalog logins with salted PBKDF2 hashes, NOT this config: `[tds.auth]` only
 /// SEEDS logins into the catalog on the first boot (see [`Self::auth`]).
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct TdsConfig {
     #[serde(default)]
     pub enabled: bool,
@@ -290,6 +293,7 @@ fn default_tds_database() -> String {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NetworkConfig {
     #[serde(default = "default_addr")]
     pub addr: String,
@@ -299,6 +303,7 @@ pub struct NetworkConfig {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct StorageConfig {
     #[serde(default = "default_storage_path")]
     pub path: String,
@@ -426,246 +431,92 @@ fn systemd_state_directory() -> Option<PathBuf> {
 const SYSTEM_CONFIG_PATH: &str = "/etc/truthdb/truthdb.toml";
 
 impl Config {
-    /// Load config: embedded default, then per-user XDG override, then system-wide override.
+    /// Load config: embedded default, then per-user XDG file, then system-wide file.
     ///
-    /// Apply order is lowest-priority first so later applications win for fields they set.
-    /// `/etc/truthdb/truthdb.toml` is the highest priority — when a sysadmin uncomments a
-    /// value there, it overrides anything in `~/.config/org.truthdb/truthdb/truthdb.toml`.
-    /// Missing files no-op.
-    pub fn load() -> Self {
-        let default_str = include_str!("../config/default.toml");
-        let mut config: Config = toml::from_str(default_str).unwrap_or_default();
-
+    /// Later files win for the keys they set. `/etc/truthdb/truthdb.toml` is the highest
+    /// priority — when a sysadmin uncomments a value there, it overrides anything in
+    /// `~/.config/org.truthdb/truthdb/truthdb.toml`. Missing files are skipped; a file that
+    /// cannot be read, is not valid TOML, or sets an unknown key is an error.
+    pub fn load() -> Result<Self, String> {
         // An explicit config file (tests, ad-hoc instances): applied INSTEAD
         // of the per-user and system files, so two instances on one machine
         // cannot bleed into each other.
         if let Some(path) = std::env::var_os("TRUTHDB_CONFIG") {
-            apply_override_file(Path::new(&path), &mut config);
-            return config;
+            return load_layers(&[PathBuf::from(path)]);
         }
 
+        let mut files = Vec::new();
         // Per-user XDG config (dev convenience).
         if let Some(proj_dirs) = ProjectDirs::from("org", "truthdb", "truthdb") {
-            let mut config_path = PathBuf::from(proj_dirs.config_dir());
-            config_path.push("truthdb.toml");
-            apply_override_file(&config_path, &mut config);
+            files.push(proj_dirs.config_dir().join("truthdb.toml"));
         }
-
         // System-wide config installed by the .deb (highest priority).
-        apply_override_file(Path::new(SYSTEM_CONFIG_PATH), &mut config);
-
-        config
+        files.push(PathBuf::from(SYSTEM_CONFIG_PATH));
+        load_layers(&files)
     }
 }
 
-/// Read a TOML override file at `path` and apply it to `config`. No-op if the file
-/// does not exist, cannot be read, or fails to parse.
-fn apply_override_file(path: &Path, config: &mut Config) {
-    if !path.exists() {
-        return;
+/// Merge the embedded default and then each of `files` in order, and deserialize the
+/// result. The config is deserialized after every file, so an unknown key or a wrongly
+/// typed value is reported against the file that introduced it.
+fn load_layers(files: &[PathBuf]) -> Result<Config, String> {
+    let mut merged: toml::Table = toml::from_str(include_str!("../config/default.toml"))
+        .expect("embedded default.toml is valid TOML");
+    let mut config: Config = toml::Value::Table(merged.clone())
+        .try_into()
+        .expect("embedded default.toml matches Config");
+    for path in files {
+        let contents = match fs::read_to_string(path) {
+            Ok(contents) => contents,
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(err) => return Err(format!("{}: {err}", path.display())),
+        };
+        let mut layer: toml::Table =
+            toml::from_str(&contents).map_err(|err| format!("{}: {err}", path.display()))?;
+        move_legacy_network_keys(&mut layer);
+        merge_tables(&mut merged, layer, "");
+        config = toml::Value::Table(merged.clone())
+            .try_into()
+            .map_err(|err| format!("{}: {err}", path.display()))?;
     }
-    let Ok(contents) = fs::read_to_string(path) else {
-        return;
-    };
-    let Ok(override_cfg) = toml::from_str::<ConfigOverride>(&contents) else {
-        return;
-    };
-    apply_override(override_cfg, config);
+    Ok(config)
 }
 
-/// Apply a parsed override to `config`. Each field is set only if the override specifies it.
-fn apply_override(override_cfg: ConfigOverride, config: &mut Config) {
-    if let Some(addr) = override_cfg.addr {
-        config.network.addr = addr;
-    }
-    if let Some(port) = override_cfg.port {
-        config.network.port = port;
-    }
-    if let Some(network) = override_cfg.network {
-        apply_network_override(&mut config.network, network);
-    }
-    if let Some(storage) = override_cfg.storage {
-        apply_storage_override(&mut config.storage, storage);
-    }
-    if let Some(tds) = override_cfg.tds {
-        apply_tds_override(&mut config.tds, tds);
-    }
-    if let Some(replication) = override_cfg.replication {
-        apply_replication_override(&mut config.replication, replication);
-    }
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ConfigOverride {
-    addr: Option<String>,
-    port: Option<u16>,
-    network: Option<NetworkConfigOverride>,
-    storage: Option<StorageConfigOverride>,
-    tds: Option<TdsConfigOverride>,
-    replication: Option<ReplicationConfigOverride>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct ReplicationConfigOverride {
-    enabled: Option<bool>,
-    role: Option<ReplicationRole>,
-    addr: Option<String>,
-    port: Option<u16>,
-    node_id: Option<u32>,
-    cluster_uuid: Option<String>,
-    shared_secret: Option<String>,
-    tls_cert: Option<String>,
-    tls_key: Option<String>,
-    tls_ca: Option<String>,
-    primary_addr: Option<String>,
-    server_name: Option<String>,
-    heartbeat_ms: Option<u64>,
-    reconnect_delay_ms: Option<u64>,
-    stall_timeout_ms: Option<u64>,
-    max_slot_retain_bytes: Option<u64>,
-    synchronous_commit: Option<bool>,
-    sync_timeout_ms: Option<u64>,
-}
-
-fn apply_replication_override(target: &mut ReplicationConfig, source: ReplicationConfigOverride) {
-    if let Some(enabled) = source.enabled {
-        target.enabled = enabled;
-    }
-    if let Some(role) = source.role {
-        target.role = role;
-    }
-    if let Some(addr) = source.addr {
-        target.addr = addr;
-    }
-    if let Some(port) = source.port {
-        target.port = port;
-    }
-    if let Some(node_id) = source.node_id {
-        target.node_id = node_id;
-    }
-    if source.cluster_uuid.is_some() {
-        target.cluster_uuid = source.cluster_uuid;
-    }
-    if source.shared_secret.is_some() {
-        target.shared_secret = source.shared_secret;
-    }
-    if source.tls_cert.is_some() {
-        target.tls_cert = source.tls_cert;
-    }
-    if source.tls_key.is_some() {
-        target.tls_key = source.tls_key;
-    }
-    if source.tls_ca.is_some() {
-        target.tls_ca = source.tls_ca;
-    }
-    if source.primary_addr.is_some() {
-        target.primary_addr = source.primary_addr;
-    }
-    if source.server_name.is_some() {
-        target.server_name = source.server_name;
-    }
-    if let Some(heartbeat_ms) = source.heartbeat_ms {
-        target.heartbeat_ms = heartbeat_ms;
-    }
-    if let Some(reconnect_delay_ms) = source.reconnect_delay_ms {
-        target.reconnect_delay_ms = reconnect_delay_ms;
-    }
-    if let Some(stall_timeout_ms) = source.stall_timeout_ms {
-        target.stall_timeout_ms = stall_timeout_ms;
-    }
-    if let Some(max_slot_retain_bytes) = source.max_slot_retain_bytes {
-        target.max_slot_retain_bytes = max_slot_retain_bytes;
-    }
-    if let Some(synchronous_commit) = source.synchronous_commit {
-        target.synchronous_commit = synchronous_commit;
-    }
-    if let Some(sync_timeout_ms) = source.sync_timeout_ms {
-        target.sync_timeout_ms = sync_timeout_ms;
+/// `addr` and `port` were top-level keys before `[network]` existed. They still work;
+/// within one file `[network]` wins.
+fn move_legacy_network_keys(layer: &mut toml::Table) {
+    for key in ["addr", "port"] {
+        let Some(value) = layer.remove(key) else {
+            continue;
+        };
+        let network = layer
+            .entry("network")
+            .or_insert_with(|| toml::Value::Table(toml::Table::new()));
+        if let toml::Value::Table(network) = network {
+            network.entry(key).or_insert(value);
+        }
     }
 }
 
-#[derive(Debug, Deserialize, Default)]
-struct TdsConfigOverride {
-    enabled: Option<bool>,
-    addr: Option<String>,
-    port: Option<u16>,
-    database: Option<String>,
-    auth: Option<HashMap<String, String>>,
-    tls_cert: Option<String>,
-    tls_key: Option<String>,
-}
-
-fn apply_tds_override(target: &mut TdsConfig, source: TdsConfigOverride) {
-    if let Some(enabled) = source.enabled {
-        target.enabled = enabled;
-    }
-    if let Some(addr) = source.addr {
-        target.addr = addr;
-    }
-    if let Some(port) = source.port {
-        target.port = port;
-    }
-    if let Some(database) = source.database {
-        target.database = database;
-    }
-    if let Some(auth) = source.auth {
-        target.auth = auth;
-    }
-    if source.tls_cert.is_some() {
-        target.tls_cert = source.tls_cert;
-    }
-    if source.tls_key.is_some() {
-        target.tls_key = source.tls_key;
-    }
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct NetworkConfigOverride {
-    addr: Option<String>,
-    port: Option<u16>,
-}
-
-#[derive(Debug, Deserialize, Default)]
-struct StorageConfigOverride {
-    path: Option<String>,
-    size_gib: Option<u64>,
-    wal_ratio: Option<f64>,
-    metadata_ratio: Option<f64>,
-    snapshot_ratio: Option<f64>,
-    allocator_ratio: Option<f64>,
-    reserved_ratio: Option<f64>,
-}
-
-fn apply_network_override(target: &mut NetworkConfig, source: NetworkConfigOverride) {
-    if let Some(addr) = source.addr {
-        target.addr = addr;
-    }
-    if let Some(port) = source.port {
-        target.port = port;
-    }
-}
-
-fn apply_storage_override(target: &mut StorageConfig, source: StorageConfigOverride) {
-    if let Some(path) = source.path {
-        target.path = path;
-    }
-    if let Some(size_gib) = source.size_gib {
-        target.size_gib = size_gib;
-    }
-    if let Some(wal_ratio) = source.wal_ratio {
-        target.wal_ratio = wal_ratio;
-    }
-    if let Some(metadata_ratio) = source.metadata_ratio {
-        target.metadata_ratio = metadata_ratio;
-    }
-    if let Some(snapshot_ratio) = source.snapshot_ratio {
-        target.snapshot_ratio = snapshot_ratio;
-    }
-    if let Some(allocator_ratio) = source.allocator_ratio {
-        target.allocator_ratio = allocator_ratio;
-    }
-    if let Some(reserved_ratio) = source.reserved_ratio {
-        target.reserved_ratio = reserved_ratio;
+/// Merge `layer` into `base`: tables merge key by key, any other value replaces. The
+/// exception is `tds.auth`: a file that sets it replaces the whole login seed map.
+fn merge_tables(base: &mut toml::Table, layer: toml::Table, prefix: &str) {
+    for (key, value) in layer {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        match (base.get_mut(&key), value) {
+            (Some(toml::Value::Table(base_table)), toml::Value::Table(layer_table))
+                if path != "tds.auth" =>
+            {
+                merge_tables(base_table, layer_table, &path);
+            }
+            (_, value) => {
+                base.insert(key, value);
+            }
+        }
     }
 }
 
@@ -673,47 +524,91 @@ fn apply_storage_override(target: &mut StorageConfig, source: StorageConfigOverr
 mod tests {
     use super::*;
 
-    fn default_config() -> Config {
-        let default_str = include_str!("../config/default.toml");
-        toml::from_str(default_str).unwrap()
+    fn test_dir(name: &str) -> PathBuf {
+        let dir =
+            std::env::temp_dir().join(format!("truthdb-config-test-{}-{name}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write(dir: &Path, file: &str, contents: &str) -> PathBuf {
+        let path = dir.join(file);
+        fs::write(&path, contents).unwrap();
+        path
     }
 
     #[test]
-    fn override_sets_only_specified_fields() {
-        let toml = r#"
-            [network]
-            port = 12345
+    fn embedded_default_loads() {
+        let config = load_layers(&[]).unwrap();
+        assert_eq!(config.network.addr, "0.0.0.0");
+        assert_eq!(config.network.port, 9623);
+        assert_eq!(config.storage.path, "truth.db");
+        assert!(!config.tds.enabled);
+        assert_eq!(config.tds.encryption, Encryption::Optional);
+        assert!(!config.replication.enabled, "disabled by default");
+    }
 
-            [storage]
-            size_gib = 42
-        "#;
-        let mut config = default_config();
-        let override_cfg: ConfigOverride = toml::from_str(toml).unwrap();
-        apply_override(override_cfg, &mut config);
+    #[test]
+    fn file_sets_only_specified_fields() {
+        let dir = test_dir("partial");
+        let path = write(
+            &dir,
+            "a.toml",
+            "[network]\nport = 12345\n\n[storage]\nsize_gib = 42\n",
+        );
+        let config = load_layers(&[path]).unwrap();
 
         assert_eq!(config.network.port, 12345);
         assert_eq!(config.storage.size_gib, 42);
         // Unset fields keep defaults.
         assert_eq!(config.network.addr, "0.0.0.0");
         assert_eq!(config.storage.path, "truth.db");
+        fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn replication_override_applies_and_uuid_parses() {
-        let toml = r#"
-            [replication]
-            enabled = true
-            role = "standby"
-            node_id = 3
-            cluster_uuid = "8f0e7a34-2d51-4c11-9c9e-3f6d2a7b1c05"
-            shared_secret = "s3cret"
-            primary_addr = "primary.example:9624"
-            tls_ca = "/tmp/ca.pem"
-        "#;
-        let mut config = default_config();
-        assert!(!config.replication.enabled, "disabled by default");
-        let override_cfg: ConfigOverride = toml::from_str(toml).unwrap();
-        apply_override(override_cfg, &mut config);
+    fn file_sets_tds_encryption() {
+        let dir = test_dir("encryption");
+        let path = write(&dir, "a.toml", "[tds]\nencryption = \"required\"\n");
+        let config = load_layers(&[path]).unwrap();
+        assert_eq!(config.tds.encryption, Encryption::Required);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_sets_default_collation() {
+        let dir = test_dir("collation");
+        let path = write(
+            &dir,
+            "a.toml",
+            "[storage]\ndefault_collation = \"Finnish_Swedish_CI_AS\"\n",
+        );
+        let config = load_layers(&[path]).unwrap();
+        assert_eq!(
+            config.storage.default_collation.as_deref(),
+            Some("Finnish_Swedish_CI_AS")
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn replication_section_applies_and_uuid_parses() {
+        let dir = test_dir("replication");
+        let path = write(
+            &dir,
+            "a.toml",
+            r#"
+                [replication]
+                enabled = true
+                role = "standby"
+                node_id = 3
+                cluster_uuid = "8f0e7a34-2d51-4c11-9c9e-3f6d2a7b1c05"
+                shared_secret = "s3cret"
+                primary_addr = "primary.example:9624"
+                tls_ca = "/tmp/ca.pem"
+            "#,
+        );
+        let mut config = load_layers(&[path]).unwrap();
 
         assert!(config.replication.enabled);
         assert_eq!(config.replication.role, ReplicationRole::Standby);
@@ -727,58 +622,100 @@ mod tests {
         assert!(config.replication.cluster_uuid_bytes().is_err());
         config.replication.cluster_uuid = None;
         assert!(config.replication.cluster_uuid_bytes().is_err());
-    }
-
-    #[test]
-    fn override_file_missing_is_noop() {
-        let mut config = default_config();
-        apply_override_file(
-            Path::new("/nonexistent/truthdb-test-missing.toml"),
-            &mut config,
-        );
-        // Still default.
-        assert_eq!(config.network.port, 9623);
-    }
-
-    #[test]
-    fn override_file_malformed_is_noop() {
-        let dir = std::env::temp_dir().join(format!(
-            "truthdb-config-test-{}-malformed",
-            std::process::id()
-        ));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("truthdb.toml");
-        fs::write(&path, "this is not valid toml === {{{").unwrap();
-
-        let mut config = default_config();
-        apply_override_file(&path, &mut config);
-        assert_eq!(config.network.port, 9623);
-
         fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
-    fn override_file_applies_when_valid() {
-        let dir =
-            std::env::temp_dir().join(format!("truthdb-config-test-{}-valid", std::process::id()));
-        fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("truthdb.toml");
-        fs::write(
-            &path,
-            r#"
-                [network]
-                addr = "127.0.0.1"
-                port = 7777
-            "#,
-        )
-        .unwrap();
+    fn unknown_key_is_an_error_naming_key_and_file() {
+        let dir = test_dir("unknown");
+        let path = write(&dir, "a.toml", "[tds]\nencrytion = \"required\"\n");
+        let err = load_layers(std::slice::from_ref(&path)).unwrap_err();
+        assert!(err.contains("encrytion"), "{err}");
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
 
-        let mut config = default_config();
-        apply_override_file(&path, &mut config);
+    #[test]
+    fn wrong_type_is_an_error_naming_file() {
+        let dir = test_dir("type");
+        let path = write(&dir, "a.toml", "[network]\nport = \"9623\"\n");
+        let err = load_layers(std::slice::from_ref(&path)).unwrap_err();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
 
+    #[test]
+    fn malformed_file_is_an_error_naming_file() {
+        let dir = test_dir("malformed");
+        let path = write(&dir, "a.toml", "this is not valid toml === {{{");
+        let err = load_layers(std::slice::from_ref(&path)).unwrap_err();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn unreadable_file_is_an_error() {
+        let dir = test_dir("unreadable");
+        // A directory where a file is expected cannot be read as a string.
+        let path = dir.join("a.toml");
+        fs::create_dir_all(&path).unwrap();
+        let err = load_layers(std::slice::from_ref(&path)).unwrap_err();
+        assert!(err.contains(&path.display().to_string()), "{err}");
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn missing_file_is_skipped() {
+        let config =
+            load_layers(&[PathBuf::from("/nonexistent/truthdb-test-missing.toml")]).unwrap();
+        assert_eq!(config.network.port, 9623);
+    }
+
+    #[test]
+    fn legacy_top_level_addr_and_port_apply() {
+        let dir = test_dir("legacy");
+        let path = write(&dir, "a.toml", "addr = \"127.0.0.1\"\nport = 7777\n");
+        let config = load_layers(&[path]).unwrap();
         assert_eq!(config.network.addr, "127.0.0.1");
         assert_eq!(config.network.port, 7777);
+        fs::remove_dir_all(&dir).ok();
+    }
 
+    #[test]
+    fn network_section_wins_over_legacy_keys_in_same_file() {
+        let dir = test_dir("legacy-vs-network");
+        let path = write(&dir, "a.toml", "port = 7777\n\n[network]\nport = 8888\n");
+        let config = load_layers(&[path]).unwrap();
+        assert_eq!(config.network.port, 8888);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn later_file_wins() {
+        let dir = test_dir("order");
+        let user = write(
+            &dir,
+            "user.toml",
+            "[network]\nport = 1111\naddr = \"127.0.0.1\"\n",
+        );
+        let system = write(&dir, "system.toml", "[network]\nport = 2222\n");
+        let config = load_layers(&[user, system]).unwrap();
+        assert_eq!(config.network.port, 2222);
+        assert_eq!(
+            config.network.addr, "127.0.0.1",
+            "kept from the earlier file"
+        );
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn later_tds_auth_replaces_earlier_map() {
+        let dir = test_dir("auth");
+        let user = write(&dir, "user.toml", "[tds.auth]\nalice = \"a\"\n");
+        let system = write(&dir, "system.toml", "[tds.auth]\nbob = \"b\"\n");
+        let config = load_layers(&[user, system]).unwrap();
+        assert_eq!(config.tds.auth.len(), 1);
+        assert_eq!(config.tds.auth.get("bob").map(String::as_str), Some("b"));
         fs::remove_dir_all(&dir).ok();
     }
 }
