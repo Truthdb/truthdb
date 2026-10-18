@@ -922,6 +922,27 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
         .collect_garbage(now(), ABANDON, u64::MAX)
         .unwrap();
     assert_eq!(freed.bodies, 1);
+
+    // An open upload keeps its bucket until it is aborted.
+    use crate::BucketError;
+    let pending = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("upl", now())?.unwrap();
+            tx.create_upload("upl", "k", &ObjectAttrs::default(), now())
+        })
+        .unwrap()
+        .unwrap();
+    let delete_bucket = || {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_bucket("upl"))
+            .unwrap()
+    };
+    assert_eq!(delete_bucket(), Err(BucketError::NotEmpty));
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.abort_upload(pending, now(), 0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(delete_bucket(), Ok(()));
     drop(storage);
 
     // The composite survives a crash and its parts go when it does.
