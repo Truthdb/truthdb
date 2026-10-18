@@ -71,3 +71,14 @@ reserved_ratio = 0.17
 # tls_ca = "/etc/truthdb/repl.crt"   # the primary's cert (or its CA)
 # server_name = "primary.example"    # defaults to the host part of primary_addr
 # reconnect_delay_ms = 1000
+#
+# [s3]
+# S3-compatible HTTP API (path-style addressing). Requests are signed with
+# AWS SigV4 using access keys created over the native protocol:
+#   truthdb-cli> s3 create access key
+# enabled = true
+# addr = "0.0.0.0"
+# port = 9000
+# region = "us-east-1"
+# tls_cert = "/etc/truthdb/s3.crt"   # both set = HTTPS
+# tls_key = "/etc/truthdb/s3.key"

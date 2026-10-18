@@ -220,6 +220,57 @@ async fn main() -> ExitCode {
         None
     };
 
+    // Optional S3-compatible HTTP API.
+    let s3_task = if config.s3.enabled {
+        let tls = match (&config.s3.tls_cert, &config.s3.tls_key) {
+            (Some(cert_path), Some(key_path)) => {
+                let acceptor = std::fs::read(cert_path).and_then(|cert| {
+                    let key = std::fs::read(key_path)?;
+                    truthdb_core::repl::tls::acceptor_from_pem(&cert, &key)
+                });
+                match acceptor {
+                    Ok(acceptor) => Some(acceptor),
+                    Err(err) => {
+                        eprintln!("Failed to load S3 TLS certificate/key: {err}");
+                        return ExitCode::FAILURE;
+                    }
+                }
+            }
+            (None, None) => None,
+            _ => {
+                eprintln!("S3 TLS needs both tls_cert and tls_key");
+                return ExitCode::FAILURE;
+            }
+        };
+        match tokio::net::TcpListener::bind((config.s3.addr.as_str(), config.s3.port)).await {
+            Ok(listener) => {
+                info!(
+                    "S3 API listening on {}:{}{}",
+                    config.s3.addr,
+                    config.s3.port,
+                    if tls.is_some() { " (TLS)" } else { "" }
+                );
+                let state = std::sync::Arc::new(truthdb_s3::server::S3State {
+                    engine: engine.clone(),
+                    region: config.s3.region.clone(),
+                });
+                let shutdown_rx = shutdown_tx.subscribe();
+                Some(tokio::spawn(truthdb_s3::server::serve(
+                    listener,
+                    state,
+                    tls,
+                    shutdown_rx,
+                )))
+            }
+            Err(err) => {
+                eprintln!("Failed to start the S3 API: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
     // Optional physical replication (Stage 18): a primary's listener + senders,
     // or a standby's receiver.
     let repl_task = if config.replication.enabled {
@@ -247,6 +298,9 @@ async fn main() -> ExitCode {
     }
     if let Some(repl_task) = repl_task {
         let _ = repl_task.await;
+    }
+    if let Some(s3_task) = s3_task {
+        let _ = s3_task.await;
     }
     // Stop the engine thread and wait for it to drain/exit.
     engine.shutdown();
