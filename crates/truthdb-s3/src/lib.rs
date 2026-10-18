@@ -2,6 +2,7 @@
 //! with AWS Signature Version 4, served over the object engine.
 
 pub mod api;
+pub mod copy;
 pub mod delete;
 pub mod error;
 pub mod listing;

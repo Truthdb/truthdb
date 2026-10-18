@@ -18,7 +18,7 @@ const MAX_LISTED: usize = 1000;
 /// Largest CompleteMultipartUpload request body read (10,000 parts).
 const MAX_COMPLETE_BODY: usize = 2 * 1024 * 1024;
 
-fn xml(body: String) -> Response<Body> {
+pub(crate) fn xml(body: String) -> Response<Body> {
     Response::builder()
         .status(StatusCode::OK)
         .header("content-type", "application/xml")
@@ -28,7 +28,7 @@ fn xml(body: String) -> Response<Body> {
         .expect("a valid response")
 }
 
-fn upload_error(err: UploadError, bucket: &str, key: &str) -> S3Error {
+pub(crate) fn upload_error(err: UploadError, bucket: &str, key: &str) -> S3Error {
     match err {
         UploadError::Object(err) => object_error(err, bucket, key),
         UploadError::NoSuchUpload => S3Error::new(
@@ -66,14 +66,26 @@ fn param(params: &[(String, String)], name: &str) -> Option<String> {
         .map(|(_, value)| value.clone())
 }
 
-fn upload_id(params: &[(String, String)]) -> Result<u64, S3Error> {
+pub(crate) fn upload_id(params: &[(String, String)]) -> Result<u64, S3Error> {
     param(params, "uploadId")
         .and_then(|id| id.parse().ok())
         .ok_or_else(|| upload_error(UploadError::NoSuchUpload, "", ""))
 }
 
+/// `?partNumber=`, within S3's limits.
+pub(crate) fn part_number(
+    params: &[(String, String)],
+    bucket: &str,
+    key: &str,
+) -> Result<u32, S3Error> {
+    param(params, "partNumber")
+        .and_then(|n| n.parse().ok())
+        .filter(|n| (1..=truthdb_object::MAX_PART_NUMBER).contains(n))
+        .ok_or_else(|| upload_error(UploadError::InvalidPartNumber, bucket, key))
+}
+
 /// The upload, which must belong to this bucket and key.
-async fn check_upload(
+pub(crate) async fn check_upload(
     state: &S3State,
     upload: u64,
     bucket: &str,
@@ -115,12 +127,7 @@ pub async fn upload_part(
 ) -> Result<Response<Body>, S3Error> {
     let params = query_params(request.uri().query().unwrap_or(""));
     let upload = upload_id(&params)?;
-    let number: u32 = param(&params, "partNumber")
-        .and_then(|n| n.parse().ok())
-        .ok_or_else(|| upload_error(UploadError::InvalidPartNumber, &bucket, &key))?;
-    if !(1..=truthdb_object::MAX_PART_NUMBER).contains(&number) {
-        return Err(upload_error(UploadError::InvalidPartNumber, &bucket, &key));
-    }
+    let number = part_number(&params, &bucket, &key)?;
     check_upload(state, upload, &bucket, &key).await?;
     let sealed = receive_body(state, request, auth).await?;
     let info = object(state, move |file| {

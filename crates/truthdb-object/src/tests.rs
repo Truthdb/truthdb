@@ -942,3 +942,112 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_copy_shares_the_body_and_outlives_its_source() {
+    use crate::{MIN_PART_BYTES, ObjectAttrs, VersionSel};
+    let path = temp_path("copy");
+    let storage = create(&path);
+    for bucket in ["src", "dst"] {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.create_bucket(bucket, now()))
+            .unwrap()
+            .unwrap();
+    }
+    let data = bytes(7, 5000);
+    let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+    writer.write(&storage, &data, now()).unwrap();
+    let sealed = writer.finish(&storage, now()).unwrap();
+    let attrs = ObjectAttrs {
+        content_type: Some("text/plain".to_string()),
+        ..ObjectAttrs::default()
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.put_object("src", "a", &sealed, &attrs, now(), 0))
+        .unwrap()
+        .unwrap();
+    let head = |bucket: &str, key: &str| {
+        ObjFile::new(&mut storage.lock())
+            .head_object(bucket, key, VersionSel::Latest)
+            .unwrap()
+    };
+    let copy = |bucket: &str, key: &str, attrs: &ObjectAttrs| {
+        let source = head("src", "a").unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.copy_object(bucket, key, &source, attrs, now(), 0))
+            .unwrap()
+    };
+    let pages = allocated_pages(&storage);
+    let copied = copy("dst", "b", &attrs).unwrap();
+    let source = head("src", "a").unwrap();
+    assert_eq!(copied.body, source.body, "the copy shares the body");
+    assert_eq!(copied.etag(), source.etag());
+    assert_eq!(allocated_pages(&storage), pages, "no bytes were copied");
+    // Replacing the source's metadata in place keeps its one body alive.
+    let replaced = ObjectAttrs {
+        content_type: Some("text/csv".to_string()),
+        ..ObjectAttrs::default()
+    };
+    copy("src", "a", &replaced).unwrap();
+    assert_eq!(
+        head("src", "a").unwrap().attrs.content_type.as_deref(),
+        Some("text/csv")
+    );
+    assert_eq!(
+        copy("nope", "b", &attrs),
+        Err(crate::ObjectError::NoSuchBucket)
+    );
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("src", "a", None, now(), 0))
+        .unwrap()
+        .unwrap();
+    let collected = ObjFile::new(&mut storage.lock())
+        .collect_garbage(now(), ABANDON, u64::MAX)
+        .unwrap();
+    assert_eq!(collected.bodies, 0, "the copy still holds the body");
+    let copied = head("dst", "b").unwrap();
+    assert_eq!(read(&storage, copied.body, 0, data.len()).unwrap(), data);
+
+    // A whole plain object shares its body as a part; a multipart object's
+    // body is refused (composites do not nest).
+    let upload = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_upload("dst", "joined", &ObjectAttrs::default(), now()))
+        .unwrap()
+        .unwrap();
+    let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+    writer
+        .write(&storage, &bytes(8, MIN_PART_BYTES as usize), now())
+        .unwrap();
+    let first = writer.finish(&storage, now()).unwrap();
+    let part1 = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.upload_part(upload, 1, &first, now(), 0))
+        .unwrap()
+        .unwrap();
+    storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+    let part2 = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.upload_part_shared(upload, 2, copied.body, now(), 0))
+        .unwrap()
+        .unwrap();
+    assert_eq!((part2.body, part2.md5), (copied.body, copied.md5));
+    let joined = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.complete_upload(upload, &[(1, part1.md5), (2, part2.md5)], now(), 0))
+        .unwrap()
+        .unwrap();
+    let other = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_upload("dst", "again", &ObjectAttrs::default(), now()))
+        .unwrap()
+        .unwrap();
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.upload_part_shared(other, 1, joined.body, now(), 0))
+            .is_err()
+    );
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("dst", "b", None, now(), 0))
+        .unwrap()
+        .unwrap();
+    let whole = read(&storage, joined.body, 0, joined.size as usize).unwrap();
+    assert_eq!(&whole[MIN_PART_BYTES as usize..], &data[..]);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

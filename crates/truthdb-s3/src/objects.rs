@@ -23,7 +23,7 @@ use crate::payload::PayloadDecoder;
 use crate::server::{Authenticated, Body, S3State, full};
 
 /// Largest single PUT (S3's limit).
-const MAX_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
+pub(crate) const MAX_PUT_BYTES: u64 = 5 * 1024 * 1024 * 1024;
 /// Largest total of user metadata names and values (S3's limit).
 const MAX_USER_METADATA: usize = 2 * 1024;
 /// Bytes a GET reads per engine call.
@@ -72,7 +72,7 @@ pub fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn header(headers: &HeaderMap, name: &str) -> Option<String> {
+pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {
     headers
         .get(name)
         .and_then(|value| value.to_str().ok())
@@ -323,30 +323,32 @@ fn etag_matches(list: &str, etag: &str) -> bool {
 }
 
 /// The conditional headers' verdict: `Some(304 or 412)` stops the request.
-fn precondition(headers: &HeaderMap, info: &ObjectInfo) -> Option<StatusCode> {
+/// `prefix` is `""` for a GET's own headers, or `x-amz-copy-source-` for a
+/// copy's conditions on its source.
+pub fn precondition(headers: &HeaderMap, prefix: &str, info: &ObjectInfo) -> Option<StatusCode> {
+    let header = |name: &str| header(headers, &format!("{prefix}{name}"));
     let etag = info.etag();
     let modified = info.mtime_ms / 1000;
-    let if_match = header(headers, "if-match");
+    let if_match = header("if-match");
     if let Some(list) = &if_match
         && !etag_matches(list, &etag)
     {
         return Some(StatusCode::PRECONDITION_FAILED);
     }
     if if_match.is_none()
-        && let Some(since) =
-            header(headers, "if-unmodified-since").and_then(|v| parse_http_date(&v))
+        && let Some(since) = header("if-unmodified-since").and_then(|v| parse_http_date(&v))
         && modified > since
     {
         return Some(StatusCode::PRECONDITION_FAILED);
     }
-    let if_none_match = header(headers, "if-none-match");
+    let if_none_match = header("if-none-match");
     if let Some(list) = &if_none_match
         && etag_matches(list, &etag)
     {
         return Some(StatusCode::NOT_MODIFIED);
     }
     if if_none_match.is_none()
-        && let Some(since) = header(headers, "if-modified-since").and_then(|v| parse_http_date(&v))
+        && let Some(since) = header("if-modified-since").and_then(|v| parse_http_date(&v))
         && modified <= since
     {
         return Some(StatusCode::NOT_MODIFIED);
@@ -439,7 +441,7 @@ pub async fn get_object(
         }
     };
 
-    if let Some(status) = precondition(headers, &info) {
+    if let Some(status) = precondition(headers, "", &info) {
         if !head_only {
             release(state).await;
         }
