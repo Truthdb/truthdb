@@ -352,11 +352,10 @@ impl Storage {
     ) -> Result<Self, StorageError> {
         assert_layout_invariants();
         opts.validate()?;
+        let engines = engine();
+        validate_engines(&engines)?;
         let core = StorageFile::create_new(path.clone(), opts, wal_min_bytes, wal_max_bytes)?;
-        let file = Locked {
-            core,
-            engines: engine(),
-        };
+        let file = Locked { core, engines };
         Self::with_log_writer(path, file)
     }
 
@@ -381,6 +380,7 @@ impl StorageFile {
         stop_at: Option<u64>,
         mut engines: Vec<Box<dyn EngineParticipant>>,
     ) -> Result<Locked, StorageError> {
+        validate_engines(&engines)?;
         let mut file = DirectFile::open_existing(path.clone())?;
         let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
         file.read_exact_at(0, &mut header_bytes)?;

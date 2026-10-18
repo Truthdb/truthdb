@@ -251,3 +251,45 @@ fn restart_undo_goes_to_the_engine_that_owns_the_tree() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_factory_without_one_catalog_engine_or_with_shared_ids_is_refused() {
+    fn only_second() -> Vec<Box<dyn EngineParticipant>> {
+        vec![Box::new(SecondEngine { root: None })]
+    }
+    fn shared_id() -> Vec<Box<dyn EngineParticipant>> {
+        vec![
+            Box::new(NoEngine),
+            Box::new(SecondEngine { root: None }),
+            Box::new(SecondEngine { root: None }),
+        ]
+    }
+    let path = unique_temp_path("engines-factory");
+    for (factory, expected) in [
+        (only_second as EngineFactory, "exactly one catalog engine"),
+        (shared_id as EngineFactory, "share id 1"),
+    ] {
+        let err = Storage::create_with_wal_bounds(
+            path.clone(),
+            test_storage_options(),
+            TEST_WAL_BYTES,
+            TEST_WAL_BYTES,
+            factory,
+        )
+        .err()
+        .expect("create refuses the factory");
+        assert!(
+            err.to_string().contains(expected),
+            "unexpected error: {err}"
+        );
+    }
+    drop(create_two(&path));
+    let err = Storage::open(path.clone(), shared_id)
+        .err()
+        .expect("open refuses the factory");
+    assert!(
+        err.to_string().contains("share id 1"),
+        "unexpected error: {err}"
+    );
+    std::fs::remove_file(&path).ok();
+}

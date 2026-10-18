@@ -36,10 +36,10 @@ mod replication;
 #[cfg(test)]
 use lifecycle::compute_layout;
 use lifecycle::live_descriptor_slot;
-use participant::RoutedUndo;
 pub use participant::{
     CATALOG_ENGINE_ID, EngineFactory, EngineParticipant, FIRST_ENGINE_OBJECT_ID,
 };
+use participant::{RoutedUndo, validate_engines};
 use replication::SyncCommitState;
 
 /// Version stamped in REL wal entries (entry-level, distinct from the record

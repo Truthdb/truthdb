@@ -9,7 +9,7 @@
 use crate::relstore::ctx::{OpMode, RelCtx};
 use crate::relstore::recovery::LogicalUndo;
 use crate::storage::{StorageError, StorageFile};
-use crate::storage_layout::PAGE_SIZE;
+use crate::storage_layout::{MAX_ENGINE_ROOTS, PAGE_SIZE};
 use crate::wal::records::{PageOpUndo, RelRecord};
 
 /// Builds fresh engines for an open, create or validating reopen. Engine ids
@@ -265,6 +265,35 @@ impl crate::storage::Locked {
             eng.capture_standby(&mut self.core, records, floor);
         }
     }
+}
+
+/// Checks an [`EngineFactory`]'s output: exactly one catalog engine, distinct
+/// ids, and no more other engines than the superblock's engine-roots table
+/// holds (a root past it would be dropped at the next checkpoint).
+pub(in crate::storage) fn validate_engines(
+    engines: &[Box<dyn EngineParticipant>],
+) -> Result<(), StorageError> {
+    let mut ids: Vec<u32> = engines.iter().map(|eng| eng.engine_id()).collect();
+    ids.sort_unstable();
+    let catalog = ids.iter().filter(|&&id| id == CATALOG_ENGINE_ID).count();
+    if catalog != 1 {
+        return Err(StorageError::InvalidConfig(format!(
+            "storage needs exactly one catalog engine, got {catalog}"
+        )));
+    }
+    if let Some(pair) = ids.windows(2).find(|pair| pair[0] == pair[1]) {
+        return Err(StorageError::InvalidConfig(format!(
+            "two storage engines share id {}",
+            pair[0]
+        )));
+    }
+    if ids.len() - 1 > MAX_ENGINE_ROOTS {
+        return Err(StorageError::InvalidConfig(format!(
+            "{} non-catalog storage engines; the superblock holds {MAX_ENGINE_ROOTS} roots",
+            ids.len() - 1
+        )));
+    }
+    Ok(())
 }
 
 /// Restart recovery's logical undo over every engine: each tree undo goes to
