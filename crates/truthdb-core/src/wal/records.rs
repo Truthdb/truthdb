@@ -42,6 +42,10 @@ pub const REL_KIND_PAGE_IMAGES: u16 = 10;
 /// (engine id + page number in redo payload). The relational catalog root
 /// keeps its own `SET_CATALOG_ROOT` record.
 pub const REL_KIND_SET_ENGINE_ROOT: u16 = 11;
+/// Compensation for a transactional ALLOC_EXTENT: frees the extent and moves
+/// the undo cursor past the allocation in one record (redo = undo_next LSN +
+/// extent). Never undone itself.
+pub const REL_KIND_CLR_FREE_EXTENT: u16 = 12;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelRecord {
@@ -261,6 +265,11 @@ pub enum PageOpUndo {
         page: u64,
         delta: i64,
     },
+    /// Undo of a transactional extent allocation: free the extent.
+    FreeExtent {
+        start_page: u64,
+        num_pages: u64,
+    },
 }
 
 impl PageOpUndo {
@@ -314,6 +323,14 @@ impl PageOpUndo {
                 put_u64(out, *page);
                 put_u64(out, *delta as u64);
             }
+            PageOpUndo::FreeExtent {
+                start_page,
+                num_pages,
+            } => {
+                out.push(8);
+                put_u64(out, *start_page);
+                put_u64(out, *num_pages);
+            }
         }
     }
 
@@ -352,6 +369,10 @@ impl PageOpUndo {
                 page: cursor.u64()?,
                 delta: cursor.u64()? as i64,
             },
+            8 => PageOpUndo::FreeExtent {
+                start_page: cursor.u64()?,
+                num_pages: cursor.u64()?,
+            },
             other => {
                 return Err(StorageError::InvalidFile(format!(
                     "unknown page-op undo tag {other}"
@@ -389,6 +410,70 @@ impl RelRecord {
             redo: extent_payload(start_page, num_pages),
             undo: Vec::new(),
         }
+    }
+
+    /// An extent allocated inside a transaction: undone (freed) if the
+    /// transaction rolls back or loses at restart.
+    pub fn alloc_extent_txn(txn_id: u64, prev_lsn: u64, start_page: u64, num_pages: u64) -> Self {
+        let mut undo = Vec::new();
+        PageOpUndo::FreeExtent {
+            start_page,
+            num_pages,
+        }
+        .encode(&mut undo);
+        RelRecord {
+            prev_lsn,
+            txn_id,
+            kind: REL_KIND_ALLOC_EXTENT,
+            flags: 0,
+            redo: extent_payload(start_page, num_pages),
+            undo,
+        }
+    }
+
+    /// An extent freed inside a transaction: the free takes effect when the
+    /// transaction commits, and never if it does not.
+    pub fn free_extent_txn(txn_id: u64, prev_lsn: u64, start_page: u64, num_pages: u64) -> Self {
+        RelRecord {
+            prev_lsn,
+            txn_id,
+            kind: REL_KIND_FREE_EXTENT,
+            flags: 0,
+            redo: extent_payload(start_page, num_pages),
+            undo: Vec::new(),
+        }
+    }
+
+    pub fn clr_free_extent(
+        txn_id: u64,
+        prev_lsn: u64,
+        undo_next: u64,
+        start_page: u64,
+        num_pages: u64,
+    ) -> Self {
+        let mut redo = Vec::new();
+        put_u64(&mut redo, undo_next);
+        redo.extend_from_slice(&extent_payload(start_page, num_pages));
+        RelRecord {
+            prev_lsn,
+            txn_id,
+            kind: REL_KIND_CLR_FREE_EXTENT,
+            flags: 0,
+            redo,
+            undo: Vec::new(),
+        }
+    }
+
+    /// Decodes a CLR_FREE_EXTENT redo into `(undo_next, start_page, num_pages)`.
+    pub fn decode_clr_free_extent(&self) -> Result<(u64, u64, u64), StorageError> {
+        debug_assert_eq!(self.kind, REL_KIND_CLR_FREE_EXTENT);
+        if self.redo.len() != 24 {
+            return Err(StorageError::InvalidFile(
+                "clr free-extent record has wrong size".to_string(),
+            ));
+        }
+        let field = |at: usize| u64::from_le_bytes(self.redo[at..at + 8].try_into().unwrap());
+        Ok((field(0), field(8), field(16)))
     }
 
     pub fn encode(&self) -> Vec<u8> {
@@ -883,6 +968,34 @@ mod tests {
         let clr = RelRecord::clr_noop(3, 700, 0);
         let decoded = RelRecord::decode(&clr.encode()).expect("decode");
         assert_eq!(decoded.decode_clr().expect("clr"), (0, None));
+    }
+
+    #[test]
+    fn transactional_extent_records_round_trip() {
+        let alloc = RelRecord::alloc_extent_txn(4, 100, 64, 256);
+        let decoded = RelRecord::decode(&alloc.encode()).expect("decode");
+        assert_eq!(decoded, alloc);
+        assert_eq!(decoded.decode_extent_redo().expect("extent"), (64, 256));
+        assert_eq!(
+            decoded.decode_page_op_undo().expect("undo"),
+            PageOpUndo::FreeExtent {
+                start_page: 64,
+                num_pages: 256
+            }
+        );
+
+        let free = RelRecord::free_extent_txn(4, 200, 64, 256);
+        let decoded = RelRecord::decode(&free.encode()).expect("decode");
+        assert_eq!(decoded, free);
+        assert_eq!(decoded.decode_extent_redo().expect("extent"), (64, 256));
+
+        let clr = RelRecord::clr_free_extent(4, 300, 90, 64, 256);
+        let decoded = RelRecord::decode(&clr.encode()).expect("decode");
+        assert_eq!(decoded, clr);
+        assert_eq!(
+            decoded.decode_clr_free_extent().expect("clr"),
+            (90, 64, 256)
+        );
     }
 
     #[test]

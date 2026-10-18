@@ -433,16 +433,23 @@ fn restore_full_plus_log_chain_recovers_post_backup_changes() {
 #[test]
 fn point_in_time_restore_stops_at_a_commit_timestamp() {
     use crate::storage_layout::WAL_ENTRY_TYPE_REL;
-    use crate::wal::records::{REL_KIND_TXN_COMMIT, RelRecord};
+    use crate::wal::records::RelRecord;
 
     let src = unique_temp_path("pitr-src");
     let bak = unique_temp_path("pitr-bak");
+    let trn = unique_temp_path("pitr-trn");
     let restored = unique_temp_path("pitr-restored");
 
     let engine = new_engine(&src);
     engine
+        .execute("ALTER DATABASE CURRENT SET RECOVERY FULL")
+        .expect("full");
+    engine
         .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
         .expect("create");
+    // The stop point must lie after the full backup finished: its page
+    // images can hold every change its log covers.
+    engine.storage().backup_full(&bak).expect("full backup");
     // Three autocommitted inserts, spaced so their commit records land in
     // distinct milliseconds; the sleeps make the timestamps separable.
     engine.execute("INSERT INTO t VALUES (1)").expect("ins 1");
@@ -450,14 +457,17 @@ fn point_in_time_restore_stops_at_a_commit_timestamp() {
     engine.execute("INSERT INTO t VALUES (2)").expect("ins 2");
     std::thread::sleep(std::time::Duration::from_millis(15));
     engine.execute("INSERT INTO t VALUES (3)").expect("ins 3");
-    // The online full backup captures all three commits in its embedded log.
-    engine.storage().backup_full(&bak).expect("full backup");
+    let trnlit = trn.to_str().unwrap().replace('\'', "''");
+    assert!(
+        sql(&engine, &format!("BACKUP LOG truthdb TO DISK = '{trnlit}'"))["error"].is_null(),
+        "BACKUP LOG succeeded"
+    );
     drop(engine);
 
     // Reopen the source so recovery's ring scan fills the replay cache, then
-    // read the commit timestamps in LSN order: create, insert-1, insert-2,
-    // insert-3. Stopping at insert-1's timestamp must keep row 1 (ts == stop
-    // is not "after") and undo rows 2 and 3 (ts > stop).
+    // read the commit timestamps in LSN order; the last three are the
+    // inserts. Stopping at insert-1's timestamp must keep row 1 (ts == stop
+    // is not "after") and drop rows 2 and 3 (ts > stop).
     let storage = RelStorage::open(src.clone()).expect("reopen src");
     let mut commit_ts: Vec<u64> = Vec::new();
     for r in storage.replay_wal_entries().expect("replay") {
@@ -471,18 +481,25 @@ fn point_in_time_restore_stops_at_a_commit_timestamp() {
     }
     drop(storage);
     assert!(
-        commit_ts.len() >= 4,
-        "create + three inserts commit; got {commit_ts:?}"
+        commit_ts.len() >= 3,
+        "three inserts commit; got {commit_ts:?}"
     );
-    let stop_at = commit_ts[1]; // insert-1's commit timestamp
+    let inserts = &commit_ts[commit_ts.len() - 3..];
+    let stop_at = inserts[0]; // insert-1's commit timestamp
     assert!(
-        commit_ts[2] > stop_at,
+        inserts[1] > stop_at,
         "insert-2 must commit strictly after insert-1 for a clean stop point: {commit_ts:?}"
     );
 
-    // Point-in-time restore of the full backup, stopping after insert-1.
-    crate::storage::RelStorage::restore_full_with_logs(&restored, &bak, &[], Some(stop_at))
-        .expect("pitr restore");
+    // Point-in-time restore of the full backup and the log backup, stopping
+    // after insert-1.
+    crate::storage::RelStorage::restore_full_with_logs(
+        &restored,
+        &bak,
+        &[trn.clone()],
+        Some(stop_at),
+    )
+    .expect("pitr restore");
     let engine2 = Engine::new(RelStorage::open(restored.clone()).expect("open")).expect("engine");
     assert_eq!(
         sql_rows(&engine2, "SELECT id FROM t ORDER BY id").1,
@@ -491,9 +508,8 @@ fn point_in_time_restore_stops_at_a_commit_timestamp() {
     );
     drop(engine2);
 
-    // The undo persists: a plain reopen (no stop point) still shows only
-    // row 1 — the losers were rolled back durably via CLRs, not re-derived
-    // from stop_at.
+    // The cut persists: the log past it is gone, so a plain reopen (no stop
+    // point) still shows only row 1.
     let engine3 = Engine::new(RelStorage::open(restored.clone()).expect("reopen")).expect("engine");
     assert_eq!(
         sql_rows(&engine3, "SELECT id FROM t ORDER BY id").1,
@@ -502,7 +518,80 @@ fn point_in_time_restore_stops_at_a_commit_timestamp() {
     );
     drop(engine3);
 
-    for p in [src, bak, restored] {
+    for p in [src, bak, trn, restored] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn point_in_time_restore_refuses_a_stop_point_inside_the_full_backup() {
+    let src = unique_temp_path("pitr-early-src");
+    let bak = unique_temp_path("pitr-early-bak");
+    let restored = unique_temp_path("pitr-early-restored");
+
+    let engine = new_engine(&src);
+    engine
+        .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .expect("create");
+    engine.execute("INSERT INTO t VALUES (1)").expect("ins 1");
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let stop_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    engine.execute("INSERT INTO t VALUES (2)").expect("ins 2");
+    // The full backup's log covers row 2's commit, past the stop point.
+    engine.storage().backup_full(&bak).expect("full backup");
+    drop(engine);
+
+    let err =
+        crate::storage::RelStorage::restore_full_with_logs(&restored, &bak, &[], Some(stop_at))
+            .expect_err("a stop point inside the full backup is refused");
+    assert!(
+        err.to_string().contains("restore an older full backup"),
+        "unexpected error: {err}"
+    );
+    assert!(!restored.exists());
+    for p in [src, bak] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
+fn point_in_time_restore_refuses_a_stop_point_before_a_checkpointed_backup() {
+    let src = unique_temp_path("pitr-ckpt-src");
+    let bak = unique_temp_path("pitr-ckpt-bak");
+    let restored = unique_temp_path("pitr-ckpt-restored");
+
+    let engine = new_engine(&src);
+    engine
+        .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .expect("create");
+    engine.execute("INSERT INTO t VALUES (1)").expect("ins 1");
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let stop_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    engine.execute("INSERT INTO t VALUES (2)").expect("ins 2");
+    // The checkpoint moves the backup's log start past both commits: the
+    // backup's own log holds no commit past the stop time, yet its page
+    // images hold row 2.
+    engine.checkpoint().expect("checkpoint");
+    engine.storage().backup_full(&bak).expect("full backup");
+    drop(engine);
+
+    let err =
+        crate::storage::RelStorage::restore_full_with_logs(&restored, &bak, &[], Some(stop_at))
+            .expect_err("a stop time before the backup began is refused");
+    assert!(
+        err.to_string().contains("restore an older full backup"),
+        "unexpected error: {err}"
+    );
+    assert!(!restored.exists());
+    for p in [src, bak] {
         let _ = std::fs::remove_file(p);
     }
 }

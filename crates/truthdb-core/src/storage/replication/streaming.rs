@@ -358,17 +358,14 @@ impl Locked {
         // allocate scratch space over replicated pages. (Safe to do before the
         // fallible redo: on failure the extra marked-used extents are merely
         // conservative, and the re-apply re-marks them idempotently.)
-        for (_, record) in &records {
-            match record.kind {
-                REL_KIND_ALLOC_EXTENT => {
-                    let (start, pages) = record.decode_extent_redo()?;
-                    self.core.allocator.mark_used(start, pages);
-                }
-                REL_KIND_FREE_EXTENT => {
-                    let (start, pages) = record.decode_extent_redo()?;
-                    self.core.allocator.free(start, pages);
-                }
-                _ => {}
+        // Records below the applied tail were replayed when they first
+        // arrived; replaying a re-shipped overlap again would re-free pages
+        // reallocated since, or leave a stale pending free behind.
+        let core = &mut self.core;
+        for (lsn, record) in &records {
+            if *lsn >= current_tail {
+                core.standby_pending_frees
+                    .replay(&mut core.allocator, record)?;
             }
         }
 

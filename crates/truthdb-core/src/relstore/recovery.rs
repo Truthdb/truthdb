@@ -20,9 +20,10 @@ use crate::relstore::page;
 use crate::relstore::slotted::SlottedRead;
 use crate::storage::StorageError;
 use crate::wal::records::{
-    PageOpRedo, PageOpUndo, REL_KIND_ALLOC_EXTENT, REL_KIND_CLR, REL_KIND_FREE_EXTENT,
-    REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_IMAGES, REL_KIND_PAGE_OP, REL_KIND_SET_CATALOG_ROOT,
-    REL_KIND_SET_ENGINE_ROOT, REL_KIND_TXN_BEGIN, REL_KIND_TXN_COMMIT, REL_KIND_TXN_END, RelRecord,
+    PageOpRedo, PageOpUndo, REL_KIND_ALLOC_EXTENT, REL_KIND_CLR, REL_KIND_CLR_FREE_EXTENT,
+    REL_KIND_FREE_EXTENT, REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_IMAGES, REL_KIND_PAGE_OP,
+    REL_KIND_SET_CATALOG_ROOT, REL_KIND_SET_ENGINE_ROOT, REL_KIND_TXN_BEGIN, REL_KIND_TXN_COMMIT,
+    REL_KIND_TXN_END, RelRecord,
 };
 
 pub(crate) struct AnalysisRedoOutcome {
@@ -37,58 +38,35 @@ pub(crate) struct AnalysisRedoOutcome {
 }
 
 /// Analysis + redo over the recovered records (`(lsn, record)`, log order).
-///
-/// `stop_at` drives point-in-time restore. Recovery keeps a log *prefix*: the
-/// first commit (in log order) whose wall-clock timestamp is past `stop_at`
-/// marks the cut, and that commit plus every later or still-uncommitted
-/// transaction is a loser. Redo still repeats ALL history and undo rolls those
-/// losers back with CLRs, so the point-in-time state persists across a later
-/// normal reopen. Cutting by LSN — not by each commit's own timestamp — keeps
-/// the restore internally consistent even when commit timestamps run backwards
-/// across increasing LSN (a non-monotonic clock): a transaction is never kept
-/// while an earlier one it depended on is dropped. `None` recovers to the end of
-/// the log (normal open).
+/// Point-in-time restore has already cut the log (see `open_existing`), so the
+/// records are always a crash-consistent prefix.
 pub(crate) fn analyze_and_redo(
     ctx: &mut RelCtx<'_>,
     records: &[(u64, RelRecord)],
-    stop_at: Option<u64>,
 ) -> Result<AnalysisRedoOutcome, StorageError> {
-    // The point-in-time cut: every transaction committed at or after this LSN is
-    // undone. `u64::MAX` (no stop, or a stop past every commit) keeps them all.
-    let cut_lsn = match stop_at {
-        Some(limit) => first_commit_past(records, limit)?,
-        None => u64::MAX,
-    };
-
     // Analysis: rebuild the active-transaction table.
     let mut att: HashMap<u64, u64> = HashMap::new();
     let mut catalog_root = None;
     let mut engine_roots = HashMap::new();
     let mut max_txn_id = 0u64;
-    // Transactions committed at or past the cut: losers whose later TXN_END must
-    // not clear them from the ATT.
-    let mut forced_losers: std::collections::HashSet<u64> = std::collections::HashSet::new();
     for (lsn, record) in records {
         max_txn_id = max_txn_id.max(record.txn_id);
         match record.kind {
             REL_KIND_TXN_BEGIN => {
                 att.insert(record.txn_id, *lsn);
             }
-            REL_KIND_TXN_COMMIT => {
-                // A commit at or after the point-in-time cut does not count: keep
-                // the txn in the ATT so undo rolls it back.
-                if *lsn >= cut_lsn {
-                    forced_losers.insert(record.txn_id);
-                } else {
-                    att.remove(&record.txn_id);
-                }
+            REL_KIND_TXN_COMMIT | REL_KIND_TXN_END => {
+                att.remove(&record.txn_id);
             }
-            REL_KIND_TXN_END => {
-                if !forced_losers.contains(&record.txn_id) {
-                    att.remove(&record.txn_id);
-                }
-            }
-            REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE | REL_KIND_PAGE_IMAGES | REL_KIND_CLR => {
+            REL_KIND_PAGE_OP
+            | REL_KIND_PAGE_IMAGE
+            | REL_KIND_PAGE_IMAGES
+            | REL_KIND_CLR
+            | REL_KIND_CLR_FREE_EXTENT
+            | REL_KIND_ALLOC_EXTENT
+            | REL_KIND_FREE_EXTENT => {
+                // Extent records with a transaction belong to its chain; the
+                // plain (txn 0) ones are allocator bookkeeping only.
                 if record.txn_id != 0 {
                     att.insert(record.txn_id, *lsn);
                 }
@@ -100,7 +78,6 @@ pub(crate) fn analyze_and_redo(
                 let (engine_id, root) = record.decode_engine_root()?;
                 engine_roots.insert(engine_id, root);
             }
-            REL_KIND_ALLOC_EXTENT | REL_KIND_FREE_EXTENT => {}
             other => {
                 return Err(StorageError::InvalidFile(format!(
                     "unknown rel record kind {other} during analysis"
@@ -157,12 +134,19 @@ pub(crate) fn redo_records(
     Ok(())
 }
 
-/// The LSN of the first commit record (lowest LSN) whose wall-clock timestamp is
-/// strictly past `limit`, or `u64::MAX` when none is. Errors if any commit record
+/// The point-in-time cut: the LSN of the first commit record (lowest LSN) whose
+/// wall-clock timestamp is strictly past `limit`, or `u64::MAX` when none is.
+/// Cutting by LSN — not by each commit's own timestamp — keeps the restore
+/// internally consistent even when commit timestamps run backwards across
+/// increasing LSN (a non-monotonic clock): a transaction is never kept while an
+/// earlier one it depended on is dropped. Errors if any commit record
 /// carries no timestamp (a pre-timestamp WAL entry): point-in-time restore cannot
 /// place such a commit relative to the stop point, and silently treating it as a
 /// winner would keep post-stop data.
-fn first_commit_past(records: &[(u64, RelRecord)], limit: u64) -> Result<u64, StorageError> {
+pub(crate) fn first_commit_past(
+    records: &[(u64, RelRecord)],
+    limit: u64,
+) -> Result<u64, StorageError> {
     let mut cut = u64::MAX;
     for (lsn, record) in records {
         if record.kind != REL_KIND_TXN_COMMIT {
@@ -277,6 +261,7 @@ pub(crate) fn undo_losers(
                         txn_id,
                         last_lsn,
                         undo_log: Vec::new(),
+                        pending_frees: Vec::new(),
                     },
                 ),
             )
@@ -300,7 +285,8 @@ pub(crate) fn undo_losers(
         })?;
         let next_cursor = match record.kind {
             REL_KIND_CLR => record.decode_clr()?.0,
-            REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE => {
+            REL_KIND_CLR_FREE_EXTENT => record.decode_clr_free_extent()?.0,
+            REL_KIND_PAGE_OP | REL_KIND_PAGE_IMAGE | REL_KIND_ALLOC_EXTENT => {
                 let undo = record.decode_page_op_undo()?;
                 let (_, link) = active.get_mut(&txn_id).expect("active loser");
                 undo_one(ctx, link, &undo, cursor, record.prev_lsn, logical)?;
@@ -341,7 +327,7 @@ pub(crate) fn undo_one(
         // (textbook ARIES): a re-run resumes at `record_prev` and can never
         // revisit it.
         let undo_next = match undo {
-            PageOpUndo::CounterAdd { .. } => record_prev,
+            PageOpUndo::CounterAdd { .. } | PageOpUndo::FreeExtent { .. } => record_prev,
             _ => record_lsn,
         };
         let mut mode = OpMode::Clr {
@@ -367,6 +353,23 @@ pub(crate) fn undo_one(
                         delta: *delta,
                     },
                 )?;
+            }
+            PageOpUndo::FreeExtent {
+                start_page,
+                num_pages,
+            } => {
+                // Like the counter: one record that frees AND moves the cursor
+                // past the allocation, so a crash can never free it twice
+                // (the second free could take back pages reallocated since).
+                let clr = RelRecord::clr_free_extent(
+                    link.txn_id,
+                    link.last_lsn,
+                    undo_next,
+                    *start_page,
+                    *num_pages,
+                );
+                link.last_lsn = ctx.append(&clr, false)?;
+                ctx.allocator.free(*start_page, *num_pages);
             }
             PageOpUndo::HeapDeleteSlot { page, slot } => {
                 if heap_slot_occupied(ctx, *page, *slot)? {
@@ -422,6 +425,15 @@ pub fn rollback_to(
     savepoint: crate::relstore::ctx::Savepoint,
     logical: &dyn LogicalUndo,
 ) -> Result<(), StorageError> {
+    // A free logged after the savepoint has no compensation record that a
+    // restart replay would honour: the free would still land at commit.
+    if txn.pending_frees.len() > savepoint.pending_frees_len {
+        return Err(StorageError::InvalidConfig(
+            "cannot roll back to a savepoint taken before an extent free; roll back the \
+             whole transaction"
+                .to_string(),
+        ));
+    }
     ctx.use_reserve = true;
     // Detach the suffix (work done after the savepoint) and undo it tail-first.
     let suffix: Vec<(u64, PageOpUndo)> = txn.undo_log.split_off(savepoint.undo_len);

@@ -376,6 +376,32 @@ pub(crate) struct ScanResult {
     pub tail: u64,
 }
 
+/// Zeroes the ring bytes `[from, to)` (logical LSNs, lap-aware), so a
+/// forward scan stops at `from`: an all-zero header reads as a wrap gap, and
+/// the bytes after it are zero too (on every lap the range touches), so the
+/// scan ends at `from`. Point-in-time restore cuts the log this way.
+pub(crate) fn zero_ring_range(
+    file: &mut DirectFile,
+    ring_offset: u64,
+    ring_size: u64,
+    from: u64,
+    to: u64,
+) -> Result<(), StorageError> {
+    debug_assert!(ring_size.is_multiple_of(PAGE_SIZE as u64));
+    let mut page_start = from - from % PAGE_SIZE as u64;
+    while page_start < to {
+        let file_offset = ring_offset + page_start % ring_size;
+        let mut page = AlignedPageBuf::new();
+        file.read_page_into(file_offset, &mut page)?;
+        let zero_from = from.saturating_sub(page_start) as usize;
+        let zero_to = (to - page_start).min(PAGE_SIZE as u64) as usize;
+        page.as_mut_slice()[zero_from..zero_to].fill(0);
+        file.write_page_from(file_offset, &page)?;
+        page_start += PAGE_SIZE as u64;
+    }
+    Ok(())
+}
+
 /// Scans the ring from `head`, collecting valid entries.
 ///
 /// Entries starting before `trusted_tail` (the superblock's recorded tail)

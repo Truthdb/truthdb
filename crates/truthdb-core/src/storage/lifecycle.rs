@@ -212,20 +212,7 @@ impl Storage {
 
     pub fn open(path: PathBuf, engine: EngineFactory) -> Result<Self, StorageError> {
         assert_layout_invariants();
-        let file = StorageFile::open_existing(path.clone(), None, engine())?;
-        Self::with_log_writer(path, file)
-    }
-
-    /// Opens with recovery stopped at a point in time: transactions whose commit
-    /// timestamp is past `stop_at` are undone (point-in-time restore). Used by
-    /// the restore path to validate + finalize a `--stopat` recovery.
-    pub(super) fn open_with_stop_at(
-        path: PathBuf,
-        stop_at: u64,
-        engine: EngineFactory,
-    ) -> Result<Self, StorageError> {
-        assert_layout_invariants();
-        let file = StorageFile::open_existing(path.clone(), Some(stop_at), engine())?;
+        let file = StorageFile::open_existing(path.clone(), engine())?;
         Self::with_log_writer(path, file)
     }
 
@@ -377,7 +364,6 @@ impl StorageFile {
 
     pub(super) fn open_existing(
         path: PathBuf,
-        stop_at: Option<u64>,
         mut engines: Vec<Box<dyn EngineParticipant>>,
     ) -> Result<Locked, StorageError> {
         validate_engines(&engines)?;
@@ -511,6 +497,7 @@ impl StorageFile {
             allocator: PageAllocator::new(layout.data_size),
             pages: PageState::new(DEFAULT_CAPACITY_BYTES),
             replay_cache: scan.records,
+            standby_pending_frees: Default::default(),
         };
         let mut storage = Locked { core, engines };
         // Re-establish the FULL-model log-backup hold so a checkpoint cannot
@@ -587,7 +574,7 @@ impl StorageFile {
         // recovery — which for a standby is redo-only and never appends, so
         // this blocks only later local writes.
         storage.wal.set_read_only(redo_only);
-        storage.recover(stop_at, redo_only)?;
+        storage.recover(redo_only)?;
         Ok(storage)
     }
 
@@ -598,7 +585,7 @@ impl StorageFile {
         wal_max_bytes: u64,
     ) -> Result<Self, StorageError> {
         let layout = compute_layout(opts.clone(), wal_min_bytes, wal_max_bytes)?;
-        Self::create_from_layout(path, layout, opts.default_collation)
+        Self::create_from_layout(path, layout, opts.default_collation, true)
     }
 
     /// Creates a fresh file with an explicit layout. The restore path
@@ -606,10 +593,15 @@ impl StorageFile {
     /// rather than recomputing them from ratios, so it lays regions back
     /// byte-for-byte. Mirrors [`Self::create_new`] from
     /// `validate_allocator_region` onward.
+    /// Creates a fresh file. With `openable` false (a restore in progress) its
+    /// superblocks are written as zeros, failing their checksums, so the file
+    /// does not open until the restore writes the restored ones: a crash
+    /// mid-restore never leaves a database that opens.
     pub(super) fn create_from_layout(
         path: PathBuf,
         layout: StorageLayout,
         default_collation: Option<String>,
+        openable: bool,
     ) -> Result<Self, StorageError> {
         validate_allocator_region(&layout)?;
         let mut header = FileHeader::default();
@@ -642,17 +634,18 @@ impl StorageFile {
         let mut superblock_b = Superblock::default();
         superblock_b.active = SUPERBLOCK_ACTIVE_B;
         superblock_b.checksum = superblock_b.compute_checksum();
+        let superblock_bytes = |sb: Superblock| {
+            if openable {
+                sb.to_le_bytes_with_checksum()
+            } else {
+                [0u8; crate::storage_layout::SUPERBLOCK_SIZE]
+            }
+        };
 
         let mut file = DirectFile::create_new(path.clone(), layout.total_size)?;
         file.write_all_at(layout.header_offset, &header.to_le_bytes_with_checksum())?;
-        file.write_all_at(
-            layout.superblock_a_offset,
-            &superblock_a.to_le_bytes_with_checksum(),
-        )?;
-        file.write_all_at(
-            layout.superblock_b_offset,
-            &superblock_b.to_le_bytes_with_checksum(),
-        )?;
+        file.write_all_at(layout.superblock_a_offset, &superblock_bytes(superblock_a))?;
+        file.write_all_at(layout.superblock_b_offset, &superblock_bytes(superblock_b))?;
         file.sync_data()?;
 
         let log_file = DirectFile::open_existing_unlocked(path.clone())?;
@@ -677,6 +670,7 @@ impl StorageFile {
             allocator: PageAllocator::new(layout.data_size),
             pages: PageState::new(DEFAULT_CAPACITY_BYTES),
             replay_cache: Vec::new(),
+            standby_pending_frees: Default::default(),
         })
     }
 

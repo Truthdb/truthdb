@@ -433,8 +433,10 @@ impl Storage {
 
     /// Offline restore of a full backup followed by an ordered chain of
     /// `BACKUP LOG` archives. Recovers to the end of the last log, or — when
-    /// `stop_at` is set — to that wall-clock point in time (transactions that
-    /// committed past it are undone). Each archive must continue from where the
+    /// `stop_at` is set — to that wall-clock point in time: the log ends just
+    /// before the first commit past it, as if the database had crashed there.
+    /// The stop point must lie after the full backup finished (see
+    /// `cut_restored_log`). Each archive must continue from where the
     /// previous coverage ended (no gap, error 4305); the whole recoverable range
     /// must fit in the WAL ring (a longer chain needs incremental restore, not
     /// yet supported).
@@ -514,6 +516,7 @@ impl Storage {
             dst_path.to_path_buf(),
             layout,
             header.default_collation.clone(),
+            false,
         )?;
         // The destination now exists and is ours: remove the partial file if any
         // later step fails, so a retry (which requires a fresh destination) can
@@ -594,6 +597,9 @@ impl Storage {
             Some((start_lsn, bytes)) => file.seed_ring(*start_lsn, bytes)?,
             None => header.redo_start_lsn,
         };
+        // The full backup's page images and allocation map can hold changes
+        // from anywhere up to here: the earliest point it can be restored to.
+        let full_backup_end = tail;
         // Apply the log chain in order, extending the seeded ring past the full
         // backup's end. Each archive continues from the current coverage (no
         // gap) and the whole range must fit the ring.
@@ -617,6 +623,20 @@ impl Storage {
                 &mut tail,
             )?;
         }
+        if let Some(limit) = stop_at {
+            tail = file.cut_restored_log(
+                header.redo_start_lsn,
+                tail,
+                full_backup_end,
+                header.finished_at_millis,
+                limit,
+            )?;
+        }
+        #[cfg(test)]
+        if CRASH_RESTORE_BEFORE_SUPERBLOCK.with(|crash| crash.replace(false)) {
+            // Test hook: stop here like a crash would, leaving the file behind.
+            return Ok(());
+        }
         // The restored superblock brackets the ring at `[redo_start, tail)`; the
         // log-backup floor is the end of the applied chain (a fresh chain). A
         // standby seed is stamped BEFORE the validating open, so that open is
@@ -626,17 +646,92 @@ impl Storage {
         drop(file);
 
         // Validate + finalize: opening reruns allocator recovery + ARIES
-        // relational recovery over the seeded ring. For a point-in-time restore,
-        // recovery stops at `stop_at`, undoing later transactions with CLRs that
-        // persist the point-in-time state across a normal reopen (their undo is
-        // replayed and each undone txn is sealed with a TXN_END). Failing loudly
-        // if the restored file is not recoverable.
-        let storage = match stop_at {
-            Some(ts) => Storage::open_with_stop_at(dst_path.to_path_buf(), ts, engine)?,
-            None => Storage::open(dst_path.to_path_buf(), engine)?,
-        };
-        drop(storage);
+        // relational recovery over the seeded ring (for a point-in-time restore,
+        // the ring already ends at the cut, and restart undo rolls back the
+        // transactions still open there). Failing loudly if the restored file is
+        // not recoverable.
+        drop(Storage::open(dst_path.to_path_buf(), engine)?);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test fault injection: the next restore stops just before writing the
+    /// restored superblock and returns `Ok`, leaving the file as a crash would.
+    pub(crate) static CRASH_RESTORE_BEFORE_SUPERBLOCK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
+impl StorageFile {
+    /// Point-in-time restore: ends the restored log `[redo_start, tail)` just
+    /// before the first commit whose timestamp is past `stop_at`, exactly as if
+    /// the database had crashed there, and returns the new tail. Everything
+    /// from the cut on is zeroed out of the ring, so neither redo nor any later
+    /// open sees it; the open that follows rolls back the transactions still
+    /// open at the cut.
+    ///
+    /// A log prefix is only a crash state of the restored pages if it reaches
+    /// past every change those pages already hold. The full backup's page
+    /// images and allocation map carry every commit made before the backup
+    /// began (`backup_started_at`, the header's `finished_at_millis`, taken
+    /// at its start) and can carry changes up to its end (`full_backup_end`),
+    /// so a stop time before the start, or a cut before the end, is refused.
+    /// Runs before the restored superblock exists (the fresh file's are
+    /// invalid), so a crash here leaves a file that does not open.
+    fn cut_restored_log(
+        &mut self,
+        redo_start: u64,
+        tail: u64,
+        full_backup_end: u64,
+        backup_started_at: u64,
+        stop_at: u64,
+    ) -> Result<u64, StorageError> {
+        let refuse = |reason: String| {
+            StorageError::InvalidConfig(format!(
+                "cannot stop at {stop_at} ms with this full backup: {reason}; restore an older \
+                 full backup with its log backups, or choose a later stop time"
+            ))
+        };
+        if stop_at < backup_started_at {
+            return Err(refuse(format!(
+                "the backup began later, at {backup_started_at} ms"
+            )));
+        }
+        let scan = scan_ring(
+            &mut self.file,
+            self.layout.wal_offset,
+            self.layout.wal_size,
+            redo_start,
+            tail,
+        )?;
+        let records: Vec<(u64, RelRecord)> = scan
+            .records
+            .iter()
+            .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
+            .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
+            .collect::<Result<_, StorageError>>()?;
+        let cut = rel_recovery::first_commit_past(&records, stop_at)?;
+        if cut >= tail {
+            return Ok(tail);
+        }
+        if cut < full_backup_end {
+            return Err(refuse(format!(
+                "the backup already holds a later commit (at LSN {cut}; its log ends at LSN \
+                 {full_backup_end})"
+            )));
+        }
+        crate::wal::zero_ring_range(
+            &mut self.file,
+            self.layout.wal_offset,
+            self.layout.wal_size,
+            cut,
+            tail,
+        )?;
+        // Durable before the superblock that trusts the log only up to `cut`:
+        // past it, surviving old bytes would still pass the scan's checks.
+        self.file.sync_data()?;
+        Ok(cut)
     }
 }
 
