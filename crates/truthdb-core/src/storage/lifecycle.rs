@@ -585,7 +585,7 @@ impl StorageFile {
         wal_max_bytes: u64,
     ) -> Result<Self, StorageError> {
         let layout = compute_layout(opts.clone(), wal_min_bytes, wal_max_bytes)?;
-        Self::create_from_layout(path, layout, opts.default_collation)
+        Self::create_from_layout(path, layout, opts.default_collation, true)
     }
 
     /// Creates a fresh file with an explicit layout. The restore path
@@ -593,10 +593,15 @@ impl StorageFile {
     /// rather than recomputing them from ratios, so it lays regions back
     /// byte-for-byte. Mirrors [`Self::create_new`] from
     /// `validate_allocator_region` onward.
+    /// Creates a fresh file. With `openable` false (a restore in progress) its
+    /// superblocks are written as zeros, failing their checksums, so the file
+    /// does not open until the restore writes the restored ones: a crash
+    /// mid-restore never leaves a database that opens.
     pub(super) fn create_from_layout(
         path: PathBuf,
         layout: StorageLayout,
         default_collation: Option<String>,
+        openable: bool,
     ) -> Result<Self, StorageError> {
         validate_allocator_region(&layout)?;
         let mut header = FileHeader::default();
@@ -629,17 +634,18 @@ impl StorageFile {
         let mut superblock_b = Superblock::default();
         superblock_b.active = SUPERBLOCK_ACTIVE_B;
         superblock_b.checksum = superblock_b.compute_checksum();
+        let superblock_bytes = |sb: Superblock| {
+            if openable {
+                sb.to_le_bytes_with_checksum()
+            } else {
+                [0u8; crate::storage_layout::SUPERBLOCK_SIZE]
+            }
+        };
 
         let mut file = DirectFile::create_new(path.clone(), layout.total_size)?;
         file.write_all_at(layout.header_offset, &header.to_le_bytes_with_checksum())?;
-        file.write_all_at(
-            layout.superblock_a_offset,
-            &superblock_a.to_le_bytes_with_checksum(),
-        )?;
-        file.write_all_at(
-            layout.superblock_b_offset,
-            &superblock_b.to_le_bytes_with_checksum(),
-        )?;
+        file.write_all_at(layout.superblock_a_offset, &superblock_bytes(superblock_a))?;
+        file.write_all_at(layout.superblock_b_offset, &superblock_bytes(superblock_b))?;
         file.sync_data()?;
 
         let log_file = DirectFile::open_existing_unlocked(path.clone())?;
@@ -677,18 +683,6 @@ impl StorageFile {
     }
 
     /// Fsyncs the restored file's data handle.
-    /// Overwrites both superblocks with zeros (failing their checksums), so the
-    /// file does not open until valid ones are written.
-    pub(super) fn void_superblocks(&mut self) -> Result<(), StorageError> {
-        let zeros = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
-        self.file
-            .write_all_at(self.layout.superblock_a_offset, &zeros)?;
-        self.file
-            .write_all_at(self.layout.superblock_b_offset, &zeros)?;
-        self.file.sync_data()?;
-        Ok(())
-    }
-
     pub(super) fn sync_file(&mut self) -> Result<(), StorageError> {
         self.file.sync_data()?;
         Ok(())

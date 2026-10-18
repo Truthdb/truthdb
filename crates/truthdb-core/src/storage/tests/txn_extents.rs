@@ -326,7 +326,7 @@ fn a_stop_point_inside_the_full_backup_is_refused() {
 
     let err = restore_at(&dst, &bak, &log, stop_at).expect_err("refused");
     assert!(
-        err.to_string().contains("before the full backup finished"),
+        err.to_string().contains("restore an older full backup"),
         "unexpected error: {err}"
     );
     assert!(!dst.exists(), "the refused restore leaves no file behind");

@@ -69,7 +69,8 @@ enum Command {
         /// Point-in-time restore: stop recovery at this wall-clock time
         /// (milliseconds since the Unix epoch). The log ends just before the
         /// first commit after it, as if the database had crashed there. The
-        /// time must fall after the full backup finished.
+        /// time must not fall before the full backup began, nor before any
+        /// commit the full backup's own log carries.
         #[arg(long = "stopat")]
         stopat: Option<u64>,
         /// Restore as a replication STANDBY seed: recovery repeats history

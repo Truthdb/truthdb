@@ -516,6 +516,7 @@ impl Storage {
             dst_path.to_path_buf(),
             layout,
             header.default_collation.clone(),
+            false,
         )?;
         // The destination now exists and is ours: remove the partial file if any
         // later step fails, so a retry (which requires a fresh destination) can
@@ -546,10 +547,6 @@ impl Storage {
         engine: EngineFactory,
     ) -> Result<(), StorageError> {
         use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
-        // The fresh file's valid empty superblocks would let a crash mid-restore
-        // open a half-restored file (with the log seeded but not yet cut). Void
-        // them: the file opens only once `restore_superblock` lands.
-        file.void_superblocks()?;
         let data_pages = header.data_size / PAGE_SIZE as u64;
         let mut runs: Vec<(u64, u64)> = Vec::new();
         let mut log: Option<(u64, Vec<u8>)> = None;
@@ -681,7 +678,7 @@ impl StorageFile {
     /// at its start) and can carry changes up to its end (`full_backup_end`),
     /// so a stop time before the start, or a cut before the end, is refused.
     /// Runs before the restored superblock exists (the fresh file's are
-    /// voided), so a crash here leaves a file that does not open.
+    /// invalid), so a crash here leaves a file that does not open.
     fn cut_restored_log(
         &mut self,
         redo_start: u64,
@@ -690,15 +687,15 @@ impl StorageFile {
         backup_started_at: u64,
         stop_at: u64,
     ) -> Result<u64, StorageError> {
-        let refuse = |detail: String| {
+        let refuse = |reason: String| {
             StorageError::InvalidConfig(format!(
-                "the stop time falls before the full backup finished ({detail}): restore an \
-                 older full backup with its log backups, or choose a later stop time"
+                "cannot stop at {stop_at} ms with this full backup: {reason}; restore an older \
+                 full backup with its log backups, or choose a later stop time"
             ))
         };
         if stop_at < backup_started_at {
             return Err(refuse(format!(
-                "the backup began at {backup_started_at} ms, the stop time is {stop_at} ms"
+                "the backup began later, at {backup_started_at} ms"
             )));
         }
         let scan = scan_ring(
@@ -720,8 +717,8 @@ impl StorageFile {
         }
         if cut < full_backup_end {
             return Err(refuse(format!(
-                "its log ends at LSN {full_backup_end}, the first commit past the stop time is \
-                 at LSN {cut}"
+                "the backup already holds a later commit (at LSN {cut}; its log ends at LSN \
+                 {full_backup_end})"
             )));
         }
         crate::wal::zero_ring_range(

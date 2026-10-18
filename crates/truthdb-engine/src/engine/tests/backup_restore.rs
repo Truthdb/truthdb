@@ -549,7 +549,7 @@ fn point_in_time_restore_refuses_a_stop_point_inside_the_full_backup() {
         crate::storage::RelStorage::restore_full_with_logs(&restored, &bak, &[], Some(stop_at))
             .expect_err("a stop point inside the full backup is refused");
     assert!(
-        err.to_string().contains("before the full backup finished"),
+        err.to_string().contains("restore an older full backup"),
         "unexpected error: {err}"
     );
     assert!(!restored.exists());
@@ -587,7 +587,7 @@ fn point_in_time_restore_refuses_a_stop_point_before_a_checkpointed_backup() {
         crate::storage::RelStorage::restore_full_with_logs(&restored, &bak, &[], Some(stop_at))
             .expect_err("a stop time before the backup began is refused");
     assert!(
-        err.to_string().contains("before the full backup finished"),
+        err.to_string().contains("restore an older full backup"),
         "unexpected error: {err}"
     );
     assert!(!restored.exists());
