@@ -4,6 +4,7 @@
 
 use bytes::Bytes;
 use hyper::body::Incoming;
+use hyper::header::HeaderMap;
 use hyper::{Request, Response, StatusCode};
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -54,8 +55,18 @@ fn validate(tags: &[(String, String)]) -> Result<(), S3Error> {
     Ok(())
 }
 
+/// The tags of an `x-amz-tagging` header, if any.
+pub fn tags_from(headers: &HeaderMap) -> Result<Vec<(String, String)>, S3Error> {
+    match headers.get("x-amz-tagging") {
+        None => Ok(Vec::new()),
+        Some(value) => tags_from_header(value.to_str().map_err(|_| {
+            invalid_tag("The header 'x-amz-tagging' shall be encoded as UTF-8 then URLEncoded URL query parameters without tag name duplicates.")
+        })?),
+    }
+}
+
 /// The `x-amz-tagging` header: URL query form, `key1=value1&key2=value2`.
-pub fn tags_from_header(value: &str) -> Result<Vec<(String, String)>, S3Error> {
+fn tags_from_header(value: &str) -> Result<Vec<(String, String)>, S3Error> {
     let decode = |text: &str| {
         percent_encoding::percent_decode_str(&text.replace('+', " "))
             .decode_utf8()
@@ -74,7 +85,8 @@ pub fn tags_from_header(value: &str) -> Result<Vec<(String, String)>, S3Error> {
     Ok(tags)
 }
 
-/// The tag set of a PutObjectTagging body.
+/// The tag set of a PutObjectTagging body: one `<Tagging>` holding one
+/// `<TagSet>` of `<Tag>`s, each with one `<Key>` and one `<Value>`.
 fn parse_tagging(body: &[u8]) -> Result<Vec<(String, String)>, S3Error> {
     let malformed = || {
         S3Error::new(
@@ -85,57 +97,76 @@ fn parse_tagging(body: &[u8]) -> Result<Vec<(String, String)>, S3Error> {
     };
     let mut reader = Reader::from_reader(body);
     let mut path: Vec<Vec<u8>> = Vec::new();
+    let (mut seen_root, mut seen_tag_set) = (false, false);
     let (mut key, mut value): (Option<String>, Option<String>) = (None, None);
     let mut tags = Vec::new();
     let mut buf = Vec::new();
     loop {
-        match reader.read_event_into(&mut buf).map_err(|_| malformed())? {
-            Event::Start(element) => {
-                path.push(element.local_name().as_ref().to_vec());
-                if path.last().map(Vec::as_slice) == Some(b"Tag") {
+        let event = reader.read_event_into(&mut buf).map_err(|_| malformed())?;
+        // An empty element is its start and its end.
+        let (start, end) = match &event {
+            Event::Start(element) => (Some(element.local_name().as_ref().to_vec()), None),
+            Event::Empty(element) => {
+                let name = element.local_name().as_ref().to_vec();
+                (Some(name.clone()), Some(name))
+            }
+            Event::End(element) => (None, Some(element.local_name().as_ref().to_vec())),
+            _ => (None, None),
+        };
+        if let Some(name) = start {
+            let parent = path.last().map(Vec::as_slice);
+            let allowed = match (parent, name.as_slice()) {
+                (None, b"Tagging") => !std::mem::replace(&mut seen_root, true),
+                (Some(b"Tagging"), b"TagSet") => !std::mem::replace(&mut seen_tag_set, true),
+                (Some(b"TagSet"), b"Tag") => {
                     (key, value) = (None, None);
+                    true
                 }
+                (Some(b"Tag"), b"Key") => key.replace(String::new()).is_none(),
+                (Some(b"Tag"), b"Value") => value.replace(String::new()).is_none(),
+                _ => false,
+            };
+            if !allowed {
+                return Err(malformed());
             }
-            Event::End(element) => {
-                match element.local_name().as_ref() {
-                    b"Tag" => tags.push((
-                        key.take().ok_or_else(malformed)?,
-                        value.take().unwrap_or_default(),
-                    )),
-                    // `<Key></Key>` and `<Value></Value>` carry no text event.
-                    b"Key" => key = Some(key.take().unwrap_or_default()),
-                    b"Value" => value = Some(value.take().unwrap_or_default()),
-                    _ => {}
-                }
-                path.pop();
+            path.push(name);
+        }
+        if let Some(name) = end {
+            if name == b"Tag" {
+                tags.push((
+                    key.take().ok_or_else(malformed)?,
+                    value.take().ok_or_else(malformed)?,
+                ));
             }
-            Event::Text(text) => {
-                let text = text.unescape().map_err(|_| malformed())?;
-                match path.last().map(Vec::as_slice) {
-                    Some(b"Key") => key.get_or_insert_default().push_str(&text),
-                    Some(b"Value") => value.get_or_insert_default().push_str(&text),
-                    _ => {}
-                }
+            path.pop();
+        }
+        let text = match &event {
+            Event::Text(text) => Some(text.unescape().map_err(|_| malformed())?.into_owned()),
+            Event::CData(text) => Some(
+                std::str::from_utf8(text)
+                    .map_err(|_| malformed())?
+                    .to_string(),
+            ),
+            _ => None,
+        };
+        if let Some(text) = text {
+            match path.last().map(Vec::as_slice) {
+                Some(b"Key") => key.get_or_insert_default().push_str(&text),
+                Some(b"Value") => value.get_or_insert_default().push_str(&text),
+                _ if text.trim().is_empty() => {}
+                _ => return Err(malformed()),
             }
-            Event::Eof if path.is_empty() => break,
-            Event::Eof => return Err(malformed()),
-            _ => {}
+        }
+        if matches!(event, Event::Eof) {
+            if !path.is_empty() || !seen_tag_set {
+                return Err(malformed());
+            }
+            break;
         }
         buf.clear();
     }
     validate(&tags)?;
     Ok(tags)
-}
-
-fn tagging_error(err: ObjectError, bucket: &str, key: &str) -> S3Error {
-    match err {
-        ObjectError::DeleteMarker => S3Error::new(
-            405,
-            "MethodNotAllowed",
-            "The specified method is not allowed against this resource.",
-        ),
-        err => object_error(err, bucket, key),
-    }
 }
 
 fn empty(status: StatusCode) -> Response<Body> {
@@ -160,7 +191,7 @@ pub async fn put_tagging(
         file.transaction(|tx| tx.set_tags(&tag_bucket, &tag_key, which, tags))
     })
     .await?
-    .map_err(|err| tagging_error(err, &bucket, &key))?;
+    .map_err(|err| object_error(err, &bucket, &key))?;
     Ok(empty(StatusCode::OK))
 }
 
@@ -176,7 +207,7 @@ pub async fn delete_tagging(
         file.transaction(|tx| tx.set_tags(&tag_bucket, &tag_key, which, Vec::new()))
     })
     .await?
-    .map_err(|err| tagging_error(err, &bucket, &key))?;
+    .map_err(|err| object_error(err, &bucket, &key))?;
     Ok(empty(StatusCode::NO_CONTENT))
 }
 
@@ -192,9 +223,9 @@ pub async fn get_tagging(
         file.head_object(&tag_bucket, &tag_key, which)
     })
     .await?
-    .map_err(|err| tagging_error(err, &bucket, &key))?;
+    .map_err(|err| object_error(err, &bucket, &key))?;
     if info.delete_marker {
-        return Err(tagging_error(ObjectError::DeleteMarker, &bucket, &key));
+        return Err(object_error(ObjectError::DeleteMarker, &bucket, &key));
     }
     let tags: String = info
         .attrs
@@ -251,9 +282,26 @@ mod tests {
             parse_tagging(b"<Tagging><TagSet></TagSet></Tagging>").unwrap(),
             []
         );
+        assert_eq!(
+            parse_tagging(
+                b"<Tagging><TagSet><Tag><Key><![CDATA[x&y]]></Key><Value/></Tag></TagSet></Tagging>"
+            )
+            .unwrap(),
+            [("x&y".to_string(), String::new())]
+        );
+        assert_eq!(parse_tagging(b"<Tagging><TagSet/></Tagging>").unwrap(), []);
         for bad in [
             &b"<Tagging><TagSet><Tag><Value>1</Value></Tag></TagSet></Tagging>"[..],
+            b"<Tagging><TagSet><Tag><Key>k</Key></Tag></TagSet></Tagging>",
             b"<Tagging><TagSet>",
+            b"",
+            b"hello",
+            b"<Tagging/>",
+            b"<Foo></Foo>",
+            b"<Tagging><TagSet><Tag><Key>a</Key><Key>b</Key><Value>1</Value></Tag></TagSet></Tagging>",
+            b"<Tagging><TagSet><Tag><Key>a</Key><Value>1</Value></Tag><Key>z</Key></TagSet></Tagging>",
+            b"<Tagging><TagSet></TagSet></Tagging><Tagging><TagSet></TagSet></Tagging>",
+            b"<Tagging><TagSet>text</TagSet></Tagging>",
         ] {
             assert_eq!(parse_tagging(bad).unwrap_err().code, "MalformedXML");
         }

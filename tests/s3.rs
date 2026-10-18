@@ -1001,9 +1001,16 @@ fn objects_are_tagged_at_put_and_by_the_tagging_api() {
     );
     assert_eq!(status, 400, "{xml}");
     assert!(xml.contains("InvalidTag"), "{xml}");
-    let (status, xml) = set("<Tagging><TagSet>");
-    assert_eq!(status, 400, "{xml}");
-    assert!(xml.contains("MalformedXML"), "{xml}");
+    for bad in ["<Tagging><TagSet>", "", "<Foo/>"] {
+        let (status, xml) = set(bad);
+        assert_eq!(status, 400, "{xml}");
+        assert!(xml.contains("MalformedXML"), "{xml}");
+    }
+    let (_, (_, xml)) = call("GET", "/tagged/obj", "tagging", &[], b"");
+    assert!(
+        xml.contains("<Key>k&amp;1</Key>"),
+        "a refused body keeps the tags: {xml}"
+    );
     let (status, xml) = call(
         "PUT",
         "/tagged/none",

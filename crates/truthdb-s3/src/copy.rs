@@ -14,8 +14,8 @@ use crate::error::{S3Error, escape};
 use crate::listing::query_params;
 use crate::multipart::{check_upload, part_number, upload_error, upload_id, xml};
 use crate::objects::{
-    DROP_GRACE_MS, MAX_PUT_BYTES, attrs_from, header, now_ms, object, object_error, precondition,
-    version_sel,
+    DROP_GRACE_MS, MAX_PUT_BYTES, header, metadata_from, now_ms, object, object_error,
+    precondition, version_sel,
 };
 use crate::server::Body;
 use crate::server::S3State;
@@ -99,10 +99,16 @@ pub async fn copy_object(
     let (src_bucket, src_key, which) = copy_source(&headers)?;
     let replace = replaces(&headers, "x-amz-metadata-directive", "metadata")?;
     let replace_tags = replaces(&headers, "x-amz-tagging-directive", "tagging")?;
-    let new_attrs = if replace || replace_tags {
-        attrs_from(&headers)?
+    // Only what a directive replaces is read from the request.
+    let new_metadata = if replace {
+        metadata_from(&headers)?
     } else {
         Default::default()
+    };
+    let new_tags = if replace_tags {
+        crate::tagging::tags_from(&headers)?
+    } else {
+        Vec::new()
     };
     let (dst_bucket, dst_key) = (bucket, key);
     // Resolve and copy in one lock hold: the source cannot change between.
@@ -122,12 +128,12 @@ pub async fn copy_object(
             }
         }
         let mut attrs = if replace {
-            new_attrs.clone()
+            new_metadata
         } else {
             source.attrs.clone()
         };
         attrs.tags = if replace_tags {
-            new_attrs.tags
+            new_tags
         } else {
             source.attrs.tags.clone()
         };

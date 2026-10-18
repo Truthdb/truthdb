@@ -86,6 +86,14 @@ pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {
 
 /// The system headers, user metadata and tags a PUT stores.
 pub fn attrs_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
+    Ok(ObjectAttrs {
+        tags: crate::tagging::tags_from(headers)?,
+        ..metadata_from(headers)?
+    })
+}
+
+/// The system headers and user metadata a PUT stores (no tags).
+pub fn metadata_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
     let mut user = Vec::new();
     let mut user_bytes = 0;
     for (name, value) in headers {
@@ -123,10 +131,7 @@ pub fn attrs_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
         content_language: header(headers, "content-language"),
         expires: header(headers, "expires"),
         user,
-        tags: match header(headers, "x-amz-tagging") {
-            Some(value) => crate::tagging::tags_from_header(&value)?,
-            None => Vec::new(),
-        },
+        tags: Vec::new(),
     })
 }
 
