@@ -1,0 +1,12 @@
+[package]
+name = "truthdb-object"
+version = "0.1.0"
+edition = "2024"
+description = "TruthDB object engine: buckets, versioned objects and their bodies over the shared log."
+
+[dependencies]
+truthdb-core = { workspace = true }
+md-5 = "0.10.6"
+
+[dev-dependencies]
+truthdb-core = { workspace = true, features = ["test-hooks"] }
