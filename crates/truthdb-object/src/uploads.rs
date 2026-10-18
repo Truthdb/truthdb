@@ -410,6 +410,31 @@ impl ObjFile<'_> {
             .transpose()
     }
 
+    /// Up to `max` uploads started before `before_ms`, oldest first. Upload
+    /// ids grow with time, so the scan stops at the first younger one.
+    pub fn expired_uploads(
+        &mut self,
+        before_ms: u64,
+        max: usize,
+    ) -> Result<Vec<u64>, StorageError> {
+        let Some(uploads) = self.existing_tree(UPLOADS_TREE)? else {
+            return Ok(Vec::new());
+        };
+        let mut expired = Vec::new();
+        for (key, row) in uploads.scan_range_limit(&mut self.core.page_ctx(0), None, None, max)? {
+            let upload = u64::from_be_bytes(
+                key.as_slice()
+                    .try_into()
+                    .map_err(|_| corrupt("upload key"))?,
+            );
+            if decode_upload(upload, &row)?.initiated_ms >= before_ms {
+                break;
+            }
+            expired.push(upload);
+        }
+        Ok(expired)
+    }
+
     /// Up to `max` parts of `upload` numbered after `after`, and whether more
     /// follow.
     pub fn list_parts(
