@@ -193,7 +193,7 @@ fn a_dropped_body_is_freed_after_its_grace_unless_leased() {
 
     let collect = |at: u64| {
         ObjFile::new(&mut storage.lock())
-            .collect_garbage(at, ABANDON)
+            .collect_garbage(at, ABANDON, u64::MAX)
             .unwrap()
             .bodies
     };
@@ -234,7 +234,7 @@ fn a_body_abandoned_mid_write_is_collected_after_a_crash() {
     let kept = put(&storage, &bytes(3, 1000), now());
     // Collect once so every tree the engine uses exists before the baseline.
     ObjFile::new(&mut storage.lock())
-        .collect_garbage(now(), ABANDON)
+        .collect_garbage(now(), ABANDON, u64::MAX)
         .unwrap();
     let before = allocated_pages(&storage);
     let mut writer = BodyWriter::begin(&storage, now()).unwrap();
@@ -251,7 +251,7 @@ fn a_body_abandoned_mid_write_is_collected_after_a_crash() {
         "the written segment survives"
     );
     let freed = ObjFile::new(&mut storage.lock())
-        .collect_garbage(now() + ABANDON, ABANDON)
+        .collect_garbage(now() + ABANDON, ABANDON, u64::MAX)
         .unwrap();
     assert_eq!(freed.bodies, 1);
     assert_eq!(allocated_pages(&storage), before, "nothing leaked");
@@ -339,7 +339,7 @@ fn a_slow_upload_that_keeps_writing_is_not_taken_for_abandoned() {
         .write(&storage, &bytes(7, SEGMENT_BYTES), now() + ABANDON - 1)
         .unwrap();
     let freed = ObjFile::new(&mut storage.lock())
-        .collect_garbage(now() + ABANDON, ABANDON)
+        .collect_garbage(now() + ABANDON, ABANDON, u64::MAX)
         .unwrap();
     assert_eq!(freed.bodies, 0, "touched recently");
     let sealed = writer.finish(&storage, now() + ABANDON).unwrap();
@@ -378,7 +378,7 @@ fn a_read_on_a_store_the_engine_never_wrote_changes_nothing() {
     assert!(err.to_string().contains("no body 1"), "{err}");
     assert!(ObjFile::new(&mut storage.lock()).body_info(1).is_err());
     let freed = ObjFile::new(&mut storage.lock())
-        .collect_garbage(now(), ABANDON)
+        .collect_garbage(now(), ABANDON, u64::MAX)
         .unwrap();
     assert_eq!(freed.bodies, 0);
     assert_eq!(storage.wal_flushed_lsn(), tail, "nothing was logged");
@@ -401,7 +401,7 @@ fn a_seal_rolls_back_with_the_transaction_it_joined() {
     let info = ObjFile::new(&mut storage.lock()).body_info(sealed.body);
     assert!(info.is_err(), "the body is still staging");
     let freed = ObjFile::new(&mut storage.lock())
-        .collect_garbage(now() + ABANDON, ABANDON)
+        .collect_garbage(now() + ABANDON, ABANDON, u64::MAX)
         .unwrap();
     assert_eq!(freed.bodies, 1, "and is collected as abandoned");
     drop(storage);
@@ -422,7 +422,7 @@ fn a_wedged_store_refuses_every_object_operation() {
     );
     assert!(
         ObjFile::new(&mut storage.lock())
-            .collect_garbage(now(), ABANDON)
+            .collect_garbage(now(), ABANDON, u64::MAX)
             .is_err(),
         "collect"
     );
@@ -475,6 +475,33 @@ fn access_keys_are_created_looked_up_listed_and_dropped_durably() {
     assert_eq!(file.access_key_secret("A").unwrap(), None);
     assert_eq!(file.access_key_ids().unwrap(), vec!["B"]);
     drop(guard);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_collection_pass_stops_at_its_limit_and_says_so() {
+    let path = temp_path("gc-limit");
+    let storage = create(&path);
+    let bodies: Vec<u64> = (0..20)
+        .map(|i| put(&storage, &bytes(i, 10), now()))
+        .collect();
+    for body in &bodies {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.drop_ref(*body, now(), 0))
+            .unwrap();
+    }
+    let mut passes = Vec::new();
+    loop {
+        let outcome = ObjFile::new(&mut storage.lock())
+            .collect_garbage(now(), ABANDON, 8)
+            .unwrap();
+        passes.push(outcome.bodies);
+        if !outcome.more {
+            break;
+        }
+    }
+    assert_eq!(passes, vec![8, 8, 4]);
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

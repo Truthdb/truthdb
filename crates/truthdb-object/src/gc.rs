@@ -15,15 +15,21 @@ use crate::{GC_TREE, ObjFile, ObjTxn, STAGING_TREE};
 pub struct GcOutcome {
     pub bodies: u64,
     pub pages: u64,
+    /// The pass stopped at its limit with due bodies left.
+    pub more: bool,
 }
 
 impl ObjFile<'_> {
-    /// Frees every unreferenced body due by `now_ms` that no reader leases, and
-    /// every staging body untouched since `now_ms - abandon_after_ms`.
+    /// Frees up to `limit` bodies: unreferenced ones due by `now_ms` that no
+    /// reader leases, and staging ones untouched since `now_ms -
+    /// abandon_after_ms`. Each body is one transaction forced to disk, all
+    /// under the caller's one lock hold, so callers bound the hold with
+    /// `limit` and call again while [`GcOutcome::more`].
     pub fn collect_garbage(
         &mut self,
         now_ms: u64,
         abandon_after_ms: u64,
+        limit: u64,
     ) -> Result<GcOutcome, StorageError> {
         let mut outcome = GcOutcome::default();
         for (queue, upper) in [
@@ -41,6 +47,10 @@ impl ObjFile<'_> {
                 let (_, body) = codec::decode_timed_key(&key)?;
                 if self.eng.leases.contains_key(&body) {
                     continue;
+                }
+                if outcome.bodies == limit {
+                    outcome.more = true;
+                    return Ok(outcome);
                 }
                 outcome.pages += self.transaction(|tx| tx.free_body(&queue, &key, body))?;
                 outcome.bodies += 1;
