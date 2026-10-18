@@ -225,6 +225,7 @@ impl<'a> ObjFile<'a> {
         &mut self,
         body: impl FnOnce(&mut ObjTxn<'_, '_>) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
+        self.core.ensure_rel_usable()?;
         let trees = Trees {
             meta: self.meta()?.root,
             bodies: self.tree(BODIES_TREE)?.root,
@@ -236,8 +237,14 @@ impl<'a> ObjFile<'a> {
     }
 
     /// The engine's trees if they all exist, for reads: a read never creates
-    /// anything (a standby's log is read-only).
-    pub(crate) fn existing_trees(&self) -> Option<Trees> {
+    /// anything (a standby's log is read-only). Fails on a wedged store, whose
+    /// pool may hold changes the log does not back.
+    pub(crate) fn existing_trees(&self) -> Result<Option<Trees>, StorageError> {
+        self.core.ensure_rel_usable()?;
+        Ok(self.existing_trees_unchecked())
+    }
+
+    fn existing_trees_unchecked(&self) -> Option<Trees> {
         let tree = |object_id: u32| self.eng.trees.get(&object_id).copied();
         Some(Trees {
             meta: self.eng.root?,
@@ -294,6 +301,7 @@ impl<'a> ObjFile<'a> {
         &mut self,
         body: impl FnOnce(&mut RelCtx<'_>, &mut TxnLink) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
+        self.core.ensure_rel_usable()?;
         let roots = self.eng.tree_roots();
         let txn_id = self.core.alloc_txn_id();
         let mut wedge = false;

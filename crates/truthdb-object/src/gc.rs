@@ -26,7 +26,7 @@ impl ObjFile<'_> {
         abandon_after_ms: u64,
     ) -> Result<GcOutcome, StorageError> {
         let mut outcome = GcOutcome::default();
-        let Some(trees) = self.existing_trees() else {
+        let Some(trees) = self.existing_trees()? else {
             return Ok(outcome);
         };
         for (queue, upper) in [

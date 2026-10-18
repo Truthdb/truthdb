@@ -218,7 +218,7 @@ impl ObjFile<'_> {
 
     /// The sealed body's length and digest.
     pub fn body_info(&mut self, body: u64) -> Result<BodyInfo, StorageError> {
-        let trees = self.existing_trees().ok_or_else(|| no_body(body))?;
+        let trees = self.existing_trees()?.ok_or_else(|| no_body(body))?;
         let mut ctx = self.core.page_ctx(0);
         let row = load_body(&mut ctx, &trees.bodies(), body)?;
         if row.state != BodyState::Sealed {
@@ -240,7 +240,7 @@ impl ObjFile<'_> {
         offset: u64,
         out: &mut [u8],
     ) -> Result<(), StorageError> {
-        let trees = self.existing_trees().ok_or_else(|| no_body(body))?;
+        let trees = self.existing_trees()?.ok_or_else(|| no_body(body))?;
         let segments = trees.segments();
         let mut ctx = self.core.page_ctx(0);
         let row = load_body(&mut ctx, &trees.bodies(), body)?;
@@ -297,17 +297,27 @@ pub(crate) fn load_body(
 }
 
 /// A reader's hold on a body: garbage collection leaves the body alone until
-/// the lease drops.
+/// the lease drops. Taking and dropping it lock the storage, so neither may
+/// happen while the caller already holds the lock.
 pub struct BodyLease<'s> {
     storage: &'s Storage,
     body: u64,
 }
 
 impl<'s> BodyLease<'s> {
-    pub fn take(storage: &'s Storage, body: u64) -> Self {
+    /// Leases a live (sealed, referenced) body. The body is checked under the
+    /// same lock hold that takes the lease, so it cannot be collected between
+    /// the check and the lease.
+    pub fn take(storage: &'s Storage, body: u64) -> Result<Self, StorageError> {
         let mut guard = storage.lock();
-        *ObjFile::new(&mut guard).eng.leases.entry(body).or_default() += 1;
-        BodyLease { storage, body }
+        let file = ObjFile::new(&mut guard);
+        let trees = file.existing_trees()?.ok_or_else(|| no_body(body))?;
+        let row = load_body(&mut file.core.page_ctx(0), &trees.bodies(), body)?;
+        if row.state != BodyState::Sealed || row.refcount == 0 {
+            return Err(invalid(format!("body {body} is not live")));
+        }
+        *file.eng.leases.entry(body).or_default() += 1;
+        Ok(BodyLease { storage, body })
     }
 }
 

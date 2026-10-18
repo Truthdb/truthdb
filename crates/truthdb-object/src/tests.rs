@@ -203,12 +203,18 @@ fn a_dropped_body_is_freed_after_its_grace_unless_leased() {
     in_tx(&|tx| tx.add_ref(body));
     in_tx(&|tx| tx.drop_ref(body, now(), GRACE));
     assert_eq!(collect(now() + 2 * GRACE), 0, "still referenced");
-    in_tx(&|tx| tx.drop_ref(body, now(), GRACE));
-    assert_eq!(collect(now()), 0, "not due yet");
     {
-        let _lease = BodyLease::take(&storage, body);
+        // A reader leases the body while it is live; the last reference
+        // drops while it reads.
+        let _lease = BodyLease::take(&storage, body).unwrap();
+        in_tx(&|tx| tx.drop_ref(body, now(), GRACE));
+        assert_eq!(collect(now()), 0, "not due yet");
         assert_eq!(collect(now() + GRACE), 0, "leased");
     }
+    assert!(
+        BodyLease::take(&storage, body).is_err(),
+        "a body without references cannot be leased"
+    );
     assert_eq!(collect(now() + GRACE), 1, "the lease dropped");
     let after = allocated_pages(&storage);
     drop(storage);
@@ -398,6 +404,36 @@ fn a_seal_rolls_back_with_the_transaction_it_joined() {
         .collect_garbage(now() + ABANDON, ABANDON)
         .unwrap();
     assert_eq!(freed.bodies, 1, "and is collected as abandoned");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_wedged_store_refuses_every_object_operation() {
+    let path = temp_path("wedged");
+    let storage = create(&path);
+    let body = put(&storage, &bytes(10, 100), now());
+    storage.lock().set_wedged();
+    assert!(BodyWriter::begin(&storage, now()).is_err(), "write");
+    assert!(read(&storage, body, 0, 100).is_err(), "read");
+    assert!(
+        ObjFile::new(&mut storage.lock()).body_info(body).is_err(),
+        "info"
+    );
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .collect_garbage(now(), ABANDON)
+            .is_err(),
+        "collect"
+    );
+    assert!(BodyLease::take(&storage, body).is_err(), "lease");
+    drop(storage);
+    let storage = open(&path);
+    assert_eq!(
+        read(&storage, body, 0, 100).unwrap(),
+        bytes(10, 100),
+        "a restart clears it"
+    );
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
