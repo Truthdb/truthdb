@@ -315,9 +315,20 @@ fn buckets_are_created_listed_located_headed_and_deleted() {
     };
 
     assert_eq!(call("PUT", "/alpha", "").0, 200);
+    // us-east-1 answers success when the owner creates a bucket again.
     let (status, body) = call("PUT", "/alpha", "");
-    assert_eq!(status, 409, "{body}");
-    assert!(body.contains("BucketAlreadyOwnedByYou"), "{body}");
+    assert_eq!(status, 200, "{body}");
+    let (status, body) = send(
+        port,
+        "PUT",
+        "/gamma",
+        "",
+        b"<CreateBucketConfiguration><LocationConstraint>",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 400, "{body}");
+    assert!(body.contains("MalformedXML"), "{body}");
     let (status, body) = call("PUT", "/Not_Valid", "");
     assert_eq!(status, 400, "{body}");
     assert!(body.contains("InvalidBucketName"), "{body}");
