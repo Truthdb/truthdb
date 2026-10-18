@@ -299,6 +299,45 @@ impl ObjTxn<'_, '_> {
         Ok(Ok(info))
     }
 
+    /// Writes `source` as the newest version of `key` (S3 CopyObject), with
+    /// `attrs`: the new version shares the source's body (one more
+    /// reference), so no bytes are copied. `source` must be a version read in
+    /// the same lock hold, and not a delete marker.
+    pub fn copy_object(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        source: &ObjectInfo,
+        attrs: &ObjectAttrs,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<Result<ObjectInfo, ObjectError>, StorageError> {
+        if let Err(err) = validate_key(key) {
+            return Ok(Err(err));
+        }
+        let Some(bucket_row) = self.bucket_row(bucket)? else {
+            return Ok(Err(ObjectError::NoSuchBucket));
+        };
+        // The reference comes first: replacing the source's own null version
+        // drops one, and the body must not reach zero in between.
+        self.add_ref(source.body)?;
+        let info = self.insert_version(
+            bucket,
+            key,
+            bucket_row.versioning,
+            NewVersion {
+                body: source.body,
+                size: source.size,
+                md5: source.md5,
+                parts: source.parts,
+            },
+            attrs,
+            now_ms,
+            grace_ms,
+        )?;
+        Ok(Ok(info))
+    }
+
     /// Writes a version of `key` holding `version.body`'s one reference and,
     /// unless versioning is enabled, replaces the key's null version.
     #[allow(clippy::too_many_arguments)]

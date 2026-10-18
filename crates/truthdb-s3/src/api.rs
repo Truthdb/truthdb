@@ -159,15 +159,6 @@ pub async fn dispatch(
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "location") => {
             bucket_location(state, bucket).await
         }
-        // Copies (CopyObject, UploadPartCopy) are not implemented yet:
-        // refused, rather than stored as an empty object or part.
-        (Target::Object(..), Method::PUT)
-            if request.headers().contains_key("x-amz-copy-source") =>
-        {
-            Err(S3Error::not_implemented(
-                "copying objects is not implemented yet",
-            ))
-        }
         // GetObject of one part of a multipart object is not implemented.
         (Target::Object(..), Method::GET | Method::HEAD)
             if has_param(&request, "partNumber") && !has_param(&request, "uploadId") =>
@@ -191,6 +182,17 @@ pub async fn dispatch(
         }
         (Target::Object(bucket, key), Method::POST) if has_param(&request, "uploadId") => {
             crate::multipart::complete_upload(state, request, auth, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::PUT)
+            if has_param(&request, "uploadId")
+                && request.headers().contains_key("x-amz-copy-source") =>
+        {
+            crate::copy::upload_part_copy(state, request, bucket, key).await
+        }
+        (Target::Object(bucket, key), Method::PUT)
+            if request.headers().contains_key("x-amz-copy-source") =>
+        {
+            crate::copy::copy_object(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), Method::PUT) if has_param(&request, "uploadId") => {
             crate::multipart::upload_part(state, request, auth, bucket, key).await

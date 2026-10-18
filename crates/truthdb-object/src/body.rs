@@ -37,7 +37,7 @@ fn no_body(body: u64) -> StorageError {
 }
 
 impl ObjTxn<'_, '_> {
-    fn load_body(&mut self, body: u64) -> Result<BodyRow, StorageError> {
+    pub(crate) fn load_body(&mut self, body: u64) -> Result<BodyRow, StorageError> {
         load_body(self.ctx, &self.trees.bodies(), body)
     }
 

@@ -12,6 +12,7 @@ use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
 use crate::body::{BodyInfo, SealedBody};
+use crate::codec::BodyState;
 use crate::objects::{NewVersion, validate_key};
 use crate::{
     NEXT_UPLOAD_KEY, ObjFile, ObjTxn, ObjectAttrs, ObjectError, ObjectInfo, PARTS_TREE,
@@ -250,6 +251,54 @@ impl ObjTxn<'_, '_> {
             return Ok(Err(UploadError::NoSuchUpload));
         }
         let sealed = body.seal_in(self)?;
+        self.store_part(upload, number, sealed, now_ms, grace_ms)?;
+        Ok(Ok(sealed))
+    }
+
+    /// Stores the plain sealed body `body` as part `number` of `upload`,
+    /// sharing it (UploadPartCopy of a whole object): the part takes a new
+    /// reference and no bytes are copied. A multipart object's body cannot be
+    /// a part (composites do not nest): copy its bytes instead.
+    pub fn upload_part_shared(
+        &mut self,
+        upload: u64,
+        number: u32,
+        body: u64,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<Result<BodyInfo, UploadError>, StorageError> {
+        if !(1..=MAX_PART_NUMBER).contains(&number) {
+            return Ok(Err(UploadError::InvalidPartNumber));
+        }
+        if self.upload_row(upload)?.is_none() {
+            return Ok(Err(UploadError::NoSuchUpload));
+        }
+        let row = self.load_body(body)?;
+        if row.state != BodyState::Sealed {
+            return Err(StorageError::InvalidConfig(format!(
+                "body {body} is not a plain sealed body"
+            )));
+        }
+        self.add_ref(body)?;
+        let shared = BodyInfo {
+            body,
+            len: row.len,
+            md5: row.md5,
+        };
+        self.store_part(upload, number, shared, now_ms, grace_ms)?;
+        Ok(Ok(shared))
+    }
+
+    /// Records `sealed` (holding a reference for the part) as part `number`,
+    /// releasing the body of a part it replaces.
+    fn store_part(
+        &mut self,
+        upload: u64,
+        number: u32,
+        sealed: BodyInfo,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<(), StorageError> {
         let part = PartInfo {
             number,
             body: sealed.body,
@@ -279,7 +328,7 @@ impl ObjTxn<'_, '_> {
                 self.drop_ref(old.body, now_ms, grace_ms)?;
             }
         }
-        Ok(Ok(sealed))
+        Ok(())
     }
 
     /// Removes the upload, its index entry, its attributes and its part rows,

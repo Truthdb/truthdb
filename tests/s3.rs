@@ -723,18 +723,6 @@ fn a_multipart_upload_completes_lists_and_aborts() {
             .to_string()
     };
     assert_eq!(call("PUT", "/mpu", "", b"").1.0, 200);
-    // Copies are not implemented yet: refused, not stored empty.
-    let (_, (status, body)) = send_with(
-        port,
-        "PUT",
-        "/mpu/copy",
-        "",
-        &[("x-amz-copy-source", "/mpu/other")],
-        b"",
-        &key,
-        Some(&secret),
-    );
-    assert_eq!(status, 501, "{body}");
     let (_, (status, xml)) = call("POST", "/mpu/big.bin", "uploads", b"");
     assert_eq!(status, 200, "{xml}");
     let upload = tag_of(&xml, "UploadId");
@@ -832,4 +820,182 @@ fn a_multipart_upload_completes_lists_and_aborts() {
     let (_, (status, xml)) = call("DELETE", "/mpu/small", &format!("uploadId={small}"), b"");
     assert_eq!(status, 404, "{xml}");
     assert!(xml.contains("NoSuchUpload"), "{xml}");
+}
+
+#[test]
+fn objects_and_parts_are_copied() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    let tag_of = |xml: &str, tag: &str| -> String {
+        xml.split(&format!("<{tag}>"))
+            .nth(1)
+            .and_then(|rest| rest.split(&format!("</{tag}>")).next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    for bucket in ["/copysrc", "/copydst"] {
+        assert_eq!(call("PUT", bucket, "", &[], b"").1.0, 200);
+    }
+    let (head, (status, _)) = call(
+        "PUT",
+        "/copysrc/orig",
+        "",
+        &[("content-type", "text/plain"), ("x-amz-meta-color", "blue")],
+        b"copy me",
+    );
+    assert_eq!(status, 200);
+    let etag = response_header(&head, "etag").expect("etag");
+
+    // A copy keeps the metadata and the ETag.
+    let (_, (status, xml)) = call(
+        "PUT",
+        "/copydst/a%20copy",
+        "",
+        &[("x-amz-copy-source", "/copysrc/orig")],
+        b"",
+    );
+    assert_eq!(status, 200, "{xml}");
+    assert!(xml.contains("<CopyObjectResult"), "{xml}");
+    assert_eq!(tag_of(&xml, "ETag").replace("&quot;", "\""), etag);
+    let (head, (status, body)) = call("GET", "/copydst/a%20copy", "", &[], b"");
+    assert_eq!((status, body.as_str()), (200, "copy me"));
+    assert_eq!(
+        response_header(&head, "x-amz-meta-color").as_deref(),
+        Some("blue")
+    );
+    assert_eq!(
+        response_header(&head, "content-type").as_deref(),
+        Some("text/plain")
+    );
+
+    // Onto itself only with new metadata.
+    let to_self = |directive: &str| {
+        call(
+            "PUT",
+            "/copysrc/orig",
+            "",
+            &[
+                ("x-amz-copy-source", "copysrc/orig"),
+                ("x-amz-metadata-directive", directive),
+                ("content-type", "text/csv"),
+            ],
+            b"",
+        )
+        .1
+    };
+    let (status, xml) = to_self("COPY");
+    assert_eq!(status, 400, "{xml}");
+    assert!(xml.contains("InvalidRequest"), "{xml}");
+    assert_eq!(to_self("SIDEWAYS").0, 400);
+    assert_eq!(to_self("REPLACE").0, 200);
+    let (head, (_, body)) = call("GET", "/copysrc/orig", "", &[], b"");
+    assert_eq!(body, "copy me");
+    assert_eq!(
+        response_header(&head, "content-type").as_deref(),
+        Some("text/csv")
+    );
+    assert_eq!(response_header(&head, "x-amz-meta-color"), None);
+
+    // The source's conditions, and a missing source.
+    let (_, (status, xml)) = call(
+        "PUT",
+        "/copydst/b",
+        "",
+        &[
+            ("x-amz-copy-source", "/copysrc/orig"),
+            ("x-amz-copy-source-if-match", "\"0123\""),
+        ],
+        b"",
+    );
+    assert_eq!(status, 412, "{xml}");
+    let (_, (status, xml)) = call(
+        "PUT",
+        "/copydst/b",
+        "",
+        &[("x-amz-copy-source", "/copysrc/missing")],
+        b"",
+    );
+    assert_eq!(status, 404, "{xml}");
+    assert!(xml.contains("NoSuchKey"), "{xml}");
+
+    // The copy outlives its source.
+    assert_eq!(call("DELETE", "/copysrc/orig", "", &[], b"").1.0, 204);
+    assert_eq!(
+        call("GET", "/copydst/a%20copy", "", &[], b"").1,
+        (200, "copy me".to_string())
+    );
+
+    // Parts copied whole (shared), by range, and from a multipart object.
+    let big = "x".repeat(5 * 1024 * 1024);
+    assert_eq!(
+        call("PUT", "/copysrc/big", "", &[], big.as_bytes()).1.0,
+        200
+    );
+    let upload_into = |path: &str, sources: &[(&str, Option<&str>)]| {
+        let (_, (_, xml)) = call("POST", path, "uploads", &[], b"");
+        let upload = tag_of(&xml, "UploadId");
+        let mut parts = String::from("<CompleteMultipartUpload>");
+        for (index, (source, range)) in sources.iter().enumerate() {
+            let number = index + 1;
+            let mut extra = vec![("x-amz-copy-source", *source)];
+            if let Some(range) = range {
+                extra.push(("x-amz-copy-source-range", *range));
+            }
+            let (_, (status, xml)) = call(
+                "PUT",
+                path,
+                &format!("partNumber={number}&uploadId={upload}"),
+                &extra,
+                b"",
+            );
+            assert_eq!(status, 200, "{xml}");
+            assert!(xml.contains("<CopyPartResult"), "{xml}");
+            parts.push_str(&format!(
+                "<Part><PartNumber>{number}</PartNumber><ETag>{}</ETag></Part>",
+                tag_of(&xml, "ETag")
+            ));
+        }
+        parts.push_str("</CompleteMultipartUpload>");
+        let (_, (status, xml)) = call(
+            "POST",
+            path,
+            &format!("uploadId={upload}"),
+            &[],
+            parts.as_bytes(),
+        );
+        assert_eq!(status, 200, "{xml}");
+    };
+    upload_into(
+        "/copydst/joined",
+        &[
+            ("/copysrc/big", None),
+            ("/copydst/a%20copy", Some("bytes=5-6")),
+        ],
+    );
+    let (_, (status, body)) = call("GET", "/copydst/joined", "", &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(body, format!("{big}me"));
+    upload_into("/copydst/again", &[("/copydst/joined", None)]);
+    let (_, (status, body)) = call("GET", "/copydst/again", "", &[], b"");
+    assert_eq!((status, body.len()), (200, big.len() + 2));
+    assert!(body.ends_with("xme"));
+
+    // A range past the source's end is refused.
+    let (_, (_, xml)) = call("POST", "/copydst/c", "uploads", &[], b"");
+    let upload = tag_of(&xml, "UploadId");
+    let (_, (status, xml)) = call(
+        "PUT",
+        "/copydst/c",
+        &format!("partNumber=1&uploadId={upload}"),
+        &[
+            ("x-amz-copy-source", "/copysrc/big"),
+            ("x-amz-copy-source-range", "bytes=0-99999999"),
+        ],
+        b"",
+    );
+    assert_eq!(status, 400, "{xml}");
+    assert!(xml.contains("InvalidArgument"), "{xml}");
 }
