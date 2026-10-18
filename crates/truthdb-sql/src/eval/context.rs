@@ -72,6 +72,8 @@ pub struct EvalContext {
     /// contexts with no storage in scope (the argument forms then answer
     /// NULL, like USER_NAME's by-id form).
     pub databases: Vec<(u32, String)>,
+    /// The database default collation — `SERVERPROPERTY('Collation')`.
+    pub collation: String,
     /// The authenticated login name — `SUSER_SNAME()`.
     pub login: String,
     /// The session's database user name — `USER_NAME()` (with no argument).
@@ -121,6 +123,7 @@ impl Default for EvalContext {
             database: String::new(),
             database_id: DEFAULT_DATABASE_ID,
             databases: Vec::new(),
+            collation: crate::collation::DEFAULT_COLLATION.to_string(),
             login: String::new(),
             user: String::new(),
             server_roles: Default::default(),

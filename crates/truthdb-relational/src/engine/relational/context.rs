@@ -91,6 +91,10 @@ pub struct TxnContext {
     /// batch start (a same-batch CREATE DATABASE is visible next batch, a
     /// documented staleness matching the per-batch security refresh).
     pub(super) databases_snapshot: Vec<(u32, String)>,
+    /// The database default collation stamped into the file (`None` = the
+    /// built-in default) — `SERVERPROPERTY('Collation')`. Refreshed with
+    /// `databases_snapshot`.
+    pub(super) default_collation: Option<String>,
     /// The session's current database id — the namespace every unqualified
     /// object name resolves in. Sessions run in the default database until
     /// `USE` learns to switch it (the multi-database plan's A2 slice).
@@ -165,6 +169,10 @@ impl TxnContext {
         EvalContext {
             database_id: self.database_id.0,
             databases: self.databases_snapshot.clone(),
+            collation: self
+                .default_collation
+                .clone()
+                .unwrap_or_else(|| collation::DEFAULT_COLLATION.to_string()),
             trancount: self.trancount as i32,
             variables: self
                 .variables
@@ -279,6 +287,7 @@ impl TxnContext {
         self.session_server_roles = names(&server_role_ids);
         self.session_db_roles = names(&db_role_ids);
         self.databases_snapshot = storage.rel_databases();
+        self.default_collation = storage.default_collation();
 
         // The object-permission subject. A trusted/internal connection
         // (login_sid 0 — the native protocol and in-process tests), a sysadmin,

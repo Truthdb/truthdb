@@ -439,3 +439,66 @@ fn collation_ci_self_ref_fk_update() {
     assert_eq!(rows, vec![vec![Some("abc".into())]], "UPDATE applied");
     let _ = std::fs::remove_file(path);
 }
+
+// ---- Reporting the database default collation -------------------------------
+//
+// `sys.databases.collation_name` and `SERVERPROPERTY('Collation')` report the
+// default stamped into the database file, not the built-in default.
+
+fn engine_with_default_collation(path: &std::path::Path, name: Option<&str>) -> Engine {
+    let options = crate::storage::StorageOptions {
+        default_collation: name.map(str::to_string),
+        ..test_storage_options()
+    };
+    let storage = crate::storage::RelStorage::create(path.to_path_buf(), options).expect("create");
+    Engine::new(storage).expect("engine")
+}
+
+fn reported_collations(engine: &Engine) -> (Option<String>, Option<String>) {
+    let (_, databases) = sql_rows(engine, "SELECT collation_name FROM sys.databases");
+    let (_, server) = sql_rows(engine, "SELECT SERVERPROPERTY('Collation')");
+    (databases[0][0].clone(), server[0][0].clone())
+}
+
+#[test]
+fn built_in_default_collation_is_reported() {
+    let path = unique_temp_path("coll-report-default");
+    let engine = engine_with_default_collation(&path, None);
+    let latin1 = Some("SQL_Latin1_General_CP1_CI_AS".to_string());
+    assert_eq!(reported_collations(&engine), (latin1.clone(), latin1));
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn configured_default_collation_is_reported() {
+    let path = unique_temp_path("coll-report-configured");
+    let engine = engine_with_default_collation(&path, Some("Finnish_Swedish_CI_AS"));
+    let finnish = Some("Finnish_Swedish_CI_AS".to_string());
+    assert_eq!(
+        reported_collations(&engine),
+        (finnish.clone(), finnish.clone())
+    );
+
+    // A function body runs in its own context; it must see the same value.
+    engine
+        .execute(
+            "CREATE FUNCTION dbo.server_collation() RETURNS NVARCHAR(128) AS \
+             BEGIN RETURN CAST(SERVERPROPERTY('Collation') AS NVARCHAR(128)) END",
+        )
+        .expect("create function");
+    let (_, rows) = sql_rows(&engine, "SELECT dbo.server_collation()");
+    assert_eq!(rows[0][0], finnish, "inside a scalar function");
+    engine
+        .execute(
+            "CREATE FUNCTION dbo.collation_table() RETURNS @r TABLE (c NVARCHAR(128)) AS \
+             BEGIN INSERT INTO @r VALUES (CAST(SERVERPROPERTY('Collation') AS NVARCHAR(128))); \
+             RETURN END",
+        )
+        .expect("create table-valued function");
+    let (_, rows) = sql_rows(&engine, "SELECT c FROM dbo.collation_table()");
+    assert_eq!(
+        rows[0][0], finnish,
+        "inside a multi-statement table-valued function"
+    );
+    let _ = std::fs::remove_file(path);
+}

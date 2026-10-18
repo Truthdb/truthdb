@@ -474,6 +474,7 @@ pub(in crate::engine::relational) fn run_multi_statement_tvf(
         0,
     );
     txn_ctx.databases_snapshot = eval_ctx.databases.clone();
+    txn_ctx.default_collation = Some(eval_ctx.collation.clone());
     txn_ctx.session_server_roles = eval_ctx.server_roles.clone();
     txn_ctx.session_db_roles = eval_ctx.db_roles.clone();
     txn_ctx.security = eval_ctx.security.clone();
