@@ -271,3 +271,11 @@ jobs:
         if: always()
         run: |
           if [ -f /tmp/truthdb.pid ]; then kill "$(cat /tmp/truthdb.pid)" || true; fi
+
+  install-test:
+    name: Install test
+    # Builds an installer ISO with this commit's truthdb server and installs it
+    # in QEMU (the workflow lives in Truthdb/installer-iso).
+    uses: Truthdb/installer-iso/.github/workflows/e2e.yml@main
+    with:
+      truthdb-from-source: true
