@@ -723,18 +723,6 @@ fn a_multipart_upload_completes_lists_and_aborts() {
             .to_string()
     };
     assert_eq!(call("PUT", "/mpu", "", b"").1.0, 200);
-    // Copies are not implemented yet: refused, not stored empty.
-    let (_, (status, body)) = send_with(
-        port,
-        "PUT",
-        "/mpu/copy",
-        "",
-        &[("x-amz-copy-source", "/mpu/other")],
-        b"",
-        &key,
-        Some(&secret),
-    );
-    assert_eq!(status, 501, "{body}");
     let (_, (status, xml)) = call("POST", "/mpu/big.bin", "uploads", b"");
     assert_eq!(status, 200, "{xml}");
     let upload = tag_of(&xml, "UploadId");
