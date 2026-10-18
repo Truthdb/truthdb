@@ -559,6 +559,44 @@ fn point_in_time_restore_refuses_a_stop_point_inside_the_full_backup() {
 }
 
 #[test]
+fn point_in_time_restore_refuses_a_stop_point_before_a_checkpointed_backup() {
+    let src = unique_temp_path("pitr-ckpt-src");
+    let bak = unique_temp_path("pitr-ckpt-bak");
+    let restored = unique_temp_path("pitr-ckpt-restored");
+
+    let engine = new_engine(&src);
+    engine
+        .execute("CREATE TABLE t (id INT NOT NULL PRIMARY KEY)")
+        .expect("create");
+    engine.execute("INSERT INTO t VALUES (1)").expect("ins 1");
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    let stop_at = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    engine.execute("INSERT INTO t VALUES (2)").expect("ins 2");
+    // The checkpoint moves the backup's log start past both commits: the
+    // backup's own log holds no commit past the stop time, yet its page
+    // images hold row 2.
+    engine.checkpoint().expect("checkpoint");
+    engine.storage().backup_full(&bak).expect("full backup");
+    drop(engine);
+
+    let err =
+        crate::storage::RelStorage::restore_full_with_logs(&restored, &bak, &[], Some(stop_at))
+            .expect_err("a stop time before the backup began is refused");
+    assert!(
+        err.to_string().contains("before the full backup finished"),
+        "unexpected error: {err}"
+    );
+    assert!(!restored.exists());
+    for p in [src, bak] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
+#[test]
 fn restore_inspect_verbs_read_a_backup_without_restoring() {
     let src = unique_temp_path("restinspect-src");
     let bak = unique_temp_path("restinspect-bak");

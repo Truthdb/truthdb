@@ -422,3 +422,30 @@ fn a_standby_lands_a_free_when_the_commit_arrives_even_across_a_reopen() {
         std::fs::remove_file(p).ok();
     }
 }
+
+#[test]
+fn a_restore_that_crashes_before_its_superblock_leaves_a_file_that_does_not_open() {
+    let path = unique_temp_path("restore-crash-src");
+    let bak = unique_temp_path("restore-crash-bak");
+    let dst = unique_temp_path("restore-crash-dst");
+    // A young database: its log starts at LSN 0, so the seeded ring sits at
+    // its true positions and would scan from a default superblock.
+    let storage = create_small(&path);
+    committed_extent(&storage);
+    storage.backup_full(&bak).expect("full backup");
+    drop(storage);
+
+    crate::storage::backup_restore::CRASH_RESTORE_BEFORE_SUPERBLOCK.with(|crash| crash.set(true));
+    Storage::restore_full(&dst, &bak, no_engine).expect("restore stops early");
+    assert!(dst.exists(), "the crash left the file behind");
+    let err = Storage::open(dst.clone(), no_engine)
+        .err()
+        .expect("a half-restored file does not open");
+    assert!(
+        err.to_string().contains("superblock"),
+        "unexpected error: {err}"
+    );
+    for p in [&path, &bak, &dst] {
+        std::fs::remove_file(p).ok();
+    }
+}

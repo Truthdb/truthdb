@@ -546,6 +546,10 @@ impl Storage {
         engine: EngineFactory,
     ) -> Result<(), StorageError> {
         use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
+        // The fresh file's valid empty superblocks would let a crash mid-restore
+        // open a half-restored file (with the log seeded but not yet cut). Void
+        // them: the file opens only once `restore_superblock` lands.
+        file.void_superblocks()?;
         let data_pages = header.data_size / PAGE_SIZE as u64;
         let mut runs: Vec<(u64, u64)> = Vec::new();
         let mut log: Option<(u64, Vec<u8>)> = None;
@@ -623,7 +627,18 @@ impl Storage {
             )?;
         }
         if let Some(limit) = stop_at {
-            tail = file.cut_restored_log(header.redo_start_lsn, tail, full_backup_end, limit)?;
+            tail = file.cut_restored_log(
+                header.redo_start_lsn,
+                tail,
+                full_backup_end,
+                header.finished_at_millis,
+                limit,
+            )?;
+        }
+        #[cfg(test)]
+        if CRASH_RESTORE_BEFORE_SUPERBLOCK.with(|crash| crash.replace(false)) {
+            // Test hook: stop here like a crash would, leaving the file behind.
+            return Ok(());
         }
         // The restored superblock brackets the ring at `[redo_start, tail)`; the
         // log-backup floor is the end of the applied chain (a fresh chain). A
@@ -643,6 +658,14 @@ impl Storage {
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Test fault injection: the next restore stops just before writing the
+    /// restored superblock and returns `Ok`, leaving the file as a crash would.
+    pub(crate) static CRASH_RESTORE_BEFORE_SUPERBLOCK: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 impl StorageFile {
     /// Point-in-time restore: ends the restored log `[redo_start, tail)` just
     /// before the first commit whose timestamp is past `stop_at`, exactly as if
@@ -652,17 +675,32 @@ impl StorageFile {
     /// open at the cut.
     ///
     /// A log prefix is only a crash state of the restored pages if it reaches
-    /// past every change those pages already hold: the full backup's page
-    /// images and allocation map can carry changes up to its end, so a stop
-    /// point before `full_backup_end` is refused. Runs before the restored
-    /// superblock exists, so a crash here leaves a file that does not open.
+    /// past every change those pages already hold. The full backup's page
+    /// images and allocation map carry every commit made before the backup
+    /// began (`backup_started_at`, the header's `finished_at_millis`, taken
+    /// at its start) and can carry changes up to its end (`full_backup_end`),
+    /// so a stop time before the start, or a cut before the end, is refused.
+    /// Runs before the restored superblock exists (the fresh file's are
+    /// voided), so a crash here leaves a file that does not open.
     fn cut_restored_log(
         &mut self,
         redo_start: u64,
         tail: u64,
         full_backup_end: u64,
+        backup_started_at: u64,
         stop_at: u64,
     ) -> Result<u64, StorageError> {
+        let refuse = |detail: String| {
+            StorageError::InvalidConfig(format!(
+                "the stop time falls before the full backup finished ({detail}): restore an \
+                 older full backup with its log backups, or choose a later stop time"
+            ))
+        };
+        if stop_at < backup_started_at {
+            return Err(refuse(format!(
+                "the backup began at {backup_started_at} ms, the stop time is {stop_at} ms"
+            )));
+        }
         let scan = scan_ring(
             &mut self.file,
             self.layout.wal_offset,
@@ -681,11 +719,9 @@ impl StorageFile {
             return Ok(tail);
         }
         if cut < full_backup_end {
-            return Err(StorageError::InvalidConfig(format!(
-                "the stop time falls before the full backup finished (its log ends at LSN \
-                 {full_backup_end}, the first commit past the stop time is at LSN {cut}): \
-                 restore an older full backup with its log backups, or choose a later stop \
-                 time"
+            return Err(refuse(format!(
+                "its log ends at LSN {full_backup_end}, the first commit past the stop time is \
+                 at LSN {cut}"
             )));
         }
         crate::wal::zero_ring_range(
@@ -695,6 +731,9 @@ impl StorageFile {
             cut,
             tail,
         )?;
+        // Durable before the superblock that trusts the log only up to `cut`:
+        // past it, surviving old bytes would still pass the scan's checks.
+        self.file.sync_data()?;
         Ok(cut)
     }
 }

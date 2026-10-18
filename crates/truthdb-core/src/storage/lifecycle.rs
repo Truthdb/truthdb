@@ -677,6 +677,18 @@ impl StorageFile {
     }
 
     /// Fsyncs the restored file's data handle.
+    /// Overwrites both superblocks with zeros (failing their checksums), so the
+    /// file does not open until valid ones are written.
+    pub(super) fn void_superblocks(&mut self) -> Result<(), StorageError> {
+        let zeros = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
+        self.file
+            .write_all_at(self.layout.superblock_a_offset, &zeros)?;
+        self.file
+            .write_all_at(self.layout.superblock_b_offset, &zeros)?;
+        self.file.sync_data()?;
+        Ok(())
+    }
+
     pub(super) fn sync_file(&mut self) -> Result<(), StorageError> {
         self.file.sync_data()?;
         Ok(())
