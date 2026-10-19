@@ -18,6 +18,7 @@ mod ddl;
 mod describe;
 mod dispatch;
 mod dml;
+mod external;
 mod hash;
 mod helpers;
 mod lock_analysis;
@@ -46,6 +47,7 @@ pub use context::{Isolation, TxnContext};
 pub use describe::describe_first_result_set;
 #[cfg(any(test, feature = "test-hooks"))]
 pub use dispatch::execute;
+pub use external::{ExternalCaller, ExternalRowset, ExternalRowsets, ExternalStream};
 pub use helpers::{SqlStatement, render_cell};
 pub use lock_analysis::analyze_locks;
 pub use parameters::decl_names;

@@ -19,6 +19,16 @@ pub fn relational_participant() -> Box<dyn EngineParticipant> {
 }
 
 impl RelStorage {
+    /// Installs another engine's built-in rowsets (once; a second call is
+    /// ignored).
+    pub fn set_external_rowsets(&self, provider: Arc<dyn crate::engine::ExternalRowsets>) {
+        let _ = self.external.set(provider);
+    }
+
+    pub(crate) fn external_rowsets(&self) -> Option<&Arc<dyn crate::engine::ExternalRowsets>> {
+        self.external.get()
+    }
+
     /// Wraps an opened core, seeding the lock-free option mirrors from the
     /// recovered state.
     fn from_core(core: Storage) -> Self {
@@ -36,6 +46,7 @@ impl RelStorage {
             lock_epoch: std::sync::atomic::AtomicU64::new(0),
             security_version: std::sync::atomic::AtomicU64::new(0),
             membership: std::sync::Mutex::new(MembershipCache::default()),
+            external: std::sync::OnceLock::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             scan_slices: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-hooks"))]

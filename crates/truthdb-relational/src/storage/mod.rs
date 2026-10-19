@@ -78,6 +78,10 @@ pub struct RelStorage {
     /// Memoized transitive-closure of role membership, tagged with the
     /// `security_version` it was computed under; a version mismatch discards it.
     membership: std::sync::Mutex<MembershipCache>,
+    /// Another engine's built-in rowsets (the object store's `sys.s3_*`),
+    /// installed once by the code that runs both engines; absent when the
+    /// relational engine runs alone.
+    external: std::sync::OnceLock<Arc<dyn crate::engine::ExternalRowsets>>,
     /// Scan slices read, so a test can prove a scan stopped early rather than
     /// reading the table and discarding the rest. On the instance and not in a
     /// `static`: the suite runs in parallel in one binary, so a static would

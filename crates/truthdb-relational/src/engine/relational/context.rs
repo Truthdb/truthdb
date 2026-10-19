@@ -295,14 +295,16 @@ impl TxnContext {
         // controls the database). Otherwise a GRANT/DENY matches the database
         // user, its effective roles, or `public`.
         use crate::storage::{DB_OWNER_ID, DBO_ID, PUBLIC_ID, SYSADMIN_ID};
-        let bypass = self.login_sid == 0
-            || server_role_ids.contains(&SYSADMIN_ID)
-            || self.user_sid == DBO_ID
-            || db_role_ids.contains(&DB_OWNER_ID);
+        let server_admin = self.login_sid == 0 || server_role_ids.contains(&SYSADMIN_ID);
+        let bypass = server_admin || self.user_sid == DBO_ID || db_role_ids.contains(&DB_OWNER_ID);
         let mut principals = db_role_ids;
         principals.insert(self.user_sid);
         principals.insert(PUBLIC_ID);
-        self.security = truthdb_sql::eval::SecurityContext { bypass, principals };
+        self.security = truthdb_sql::eval::SecurityContext {
+            bypass,
+            principals,
+            server_admin,
+        };
     }
 
     /// Clears batch-scoped variables (called at the start of each batch).

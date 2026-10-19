@@ -5,7 +5,7 @@ use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
 use quick_xml::Reader;
 use quick_xml::events::Event;
-use truthdb_object::{Deleted, ObjectError, VersionSel};
+use truthdb_object::{Deleted, ObjectError, VersionSel, version_id};
 
 use crate::error::{S3Error, escape};
 use crate::objects::{object_error, version_sel};
@@ -25,15 +25,6 @@ fn now_ms() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
-}
-
-/// A version id as S3 writes it.
-pub fn version_id(version: u64, null_version: bool) -> String {
-    if null_version {
-        "null".to_string()
-    } else {
-        version.to_string()
-    }
 }
 
 async fn delete_one(

@@ -386,24 +386,26 @@ pub(in crate::engine::relational) fn collect_column_refs(expr: &Expr, out: &mut 
 /// The `sys.*` catalog views, which [`build_table_source`] answers by name
 /// ahead of any catalog lookup.
 pub(in crate::engine::relational) fn is_sys_view(name: &str) -> bool {
-    matches!(
-        name.to_ascii_lowercase().as_str(),
-        "sys.tables"
-            | "sys.views"
-            | "sys.sql_modules"
-            | "sys.columns"
-            | "sys.indexes"
-            | "sys.check_constraints"
-            | "sys.foreign_keys"
-            | "sys.default_constraints"
-            | "sys.databases"
-            | "sys.dm_repl_replica_states"
-            | "sys.dm_repl_slots"
-            | "sys.configurations"
-            | "sys.database_principals"
-            | "sys.database_role_members"
-            | "sys.database_permissions"
-    )
+    let name = name.to_ascii_lowercase();
+    name.starts_with("sys.s3_")
+        || matches!(
+            name.as_str(),
+            "sys.tables"
+                | "sys.views"
+                | "sys.sql_modules"
+                | "sys.columns"
+                | "sys.indexes"
+                | "sys.check_constraints"
+                | "sys.foreign_keys"
+                | "sys.default_constraints"
+                | "sys.databases"
+                | "sys.dm_repl_replica_states"
+                | "sys.dm_repl_slots"
+                | "sys.configurations"
+                | "sys.database_principals"
+                | "sys.database_role_members"
+                | "sys.database_permissions"
+        )
 }
 
 /// Scans, filters and projects one base table a row at a time.
