@@ -341,3 +341,123 @@ fn a_standby_replays_the_frees_and_matches_the_primary() {
         std::fs::remove_file(p).ok();
     }
 }
+
+/// Marks every free page outside `keep` used, so the next allocation lands on
+/// one of `keep` (the next-fit allocator would otherwise come back to them
+/// only after wrapping).
+fn steer_allocations_to(storage: &Storage, keep: &[u64]) {
+    let mut guard = storage.lock();
+    let pages = guard.data_pages();
+    let free: Vec<u64> = (0..pages)
+        .filter(|&page| !guard.is_page_allocated(page) && !keep.contains(&page))
+        .collect();
+    let allocator = guard.allocator_mut();
+    for page in free {
+        allocator.mark_used(page, 1);
+    }
+}
+
+fn snapshot_reads_back(storage: &Storage, data: &[u8]) {
+    let snapshot = storage
+        .load_snapshot()
+        .expect("the snapshot reads back")
+        .expect("a snapshot");
+    assert_eq!(snapshot.data, data);
+}
+
+#[test]
+fn a_checkpoint_snapshot_on_freed_tree_pages_is_never_overwritten() {
+    let path = unique_temp_path("btree-free-snapshot");
+    let storage = create(&path);
+    let tree = create_tree(&storage);
+    insert(&storage, &tree, 0..3000);
+    checkpoint(&storage);
+    let in_use: Vec<u64> = {
+        let guard = storage.lock();
+        (0..guard.data_pages())
+            .filter(|&page| guard.is_page_allocated(page))
+            .collect()
+    };
+    delete(&storage, &tree, 0..2900);
+    let freed: Vec<u64> = {
+        let guard = storage.lock();
+        in_use
+            .iter()
+            .copied()
+            .filter(|&page| !guard.is_page_allocated(page))
+            .collect()
+    };
+    assert!(freed.len() > 10);
+    let data = vec![0x5A; 3 * 4096];
+    // Live: the snapshot lands on freed leaves, then the pool is flushed.
+    steer_allocations_to(&storage, &freed);
+    storage
+        .write_checkpoint(&data, 1, 2, 1)
+        .expect("checkpoint");
+    snapshot_reads_back(&storage, &data);
+    drop(storage);
+    let storage = Storage::open(path.clone(), no_engine).expect("reopen");
+    snapshot_reads_back(&storage, &data);
+    // After a restart (redo has run): again on freed pages.
+    steer_allocations_to(&storage, &freed);
+    let data = vec![0xA5; 2 * 4096];
+    storage
+        .write_checkpoint(&data, 2, 3, 1)
+        .expect("checkpoint");
+    snapshot_reads_back(&storage, &data);
+    drop(storage);
+    let storage = Storage::open(path.clone(), no_engine).expect("reopen");
+    snapshot_reads_back(&storage, &data);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn redo_skips_pages_freed_later_in_the_log() {
+    let path = unique_temp_path("btree-free-redo");
+    let storage = create(&path);
+    storage.lock().commit_db_options(0, Some(true)).unwrap();
+    let tree = create_tree(&storage);
+    insert(&storage, &tree, 0..3000);
+    let backup = unique_temp_path("btree-free-redo-bak");
+    storage.backup_full(&backup).unwrap();
+    checkpoint(&storage);
+    // Touch every leaf, then hold the log from here: restart redo will see
+    // these page records again.
+    delete(&storage, &tree, (0..3000).step_by(7));
+    let log = unique_temp_path("btree-free-redo-log");
+    storage.backup_log(&log, true, false).unwrap();
+    let in_use: Vec<u64> = {
+        let guard = storage.lock();
+        (0..guard.data_pages())
+            .filter(|&page| guard.is_page_allocated(page))
+            .collect()
+    };
+    let rest: Vec<u64> = (0..2900).filter(|n| n % 7 != 0).collect();
+    delete(&storage, &tree, rest.into_iter());
+    let freed: Vec<u64> = {
+        let guard = storage.lock();
+        in_use
+            .iter()
+            .copied()
+            .filter(|&page| !guard.is_page_allocated(page))
+            .collect()
+    };
+    // The freed leaves now hold a checkpoint snapshot, which is not a page.
+    steer_allocations_to(&storage, &freed);
+    let data = vec![0x3C; 3 * 4096];
+    storage
+        .write_checkpoint(&data, 1, 2, 1)
+        .expect("checkpoint");
+    snapshot_reads_back(&storage, &data);
+    drop(storage);
+
+    let storage = Storage::open(path.clone(), no_engine).expect("restart redo succeeds");
+    snapshot_reads_back(&storage, &data);
+    let expected: Vec<u64> = (2900..3000).filter(|n| n % 7 != 0).collect();
+    assert_eq!(contents(&storage, &tree), expected);
+    drop(storage);
+    for p in [&path, &backup, &log] {
+        std::fs::remove_file(p).ok();
+    }
+}

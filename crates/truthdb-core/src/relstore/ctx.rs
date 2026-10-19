@@ -243,6 +243,9 @@ impl RelCtx<'_> {
     /// freeing a page still linked.
     pub fn free_page(&mut self, page_no: u64) -> Result<(), StorageError> {
         self.append(&RelRecord::free_extent(page_no, 1), false)?;
+        // Its content no longer matters: the frame goes, so it cannot be
+        // flushed over whatever the page holds next.
+        self.pool.discard(page_no);
         self.allocator.free(page_no, 1);
         Ok(())
     }
