@@ -683,32 +683,30 @@ fn build_type(
             builder = builder.with_repetition(repetition);
         }
         builder.build()
+    } else if is_root {
+        Type::group_type_builder(&name).build()
     } else {
-        if is_root {
-            Type::group_type_builder(&name).build()
-        } else {
-            let repetition = repetition(
-                element
-                    .repetition
-                    .ok_or_else(|| "a field with no repetition".to_string())?,
-            )?;
-            match element.physical {
-                Some(physical) => Type::primitive_type_builder(&name, physical_type(physical)?)
-                    .with_repetition(repetition)
-                    .with_converted_type(converted)
-                    .with_logical_type(element.logical)
-                    .with_length(element.type_length.unwrap_or(-1))
-                    .with_precision(element.precision.unwrap_or(-1))
-                    .with_scale(element.scale.unwrap_or(-1))
-                    .with_id(field_id)
-                    .build(),
-                None => Type::group_type_builder(&name)
-                    .with_converted_type(converted)
-                    .with_logical_type(element.logical)
-                    .with_id(field_id)
-                    .with_repetition(repetition)
-                    .build(),
-            }
+        let repetition = repetition(
+            element
+                .repetition
+                .ok_or_else(|| "a field with no repetition".to_string())?,
+        )?;
+        match element.physical {
+            Some(physical) => Type::primitive_type_builder(&name, physical_type(physical)?)
+                .with_repetition(repetition)
+                .with_converted_type(converted)
+                .with_logical_type(element.logical)
+                .with_length(element.type_length.unwrap_or(-1))
+                .with_precision(element.precision.unwrap_or(-1))
+                .with_scale(element.scale.unwrap_or(-1))
+                .with_id(field_id)
+                .build(),
+            None => Type::group_type_builder(&name)
+                .with_converted_type(converted)
+                .with_logical_type(element.logical)
+                .with_id(field_id)
+                .with_repetition(repetition)
+                .build(),
         }
     };
     built.map(Arc::new).map_err(|err| err.to_string())
