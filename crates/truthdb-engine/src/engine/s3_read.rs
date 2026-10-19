@@ -810,8 +810,10 @@ const PAGE_HEADER_READ: usize = 16 << 10;
 /// and then fetches the page with [`ParquetFile::get_bytes`]. The fetch parses
 /// that header itself first and refuses a page whose decompressed size is
 /// over the read's page cap, so a small file cannot make the reader allocate
-/// gigabytes. Until the file's metadata has been read (`pages` is false),
-/// reads are of the footer and the metadata.
+/// gigabytes. The gzip, Brotli and LZ4 decoders the reader uses do not stop
+/// at the size a header declares, so a page in one of those is also decoded
+/// here first, into nothing, up to that cap. Until the file's metadata has
+/// been read (`pages` is false), reads are of the footer and the metadata.
 struct ParquetSource {
     state: std::sync::Mutex<SourceState>,
     size: u64,
@@ -826,6 +828,8 @@ struct SourceState {
     pages: bool,
     /// The largest page this read may decompress.
     page_cap: usize,
+    /// Each column chunk's byte range and compression, to tell a page's.
+    chunks: Vec<(u64, u64, parquet::basic::Compression)>,
 }
 
 fn parquet_failure(message: impl Into<String>) -> parquet::errors::ParquetError {
@@ -911,17 +915,36 @@ impl parquet::file::reader::ChunkReader for ParquetFile {
             Some(header) if header < start && start - header <= MAX_PAGE_HEADER => {
                 let mut bytes = vec![0; (start - header) as usize];
                 ParquetSource::read_exact_at(&mut state, header, &mut bytes)?;
-                let (uncompressed, compressed) = page_sizes(&bytes)
+                let page = page_sizes(&bytes)
                     .ok_or_else(|| parquet_failure("a page header that cannot be read"))?;
-                if compressed != length as u64 {
+                if page.compressed != length as u64 {
                     return Err(parquet_failure("a page read that is not its header's page"));
                 }
-                if uncompressed.max(compressed) > state.page_cap as u64 {
+                let cap = state.page_cap as u64;
+                if page.uncompressed.max(page.compressed) > cap {
                     return Err(parquet_failure(format!(
-                        "a page of {uncompressed} bytes is larger than this file's limit of {} bytes",
-                        state.page_cap
+                        "a page of {} bytes is larger than this file's limit of {cap} bytes",
+                        page.uncompressed
                     )));
                 }
+                let codec = state
+                    .chunks
+                    .iter()
+                    .find(|(from, to, _)| (*from..*to).contains(&start))
+                    .map(|(_, _, codec)| *codec)
+                    .ok_or_else(|| parquet_failure("a page outside every column chunk"))?;
+                let mut out = vec![0u8; length];
+                ParquetSource::read_exact_at(&mut state, start, &mut out)?;
+                if page.is_compressed
+                    && out
+                        .get(page.levels as usize..)
+                        .is_some_and(|data| inflates_past(codec, data, cap))
+                {
+                    return Err(parquet_failure(format!(
+                        "a page that decompresses past this file's limit of {cap} bytes"
+                    )));
+                }
+                return Ok(out.into());
             }
             Some(_) => return Err(parquet_failure("a page read that is not its header's page")),
             None if state.pages => {
@@ -1043,28 +1066,163 @@ impl Thrift<'_> {
     }
 }
 
-/// A page header's uncompressed and compressed sizes, when `bytes` holds
-/// exactly one well-formed header carrying both. A size given twice counts
-/// as its last value, as the Parquet reader takes it.
-fn page_sizes(bytes: &[u8]) -> Option<(u64, u64)> {
+/// What the page fetch checks of a page header.
+#[derive(Debug, PartialEq, Eq)]
+struct PageSizes {
+    uncompressed: u64,
+    compressed: u64,
+    /// A version 2 data page's level bytes, stored uncompressed before its
+    /// compressed values (0 for any other page).
+    levels: u64,
+    /// Whether the page's values are compressed (a version 2 data page may
+    /// say they are not).
+    is_compressed: bool,
+}
+
+/// A page header's sizes, when `bytes` holds exactly one well-formed header
+/// carrying both. A field given twice counts as its last value, as the
+/// Parquet reader takes it.
+fn page_sizes(bytes: &[u8]) -> Option<PageSizes> {
     let mut thrift = Thrift { bytes, at: 0 };
     let (mut uncompressed, mut compressed) = (None, None);
+    let (mut definition, mut repetition, mut is_compressed) = (0u64, 0u64, true);
     let mut bad = false;
-    thrift.fields(0, |thrift, id, kind| {
-        if !matches!(id, 2 | 3) || kind != 5 {
-            return None;
-        }
+    let mut size = |thrift: &mut Thrift<'_>| {
         let value = thrift.zigzag().and_then(|v| u64::try_from(v).ok());
         bad |= value.is_none();
-        if id == 2 {
-            uncompressed = value;
-        } else {
-            compressed = value;
+        value
+    };
+    thrift.fields(0, |thrift, id, kind| match (id, kind) {
+        (2, 5) => {
+            uncompressed = size(thrift);
+            Some(())
         }
-        Some(())
+        (3, 5) => {
+            compressed = size(thrift);
+            Some(())
+        }
+        // The version 2 data page header.
+        (8, 12) => {
+            (definition, repetition, is_compressed) = (0, 0, true);
+            thrift.fields(1, |thrift, id, kind| match (id, kind) {
+                (5, 5) => {
+                    definition = size(thrift).unwrap_or(0);
+                    Some(())
+                }
+                (6, 5) => {
+                    repetition = size(thrift).unwrap_or(0);
+                    Some(())
+                }
+                (7, 1 | 2) => {
+                    is_compressed = kind == 1;
+                    Some(())
+                }
+                _ => None,
+            })
+        }
+        _ => None,
     })?;
     (!bad && thrift.at == bytes.len()).then_some(())?;
-    Some((uncompressed?, compressed?))
+    Some(PageSizes {
+        uncompressed: uncompressed?,
+        compressed: compressed?,
+        levels: definition.checked_add(repetition)?,
+        is_compressed,
+    })
+}
+
+/// How deep the schema in a Parquet footer's metadata nests (0 for the
+/// root, 1 for a top-level column), read without recursing: the Parquet
+/// reader builds the schema recursing once per level, so a deep one would
+/// overflow the stack. `None` when the metadata cannot be read.
+fn schema_depth(metadata: &[u8]) -> Option<usize> {
+    let mut thrift = Thrift {
+        bytes: metadata,
+        at: 0,
+    };
+    let mut depth = None;
+    let mut bad = false;
+    thrift.fields(0, |thrift, id, kind| {
+        if (id, kind) != (2, 9) {
+            return None;
+        }
+        // The schema: a flat list of elements, each followed by its children.
+        depth = schema_list_depth(thrift);
+        bad |= depth.is_none();
+        Some(())
+    })?;
+    if bad {
+        return None;
+    }
+    depth
+}
+
+fn schema_list_depth(thrift: &mut Thrift<'_>) -> Option<usize> {
+    let head = thrift.byte()?;
+    if head & 0x0F != 12 {
+        return None;
+    }
+    let count = match head >> 4 {
+        15 => thrift.varint()?,
+        count => u64::from(count),
+    };
+    // Children still to come under each open element.
+    let mut open: Vec<u64> = Vec::new();
+    let mut deepest = 0;
+    for _ in 0..count {
+        let mut children = 0;
+        let mut bad = false;
+        thrift.fields(1, |thrift, id, kind| {
+            if (id, kind) != (5, 5) {
+                return None;
+            }
+            let value = thrift.zigzag();
+            bad |= value.is_none();
+            children = value.unwrap_or(0).max(0) as u64;
+            Some(())
+        })?;
+        if bad {
+            return None;
+        }
+        if let Some(remaining) = open.last_mut() {
+            *remaining -= 1;
+        }
+        deepest = deepest.max(open.len());
+        if children > 0 {
+            open.push(children);
+        }
+        while open.last() == Some(&0) {
+            open.pop();
+        }
+    }
+    Some(deepest)
+}
+
+/// Whether `data`, compressed with `codec`, decodes to more than `cap`
+/// bytes. It is decoded into nothing, so the check takes no memory for the
+/// output. A stream that fails to decode within the cap is left to the
+/// Parquet reader, which fails at the same place.
+fn inflates_past(codec: parquet::basic::Compression, data: &[u8], cap: u64) -> bool {
+    use parquet::basic::Compression;
+    let limit = cap + 1;
+    let decoded = match codec {
+        Compression::GZIP(_) => std::io::copy(
+            &mut flate2::read::MultiGzDecoder::new(data).take(limit),
+            &mut std::io::sink(),
+        ),
+        Compression::BROTLI(_) => std::io::copy(
+            &mut brotli::Decompressor::new(data, 4096).take(limit),
+            &mut std::io::sink(),
+        ),
+        // The reader decodes LZ4 as Hadoop's framing, which stops at the
+        // declared size, and failing that as an LZ4 frame, which does not.
+        Compression::LZ4 => std::io::copy(
+            &mut lz4_flex::frame::FrameDecoder::new(data).take(limit),
+            &mut std::io::sink(),
+        ),
+        _ => return false,
+    };
+    matches!(decoded, Ok(n) if n > cap)
 }
 
 fn parquet_error(err: parquet::errors::ParquetError) -> SqlError {
@@ -1456,9 +1614,41 @@ fn parquet_rows(
             header_at: None,
             pages: false,
             page_cap: 0,
+            chunks: Vec::new(),
         }),
         size,
     });
+    // The footer: the metadata, its length and the magic. Its schema's depth
+    // is checked before the Parquet reader builds the schema.
+    {
+        let mut state = source.state();
+        let mut tail = [0u8; 8];
+        if size < 12 {
+            return Err(read_error("Invalid Parquet: the file is too short."));
+        }
+        ParquetSource::read_exact_at(&mut state, size - 8, &mut tail)
+            .map_err(|err| read_error(err.to_string()))?;
+        let len = u64::from(u32::from_le_bytes(tail[..4].try_into().expect("4 bytes")));
+        if &tail[4..] != b"PAR1" || len > size - 12 || len > MAX_PARQUET_METADATA as u64 {
+            return Err(read_error("Invalid Parquet: the footer cannot be read."));
+        }
+        let mut metadata = vec![0u8; len as usize];
+        ParquetSource::read_exact_at(&mut state, size - 8 - len, &mut metadata)
+            .map_err(|err| read_error(err.to_string()))?;
+        match schema_depth(&metadata) {
+            Some(depth) if depth <= MAX_PARQUET_DEPTH => {}
+            Some(_) => {
+                return Err(read_error(format!(
+                    "The Parquet file's schema nests deeper than {MAX_PARQUET_DEPTH} levels."
+                )));
+            }
+            None => {
+                return Err(read_error(
+                    "Invalid Parquet: the file metadata cannot be read.",
+                ));
+            }
+        }
+    }
     let parquet = parquet_guarded(|| {
         parquet::file::serialized_reader::SerializedFileReader::new(ParquetFile(Arc::clone(
             &source,
@@ -1488,6 +1678,16 @@ fn parquet_rows(
     {
         let mut state = source.state();
         state.page_cap = (PARQUET_PAGE_BUDGET / leaves.len().max(1)).max(MIN_PARQUET_PAGE);
+        state.chunks = parquet
+            .metadata()
+            .row_groups()
+            .iter()
+            .flat_map(|group| group.columns())
+            .map(|column| {
+                let (start, len) = column.byte_range();
+                (start, start.saturating_add(len), column.compression())
+            })
+            .collect();
         state.pages = true;
     }
     let fields: Vec<(String, ColumnType)> = descr
@@ -1568,7 +1768,7 @@ fn parquet_rows(
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::page_sizes;
 
     #[test]
@@ -1583,7 +1783,26 @@ mod tests {
             0x15, 0x04, 0x11, 0x19, 0x25, 0x02, 0x04, 0x00, // i32, bool, list<i32>
             0x00,
         ];
-        assert_eq!(page_sizes(&header), Some((100, 60)));
+        let sizes = |uncompressed, compressed, levels, is_compressed| {
+            Some(super::PageSizes {
+                uncompressed,
+                compressed,
+                levels,
+                is_compressed,
+            })
+        };
+        assert_eq!(page_sizes(&header), sizes(100, 60, 0, true));
+        // A version 2 data page header (field 8): level lengths 3 and 4, values
+        // not compressed.
+        assert_eq!(
+            page_sizes(&[
+                0x25, 0xC8, 0x01, 0x15, 0x78, 0x5C, // sizes, field 8 struct
+                0x15, 0x02, 0x15, 0x00, 0x15, 0x02, 0x15, 0x02, // fields 1-4
+                0x15, 0x06, 0x15, 0x08, 0x12, 0x00, // 5 = 3, 6 = 4, 7 = false
+                0x00,
+            ]),
+            sizes(100, 60, 7, false)
+        );
         // Trailing bytes, a cut-short header, a missing size, a size given
         // again larger, and a negative size are all refused or read last.
         assert_eq!(page_sizes(&[&header[..], &[0]].concat()), None);
@@ -1593,8 +1812,50 @@ mod tests {
             page_sizes(&[
                 0x25, 0xC8, 0x01, 0x15, 0x78, 0x05, 0x04, 0xFE, 0xFF, 0x03, 0x00
             ]),
-            Some((32767, 60))
+            sizes(32767, 60, 0, true)
         );
         assert_eq!(page_sizes(&[0x25, 0x01, 0x15, 0x78, 0x00]), None);
+    }
+
+    /// File metadata whose schema list holds `elements`, each given by its
+    /// number of children (field 5).
+    pub(in crate::engine) fn metadata(elements: &[i64]) -> Vec<u8> {
+        let mut out = vec![0x15, 0x02]; // field 1, version 1
+        out.push(0x19); // field 2, a list
+        out.push(0xFC); // of structs, count follows
+        let mut count = elements.len() as u64;
+        loop {
+            let byte = (count & 0x7F) as u8;
+            count >>= 7;
+            out.push(if count > 0 { byte | 0x80 } else { byte });
+            if count == 0 {
+                break;
+            }
+        }
+        for &children in elements {
+            out.push(0x48); // field 4, a binary name
+            out.push(1);
+            out.push(b'x');
+            if children > 0 {
+                out.push(0x15); // field 5, num_children
+                out.push((children * 2) as u8);
+            }
+            out.push(0);
+        }
+        out.push(0);
+        out
+    }
+
+    #[test]
+    fn schema_depth_is_read_without_recursing() {
+        use super::schema_depth;
+        // message { a; group g { b; group h { c; } } d; }
+        assert_eq!(schema_depth(&metadata(&[3, 0, 2, 0, 1, 0, 0])), Some(3));
+        assert_eq!(schema_depth(&metadata(&[1, 0])), Some(1));
+        // A chain a hundred thousand groups deep is measured, not recursed.
+        let mut chain = vec![1; 100_000];
+        chain.push(0);
+        assert_eq!(schema_depth(&metadata(&chain)), Some(100_000));
+        assert_eq!(schema_depth(&metadata(&[1, 0])[..5]), None);
     }
 }

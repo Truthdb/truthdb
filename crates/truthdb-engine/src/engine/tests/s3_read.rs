@@ -813,6 +813,18 @@ fn hostile_parquet_files_are_errors_and_odd_types_read_right() {
         assert_eq!(sql_error_number(&engine, &read(name)), 4864, "{name}");
     }
 
+    // A schema nested a hundred thousand groups deep: the Parquet reader
+    // would recurse once per level building it, so it is measured first.
+    let mut chain = vec![1; 100_000];
+    chain.push(0);
+    let metadata = crate::engine::s3_read::tests::metadata(&chain);
+    let mut deep = b"PAR1".to_vec();
+    deep.extend_from_slice(&metadata);
+    deep.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
+    deep.extend_from_slice(b"PAR1");
+    put(&engine, "pqh", "deep", &deep);
+    assert_eq!(sql_error_number(&engine, &read("deep")), 4864);
+
     // The edges of the ranges read, and so do FLOAT16, UUID, nanosecond
     // timestamps and nested values.
     let mut day = parquet::data_type::Int96::new();
@@ -909,6 +921,26 @@ fn hostile_parquet_files_are_errors_and_odd_types_read_right() {
     assert!(bomb.len() < 100_000, "{} bytes", bomb.len());
     put(&engine, "pqh", "bomb", &bomb);
     assert_eq!(sql_error_number(&engine, &read("bomb")), 4864);
+    // The same page with a header that understates its size (1,000 bytes,
+    // written as a four-byte varint like the true size): gzip decoding does
+    // not stop at a declared size, so the page is decoded into nothing first
+    // and refused there, not after being inflated whole.
+    let mut lying = bomb.clone();
+    let offset = {
+        use parquet::file::reader::FileReader;
+        let reader = parquet::file::serialized_reader::SerializedFileReader::new(
+            bytes::Bytes::from(bomb.clone()),
+        )
+        .unwrap();
+        reader.metadata().row_group(0).column(0).data_page_offset() as usize
+    };
+    // Field 1 (type) = 0, then field 2 (uncompressed size) as a zigzag varint.
+    assert_eq!(&lying[offset..offset + 3], &[0x15, 0x00, 0x15]);
+    assert_eq!(lying[offset + 6] & 0x80, 0, "a four-byte size");
+    lying[offset + 3..offset + 7].copy_from_slice(&[0xD0, 0x8F, 0x80, 0x00]);
+    put(&engine, "pqh", "lying", &lying);
+    let reply = engine.execute(&read("lying")).unwrap();
+    assert!(reply.contains("decompresses past"), "{reply}");
 
     // A column chunk of many small pages, each header checked, reads whole.
     let pages = parquet::file::properties::WriterProperties::builder()
@@ -933,6 +965,57 @@ fn hostile_parquet_files_are_errors_and_odd_types_read_right() {
         ),
         [some(&["100000", "4999950000"])]
     );
+    // Every codec and both data page versions, with dictionaries, read.
+    for (index, codec) in [
+        Compression::GZIP(Default::default()),
+        Compression::BROTLI(Default::default()),
+        Compression::LZ4,
+        Compression::LZ4_RAW,
+        Compression::SNAPPY,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        for version in [
+            parquet::file::properties::WriterVersion::PARQUET_1_0,
+            parquet::file::properties::WriterVersion::PARQUET_2_0,
+        ] {
+            let props = parquet::file::properties::WriterProperties::builder()
+                .set_compression(codec)
+                .set_writer_version(version)
+                .set_data_page_size_limit(4096)
+                .set_write_batch_size(256)
+                .build();
+            let name = format!("codec-{index}-{version:?}");
+            put(
+                &engine,
+                "pqh",
+                &name,
+                &parquet_file(
+                    "message s { REQUIRED INT64 n; REQUIRED BINARY s (UTF8); }",
+                    props,
+                    vec![
+                        Column::I64((0..20_000).collect()),
+                        Column::Bytes(
+                            (0..20_000)
+                                .map(|n| format!("v{}", n % 50).into_bytes())
+                                .collect(),
+                        ),
+                    ],
+                ),
+            );
+            assert_eq!(
+                rows(
+                    &engine,
+                    &format!(
+                        "SELECT COUNT(*), SUM(n), COUNT(DISTINCT s) FROM sys.s3_read('pqh', '{name}', 'parquet')"
+                    )
+                ),
+                [some(&["20000", "199990000", "50"])],
+                "{name}"
+            );
+        }
+    }
     assert_collectable(&engine, "pqh", "pages");
     drop(engine);
     let _ = std::fs::remove_file(path);
