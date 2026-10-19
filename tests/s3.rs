@@ -1235,3 +1235,62 @@ fn versioned_buckets_keep_versions_markers_and_null_versions() {
     assert_eq!(call("PUT", "/vers", "tagging", b"").1.0, 501);
     assert_eq!(call("GET", "/vers/k", "acl", b"").1.0, 501);
 }
+
+#[test]
+fn objects_are_found_by_exact_key_and_by_prefix() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_with(port, method, path, query, &[], body, &key, Some(&secret))
+    };
+    assert_eq!(call("PUT", "/find", "", b"").1.0, 200);
+    for name in [
+        "caf%C3%A9/a.txt",
+        "caf%C3%A9/%C3%A4.txt",
+        "cafe/x",
+        "caf%C3%A9s",
+    ] {
+        assert_eq!(call("PUT", &format!("/find/{name}"), "", b"x").1.0, 200);
+    }
+
+    // Exact lookup: the key that exists, and one that does not (a HEAD
+    // answer carries no body).
+    assert_eq!(call("HEAD", "/find/caf%C3%A9/a.txt", "", b"").1.0, 200);
+    let (_, (status, body)) = call("HEAD", "/find/caf%C3%A9/missing", "", b"");
+    assert_eq!((status, body.as_str()), (404, ""));
+    assert_eq!(call("GET", "/find/cafe/a.txt", "", b"").1.0, 404);
+
+    // Prefix search: exactly the keys under the prefix, in UTF-8 order.
+    // The test client reads bodies one char per byte: back to UTF-8.
+    let keys_of = |xml: &str| -> Vec<String> {
+        let bytes: Vec<u8> = xml.chars().map(|c| c as u8).collect();
+        String::from_utf8(bytes)
+            .unwrap()
+            .split("<Key>")
+            .skip(1)
+            .filter_map(|rest| rest.split("</Key>").next())
+            .map(str::to_string)
+            .collect()
+    };
+    let (_, (status, xml)) = call("GET", "/find", "list-type=2&prefix=caf%C3%A9%2F", b"");
+    assert_eq!(status, 200, "{xml}");
+    assert_eq!(keys_of(&xml), ["café/a.txt", "café/ä.txt"]);
+    let (_, (_, xml)) = call("GET", "/find", "list-type=2&prefix=caf", b"");
+    assert_eq!(
+        keys_of(&xml),
+        ["cafe/x", "café/a.txt", "café/ä.txt", "cafés"]
+    );
+
+    // A key whose newest version is a delete marker is not found, and says so.
+    let versioning = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    assert_eq!(call("PUT", "/find", "versioning", versioning).1.0, 200);
+    assert_eq!(call("DELETE", "/find/cafe/x", "", b"").1.0, 204);
+    let (head, (status, _)) = call("HEAD", "/find/cafe/x", "", b"");
+    assert_eq!(status, 404);
+    assert_eq!(
+        response_header(&head, "x-amz-delete-marker").as_deref(),
+        Some("true")
+    );
+    let (_, (_, xml)) = call("GET", "/find", "list-type=2&prefix=cafe", b"");
+    assert!(keys_of(&xml).is_empty(), "{xml}");
+}
