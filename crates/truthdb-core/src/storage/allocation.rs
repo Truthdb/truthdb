@@ -164,6 +164,9 @@ impl StorageFile {
 
     pub(super) fn spill_write_page(&mut self, page: u64, data: &[u8]) -> Result<(), StorageError> {
         debug_assert_eq!(data.len(), PAGE_SIZE);
+        // A cached frame of the page's previous (freed) use must never be
+        // flushed over the spill page.
+        self.pages.pool.discard(page);
         let mut frame = crate::direct_io::AlignedPageBuf::new();
         frame.as_mut_slice().copy_from_slice(data);
         let offset = self.layout.data_offset + page * PAGE_SIZE as u64;

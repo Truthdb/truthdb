@@ -237,6 +237,16 @@ impl RelCtx<'_> {
         Ok(page_no)
     }
 
+    /// Frees one page outside any transaction: a structural change (a B+
+    /// tree page emptied and unlinked), never undone. The caller logs the
+    /// unlinking first, so a crash between the two leaks the page rather than
+    /// freeing a page still linked.
+    pub fn free_page(&mut self, page_no: u64) -> Result<(), StorageError> {
+        self.append(&RelRecord::free_extent(page_no, 1), false)?;
+        self.allocator.free(page_no, 1);
+        Ok(())
+    }
+
     pub fn append(&mut self, record: &RelRecord, sync: bool) -> Result<u64, StorageError> {
         let mut payload = record.encode();
         // Stamp the container tag into FORWARD page-scoped records (the
@@ -377,6 +387,9 @@ impl RelCtx<'_> {
         txn.last_lsn = lsn;
         for (index, chunk) in data.chunks(page::BLOB_PAGE_DATA).enumerate() {
             let page_no = start_page + index as u64;
+            // A cached frame of the page's previous (freed) use must never be
+            // flushed over the blob.
+            self.pool.discard(page_no);
             let image = blob_page_image(lsn, object_id, page_no, chunk);
             self.io.write_page(page_no, &image)?;
         }

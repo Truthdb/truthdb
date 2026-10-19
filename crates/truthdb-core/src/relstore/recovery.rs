@@ -190,6 +190,9 @@ fn redo_blob_pages(
     let (object_id, start_page, data) = record.decode_blob_pages()?;
     for (index, chunk) in data.chunks(page::BLOB_PAGE_DATA).enumerate() {
         let page_no = start_page + index as u64;
+        // At this record the page is this blob's: a cached frame of an
+        // earlier (freed) use is stale and must never be flushed over it.
+        ctx.pool.discard(page_no);
         if frees
             .iter()
             .any(|&(start, end, free_lsn)| free_lsn > lsn && (start..end).contains(&page_no))
