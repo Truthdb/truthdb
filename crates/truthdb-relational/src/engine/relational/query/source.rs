@@ -27,6 +27,8 @@ pub(in crate::engine::relational) struct Source {
 pub(in crate::engine::relational) enum SourceRows {
     Materialized(Vec<Vec<Datum>>),
     Scan(ScanStream),
+    /// Another engine's rowset (see [`crate::engine::ExternalRowsets`]).
+    External(Box<dyn crate::engine::ExternalStream>),
 }
 
 /// A base-table scan not yet read: full-width rows, [`SCAN_SLICE_ROWS`] at a
@@ -108,6 +110,10 @@ impl SourceRows {
                 }
             }
             SourceRows::Scan(stream) => stream.next_slice(storage),
+            SourceRows::External(stream) => {
+                check_cancelled()?;
+                stream.next_slice()
+            }
         }
     }
 
@@ -121,6 +127,13 @@ impl SourceRows {
                 storage.count_scan_materialization();
                 let mut rows = Vec::new();
                 while let Some(mut slice) = stream.next_slice(storage)? {
+                    rows.append(&mut slice);
+                }
+                Ok(rows)
+            }
+            mut external @ SourceRows::External(_) => {
+                let mut rows = Vec::new();
+                while let Some(mut slice) = external.next_slice(storage)? {
                     rows.append(&mut slice);
                 }
                 Ok(rows)

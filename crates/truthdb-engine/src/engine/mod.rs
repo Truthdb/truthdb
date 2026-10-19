@@ -138,6 +138,10 @@ impl Engine {
             meta.next_seq_no = record.seq_no.saturating_add(1);
         }
 
+        // The object store's inventory, readable from SQL (`sys.s3_*`).
+        storage.set_external_rowsets(Arc::new(s3_sql::S3Rowsets {
+            core: storage.core_arc(),
+        }));
         Ok(Engine {
             storage: Arc::new(storage),
             meta: RwLock::new(meta),
@@ -756,6 +760,7 @@ fn render_sql_outcome(outcome: &crate::engine::BatchOutcome) -> String {
 
 #[cfg(test)]
 mod relational_tests;
+mod s3_sql;
 #[cfg(test)]
 mod search_tests;
 #[cfg(test)]
