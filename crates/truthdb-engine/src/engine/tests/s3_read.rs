@@ -1,4 +1,4 @@
-//! `sys.s3_read`: SQL over stored CSV and JSON objects, streamed a chunk per
+//! `sys.s3_read`: SQL over stored CSV, JSON and Parquet objects, streamed a chunk per
 //! storage-lock hold under a lease that is released when the read ends.
 
 use crate::engine::test_support::*;
@@ -471,44 +471,42 @@ fn parquet_bytes(schema: &str, groups: Vec<Vec<(Values, Option<Vec<i16>>)>>) -> 
             let mut column = row_group.next_column().unwrap().expect("a column");
             let levels = levels.as_deref();
             match values {
-                Values::Bool(v) => drop(
+                Values::Bool(v) => {
                     column
                         .typed::<BoolType>()
                         .write_batch(&v, levels, None)
-                        .unwrap(),
-                ),
-                Values::I32(v) => drop(
+                        .unwrap();
+                }
+                Values::I32(v) => {
                     column
                         .typed::<Int32Type>()
                         .write_batch(&v, levels, None)
-                        .unwrap(),
-                ),
-                Values::I64(v) => drop(
+                        .unwrap();
+                }
+                Values::I64(v) => {
                     column
                         .typed::<Int64Type>()
                         .write_batch(&v, levels, None)
-                        .unwrap(),
-                ),
-                Values::F32(v) => drop(
+                        .unwrap();
+                }
+                Values::F32(v) => {
                     column
                         .typed::<FloatType>()
                         .write_batch(&v, levels, None)
-                        .unwrap(),
-                ),
-                Values::F64(v) => drop(
+                        .unwrap();
+                }
+                Values::F64(v) => {
                     column
                         .typed::<DoubleType>()
                         .write_batch(&v, levels, None)
-                        .unwrap(),
-                ),
+                        .unwrap();
+                }
                 Values::Bytes(v) => {
                     let v: Vec<ByteArray> = v.iter().map(|b| ByteArray::from(b.to_vec())).collect();
-                    drop(
-                        column
-                            .typed::<ByteArrayType>()
-                            .write_batch(&v, levels, None)
-                            .unwrap(),
-                    )
+                    column
+                        .typed::<ByteArrayType>()
+                        .write_batch(&v, levels, None)
+                        .unwrap();
                 }
             }
             column.close().unwrap();
@@ -640,6 +638,302 @@ fn parquet_objects_read_as_typed_rows() {
         ),
         4864
     );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+/// One required column's values, for [`parquet_file`].
+enum Column {
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    I96(Vec<parquet::data_type::Int96>),
+    Fixed(Vec<Vec<u8>>),
+    Bytes(Vec<Vec<u8>>),
+}
+
+/// A Parquet file of `schema` with one row group of these columns, written
+/// with `props`.
+fn parquet_file(
+    schema: &str,
+    props: parquet::file::properties::WriterProperties,
+    columns: Vec<Column>,
+) -> Vec<u8> {
+    use parquet::data_type::{
+        ByteArray, ByteArrayType, FixedLenByteArray, FixedLenByteArrayType, Int32Type, Int64Type,
+        Int96Type,
+    };
+    let schema = std::sync::Arc::new(parquet::schema::parser::parse_message_type(schema).unwrap());
+    let mut out = Vec::new();
+    let mut writer =
+        parquet::file::writer::SerializedFileWriter::new(&mut out, schema, props.into()).unwrap();
+    let mut row_group = writer.next_row_group().unwrap();
+    for values in columns {
+        let mut column = row_group.next_column().unwrap().expect("a column");
+        match values {
+            Column::I32(v) => {
+                column
+                    .typed::<Int32Type>()
+                    .write_batch(&v, None, None)
+                    .unwrap();
+            }
+            Column::I64(v) => {
+                column
+                    .typed::<Int64Type>()
+                    .write_batch(&v, None, None)
+                    .unwrap();
+            }
+            Column::I96(v) => {
+                column
+                    .typed::<Int96Type>()
+                    .write_batch(&v, None, None)
+                    .unwrap();
+            }
+            Column::Fixed(v) => {
+                let v: Vec<FixedLenByteArray> =
+                    v.into_iter().map(|b| ByteArray::from(b).into()).collect();
+                column
+                    .typed::<FixedLenByteArrayType>()
+                    .write_batch(&v, None, None)
+                    .unwrap();
+            }
+            Column::Bytes(v) => {
+                let v: Vec<ByteArray> = v.into_iter().map(ByteArray::from).collect();
+                column
+                    .typed::<ByteArrayType>()
+                    .write_batch(&v, None, None)
+                    .unwrap();
+            }
+        }
+        column.close().unwrap();
+    }
+    row_group.close().unwrap();
+    writer.close().unwrap();
+    out
+}
+
+fn plain() -> parquet::file::properties::WriterProperties {
+    parquet::file::properties::WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .build()
+}
+
+#[test]
+fn hostile_parquet_files_are_errors_and_odd_types_read_right() {
+    use parquet::basic::Compression;
+    let path = unique_temp_path("s3-read-parquet-hostile");
+    let engine = new_engine(&path);
+    bucket(&engine, "pqh");
+    let file = |name: &str, schema: &str, columns: Vec<Column>| {
+        put(
+            &engine,
+            "pqh",
+            name,
+            &parquet_file(schema, plain(), columns),
+        );
+    };
+    let read = |name: &str| format!("SELECT * FROM sys.s3_read('pqh', '{name}', 'parquet')");
+    // Types the record reader would panic on, and values out of range: each
+    // an error, and the engine still answers afterwards.
+    file(
+        "interval",
+        "message s { REQUIRED FIXED_LEN_BYTE_ARRAY (12) iv (INTERVAL); }",
+        vec![Column::Fixed(vec![vec![1; 12]])],
+    );
+    file(
+        "nested-date",
+        "message s { REQUIRED group g { REQUIRED INT32 d (DATE); } }",
+        vec![Column::I32(vec![i32::MAX])],
+    );
+    file(
+        "nested-ts",
+        "message s { REQUIRED group g { REQUIRED INT64 t (TIMESTAMP_MILLIS); } }",
+        vec![Column::I64(vec![i64::MAX])],
+    );
+    file(
+        "ts-micros",
+        "message s { REQUIRED INT64 t (TIMESTAMP_MICROS); }",
+        vec![Column::I64(vec![i64::MAX])],
+    );
+    file(
+        "ts-millis",
+        "message s { REQUIRED INT64 t (TIMESTAMP_MILLIS); }",
+        vec![Column::I64(vec![1_000_000_000_000_000])],
+    );
+    file(
+        "time-negative",
+        "message s { REQUIRED INT32 t (TIME_MILLIS); }",
+        vec![Column::I32(vec![-1])],
+    );
+    file(
+        "time-day",
+        "message s { REQUIRED INT32 t (TIME_MILLIS); }",
+        vec![Column::I32(vec![86_400_000])],
+    );
+    file(
+        "time-micros",
+        "message s { REQUIRED INT64 t (TIME_MICROS); }",
+        vec![Column::I64(vec![1 << 60])],
+    );
+    file(
+        "date-far",
+        "message s { REQUIRED INT32 d (DATE); }",
+        vec![Column::I32(vec![2_932_897])],
+    );
+    file(
+        "decimal-digits",
+        "message s { REQUIRED INT32 a (DECIMAL(2,0)); }",
+        vec![Column::I32(vec![100])],
+    );
+    file(
+        "decimal-wide",
+        "message s { REQUIRED FIXED_LEN_BYTE_ARRAY (16) b (DECIMAL(38,0)); }",
+        vec![Column::Fixed(vec![i128::MAX.to_be_bytes().to_vec()])],
+    );
+    let mut far = parquet::data_type::Int96::new();
+    far.set_data(0, 0, i32::MAX as u32);
+    file(
+        "int96-far",
+        "message s { REQUIRED INT96 t; }",
+        vec![Column::I96(vec![far])],
+    );
+    for name in [
+        "interval",
+        "nested-date",
+        "nested-ts",
+        "ts-micros",
+        "ts-millis",
+        "time-negative",
+        "time-day",
+        "time-micros",
+        "date-far",
+        "decimal-digits",
+        "decimal-wide",
+        "int96-far",
+    ] {
+        assert_eq!(sql_error_number(&engine, &read(name)), 4864, "{name}");
+    }
+
+    // The edges of the ranges read, and so do FLOAT16, UUID, nanosecond
+    // timestamps and nested values.
+    let mut day = parquet::data_type::Int96::new();
+    day.set_data(1_000_000, 0, 2_460_311); // 2024-01-01 00:00:00.001
+    file(
+        "edges",
+        "message s {
+            REQUIRED INT32 d (DATE);
+            REQUIRED INT32 t (TIME_MILLIS);
+            REQUIRED INT32 a (DECIMAL(2,1));
+            REQUIRED INT96 x;
+            REQUIRED FIXED_LEN_BYTE_ARRAY (2) h (FLOAT16);
+            REQUIRED FIXED_LEN_BYTE_ARRAY (16) u (UUID);
+            REQUIRED INT64 n (TIMESTAMP(NANOS,true));
+            REQUIRED group g { REQUIRED INT32 d (DATE); REQUIRED BINARY s (UTF8); REQUIRED INT32 c (DECIMAL(5,2)); }
+        }",
+        vec![
+            Column::I32(vec![2_932_896]),
+            Column::I32(vec![86_399_999]),
+            Column::I32(vec![-99]),
+            Column::I96(vec![day]),
+            Column::Fixed(vec![vec![0x00, 0x3C]]),
+            Column::Fixed(vec![vec![7; 16]]),
+            Column::I64(vec![1_704_067_200_123_456_789]),
+            Column::I32(vec![-719_162]),
+            Column::Bytes(vec![b"q\"x".to_vec()]),
+            Column::I32(vec![-5]),
+        ],
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT CAST(d AS nvarchar(30)), CAST(t AS nvarchar(30)), CAST(a AS nvarchar(30)),              CAST(x AS nvarchar(40)), h, DATALENGTH(u), CAST(n AS nvarchar(40)), g              FROM sys.s3_read('pqh', 'edges', 'parquet')"
+        ),
+        [some(&[
+            "9999-12-31",
+            "23:59:59.9990000",
+            "-9.9",
+            "2024-01-01 00:00:00.0010000",
+            "1.0",
+            "16",
+            "2024-01-01 00:00:00.1234567",
+            r#"{"d":"0001-01-01","s":"q\"x","c":-0.05}"#,
+        ])]
+    );
+
+    // A later file in prefix mode whose names differ only in case maps each
+    // column to its own name. Two columns of one name cannot be told apart
+    // by the record reader, which finds columns by name: an error.
+    let case = "message s { REQUIRED INT32 A; REQUIRED INT32 a; }";
+    file(
+        "case/1",
+        case,
+        vec![Column::I32(vec![1]), Column::I32(vec![2])],
+    );
+    file(
+        "case/2",
+        case,
+        vec![Column::I32(vec![10]), Column::I32(vec![20])],
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            r#"SELECT * FROM sys.s3_read('pqh', 'case/', 'parquet', '{"prefix": true}')"#
+        ),
+        [some(&["case/1", "1", "2"]), some(&["case/2", "10", "20"])]
+    );
+    file(
+        "duplicate",
+        "message s { REQUIRED INT32 a; REQUIRED BINARY a (UTF8); }",
+        vec![Column::I32(vec![1]), Column::Bytes(vec![b"x".to_vec()])],
+    );
+    assert_eq!(sql_error_number(&engine, &read("duplicate")), 4864);
+
+    // A page that decompresses past the file's page limit is refused before
+    // it is decompressed: 300 leaf columns leave each page 1 MiB, and one
+    // holds 2 MiB of zeros (a few kilobytes of gzip).
+    let mut schema = String::from("message s {");
+    let mut columns = Vec::new();
+    for column in 0..300 {
+        schema.push_str(&format!(" REQUIRED BINARY c{column};"));
+        columns.push(Column::Bytes(vec![if column == 0 {
+            vec![0; 2 << 20]
+        } else {
+            b"x".to_vec()
+        }]));
+    }
+    schema.push('}');
+    let gzip = parquet::file::properties::WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_compression(Compression::GZIP(Default::default()))
+        .build();
+    let bomb = parquet_file(&schema, gzip, columns);
+    assert!(bomb.len() < 100_000, "{} bytes", bomb.len());
+    put(&engine, "pqh", "bomb", &bomb);
+    assert_eq!(sql_error_number(&engine, &read("bomb")), 4864);
+
+    // A column chunk of many small pages, each header checked, reads whole.
+    let pages = parquet::file::properties::WriterProperties::builder()
+        .set_dictionary_enabled(false)
+        .set_data_page_size_limit(1024)
+        .set_write_batch_size(64)
+        .build();
+    put(
+        &engine,
+        "pqh",
+        "pages",
+        &parquet_file(
+            "message s { REQUIRED INT64 n; }",
+            pages,
+            vec![Column::I64((0..100_000).collect())],
+        ),
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT COUNT(*), SUM(n) FROM sys.s3_read('pqh', 'pages', 'parquet')"
+        ),
+        [some(&["100000", "4999950000"])]
+    );
+    assert_collectable(&engine, "pqh", "pages");
     drop(engine);
     let _ = std::fs::remove_file(path);
 }

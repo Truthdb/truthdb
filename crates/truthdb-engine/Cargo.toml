@@ -17,7 +17,8 @@ thiserror = { workspace = true }
 serde_json = { workspace = true, features = ["raw_value"] }
 serde = { workspace = true }
 csv = "1.4.0"
-parquet = { version = "60.0.0", default-features = false, features = ["snap", "lz4", "flate2-zlib-rs", "brotli", "json"] }
+parquet = { version = "60.0.0", default-features = false, features = ["snap", "lz4", "flate2-zlib-rs", "brotli"] }
+base64 = "0.22.1"
 bytes = "1"
 
 [dev-dependencies]

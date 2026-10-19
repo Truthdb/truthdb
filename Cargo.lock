@@ -124,12 +124,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "72b3254f16251a8381aa12e40e3c4d2f0199f8c6508fbecb9d91f575e0fbb8c6"
 
 [[package]]
-name = "base64"
-version = "0.23.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ac07cdecf99051d9a5238b80f35af32cdeba5b336e55d957b318b50137e18da5"
-
-[[package]]
 name = "bincode"
 version = "1.3.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -963,7 +957,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "8af83d2940bc0510f9aef86d865f56fdc6095f87ab115ac885a80b7c5226d3ba"
 dependencies = [
  "ahash",
- "base64 0.23.1",
  "brotli",
  "bytes",
  "chrono",
@@ -975,7 +968,6 @@ dependencies = [
  "num-integer",
  "num-traits",
  "seq-macro",
- "serde_json",
  "snap",
  "twox-hash",
 ]
@@ -986,7 +978,7 @@ version = "3.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d30c53c26bc5b31a98cd02d20f25a7c8567146caf63ed593a9d87b2775291be"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "serde_core",
 ]
 
@@ -1572,7 +1564,7 @@ dependencies = [
 name = "truthdb"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "directories",
  "md-5",
  "rcgen",
@@ -1641,6 +1633,7 @@ dependencies = [
 name = "truthdb-engine"
 version = "0.1.0"
 dependencies = [
+ "base64",
  "bytes",
  "csv",
  "parquet",
@@ -1709,7 +1702,7 @@ dependencies = [
 name = "truthdb-s3"
 version = "0.1.0"
 dependencies = [
- "base64 0.22.1",
+ "base64",
  "bytes",
  "crc32fast",
  "http-body",
