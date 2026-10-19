@@ -12,7 +12,10 @@
 //!   `x-amz-meta-*` metadata of each key's newest version, one row per pair.
 //! - `sys.s3_journal(@bucket [, @after_sequence])`: the change journal's rows
 //!   for `bucket` numbered after `@after_sequence`, oldest first (S3
-//!   Metadata's journal table).
+//!   Metadata's journal table): only the current bucket's, not those of a
+//!   deleted bucket of the same name. A restore to an earlier point rewinds
+//!   the numbering with everything else, so a reader resuming from a number
+//!   seen before the restore reads the numbers handed out again after it.
 //!
 //! Rows stream a slice at a time, each slice under its own storage-lock hold,
 //! so a scan reads what is committed when each slice is read (read
@@ -97,6 +100,16 @@ impl S3Rowsets {
                 ));
             }
         };
+        // The bucket's own rows start after the journal's position at its
+        // creation.
+        let from = {
+            let mut guard = self.core.lock();
+            let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+            file.bucket(&bucket)
+                .map_err(storage_error)?
+                .ok_or_else(|| object_error(ObjectError::NoSuchBucket, &bucket))?
+                .journal_from
+        };
         Ok(ExternalRowset {
             columns: vec![
                 nvarchar("bucket", 63),
@@ -115,7 +128,7 @@ impl S3Rowsets {
             rows: Box::new(JournalStream {
                 core: Arc::clone(&self.core),
                 bucket,
-                after,
+                after: after.max(from),
                 done: false,
             }),
         })

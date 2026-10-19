@@ -1270,6 +1270,7 @@ fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
             let row = BucketRow {
                 created_ms: now(),
                 versioning: Versioning::Enabled,
+                journal_from: 0,
             };
             tx.trees
                 .buckets()
@@ -1328,6 +1329,7 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
             let row = BucketRow {
                 created_ms: now(),
                 versioning: Versioning::Enabled,
+                journal_from: 0,
             };
             tx.trees
                 .buckets()
@@ -1560,15 +1562,39 @@ fn the_journal_records_every_change_in_its_own_transaction() {
     let records = journal(&storage);
     assert_eq!(records.len(), before + 1);
     assert!(records[before].sequence > records[before - 1].sequence);
-    let trim = |before_ms: u64, limit: usize| {
+    // Trimming at `at` with a 1 ms retention takes the rows stamped before it.
+    let trim = |at: u64, limit: usize| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.trim_journal(before_ms, limit))
+            .transaction(|tx| tx.trim_journal(at, 1, limit))
+            .unwrap()
+    };
+    let due = |at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .journal_due(at, 1)
             .unwrap()
     };
     assert_eq!(trim(now() + 1, 3), 3);
     assert_eq!(journal(&storage).len(), before + 1 - 3);
+    assert!(!due(now()));
     assert_eq!(trim(now(), 100), 0, "nothing is older than now()");
+    assert!(due(now() + 1));
     assert_eq!(trim(now() + 1, 1000), before + 1 - 3);
+    assert!(journal(&storage).is_empty());
+    assert!(!due(now() + 1));
+
+    // A row stamped by a clock that ran ahead goes with the rows recorded
+    // after it, once they expire.
+    let tag = |at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.set_tags("plain", "after", VersionSel::Latest, Vec::new(), at))
+            .unwrap()
+            .unwrap();
+    };
+    tag(now() + 1_000_000);
+    tag(now());
+    tag(now());
+    assert!(due(now() + 1));
+    assert_eq!(trim(now() + 1, 100), 3);
     assert!(journal(&storage).is_empty());
     drop(storage);
     std::fs::remove_file(&path).ok();

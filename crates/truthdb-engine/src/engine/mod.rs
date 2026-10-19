@@ -635,11 +635,20 @@ impl Engine {
                 self.object(|file| file.transaction(|tx| tx.abort_upload(upload, now_ms, 0)))?;
         }
         // Journal rows past their retention, a bounded batch per transaction
-        // and a bounded number of batches per sweep.
-        let before = now_ms.saturating_sub(OBJECT_JOURNAL_RETENTION_MS);
+        // and a bounded number of batches per sweep. Whether anything is due
+        // is read first: an idle sweep writes nothing.
         for _ in 0..8 {
             let trimmed = self.object(|file| {
-                file.transaction(|tx| tx.trim_journal(before, OBJECT_JOURNAL_TRIM_BATCH))
+                if !file.journal_due(now_ms, OBJECT_JOURNAL_RETENTION_MS)? {
+                    return Ok(0);
+                }
+                file.transaction(|tx| {
+                    tx.trim_journal(
+                        now_ms,
+                        OBJECT_JOURNAL_RETENTION_MS,
+                        OBJECT_JOURNAL_TRIM_BATCH,
+                    )
+                })
             })?;
             if trimmed < OBJECT_JOURNAL_TRIM_BATCH {
                 break;

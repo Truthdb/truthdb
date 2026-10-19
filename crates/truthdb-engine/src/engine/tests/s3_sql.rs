@@ -448,3 +448,44 @@ fn the_journal_reads_as_a_table_from_a_sequence_on() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn an_idle_sweep_writes_nothing_and_a_new_bucket_starts_a_new_journal() {
+    let path = unique_temp_path("s3-sql-journal-scope");
+    let engine = new_engine(&path);
+    // An idle maintenance sweep reads only: the log does not grow.
+    engine.object_gc().expect("sweep");
+    let tail = engine.storage().wal_tail();
+    for _ in 0..3 {
+        engine.object_gc().expect("sweep");
+    }
+    assert_eq!(
+        engine.storage().wal_tail(),
+        tail,
+        "an idle sweep wrote to the log"
+    );
+
+    create_bucket(&engine, "again", Versioning::Unversioned);
+    put(&engine, "again", "old", b"1", &ObjectAttrs::default());
+    engine
+        .object(|file| file.transaction(|tx| tx.delete_object("again", "old", None, 3_000, 0)))
+        .expect("delete")
+        .expect("delete accepted");
+    engine
+        .object(|file| file.transaction(|tx| tx.delete_bucket("again")))
+        .expect("drop")
+        .expect("dropped");
+    assert_eq!(
+        sql_error_number(&engine, "SELECT * FROM sys.s3_journal('again')"),
+        208
+    );
+    create_bucket(&engine, "again", Versioning::Unversioned);
+    put(&engine, "again", "new", b"2", &ObjectAttrs::default());
+    let (_, rows) = sql_rows(
+        &engine,
+        "SELECT [key], record_type FROM sys.s3_journal('again')",
+    );
+    assert_eq!(rows, [vec![Some("new".into()), Some("CREATE".into())]]);
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}

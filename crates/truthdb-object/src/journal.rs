@@ -159,6 +159,14 @@ pub(crate) struct Change<'a> {
 }
 
 impl ObjTxn<'_, '_> {
+    /// The journal's last sequence number handed out (0 before any).
+    pub(crate) fn last_change(&mut self) -> Result<u64, StorageError> {
+        Ok(match self.trees.meta().get(self.ctx, NEXT_CHANGE_KEY)? {
+            Some(next) => crate::codec::u64_le(&next)?.saturating_sub(1),
+            None => 0,
+        })
+    }
+
     /// Records `change` as the journal's next row, in this transaction.
     pub(crate) fn record_change(
         &mut self,
@@ -186,25 +194,68 @@ impl ObjTxn<'_, '_> {
         Ok(())
     }
 
-    /// Deletes up to `limit` of the oldest rows recorded before `before_ms`
-    /// and returns how many it deleted.
-    pub fn trim_journal(&mut self, before_ms: u64, limit: usize) -> Result<usize, StorageError> {
+    /// Deletes up to `limit` of the oldest rows that are past `retention_ms`
+    /// at `now_ms` and returns how many it deleted. Rows are in recording
+    /// order, so a row recorded before an expired one is at least as old,
+    /// whatever its timestamp says (the clock may have stepped back since):
+    /// everything up to the last expired row in a window from the head goes.
+    pub fn trim_journal(
+        &mut self,
+        now_ms: u64,
+        retention_ms: u64,
+        limit: usize,
+    ) -> Result<usize, StorageError> {
         let changes = self.trees.changes();
-        let rows = changes.scan_range_limit(self.ctx, None, None, limit)?;
+        let window = changes.scan_range_limit(self.ctx, None, None, trim_window(limit))?;
+        let Some(last) = last_expired(&window, now_ms, retention_ms)? else {
+            return Ok(0);
+        };
         let mut trimmed = 0;
-        for (key, row) in rows {
-            let sequence = u64::from_be_bytes(key.as_slice().try_into().map_err(|_| corrupt())?);
-            if JournalRecord::decode(sequence, &row)?.timestamp_ms >= before_ms {
-                break;
-            }
-            changes.delete(self.ctx, &mut OpMode::Txn(self.txn), &key)?;
+        for (key, _) in window.iter().take((last + 1).min(limit)) {
+            changes.delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
             trimmed += 1;
         }
         Ok(trimmed)
     }
 }
 
+/// Rows a trim looks at from the head to find the last expired one: a few
+/// batches, so a short run of rows stamped by a clock that ran ahead does not
+/// hold up the rows recorded after them.
+fn trim_window(limit: usize) -> usize {
+    limit.saturating_mul(4).max(64)
+}
+
+/// The index of the last row in `rows` (journal rows from the head) past
+/// `retention_ms` at `now_ms`.
+fn last_expired(
+    rows: &[(Vec<u8>, Vec<u8>)],
+    now_ms: u64,
+    retention_ms: u64,
+) -> Result<Option<usize>, StorageError> {
+    let mut last = None;
+    for (index, (key, row)) in rows.iter().enumerate() {
+        let sequence = u64::from_be_bytes(key.as_slice().try_into().map_err(|_| corrupt())?);
+        let record = JournalRecord::decode(sequence, row)?;
+        if record.timestamp_ms.saturating_add(retention_ms) <= now_ms {
+            last = Some(index);
+        }
+    }
+    Ok(last)
+}
+
 impl ObjFile<'_> {
+    /// Whether a trim at `now_ms` would delete anything: a read, so a sweep
+    /// with nothing to trim writes nothing (not even the log).
+    pub fn journal_due(&mut self, now_ms: u64, retention_ms: u64) -> Result<bool, StorageError> {
+        let Some(changes) = self.existing_tree(CHANGES_TREE)? else {
+            return Ok(false);
+        };
+        let window =
+            changes.scan_range_limit(&mut self.core.page_ctx(0), None, None, trim_window(1))?;
+        Ok(last_expired(&window, now_ms, retention_ms)?.is_some())
+    }
+
     /// Up to `limit` journal rows numbered after `after`, oldest first.
     pub fn journal(
         &mut self,

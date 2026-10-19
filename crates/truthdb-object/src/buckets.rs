@@ -22,6 +22,10 @@ pub struct BucketInfo {
     pub name: String,
     pub created_ms: u64,
     pub versioning: Versioning,
+    /// The change journal's last sequence number when the bucket was
+    /// created: its rows numbered after this are this bucket's (a bucket
+    /// deleted and created again does not inherit the old one's history).
+    pub journal_from: u64,
 }
 
 /// Why a bucket operation was refused (the storage itself worked).
@@ -33,10 +37,12 @@ pub enum BucketError {
     InvalidName(&'static str),
 }
 
-/// A bucket's stored row: creation time and versioning state.
+/// A bucket's stored row: creation time, versioning state, and where its
+/// journal starts.
 pub(crate) struct BucketRow {
     pub created_ms: u64,
     pub versioning: Versioning,
+    pub journal_from: u64,
 }
 
 impl BucketRow {
@@ -47,12 +53,15 @@ impl BucketRow {
             Versioning::Enabled => 1,
             Versioning::Suspended => 2,
         });
+        out.extend_from_slice(&self.journal_from.to_le_bytes());
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         let corrupt = || StorageError::InvalidFile("corrupt bucket row".to_string());
-        if bytes.len() != 9 {
+        // A row written before the journal has no journal start: all of the
+        // journal is the bucket's.
+        if bytes.len() != 9 && bytes.len() != 17 {
             return Err(corrupt());
         }
         Ok(BucketRow {
@@ -62,6 +71,10 @@ impl BucketRow {
                 1 => Versioning::Enabled,
                 2 => Versioning::Suspended,
                 _ => return Err(corrupt()),
+            },
+            journal_from: match bytes.get(9..17) {
+                Some(from) => u64::from_le_bytes(from.try_into().unwrap()),
+                None => 0,
             },
         })
     }
@@ -132,6 +145,7 @@ impl ObjTxn<'_, '_> {
         let row = BucketRow {
             created_ms: now_ms,
             versioning: Versioning::Unversioned,
+            journal_from: self.last_change()?,
         };
         let buckets = self.trees.buckets();
         let inserted = buckets.insert_unique(
@@ -204,6 +218,7 @@ impl ObjFile<'_> {
                     name: name.to_string(),
                     created_ms: row.created_ms,
                     versioning: row.versioning,
+                    journal_from: row.journal_from,
                 })
             })
             .transpose()
@@ -226,6 +241,7 @@ impl ObjFile<'_> {
                     })?,
                     created_ms: row.created_ms,
                     versioning: row.versioning,
+                    journal_from: row.journal_from,
                 })
             })
             .collect()
