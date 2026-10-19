@@ -163,7 +163,7 @@ fn json_objects_read_as_rows() {
                 vec![
                     Some("1".into()),
                     Some("click".into()),
-                    Some(r#"["a","b"]"#.into()),
+                    Some(r#"["a", "b"]"#.into()),
                     None
                 ],
                 vec![Some("2".into()), None, None, None],
@@ -171,7 +171,7 @@ fn json_objects_read_as_rows() {
                     Some("3".into()),
                     None,
                     None,
-                    Some(r#"{"deep":true}"#.into())
+                    Some(r#"{"deep": true}"#.into())
                 ],
             ]
         )
@@ -306,6 +306,133 @@ fn a_prefix_reads_every_object_under_it_and_a_multipart_body_reads_whole() {
         sql_error_number(
             &engine,
             r#"SELECT * FROM sys.s3_read('logs', '2025/01.csv', 'csv', '{"nope": 1}')"#
+        ),
+        4864
+    );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn reads_hold_up_to_odd_files() {
+    let path = unique_temp_path("s3-read-odd");
+    let engine = new_engine(&path);
+    bucket(&engine, "odd");
+    // Prefix mode: later files by their header names; folder markers.
+    put(&engine, "odd", "ord/", b"");
+    put(&engine, "odd", "ord/a.csv", b"x,y\n1,2\n");
+    put(&engine, "odd", "ord/b.csv", b"y,x\n20,10\n");
+    put(&engine, "odd", "ord/c.csv", b"x\n100\n");
+    assert_eq!(
+        rows(
+            &engine,
+            r#"SELECT * FROM sys.s3_read('odd', 'ord/', 'csv', '{"prefix": true}')"#
+        ),
+        [
+            some(&["ord/a.csv", "1", "2"]),
+            some(&["ord/b.csv", "10", "20"]),
+            vec![Some("ord/c.csv".into()), Some("100".into()), None],
+        ]
+    );
+    put(&engine, "odd", "bad/a.csv", b"x\n1\n");
+    put(&engine, "odd", "bad/b.csv", b"z\n2\n");
+    assert_eq!(
+        sql_error_number(
+            &engine,
+            r#"SELECT * FROM sys.s3_read('odd', 'bad/', 'csv', '{"prefix": true}')"#
+        ),
+        4864
+    );
+    put(&engine, "odd", "js/", b"");
+    put(&engine, "odd", "js/a.json", br#"{"x": 1, "y": 2}"#);
+    assert_eq!(
+        sql_rows(
+            &engine,
+            r#"SELECT * FROM sys.s3_read('odd', 'js/', 'json', '{"prefix": true}')"#
+        ),
+        (
+            vec!["_s3_key".into(), "x".into(), "y".into()],
+            vec![some(&["js/a.json", "1", "2"])]
+        )
+    );
+
+    // JSON: a byte order mark, records that are arrays, exact numbers, and
+    // keys in the order written.
+    put(&engine, "odd", "bom.json", b"\xEF\xBB\xBF{\"x\": 1}");
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT x FROM sys.s3_read('odd', 'bom.json', 'json')"
+        ),
+        [some(&["1"])]
+    );
+    put(&engine, "odd", "arrays.jsonl", b"[1,2]\n[3,4]\n");
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT value FROM sys.s3_read('odd', 'arrays.jsonl', 'json')"
+        ),
+        [some(&["[1,2]"]), some(&["[3,4]"])]
+    );
+    put(
+        &engine,
+        "odd",
+        "numbers.json",
+        br#"{"zeta": 12345678901234567890123, "alpha": 0.1000000000000000055511151231257827, "mid": 1.50}"#,
+    );
+    assert_eq!(
+        sql_rows(
+            &engine,
+            "SELECT * FROM sys.s3_read('odd', 'numbers.json', 'json')"
+        ),
+        (
+            vec!["zeta".into(), "alpha".into(), "mid".into()],
+            vec![some(&[
+                "12345678901234567890123",
+                "0.1000000000000000055511151231257827",
+                "1.50"
+            ])]
+        )
+    );
+
+    // Column names made unique, the prefix key reserved; no columns at all
+    // and bad separators are errors.
+    put(&engine, "odd", "dups.csv", b"a,a,,_s3_key\n1,2,3,4\n");
+    assert_eq!(
+        sql_rows(
+            &engine,
+            "SELECT * FROM sys.s3_read('odd', 'dups.csv', 'csv')"
+        )
+        .0,
+        ["a", "a_2", "c3", "_s3_key"]
+    );
+    put(&engine, "odd", "p/dups.csv", b"_s3_key,b\n1,2\n");
+    assert_eq!(
+        sql_rows(
+            &engine,
+            r#"SELECT * FROM sys.s3_read('odd', 'p/', 'csv', '{"prefix": true}')"#
+        )
+        .0,
+        ["_s3_key", "_s3_key_2", "b"]
+    );
+    put(&engine, "odd", "empty.csv", b"");
+    put(&engine, "odd", "empty.json", b"{}\n{}\n");
+    for query in [
+        "SELECT * FROM sys.s3_read('odd', 'empty.csv', 'csv')",
+        "SELECT * FROM sys.s3_read('odd', 'empty.json', 'json')",
+        r#"SELECT * FROM sys.s3_read('odd', 'dups.csv', 'csv', '{"delimiter": "\n"}')"#,
+        r#"SELECT * FROM sys.s3_read('odd', 'dups.csv', 'csv', '{"delimiter": "\""}')"#,
+    ] {
+        assert_eq!(sql_error_number(&engine, query), 4864, "{query}");
+    }
+
+    // One record without an end is refused, not read whole.
+    let endless = vec![b'x'; 4 * 1024 * 1024];
+    put(&engine, "odd", "endless.csv", &endless);
+    assert_eq!(
+        sql_error_number(
+            &engine,
+            r#"SELECT COUNT(*) FROM sys.s3_read('odd', 'endless.csv', 'csv', '{"header": false}')"#
         ),
         4864
     );
