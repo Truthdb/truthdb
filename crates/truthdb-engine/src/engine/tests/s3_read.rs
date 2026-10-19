@@ -817,7 +817,7 @@ fn hostile_parquet_files_are_errors_and_odd_types_read_right() {
     // would recurse once per level building it, so it is measured first.
     let mut chain = vec![1; 100_000];
     chain.push(0);
-    let metadata = crate::engine::s3_read::tests::metadata(&chain);
+    let metadata = crate::engine::s3_parquet::thrift::tests::metadata(&chain, 5);
     let mut deep = b"PAR1".to_vec();
     deep.extend_from_slice(&metadata);
     deep.extend_from_slice(&(metadata.len() as u32).to_le_bytes());
@@ -1017,6 +1017,142 @@ fn hostile_parquet_files_are_errors_and_odd_types_read_right() {
         }
     }
     assert_collectable(&engine, "pqh", "pages");
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+/// `file` with its footer rewritten by `edit`.
+fn with_footer(
+    file: &[u8],
+    edit: impl FnOnce(
+        parquet::file::metadata::ParquetMetaData,
+    ) -> parquet::file::metadata::ParquetMetaData,
+) -> Vec<u8> {
+    let len = u32::from_le_bytes(file[file.len() - 8..file.len() - 4].try_into().unwrap()) as usize;
+    let metadata = parquet::file::metadata::ParquetMetaDataReader::new()
+        .parse_and_finish(&bytes::Bytes::from(file.to_vec()))
+        .unwrap();
+    let mut out = file[..file.len() - 8 - len].to_vec();
+    parquet::file::metadata::ParquetMetaDataWriter::new(&mut out, &edit(metadata))
+        .finish()
+        .unwrap();
+    out
+}
+
+#[test]
+fn parquet_files_that_lie_about_their_layout_are_refused_before_reading() {
+    use parquet::basic::Compression;
+    let path = unique_temp_path("s3-read-parquet-layout");
+    let engine = new_engine(&path);
+    bucket(&engine, "pql");
+    let read = |name: &str| format!("SELECT COUNT(*) FROM sys.s3_read('pql', '{name}', 'parquet')");
+    let message = |name: &str| engine.execute(&read(name)).unwrap();
+
+    // An empty row group whose dictionary page ends its chunk reads.
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .build();
+    put(
+        &engine,
+        "pql",
+        "empty",
+        &parquet_file(
+            "message s { REQUIRED BINARY s (UTF8); }",
+            props,
+            vec![Column::Bytes(vec![])],
+        ),
+    );
+    assert_eq!(rows(&engine, &read("empty")), [some(&["0"])]);
+
+    // Two column chunks whose ranges overlap.
+    let two = parquet_file(
+        "message s { REQUIRED INT32 a; REQUIRED INT32 b; }",
+        plain(),
+        vec![Column::I32(vec![1, 2]), Column::I32(vec![3, 4])],
+    );
+    let overlapping = with_footer(&two, |metadata| {
+        let mut builder = metadata.clone().into_builder();
+        let groups = builder.take_row_groups();
+        for group in groups {
+            let columns = group.columns().to_vec();
+            let first = columns[0].clone();
+            let grown = first
+                .clone()
+                .into_builder()
+                .set_total_compressed_size(first.compressed_size() + 10)
+                .build()
+                .unwrap();
+            let group = group
+                .into_builder()
+                .set_column_metadata(vec![grown, columns[1].clone()])
+                .build()
+                .unwrap();
+            builder = builder.add_row_group(group);
+        }
+        builder.build()
+    });
+    put(&engine, "pql", "overlap", &overlapping);
+    assert!(
+        message("overlap").contains("overlap"),
+        "{}",
+        message("overlap")
+    );
+
+    // A dictionary page declaring 63 values in the 4 bytes of one.
+    let props = parquet::file::properties::WriterProperties::builder()
+        .set_compression(Compression::UNCOMPRESSED)
+        .build();
+    let mut dictionary = parquet_file(
+        "message s { REQUIRED BINARY s (UTF8); }",
+        props,
+        vec![Column::Bytes(vec![Vec::new(); 3])],
+    );
+    let at = dictionary
+        .windows(3)
+        .position(|w| w == [0x4C, 0x15, 0x02])
+        .expect("the dictionary page header's value count");
+    dictionary[at + 2] = 0x7E;
+    put(&engine, "pql", "dictionary", &dictionary);
+    assert!(
+        message("dictionary").contains("dictionary page declaring"),
+        "{}",
+        message("dictionary")
+    );
+
+    // One row holding two million null list elements, a few kilobytes on
+    // disk: refused from its repetition levels before the row is built.
+    let schema = std::sync::Arc::new(
+        parquet::schema::parser::parse_message_type(
+            "message s { OPTIONAL group l (LIST) { REPEATED group list { OPTIONAL INT32 element; } } }",
+        )
+        .unwrap(),
+    );
+    let mut long = Vec::new();
+    {
+        let mut writer =
+            parquet::file::writer::SerializedFileWriter::new(&mut long, schema, plain().into())
+                .unwrap();
+        let mut group = writer.next_row_group().unwrap();
+        let mut column = group.next_column().unwrap().unwrap();
+        let count = 2_000_000;
+        let definition = vec![2i16; count];
+        let mut repetition = vec![1i16; count];
+        repetition[0] = 0;
+        column
+            .typed::<parquet::data_type::Int32Type>()
+            .write_batch(&[], Some(&definition), Some(&repetition))
+            .unwrap();
+        column.close().unwrap();
+        group.close().unwrap();
+        writer.close().unwrap();
+    }
+    assert!(long.len() < 100_000, "{} bytes", long.len());
+    put(&engine, "pql", "long", &long);
+    assert!(
+        message("long").contains("row holds more than"),
+        "{}",
+        message("long")
+    );
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
