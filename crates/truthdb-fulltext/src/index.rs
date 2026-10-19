@@ -20,7 +20,7 @@ use truthdb_core::relstore::btree::{BTree, TREE_MAX_CELL, TreeInsert};
 use truthdb_core::relstore::ctx::{OpMode, RelCtx, TxnLink};
 use truthdb_core::storage::StorageError;
 
-use crate::tokenize::DocTerms;
+use crate::tokenize::{DocTerms, MAX_TERM_BYTES};
 
 /// The two trees an index lives in.
 pub struct Index {
@@ -154,6 +154,16 @@ impl Index {
         doc: u64,
         terms: &DocTerms,
     ) -> Result<(), StorageError> {
+        // A term is stored behind a length byte and ends at a 0 in posting keys.
+        if let Some(bad) = terms
+            .counts
+            .keys()
+            .find(|term| term.is_empty() || term.len() > MAX_TERM_BYTES || term.contains('\0'))
+        {
+            return Err(StorageError::InvalidConfig(format!(
+                "{bad:?} cannot be indexed as a full-text term"
+            )));
+        }
         self.unindex_document(ctx, txn, scope, doc)?;
         let posting = |tf: u32| {
             let mut row = tf.to_le_bytes().to_vec();

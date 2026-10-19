@@ -106,7 +106,8 @@ impl Search {
                 self.resume.as_deref(),
                 budget,
             )?;
-            budget -= postings.len();
+            // A lookup that finds nothing still costs a tree descent.
+            budget = budget.saturating_sub(postings.len().max(1));
             self.read += postings.len();
             if self.read > MAX_POSTINGS {
                 return Err(SearchError::TooManyPostings);

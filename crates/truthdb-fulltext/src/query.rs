@@ -13,7 +13,16 @@
 //! Server. A bare word that splits into several terms (`e-mail`) is read as
 //! a phrase.
 
-use crate::tokenize::terms;
+use crate::tokenize::{MAX_TERM_BYTES, words};
+
+/// The most operators, parentheses, words and phrases one condition holds.
+/// Parsing and ranking recurse once per nesting level, so this bounds their
+/// stack as well as the work.
+pub const MAX_TOKENS: usize = 512;
+/// The deepest parentheses may nest.
+pub const MAX_NESTING: usize = 32;
+/// The most distinct terms one condition looks up.
+pub const MAX_TERMS: usize = 256;
 
 /// One term the condition looks up: a whole term, or every term that starts
 /// with it.
@@ -63,10 +72,16 @@ enum Token {
 impl Query {
     pub fn parse(condition: &str) -> Result<Query, QueryError> {
         let tokens = lex(condition)?;
+        if tokens.len() > MAX_TOKENS {
+            return Err(QueryError(format!(
+                "The full-text search condition has more than {MAX_TOKENS} words and operators."
+            )));
+        }
         let mut parser = Parser {
             condition,
             tokens,
             at: 0,
+            nesting: 0,
             leaves: Vec::new(),
         };
         let root = parser.or()?;
@@ -126,6 +141,7 @@ struct Parser<'a> {
     condition: &'a str,
     tokens: Vec<Token>,
     at: usize,
+    nesting: usize,
     leaves: Vec<Leaf>,
 }
 
@@ -170,7 +186,14 @@ impl Parser<'_> {
         self.at += 1;
         match token {
             Token::Open => {
+                self.nesting += 1;
+                if self.nesting > MAX_NESTING {
+                    return Err(QueryError(format!(
+                        "The full-text search condition nests parentheses more than {MAX_NESTING} deep."
+                    )));
+                }
                 let node = self.or()?;
+                self.nesting -= 1;
                 if !self.eat(&Token::Close) {
                     return Err(match self.tokens.get(self.at) {
                         Some(token) => self.error_near(token),
@@ -197,9 +220,15 @@ impl Parser<'_> {
 
     /// The node for the terms of `text`: all of them must match.
     fn words(&mut self, text: &str, prefix: bool, shown: &str) -> Result<Node, QueryError> {
-        let mut nodes: Vec<Node> = terms(text)
-            .map(|term| Node::Leaf(self.leaf(Leaf { term, prefix })))
-            .collect();
+        let mut nodes = Vec::new();
+        for term in words(text) {
+            if term.len() > MAX_TERM_BYTES {
+                return Err(QueryError(format!(
+                    "The word '{term}' in the full-text search condition is longer than {MAX_TERM_BYTES} bytes."
+                )));
+            }
+            nodes.push(Node::Leaf(self.leaf(Leaf { term, prefix })?));
+        }
         match nodes.len() {
             0 => Err(QueryError(format!(
                 "The full-text search condition '{}' has no searchable word in '{shown}'.",
@@ -210,14 +239,17 @@ impl Parser<'_> {
         }
     }
 
-    fn leaf(&mut self, leaf: Leaf) -> usize {
-        match self.leaves.iter().position(|known| *known == leaf) {
-            Some(index) => index,
-            None => {
-                self.leaves.push(leaf);
-                self.leaves.len() - 1
-            }
+    fn leaf(&mut self, leaf: Leaf) -> Result<usize, QueryError> {
+        if let Some(index) = self.leaves.iter().position(|known| *known == leaf) {
+            return Ok(index);
         }
+        if self.leaves.len() == MAX_TERMS {
+            return Err(QueryError(format!(
+                "The full-text search condition has more than {MAX_TERMS} distinct terms."
+            )));
+        }
+        self.leaves.push(leaf);
+        Ok(self.leaves.len() - 1)
     }
 
     fn eat(&mut self, token: &Token) -> bool {
@@ -332,8 +364,31 @@ mod tests {
             "a & ()",
             "a ! b",
             "wow!",
+            "\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa b\"",
         ] {
             assert!(Query::parse(bad).is_err(), "{bad:?} parsed");
         }
+    }
+
+    #[test]
+    fn conditions_past_the_limits_are_rejected_not_overflowed() {
+        let nested = |depth| format!("{}a{}", "(".repeat(depth), ")".repeat(depth));
+        assert!(Query::parse(&nested(MAX_NESTING)).is_ok());
+        assert!(Query::parse(&nested(MAX_NESTING + 1)).is_err());
+        assert!(Query::parse(&nested(100_000)).is_err());
+        let chain = |n: usize| {
+            let mut condition = "a".to_string();
+            for i in 0..n {
+                condition.push_str(&format!(" &! w{i}"));
+            }
+            condition
+        };
+        // Each "&!" and its word are three tokens: "&", "!" and the word.
+        assert!(Query::parse(&chain((MAX_TOKENS - 1) / 3)).is_ok());
+        assert!(Query::parse(&chain((MAX_TOKENS - 1) / 3 + 1)).is_err());
+        let phrase: String = (0..=MAX_TERMS).map(|n| format!("w{n} ")).collect();
+        assert!(Query::parse(&format!("\"{phrase}\"")).is_err());
+        let phrase: String = (0..MAX_TERMS).map(|n| format!("w{n} ")).collect();
+        assert!(Query::parse(&format!("\"{phrase}\"")).is_ok());
     }
 }

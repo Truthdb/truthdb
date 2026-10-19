@@ -16,9 +16,12 @@ pub const MAX_TERM_BYTES: usize = 64;
 
 /// The terms of `text`, in order, repeats included.
 pub fn terms(text: &str) -> impl Iterator<Item = String> + '_ {
-    text.unicode_words()
-        .map(str::to_lowercase)
-        .filter(|term| term.len() <= MAX_TERM_BYTES)
+    words(text).filter(|term| term.len() <= MAX_TERM_BYTES)
+}
+
+/// The lowercased words of `text`, overlong ones included.
+pub(crate) fn words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.unicode_words().map(str::to_lowercase)
 }
 
 /// What a document contributes to the index: how often each term occurs,

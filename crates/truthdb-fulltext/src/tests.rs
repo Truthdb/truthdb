@@ -400,3 +400,49 @@ fn a_prefix_matching_too_many_terms_is_refused() {
         Err(SearchError::Query(_))
     ));
 }
+
+#[test]
+fn terms_a_row_cannot_hold_are_refused_before_anything_is_written() {
+    let f = fixture("bad-terms");
+    for bad in [
+        "x".repeat(300),
+        "y".repeat(65),
+        String::new(),
+        "a\0b".to_string(),
+    ] {
+        let doc = DocTerms {
+            counts: [("fine".to_string(), 1), (bad.clone(), 1)].into(),
+            len: 2,
+        };
+        f.txn(true, |ctx, txn, index| {
+            assert!(
+                index.index_document(ctx, txn, b"b", 1, &doc).is_err(),
+                "{bad:?}"
+            );
+        });
+    }
+    assert_eq!(f.rows(), 0);
+}
+
+#[test]
+fn every_lookup_counts_against_the_slice_budget() {
+    let f = fixture("budget");
+    f.index("b", 1, "hit");
+    let condition: String = std::iter::once("hit".to_string())
+        .chain((0..200).map(|n| format!(" or miss{n}")))
+        .collect();
+    let mut search = Search::new(&condition).unwrap();
+    let mut steps = 0;
+    loop {
+        steps += 1;
+        let mut guard = f.storage.lock();
+        if search
+            .step(&mut guard.page_ctx(0), &f.index, b"b", 10)
+            .unwrap()
+        {
+            break;
+        }
+    }
+    // 201 lookups, at most 10 per step.
+    assert!(steps >= 20, "{steps} steps");
+}
