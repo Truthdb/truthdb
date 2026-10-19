@@ -10,6 +10,12 @@
 //! - `sys.s3_object_tags(@bucket [, @prefix])` and
 //!   `sys.s3_object_metadata(@bucket [, @prefix])`: the tags and the
 //!   `x-amz-meta-*` metadata of each key's newest version, one row per pair.
+//! - `sys.s3_journal(@bucket [, @after_sequence])`: the change journal's rows
+//!   for `bucket` numbered after `@after_sequence`, oldest first (S3
+//!   Metadata's journal table): only the current bucket's, not those of a
+//!   deleted bucket of the same name. A restore to an earlier point rewinds
+//!   the numbering with everything else, so a reader resuming from a number
+//!   seen before the restore reads the numbers handed out again after it.
 //!
 //! Rows stream a slice at a time, each slice under its own storage-lock hold,
 //! so a scan reads what is committed when each slice is read (read
@@ -20,7 +26,8 @@ use std::sync::Arc;
 
 use truthdb_core::storage::{Storage, StorageError};
 use truthdb_object::{
-    ListAfter, Listing, ObjFile, ObjectAttrs, ObjectError, ObjectInfo, Versioning, version_id,
+    JournalRecord, ListAfter, Listing, ObjFile, ObjectAttrs, ObjectError, ObjectInfo, Versioning,
+    version_id,
 };
 use truthdb_relational::engine::{
     ExternalCaller, ExternalRowset, ExternalRowsets, ExternalStream, ResultColumn, check_cancelled,
@@ -62,6 +69,7 @@ impl ExternalRowsets for S3Rowsets {
             "sys.s3_object_versions" => Some(Kind::Versions),
             "sys.s3_object_tags" => Some(Kind::Tags),
             "sys.s3_object_metadata" => Some(Kind::Metadata),
+            "sys.s3_journal" => return Some(self.open_journal(name, args, caller)),
             _ => return None,
         };
         Some(self.open_kind(name, kind, args, caller))
@@ -69,6 +77,63 @@ impl ExternalRowsets for S3Rowsets {
 }
 
 impl S3Rowsets {
+    fn open_journal(
+        &self,
+        name: &str,
+        args: &[SqlValue],
+        caller: ExternalCaller,
+    ) -> Result<ExternalRowset, SqlError> {
+        check_admin(name, caller)?;
+        check_arg_count(name, args, 1, 2)?;
+        let bucket = string_arg(name, &args[0])?;
+        let after = match args.get(1) {
+            None => 0,
+            Some(SqlValue::Int(after)) if *after >= 0 => *after as u64,
+            Some(_) => {
+                return Err(SqlError::new(
+                    206,
+                    16,
+                    2,
+                    format!(
+                        "Operand type clash: the sequence argument of {name} must be a non-negative integer."
+                    ),
+                ));
+            }
+        };
+        // The bucket's own rows start after the journal's position at its
+        // creation.
+        let from = {
+            let mut guard = self.core.lock();
+            let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+            file.bucket(&bucket)
+                .map_err(storage_error)?
+                .ok_or_else(|| object_error(ObjectError::NoSuchBucket, &bucket))?
+                .journal_from
+        };
+        Ok(ExternalRowset {
+            columns: vec![
+                nvarchar("bucket", 63),
+                nvarchar("key", 1024),
+                bigint("sequence_number"),
+                nvarchar("record_type", 16),
+                datetime2("record_timestamp"),
+                nvarchar("version_id", 20),
+                bit("is_delete_marker"),
+                bigint("size"),
+                datetime2("last_modified_date"),
+                nvarchar("e_tag", 64),
+                nvarchar("storage_class", 16),
+                bit("is_multipart"),
+            ],
+            rows: Box::new(JournalStream {
+                core: Arc::clone(&self.core),
+                bucket,
+                after: after.max(from),
+                done: false,
+            }),
+        })
+    }
+
     fn open_kind(
         &self,
         name: &str,
@@ -76,17 +141,7 @@ impl S3Rowsets {
         args: &[SqlValue],
         caller: ExternalCaller,
     ) -> Result<ExternalRowset, SqlError> {
-        if !caller.server_admin {
-            return Err(SqlError::new(
-                229,
-                14,
-                5,
-                format!(
-                    "The SELECT permission was denied on the object '{}', database 'mssqlsystemresource', schema 'sys'.",
-                    name.trim_start_matches("sys.")
-                ),
-            ));
-        }
+        check_admin(name, caller)?;
         let Some(kind) = kind else {
             check_arg_count(name, args, 0, 0)?;
             return Ok(ExternalRowset {
@@ -146,6 +201,22 @@ impl S3Rowsets {
             }),
         })
     }
+}
+
+/// Buckets are server-wide: only a server administrator reads them.
+fn check_admin(name: &str, caller: ExternalCaller) -> Result<(), SqlError> {
+    if caller.server_admin {
+        return Ok(());
+    }
+    Err(SqlError::new(
+        229,
+        14,
+        5,
+        format!(
+            "The SELECT permission was denied on the object '{}', database 'mssqlsystemresource', schema 'sys'.",
+            name.trim_start_matches("sys.")
+        ),
+    ))
 }
 
 fn check_arg_count(name: &str, args: &[SqlValue], min: usize, max: usize) -> Result<(), SqlError> {
@@ -396,6 +467,81 @@ impl ExternalStream for ObjectStream {
                 (true, Some((last, _))) => self.after = Some((last, listing.last_version)),
                 _ => self.done = true,
             }
+        }
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// `sys.s3_journal`: the journal from `after` on, a bounded slice of rows per
+/// lock hold, keeping `bucket`'s.
+struct JournalStream {
+    core: Arc<Storage>,
+    bucket: String,
+    after: u64,
+    done: bool,
+}
+
+/// An S3 ETag: the MD5 in hex, with the part count for a multipart object.
+fn etag(md5: &[u8; 16], parts: u16) -> String {
+    let hex: String = md5.iter().map(|b| format!("{b:02x}")).collect();
+    if parts == 0 {
+        format!("\"{hex}\"")
+    } else {
+        format!("\"{hex}-{parts}\"")
+    }
+}
+
+fn journal_row(record: &JournalRecord) -> Vec<Datum> {
+    let object = record.object.as_ref();
+    vec![
+        text(&record.bucket),
+        text(&record.key),
+        Datum::BigInt(record.sequence as i64),
+        text(record.record_type.as_str()),
+        datetime(record.timestamp_ms),
+        text(&version_id(record.version, record.null_version)),
+        record.is_delete_marker.map_or(Datum::Null, Datum::Bit),
+        object.map_or(Datum::Null, |o| Datum::BigInt(o.size as i64)),
+        object.map_or(Datum::Null, |o| datetime(o.last_modified_ms)),
+        match (object, record.is_delete_marker) {
+            (Some(o), Some(false)) => text(&etag(&o.md5, o.parts)),
+            _ => Datum::Null,
+        },
+        match record.is_delete_marker {
+            Some(false) => text("STANDARD"),
+            _ => Datum::Null,
+        },
+        match (object, record.is_delete_marker) {
+            (Some(o), Some(false)) => Datum::Bit(o.parts > 0),
+            _ => Datum::Null,
+        },
+    ]
+}
+
+impl ExternalStream for JournalStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        let mut rows = Vec::new();
+        while rows.is_empty() && !self.done {
+            // Other buckets' rows can fill many slices: stay cancellable.
+            check_cancelled()?;
+            let records = {
+                let mut guard = self.core.lock();
+                let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+                file.journal(self.after, SLICE_KEYS)
+                    .map_err(storage_error)?
+            };
+            if records.len() < SLICE_KEYS {
+                self.done = true;
+            }
+            if let Some(last) = records.last() {
+                self.after = last.sequence;
+            }
+            rows.extend(
+                records
+                    .iter()
+                    .filter(|record| record.bucket == self.bucket)
+                    .map(journal_row),
+            );
         }
         Ok((!rows.is_empty()).then_some(rows))
     }

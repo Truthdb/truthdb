@@ -1097,7 +1097,7 @@ fn tags_are_set_replaced_and_cleared_per_version() {
             .map(|(k, v)| (k.to_string(), v.to_string()))
             .collect();
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.set_tags("bkt", key, which, tags))
+            .transaction(|tx| tx.set_tags("bkt", key, which, tags, now()))
             .unwrap()
     };
     let head = |key: &str| {
@@ -1270,6 +1270,7 @@ fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
             let row = BucketRow {
                 created_ms: now(),
                 versioning: Versioning::Enabled,
+                journal_from: 0,
             };
             tx.trees
                 .buckets()
@@ -1328,6 +1329,7 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
             let row = BucketRow {
                 created_ms: now(),
                 versioning: Versioning::Enabled,
+                journal_from: 0,
             };
             tx.trees
                 .buckets()
@@ -1421,4 +1423,233 @@ fn uploads_past_their_age_are_found_oldest_first() {
     assert_eq!(expired(10_000, 10), [older_still_running, fresh]);
     drop(storage);
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn the_journal_records_every_change_in_its_own_transaction() {
+    use crate::{JournalRecord, ObjectAttrs, RecordType, VersionSel, Versioning};
+    let path = temp_path("journal");
+    let storage = create(&path);
+    let journal = |storage: &Storage| -> Vec<JournalRecord> {
+        ObjFile::new(&mut storage.lock()).journal(0, 1000).unwrap()
+    };
+    let shape = |records: &[JournalRecord]| -> Vec<(RecordType, String, Option<bool>)> {
+        records
+            .iter()
+            .map(|r| (r.record_type, r.key.clone(), r.is_delete_marker))
+            .collect()
+    };
+    let put = |storage: &Storage, bucket: &str, key: &str| {
+        let mut writer = BodyWriter::begin(storage, now()).unwrap();
+        writer.write(storage, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.put_object(bucket, key, &sealed, &ObjectAttrs::default(), now(), 0)
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let delete = |storage: &Storage, bucket: &str, key: &str, which| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_object(bucket, key, which, now(), 0))
+            .unwrap()
+            .unwrap()
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("plain", now())?.unwrap();
+            tx.create_bucket("hist", now())?.unwrap();
+            tx.set_versioning("hist", Versioning::Enabled)
+        })
+        .unwrap()
+        .unwrap();
+
+    // An unversioned bucket: an overwrite records only the new version.
+    let first = put(&storage, "plain", "k");
+    put(&storage, "plain", "k");
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.set_tags(
+                "plain",
+                "k",
+                VersionSel::Latest,
+                vec![("a".into(), "1".into())],
+                now(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    delete(&storage, "plain", "k", None);
+    let records = journal(&storage);
+    assert_eq!(
+        shape(&records),
+        [
+            (RecordType::Create, "k".to_string(), Some(false)),
+            (RecordType::Create, "k".to_string(), Some(false)),
+            (RecordType::UpdateMetadata, "k".to_string(), Some(false)),
+            (RecordType::Delete, "k".to_string(), None),
+        ]
+    );
+    assert_eq!(records[0].version, first.version);
+    assert!(
+        records
+            .iter()
+            .all(|r| r.null_version && r.bucket == "plain")
+    );
+    assert_eq!(records[0].object.unwrap().size, 1);
+    assert!(
+        records[3].object.is_none(),
+        "a permanent delete has no object columns"
+    );
+    assert!(records.windows(2).all(|w| w[0].sequence < w[1].sequence));
+
+    // A versioned bucket: a delete adds a marker; removing a version by id is
+    // a permanent delete.
+    let kept = put(&storage, "hist", "v");
+    let marker = delete(&storage, "hist", "v", None).version.unwrap();
+    delete(&storage, "hist", "v", Some(VersionSel::Seq(kept.version)));
+    let records = journal(&storage);
+    let tail = &records[4..];
+    assert_eq!(
+        shape(tail),
+        [
+            (RecordType::Create, "v".to_string(), Some(false)),
+            (RecordType::Delete, "v".to_string(), Some(true)),
+            (RecordType::Delete, "v".to_string(), None),
+        ]
+    );
+    assert_eq!((tail[1].version, tail[2].version), (marker, kept.version));
+    assert_eq!(tail[1].object.unwrap().size, 0, "a marker's size is 0");
+
+    // A suspended bucket: the null version replaced by a null marker records
+    // the marker only.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.set_versioning("hist", Versioning::Suspended))
+        .unwrap()
+        .unwrap();
+    put(&storage, "hist", "s");
+    delete(&storage, "hist", "s", None);
+    let records = journal(&storage);
+    assert_eq!(
+        shape(&records[7..]),
+        [
+            (RecordType::Create, "s".to_string(), Some(false)),
+            (RecordType::Delete, "s".to_string(), Some(true)),
+        ]
+    );
+    assert!(records[8].null_version);
+
+    // A change rolled back leaves no row.
+    let before = journal(&storage).len();
+    let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+    writer.write(&storage, b"x", now()).unwrap();
+    let sealed = writer.finish(&storage, now()).unwrap();
+    let failed: Result<(), StorageError> = ObjFile::new(&mut storage.lock()).transaction(|tx| {
+        tx.put_object("plain", "gone", &sealed, &ObjectAttrs::default(), now(), 0)?
+            .unwrap();
+        Err(StorageError::InvalidConfig("abort".into()))
+    });
+    assert!(failed.is_err());
+    assert_eq!(journal(&storage).len(), before);
+    drop(storage);
+
+    // The journal survives a crash, numbering goes on, and trimming deletes
+    // the oldest rows up to its limit and stops at the first young row.
+    let storage = open(&path);
+    assert_eq!(journal(&storage).len(), before);
+    put(&storage, "plain", "after");
+    let records = journal(&storage);
+    assert_eq!(records.len(), before + 1);
+    assert!(records[before].sequence > records[before - 1].sequence);
+    // Trimming at `at` with a 1 ms retention takes the rows stamped before it.
+    let trim = |at: u64, limit: usize| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.trim_journal(at, 1, limit))
+            .unwrap()
+    };
+    let due = |at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .journal_due(at, 1)
+            .unwrap()
+    };
+    assert_eq!(trim(now() + 1, 3), 3);
+    assert_eq!(journal(&storage).len(), before + 1 - 3);
+    assert!(!due(now()));
+    assert_eq!(trim(now(), 100), 0, "nothing is older than now()");
+    assert!(due(now() + 1));
+    assert_eq!(trim(now() + 1, 1000), before + 1 - 3);
+    assert!(journal(&storage).is_empty());
+    assert!(!due(now() + 1));
+
+    // A row stamped by a clock that ran ahead goes with the rows recorded
+    // after it, once they expire.
+    let tag = |at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.set_tags("plain", "after", VersionSel::Latest, Vec::new(), at))
+            .unwrap()
+            .unwrap();
+    };
+    tag(now() + 1_000_000);
+    tag(now());
+    tag(now());
+    assert!(due(now() + 1));
+    assert_eq!(trim(now() + 1, 100), 3);
+    assert!(journal(&storage).is_empty());
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn the_journal_ships_to_a_standby_and_restores_from_a_log_backup() {
+    use crate::ObjectAttrs;
+    let path = temp_path("journal-ship-src");
+    let bak = temp_path("journal-ship-bak");
+    let log = temp_path("journal-ship-log");
+    let seed = temp_path("journal-ship-seed");
+    let dst = temp_path("journal-ship-dst");
+    let primary = create(&path);
+    primary.lock().commit_db_options(0, Some(true)).unwrap();
+    let summary = primary.backup_full(&bak).unwrap();
+    ObjFile::new(&mut primary.lock())
+        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .unwrap()
+        .unwrap();
+    for key in ["a", "b"] {
+        let mut writer = BodyWriter::begin(&primary, now()).unwrap();
+        writer.write(&primary, key.as_bytes(), now()).unwrap();
+        let sealed = writer.finish(&primary, now()).unwrap();
+        ObjFile::new(&mut primary.lock())
+            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .unwrap()
+            .unwrap();
+    }
+    ObjFile::new(&mut primary.lock())
+        .transaction(|tx| tx.delete_object("bkt", "a", None, now(), 0))
+        .unwrap()
+        .unwrap();
+    let journal = |storage: &Storage| ObjFile::new(&mut storage.lock()).journal(0, 100).unwrap();
+    let expected = journal(&primary);
+    assert_eq!(expected.len(), 3);
+    let delta = primary
+        .read_wal_range(summary.backup_end_lsn, primary.wal_flushed_lsn())
+        .unwrap();
+    primary.backup_log(&log, true, false).unwrap();
+
+    Storage::restore_full_standby(&seed, &bak, &[], engines).unwrap();
+    let standby = open(&seed);
+    standby
+        .apply_wal_stream(summary.backup_end_lsn, &delta)
+        .unwrap();
+    assert_eq!(journal(&standby), expected);
+    drop(standby);
+
+    Storage::restore_full_with_logs(&dst, &bak, &[log.clone()], None, engines).unwrap();
+    let restored = open(&dst);
+    assert_eq!(journal(&restored), expected);
+    drop(restored);
+    drop(primary);
+    for p in [&path, &bak, &log, &seed, &dst] {
+        std::fs::remove_file(p).ok();
+    }
 }

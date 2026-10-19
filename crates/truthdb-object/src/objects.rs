@@ -11,6 +11,7 @@ use truthdb_core::storage::StorageError;
 
 use crate::body::SealedBody;
 use crate::buckets::BucketRow;
+use crate::journal::{Change, JournalObject, RecordType};
 use crate::{
     ATTRS_TREE, BUCKETS_TREE, NEXT_VERSION_KEY, OBJECTS_TREE, ObjFile, ObjTxn, Versioning,
     next_counter,
@@ -431,7 +432,8 @@ impl ObjTxn<'_, '_> {
     ) -> Result<ObjectInfo, StorageError> {
         let null_version = versioning != Versioning::Enabled;
         if null_version {
-            self.remove_null_version(bucket, key, now_ms, grace_ms)?;
+            // Replaced in place: the journal records the new version only.
+            self.remove_null_version(bucket, key, false, now_ms, grace_ms)?;
         }
         let version = next_counter(self, NEXT_VERSION_KEY)?;
         let has_attrs = !attrs.is_empty();
@@ -455,6 +457,23 @@ impl ObjTxn<'_, '_> {
         if has_attrs {
             self.write_attrs(version, attrs)?;
         }
+        self.record_change(
+            Change {
+                record_type: RecordType::Create,
+                bucket,
+                key,
+                version,
+                null_version,
+                is_delete_marker: Some(false),
+                object: Some(JournalObject {
+                    size: new.size,
+                    md5: new.md5,
+                    parts: new.parts,
+                    last_modified_ms: now_ms,
+                }),
+            },
+            now_ms,
+        )?;
         Ok(ObjectInfo {
             version,
             null_version,
@@ -502,6 +521,7 @@ impl ObjTxn<'_, '_> {
         key: &str,
         which: VersionSel,
         tags: Vec<(String, String)>,
+        now_ms: u64,
     ) -> Result<Result<(u64, bool), ObjectError>, StorageError> {
         if let Err(err) = validate_key(key) {
             return Ok(Err(err));
@@ -543,18 +563,39 @@ impl ObjTxn<'_, '_> {
             &row_key,
             &row.encode(),
         )?;
-        Ok(Ok((version, row.flags & FLAG_NULL_VERSION != 0)))
+        let null_version = row.flags & FLAG_NULL_VERSION != 0;
+        self.record_change(
+            Change {
+                record_type: RecordType::UpdateMetadata,
+                bucket,
+                key,
+                version,
+                null_version,
+                is_delete_marker: Some(false),
+                object: Some(JournalObject {
+                    size: row.size,
+                    md5: row.md5,
+                    parts: row.parts,
+                    last_modified_ms: row.mtime_ms,
+                }),
+            },
+            now_ms,
+        )?;
+        Ok(Ok((version, null_version)))
     }
 
     /// Removes the key's versions that `wanted` picks: each row, its
     /// attributes and its body's reference. Returns the removed versions'
     /// numbers. With `only`, reads that version's row alone instead of every
-    /// version of the key.
+    /// version of the key. With `journal`, each removal is recorded as a
+    /// permanent delete.
+    #[allow(clippy::too_many_arguments)]
     fn remove_versions(
         &mut self,
         bucket: &str,
         key: &str,
         only: Option<u64>,
+        journal: bool,
         now_ms: u64,
         grace_ms: u64,
         mut wanted: impl FnMut(u64, &VersionRow) -> bool,
@@ -586,20 +627,36 @@ impl ObjTxn<'_, '_> {
             if row.flags & FLAG_DELETE_MARKER == 0 {
                 self.drop_ref(row.body, now_ms, grace_ms)?;
             }
+            if journal {
+                self.record_change(
+                    Change {
+                        record_type: RecordType::Delete,
+                        bucket,
+                        key,
+                        version,
+                        null_version: row.flags & FLAG_NULL_VERSION != 0,
+                        is_delete_marker: None,
+                        object: None,
+                    },
+                    now_ms,
+                )?;
+            }
             removed.push(version);
         }
         Ok(removed)
     }
 
-    /// Removes the key's null version, if any.
+    /// Removes the key's null version, if any, recording it in the journal
+    /// when `journal` (not when a new null version or marker replaces it).
     fn remove_null_version(
         &mut self,
         bucket: &str,
         key: &str,
+        journal: bool,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<(), StorageError> {
-        self.remove_versions(bucket, key, None, now_ms, grace_ms, |_, row| {
+        self.remove_versions(bucket, key, None, journal, now_ms, grace_ms, |_, row| {
             row.flags & FLAG_NULL_VERSION != 0
         })?;
         Ok(())
@@ -629,6 +686,23 @@ impl ObjTxn<'_, '_> {
             &version_key(bucket, key, version),
             &row.encode(),
         )?;
+        self.record_change(
+            Change {
+                record_type: RecordType::Delete,
+                bucket,
+                key,
+                version,
+                null_version,
+                is_delete_marker: Some(true),
+                object: Some(JournalObject {
+                    size: 0,
+                    md5: [0; 16],
+                    parts: 0,
+                    last_modified_ms: now_ms,
+                }),
+            },
+            now_ms,
+        )?;
         Ok(version)
     }
 
@@ -654,7 +728,7 @@ impl ObjTxn<'_, '_> {
         Ok(Ok(match which {
             Some(VersionSel::Latest) | None => match bucket_row.versioning {
                 Versioning::Unversioned => {
-                    self.remove_null_version(bucket, key, now_ms, grace_ms)?;
+                    self.remove_null_version(bucket, key, true, now_ms, grace_ms)?;
                     Deleted::default()
                 }
                 Versioning::Enabled => Deleted {
@@ -663,7 +737,8 @@ impl ObjTxn<'_, '_> {
                     delete_marker: true,
                 },
                 Versioning::Suspended => {
-                    self.remove_null_version(bucket, key, now_ms, grace_ms)?;
+                    // Replaced by a null marker, which the journal records.
+                    self.remove_null_version(bucket, key, false, now_ms, grace_ms)?;
                     Deleted {
                         version: Some(self.add_delete_marker(bucket, key, true, now_ms)?),
                         null_version: true,
@@ -677,8 +752,14 @@ impl ObjTxn<'_, '_> {
                     _ => None,
                 };
                 let mut marker = false;
-                let removed =
-                    self.remove_versions(bucket, key, only, now_ms, grace_ms, |version, row| {
+                let removed = self.remove_versions(
+                    bucket,
+                    key,
+                    only,
+                    true,
+                    now_ms,
+                    grace_ms,
+                    |version, row| {
                         let hit = match sel {
                             VersionSel::Null => row.flags & FLAG_NULL_VERSION != 0,
                             VersionSel::Seq(seq) => seq == version,
@@ -688,7 +769,8 @@ impl ObjTxn<'_, '_> {
                             marker = row.flags & FLAG_DELETE_MARKER != 0;
                         }
                         hit
-                    })?;
+                    },
+                )?;
                 Deleted {
                     version: removed.first().copied(),
                     null_version: sel == VersionSel::Null,

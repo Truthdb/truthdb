@@ -16,6 +16,7 @@ mod buckets;
 mod codec;
 mod credentials;
 mod gc;
+mod journal;
 mod listing;
 mod objects;
 mod uploads;
@@ -36,6 +37,7 @@ use truthdb_core::wal::records::RelRecord;
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use gc::GcOutcome;
+pub use journal::{JournalObject, JournalRecord, RecordType};
 pub use listing::{ListAfter, ListedObject, Listing};
 pub use objects::{Deleted, ObjectAttrs, ObjectError, ObjectInfo, VersionSel, version_id};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
@@ -69,6 +71,8 @@ const UPLOADS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 9;
 const UPLOAD_INDEX_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 10;
 /// (upload, part number) -> the part.
 const PARTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 11;
+/// Sequence number -> a [`journal::JournalRecord`]: every change, in order.
+const CHANGES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 12;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -83,6 +87,8 @@ const NEXT_BODY_KEY: &[u8] = b"next_body";
 const NEXT_VERSION_KEY: &[u8] = b"next_version";
 /// META key of the next multipart upload id to hand out.
 const NEXT_UPLOAD_KEY: &[u8] = b"next_upload";
+/// META key of the journal's next sequence number.
+const NEXT_CHANGE_KEY: &[u8] = b"next_change";
 
 /// The object engine's in-memory state under the storage lock.
 #[derive(Default)]
@@ -198,6 +204,7 @@ pub(crate) struct Trees {
     uploads: u64,
     upload_index: u64,
     parts: u64,
+    changes: u64,
 }
 
 impl Trees {
@@ -250,6 +257,12 @@ impl Trees {
         BTree {
             object_id: PARTS_TREE,
             root: self.parts,
+        }
+    }
+    pub fn changes(&self) -> BTree {
+        BTree {
+            object_id: CHANGES_TREE,
+            root: self.changes,
         }
     }
     pub fn attrs(&self) -> BTree {
@@ -323,6 +336,7 @@ impl<'a> ObjFile<'a> {
             uploads: self.tree(UPLOADS_TREE)?.root,
             upload_index: self.tree(UPLOAD_INDEX_TREE)?.root,
             parts: self.tree(PARTS_TREE)?.root,
+            changes: self.tree(CHANGES_TREE)?.root,
         };
         self.in_txn(|ctx, txn| body(&mut ObjTxn { ctx, txn, trees }))
     }

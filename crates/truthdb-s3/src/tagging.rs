@@ -13,7 +13,7 @@ use truthdb_object::{ObjectError, VersionSel};
 use crate::error::{S3Error, escape};
 use crate::multipart::xml;
 use crate::objects::{
-    add_header, object, object_error, version_header, version_sel, versioning_of,
+    add_header, now_ms, object, object_error, version_header, version_sel, versioning_of,
 };
 use crate::server::{Authenticated, Body, S3State, full, read_body};
 
@@ -202,7 +202,8 @@ async fn set_tags(
 ) -> Result<Response<Body>, S3Error> {
     let (tag_bucket, tag_key) = (bucket.clone(), key.clone());
     let (changed, versioning) = object(state, move |file| {
-        let changed = file.transaction(|tx| tx.set_tags(&tag_bucket, &tag_key, which, tags))?;
+        let changed =
+            file.transaction(|tx| tx.set_tags(&tag_bucket, &tag_key, which, tags, now_ms()))?;
         Ok((changed, versioning_of(file, &tag_bucket)?))
     })
     .await?;

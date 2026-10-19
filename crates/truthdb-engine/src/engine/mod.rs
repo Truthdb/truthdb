@@ -80,6 +80,12 @@ const OBJECT_GC_SWEEP_LIMIT: u64 = 512;
 /// garbage collection reclaims it.
 const OBJECT_ABANDON_AFTER_MS: u64 = 60 * 60 * 1000;
 
+/// The change journal (`sys.s3_journal`) keeps this much history.
+const OBJECT_JOURNAL_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
+
+/// Journal rows one trimming transaction deletes at most.
+const OBJECT_JOURNAL_TRIM_BATCH: usize = 512;
+
 /// A multipart upload left open this long is abandoned: garbage collection
 /// aborts it, releasing its parts (as an S3 lifecycle rule would).
 const OBJECT_UPLOAD_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -627,6 +633,26 @@ impl Engine {
             // Gone meanwhile (completed or aborted) is fine.
             let _ =
                 self.object(|file| file.transaction(|tx| tx.abort_upload(upload, now_ms, 0)))?;
+        }
+        // Journal rows past their retention, a bounded batch per transaction
+        // and a bounded number of batches per sweep. Whether anything is due
+        // is read first: an idle sweep writes nothing.
+        for _ in 0..8 {
+            let trimmed = self.object(|file| {
+                if !file.journal_due(now_ms, OBJECT_JOURNAL_RETENTION_MS)? {
+                    return Ok(0);
+                }
+                file.transaction(|tx| {
+                    tx.trim_journal(
+                        now_ms,
+                        OBJECT_JOURNAL_RETENTION_MS,
+                        OBJECT_JOURNAL_TRIM_BATCH,
+                    )
+                })
+            })?;
+            if trimmed < OBJECT_JOURNAL_TRIM_BATCH {
+                break;
+            }
         }
         // A few bodies per storage-lock hold (each is a forced transaction),
         // so a large backlog never blocks other work for long, and a bounded
