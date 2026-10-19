@@ -18,12 +18,15 @@ use truthdb_s3::sigv4;
 
 const DEADLINE: Duration = Duration::from_secs(60);
 
-fn free_port() -> u16 {
-    std::net::TcpListener::bind("127.0.0.1:0")
-        .expect("bind")
-        .local_addr()
-        .expect("addr")
-        .port()
+/// Two distinct free ports: both are held until both are chosen, so the
+/// second cannot be the first one released.
+fn free_ports() -> (u16, u16) {
+    let bind = || std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let (first, second) = (bind(), bind());
+    (
+        first.local_addr().expect("addr").port(),
+        second.local_addr().expect("addr").port(),
+    )
 }
 
 struct Server {
@@ -41,7 +44,36 @@ impl Drop for Server {
     }
 }
 
+/// Starts the server binary on fresh ports and waits until both listeners
+/// answer. A port can still be taken by another process between choosing it
+/// and the server binding it; the server then exits, and it is started again
+/// on new ports.
 fn start_server() -> Server {
+    for _ in 0..5 {
+        let server = spawn_server();
+        let deadline = Instant::now() + DEADLINE;
+        let mut server = Some(server);
+        while Instant::now() < deadline {
+            let running = server.as_mut().unwrap();
+            if running.child.try_wait().expect("poll the server").is_some() {
+                break;
+            }
+            let up = [running.native_port, running.s3_port]
+                .iter()
+                .all(|&port| std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
+            // Answering on both ports and still running: the listeners are
+            // the server's own.
+            if up && running.child.try_wait().expect("poll the server").is_none() {
+                return server.take().unwrap();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        drop(server);
+    }
+    panic!("the server never came up");
+}
+
+fn spawn_server() -> Server {
     let dir = std::env::temp_dir().join(format!(
         "truthdb-s3-{}-{}",
         std::process::id(),
@@ -51,7 +83,7 @@ fn start_server() -> Server {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).expect("dir");
-    let (native_port, s3_port) = (free_port(), free_port());
+    let (native_port, s3_port) = free_ports();
     let config = dir.join("truthdb.toml");
     std::fs::write(
         &config,
