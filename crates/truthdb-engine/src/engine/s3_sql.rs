@@ -70,6 +70,12 @@ impl ExternalRowsets for S3Rowsets {
             "sys.s3_object_tags" => Some(Kind::Tags),
             "sys.s3_object_metadata" => Some(Kind::Metadata),
             "sys.s3_journal" => return Some(self.open_journal(name, args, caller)),
+            "sys.s3_read" => {
+                return Some(
+                    check_admin(name, caller)
+                        .and_then(|()| super::s3_read::open(&self.core, name, args)),
+                );
+            }
             _ => return None,
         };
         Some(self.open_kind(name, kind, args, caller))
@@ -219,7 +225,12 @@ fn check_admin(name: &str, caller: ExternalCaller) -> Result<(), SqlError> {
     ))
 }
 
-fn check_arg_count(name: &str, args: &[SqlValue], min: usize, max: usize) -> Result<(), SqlError> {
+pub(super) fn check_arg_count(
+    name: &str,
+    args: &[SqlValue],
+    min: usize,
+    max: usize,
+) -> Result<(), SqlError> {
     if args.len() < min {
         return Err(SqlError::new(
             313,
@@ -241,7 +252,7 @@ fn check_arg_count(name: &str, args: &[SqlValue], min: usize, max: usize) -> Res
     Ok(())
 }
 
-fn string_arg(name: &str, value: &SqlValue) -> Result<String, SqlError> {
+pub(super) fn string_arg(name: &str, value: &SqlValue) -> Result<String, SqlError> {
     match value {
         SqlValue::Str(text) => Ok(text.clone()),
         _ => Err(SqlError::new(
@@ -296,11 +307,11 @@ fn optional(value: &Option<String>) -> Datum {
     value.as_deref().map_or(Datum::Null, text)
 }
 
-fn storage_error(err: StorageError) -> SqlError {
+pub(super) fn storage_error(err: StorageError) -> SqlError {
     SqlError::new(50000, 16, 1, format!("object store: {err}"))
 }
 
-fn object_error(err: ObjectError, bucket: &str) -> SqlError {
+pub(super) fn object_error(err: ObjectError, bucket: &str) -> SqlError {
     match err {
         ObjectError::NoSuchBucket => {
             SqlError::new(208, 16, 1, format!("The bucket '{bucket}' does not exist."))
@@ -309,7 +320,7 @@ fn object_error(err: ObjectError, bucket: &str) -> SqlError {
     }
 }
 
-fn no_object_engine() -> SqlError {
+pub(super) fn no_object_engine() -> SqlError {
     SqlError::new(50000, 16, 1, "this database does not run the object store")
 }
 

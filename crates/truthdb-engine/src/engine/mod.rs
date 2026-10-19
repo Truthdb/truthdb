@@ -786,6 +786,7 @@ fn render_sql_outcome(outcome: &crate::engine::BatchOutcome) -> String {
 
 #[cfg(test)]
 mod relational_tests;
+mod s3_read;
 mod s3_sql;
 #[cfg(test)]
 mod search_tests;
