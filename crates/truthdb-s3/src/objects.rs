@@ -465,7 +465,7 @@ pub fn versioning_of(file: &mut ObjFile<'_>, bucket: &str) -> Result<Versioning,
 /// bucket that never had versioning, as in S3.
 pub fn version_header(versioning: Versioning, version: u64, null_version: bool) -> Option<String> {
     (versioning != Versioning::Unversioned)
-        .then(|| crate::delete::version_id(version, null_version))
+        .then(|| truthdb_object::version_id(version, null_version))
 }
 
 /// Adds a header to a built response.
@@ -553,7 +553,7 @@ async fn read_object(
         };
         return Err(err.with_header("x-amz-delete-marker", "true").with_header(
             "x-amz-version-id",
-            crate::delete::version_id(info.version, info.null_version),
+            truthdb_object::version_id(info.version, info.null_version),
         ));
     }
     let release = |state: &S3State| {

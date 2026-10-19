@@ -124,6 +124,13 @@ pub(in crate::engine::relational) fn exec_select(
                 }
             }
         }
+        mut external @ SourceRows::External(_) => {
+            while let Some(slice) = external.next_slice(storage)? {
+                for row in slice {
+                    take(row, &mut rows)?;
+                }
+            }
+        }
     }
 
     // A grouped/aggregated or DISTINCT query projects first (its ORDER BY

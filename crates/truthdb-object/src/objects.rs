@@ -119,6 +119,15 @@ pub enum VersionSel {
     Seq(u64),
 }
 
+/// A version id as S3 writes it: `null` for the null version, else its number.
+pub fn version_id(version: u64, null_version: bool) -> String {
+    if null_version {
+        "null".to_string()
+    } else {
+        version.to_string()
+    }
+}
+
 /// An object version as read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectInfo {
@@ -691,6 +700,14 @@ impl ObjTxn<'_, '_> {
 }
 
 impl ObjFile<'_> {
+    /// The attributes of version `version` (none when it has none, or is gone).
+    pub fn version_attrs(&mut self, version: u64) -> Result<ObjectAttrs, StorageError> {
+        match self.existing_tree(ATTRS_TREE)? {
+            Some(attrs_tree) => read_attrs(&mut self.core.page_ctx(0), &attrs_tree, version),
+            None => Ok(ObjectAttrs::default()),
+        }
+    }
+
     /// A version of `key` and its attributes; `NoSuchKey` when the key's
     /// newest version is a delete marker.
     pub fn head_object(

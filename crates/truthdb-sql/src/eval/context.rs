@@ -160,6 +160,9 @@ pub struct UpdatedColumns {
 pub struct SecurityContext {
     pub bypass: bool,
     pub principals: std::collections::HashSet<u32>,
+    /// A `sysadmin` login or the trusted native session: may read server-wide
+    /// data (unlike `bypass`, which a database owner also has).
+    pub server_admin: bool,
 }
 
 /// The error captured by a `CATCH` block, surfaced by the `ERROR_*()`

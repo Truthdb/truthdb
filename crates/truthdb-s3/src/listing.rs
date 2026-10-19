@@ -329,7 +329,7 @@ pub async fn list_versions(
         let common = format!(
             "<Key>{}</Key><VersionId>{}</VersionId><IsLatest>{}</IsLatest><LastModified>{}</LastModified>",
             encode(&object.key),
-            crate::delete::version_id(info.version, info.null_version),
+            truthdb_object::version_id(info.version, info.null_version),
             object.latest,
             crate::time::iso8601(info.mtime_ms)
         );

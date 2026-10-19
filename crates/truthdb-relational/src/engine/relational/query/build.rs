@@ -176,6 +176,12 @@ pub(in crate::engine::relational) fn build_table_source(
     if let Some(source) = current_trigger_source(&name.value, &qualifier) {
         return Ok(source);
     }
+    // Another engine's built-in rowset named as a view (no arguments).
+    if name.value.to_ascii_lowercase().starts_with("sys.")
+        && let Some(source) = build_external_rowset(storage, name, &[], &qualifier, eval_ctx)?
+    {
+        return Ok(source);
+    }
     let base = match name.value.to_ascii_lowercase().as_str() {
         "sys.tables" => sys_tables(storage, eval_ctx.database_id),
         "sys.databases" => sys_databases(storage),
@@ -323,6 +329,35 @@ pub(in crate::engine::relational) fn build_table_source(
     })
 }
 
+/// Another engine's built-in rowset `name(values)` as a source under
+/// `qualifier`, or `None` when no installed provider serves `name`.
+fn build_external_rowset(
+    storage: &RelStorage,
+    name: &Name,
+    values: &[SqlValue],
+    qualifier: &str,
+    eval_ctx: &EvalContext,
+) -> Result<Option<Source>, SqlError> {
+    let Some(provider) = storage.external_rowsets() else {
+        return Ok(None);
+    };
+    let caller = crate::engine::ExternalCaller {
+        server_admin: eval_ctx.security.server_admin,
+    };
+    let lowered = name.value.to_ascii_lowercase();
+    let Some(opened) = provider.open(&lowered, values, caller) else {
+        return Ok(None);
+    };
+    let rowset = opened.map_err(|err| err.at(name.span))?;
+    let count = rowset.columns.len();
+    Ok(Some(Source {
+        columns: rowset.columns,
+        qualifiers: vec![Some(qualifier.to_string()); count],
+        collations: vec![None; count],
+        rows: SourceRows::External(rowset.rows),
+    }))
+}
+
 /// Expands an inline table-valued function call `dbo.f(args) [AS alias]` in a
 /// FROM clause: binds the call's argument values to the function's `@params`,
 /// then runs its stored body SELECT as a derived table under the call's
@@ -338,6 +373,25 @@ pub(in crate::engine::relational) fn build_function_source(
     alias: Option<&Name>,
     eval_ctx: &EvalContext,
 ) -> Result<Source, SqlError> {
+    let qualifier = alias
+        .map(|a| a.value.clone())
+        .unwrap_or_else(|| strip_schema(&name.value).to_string());
+    // Another engine's built-in rowset: matched by its full name before
+    // catalog resolution, which strips the schema and could otherwise answer
+    // `sys.s3_objects` with a user function called `s3_objects`.
+    if name.value.to_ascii_lowercase().starts_with("sys.") {
+        let no_outer = |_: &str| -> Option<usize> { None };
+        let values = args
+            .iter()
+            .map(|arg| {
+                substitute_correlated_in_expr(storage, arg, &no_outer, &[], eval_ctx)
+                    .and_then(|bound| eval_constant(&bound, eval_ctx))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        if let Some(source) = build_external_rowset(storage, name, &values, &qualifier, eval_ctx)? {
+            return Ok(source);
+        }
+    }
     let def = resolve_table(storage, eval_ctx.database_id, &name.value)
         .ok_or_else(|| SqlError::invalid_object(&name.value).at(name.span))?;
     let function = def
