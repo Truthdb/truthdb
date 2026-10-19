@@ -12,6 +12,7 @@ members = [
     "crates/truthdb-relational",
     "crates/truthdb-search",
     "crates/truthdb-object",
+    "crates/truthdb-fulltext",
     "crates/truthdb-s3",
     "crates/truthdb-cli",
     "crates/truthdb-bench",
@@ -37,6 +38,7 @@ truthdb-engine = { path = "crates/truthdb-engine", version = "0.1.0" }
 truthdb-relational = { path = "crates/truthdb-relational", version = "0.1.0" }
 truthdb-search = { path = "crates/truthdb-search", version = "0.1.0" }
 truthdb-object = { path = "crates/truthdb-object", version = "0.1.0" }
+truthdb-fulltext = { path = "crates/truthdb-fulltext", version = "0.1.0" }
 truthdb-s3 = { path = "crates/truthdb-s3", version = "0.1.0" }
 truthdb-proto = { path = "crates/truthdb-proto", version = "0.1.0" }
 truthdb-net = { path = "crates/truthdb-net", version = "0.1.0" }
