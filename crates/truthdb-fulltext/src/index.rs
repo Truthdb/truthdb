@@ -145,7 +145,11 @@ impl Index {
     }
 
     /// Indexes `doc` in `scope` with `terms`, replacing what was indexed for
-    /// it before. Runs inside the caller's transaction.
+    /// it before. Runs inside the caller's transaction. Returns `false`, with
+    /// the document half written, once it has written more than
+    /// `max_log_bytes` of log: the caller then rolls back to a savepoint
+    /// taken before the call (a rollback's compensation must fit the log's
+    /// reserve, so no transaction may grow without bound).
     pub fn index_document(
         &self,
         ctx: &mut RelCtx<'_>,
@@ -153,7 +157,8 @@ impl Index {
         scope: &[u8],
         doc: u64,
         terms: &DocTerms,
-    ) -> Result<(), StorageError> {
+        max_log_bytes: u64,
+    ) -> Result<bool, StorageError> {
         // A term is stored behind a length byte and ends at a 0 in posting keys.
         if let Some(bad) = terms
             .counts
@@ -164,6 +169,7 @@ impl Index {
                 "{bad:?} cannot be indexed as a full-text term"
             )));
         }
+        let start = ctx.io.wal.tail();
         self.unindex_document(ctx, txn, scope, doc)?;
         let posting = |tf: u32| {
             let mut row = tf.to_le_bytes().to_vec();
@@ -174,7 +180,10 @@ impl Index {
         // up to the cell cap.
         let cap = TREE_MAX_CELL - 2 - doc_key(scope, doc, 0)?.len();
         let mut chunks = vec![terms.len.to_le_bytes().to_vec()];
-        for (term, &tf) in &terms.counts {
+        for (index, (term, &tf)) in terms.counts.iter().enumerate() {
+            if index % 64 == 0 && ctx.io.wal.tail() - start > max_log_bytes {
+                return Ok(false);
+            }
             let inserted = self.postings.insert_unique(
                 ctx,
                 &mut OpMode::Txn(txn),
@@ -204,7 +213,8 @@ impl Index {
                 chunk,
             )?;
         }
-        self.add_stats(ctx, txn, scope, 1, i64::from(terms.len))
+        self.add_stats(ctx, txn, scope, 1, i64::from(terms.len))?;
+        Ok(true)
     }
 
     /// Removes `doc` from `scope`. Returns whether it was indexed. Runs inside

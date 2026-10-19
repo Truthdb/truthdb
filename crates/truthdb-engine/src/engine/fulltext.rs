@@ -1,8 +1,9 @@
 //! The full-text indexer (S3 plan item 15): keeps the object engine's
 //! full-text index in step with the change journal, backfills newly enabled
 //! buckets and purges disabled ones. It runs on its own thread, a bounded
-//! pass at a time; every storage-lock hold in a pass is short, and a body is
-//! read and tokenized outside the lock under a lease.
+//! pass at a time; a body is read and tokenized outside the storage lock
+//! under a lease, and each transaction is bounded by its log (see
+//! `ObjTxn::apply_fulltext`).
 
 use truthdb_fulltext::DocTerms;
 use truthdb_object::{FtBucket, FtDoc, FtState, FtStatus, ListAfter, VersionSel};
@@ -13,7 +14,8 @@ use super::{Engine, EngineError};
 const JOURNAL_BATCH: usize = 64;
 /// Keys one pass backfills per bucket at most.
 const BACKFILL_BATCH: usize = 64;
-/// Documents (or key rows) one purge transaction removes at most.
+/// Documents (or key rows) one purge transaction removes at most (and
+/// fewer when they fill its log budget).
 const PURGE_BATCH: usize = 256;
 /// Bytes of a body read per storage-lock hold.
 const READ_CHUNK: usize = 1 << 20;
@@ -30,9 +32,11 @@ enum Plan {
 
 impl Engine {
     /// One pass of the full-text indexer: purges, journal rows, backfill.
-    /// Returns whether work remains. A standby never indexes (its log is the
-    /// primary's).
-    pub(crate) fn fulltext_pass(&self) -> Result<bool, EngineError> {
+    /// Returns whether work remains; `stop` is asked between keys, so a
+    /// shutdown does not wait out a whole pass. A failure in one part leaves
+    /// the others to run and is returned at the end. A standby never indexes
+    /// (its log is the primary's).
+    pub(crate) fn fulltext_pass(&self, stop: &dyn Fn() -> bool) -> Result<bool, EngineError> {
         if self.storage.is_standby() || !self.runs_objects() {
             return Ok(false);
         }
@@ -41,58 +45,124 @@ impl Engine {
             return Ok(false);
         }
         let mut more = false;
+        let mut failure = None;
+        let mut note = |result: Result<bool, EngineError>| match result {
+            Ok(left) => more |= left,
+            Err(err) => {
+                failure.get_or_insert(err);
+            }
+        };
         for bucket in &buckets {
             if bucket.state == FtState::Purging {
-                let done = self.object(|file| {
-                    file.transaction(|tx| tx.purge_fulltext(&bucket.name, PURGE_BATCH))
-                })?;
-                more |= !done;
+                note(
+                    self.object(|file| {
+                        file.transaction(|tx| tx.purge_fulltext(&bucket.name, PURGE_BATCH))
+                    })
+                    .map(|done| !done),
+                );
             }
         }
+        note(self.fulltext_journal(&buckets, stop));
+        for bucket in &buckets {
+            if let FtState::Backfilling(after) = &bucket.state {
+                note(self.fulltext_backfill(bucket, after.as_deref(), stop));
+            }
+        }
+        match failure {
+            Some(err) => Err(err),
+            None => Ok(more),
+        }
+    }
+
+    /// Applies the journal rows after the cursor (a batch) to the indexed
+    /// buckets, and moves the cursor past the ones applied. Returns whether
+    /// rows remain.
+    fn fulltext_journal(
+        &self,
+        buckets: &[FtBucket],
+        stop: &dyn Fn() -> bool,
+    ) -> Result<bool, EngineError> {
         let cursor = self.object(|file| file.fulltext_cursor())?;
         let records = self.object(|file| file.journal(cursor, JOURNAL_BATCH))?;
+        let mut applied = None;
+        let mut outcome = Ok(records.len() == JOURNAL_BATCH);
         for record in &records {
+            if stop() {
+                outcome = Ok(true);
+                break;
+            }
             if let Some(bucket) = buckets
                 .iter()
                 .find(|bucket| bucket.name == record.bucket && bucket.state != FtState::Purging)
+                && let Err(err) = self.fulltext_sync(bucket, &record.key)
             {
-                self.fulltext_sync(bucket, &record.key)?;
+                outcome = Err(err);
+                break;
             }
+            applied = Some(record.sequence);
         }
-        if let Some(last) = records.last() {
-            self.object(|file| file.transaction(|tx| tx.set_fulltext_cursor(last.sequence)))?;
-            more |= records.len() == JOURNAL_BATCH;
+        if let Some(sequence) = applied {
+            self.object(|file| file.transaction(|tx| tx.set_fulltext_cursor(sequence)))?;
         }
-        for bucket in &buckets {
-            let FtState::Backfilling(after) = &bucket.state else {
-                continue;
-            };
-            let listing = self.object(|file| {
-                file.list_objects(
-                    &bucket.name,
-                    "",
-                    None,
-                    after.as_deref().map(ListAfter::Key),
-                    BACKFILL_BATCH,
-                )
-            })?;
-            // A bucket deleted since is purging now.
-            let Ok(listing) = listing else {
-                continue;
-            };
-            for object in &listing.objects {
-                self.fulltext_sync(bucket, &object.key)?;
+        outcome
+    }
+
+    /// Backfills a batch of `bucket`'s keys after `after`, and records how
+    /// far it got. Returns whether keys remain.
+    fn fulltext_backfill(
+        &self,
+        bucket: &FtBucket,
+        after: Option<&str>,
+        stop: &dyn Fn() -> bool,
+    ) -> Result<bool, EngineError> {
+        let listing = self.object(|file| {
+            file.list_objects(
+                &bucket.name,
+                "",
+                None,
+                after.map(ListAfter::Key),
+                BACKFILL_BATCH,
+            )
+        })?;
+        // A bucket deleted since is purging now.
+        let Ok(listing) = listing else {
+            return Ok(false);
+        };
+        // The last key synced, and whether the whole page was.
+        let mut done = None;
+        let mut complete = true;
+        let mut outcome = Ok(());
+        for object in &listing.objects {
+            if stop() {
+                complete = false;
+                break;
             }
-            let next = listing
+            if let Err(err) = self.fulltext_sync(bucket, &object.key) {
+                outcome = Err(err);
+                complete = false;
+                break;
+            }
+            done = Some(object.key.clone());
+        }
+        let next = if complete {
+            // A truncated page may end past its last listed key (rows read
+            // but not listed): resume where the listing says.
+            listing
                 .truncated
-                .then(|| listing.last.map(|(key, _)| key))
-                .flatten();
-            more |= next.is_some();
-            self.object(|file| {
-                file.transaction(|tx| tx.set_fulltext_backfill(&bucket.name, next.as_deref()))
-            })?;
-        }
-        Ok(more)
+                .then(|| listing.last.map(|(key, _)| key).or(done))
+                .flatten()
+        } else {
+            match done {
+                Some(key) => Some(key),
+                None => return outcome.map(|()| true),
+            }
+        };
+        self.object(|file| {
+            file.transaction(|tx| {
+                tx.set_fulltext_backfill(&bucket.name, bucket.generation, next.as_deref())
+            })
+        })?;
+        outcome.map(|()| next.is_some())
     }
 
     /// Makes the index hold what it should for `key`: its latest live
@@ -155,23 +225,18 @@ impl Engine {
                 )
             }
         };
-        let apply = |doc: FtDoc<'_>| {
-            self.object(|file| {
-                file.transaction(|tx| tx.apply_fulltext(&bucket.name, key, version, doc))
-            })
+        // A failure here (the log full for the moment, say) is returned and
+        // the row tried again; a document too large for one transaction is
+        // held as too large by the apply itself.
+        let doc = match &terms {
+            Ok(terms) => FtDoc::Indexed(terms),
+            Err(status) => FtDoc::Skipped(*status),
         };
-        match &terms {
-            Ok(terms) => {
-                if apply(FtDoc::Indexed(terms)).is_err() {
-                    // Rolled back (its terms did not fit the log, say): hold the
-                    // version as failed so the journal moves on.
-                    apply(FtDoc::Skipped(FtStatus::Failed))?;
-                }
-            }
-            Err(status) => {
-                apply(FtDoc::Skipped(*status))?;
-            }
-        }
+        self.object(|file| {
+            file.transaction(|tx| {
+                tx.apply_fulltext(&bucket.name, key, bucket.generation, version, doc)
+            })
+        })?;
         Ok(())
     }
 

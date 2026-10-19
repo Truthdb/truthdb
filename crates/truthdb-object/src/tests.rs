@@ -1683,11 +1683,31 @@ fn ft_hits(storage: &Storage, bucket: &str, condition: &str) -> Vec<u64> {
     docs
 }
 
+/// The bucket's full-text generation (0 when it has no full-text state).
+fn ft_generation(storage: &Storage, bucket: &str) -> u64 {
+    ObjFile::new(&mut storage.lock())
+        .fulltext_buckets()
+        .unwrap()
+        .into_iter()
+        .find(|ft| ft.name == bucket)
+        .map_or(0, |ft| ft.generation)
+}
+
 fn ft_apply(storage: &Storage, bucket: &str, key: &str, version: Option<u64>, text: &str) -> bool {
     let terms = truthdb_fulltext::DocTerms::from_text(text);
+    let generation = ft_generation(storage, bucket);
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.apply_fulltext(bucket, key, version, crate::FtDoc::Indexed(&terms)))
+        .transaction(|tx| {
+            tx.apply_fulltext(
+                bucket,
+                key,
+                generation,
+                version,
+                crate::FtDoc::Indexed(&terms),
+            )
+        })
         .unwrap()
+        .is_some()
 }
 
 #[test]
@@ -1715,7 +1735,7 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
             let terms = truthdb_fulltext::DocTerms::from_text("beta shared");
             ObjFile::new(&mut storage.lock()).transaction(|tx| {
                 // The failed op stands for the crash: no rollback runs.
-                match tx.apply_fulltext("docs", "k", Some(v2), crate::FtDoc::Indexed(&terms)) {
+                match tx.apply_fulltext("docs", "k", 1, Some(v2), crate::FtDoc::Indexed(&terms)) {
                     Ok(applied) => Ok(applied),
                     Err(err) => panic!("crash: {err}"),
                 }

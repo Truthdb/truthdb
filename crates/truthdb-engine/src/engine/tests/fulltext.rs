@@ -41,7 +41,7 @@ fn put_with(engine: &Engine, bucket: &str, key: &str, data: &[u8], attrs: Object
 /// Runs indexer passes until no work remains.
 fn index(engine: &Engine) -> usize {
     let mut passes = 1;
-    while engine.fulltext_pass().expect("pass") {
+    while engine.fulltext_pass(&|| false).expect("pass") {
         passes += 1;
         assert!(passes < 1000, "the indexer does not finish");
     }
@@ -320,6 +320,141 @@ fn a_restart_or_a_row_applied_twice_changes_nothing() {
             docs: 2,
             total_len: 4
         }
+    );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+fn small_ring_engine(path: &std::path::Path) -> Engine {
+    let storage = RelStorage::create_with_wal_bounds_with(
+        path.to_path_buf(),
+        test_storage_options(),
+        8 * 1024 * 1024,
+        8 * 1024 * 1024,
+        crate::database_engines,
+    )
+    .expect("create");
+    Engine::new(storage).expect("engine")
+}
+
+fn reopen(path: &std::path::Path) -> Engine {
+    Engine::new(RelStorage::open_with(path.to_path_buf(), crate::database_engines).expect("open"))
+        .expect("engine")
+}
+
+#[test]
+fn a_document_too_large_for_one_transaction_is_held_as_too_large_not_wedging() {
+    // An 8 MiB ring: a 2 MiB compensation reserve, so a document's index
+    // entries may take a quarter MiB of log; forty thousand distinct words
+    // take far more.
+    let path = unique_temp_path("ft-big-doc");
+    let engine = small_ring_engine(&path);
+    engine
+        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .unwrap()
+        .unwrap();
+    command(&engine, "s3 enable fulltext docs");
+    let big: String = (0..40_000).map(|n| format!("word{n} ")).collect();
+    put(&engine, "docs", "big.txt", big.as_bytes(), "text/plain");
+    put(&engine, "docs", "small.txt", b"word7 small", "text/plain");
+    index(&engine);
+    assert_eq!(
+        held(&engine, "docs", "big.txt").unwrap().status,
+        FtStatus::TooLarge
+    );
+    assert_eq!(hits(&engine, "docs", "word7"), ["small.txt"]);
+    // The store goes on: a write, then a clean reopen.
+    put(&engine, "docs", "after.txt", b"after", "text/plain");
+    index(&engine);
+    drop(engine);
+    let engine = reopen(&path);
+    assert_eq!(hits(&engine, "docs", "after"), ["after.txt"]);
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn purging_a_large_index_through_a_small_log_takes_bounded_transactions() {
+    let path = unique_temp_path("ft-big-purge");
+    let engine = small_ring_engine(&path);
+    engine
+        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .unwrap()
+        .unwrap();
+    command(&engine, "s3 enable fulltext docs");
+    for n in 0..300 {
+        let text: String = (0..200).map(|w| format!("d{n}w{w} ")).collect();
+        put(
+            &engine,
+            "docs",
+            &format!("k{n:03}"),
+            text.as_bytes(),
+            "text/plain",
+        );
+    }
+    index(&engine);
+    assert_eq!(hits(&engine, "docs", "d150w7"), ["k150"]);
+    command(&engine, "s3 disable fulltext docs");
+    let passes = index(&engine);
+    assert!(passes > 2, "{passes} passes");
+    assert!(states(&engine).is_empty());
+    put(&engine, "docs", "after.txt", b"after", "text/plain");
+    drop(engine);
+    let engine = reopen(&path);
+    assert!(
+        engine
+            .object(|file| file.fulltext_buckets())
+            .unwrap()
+            .is_empty()
+    );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_pass_from_before_a_re_enable_changes_nothing() {
+    let path = unique_temp_path("ft-generation");
+    let engine = new_engine(&path);
+    engine
+        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .unwrap()
+        .unwrap();
+    for n in 0..100 {
+        put(
+            &engine,
+            "docs",
+            &format!("k{n:03}"),
+            b"some words here",
+            "text/plain",
+        );
+    }
+    command(&engine, "s3 enable fulltext docs 5");
+    let stale = engine
+        .object(|file| file.fulltext_buckets())
+        .unwrap()
+        .remove(0);
+    // Enabled again (a larger size) while a pass holds the old state.
+    command(&engine, "s3 enable fulltext docs 1000");
+    // The stale pass syncs a key with its old size and finishes its backfill:
+    // neither lands.
+    engine.fulltext_sync(&stale, "k000").unwrap();
+    assert!(held(&engine, "docs", "k000").is_none());
+    engine
+        .object(|file| {
+            file.transaction(|tx| tx.set_fulltext_backfill("docs", stale.generation, None))
+        })
+        .unwrap();
+    assert_eq!(
+        states(&engine),
+        [("docs".to_string(), FtState::Backfilling(None))]
+    );
+    index(&engine);
+    assert_eq!(hits(&engine, "docs", "words").len(), 100);
+    // Too large a size is refused.
+    assert!(
+        engine
+            .execute("s3 enable fulltext docs 999999999999")
+            .is_err()
     );
     drop(engine);
     let _ = std::fs::remove_file(path);

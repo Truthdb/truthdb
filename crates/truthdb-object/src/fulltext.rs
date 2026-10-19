@@ -16,6 +16,7 @@
 
 use truthdb_core::relstore::btree::TreeInsert;
 use truthdb_core::relstore::ctx::OpMode;
+use truthdb_core::relstore::recovery::rollback_to;
 use truthdb_core::storage::StorageError;
 use truthdb_fulltext::DocTerms;
 
@@ -24,6 +25,9 @@ use crate::{FT_BUCKETS_TREE, FT_CURSOR_KEY, FT_KEYS_TREE, ObjFile, ObjTxn, codec
 
 /// The largest object `s3 enable fulltext` indexes unless told otherwise.
 pub const DEFAULT_FULLTEXT_MAX_BYTES: u64 = 16 << 20;
+/// The largest `max_bytes` a bucket may have: an object is read and
+/// tokenized in memory, a few times its size.
+pub const MAX_FULLTEXT_BYTES: u64 = 64 << 20;
 
 /// A bucket's full-text state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -42,6 +46,9 @@ pub struct FtBucket {
     pub state: FtState,
     /// Larger objects are not indexed.
     pub max_bytes: u64,
+    /// Counts the times full-text search was enabled on the bucket: what an
+    /// indexer pass read under one generation is not applied under another.
+    pub generation: u64,
 }
 
 /// Why a full-text command was refused.
@@ -140,9 +147,10 @@ pub fn fulltext_status(info: &ObjectInfo, max_bytes: u64) -> Option<FtStatus> {
     (info.size > max_bytes).then_some(FtStatus::TooLarge)
 }
 
-/// `[state][max_bytes u64][backfill key]`: state 0 backfilling (the key
-/// done up to, empty for none), 1 on, 2 purging.
-fn encode_bucket(state: &FtState, max_bytes: u64) -> Vec<u8> {
+/// `[state][max_bytes u64][generation u64][backfill key]`: state 0
+/// backfilling (the key done up to, empty for none), 1 on, 2 purging.
+fn encode_bucket(bucket: &FtBucket) -> Vec<u8> {
+    let (state, max_bytes) = (&bucket.state, bucket.max_bytes);
     let (code, after) = match state {
         FtState::Backfilling(after) => (0, after.as_deref().unwrap_or("")),
         FtState::On => (1, ""),
@@ -150,16 +158,17 @@ fn encode_bucket(state: &FtState, max_bytes: u64) -> Vec<u8> {
     };
     let mut out = vec![code];
     out.extend_from_slice(&max_bytes.to_le_bytes());
+    out.extend_from_slice(&bucket.generation.to_le_bytes());
     out.extend_from_slice(after.as_bytes());
     out
 }
 
 fn decode_bucket(name: &[u8], row: &[u8]) -> Result<FtBucket, StorageError> {
     let bad = || corrupt("full-text bucket row");
-    if row.len() < 9 {
+    if row.len() < 17 {
         return Err(bad());
     }
-    let after = std::str::from_utf8(&row[9..]).map_err(|_| bad())?;
+    let after = std::str::from_utf8(&row[17..]).map_err(|_| bad())?;
     let state = match row[0] {
         0 => FtState::Backfilling((!after.is_empty()).then(|| after.to_string())),
         1 => FtState::On,
@@ -170,6 +179,7 @@ fn decode_bucket(name: &[u8], row: &[u8]) -> Result<FtBucket, StorageError> {
         name: String::from_utf8(name.to_vec()).map_err(|_| bad())?,
         state,
         max_bytes: u64::from_le_bytes(row[1..9].try_into().expect("8 bytes")),
+        generation: u64::from_le_bytes(row[9..17].try_into().expect("8 bytes")),
     })
 }
 
@@ -210,7 +220,7 @@ impl ObjTxn<'_, '_> {
 
     fn put_ft_bucket(&mut self, bucket: &FtBucket) -> Result<(), StorageError> {
         let tree = self.trees.ft_buckets();
-        let row = encode_bucket(&bucket.state, bucket.max_bytes);
+        let row = encode_bucket(bucket);
         let mode = &mut OpMode::Txn(self.txn);
         if tree
             .update(self.ctx, mode, bucket.name.as_bytes(), &row)?
@@ -232,12 +242,12 @@ impl ObjTxn<'_, '_> {
         if self.bucket_row(bucket)?.is_none() {
             return Ok(Err(FtError::NoSuchBucket));
         }
-        let state = match self.ft_bucket(bucket)? {
+        let generation = match self.ft_bucket(bucket)? {
             Some(FtBucket {
                 state: FtState::Purging,
                 ..
             }) => return Ok(Err(FtError::Purging)),
-            Some(_) => FtState::Backfilling(None),
+            Some(existing) => existing.generation + 1,
             None => {
                 // With no bucket indexed, nothing has held the journal back,
                 // and the cursor may point at rows long trimmed: the backfill
@@ -251,13 +261,14 @@ impl ObjTxn<'_, '_> {
                     let last = self.last_change()?;
                     self.set_fulltext_cursor(last)?;
                 }
-                FtState::Backfilling(None)
+                1
             }
         };
         self.put_ft_bucket(&FtBucket {
             name: bucket.to_string(),
-            state,
+            state: FtState::Backfilling(None),
             max_bytes,
+            generation,
         })?;
         Ok(Ok(()))
     }
@@ -303,16 +314,17 @@ impl ObjTxn<'_, '_> {
 
     /// Records backfill progress: every key up to `after` is done, or, with
     /// `None`, the whole bucket (it is then on). Does nothing to a bucket no
-    /// longer backfilling.
+    /// longer backfilling, or enabled again since `generation`.
     pub fn set_fulltext_backfill(
         &mut self,
         bucket: &str,
+        generation: u64,
         after: Option<&str>,
     ) -> Result<(), StorageError> {
         let Some(mut existing) = self.ft_bucket(bucket)? else {
             return Ok(());
         };
-        if !matches!(existing.state, FtState::Backfilling(_)) {
+        if !matches!(existing.state, FtState::Backfilling(_)) || existing.generation != generation {
             return Ok(());
         }
         existing.state = match after {
@@ -324,24 +336,32 @@ impl ObjTxn<'_, '_> {
 
     /// Makes the index hold `version` of `key` as `doc` (with `version`
     /// `None`, hold nothing for the key) when `version` is still the key's
-    /// latest live version and the bucket is still indexed; returns whether
-    /// it did. Whatever the index held for the key before is removed.
+    /// latest live version and the bucket is still indexed under
+    /// `generation`; returns how it now holds the key, or `None` when it did
+    /// nothing. Whatever the index held for the key before is removed.
+    ///
+    /// A document whose index entries would take more than an eighth of the
+    /// log's compensation reserve is undone back to a savepoint and held as
+    /// [`FtStatus::TooLarge`]: the transaction then stays small enough that
+    /// a rollback (or recovery's undo) of it always fits the log.
     pub fn apply_fulltext(
         &mut self,
         bucket: &str,
         key: &str,
+        generation: u64,
         version: Option<u64>,
         doc: FtDoc<'_>,
-    ) -> Result<bool, StorageError> {
+    ) -> Result<Option<FtStatus>, StorageError> {
         match self.ft_bucket(bucket)? {
             Some(FtBucket {
                 state: FtState::Backfilling(_) | FtState::On,
+                generation: current,
                 ..
-            }) => {}
-            _ => return Ok(false),
+            }) if current == generation => {}
+            _ => return Ok(None),
         }
         if self.latest_live_version(bucket, key)? != version {
-            return Ok(false);
+            return Ok(None);
         }
         let row_key = key_row_key(bucket, key);
         let keys = self.trees.ft_keys();
@@ -367,24 +387,32 @@ impl ObjTxn<'_, '_> {
             if held.is_some() {
                 keys.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
             }
-            return Ok(true);
+            return Ok(Some(FtStatus::Indexed));
         };
         let status = match doc {
             FtDoc::Indexed(terms) => {
-                self.trees.ft_index().index_document(
+                let savepoint = self.txn.savepoint();
+                let budget = self.log_budget();
+                if self.trees.ft_index().index_document(
                     self.ctx,
                     self.txn,
                     bucket.as_bytes(),
                     version,
                     terms,
-                )?;
-                self.trees.ft_versions().insert_unique(
-                    self.ctx,
-                    &mut OpMode::Txn(self.txn),
-                    &version_row_key(bucket, version),
-                    key.as_bytes(),
-                )?;
-                FtStatus::Indexed
+                    budget,
+                )? {
+                    self.trees.ft_versions().insert_unique(
+                        self.ctx,
+                        &mut OpMode::Txn(self.txn),
+                        &version_row_key(bucket, version),
+                        key.as_bytes(),
+                    )?;
+                    FtStatus::Indexed
+                } else {
+                    let roots = self.trees.roots();
+                    rollback_to(self.ctx, self.txn, savepoint, &roots)?;
+                    FtStatus::TooLarge
+                }
             }
             FtDoc::Skipped(status) => status,
         };
@@ -397,11 +425,19 @@ impl ObjTxn<'_, '_> {
             let inserted = keys.insert_unique(self.ctx, mode, &row_key, &row)?;
             debug_assert_eq!(inserted, TreeInsert::Inserted);
         }
-        Ok(true)
+        Ok(Some(status))
     }
 
-    /// Removes up to `limit` documents (and then key rows) of a purging
-    /// bucket's index, and the bucket's full-text state once nothing is
+    /// The log one full-text step may write: an eighth of the compensation
+    /// reserve, so that unindexing one document and indexing another (each
+    /// within it) can always be rolled back.
+    fn log_budget(&mut self) -> u64 {
+        self.ctx.io.wal.reserve() / 8
+    }
+
+    /// Removes documents (and then key and version rows) of a purging
+    /// bucket's index, at most `limit` and while the transaction is within
+    /// the log budget, and the bucket's full-text state once nothing is
     /// left. Returns whether the purge is done.
     pub fn purge_fulltext(&mut self, bucket: &str, limit: usize) -> Result<bool, StorageError> {
         match self.ft_bucket(bucket)? {
@@ -411,13 +447,24 @@ impl ObjTxn<'_, '_> {
             }) => {}
             _ => return Ok(true),
         }
+        // One document at a time: each was indexed within the budget, so
+        // unindexing it stays within it too.
+        let budget = self.log_budget();
+        let start = self.ctx.io.wal.tail();
+        let over = |c: &mut ObjTxn<'_, '_>| c.ctx.io.wal.tail() - start > budget;
         let index = self.trees.ft_index();
-        let docs = index.documents(self.ctx, bucket.as_bytes(), limit)?;
-        for doc in &docs {
-            index.unindex_document(self.ctx, self.txn, bucket.as_bytes(), *doc)?;
+        let mut left = limit;
+        while left > 0 {
+            if over(self) {
+                return Ok(false);
+            }
+            let Some(&doc) = index.documents(self.ctx, bucket.as_bytes(), 1)?.first() else {
+                break;
+            };
+            index.unindex_document(self.ctx, self.txn, bucket.as_bytes(), doc)?;
+            left -= 1;
         }
-        let mut left = limit - docs.len();
-        if left == 0 {
+        if left == 0 || over(self) {
             return Ok(false);
         }
         // Key rows, then version rows: both start `bucket, 0`.

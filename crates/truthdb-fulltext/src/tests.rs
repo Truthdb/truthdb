@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use truthdb_core::relstore::btree::{BTree, TreeRoots};
 use truthdb_core::relstore::ctx::{OpMode, RelCtx, TxnLink};
-use truthdb_core::relstore::recovery::{LogicalUndo, rollback};
+use truthdb_core::relstore::recovery::{LogicalUndo, rollback, rollback_to};
 use truthdb_core::storage::{
     CATALOG_ENGINE_ID, EngineParticipant, Storage, StorageError, StorageFile, StorageOptions,
 };
@@ -158,7 +158,14 @@ impl Fixture {
     fn index(&self, scope: &str, doc: u64, text: &str) {
         self.txn(true, |ctx, txn, index| {
             index
-                .index_document(ctx, txn, scope.as_bytes(), doc, &DocTerms::from_text(text))
+                .index_document(
+                    ctx,
+                    txn,
+                    scope.as_bytes(),
+                    doc,
+                    &DocTerms::from_text(text),
+                    u64::MAX,
+                )
                 .expect("index")
         });
     }
@@ -317,7 +324,14 @@ fn a_rolled_back_index_leaves_nothing() {
     f.index("b", 1, "kept words");
     f.txn(false, |ctx, txn, index| {
         index
-            .index_document(ctx, txn, b"b", 2, &DocTerms::from_text("lost words"))
+            .index_document(
+                ctx,
+                txn,
+                b"b",
+                2,
+                &DocTerms::from_text("lost words"),
+                u64::MAX,
+            )
             .unwrap();
         index.unindex_document(ctx, txn, b"b", 1).unwrap();
     });
@@ -365,7 +379,14 @@ fn scopes_are_separate_collections() {
     f.txn(false, |ctx, txn, index| {
         assert!(
             index
-                .index_document(ctx, txn, long.as_bytes(), 1, &DocTerms::from_text("x"))
+                .index_document(
+                    ctx,
+                    txn,
+                    long.as_bytes(),
+                    1,
+                    &DocTerms::from_text("x"),
+                    u64::MAX
+                )
                 .is_err()
         );
     });
@@ -432,7 +453,9 @@ fn terms_a_row_cannot_hold_are_refused_before_anything_is_written() {
         };
         f.txn(true, |ctx, txn, index| {
             assert!(
-                index.index_document(ctx, txn, b"b", 1, &doc).is_err(),
+                index
+                    .index_document(ctx, txn, b"b", 1, &doc, u64::MAX)
+                    .is_err(),
                 "{bad:?}"
             );
         });
@@ -461,4 +484,39 @@ fn every_lookup_counts_against_the_slice_budget() {
     }
     // 201 lookups, at most 10 per step.
     assert!(steps >= 20, "{steps} steps");
+}
+
+#[test]
+fn a_document_past_the_log_budget_stops_and_rolls_back_to_a_savepoint() {
+    let f = fixture("budget-log");
+    f.index("b", 1, "kept");
+    let text: String = (0..5000).map(|n| format!("w{n} ")).collect();
+    let roots = TreeRoots(HashMap::from([
+        (POSTINGS, f.index.postings.root),
+        (DOCS, f.index.docs.root),
+    ]));
+    f.txn(true, |ctx, txn, index| {
+        let savepoint = txn.savepoint();
+        let start = ctx.io.wal.tail();
+        let done = index
+            .index_document(ctx, txn, b"b", 2, &DocTerms::from_text(&text), 64 * 1024)
+            .unwrap();
+        assert!(
+            !done,
+            "five thousand postings write more than 64 KiB of log"
+        );
+        // Stopped close to the budget, not at the end of the document.
+        assert!(ctx.io.wal.tail() - start < 256 * 1024);
+        rollback_to(ctx, txn, savepoint, &roots).unwrap();
+        // Within the budget it goes through.
+        assert!(
+            index
+                .index_document(ctx, txn, b"b", 3, &DocTerms::from_text("small"), 64 * 1024)
+                .unwrap()
+        );
+    });
+    assert_eq!(f.docs("b", "kept"), [1]);
+    assert_eq!(f.docs("b", "small"), [3]);
+    assert!(f.docs("b", "w42").is_empty());
+    assert_eq!(f.stats("b").docs, 2);
 }

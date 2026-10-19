@@ -595,11 +595,16 @@ impl Engine {
             S3Admin::EnableFulltext(bucket, max_bytes) => {
                 let max_bytes = match max_bytes {
                     None => truthdb_object::DEFAULT_FULLTEXT_MAX_BYTES,
-                    Some(text) => text.parse::<u64>().ok().filter(|&n| n > 0).ok_or_else(|| {
-                        CommandError::InvalidCommand(format!(
-                            "max_bytes must be a positive number of bytes, not '{text}'"
-                        ))
-                    })?,
+                    Some(text) => text
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|n| (1..=truthdb_object::MAX_FULLTEXT_BYTES).contains(n))
+                        .ok_or_else(|| {
+                            CommandError::InvalidCommand(format!(
+                                "max_bytes must be a number of bytes from 1 to {}, not '{text}'",
+                                truthdb_object::MAX_FULLTEXT_BYTES
+                            ))
+                        })?,
                 };
                 self.object(|file| file.transaction(|tx| tx.enable_fulltext(&bucket, max_bytes)))?
                     .map_err(|err| fulltext_error(&bucket, err))?;

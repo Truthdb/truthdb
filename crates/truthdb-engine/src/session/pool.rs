@@ -271,7 +271,8 @@ const INDEXER_IDLE: Duration = Duration::from_secs(1);
 /// time while work remains, else a sleep.
 pub(super) fn indexer_loop(shared: &Arc<Shared>) {
     while !shared.stop.load(Ordering::Acquire) {
-        let more = shared.engine.fulltext_pass().unwrap_or_else(|err| {
+        let stop = || shared.stop.load(Ordering::Acquire);
+        let more = shared.engine.fulltext_pass(&stop).unwrap_or_else(|err| {
             eprintln!("full-text indexing failed: {err}");
             false
         });
