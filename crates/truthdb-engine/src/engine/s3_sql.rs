@@ -23,7 +23,7 @@ use truthdb_object::{
     ListAfter, Listing, ObjFile, ObjectAttrs, ObjectError, ObjectInfo, Versioning, version_id,
 };
 use truthdb_relational::engine::{
-    ExternalCaller, ExternalRowset, ExternalRowsets, ExternalStream, ResultColumn,
+    ExternalCaller, ExternalRowset, ExternalRowsets, ExternalStream, ResultColumn, check_cancelled,
 };
 use truthdb_relational::relstore::types::{ColumnType, Datum};
 use truthdb_sql::error::SqlError;
@@ -386,6 +386,8 @@ impl ExternalStream for ObjectStream {
         // all when its row budget went to deleted keys: read on until some
         // rows come, or the listing ends.
         while rows.is_empty() && !self.done {
+            // A run of slices that yield no rows is cancellable too.
+            check_cancelled()?;
             let (listing, attrs) = self.read_slice()?;
             for (object, attrs) in listing.objects.iter().zip(&attrs) {
                 self.rows_of(&object.key, &object.info, object.latest, attrs, &mut rows);
