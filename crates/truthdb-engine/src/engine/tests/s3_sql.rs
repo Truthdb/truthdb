@@ -324,3 +324,127 @@ fn a_scan_streams_past_one_slice_while_writers_keep_writing() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn the_journal_reads_as_a_table_from_a_sequence_on() {
+    let path = unique_temp_path("s3-sql-journal");
+    let engine = new_engine(&path);
+    create_bucket(&engine, "jour", Versioning::Enabled);
+    create_bucket(&engine, "other", Versioning::Unversioned);
+    let v1 = put(&engine, "jour", "k", b"abc", &ObjectAttrs::default());
+    put(&engine, "other", "x", b"x", &ObjectAttrs::default());
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.set_tags(
+                    "jour",
+                    "k",
+                    truthdb_object::VersionSel::Latest,
+                    vec![("t".into(), "1".into())],
+                    4_000,
+                )
+            })
+        })
+        .expect("tag")
+        .expect("tag accepted");
+    engine
+        .object(|file| file.transaction(|tx| tx.delete_object("jour", "k", None, 5_000, 0)))
+        .expect("delete")
+        .expect("delete accepted");
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.delete_object(
+                    "jour",
+                    "k",
+                    Some(truthdb_object::VersionSel::Seq(v1)),
+                    6_000,
+                    0,
+                )
+            })
+        })
+        .expect("delete version")
+        .expect("delete version accepted");
+
+    let (columns, rows) = sql_rows(
+        &engine,
+        "SELECT record_type, version_id, is_delete_marker, size, e_tag, storage_class, is_multipart FROM sys.s3_journal('jour') ORDER BY sequence_number",
+    );
+    assert_eq!(
+        columns,
+        [
+            "record_type",
+            "version_id",
+            "is_delete_marker",
+            "size",
+            "e_tag",
+            "storage_class",
+            "is_multipart"
+        ]
+    );
+    let etag = format!("\"{}\"", "07".repeat(16));
+    let v1 = v1.to_string();
+    assert_eq!(rows.len(), 4, "{rows:?}");
+    assert_eq!(
+        rows[0],
+        [
+            Some("CREATE".into()),
+            Some(v1.clone()),
+            Some("0".into()),
+            Some("3".into()),
+            Some(etag.clone()),
+            Some("STANDARD".into()),
+            Some("0".into())
+        ]
+    );
+    assert_eq!(rows[1][0].as_deref(), Some("UPDATE_METADATA"));
+    assert_eq!(rows[1][1], Some(v1.clone()));
+    assert_eq!(
+        rows[2][..4],
+        [
+            Some("DELETE".into()),
+            rows[2][1].clone(),
+            Some("1".into()),
+            Some("0".into())
+        ]
+    );
+    assert_eq!(
+        rows[3],
+        [
+            Some("DELETE".into()),
+            Some(v1),
+            None,
+            None,
+            None,
+            None,
+            None
+        ],
+        "a version removed for good carries only its identity"
+    );
+
+    // From a sequence on, and per bucket.
+    let (_, rows) = sql_rows(
+        &engine,
+        "SELECT sequence_number FROM sys.s3_journal('jour') ORDER BY sequence_number",
+    );
+    let sequences = cells(&rows, 0);
+    let (_, rows) = sql_rows(
+        &engine,
+        &format!(
+            "SELECT sequence_number FROM sys.s3_journal('jour', {}) ORDER BY sequence_number",
+            sequences[1]
+        ),
+    );
+    assert_eq!(cells(&rows, 0), sequences[2..]);
+    let (_, rows) = sql_rows(
+        &engine,
+        "SELECT [key], record_type FROM sys.s3_journal('other')",
+    );
+    assert_eq!(rows, [vec![Some("x".into()), Some("CREATE".into())]]);
+    assert_eq!(
+        sql_error_number(&engine, "SELECT * FROM sys.s3_journal('jour', 'x')"),
+        206
+    );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
