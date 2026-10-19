@@ -439,3 +439,207 @@ fn reads_hold_up_to_odd_files() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+/// One Parquet column's values in a row group, and for an optional column
+/// its definition levels (1 = present, 0 = NULL).
+enum Values {
+    Bool(Vec<bool>),
+    I32(Vec<i32>),
+    I64(Vec<i64>),
+    F32(Vec<f32>),
+    F64(Vec<f64>),
+    Bytes(Vec<&'static [u8]>),
+}
+
+/// A Snappy-compressed Parquet file of `schema` with these row groups.
+fn parquet_bytes(schema: &str, groups: Vec<Vec<(Values, Option<Vec<i16>>)>>) -> Vec<u8> {
+    use parquet::data_type::{
+        BoolType, ByteArray, ByteArrayType, DoubleType, FloatType, Int32Type, Int64Type,
+    };
+    let schema = std::sync::Arc::new(parquet::schema::parser::parse_message_type(schema).unwrap());
+    let props = std::sync::Arc::new(
+        parquet::file::properties::WriterProperties::builder()
+            .set_compression(parquet::basic::Compression::SNAPPY)
+            .build(),
+    );
+    let mut out = Vec::new();
+    let mut writer =
+        parquet::file::writer::SerializedFileWriter::new(&mut out, schema, props).unwrap();
+    for group in groups {
+        let mut row_group = writer.next_row_group().unwrap();
+        for (values, levels) in group {
+            let mut column = row_group.next_column().unwrap().expect("a column");
+            let levels = levels.as_deref();
+            match values {
+                Values::Bool(v) => drop(
+                    column
+                        .typed::<BoolType>()
+                        .write_batch(&v, levels, None)
+                        .unwrap(),
+                ),
+                Values::I32(v) => drop(
+                    column
+                        .typed::<Int32Type>()
+                        .write_batch(&v, levels, None)
+                        .unwrap(),
+                ),
+                Values::I64(v) => drop(
+                    column
+                        .typed::<Int64Type>()
+                        .write_batch(&v, levels, None)
+                        .unwrap(),
+                ),
+                Values::F32(v) => drop(
+                    column
+                        .typed::<FloatType>()
+                        .write_batch(&v, levels, None)
+                        .unwrap(),
+                ),
+                Values::F64(v) => drop(
+                    column
+                        .typed::<DoubleType>()
+                        .write_batch(&v, levels, None)
+                        .unwrap(),
+                ),
+                Values::Bytes(v) => {
+                    let v: Vec<ByteArray> = v.iter().map(|b| ByteArray::from(b.to_vec())).collect();
+                    drop(
+                        column
+                            .typed::<ByteArrayType>()
+                            .write_batch(&v, levels, None)
+                            .unwrap(),
+                    )
+                }
+            }
+            column.close().unwrap();
+        }
+        row_group.close().unwrap();
+    }
+    writer.close().unwrap();
+    out
+}
+
+#[test]
+fn parquet_objects_read_as_typed_rows() {
+    let path = unique_temp_path("s3-read-parquet");
+    let engine = new_engine(&path);
+    bucket(&engine, "pqt");
+    let schema = "message s {
+        REQUIRED BOOLEAN flag;
+        REQUIRED INT32 small (INT_16);
+        REQUIRED INT32 i;
+        OPTIONAL INT64 big;
+        REQUIRED FLOAT f;
+        REQUIRED DOUBLE d;
+        REQUIRED INT32 dec (DECIMAL(9,2));
+        REQUIRED INT32 day (DATE);
+        REQUIRED INT64 ts (TIMESTAMP_MICROS);
+        OPTIONAL BINARY name (UTF8);
+        REQUIRED BINARY raw;
+    }";
+    let at = 1_704_067_200_000_000i64 + 3_723_000_000; // 2024-01-01 01:02:03
+    let file = parquet_bytes(
+        schema,
+        vec![vec![
+            (Values::Bool(vec![true, false]), None),
+            (Values::I32(vec![-3, 7]), None),
+            (Values::I32(vec![100, -200]), None),
+            (Values::I64(vec![9_000_000_000]), Some(vec![1, 0])),
+            (Values::F32(vec![1.5, -2.25]), None),
+            (Values::F64(vec![3.25, 1e10]), None),
+            (Values::I32(vec![1234, -5]), None),
+            (Values::I32(vec![19_723, -1]), None),
+            (Values::I64(vec![at, -1]), None),
+            (Values::Bytes(vec![b"Ann"]), Some(vec![1, 0])),
+            (Values::Bytes(vec![b"\x00\x01", b""]), None),
+        ]],
+    );
+    put(&engine, "pqt", "typed.parquet", &file);
+    assert_eq!(
+        sql_rows(
+            &engine,
+            "SELECT * FROM sys.s3_read('pqt', 'typed.parquet', 'parquet')"
+        )
+        .0,
+        [
+            "flag", "small", "i", "big", "f", "d", "dec", "day", "ts", "name", "raw"
+        ]
+    );
+    // Each column compares as its type.
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT COUNT(*) FROM sys.s3_read('pqt', 'typed.parquet', 'parquet') \
+             WHERE flag = 1 AND small = -3 AND i = 100 AND big = 9000000000 AND f = 1.5 \
+             AND d = 3.25 AND dec = 12.34 AND day = '2024-01-01' \
+             AND ts = '2024-01-01 01:02:03' AND name = N'Ann' AND DATALENGTH(raw) = 2"
+        ),
+        [some(&["1"])]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            "SELECT COUNT(*) FROM sys.s3_read('pqt', 'typed.parquet', 'parquet') \
+             WHERE flag = 0 AND small = 7 AND i = -200 AND big IS NULL AND f = -2.25 \
+             AND d = 10000000000 AND dec = -0.05 AND day = '1969-12-31' \
+             AND ts < '1970-01-01' AND name IS NULL AND DATALENGTH(raw) = 0"
+        ),
+        [some(&["1"])]
+    );
+
+    // Several row groups; prefix mode matches a later file's columns by name.
+    let groups = (0..3)
+        .map(|g| {
+            vec![
+                (Values::I64((g * 1000..g * 1000 + 1000).collect()), None),
+                (Values::Bytes(vec![b"x"; 1000]), None),
+            ]
+        })
+        .collect();
+    put(
+        &engine,
+        "pqt",
+        "many/a.parquet",
+        &parquet_bytes(
+            "message s { REQUIRED INT64 n; REQUIRED BINARY tag (UTF8); }",
+            groups,
+        ),
+    );
+    put(
+        &engine,
+        "pqt",
+        "many/b.parquet",
+        &parquet_bytes(
+            "message s { REQUIRED BINARY tag (UTF8); REQUIRED INT64 n; }",
+            vec![vec![
+                (Values::Bytes(vec![b"y"]), None),
+                (Values::I64(vec![-1]), None),
+            ]],
+        ),
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            r#"SELECT COUNT(*), SUM(n), MIN(n) FROM sys.s3_read('pqt', 'many/', 'parquet', '{"prefix": true}')"#
+        ),
+        [some(&["3001", "4498499", "-1"])]
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            r#"SELECT tag FROM sys.s3_read('pqt', 'many/', 'parquet', '{"prefix": true}') WHERE n = -1"#
+        ),
+        [some(&["y"])]
+    );
+    // Not Parquet at all.
+    put(&engine, "pqt", "not.parquet", b"plain text");
+    assert_eq!(
+        sql_error_number(
+            &engine,
+            "SELECT * FROM sys.s3_read('pqt', 'not.parquet', 'parquet')"
+        ),
+        4864
+    );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}

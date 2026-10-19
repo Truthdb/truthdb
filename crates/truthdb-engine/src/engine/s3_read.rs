@@ -10,6 +10,11 @@
 //!   NULL; a column the first file lacks is an error), or by position
 //!   without headers. A short row is padded with NULLs; a longer one is an
 //!   error.
+//! - **Parquet**: typed columns from the file's schema (integers, `real`,
+//!   `float`, `decimal`, `bit`, `date`, `time`, `datetime2`, text and
+//!   binary); nested groups and lists are their JSON text. A later file in
+//!   prefix mode is matched by column name. Snappy, gzip, LZ4 and Brotli
+//!   pages are read; Zstandard is not.
 //! - **JSON**: JSON Lines or concatenated values, or one top-level array
 //!   whose elements are the records. Object records give one column per key,
 //!   in the order first seen in the first 100 records (later keys are left
@@ -67,6 +72,7 @@ fn read_error(message: impl Into<String>) -> SqlError {
 enum Format {
     Csv,
     Json,
+    Parquet,
 }
 
 #[derive(Debug, Clone)]
@@ -256,6 +262,8 @@ enum Schema {
     Csv(Vec<String>),
     /// Object records' keys, or `None` for one `value` column.
     Json(Option<Vec<String>>),
+    /// The top-level fields and their column types.
+    Parquet(Vec<(String, ColumnType)>),
 }
 
 impl Schema {
@@ -264,6 +272,14 @@ impl Schema {
             Schema::Csv(names) => names.clone(),
             Schema::Json(Some(keys)) => keys.clone(),
             Schema::Json(None) => vec!["value".to_string()],
+            Schema::Parquet(fields) => fields.iter().map(|(name, _)| name.clone()).collect(),
+        }
+    }
+
+    fn types(&self) -> Vec<ColumnType> {
+        match self {
+            Schema::Parquet(fields) => fields.iter().map(|(_, column_type)| *column_type).collect(),
+            other => vec![ColumnType::NVarCharMax; other.columns().len()],
         }
     }
 }
@@ -571,6 +587,7 @@ fn object_rows(
     match format {
         Format::Csv => csv_rows(reader, progress, options, schema, key),
         Format::Json => json_rows(reader, progress, schema),
+        Format::Parquet => parquet_rows(reader.into_inner().inner, schema, key),
     }
 }
 
@@ -589,9 +606,10 @@ pub(super) fn open(
     {
         "csv" => Format::Csv,
         "json" => Format::Json,
+        "parquet" => Format::Parquet,
         other => {
             return Err(read_error(format!(
-                "sys.s3_read reads 'csv' or 'json', not '{other}'."
+                "sys.s3_read reads 'csv', 'json' or 'parquet', not '{other}'."
             )));
         }
     };
@@ -636,7 +654,8 @@ pub(super) fn open(
         columns.extend(
             unique_names(&names, reserved)
                 .iter()
-                .map(|name| text_column(name, ColumnType::NVarCharMax)),
+                .zip(schema.types())
+                .map(|(name, column_type)| text_column(name, column_type)),
         );
     }
     Ok(ExternalRowset {
@@ -761,4 +780,274 @@ impl ExternalStream for ReadStream {
         }
         Ok((!rows.is_empty()).then_some(rows))
     }
+}
+
+/// Largest single read the Parquet reader may ask for (a column chunk).
+const MAX_PARQUET_READ: usize = 256 * 1024 * 1024;
+
+/// A leased body as a Parquet source: positioned reads, each a chunk per
+/// storage-lock hold. The lease goes when the last reader of it does.
+struct ParquetSource {
+    reader: std::sync::Mutex<BodyReader>,
+    size: u64,
+}
+
+impl ParquetSource {
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        let mut reader = self.reader.lock().expect("parquet source poisoned");
+        reader.pos = pos;
+        reader.read(buf)
+    }
+}
+
+#[derive(Clone)]
+struct ParquetFile(Arc<ParquetSource>);
+
+struct ParquetRead {
+    source: Arc<ParquetSource>,
+    pos: u64,
+}
+
+impl Read for ParquetRead {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let n = self.source.read_at(self.pos, buf)?;
+        self.pos += n as u64;
+        Ok(n)
+    }
+}
+
+impl parquet::file::reader::Length for ParquetFile {
+    fn len(&self) -> u64 {
+        self.0.size
+    }
+}
+
+impl parquet::file::reader::ChunkReader for ParquetFile {
+    type T = ParquetRead;
+
+    fn get_read(&self, start: u64) -> parquet::errors::Result<ParquetRead> {
+        Ok(ParquetRead {
+            source: Arc::clone(&self.0),
+            pos: start,
+        })
+    }
+
+    fn get_bytes(&self, start: u64, length: usize) -> parquet::errors::Result<bytes::Bytes> {
+        if length > MAX_PARQUET_READ {
+            return Err(parquet::errors::ParquetError::General(format!(
+                "a column chunk of {length} bytes is larger than 256 MiB"
+            )));
+        }
+        let mut out = vec![0u8; length];
+        let mut done = 0;
+        while done < length {
+            let n = self.0.read_at(start + done as u64, &mut out[done..])?;
+            if n == 0 {
+                return Err(parquet::errors::ParquetError::EOF(
+                    "the object ended inside the file".to_string(),
+                ));
+            }
+            done += n;
+        }
+        Ok(out.into())
+    }
+}
+
+fn parquet_error(err: parquet::errors::ParquetError) -> SqlError {
+    read_error(format!("Invalid Parquet: {err}"))
+}
+
+/// A top-level Parquet field's column type: from its leaf's physical and
+/// converted type; a group or a repeated field is its JSON text.
+fn parquet_column_type(
+    field: &parquet::schema::types::Type,
+    leaf: Option<&parquet::schema::types::ColumnDescriptor>,
+) -> ColumnType {
+    use parquet::basic::{ConvertedType as C, Repetition, Type as P};
+    let (Some(leaf), true) = (
+        leaf,
+        field.is_primitive() && field.get_basic_info().repetition() != Repetition::REPEATED,
+    ) else {
+        return ColumnType::NVarCharMax;
+    };
+    let decimal = || {
+        let (precision, scale) = (leaf.type_precision(), leaf.type_scale());
+        if (1..=38).contains(&precision) && (0..=precision).contains(&scale) {
+            ColumnType::Decimal {
+                precision: precision as u8,
+                scale: scale as u8,
+            }
+        } else {
+            ColumnType::NVarCharMax
+        }
+    };
+    match (leaf.physical_type(), leaf.converted_type()) {
+        (_, C::DECIMAL) => decimal(),
+        (P::BOOLEAN, _) => ColumnType::Bit,
+        (P::INT32, C::INT_8 | C::INT_16) => ColumnType::SmallInt,
+        (P::INT32, C::UINT_8) => ColumnType::TinyInt,
+        (P::INT32, C::UINT_16) => ColumnType::Int,
+        (P::INT32, C::UINT_32) => ColumnType::BigInt,
+        (P::INT32, C::DATE) => ColumnType::Date,
+        (P::INT32, C::TIME_MILLIS) => ColumnType::Time,
+        (P::INT32, _) => ColumnType::Int,
+        (P::INT64, C::UINT_64) => ColumnType::Decimal {
+            precision: 20,
+            scale: 0,
+        },
+        (P::INT64, C::TIMESTAMP_MILLIS | C::TIMESTAMP_MICROS) => ColumnType::DateTime2,
+        (P::INT64, C::TIME_MICROS) => ColumnType::Time,
+        (P::INT64, _) => ColumnType::BigInt,
+        (P::INT96, _) => ColumnType::DateTime2,
+        (P::FLOAT, _) => ColumnType::Real,
+        (P::DOUBLE, _) => ColumnType::Float,
+        (P::BYTE_ARRAY, C::UTF8 | C::ENUM | C::JSON) => ColumnType::NVarCharMax,
+        (P::BYTE_ARRAY | P::FIXED_LEN_BYTE_ARRAY, _) => ColumnType::VarBinaryMax,
+    }
+}
+
+const TICKS_PER_DAY: i64 = 864_000_000_000;
+
+/// Days since 1970 as days since 0001-01-01.
+fn date_datum(days: i64) -> Result<Datum, SqlError> {
+    u32::try_from(days + 719_162)
+        .map(Datum::Date)
+        .map_err(|_| read_error(format!("A date {days} days from 1970 is out of range.")))
+}
+
+/// 100 ns ticks since 1970 as a `datetime2`.
+fn datetime_datum(ticks: i64) -> Result<Datum, SqlError> {
+    let days = ticks.div_euclid(TICKS_PER_DAY);
+    let Datum::Date(day) = date_datum(days)? else {
+        unreachable!("date_datum makes a date");
+    };
+    Ok(Datum::DateTime2(
+        day,
+        ticks.rem_euclid(TICKS_PER_DAY) as u64,
+    ))
+}
+
+/// A Parquet value as a cell of `column_type`.
+fn parquet_datum(
+    field: &parquet::record::Field,
+    column_type: ColumnType,
+) -> Result<Datum, SqlError> {
+    use parquet::record::Field as F;
+    let mismatch = || {
+        read_error(format!(
+            "A Parquet value {field} does not fit its column's type."
+        ))
+    };
+    Ok(match (column_type, field) {
+        (_, F::Null) => Datum::Null,
+        (ColumnType::Bit, F::Bool(v)) => Datum::Bit(*v),
+        (ColumnType::TinyInt, F::UByte(v)) => Datum::TinyInt(*v),
+        (ColumnType::SmallInt, F::Byte(v)) => Datum::SmallInt(*v as i16),
+        (ColumnType::SmallInt, F::Short(v)) => Datum::SmallInt(*v),
+        (ColumnType::Int, F::Int(v)) => Datum::Int(*v),
+        (ColumnType::Int, F::UShort(v)) => Datum::Int(*v as i32),
+        (ColumnType::BigInt, F::Long(v)) => Datum::BigInt(*v),
+        (ColumnType::BigInt, F::UInt(v)) => Datum::BigInt(*v as i64),
+        (ColumnType::Decimal { .. }, F::ULong(v)) => Datum::Decimal(*v as i128),
+        (ColumnType::Decimal { .. }, F::Decimal(d)) => {
+            let bytes = d.data();
+            if bytes.is_empty() || bytes.len() > 16 {
+                return Err(mismatch());
+            }
+            // Big-endian two's complement, sign-extended to 128 bits.
+            let fill = if bytes[0] & 0x80 != 0 { 0xFF } else { 0 };
+            let mut wide = [fill; 16];
+            wide[16 - bytes.len()..].copy_from_slice(bytes);
+            Datum::Decimal(i128::from_be_bytes(wide))
+        }
+        (ColumnType::Real, F::Float(v)) => Datum::Real(*v),
+        (ColumnType::Real, F::Float16(v)) => Datum::Real(f32::from(*v)),
+        (ColumnType::Float, F::Double(v)) => Datum::Float(*v),
+        (ColumnType::Date, F::Date(days)) => date_datum(*days as i64)?,
+        (ColumnType::Time, F::TimeMillis(ms)) => Datum::Time(*ms as u64 * 10_000),
+        (ColumnType::Time, F::TimeMicros(us)) => Datum::Time(*us as u64 * 10),
+        (ColumnType::DateTime2, F::TimestampMillis(ms)) => datetime_datum(ms * 10_000)?,
+        (ColumnType::DateTime2, F::TimestampMicros(us)) => datetime_datum(us * 10)?,
+        (ColumnType::VarBinaryMax, F::Bytes(bytes)) => Datum::VarBinary(bytes.data().to_vec()),
+        (ColumnType::NVarCharMax, F::Str(text)) => Datum::NVarChar(text.clone()),
+        (ColumnType::NVarCharMax, F::Group(row)) => {
+            Datum::NVarChar(row.to_json_value().to_string())
+        }
+        (ColumnType::NVarCharMax, other) => Datum::NVarChar(other.to_json_value().to_string()),
+        _ => return Err(mismatch()),
+    })
+}
+
+/// A Parquet body's rows: typed columns from its schema (`schema`, when one
+/// is fixed already, by column name).
+fn parquet_rows(
+    reader: BodyReader,
+    schema: Option<&Schema>,
+    key: &str,
+) -> Result<(Schema, Rows), SqlError> {
+    use parquet::file::reader::FileReader;
+    let size = reader.size;
+    let file = ParquetFile(Arc::new(ParquetSource {
+        reader: std::sync::Mutex::new(reader),
+        size,
+    }));
+    let parquet =
+        parquet::file::serialized_reader::SerializedFileReader::new(file).map_err(parquet_error)?;
+    let descr = parquet.metadata().file_metadata().schema_descr_ptr();
+    let fields: Vec<(String, ColumnType)> = descr
+        .root_schema()
+        .get_fields()
+        .iter()
+        .map(|field| {
+            let leaf = descr.columns().iter().find(|column| {
+                column.path().parts().len() == 1 && column.path().parts()[0] == field.name()
+            });
+            (
+                field.name().to_string(),
+                parquet_column_type(field, leaf.map(|leaf| leaf.as_ref())),
+            )
+        })
+        .collect();
+    let (schema, map) = match schema {
+        None => (Schema::Parquet(fields.clone()), None),
+        Some(schema) => {
+            let columns = schema.columns();
+            let types = schema.types();
+            let map = fields
+                .iter()
+                .map(|(name, column_type)| {
+                    let index = columns
+                        .iter()
+                        .position(|column| column.eq_ignore_ascii_case(name))
+                        .ok_or_else(|| {
+                            read_error(format!(
+                                "The object '{key}' has a column '{name}' the first object does not."
+                            ))
+                        })?;
+                    if types[index] != *column_type {
+                        return Err(read_error(format!(
+                            "The object '{key}' has column '{name}' of another type than the first object's."
+                        )));
+                    }
+                    Ok(index)
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            (schema.clone(), Some(map))
+        }
+    };
+    let types = schema.types();
+    let iter = parquet::record::reader::RowIter::from_file_into(Box::new(parquet));
+    let rows = iter.map(move |row| {
+        let row = row.map_err(parquet_error)?;
+        let mut out = vec![Datum::Null; types.len()];
+        for (index, (_, field)) in row.get_column_iter().enumerate() {
+            let column = match &map {
+                Some(map) => map[index],
+                None => index,
+            };
+            out[column] = parquet_datum(field, types[column])?;
+        }
+        Ok(out)
+    });
+    Ok((schema, Box::new(rows)))
 }
