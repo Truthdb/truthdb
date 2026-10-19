@@ -509,6 +509,8 @@ impl ExternalStream for JournalStream {
     fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
         let mut rows = Vec::new();
         while rows.is_empty() && !self.done {
+            // Other buckets' rows can fill many slices: stay cancellable.
+            check_cancelled()?;
             let records = {
                 let mut guard = self.core.lock();
                 let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
