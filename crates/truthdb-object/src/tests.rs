@@ -1760,6 +1760,13 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
                 total_len: 2
             }
         );
+        let version_key = |version| {
+            ObjFile::new(&mut storage.lock())
+                .fulltext_version_key("docs", version)
+                .unwrap()
+        };
+        assert_eq!(version_key(v2).as_deref(), Some("k"));
+        assert_eq!(version_key(v1), None);
         // A version that is no longer the latest is not applied.
         assert!(!ft_apply(&storage, "docs", "k", Some(v1), "alpha"));
         assert_eq!(ft_hits(&storage, "docs", "shared"), [v2]);
@@ -1844,6 +1851,12 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
             .unwrap()
             .is_none()
     );
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    for n in 0..20 {
+        assert_eq!(file.fulltext_version_key("docs", n).unwrap(), None);
+    }
+    drop(guard);
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

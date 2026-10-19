@@ -181,6 +181,14 @@ fn key_row_key(bucket: &str, key: &str) -> Vec<u8> {
     out
 }
 
+/// `bucket, 0, version`.
+fn version_row_key(bucket: &str, version: u64) -> Vec<u8> {
+    let mut out = bucket.as_bytes().to_vec();
+    out.push(0);
+    out.extend_from_slice(&version.to_be_bytes());
+    out
+}
+
 fn decode_key(row: &[u8]) -> Result<FtKey, StorageError> {
     if row.len() != 9 {
         return Err(corrupt("full-text key row"));
@@ -349,6 +357,11 @@ impl ObjTxn<'_, '_> {
             self.trees
                 .ft_index()
                 .unindex_document(self.ctx, self.txn, bucket.as_bytes(), old)?;
+            self.trees.ft_versions().delete(
+                self.ctx,
+                &mut OpMode::Txn(self.txn),
+                &version_row_key(bucket, old),
+            )?;
         }
         let Some(version) = version else {
             if held.is_some() {
@@ -364,6 +377,12 @@ impl ObjTxn<'_, '_> {
                     bucket.as_bytes(),
                     version,
                     terms,
+                )?;
+                self.trees.ft_versions().insert_unique(
+                    self.ctx,
+                    &mut OpMode::Txn(self.txn),
+                    &version_row_key(bucket, version),
+                    key.as_bytes(),
                 )?;
                 FtStatus::Indexed
             }
@@ -401,17 +420,19 @@ impl ObjTxn<'_, '_> {
         if left == 0 {
             return Ok(false);
         }
+        // Key rows, then version rows: both start `bucket, 0`.
         let lower = key_row_key(bucket, "");
         let mut upper = bucket.as_bytes().to_vec();
         upper.push(1);
-        let keys = self.trees.ft_keys();
-        let rows = keys.scan_range_limit(self.ctx, Some(&lower), Some(&upper), left)?;
-        for (row_key, _) in &rows {
-            keys.delete(self.ctx, &mut OpMode::Txn(self.txn), row_key)?;
-        }
-        left -= rows.len();
-        if left == 0 {
-            return Ok(false);
+        for tree in [self.trees.ft_keys(), self.trees.ft_versions()] {
+            let rows = tree.scan_range_limit(self.ctx, Some(&lower), Some(&upper), left)?;
+            for (row_key, _) in &rows {
+                tree.delete(self.ctx, &mut OpMode::Txn(self.txn), row_key)?;
+            }
+            left -= rows.len();
+            if left == 0 {
+                return Ok(false);
+            }
         }
         self.trees
             .ft_buckets()
@@ -520,6 +541,23 @@ impl ObjFile<'_> {
             Some(index) => index.stats(&mut self.core.page_ctx(0), bucket.as_bytes()),
             None => Ok(truthdb_fulltext::Stats::default()),
         }
+    }
+
+    /// The key of `version`, when the index holds it.
+    pub fn fulltext_version_key(
+        &mut self,
+        bucket: &str,
+        version: u64,
+    ) -> Result<Option<String>, StorageError> {
+        let Some(tree) = self.existing_tree(crate::FT_VERSIONS_TREE)? else {
+            return Ok(None);
+        };
+        tree.get(
+            &mut self.core.page_ctx(0),
+            &version_row_key(bucket, version),
+        )?
+        .map(|key| String::from_utf8(key).map_err(|_| corrupt("full-text version row")))
+        .transpose()
     }
 
     /// The version of `key` the index holds, and how.

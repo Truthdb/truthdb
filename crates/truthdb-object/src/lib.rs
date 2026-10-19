@@ -85,6 +85,9 @@ const FT_DOCS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 14;
 const FT_POSTINGS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 15;
 /// (bucket, 0, key) -> the version of the key the index holds, and how.
 const FT_KEYS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 16;
+/// (bucket, 0, version) -> key: the key of each version the index holds, to
+/// name a search's hits.
+const FT_VERSIONS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 17;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -223,6 +226,7 @@ pub(crate) struct Trees {
     ft_docs: u64,
     ft_postings: u64,
     ft_keys: u64,
+    ft_versions: u64,
 }
 
 impl Trees {
@@ -307,6 +311,12 @@ impl Trees {
             root: self.ft_keys,
         }
     }
+    pub fn ft_versions(&self) -> BTree {
+        BTree {
+            object_id: FT_VERSIONS_TREE,
+            root: self.ft_versions,
+        }
+    }
     pub fn attrs(&self) -> BTree {
         BTree {
             object_id: ATTRS_TREE,
@@ -383,6 +393,7 @@ impl<'a> ObjFile<'a> {
             ft_docs: self.tree(FT_DOCS_TREE)?.root,
             ft_postings: self.tree(FT_POSTINGS_TREE)?.root,
             ft_keys: self.tree(FT_KEYS_TREE)?.root,
+            ft_versions: self.tree(FT_VERSIONS_TREE)?.root,
         };
         self.in_txn(|ctx, txn| body(&mut ObjTxn { ctx, txn, trees }))
     }
