@@ -35,8 +35,8 @@ pub(in crate::engine::relational) enum SourceRows {
 /// the table's S lock spans the whole batch, so lazy pulling changes no
 /// isolation semantics — and READ UNCOMMITTED took no read lock before
 /// either. A READ UNCOMMITTED scan can therefore resume on a page another
-/// session emptied and freed: the cursor's per-page object check stops it
-/// on a page recycled to another object, but a page recycled into the same
+/// session emptied and freed: it stops on a page recycled to another object
+/// or to something that is no longer a page, but a page recycled into the same
 /// tree is read as it now is, so such a scan can miss or repeat rows — as
 /// SQL Server's NOLOCK scans can.
 pub(in crate::engine::relational) struct ScanStream {

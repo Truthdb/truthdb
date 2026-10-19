@@ -128,6 +128,10 @@ impl StorageFile {
                         .to_string(),
                 ));
             }
+            // The extent may be pages freed by records not yet forced to disk
+            // (a B+ tree page a delete emptied): spill writes go straight to
+            // the file, so the log of those frees must reach the disk first.
+            self.wal_sync_all()?;
             return self.allocator.allocate_temp_extent().ok_or_else(|| {
                 StorageError::InvalidConfig("data region full: cannot allocate extent".to_string())
             });

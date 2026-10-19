@@ -461,3 +461,42 @@ fn redo_skips_pages_freed_later_in_the_log() {
         std::fs::remove_file(p).ok();
     }
 }
+
+#[test]
+fn a_scan_resumed_on_a_page_that_is_no_longer_a_page_stops() {
+    let path = unique_temp_path("btree-free-resume");
+    let storage = create(&path);
+    let tree = create_tree(&storage);
+    insert(&storage, &tree, 0..3000);
+    checkpoint(&storage);
+    // A sliced scan stops early in the tree…
+    let mut first = Vec::new();
+    let cursor = {
+        let mut guard = storage.lock();
+        tree.scan_from(
+            &mut guard.page_ctx(0),
+            crate::relstore::btree::ScanCursor::start(),
+            10,
+            &mut first,
+        )
+        .expect("first slice")
+    };
+    let resume_page = cursor.page().expect("a page");
+    // …its page is emptied, freed and taken by a checkpoint snapshot…
+    delete(&storage, &tree, 0..2900);
+    assert!(!storage.lock().is_page_allocated(resume_page));
+    steer_allocations_to(&storage, &[resume_page]);
+    storage
+        .write_checkpoint(&[0x77; 4096], 1, 2, 1)
+        .expect("checkpoint");
+    // …and the scan resumes: it stops rather than failing on the snapshot.
+    let mut rest = Vec::new();
+    let next = {
+        let mut guard = storage.lock();
+        tree.scan_from(&mut guard.page_ctx(0), cursor, 100, &mut rest)
+            .expect("the resumed scan does not fail")
+    };
+    assert!(next.done());
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

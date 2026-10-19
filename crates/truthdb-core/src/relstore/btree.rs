@@ -606,10 +606,18 @@ impl BTree {
             Some(page) => page,
             None => self.leftmost_leaf(ctx)?,
         };
+        let resumed_on = cursor.page;
         let mut slot = cursor.slot;
         let mut taken = 0;
         while page_no != NO_PAGE {
-            let frame = ctx.fetch(page_no)?;
+            let frame = match ctx.fetch(page_no) {
+                Ok(frame) => frame,
+                // The page resumed on was freed since and holds something that
+                // is not a page now (a snapshot, a spill page): stop, as on a
+                // page recycled to another object.
+                Err(_) if resumed_on == Some(page_no) => return Ok(ScanCursor::finished()),
+                Err(err) => return Err(err),
+            };
             if page::read_header(ctx.pool.page(frame)).object_id != self.object_id {
                 ctx.pool.unpin(frame);
                 return Ok(ScanCursor::finished());
