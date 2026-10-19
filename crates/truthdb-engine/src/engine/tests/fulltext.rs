@@ -1,0 +1,326 @@
+//! The full-text indexer: enabling a bucket backfills it, the journal keeps
+//! it current (overwrites, deletes, delete markers), only text within the
+//! size is indexed, a restart or a repeated row changes nothing, and
+//! disabling purges it.
+
+use crate::engine::test_support::*;
+use crate::engine::*;
+use truthdb_object::{BodyWriter, FtKey, FtState, FtStatus, ObjectAttrs, VersionSel, Versioning};
+
+fn now() -> u64 {
+    2_000
+}
+
+fn put(engine: &Engine, bucket: &str, key: &str, data: &[u8], content_type: &str) -> u64 {
+    put_with(
+        engine,
+        bucket,
+        key,
+        data,
+        ObjectAttrs {
+            content_type: Some(content_type.to_string()),
+            ..ObjectAttrs::default()
+        },
+    )
+}
+
+fn put_with(engine: &Engine, bucket: &str, key: &str, data: &[u8], attrs: ObjectAttrs) -> u64 {
+    let storage = engine.storage();
+    let mut writer = BodyWriter::begin(storage, now()).expect("begin");
+    for chunk in data.chunks(300_000) {
+        writer.write(storage, chunk, now()).expect("write");
+    }
+    let sealed = writer.finish(storage, now()).expect("finish");
+    engine
+        .object(|file| file.transaction(|tx| tx.put_object(bucket, key, &sealed, &attrs, now(), 0)))
+        .expect("put")
+        .expect("put accepted")
+        .version
+}
+
+/// Runs indexer passes until no work remains.
+fn index(engine: &Engine) -> usize {
+    let mut passes = 1;
+    while engine.fulltext_pass().expect("pass") {
+        passes += 1;
+        assert!(passes < 1000, "the indexer does not finish");
+    }
+    passes
+}
+
+/// The keys whose latest version matches `condition`, sorted.
+fn hits(engine: &Engine, bucket: &str, condition: &str) -> Vec<String> {
+    let mut search = truthdb_fulltext::Search::new(condition).expect("condition");
+    let docs = engine
+        .object(|file| {
+            assert!(file.fulltext_step(&mut search, bucket, usize::MAX).unwrap());
+            Ok(search.rank(file.fulltext_stats(bucket)?))
+        })
+        .expect("search");
+    let mut keys: Vec<String> = engine
+        .object(|file| {
+            let listing = file
+                .list_objects(bucket, "", None, None, 1000)?
+                .expect("bucket");
+            Ok(listing
+                .objects
+                .into_iter()
+                .filter(|object| docs.iter().any(|hit| hit.doc == object.info.version))
+                .map(|object| object.key)
+                .collect())
+        })
+        .expect("list");
+    assert_eq!(keys.len(), docs.len(), "every hit is a latest version");
+    keys.sort();
+    keys
+}
+
+fn held(engine: &Engine, bucket: &str, key: &str) -> Option<FtKey> {
+    engine
+        .object(|file| file.fulltext_key(bucket, key))
+        .expect("key")
+}
+
+fn command(engine: &Engine, text: &str) -> String {
+    engine.execute(text).expect("command")
+}
+
+fn states(engine: &Engine) -> Vec<(String, FtState)> {
+    engine
+        .object(|file| file.fulltext_buckets())
+        .expect("buckets")
+        .into_iter()
+        .map(|bucket| (bucket.name, bucket.state))
+        .collect()
+}
+
+#[test]
+fn enabling_backfills_text_objects_and_skips_the_rest() {
+    let path = unique_temp_path("ft-backfill");
+    let engine = new_engine(&path);
+    engine
+        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .unwrap()
+        .unwrap();
+    // More keys than one backfill pass takes.
+    for n in 0..150 {
+        put(
+            &engine,
+            "docs",
+            &format!("note/{n:03}"),
+            format!("note number{n} common").as_bytes(),
+            "text/plain; charset=utf-8",
+        );
+    }
+    put(
+        &engine,
+        "docs",
+        "data.json",
+        br#"{"city": "Lisbon"}"#,
+        "application/json",
+    );
+    put(
+        &engine,
+        "docs",
+        "feed.xml",
+        b"<t>Lisbon feed</t>",
+        "application/atom+xml",
+    );
+    put(&engine, "docs", "photo.jpg", b"Lisbon pixels", "image/jpeg");
+    put(&engine, "docs", "untyped", b"Lisbon untyped", "");
+    put_with(
+        &engine,
+        "docs",
+        "packed.txt",
+        b"Lisbon packed",
+        ObjectAttrs {
+            content_type: Some("text/plain".into()),
+            content_encoding: Some("gzip".into()),
+            ..ObjectAttrs::default()
+        },
+    );
+    put(
+        &engine,
+        "docs",
+        "big.txt",
+        &b"Lisbon ".repeat(200),
+        "text/plain",
+    );
+
+    assert!(command(&engine, "s3 enable fulltext docs 1000").contains("backfilling"));
+    assert_eq!(
+        states(&engine),
+        [("docs".to_string(), FtState::Backfilling(None))]
+    );
+    assert!(index(&engine) > 2);
+    assert_eq!(states(&engine), [("docs".to_string(), FtState::On)]);
+
+    assert_eq!(hits(&engine, "docs", "lisbon"), ["data.json", "feed.xml"]);
+    assert_eq!(hits(&engine, "docs", "common").len(), 150);
+    assert_eq!(hits(&engine, "docs", "number42"), ["note/042"]);
+    let status = |key| held(&engine, "docs", key).map(|held| held.status);
+    assert_eq!(status("photo.jpg"), Some(FtStatus::NotText));
+    assert_eq!(status("untyped"), Some(FtStatus::NotText));
+    assert_eq!(status("packed.txt"), Some(FtStatus::Encoded));
+    assert_eq!(status("big.txt"), Some(FtStatus::TooLarge));
+
+    // Enabling again with a larger size looks at every key anew: the large
+    // one is indexed now, and the rest are left as they are.
+    command(&engine, "s3 enable fulltext docs 100000");
+    index(&engine);
+    assert_eq!(
+        hits(&engine, "docs", "lisbon"),
+        ["big.txt", "data.json", "feed.xml"]
+    );
+    assert_eq!(hits(&engine, "docs", "common").len(), 150);
+
+    // Errors: no such bucket, a bad size, disabling twice.
+    assert!(engine.execute("s3 enable fulltext nope").is_err());
+    assert!(engine.execute("s3 enable fulltext docs -5").is_err());
+    assert!(command(&engine, "s3 disable fulltext docs").contains("purging"));
+    assert!(engine.execute("s3 disable fulltext docs").is_err());
+    index(&engine);
+    assert!(states(&engine).is_empty());
+    assert!(hits(&engine, "docs", "common").is_empty());
+    assert!(held(&engine, "docs", "note/001").is_none());
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn the_journal_keeps_the_index_on_each_keys_latest_version() {
+    let path = unique_temp_path("ft-journal");
+    let engine = new_engine(&path);
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.create_bucket("plain", now())?.unwrap();
+                tx.create_bucket("hist", now())?.unwrap();
+                tx.set_versioning("hist", Versioning::Enabled)
+            })
+        })
+        .unwrap()
+        .unwrap();
+    command(&engine, "s3 enable fulltext plain");
+    command(&engine, "s3 enable fulltext hist");
+    index(&engine);
+
+    // An overwrite replaces the old text; a delete removes it.
+    put(&engine, "plain", "a", b"red apple", "text/plain");
+    put(&engine, "plain", "b", b"red berry", "text/plain");
+    index(&engine);
+    assert_eq!(hits(&engine, "plain", "red"), ["a", "b"]);
+    put(&engine, "plain", "a", b"green apple", "text/plain");
+    index(&engine);
+    assert_eq!(hits(&engine, "plain", "red"), ["b"]);
+    assert_eq!(hits(&engine, "plain", "green"), ["a"]);
+    engine
+        .object(|file| file.transaction(|tx| tx.delete_object("plain", "b", None, now(), 0)))
+        .unwrap()
+        .unwrap();
+    // Overwritten with something that is not text: it leaves the index.
+    put(&engine, "plain", "a", b"green", "image/png");
+    index(&engine);
+    assert!(hits(&engine, "plain", "red or green").is_empty());
+    assert!(held(&engine, "plain", "b").is_none());
+    assert_eq!(
+        held(&engine, "plain", "a").unwrap().status,
+        FtStatus::NotText
+    );
+
+    // Versioned: a delete marker hides the text; removing the marker brings
+    // the older version back into the index.
+    let v1 = put(&engine, "hist", "k", b"first draft", "text/plain");
+    let v2 = put(&engine, "hist", "k", b"second draft", "text/plain");
+    index(&engine);
+    assert_eq!(hits(&engine, "hist", "draft"), ["k"]);
+    assert_eq!(held(&engine, "hist", "k").unwrap().version, v2);
+    let marker = engine
+        .object(|file| file.transaction(|tx| tx.delete_object("hist", "k", None, now(), 0)))
+        .unwrap()
+        .unwrap()
+        .version
+        .unwrap();
+    index(&engine);
+    assert!(held(&engine, "hist", "k").is_none());
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.delete_object("hist", "k", Some(VersionSel::Seq(marker)), now(), 0)
+            })
+        })
+        .unwrap()
+        .unwrap();
+    index(&engine);
+    assert_eq!(held(&engine, "hist", "k").unwrap().version, v2);
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.delete_object("hist", "k", Some(VersionSel::Seq(v2)), now(), 0)
+            })
+        })
+        .unwrap()
+        .unwrap();
+    index(&engine);
+    assert_eq!(held(&engine, "hist", "k").unwrap().version, v1);
+    assert_eq!(hits(&engine, "hist", "first"), ["k"]);
+    assert!(hits(&engine, "hist", "second").is_empty());
+
+    // A bucket that is not indexed is left alone.
+    engine
+        .object(|file| file.transaction(|tx| tx.create_bucket("other", now())))
+        .unwrap()
+        .unwrap();
+    put(&engine, "other", "x", b"red", "text/plain");
+    index(&engine);
+    assert!(held(&engine, "other", "x").is_none());
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_restart_or_a_row_applied_twice_changes_nothing() {
+    let path = unique_temp_path("ft-restart");
+    let engine = new_engine(&path);
+    engine
+        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .unwrap()
+        .unwrap();
+    command(&engine, "s3 enable fulltext docs");
+    index(&engine);
+    put(&engine, "docs", "a", b"one two", "text/plain");
+    put(&engine, "docs", "b", b"two three", "text/plain");
+    // The rows are applied but the cursor is not advanced (as when the
+    // indexer crashes between the two), then the store goes down uncleanly.
+    let bucket = engine
+        .object(|file| file.fulltext_buckets())
+        .unwrap()
+        .remove(0);
+    engine.fulltext_sync(&bucket, "a").unwrap();
+    engine.fulltext_sync(&bucket, "b").unwrap();
+    let cursor = engine.object(|file| file.fulltext_cursor()).unwrap();
+    drop(engine);
+    let engine =
+        Engine::new(RelStorage::open_with(path.clone(), crate::database_engines).expect("open"))
+            .expect("engine");
+    assert_eq!(
+        engine.object(|file| file.fulltext_cursor()).unwrap(),
+        cursor
+    );
+    assert_eq!(hits(&engine, "docs", "two"), ["a", "b"]);
+    // Applying the rows again (and backfilling again) changes nothing.
+    index(&engine);
+    command(&engine, "s3 enable fulltext docs");
+    index(&engine);
+    assert_eq!(hits(&engine, "docs", "two"), ["a", "b"]);
+    assert_eq!(hits(&engine, "docs", "three"), ["b"]);
+    assert_eq!(
+        engine.object(|file| file.fulltext_stats("docs")).unwrap(),
+        truthdb_fulltext::Stats {
+            docs: 2,
+            total_len: 4
+        }
+    );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}

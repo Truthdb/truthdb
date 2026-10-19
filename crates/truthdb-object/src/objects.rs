@@ -333,6 +333,23 @@ fn read_attrs(
 }
 
 impl ObjTxn<'_, '_> {
+    /// The newest version of `key`, unless it is a delete marker.
+    pub(crate) fn latest_live_version(
+        &mut self,
+        bucket: &str,
+        key: &str,
+    ) -> Result<Option<u64>, StorageError> {
+        Ok(find_version(
+            self.ctx,
+            &self.trees.objects(),
+            bucket,
+            key,
+            VersionSel::Latest,
+        )?
+        .filter(|(_, _, row)| row.flags & FLAG_DELETE_MARKER == 0)
+        .map(|(_, version, _)| version))
+    }
+
     pub(crate) fn bucket_row(&mut self, bucket: &str) -> Result<Option<BucketRow>, StorageError> {
         self.trees
             .buckets()

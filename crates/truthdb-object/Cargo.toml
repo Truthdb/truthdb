@@ -6,6 +6,7 @@ description = "TruthDB object engine: buckets, versioned objects and their bodie
 
 [dependencies]
 truthdb-core = { workspace = true }
+truthdb-fulltext = { workspace = true }
 md-5 = "0.10.6"
 
 [dev-dependencies]

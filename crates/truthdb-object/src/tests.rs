@@ -1653,3 +1653,315 @@ fn the_journal_ships_to_a_standby_and_restores_from_a_log_backup() {
         std::fs::remove_file(p).ok();
     }
 }
+
+/// Puts `text` as `key` in `bucket` (a text object) and returns its version.
+fn put_text(storage: &Storage, bucket: &str, key: &str, text: &str) -> u64 {
+    use crate::ObjectAttrs;
+    let mut writer = BodyWriter::begin(storage, now()).unwrap();
+    writer.write(storage, text.as_bytes(), now()).unwrap();
+    let sealed = writer.finish(storage, now()).unwrap();
+    let attrs = ObjectAttrs {
+        content_type: Some("text/plain".into()),
+        ..ObjectAttrs::default()
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.put_object(bucket, key, &sealed, &attrs, now(), 0))
+        .unwrap()
+        .unwrap()
+        .version
+}
+
+/// The documents matching `condition` in `bucket`'s full-text index.
+fn ft_hits(storage: &Storage, bucket: &str, condition: &str) -> Vec<u64> {
+    let mut search = truthdb_fulltext::Search::new(condition).unwrap();
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    assert!(file.fulltext_step(&mut search, bucket, usize::MAX).unwrap());
+    let stats = file.fulltext_stats(bucket).unwrap();
+    let mut docs: Vec<u64> = search.rank(stats).iter().map(|hit| hit.doc).collect();
+    docs.sort();
+    docs
+}
+
+fn ft_apply(storage: &Storage, bucket: &str, key: &str, version: Option<u64>, text: &str) -> bool {
+    let terms = truthdb_fulltext::DocTerms::from_text(text);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.apply_fulltext(bucket, key, version, crate::FtDoc::Indexed(&terms)))
+        .unwrap()
+}
+
+#[test]
+fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_op() {
+    use crate::{FtKey, FtState, FtStatus};
+    // Version 1 indexed; then applying version 2 crashes after each of its
+    // page operations in turn. After every crash the index holds exactly
+    // version 1; applied again, exactly version 2.
+    let mut crash_at = 0;
+    loop {
+        let path = temp_path("ft-crash");
+        let storage = create(&path);
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_bucket("docs", now())?.unwrap();
+                tx.enable_fulltext("docs", 1 << 20)
+            })
+            .unwrap()
+            .unwrap();
+        let v1 = put_text(&storage, "docs", "k", "alpha shared");
+        assert!(ft_apply(&storage, "docs", "k", Some(v1), "alpha shared"));
+        let v2 = put_text(&storage, "docs", "k", "beta shared");
+        FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(Some(crash_at)));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let terms = truthdb_fulltext::DocTerms::from_text("beta shared");
+            ObjFile::new(&mut storage.lock()).transaction(|tx| {
+                // The failed op stands for the crash: no rollback runs.
+                match tx.apply_fulltext("docs", "k", Some(v2), crate::FtDoc::Indexed(&terms)) {
+                    Ok(applied) => Ok(applied),
+                    Err(err) => panic!("crash: {err}"),
+                }
+            })
+        }))
+        .is_err();
+        let fired = FAIL_APPLY_OPS_AFTER
+            .with(|fail| fail.replace(None))
+            .is_none();
+        drop(storage);
+        let storage = open(&path);
+        let key = |storage: &Storage| {
+            ObjFile::new(&mut storage.lock())
+                .fulltext_key("docs", "k")
+                .unwrap()
+        };
+        if crashed {
+            assert!(fired);
+            assert_eq!(
+                ft_hits(&storage, "docs", "shared"),
+                [v1],
+                "crash at {crash_at}"
+            );
+            assert!(ft_hits(&storage, "docs", "beta").is_empty());
+            assert_eq!(
+                key(&storage),
+                Some(FtKey {
+                    version: v1,
+                    status: FtStatus::Indexed
+                })
+            );
+            assert!(ft_apply(&storage, "docs", "k", Some(v2), "beta shared"));
+        }
+        assert_eq!(ft_hits(&storage, "docs", "shared"), [v2]);
+        assert!(ft_hits(&storage, "docs", "alpha").is_empty());
+        assert_eq!(
+            ObjFile::new(&mut storage.lock())
+                .fulltext_stats("docs")
+                .unwrap(),
+            truthdb_fulltext::Stats {
+                docs: 1,
+                total_len: 2
+            }
+        );
+        // A version that is no longer the latest is not applied.
+        assert!(!ft_apply(&storage, "docs", "k", Some(v1), "alpha"));
+        assert_eq!(ft_hits(&storage, "docs", "shared"), [v2]);
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+        if !crashed {
+            assert!(crash_at > 5, "the apply crashed at only {crash_at} points");
+            break;
+        }
+        crash_at += 1;
+    }
+
+    // Deleting the bucket purges its index in batches; a bucket created again
+    // under the name starts with none and cannot be enabled until the purge
+    // is done.
+    let path = temp_path("ft-purge");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("docs", now())?.unwrap();
+            tx.enable_fulltext("docs", 1 << 20)
+        })
+        .unwrap()
+        .unwrap();
+    let mut keys = Vec::new();
+    for n in 0..10 {
+        let key = format!("k{n}");
+        let version = put_text(&storage, "docs", &key, "word");
+        assert!(ft_apply(&storage, "docs", &key, Some(version), "word"));
+        keys.push(key);
+    }
+    assert_eq!(ft_hits(&storage, "docs", "word").len(), 10);
+    for key in &keys {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_object("docs", key, None, now(), 0))
+            .unwrap()
+            .unwrap();
+    }
+    let state = |storage: &Storage| {
+        ObjFile::new(&mut storage.lock())
+            .fulltext_buckets()
+            .unwrap()
+            .into_iter()
+            .map(|bucket| bucket.state)
+            .collect::<Vec<_>>()
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.delete_bucket("docs")?.unwrap();
+            tx.create_bucket("docs", now())
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(state(&storage), [FtState::Purging]);
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.enable_fulltext("docs", 1 << 20))
+            .unwrap(),
+        Err(crate::FtError::Purging)
+    );
+    // Nothing more is applied to a purging bucket.
+    assert!(!ft_apply(&storage, "docs", "k0", None, ""));
+    let mut passes = 0;
+    while !ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.purge_fulltext("docs", 3))
+        .unwrap()
+    {
+        passes += 1;
+    }
+    assert!(passes >= 6, "{passes} purge passes");
+    assert!(state(&storage).is_empty());
+    assert!(ft_hits(&storage, "docs", "word").is_empty());
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .fulltext_stats("docs")
+            .unwrap(),
+        truthdb_fulltext::Stats::default()
+    );
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .fulltext_key("docs", "k0")
+            .unwrap()
+            .is_none()
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn the_journal_is_not_trimmed_past_the_indexer_while_a_bucket_is_indexed() {
+    let path = temp_path("ft-journal");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("docs", now()))
+        .unwrap()
+        .unwrap();
+    put_text(&storage, "docs", "a", "x");
+    // Enabling starts the cursor at the journal's end: the backfill covers
+    // what came before.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.enable_fulltext("docs", 1 << 20))
+        .unwrap()
+        .unwrap();
+    let cursor = |storage: &Storage| ObjFile::new(&mut storage.lock()).fulltext_cursor().unwrap();
+    assert_eq!(cursor(&storage), 1);
+    put_text(&storage, "docs", "b", "y");
+    put_text(&storage, "docs", "c", "z");
+    let trim = |storage: &Storage| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.trim_journal(now() + 1, 1, 100))
+            .unwrap()
+    };
+    let due = |storage: &Storage| {
+        ObjFile::new(&mut storage.lock())
+            .journal_due(now() + 1, 1)
+            .unwrap()
+    };
+    assert!(due(&storage));
+    assert_eq!(trim(&storage), 1, "only the row the indexer has passed");
+    assert!(
+        !due(&storage),
+        "nothing more is due: an idle sweep writes nothing"
+    );
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.set_fulltext_cursor(2))
+        .unwrap();
+    assert_eq!(trim(&storage), 1);
+    // Disabled and purged: nothing holds the journal back.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.disable_fulltext("docs"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(trim(&storage), 0, "a purging bucket still holds it");
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.purge_fulltext("docs", 100))
+            .unwrap()
+    );
+    assert_eq!(trim(&storage), 1);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn the_full_text_index_ships_to_a_standby_and_restores_from_a_log_backup() {
+    let path = temp_path("ft-ship-src");
+    let bak = temp_path("ft-ship-bak");
+    let log = temp_path("ft-ship-log");
+    let seed = temp_path("ft-ship-seed");
+    let dst = temp_path("ft-ship-dst");
+    let primary = create(&path);
+    primary.lock().commit_db_options(0, Some(true)).unwrap();
+    let summary = primary.backup_full(&bak).unwrap();
+    ObjFile::new(&mut primary.lock())
+        .transaction(|tx| {
+            tx.create_bucket("docs", now())?.unwrap();
+            tx.enable_fulltext("docs", 1 << 20)
+        })
+        .unwrap()
+        .unwrap();
+    let a = put_text(&primary, "docs", "a", "north wind");
+    let b = put_text(&primary, "docs", "b", "south wind");
+    assert!(ft_apply(&primary, "docs", "a", Some(a), "north wind"));
+    assert!(ft_apply(&primary, "docs", "b", Some(b), "south wind"));
+    let b2 = put_text(&primary, "docs", "b", "east");
+    assert!(ft_apply(&primary, "docs", "b", Some(b2), "east"));
+    let expected = (
+        ft_hits(&primary, "docs", "wind"),
+        ft_hits(&primary, "docs", "east"),
+    );
+    assert_eq!(expected, (vec![a], vec![b2]));
+    let delta = primary
+        .read_wal_range(summary.backup_end_lsn, primary.wal_flushed_lsn())
+        .unwrap();
+    primary.backup_log(&log, true, false).unwrap();
+
+    Storage::restore_full_standby(&seed, &bak, &[], engines).unwrap();
+    let standby = open(&seed);
+    standby
+        .apply_wal_stream(summary.backup_end_lsn, &delta)
+        .unwrap();
+    assert_eq!(
+        (
+            ft_hits(&standby, "docs", "wind"),
+            ft_hits(&standby, "docs", "east")
+        ),
+        expected
+    );
+    drop(standby);
+
+    Storage::restore_full_with_logs(&dst, &bak, &[log.clone()], None, engines).unwrap();
+    let restored = open(&dst);
+    assert_eq!(
+        (
+            ft_hits(&restored, "docs", "wind"),
+            ft_hits(&restored, "docs", "east")
+        ),
+        expected
+    );
+    drop(restored);
+    drop(primary);
+    for p in [&path, &bak, &log, &seed, &dst] {
+        std::fs::remove_file(p).ok();
+    }
+}

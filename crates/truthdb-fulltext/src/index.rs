@@ -240,6 +240,37 @@ impl Index {
         Ok(true)
     }
 
+    /// Up to `limit` of the documents indexed in `scope`, lowest first (to
+    /// unindex a whole scope a batch at a time).
+    pub fn documents(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        scope: &[u8],
+        limit: usize,
+    ) -> Result<Vec<u64>, StorageError> {
+        let lower = doc_key(scope, 0, 0)?;
+        let upper = doc_key(scope, u64::MAX, u16::MAX)?;
+        let mut docs = Vec::new();
+        let mut after = lower;
+        while docs.len() < limit {
+            let rows = self
+                .docs
+                .scan_range_limit(ctx, Some(&after), Some(&upper), 1)?;
+            let Some((key, _)) = rows.first() else {
+                break;
+            };
+            let at = key.len() - 10;
+            let doc = u64::from_be_bytes(key[at..at + 8].try_into().expect("8 bytes"));
+            docs.push(doc);
+            // Past every chunk of this document.
+            match doc.checked_add(1) {
+                Some(next) => after = doc_key(scope, next, 0)?,
+                None => break,
+            }
+        }
+        Ok(docs)
+    }
+
     /// Reads up to `limit` postings of `term` in `scope` (of every term that
     /// starts with it, when `prefix`), in (term, doc) order, after the
     /// posting `after` names (from the start when `None`). Returns them with

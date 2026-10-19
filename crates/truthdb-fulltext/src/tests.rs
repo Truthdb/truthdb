@@ -342,6 +342,22 @@ fn scopes_are_separate_collections() {
     assert_eq!(f.docs("ab", "shared"), [2]);
     assert_eq!(f.docs("", "shared"), [3]);
     assert_eq!(f.stats("a").docs, 1);
+    f.index(
+        "a",
+        9,
+        &(0..2000).map(|n| format!("w{n} ")).collect::<String>(),
+    );
+    f.index("a", 4, "four");
+    {
+        let mut guard = f.storage.lock();
+        let mut ctx = guard.page_ctx(0);
+        assert_eq!(f.index.documents(&mut ctx, b"a", 10).unwrap(), [1, 4, 9]);
+        assert_eq!(f.index.documents(&mut ctx, b"a", 2).unwrap(), [1, 4]);
+        assert_eq!(f.index.documents(&mut ctx, b"ab", 10).unwrap(), [2]);
+        assert!(f.index.documents(&mut ctx, b"zz", 10).unwrap().is_empty());
+    }
+    assert!(f.unindex("a", 4));
+    assert!(f.unindex("a", 9));
     assert!(f.unindex("a", 1));
     assert_eq!(f.docs("ab", "shared"), [2]);
     // A scope longer than 255 bytes cannot be written.
