@@ -351,6 +351,26 @@ pub(super) fn footer_schema(metadata: &[u8], max_depth: usize) -> Result<SchemaD
             _ => return Err("the file metadata does not start with its schema".to_string()),
         }
     };
+    // Then the row count and the row groups' list: the reader reserves room
+    // for as many row groups as the list declares before reading one, so
+    // the count may be no more than the bytes left (a row group takes at
+    // least one).
+    let order = || "the file metadata's fields are out of order".to_string();
+    match c.field(2).ok_or_else(bad)? {
+        Field::Field { kind: 6, id: 3 } => {
+            c.zigzag().ok_or_else(bad)?;
+        }
+        _ => return Err(order()),
+    }
+    match c.field(3).ok_or_else(bad)? {
+        Field::Field { kind: 9, id: 4 } => {
+            let (kind, count) = c.list_begin().ok_or_else(bad)?;
+            if kind != 12 || count > (metadata.len() - c.at) as u64 {
+                return Err("the file metadata declares more row groups than it holds".to_string());
+            }
+        }
+        _ => return Err(order()),
+    }
     build_schema(elements, max_depth)
 }
 
@@ -732,6 +752,8 @@ pub(in crate::engine) mod tests {
             }
             out.push(0);
         }
+        // Field 3 (num_rows 0) and field 4 (an empty list of row groups).
+        out.extend_from_slice(&[0x16, 0x00, 0x19, 0x0C]);
         out.push(0);
         out
     }
@@ -821,5 +843,14 @@ pub(in crate::engine) mod tests {
         assert!(footer_schema(&metadata(&[5, 0], 5), 32).is_err());
         assert!(footer_schema(&metadata(&[1, 0, 0], 5), 32).is_err());
         assert!(footer_schema(&metadata(&[1, 0], 5)[..10], 32).is_err());
+        // A row group list claiming more groups than bytes left.
+        let mut lying = metadata(&[1, 0], 5);
+        // The list header (0x0C, before the final stop) becomes a list of
+        // structs with i32::MAX elements.
+        let at = lying.len() - 2;
+        lying[at] = 0xFC;
+        lying.splice(at + 1..at + 1, [0xFF, 0xFF, 0xFF, 0xFF, 0x07]);
+        let err = footer_schema(&lying, 32).unwrap_err();
+        assert!(err.contains("row groups"), "{err}");
     }
 }

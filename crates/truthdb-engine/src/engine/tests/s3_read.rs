@@ -1119,6 +1119,47 @@ fn parquet_files_that_lie_about_their_layout_are_refused_before_reading() {
         message("dictionary")
     );
 
+    // Dictionaries the reader would hold together past the budget (512 KiB
+    // under test): one column's reads, three columns' are refused, and
+    // reading the first column twice (the row check and the rows) counts it
+    // once.
+    let dictionary_props = || {
+        parquet::file::properties::WriterProperties::builder()
+            .set_compression(Compression::SNAPPY)
+            .build()
+    };
+    let strings = || -> Vec<Vec<u8>> { (0..6000).map(|n| format!("s{n}").into_bytes()).collect() };
+    put(
+        &engine,
+        "pql",
+        "one-dictionary",
+        &parquet_file(
+            "message s { REQUIRED BINARY a (UTF8); }",
+            dictionary_props(),
+            vec![Column::Bytes(strings())],
+        ),
+    );
+    assert_eq!(rows(&engine, &read("one-dictionary")), [some(&["6000"])]);
+    put(
+        &engine,
+        "pql",
+        "three-dictionaries",
+        &parquet_file(
+            "message s { REQUIRED BINARY a (UTF8); REQUIRED BINARY b (UTF8); REQUIRED BINARY c (UTF8); }",
+            dictionary_props(),
+            vec![
+                Column::Bytes(strings()),
+                Column::Bytes(strings()),
+                Column::Bytes(strings()),
+            ],
+        ),
+    );
+    assert!(
+        message("three-dictionaries").contains("dictionaries taking more than"),
+        "{}",
+        message("three-dictionaries")
+    );
+
     // One row holding two million null list elements, a few kilobytes on
     // disk: refused from its repetition levels before the row is built.
     let schema = std::sync::Arc::new(

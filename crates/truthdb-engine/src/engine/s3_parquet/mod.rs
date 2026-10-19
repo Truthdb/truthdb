@@ -30,6 +30,9 @@ use super::s3_read::{BodyReader, Rows, Schema, read_error};
 /// never less than [`MIN_PARQUET_PAGE`] (writers cut pages at about 1 MiB).
 const PARQUET_PAGE_BUDGET: usize = 256 << 20;
 const MIN_PARQUET_PAGE: usize = 1 << 20;
+/// The memory one row group's decoded dictionaries may take together (tiny
+/// under test, so the limit is reached with small files).
+const DICTIONARY_BUDGET: u64 = if cfg!(test) { 512 << 10 } else { 256 << 20 };
 /// The most leaf columns a Parquet file read here may have.
 const MAX_PARQUET_LEAVES: usize = 1024;
 /// The deepest a Parquet column may nest.
@@ -70,17 +73,22 @@ struct SourceState {
     /// The largest page this read may decompress.
     page_cap: usize,
     /// The column chunks, by byte range: a page's chunk gives its codec and
-    /// its values' smallest size.
+    /// its values' sizes.
     chunks: Vec<Chunk>,
+    /// The memory each chunk's decoded dictionary takes, by chunk start: the
+    /// reader holds every dictionary of a row group at once.
+    dictionaries: std::collections::HashMap<u64, u64>,
 }
 
-/// A column chunk's byte range, compression and the fewest bits one of its
-/// values takes.
+/// A column chunk's byte range, row group, compression, the fewest bits one
+/// of its values takes on disk, and the bytes one takes decoded.
 struct Chunk {
     start: u64,
     end: u64,
+    group: usize,
     codec: parquet::basic::Compression,
     value_bits: u64,
+    value_memory: u64,
 }
 
 fn parquet_failure(message: impl Into<String>) -> parquet::errors::ParquetError {
@@ -197,15 +205,32 @@ impl parquet::file::reader::ChunkReader for ParquetFile {
                 // A dictionary holds its values in its bytes: the reader
                 // allocates the count it declares.
                 if page.page_type == thrift::DICTIONARY_PAGE
-                    && page.dictionary_values.is_some_and(|values| {
-                        u64::try_from(values).map_or(true, |values| {
-                            values.saturating_mul(chunk.value_bits) > uncompressed * 8
-                        })
-                    })
+                    && let Some(values) = page.dictionary_values
                 {
-                    return Err(parquet_failure(
-                        "a dictionary page declaring more values than its bytes hold",
-                    ));
+                    let Ok(values) = u64::try_from(values) else {
+                        return Err(parquet_failure("a dictionary page with a negative count"));
+                    };
+                    if values.saturating_mul(chunk.value_bits) > uncompressed * 8 {
+                        return Err(parquet_failure(
+                            "a dictionary page declaring more values than its bytes hold",
+                        ));
+                    }
+                    // Decoded, each value takes its in-memory size: a row
+                    // group's dictionaries together stay within the budget.
+                    let (chunk_start, group) = (chunk.start, chunk.group);
+                    let memory = values.saturating_mul(chunk.value_memory);
+                    let others: u64 = state
+                        .chunks
+                        .iter()
+                        .filter(|other| other.group == group && other.start != chunk_start)
+                        .filter_map(|other| state.dictionaries.get(&other.start))
+                        .sum();
+                    if others.saturating_add(memory) > DICTIONARY_BUDGET {
+                        return Err(parquet_failure(format!(
+                            "dictionaries taking more than {DICTIONARY_BUDGET} bytes in one row group"
+                        )));
+                    }
+                    state.dictionaries.insert(chunk_start, memory);
                 }
                 let levels = match page.levels {
                     Some((definition, repetition)) => {
@@ -665,6 +690,7 @@ pub(super) fn rows(
             pages: false,
             page_cap: 0,
             chunks: Vec::new(),
+            dictionaries: std::collections::HashMap::new(),
         }),
         size,
     });
@@ -725,14 +751,20 @@ pub(super) fn rows(
             .metadata()
             .row_groups()
             .iter()
-            .flat_map(|group| group.columns())
-            .map(|column| {
+            .enumerate()
+            .flat_map(|(group, columns)| {
+                columns.columns().iter().map(move |column| (group, column))
+            })
+            .map(|(group, column)| {
                 let (start, len) = column.byte_range();
+                let (value_bits, value_memory) = value_sizes(column.column_descr());
                 Chunk {
                     start,
                     end: start.saturating_add(len),
+                    group,
                     codec: column.compression(),
-                    value_bits: value_bits(column.column_descr()),
+                    value_bits,
+                    value_memory,
                 }
             })
             .collect();
@@ -823,17 +855,19 @@ pub(super) fn rows(
     Ok((schema, Box::new(rows)))
 }
 
-/// The fewest bits one value of a leaf column takes in a plain dictionary.
-fn value_bits(leaf: &parquet::schema::types::ColumnDescriptor) -> u64 {
+/// The fewest bits one value of a leaf column takes in a plain dictionary,
+/// and the bytes the reader takes for it decoded.
+fn value_sizes(leaf: &parquet::schema::types::ColumnDescriptor) -> (u64, u64) {
     use parquet::basic::Type as P;
+    let byte_array = std::mem::size_of::<parquet::data_type::ByteArray>() as u64;
     match leaf.physical_type() {
-        P::BOOLEAN => 1,
-        P::INT32 | P::FLOAT => 32,
-        P::INT64 | P::DOUBLE => 64,
-        P::INT96 => 96,
+        P::BOOLEAN => (1, 1),
+        P::INT32 | P::FLOAT => (32, 4),
+        P::INT64 | P::DOUBLE => (64, 8),
+        P::INT96 => (96, 12),
         // A length prefix.
-        P::BYTE_ARRAY => 32,
-        P::FIXED_LEN_BYTE_ARRAY => (leaf.type_length().max(1) as u64) * 8,
+        P::BYTE_ARRAY => (32, byte_array),
+        P::FIXED_LEN_BYTE_ARRAY => ((leaf.type_length().max(1) as u64) * 8, byte_array),
     }
 }
 
@@ -859,7 +893,11 @@ fn check_row_lengths(
         for &leaf in &repeated {
             let max_level = descr.column(leaf).max_rep_level();
             let width = 16 - (max_level as u16).leading_zeros();
-            let mut row = Row { values: 0, cap };
+            let mut row = Row {
+                values: 0,
+                cap,
+                seen: 0,
+            };
             let mut pages = group.get_column_page_reader(leaf).map_err(parquet_error)?;
             while let Some(page) = pages.get_next_page().map_err(parquet_error)? {
                 check_cancelled()?;
@@ -903,12 +941,19 @@ fn check_row_lengths(
 struct Row {
     values: u64,
     cap: u64,
+    /// Level runs looked at, to check for cancellation now and then.
+    seen: u64,
 }
 
 impl Row {
     fn level(&mut self, level: u64, count: u64) -> Result<(), SqlError> {
         if count == 0 {
             return Ok(());
+        }
+        // A page may hold hundreds of millions of levels.
+        self.seen = self.seen.wrapping_add(1);
+        if self.seen.is_multiple_of(1 << 16) {
+            check_cancelled()?;
         }
         self.values = if level == 0 { 1 } else { self.values + count };
         if self.values > self.cap {
