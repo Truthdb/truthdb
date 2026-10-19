@@ -128,6 +128,10 @@ impl StorageFile {
                         .to_string(),
                 ));
             }
+            // The extent may be pages freed by records not yet forced to disk
+            // (a B+ tree page a delete emptied): spill writes go straight to
+            // the file, so the log of those frees must reach the disk first.
+            self.wal_sync_all()?;
             return self.allocator.allocate_temp_extent().ok_or_else(|| {
                 StorageError::InvalidConfig("data region full: cannot allocate extent".to_string())
             });
@@ -164,6 +168,9 @@ impl StorageFile {
 
     pub(super) fn spill_write_page(&mut self, page: u64, data: &[u8]) -> Result<(), StorageError> {
         debug_assert_eq!(data.len(), PAGE_SIZE);
+        // A cached frame of the page's previous (freed) use must never be
+        // flushed over the spill page.
+        self.pages.pool.discard(page);
         let mut frame = crate::direct_io::AlignedPageBuf::new();
         frame.as_mut_slice().copy_from_slice(data);
         let offset = self.layout.data_offset + page * PAGE_SIZE as u64;

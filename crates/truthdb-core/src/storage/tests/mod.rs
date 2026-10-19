@@ -45,6 +45,7 @@ fn create_small(path: &Path) -> Storage {
 }
 
 mod blob_pages;
+mod btree_free;
 mod engines;
 mod recovery;
 mod txn_extents;

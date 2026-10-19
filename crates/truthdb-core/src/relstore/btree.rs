@@ -14,6 +14,13 @@
 //! through later splits, so undo re-descends by key). Splits are structural:
 //! performed in memory, then logged as full-page images of every touched
 //! page (redo is idempotent by page LSN), never undone.
+//!
+//! A delete that empties a leaf (other than the root) frees it, the same way:
+//! the leaf is unlinked from its parent and its left neighbour (with any
+//! ancestor that loses its last child), logged as one image group, and only
+//! then are the pages freed — a crash in between leaks them, never leaves a
+//! freed page linked. The root is never freed; a tree emptied to its last
+//! leaf turns its root back into an empty leaf.
 
 use std::collections::HashMap;
 
@@ -305,8 +312,8 @@ impl BTree {
         }
     }
 
-    /// Deletes `key`, returning the removed row. No rebalancing (deletes
-    /// leave pages sparse, SQL Server-style).
+    /// Deletes `key`, returning the removed row. A leaf the delete empties is
+    /// freed (see the module docs); partly empty pages are not merged.
     pub fn delete(
         &self,
         ctx: &mut RelCtx<'_>,
@@ -338,7 +345,163 @@ impl BTree {
                 index: index as u16,
             },
         )?;
+        if path.len() > 1 {
+            let frame = ctx.fetch(leaf)?;
+            let emptied = SlottedRead::new(ctx.pool.page(frame)).slot_count() == 0;
+            ctx.pool.unpin(frame);
+            if emptied {
+                self.free_emptied_leaf(ctx, &path)?;
+            }
+        }
         Ok(Some(row))
+    }
+
+    /// The child page entry `index` of internal page `page_no` routes to.
+    fn child_at(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        page_no: u64,
+        index: usize,
+    ) -> Result<u64, StorageError> {
+        let frame = ctx.fetch(page_no)?;
+        let child = internal_cell_child(
+            SlottedRead::new(ctx.pool.page(frame))
+                .get(index)
+                .expect("routed entry"),
+        );
+        ctx.pool.unpin(frame);
+        Ok(child)
+    }
+
+    /// The leaf just left of the leaf at the end of `path` (whose next-page
+    /// link points at it), or `None` when it is the leftmost leaf.
+    fn left_neighbour(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        path: &[PathNode],
+    ) -> Result<Option<u64>, StorageError> {
+        // The nearest ancestor where the path did not take the first entry:
+        // the neighbour is the rightmost leaf under the entry before it.
+        let Some(depth) = (1..path.len()).rev().find(|&d| path[d].parent_index > 0) else {
+            return Ok(None);
+        };
+        let mut page_no = self.child_at(ctx, path[depth - 1].page, path[depth].parent_index - 1)?;
+        loop {
+            let frame = ctx.fetch(page_no)?;
+            let page = SlottedRead::new(ctx.pool.page(frame));
+            if page.level() == 0 {
+                ctx.pool.unpin(frame);
+                return Ok(Some(page_no));
+            }
+            let last = page.slot_count() - 1;
+            let child = internal_cell_child(page.get(last).expect("rightmost entry"));
+            ctx.pool.unpin(frame);
+            page_no = child;
+        }
+    }
+
+    /// Frees the emptied leaf at the end of `path` (not the root): unlinks it
+    /// from its left neighbour's chain and from its parent — and frees each
+    /// ancestor that loses its last child, the same way — in one atomic image
+    /// group, then frees the pages. If the root itself would lose its last
+    /// child, the tree is empty: the root becomes an empty leaf instead.
+    fn free_emptied_leaf(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        path: &[PathNode],
+    ) -> Result<(), StorageError> {
+        let leaf_depth = path.len() - 1;
+        let leaf = path[leaf_depth].page;
+        let left = self.left_neighbour(ctx, path)?;
+
+        // Climb while the parent's only entry is the child being removed: the
+        // parent goes too. `depth` ends at the node that keeps entries (or
+        // the root).
+        let mut depth = leaf_depth - 1;
+        loop {
+            let frame = ctx.fetch(path[depth].page)?;
+            let only_child = SlottedRead::new(ctx.pool.page(frame)).slot_count() == 1;
+            ctx.pool.unpin(frame);
+            if !only_child || depth == 0 {
+                break;
+            }
+            depth -= 1;
+        }
+        let freed: Vec<u64> = path[depth + 1..].iter().map(|node| node.page).collect();
+        let remove_index = path[depth + 1].parent_index;
+
+        // Mutate in memory with every touched frame pinned until the image
+        // group is logged; restore the pre-images if that fails.
+        let leaf_next = {
+            let frame = ctx.fetch(leaf)?;
+            let next = SlottedRead::new(ctx.pool.page(frame)).next_page();
+            ctx.pool.unpin(frame);
+            next
+        };
+        let keeper = path[depth].page;
+        let keeper_frame = ctx.fetch(keeper)?;
+        let keeper_pre_image = ctx.pool.page(keeper_frame).to_vec();
+        let mut touched = vec![(keeper, keeper_frame)];
+        let left_frame = match left {
+            Some(left) => {
+                let frame = match ctx.fetch(left) {
+                    Ok(frame) => frame,
+                    Err(err) => {
+                        ctx.pool.unpin(keeper_frame);
+                        return Err(err);
+                    }
+                };
+                touched.push((left, frame));
+                Some((frame, ctx.pool.page(frame).to_vec()))
+            }
+            None => None,
+        };
+        let restore = |ctx: &mut RelCtx<'_>| {
+            ctx.pool
+                .page_mut(keeper_frame)
+                .copy_from_slice(&keeper_pre_image);
+            ctx.pool.unpin(keeper_frame);
+            if let Some((frame, pre_image)) = &left_frame {
+                ctx.pool.page_mut(*frame).copy_from_slice(pre_image);
+                ctx.pool.unpin(*frame);
+            }
+        };
+        let changed = (|| -> Result<(), StorageError> {
+            let count = SlottedRead::new(ctx.pool.page(keeper_frame)).slot_count();
+            if count == 1 {
+                // The root lost its last child: the tree is empty.
+                debug_assert_eq!(depth, 0);
+                let mut root = SlottedPage::format(ctx.pool.page_mut(keeper_frame), 0);
+                root.set_next_page(NO_PAGE);
+            } else {
+                let mut page = SlottedPage::new(ctx.pool.page_mut(keeper_frame));
+                page.remove_at(remove_index);
+                if remove_index == 0 {
+                    // The new first entry takes over the sentinel's range.
+                    let child = internal_cell_child(page.get(0).expect("an entry remains"));
+                    page.remove_at(0);
+                    page.insert_at(0, &internal_cell(&[], child))
+                        .map_err(|_| split_overflow())?;
+                }
+            }
+            if let Some((frame, _)) = &left_frame {
+                SlottedPage::new(ctx.pool.page_mut(*frame)).set_next_page(leaf_next);
+            }
+            ctx.log_system_images(&touched)?;
+            Ok(())
+        })();
+        if let Err(err) = changed {
+            restore(ctx);
+            return Err(err);
+        }
+        ctx.pool.unpin(keeper_frame);
+        if let Some((frame, _)) = left_frame {
+            ctx.pool.unpin(frame);
+        }
+        for page_no in freed {
+            ctx.free_page(page_no)?;
+        }
+        Ok(())
     }
 
     /// Replaces the row stored under `key` (the key itself is immutable).
@@ -443,10 +606,18 @@ impl BTree {
             Some(page) => page,
             None => self.leftmost_leaf(ctx)?,
         };
+        let resumed_on = cursor.page;
         let mut slot = cursor.slot;
         let mut taken = 0;
         while page_no != NO_PAGE {
-            let frame = ctx.fetch(page_no)?;
+            let frame = match ctx.fetch(page_no) {
+                Ok(frame) => frame,
+                // The page resumed on was freed since and holds something that
+                // is not a page now (a snapshot, a spill page): stop, as on a
+                // page recycled to another object.
+                Err(_) if resumed_on == Some(page_no) => return Ok(ScanCursor::finished()),
+                Err(err) => return Err(err),
+            };
             if page::read_header(ctx.pool.page(frame)).object_id != self.object_id {
                 ctx.pool.unpin(frame);
                 return Ok(ScanCursor::finished());

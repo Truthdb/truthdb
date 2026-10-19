@@ -186,6 +186,26 @@ impl BufferPool {
         Ok(())
     }
 
+    /// Drops `page_no`'s frame without writing it back: the page is being
+    /// written past the pool (a blob or spill page), and a stale frame of what
+    /// the page held before it was freed must never be flushed over that. A
+    /// pinned frame is left alone (nothing pins a freed page).
+    pub fn discard(&mut self, page_no: u64) {
+        let Some(&index) = self.table.get(&page_no) else {
+            return;
+        };
+        let frame = &mut self.frames[index];
+        debug_assert_eq!(frame.pin_count, 0, "discarding a pinned page");
+        if frame.pin_count > 0 {
+            return;
+        }
+        frame.valid = false;
+        frame.dirty = false;
+        frame.referenced = false;
+        self.table.remove(&page_no);
+        self.free.push(index);
+    }
+
     /// Whether a page is currently cached (test hook).
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn contains(&self, page_no: u64) -> bool {

@@ -109,25 +109,38 @@ pub(crate) fn redo_records(
     ctx: &mut RelCtx<'_>,
     records: &[(u64, RelRecord)],
 ) -> Result<(), StorageError> {
-    let frees = effective_frees(records)?;
+    let frees = FreedAfter::of(records)?;
+    // A page a later record frees is not redone: its content then no longer
+    // matters, and the page may since hold something that is not a page at
+    // all (a checkpoint snapshot, a spill page) — redo must not take that for
+    // a torn page. A later reuse starts from a full page image logged after
+    // the free, which is redone as usual.
     for (lsn, record) in records {
         match record.kind {
             REL_KIND_PAGE_IMAGE => {
                 let (page_no, image) = record.decode_page_image()?;
-                redo_page_image(ctx, *lsn, page_no, image)?;
+                if !frees.freed_after(page_no, *lsn) {
+                    redo_page_image(ctx, *lsn, page_no, image)?;
+                }
             }
             REL_KIND_PAGE_IMAGES => {
                 for (page_no, image) in record.decode_page_images()? {
-                    redo_page_image(ctx, *lsn, page_no, image)?;
+                    if !frees.freed_after(page_no, *lsn) {
+                        redo_page_image(ctx, *lsn, page_no, image)?;
+                    }
                 }
             }
             REL_KIND_PAGE_OP => {
                 let redo = record.decode_page_op_redo()?;
-                redo_page_op(ctx, *lsn, &redo)?;
+                if !frees.freed_after(redo.page(), *lsn) {
+                    redo_page_op(ctx, *lsn, &redo)?;
+                }
             }
             REL_KIND_CLR => {
                 let (_, redo) = record.decode_clr()?;
-                if let Some(redo) = redo {
+                if let Some(redo) = redo
+                    && !frees.freed_after(redo.page(), *lsn)
+                {
                     redo_page_op(ctx, *lsn, &redo)?;
                 }
             }
@@ -136,6 +149,42 @@ pub(crate) fn redo_records(
         }
     }
     Ok(())
+}
+
+/// The frees in a range of records that take effect, by page, to answer
+/// whether a page is freed by a record after a given LSN.
+struct FreedAfter {
+    /// Single pages (B+ tree pages): the LSN of the last free of each.
+    pages: HashMap<u64, u64>,
+    /// Multi-page extents: `(start_page, end_page, lsn)`.
+    extents: Vec<(u64, u64, u64)>,
+}
+
+impl FreedAfter {
+    fn of(records: &[(u64, RelRecord)]) -> Result<Self, StorageError> {
+        let mut index = FreedAfter {
+            pages: HashMap::new(),
+            extents: Vec::new(),
+        };
+        for (start, end, lsn) in effective_frees(records)? {
+            if end - start == 1 {
+                let last = index.pages.entry(start).or_insert(lsn);
+                *last = (*last).max(lsn);
+            } else {
+                index.extents.push((start, end, lsn));
+            }
+        }
+        Ok(index)
+    }
+
+    /// Whether a record after `lsn` frees `page_no`.
+    fn freed_after(&self, page_no: u64, lsn: u64) -> bool {
+        self.pages.get(&page_no).is_some_and(|&free| free > lsn)
+            || self
+                .extents
+                .iter()
+                .any(|&(start, end, free)| free > lsn && (start..end).contains(&page_no))
+    }
 }
 
 /// Every free in `records` that takes effect, as `(start_page, end_page,
@@ -185,15 +234,15 @@ fn redo_blob_pages(
     ctx: &mut RelCtx<'_>,
     lsn: u64,
     record: &RelRecord,
-    frees: &[(u64, u64, u64)],
+    frees: &FreedAfter,
 ) -> Result<(), StorageError> {
     let (object_id, start_page, data) = record.decode_blob_pages()?;
     for (index, chunk) in data.chunks(page::BLOB_PAGE_DATA).enumerate() {
         let page_no = start_page + index as u64;
-        if frees
-            .iter()
-            .any(|&(start, end, free_lsn)| free_lsn > lsn && (start..end).contains(&page_no))
-        {
+        // At this record the page is this blob's: a cached frame of an
+        // earlier (freed) use is stale and must never be flushed over it.
+        ctx.pool.discard(page_no);
+        if frees.freed_after(page_no, lsn) {
             continue;
         }
         let mut on_disk = crate::direct_io::AlignedPageBuf::new();

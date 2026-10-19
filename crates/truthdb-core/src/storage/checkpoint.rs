@@ -182,6 +182,11 @@ impl Locked {
             )
         })?;
         let data_write_offset = self.core.layout.data_offset + alloc_start * page;
+        // The snapshot goes straight to the file: a cached frame of a freed
+        // page in the extent must never be flushed over it.
+        for page_no in alloc_start..alloc_start + num_pages {
+            self.core.pages.pool.discard(page_no);
+        }
 
         // Phase 1a — snapshot pages + fsync. A failure here may roll the
         // allocation back: nothing references the extent yet.
