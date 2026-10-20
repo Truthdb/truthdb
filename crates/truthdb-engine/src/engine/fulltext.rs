@@ -96,10 +96,19 @@ impl Engine {
             if let Some(bucket) = buckets
                 .iter()
                 .find(|bucket| bucket.name == record.bucket && bucket.state != FtState::Purging)
-                && let Err(err) = self.fulltext_sync(bucket, &record.key)
             {
-                outcome = Err(err);
-                break;
+                match self.fulltext_sync(bucket, &record.key, stop) {
+                    Ok(true) => {}
+                    // Stopped part way: the row is applied on the next pass.
+                    Ok(false) => {
+                        outcome = Ok(true);
+                        break;
+                    }
+                    Err(err) => {
+                        outcome = Err(err);
+                        break;
+                    }
+                }
             }
             applied = Some(record.sequence);
         }
@@ -110,49 +119,83 @@ impl Engine {
     }
 
     /// Backfills a batch of `bucket`'s keys after `after`, and records how
-    /// far it got. Returns whether keys remain.
+    /// far it got. Returns whether keys remain. The keys are the bucket's
+    /// live keys and the keys the index holds anything for (a key deleted
+    /// while an earlier generation's pass dropped its journal row is held
+    /// still, and removed here).
     fn fulltext_backfill(
         &self,
         bucket: &FtBucket,
         after: Option<&str>,
         stop: &dyn Fn() -> bool,
     ) -> Result<bool, EngineError> {
-        let listing = self.object(|file| {
-            file.list_objects(
-                &bucket.name,
-                "",
-                None,
-                after.map(ListAfter::Key),
-                BACKFILL_BATCH,
+        let page = self.object(|file| {
+            Ok(
+                match file.list_objects(
+                    &bucket.name,
+                    "",
+                    None,
+                    after.map(ListAfter::Key),
+                    BACKFILL_BATCH,
+                )? {
+                    Ok(listing) => Some((
+                        listing,
+                        file.fulltext_keys(&bucket.name, after, BACKFILL_BATCH)?,
+                    )),
+                    // A bucket deleted since is purging now.
+                    Err(_) => None,
+                },
             )
         })?;
-        // A bucket deleted since is purging now.
-        let Ok(listing) = listing else {
+        let Some((listing, held)) = page else {
             return Ok(false);
         };
-        // The last key synced, and whether the whole page was.
+        // Both lists are complete up to their last key when they were cut
+        // short: the batch is every key up to the nearer of the two.
+        let listed_to = listing
+            .truncated
+            .then(|| listing.last.clone().map(|(key, _)| key))
+            .flatten();
+        let held_to = (held.len() == BACKFILL_BATCH)
+            .then(|| held.last().cloned())
+            .flatten();
+        let bound = match (listed_to, held_to) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        };
+        let mut keys: Vec<String> = listing
+            .objects
+            .iter()
+            .map(|object| object.key.clone())
+            .chain(held)
+            .filter(|key| bound.as_ref().is_none_or(|bound| key <= bound))
+            .collect();
+        keys.sort();
+        keys.dedup();
+        // The last key synced, and whether the whole batch was.
         let mut done = None;
         let mut complete = true;
         let mut outcome = Ok(());
-        for object in &listing.objects {
+        for key in &keys {
             if stop() {
                 complete = false;
                 break;
             }
-            if let Err(err) = self.fulltext_sync(bucket, &object.key) {
-                outcome = Err(err);
-                complete = false;
-                break;
+            match self.fulltext_sync(bucket, key, stop) {
+                Ok(true) => done = Some(key.clone()),
+                Ok(false) => {
+                    complete = false;
+                    break;
+                }
+                Err(err) => {
+                    outcome = Err(err);
+                    complete = false;
+                    break;
+                }
             }
-            done = Some(object.key.clone());
         }
         let next = if complete {
-            // A truncated page may end past its last listed key (rows read
-            // but not listed): resume where the listing says.
-            listing
-                .truncated
-                .then(|| listing.last.map(|(key, _)| key).or(done))
-                .flatten()
+            bound
         } else {
             match done {
                 Some(key) => Some(key),
@@ -168,12 +211,15 @@ impl Engine {
     }
 
     /// Makes the index hold what it should for `key`: its latest live
-    /// version, indexed or skipped, or nothing.
+    /// version, indexed or skipped, or nothing. Returns `false` when `stop`
+    /// ended it part way (a step at a time: what is done stays, held in
+    /// part, and the next sync of the key finishes it).
     pub(in crate::engine) fn fulltext_sync(
         &self,
         bucket: &FtBucket,
         key: &str,
-    ) -> Result<(), EngineError> {
+        stop: &dyn Fn() -> bool,
+    ) -> Result<bool, EngineError> {
         let plan = self.object(|file| {
             let held = file.fulltext_key(&bucket.name, key)?;
             let latest = file
@@ -206,7 +252,7 @@ impl Engine {
             })
         })?;
         let (version, terms) = match plan {
-            Plan::Nothing => return Ok(()),
+            Plan::Nothing => return Ok(true),
             Plan::Record(version, status) => (version, Err(status)),
             Plan::Read {
                 version,
@@ -232,16 +278,20 @@ impl Engine {
         // from the start. First whatever the index holds for the key goes.
         let (name, generation) = (bucket.name.as_str(), bucket.generation);
         loop {
+            if stop() {
+                return Ok(false);
+            }
             match self.object(|file| {
                 file.transaction(|tx| tx.fulltext_remove_step(name, key, generation))
             })? {
-                None => return Ok(()),
+                // Enabled again since: its backfill visits the key.
+                None => return Ok(true),
                 Some(true) => break,
                 Some(false) => {}
             }
         }
         let Some(version) = version else {
-            return Ok(());
+            return Ok(true);
         };
         let terms = match terms {
             Ok(terms) => terms,
@@ -251,11 +301,14 @@ impl Engine {
                         tx.fulltext_record(name, key, generation, version, status)
                     })
                 })?;
-                return Ok(());
+                return Ok(true);
             }
         };
         let mut progress = Progress::default();
         loop {
+            if stop() {
+                return Ok(false);
+            }
             match self.object(|file| {
                 file.transaction(|tx| {
                     tx.fulltext_build_step(name, key, generation, version, &terms, &mut progress)
@@ -263,7 +316,7 @@ impl Engine {
             })? {
                 // Not the latest any more, or re-enabled: the part written
                 // is held as such, for the key's next sync to remove.
-                None => return Ok(()),
+                None => return Ok(true),
                 Some(true) => break,
                 Some(false) => {}
             }
@@ -274,7 +327,7 @@ impl Engine {
                 tx.fulltext_finish(name, key, generation, version, terms.len, chunks)
             })
         })?;
-        Ok(())
+        Ok(true)
     }
 
     /// A leased body's text (invalid UTF-8 replaced), read a chunk per

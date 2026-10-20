@@ -337,27 +337,33 @@ impl Index {
         if let Some(header) = self.docs.delete(ctx, &mut OpMode::Txn(txn), &header_key)? {
             self.add_stats(ctx, txn, scope, -1, -i64::from(u32_at(&header, 0)?))?;
         }
-        let rows = self.docs.scan_range(
-            ctx,
-            Some(&doc_key(scope, doc, 1)?),
-            Some(&doc_key(scope, doc, u16::MAX)?),
-        )?;
-        for (key, row) in &rows {
-            if ctx.io.wal.tail() - start > max_log_bytes {
-                return Ok(false);
+        // A few rows at a time: a large document's rows are not all read on
+        // every step of its removal.
+        let lower = doc_key(scope, doc, 1)?;
+        let upper = doc_key(scope, doc, u16::MAX)?;
+        loop {
+            let rows = self
+                .docs
+                .scan_range_limit(ctx, Some(&lower), Some(&upper), 16)?;
+            if rows.is_empty() {
+                return Ok(true);
             }
-            for (term, _) in decode_terms(row)? {
-                if self
-                    .postings
-                    .delete(ctx, &mut OpMode::Txn(txn), &posting_key(scope, &term, doc)?)?
-                    .is_none()
-                {
-                    return Err(corrupt("a document's posting is missing"));
+            for (key, row) in &rows {
+                if ctx.io.wal.tail() - start > max_log_bytes {
+                    return Ok(false);
                 }
+                for (term, _) in decode_terms(row)? {
+                    if self
+                        .postings
+                        .delete(ctx, &mut OpMode::Txn(txn), &posting_key(scope, &term, doc)?)?
+                        .is_none()
+                    {
+                        return Err(corrupt("a document's posting is missing"));
+                    }
+                }
+                self.docs.delete(ctx, &mut OpMode::Txn(txn), key)?;
             }
-            self.docs.delete(ctx, &mut OpMode::Txn(txn), key)?;
         }
-        Ok(true)
     }
 
     /// Up to `limit` of the documents indexed in `scope`, lowest first (to

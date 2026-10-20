@@ -25,8 +25,9 @@ use crate::{FT_BUCKETS_TREE, FT_CURSOR_KEY, FT_KEYS_TREE, ObjFile, ObjTxn, codec
 /// The largest object `s3 enable fulltext` indexes unless told otherwise.
 pub const DEFAULT_FULLTEXT_MAX_BYTES: u64 = 16 << 20;
 /// The largest `max_bytes` a bucket may have: an object is read and
-/// tokenized in memory, a few times its size.
-pub const MAX_FULLTEXT_BYTES: u64 = 64 << 20;
+/// tokenized in memory, which takes many times its size for text of many
+/// distinct words.
+pub const MAX_FULLTEXT_BYTES: u64 = 16 << 20;
 
 /// A bucket's full-text state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -707,6 +708,39 @@ impl ObjFile<'_> {
             Some(index) => index.stats(&mut self.core.page_ctx(0), bucket.as_bytes()),
             None => Ok(truthdb_fulltext::Stats::default()),
         }
+    }
+
+    /// Up to `limit` keys of `bucket` the index holds anything for, after
+    /// `after`, in key order: a backfill visits them as well as the live
+    /// keys, so an entry for a key deleted since is removed.
+    pub fn fulltext_keys(
+        &mut self,
+        bucket: &str,
+        after: Option<&str>,
+        limit: usize,
+    ) -> Result<Vec<String>, StorageError> {
+        let Some(tree) = self.existing_tree(FT_KEYS_TREE)? else {
+            return Ok(Vec::new());
+        };
+        let mut lower = key_row_key(bucket, after.unwrap_or(""));
+        if after.is_some() {
+            // Just past `after`.
+            lower.push(0);
+        }
+        let mut upper = bucket.as_bytes().to_vec();
+        upper.push(1);
+        let skip = bucket.len() + 1;
+        tree.scan_range_limit(
+            &mut self.core.page_ctx(0),
+            Some(&lower),
+            Some(&upper),
+            limit,
+        )?
+        .into_iter()
+        .map(|(row_key, _)| {
+            String::from_utf8(row_key[skip..].to_vec()).map_err(|_| corrupt("full-text key row"))
+        })
+        .collect()
     }
 
     /// The key of `version`, when the index holds it.

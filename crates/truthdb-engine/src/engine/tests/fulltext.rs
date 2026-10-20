@@ -296,8 +296,8 @@ fn a_restart_or_a_row_applied_twice_changes_nothing() {
         .object(|file| file.fulltext_buckets())
         .unwrap()
         .remove(0);
-    engine.fulltext_sync(&bucket, "a").unwrap();
-    engine.fulltext_sync(&bucket, "b").unwrap();
+    assert!(engine.fulltext_sync(&bucket, "a", &|| false).unwrap());
+    assert!(engine.fulltext_sync(&bucket, "b", &|| false).unwrap());
     let cursor = engine.object(|file| file.fulltext_cursor()).unwrap();
     drop(engine);
     let engine =
@@ -442,7 +442,7 @@ fn a_pass_from_before_a_re_enable_changes_nothing() {
     command(&engine, "s3 enable fulltext docs 1000");
     // The stale pass syncs a key with its old size and finishes its backfill:
     // neither lands.
-    engine.fulltext_sync(&stale, "k000").unwrap();
+    engine.fulltext_sync(&stale, "k000", &|| false).unwrap();
     assert!(held(&engine, "docs", "k000").is_none());
     engine
         .object(|file| {
@@ -461,6 +461,143 @@ fn a_pass_from_before_a_re_enable_changes_nothing() {
             .execute("s3 enable fulltext docs 999999999999")
             .is_err()
     );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+/// The raw documents of `bucket`'s index matching `condition`, version rows
+/// or not (a document left behind would show here, not in `hits`).
+fn raw_docs(engine: &Engine, bucket: &str, condition: &str) -> Vec<u64> {
+    let mut search = truthdb_fulltext::Search::new(condition).expect("condition");
+    engine
+        .object(|file| {
+            assert!(file.fulltext_step(&mut search, bucket, usize::MAX).unwrap());
+            Ok(search
+                .rank(file.fulltext_stats(bucket)?)
+                .iter()
+                .map(|hit| hit.doc)
+                .collect())
+        })
+        .expect("search")
+}
+
+/// A pass from before a re-enable dropped the key's delete row and moved
+/// the cursor past it (as a stale pass does).
+fn skip_journal(engine: &Engine) {
+    let last = engine
+        .object(|file| Ok(file.journal(0, 100_000)?.last().map(|row| row.sequence)))
+        .unwrap()
+        .unwrap();
+    engine
+        .object(|file| file.transaction(|tx| tx.set_fulltext_cursor(last)))
+        .unwrap();
+}
+
+#[test]
+fn a_key_deleted_while_a_stale_pass_ran_is_removed_by_the_new_backfill() {
+    // A whole document left behind.
+    let path = unique_temp_path("ft-stale-delete");
+    let engine = new_engine(&path);
+    engine
+        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .unwrap()
+        .unwrap();
+    command(&engine, "s3 enable fulltext docs");
+    put(&engine, "docs", "k", b"hello world", "text/plain");
+    index(&engine);
+    let stale = engine
+        .object(|file| file.fulltext_buckets())
+        .unwrap()
+        .remove(0);
+    engine
+        .object(|file| file.transaction(|tx| tx.delete_object("docs", "k", None, now(), 0)))
+        .unwrap()
+        .unwrap();
+    command(&engine, "s3 enable fulltext docs");
+    assert!(engine.fulltext_sync(&stale, "k", &|| false).unwrap());
+    skip_journal(&engine);
+    index(&engine);
+    assert!(held(&engine, "docs", "k").is_none());
+    assert!(raw_docs(&engine, "docs", "hello").is_empty());
+    assert_eq!(
+        engine
+            .object(|file| file.fulltext_stats("docs"))
+            .unwrap()
+            .docs,
+        0
+    );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+
+    // A large document part removed when the re-enable came.
+    let path = unique_temp_path("ft-stale-partial");
+    let engine = small_ring_engine(&path);
+    engine
+        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .unwrap()
+        .unwrap();
+    command(&engine, "s3 enable fulltext docs");
+    let big: String = (0..3000).map(|n| format!("t{n} ")).collect();
+    put(&engine, "docs", "k", big.as_bytes(), "text/plain");
+    index(&engine);
+    let stale = engine
+        .object(|file| file.fulltext_buckets())
+        .unwrap()
+        .remove(0);
+    engine
+        .object(|file| file.transaction(|tx| tx.delete_object("docs", "k", None, now(), 0)))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        engine
+            .object(|file| file.transaction(|tx| tx.fulltext_remove_step(
+                "docs",
+                "k",
+                stale.generation
+            )))
+            .unwrap(),
+        Some(false),
+        "one step does not remove three thousand terms"
+    );
+    assert_eq!(
+        held(&engine, "docs", "k").unwrap().status,
+        FtStatus::Partial
+    );
+    command(&engine, "s3 enable fulltext docs");
+    skip_journal(&engine);
+    index(&engine);
+    assert!(held(&engine, "docs", "k").is_none());
+    assert!(raw_docs(&engine, "docs", "t42 or t2999").is_empty());
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_stopped_pass_leaves_nothing_skipped() {
+    let path = unique_temp_path("ft-stop");
+    let engine = small_ring_engine(&path);
+    engine
+        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .unwrap()
+        .unwrap();
+    command(&engine, "s3 enable fulltext docs");
+    index(&engine);
+    let big: String = (0..3000).map(|n| format!("t{n} ")).collect();
+    put(&engine, "docs", "big", big.as_bytes(), "text/plain");
+    put(&engine, "docs", "small", b"t7 small", "text/plain");
+    // Stopped after a few steps, again and again: every pass leaves the
+    // big document part written, and the next one finishes it.
+    for _ in 0..20 {
+        let calls = std::cell::Cell::new(0);
+        let stop = || {
+            calls.set(calls.get() + 1);
+            calls.get() > 3
+        };
+        let _ = engine.fulltext_pass(&stop).unwrap();
+    }
+    index(&engine);
+    assert_eq!(hits(&engine, "docs", "t7"), ["big", "small"]);
+    assert_eq!(hits(&engine, "docs", "t2999"), ["big"]);
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
