@@ -93,6 +93,10 @@ fn random_text(len: usize, alphabet: &[u8]) -> Result<String, EngineError> {
 /// quarter), so waiting for [`WAL_CHECKPOINT_THRESHOLD`] would run it full.
 const OBJECT_CHECKPOINT_THRESHOLD: f64 = 0.5;
 
+/// Budgeted transactions one maintenance sweep spends purging deleted
+/// vector indexes at most.
+const VECTOR_PURGE_STEPS: usize = 16;
+
 /// Object bodies garbage collection frees per storage-lock hold.
 const OBJECT_GC_BATCH: u64 = 8;
 
@@ -647,6 +651,54 @@ impl Engine {
             }
         }
         Ok(out?)
+    }
+
+    /// Runs one vector-engine operation under the storage lock, then takes a
+    /// checkpoint if the log is filling (a batch of vectors fills it fast).
+    pub fn vector<T>(
+        &self,
+        op: impl FnOnce(&mut truthdb_vector::VecFile<'_>) -> Result<T, StorageError>,
+    ) -> Result<T, EngineError> {
+        let out = {
+            let core = self.storage.core_arc();
+            let mut guard = core.lock();
+            match truthdb_vector::VecFile::try_new(&mut guard) {
+                Some(mut file) => op(&mut file),
+                None => Err(StorageError::InvalidConfig(
+                    "this database does not run the vector engine".to_string(),
+                )),
+            }
+        };
+        if !self.storage.is_standby() {
+            let meta = self.meta.read().expect("engine meta poisoned");
+            if let Err(err) = self.checkpoint_at(&meta, OBJECT_CHECKPOINT_THRESHOLD) {
+                eprintln!("vector checkpoint failed: {err}");
+            }
+        }
+        Ok(out?)
+    }
+
+    /// The maintenance sweep's purge of deleted vector indexes: a bounded
+    /// number of budgeted transactions per sweep. A standby never purges (its
+    /// log is the primary's).
+    pub(crate) fn vector_purge(&self) -> Result<(), EngineError> {
+        if self.storage.is_standby() {
+            return Ok(());
+        }
+        let runs = {
+            let core = self.storage.core_arc();
+            let mut guard = core.lock();
+            truthdb_vector::VecFile::try_new(&mut guard).is_some()
+        };
+        if !runs || !self.vector(|file| file.purge_pending())? {
+            return Ok(());
+        }
+        for _ in 0..VECTOR_PURGE_STEPS {
+            if self.vector(|file| file.transaction(|tx| tx.purge_step()))? {
+                break;
+            }
+        }
+        Ok(())
     }
 
     /// Whether this database runs the object engine.

@@ -1655,6 +1655,7 @@ dependencies = [
  "truthdb-relational",
  "truthdb-search",
  "truthdb-sql",
+ "truthdb-vector",
 ]
 
 [[package]]
@@ -1756,6 +1757,14 @@ dependencies = [
  "truthdb-engine",
  "truthdb-relational",
  "truthdb-sql",
+]
+
+[[package]]
+name = "truthdb-vector"
+version = "0.1.0"
+dependencies = [
+ "serde_json",
+ "truthdb-core",
 ]
 
 [[package]]
