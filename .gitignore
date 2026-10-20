@@ -25,3 +25,6 @@ target
 
 /target
 /target-deb
+
+# Extra build directories (alternate toolchains, review copies)
+/target-*/
