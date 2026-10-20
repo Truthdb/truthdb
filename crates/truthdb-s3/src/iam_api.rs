@@ -175,23 +175,32 @@ fn fresh_id(prefix: &str) -> Result<String, IamError> {
     Ok(format!("{prefix}{tail}"))
 }
 
-/// The request's parameters: its query and its form-encoded body.
+/// The request's parameters: its query and its form-encoded body. The query
+/// is decoded as the signature reads it (`+` stays a plus); only the body,
+/// signed byte for byte, is form-encoded (`+` is a space).
 fn params(query: &str, body: &[u8]) -> Vec<(String, String)> {
-    let decode = |text: &str| {
-        percent_encoding::percent_decode_str(&text.replace('+', " "))
+    let decode = |text: &str, form: bool| {
+        let text = if form {
+            text.replace('+', " ")
+        } else {
+            text.to_string()
+        };
+        percent_encoding::percent_decode_str(&text)
             .decode_utf8_lossy()
             .into_owned()
     };
-    let body = String::from_utf8_lossy(body);
-    query
-        .split('&')
-        .chain(body.split('&'))
-        .filter(|pair| !pair.is_empty())
-        .map(|pair| {
-            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
-            (decode(key), decode(value))
-        })
-        .collect()
+    let pairs = |text: &str, form: bool| -> Vec<(String, String)> {
+        text.split('&')
+            .filter(|pair| !pair.is_empty())
+            .map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                (decode(key, form), decode(value, form))
+            })
+            .collect()
+    };
+    let mut out = pairs(query, false);
+    out.extend(pairs(&String::from_utf8_lossy(body), true));
+    out
 }
 
 struct Input {
@@ -822,4 +831,20 @@ async fn managed(
     object(state, move |file| file.managed_policy(&acct, &policy))
         .await?
         .ok_or_else(|| IamError::no_such_entity(format!("Policy {name} does not exist.")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::params;
+
+    #[test]
+    fn a_query_plus_is_a_plus_and_a_body_plus_a_space() {
+        // The signature reads `a+b` and `a%2Bb` alike: so does the query.
+        let from_query = params("UserName=a+b&PolicyName=a%2Bb", b"");
+        assert_eq!(from_query[0].1, "a+b");
+        assert_eq!(from_query[1].1, "a+b");
+        let from_body = params("", b"UserName=a+b&PolicyName=a%2Bb");
+        assert_eq!(from_body[0].1, "a b");
+        assert_eq!(from_body[1].1, "a+b");
+    }
 }
