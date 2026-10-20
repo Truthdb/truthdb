@@ -16,9 +16,8 @@
 
 use truthdb_core::relstore::btree::TreeInsert;
 use truthdb_core::relstore::ctx::OpMode;
-use truthdb_core::relstore::recovery::rollback_to;
 use truthdb_core::storage::StorageError;
-use truthdb_fulltext::DocTerms;
+use truthdb_fulltext::{DocTerms, Progress};
 
 use crate::objects::ObjectInfo;
 use crate::{FT_BUCKETS_TREE, FT_CURSOR_KEY, FT_KEYS_TREE, ObjFile, ObjTxn, codec};
@@ -70,8 +69,12 @@ pub enum FtStatus {
     Encoded,
     /// It is larger than the bucket's `max_bytes`.
     TooLarge,
-    /// Indexing it failed (its terms did not fit one transaction, say).
+    /// Its body could not be read.
     Failed,
+    /// The index holds part of it: it is being written, or removed, a
+    /// transaction at a time (and a crash may have left it so). Its part is
+    /// never a search hit, and the key's next sync removes it.
+    Partial,
 }
 
 impl FtStatus {
@@ -82,6 +85,7 @@ impl FtStatus {
             FtStatus::Encoded => 2,
             FtStatus::TooLarge => 3,
             FtStatus::Failed => 4,
+            FtStatus::Partial => 5,
         }
     }
 
@@ -92,6 +96,7 @@ impl FtStatus {
             2 => FtStatus::Encoded,
             3 => FtStatus::TooLarge,
             4 => FtStatus::Failed,
+            5 => FtStatus::Partial,
             _ => return Err(corrupt("full-text key row")),
         })
     }
@@ -102,12 +107,6 @@ impl FtStatus {
 pub struct FtKey {
     pub version: u64,
     pub status: FtStatus,
-}
-
-/// What [`ObjTxn::apply_fulltext`] records for a version.
-pub enum FtDoc<'a> {
-    Indexed(&'a DocTerms),
-    Skipped(FtStatus),
 }
 
 fn corrupt(what: &str) -> StorageError {
@@ -334,103 +333,220 @@ impl ObjTxn<'_, '_> {
         self.put_ft_bucket(&existing)
     }
 
-    /// Makes the index hold `version` of `key` as `doc` (with `version`
-    /// `None`, hold nothing for the key) when `version` is still the key's
-    /// latest live version and the bucket is still indexed under
-    /// `generation`; returns how it now holds the key, or `None` when it did
-    /// nothing. Whatever the index held for the key before is removed.
-    ///
-    /// A document whose index entries would take more than an eighth of the
-    /// log's compensation reserve is undone back to a savepoint and held as
-    /// [`FtStatus::TooLarge`]: the transaction then stays small enough that
-    /// a rollback (or recovery's undo) of it always fits the log.
-    pub fn apply_fulltext(
-        &mut self,
-        bucket: &str,
-        key: &str,
-        generation: u64,
-        version: Option<u64>,
-        doc: FtDoc<'_>,
-    ) -> Result<Option<FtStatus>, StorageError> {
-        match self.ft_bucket(bucket)? {
+    /// Whether `bucket` is still indexed (on or backfilling) under
+    /// `generation`.
+    fn indexed_under(&mut self, bucket: &str, generation: u64) -> Result<bool, StorageError> {
+        Ok(matches!(
+            self.ft_bucket(bucket)?,
             Some(FtBucket {
                 state: FtState::Backfilling(_) | FtState::On,
                 generation: current,
                 ..
-            }) if current == generation => {}
-            _ => return Ok(None),
-        }
-        if self.latest_live_version(bucket, key)? != version {
-            return Ok(None);
-        }
+            }) if current == generation
+        ))
+    }
+
+    fn held(&mut self, bucket: &str, key: &str) -> Result<Option<FtKey>, StorageError> {
+        self.trees
+            .ft_keys()
+            .get(self.ctx, &key_row_key(bucket, key))?
+            .map(|row| decode_key(&row))
+            .transpose()
+    }
+
+    fn set_held(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        held: Option<FtKey>,
+    ) -> Result<(), StorageError> {
         let row_key = key_row_key(bucket, key);
         let keys = self.trees.ft_keys();
-        let held = keys
-            .get(self.ctx, &row_key)?
-            .map(|row| decode_key(&row))
-            .transpose()?;
-        if let Some(FtKey {
-            version: old,
-            status: FtStatus::Indexed,
-        }) = held
-        {
-            self.trees
-                .ft_index()
-                .unindex_document(self.ctx, self.txn, bucket.as_bytes(), old)?;
+        let mode = &mut OpMode::Txn(self.txn);
+        match held {
+            None => {
+                keys.delete(self.ctx, mode, &row_key)?;
+            }
+            Some(held) => {
+                let mut row = held.version.to_le_bytes().to_vec();
+                row.push(held.status.code());
+                if keys.update(self.ctx, mode, &row_key, &row)?.is_none() {
+                    let inserted = keys.insert_unique(self.ctx, mode, &row_key, &row)?;
+                    debug_assert_eq!(inserted, TreeInsert::Inserted);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A step of removing whatever the index holds for `key`, within the log
+    /// budget. Returns whether nothing is held any more, or `None` when the
+    /// bucket is no longer indexed under `generation`.
+    pub fn fulltext_remove_step(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        generation: u64,
+    ) -> Result<Option<bool>, StorageError> {
+        if !self.indexed_under(bucket, generation)? {
+            return Ok(None);
+        }
+        let Some(held) = self.held(bucket, key)? else {
+            return Ok(Some(true));
+        };
+        if matches!(held.status, FtStatus::Indexed | FtStatus::Partial) {
+            // No longer a hit from here on: a search names its hits by
+            // their version rows.
             self.trees.ft_versions().delete(
                 self.ctx,
                 &mut OpMode::Txn(self.txn),
-                &version_row_key(bucket, old),
+                &version_row_key(bucket, held.version),
             )?;
-        }
-        let Some(version) = version else {
-            if held.is_some() {
-                keys.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
+            let budget = self.log_budget();
+            if !self.trees.ft_index().remove_document(
+                self.ctx,
+                self.txn,
+                bucket.as_bytes(),
+                held.version,
+                budget,
+            )? {
+                self.set_held(
+                    bucket,
+                    key,
+                    Some(FtKey {
+                        version: held.version,
+                        status: FtStatus::Partial,
+                    }),
+                )?;
+                return Ok(Some(false));
             }
-            return Ok(Some(FtStatus::Indexed));
-        };
-        let status = match doc {
-            FtDoc::Indexed(terms) => {
-                let savepoint = self.txn.savepoint();
-                let budget = self.log_budget();
-                if self.trees.ft_index().index_document(
-                    self.ctx,
-                    self.txn,
-                    bucket.as_bytes(),
-                    version,
-                    terms,
-                    budget,
-                )? {
-                    self.trees.ft_versions().insert_unique(
-                        self.ctx,
-                        &mut OpMode::Txn(self.txn),
-                        &version_row_key(bucket, version),
-                        key.as_bytes(),
-                    )?;
-                    FtStatus::Indexed
-                } else {
-                    let roots = self.trees.roots();
-                    rollback_to(self.ctx, self.txn, savepoint, &roots)?;
-                    FtStatus::TooLarge
-                }
-            }
-            FtDoc::Skipped(status) => status,
-        };
-        let mut row = version.to_le_bytes().to_vec();
-        row.push(status.code());
-        let mode = &mut OpMode::Txn(self.txn);
-        if held.is_some() {
-            keys.update(self.ctx, mode, &row_key, &row)?;
-        } else {
-            let inserted = keys.insert_unique(self.ctx, mode, &row_key, &row)?;
-            debug_assert_eq!(inserted, TreeInsert::Inserted);
         }
-        Ok(Some(status))
+        self.set_held(bucket, key, None)?;
+        Ok(Some(true))
+    }
+
+    /// Whether `version` may be written for `key` now: the bucket is indexed
+    /// under `generation`, `version` is the key's latest live version, and
+    /// the index holds nothing for the key or this version in part.
+    fn may_write(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        generation: u64,
+        version: u64,
+    ) -> Result<bool, StorageError> {
+        Ok(self.indexed_under(bucket, generation)?
+            && self.latest_live_version(bucket, key)? == Some(version)
+            && match self.held(bucket, key)? {
+                None => true,
+                Some(held) => held.version == version && held.status == FtStatus::Partial,
+            })
+    }
+
+    /// A step of indexing `version` of `key` with `terms` from `progress`,
+    /// within the log budget (the key is held as [`FtStatus::Partial`] until
+    /// [`Self::fulltext_finish`]). Returns whether every term is written, or
+    /// `None` when the version may not be written any more (see
+    /// [`Self::may_write`]): what was written stays, held in part, for the
+    /// key's next sync to remove.
+    #[allow(clippy::too_many_arguments)]
+    pub fn fulltext_build_step(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        generation: u64,
+        version: u64,
+        terms: &DocTerms,
+        progress: &mut Progress,
+    ) -> Result<Option<bool>, StorageError> {
+        if !self.may_write(bucket, key, generation, version)? {
+            return Ok(None);
+        }
+        self.set_held(
+            bucket,
+            key,
+            Some(FtKey {
+                version,
+                status: FtStatus::Partial,
+            }),
+        )?;
+        let budget = self.log_budget();
+        self.trees
+            .ft_index()
+            .add_terms(
+                self.ctx,
+                self.txn,
+                bucket.as_bytes(),
+                version,
+                terms,
+                progress,
+                budget,
+            )
+            .map(Some)
+    }
+
+    /// Completes the index of `version` of `key`, all of whose terms are
+    /// written in `chunks` rows: from now on it is a search hit. Returns
+    /// whether it did (see [`Self::may_write`]).
+    pub fn fulltext_finish(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        generation: u64,
+        version: u64,
+        len: u32,
+        chunks: u16,
+    ) -> Result<bool, StorageError> {
+        if !self.may_write(bucket, key, generation, version)? {
+            return Ok(false);
+        }
+        self.trees.ft_index().finish_document(
+            self.ctx,
+            self.txn,
+            bucket.as_bytes(),
+            version,
+            len,
+            chunks,
+        )?;
+        self.trees.ft_versions().insert_unique(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &version_row_key(bucket, version),
+            key.as_bytes(),
+        )?;
+        self.set_held(
+            bucket,
+            key,
+            Some(FtKey {
+                version,
+                status: FtStatus::Indexed,
+            }),
+        )?;
+        Ok(true)
+    }
+
+    /// Holds `version` of `key` as not indexed, for `status`. Returns
+    /// whether it did (see [`Self::may_write`]; the index must hold nothing
+    /// for the key).
+    pub fn fulltext_record(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        generation: u64,
+        version: u64,
+        status: FtStatus,
+    ) -> Result<bool, StorageError> {
+        debug_assert!(!matches!(status, FtStatus::Indexed | FtStatus::Partial));
+        if !self.may_write(bucket, key, generation, version)? || self.held(bucket, key)?.is_some() {
+            return Ok(false);
+        }
+        self.set_held(bucket, key, Some(FtKey { version, status }))?;
+        Ok(true)
     }
 
     /// The log one full-text step may write: an eighth of the compensation
-    /// reserve, so that unindexing one document and indexing another (each
-    /// within it) can always be rolled back.
+    /// reserve, so that a rollback (or recovery's undo) of any full-text
+    /// transaction always fits the log.
     fn log_budget(&mut self) -> u64 {
         self.ctx.io.wal.reserve() / 8
     }
@@ -447,8 +563,8 @@ impl ObjTxn<'_, '_> {
             }) => {}
             _ => return Ok(true),
         }
-        // One document at a time: each was indexed within the budget, so
-        // unindexing it stays within it too.
+        // A document at a time, each removal within what is left of the
+        // budget (a large one over several transactions).
         let budget = self.log_budget();
         let start = self.ctx.io.wal.tail();
         let over = |c: &mut ObjTxn<'_, '_>| c.ctx.io.wal.tail() - start > budget;
@@ -461,7 +577,10 @@ impl ObjTxn<'_, '_> {
             let Some(&doc) = index.documents(self.ctx, bucket.as_bytes(), 1)?.first() else {
                 break;
             };
-            index.unindex_document(self.ctx, self.txn, bucket.as_bytes(), doc)?;
+            let spent = self.ctx.io.wal.tail() - start;
+            if !index.remove_document(self.ctx, self.txn, bucket.as_bytes(), doc, budget - spent)? {
+                return Ok(false);
+            }
             left -= 1;
         }
         if left == 0 || over(self) {

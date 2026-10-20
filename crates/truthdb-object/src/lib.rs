@@ -38,8 +38,8 @@ use truthdb_core::wal::records::RelRecord;
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use fulltext::{
-    DEFAULT_FULLTEXT_MAX_BYTES, FtBucket, FtDoc, FtError, FtKey, FtState, FtStatus,
-    MAX_FULLTEXT_BYTES, fulltext_status,
+    DEFAULT_FULLTEXT_MAX_BYTES, FtBucket, FtError, FtKey, FtState, FtStatus, MAX_FULLTEXT_BYTES,
+    fulltext_status,
 };
 pub use gc::GcOutcome;
 pub use journal::{JournalObject, JournalRecord, RecordType};
@@ -231,30 +231,6 @@ pub(crate) struct Trees {
 }
 
 impl Trees {
-    /// Every tree's root, for a rollback's logical undo.
-    pub(crate) fn roots(&self) -> TreeRoots {
-        TreeRoots(HashMap::from([
-            (META_TREE, self.meta),
-            (BODIES_TREE, self.bodies),
-            (SEGMENTS_TREE, self.segments),
-            (GC_TREE, self.gc),
-            (STAGING_TREE, self.staging),
-            (CREDENTIALS_TREE, self.credentials),
-            (BUCKETS_TREE, self.buckets),
-            (OBJECTS_TREE, self.objects),
-            (ATTRS_TREE, self.attrs),
-            (UPLOADS_TREE, self.uploads),
-            (UPLOAD_INDEX_TREE, self.upload_index),
-            (PARTS_TREE, self.parts),
-            (CHANGES_TREE, self.changes),
-            (FT_BUCKETS_TREE, self.ft_buckets),
-            (FT_DOCS_TREE, self.ft_docs),
-            (FT_POSTINGS_TREE, self.ft_postings),
-            (FT_KEYS_TREE, self.ft_keys),
-            (FT_VERSIONS_TREE, self.ft_versions),
-        ]))
-    }
-
     pub fn meta(&self) -> BTree {
         meta_tree(self.meta)
     }

@@ -1678,7 +1678,14 @@ fn ft_hits(storage: &Storage, bucket: &str, condition: &str) -> Vec<u64> {
     let mut file = ObjFile::new(&mut guard);
     assert!(file.fulltext_step(&mut search, bucket, usize::MAX).unwrap());
     let stats = file.fulltext_stats(bucket).unwrap();
-    let mut docs: Vec<u64> = search.rank(stats).iter().map(|hit| hit.doc).collect();
+    // A hit counts when its version row names it (a document written in
+    // part has none).
+    let mut docs: Vec<u64> = search
+        .rank(stats)
+        .iter()
+        .map(|hit| hit.doc)
+        .filter(|&doc| file.fulltext_version_key(bucket, doc).unwrap().is_some())
+        .collect();
     docs.sort();
     docs
 }
@@ -1693,30 +1700,69 @@ fn ft_generation(storage: &Storage, bucket: &str) -> u64 {
         .map_or(0, |ft| ft.generation)
 }
 
-fn ft_apply(storage: &Storage, bucket: &str, key: &str, version: Option<u64>, text: &str) -> bool {
-    let terms = truthdb_fulltext::DocTerms::from_text(text);
-    let generation = ft_generation(storage, bucket);
+/// Runs `body` in one transaction; an error inside it panics instead of
+/// rolling back (with `FAIL_APPLY_OPS_AFTER`, a crash at that op).
+fn ft_txn<T>(
+    storage: &Storage,
+    body: impl FnOnce(&mut crate::ObjTxn<'_, '_>) -> Result<T, StorageError>,
+) -> T {
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| {
-            tx.apply_fulltext(
-                bucket,
-                key,
-                generation,
-                version,
-                crate::FtDoc::Indexed(&terms),
-            )
-        })
+        .transaction(|tx| Ok(body(tx).unwrap_or_else(|err| panic!("crash: {err}"))))
         .unwrap()
-        .is_some()
+}
+
+/// Syncs the index for `key` as the indexer does: removes what it holds,
+/// then indexes the key's latest version with `text`, a step per
+/// transaction. Returns whether every step went through.
+fn ft_sync(storage: &Storage, bucket: &str, key: &str, text: &str) -> bool {
+    let generation = ft_generation(storage, bucket);
+    loop {
+        match ft_txn(storage, |tx| {
+            tx.fulltext_remove_step(bucket, key, generation)
+        }) {
+            None => return false,
+            Some(true) => break,
+            Some(false) => {}
+        }
+    }
+    let latest = ObjFile::new(&mut storage.lock())
+        .head_object(bucket, key, crate::VersionSel::Latest)
+        .unwrap()
+        .ok()
+        .map(|info| info.version);
+    let Some(version) = latest else {
+        return true;
+    };
+    let terms = truthdb_fulltext::DocTerms::from_text(text);
+    let mut progress = truthdb_fulltext::Progress::default();
+    loop {
+        match ft_txn(storage, |tx| {
+            tx.fulltext_build_step(bucket, key, generation, version, &terms, &mut progress)
+        }) {
+            None => return false,
+            Some(true) => break,
+            Some(false) => {}
+        }
+    }
+    let chunks = progress.next_chunk;
+    ft_txn(storage, |tx| {
+        tx.fulltext_finish(bucket, key, generation, version, terms.len, chunks)
+    })
 }
 
 #[test]
 fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_op() {
-    use crate::{FtKey, FtState, FtStatus};
-    // Version 1 indexed; then applying version 2 crashes after each of its
-    // page operations in turn. After every crash the index holds exactly
-    // version 1; applied again, exactly version 2.
+    use crate::FtState;
+    // Version 1 indexed; then syncing to version 2 crashes after each of
+    // its page operations in turn (across its transactions: removing version
+    // 1, writing version 2 a step at a time, completing it). After every
+    // crash a search finds version 1 or nothing, never version 2 in part;
+    // the next sync leaves exactly version 2. Version 2 has enough terms
+    // that writing it takes several transactions of the 8 MiB ring's
+    // budget, so the crash points are taken a stride apart.
+    let v2_text: String = (0..1500).map(|n| format!("t{n} ")).collect::<String>() + "shared";
     let mut crash_at = 0;
+    let mut crashes = 0;
     loop {
         let path = temp_path("ft-crash");
         let storage = create(&path);
@@ -1728,18 +1774,11 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
             .unwrap()
             .unwrap();
         let v1 = put_text(&storage, "docs", "k", "alpha shared");
-        assert!(ft_apply(&storage, "docs", "k", Some(v1), "alpha shared"));
-        let v2 = put_text(&storage, "docs", "k", "beta shared");
+        assert!(ft_sync(&storage, "docs", "k", "alpha shared"));
+        let v2 = put_text(&storage, "docs", "k", &v2_text);
         FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(Some(crash_at)));
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            let terms = truthdb_fulltext::DocTerms::from_text("beta shared");
-            ObjFile::new(&mut storage.lock()).transaction(|tx| {
-                // The failed op stands for the crash: no rollback runs.
-                match tx.apply_fulltext("docs", "k", 1, Some(v2), crate::FtDoc::Indexed(&terms)) {
-                    Ok(applied) => Ok(applied),
-                    Err(err) => panic!("crash: {err}"),
-                }
-            })
+            ft_sync(&storage, "docs", "k", &v2_text)
         }))
         .is_err();
         let fired = FAIL_APPLY_OPS_AFTER
@@ -1747,29 +1786,26 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
             .is_none();
         drop(storage);
         let storage = open(&path);
-        let key = |storage: &Storage| {
-            ObjFile::new(&mut storage.lock())
-                .fulltext_key("docs", "k")
-                .unwrap()
-        };
         if crashed {
             assert!(fired);
-            assert_eq!(
-                ft_hits(&storage, "docs", "shared"),
-                [v1],
+            crashes += 1;
+            let hits = ft_hits(&storage, "docs", "shared");
+            assert!(
+                hits == [v1] || hits.is_empty(),
+                "crash at {crash_at}: {hits:?}"
+            );
+            assert!(
+                ft_hits(&storage, "docs", "t42").is_empty(),
                 "crash at {crash_at}"
             );
-            assert!(ft_hits(&storage, "docs", "beta").is_empty());
-            assert_eq!(
-                key(&storage),
-                Some(FtKey {
-                    version: v1,
-                    status: FtStatus::Indexed
-                })
-            );
-            assert!(ft_apply(&storage, "docs", "k", Some(v2), "beta shared"));
+            let stats = ObjFile::new(&mut storage.lock())
+                .fulltext_stats("docs")
+                .unwrap();
+            assert_eq!(stats.docs, hits.len() as u64, "crash at {crash_at}");
+            assert!(ft_sync(&storage, "docs", "k", &v2_text));
         }
         assert_eq!(ft_hits(&storage, "docs", "shared"), [v2]);
+        assert_eq!(ft_hits(&storage, "docs", "t1499"), [v2]);
         assert!(ft_hits(&storage, "docs", "alpha").is_empty());
         assert_eq!(
             ObjFile::new(&mut storage.lock())
@@ -1777,7 +1813,7 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
                 .unwrap(),
             truthdb_fulltext::Stats {
                 docs: 1,
-                total_len: 2
+                total_len: 1501
             }
         );
         let version_key = |version| {
@@ -1787,16 +1823,28 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
         };
         assert_eq!(version_key(v2).as_deref(), Some("k"));
         assert_eq!(version_key(v1), None);
-        // A version that is no longer the latest is not applied.
-        assert!(!ft_apply(&storage, "docs", "k", Some(v1), "alpha"));
+        // A version that is no longer the latest is not written.
+        let terms = truthdb_fulltext::DocTerms::from_text("alpha");
+        let mut progress = truthdb_fulltext::Progress::default();
+        assert_eq!(
+            ft_txn(&storage, |tx| tx.fulltext_build_step(
+                "docs",
+                "k",
+                1,
+                v1,
+                &terms,
+                &mut progress
+            )),
+            None
+        );
         assert_eq!(ft_hits(&storage, "docs", "shared"), [v2]);
         drop(storage);
         std::fs::remove_file(&path).ok();
         if !crashed {
-            assert!(crash_at > 5, "the apply crashed at only {crash_at} points");
+            assert!(crashes > 20, "the sync crashed at only {crashes} points");
             break;
         }
-        crash_at += 1;
+        crash_at += 53;
     }
 
     // Deleting the bucket purges its index in batches; a bucket created again
@@ -1814,8 +1862,8 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
     let mut keys = Vec::new();
     for n in 0..10 {
         let key = format!("k{n}");
-        let version = put_text(&storage, "docs", &key, "word");
-        assert!(ft_apply(&storage, "docs", &key, Some(version), "word"));
+        put_text(&storage, "docs", &key, "word");
+        assert!(ft_sync(&storage, "docs", &key, "word"));
         keys.push(key);
     }
     assert_eq!(ft_hits(&storage, "docs", "word").len(), 10);
@@ -1848,7 +1896,10 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
         Err(crate::FtError::Purging)
     );
     // Nothing more is applied to a purging bucket.
-    assert!(!ft_apply(&storage, "docs", "k0", None, ""));
+    assert_eq!(
+        ft_txn(&storage, |tx| tx.fulltext_remove_step("docs", "k0", 1)),
+        None
+    );
     let mut passes = 0;
     while !ObjFile::new(&mut storage.lock())
         .transaction(|tx| tx.purge_fulltext("docs", 3))
@@ -1954,11 +2005,11 @@ fn the_full_text_index_ships_to_a_standby_and_restores_from_a_log_backup() {
         .unwrap()
         .unwrap();
     let a = put_text(&primary, "docs", "a", "north wind");
-    let b = put_text(&primary, "docs", "b", "south wind");
-    assert!(ft_apply(&primary, "docs", "a", Some(a), "north wind"));
-    assert!(ft_apply(&primary, "docs", "b", Some(b), "south wind"));
+    put_text(&primary, "docs", "b", "south wind");
+    assert!(ft_sync(&primary, "docs", "a", "north wind"));
+    assert!(ft_sync(&primary, "docs", "b", "south wind"));
     let b2 = put_text(&primary, "docs", "b", "east");
-    assert!(ft_apply(&primary, "docs", "b", Some(b2), "east"));
+    assert!(ft_sync(&primary, "docs", "b", "east"));
     let expected = (
         ft_hits(&primary, "docs", "wind"),
         ft_hits(&primary, "docs", "east"),

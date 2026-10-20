@@ -13,7 +13,7 @@ mod tokenize;
 #[cfg(test)]
 mod tests;
 
-pub use index::{Index, Posting, Stats};
+pub use index::{Index, Posting, Progress, Stats};
 pub use query::{Leaf, MAX_NESTING, MAX_TERMS, MAX_TOKENS, Query, QueryError};
 pub use search::{Hit, MAX_POSTINGS, MAX_PREFIX_TERMS, Search, SearchError};
 pub use tokenize::{DocTerms, MAX_TERM_BYTES, terms};

@@ -2,11 +2,13 @@
 //! full-text index in step with the change journal, backfills newly enabled
 //! buckets and purges disabled ones. It runs on its own thread, a bounded
 //! pass at a time; a body is read and tokenized outside the storage lock
-//! under a lease, and each transaction is bounded by its log (see
-//! `ObjTxn::apply_fulltext`).
+//! under a lease, and each transaction is bounded by its log: a large
+//! document is written, and removed, over several (see
+//! `ObjTxn::fulltext_build_step`).
 
 use truthdb_fulltext::DocTerms;
-use truthdb_object::{FtBucket, FtDoc, FtState, FtStatus, ListAfter, VersionSel};
+use truthdb_fulltext::Progress;
+use truthdb_object::{FtBucket, FtState, FtStatus, ListAfter, VersionSel};
 
 use super::{Engine, EngineError};
 
@@ -185,8 +187,8 @@ impl Engine {
             };
             let wanted = truthdb_object::fulltext_status(&info, bucket.max_bytes)
                 .unwrap_or(FtStatus::Indexed);
-            // Held as wanted, or failed already: a failure is retried only by
-            // a later write (or enabling the bucket again).
+            // Held as wanted, or failed already: a version whose body could
+            // not be read is retried only by a later write.
             if held.is_some_and(|held| {
                 held.version == info.version
                     && (held.status == wanted || held.status == FtStatus::Failed)
@@ -225,16 +227,51 @@ impl Engine {
                 )
             }
         };
-        // A failure here (the log full for the moment, say) is returned and
-        // the row tried again; a document too large for one transaction is
-        // held as too large by the apply itself.
-        let doc = match &terms {
-            Ok(terms) => FtDoc::Indexed(terms),
-            Err(status) => FtDoc::Skipped(*status),
+        // Each step is a transaction within the log budget; a failure (the
+        // log full for the moment, say) is returned and the key synced again
+        // from the start. First whatever the index holds for the key goes.
+        let (name, generation) = (bucket.name.as_str(), bucket.generation);
+        loop {
+            match self.object(|file| {
+                file.transaction(|tx| tx.fulltext_remove_step(name, key, generation))
+            })? {
+                None => return Ok(()),
+                Some(true) => break,
+                Some(false) => {}
+            }
+        }
+        let Some(version) = version else {
+            return Ok(());
         };
+        let terms = match terms {
+            Ok(terms) => terms,
+            Err(status) => {
+                self.object(|file| {
+                    file.transaction(|tx| {
+                        tx.fulltext_record(name, key, generation, version, status)
+                    })
+                })?;
+                return Ok(());
+            }
+        };
+        let mut progress = Progress::default();
+        loop {
+            match self.object(|file| {
+                file.transaction(|tx| {
+                    tx.fulltext_build_step(name, key, generation, version, &terms, &mut progress)
+                })
+            })? {
+                // Not the latest any more, or re-enabled: the part written
+                // is held as such, for the key's next sync to remove.
+                None => return Ok(()),
+                Some(true) => break,
+                Some(false) => {}
+            }
+        }
+        let chunks = progress.next_chunk;
         self.object(|file| {
             file.transaction(|tx| {
-                tx.apply_fulltext(&bucket.name, key, bucket.generation, version, doc)
+                tx.fulltext_finish(name, key, generation, version, terms.len, chunks)
             })
         })?;
         Ok(())

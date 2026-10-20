@@ -343,10 +343,10 @@ fn reopen(path: &std::path::Path) -> Engine {
 }
 
 #[test]
-fn a_document_too_large_for_one_transaction_is_held_as_too_large_not_wedging() {
-    // An 8 MiB ring: a 2 MiB compensation reserve, so a document's index
-    // entries may take a quarter MiB of log; forty thousand distinct words
-    // take far more.
+fn a_document_too_large_for_one_transaction_is_indexed_over_several() {
+    // An 8 MiB ring: a 2 MiB compensation reserve, so one transaction may
+    // write a quarter MiB of log; forty thousand distinct words take far
+    // more, and are written (and later removed) a transaction at a time.
     let path = unique_temp_path("ft-big-doc");
     let engine = small_ring_engine(&path);
     engine
@@ -360,15 +360,20 @@ fn a_document_too_large_for_one_transaction_is_held_as_too_large_not_wedging() {
     index(&engine);
     assert_eq!(
         held(&engine, "docs", "big.txt").unwrap().status,
-        FtStatus::TooLarge
+        FtStatus::Indexed
     );
-    assert_eq!(hits(&engine, "docs", "word7"), ["small.txt"]);
-    // The store goes on: a write, then a clean reopen.
+    assert_eq!(hits(&engine, "docs", "word7"), ["big.txt", "small.txt"]);
+    assert_eq!(hits(&engine, "docs", "word39999"), ["big.txt"]);
+    // Overwritten: the large document is removed over several transactions
+    // too. The store goes on: a write, then a clean reopen.
+    put(&engine, "docs", "big.txt", b"replaced", "text/plain");
     put(&engine, "docs", "after.txt", b"after", "text/plain");
     index(&engine);
+    assert_eq!(hits(&engine, "docs", "word7"), ["small.txt"]);
     drop(engine);
     let engine = reopen(&path);
     assert_eq!(hits(&engine, "docs", "after"), ["after.txt"]);
+    assert_eq!(hits(&engine, "docs", "replaced"), ["big.txt"]);
     drop(engine);
     let _ = std::fs::remove_file(path);
 }

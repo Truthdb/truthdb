@@ -7,7 +7,7 @@ use std::path::{Path, PathBuf};
 
 use truthdb_core::relstore::btree::{BTree, TreeRoots};
 use truthdb_core::relstore::ctx::{OpMode, RelCtx, TxnLink};
-use truthdb_core::relstore::recovery::{LogicalUndo, rollback, rollback_to};
+use truthdb_core::relstore::recovery::{LogicalUndo, rollback};
 use truthdb_core::storage::{
     CATALOG_ENGINE_ID, EngineParticipant, Storage, StorageError, StorageFile, StorageOptions,
 };
@@ -158,14 +158,7 @@ impl Fixture {
     fn index(&self, scope: &str, doc: u64, text: &str) {
         self.txn(true, |ctx, txn, index| {
             index
-                .index_document(
-                    ctx,
-                    txn,
-                    scope.as_bytes(),
-                    doc,
-                    &DocTerms::from_text(text),
-                    u64::MAX,
-                )
+                .index_document(ctx, txn, scope.as_bytes(), doc, &DocTerms::from_text(text))
                 .expect("index")
         });
     }
@@ -324,14 +317,7 @@ fn a_rolled_back_index_leaves_nothing() {
     f.index("b", 1, "kept words");
     f.txn(false, |ctx, txn, index| {
         index
-            .index_document(
-                ctx,
-                txn,
-                b"b",
-                2,
-                &DocTerms::from_text("lost words"),
-                u64::MAX,
-            )
+            .index_document(ctx, txn, b"b", 2, &DocTerms::from_text("lost words"))
             .unwrap();
         index.unindex_document(ctx, txn, b"b", 1).unwrap();
     });
@@ -379,14 +365,7 @@ fn scopes_are_separate_collections() {
     f.txn(false, |ctx, txn, index| {
         assert!(
             index
-                .index_document(
-                    ctx,
-                    txn,
-                    long.as_bytes(),
-                    1,
-                    &DocTerms::from_text("x"),
-                    u64::MAX
-                )
+                .index_document(ctx, txn, long.as_bytes(), 1, &DocTerms::from_text("x"),)
                 .is_err()
         );
     });
@@ -453,9 +432,7 @@ fn terms_a_row_cannot_hold_are_refused_before_anything_is_written() {
         };
         f.txn(true, |ctx, txn, index| {
             assert!(
-                index
-                    .index_document(ctx, txn, b"b", 1, &doc, u64::MAX)
-                    .is_err(),
+                index.index_document(ctx, txn, b"b", 1, &doc).is_err(),
                 "{bad:?}"
             );
         });
@@ -487,36 +464,52 @@ fn every_lookup_counts_against_the_slice_budget() {
 }
 
 #[test]
-fn a_document_past_the_log_budget_stops_and_rolls_back_to_a_savepoint() {
-    let f = fixture("budget-log");
+fn a_large_document_is_written_and_removed_a_bounded_transaction_at_a_time() {
+    use crate::Progress;
+    let f = fixture("parts");
     f.index("b", 1, "kept");
     let text: String = (0..5000).map(|n| format!("w{n} ")).collect();
-    let roots = TreeRoots(HashMap::from([
-        (POSTINGS, f.index.postings.root),
-        (DOCS, f.index.docs.root),
-    ]));
+    let terms = DocTerms::from_text(&text);
+    let budget = 64 * 1024;
+    let mut progress = Progress::default();
+    let mut transactions = 0;
+    loop {
+        transactions += 1;
+        let done = f.txn(true, |ctx, txn, index| {
+            let start = ctx.io.wal.tail();
+            let done = index
+                .add_terms(ctx, txn, b"b", 2, &terms, &mut progress, budget)
+                .unwrap();
+            // Stopped close to the budget: a chunk of terms past it at most.
+            assert!(ctx.io.wal.tail() - start < 2 * budget);
+            done
+        });
+        if done {
+            break;
+        }
+        // Written in part: not yet a document.
+        assert_eq!(f.stats("b").docs, 1);
+    }
+    assert!(transactions > 3, "{transactions} transactions");
     f.txn(true, |ctx, txn, index| {
-        let savepoint = txn.savepoint();
-        let start = ctx.io.wal.tail();
-        let done = index
-            .index_document(ctx, txn, b"b", 2, &DocTerms::from_text(&text), 64 * 1024)
-            .unwrap();
-        assert!(
-            !done,
-            "five thousand postings write more than 64 KiB of log"
-        );
-        // Stopped close to the budget, not at the end of the document.
-        assert!(ctx.io.wal.tail() - start < 256 * 1024);
-        rollback_to(ctx, txn, savepoint, &roots).unwrap();
-        // Within the budget it goes through.
-        assert!(
-            index
-                .index_document(ctx, txn, b"b", 3, &DocTerms::from_text("small"), 64 * 1024)
-                .unwrap()
-        );
+        index
+            .finish_document(ctx, txn, b"b", 2, terms.len, progress.next_chunk)
+            .unwrap()
     });
-    assert_eq!(f.docs("b", "kept"), [1]);
-    assert_eq!(f.docs("b", "small"), [3]);
-    assert!(f.docs("b", "w42").is_empty());
     assert_eq!(f.stats("b").docs, 2);
+    assert_eq!(f.docs("b", "w4999"), [2]);
+    assert_eq!(f.docs("b", "w0"), [2]);
+    // Removed in parts too; it stops counting at once.
+    let mut removals = 0;
+    while !f.txn(true, |ctx, txn, index| {
+        index.remove_document(ctx, txn, b"b", 2, budget).unwrap()
+    }) {
+        removals += 1;
+        assert_eq!(f.stats("b").docs, 1);
+    }
+    assert!(removals > 3, "{removals} removals");
+    assert!(f.docs("b", "w42").is_empty());
+    assert_eq!(f.docs("b", "kept"), [1]);
+    assert!(f.unindex("b", 1));
+    assert_eq!(f.rows(), 0);
 }
