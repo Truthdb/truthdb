@@ -116,6 +116,16 @@ pub fn canonical_uri(raw_path: &str) -> String {
         .join("/")
 }
 
+/// The canonical URI of every service but S3: the S3 canonical URI encoded
+/// once more, as AWS's SDKs sign it.
+fn double_encoded_uri(raw_path: &str) -> String {
+    canonical_uri(raw_path)
+        .split('/')
+        .map(|segment| percent_encoding::utf8_percent_encode(segment, ENCODE).to_string())
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
 /// The canonical query string: every parameter encoded and sorted by name,
 /// then value; a parameter without a value gets an empty one.
 pub fn canonical_query(raw_query: &str) -> String {
@@ -154,6 +164,28 @@ pub fn canonical_request(
     signed_headers: &[String],
     payload_hash: &str,
 ) -> Result<String, AuthError> {
+    canonical_request_for(
+        "s3",
+        method,
+        raw_path,
+        raw_query,
+        headers,
+        signed_headers,
+        payload_hash,
+    )
+}
+
+/// [`canonical_request`] for `service`: every service but S3 encodes the
+/// path twice.
+pub fn canonical_request_for(
+    service: &str,
+    method: &str,
+    raw_path: &str,
+    raw_query: &str,
+    headers: &[(String, String)],
+    signed_headers: &[String],
+    payload_hash: &str,
+) -> Result<String, AuthError> {
     let mut canonical_headers = String::new();
     for name in signed_headers {
         let values: Vec<String> = headers
@@ -170,7 +202,11 @@ pub fn canonical_request(
     }
     Ok(format!(
         "{method}\n{}\n{}\n{canonical_headers}\n{}\n{payload_hash}",
-        canonical_uri(raw_path),
+        if service == "s3" {
+            canonical_uri(raw_path)
+        } else {
+            double_encoded_uri(raw_path)
+        },
         canonical_query(raw_query),
         signed_headers.join(";"),
     ))
@@ -250,6 +286,16 @@ pub fn encode_key(key: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn other_services_sign_the_path_encoded_twice() {
+        assert_eq!(
+            super::double_encoded_uri("/tags/arn%3Aaws%3As3vectors"),
+            "/tags/arn%253Aaws%253As3vectors"
+        );
+        assert_eq!(super::double_encoded_uri("/PutVectors"), "/PutVectors");
+        assert_eq!(super::canonical_uri("/a%3Ab"), "/a%3Ab");
+    }
+
     use super::*;
 
     const SECRET: &str = "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY";
