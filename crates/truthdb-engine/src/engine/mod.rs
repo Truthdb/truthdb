@@ -22,7 +22,9 @@ const STANDBY_RESTARTPOINT_THRESHOLD: f64 = 0.5;
 
 /// An S3 administration command: `s3 create account <name>`, `s3 list
 /// accounts`, `s3 drop account <id>`, `s3 create user <account> <name>`,
-/// `s3 drop user <account> <name>`, `s3 create access key [<account>
+/// `s3 drop user <account> <name>`, `s3 put user policy <account> <user>
+/// <name> <json>`, `s3 delete user policy <account> <user> <name>`, `s3 list
+/// user policies <account> <user>`, `s3 create access key [<account>
 /// [<user>]]`, `s3 drop access key <id>`, `s3 list access keys`, `s3 enable
 /// fulltext <bucket> [max_bytes]`, `s3 disable fulltext <bucket>`.
 ///
@@ -37,6 +39,14 @@ enum S3Admin {
     DropAccount(String),
     CreateUser(String, String),
     DropUser(String, String),
+    PutUserPolicy {
+        account: String,
+        user: String,
+        name: String,
+        document: String,
+    },
+    DeleteUserPolicy(String, String, String),
+    ListUserPolicies(String, String),
     CreateAccessKey(Option<String>, Option<String>),
     DropAccessKey(String),
     ListAccessKeys,
@@ -61,6 +71,21 @@ fn parse_s3_admin(input: &str) -> Option<S3Admin> {
         ["s3", "drop", "user", _, _] => Some(S3Admin::DropUser(
             words[3].to_string(),
             words[4].to_string(),
+        )),
+        ["s3", "put", "user", "policy", _, _, _, _, ..] => Some(S3Admin::PutUserPolicy {
+            account: words[4].to_string(),
+            user: words[5].to_string(),
+            name: words[6].to_string(),
+            document: after_words(input, 7).to_string(),
+        }),
+        ["s3", "delete", "user", "policy", _, _, _] => Some(S3Admin::DeleteUserPolicy(
+            words[4].to_string(),
+            words[5].to_string(),
+            words[6].to_string(),
+        )),
+        ["s3", "list", "user", "policies", _, _] => Some(S3Admin::ListUserPolicies(
+            words[4].to_string(),
+            words[5].to_string(),
         )),
         ["s3", "create", "access", "key"] => Some(S3Admin::CreateAccessKey(None, None)),
         ["s3", "create", "access", "key", _] => {
@@ -94,6 +119,17 @@ fn fulltext_error(bucket: &str, err: truthdb_object::FtError) -> EngineError {
         ),
     })
     .into()
+}
+
+/// `input` after its first `count` words, as written (a policy document
+/// keeps its spacing).
+fn after_words(input: &str, count: usize) -> &str {
+    let mut rest = input;
+    for _ in 0..count {
+        rest = rest.trim_start();
+        rest = &rest[rest.find(char::is_whitespace).unwrap_or(rest.len())..];
+    }
+    rest.trim()
 }
 
 fn account_error(err: truthdb_object::AccountError) -> EngineError {
@@ -759,6 +795,46 @@ impl Engine {
                 self.object(|file| file.transaction(|tx| tx.drop_user(&account, &name)))?
                     .map_err(account_error)?;
                 json!({ "dropped": name })
+            }
+            S3Admin::PutUserPolicy {
+                account,
+                user,
+                name,
+                document,
+            } => {
+                truthdb_iam::Policy::parse(&document, truthdb_iam::PolicyKind::UserInline)
+                    .map_err(|err| {
+                        CommandError::InvalidCommand(format!("malformed policy: {}", err.0))
+                    })?;
+                self.object(|file| {
+                    file.transaction(|tx| {
+                        if !tx.user_exists(&account, &user)? {
+                            return Ok(Err(truthdb_object::AccountError::NoSuchUser));
+                        }
+                        tx.put_user_policy(&account, &user, &name, document.as_bytes())
+                            .map(Ok)
+                    })
+                })?
+                .map_err(account_error)?;
+                json!({ "account_id": account, "user_name": user, "policy_name": name })
+            }
+            S3Admin::DeleteUserPolicy(account, user, name) => {
+                if !self.object(|file| {
+                    file.transaction(|tx| tx.delete_user_policy(&account, &user, &name))
+                })? {
+                    return Err(CommandError::InvalidCommand(format!(
+                        "user {user} of account {account} has no policy {name}"
+                    ))
+                    .into());
+                }
+                json!({ "deleted": name })
+            }
+            S3Admin::ListUserPolicies(account, user) => {
+                let policies = self.object(|file| file.user_policies(&account, &user))?;
+                json!({ "policies": policies.iter().map(|(name, document)| json!({
+                    "policy_name": name,
+                    "policy_document": String::from_utf8_lossy(document),
+                })).collect::<Vec<_>>() })
             }
             S3Admin::CreateAccessKey(account, user) => {
                 let account =

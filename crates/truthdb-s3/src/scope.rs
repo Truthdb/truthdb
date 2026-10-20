@@ -5,7 +5,8 @@
 //! by another account meanwhile must not let the operation through. So each
 //! engine call of a request, in the same storage-lock hold as its work,
 //! checks that the request's access key is still there and active, and that
-//! every bucket the request names is missing or its account's.
+//! every bucket the request names has the owner it had when the request was
+//! authorized (or is still missing).
 //!
 //! The scope is task-local, set by `api::dispatch` around the operation (and
 //! carried into the tasks it spawns); an engine call outside one fails.
@@ -18,12 +19,13 @@ use truthdb_object::ObjFile;
 use crate::error::S3Error;
 use crate::server::S3State;
 
-/// A request's access key, its account, and the buckets it names.
+/// A request's access key, its account, and the buckets it names with the
+/// owners they had when it was authorized (`None`: missing).
 #[derive(Clone)]
 pub struct Scope {
     pub access_key: String,
     pub account: String,
-    pub buckets: Vec<String>,
+    pub buckets: Vec<(String, Option<String>)>,
 }
 
 tokio::task_local! {
@@ -41,16 +43,14 @@ pub fn current() -> Option<Scope> {
 }
 
 /// Whether `scope` still holds: its key exists, is active and acts for its
-/// account, and its buckets are missing or the account's.
+/// account, and its buckets have the owners they had.
 fn holds(file: &mut ObjFile<'_>, scope: &Scope) -> Result<bool, StorageError> {
     match file.access_key(&scope.access_key)? {
         Some((key, _)) if key.active && key.account == scope.account => {}
         _ => return Ok(false),
     }
-    for bucket in &scope.buckets {
-        if let Some(info) = file.bucket(bucket)?
-            && info.owner != scope.account
-        {
+    for (bucket, owner) in &scope.buckets {
+        if file.bucket(bucket)?.map(|info| info.owner) != *owner {
             return Ok(false);
         }
     }

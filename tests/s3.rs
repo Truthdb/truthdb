@@ -427,7 +427,8 @@ fn each_account_sees_and_touches_only_its_own_buckets() {
         sigv4::sha256_hex(account_b.as_bytes())
     )));
 
-    // A key of one of B's users acts for B.
+    // A key of one of B's users acts for B, as far as the user's policies
+    // allow.
     native(
         server.native_port,
         &format!("s3 create user {account_b} carol"),
@@ -436,16 +437,26 @@ fn each_account_sees_and_touches_only_its_own_buckets() {
         server.native_port,
         &format!("s3 create access key {account_b} carol"),
     );
-    let (status, _) = send(
-        port,
-        "GET",
-        "/bees",
-        "list-type=2",
-        b"",
-        carol["access_key_id"].as_str().unwrap(),
-        carol["secret_access_key"].as_str(),
+    let carol_lists = || {
+        send(
+            port,
+            "GET",
+            "/bees",
+            "list-type=2",
+            b"",
+            carol["access_key_id"].as_str().unwrap(),
+            carol["secret_access_key"].as_str(),
+        )
+        .0
+    };
+    assert_eq!(carol_lists(), 403, "a user with no policy may do nothing");
+    native(
+        server.native_port,
+        &format!(
+            r#"s3 put user policy {account_b} carol list {{"Version": "2012-10-17", "Statement": {{"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::bees"}}}}"#
+        ),
     );
-    assert_eq!(status, 200);
+    assert_eq!(carol_lists(), 200);
 
     // Vector buckets too are their owner's.
     use serde_json::json;
@@ -572,6 +583,691 @@ fn a_request_is_checked_again_when_its_operation_runs() {
     );
     assert_eq!(status, 403);
     assert_eq!(a("PUT", "/orphan", "", b"").0, 200, "the name is free");
+}
+
+/// A user of `account` with an access key, and (when given) a policy.
+fn user_with_key(
+    server: &Server,
+    account: &str,
+    name: &str,
+    policy: Option<&str>,
+) -> (String, String) {
+    native(
+        server.native_port,
+        &format!("s3 create user {account} {name}"),
+    );
+    if let Some(policy) = policy {
+        let reply = native(
+            server.native_port,
+            &format!("s3 put user policy {account} {name} p {policy}"),
+        );
+        assert_eq!(reply["policy_name"], "p", "{reply}");
+    }
+    let key = native(
+        server.native_port,
+        &format!("s3 create access key {account} {name}"),
+    );
+    (
+        key["access_key_id"].as_str().unwrap().to_string(),
+        key["secret_access_key"].as_str().unwrap().to_string(),
+    )
+}
+
+#[test]
+fn a_user_without_policies_is_refused_every_operation() {
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, root_key, root_secret) = account_with_key(&server, "acme");
+    let root = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send(
+            port,
+            method,
+            path,
+            query,
+            body,
+            &root_key,
+            Some(&root_secret),
+        )
+    };
+    assert_eq!(root("PUT", "/cov", "", b"").0, 200);
+    assert_eq!(root("PUT", "/cov/o", "", b"data").0, 200);
+    let (_, upload) = root("POST", "/cov/up", "uploads", b"");
+    let upload_id = upload
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|rest| rest.split('<').next())
+        .expect("an upload id")
+        .to_string();
+    let (key, secret) = user_with_key(&server, &account, "nobody", None);
+    let delete_body = b"<Delete><Object><Key>o</Key></Object></Delete>";
+    let md5 = {
+        use base64::Engine as _;
+        use md5::Digest;
+        base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(delete_body))
+    };
+    let tagging = b"<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>";
+    let upload_part = format!("uploadId={upload_id}&partNumber=1");
+    let upload_query = format!("uploadId={upload_id}");
+    // Method, path, query, body, extra headers.
+    type Probe<'a> = (
+        &'a str,
+        &'a str,
+        &'a str,
+        &'a [u8],
+        &'a [(&'a str, &'a str)],
+    );
+    let requests: Vec<Probe<'_>> = vec![
+        ("GET", "/", "", b"", &[]),
+        ("PUT", "/cov2", "", b"", &[]),
+        ("DELETE", "/cov", "", b"", &[]),
+        ("HEAD", "/cov", "", b"", &[]),
+        ("GET", "/cov", "list-type=2", b"", &[]),
+        ("GET", "/cov", "versions", b"", &[]),
+        ("GET", "/cov", "location", b"", &[]),
+        ("GET", "/cov", "versioning", b"", &[]),
+        (
+            "PUT",
+            "/cov",
+            "versioning",
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            &[],
+        ),
+        ("GET", "/cov", "policy", b"", &[]),
+        ("PUT", "/cov", "policy", b"{}", &[]),
+        ("DELETE", "/cov", "policy", b"", &[]),
+        ("GET", "/cov", "policyStatus", b"", &[]),
+        ("GET", "/cov", "acl", b"", &[]),
+        ("PUT", "/cov", "acl", b"", &[]),
+        ("GET", "/cov", "ownershipControls", b"", &[]),
+        ("PUT", "/cov", "ownershipControls", b"", &[]),
+        ("GET", "/cov", "uploads", b"", &[]),
+        ("PUT", "/cov/o", "", b"x", &[]),
+        ("GET", "/cov/o", "", b"", &[]),
+        ("HEAD", "/cov/o", "", b"", &[]),
+        ("DELETE", "/cov/o", "", b"", &[]),
+        ("GET", "/cov/o", "tagging", b"", &[]),
+        ("PUT", "/cov/o", "tagging", tagging, &[]),
+        ("DELETE", "/cov/o", "tagging", b"", &[]),
+        ("GET", "/cov/o", "acl", b"", &[]),
+        ("PUT", "/cov/o", "acl", b"", &[]),
+        ("POST", "/cov/up", "uploads", b"", &[]),
+        ("PUT", "/cov/up", &upload_part, b"part", &[]),
+        ("GET", "/cov/up", &upload_query, b"", &[]),
+        (
+            "POST",
+            "/cov/up",
+            &upload_query,
+            b"<CompleteMultipartUpload></CompleteMultipartUpload>",
+            &[],
+        ),
+        ("DELETE", "/cov/up", &upload_query, b"", &[]),
+        (
+            "PUT",
+            "/cov/copy",
+            "",
+            b"",
+            &[("x-amz-copy-source", "/cov/o")],
+        ),
+        (
+            "PUT",
+            "/cov/up",
+            &upload_part,
+            b"",
+            &[("x-amz-copy-source", "/cov/o")],
+        ),
+    ];
+    for (method, path, query, body, extra) in requests {
+        let (_, (status, reply)) =
+            send_with(port, method, path, query, extra, body, &key, Some(&secret));
+        assert_eq!(status, 403, "{method} {path}?{query}: {reply}");
+    }
+    // DeleteObjects reports each key's denial.
+    let (_, (status, reply)) = send_with(
+        port,
+        "POST",
+        "/cov",
+        "delete",
+        &[("content-md5", &md5)],
+        delete_body,
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 200);
+    assert!(reply.contains("<Code>AccessDenied</Code>"), "{reply}");
+    assert_eq!(root("GET", "/cov/o", "", b"").1, "data", "nothing changed");
+}
+
+#[test]
+fn bucket_and_user_policies_grant_and_deny_as_aws_does() {
+    let server = start_server();
+    let port = server.s3_port;
+    let (owner, owner_key, owner_secret) = account_with_key(&server, "owner");
+    let (other, other_key, other_secret) = account_with_key(&server, "other");
+    let as_owner = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send(
+            port,
+            method,
+            path,
+            query,
+            body,
+            &owner_key,
+            Some(&owner_secret),
+        )
+    };
+    assert_eq!(as_owner("PUT", "/shared", "", b"").0, 200);
+    for key in ["public/a", "private/b", "home/alice/c", "home/bob/d"] {
+        assert_eq!(as_owner("PUT", &format!("/shared/{key}"), "", b"x").0, 200);
+    }
+    // A malformed policy is refused; a valid one kept and returned.
+    let (status, reply) = as_owner("PUT", "/shared", "policy", b"{\"Statement\": []}");
+    assert_eq!(status, 400);
+    assert!(reply.contains("MalformedPolicy"), "{reply}");
+    let policy = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+          {{"Effect": "Allow", "Principal": {{"AWS": "{other}"}}, "Action": "s3:GetObject",
+            "Resource": "arn:aws:s3:::shared/public/*"}},
+          {{"Effect": "Deny", "Principal": {{"AWS": "arn:aws:iam::{other}:user/mallory"}},
+            "Action": "s3:*", "Resource": "arn:aws:s3:::shared/*"}}
+        ]}}"#
+    );
+    assert_eq!(
+        as_owner("PUT", "/shared", "policy", policy.as_bytes()).0,
+        204
+    );
+    assert_eq!(
+        as_owner("GET", "/shared", "policy", b""),
+        (200, policy.clone())
+    );
+    assert!(
+        as_owner("GET", "/shared", "policyStatus", b"")
+            .1
+            .contains("<IsPublic>FALSE</IsPublic>")
+    );
+
+    // The other account's root reads public/ only; its user needs its own
+    // policy too; an explicit deny wins.
+    let other_root =
+        |path: &str| send(port, "GET", path, "", b"", &other_key, Some(&other_secret)).0;
+    assert_eq!(other_root("/shared/public/a"), 200);
+    assert_eq!(other_root("/shared/private/b"), 403);
+    let read_all = r#"{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}}"#;
+    let (bob_key, bob_secret) = user_with_key(&server, &other, "bob", None);
+    let (eve_key, eve_secret) = user_with_key(&server, &other, "eve", Some(read_all));
+    let (mal_key, mal_secret) = user_with_key(&server, &other, "mallory", Some(read_all));
+    let get =
+        |key: &str, secret: &str, path: &str| send(port, "GET", path, "", b"", key, Some(secret)).0;
+    assert_eq!(get(&bob_key, &bob_secret, "/shared/public/a"), 403);
+    assert_eq!(get(&eve_key, &eve_secret, "/shared/public/a"), 200);
+    assert_eq!(get(&eve_key, &eve_secret, "/shared/private/b"), 403);
+    assert_eq!(get(&mal_key, &mal_secret, "/shared/public/a"), 403);
+
+    // In the owner's account, a user policy with ${aws:username} scopes each
+    // user to its home.
+    let home = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject"],
+         "Resource": "arn:aws:s3:::shared/home/${aws:username}/*"},
+        {"Effect": "Allow", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::shared",
+         "Condition": {"StringLike": {"s3:prefix": "home/${aws:username}/*"}}}]}"#;
+    let (alice_key, alice_secret) = user_with_key(&server, &owner, "alice", Some(home));
+    let alice = |method: &str, path: &str, query: &str| {
+        send(
+            port,
+            method,
+            path,
+            query,
+            b"y",
+            &alice_key,
+            Some(&alice_secret),
+        )
+        .0
+    };
+    assert_eq!(alice("GET", "/shared/home/alice/c", ""), 200);
+    assert_eq!(alice("PUT", "/shared/home/alice/new", ""), 200);
+    assert_eq!(alice("GET", "/shared/home/bob/d", ""), 403);
+    assert_eq!(
+        alice("GET", "/shared", "list-type=2&prefix=home/alice/"),
+        200
+    );
+    assert_eq!(alice("GET", "/shared", "list-type=2&prefix=home/bob/"), 403);
+    assert_eq!(alice("GET", "/shared", "list-type=2"), 403);
+
+    // A policy that denies everyone everything locks the owner out of the
+    // objects, but never out of the policy itself.
+    let lockout = r#"{"Statement": {"Effect": "Deny", "Principal": "*", "Action": "s3:*",
+        "Resource": ["arn:aws:s3:::shared", "arn:aws:s3:::shared/*"]}}"#;
+    assert_eq!(
+        as_owner("PUT", "/shared", "policy", lockout.as_bytes()).0,
+        204
+    );
+    assert_eq!(as_owner("GET", "/shared/public/a", "", b"").0, 403);
+    assert_eq!(as_owner("DELETE", "/shared", "policy", b"").0, 204);
+    assert_eq!(as_owner("GET", "/shared/public/a", "", b"").0, 200);
+    assert_eq!(as_owner("GET", "/shared", "policy", b"").0, 404);
+
+    // A grant to anyone makes the policy public (anonymous access itself
+    // comes later).
+    let public = r#"{"Statement": {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::shared/public/*"}}"#;
+    assert_eq!(
+        as_owner("PUT", "/shared", "policy", public.as_bytes()).0,
+        204
+    );
+    assert!(
+        as_owner("GET", "/shared", "policyStatus", b"")
+            .1
+            .contains("<IsPublic>TRUE</IsPublic>")
+    );
+    assert_eq!(
+        get(&bob_key, &bob_secret, "/shared/public/a"),
+        403,
+        "still needs its own policy"
+    );
+    assert_eq!(other_root("/shared/public/a"), 200);
+
+    // A condition on the transport: this listener is plain HTTP.
+    let tls_only = r#"{"Statement": {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::shared/*", "Condition": {"Bool": {"aws:SecureTransport": "false"}}}}"#;
+    assert_eq!(
+        as_owner("PUT", "/shared", "policy", tls_only.as_bytes()).0,
+        204
+    );
+    assert_eq!(as_owner("GET", "/shared/public/a", "", b"").0, 403);
+}
+
+#[test]
+fn conditions_see_what_the_operation_acts_on() {
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, root_key, root_secret) = account_with_key(&server, "acme");
+    let root = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &root_key,
+            Some(&root_secret),
+        )
+        .1
+    };
+    assert_eq!(root("PUT", "/tgs", "", &[], b"").0, 200);
+    assert_eq!(
+        root(
+            "PUT",
+            "/tgs/secret",
+            "",
+            &[("x-amz-tagging", "class=secret")],
+            b"data"
+        )
+        .0,
+        200
+    );
+    // A copy reads its source under the source's own tags.
+    let no_secrets = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "s3:GetObject", "Resource": "*",
+         "Condition": {"StringEquals": {"s3:ExistingObjectTag/class": "secret"}}}]}"#;
+    let (key, secret) = user_with_key(&server, &account, "reader", Some(no_secrets));
+    let user = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret)).1
+    };
+    assert_eq!(user("GET", "/tgs/secret", "", &[], b"").0, 403);
+    assert_eq!(
+        user(
+            "PUT",
+            "/tgs/copy",
+            "",
+            &[
+                ("x-amz-copy-source", "/tgs/secret"),
+                ("x-amz-tagging-directive", "REPLACE")
+            ],
+            b""
+        )
+        .0,
+        403
+    );
+    assert_eq!(root("GET", "/tgs/copy", "", &[], b"").0, 404);
+
+    // Request tags are those the operation stores, and storing them needs
+    // s3:PutObjectTagging.
+    let public_tags_only = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:PutObjectTagging", "s3:PutObject"], "Resource": "*",
+         "Condition": {"StringEquals": {"s3:RequestObjectTag/class": "public"}}},
+        {"Effect": "Allow", "Action": ["s3:GetObject", "s3:GetObjectTagging"], "Resource": "*"}]}"#;
+    let (key, secret) = user_with_key(&server, &account, "tagger", Some(public_tags_only));
+    let tagger = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret)).1
+    };
+    let tagging =
+        b"<Tagging><TagSet><Tag><Key>owner</Key><Value>mallory</Value></Tag></TagSet></Tagging>";
+    assert_eq!(
+        tagger(
+            "PUT",
+            "/tgs/secret",
+            "tagging",
+            &[("x-amz-tagging", "class=public")],
+            tagging
+        )
+        .0,
+        403,
+        "the header's tags are not the body's"
+    );
+    assert_eq!(
+        tagger(
+            "PUT",
+            "/tgs/dst",
+            "",
+            &[
+                ("x-amz-copy-source", "/tgs/secret"),
+                ("x-amz-tagging", "class=public")
+            ],
+            b""
+        )
+        .0,
+        403,
+        "a copy without REPLACE stores the source's tags, not the header's"
+    );
+    assert_eq!(
+        tagger(
+            "PUT",
+            "/tgs/new",
+            "",
+            &[("x-amz-tagging", "class=public")],
+            b"x"
+        )
+        .0,
+        200
+    );
+    let no_tagging = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:PutObject", "s3:GetObjectTagging"], "Resource": "*"},
+        {"Effect": "Deny", "Action": "s3:PutObjectTagging", "Resource": "*"}]}"#;
+    let (key, secret) = user_with_key(&server, &account, "untagged", Some(no_tagging));
+    let untagged = |extra: &[(&str, &str)]| {
+        send_with(port, "PUT", "/tgs/u", "", extra, b"x", &key, Some(&secret))
+            .1
+            .0
+    };
+    assert_eq!(untagged(&[]), 200);
+    assert_eq!(untagged(&[("x-amz-tagging", "class=public")]), 403);
+
+    // The version a condition sees is the version served.
+    assert_eq!(root("PUT", "/vvv", "", &[], b"").0, 200);
+    assert_eq!(
+        root(
+            "PUT",
+            "/vvv",
+            "versioning",
+            &[],
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>"
+        )
+        .0,
+        200
+    );
+    let version_of = |body: &[u8]| {
+        let (head, (status, _)) = send_with(
+            port,
+            "PUT",
+            "/vvv/o",
+            "",
+            &[],
+            body,
+            &root_key,
+            Some(&root_secret),
+        );
+        assert_eq!(status, 200);
+        response_header(&head, "x-amz-version-id").expect("a version")
+    };
+    let (v1, v2) = (version_of(b"public-version"), version_of(b"secret-version"));
+    let one_version = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+            {{"Effect": "Allow", "Action": "s3:PutObject", "Resource": "*"}},
+            {{"Effect": "Allow", "Action": "s3:GetObjectVersion",
+              "Resource": "*", "Condition": {{"StringEquals": {{"s3:VersionId": "{v1}"}}}}}}]}}"#
+    );
+    let (key, secret) = user_with_key(&server, &account, "versioned", Some(&one_version));
+    let get = |query: &str| send(port, "GET", "/vvv/o", query, b"", &key, Some(&secret));
+    assert_eq!(get(&format!("versionId={v1}")).0, 200);
+    assert_eq!(get(&format!("versionId={v2}")).0, 403);
+    let (status, body) = get(&format!("version%49d={v1}&versionId={v2}"));
+    assert_ne!((status, body.as_str()), (200, "secret-version"));
+    let deny_v2 = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+            {{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}},
+            {{"Effect": "Deny", "Action": "s3:GetObjectVersion",
+              "Resource": "*", "Condition": {{"StringEquals": {{"s3:VersionId": "{v2}"}}}}}}]}}"#
+    );
+    let (deny_key, deny_secret) = user_with_key(&server, &account, "denied", Some(&deny_v2));
+    let denied = |query: &str| {
+        send(
+            port,
+            "GET",
+            "/vvv/o",
+            query,
+            b"",
+            &deny_key,
+            Some(&deny_secret),
+        )
+        .0
+    };
+    assert_eq!(denied(&format!("versionId={v1}")), 200);
+    assert_eq!(
+        denied(&format!("versionId=00{v2}")),
+        403,
+        "a version in another spelling"
+    );
+    // A copy's source version is the copy source's, not the query's.
+    let copy = |query: &str, source: &str| {
+        send_with(
+            port,
+            "PUT",
+            "/vvv/c",
+            query,
+            &[("x-amz-copy-source", source)],
+            b"",
+            &key,
+            Some(&secret),
+        )
+        .1
+        .0
+    };
+    assert_eq!(
+        copy(
+            &format!("versionId={v1}"),
+            &format!("/vvv/o?versionId={v2}")
+        ),
+        403
+    );
+
+    // DeleteObjects reads a key's version as it deletes it.
+    let deny_delete = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+            {{"Effect": "Allow", "Action": "s3:*", "Resource": "*"}},
+            {{"Effect": "Deny", "Action": "s3:DeleteObjectVersion",
+              "Resource": "*", "Condition": {{"StringEquals": {{"s3:VersionId": "{v1}"}}}}}},
+            {{"Effect": "Deny", "Action": "s3:PutObjectTagging", "Resource": "*",
+              "Condition": {{"StringEquals": {{"s3:ExistingObjectTag/locked": "true"}}}}}}]}}"#
+    );
+    let (del_key, del_secret) = user_with_key(&server, &account, "deleter", Some(&deny_delete));
+    let body =
+        format!("<Delete><Object><Key>o</Key><VersionId>00{v1}</VersionId></Object></Delete>");
+    let md5 = {
+        use base64::Engine as _;
+        use md5::Digest;
+        base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(body.as_bytes()))
+    };
+    let (_, (status, reply)) = send_with(
+        port,
+        "POST",
+        "/vvv",
+        "delete",
+        &[("content-md5", &md5)],
+        body.as_bytes(),
+        &del_key,
+        Some(&del_secret),
+    );
+    assert_eq!(status, 200);
+    assert!(reply.contains("AccessDenied"), "{reply}");
+    assert_eq!(
+        send(
+            port,
+            "GET",
+            "/vvv/o",
+            &format!("versionId={v1}"),
+            b"",
+            &root_key,
+            Some(&root_secret)
+        )
+        .0,
+        200
+    );
+    // PutObjectTagging with a copy source header is not a copy: the target's
+    // own tags hold.
+    let locked =
+        b"<Tagging><TagSet><Tag><Key>locked</Key><Value>true</Value></Tag></TagSet></Tagging>";
+    assert_eq!(
+        send(
+            port,
+            "PUT",
+            "/vvv/o",
+            "tagging",
+            locked,
+            &root_key,
+            Some(&root_secret)
+        )
+        .0,
+        200
+    );
+    let unlock =
+        b"<Tagging><TagSet><Tag><Key>locked</Key><Value>false</Value></Tag></TagSet></Tagging>";
+    let retag = |extra: &[(&str, &str)]| {
+        send_with(
+            port,
+            "PUT",
+            "/vvv/o",
+            "tagging",
+            extra,
+            unlock,
+            &del_key,
+            Some(&del_secret),
+        )
+        .1
+        .0
+    };
+    assert_eq!(retag(&[]), 403);
+    assert_eq!(
+        retag(&[("x-amz-copy-source", &format!("/vvv/o?versionId={v1}"))]),
+        403
+    );
+
+    // An ACL body is read as XML: a spaced tag grants no more than a plain
+    // one.
+    let id = sigv4::sha256_hex(account.as_bytes());
+    let acl = format!(
+        "<AccessControlPolicy><AccessControlList><Grant><Grantee><ID>{id}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant><Grant ><Grantee><URI >http://acs.amazonaws.com/groups/global/AllUsers</URI></Grantee><Permission >READ</Permission></Grant></AccessControlList></AccessControlPolicy>"
+    );
+    assert_eq!(root("PUT", "/tgs", "acl", &[], acl.as_bytes()).0, 400);
+    let own = format!(
+        "<AccessControlPolicy><AccessControlList><Grant><Grantee><ID>{id}</ID></Grantee><Permission>FULL_CONTROL</Permission></Grant></AccessControlList></AccessControlPolicy>"
+    );
+    assert_eq!(root("PUT", "/tgs", "acl", &[], own.as_bytes()).0, 200);
+}
+
+#[test]
+fn acls_are_disabled_and_ownership_is_enforced() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret)).1
+    };
+    assert_eq!(call("PUT", "/acl", "", &[], b"").0, 200);
+    assert_eq!(
+        call("PUT", "/acl/o", "", &[("x-amz-acl", "private")], b"x").0,
+        200
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/acl/o",
+            "",
+            &[("x-amz-acl", "bucket-owner-full-control")],
+            b"x"
+        )
+        .0,
+        200
+    );
+    let (status, reply) = call("PUT", "/acl/o", "", &[("x-amz-acl", "public-read")], b"x");
+    assert_eq!(status, 400);
+    assert!(reply.contains("AccessControlListNotSupported"), "{reply}");
+    assert_eq!(
+        call("PUT", "/acl/o", "", &[("x-amz-grant-read", "uri=x")], b"x").0,
+        400
+    );
+    for path in ["/acl", "/acl/o"] {
+        let (status, reply) = call("GET", path, "acl", &[], b"");
+        assert_eq!(status, 200);
+        assert!(
+            reply.contains("<Permission>FULL_CONTROL</Permission>"),
+            "{reply}"
+        );
+        assert!(
+            reply.contains(&sigv4::sha256_hex(b"000000000000")),
+            "{reply}"
+        );
+    }
+    assert_eq!(
+        call("PUT", "/acl", "acl", &[("x-amz-acl", "private")], b"").0,
+        200
+    );
+    assert_eq!(
+        call("PUT", "/acl", "acl", &[("x-amz-acl", "public-read")], b"").0,
+        400
+    );
+    let (status, reply) = call("GET", "/acl", "ownershipControls", &[], b"");
+    assert_eq!(status, 200);
+    assert!(reply.contains("BucketOwnerEnforced"), "{reply}");
+    let preferred = b"<OwnershipControls><Rule><ObjectOwnership>BucketOwnerPreferred</ObjectOwnership></Rule></OwnershipControls>";
+    assert_eq!(
+        call("PUT", "/acl", "ownershipControls", &[], preferred).0,
+        400
+    );
+}
+
+#[test]
+fn s3_vectors_operations_follow_the_user_policies() {
+    use serde_json::json;
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, root_key, root_secret) = account_with_key(&server, "vec");
+    let (none_key, none_secret) = user_with_key(&server, &account, "none", None);
+    let all = r#"{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3vectors:*", "Resource": "*"}}"#;
+    let (all_key, all_secret) = user_with_key(&server, &account, "all", Some(all));
+    let (status, _, _) = vectors(
+        port,
+        &root_key,
+        &root_secret,
+        "CreateVectorBucket",
+        json!({"vectorBucketName": "vbk"}),
+    );
+    assert_eq!(status, 200);
+    for (operation, body) in [
+        ("ListVectorBuckets", json!({})),
+        ("GetVectorBucket", json!({"vectorBucketName": "vbk"})),
+        (
+            "CreateIndex",
+            json!({"vectorBucketName": "vbk", "indexName": "idx", "dataType": "float32", "dimension": 2, "distanceMetric": "cosine"}),
+        ),
+    ] {
+        let (status, kind, _) = vectors(port, &none_key, &none_secret, operation, body.clone());
+        assert_eq!(
+            (status, kind.as_deref()),
+            (403, Some("AccessDeniedException")),
+            "{operation}"
+        );
+        let (status, _, reply) = vectors(port, &all_key, &all_secret, operation, body);
+        assert_eq!(status, 200, "{operation}: {reply}");
+    }
 }
 
 #[test]
@@ -911,7 +1607,11 @@ fn listings_page_through_keys_and_common_prefixes() {
     }
     // A sub-resource that is not implemented is refused, not answered with
     // a listing or an object body.
-    for (path, query) in [("/lst", "policy"), ("/lst", "acl"), ("/lst/a", "acl")] {
+    for (path, query) in [
+        ("/lst", "website"),
+        ("/lst", "cors"),
+        ("/lst/a", "retention"),
+    ] {
         let (status, body) = call("GET", path, query, b"");
         assert_eq!(status, 501, "{path}?{query}: {body}");
     }
@@ -1543,7 +2243,7 @@ fn versioned_buckets_keep_versions_markers_and_null_versions() {
 
     // Sub-resources that are not implemented are refused, not misrouted.
     assert_eq!(call("PUT", "/vers", "tagging", b"").1.0, 501);
-    assert_eq!(call("GET", "/vers/k", "acl", b"").1.0, 501);
+    assert_eq!(call("GET", "/vers/k", "legal-hold", b"").1.0, 501);
 }
 
 #[test]

@@ -1649,6 +1649,7 @@ dependencies = [
  "tokio-rustls",
  "truthdb-core",
  "truthdb-fulltext",
+ "truthdb-iam",
  "truthdb-net",
  "truthdb-object",
  "truthdb-proto",
@@ -1664,6 +1665,15 @@ version = "0.1.0"
 dependencies = [
  "truthdb-core",
  "unicode-segmentation",
+]
+
+[[package]]
+name = "truthdb-iam"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -1720,12 +1730,12 @@ dependencies = [
  "percent-encoding",
  "quick-xml",
  "ring",
- "serde",
  "serde_json",
  "tokio",
  "tokio-rustls",
  "truthdb-core",
  "truthdb-engine",
+ "truthdb-iam",
  "truthdb-object",
  "truthdb-vector",
 ]

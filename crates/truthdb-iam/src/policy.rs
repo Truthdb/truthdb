@@ -297,7 +297,7 @@ fn parse_principals(value: &Value) -> Result<Vec<Principal>, MalformedPolicy> {
             if principal == "*" {
                 return Ok(Principal::Anyone);
             }
-            if truthdb_object::valid_account_id(&principal) {
+            if valid_account_id(&principal) {
                 return Ok(Principal::Account(principal));
             }
             let invalid = || malformed(format!("Invalid principal {principal}."));
@@ -305,7 +305,7 @@ fn parse_principals(value: &Value) -> Result<Vec<Principal>, MalformedPolicy> {
                 .strip_prefix("arn:aws:iam::")
                 .ok_or_else(invalid)?;
             let (account, resource) = rest.split_once(':').ok_or_else(invalid)?;
-            if !truthdb_object::valid_account_id(account) {
+            if !valid_account_id(account) {
                 return Err(invalid());
             }
             match resource {
@@ -386,4 +386,9 @@ impl<'de> Visitor<'de> for UniqueVisitor {
         }
         Ok(Unique(Value::Object(out)))
     }
+}
+
+/// Whether `id` is an account id: 12 ASCII digits.
+fn valid_account_id(id: &str) -> bool {
+    id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit())
 }
