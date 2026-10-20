@@ -17,6 +17,7 @@ pub fn database_engines() -> Vec<Box<dyn truthdb_core::storage::EngineParticipan
     vec![
         truthdb_relational::storage::relational_participant(),
         truthdb_object::ObjEngine::boxed(),
+        truthdb_vector::VecEngine::boxed(),
     ]
 }
 #[allow(unused_imports)]

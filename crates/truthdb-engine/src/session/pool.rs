@@ -250,6 +250,9 @@ pub(super) fn maintenance_loop(shared: &Arc<Shared>) {
             eprintln!("standby restartpoint failed: {err}");
         }
         // Object bodies nothing references any more, and abandoned uploads.
+        if let Err(err) = shared.engine.vector_purge() {
+            eprintln!("vector index purge failed: {err}");
+        }
         if let Err(err) = shared.engine.object_gc() {
             eprintln!("object garbage collection failed: {err}");
         }
