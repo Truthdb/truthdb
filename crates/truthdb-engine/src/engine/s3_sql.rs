@@ -16,6 +16,14 @@
 //!   deleted bucket of the same name. A restore to an earlier point rewinds
 //!   the numbering with everything else, so a reader resuming from a number
 //!   seen before the restore reads the numbers handed out again after it.
+//! - `sys.s3_search(@bucket, @condition [, @top])`: full-text search over
+//!   the contents of a bucket with full-text search enabled (S3 plan item
+//!   15; `s3 enable fulltext`), the shape of `CONTAINSTABLE`: up to `@top`
+//!   (default 100, also when NULL; at most 10,000) keys whose latest
+//!   version matches the `CONTAINS`-style condition, best first by BM25
+//!   score. The index follows
+//!   the change journal a moment behind the writes: a key is returned only
+//!   while the version that matched is still its latest.
 //!
 //! Rows stream a slice at a time, each slice under its own storage-lock hold,
 //! so a scan reads what is committed when each slice is read (read
@@ -24,10 +32,13 @@
 
 use std::sync::Arc;
 
+use std::collections::VecDeque;
 use truthdb_core::storage::{Storage, StorageError};
+
+use truthdb_fulltext::{Hit, Search, SearchError};
 use truthdb_object::{
-    JournalRecord, ListAfter, Listing, ObjFile, ObjectAttrs, ObjectError, ObjectInfo, Versioning,
-    version_id,
+    FtState, JournalRecord, ListAfter, Listing, ObjFile, ObjectAttrs, ObjectError, ObjectInfo,
+    VersionSel, Versioning, version_id,
 };
 use truthdb_relational::engine::{
     ExternalCaller, ExternalRowset, ExternalRowsets, ExternalStream, ResultColumn, check_cancelled,
@@ -38,6 +49,12 @@ use truthdb_sql::value::SqlValue;
 
 /// Keys one slice lists (one storage-lock hold), as a table scan's slice.
 const SLICE_KEYS: usize = 1024;
+
+/// Postings a search reads per storage-lock hold.
+const SEARCH_STEP_POSTINGS: usize = 16 * 1024;
+/// The keys `sys.s3_search` returns unless told otherwise, and at most.
+const DEFAULT_SEARCH_TOP: usize = 100;
+const MAX_SEARCH_TOP: usize = 10_000;
 
 /// Days from 0001-01-01 to 1970-01-01.
 const DAYS_0001_TO_1970: u64 = 719_162;
@@ -70,6 +87,7 @@ impl ExternalRowsets for S3Rowsets {
             "sys.s3_object_tags" => Some(Kind::Tags),
             "sys.s3_object_metadata" => Some(Kind::Metadata),
             "sys.s3_journal" => return Some(self.open_journal(name, args, caller)),
+            "sys.s3_search" => return Some(self.open_search(name, args, caller)),
             "sys.s3_read" => {
                 return Some(
                     check_admin(name, caller)
@@ -83,6 +101,80 @@ impl ExternalRowsets for S3Rowsets {
 }
 
 impl S3Rowsets {
+    fn open_search(
+        &self,
+        name: &str,
+        args: &[SqlValue],
+        caller: ExternalCaller,
+    ) -> Result<ExternalRowset, SqlError> {
+        check_admin(name, caller)?;
+        check_arg_count(name, args, 2, 3)?;
+        let bucket = string_arg(name, &args[0])?;
+        let condition = string_arg(name, &args[1])?;
+        let top = match args.get(2) {
+            None | Some(SqlValue::Null) => DEFAULT_SEARCH_TOP,
+            Some(SqlValue::Int(top)) if (1..=MAX_SEARCH_TOP as i64).contains(top) => *top as usize,
+            Some(_) => {
+                return Err(SqlError::new(
+                    206,
+                    16,
+                    2,
+                    format!(
+                        "Operand type clash: the top argument of {name} must be an integer from 1 to {MAX_SEARCH_TOP}."
+                    ),
+                ));
+            }
+        };
+        {
+            let mut guard = self.core.lock();
+            let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+            file.bucket(&bucket)
+                .map_err(storage_error)?
+                .ok_or_else(|| object_error(ObjectError::NoSuchBucket, &bucket))?;
+            let indexed = file
+                .fulltext_buckets()
+                .map_err(storage_error)?
+                .iter()
+                .any(|ft| ft.name == bucket && ft.state != FtState::Purging);
+            if !indexed {
+                return Err(SqlError::new(
+                    7601,
+                    16,
+                    2,
+                    format!(
+                        "Cannot use a CONTAINS predicate on bucket '{bucket}' because it does not have full-text search enabled."
+                    ),
+                ));
+            }
+        }
+        if condition.trim().is_empty() {
+            return Err(SqlError::new(
+                7645,
+                15,
+                1,
+                "Null or empty full-text predicate.",
+            ));
+        }
+        let search = Search::new(&condition).map_err(search_error)?;
+        Ok(ExternalRowset {
+            columns: vec![
+                nvarchar("bucket", 63),
+                nvarchar("key", 1024),
+                nvarchar("version_id", 20),
+                column("score", ColumnType::Float),
+                bigint("size"),
+                datetime2("last_modified_date"),
+            ],
+            rows: Box::new(SearchStream {
+                core: Arc::clone(&self.core),
+                bucket,
+                search,
+                hits: None,
+                left: top,
+            }),
+        })
+    }
+
     fn open_journal(
         &self,
         name: &str,
@@ -553,6 +645,100 @@ impl ExternalStream for JournalStream {
                     .filter(|record| record.bucket == self.bucket)
                     .map(journal_row),
             );
+        }
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// A search condition SQL Server would refuse as malformed is 7630; one
+/// past this engine's limits is 7619 (a full-text query that failed).
+fn search_error(err: SearchError) -> SqlError {
+    match err {
+        // Well formed but past a limit: a query that failed, as below.
+        SearchError::Query(err) if err.past_limit => SqlError::new(
+            7619,
+            16,
+            1,
+            format!("The execution of a full-text query failed. \"{err}\""),
+        ),
+        SearchError::Query(err) => SqlError::new(7630, 15, 2, err.to_string()),
+        SearchError::Storage(err) => storage_error(err),
+        other => SqlError::new(
+            7619,
+            16,
+            1,
+            format!("The execution of a full-text query failed. \"{other}\""),
+        ),
+    }
+}
+
+/// `sys.s3_search`: the postings are read a step per storage-lock hold on
+/// the first slice, then the ranked hits are checked against each key's
+/// latest version a slice at a time.
+struct SearchStream {
+    core: Arc<Storage>,
+    bucket: String,
+    search: Search,
+    /// The ranked hits not yet looked at, once every posting is read.
+    hits: Option<VecDeque<Hit>>,
+    /// Rows still to return.
+    left: usize,
+}
+
+impl ExternalStream for SearchStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        while self.hits.is_none() {
+            check_cancelled()?;
+            let mut guard = self.core.lock();
+            let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+            if file
+                .fulltext_step(&mut self.search, &self.bucket, SEARCH_STEP_POSTINGS)
+                .map_err(search_error)?
+            {
+                let stats = file.fulltext_stats(&self.bucket).map_err(storage_error)?;
+                self.hits = Some(self.search.rank(stats).into());
+            }
+        }
+        let hits = self.hits.as_mut().expect("ranked");
+        let mut rows = Vec::new();
+        while rows.is_empty() && self.left > 0 && !hits.is_empty() {
+            check_cancelled()?;
+            let mut guard = self.core.lock();
+            let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+            for _ in 0..SLICE_KEYS {
+                if self.left == 0 {
+                    break;
+                }
+                let Some(hit) = hits.pop_front() else {
+                    break;
+                };
+                // The hit counts while the version that matched is still the
+                // key's latest: the index follows the writes a moment behind.
+                let Some(key) = file
+                    .fulltext_version_key(&self.bucket, hit.doc)
+                    .map_err(storage_error)?
+                else {
+                    continue;
+                };
+                let Ok(info) = file
+                    .head_object(&self.bucket, &key, VersionSel::Latest)
+                    .map_err(storage_error)?
+                else {
+                    continue;
+                };
+                if info.version != hit.doc {
+                    continue;
+                }
+                rows.push(vec![
+                    text(&self.bucket),
+                    text(&key),
+                    text(&version_id(info.version, info.null_version)),
+                    Datum::Float(hit.score),
+                    Datum::BigInt(info.size as i64),
+                    datetime(info.mtime_ms),
+                ]);
+                self.left -= 1;
+            }
         }
         Ok((!rows.is_empty()).then_some(rows))
     }

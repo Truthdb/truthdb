@@ -72,6 +72,9 @@ pub struct Search {
     leaf: usize,
     resume: Option<Vec<u8>>,
     read: usize,
+    /// Each document seen so far, and whether it counts (see
+    /// [`Self::step`]).
+    counted: HashMap<u64, bool>,
 }
 
 impl Search {
@@ -83,17 +86,27 @@ impl Search {
             leaf: 0,
             resume: None,
             read: 0,
+            counted: HashMap::new(),
         })
     }
 
-    /// Reads up to `budget` more postings from `scope` of `index`. Returns
-    /// whether every posting has been read.
+    /// Reads up to `budget` more postings from `scope` of `index`, keeping
+    /// those of the documents `counts` accepts. Returns whether every posting
+    /// has been read.
+    ///
+    /// `counts` is asked once per document, when its first posting is read,
+    /// in the same storage-lock hold, and its answer stands for the rest of
+    /// the search: a document being written (or removed) a transaction at a
+    /// time is then either left out of every term or seen in every term as
+    /// it was when first read, so `a AND NOT b` cannot match it on a term it
+    /// had not reached yet.
     pub fn step(
         &mut self,
         ctx: &mut RelCtx<'_>,
         index: &Index,
         scope: &[u8],
         budget: usize,
+        counts: &mut dyn FnMut(&mut RelCtx<'_>, u64) -> Result<bool, StorageError>,
     ) -> Result<bool, SearchError> {
         let mut budget = budget.max(1);
         while budget > 0 && self.leaf < self.query.leaves.len() {
@@ -112,10 +125,20 @@ impl Search {
             if self.read > MAX_POSTINGS {
                 return Err(SearchError::TooManyPostings);
             }
-            let found = &mut self.found[self.leaf];
             for (term, posting) in postings {
-                found.entry(term).or_default().push(posting);
+                let keep = match self.counted.get(&posting.doc) {
+                    Some(&keep) => keep,
+                    None => {
+                        let keep = counts(ctx, posting.doc)?;
+                        self.counted.insert(posting.doc, keep);
+                        keep
+                    }
+                };
+                if keep {
+                    self.found[self.leaf].entry(term).or_default().push(posting);
+                }
             }
+            let found = &self.found[self.leaf];
             if found.len() > MAX_PREFIX_TERMS {
                 return Err(SearchError::TooManyTerms(leaf.term.clone()));
             }

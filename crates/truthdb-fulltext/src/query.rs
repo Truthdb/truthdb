@@ -50,11 +50,32 @@ pub struct Query {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct QueryError(pub String);
+pub struct QueryError {
+    pub message: String,
+    /// The condition is well formed but past one of the limits (as opposed
+    /// to malformed).
+    pub past_limit: bool,
+}
+
+impl QueryError {
+    fn syntax(message: String) -> Self {
+        QueryError {
+            message,
+            past_limit: false,
+        }
+    }
+
+    fn limit(message: String) -> Self {
+        QueryError {
+            message,
+            past_limit: true,
+        }
+    }
+}
 
 impl std::fmt::Display for QueryError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(&self.0)
+        f.write_str(&self.message)
     }
 }
 
@@ -73,7 +94,7 @@ impl Query {
     pub fn parse(condition: &str) -> Result<Query, QueryError> {
         let tokens = lex(condition)?;
         if tokens.len() > MAX_TOKENS {
-            return Err(QueryError(format!(
+            return Err(QueryError::limit(format!(
                 "The full-text search condition has more than {MAX_TOKENS} words and operators."
             )));
         }
@@ -108,7 +129,7 @@ fn lex(condition: &str) -> Result<Vec<Token>, QueryError> {
             '!' => tokens.push(Token::Not),
             '"' => {
                 let Some(len) = condition[start + 1..].find('"') else {
-                    return Err(QueryError(format!(
+                    return Err(QueryError::syntax(format!(
                         "Unterminated phrase in the full-text search condition '{condition}'."
                     )));
                 };
@@ -178,7 +199,7 @@ impl Parser<'_> {
 
     fn primary(&mut self) -> Result<Node, QueryError> {
         let Some(token) = self.tokens.get(self.at).cloned() else {
-            return Err(QueryError(format!(
+            return Err(QueryError::syntax(format!(
                 "Syntax error: the full-text search condition '{}' ends early.",
                 self.condition
             )));
@@ -188,7 +209,7 @@ impl Parser<'_> {
             Token::Open => {
                 self.nesting += 1;
                 if self.nesting > MAX_NESTING {
-                    return Err(QueryError(format!(
+                    return Err(QueryError::limit(format!(
                         "The full-text search condition nests parentheses more than {MAX_NESTING} deep."
                     )));
                 }
@@ -197,7 +218,7 @@ impl Parser<'_> {
                 if !self.eat(&Token::Close) {
                     return Err(match self.tokens.get(self.at) {
                         Some(token) => self.error_near(token),
-                        None => QueryError(format!(
+                        None => QueryError::syntax(format!(
                             "Syntax error: missing ')' in the full-text search condition '{}'.",
                             self.condition
                         )),
@@ -223,14 +244,14 @@ impl Parser<'_> {
         let mut nodes = Vec::new();
         for term in words(text) {
             if term.len() > MAX_TERM_BYTES {
-                return Err(QueryError(format!(
+                return Err(QueryError::syntax(format!(
                     "The word '{term}' in the full-text search condition is longer than {MAX_TERM_BYTES} bytes."
                 )));
             }
             nodes.push(Node::Leaf(self.leaf(Leaf { term, prefix })?));
         }
         match nodes.len() {
-            0 => Err(QueryError(format!(
+            0 => Err(QueryError::syntax(format!(
                 "The full-text search condition '{}' has no searchable word in '{shown}'.",
                 self.condition
             ))),
@@ -244,7 +265,7 @@ impl Parser<'_> {
             return Ok(index);
         }
         if self.leaves.len() == MAX_TERMS {
-            return Err(QueryError(format!(
+            return Err(QueryError::limit(format!(
                 "The full-text search condition has more than {MAX_TERMS} distinct terms."
             )));
         }
@@ -270,7 +291,7 @@ impl Parser<'_> {
             Token::Phrase(text) => format!("\"{text}\""),
             Token::Word(word) => word.clone(),
         };
-        QueryError(format!(
+        QueryError::syntax(format!(
             "Syntax error near '{near}' in the full-text search condition '{}'.",
             self.condition
         ))
