@@ -15,7 +15,8 @@
 //! the access key must exist first, the read must finish within a minute,
 //! and the bytes of all bodies not yet verified are bounded (past that, a
 //! request is told to retry). A body is parsed only once it has at most
-//! [`MAX_JSON_VALUES`] values, which bounds the memory a parse takes.
+//! [`MAX_JSON_VALUES`] values, and at most 16 verified requests are parsed
+//! and served at once, which bounds the memory parsing takes.
 //!
 //! A QueryVectors response holds all its results (no `nextToken`): one scan
 //! per query, and no pages drawn from a moving index. A PutVectors or
@@ -50,9 +51,13 @@ const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// much within [`BODY_TIMEOUT`] to turn others away.
 static UNVERIFIED: AtomicUsize = AtomicUsize::new(0);
 const UNVERIFIED_MAX: usize = 16 * MAX_BODY;
-/// The most values (of 32 bytes each, parsed) a request body may hold:
-/// more than the largest PutVectors needs (500 vectors of 4096 numbers).
+/// The most values a request body may hold: more than the largest
+/// PutVectors needs (500 vectors of 4096 numbers). Parsed, a value takes
+/// about 64 bytes (an object member about 110).
 const MAX_JSON_VALUES: usize = 4 << 20;
+/// Verified requests parsed and served at once (the rest wait their turn):
+/// each holds its body and its parsed form, a few hundred MiB at most.
+static SERVING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
 
 /// An S3 Vectors error: HTTP status, error type and message.
 #[derive(Debug)]
@@ -177,6 +182,7 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, VEr
     )
     .await?;
     drop(held);
+    let _serving = SERVING.acquire().await.expect("never closed");
     let operation = parts.uri.path().trim_start_matches('/').to_string();
     if parts.method != Method::POST {
         return Err(not_implemented(&operation));
