@@ -199,11 +199,8 @@ pub async fn receive_body(
             )
         }
     };
-    let now = now_ms();
-    let body_id = object(state, move |file| file.begin_body(now)).await?;
+    let mut sink = BodySink::begin(state).await?;
     let mut decoder = PayloadDecoder::new(auth.framing, auth.checksum)?;
-    let mut md5 = Md5::new();
-    let mut segment = Vec::with_capacity(SEGMENT_BYTES);
     let mut decoded = Vec::new();
     let mut incoming = request.into_body();
     while let Some(frame) = incoming.frame().await {
@@ -216,41 +213,79 @@ pub async fn receive_body(
         if decoder.decoded_len() > MAX_PUT_BYTES {
             return Err(too_large());
         }
-        md5.update(&decoded);
-        let mut rest = decoded.as_slice();
-        while !rest.is_empty() {
-            let take = (SEGMENT_BYTES - segment.len()).min(rest.len());
-            segment.extend_from_slice(&rest[..take]);
-            rest = &rest[take..];
-            if segment.len() == SEGMENT_BYTES {
-                let full_segment =
-                    std::mem::replace(&mut segment, Vec::with_capacity(SEGMENT_BYTES));
-                let now = now_ms();
-                object(state, move |file| {
-                    file.append_segment(body_id, &full_segment, now)
-                })
-                .await?;
-            }
-        }
+        sink.push(state, &decoded).await?;
     }
     decoder.finish(declared)?;
-    let digest: [u8; 16] = md5.finalize().into();
-    if content_md5.is_some_and(|expected| expected != digest) {
+    let sealed = sink.finish(state).await?;
+    if content_md5.is_some_and(|expected| expected != sealed.md5) {
         return Err(S3Error::bad_digest(
             "The Content-MD5 you specified did not match what we received.",
         ));
     }
-    if !segment.is_empty() {
+    Ok(sealed)
+}
+
+/// A body written into the object engine as it arrives: in segments, with
+/// its MD5. A body never finished stays staged until garbage collection
+/// reclaims it.
+pub struct BodySink {
+    body: u64,
+    md5: Md5,
+    segment: Vec<u8>,
+    len: u64,
+}
+
+impl BodySink {
+    pub async fn begin(state: &S3State) -> Result<BodySink, S3Error> {
         let now = now_ms();
-        object(state, move |file| {
-            file.append_segment(body_id, &segment, now)
+        let body = object(state, move |file| file.begin_body(now)).await?;
+        Ok(BodySink {
+            body,
+            md5: Md5::new(),
+            segment: Vec::with_capacity(SEGMENT_BYTES),
+            len: 0,
         })
-        .await?;
     }
-    Ok(SealedBody {
-        body: body_id,
-        md5: digest,
-    })
+
+    /// Bytes pushed so far.
+    pub fn pushed(&self) -> u64 {
+        self.len
+    }
+
+    pub async fn push(&mut self, state: &S3State, data: &[u8]) -> Result<(), S3Error> {
+        self.md5.update(data);
+        self.len += data.len() as u64;
+        let mut rest = data;
+        while !rest.is_empty() {
+            let take = (SEGMENT_BYTES - self.segment.len()).min(rest.len());
+            self.segment.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+            if self.segment.len() == SEGMENT_BYTES {
+                let full_segment =
+                    std::mem::replace(&mut self.segment, Vec::with_capacity(SEGMENT_BYTES));
+                let (body, now) = (self.body, now_ms());
+                object(state, move |file| {
+                    file.append_segment(body, &full_segment, now)
+                })
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    pub async fn finish(self, state: &S3State) -> Result<SealedBody, S3Error> {
+        let BodySink {
+            body, md5, segment, ..
+        } = self;
+        if !segment.is_empty() {
+            let now = now_ms();
+            object(state, move |file| file.append_segment(body, &segment, now)).await?;
+        }
+        Ok(SealedBody {
+            body,
+            md5: md5.finalize().into(),
+        })
+    }
 }
 
 pub async fn put_object(
