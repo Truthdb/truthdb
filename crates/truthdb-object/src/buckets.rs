@@ -1,11 +1,13 @@
 //! Buckets: one flat namespace of names (AWS general-purpose naming rules),
-//! each with its creation time and versioning state. A bucket is deleted only
-//! when it holds no object key and no multipart upload.
+//! each with its owning account, creation time and versioning state. A
+//! bucket is deleted only when it holds no object key and no multipart
+//! upload.
 
 use truthdb_core::relstore::btree::TreeInsert;
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
+use crate::accounts::DEFAULT_ACCOUNT;
 use crate::{BUCKETS_TREE, ObjFile, ObjTxn};
 
 /// A bucket's versioning state (S3 `PutBucketVersioning`).
@@ -20,6 +22,8 @@ pub enum Versioning {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BucketInfo {
     pub name: String,
+    /// The account that owns the bucket.
+    pub owner: String,
     pub created_ms: u64,
     pub versioning: Versioning,
     /// The change journal's last sequence number when the bucket was
@@ -33,16 +37,19 @@ pub struct BucketInfo {
 pub enum BucketError {
     NoSuchBucket,
     AlreadyOwnedByYou,
+    /// Another account owns a bucket of that name.
+    AlreadyExists,
     NotEmpty,
     InvalidName(&'static str),
 }
 
-/// A bucket's stored row: creation time, versioning state, and where its
-/// journal starts.
+/// A bucket's stored row: creation time, versioning state, where its journal
+/// starts, and its owning account.
 pub(crate) struct BucketRow {
     pub created_ms: u64,
     pub versioning: Versioning,
     pub journal_from: u64,
+    pub owner: String,
 }
 
 impl BucketRow {
@@ -54,14 +61,16 @@ impl BucketRow {
             Versioning::Suspended => 2,
         });
         out.extend_from_slice(&self.journal_from.to_le_bytes());
+        out.extend_from_slice(self.owner.as_bytes());
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         let corrupt = || StorageError::InvalidFile("corrupt bucket row".to_string());
         // A row written before the journal has no journal start: all of the
-        // journal is the bucket's.
-        if bytes.len() != 9 && bytes.len() != 17 {
+        // journal is the bucket's. A row written before accounts has no owner:
+        // the default account owns it.
+        if ![9, 17, 29].contains(&bytes.len()) {
             return Err(corrupt());
         }
         Ok(BucketRow {
@@ -75,6 +84,10 @@ impl BucketRow {
             journal_from: match bytes.get(9..17) {
                 Some(from) => u64::from_le_bytes(from.try_into().unwrap()),
                 None => 0,
+            },
+            owner: match bytes.get(17..29) {
+                Some(owner) => String::from_utf8(owner.to_vec()).map_err(|_| corrupt())?,
+                None => DEFAULT_ACCOUNT.to_string(),
             },
         })
     }
@@ -134,9 +147,11 @@ pub(crate) fn bucket_object_range(bucket: &str) -> (Vec<u8>, Vec<u8>) {
 }
 
 impl ObjTxn<'_, '_> {
+    /// Creates bucket `name`, owned by account `owner`.
     pub fn create_bucket(
         &mut self,
         name: &str,
+        owner: &str,
         now_ms: u64,
     ) -> Result<Result<(), BucketError>, StorageError> {
         if let Err(err) = validate_bucket_name(name) {
@@ -146,6 +161,7 @@ impl ObjTxn<'_, '_> {
             created_ms: now_ms,
             versioning: Versioning::Unversioned,
             journal_from: self.last_change()?,
+            owner: owner.to_string(),
         };
         let buckets = self.trees.buckets();
         let inserted = buckets.insert_unique(
@@ -156,7 +172,10 @@ impl ObjTxn<'_, '_> {
         )?;
         Ok(match inserted {
             TreeInsert::Inserted => Ok(()),
-            TreeInsert::DuplicateKey => Err(BucketError::AlreadyOwnedByYou),
+            TreeInsert::DuplicateKey => match self.bucket_row(name)? {
+                Some(existing) if existing.owner != owner => Err(BucketError::AlreadyExists),
+                _ => Err(BucketError::AlreadyOwnedByYou),
+            },
         })
     }
 
@@ -217,6 +236,7 @@ impl ObjFile<'_> {
                 let row = BucketRow::decode(&row)?;
                 Ok(BucketInfo {
                     name: name.to_string(),
+                    owner: row.owner,
                     created_ms: row.created_ms,
                     versioning: row.versioning,
                     journal_from: row.journal_from,
@@ -240,6 +260,7 @@ impl ObjFile<'_> {
                     name: String::from_utf8(name).map_err(|_| {
                         StorageError::InvalidFile("corrupt bucket name".to_string())
                     })?,
+                    owner: row.owner,
                     created_ms: row.created_ms,
                     versioning: row.versioning,
                     journal_from: row.journal_from,

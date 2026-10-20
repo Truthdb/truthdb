@@ -46,9 +46,19 @@ pub struct S3State {
     pub region: String,
 }
 
+/// Who sent a request: an account, acting as its root or as one of its
+/// users.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Principal {
+    /// The access key the request was signed with.
+    pub access_key: String,
+    pub account: String,
+    pub user: Option<String>,
+}
+
 /// A request that passed authentication: who sent it and how to read its body.
 pub struct Authenticated {
-    pub access_key: String,
+    pub principal: Principal,
     pub framing: Framing,
     /// The full-body checksum header's name and (for a header checksum) value.
     pub checksum: Option<(String, Option<String>)>,
@@ -237,7 +247,7 @@ pub fn check_signed_headers(
 }
 
 /// Verifies the request's signature over `payload_hash` against the access
-/// key's secret; returns the signing key.
+/// key's secret; returns the signing key and who the key acts for.
 pub async fn verify_signature(
     state: &S3State,
     method: &hyper::Method,
@@ -246,14 +256,20 @@ pub async fn verify_signature(
     auth: &sigv4::AuthHeader,
     amz_date: &str,
     payload_hash: &str,
-) -> Result<ring::hmac::Key, S3Error> {
+) -> Result<(ring::hmac::Key, Principal), S3Error> {
     let access_key = auth.credential.access_key.clone();
-    let secret = state
+    let (key, secret) = state
         .engine
-        .run_object(move |file: &mut ObjFile<'_>| file.access_key_secret(&access_key))
+        .run_object(move |file: &mut ObjFile<'_>| file.access_key(&access_key))
         .await
         .map_err(|err| S3Error::internal(err.to_string()))?
+        .filter(|(key, _)| key.active)
         .ok_or_else(S3Error::invalid_access_key)?;
+    let principal = Principal {
+        access_key: key.id,
+        account: key.account,
+        user: key.user,
+    };
 
     let headers: Vec<(String, String)> = request_headers
         .iter()
@@ -284,7 +300,7 @@ pub async fn verify_signature(
     ) {
         return Err(S3Error::signature_mismatch());
     }
-    Ok(key)
+    Ok((key, principal))
 }
 
 /// Checks the request's SigV4 signature against the access key's secret.
@@ -302,7 +318,7 @@ pub async fn authenticate(
         &auth,
         &["host", "x-amz-date", "x-amz-content-sha256"],
     )?;
-    let key = verify_signature(
+    let (key, principal) = verify_signature(
         state,
         request.method(),
         request.uri(),
@@ -346,7 +362,7 @@ pub async fn authenticate(
             }),
     };
     Ok(Authenticated {
-        access_key: auth.credential.access_key,
+        principal,
         framing,
         checksum,
     })

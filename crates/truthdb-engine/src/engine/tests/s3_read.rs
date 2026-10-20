@@ -7,7 +7,9 @@ use truthdb_object::{BodyWriter, ObjectAttrs, VersionSel};
 
 fn bucket(engine: &Engine, name: &str) {
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket(name, 1_000)))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket(name, truthdb_object::DEFAULT_ACCOUNT, 1_000))
+        })
         .expect("create")
         .expect("bucket");
 }

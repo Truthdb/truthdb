@@ -204,6 +204,36 @@ fn send_with(
     key: &str,
     secret: Option<&str>,
 ) -> (String, (u16, String)) {
+    send_paused(
+        port,
+        method,
+        path,
+        query,
+        extra,
+        body,
+        key,
+        secret,
+        body.len(),
+        || {},
+    )
+}
+
+/// [`send_with`], sending the first `split` bytes of the body, then running
+/// `pause`, then sending the rest: the request is signed and its head
+/// received before `pause` acts.
+#[allow(clippy::too_many_arguments)]
+fn send_paused(
+    port: u16,
+    method: &str,
+    path: &str,
+    query: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+    key: &str,
+    secret: Option<&str>,
+    split: usize,
+    pause: impl FnOnce(),
+) -> (String, (u16, String)) {
     let amz_date = amz_now();
     let host = format!("127.0.0.1:{port}");
     let payload = sigv4::sha256_hex(body);
@@ -264,7 +294,10 @@ fn send_with(
         }
     };
     stream.write_all(request.as_bytes()).expect("send");
-    stream.write_all(body).expect("send body");
+    stream.write_all(&body[..split]).expect("send body");
+    stream.flush().expect("flush");
+    pause();
+    stream.write_all(&body[split..]).expect("send body");
     let mut raw = Vec::new();
     stream.read_to_end(&mut raw).expect("read");
     let response = latin1(&raw);
@@ -294,6 +327,251 @@ fn server_with_key() -> (Server, String, String) {
         .expect("secret")
         .to_string();
     (server, key, secret)
+}
+
+/// A new account on the server, and a root access key of it.
+fn account_with_key(server: &Server, name: &str) -> (String, String, String) {
+    let account = native(server.native_port, &format!("s3 create account {name}"));
+    let account = account["account_id"].as_str().expect("id").to_string();
+    let created = native(
+        server.native_port,
+        &format!("s3 create access key {account}"),
+    );
+    (
+        account,
+        created["access_key_id"].as_str().expect("id").to_string(),
+        created["secret_access_key"]
+            .as_str()
+            .expect("secret")
+            .to_string(),
+    )
+}
+
+#[test]
+fn each_account_sees_and_touches_only_its_own_buckets() {
+    let (server, key_a, secret_a) = server_with_key();
+    let port = server.s3_port;
+    let (account_b, key_b, secret_b) = account_with_key(&server, "bee");
+    let a = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send(port, method, path, query, body, &key_a, Some(&secret_a))
+    };
+    let b = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send(port, method, path, query, body, &key_b, Some(&secret_b))
+    };
+    assert_eq!(a("PUT", "/shared", "", b"").0, 200);
+    assert_eq!(a("PUT", "/shared/doc", "", b"hello").0, 200);
+
+    // Account B can neither read, write, list nor delete A's bucket, nor
+    // take its name.
+    for (method, path, query) in [
+        ("GET", "/shared", "list-type=2"),
+        ("HEAD", "/shared", ""),
+        ("GET", "/shared/doc", ""),
+        ("PUT", "/shared/other", ""),
+        ("DELETE", "/shared/doc", ""),
+        ("GET", "/shared", "versions"),
+        ("PUT", "/shared", "versioning"),
+        ("DELETE", "/shared", ""),
+    ] {
+        let (status, body) = b(method, path, query, b"");
+        assert_eq!(status, 403, "{method} {path}?{query}: {body}");
+    }
+    let (status, body) = b("PUT", "/shared", "", b"");
+    assert_eq!(status, 409);
+    assert!(body.contains("BucketAlreadyExists"), "{body}");
+    assert_eq!(a("GET", "/shared/doc", "", b"").1, "hello", "untouched");
+
+    // B's own bucket, which A cannot copy into nor B copy out of A's.
+    assert_eq!(b("PUT", "/bees", "", b"").0, 200);
+    let (_, (status, body)) = send_with(
+        port,
+        "PUT",
+        "/bees/stolen",
+        "",
+        &[("x-amz-copy-source", "/shared/doc")],
+        b"",
+        &key_b,
+        Some(&secret_b),
+    );
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(a("PUT", "/bees/x", "", b"").0, 403);
+    // A copy source header on anything but a copy is not a copy.
+    assert_eq!(b("PUT", "/bees/own", "", b"mine").0, 200);
+    let (_, (status, body)) = send_with(
+        port,
+        "GET",
+        "/bees/own",
+        "",
+        &[("x-amz-copy-source", "/shared/doc")],
+        b"",
+        &key_b,
+        Some(&secret_b),
+    );
+    assert_eq!((status, body.as_str()), (200, "mine"));
+
+    // Each lists its own buckets, as their owner.
+    let listed = |list: &str| -> Vec<String> {
+        list.split("<Name>")
+            .skip(1)
+            .map(|rest| rest.split('<').next().unwrap().to_string())
+            .collect()
+    };
+    let (status, list_a) = a("GET", "/", "", b"");
+    assert_eq!(status, 200);
+    assert_eq!(listed(&list_a), ["shared"]);
+    assert!(list_a.contains(&format!("<ID>{}</ID>", sigv4::sha256_hex(b"000000000000"))));
+    let (_, list_b) = b("GET", "/", "", b"");
+    assert_eq!(listed(&list_b), ["bees"]);
+    assert!(list_b.contains(&format!(
+        "<ID>{}</ID>",
+        sigv4::sha256_hex(account_b.as_bytes())
+    )));
+
+    // A key of one of B's users acts for B.
+    native(
+        server.native_port,
+        &format!("s3 create user {account_b} carol"),
+    );
+    let carol = native(
+        server.native_port,
+        &format!("s3 create access key {account_b} carol"),
+    );
+    let (status, _) = send(
+        port,
+        "GET",
+        "/bees",
+        "list-type=2",
+        b"",
+        carol["access_key_id"].as_str().unwrap(),
+        carol["secret_access_key"].as_str(),
+    );
+    assert_eq!(status, 200);
+
+    // Vector buckets too are their owner's.
+    use serde_json::json;
+    let (status, _, _) = vectors(
+        port,
+        &key_b,
+        &secret_b,
+        "CreateVectorBucket",
+        json!({"vectorBucketName": "bee-vectors"}),
+    );
+    assert_eq!(status, 200);
+    let (status, kind, _) = vectors(
+        port,
+        &key_a,
+        &secret_a,
+        "GetVectorBucket",
+        json!({"vectorBucketName": "bee-vectors"}),
+    );
+    assert_eq!(
+        (status, kind.as_deref()),
+        (403, Some("AccessDeniedException"))
+    );
+    let (status, _, listed) = vectors(port, &key_a, &secret_a, "ListVectorBuckets", json!({}));
+    assert_eq!(status, 200);
+    assert_eq!(listed["vectorBuckets"], json!([]));
+    let (_, _, got) = vectors(
+        port,
+        &key_b,
+        &secret_b,
+        "GetVectorBucket",
+        json!({"vectorBucketName": "bee-vectors"}),
+    );
+    assert_eq!(
+        got["vectorBucket"]["vectorBucketArn"],
+        json!(format!(
+            "arn:aws:s3vectors:us-east-1:{account_b}:bucket/bee-vectors"
+        ))
+    );
+}
+
+#[test]
+fn a_request_is_checked_again_when_its_operation_runs() {
+    let (server, key_a, secret_a) = server_with_key();
+    let port = server.s3_port;
+    let (_, key_b, secret_b) = account_with_key(&server, "bee");
+    let a = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send(port, method, path, query, body, &key_a, Some(&secret_a))
+    };
+    let pause = || std::thread::sleep(Duration::from_millis(300));
+
+    // B starts deleting from a bucket that does not exist yet; A creates it
+    // and stores an object before B's body arrives.
+    let delete = b"<Delete><Object><Key>doc</Key></Object></Delete>";
+    let md5 = {
+        use base64::Engine as _;
+        use md5::Digest;
+        base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(delete))
+    };
+    let (_, (status, body)) = send_paused(
+        port,
+        "POST",
+        "/victim",
+        "delete",
+        &[("content-md5", &md5)],
+        delete,
+        &key_b,
+        Some(&secret_b),
+        5,
+        || {
+            pause();
+            assert_eq!(a("PUT", "/victim", "", b"").0, 200);
+            assert_eq!(a("PUT", "/victim/doc", "", b"kept").0, 200);
+        },
+    );
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(a("GET", "/victim/doc", "", b"").1, "kept");
+
+    // B starts a put into its own bucket, gives the bucket up, and A takes
+    // the name before B's body arrives.
+    assert_eq!(
+        send(port, "PUT", "/grab", "", b"", &key_b, Some(&secret_b)).0,
+        200
+    );
+    let (_, (status, body)) = send_paused(
+        port,
+        "PUT",
+        "/grab/evil",
+        "",
+        &[],
+        b"planted by B",
+        &key_b,
+        Some(&secret_b),
+        3,
+        || {
+            pause();
+            assert_eq!(
+                send(port, "DELETE", "/grab", "", b"", &key_b, Some(&secret_b)).0,
+                204
+            );
+            assert_eq!(a("PUT", "/grab", "", b"").0, 200);
+        },
+    );
+    assert_eq!(status, 403, "{body}");
+    assert_eq!(a("GET", "/grab/evil", "", b"").0, 404);
+
+    // An account dropped while its request is in flight creates nothing.
+    let (account_c, key_c, secret_c) = account_with_key(&server, "sea");
+    let config = b"<CreateBucketConfiguration><LocationConstraint>us-east-1</LocationConstraint></CreateBucketConfiguration>";
+    let (_, (status, _)) = send_paused(
+        port,
+        "PUT",
+        "/orphan",
+        "",
+        &[],
+        config,
+        &key_c,
+        Some(&secret_c),
+        10,
+        || {
+            pause();
+            native(server.native_port, &format!("s3 drop access key {key_c}"));
+            native(server.native_port, &format!("s3 drop account {account_c}"));
+        },
+    );
+    assert_eq!(status, 403);
+    assert_eq!(a("PUT", "/orphan", "", b"").0, 200, "the name is free");
 }
 
 #[test]

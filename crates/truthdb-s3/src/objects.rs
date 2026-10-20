@@ -67,11 +67,7 @@ where
     T: Send + 'static,
     F: FnOnce(&mut ObjFile<'_>) -> Result<T, truthdb_core::storage::StorageError> + Send + 'static,
 {
-    state
-        .engine
-        .run_object(op)
-        .await
-        .map_err(|err| S3Error::internal(err.to_string()))
+    crate::scope::object(state, op).await
 }
 
 pub fn now_ms() -> u64 {
@@ -505,9 +501,10 @@ pub async fn get_object(
         engine: state.engine.clone(),
         region: state.region.clone(),
     };
-    tokio::spawn(
-        async move { read_object(&task_state, &headers, bucket, key, which, head_only).await },
-    )
+    let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
+    tokio::spawn(crate::scope::within(scope, async move {
+        read_object(&task_state, &headers, bucket, key, which, head_only).await
+    }))
     .await
     .map_err(|err| S3Error::internal(err.to_string()))?
 }

@@ -20,14 +20,24 @@ const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
 /// leaves headroom when the floor lags.
 const STANDBY_RESTARTPOINT_THRESHOLD: f64 = 0.5;
 
-/// A native-protocol S3 administration command (`s3 create access key`,
-/// `s3 drop access key <id>`, `s3 list access keys`, `s3 enable fulltext
-/// <bucket> [max_bytes]`, `s3 disable fulltext <bucket>`). Like everything on
-/// the native protocol, it runs with full privileges and no authentication:
-/// whoever can reach the native port can mint, list and drop S3 credentials
-/// (and the new secret is returned in cleartext over that connection).
+/// An S3 administration command: `s3 create account <name>`, `s3 list
+/// accounts`, `s3 drop account <id>`, `s3 create user <account> <name>`,
+/// `s3 drop user <account> <name>`, `s3 create access key [<account>
+/// [<user>]]`, `s3 drop access key <id>`, `s3 list access keys`, `s3 enable
+/// fulltext <bucket> [max_bytes]`, `s3 disable fulltext <bucket>`.
+///
+/// Over TDS it runs only for a `sysadmin` login. The native protocol is a
+/// trusted connection, so there it runs with full privileges and no
+/// authentication: whoever can reach the native port can mint, list and drop
+/// S3 accounts and credentials (and a new secret is returned in cleartext
+/// over that connection).
 enum S3Admin {
-    CreateAccessKey,
+    CreateAccount(String),
+    ListAccounts,
+    DropAccount(String),
+    CreateUser(String, String),
+    DropUser(String, String),
+    CreateAccessKey(Option<String>, Option<String>),
     DropAccessKey(String),
     ListAccessKeys,
     EnableFulltext(String, Option<String>),
@@ -41,7 +51,25 @@ fn parse_s3_admin(input: &str) -> Option<S3Admin> {
     let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
     let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
     match lower.as_slice() {
-        ["s3", "create", "access", "key"] => Some(S3Admin::CreateAccessKey),
+        ["s3", "create", "account", _] => Some(S3Admin::CreateAccount(words[3].to_string())),
+        ["s3", "list", "accounts"] => Some(S3Admin::ListAccounts),
+        ["s3", "drop", "account", _] => Some(S3Admin::DropAccount(words[3].to_string())),
+        ["s3", "create", "user", _, _] => Some(S3Admin::CreateUser(
+            words[3].to_string(),
+            words[4].to_string(),
+        )),
+        ["s3", "drop", "user", _, _] => Some(S3Admin::DropUser(
+            words[3].to_string(),
+            words[4].to_string(),
+        )),
+        ["s3", "create", "access", "key"] => Some(S3Admin::CreateAccessKey(None, None)),
+        ["s3", "create", "access", "key", _] => {
+            Some(S3Admin::CreateAccessKey(Some(words[4].to_string()), None))
+        }
+        ["s3", "create", "access", "key", _, _] => Some(S3Admin::CreateAccessKey(
+            Some(words[4].to_string()),
+            Some(words[5].to_string()),
+        )),
         ["s3", "drop", "access", "key", _] => Some(S3Admin::DropAccessKey(words[4].to_string())),
         ["s3", "list", "access", "keys"] => Some(S3Admin::ListAccessKeys),
         ["s3", "enable", "fulltext", _] => {
@@ -66,6 +94,53 @@ fn fulltext_error(bucket: &str, err: truthdb_object::FtError) -> EngineError {
         ),
     })
     .into()
+}
+
+fn account_error(err: truthdb_object::AccountError) -> EngineError {
+    use truthdb_object::AccountError;
+    CommandError::InvalidCommand(match err {
+        AccountError::NoSuchAccount => "no such account".to_string(),
+        AccountError::AccountExists => "the account already exists".to_string(),
+        AccountError::DefaultAccount => "the default account cannot be dropped".to_string(),
+        AccountError::NoSuchUser => "no such user".to_string(),
+        AccountError::UserExists => "the user already exists".to_string(),
+        AccountError::NotEmpty(what) => format!("drop its {what} first"),
+        AccountError::InvalidName(why) => format!("the name {why}"),
+    })
+    .into()
+}
+
+/// A fresh 12-digit account id, drawn by the system's secure random
+/// generator.
+fn random_account_id() -> Result<String, EngineError> {
+    use ring::rand::SecureRandom;
+    let mut digits = String::new();
+    while digits.len() < 12 {
+        let mut bytes = [0u8; 16];
+        ring::rand::SystemRandom::new()
+            .fill(&mut bytes)
+            .map_err(|_| {
+                EngineError::Storage(
+                    std::io::Error::other("the system random generator failed").into(),
+                )
+            })?;
+        // 250 is a multiple of 10: bytes below it map to digits without bias.
+        digits.extend(
+            bytes
+                .iter()
+                .filter(|byte| **byte < 250)
+                .map(|byte| char::from(b'0' + byte % 10)),
+        );
+    }
+    digits.truncate(12);
+    Ok(digits)
+}
+
+fn now_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 const ACCESS_KEY_ID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -466,6 +541,9 @@ impl Engine {
         params: &[crate::engine::RpcParam],
         emitter: &mut dyn crate::engine::BatchEmitter,
     ) -> Result<Option<truthdb_sql::error::SqlError>, EngineError> {
+        if let Some(command) = parse_s3_admin(input) {
+            return Ok(self.s3_admin_batch(command, txn_ctx, emitter));
+        }
         // Hold the execution gate shared for the whole batch: concurrent
         // relational batches run together, but a native writer is excluded (see
         // [`Engine`]). The guard also gives the checkpointer its `meta` read.
@@ -474,6 +552,44 @@ impl Engine {
             crate::engine::execute_batch_streamed(&self.storage, input, txn_ctx, params, emitter);
         self.maybe_checkpoint(&meta)?;
         Ok(error)
+    }
+
+    /// An S3 administration command sent as a SQL batch: run for a
+    /// `sysadmin` login only, its JSON reply returned as one row of one
+    /// `result` column.
+    fn s3_admin_batch(
+        &self,
+        command: S3Admin,
+        txn_ctx: &mut crate::engine::TxnContext,
+        emitter: &mut dyn crate::engine::BatchEmitter,
+    ) -> Option<truthdb_sql::error::SqlError> {
+        use truthdb_sql::error::SqlError;
+        if !txn_ctx.is_server_admin(&self.storage) {
+            return Some(SqlError::new(
+                15247,
+                16,
+                1,
+                "User does not have permission to perform this action.".to_string(),
+            ));
+        }
+        match self.execute_s3_admin(command) {
+            Ok(reply) => {
+                emitter.columns(vec![crate::engine::ResultColumn {
+                    name: "result".to_string(),
+                    column_type: truthdb_relational::relstore::types::ColumnType::NVarCharMax,
+                }]);
+                emitter.rows(vec![vec![
+                    truthdb_relational::relstore::types::Datum::NVarChar(reply),
+                ]]);
+                emitter.statement_done(
+                    Some(1),
+                    txn_ctx.in_transaction(),
+                    crate::engine::DoneCommand::Select,
+                );
+                None
+            }
+            Err(err) => Some(SqlError::new(50000, 16, 1, err.to_string())),
+        }
     }
 
     /// Rolls back and discards a session's open transaction (connection
@@ -579,22 +695,101 @@ impl Engine {
         self.standby_restartpoint()
     }
 
-    /// The S3 API's access-key administration over the native protocol.
+    /// The S3 API's account and access-key administration.
     fn execute_s3_admin(&self, command: S3Admin) -> Result<String, EngineError> {
         let rendered = match command {
-            S3Admin::CreateAccessKey => {
+            S3Admin::CreateAccount(name) => {
+                // A drawn id may be taken (or be the default account's): draw
+                // again.
+                let mut attempts = 0;
+                let id = loop {
+                    let id = random_account_id()?;
+                    match self.object(|file| {
+                        file.transaction(|tx| tx.create_account(&id, &name, now_ms()))
+                    })? {
+                        Ok(()) => break id,
+                        Err(truthdb_object::AccountError::AccountExists) if attempts < 8 => {
+                            attempts += 1;
+                        }
+                        Err(err) => return Err(account_error(err)),
+                    }
+                };
+                json!({ "account_id": id, "name": name })
+            }
+            S3Admin::ListAccounts => {
+                let accounts = self.object(|file| file.accounts())?;
+                json!({ "accounts": accounts.iter().map(|account| json!({
+                    "account_id": account.id,
+                    "name": account.name,
+                })).collect::<Vec<_>>() })
+            }
+            S3Admin::DropAccount(id) => {
+                // The vector engine's buckets are checked first; the object
+                // engine checks its own, its users and keys in the drop. With
+                // no access keys left, no request can create a bucket for it.
+                let mut after: Option<String> = None;
+                loop {
+                    let page = self.vector(|file| file.list_buckets(after.as_deref(), 500))?;
+                    if page
+                        .iter()
+                        .any(|bucket| bucket.owner.as_deref() == Some(id.as_str()))
+                    {
+                        return Err(account_error(truthdb_object::AccountError::NotEmpty(
+                            "vector buckets",
+                        )));
+                    }
+                    match page.last() {
+                        Some(last) if page.len() == 500 => after = Some(last.name.clone()),
+                        _ => break,
+                    }
+                }
+                self.object(|file| file.transaction(|tx| tx.drop_account(&id)))?
+                    .map_err(account_error)?;
+                json!({ "dropped": id })
+            }
+            S3Admin::CreateUser(account, name) => {
+                let user_id = format!("AIDA{}", random_text(17, ACCESS_KEY_ID_ALPHABET)?);
+                self.object(|file| {
+                    file.transaction(|tx| tx.create_user(&account, &name, &user_id, now_ms()))
+                })?
+                .map_err(account_error)?;
+                json!({ "account_id": account, "user_name": name, "user_id": user_id })
+            }
+            S3Admin::DropUser(account, name) => {
+                self.object(|file| file.transaction(|tx| tx.drop_user(&account, &name)))?
+                    .map_err(account_error)?;
+                json!({ "dropped": name })
+            }
+            S3Admin::CreateAccessKey(account, user) => {
+                let account =
+                    account.unwrap_or_else(|| truthdb_object::DEFAULT_ACCOUNT.to_string());
                 let id = format!("TDB{}", random_text(17, ACCESS_KEY_ID_ALPHABET)?);
                 let secret = random_text(40, SECRET_ALPHABET)?;
-                self.object(|file| file.transaction(|tx| tx.create_access_key(&id, &secret)))?;
-                json!({ "access_key_id": id, "secret_access_key": secret })
+                self.object(|file| {
+                    file.transaction(|tx| {
+                        tx.create_access_key(&id, &secret, &account, user.as_deref(), now_ms())
+                    })
+                })?
+                .map_err(account_error)?;
+                json!({
+                    "access_key_id": id,
+                    "secret_access_key": secret,
+                    "account_id": account,
+                    "user_name": user,
+                })
             }
             S3Admin::DropAccessKey(id) => {
                 self.object(|file| file.transaction(|tx| tx.drop_access_key(&id)))?;
                 json!({ "dropped": id })
             }
             S3Admin::ListAccessKeys => {
-                let ids = self.object(|file| file.access_key_ids())?;
-                json!({ "access_keys": ids })
+                let keys = self.object(|file| file.access_keys())?;
+                json!({ "access_keys": keys.iter().map(|key| json!({
+                    "access_key_id": key.id,
+                    "account_id": key.account,
+                    "user_name": key.user,
+                    "status": if key.active { "Active" } else { "Inactive" },
+                })).collect::<Vec<_>>() })
             }
             S3Admin::EnableFulltext(bucket, max_bytes) => {
                 let max_bytes = match max_bytes {
@@ -669,12 +864,51 @@ impl Engine {
                 )),
             }
         };
+        self.vector_checkpoint();
+        Ok(out?)
+    }
+
+    /// The checkpoint a vector operation takes after it if the log is
+    /// filling.
+    fn vector_checkpoint(&self) {
         if !self.storage.is_standby() {
             let meta = self.meta.read().expect("engine meta poisoned");
             if let Err(err) = self.checkpoint_at(&meta, OBJECT_CHECKPOINT_THRESHOLD) {
                 eprintln!("vector checkpoint failed: {err}");
             }
         }
+    }
+
+    /// Runs `gate` on the object engine, then (when it passes) `op` on the
+    /// vector engine, in one storage-lock hold: what the gate checked (an S3
+    /// Vectors request's access key) still holds when `op` runs. `None` when
+    /// the gate refused.
+    pub fn vector_gated<T>(
+        &self,
+        gate: impl FnOnce(&mut truthdb_object::ObjFile<'_>) -> Result<bool, StorageError>,
+        op: impl FnOnce(&mut truthdb_vector::VecFile<'_>) -> Result<T, StorageError>,
+    ) -> Result<Option<T>, EngineError> {
+        let out = {
+            let core = self.storage.core_arc();
+            let mut guard = core.lock();
+            let passed = match truthdb_object::ObjFile::try_new(&mut guard) {
+                Some(mut file) => gate(&mut file),
+                None => Err(StorageError::InvalidConfig(
+                    "this database does not run the object engine".to_string(),
+                )),
+            };
+            match passed {
+                Ok(true) => match truthdb_vector::VecFile::try_new(&mut guard) {
+                    Some(mut file) => op(&mut file).map(Some),
+                    None => Err(StorageError::InvalidConfig(
+                        "this database does not run the vector engine".to_string(),
+                    )),
+                },
+                Ok(false) => Ok(None),
+                Err(err) => Err(err),
+            }
+        };
+        self.vector_checkpoint();
         Ok(out?)
     }
 

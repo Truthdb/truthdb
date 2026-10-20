@@ -10,7 +10,8 @@ fn create_bucket(engine: &Engine, bucket: &str, versioning: Versioning) {
     engine
         .object(|file| {
             file.transaction(|tx| {
-                tx.create_bucket(bucket, 1_000)?.expect("bucket");
+                tx.create_bucket(bucket, truthdb_object::DEFAULT_ACCOUNT, 1_000)?
+                    .expect("bucket");
                 if versioning != Versioning::Unversioned {
                     tx.set_versioning(bucket, versioning)?.expect("versioning");
                 }

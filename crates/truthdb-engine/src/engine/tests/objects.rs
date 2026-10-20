@@ -132,35 +132,167 @@ fn an_object_operation_runs_on_a_worker() {
 fn access_keys_are_administered_over_the_native_protocol() {
     let path = unique_temp_path("objects-keys");
     let engine = new_engine(&path);
-    let created: serde_json::Value =
-        serde_json::from_str(&engine.execute("S3 Create Access Key").expect("create")).unwrap();
+    let json = |command: &str| -> serde_json::Value {
+        serde_json::from_str(&engine.execute(command).expect(command)).unwrap()
+    };
+    let created = json("S3 Create Access Key");
     let id = created["access_key_id"].as_str().expect("id").to_string();
     let secret = created["secret_access_key"].as_str().expect("secret");
     assert_eq!(id.len(), 20);
     assert!(id.starts_with("TDB"));
     assert_eq!(secret.len(), 40);
+    assert_eq!(created["account_id"], truthdb_object::DEFAULT_ACCOUNT);
+    let (key, stored) = engine
+        .object(|file| file.access_key(&id))
+        .expect("lookup")
+        .expect("the key");
+    assert_eq!(stored, secret);
     assert_eq!(
-        engine
-            .object(|file| file.access_key_secret(&id))
-            .expect("lookup")
-            .as_deref(),
-        Some(secret)
+        (key.account.as_str(), key.user),
+        (truthdb_object::DEFAULT_ACCOUNT, None)
     );
 
-    let listed: serde_json::Value =
-        serde_json::from_str(&engine.execute("s3 list access keys;").expect("list")).unwrap();
-    assert_eq!(
-        listed["access_keys"],
-        serde_json::json!([id]),
-        "a trailing ';' is fine"
+    // An account, its user, and a key of each.
+    let account = json("s3 create account acme");
+    let account_id = account["account_id"].as_str().unwrap().to_string();
+    assert!(
+        truthdb_object::valid_account_id(&account_id),
+        "{account_id}"
     );
+    assert_eq!(
+        json("s3 list accounts")["accounts"],
+        serde_json::json!([
+            {"account_id": truthdb_object::DEFAULT_ACCOUNT, "name": "default"},
+            {"account_id": account_id, "name": "acme"},
+        ])
+    );
+    let user = json(&format!("s3 create user {account_id} alice"));
+    assert!(user["user_id"].as_str().unwrap().starts_with("AIDA"));
+    let root_key = json(&format!("s3 create access key {account_id}"));
+    let alice_key = json(&format!("s3 create access key {account_id} alice"));
+    assert_eq!(alice_key["user_name"], "alice");
+    assert!(
+        engine.execute("s3 create access key 999999999999").is_err(),
+        "no such account"
+    );
+    assert!(
+        engine
+            .execute(&format!("s3 create access key {account_id} bob"))
+            .is_err(),
+        "no such user"
+    );
+
+    let listed = json("s3 list access keys;");
+    let listed: Vec<(String, String, serde_json::Value)> = listed["access_keys"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|key| {
+            (
+                key["access_key_id"].as_str().unwrap().to_string(),
+                key["account_id"].as_str().unwrap().to_string(),
+                key["user_name"].clone(),
+            )
+        })
+        .collect();
+    assert_eq!(listed.len(), 3, "a trailing ';' is fine");
+    assert!(listed.contains(&(
+        alice_key["access_key_id"].as_str().unwrap().to_string(),
+        account_id.clone(),
+        serde_json::json!("alice")
+    )));
+
+    // An account goes only once its keys, users and buckets have.
+    assert!(
+        engine
+            .execute(&format!("s3 drop account {account_id}"))
+            .is_err()
+    );
+    assert!(
+        engine
+            .execute(&format!("s3 drop user {account_id} alice"))
+            .is_err()
+    );
+    for key in [&root_key, &alice_key, &created] {
+        engine
+            .execute(&format!(
+                "s3 drop access key {}",
+                key["access_key_id"].as_str().unwrap()
+            ))
+            .expect("drop key");
+    }
+    json(&format!("s3 drop user {account_id} alice"));
     engine
-        .execute(&format!("s3 drop access key {id}"))
-        .expect("drop");
-    let listed: serde_json::Value =
-        serde_json::from_str(&engine.execute("s3 list access keys").expect("list")).unwrap();
-    assert_eq!(listed["access_keys"], serde_json::json!([]));
+        .vector(|file| file.transaction(|tx| tx.create_bucket("vb1", &account_id, 1)))
+        .expect("vector bucket")
+        .expect("created");
+    let refused = engine
+        .execute(&format!("s3 drop account {account_id}"))
+        .unwrap_err();
+    assert!(refused.to_string().contains("vector buckets"), "{refused}");
+    engine
+        .vector(|file| file.transaction(|tx| tx.delete_bucket("vb1")))
+        .expect("delete")
+        .expect("deleted");
+    json(&format!("s3 drop account {account_id}"));
+    assert!(engine.execute("s3 drop account 000000000000").is_err());
+    assert_eq!(
+        json("s3 list access keys")["access_keys"],
+        serde_json::json!([])
+    );
     assert!(engine.execute(&format!("s3 drop access key {id}")).is_err());
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn over_tds_only_a_sysadmin_runs_the_s3_administration() {
+    use crate::engine::TxnContext;
+    let path = unique_temp_path("objects-admin-tds");
+    let engine = new_engine(&path);
+    engine
+        .execute("CREATE LOGIN owner WITH PASSWORD = 'S3cret!'")
+        .unwrap();
+    engine.execute("CREATE USER owner FOR LOGIN owner").unwrap();
+    engine
+        .execute("ALTER ROLE db_owner ADD MEMBER owner")
+        .unwrap();
+    // `sa` is a sysadmin.
+    engine
+        .execute("CREATE LOGIN sa WITH PASSWORD = 'x'")
+        .unwrap();
+    let session = |login: &str| {
+        let login_sid = engine.lookup_login(login).unwrap().principal_id;
+        let (user, user_sid) = engine.resolve_session_user(login, login_sid);
+        let mut ctx = TxnContext::default();
+        ctx.set_session_identity(
+            "truthdb".into(),
+            crate::relstore::catalog::DEFAULT_DATABASE_ID,
+            login.into(),
+            9,
+            user,
+            login_sid,
+            user_sid,
+        );
+        ctx
+    };
+    // A database owner is not a server administrator.
+    let outcome = batch(&engine, &mut session("owner"), "s3 create account acme");
+    assert_eq!(outcome.error.as_ref().map(|e| e.number), Some(15247));
+    assert_eq!(engine.object(|file| file.accounts()).unwrap().len(), 1);
+
+    let outcome = batch(&engine, &mut session("sa"), "s3 create account acme;");
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    let reply = match &outcome.results[..] {
+        [StatementResult::Rows(rows)] => match &rows.rows[0][0] {
+            truthdb_relational::relstore::types::Datum::NVarChar(text) => text.clone(),
+            other => panic!("{other:?}"),
+        },
+        other => panic!("{other:?}"),
+    };
+    let reply: serde_json::Value = serde_json::from_str(&reply).unwrap();
+    assert_eq!(reply["name"], "acme");
+    assert_eq!(engine.object(|file| file.accounts()).unwrap().len(), 2);
     drop(engine);
     let _ = std::fs::remove_file(path);
 }

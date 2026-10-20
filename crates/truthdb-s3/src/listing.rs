@@ -106,27 +106,24 @@ pub async fn list_objects(
 
     let (bucket_name, list_prefix, list_delimiter) =
         (bucket.clone(), prefix.clone(), delimiter.clone());
-    let listing = state
-        .engine
-        .run_object(move |file| {
-            let after = start.as_ref().map(|(entry, is_prefix)| {
-                if *is_prefix {
-                    ListAfter::CommonPrefix(entry)
-                } else {
-                    ListAfter::Key(entry)
-                }
-            });
-            file.list_objects(
-                &bucket_name,
-                &list_prefix,
-                list_delimiter.as_deref(),
-                after,
-                max_keys,
-            )
-        })
-        .await
-        .map_err(|err| S3Error::internal(err.to_string()))?
-        .map_err(|err| object_error(err, &bucket, ""))?;
+    let listing = crate::scope::object(state, move |file| {
+        let after = start.as_ref().map(|(entry, is_prefix)| {
+            if *is_prefix {
+                ListAfter::CommonPrefix(entry)
+            } else {
+                ListAfter::Key(entry)
+            }
+        });
+        file.list_objects(
+            &bucket_name,
+            &list_prefix,
+            list_delimiter.as_deref(),
+            after,
+            max_keys,
+        )
+    })
+    .await?
+    .map_err(|err| object_error(err, &bucket, ""))?;
 
     let encode = |text: &str| {
         if url_encoding {
@@ -210,9 +207,11 @@ pub async fn list_objects(
 
 /// ListObjectVersions (`GET ?versions`): every version and delete marker,
 /// newest first within a key, paged by key and version-id markers.
+/// ListObjectVersions over `bucket`, which account `owner` owns.
 pub async fn list_versions(
     state: &S3State,
     bucket: String,
+    owner: &str,
     query: &str,
 ) -> Result<Response<Body>, S3Error> {
     let params = query_params(query);
@@ -259,36 +258,33 @@ pub async fn list_versions(
         delimiter.clone(),
         key_marker.clone(),
     );
-    let listing = state
-        .engine
-        .run_object(move |file| {
-            // A `null` marker names the key's null version, by its number.
-            let version = match version_marker {
-                Some(None) => {
-                    let key = marker.as_deref().expect("checked above");
-                    file.object_version(&bucket_name, key, VersionSel::Null)?
-                        .ok()
-                        .map(|info| info.version)
-                }
-                Some(Some(version)) => Some(version),
-                None => None,
-            };
-            let after = match (marker.as_deref(), version) {
-                (Some(key), Some(version)) => Some(ListAfter::Version(key, version)),
-                (Some(key), None) => Some(ListAfter::Key(key)),
-                (None, _) => None,
-            };
-            file.list_versions(
-                &bucket_name,
-                &list_prefix,
-                list_delimiter.as_deref(),
-                after,
-                max_keys,
-            )
-        })
-        .await
-        .map_err(|err| S3Error::internal(err.to_string()))?
-        .map_err(|err| object_error(err, &bucket, ""))?;
+    let listing = crate::scope::object(state, move |file| {
+        // A `null` marker names the key's null version, by its number.
+        let version = match version_marker {
+            Some(None) => {
+                let key = marker.as_deref().expect("checked above");
+                file.object_version(&bucket_name, key, VersionSel::Null)?
+                    .ok()
+                    .map(|info| info.version)
+            }
+            Some(Some(version)) => Some(version),
+            None => None,
+        };
+        let after = match (marker.as_deref(), version) {
+            (Some(key), Some(version)) => Some(ListAfter::Version(key, version)),
+            (Some(key), None) => Some(ListAfter::Key(key)),
+            (None, _) => None,
+        };
+        file.list_versions(
+            &bucket_name,
+            &list_prefix,
+            list_delimiter.as_deref(),
+            after,
+            max_keys,
+        )
+    })
+    .await?
+    .map_err(|err| object_error(err, &bucket, ""))?;
 
     let encode = |text: &str| {
         if url_encoding {
@@ -323,7 +319,7 @@ pub async fn list_versions(
             ));
         }
     }
-    let owner = "<Owner><ID>truthdb</ID><DisplayName>truthdb</DisplayName></Owner>";
+    let owner = crate::api::owner_xml(owner);
     for object in &listing.objects {
         let info = &object.info;
         let common = format!(

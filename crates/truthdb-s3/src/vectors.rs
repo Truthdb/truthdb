@@ -42,8 +42,6 @@ use crate::server::{Body, S3State, check_signed_headers, full, signed_request, v
 
 /// The largest request body.
 const MAX_BODY: usize = 20 << 20;
-/// The account id in this server's ARNs.
-const ACCOUNT: &str = "000000000000";
 /// How long a request body may take to arrive.
 const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 /// Bytes of request bodies held before their signatures are checked, and
@@ -143,9 +141,7 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, VEr
     let access_key = auth.credential.access_key.clone();
     if state
         .engine
-        .run_object(move |file: &mut truthdb_object::ObjFile<'_>| {
-            file.access_key_secret(&access_key)
-        })
+        .run_object(move |file: &mut truthdb_object::ObjFile<'_>| file.access_key(&access_key))
         .await?
         .is_none()
     {
@@ -171,7 +167,7 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, VEr
     {
         return Err(S3Error::signature_mismatch().into());
     }
-    verify_signature(
+    let (_, principal) = verify_signature(
         state,
         &parts.method,
         &parts.uri,
@@ -202,7 +198,7 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, VEr
     let region = state.region.clone();
     state
         .engine
-        .run_engine(move |engine| Ok(dispatch(engine, &region, &operation, &input)))
+        .run_engine(move |engine| Ok(dispatch(engine, &region, &principal, &operation, &input)))
         .await?
 }
 
@@ -296,17 +292,19 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-fn bucket_arn(region: &str, bucket: &str) -> String {
-    format!("arn:aws:s3vectors:{region}:{ACCOUNT}:bucket/{bucket}")
+/// A bucket's ARN: a caller reaches only its own account's buckets, so the
+/// account in it is the caller's.
+fn bucket_arn(region: &str, account: &str, bucket: &str) -> String {
+    format!("arn:aws:s3vectors:{region}:{account}:bucket/{bucket}")
 }
 
-fn index_arn(region: &str, bucket: &str, index: &str) -> String {
-    format!("{}/index/{index}", bucket_arn(region, bucket))
+fn index_arn(region: &str, account: &str, bucket: &str, index: &str) -> String {
+    format!("{}/index/{index}", bucket_arn(region, account, bucket))
 }
 
-/// An ARN's bucket and (when it names one) index: an ARN of this server
-/// (its region and account).
-fn parse_arn(arn: &str, region: &str) -> Option<(String, Option<String>)> {
+/// An ARN's bucket and (when it names one) index: an ARN of this server's
+/// region and the caller's account.
+fn parse_arn(arn: &str, region: &str, caller: &str) -> Option<(String, Option<String>)> {
     let rest = arn.strip_prefix("arn:")?;
     let mut parts = rest.splitn(5, ':');
     let (partition, service, arn_region, account, resource) = (
@@ -316,7 +314,7 @@ fn parse_arn(arn: &str, region: &str) -> Option<(String, Option<String>)> {
         parts.next()?,
         parts.next()?,
     );
-    if partition != "aws" || service != "s3vectors" || arn_region != region || account != ACCOUNT {
+    if partition != "aws" || service != "s3vectors" || arn_region != region || account != caller {
         return None;
     }
     let resource = resource.strip_prefix("bucket/")?;
@@ -364,14 +362,14 @@ fn boolean(input: &Map<String, Value>, name: &str) -> Result<bool, VError> {
 }
 
 /// The vector bucket a request names (by name or ARN, not both).
-fn bucket_of(input: &Map<String, Value>, region: &str) -> Result<String, VError> {
+fn bucket_of(input: &Map<String, Value>, region: &str, account: &str) -> Result<String, VError> {
     if let Some(arn) = string(input, "vectorBucketArn")? {
         if string(input, "vectorBucketName")?.is_some() {
             return Err(VError::validation(
                 "Give vectorBucketName or vectorBucketArn, not both.",
             ));
         }
-        return match parse_arn(arn, region) {
+        return match parse_arn(arn, region, account) {
             Some((bucket, None)) => Ok(bucket),
             _ => Err(VError::validation(
                 "vectorBucketArn is not a vector bucket ARN of this server.",
@@ -383,12 +381,43 @@ fn bucket_of(input: &Map<String, Value>, region: &str) -> Result<String, VError>
         .ok_or_else(|| VError::validation("vectorBucketName or vectorBucketArn is required."))
 }
 
+/// The vector bucket a request names, which must exist and be the caller's
+/// account's: until bucket policies, a bucket is its owner's alone.
+fn owned_bucket(
+    caller: &Caller<'_>,
+    input: &Map<String, Value>,
+    region: &str,
+    account: &str,
+) -> Result<truthdb_vector::BucketInfo, VError> {
+    let bucket = bucket_of(input, region, account)?;
+    let info = caller
+        .vector(|file| file.bucket(&bucket))?
+        .ok_or_else(|| VError::not_found(format!("The vector bucket {bucket} does not exist.")))?;
+    check_owner(&info, account)?;
+    Ok(info)
+}
+
+/// Refuses a bucket another account owns (a bucket from before owners is the
+/// default account's).
+fn check_owner(info: &truthdb_vector::BucketInfo, account: &str) -> Result<(), VError> {
+    if info
+        .owner
+        .as_deref()
+        .unwrap_or(truthdb_object::DEFAULT_ACCOUNT)
+        != account
+    {
+        return Err(VError::new(403, "AccessDeniedException", "Access denied."));
+    }
+    Ok(())
+}
+
 /// The vector index a request names (by bucket and name, or ARN, not
 /// both), as it is.
 fn index_of(
-    engine: &Engine,
+    caller: &Caller<'_>,
     input: &Map<String, Value>,
     region: &str,
+    account: &str,
 ) -> Result<IndexInfo, VError> {
     let (bucket, name) = match string(input, "indexArn")? {
         Some(arn) => {
@@ -400,7 +429,7 @@ fn index_of(
                     "Give indexArn, or the bucket and indexName, not both.",
                 ));
             }
-            match parse_arn(arn, region) {
+            match parse_arn(arn, region, account) {
                 Some((bucket, Some(index))) => (bucket, index),
                 _ => {
                     return Err(VError::validation(
@@ -410,17 +439,21 @@ fn index_of(
             }
         }
         None => (
-            bucket_of(input, region)?,
+            bucket_of(input, region, account)?,
             string(input, "indexName")?
                 .ok_or_else(|| VError::validation("indexName or indexArn is required."))?
                 .to_string(),
         ),
     };
-    engine
+    let not_found =
+        || VError::not_found(format!("The vector index {bucket}/{name} does not exist."));
+    let info = caller
+        .vector(|file| file.bucket(&bucket))?
+        .ok_or_else(not_found)?;
+    check_owner(&info, account)?;
+    caller
         .vector(|file| file.index(&bucket, &name))?
-        .ok_or_else(|| {
-            VError::not_found(format!("The vector index {bucket}/{name} does not exist."))
-        })
+        .ok_or_else(not_found)
 }
 
 fn vector_error(err: VectorError) -> VError {
@@ -509,12 +542,87 @@ fn entry_json(entry: truthdb_vector::VectorEntry) -> Value {
     out
 }
 
+/// The caller of an S3 Vectors request. Each of its vector-engine calls
+/// checks, in the same storage-lock hold as its work, that the request's
+/// access key still acts for its account and that the bucket the request
+/// names is missing or the account's: a key dropped or a bucket deleted and
+/// created again by another account meanwhile does not let it through.
+struct Caller<'e> {
+    engine: &'e Engine,
+    access_key: String,
+    account: String,
+    /// The bucket the request names (none for creating or listing buckets).
+    bucket: Option<String>,
+}
+
+impl Caller<'_> {
+    fn vector<T>(
+        &self,
+        op: impl FnOnce(
+            &mut truthdb_vector::VecFile<'_>,
+        ) -> Result<T, truthdb_core::storage::StorageError>,
+    ) -> Result<T, VError> {
+        let (access_key, account, bucket) =
+            (&self.access_key, &self.account, self.bucket.as_deref());
+        self.engine
+            .vector_gated(
+                |objects| {
+                    Ok(matches!(
+                        objects.access_key(access_key)?,
+                        Some((key, _)) if key.active && &key.account == account
+                    ))
+                },
+                |vectors| {
+                    if let Some(bucket) = bucket
+                        && let Some(info) = vectors.bucket(bucket)?
+                        && check_owner(&info, account).is_err()
+                    {
+                        return Ok(None);
+                    }
+                    op(vectors).map(Some)
+                },
+            )?
+            .flatten()
+            .ok_or_else(|| VError::new(403, "AccessDeniedException", "Access denied."))
+    }
+}
+
+/// The bucket a request names: its index ARN's, or the one [`bucket_of`]
+/// finds.
+fn named_bucket(input: &Map<String, Value>, region: &str, account: &str) -> Result<String, VError> {
+    match string(input, "indexArn")? {
+        Some(arn) => parse_arn(arn, region, account)
+            .map(|(bucket, _)| bucket)
+            .ok_or_else(|| {
+                VError::validation("indexArn is not a vector index ARN of this server.")
+            }),
+        None => bucket_of(input, region, account),
+    }
+}
+
 fn dispatch(
     engine: &Engine,
     region: &str,
+    principal: &crate::server::Principal,
     operation: &str,
     input: &Map<String, Value>,
 ) -> Result<Value, VError> {
+    let account = principal.account.as_str();
+    // The bucket each operation acts on, found as the operation finds it.
+    let bucket = match operation {
+        "GetVectorBucket" | "DeleteVectorBucket" | "CreateIndex" | "ListIndexes" => {
+            Some(bucket_of(input, region, account)?)
+        }
+        "GetIndex" | "DeleteIndex" | "PutVectors" | "GetVectors" | "ListVectors"
+        | "DeleteVectors" | "QueryVectors" => Some(named_bucket(input, region, account)?),
+        _ => None,
+    };
+    let caller = &Caller {
+        engine,
+        access_key: principal.access_key.clone(),
+        account: account.to_string(),
+        bucket,
+    };
     match operation {
         "CreateVectorBucket" => {
             let bucket = string(input, "vectorBucketName")?
@@ -524,19 +632,16 @@ fn dispatch(
             {
                 return Err(not_implemented("SSE-KMS"));
             }
-            engine
-                .vector(|file| file.transaction(|tx| tx.create_bucket(bucket, now_ms())))?
+            caller
+                .vector(|file| file.transaction(|tx| tx.create_bucket(bucket, account, now_ms())))?
                 .map_err(vector_error)?;
-            Ok(json!({ "vectorBucketArn": bucket_arn(region, bucket) }))
+            Ok(json!({ "vectorBucketArn": bucket_arn(region, account, bucket) }))
         }
         "GetVectorBucket" => {
-            let bucket = bucket_of(input, region)?;
-            let info = engine.vector(|file| file.bucket(&bucket))?.ok_or_else(|| {
-                VError::not_found(format!("The vector bucket {bucket} does not exist."))
-            })?;
+            let info = owned_bucket(caller, input, region, account)?;
             Ok(json!({ "vectorBucket": {
                 "vectorBucketName": info.name,
-                "vectorBucketArn": bucket_arn(region, &info.name),
+                "vectorBucketArn": bucket_arn(region, account, &info.name),
                 "creationTime": seconds(info.created_ms),
                 "encryptionConfiguration": { "sseType": "AES256" },
             }}))
@@ -548,10 +653,18 @@ fn dispatch(
             let mut out = Vec::new();
             let mut more = false;
             'pages: loop {
-                let page = engine.vector(|file| file.list_buckets(after.as_deref(), 500))?;
+                let page = caller.vector(|file| file.list_buckets(after.as_deref(), 500))?;
                 let last_page = page.len() < 500;
                 for bucket in page {
                     after = Some(bucket.name.clone());
+                    if bucket
+                        .owner
+                        .as_deref()
+                        .unwrap_or(truthdb_object::DEFAULT_ACCOUNT)
+                        != account
+                    {
+                        continue;
+                    }
                     if !bucket.name.starts_with(&prefix) {
                         if bucket.name.as_str() > prefix.as_str() {
                             break 'pages;
@@ -564,7 +677,7 @@ fn dispatch(
                     }
                     out.push(json!({
                         "vectorBucketName": bucket.name,
-                        "vectorBucketArn": bucket_arn(region, &bucket.name),
+                        "vectorBucketArn": bucket_arn(region, account, &bucket.name),
                         "creationTime": seconds(bucket.created_ms),
                     }));
                 }
@@ -581,14 +694,14 @@ fn dispatch(
             Ok(response)
         }
         "DeleteVectorBucket" => {
-            let bucket = bucket_of(input, region)?;
-            engine
+            let bucket = owned_bucket(caller, input, region, account)?.name;
+            caller
                 .vector(|file| file.transaction(|tx| tx.delete_bucket(&bucket)))?
                 .map_err(vector_error)?;
             Ok(json!({}))
         }
         "CreateIndex" => {
-            let bucket = bucket_of(input, region)?;
+            let bucket = owned_bucket(caller, input, region, account)?.name;
             let name = string(input, "indexName")?
                 .ok_or_else(|| VError::validation("indexName is required."))?;
             if string(input, "dataType")? != Some("float32") {
@@ -635,17 +748,17 @@ fn dispatch(
                 metric,
                 non_filterable,
             };
-            let index = engine
+            let index = caller
                 .vector(|file| file.transaction(|tx| tx.create_index(&bucket, &new, now_ms())))?
                 .map_err(vector_error)?;
-            Ok(json!({ "indexArn": index_arn(region, &index.bucket, &index.name) }))
+            Ok(json!({ "indexArn": index_arn(region, account, &index.bucket, &index.name) }))
         }
         "GetIndex" => {
-            let index = index_of(engine, input, region)?;
+            let index = index_of(caller, input, region, account)?;
             let mut out = json!({
                 "vectorBucketName": index.bucket,
                 "indexName": index.name,
-                "indexArn": index_arn(region, &index.bucket, &index.name),
+                "indexArn": index_arn(region, account, &index.bucket, &index.name),
                 "creationTime": seconds(index.created_ms),
                 "dataType": "float32",
                 "dimension": index.dimension,
@@ -659,12 +772,7 @@ fn dispatch(
             Ok(json!({ "index": out }))
         }
         "ListIndexes" => {
-            let bucket = bucket_of(input, region)?;
-            if engine.vector(|file| file.bucket(&bucket))?.is_none() {
-                return Err(VError::not_found(format!(
-                    "The vector bucket {bucket} does not exist."
-                )));
-            }
+            let bucket = owned_bucket(caller, input, region, account)?.name;
             let limit = integer(input, "maxResults", 1..=500)?.unwrap_or(500) as usize;
             let prefix = prefix(input)?;
             let mut after = untoken(input)?;
@@ -672,7 +780,7 @@ fn dispatch(
             let mut more = false;
             'pages: loop {
                 let page =
-                    engine.vector(|file| file.list_indexes(&bucket, after.as_deref(), 500))?;
+                    caller.vector(|file| file.list_indexes(&bucket, after.as_deref(), 500))?;
                 let last_page = page.len() < 500;
                 for index in page {
                     after = Some(index.name.clone());
@@ -689,7 +797,7 @@ fn dispatch(
                     out.push(json!({
                         "vectorBucketName": index.bucket,
                         "indexName": index.name,
-                        "indexArn": index_arn(region, &index.bucket, &index.name),
+                        "indexArn": index_arn(region, account, &index.bucket, &index.name),
                         "creationTime": seconds(index.created_ms),
                     }));
                 }
@@ -704,14 +812,14 @@ fn dispatch(
             Ok(response)
         }
         "DeleteIndex" => {
-            let index = index_of(engine, input, region)?;
-            engine
+            let index = index_of(caller, input, region, account)?;
+            caller
                 .vector(|file| file.transaction(|tx| tx.delete_index(&index.bucket, &index.name)))?
                 .map_err(vector_error)?;
             Ok(json!({}))
         }
         "PutVectors" => {
-            let index = index_of(engine, input, region)?;
+            let index = index_of(caller, input, region, account)?;
             let items = input
                 .get("vectors")
                 .and_then(Value::as_array)
@@ -734,24 +842,24 @@ fn dispatch(
             // As many transactions as the batch takes.
             let mut from = 0;
             while from < vectors.len() {
-                from = engine
+                from = caller
                     .vector(|file| file.transaction(|tx| tx.put_vectors(&index, &vectors, from)))?
                     .map_err(vector_error)?;
             }
             Ok(json!({}))
         }
         "GetVectors" => {
-            let index = index_of(engine, input, region)?;
+            let index = index_of(caller, input, region, account)?;
             let keys = keys(input, 100)?;
             let (data, metadata) = (
                 boolean(input, "returnData")?,
                 boolean(input, "returnMetadata")?,
             );
-            let entries = engine.vector(|file| file.get_vectors(&index, &keys, data, metadata))?;
+            let entries = caller.vector(|file| file.get_vectors(&index, &keys, data, metadata))?;
             Ok(json!({ "vectors": entries.into_iter().map(entry_json).collect::<Vec<_>>() }))
         }
         "ListVectors" => {
-            let index = index_of(engine, input, region)?;
+            let index = index_of(caller, input, region, account)?;
             let limit = integer(input, "maxResults", 1..=1000)?.unwrap_or(500) as usize;
             let (segments, segment) = match (
                 integer(input, "segmentCount", 1..=16)?,
@@ -779,7 +887,7 @@ fn dispatch(
             let mut keys = Vec::new();
             let mut more = false;
             'pages: loop {
-                let page = engine.vector(|file| {
+                let page = caller.vector(|file| {
                     file.list_vectors(&index, after.as_deref(), 1000, false, false)
                 })?;
                 let last_page = page.len() < 1000;
@@ -800,7 +908,7 @@ fn dispatch(
             }
             let next = more.then(|| keys.last().map(|key| token(key))).flatten();
             let out = if data || metadata {
-                engine.vector(|file| file.get_vectors(&index, &keys, data, metadata))?
+                caller.vector(|file| file.get_vectors(&index, &keys, data, metadata))?
             } else {
                 keys.into_iter()
                     .map(|key| truthdb_vector::VectorEntry {
@@ -818,18 +926,18 @@ fn dispatch(
             Ok(response)
         }
         "DeleteVectors" => {
-            let index = index_of(engine, input, region)?;
+            let index = index_of(caller, input, region, account)?;
             let keys = keys(input, 500)?;
             let mut from = 0;
             while from < keys.len() {
-                from = engine
+                from = caller
                     .vector(|file| file.transaction(|tx| tx.delete_vectors(&index, &keys, from)))?
                     .map_err(vector_error)?;
             }
             Ok(json!({}))
         }
         "QueryVectors" => {
-            let index = index_of(engine, input, region)?;
+            let index = index_of(caller, input, region, account)?;
             let top_k = integer(input, "topK", 1..=10_000)?
                 .ok_or_else(|| VError::validation("topK is required."))?
                 as usize;
@@ -856,7 +964,7 @@ fn dispatch(
                 })?;
             loop {
                 let done =
-                    engine
+                    caller
                         .vector(|file| Ok(query.step(file, 512)))?
                         .map_err(|err| match err {
                             QueryError::Invalid(message) => VError::validation(message),
@@ -866,7 +974,7 @@ fn dispatch(
                     break;
                 }
             }
-            let hits = engine.vector(|file| query.finish(file, with_metadata))?;
+            let hits = caller.vector(|file| query.finish(file, with_metadata))?;
             let page: Vec<Value> = hits
                 .iter()
                 .map(|hit| {

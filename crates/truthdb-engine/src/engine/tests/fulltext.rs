@@ -99,7 +99,9 @@ fn enabling_backfills_text_objects_and_skips_the_rest() {
     let path = unique_temp_path("ft-backfill");
     let engine = new_engine(&path);
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("docs", truthdb_object::DEFAULT_ACCOUNT, now()))
+        })
         .unwrap()
         .unwrap();
     // More keys than one backfill pass takes.
@@ -194,8 +196,10 @@ fn the_journal_keeps_the_index_on_each_keys_latest_version() {
     engine
         .object(|file| {
             file.transaction(|tx| {
-                tx.create_bucket("plain", now())?.unwrap();
-                tx.create_bucket("hist", now())?.unwrap();
+                tx.create_bucket("plain", truthdb_object::DEFAULT_ACCOUNT, now())?
+                    .unwrap();
+                tx.create_bucket("hist", truthdb_object::DEFAULT_ACCOUNT, now())?
+                    .unwrap();
                 tx.set_versioning("hist", Versioning::Enabled)
             })
         })
@@ -268,7 +272,9 @@ fn the_journal_keeps_the_index_on_each_keys_latest_version() {
 
     // A bucket that is not indexed is left alone.
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("other", now())))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("other", truthdb_object::DEFAULT_ACCOUNT, now()))
+        })
         .unwrap()
         .unwrap();
     put(&engine, "other", "x", b"red", "text/plain");
@@ -283,7 +289,9 @@ fn a_restart_or_a_row_applied_twice_changes_nothing() {
     let path = unique_temp_path("ft-restart");
     let engine = new_engine(&path);
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("docs", truthdb_object::DEFAULT_ACCOUNT, now()))
+        })
         .unwrap()
         .unwrap();
     command(&engine, "s3 enable fulltext docs");
@@ -350,7 +358,9 @@ fn a_document_too_large_for_one_transaction_is_indexed_over_several() {
     let path = unique_temp_path("ft-big-doc");
     let engine = small_ring_engine(&path);
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("docs", truthdb_object::DEFAULT_ACCOUNT, now()))
+        })
         .unwrap()
         .unwrap();
     command(&engine, "s3 enable fulltext docs");
@@ -383,7 +393,9 @@ fn purging_a_large_index_through_a_small_log_takes_bounded_transactions() {
     let path = unique_temp_path("ft-big-purge");
     let engine = small_ring_engine(&path);
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("docs", truthdb_object::DEFAULT_ACCOUNT, now()))
+        })
         .unwrap()
         .unwrap();
     command(&engine, "s3 enable fulltext docs");
@@ -421,7 +433,9 @@ fn a_pass_from_before_a_re_enable_changes_nothing() {
     let path = unique_temp_path("ft-generation");
     let engine = new_engine(&path);
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("docs", truthdb_object::DEFAULT_ACCOUNT, now()))
+        })
         .unwrap()
         .unwrap();
     for n in 0..100 {
@@ -499,7 +513,9 @@ fn a_key_deleted_while_a_stale_pass_ran_is_removed_by_the_new_backfill() {
     let path = unique_temp_path("ft-stale-delete");
     let engine = new_engine(&path);
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("docs", truthdb_object::DEFAULT_ACCOUNT, now()))
+        })
         .unwrap()
         .unwrap();
     command(&engine, "s3 enable fulltext docs");
@@ -533,7 +549,9 @@ fn a_key_deleted_while_a_stale_pass_ran_is_removed_by_the_new_backfill() {
     let path = unique_temp_path("ft-stale-partial");
     let engine = small_ring_engine(&path);
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("docs", truthdb_object::DEFAULT_ACCOUNT, now()))
+        })
         .unwrap()
         .unwrap();
     command(&engine, "s3 enable fulltext docs");
@@ -577,7 +595,9 @@ fn a_stopped_pass_leaves_nothing_skipped() {
     let path = unique_temp_path("ft-stop");
     let engine = small_ring_engine(&path);
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("docs", now())))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("docs", truthdb_object::DEFAULT_ACCOUNT, now()))
+        })
         .unwrap()
         .unwrap();
     command(&engine, "s3 enable fulltext docs");
