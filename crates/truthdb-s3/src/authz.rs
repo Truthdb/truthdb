@@ -16,7 +16,7 @@ use truthdb_iam::{Context, Decision, Identity, Policy, PolicyKind, evaluate};
 use truthdb_object::{BUCKET_POLICY, ObjFile, VersionSel};
 
 use crate::error::S3Error;
-use crate::server::{Connection, Principal, S3State};
+use crate::server::{Connection, Principal, S3State, Signed};
 
 /// A bucket as authorization sees it.
 #[derive(Debug, Clone)]
@@ -193,7 +193,7 @@ fn context(
     raw_query: &str,
     query: &[(String, String)],
     connection: Option<Connection>,
-    signed_at: Option<&str>,
+    signed: Option<Signed>,
     now_ms: u64,
 ) -> Context {
     let mut context = Context::default();
@@ -209,14 +209,11 @@ fn context(
     one("aws:EpochTime", (now_ms / 1000).to_string());
     // The signature's keys, for a signed request only (an anonymous one has
     // none: a condition on them sees them absent).
-    if let Some(amz_date) = signed_at {
-        one("s3:authType", "REST-HEADER".to_string());
+    if let Some(signed) = signed {
+        one("s3:authType", signed.auth_type.to_string());
         one("s3:signatureversion", "AWS4-HMAC-SHA256".to_string());
-        if let Some(signed) = crate::server::parse_amz_date(amz_date) {
-            one(
-                "s3:signatureAge",
-                now_ms.saturating_sub(signed * 1000).to_string(),
-            );
+        if let Some(at_ms) = signed.at_ms {
+            one("s3:signatureAge", now_ms.saturating_sub(at_ms).to_string());
         }
     }
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
@@ -277,6 +274,7 @@ impl Authz {
     pub async fn load(
         state: &S3State,
         principal: Option<&Principal>,
+        signed: Option<Signed>,
         headers: &HeaderMap,
         raw_query: &str,
         connection: Option<Connection>,
@@ -294,15 +292,7 @@ impl Authz {
             raw_query,
             &crate::listing::query_params(raw_query),
             connection,
-            match principal {
-                Some(_) => Some(
-                    headers
-                        .get("x-amz-date")
-                        .and_then(|value| value.to_str().ok())
-                        .unwrap_or(""),
-                ),
-                None => None,
-            },
+            signed,
             crate::objects::now_ms(),
         );
         Ok(Authz {

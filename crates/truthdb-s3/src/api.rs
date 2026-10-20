@@ -205,6 +205,7 @@ pub async fn dispatch(
     let authz = Authz::load(
         state,
         principal.as_ref(),
+        auth.signed,
         request.headers(),
         &raw_query,
         connection,
@@ -282,6 +283,7 @@ async fn account_public_access(
     let authz = Authz::load(
         state,
         Some(&principal),
+        auth.signed,
         request.headers(),
         "",
         request.extensions().get::<Connection>().copied(),
@@ -564,14 +566,15 @@ async fn route(
                 versioned(&request, "s3:GetObject", "s3:GetObjectVersion"),
                 Object(&bucket, &key),
             )?;
-            crate::objects::get_object(state, request, bucket, key, false).await
+            crate::objects::get_object(state, request, bucket, key, false, principal.is_some())
+                .await
         }
         (Target::Object(bucket, key), Method::HEAD) => {
             authz.check(
                 versioned(&request, "s3:GetObject", "s3:GetObjectVersion"),
                 Object(&bucket, &key),
             )?;
-            crate::objects::get_object(state, request, bucket, key, true).await
+            crate::objects::get_object(state, request, bucket, key, true, principal.is_some()).await
         }
         (Target::Object(bucket, key), Method::DELETE) => {
             authz.check(

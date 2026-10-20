@@ -155,10 +155,16 @@ fn native(port: u16, command: &str) -> serde_json::Value {
 }
 
 fn amz_now() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
+    sigv4_date(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs(),
+    )
+}
+
+/// Seconds since the epoch as an `x-amz-date`.
+fn sigv4_date(secs: u64) -> String {
     let (days, rem) = (secs / 86_400, secs % 86_400);
     // Civil date from days since 1970 (Howard Hinnant's algorithm).
     let z = days + 719_468;
@@ -1370,7 +1376,7 @@ fn anonymous_access_follows_bucket_policies_and_block_public_access() {
             None
         )
         .0,
-        403
+        400
     );
     // A grant pinned to the anonymous caller's own userid is public.
     let userid = r#"{"Statement": {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
@@ -1418,6 +1424,335 @@ fn anonymous_access_follows_bucket_policies_and_block_public_access() {
         403
     );
     assert_eq!(anonymous("GET", "/open/k"), 403);
+}
+
+/// A presigned URL's path and query for `method` on `path`: SigV4 in the
+/// query string, as the SDKs' presigners build it, signed at `amz_date` for
+/// `expires` seconds. `extra` are more (unsigned-by-name) query parameters.
+#[allow(clippy::too_many_arguments)]
+fn presign(
+    port: u16,
+    method: &str,
+    path: &str,
+    extra: &str,
+    key: &str,
+    secret: &str,
+    amz_date: &str,
+    expires: u64,
+) -> String {
+    let credential = sigv4::Credential {
+        access_key: key.to_string(),
+        date: amz_date[..8].to_string(),
+        region: "us-east-1".to_string(),
+        service: "s3".to_string(),
+    };
+    let encode = |text: &str| {
+        percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC).to_string()
+    };
+    let mut query = format!(
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={amz_date}&X-Amz-Expires={expires}&X-Amz-SignedHeaders=host",
+        encode(&format!("{key}/{}", credential.scope()))
+    );
+    if !extra.is_empty() {
+        query = format!("{extra}&{query}");
+    }
+    let headers = vec![("host".to_string(), format!("127.0.0.1:{port}"))];
+    let canonical = sigv4::canonical_request(
+        method,
+        path,
+        &query,
+        &headers,
+        &["host".to_string()],
+        sigv4::UNSIGNED_PAYLOAD,
+    )
+    .unwrap();
+    let signature = sigv4::sign(
+        &sigv4::signing_key(secret, &credential),
+        &sigv4::string_to_sign(amz_date, &credential.scope(), &canonical),
+    );
+    format!("{path}?{query}&X-Amz-Signature={signature}")
+}
+
+/// Sends a request to a presigned `target` (path and query), with no
+/// Authorization header; returns the response head and the status and body.
+fn send_presigned(port: u16, method: &str, target: &str, body: &[u8]) -> (String, (u16, String)) {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let request = format!(
+        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(request.as_bytes()).expect("send");
+    stream.write_all(body).expect("send body");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read");
+    let response = latin1(&raw);
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .map(|(head, body)| (head.to_string(), body.to_string()))
+        .unwrap_or_default();
+    (head, (status, body))
+}
+
+#[test]
+fn presigned_urls_grant_their_request_until_they_expire() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    assert_eq!(
+        send(port, "PUT", "/shr", "", b"", &key, Some(&secret)).0,
+        200
+    );
+    assert_eq!(
+        send(
+            port,
+            "PUT",
+            "/shr/doc.txt",
+            "",
+            b"shared",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        200
+    );
+    let now = amz_now();
+
+    // A download, with response headers chosen by the URL.
+    let url = presign(
+        port,
+        "GET",
+        "/shr/doc.txt",
+        "response-content-type=text%2Fplain&response-content-disposition=attachment",
+        &key,
+        &secret,
+        &now,
+        3600,
+    );
+    let (head, (status, body)) = send_presigned(port, "GET", &url, b"");
+    assert_eq!((status, body.as_str()), (200, "shared"), "{head}");
+    assert_eq!(
+        response_header(&head, "content-type").as_deref(),
+        Some("text/plain")
+    );
+    assert_eq!(
+        response_header(&head, "content-disposition").as_deref(),
+        Some("attachment")
+    );
+    // An upload.
+    let url = presign(
+        port,
+        "PUT",
+        "/shr/upload.bin",
+        "",
+        &key,
+        &secret,
+        &now,
+        3600,
+    );
+    assert_eq!(send_presigned(port, "PUT", &url, b"uploaded").1.0, 200);
+    assert_eq!(
+        get(port, "/shr/upload.bin", &key, Some(&secret)),
+        (200, "uploaded".to_string())
+    );
+
+    // The URL is for its request only: another method, path or parameter
+    // does not verify.
+    let url = presign(port, "GET", "/shr/doc.txt", "", &key, &secret, &now, 3600);
+    assert_eq!(send_presigned(port, "DELETE", &url, b"").1.0, 403);
+    assert_eq!(
+        send_presigned(port, "GET", &url.replace("doc.txt", "upload.bin"), b"")
+            .1
+            .0,
+        403
+    );
+    assert_eq!(
+        send_presigned(port, "GET", &format!("{url}&response-content-type=x"), b"")
+            .1
+            .0,
+        403
+    );
+
+    // A parameter name written encoded is refused, rather than signed as one
+    // operation and served as another (`%74agging` is `tagging` signed).
+    let url = presign(
+        port,
+        "DELETE",
+        "/shr/doc.txt",
+        "tagging=",
+        &key,
+        &secret,
+        &now,
+        3600,
+    );
+    let (status, _) = send_presigned(
+        port,
+        "DELETE",
+        &url.replacen("tagging=", "%74agging=", 1),
+        b"",
+    )
+    .1;
+    assert_eq!(status, 400);
+    assert_eq!(
+        get(port, "/shr/doc.txt", &key, Some(&secret)).0,
+        200,
+        "not deleted"
+    );
+    // An override must be a valid header value.
+    let url = presign(
+        port,
+        "GET",
+        "/shr/doc.txt",
+        "response-content-type=a%0D%0AX-Injected%3A%201",
+        &key,
+        &secret,
+        &now,
+        3600,
+    );
+    let (status, body) = send_presigned(port, "GET", &url, b"").1;
+    assert_eq!(status, 400, "{body}");
+    // A payload hash the URL fixes must be one.
+    let url = presign(
+        port,
+        "PUT",
+        "/shr/x",
+        "X-Amz-Content-Sha256=STREAMING-UNSIGNED-PAYLOAD-TRAILER",
+        &key,
+        &secret,
+        &now,
+        3600,
+    );
+    assert_eq!(send_presigned(port, "PUT", &url, b"x").1.0, 400);
+
+    // Time bounds: expired, not yet valid, longer than seven days.
+    let epoch = sigv4_date;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs();
+    let old = epoch(now_secs - 7200);
+    let url = presign(port, "GET", "/shr/doc.txt", "", &key, &secret, &old, 3600);
+    let (status, body) = send_presigned(port, "GET", &url, b"").1;
+    assert_eq!(status, 403);
+    assert!(body.contains("expired"), "{body}");
+    let ahead = epoch(now_secs + 3600);
+    let url = presign(port, "GET", "/shr/doc.txt", "", &key, &secret, &ahead, 3600);
+    assert_eq!(send_presigned(port, "GET", &url, b"").1.0, 403);
+    let url = presign(
+        port,
+        "GET",
+        "/shr/doc.txt",
+        "",
+        &key,
+        &secret,
+        &now,
+        604_801,
+    );
+    assert_eq!(send_presigned(port, "GET", &url, b"").1.0, 400);
+
+    // A policy can refuse presigned access; header-signed requests go on.
+    let (account, owner_key, owner_secret) = account_with_key(&server, "acme");
+    assert_eq!(
+        send(
+            port,
+            "PUT",
+            "/acme-docs",
+            "",
+            b"",
+            &owner_key,
+            Some(&owner_secret)
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        send(
+            port,
+            "PUT",
+            "/acme-docs/d",
+            "",
+            b"x",
+            &owner_key,
+            Some(&owner_secret)
+        )
+        .0,
+        200
+    );
+    let no_urls = r#"{"Statement": {"Effect": "Deny", "Principal": "*", "Action": "s3:*", "Resource": "arn:aws:s3:::acme-docs/*",
+        "Condition": {"StringEquals": {"s3:authType": "REST-QUERY-STRING"}}}}"#;
+    assert_eq!(
+        send(
+            port,
+            "PUT",
+            "/acme-docs",
+            "policy",
+            no_urls.as_bytes(),
+            &owner_key,
+            Some(&owner_secret)
+        )
+        .0,
+        204
+    );
+    let url = presign(
+        port,
+        "GET",
+        "/acme-docs/d",
+        "",
+        &owner_key,
+        &owner_secret,
+        &now,
+        600,
+    );
+    assert_eq!(send_presigned(port, "GET", &url, b"").1.0, 403);
+    assert_eq!(
+        get(port, "/acme-docs/d", &owner_key, Some(&owner_secret)).0,
+        200
+    );
+
+    // Dropping the key revokes its URLs.
+    let url = presign(port, "GET", "/shr/doc.txt", "", &key, &secret, &now, 3600);
+    assert_eq!(send_presigned(port, "GET", &url, b"").1.0, 200);
+    native(server.native_port, &format!("s3 drop access key {key}"));
+    assert_eq!(send_presigned(port, "GET", &url, b"").1.0, 403);
+    // And an anonymous request may not choose response headers, even for
+    // an object it may read.
+    let _ = account;
+    let open = b"<PublicAccessBlockConfiguration/>";
+    let public = r#"{"Statement": {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::acme-docs/*"}}"#;
+    assert_eq!(
+        send(
+            port,
+            "PUT",
+            "/acme-docs",
+            "publicAccessBlock",
+            open,
+            &owner_key,
+            Some(&owner_secret)
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        send(
+            port,
+            "PUT",
+            "/acme-docs",
+            "policy",
+            public.as_bytes(),
+            &owner_key,
+            Some(&owner_secret)
+        )
+        .0,
+        204
+    );
+    assert_eq!(get(port, "/acme-docs/d", "", None).0, 200);
+    assert_eq!(
+        get(port, "/acme-docs/d?response-content-type=x", "", None).0,
+        400
+    );
 }
 
 #[test]

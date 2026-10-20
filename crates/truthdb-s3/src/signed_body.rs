@@ -81,6 +81,7 @@ pub async fn read(
         &auth,
         &amz_date,
         &hash,
+        parts.uri.query().unwrap_or(""),
     )
     .await?;
     drop(held);
