@@ -10,6 +10,18 @@
 //!   NULL; a column the first file lacks is an error), or by position
 //!   without headers. A short row is padded with NULLs; a longer one is an
 //!   error.
+//! - **Parquet**: typed columns from the file's schema (integers, `real`,
+//!   `float`, `decimal`, `bit`, `date`, `time`, `datetime2`, text and
+//!   binary); nested groups, lists and maps are their JSON text. A value
+//!   outside its SQL type's range (a date past 9999, a decimal with more
+//!   digits than declared) is an error. A later file in prefix mode is
+//!   matched by column name. Snappy, gzip, LZ4 and Brotli pages are read;
+//!   Zstandard is not. A page may decompress to at most 256 MiB over the
+//!   number of leaf columns (and at least 1 MiB), and a file may have at
+//!   most 1,024 leaf columns, and one row at most about a million values
+//!   in its repeated columns. INT96 timestamps keep milliseconds only, and a
+//!   nanosecond timestamp nested in a group is its number in the JSON text
+//!   (the record reader gives both no more than that).
 //! - **JSON**: JSON Lines or concatenated values, or one top-level array
 //!   whose elements are the records. Object records give one column per key,
 //!   in the order first seen in the first 100 records (later keys are left
@@ -59,7 +71,7 @@ const LIST_KEYS: usize = 1024;
 /// The key column a prefix read adds.
 const KEY_COLUMN: &str = "_s3_key";
 
-fn read_error(message: impl Into<String>) -> SqlError {
+pub(super) fn read_error(message: impl Into<String>) -> SqlError {
     SqlError::new(4864, 16, 1, message)
 }
 
@@ -67,6 +79,7 @@ fn read_error(message: impl Into<String>) -> SqlError {
 enum Format {
     Csv,
     Json,
+    Parquet,
 }
 
 #[derive(Debug, Clone)]
@@ -136,12 +149,12 @@ fn parse_options(text: Option<&str>) -> Result<Options, SqlError> {
 /// leased in one lock hold, then read a chunk per lock hold (from the plain
 /// part holding each byte, for a multipart body). The lease goes with the
 /// reader.
-struct BodyReader {
+pub(super) struct BodyReader {
     core: Arc<Storage>,
     body: u64,
     layout: Vec<(u64, u64, u64)>,
-    size: u64,
-    pos: u64,
+    pub(super) size: u64,
+    pub(super) pos: u64,
 }
 
 /// The object is not there (any more): error 208.
@@ -247,23 +260,33 @@ impl Read for GuardedReader {
     }
 }
 
-type Rows = Box<dyn Iterator<Item = Result<Vec<Datum>, SqlError>> + Send>;
+pub(super) type Rows = Box<dyn Iterator<Item = Result<Vec<Datum>, SqlError>> + Send>;
 
 /// What rows are read as: the first object fixes it.
 #[derive(Debug, Clone)]
-enum Schema {
+pub(super) enum Schema {
     /// The (unique) column names.
     Csv(Vec<String>),
     /// Object records' keys, or `None` for one `value` column.
     Json(Option<Vec<String>>),
+    /// The top-level fields and their column types.
+    Parquet(Vec<(String, ColumnType)>),
 }
 
 impl Schema {
-    fn columns(&self) -> Vec<String> {
+    pub(super) fn columns(&self) -> Vec<String> {
         match self {
             Schema::Csv(names) => names.clone(),
             Schema::Json(Some(keys)) => keys.clone(),
             Schema::Json(None) => vec!["value".to_string()],
+            Schema::Parquet(fields) => fields.iter().map(|(name, _)| name.clone()).collect(),
+        }
+    }
+
+    pub(super) fn types(&self) -> Vec<ColumnType> {
+        match self {
+            Schema::Parquet(fields) => fields.iter().map(|(_, column_type)| *column_type).collect(),
+            other => vec![ColumnType::NVarCharMax; other.columns().len()],
         }
     }
 }
@@ -571,6 +594,7 @@ fn object_rows(
     match format {
         Format::Csv => csv_rows(reader, progress, options, schema, key),
         Format::Json => json_rows(reader, progress, schema),
+        Format::Parquet => super::s3_parquet::rows(reader.into_inner().inner, schema, key),
     }
 }
 
@@ -589,9 +613,10 @@ pub(super) fn open(
     {
         "csv" => Format::Csv,
         "json" => Format::Json,
+        "parquet" => Format::Parquet,
         other => {
             return Err(read_error(format!(
-                "sys.s3_read reads 'csv' or 'json', not '{other}'."
+                "sys.s3_read reads 'csv', 'json' or 'parquet', not '{other}'."
             )));
         }
     };
@@ -636,7 +661,8 @@ pub(super) fn open(
         columns.extend(
             unique_names(&names, reserved)
                 .iter()
-                .map(|name| text_column(name, ColumnType::NVarCharMax)),
+                .zip(schema.types())
+                .map(|(name, column_type)| text_column(name, column_type)),
         );
     }
     Ok(ExternalRowset {
