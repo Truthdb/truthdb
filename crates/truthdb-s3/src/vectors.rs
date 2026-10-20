@@ -13,12 +13,16 @@
 //! As AWS's SDKs send no `x-amz-content-sha256` for this service, the body
 //! is read (at most 20 MiB) and hashed before the signature is checked: so
 //! the access key must exist first, the read must finish within a minute,
-//! and at most 16 requests read bodies at once (the rest are told to retry).
+//! and the bytes of all bodies not yet verified are bounded (past that, a
+//! request is told to retry). A body is parsed only once it has at most
+//! [`MAX_JSON_VALUES`] values, which bounds the memory a parse takes.
 //!
 //! A QueryVectors response holds all its results (no `nextToken`): one scan
 //! per query, and no pages drawn from a moving index. A PutVectors or
 //! DeleteVectors batch is written over as many transactions as it takes, so
 //! a failure part way leaves the vectors before it written.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
@@ -41,9 +45,14 @@ const MAX_BODY: usize = 20 << 20;
 const ACCOUNT: &str = "000000000000";
 /// How long a request body may take to arrive.
 const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// Requests that may read their bodies (before their signature can be
-/// checked) at once: at most this many times [`MAX_BODY`] of memory.
-static READING: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(16);
+/// Bytes of request bodies held before their signatures are checked, and
+/// their bound: a client that knows only an access key id must send this
+/// much within [`BODY_TIMEOUT`] to turn others away.
+static UNVERIFIED: AtomicUsize = AtomicUsize::new(0);
+const UNVERIFIED_MAX: usize = 16 * MAX_BODY;
+/// The most values (of 32 bytes each, parsed) a request body may hold:
+/// more than the largest PutVectors needs (500 vectors of 4096 numbers).
+const MAX_JSON_VALUES: usize = 4 << 20;
 
 /// An S3 Vectors error: HTTP status, error type and message.
 #[derive(Debug)]
@@ -124,8 +133,8 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, VEr
     let (auth, amz_date) = signed_request(state, &request, "s3vectors")?;
     check_signed_headers(&request, &auth, &["host", "x-amz-date"])?;
     // The signature covers the body, which must be read first: refuse an
-    // unknown key before that, and bound how many bodies are read at once and
-    // for how long.
+    // unknown key before that, and bound the unverified bytes held and for
+    // how long.
     let access_key = auth.credential.access_key.clone();
     if state
         .engine
@@ -137,15 +146,9 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, VEr
     {
         return Err(S3Error::invalid_access_key().into());
     }
-    let Ok(_reading) = READING.try_acquire() else {
-        return Err(VError::new(
-            503,
-            "ServiceUnavailableException",
-            "The service is busy; retry the request.",
-        ));
-    };
+    let mut held = Unverified(0);
     let (parts, body) = request.into_parts();
-    let body = tokio::time::timeout(BODY_TIMEOUT, read_body(body))
+    let body = tokio::time::timeout(BODY_TIMEOUT, read_body(body, &mut held))
         .await
         .map_err(|_| {
             VError::new(
@@ -173,12 +176,17 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, VEr
         &hash,
     )
     .await?;
+    drop(held);
     let operation = parts.uri.path().trim_start_matches('/').to_string();
     if parts.method != Method::POST {
         return Err(not_implemented(&operation));
     }
     let input: Map<String, Value> = if body.is_empty() {
         Map::new()
+    } else if json_values(&body) > MAX_JSON_VALUES {
+        return Err(VError::validation(format!(
+            "The request body holds more than {MAX_JSON_VALUES} JSON values."
+        )));
     } else {
         match serde_json::from_slice(&body) {
             Ok(Value::Object(map)) => map,
@@ -200,19 +208,75 @@ fn not_implemented(operation: &str) -> VError {
     )
 }
 
-async fn read_body(body: Incoming) -> Result<Bytes, VError> {
-    let limited = http_body_util::Limited::new(body, MAX_BODY);
-    limited
-        .collect()
-        .await
-        .map(|collected| collected.to_bytes())
-        .map_err(|_| {
-            VError::new(
+/// Body bytes held before the signature is checked, counted in
+/// [`UNVERIFIED`] until dropped.
+struct Unverified(usize);
+
+impl Unverified {
+    fn take(&mut self, bytes: usize) -> bool {
+        if UNVERIFIED.fetch_add(bytes, Ordering::Relaxed) + bytes > UNVERIFIED_MAX {
+            UNVERIFIED.fetch_sub(bytes, Ordering::Relaxed);
+            return false;
+        }
+        self.0 += bytes;
+        true
+    }
+}
+
+impl Drop for Unverified {
+    fn drop(&mut self) {
+        UNVERIFIED.fetch_sub(self.0, Ordering::Relaxed);
+    }
+}
+
+/// Reads the body, counting its bytes in `held` as they arrive.
+async fn read_body(mut body: Incoming, held: &mut Unverified) -> Result<Bytes, VError> {
+    let mut out = Vec::new();
+    while let Some(frame) = body.frame().await {
+        let frame = frame.map_err(|_| VError::validation("The request body could not be read."))?;
+        let Ok(data) = frame.into_data() else {
+            continue;
+        };
+        if out.len() + data.len() > MAX_BODY {
+            return Err(VError::new(
                 413,
                 "ValidationException",
                 format!("The request body is larger than {MAX_BODY} bytes."),
-            )
-        })
+            ));
+        }
+        if !held.take(data.len()) {
+            return Err(VError::new(
+                503,
+                "ServiceUnavailableException",
+                "The service is busy; retry the request.",
+            ));
+        }
+        out.extend_from_slice(&data);
+    }
+    Ok(Bytes::from(out))
+}
+
+/// At least the number of values in a JSON text: one, plus one per comma
+/// and per opening bracket outside strings.
+fn json_values(text: &[u8]) -> usize {
+    let (mut count, mut in_string, mut escaped) = (1, false, false);
+    for &byte in text {
+        if in_string {
+            match byte {
+                _ if escaped => escaped = false,
+                b'\\' => escaped = true,
+                b'"' => in_string = false,
+                _ => {}
+            }
+        } else {
+            match byte {
+                b'"' => in_string = true,
+                b',' | b'[' | b'{' => count += 1,
+                _ => {}
+            }
+        }
+    }
+    count
 }
 
 fn hex(digest: &ring::digest::Digest) -> String {
@@ -529,10 +593,16 @@ fn dispatch(
             let metric = string(input, "distanceMetric")?
                 .and_then(DistanceMetric::parse)
                 .ok_or_else(|| VError::validation("distanceMetric must be euclidean or cosine."))?;
-            let non_filterable = match input
-                .get("metadataConfiguration")
-                .and_then(|config| config.get("nonFilterableMetadataKeys"))
-            {
+            let non_filterable = match input.get("metadataConfiguration") {
+                None | Some(Value::Null) => None,
+                Some(Value::Object(config)) => config.get("nonFilterableMetadataKeys"),
+                Some(_) => {
+                    return Err(VError::validation(
+                        "metadataConfiguration must be an object.",
+                    ));
+                }
+            };
+            let non_filterable = match non_filterable {
                 None | Some(Value::Null) => Vec::new(),
                 Some(Value::Array(items)) if items.is_empty() => {
                     return Err(VError::validation(

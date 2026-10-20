@@ -1503,6 +1503,13 @@ fn the_s3_vectors_api_manages_buckets_indexes_and_vectors_and_queries_them() {
             "CreateIndex",
             json!({
                 "vectorBucketName": "vb1", "indexName": "idx2", "dataType": "float32",
+                "dimension": 3, "distanceMetric": "cosine", "metadataConfiguration": "x"
+            }),
+        ),
+        (
+            "CreateIndex",
+            json!({
+                "vectorBucketName": "vb1", "indexName": "idx2", "dataType": "float32",
                 "dimension": 3, "distanceMetric": "cosine",
                 "metadataConfiguration": {"nonFilterableMetadataKeys": []}
             }),
@@ -1671,6 +1678,32 @@ fn the_s3_vectors_api_manages_buckets_indexes_and_vectors_and_queries_them() {
         .read_exact(&mut head)
         .expect("a reply before the body");
     assert_eq!(&head, b"HTTP/1.1 403");
+
+    // Clients that know the key id but not its secret, holding bodies open,
+    // turn no signed request away.
+    let slow: Vec<std::net::TcpStream> = (0..20)
+        .map(|_| {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            let request = format!(
+                "POST /ListVectorBuckets HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nx-amz-date: {amz_date}\r\nContent-Length: 1000\r\nAuthorization: AWS4-HMAC-SHA256 Credential={key}/{}/us-east-1/s3vectors/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature={}\r\n\r\n{{",
+                &amz_date[..8],
+                "0".repeat(64)
+            );
+            stream.write_all(request.as_bytes()).expect("send");
+            stream
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (status, kind, reply) = call("ListVectorBuckets", json!({}));
+    assert_eq!((status, kind.as_deref()), (200, None), "{reply}");
+    drop(slow);
+
+    // A body of more values than any request needs is refused unparsed.
+    let (status, kind, _) = call("ListVectorBuckets", json!({"junk": vec![0u8; 5 << 20]}));
+    assert_eq!(
+        (status, kind.as_deref()),
+        (400, Some("ValidationException"))
+    );
 
     // The S3 API on the same port is unchanged.
     assert_eq!(get(port, "/", &key, Some(&secret)).0, 200);
