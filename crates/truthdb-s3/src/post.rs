@@ -22,6 +22,7 @@ use hyper::body::Incoming;
 use hyper::header::{HeaderMap, HeaderName, HeaderValue};
 use hyper::{Request, Response, StatusCode};
 use serde_json::Value;
+use truthdb_object::{ObjectError, VersionSel};
 
 use crate::authz::{Authz, Resource};
 use crate::error::{S3Error, escape};
@@ -30,6 +31,14 @@ use crate::server::{Body, Connection, Principal, S3State, Signed, full};
 
 /// The most bytes of fields before the file.
 const MAX_FIELDS: usize = 20 * 1024;
+
+/// What a key keeps unencoded in the response's Location.
+const LOCATION: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'/');
 
 /// Whether a request is a form upload: a POST of `multipart/form-data`.
 pub fn is_form(request: &Request<Incoming>) -> bool {
@@ -75,6 +84,41 @@ impl Form {
         Ok(false)
     }
 
+    /// Where the buffer's first delimiter starts: one followed by CRLF or
+    /// `--` (the boundary followed by anything else is data). `Err(n)`: none
+    /// is complete yet, and the first `n` bytes cannot be part of one.
+    fn delimiter(&self) -> Result<usize, usize> {
+        let mut from = 0;
+        while let Some(found) = self.buf[from..]
+            .windows(self.delimiter.len())
+            .position(|w| w == self.delimiter.as_slice())
+        {
+            let at = from + found;
+            let after = &self.buf[at + self.delimiter.len()..];
+            if after.starts_with(b"\r\n") || after.starts_with(b"--") {
+                return Ok(at);
+            }
+            if after.is_empty() || after == b"\r" || after == b"-" {
+                return Err(at);
+            }
+            from = at + 1;
+        }
+        Err(from.max((self.buf.len() + 1).saturating_sub(self.delimiter.len())))
+    }
+
+    /// The position of the next delimiter, reading until it is there
+    /// (`None` past `limit` bytes or at the end).
+    async fn find_delimiter(&mut self, limit: usize) -> Result<Option<usize>, S3Error> {
+        loop {
+            if let Ok(at) = self.delimiter() {
+                return Ok(Some(at));
+            }
+            if self.buf.len() > limit || !self.fill().await? {
+                return Ok(None);
+            }
+        }
+    }
+
     /// The position of `needle` in the buffer, reading until it is there
     /// (`None` past `limit` bytes or at the end).
     async fn find(&mut self, needle: &[u8], limit: usize) -> Result<Option<usize>, S3Error> {
@@ -95,12 +139,41 @@ fn disposition(headers: &str) -> Option<(String, Option<String>)> {
         line.to_ascii_lowercase()
             .starts_with("content-disposition:")
     })?;
+    // `; key=value` parameters, a quoted value holding `;` and `\"`.
+    let mut params: Vec<(String, String)> = Vec::new();
+    let mut rest = line.split_once(';')?.1;
+    while let Some((key, after)) = rest.split_once('=') {
+        let key = key.trim().to_ascii_lowercase();
+        let after = after.trim_start();
+        let value;
+        if let Some(quoted) = after.strip_prefix('"') {
+            let mut text = String::new();
+            let mut chars = quoted.char_indices();
+            let mut end = quoted.len();
+            while let Some((at, c)) = chars.next() {
+                match c {
+                    '\\' => text.extend(chars.next().map(|(_, c)| c)),
+                    '"' => {
+                        end = at + 1;
+                        break;
+                    }
+                    c => text.push(c),
+                }
+            }
+            value = text;
+            rest = quoted[end..].split_once(';').map_or("", |(_, rest)| rest);
+        } else {
+            let (text, after) = after.split_once(';').unwrap_or((after, ""));
+            value = text.trim().to_string();
+            rest = after;
+        }
+        params.push((key, value));
+    }
     let param = |name: &str| {
-        line.split(';').find_map(|part| {
-            let (key, value) = part.trim().split_once('=')?;
-            key.eq_ignore_ascii_case(name)
-                .then(|| value.trim().trim_matches('"').to_string())
-        })
+        params
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
     };
     Some((param("name")?, param("filename")))
 }
@@ -124,7 +197,7 @@ async fn read_fields(form: &mut Form) -> Result<(Vec<(String, String)>, String),
     let mut read = 0;
     loop {
         let at = form
-            .find(&delimiter, MAX_FIELDS.saturating_sub(read))
+            .find_delimiter(MAX_FIELDS.saturating_sub(read))
             .await?
             .ok_or_else(too_large)?;
         read += at + delimiter.len();
@@ -137,7 +210,6 @@ async fn read_fields(form: &mut Form) -> Result<(Vec<(String, String)>, String),
         }
         form.buf.drain(..at + delimiter.len());
         // `--` after the boundary closes the form.
-        while form.buf.len() < 2 && form.fill().await? {}
         if form.buf.starts_with(b"--") {
             return Err(invalid("The form has no file field."));
         }
@@ -152,6 +224,10 @@ async fn read_fields(form: &mut Form) -> Result<(Vec<(String, String)>, String),
             disposition(&headers).ok_or_else(|| invalid("A form part has no name."))?;
         if name.eq_ignore_ascii_case("file") {
             return Ok((fields, filename.unwrap_or_default()));
+        }
+        // Each field is read once, so that the policy checks the value used.
+        if field(&fields, &name).is_some() {
+            return Err(invalid(format!("The form has more than one {name} field.")));
         }
         pending = Some(name);
     }
@@ -361,6 +437,7 @@ pub async fn post_object(
     bucket: String,
 ) -> Result<Response<Body>, S3Error> {
     let connection = request.extensions().get::<Connection>().copied();
+    let headers = request.headers().clone();
     let content_type = request
         .headers()
         .get("content-type")
@@ -428,7 +505,7 @@ pub async fn post_object(
             auth_type: "POST",
             at_ms: Some(*at_ms),
         }),
-        &HeaderMap::new(),
+        &headers,
         "",
         connection,
         vec![bucket.clone()],
@@ -447,22 +524,35 @@ pub async fn post_object(
         buckets: authz.owners(),
     };
     let redirect = field(&fields, "success_action_redirect").map(str::to_string);
+    // Refused before the upload, not after it is stored.
+    if let Some(redirect) = &redirect
+        && HeaderValue::from_str(redirect).is_err()
+    {
+        return Err(invalid("success_action_redirect is not a valid URL."));
+    }
     let status = field(&fields, "success_action_status").map(str::to_string);
     crate::scope::within(scope, async move {
         let (min, max) = bounds;
+        // Fail before reading the file when the bucket or key is wrong.
+        let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
+        let check = object(state, move |file| {
+            file.head_object(&lookup_bucket, &lookup_key, VersionSel::Latest)
+        })
+        .await?;
+        if let Err(err @ (ObjectError::NoSuchBucket | ObjectError::InvalidKey(_))) = check {
+            return Err(object_error(err, &bucket, &key));
+        }
         let mut sink = BodySink::begin(state).await?;
-        let delimiter = form.delimiter.clone();
         loop {
-            match form.buf.windows(delimiter.len()).position(|w| w == delimiter.as_slice()) {
-                Some(end) => {
+            match form.delimiter() {
+                Ok(end) => {
                     let rest = form.buf[..end].to_vec();
                     push_bounded(state, &mut sink, &rest, max).await?;
                     break;
                 }
-                None => {
+                Err(ready) => {
                     // Keep what could be the start of the delimiter.
-                    let keep = (delimiter.len() - 1).min(form.buf.len());
-                    let ready: Vec<u8> = form.buf.drain(..form.buf.len() - keep).collect();
+                    let ready: Vec<u8> = form.buf.drain(..ready).collect();
                     push_bounded(state, &mut sink, &ready, max).await?;
                     if !form.fill().await? {
                         return Err(invalid("The form ends inside the file."));
@@ -495,7 +585,10 @@ pub async fn post_object(
         .await?;
         let info = stored.map_err(|err| object_error(err, &bucket, &key))?;
         let etag = info.etag();
-        let location = format!("/{bucket}/{key}");
+        let location = format!(
+            "/{bucket}/{}",
+            percent_encoding::utf8_percent_encode(&key, LOCATION)
+        );
         let mut response = Response::builder().header("etag", &etag);
         if let Some(version) = version_header(versioning, info.version, info.null_version) {
             response = response.header("x-amz-version-id", version);
