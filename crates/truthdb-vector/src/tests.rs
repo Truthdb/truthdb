@@ -628,3 +628,43 @@ fn vectors_ship_to_a_standby_and_restore_from_a_log_backup() {
         std::fs::remove_file(p).ok();
     }
 }
+
+#[test]
+fn cosine_and_euclidean_distances_hold_for_extreme_magnitudes() {
+    let path = temp_path("extreme");
+    let storage = create(&path);
+    let index = setup(&storage, DistanceMetric::Cosine, 2);
+    let vector = |key: &str, data: [f32; 2]| VectorInput {
+        key: key.into(),
+        data: data.to_vec(),
+        metadata: None,
+    };
+    put(
+        &storage,
+        &index,
+        &[
+            vector("exact", [1.0, 1.0]),
+            vector("tiny", [1e-30, 0.0]),
+            vector("huge", [3e38, 3e38]),
+            vector("opposite", [-1.0, -1.0]),
+        ],
+    );
+    let hits = query(&storage, &index, vec![1.0, 1.0], 4, None);
+    let keys: Vec<&str> = hits.iter().map(|(key, _)| key.as_str()).collect();
+    assert!(
+        keys[..2].contains(&"exact") && keys[..2].contains(&"huge"),
+        "{hits:?}"
+    );
+    assert_eq!(&keys[2..], ["tiny", "opposite"]);
+    assert!(
+        hits.iter().all(|(_, distance)| distance.is_finite()),
+        "{hits:?}"
+    );
+    assert!((hits[2].1 - (1.0 - std::f32::consts::FRAC_1_SQRT_2)).abs() < 1e-6);
+    assert!((hits[3].1 - 2.0).abs() < 1e-6);
+    let hits = query(&storage, &index, vec![3e19, 0.0], 4, None);
+    assert_eq!(hits[0].0, "tiny");
+    assert!(hits[0].1.abs() < 1e-6, "{hits:?}");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

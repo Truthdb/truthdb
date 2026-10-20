@@ -16,16 +16,12 @@ use crate::{DATA_TREE, FILTER_TREE, VecFile};
 
 /// The most results one query returns.
 pub const MAX_TOP_K: usize = 10_000;
-/// The most vectors one query reads.
-pub const MAX_SCANNED: u64 = 1_000_000;
 /// Float32 values per data row (as stored).
 const FLOATS_PER_ROW: usize = 448;
 
 #[derive(Debug)]
 pub enum QueryError {
     Invalid(String),
-    /// The index holds more than [`MAX_SCANNED`] vectors.
-    TooManyVectors,
     Storage(StorageError),
 }
 
@@ -46,7 +42,8 @@ pub struct Hit {
 /// A candidate kept: the heap's greatest is the farthest.
 #[derive(Debug, Clone, Copy)]
 struct Candidate {
-    distance: f32,
+    /// In f64: no finite float32 vectors overflow or underflow it.
+    distance: f64,
     seq: u64,
 }
 
@@ -73,17 +70,22 @@ impl Ord for Candidate {
 pub struct Query {
     index: IndexInfo,
     vector: Vec<f32>,
-    norm: f32,
+    norm: f64,
     top_k: usize,
     filter: Option<Filter>,
     nearest: BinaryHeap<Candidate>,
     /// The next sequence number to read.
     next_seq: u64,
-    scanned: u64,
 }
 
-fn norm(values: &[f32]) -> f32 {
-    values.iter().map(|v| v * v).sum::<f32>().sqrt()
+/// A vector's length, in f64: squaring a float32 overflows or underflows
+/// float32 itself for values past about 1e19 or under 1e-23.
+fn norm(values: &[f32]) -> f64 {
+    values
+        .iter()
+        .map(|v| f64::from(*v) * f64::from(*v))
+        .sum::<f64>()
+        .sqrt()
 }
 
 impl Query {
@@ -116,21 +118,19 @@ impl Query {
             filter,
             nearest: BinaryHeap::new(),
             next_seq: 0,
-            scanned: 0,
         })
     }
 
-    fn distance(&self, values: &[f32]) -> f32 {
+    fn distance(&self, values: &[f32]) -> f64 {
+        let pairs = self
+            .vector
+            .iter()
+            .zip(values)
+            .map(|(a, b)| (f64::from(*a), f64::from(*b)));
         match self.index.metric {
-            DistanceMetric::Euclidean => self
-                .vector
-                .iter()
-                .zip(values)
-                .map(|(a, b)| (a - b) * (a - b))
-                .sum::<f32>()
-                .sqrt(),
+            DistanceMetric::Euclidean => pairs.map(|(a, b)| (a - b) * (a - b)).sum::<f64>().sqrt(),
             DistanceMetric::Cosine => {
-                let dot: f32 = self.vector.iter().zip(values).map(|(a, b)| a * b).sum();
+                let dot: f64 = pairs.map(|(a, b)| a * b).sum();
                 1.0 - dot / (self.norm * norm(values))
             }
         }
@@ -181,10 +181,6 @@ impl Query {
                 continue;
             }
             self.next_seq = seq + 1;
-            self.scanned += 1;
-            if self.scanned > MAX_SCANNED {
-                return Err(QueryError::TooManyVectors);
-            }
             if let (Some(filter), Some(tree)) = (&self.filter, &filter_tree) {
                 let mut from = id.to_be_bytes().to_vec();
                 from.extend_from_slice(&seq.to_be_bytes());
@@ -239,7 +235,8 @@ impl Query {
             };
             hits.push(Hit {
                 key,
-                distance: candidate.distance,
+                // A euclidean distance past float32's range reads as infinite.
+                distance: candidate.distance as f32,
                 metadata,
             });
         }

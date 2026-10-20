@@ -9,8 +9,9 @@
 //! needed. Searches are exact: an index is scanned a slice per storage-lock
 //! hold (see [`query`]).
 //!
-//! Every transaction writes a bounded amount of log (an eighth of its
-//! compensation reserve), so its rollback, or recovery's undo, always fits
+//! Every transaction stops writing once it has written an eighth of the
+//! log's compensation reserve, past which it takes at most one more vector
+//! (or 64 more rows of a purge), so its rollback, or recovery's undo, fits
 //! the log: a batch of vectors is put, and a deleted index purged, over as
 //! many transactions as that takes.
 
@@ -213,8 +214,9 @@ pub struct VecTxn<'t, 'c> {
 }
 
 impl VecTxn<'_, '_> {
-    /// The log one transaction may write: an eighth of the compensation
-    /// reserve, so its rollback, or recovery's undo, always fits the log.
+    /// The log after which a transaction stops writing: an eighth of the
+    /// compensation reserve, so its rollback, or recovery's undo, fits the
+    /// log with room for the one vector (or batch of rows) past it.
     pub(crate) fn log_budget(&mut self) -> u64 {
         self.ctx.io.wal.reserve() / 8
     }
