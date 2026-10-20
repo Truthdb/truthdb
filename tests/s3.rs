@@ -1755,6 +1755,515 @@ fn presigned_urls_grant_their_request_until_they_expire() {
     );
 }
 
+/// A browser form's body: `fields`, then the file part (sent in pieces of
+/// `piece` bytes, so the server sees the file across many reads).
+fn post_form(
+    port: u16,
+    bucket: &str,
+    fields: &[(String, String)],
+    filename: &str,
+    file: &[u8],
+    piece: usize,
+) -> (String, (u16, String)) {
+    let boundary = "----truthdbFormBoundary7MA4YWxk";
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes(),
+    );
+    body.extend_from_slice(file);
+    body.extend_from_slice(
+        format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"submit\"\r\n\r\nUpload\r\n--{boundary}--\r\n").as_bytes(),
+    );
+    post_raw(port, bucket, boundary, &body, piece, &[])
+}
+
+/// Sends a form `body` (in pieces of `piece` bytes) with extra request
+/// `headers`; returns the response head and the status and body.
+fn post_raw(
+    port: u16,
+    bucket: &str,
+    boundary: &str,
+    body: &[u8],
+    piece: usize,
+    headers: &[(&str, &str)],
+) -> (String, (u16, String)) {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.set_nodelay(true).expect("nodelay");
+    let mut head = format!(
+        "POST /{bucket} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nConnection: close\r\n",
+        body.len()
+    );
+    for (name, value) in headers {
+        head.push_str(&format!("{name}: {value}\r\n"));
+    }
+    head.push_str("\r\n");
+    stream.write_all(head.as_bytes()).expect("send");
+    for chunk in body.chunks(piece) {
+        // The server may answer (and close) before the whole body is sent.
+        if stream.write_all(chunk).is_err() {
+            break;
+        }
+        stream.flush().expect("flush");
+    }
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    let response = latin1(&raw);
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    let (head, body) = response
+        .split_once("\r\n\r\n")
+        .map(|(head, body)| (head.to_string(), body.to_string()))
+        .unwrap_or_default();
+    (head, (status, body))
+}
+
+/// The fields of a form signed with `secret`, as the SDKs' presigned POST
+/// builds them: `fields`, then the policy (`conditions` plus the signature
+/// fields' own) expiring at `expiration`, and its signature.
+fn signed_form(
+    key: &str,
+    secret: &str,
+    expiration: &str,
+    conditions: &[serde_json::Value],
+    fields: &[(&str, &str)],
+) -> Vec<(String, String)> {
+    use base64::Engine as _;
+    let amz_date = amz_now();
+    let credential = sigv4::Credential {
+        access_key: key.to_string(),
+        date: amz_date[..8].to_string(),
+        region: "us-east-1".to_string(),
+        service: "s3".to_string(),
+    };
+    let credential_field = format!("{key}/{}", credential.scope());
+    let mut all: Vec<serde_json::Value> = conditions.to_vec();
+    all.push(serde_json::json!({"x-amz-algorithm": "AWS4-HMAC-SHA256"}));
+    all.push(serde_json::json!({"x-amz-credential": credential_field}));
+    all.push(serde_json::json!({"x-amz-date": amz_date}));
+    let policy = serde_json::json!({"expiration": expiration, "conditions": all}).to_string();
+    let policy = base64::engine::general_purpose::STANDARD.encode(policy);
+    let signature = sigv4::sign(&sigv4::signing_key(secret, &credential), &policy);
+    let mut out: Vec<(String, String)> = fields
+        .iter()
+        .map(|(name, value)| (name.to_string(), value.to_string()))
+        .collect();
+    out.extend([
+        (
+            "x-amz-algorithm".to_string(),
+            "AWS4-HMAC-SHA256".to_string(),
+        ),
+        ("x-amz-credential".to_string(), credential_field),
+        ("x-amz-date".to_string(), amz_date),
+        ("policy".to_string(), policy),
+        ("x-amz-signature".to_string(), signature),
+    ]);
+    out
+}
+
+#[test]
+fn form_uploads_store_objects_within_their_policy() {
+    use serde_json::json;
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let as_owner = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send(port, method, path, query, body, &key, Some(&secret))
+    };
+    assert_eq!(as_owner("PUT", "/forms", "", b"").0, 200);
+    let later = "2099-01-01T00:00:00.000Z";
+    let conditions = [
+        json!({"bucket": "forms"}),
+        json!(["starts-with", "$key", "up/"]),
+        json!(["content-length-range", 1, 100]),
+        json!(["starts-with", "$Content-Type", "text/"]),
+        json!({"x-amz-meta-note": "hi"}),
+        json!({"success_action_status": "201"}),
+        json!({"tagging": "<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>"}),
+    ];
+    let fields = [
+        ("key", "up/${filename}"),
+        ("Content-Type", "text/plain"),
+        ("x-amz-meta-note", "hi"),
+        ("success_action_status", "201"),
+        (
+            "tagging",
+            "<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>",
+        ),
+    ];
+    // The file holds what looks like the start of a delimiter, and arrives
+    // three bytes at a time.
+    let file = b"line one\r\n------truthdb\r\n--\r\nend";
+    let form = signed_form(&key, &secret, later, &conditions, &fields);
+    let (head, (status, reply)) = post_form(port, "forms", &form, "a.txt", file, 3);
+    assert_eq!(status, 201, "{reply}");
+    assert!(reply.contains("<Key>up/a.txt</Key>"), "{reply}");
+    assert!(reply.contains("<Bucket>forms</Bucket>"), "{reply}");
+    let etag = response_header(&head, "etag").expect("an ETag");
+    assert_eq!(etag, format!("\"{}\"", md5_hex(file)));
+    let (head, (status, body)) = send_with(
+        port,
+        "GET",
+        "/forms/up/a.txt",
+        "",
+        &[],
+        b"",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!((status, body.as_bytes()), (200, file.as_slice()));
+    assert_eq!(
+        response_header(&head, "content-type").as_deref(),
+        Some("text/plain")
+    );
+    assert_eq!(
+        response_header(&head, "x-amz-meta-note").as_deref(),
+        Some("hi")
+    );
+    let (_, tags) = as_owner("GET", "/forms/up/a.txt", "tagging", b"");
+    assert!(tags.contains("<Key>k</Key><Value>v</Value>"), "{tags}");
+
+    // Without success_action_status: 204; with a redirect: 303 to it.
+    let plain = [
+        json!({"bucket": "forms"}),
+        json!(["starts-with", "$key", ""]),
+    ];
+    let form = signed_form(&key, &secret, later, &plain, &[("key", "b.txt")]);
+    assert_eq!(post_form(port, "forms", &form, "x", b"b", 1000).1.0, 204);
+    let redirect = [
+        json!({"bucket": "forms"}),
+        json!({"key": "c.txt"}),
+        json!({"success_action_redirect": "https://example.com/done"}),
+    ];
+    let form = signed_form(
+        &key,
+        &secret,
+        later,
+        &redirect,
+        &[
+            ("key", "c.txt"),
+            ("success_action_redirect", "https://example.com/done"),
+        ],
+    );
+    let (head, (status, _)) = post_form(port, "forms", &form, "x", b"c", 1000);
+    assert_eq!(status, 303);
+    let location = response_header(&head, "location").expect("a location");
+    assert!(
+        location.starts_with("https://example.com/done?bucket=forms&key=c%2Etxt&etag="),
+        "{location}"
+    );
+
+    // What the policy does not allow is refused, and nothing is stored.
+    let refused = |form: Vec<(String, String)>, file: &[u8], code: &str, status: u16| {
+        let (_, (got, reply)) = post_form(port, "forms", &form, "a.txt", file, 1000);
+        assert_eq!(got, status, "{code}: {reply}");
+        assert!(reply.contains(code), "{code}: {reply}");
+        assert_eq!(as_owner("GET", "/forms/up/refused", "", b"").0, 404);
+    };
+    let bounded = [
+        json!({"bucket": "forms"}),
+        json!({"key": "up/refused"}),
+        json!(["content-length-range", 2, 5]),
+    ];
+    let key_only = [("key", "up/refused")];
+    refused(
+        signed_form(&key, &secret, later, &bounded, &key_only),
+        b"too long",
+        "EntityTooLarge",
+        400,
+    );
+    refused(
+        signed_form(&key, &secret, later, &bounded, &key_only),
+        b"1",
+        "EntityTooSmall",
+        400,
+    );
+    let with_extra = [("key", "up/refused"), ("Content-Type", "text/html")];
+    refused(
+        signed_form(&key, &secret, later, &bounded, &with_extra),
+        b"abc",
+        "Extra input fields: content-type",
+        403,
+    );
+    let prefixed = [
+        json!({"bucket": "forms"}),
+        json!(["starts-with", "$key", "elsewhere/"]),
+    ];
+    refused(
+        signed_form(&key, &secret, later, &prefixed, &key_only),
+        b"abc",
+        "Policy Condition failed",
+        403,
+    );
+    refused(
+        signed_form(&key, &secret, "2001-01-01T00:00:00Z", &bounded, &key_only),
+        b"abc",
+        "Policy expired",
+        403,
+    );
+    let mut forged = signed_form(&key, &secret, later, &bounded, &key_only);
+    forged
+        .iter_mut()
+        .find(|(name, _)| name == "x-amz-signature")
+        .unwrap()
+        .1 = "0".repeat(64);
+    refused(forged, b"abc", "SignatureDoesNotMatch", 403);
+    let mut huge = signed_form(&key, &secret, later, &bounded, &key_only);
+    huge.insert(0, ("x-ignore-pad".to_string(), "p".repeat(30 * 1024)));
+    refused(huge, b"abc", "MaxPostPreDataLengthExceeded", 400);
+
+    // An unsigned form is anonymous: refused until a bucket policy lets
+    // anyone upload there.
+    let anonymous = vec![("key".to_string(), "up/anon".to_string())];
+    let (_, (status, reply)) = post_form(port, "forms", &anonymous, "a", b"anon", 1000);
+    assert_eq!(status, 403, "{reply}");
+    assert_eq!(
+        as_owner(
+            "PUT",
+            "/forms",
+            "publicAccessBlock",
+            b"<PublicAccessBlockConfiguration/>"
+        )
+        .0,
+        200
+    );
+    let public = r#"{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*",
+        "Action": "s3:PutObject", "Resource": "arn:aws:s3:::forms/up/*"}]}"#;
+    assert_eq!(
+        as_owner("PUT", "/forms", "policy", public.as_bytes()).0,
+        204
+    );
+    assert_eq!(
+        post_form(port, "forms", &anonymous, "a", b"anon", 1000).1.0,
+        204
+    );
+    assert_eq!(
+        as_owner("GET", "/forms/up/anon", "", b""),
+        (200, "anon".to_string())
+    );
+    let outside = vec![("key".to_string(), "down/anon".to_string())];
+    assert_eq!(
+        post_form(port, "forms", &outside, "a", b"anon", 1000).1.0,
+        403
+    );
+}
+
+#[test]
+fn form_uploads_decide_each_field_once_and_parse_the_form_strictly() {
+    use serde_json::json;
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let as_owner = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send(port, method, path, query, body, &key, Some(&secret))
+    };
+    assert_eq!(as_owner("PUT", "/strict", "", b"").0, 200);
+    let later = "2099-01-01T00:00:00.000Z";
+    let absent = |path: &str| assert_eq!(as_owner("GET", path, "", b"").0, 404, "{path}");
+
+    // A field given twice (in any case) is refused: the policy and the
+    // stored object must see the same value.
+    let conditions = [
+        json!({"bucket": "strict"}),
+        json!({"key": "twice"}),
+        json!(["eq", "$Content-Type", "image/png"]),
+    ];
+    let mut form = signed_form(
+        &key,
+        &secret,
+        later,
+        &conditions,
+        &[("key", "twice"), ("Content-Type", "image/png")],
+    );
+    form.push(("content-type".to_string(), "text/html".to_string()));
+    let (_, (status, reply)) = post_form(port, "strict", &form, "a", b"<script>", 1000);
+    assert_eq!(status, 400, "{reply}");
+    absent("/strict/twice");
+
+    // A redirect that is not a valid header value is refused before
+    // anything is stored; a key with a control byte is answered with its
+    // location encoded.
+    let open = [
+        json!({"bucket": "strict"}),
+        json!(["starts-with", "$key", ""]),
+        json!(["starts-with", "$success_action_redirect", "https://site/"]),
+    ];
+    let form = signed_form(
+        &key,
+        &secret,
+        later,
+        &open,
+        &[
+            ("key", "redirected"),
+            (
+                "success_action_redirect",
+                "https://site/\r\nSet-Cookie: a=b",
+            ),
+        ],
+    );
+    let (_, (status, reply)) = post_form(port, "strict", &form, "a", b"x", 1000);
+    assert_eq!(status, 400, "{reply}");
+    absent("/strict/redirected");
+    let keyed = [
+        json!({"bucket": "strict"}),
+        json!(["starts-with", "$key", ""]),
+    ];
+    let form = signed_form(&key, &secret, later, &keyed, &[("key", "ctl\u{1}key")]);
+    let (head, (status, reply)) = post_form(port, "strict", &form, "a", b"x", 1000);
+    assert_eq!(status, 204, "{reply}");
+    assert_eq!(
+        response_header(&head, "location").as_deref(),
+        Some("/strict/ctl%01key")
+    );
+
+    // A form to a bucket that does not exist is refused before its file is
+    // read (this form ends inside the file).
+    let elsewhere = [
+        json!({"bucket": "missing"}),
+        json!(["starts-with", "$key", ""]),
+    ];
+    let form = signed_form(&key, &secret, later, &elsewhere, &[("key", "k")]);
+    let boundary = "B0undary";
+    let mut body = Vec::new();
+    for (name, value) in &form {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\npartial")
+            .as_bytes(),
+    );
+    let (_, (status, reply)) = post_raw(port, "missing", boundary, &body, 1000, &[]);
+    assert_eq!(status, 404, "{reply}");
+    assert!(reply.contains("NoSuchBucket"), "{reply}");
+
+    // Quoted parameters may hold `;` and `=`; a boundary followed by
+    // anything but CRLF or `--` is part of the file.
+    let form = signed_form(&key, &secret, later, &keyed, &[("key", "k")]);
+    let file = format!("one\r\n--{boundary}X two");
+    let mut body = Vec::new();
+    for (name, value) in &form {
+        let value = if name == "key" {
+            "up/${filename}"
+        } else {
+            value.as_str()
+        };
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; filename=\"q;name=key\"; name=\"file\"\r\n\r\n{file}\r\n--{boundary}--\r\n").as_bytes(),
+    );
+    let (_, (status, reply)) = post_raw(port, "strict", boundary, &body, 7, &[]);
+    assert_eq!(status, 204, "{reply}");
+    assert_eq!(
+        as_owner("GET", "/strict/up/q;name=key", "", b""),
+        (200, file)
+    );
+
+    // The request's own headers are in the policy context.
+    assert_eq!(
+        as_owner(
+            "PUT",
+            "/strict",
+            "publicAccessBlock",
+            b"<PublicAccessBlockConfiguration/>"
+        )
+        .0,
+        200
+    );
+    let public = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::strict/*"},
+        {"Effect": "Deny", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::strict/*",
+         "Condition": {"StringLike": {"aws:Referer": "*evil*"}}}]}"#;
+    assert_eq!(
+        as_owner("PUT", "/strict", "policy", public.as_bytes()).0,
+        204
+    );
+    let anonymous = [("key".to_string(), "anon".to_string())];
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nanon\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nx\r\n--{boundary}--\r\n").as_bytes(),
+    );
+    let referer = [("Referer", "https://evil.example/")];
+    assert_eq!(
+        post_raw(port, "strict", boundary, &body, 1000, &referer)
+            .1
+            .0,
+        403
+    );
+    absent("/strict/anon");
+    assert_eq!(
+        post_form(port, "strict", &anonymous, "a", b"x", 1000).1.0,
+        204
+    );
+
+    // Only what the form acts on reaches the policy: a copy source header
+    // (which a form never copies from) does not, the acl field does.
+    let conditional = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::strict/copied/*",
+         "Condition": {"StringEquals": {"s3:x-amz-copy-source": "strict/template"}}},
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::strict/owned/*",
+         "Condition": {"StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}}}]}"#;
+    assert_eq!(
+        as_owner("PUT", "/strict", "policy", conditional.as_bytes()).0,
+        204
+    );
+    let form_of = |fields: &[(&str, &str)]| {
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a\\b.txt\"\r\n\r\nx\r\n--{boundary}--\r\n").as_bytes(),
+        );
+        body
+    };
+    let copy_source = [("x-amz-copy-source", "strict/template")];
+    let body = form_of(&[("key", "copied/evil")]);
+    assert_eq!(
+        post_raw(port, "strict", boundary, &body, 1000, &copy_source)
+            .1
+            .0,
+        403
+    );
+    absent("/strict/copied/evil");
+    let body = form_of(&[
+        ("key", "owned/${filename}"),
+        ("acl", "bucket-owner-full-control"),
+    ]);
+    let (_, (status, reply)) = post_raw(port, "strict", boundary, &body, 1000, &[]);
+    assert_eq!(status, 204, "{reply}");
+    // A file name is taken as the browser sends it: `\` is not an escape.
+    assert_eq!(as_owner("GET", "/strict/owned/a%5Cb.txt", "", b"").0, 200);
+
+    // A boundary is at most 70 characters (RFC 2046).
+    let long = "b".repeat(71);
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!("--{long}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nk\r\n--{long}\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nx\r\n--{long}--\r\n").as_bytes(),
+    );
+    assert_eq!(post_raw(port, "strict", &long, &body, 1000, &[]).1.0, 400);
+}
+
 #[test]
 fn acls_are_disabled_and_ownership_is_enforced() {
     let (server, key, secret) = server_with_key();

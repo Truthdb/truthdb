@@ -12,6 +12,7 @@ pub mod multipart;
 pub mod objects;
 pub mod payload;
 pub mod policy;
+pub mod post;
 pub mod public_access;
 pub mod scope;
 pub mod server;

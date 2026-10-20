@@ -89,7 +89,7 @@ fn tags_from_header(value: &str) -> Result<Vec<(String, String)>, S3Error> {
 
 /// The tag set of a PutObjectTagging body: one `<Tagging>` holding one
 /// `<TagSet>` of `<Tag>`s, each with one `<Key>` and one `<Value>`.
-fn parse_tagging(body: &[u8]) -> Result<Vec<(String, String)>, S3Error> {
+pub(crate) fn parse_tagging(body: &[u8]) -> Result<Vec<(String, String)>, S3Error> {
     let malformed = || {
         S3Error::new(
             400,

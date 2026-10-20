@@ -209,6 +209,15 @@ async fn route(state: &S3State, request: Request<Incoming>) -> Result<Response<B
             "A query parameter name must not be percent-encoded",
         ));
     }
+    // A form upload (POST Object) carries its signature in the form.
+    if request.method() == hyper::Method::POST
+        && request.uri().query().is_none()
+        && !request.headers().contains_key("authorization")
+        && crate::post::is_form(&request)
+        && let crate::api::Target::Bucket(bucket) = crate::api::target(request.uri().path())?
+    {
+        return crate::post::post_object(state, request, bucket).await;
+    }
     let auth = match anonymous(&request)? {
         Some(anonymous) => anonymous,
         None if request.headers().contains_key("authorization") => {
