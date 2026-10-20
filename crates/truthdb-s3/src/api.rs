@@ -15,13 +15,13 @@ use crate::server::{Authenticated, Body, Connection, Principal, S3State, full, r
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// What a request path names.
-enum Target {
+pub(crate) enum Target {
     Service,
     Bucket(String),
     Object(String, String),
 }
 
-fn target(raw_path: &str) -> Result<Target, S3Error> {
+pub(crate) fn target(raw_path: &str) -> Result<Target, S3Error> {
     let path = crate::sigv4::decode_path(raw_path)
         .ok_or_else(|| S3Error::invalid_request("the path is not UTF-8"))?;
     let path = path.strip_prefix('/').unwrap_or(&path);

@@ -21,6 +21,12 @@ use std::collections::HashMap;
 pub use eval::{Decision, evaluate, is_public, without_public_grants};
 pub use policy::{MalformedPolicy, Policy, PolicyKind};
 
+/// A date as milliseconds since the epoch: epoch seconds, or a W3C ISO 8601
+/// form (as policy conditions and S3 POST policies write them).
+pub fn parse_date_ms(text: &str) -> Option<i64> {
+    cond::date_ms(text)
+}
+
 /// Who makes a request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Identity {
