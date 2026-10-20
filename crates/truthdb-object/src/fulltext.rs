@@ -682,21 +682,27 @@ impl ObjFile<'_> {
 
     /// Reads up to `budget` more postings of `search` in `bucket`'s index;
     /// returns whether all are read (see `truthdb_fulltext::Search::step`).
+    /// A document counts only when its version row exists when its first
+    /// posting is read: a document being written, or removed, is left out.
     pub fn fulltext_step(
         &mut self,
         search: &mut truthdb_fulltext::Search,
         bucket: &str,
         budget: usize,
     ) -> Result<bool, truthdb_fulltext::SearchError> {
-        match self.fulltext_index()? {
-            Some(index) => search.step(
-                &mut self.core.page_ctx(0),
-                &index,
-                bucket.as_bytes(),
-                budget,
-            ),
-            None => Ok(true),
-        }
+        let (Some(index), Some(versions)) = (
+            self.fulltext_index()?,
+            self.existing_tree(crate::FT_VERSIONS_TREE)?,
+        ) else {
+            return Ok(true);
+        };
+        search.step(
+            &mut self.core.page_ctx(0),
+            &index,
+            bucket.as_bytes(),
+            budget,
+            &mut |ctx, doc| Ok(versions.get(ctx, &version_row_key(bucket, doc))?.is_some()),
+        )
     }
 
     /// `bucket`'s document count and length, for ranking.

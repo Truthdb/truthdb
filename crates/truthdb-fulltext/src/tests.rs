@@ -197,7 +197,13 @@ impl Fixture {
         loop {
             let mut guard = self.storage.lock();
             let mut ctx = guard.page_ctx(0);
-            if search.step(&mut ctx, &self.index, scope.as_bytes(), budget)? {
+            if search.step(
+                &mut ctx,
+                &self.index,
+                scope.as_bytes(),
+                budget,
+                &mut |_, _| Ok(true),
+            )? {
                 let stats = self.index.stats(&mut ctx, scope.as_bytes())?;
                 return Ok(search.rank(stats));
             }
@@ -453,7 +459,9 @@ fn every_lookup_counts_against_the_slice_budget() {
         steps += 1;
         let mut guard = f.storage.lock();
         if search
-            .step(&mut guard.page_ctx(0), &f.index, b"b", 10)
+            .step(&mut guard.page_ctx(0), &f.index, b"b", 10, &mut |_, _| {
+                Ok(true)
+            })
             .unwrap()
         {
             break;

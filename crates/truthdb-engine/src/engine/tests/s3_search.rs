@@ -158,6 +158,11 @@ fn a_search_finds_ranks_and_checks_each_hit_against_the_latest_version() {
         ("SELECT * FROM sys.s3_search('docs', 'x', 0)", 206),
         ("SELECT * FROM sys.s3_search('docs', 'x', 10001)", 206),
         ("SELECT * FROM sys.s3_search('docs')", 313),
+        ("SELECT * FROM sys.s3_search('docs', '   ')", 7645),
+        (
+            "SELECT * FROM sys.s3_search('docs', '((((((((((((((((((((((((((((((((((a))))))))))))))))))))))))))))))))))')",
+            7619,
+        ),
     ] {
         assert_eq!(sql_error_number(&engine, query), number, "{query}");
     }

@@ -2049,3 +2049,62 @@ fn the_full_text_index_ships_to_a_standby_and_restores_from_a_log_backup() {
         std::fs::remove_file(p).ok();
     }
 }
+
+#[test]
+fn a_search_leaves_out_a_document_being_written_on_every_term() {
+    // A document written a transaction at a time, terms in order: a search
+    // reading its postings after the first step sees "aaa" but not yet
+    // "zzz". Read then, it must not match "aaa AND NOT zzz" once the
+    // document is complete (as it would if it were decided only after).
+    let path = temp_path("ft-race");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("docs", now())?.unwrap();
+            tx.enable_fulltext("docs", 1 << 20)
+        })
+        .unwrap()
+        .unwrap();
+    let text =
+        String::from("aaa ") + &(0..1500).map(|n| format!("t{n} ")).collect::<String>() + "zzz";
+    let version = put_text(&storage, "docs", "k", &text);
+    let terms = truthdb_fulltext::DocTerms::from_text(&text);
+    let mut progress = truthdb_fulltext::Progress::default();
+    assert_eq!(
+        ft_txn(&storage, |tx| tx.fulltext_build_step(
+            "docs",
+            "k",
+            1,
+            version,
+            &terms,
+            &mut progress
+        )),
+        Some(false)
+    );
+    // The search reads every posting now, mid-write.
+    let mut search = truthdb_fulltext::Search::new("aaa AND NOT zzz").unwrap();
+    let ranked = {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        assert!(file.fulltext_step(&mut search, "docs", usize::MAX).unwrap());
+        search.rank(file.fulltext_stats("docs").unwrap())
+    };
+    // The document completes before the search checks its hits.
+    loop {
+        match ft_txn(&storage, |tx| {
+            tx.fulltext_build_step("docs", "k", 1, version, &terms, &mut progress)
+        }) {
+            Some(true) => break,
+            Some(false) => {}
+            None => panic!("not writable"),
+        }
+    }
+    let chunks = progress.next_chunk;
+    assert!(ft_txn(&storage, |tx| tx
+        .fulltext_finish("docs", "k", 1, version, terms.len, chunks)));
+    assert!(ranked.is_empty(), "{ranked:?}");
+    assert_eq!(ft_hits(&storage, "docs", "aaa AND zzz"), [version]);
+    assert!(ft_hits(&storage, "docs", "aaa AND NOT zzz").is_empty());
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

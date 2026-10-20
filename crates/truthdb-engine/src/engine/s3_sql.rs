@@ -19,8 +19,9 @@
 //! - `sys.s3_search(@bucket, @condition [, @top])`: full-text search over
 //!   the contents of a bucket with full-text search enabled (S3 plan item
 //!   15; `s3 enable fulltext`), the shape of `CONTAINSTABLE`: up to `@top`
-//!   (default 100, at most 10,000) keys whose latest version matches the
-//!   `CONTAINS`-style condition, best first by BM25 score. The index follows
+//!   (default 100, also when NULL; at most 10,000) keys whose latest
+//!   version matches the `CONTAINS`-style condition, best first by BM25
+//!   score. The index follows
 //!   the change journal a moment behind the writes: a key is returned only
 //!   while the version that matched is still its latest.
 //!
@@ -145,6 +146,14 @@ impl S3Rowsets {
                     ),
                 ));
             }
+        }
+        if condition.trim().is_empty() {
+            return Err(SqlError::new(
+                7645,
+                15,
+                1,
+                "Null or empty full-text predicate.",
+            ));
         }
         let search = Search::new(&condition).map_err(search_error)?;
         Ok(ExternalRowset {
@@ -645,6 +654,13 @@ impl ExternalStream for JournalStream {
 /// past this engine's limits is 7619 (a full-text query that failed).
 fn search_error(err: SearchError) -> SqlError {
     match err {
+        // Well formed but past a limit: a query that failed, as below.
+        SearchError::Query(err) if err.past_limit => SqlError::new(
+            7619,
+            16,
+            1,
+            format!("The execution of a full-text query failed. \"{err}\""),
+        ),
         SearchError::Query(err) => SqlError::new(7630, 15, 2, err.to_string()),
         SearchError::Storage(err) => storage_error(err),
         other => SqlError::new(
