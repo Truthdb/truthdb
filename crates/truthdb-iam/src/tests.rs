@@ -829,3 +829,44 @@ fn review_findings_hold_fixed() {
         .is_ok()
     );
 }
+
+#[test]
+fn without_public_grants_keeps_the_principals_a_statement_names() {
+    let policy = bucket_policy(
+        r#"{"Statement": [
+            {"Effect": "Allow", "Principal": {"AWS": ["*", "arn:aws:iam::111111111111:user/alice"]},
+             "Action": "s3:GetObject", "Resource": "*"},
+            {"Effect": "Allow", "Principal": "*", "Action": "s3:ListBucket", "Resource": "*"},
+            {"Effect": "Deny", "Principal": "*", "Action": "s3:DeleteObject", "Resource": "*"}]}"#,
+    );
+    let restricted = without_public_grants(&policy);
+    assert!(!is_public(&restricted));
+    let alice = user(OWNER, "alice");
+    let bob = user(OWNER, "bob");
+    let get = |identity: &Identity, action: &str| {
+        decide(
+            identity,
+            action,
+            "arn:aws:s3:::b/k",
+            &[],
+            &[],
+            Some(&restricted),
+        )
+    };
+    assert_eq!(
+        get(&alice, "s3:GetObject"),
+        Decision::Allow,
+        "named, so kept"
+    );
+    assert_eq!(
+        get(&bob, "s3:GetObject"),
+        Decision::ImplicitDeny,
+        "only through anyone"
+    );
+    assert_eq!(get(&alice, "s3:ListBucket"), Decision::ImplicitDeny);
+    assert_eq!(
+        get(&root(OWNER), "s3:DeleteObject"),
+        Decision::ExplicitDeny,
+        "a deny stays"
+    );
+}

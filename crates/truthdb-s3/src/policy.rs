@@ -48,8 +48,21 @@ pub async fn bucket_policy(
             let body = read_body(request, auth, MAX_POLICY).await?;
             let text = String::from_utf8(body)
                 .map_err(|_| S3Error::new(400, "MalformedPolicy", "The policy is not UTF-8"))?;
-            Policy::parse(&text, PolicyKind::Bucket)
+            let policy = Policy::parse(&text, PolicyKind::Bucket)
                 .map_err(|err| S3Error::new(400, "MalformedPolicy", err.0))?;
+            // BlockPublicPolicy refuses a public policy.
+            if truthdb_iam::is_public(&policy) {
+                let (name, owner) = (bucket.clone(), bucket_owner(state, &bucket).await?);
+                let block = crate::scope::object(state, move |file| {
+                    crate::public_access::effective(file, &name, &owner)
+                })
+                .await?;
+                if block & crate::public_access::BLOCK_PUBLIC_POLICY != 0 {
+                    return Err(S3Error::access_denied(
+                        "Block Public Access forbids a public bucket policy",
+                    ));
+                }
+            }
             crate::scope::object(state, move |file| {
                 file.transaction(|tx| {
                     tx.put_bucket_config(&name, BUCKET_POLICY, "", text.as_bytes())
@@ -108,7 +121,7 @@ pub async fn policy_status(state: &S3State, bucket: String) -> Result<Response<B
     };
     Ok(xml(format!(
         "<PolicyStatus xmlns=\"{XMLNS}\"><IsPublic>{}</IsPublic></PolicyStatus>",
-        if public { "TRUE" } else { "FALSE" }
+        if public { "true" } else { "false" }
     )))
 }
 

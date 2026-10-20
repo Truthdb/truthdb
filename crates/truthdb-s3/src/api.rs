@@ -51,7 +51,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "metrics",
     "notification",
     "object-lock",
-    "publicAccessBlock",
     "replication",
     "requestPayment",
     "restore",
@@ -148,6 +147,15 @@ pub async fn dispatch(
     auth: Authenticated,
 ) -> Result<Response<Body>, S3Error> {
     let method = request.method().clone();
+    // S3 Control's account-level Block Public Access (path-style, with the
+    // account in a header). A request to an object of a bucket named
+    // `v20180820` at that path, carrying that header, is taken for it: only
+    // S3 Control's own host (virtual-hosted addressing) would tell them apart.
+    if request.uri().path() == "/v20180820/configuration/publicAccessBlock"
+        && request.headers().contains_key("x-amz-account-id")
+    {
+        return account_public_access(state, request, auth, method).await;
+    }
     let target = target(request.uri().path())?;
     let principal = auth.principal.clone();
     let raw_query = request.uri().query().unwrap_or("").to_string();
@@ -196,7 +204,7 @@ pub async fn dispatch(
     let connection = request.extensions().get::<Connection>().copied();
     let authz = Authz::load(
         state,
-        &principal,
+        principal.as_ref(),
         request.headers(),
         &raw_query,
         connection,
@@ -205,8 +213,9 @@ pub async fn dispatch(
     )
     .await?;
     let scope = crate::scope::Scope {
-        access_key: principal.access_key.clone(),
-        account: principal.account.clone(),
+        key: principal
+            .as_ref()
+            .map(|principal| (principal.access_key.clone(), principal.account.clone())),
         buckets: authz
             .owners()
             .into_iter()
@@ -219,7 +228,14 @@ pub async fn dispatch(
         // Refused before the body is read, too.
         crate::scope::object(state, |_| Ok(())).await?;
         route(
-            state, request, auth, &authz, &principal, target, method, copying,
+            state,
+            request,
+            auth,
+            &authz,
+            principal.as_ref(),
+            target,
+            method,
+            copying,
         )
         .await
     })
@@ -233,6 +249,56 @@ fn header_tags(request: &Request<Incoming>) -> Result<Option<Vec<(String, String
         return Ok(None);
     }
     crate::tagging::tags_from(request.headers()).map(Some)
+}
+
+/// S3 Control's Put, Get or DeletePublicAccessBlock, for the caller's own
+/// account.
+async fn account_public_access(
+    state: &S3State,
+    request: Request<Incoming>,
+    auth: Authenticated,
+    method: Method,
+) -> Result<Response<Body>, S3Error> {
+    let Some(principal) = auth.principal.clone() else {
+        return Err(S3Error::access_denied("Access Denied"));
+    };
+    let account = request
+        .headers()
+        .get("x-amz-account-id")
+        .and_then(|value| value.to_str().ok())
+        .unwrap_or("");
+    if account != principal.account {
+        return Err(S3Error::access_denied("Access Denied"));
+    }
+    let action = match method {
+        Method::GET => "s3:GetAccountPublicAccessBlock",
+        Method::PUT | Method::DELETE => "s3:PutAccountPublicAccessBlock",
+        _ => {
+            return Err(S3Error::not_implemented(format!(
+                "{method} account publicAccessBlock"
+            )));
+        }
+    };
+    let authz = Authz::load(
+        state,
+        Some(&principal),
+        request.headers(),
+        "",
+        request.extensions().get::<Connection>().copied(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await?;
+    authz.check(action, crate::authz::Resource::Service)?;
+    let scope = crate::scope::Scope {
+        key: Some((principal.access_key.clone(), principal.account.clone())),
+        buckets: Vec::new(),
+    };
+    let account = principal.account.clone();
+    crate::scope::within(scope, async move {
+        crate::public_access::handle(state, request, auth, String::new(), account, method).await
+    })
+    .await
 }
 
 /// The action for an object operation, on a version when the request names
@@ -255,7 +321,7 @@ async fn route(
     request: Request<Incoming>,
     auth: Authenticated,
     authz: &Authz,
-    principal: &Principal,
+    principal: Option<&Principal>,
     target: Target,
     method: Method,
     copying: bool,
@@ -279,6 +345,8 @@ async fn route(
         )),
         (Target::Service, Method::GET) => {
             authz.check("s3:ListAllMyBuckets", Service)?;
+            // An anonymous caller is denied before this.
+            let principal = principal.ok_or_else(|| S3Error::access_denied("Access Denied"))?;
             list_buckets(state, principal).await
         }
         (Target::Bucket(bucket), Method::PUT) if has_param(&request, "versioning") => {
@@ -298,6 +366,19 @@ async fn route(
             };
             authz.check(action, Bucket(&bucket))?;
             crate::policy::bucket_policy(state, request, auth, bucket, method).await
+        }
+        (Target::Bucket(bucket), method) if has_param(&request, "publicAccessBlock") => {
+            let action = match method {
+                Method::GET => "s3:GetBucketPublicAccessBlock",
+                Method::PUT | Method::DELETE => "s3:PutBucketPublicAccessBlock",
+                _ => {
+                    return Err(S3Error::not_implemented(format!(
+                        "{method} ?publicAccessBlock"
+                    )));
+                }
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::public_access::handle(state, request, auth, bucket, String::new(), method).await
         }
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "policyStatus") => {
             authz.check("s3:GetBucketPolicyStatus", Bucket(&bucket))?;
@@ -328,7 +409,13 @@ async fn route(
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "versions") => {
             authz.check("s3:ListBucketVersions", Bucket(&bucket))?;
             let query = request.uri().query().unwrap_or("").to_string();
-            crate::listing::list_versions(state, bucket, &principal.account, &query).await
+            // The owner shown is the bucket's (the objects are the owner's).
+            let owner = authz
+                .buckets
+                .get(&bucket)
+                .and_then(|grant| grant.owner.clone())
+                .unwrap_or_default();
+            crate::listing::list_versions(state, bucket, &owner, &query).await
         }
         (Target::Bucket(bucket), Method::PUT) => {
             authz.check("s3:CreateBucket", Bucket(&bucket))?;
@@ -536,7 +623,12 @@ async fn create_bucket(
     auth: Authenticated,
     bucket: String,
 ) -> Result<Response<Body>, S3Error> {
-    let owner = auth.principal.account.clone();
+    // An anonymous caller's CreateBucket is denied before this.
+    let owner = auth
+        .principal
+        .as_ref()
+        .map(|principal| principal.account.clone())
+        .ok_or_else(|| S3Error::access_denied("Access Denied"))?;
     let body = read_body(request, auth, 64 * 1024).await?;
     if let Some(constraint) = location_constraint(&body)?
         && !constraint.is_empty()
@@ -554,7 +646,19 @@ async fn create_bucket(
     let name = bucket.clone();
     let now = now_ms();
     match object(state, move |file| {
-        file.transaction(|tx| tx.create_bucket(&name, &owner, now))
+        // A new bucket blocks public access, until its owner says otherwise.
+        file.transaction(|tx| {
+            let created = tx.create_bucket(&name, &owner, now)?;
+            if created.is_ok() {
+                tx.put_bucket_config(
+                    &name,
+                    truthdb_object::PUBLIC_ACCESS_BLOCK,
+                    "",
+                    &[crate::public_access::ALL],
+                )?;
+            }
+            Ok(created)
+        })
     })
     .await?
     {

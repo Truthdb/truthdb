@@ -18,7 +18,7 @@ mod tests;
 
 use std::collections::HashMap;
 
-pub use eval::{Decision, evaluate, is_public};
+pub use eval::{Decision, evaluate, is_public, without_public_grants};
 pub use policy::{MalformedPolicy, Policy, PolicyKind};
 
 /// Who makes a request.

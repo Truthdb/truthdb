@@ -24,6 +24,11 @@ pub struct BucketGrant {
     /// The owning account; `None` when the bucket does not exist.
     pub owner: Option<String>,
     pub policy: Option<Policy>,
+    /// Whether the policy grants anything to the public (see
+    /// `truthdb_iam::is_public`).
+    pub policy_public: bool,
+    /// The Block Public Access settings that apply (see `public_access`).
+    pub public_block: u8,
 }
 
 /// What a request is authorized against.
@@ -66,56 +71,58 @@ pub type Named = (String, String, VersionSel);
 
 fn load(
     file: &mut ObjFile<'_>,
-    principal: &Principal,
+    principal: Option<&Principal>,
     buckets: &[String],
     objects: &[Named],
 ) -> Result<Loaded, StorageError> {
     let mut texts = Vec::new();
-    let (identity, policies) = match &principal.user {
-        None => (
-            Identity::Root {
-                account: principal.account.clone(),
-            },
-            Vec::new(),
-        ),
-        Some(name) => {
-            let user_id = file
-                .users(&principal.account)?
-                .into_iter()
-                .find(|user| &user.name == name)
-                .map(|user| user.user_id)
-                // A user dropped since its key was checked: no policy holds.
-                .unwrap_or_default();
-            let mut policies = Vec::new();
-            for (policy_name, document) in file.user_policies(&principal.account, name)? {
-                let text = String::from_utf8_lossy(&document).into_owned();
-                policies.push(
-                    Policy::parse(&text, PolicyKind::UserInline).map_err(|err| {
-                        corrupt_policy(&format!("user policy {policy_name}"), err)
-                    })?,
-                );
-                texts.push(text);
-            }
-            for policy_name in file.attached_policies(&principal.account, name)? {
-                // A policy detached meanwhile is gone: it grants nothing.
-                let Some(managed) = file.managed_policy(&principal.account, &policy_name)? else {
-                    continue;
-                };
-                let text = String::from_utf8_lossy(&managed.document).into_owned();
-                policies.push(Policy::parse(&text, PolicyKind::Managed).map_err(|err| {
-                    corrupt_policy(&format!("managed policy {policy_name}"), err)
-                })?);
-                texts.push(text);
-            }
-            (
-                Identity::User {
+    let (identity, policies) = match principal {
+        None => (Identity::Anonymous, Vec::new()),
+        Some(principal) => match &principal.user {
+            None => (
+                Identity::Root {
                     account: principal.account.clone(),
-                    name: name.clone(),
-                    user_id,
                 },
-                policies,
-            )
-        }
+                Vec::new(),
+            ),
+            Some(name) => {
+                let user_id = file
+                    .users(&principal.account)?
+                    .into_iter()
+                    .find(|user| &user.name == name)
+                    .map(|user| user.user_id)
+                    // A user dropped since its key was checked: no policy holds.
+                    .unwrap_or_default();
+                let mut policies = Vec::new();
+                for (policy_name, document) in file.user_policies(&principal.account, name)? {
+                    let text = String::from_utf8_lossy(&document).into_owned();
+                    policies.push(Policy::parse(&text, PolicyKind::UserInline).map_err(|err| {
+                        corrupt_policy(&format!("user policy {policy_name}"), err)
+                    })?);
+                    texts.push(text);
+                }
+                for policy_name in file.attached_policies(&principal.account, name)? {
+                    // A policy detached meanwhile is gone: it grants nothing.
+                    let Some(managed) = file.managed_policy(&principal.account, &policy_name)?
+                    else {
+                        continue;
+                    };
+                    let text = String::from_utf8_lossy(&managed.document).into_owned();
+                    policies.push(Policy::parse(&text, PolicyKind::Managed).map_err(|err| {
+                        corrupt_policy(&format!("managed policy {policy_name}"), err)
+                    })?);
+                    texts.push(text);
+                }
+                (
+                    Identity::User {
+                        account: principal.account.clone(),
+                        name: name.clone(),
+                        user_id,
+                    },
+                    policies,
+                )
+            }
+        },
     };
     let mut grants = HashMap::new();
     for bucket in buckets {
@@ -133,7 +140,19 @@ fn load(
                 .transpose()?,
             None => None,
         };
-        grants.insert(bucket.clone(), BucketGrant { owner, policy });
+        let public_block = match &owner {
+            Some(owner) => crate::public_access::effective(file, bucket, owner)?,
+            None => 0,
+        };
+        grants.insert(
+            bucket.clone(),
+            BucketGrant {
+                policy_public: policy.as_ref().is_some_and(truthdb_iam::is_public),
+                owner,
+                policy,
+                public_block,
+            },
+        );
     }
     let reads_tags = texts
         .iter()
@@ -174,7 +193,7 @@ fn context(
     raw_query: &str,
     query: &[(String, String)],
     connection: Option<Connection>,
-    amz_date: Option<&str>,
+    signed_at: Option<&str>,
     now_ms: u64,
 ) -> Context {
     let mut context = Context::default();
@@ -188,13 +207,17 @@ fn context(
     }
     one("aws:CurrentTime", crate::time::iso8601(now_ms));
     one("aws:EpochTime", (now_ms / 1000).to_string());
-    one("s3:authType", "REST-HEADER".to_string());
-    one("s3:signatureversion", "AWS4-HMAC-SHA256".to_string());
-    if let Some(signed) = amz_date.and_then(crate::server::parse_amz_date) {
-        one(
-            "s3:signatureAge",
-            now_ms.saturating_sub(signed * 1000).to_string(),
-        );
+    // The signature's keys, for a signed request only (an anonymous one has
+    // none: a condition on them sees them absent).
+    if let Some(amz_date) = signed_at {
+        one("s3:authType", "REST-HEADER".to_string());
+        one("s3:signatureversion", "AWS4-HMAC-SHA256".to_string());
+        if let Some(signed) = crate::server::parse_amz_date(amz_date) {
+            one(
+                "s3:signatureAge",
+                now_ms.saturating_sub(signed * 1000).to_string(),
+            );
+        }
     }
     let header = |name: &str| headers.get(name).and_then(|value| value.to_str().ok());
     for (key, name) in [
@@ -253,17 +276,17 @@ impl Authz {
     #[allow(clippy::too_many_arguments)]
     pub async fn load(
         state: &S3State,
-        principal: &Principal,
+        principal: Option<&Principal>,
         headers: &HeaderMap,
         raw_query: &str,
         connection: Option<Connection>,
         buckets: Vec<String>,
         objects: Vec<Named>,
     ) -> Result<Authz, S3Error> {
-        let who = principal.clone();
+        let who = principal.cloned();
         let loaded = state
             .engine
-            .run_object(move |file| load(file, &who, &buckets, &objects))
+            .run_object(move |file| load(file, who.as_ref(), &buckets, &objects))
             .await
             .map_err(|err| S3Error::internal(err.to_string()))?;
         let context = context(
@@ -271,9 +294,15 @@ impl Authz {
             raw_query,
             &crate::listing::query_params(raw_query),
             connection,
-            headers
-                .get("x-amz-date")
-                .and_then(|value| value.to_str().ok()),
+            match principal {
+                Some(_) => Some(
+                    headers
+                        .get("x-amz-date")
+                        .and_then(|value| value.to_str().ok())
+                        .unwrap_or(""),
+                ),
+                None => None,
+            },
             crate::objects::now_ms(),
         );
         Ok(Authz {
@@ -375,13 +404,25 @@ impl Authz {
         {
             return Ok(());
         }
-        self.decide(
-            action,
-            &arn,
-            owner,
-            grant.and_then(|grant| grant.policy.as_ref()),
-            context,
-        )
+        // RestrictPublicBuckets: while the policy is public, nothing outside
+        // the owner's account is allowed (only a policy could allow it), and
+        // within it the policy's public grants count for no one.
+        let restricted = grant.is_some_and(|grant| {
+            grant.policy_public
+                && grant.public_block & crate::public_access::RESTRICT_PUBLIC_BUCKETS != 0
+        });
+        if restricted && self.identity.account() != owner {
+            return Err(S3Error::access_denied("Access Denied"));
+        }
+        let unrestricted;
+        let policy = match grant.and_then(|grant| grant.policy.as_ref()) {
+            Some(policy) if restricted => {
+                unrestricted = truthdb_iam::without_public_grants(policy);
+                Some(&unrestricted)
+            }
+            policy => policy,
+        };
+        self.decide(action, &arn, owner, policy, context)
     }
 
     /// Checks `action` on the resource `arn` of a bucket `owner` owns, which

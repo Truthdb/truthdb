@@ -202,11 +202,12 @@ impl ObjTxn<'_, '_> {
         self.trees
             .accounts()
             .delete(self.ctx, &mut OpMode::Txn(self.txn), id.as_bytes())?;
+        self.delete_bucket_config("", crate::documents::PUBLIC_ACCESS_BLOCK, id)?;
         Ok(Ok(()))
     }
 
     /// Whether account `id` exists (the default account always does).
-    pub(crate) fn account_exists(&mut self, id: &str) -> Result<bool, StorageError> {
+    pub fn account_exists(&mut self, id: &str) -> Result<bool, StorageError> {
         Ok(id == DEFAULT_ACCOUNT
             || self
                 .trees

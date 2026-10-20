@@ -16,6 +16,10 @@ const CHUNK: usize = 1500;
 
 /// A bucket configuration: the bucket's policy.
 pub const BUCKET_POLICY: u8 = 1;
+/// A bucket configuration: its Block Public Access settings (one byte, see
+/// `truthdb-s3`'s `public_access`). An account's own settings are kept as
+/// this kind under the empty bucket name, with the account id as the id.
+pub const PUBLIC_ACCESS_BLOCK: u8 = 2;
 
 fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
     [prefix, &chunk.to_be_bytes()].concat()

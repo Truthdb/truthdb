@@ -19,12 +19,12 @@ use truthdb_object::ObjFile;
 use crate::error::S3Error;
 use crate::server::S3State;
 
-/// A request's access key, its account, and the buckets it names with the
-/// owners they had when it was authorized (`None`: missing).
+/// A request's access key and its account (none for an anonymous request),
+/// and the buckets it names with the owners they had when it was authorized
+/// (`None`: missing).
 #[derive(Clone)]
 pub struct Scope {
-    pub access_key: String,
-    pub account: String,
+    pub key: Option<(String, String)>,
     pub buckets: Vec<(String, Option<String>)>,
 }
 
@@ -45,9 +45,11 @@ pub fn current() -> Option<Scope> {
 /// Whether `scope` still holds: its key exists, is active and acts for its
 /// account, and its buckets have the owners they had.
 fn holds(file: &mut ObjFile<'_>, scope: &Scope) -> Result<bool, StorageError> {
-    match file.access_key(&scope.access_key)? {
-        Some((key, _)) if key.active && key.account == scope.account => {}
-        _ => return Ok(false),
+    if let Some((access_key, account)) = &scope.key {
+        match file.access_key(access_key)? {
+            Some((key, _)) if key.active && &key.account == account => {}
+            _ => return Ok(false),
+        }
     }
     for (bucket, owner) in &scope.buckets {
         if file.bucket(bucket)?.map(|info| info.owner) != *owner {

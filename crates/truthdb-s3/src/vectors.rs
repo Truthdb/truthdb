@@ -146,7 +146,7 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, VEr
     };
     let authz = crate::authz::Authz::load(
         state,
-        &principal,
+        Some(&principal),
         &parts.headers,
         "",
         parts.extensions.get::<Connection>().copied(),
