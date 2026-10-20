@@ -254,7 +254,7 @@ async fn serve(
     let principal = signed.principal;
     let authz = crate::authz::Authz::load(
         state,
-        &principal,
+        Some(&principal),
         &signed.parts.headers,
         "",
         signed.parts.extensions.get::<Connection>().copied(),
@@ -263,8 +263,7 @@ async fn serve(
     )
     .await?;
     let scope = crate::scope::Scope {
-        access_key: principal.access_key.clone(),
-        account: principal.account.clone(),
+        key: Some((principal.access_key.clone(), principal.account.clone())),
         buckets: Vec::new(),
     };
     let result = crate::scope::within(scope, async {

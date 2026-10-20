@@ -781,7 +781,7 @@ fn bucket_and_user_policies_grant_and_deny_as_aws_does() {
     assert!(
         as_owner("GET", "/shared", "policyStatus", b"")
             .1
-            .contains("<IsPublic>FALSE</IsPublic>")
+            .contains("<IsPublic>false</IsPublic>")
     );
 
     // The other account's root reads public/ only; its user needs its own
@@ -844,10 +844,16 @@ fn bucket_and_user_policies_grant_and_deny_as_aws_does() {
     assert_eq!(as_owner("GET", "/shared/public/a", "", b"").0, 200);
     assert_eq!(as_owner("GET", "/shared", "policy", b"").0, 404);
 
-    // A grant to anyone makes the policy public (anonymous access itself
-    // comes later).
+    // A grant to anyone makes the policy public; Block Public Access (on
+    // for a new bucket) must be off to allow one.
     let public = r#"{"Statement": {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
         "Resource": "arn:aws:s3:::shared/public/*"}}"#;
+    assert_eq!(
+        as_owner("PUT", "/shared", "policy", public.as_bytes()).0,
+        403
+    );
+    let open = b"<PublicAccessBlockConfiguration><BlockPublicPolicy>false</BlockPublicPolicy></PublicAccessBlockConfiguration>";
+    assert_eq!(as_owner("PUT", "/shared", "publicAccessBlock", open).0, 200);
     assert_eq!(
         as_owner("PUT", "/shared", "policy", public.as_bytes()).0,
         204
@@ -855,7 +861,7 @@ fn bucket_and_user_policies_grant_and_deny_as_aws_does() {
     assert!(
         as_owner("GET", "/shared", "policyStatus", b"")
             .1
-            .contains("<IsPublic>TRUE</IsPublic>")
+            .contains("<IsPublic>true</IsPublic>")
     );
     assert_eq!(
         get(&bob_key, &bob_secret, "/shared/public/a"),
@@ -1175,6 +1181,246 @@ fn conditions_see_what_the_operation_acts_on() {
 }
 
 #[test]
+fn anonymous_access_follows_bucket_policies_and_block_public_access() {
+    let server = start_server();
+    let port = server.s3_port;
+    let (owner, owner_key, owner_secret) = account_with_key(&server, "owner");
+    let (other, other_key, other_secret) = account_with_key(&server, "other");
+    let as_owner = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &owner_key,
+            Some(&owner_secret),
+        )
+        .1
+    };
+    let anonymous = |method: &str, path: &str| send(port, method, path, "", b"x", "", None).0;
+    assert_eq!(as_owner("PUT", "/site", "", &[], b"").0, 200);
+    for (key, tags) in [
+        ("public/index.html", ""),
+        ("private/key", ""),
+        ("tagged", "public=true"),
+        ("untagged", ""),
+    ] {
+        let extra: Vec<(&str, &str)> = if tags.is_empty() {
+            vec![]
+        } else {
+            vec![("x-amz-tagging", tags)]
+        };
+        assert_eq!(
+            as_owner("PUT", &format!("/site/{key}"), "", &extra, b"page").0,
+            200
+        );
+    }
+    // A new bucket blocks public access.
+    let (status, settings) = as_owner("GET", "/site", "publicAccessBlock", &[], b"");
+    assert_eq!(status, 200);
+    for name in [
+        "BlockPublicAcls",
+        "IgnorePublicAcls",
+        "BlockPublicPolicy",
+        "RestrictPublicBuckets",
+    ] {
+        assert!(
+            settings.contains(&format!("<{name}>true</{name}>")),
+            "{settings}"
+        );
+    }
+    let public = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::site/public/*"},
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::site/*",
+         "Condition": {"StringEquals": {"s3:ExistingObjectTag/public": "true"}}},
+        {"Effect": "Allow", "Principal": {"AWS": "OTHER"}, "Action": "s3:GetObject", "Resource": "arn:aws:s3:::site/private/*"}]}"#
+        .replace("OTHER", &other);
+    let (status, reply) = as_owner("PUT", "/site", "policy", &[], public.as_bytes());
+    assert_eq!(status, 403, "BlockPublicPolicy: {reply}");
+    let off = b"<PublicAccessBlockConfiguration/>";
+    assert_eq!(
+        as_owner("PUT", "/site", "publicAccessBlock", &[], off).0,
+        200
+    );
+    assert_eq!(
+        as_owner("PUT", "/site", "policy", &[], public.as_bytes()).0,
+        204
+    );
+
+    // Anonymous reads: by prefix, by tag; nothing else.
+    assert_eq!(anonymous("GET", "/site/public/index.html"), 200);
+    assert_eq!(anonymous("GET", "/site/tagged"), 200);
+    assert_eq!(anonymous("GET", "/site/untagged"), 403);
+    assert_eq!(anonymous("GET", "/site/private/key"), 403);
+    assert_eq!(anonymous("PUT", "/site/public/new"), 403);
+    assert_eq!(anonymous("GET", "/"), 403);
+    assert_eq!(anonymous("PUT", "/anon-bucket"), 403);
+    let other_get =
+        |path: &str| send(port, "GET", path, "", b"", &other_key, Some(&other_secret)).0;
+    assert_eq!(other_get("/site/private/key"), 200);
+
+    // RestrictPublicBuckets: with the policy public, only the owner's account
+    // keeps access; the grant to the other account goes too.
+    let restrict = b"<PublicAccessBlockConfiguration><RestrictPublicBuckets>true</RestrictPublicBuckets></PublicAccessBlockConfiguration>";
+    assert_eq!(
+        as_owner("PUT", "/site", "publicAccessBlock", &[], restrict).0,
+        200
+    );
+    assert_eq!(anonymous("GET", "/site/public/index.html"), 403);
+    assert_eq!(other_get("/site/private/key"), 403);
+    assert_eq!(as_owner("GET", "/site/private/key", "", &[], b"").0, 200);
+    assert_eq!(
+        as_owner("DELETE", "/site", "publicAccessBlock", &[], b"").0,
+        204
+    );
+    assert_eq!(
+        as_owner("GET", "/site", "publicAccessBlock", &[], b"").0,
+        404
+    );
+    assert_eq!(anonymous("GET", "/site/public/index.html"), 200);
+
+    // The account's settings apply to all its buckets (S3 Control's API).
+    let control = |method: &str, account: &str, body: &[u8]| {
+        send_with(
+            port,
+            method,
+            "/v20180820/configuration/publicAccessBlock",
+            "",
+            &[("x-amz-account-id", account)],
+            body,
+            &owner_key,
+            Some(&owner_secret),
+        )
+        .1
+    };
+    assert_eq!(control("GET", &owner, b"").0, 404);
+    assert_eq!(control("PUT", &owner, restrict).0, 200);
+    assert!(
+        control("GET", &owner, b"")
+            .1
+            .contains("<RestrictPublicBuckets>true</RestrictPublicBuckets>")
+    );
+    assert_eq!(anonymous("GET", "/site/public/index.html"), 403);
+    assert_eq!(
+        control("PUT", &other, restrict).0,
+        403,
+        "another account's settings"
+    );
+    assert_eq!(control("DELETE", &owner, b"").0, 204);
+    assert_eq!(anonymous("GET", "/site/public/index.html"), 200);
+    // And the admin command sets them too.
+    native(
+        server.native_port,
+        &format!("s3 put public access block {owner} false false false true"),
+    );
+    assert_eq!(anonymous("GET", "/site/public/index.html"), 403);
+
+    // A raw request, to send what a client library would not.
+    let raw = |request: String| -> String {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.write_all(request.as_bytes()).expect("send");
+        let mut out = Vec::new();
+        stream.read_to_end(&mut out).expect("read");
+        latin1(&out)
+    };
+    native(
+        server.native_port,
+        &format!("s3 put public access block {owner} false false false false"),
+    );
+    assert_eq!(as_owner("PUT", "/open", "", &[], b"").0, 200);
+    assert_eq!(as_owner("PUT", "/open/k", "", &[], b"data").0, 200);
+    assert_eq!(
+        as_owner("PUT", "/open", "publicAccessBlock", &[], off).0,
+        200
+    );
+    // An anonymous caller has no signature keys: a negated condition on them
+    // holds for it.
+    let signed_only = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": "*", "Action": ["s3:GetObject", "s3:PutObject"], "Resource": "arn:aws:s3:::open/*"},
+        {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::open/*",
+         "Condition": {"StringNotEquals": {"s3:signatureversion": "AWS4-HMAC-SHA256"}}}]}"#;
+    assert_eq!(
+        as_owner("PUT", "/open", "policy", &[], signed_only.as_bytes()).0,
+        204
+    );
+    assert_eq!(anonymous("GET", "/open/k"), 403);
+    // An anonymous body must match the hash it claims.
+    let reply = raw(format!(
+        "PUT /open/forged HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nx-amz-content-sha256: {}\r\nContent-Length: 8\r\nConnection: close\r\n\r\ntampered",
+        "0".repeat(64)
+    ));
+    assert!(reply.starts_with("HTTP/1.1 400"), "{reply}");
+    assert_eq!(as_owner("GET", "/open/forged", "", &[], b"").0, 404);
+    // An unreadable Authorization header, or a signature parameter in another
+    // spelling, does not make a request anonymous.
+    let reply = raw(format!(
+        "GET /open/k HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nAuthorization: AWS4-HMAC-SHA256 Credential=\u{e9}\r\nConnection: close\r\n\r\n"
+    ));
+    assert!(!reply.starts_with("HTTP/1.1 200"), "{reply}");
+    assert_eq!(
+        send(
+            port,
+            "GET",
+            "/site/public/index.html",
+            "x-amz-algorithm=AWS4-HMAC-SHA256&X-Amz-Signature=00",
+            b"",
+            "",
+            None
+        )
+        .0,
+        403
+    );
+    // A grant pinned to the anonymous caller's own userid is public.
+    let userid = r#"{"Statement": {"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject",
+        "Resource": "arn:aws:s3:::open/*", "Condition": {"StringEquals": {"aws:userid": "anonymous"}}}}"#;
+    let block_policy = b"<PublicAccessBlockConfiguration><BlockPublicPolicy>true</BlockPublicPolicy></PublicAccessBlockConfiguration>";
+    assert_eq!(
+        as_owner("PUT", "/open", "publicAccessBlock", &[], block_policy).0,
+        200
+    );
+    assert_eq!(
+        as_owner("PUT", "/open", "policy", &[], userid.as_bytes()).0,
+        403
+    );
+    // Under RestrictPublicBuckets the public grants count for the owner's
+    // users too: they need their own policies.
+    assert_eq!(
+        as_owner("PUT", "/open", "publicAccessBlock", &[], off).0,
+        200
+    );
+    assert_eq!(
+        as_owner("PUT", "/open", "policy", &[], userid.as_bytes()).0,
+        204
+    );
+    assert!(
+        as_owner("GET", "/open", "policyStatus", &[], b"")
+            .1
+            .contains("<IsPublic>true</IsPublic>")
+    );
+    assert_eq!(
+        as_owner("PUT", "/open", "publicAccessBlock", &[], restrict).0,
+        200
+    );
+    let (user_key, user_secret) = user_with_key(&server, &owner, "staff", None);
+    assert_eq!(
+        send(
+            port,
+            "GET",
+            "/open/k",
+            "",
+            b"",
+            &user_key,
+            Some(&user_secret)
+        )
+        .0,
+        403
+    );
+    assert_eq!(anonymous("GET", "/open/k"), 403);
+}
+
+#[test]
 fn acls_are_disabled_and_ownership_is_enforced() {
     let (server, key, secret) = server_with_key();
     let port = server.s3_port;
@@ -1307,7 +1553,25 @@ fn requests_are_authenticated_with_sigv4_against_native_access_keys() {
     assert_eq!(status, 403, "{body}");
     assert!(body.contains("<Code>InvalidAccessKeyId</Code>"), "{body}");
 
+    // An unsigned request is anonymous: a missing bucket is 404, as in AWS;
+    // a private one refuses it.
     let (status, body) = get(server.s3_port, "/bucket/key", &key, None);
+    assert_eq!(status, 404, "{body}");
+    assert_eq!(get(server.s3_port, "/bucket", &key, Some(&secret)).0, 404);
+    assert_eq!(
+        send(
+            server.s3_port,
+            "PUT",
+            "/private",
+            "",
+            b"",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        200
+    );
+    let (status, body) = get(server.s3_port, "/private/key", &key, None);
     assert_eq!(status, 403, "{body}");
     assert!(body.contains("<Code>AccessDenied</Code>"), "{body}");
 }

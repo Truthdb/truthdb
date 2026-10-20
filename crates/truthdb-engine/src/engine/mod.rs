@@ -47,6 +47,7 @@ enum S3Admin {
     },
     DeleteUserPolicy(String, String, String),
     ListUserPolicies(String, String),
+    PutPublicAccessBlock(String, [String; 4]),
     CreateAccessKey(Option<String>, Option<String>),
     DropAccessKey(String),
     ListAccessKeys,
@@ -87,6 +88,12 @@ fn parse_s3_admin(input: &str) -> Option<S3Admin> {
             words[4].to_string(),
             words[5].to_string(),
         )),
+        ["s3", "put", "public", "access", "block", _, _, _, _, _] => {
+            Some(S3Admin::PutPublicAccessBlock(
+                words[5].to_string(),
+                [5, 6, 7, 8].map(|i| words[i + 1].to_ascii_lowercase()),
+            ))
+        }
         ["s3", "create", "access", "key"] => Some(S3Admin::CreateAccessKey(None, None)),
         ["s3", "create", "access", "key", _] => {
             Some(S3Admin::CreateAccessKey(Some(words[4].to_string()), None))
@@ -837,6 +844,39 @@ impl Engine {
                     "policy_name": name,
                     "policy_document": String::from_utf8_lossy(document),
                 })).collect::<Vec<_>>() })
+            }
+            S3Admin::PutPublicAccessBlock(account, settings) => {
+                // BlockPublicAcls, IgnorePublicAcls, BlockPublicPolicy,
+                // RestrictPublicBuckets: one bit each, as truthdb-s3 reads them.
+                let mut flags = 0u8;
+                for (bit, setting) in settings.iter().enumerate() {
+                    match setting.as_str() {
+                        "true" => flags |= 1 << bit,
+                        "false" => {}
+                        other => {
+                            return Err(CommandError::InvalidCommand(format!(
+                                "a setting is true or false, not '{other}'"
+                            ))
+                            .into());
+                        }
+                    }
+                }
+                self.object(|file| {
+                    file.transaction(|tx| {
+                        if !tx.account_exists(&account)? {
+                            return Ok(Err(truthdb_object::AccountError::NoSuchAccount));
+                        }
+                        tx.put_bucket_config(
+                            "",
+                            truthdb_object::PUBLIC_ACCESS_BLOCK,
+                            &account,
+                            &[flags],
+                        )
+                        .map(Ok)
+                    })
+                })?
+                .map_err(account_error)?;
+                json!({ "account_id": account, "public_access_block": settings })
             }
             S3Admin::CreateAccessKey(account, user) => {
                 let account =

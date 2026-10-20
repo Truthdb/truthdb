@@ -438,6 +438,16 @@ impl Condition {
             return false;
         }
         let fixed = |v: &String| !v.contains(['*', '?']) && !v.contains("${");
+        // An anonymous caller's `aws:userid` is the fixed value `anonymous`:
+        // pinning to it pins nothing.
+        if key.eq_ignore_ascii_case("aws:userid")
+            && self
+                .values
+                .iter()
+                .any(|v| v.eq_ignore_ascii_case("anonymous"))
+        {
+            return false;
+        }
         match &self.kind {
             Kind::StringEquals | Kind::StringEqualsIgnoreCase | Kind::StringLike | Kind::Arn => {
                 self.values.iter().all(fixed)

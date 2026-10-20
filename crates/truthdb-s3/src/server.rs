@@ -64,9 +64,10 @@ pub struct Connection {
     pub tls: bool,
 }
 
-/// A request that passed authentication: who sent it and how to read its body.
+/// A request that passed authentication: who sent it (`None`: an anonymous
+/// request, signed by no one) and how to read its body.
 pub struct Authenticated {
-    pub principal: Principal,
+    pub principal: Option<Principal>,
     pub framing: Framing,
     /// The full-body checksum header's name and (for a header checksum) value.
     pub checksum: Option<(String, Option<String>)>,
@@ -182,7 +183,10 @@ async fn route(state: &S3State, request: Request<Incoming>) -> Result<Response<B
         }
         _ => {}
     }
-    let auth = authenticate(state, &request).await?;
+    let auth = match anonymous(&request)? {
+        Some(anonymous) => anonymous,
+        None => authenticate(state, &request).await?,
+    };
     crate::api::dispatch(state, request, auth).await
 }
 
@@ -372,7 +376,17 @@ pub async fn authenticate(
             )));
         }
     };
-    let checksum = match header(request, "x-amz-trailer") {
+    Ok(Authenticated {
+        principal: Some(principal),
+        framing,
+        checksum: checksum_of(request),
+    })
+}
+
+/// The full-body checksum a request names: a trailer's name, or a checksum
+/// header's name and value.
+fn checksum_of(request: &Request<Incoming>) -> Option<(String, Option<String>)> {
+    match header(request, "x-amz-trailer") {
         Some(name) => Some((name.trim().to_string(), None)),
         None => request
             .headers()
@@ -384,12 +398,49 @@ pub async fn authenticate(
                     value.to_str().ok().map(str::to_string),
                 )
             }),
+    }
+}
+
+/// Whether a request is anonymous: no `Authorization` header (readable or
+/// not) and no query-string signature parameter (in any spelling). Its body
+/// is checked against the `x-amz-content-sha256` it claims, if any.
+fn anonymous(request: &Request<Incoming>) -> Result<Option<Authenticated>, S3Error> {
+    let presigned = request
+        .uri()
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter_map(|pair| pair.split('=').next())
+        .map(|name| {
+            percent_encoding::percent_decode_str(name)
+                .decode_utf8_lossy()
+                .to_ascii_lowercase()
+        })
+        .any(|name| {
+            matches!(
+                name.as_str(),
+                "x-amz-algorithm" | "x-amz-credential" | "x-amz-signature" | "x-amz-signedheaders"
+            )
+        });
+    if request.headers().contains_key("authorization") || presigned {
+        return Ok(None);
+    }
+    let framing = match header(request, "x-amz-content-sha256") {
+        None | Some(sigv4::UNSIGNED_PAYLOAD) => Framing::Unsigned,
+        Some(hash) if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            Framing::Sha256(hash.to_ascii_lowercase())
+        }
+        Some(other) => {
+            return Err(S3Error::invalid_request(format!(
+                "x-amz-content-sha256 {other} needs a signed request"
+            )));
+        }
     };
-    Ok(Authenticated {
-        principal,
+    Ok(Some(Authenticated {
+        principal: None,
         framing,
-        checksum,
-    })
+        checksum: checksum_of(request),
+    }))
 }
 
 /// Reads and verifies a whole (small) request body.

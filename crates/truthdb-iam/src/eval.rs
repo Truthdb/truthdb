@@ -159,15 +159,41 @@ const PINNING_KEYS: &[&str] = &[
     "s3:DataAccessPointAccount",
 ];
 
-/// Whether a bucket policy is public: some statement allows anyone, without
-/// a condition pinning one of [`PINNING_KEYS`] to fixed values.
+/// Whether a statement grants to the public: it allows anyone, without a
+/// condition pinning one of [`PINNING_KEYS`] to fixed values.
+fn public_grant(statement: &Statement) -> bool {
+    statement.effect == Effect::Allow
+        && statement.principals.contains(&Principal::Anyone)
+        && !statement
+            .conditions
+            .iter()
+            .any(|condition| PINNING_KEYS.iter().any(|key| condition.pins(key)))
+}
+
+/// Whether a bucket policy is public: some statement grants to the public.
 pub fn is_public(policy: &Policy) -> bool {
-    policy.statements.iter().any(|statement| {
-        statement.effect == Effect::Allow
-            && statement.principals.contains(&Principal::Anyone)
-            && !statement
-                .conditions
-                .iter()
-                .any(|condition| PINNING_KEYS.iter().any(|key| condition.pins(key)))
-    })
+    policy.statements.iter().any(public_grant)
+}
+
+/// The policy without its public grants (what still applies to the bucket
+/// owner's account under Block Public Access's RestrictPublicBuckets): a
+/// public statement keeps the principals it names, without anyone.
+pub fn without_public_grants(policy: &Policy) -> Policy {
+    Policy {
+        variables: policy.variables,
+        statements: policy
+            .statements
+            .iter()
+            .filter_map(|statement| {
+                if !public_grant(statement) {
+                    return Some(statement.clone());
+                }
+                let mut named = statement.clone();
+                named
+                    .principals
+                    .retain(|principal| *principal != Principal::Anyone);
+                (!named.principals.is_empty()).then_some(named)
+            })
+            .collect(),
+    }
 }
