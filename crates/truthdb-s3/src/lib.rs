@@ -5,6 +5,7 @@ pub mod api;
 pub mod copy;
 pub mod delete;
 pub mod error;
+pub mod iam;
 pub mod listing;
 pub mod multipart;
 pub mod objects;
