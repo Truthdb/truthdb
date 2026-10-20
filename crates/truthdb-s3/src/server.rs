@@ -147,6 +147,11 @@ pub fn full(text: impl Into<Bytes>) -> Body {
 }
 
 async fn route(state: &S3State, request: Request<Incoming>) -> Result<Response<Body>, S3Error> {
+    // S3 Vectors' JSON API on the same listener, told apart by the
+    // service its requests are signed for.
+    if request_service(&request).as_deref() == Some("s3vectors") {
+        return Ok(crate::vectors::handle(state, request).await);
+    }
     let auth = authenticate(state, &request).await?;
     crate::api::dispatch(state, request, auth).await
 }
@@ -158,11 +163,13 @@ fn header<'r>(request: &'r Request<Incoming>, name: &str) -> Option<&'r str> {
         .and_then(|value| value.to_str().ok())
 }
 
-/// Checks the request's SigV4 signature against the access key's secret.
-pub async fn authenticate(
+/// A request's parsed SigV4 authorization and its `x-amz-date`, checked
+/// for `service` in this server's region and within the allowed clock skew.
+pub fn signed_request(
     state: &S3State,
     request: &Request<Incoming>,
-) -> Result<Authenticated, S3Error> {
+    service: &str,
+) -> Result<(sigv4::AuthHeader, String), S3Error> {
     let authorization = header(request, "authorization")
         .ok_or_else(|| S3Error::access_denied("anonymous requests are not supported"))?;
     let auth =
@@ -174,14 +181,14 @@ pub async fn authenticate(
     let signed_at = parse_amz_date(amz_date)
         .ok_or_else(|| S3Error::access_denied("x-amz-date is not YYYYMMDDTHHMMSSZ"))?;
     if !amz_date.starts_with(&auth.credential.date)
-        || auth.credential.service != "s3"
+        || auth.credential.service != service
         || auth.credential.region != state.region
     {
         return Err(S3Error::new(
             400,
             "AuthorizationHeaderMalformed",
             format!(
-                "the credential scope must be {}/{}/s3/aws4_request",
+                "the credential scope must be {}/{}/{service}/aws4_request",
                 &amz_date[..8],
                 state.region
             ),
@@ -194,19 +201,31 @@ pub async fn authenticate(
             "The difference between the request time and the server's time is too large.",
         ));
     }
-    let payload_hash = header(request, "x-amz-content-sha256")
-        .ok_or_else(|| S3Error::invalid_request("the request has no x-amz-content-sha256"))?
-        .to_string();
+    Ok((auth, amz_date.to_string()))
+}
 
-    // As AWS requires: the host and every x-amz-* header present are signed,
-    // so none of them can be changed in transit or the request replayed
-    // against another endpoint.
+/// The SigV4 credential scope's service of a request, when it has one.
+pub fn request_service(request: &Request<Incoming>) -> Option<String> {
+    let authorization = header(request, "authorization")?;
+    sigv4::parse_authorization(authorization)
+        .ok()
+        .map(|auth| auth.credential.service)
+}
+
+/// Checks that the host, every `x-amz-*` header present, and `required`
+/// are signed: as AWS requires, so none can be changed in transit or the
+/// request replayed against another endpoint.
+pub fn check_signed_headers(
+    request: &Request<Incoming>,
+    auth: &sigv4::AuthHeader,
+    required: &[&str],
+) -> Result<(), S3Error> {
     for name in request
         .headers()
         .keys()
         .map(|name| name.as_str())
         .filter(|name| *name == "host" || name.starts_with("x-amz-"))
-        .chain(["host", "x-amz-date", "x-amz-content-sha256"])
+        .chain(required.iter().copied())
     {
         if !auth.signed_headers.iter().any(|signed| signed == name) {
             return Err(S3Error::access_denied(format!(
@@ -214,7 +233,20 @@ pub async fn authenticate(
             )));
         }
     }
+    Ok(())
+}
 
+/// Verifies the request's signature over `payload_hash` against the access
+/// key's secret; returns the signing key.
+pub async fn verify_signature(
+    state: &S3State,
+    method: &hyper::Method,
+    uri: &hyper::Uri,
+    request_headers: &hyper::HeaderMap,
+    auth: &sigv4::AuthHeader,
+    amz_date: &str,
+    payload_hash: &str,
+) -> Result<ring::hmac::Key, S3Error> {
     let access_key = auth.credential.access_key.clone();
     let secret = state
         .engine
@@ -223,8 +255,7 @@ pub async fn authenticate(
         .map_err(|err| S3Error::internal(err.to_string()))?
         .ok_or_else(S3Error::invalid_access_key)?;
 
-    let headers: Vec<(String, String)> = request
-        .headers()
+    let headers: Vec<(String, String)> = request_headers
         .iter()
         .filter_map(|(name, value)| {
             value
@@ -233,26 +264,55 @@ pub async fn authenticate(
                 .map(|value| (name.as_str().to_string(), value.to_string()))
         })
         .collect();
-    let canonical = sigv4::canonical_request(
-        request.method().as_str(),
-        request.uri().path(),
-        request.uri().query().unwrap_or(""),
+    let canonical = sigv4::canonical_request_for(
+        &auth.credential.service,
+        method.as_str(),
+        uri.path(),
+        uri.query().unwrap_or(""),
         &headers,
         &auth.signed_headers,
-        &payload_hash,
+        payload_hash,
     )
     .map_err(|sigv4::AuthError::Malformed(why)| {
         S3Error::new(400, "AuthorizationHeaderMalformed", why)
     })?;
-    let scope = auth.credential.scope();
     let key = sigv4::signing_key(&secret, &auth.credential);
     if !sigv4::verify(
         &key,
-        &sigv4::string_to_sign(amz_date, &scope, &canonical),
+        &sigv4::string_to_sign(amz_date, &auth.credential.scope(), &canonical),
         &auth.signature,
     ) {
         return Err(S3Error::signature_mismatch());
     }
+    Ok(key)
+}
+
+/// Checks the request's SigV4 signature against the access key's secret.
+pub async fn authenticate(
+    state: &S3State,
+    request: &Request<Incoming>,
+) -> Result<Authenticated, S3Error> {
+    let (auth, amz_date) = signed_request(state, request, "s3")?;
+    let amz_date = amz_date.as_str();
+    let payload_hash = header(request, "x-amz-content-sha256")
+        .ok_or_else(|| S3Error::invalid_request("the request has no x-amz-content-sha256"))?
+        .to_string();
+    check_signed_headers(
+        request,
+        &auth,
+        &["host", "x-amz-date", "x-amz-content-sha256"],
+    )?;
+    let key = verify_signature(
+        state,
+        request.method(),
+        request.uri(),
+        request.headers(),
+        &auth,
+        amz_date,
+        &payload_hash,
+    )
+    .await?;
+    let scope = auth.credential.scope();
 
     let framing = match payload_hash.as_str() {
         sigv4::UNSIGNED_PAYLOAD => Framing::Unsigned,

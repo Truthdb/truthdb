@@ -1326,3 +1326,385 @@ fn objects_are_found_by_exact_key_and_by_prefix() {
     let (_, (_, xml)) = call("GET", "/find", "list-type=2&prefix=cafe", b"");
     assert!(keys_of(&xml).is_empty(), "{xml}");
 }
+
+/// An S3 Vectors request: `POST /<operation>` with a JSON body, signed as
+/// AWS's SDKs sign it for the `s3vectors` service (content type, host and
+/// date signed; the body's hash in the signature, no x-amz-content-sha256).
+/// Returns the status, the error type (if any) and the JSON reply.
+fn vectors(
+    port: u16,
+    key: &str,
+    secret: &str,
+    operation: &str,
+    body: serde_json::Value,
+) -> (u16, Option<String>, serde_json::Value) {
+    let body = body.to_string();
+    let amz_date = amz_now();
+    let host = format!("127.0.0.1:{port}");
+    let payload = sigv4::sha256_hex(body.as_bytes());
+    let path = format!("/{operation}");
+    let headers = vec![
+        ("content-type".to_string(), "application/json".to_string()),
+        ("host".to_string(), host.clone()),
+        ("x-amz-date".to_string(), amz_date.clone()),
+    ];
+    let credential = sigv4::Credential {
+        access_key: key.to_string(),
+        date: amz_date[..8].to_string(),
+        region: "us-east-1".to_string(),
+        service: "s3vectors".to_string(),
+    };
+    let signed: Vec<String> = headers.iter().map(|(name, _)| name.clone()).collect();
+    let canonical =
+        sigv4::canonical_request_for("s3vectors", "POST", &path, "", &headers, &signed, &payload)
+            .unwrap();
+    let signature = sigv4::sign(
+        &sigv4::signing_key(secret, &credential),
+        &sigv4::string_to_sign(&amz_date, &credential.scope(), &canonical),
+    );
+    let request = format!(
+        "POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/json\r\nx-amz-date: {amz_date}\r\nContent-Length: {}\r\nConnection: close\r\nAuthorization: AWS4-HMAC-SHA256 Credential={key}/{}, SignedHeaders={}, Signature={signature}\r\n\r\n{body}",
+        body.len(),
+        credential.scope(),
+        signed.join(";")
+    );
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("send");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read");
+    let response = String::from_utf8(raw).expect("utf-8");
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    let (head, body) = response.split_once("\r\n\r\n").expect("a head");
+    let kind = response_header(head, "x-amzn-errortype");
+    (
+        status,
+        kind,
+        serde_json::from_str(body).expect("a JSON reply"),
+    )
+}
+
+#[test]
+fn the_s3_vectors_api_manages_buckets_indexes_and_vectors_and_queries_them() {
+    use serde_json::json;
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call =
+        |operation: &str, body: serde_json::Value| vectors(port, &key, &secret, operation, body);
+    let ok = |operation: &str, body: serde_json::Value| {
+        let (status, kind, reply) = call(operation, body);
+        assert_eq!(
+            (status, kind.as_deref()),
+            (200, None),
+            "{operation}: {reply}"
+        );
+        reply
+    };
+
+    // Buckets.
+    let created = ok("CreateVectorBucket", json!({"vectorBucketName": "vb1"}));
+    assert_eq!(
+        created["vectorBucketArn"],
+        json!("arn:aws:s3vectors:us-east-1:000000000000:bucket/vb1")
+    );
+    ok("CreateVectorBucket", json!({"vectorBucketName": "vb2"}));
+    let (status, kind, _) = call("CreateVectorBucket", json!({"vectorBucketName": "vb1"}));
+    assert_eq!((status, kind.as_deref()), (409, Some("ConflictException")));
+    let (status, kind, reply) = call(
+        "CreateVectorBucket",
+        json!({"vectorBucketName": "Bad_Name"}),
+    );
+    assert_eq!(
+        (status, kind.as_deref()),
+        (400, Some("ValidationException"))
+    );
+    assert!(reply["fieldList"].is_array());
+    let got = ok(
+        "GetVectorBucket",
+        json!({"vectorBucketArn": created["vectorBucketArn"]}),
+    );
+    assert_eq!(got["vectorBucket"]["vectorBucketName"], json!("vb1"));
+    assert!(got["vectorBucket"]["creationTime"].as_f64().unwrap() > 1.7e9);
+    let page = ok("ListVectorBuckets", json!({"maxResults": 1}));
+    assert_eq!(page["vectorBuckets"][0]["vectorBucketName"], json!("vb1"));
+    let page = ok(
+        "ListVectorBuckets",
+        json!({"maxResults": 1, "nextToken": page["nextToken"]}),
+    );
+    assert_eq!(page["vectorBuckets"][0]["vectorBucketName"], json!("vb2"));
+    assert!(page.get("nextToken").is_none());
+    assert_eq!(
+        ok("ListVectorBuckets", json!({"prefix": "vb2"}))["vectorBuckets"]
+            .as_array()
+            .unwrap()
+            .len(),
+        1
+    );
+
+    // An index, by name and by ARN.
+    let (status, kind, _) = call(
+        "CreateIndex",
+        json!({"vectorBucketName": "vb1", "indexName": "idx", "dataType": "float32", "dimension": 5000, "distanceMetric": "cosine"}),
+    );
+    assert_eq!(
+        (status, kind.as_deref()),
+        (400, Some("ValidationException"))
+    );
+    let index = ok(
+        "CreateIndex",
+        json!({
+            "vectorBucketName": "vb1", "indexName": "idx", "dataType": "float32",
+            "dimension": 3, "distanceMetric": "euclidean",
+            "metadataConfiguration": {"nonFilterableMetadataKeys": ["text"]}
+        }),
+    );
+    let arn = index["indexArn"].clone();
+    assert_eq!(
+        arn,
+        json!("arn:aws:s3vectors:us-east-1:000000000000:bucket/vb1/index/idx")
+    );
+    let got = ok("GetIndex", json!({"indexArn": arn}));
+    assert_eq!(got["index"]["dimension"], json!(3));
+    assert_eq!(got["index"]["distanceMetric"], json!("euclidean"));
+    assert_eq!(
+        got["index"]["metadataConfiguration"]["nonFilterableMetadataKeys"],
+        json!(["text"])
+    );
+    assert_eq!(
+        ok("ListIndexes", json!({"vectorBucketName": "vb1"}))["indexes"][0]["indexName"],
+        json!("idx")
+    );
+    let (status, kind, _) = call(
+        "GetIndex",
+        json!({"vectorBucketName": "vb1", "indexName": "nope"}),
+    );
+    assert_eq!((status, kind.as_deref()), (404, Some("NotFoundException")));
+    // Refused: an ARN of another region or account, a bucket named twice,
+    // an empty prefix, an empty list of non-filterable keys.
+    for (operation, body) in [
+        (
+            "GetIndex",
+            json!({"indexArn": "arn:aws:s3vectors:eu-west-1:000000000000:bucket/vb1/index/idx"}),
+        ),
+        (
+            "GetIndex",
+            json!({"indexArn": "arn:aws:s3vectors:us-east-1:123456789012:bucket/vb1/index/idx"}),
+        ),
+        ("GetIndex", json!({"indexArn": arn, "indexName": "idx"})),
+        (
+            "GetVectorBucket",
+            json!({"vectorBucketName": "vb2", "vectorBucketArn": created["vectorBucketArn"]}),
+        ),
+        ("ListVectorBuckets", json!({"prefix": ""})),
+        (
+            "CreateIndex",
+            json!({
+                "vectorBucketName": "vb1", "indexName": "idx2", "dataType": "float32",
+                "dimension": 3, "distanceMetric": "cosine", "metadataConfiguration": "x"
+            }),
+        ),
+        (
+            "CreateIndex",
+            json!({
+                "vectorBucketName": "vb1", "indexName": "idx2", "dataType": "float32",
+                "dimension": 3, "distanceMetric": "cosine",
+                "metadataConfiguration": {"nonFilterableMetadataKeys": []}
+            }),
+        ),
+    ] {
+        let (status, kind, reply) = call(operation, body.clone());
+        assert_eq!(
+            (status, kind.as_deref()),
+            (400, Some("ValidationException")),
+            "{operation} {body}: {reply}"
+        );
+    }
+
+    // Vectors.
+    let batch: Vec<serde_json::Value> = (0..150)
+        .map(|n| {
+            json!({
+                "key": format!("k{n:03}"),
+                "data": {"float32": [n as f32, 0.0, 1.0]},
+                "metadata": {"genre": if n % 2 == 0 { "even" } else { "odd" }, "n": n, "text": "long"}
+            })
+        })
+        .collect();
+    ok("PutVectors", json!({"indexArn": arn, "vectors": batch}));
+    let (status, kind, _) = call(
+        "PutVectors",
+        json!({"indexArn": arn, "vectors": [{"key": "bad", "data": {"float32": [1.0]}}]}),
+    );
+    assert_eq!(
+        (status, kind.as_deref()),
+        (400, Some("ValidationException"))
+    );
+    let got = ok(
+        "GetVectors",
+        json!({"indexArn": arn, "keys": ["k007", "missing"], "returnData": true, "returnMetadata": true}),
+    );
+    assert_eq!(got["vectors"].as_array().unwrap().len(), 1);
+    assert_eq!(got["vectors"][0]["data"]["float32"], json!([7.0, 0.0, 1.0]));
+    assert_eq!(got["vectors"][0]["metadata"]["text"], json!("long"));
+    // Listed in pages and in segments: every key exactly once.
+    let mut listed = Vec::new();
+    for segment in 0..3 {
+        let mut token = serde_json::Value::Null;
+        loop {
+            let page = ok(
+                "ListVectors",
+                json!({"indexArn": arn, "maxResults": 40, "segmentCount": 3, "segmentIndex": segment, "nextToken": token}),
+            );
+            listed.extend(
+                page["vectors"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|v| v["key"].as_str().unwrap().to_string()),
+            );
+            match page.get("nextToken") {
+                Some(next) => token = next.clone(),
+                None => break,
+            }
+        }
+    }
+    listed.sort();
+    assert_eq!(listed.len(), 150);
+    listed.dedup();
+    assert_eq!(listed.len(), 150);
+    // A segment's page carries the data and metadata of its keys; a segment
+    // count needs its index.
+    let page = ok(
+        "ListVectors",
+        json!({"indexArn": arn, "maxResults": 5, "segmentCount": 2, "segmentIndex": 1,
+               "returnData": true, "returnMetadata": true}),
+    );
+    for vector in page["vectors"].as_array().unwrap() {
+        let n: f64 = vector["key"].as_str().unwrap()[1..].parse().unwrap();
+        assert_eq!(vector["data"]["float32"][0], json!(n));
+        assert_eq!(vector["metadata"]["n"], json!(n as u64));
+    }
+    let (status, kind, _) = call("ListVectors", json!({"indexArn": arn, "segmentCount": 2}));
+    assert_eq!(
+        (status, kind.as_deref()),
+        (400, Some("ValidationException"))
+    );
+
+    // Queries: nearest first, filtered, with distances and metadata, every
+    // result in one response.
+    let found = ok(
+        "QueryVectors",
+        json!({"indexArn": arn, "topK": 3, "queryVector": {"float32": [10.0, 0.0, 1.0]},
+               "filter": {"genre": "even"}, "returnDistance": true, "returnMetadata": true}),
+    );
+    let keys: Vec<&str> = found["vectors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["key"].as_str().unwrap())
+        .collect();
+    assert_eq!(keys, ["k010", "k008", "k012"]);
+    assert_eq!(found["distanceMetric"], json!("euclidean"));
+    assert_eq!(found["vectors"][1]["distance"], json!(2.0));
+    assert_eq!(found["vectors"][0]["metadata"]["n"], json!(10));
+    let all = ok(
+        "QueryVectors",
+        json!({"indexArn": arn, "topK": 150, "queryVector": {"float32": [0.0, 0.0, 1.0]}}),
+    );
+    assert_eq!(all["vectors"].as_array().unwrap().len(), 150);
+    assert_eq!(all["vectors"][100]["key"], json!("k100"));
+    assert!(all["vectors"][0].get("distance").is_none());
+    assert!(all.get("nextToken").is_none());
+    let (status, kind, _) = call(
+        "QueryVectors",
+        json!({"indexArn": arn, "topK": 150, "queryVector": {"float32": [0.0, 0.0, 1.0]}, "nextToken": "MTAw"}),
+    );
+    assert_eq!(
+        (status, kind.as_deref()),
+        (400, Some("ValidationException"))
+    );
+    let (status, kind, _) = call(
+        "QueryVectors",
+        json!({"indexArn": arn, "topK": 3, "queryVector": {"float32": [1.0, 0.0, 0.0]}, "filter": {"n": {"$regex": "x"}}}),
+    );
+    assert_eq!(
+        (status, kind.as_deref()),
+        (400, Some("ValidationException"))
+    );
+
+    // Deleting: vectors, then the bucket only once its index is gone.
+    ok(
+        "DeleteVectors",
+        json!({"indexArn": arn, "keys": ["k010", "k008"]}),
+    );
+    let found = ok(
+        "QueryVectors",
+        json!({"indexArn": arn, "topK": 1, "queryVector": {"float32": [10.0, 0.0, 1.0]}, "filter": {"genre": "even"}}),
+    );
+    assert_ne!(found["vectors"][0]["key"], json!("k010"));
+    let (status, kind, _) = call("DeleteVectorBucket", json!({"vectorBucketName": "vb1"}));
+    assert_eq!((status, kind.as_deref()), (409, Some("ConflictException")));
+    ok("DeleteIndex", json!({"indexArn": arn}));
+    ok("DeleteVectorBucket", json!({"vectorBucketName": "vb1"}));
+    let (status, kind, _) = call("GetVectorBucket", json!({"vectorBucketName": "vb1"}));
+    assert_eq!((status, kind.as_deref()), (404, Some("NotFoundException")));
+
+    // A wrong secret, or an operation this server does not serve.
+    let (status, kind, _) = vectors(port, &key, "wrong", "ListVectorBuckets", json!({}));
+    assert_eq!(
+        (status, kind.as_deref()),
+        (403, Some("AccessDeniedException"))
+    );
+    let (status, kind, _) = call("PutVectorBucketPolicy", json!({"vectorBucketName": "vb2"}));
+    assert_eq!((status, kind.as_deref()), (501, Some("NotImplemented")));
+    // An unknown key is refused before its body is read: the reply comes
+    // although the promised megabyte never arrives.
+    let amz_date = amz_now();
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(20)))
+        .unwrap();
+    let request = format!(
+        "POST /ListVectorBuckets HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nx-amz-date: {amz_date}\r\nContent-Length: 1000000\r\nAuthorization: AWS4-HMAC-SHA256 Credential=NOSUCHKEY/{}/us-east-1/s3vectors/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature={}\r\n\r\n{{",
+        &amz_date[..8],
+        "0".repeat(64)
+    );
+    stream.write_all(request.as_bytes()).expect("send");
+    let mut head = [0u8; 12];
+    stream
+        .read_exact(&mut head)
+        .expect("a reply before the body");
+    assert_eq!(&head, b"HTTP/1.1 403");
+
+    // Clients that know the key id but not its secret, holding bodies open,
+    // turn no signed request away.
+    let slow: Vec<std::net::TcpStream> = (0..20)
+        .map(|_| {
+            let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+            let request = format!(
+                "POST /ListVectorBuckets HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Type: application/json\r\nx-amz-date: {amz_date}\r\nContent-Length: 1000\r\nAuthorization: AWS4-HMAC-SHA256 Credential={key}/{}/us-east-1/s3vectors/aws4_request, SignedHeaders=content-type;host;x-amz-date, Signature={}\r\n\r\n{{",
+                &amz_date[..8],
+                "0".repeat(64)
+            );
+            stream.write_all(request.as_bytes()).expect("send");
+            stream
+        })
+        .collect();
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    let (status, kind, reply) = call("ListVectorBuckets", json!({}));
+    assert_eq!((status, kind.as_deref()), (200, None), "{reply}");
+    drop(slow);
+
+    // A body of more values than any request needs is refused unparsed.
+    let (status, kind, _) = call("ListVectorBuckets", json!({"junk": vec![0u8; 5 << 20]}));
+    assert_eq!(
+        (status, kind.as_deref()),
+        (400, Some("ValidationException"))
+    );
+
+    // The S3 API on the same port is unchanged.
+    assert_eq!(get(port, "/", &key, Some(&secret)).0, 200);
+}

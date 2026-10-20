@@ -13,3 +13,4 @@ pub mod server;
 pub mod sigv4;
 pub mod tagging;
 pub mod time;
+pub mod vectors;

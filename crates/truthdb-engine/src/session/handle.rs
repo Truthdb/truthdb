@@ -259,6 +259,23 @@ impl EngineHandle {
         rx.await.map_err(|_| EngineError::Unavailable)?
     }
 
+    /// Runs `op` with the engine on a worker: for an operation of several
+    /// storage-lock holds (a vector query, a batch put a transaction at a
+    /// time), each taken through [`Engine::vector`] or [`Engine::object`].
+    pub async fn run_engine<T, F>(&self, op: F) -> Result<T, EngineError>
+    where
+        T: Send + 'static,
+        F: FnOnce(&crate::engine::Engine) -> Result<T, EngineError> + Send + 'static,
+    {
+        let (reply, rx) = oneshot::channel();
+        self.inbox.send(EngineCall::RunObject {
+            op: Box::new(move |engine| {
+                let _ = reply.send(op(engine));
+            }),
+        });
+        rx.await.map_err(|_| EngineError::Unavailable)?
+    }
+
     /// Fetches a login's stored credential for the TDS handshake. Returns
     /// `None` if the login does not exist or the worker pool is gone.
     pub async fn lookup_login(&self, name: String) -> Option<LoginRecord> {
