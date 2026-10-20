@@ -11,10 +11,8 @@
 //! Errors carry their type in `x-amzn-ErrorType` and a JSON `message`.
 //!
 //! As AWS's SDKs send no `x-amz-content-sha256` for this service, the body
-//! is read (at most 20 MiB) and hashed before the signature is checked: so
-//! the access key must exist first, the read must finish within a minute,
-//! and the bytes of all bodies not yet verified are bounded (past that, a
-//! request is told to retry). A body is parsed only once it has at most
+//! (at most 20 MiB) is read and hashed before the signature is checked (see
+//! `signed_body`). A body is parsed only once it has at most
 //! [`MAX_JSON_VALUES`] values, and at most 16 verified requests are parsed
 //! and served at once, which bounds the memory parsing takes.
 //!
@@ -23,12 +21,8 @@
 //! DeleteVectors batch is written over as many transactions as it takes, so
 //! a failure part way leaves the vectors before it written.
 
-use std::sync::atomic::{AtomicUsize, Ordering};
-
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD;
-use bytes::Bytes;
-use http_body_util::BodyExt;
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use serde_json::{Map, Value, json};
@@ -38,19 +32,10 @@ use truthdb_vector::{
 };
 
 use crate::error::S3Error;
-use crate::server::{
-    Body, Connection, S3State, check_signed_headers, full, signed_request, verify_signature,
-};
+use crate::server::{Body, Connection, S3State, full};
 
 /// The largest request body.
 const MAX_BODY: usize = 20 << 20;
-/// How long a request body may take to arrive.
-const BODY_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
-/// Bytes of request bodies held before their signatures are checked, and
-/// their bound: a client that knows only an access key id must send this
-/// much within [`BODY_TIMEOUT`] to turn others away.
-static UNVERIFIED: AtomicUsize = AtomicUsize::new(0);
-const UNVERIFIED_MAX: usize = 16 * MAX_BODY;
 /// The most values a request body may hold: more than the largest
 /// PutVectors needs (500 vectors of 4096 numbers). Parsed, a value takes
 /// about 64 bytes (an object member about 110).
@@ -96,8 +81,10 @@ impl VError {
 impl From<S3Error> for VError {
     fn from(err: S3Error) -> Self {
         let kind = match err.status {
-            400 => "ValidationException",
+            400 | 413 => "ValidationException",
             403 => "AccessDeniedException",
+            408 => "RequestTimeoutException",
+            503 => "ServiceUnavailableException",
             501 => "NotImplemented",
             _ => "InternalServerException",
         };
@@ -135,51 +122,11 @@ pub async fn handle(state: &S3State, request: Request<Incoming>) -> Response<Bod
 }
 
 async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, VError> {
-    let (auth, amz_date) = signed_request(state, &request, "s3vectors")?;
-    check_signed_headers(&request, &auth, &["host", "x-amz-date"])?;
-    // The signature covers the body, which must be read first: refuse an
-    // unknown key before that, and bound the unverified bytes held and for
-    // how long.
-    let access_key = auth.credential.access_key.clone();
-    if state
-        .engine
-        .run_object(move |file: &mut truthdb_object::ObjFile<'_>| file.access_key(&access_key))
-        .await?
-        .is_none()
-    {
-        return Err(S3Error::invalid_access_key().into());
-    }
-    let mut held = Unverified(0);
-    let (parts, body) = request.into_parts();
-    let body = tokio::time::timeout(BODY_TIMEOUT, read_body(body, &mut held))
-        .await
-        .map_err(|_| {
-            VError::new(
-                408,
-                "RequestTimeoutException",
-                "The request body took too long to arrive.",
-            )
-        })??;
-    let hash = hex(&ring::digest::digest(&ring::digest::SHA256, &body));
-    if let Some(sent) = parts
-        .headers
-        .get("x-amz-content-sha256")
-        .and_then(|value| value.to_str().ok())
-        && !sent.eq_ignore_ascii_case(&hash)
-    {
-        return Err(S3Error::signature_mismatch().into());
-    }
-    let (_, principal) = verify_signature(
-        state,
-        &parts.method,
-        &parts.uri,
-        &parts.headers,
-        &auth,
-        &amz_date,
-        &hash,
-    )
-    .await?;
-    drop(held);
+    let crate::signed_body::SignedBody {
+        parts,
+        body,
+        principal,
+    } = crate::signed_body::read(state, request, "s3vectors", MAX_BODY).await?;
     let _serving = SERVING.acquire().await.expect("never closed");
     let operation = parts.uri.path().trim_start_matches('/').to_string();
     if parts.method != Method::POST {
@@ -226,54 +173,6 @@ fn not_implemented(operation: &str) -> VError {
     )
 }
 
-/// Body bytes held before the signature is checked, counted in
-/// [`UNVERIFIED`] until dropped.
-struct Unverified(usize);
-
-impl Unverified {
-    fn take(&mut self, bytes: usize) -> bool {
-        if UNVERIFIED.fetch_add(bytes, Ordering::Relaxed) + bytes > UNVERIFIED_MAX {
-            UNVERIFIED.fetch_sub(bytes, Ordering::Relaxed);
-            return false;
-        }
-        self.0 += bytes;
-        true
-    }
-}
-
-impl Drop for Unverified {
-    fn drop(&mut self) {
-        UNVERIFIED.fetch_sub(self.0, Ordering::Relaxed);
-    }
-}
-
-/// Reads the body, counting its bytes in `held` as they arrive.
-async fn read_body(mut body: Incoming, held: &mut Unverified) -> Result<Bytes, VError> {
-    let mut out = Vec::new();
-    while let Some(frame) = body.frame().await {
-        let frame = frame.map_err(|_| VError::validation("The request body could not be read."))?;
-        let Ok(data) = frame.into_data() else {
-            continue;
-        };
-        if out.len() + data.len() > MAX_BODY {
-            return Err(VError::new(
-                413,
-                "ValidationException",
-                format!("The request body is larger than {MAX_BODY} bytes."),
-            ));
-        }
-        if !held.take(data.len()) {
-            return Err(VError::new(
-                503,
-                "ServiceUnavailableException",
-                "The service is busy; retry the request.",
-            ));
-        }
-        out.extend_from_slice(&data);
-    }
-    Ok(Bytes::from(out))
-}
-
 /// At least the number of values in a JSON text: one, plus one per comma
 /// and per opening bracket outside strings.
 fn json_values(text: &[u8]) -> usize {
@@ -295,10 +194,6 @@ fn json_values(text: &[u8]) -> usize {
         }
     }
     count
-}
-
-fn hex(digest: &ring::digest::Digest) -> String {
-    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
 }
 
 fn now_ms() -> u64 {

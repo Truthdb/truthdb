@@ -71,40 +71,52 @@ fn load(
     objects: &[Named],
 ) -> Result<Loaded, StorageError> {
     let mut texts = Vec::new();
-    let (identity, policies) =
-        match &principal.user {
-            None => (
-                Identity::Root {
-                    account: principal.account.clone(),
-                },
-                Vec::new(),
-            ),
-            Some(name) => {
-                let user_id = file
-                    .users(&principal.account)?
-                    .into_iter()
-                    .find(|user| &user.name == name)
-                    .map(|user| user.user_id)
-                    // A user dropped since its key was checked: no policy holds.
-                    .unwrap_or_default();
-                let mut policies = Vec::new();
-                for (policy_name, document) in file.user_policies(&principal.account, name)? {
-                    let text = String::from_utf8_lossy(&document).into_owned();
-                    policies.push(Policy::parse(&text, PolicyKind::UserInline).map_err(|err| {
+    let (identity, policies) = match &principal.user {
+        None => (
+            Identity::Root {
+                account: principal.account.clone(),
+            },
+            Vec::new(),
+        ),
+        Some(name) => {
+            let user_id = file
+                .users(&principal.account)?
+                .into_iter()
+                .find(|user| &user.name == name)
+                .map(|user| user.user_id)
+                // A user dropped since its key was checked: no policy holds.
+                .unwrap_or_default();
+            let mut policies = Vec::new();
+            for (policy_name, document) in file.user_policies(&principal.account, name)? {
+                let text = String::from_utf8_lossy(&document).into_owned();
+                policies.push(
+                    Policy::parse(&text, PolicyKind::UserInline).map_err(|err| {
                         corrupt_policy(&format!("user policy {policy_name}"), err)
-                    })?);
-                    texts.push(text);
-                }
-                (
-                    Identity::User {
-                        account: principal.account.clone(),
-                        name: name.clone(),
-                        user_id,
-                    },
-                    policies,
-                )
+                    })?,
+                );
+                texts.push(text);
             }
-        };
+            for policy_name in file.attached_policies(&principal.account, name)? {
+                // A policy detached meanwhile is gone: it grants nothing.
+                let Some(managed) = file.managed_policy(&principal.account, &policy_name)? else {
+                    continue;
+                };
+                let text = String::from_utf8_lossy(&managed.document).into_owned();
+                policies.push(Policy::parse(&text, PolicyKind::Managed).map_err(|err| {
+                    corrupt_policy(&format!("managed policy {policy_name}"), err)
+                })?);
+                texts.push(text);
+            }
+            (
+                Identity::User {
+                    account: principal.account.clone(),
+                    name: name.clone(),
+                    user_id,
+                },
+                policies,
+            )
+        }
+    };
     let mut grants = HashMap::new();
     for bucket in buckets {
         let owner = file.bucket(bucket)?.map(|info| info.owner);
