@@ -90,6 +90,11 @@ pub(super) fn spawn_engine_pool(
                 .name("truthdb-maintenance".to_string())
                 .spawn(move || maintenance_loop(&keeper))
                 .expect("spawn maintenance thread");
+            let indexer_shared = Arc::clone(&supervisor);
+            let indexer = std::thread::Builder::new()
+                .name("truthdb-object-indexer".to_string())
+                .spawn(move || indexer_loop(&indexer_shared))
+                .expect("spawn indexer thread");
             let handles: Vec<_> = (0..workers)
                 .map(|i| {
                     let shared = Arc::clone(&supervisor);
@@ -113,6 +118,7 @@ pub(super) fn spawn_engine_pool(
             }
             supervisor.wake.notify_all();
             let _ = maintenance.join();
+            let _ = indexer.join();
             let mut sched = supervisor.scheduler.lock().expect("scheduler poisoned");
             for parked in sched.parked.drain(..) {
                 parked
@@ -254,6 +260,33 @@ pub(super) fn maintenance_loop(shared: &Arc<Shared>) {
         // `recv_timeout(wake_cap)` used to be, at the same cost: one wakeup per
         // interval on an idle engine, which finds nothing and sleeps again.
         shared.inbox.nudge();
+    }
+}
+
+/// How long the full-text indexer sleeps when it has nothing to do.
+const INDEXER_IDLE: Duration = Duration::from_secs(1);
+
+/// The full-text indexer (see `engine::fulltext`), on its own thread so a
+/// backlog of large objects never delays the maintenance sweeps: a pass at a
+/// time while work remains, else a sleep.
+pub(super) fn indexer_loop(shared: &Arc<Shared>) {
+    while !shared.stop.load(Ordering::Acquire) {
+        let stop = || shared.stop.load(Ordering::Acquire);
+        let more = shared.engine.fulltext_pass(&stop).unwrap_or_else(|err| {
+            eprintln!("full-text indexing failed: {err}");
+            false
+        });
+        if more {
+            continue;
+        }
+        let idle = shared.idle.lock().expect("idle mutex poisoned");
+        if shared.stop.load(Ordering::Acquire) {
+            break;
+        }
+        let _ = shared
+            .wake
+            .wait_timeout(idle, INDEXER_IDLE)
+            .expect("idle mutex poisoned");
     }
 }
 

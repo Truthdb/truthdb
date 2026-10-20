@@ -9,10 +9,12 @@
 //!   document length (u32 LE each). The 0 cannot occur in a term, so a
 //!   term's postings sort together and before longer terms that share its
 //!   prefix.
-//! - **Documents:** `scope, doc (8 bytes BE), chunk (2 bytes BE)` -> the
-//!   document's terms with their frequencies, chunked under the tree's cell
-//!   cap; chunk 0 starts with the document's length. Unindexing reads them
-//!   back to find the postings to delete.
+//! - **Documents:** `scope, doc (8 bytes BE), chunk (2 bytes BE)`: chunks
+//!   1 on hold the document's terms with their frequencies, chunked under
+//!   the tree's cell cap (removing a document reads them back to find its
+//!   postings); chunk 0, written last, marks the document complete and holds
+//!   its length and chunk count. A large document is written and removed a
+//!   transaction at a time, so a document may exist in part.
 //! - **Statistics:** `scope` alone, in the documents tree -> the scope's
 //!   document count and total length (u64 LE each), for BM25.
 
@@ -33,6 +35,23 @@ pub struct Index {
 pub struct Stats {
     pub docs: u64,
     pub total_len: u64,
+}
+
+/// How far [`Index::add_terms`] has written a document: past the term
+/// `after`, with `next_chunk` the document row to write next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Progress {
+    pub after: Option<String>,
+    pub next_chunk: u16,
+}
+
+impl Default for Progress {
+    fn default() -> Self {
+        Progress {
+            after: None,
+            next_chunk: 1,
+        }
+    }
 }
 
 /// One document's entry under a term.
@@ -144,8 +163,9 @@ impl Index {
         Ok(())
     }
 
-    /// Indexes `doc` in `scope` with `terms`, replacing what was indexed for
-    /// it before. Runs inside the caller's transaction.
+    /// Indexes `doc` in `scope` with `terms` in one go, replacing what was
+    /// indexed for it before (a small document, or a test: a large one is
+    /// written by [`Self::add_terms`] a transaction at a time).
     pub fn index_document(
         &self,
         ctx: &mut RelCtx<'_>,
@@ -154,61 +174,14 @@ impl Index {
         doc: u64,
         terms: &DocTerms,
     ) -> Result<(), StorageError> {
-        // A term is stored behind a length byte and ends at a 0 in posting keys.
-        if let Some(bad) = terms
-            .counts
-            .keys()
-            .find(|term| term.is_empty() || term.len() > MAX_TERM_BYTES || term.contains('\0'))
-        {
-            return Err(StorageError::InvalidConfig(format!(
-                "{bad:?} cannot be indexed as a full-text term"
-            )));
-        }
-        self.unindex_document(ctx, txn, scope, doc)?;
-        let posting = |tf: u32| {
-            let mut row = tf.to_le_bytes().to_vec();
-            row.extend_from_slice(&terms.len.to_le_bytes());
-            row
-        };
-        // Document rows: chunk 0 opens with the length; each chunk is filled
-        // up to the cell cap.
-        let cap = TREE_MAX_CELL - 2 - doc_key(scope, doc, 0)?.len();
-        let mut chunks = vec![terms.len.to_le_bytes().to_vec()];
-        for (term, &tf) in &terms.counts {
-            let inserted = self.postings.insert_unique(
-                ctx,
-                &mut OpMode::Txn(txn),
-                &posting_key(scope, term, doc)?,
-                &posting(tf),
-            )?;
-            if inserted != TreeInsert::Inserted {
-                return Err(corrupt("a posting outlived its document"));
-            }
-            let entry_len = 1 + term.len() + 4;
-            if chunks.last().expect("a chunk").len() + entry_len > cap {
-                chunks.push(Vec::new());
-            }
-            let chunk = chunks.last_mut().expect("a chunk");
-            chunk.push(term.len() as u8);
-            chunk.extend_from_slice(term.as_bytes());
-            chunk.extend_from_slice(&tf.to_le_bytes());
-        }
-        for (index, chunk) in chunks.iter().enumerate() {
-            let index = u16::try_from(index).map_err(|_| {
-                StorageError::InvalidConfig("a document has too many distinct terms".to_string())
-            })?;
-            self.docs.insert_unique(
-                ctx,
-                &mut OpMode::Txn(txn),
-                &doc_key(scope, doc, index)?,
-                chunk,
-            )?;
-        }
-        self.add_stats(ctx, txn, scope, 1, i64::from(terms.len))
+        self.remove_document(ctx, txn, scope, doc, u64::MAX)?;
+        let mut progress = Progress::default();
+        self.add_terms(ctx, txn, scope, doc, terms, &mut progress, u64::MAX)?;
+        self.finish_document(ctx, txn, scope, doc, terms.len, progress.next_chunk)
     }
 
-    /// Removes `doc` from `scope`. Returns whether it was indexed. Runs inside
-    /// the caller's transaction.
+    /// Removes `doc` from `scope` in one go. Returns whether anything of it
+    /// was indexed.
     pub fn unindex_document(
         &self,
         ctx: &mut RelCtx<'_>,
@@ -218,26 +191,210 @@ impl Index {
     ) -> Result<bool, StorageError> {
         let lower = doc_key(scope, doc, 0)?;
         let upper = doc_key(scope, doc, u16::MAX)?;
-        let rows = self.docs.scan_range(ctx, Some(&lower), Some(&upper))?;
-        let Some((_, first)) = rows.first() else {
-            return Ok(false);
-        };
-        let len = u32_at(first, 0)?;
-        for (index, (key, row)) in rows.iter().enumerate() {
-            let entries = if index == 0 { &row[4..] } else { &row[..] };
-            for (term, _) in decode_terms(entries)? {
-                if self
-                    .postings
-                    .delete(ctx, &mut OpMode::Txn(txn), &posting_key(scope, &term, doc)?)?
-                    .is_none()
-                {
-                    return Err(corrupt("a document's posting is missing"));
-                }
-            }
-            self.docs.delete(ctx, &mut OpMode::Txn(txn), key)?;
+        let held = !self
+            .docs
+            .scan_range_limit(ctx, Some(&lower), Some(&upper), 1)?
+            .is_empty();
+        self.remove_document(ctx, txn, scope, doc, u64::MAX)?;
+        Ok(held)
+    }
+
+    /// Writes `terms` of `doc` from `progress` on, a posting each and their
+    /// list in document rows, until done or until this call has written more
+    /// than `max_log_bytes` of log; returns whether every term is written.
+    /// The document is not complete (counted or ranked as a document) until
+    /// [`Self::finish_document`]; a document written in part is removed by
+    /// [`Self::remove_document`]. Each call runs inside the caller's
+    /// transaction: a document too large for one is written by several.
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_terms(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        txn: &mut TxnLink,
+        scope: &[u8],
+        doc: u64,
+        terms: &DocTerms,
+        progress: &mut Progress,
+        max_log_bytes: u64,
+    ) -> Result<bool, StorageError> {
+        use std::ops::Bound;
+        // A term is stored behind a length byte and ends at a 0 in posting
+        // keys: refuse the document before writing any of it.
+        if let Some(bad) = terms
+            .counts
+            .keys()
+            .find(|term| term.is_empty() || term.len() > MAX_TERM_BYTES || term.contains('\0'))
+        {
+            return Err(StorageError::InvalidConfig(format!(
+                "{bad:?} cannot be indexed as a full-text term"
+            )));
         }
-        self.add_stats(ctx, txn, scope, -1, -i64::from(len))?;
-        Ok(true)
+        let start = ctx.io.wal.tail();
+        let mut posting = terms.len.to_le_bytes().to_vec();
+        posting.splice(0..0, [0u8; 4]);
+        let cap = TREE_MAX_CELL - 2 - doc_key(scope, doc, 0)?.len();
+        let lower = match &progress.after {
+            Some(after) => Bound::Excluded(after.clone()),
+            None => Bound::Unbounded,
+        };
+        let mut chunk = Vec::new();
+        let mut done = true;
+        for (index, (term, &tf)) in terms.counts.range((lower, Bound::Unbounded)).enumerate() {
+            if index % 16 == 0 && ctx.io.wal.tail() - start > max_log_bytes {
+                done = false;
+                break;
+            }
+            let entry_len = 1 + term.len() + 4;
+            if chunk.len() + entry_len > cap {
+                self.write_chunk(ctx, txn, scope, doc, progress, &mut chunk)?;
+            }
+            posting[..4].copy_from_slice(&tf.to_le_bytes());
+            let inserted = self.postings.insert_unique(
+                ctx,
+                &mut OpMode::Txn(txn),
+                &posting_key(scope, term, doc)?,
+                &posting,
+            )?;
+            if inserted != TreeInsert::Inserted {
+                return Err(corrupt("a posting outlived its document"));
+            }
+            chunk.push(term.len() as u8);
+            chunk.extend_from_slice(term.as_bytes());
+            chunk.extend_from_slice(&tf.to_le_bytes());
+            progress.after = Some(term.clone());
+        }
+        if !chunk.is_empty() {
+            self.write_chunk(ctx, txn, scope, doc, progress, &mut chunk)?;
+        }
+        Ok(done)
+    }
+
+    /// Writes one document row of terms and empties `chunk`.
+    fn write_chunk(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        txn: &mut TxnLink,
+        scope: &[u8],
+        doc: u64,
+        progress: &mut Progress,
+        chunk: &mut Vec<u8>,
+    ) -> Result<(), StorageError> {
+        if progress.next_chunk == u16::MAX {
+            return Err(StorageError::InvalidConfig(
+                "a document has too many distinct terms".to_string(),
+            ));
+        }
+        self.docs.insert_unique(
+            ctx,
+            &mut OpMode::Txn(txn),
+            &doc_key(scope, doc, progress.next_chunk)?,
+            chunk,
+        )?;
+        progress.next_chunk += 1;
+        chunk.clear();
+        Ok(())
+    }
+
+    /// Completes `doc`, whose terms are all written: from now on it counts
+    /// as a document of `scope`, `len` terms long, in `chunks` rows.
+    pub fn finish_document(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        txn: &mut TxnLink,
+        scope: &[u8],
+        doc: u64,
+        len: u32,
+        chunks: u16,
+    ) -> Result<(), StorageError> {
+        let mut header = len.to_le_bytes().to_vec();
+        header.extend_from_slice(&chunks.to_le_bytes());
+        let inserted = self.docs.insert_unique(
+            ctx,
+            &mut OpMode::Txn(txn),
+            &doc_key(scope, doc, 0)?,
+            &header,
+        )?;
+        if inserted != TreeInsert::Inserted {
+            return Err(corrupt("a document completed twice"));
+        }
+        self.add_stats(ctx, txn, scope, 1, i64::from(len))
+    }
+
+    /// Removes `doc` from `scope`, complete or written in part: first its
+    /// completion (so it no longer counts), then its rows and postings until
+    /// this call has written more than `max_log_bytes` of log. Returns
+    /// whether nothing of it is left. Runs inside the caller's transaction.
+    pub fn remove_document(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        txn: &mut TxnLink,
+        scope: &[u8],
+        doc: u64,
+        max_log_bytes: u64,
+    ) -> Result<bool, StorageError> {
+        let start = ctx.io.wal.tail();
+        let header_key = doc_key(scope, doc, 0)?;
+        if let Some(header) = self.docs.delete(ctx, &mut OpMode::Txn(txn), &header_key)? {
+            self.add_stats(ctx, txn, scope, -1, -i64::from(u32_at(&header, 0)?))?;
+        }
+        // A few rows at a time: a large document's rows are not all read on
+        // every step of its removal.
+        let lower = doc_key(scope, doc, 1)?;
+        let upper = doc_key(scope, doc, u16::MAX)?;
+        loop {
+            let rows = self
+                .docs
+                .scan_range_limit(ctx, Some(&lower), Some(&upper), 16)?;
+            if rows.is_empty() {
+                return Ok(true);
+            }
+            for (key, row) in &rows {
+                if ctx.io.wal.tail() - start > max_log_bytes {
+                    return Ok(false);
+                }
+                for (term, _) in decode_terms(row)? {
+                    if self
+                        .postings
+                        .delete(ctx, &mut OpMode::Txn(txn), &posting_key(scope, &term, doc)?)?
+                        .is_none()
+                    {
+                        return Err(corrupt("a document's posting is missing"));
+                    }
+                }
+                self.docs.delete(ctx, &mut OpMode::Txn(txn), key)?;
+            }
+        }
+    }
+
+    /// Up to `limit` of the documents indexed in `scope`, lowest first (to
+    /// unindex a whole scope a batch at a time).
+    pub fn documents(
+        &self,
+        ctx: &mut RelCtx<'_>,
+        scope: &[u8],
+        limit: usize,
+    ) -> Result<Vec<u64>, StorageError> {
+        let lower = doc_key(scope, 0, 0)?;
+        let upper = doc_key(scope, u64::MAX, u16::MAX)?;
+        let mut docs = Vec::new();
+        let mut after = lower;
+        while docs.len() < limit {
+            let rows = self
+                .docs
+                .scan_range_limit(ctx, Some(&after), Some(&upper), 1)?;
+            let Some((key, _)) = rows.first() else {
+                break;
+            };
+            let at = key.len() - 10;
+            let doc = u64::from_be_bytes(key[at..at + 8].try_into().expect("8 bytes"));
+            docs.push(doc);
+            // Past every chunk of this document.
+            match doc.checked_add(1) {
+                Some(next) => after = doc_key(scope, next, 0)?,
+                None => break,
+            }
+        }
+        Ok(docs)
     }
 
     /// Reads up to `limit` postings of `term` in `scope` (of every term that

@@ -199,6 +199,8 @@ impl ObjTxn<'_, '_> {
     /// order, so a row recorded before an expired one is at least as old,
     /// whatever its timestamp says (the clock may have stepped back since):
     /// everything up to the last expired row in a window from the head goes.
+    /// While any bucket has full-text state, no row the indexer has yet to
+    /// apply goes.
     pub fn trim_journal(
         &mut self,
         now_ms: u64,
@@ -207,7 +209,8 @@ impl ObjTxn<'_, '_> {
     ) -> Result<usize, StorageError> {
         let changes = self.trees.changes();
         let window = changes.scan_range_limit(self.ctx, None, None, trim_window(limit))?;
-        let Some(last) = last_expired(&window, now_ms, retention_ms)? else {
+        let hold = self.fulltext_hold()?;
+        let Some(last) = last_expired(&window, now_ms, retention_ms, hold)? else {
             return Ok(0);
         };
         let mut trimmed = 0;
@@ -227,15 +230,19 @@ fn trim_window(limit: usize) -> usize {
 }
 
 /// The index of the last row in `rows` (journal rows from the head) past
-/// `retention_ms` at `now_ms`.
+/// `retention_ms` at `now_ms`, and numbered at most `hold` when one is given.
 fn last_expired(
     rows: &[(Vec<u8>, Vec<u8>)],
     now_ms: u64,
     retention_ms: u64,
+    hold: Option<u64>,
 ) -> Result<Option<usize>, StorageError> {
     let mut last = None;
     for (index, (key, row)) in rows.iter().enumerate() {
         let sequence = u64::from_be_bytes(key.as_slice().try_into().map_err(|_| corrupt())?);
+        if hold.is_some_and(|hold| sequence > hold) {
+            break;
+        }
         let record = JournalRecord::decode(sequence, row)?;
         if record.timestamp_ms.saturating_add(retention_ms) <= now_ms {
             last = Some(index);
@@ -253,7 +260,8 @@ impl ObjFile<'_> {
         };
         let window =
             changes.scan_range_limit(&mut self.core.page_ctx(0), None, None, trim_window(1))?;
-        Ok(last_expired(&window, now_ms, retention_ms)?.is_some())
+        let hold = self.fulltext_hold()?;
+        Ok(last_expired(&window, now_ms, retention_ms, hold)?.is_some())
     }
 
     /// Up to `limit` journal rows numbered after `after`, oldest first.

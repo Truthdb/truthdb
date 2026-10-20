@@ -15,6 +15,7 @@ mod body;
 mod buckets;
 mod codec;
 mod credentials;
+mod fulltext;
 mod gc;
 mod journal;
 mod listing;
@@ -36,6 +37,10 @@ use truthdb_core::wal::records::RelRecord;
 
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
+pub use fulltext::{
+    DEFAULT_FULLTEXT_MAX_BYTES, FtBucket, FtError, FtKey, FtState, FtStatus, MAX_FULLTEXT_BYTES,
+    fulltext_status,
+};
 pub use gc::GcOutcome;
 pub use journal::{JournalObject, JournalRecord, RecordType};
 pub use listing::{ListAfter, ListedObject, Listing};
@@ -73,6 +78,17 @@ const UPLOAD_INDEX_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 10;
 const PARTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 11;
 /// Sequence number -> a [`journal::JournalRecord`]: every change, in order.
 const CHANGES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 12;
+/// Bucket name -> its full-text state (see `fulltext`).
+const FT_BUCKETS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 13;
+/// The full-text index's documents (see `truthdb_fulltext::Index`).
+const FT_DOCS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 14;
+/// The full-text index's postings.
+const FT_POSTINGS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 15;
+/// (bucket, 0, key) -> the version of the key the index holds, and how.
+const FT_KEYS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 16;
+/// (bucket, 0, version) -> key: the key of each version the index holds, to
+/// name a search's hits.
+const FT_VERSIONS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 17;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -89,6 +105,8 @@ const NEXT_VERSION_KEY: &[u8] = b"next_version";
 const NEXT_UPLOAD_KEY: &[u8] = b"next_upload";
 /// META key of the journal's next sequence number.
 const NEXT_CHANGE_KEY: &[u8] = b"next_change";
+/// META key of the last journal row the full-text indexer has applied.
+const FT_CURSOR_KEY: &[u8] = b"ft_cursor";
 
 /// The object engine's in-memory state under the storage lock.
 #[derive(Default)]
@@ -205,6 +223,11 @@ pub(crate) struct Trees {
     upload_index: u64,
     parts: u64,
     changes: u64,
+    ft_buckets: u64,
+    ft_docs: u64,
+    ft_postings: u64,
+    ft_keys: u64,
+    ft_versions: u64,
 }
 
 impl Trees {
@@ -263,6 +286,36 @@ impl Trees {
         BTree {
             object_id: CHANGES_TREE,
             root: self.changes,
+        }
+    }
+    pub fn ft_buckets(&self) -> BTree {
+        BTree {
+            object_id: FT_BUCKETS_TREE,
+            root: self.ft_buckets,
+        }
+    }
+    pub fn ft_index(&self) -> truthdb_fulltext::Index {
+        truthdb_fulltext::Index {
+            postings: BTree {
+                object_id: FT_POSTINGS_TREE,
+                root: self.ft_postings,
+            },
+            docs: BTree {
+                object_id: FT_DOCS_TREE,
+                root: self.ft_docs,
+            },
+        }
+    }
+    pub fn ft_keys(&self) -> BTree {
+        BTree {
+            object_id: FT_KEYS_TREE,
+            root: self.ft_keys,
+        }
+    }
+    pub fn ft_versions(&self) -> BTree {
+        BTree {
+            object_id: FT_VERSIONS_TREE,
+            root: self.ft_versions,
         }
     }
     pub fn attrs(&self) -> BTree {
@@ -337,6 +390,11 @@ impl<'a> ObjFile<'a> {
             upload_index: self.tree(UPLOAD_INDEX_TREE)?.root,
             parts: self.tree(PARTS_TREE)?.root,
             changes: self.tree(CHANGES_TREE)?.root,
+            ft_buckets: self.tree(FT_BUCKETS_TREE)?.root,
+            ft_docs: self.tree(FT_DOCS_TREE)?.root,
+            ft_postings: self.tree(FT_POSTINGS_TREE)?.root,
+            ft_keys: self.tree(FT_KEYS_TREE)?.root,
+            ft_versions: self.tree(FT_VERSIONS_TREE)?.root,
         };
         self.in_txn(|ctx, txn| body(&mut ObjTxn { ctx, txn, trees }))
     }

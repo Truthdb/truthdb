@@ -21,14 +21,17 @@ const WAL_CHECKPOINT_THRESHOLD: f64 = 0.75;
 const STANDBY_RESTARTPOINT_THRESHOLD: f64 = 0.5;
 
 /// A native-protocol S3 administration command (`s3 create access key`,
-/// `s3 drop access key <id>`, `s3 list access keys`). Like everything on the
-/// native protocol, it runs with full privileges and no authentication:
+/// `s3 drop access key <id>`, `s3 list access keys`, `s3 enable fulltext
+/// <bucket> [max_bytes]`, `s3 disable fulltext <bucket>`). Like everything on
+/// the native protocol, it runs with full privileges and no authentication:
 /// whoever can reach the native port can mint, list and drop S3 credentials
 /// (and the new secret is returned in cleartext over that connection).
 enum S3Admin {
     CreateAccessKey,
     DropAccessKey(String),
     ListAccessKeys,
+    EnableFulltext(String, Option<String>),
+    DisableFulltext(String),
 }
 
 fn parse_s3_admin(input: &str) -> Option<S3Admin> {
@@ -41,8 +44,28 @@ fn parse_s3_admin(input: &str) -> Option<S3Admin> {
         ["s3", "create", "access", "key"] => Some(S3Admin::CreateAccessKey),
         ["s3", "drop", "access", "key", _] => Some(S3Admin::DropAccessKey(words[4].to_string())),
         ["s3", "list", "access", "keys"] => Some(S3Admin::ListAccessKeys),
+        ["s3", "enable", "fulltext", _] => {
+            Some(S3Admin::EnableFulltext(words[3].to_string(), None))
+        }
+        ["s3", "enable", "fulltext", _, _] => Some(S3Admin::EnableFulltext(
+            words[3].to_string(),
+            Some(words[4].to_string()),
+        )),
+        ["s3", "disable", "fulltext", _] => Some(S3Admin::DisableFulltext(words[3].to_string())),
         _ => None,
     }
+}
+
+fn fulltext_error(bucket: &str, err: truthdb_object::FtError) -> EngineError {
+    use truthdb_object::FtError;
+    CommandError::InvalidCommand(match err {
+        FtError::NoSuchBucket => format!("no bucket '{bucket}'"),
+        FtError::NotEnabled => format!("full-text search is not enabled on bucket '{bucket}'"),
+        FtError::Purging => format!(
+            "bucket '{bucket}' is still removing its previous full-text index; try again shortly"
+        ),
+    })
+    .into()
 }
 
 const ACCESS_KEY_ID_ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
@@ -569,6 +592,29 @@ impl Engine {
                 let ids = self.object(|file| file.access_key_ids())?;
                 json!({ "access_keys": ids })
             }
+            S3Admin::EnableFulltext(bucket, max_bytes) => {
+                let max_bytes = match max_bytes {
+                    None => truthdb_object::DEFAULT_FULLTEXT_MAX_BYTES,
+                    Some(text) => text
+                        .parse::<u64>()
+                        .ok()
+                        .filter(|n| (1..=truthdb_object::MAX_FULLTEXT_BYTES).contains(n))
+                        .ok_or_else(|| {
+                            CommandError::InvalidCommand(format!(
+                                "max_bytes must be a number of bytes from 1 to {}, not '{text}'",
+                                truthdb_object::MAX_FULLTEXT_BYTES
+                            ))
+                        })?,
+                };
+                self.object(|file| file.transaction(|tx| tx.enable_fulltext(&bucket, max_bytes)))?
+                    .map_err(|err| fulltext_error(&bucket, err))?;
+                json!({ "bucket": bucket, "fulltext": "backfilling", "max_bytes": max_bytes })
+            }
+            S3Admin::DisableFulltext(bucket) => {
+                self.object(|file| file.transaction(|tx| tx.disable_fulltext(&bucket)))?
+                    .map_err(|err| fulltext_error(&bucket, err))?;
+                json!({ "bucket": bucket, "fulltext": "purging" })
+            }
         };
         render_json(&rendered).map_err(EngineError::from)
     }
@@ -784,6 +830,7 @@ fn render_sql_outcome(outcome: &crate::engine::BatchOutcome) -> String {
     json!({ "kind": "sql", "results": rendered, "error": error }).to_string()
 }
 
+mod fulltext;
 #[cfg(test)]
 mod relational_tests;
 mod s3_parquet;

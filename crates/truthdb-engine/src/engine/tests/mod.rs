@@ -1,5 +1,6 @@
 mod backup_restore;
 mod coordinator;
+mod fulltext;
 mod objects;
 mod recovery;
 mod replication;
