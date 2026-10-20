@@ -87,8 +87,9 @@ impl Form {
     /// Where the buffer's first delimiter starts: one followed by CRLF or
     /// `--` (the boundary followed by anything else is data). `Err(n)`: none
     /// is complete yet, and the first `n` bytes cannot be part of one.
-    fn delimiter(&self) -> Result<usize, usize> {
-        let mut from = 0;
+    /// Bytes before `start` are known not to begin one.
+    fn delimiter(&self, start: usize) -> Result<usize, usize> {
+        let mut from = start;
         while let Some(found) = self.buf[from..]
             .windows(self.delimiter.len())
             .position(|w| w == self.delimiter.as_slice())
@@ -109,9 +110,12 @@ impl Form {
     /// The position of the next delimiter, reading until it is there
     /// (`None` past `limit` bytes or at the end).
     async fn find_delimiter(&mut self, limit: usize) -> Result<Option<usize>, S3Error> {
+        // Each read rescans only what could begin a delimiter.
+        let mut start = 0;
         loop {
-            if let Ok(at) = self.delimiter() {
-                return Ok(Some(at));
+            match self.delimiter(start) {
+                Ok(at) => return Ok(Some(at)),
+                Err(clear) => start = clear,
             }
             if self.buf.len() > limit || !self.fill().await? {
                 return Ok(None);
@@ -122,10 +126,15 @@ impl Form {
     /// The position of `needle` in the buffer, reading until it is there
     /// (`None` past `limit` bytes or at the end).
     async fn find(&mut self, needle: &[u8], limit: usize) -> Result<Option<usize>, S3Error> {
+        let mut start = 0;
         loop {
-            if let Some(at) = self.buf.windows(needle.len()).position(|w| w == needle) {
-                return Ok(Some(at));
+            if let Some(at) = self.buf[start..]
+                .windows(needle.len())
+                .position(|w| w == needle)
+            {
+                return Ok(Some(start + at));
             }
+            start = (self.buf.len() + 1).saturating_sub(needle.len());
             if self.buf.len() > limit || !self.fill().await? {
                 return Ok(None);
             }
@@ -139,7 +148,8 @@ fn disposition(headers: &str) -> Option<(String, Option<String>)> {
         line.to_ascii_lowercase()
             .starts_with("content-disposition:")
     })?;
-    // `; key=value` parameters, a quoted value holding `;` and `\"`.
+    // `; key=value` parameters, a quoted value holding `;`. Browsers send
+    // a `"` in a file name as `%22` and a `\` as itself: it escapes nothing.
     let mut params: Vec<(String, String)> = Vec::new();
     let mut rest = line.split_once(';')?.1;
     while let Some((key, after)) = rest.split_once('=') {
@@ -147,21 +157,9 @@ fn disposition(headers: &str) -> Option<(String, Option<String>)> {
         let after = after.trim_start();
         let value;
         if let Some(quoted) = after.strip_prefix('"') {
-            let mut text = String::new();
-            let mut chars = quoted.char_indices();
-            let mut end = quoted.len();
-            while let Some((at, c)) = chars.next() {
-                match c {
-                    '\\' => text.extend(chars.next().map(|(_, c)| c)),
-                    '"' => {
-                        end = at + 1;
-                        break;
-                    }
-                    c => text.push(c),
-                }
-            }
-            value = text;
-            rest = quoted[end..].split_once(';').map_or("", |(_, rest)| rest);
+            let (text, after) = quoted.split_once('"').unwrap_or((quoted, ""));
+            value = text.to_string();
+            rest = after.split_once(';').map_or("", |(_, rest)| rest);
         } else {
             let (text, after) = after.split_once(';').unwrap_or((after, ""));
             value = text.trim().to_string();
@@ -437,7 +435,15 @@ pub async fn post_object(
     bucket: String,
 ) -> Result<Response<Body>, S3Error> {
     let connection = request.extensions().get::<Connection>().copied();
-    let headers = request.headers().clone();
+    // The policy context sees only what the form acts on: the client's
+    // identification here, the acl field below (other headers, such as a
+    // copy source, would satisfy conditions the upload never honours).
+    let mut headers = HeaderMap::new();
+    for name in [hyper::header::USER_AGENT, hyper::header::REFERER] {
+        if let Some(value) = request.headers().get(&name) {
+            headers.insert(name, value.clone());
+        }
+    }
     let content_type = request
         .headers()
         .get("content-type")
@@ -451,8 +457,9 @@ pub async fn post_object(
             key.eq_ignore_ascii_case("boundary")
                 .then(|| value.trim().trim_matches('"').to_string())
         })
-        .filter(|boundary| !boundary.is_empty())
-        .ok_or_else(|| invalid("The form has no multipart boundary."))?;
+        // RFC 2046: 1 to 70 characters.
+        .filter(|boundary| (1..=70).contains(&boundary.len()))
+        .ok_or_else(|| invalid("The form has no valid multipart boundary."))?;
     let mut form = Form {
         body: request.into_body(),
         buf: Vec::new(),
@@ -490,6 +497,12 @@ pub async fn post_object(
             "AccessControlListNotSupported",
             "The bucket does not allow ACLs",
         ));
+    }
+    if let Some(acl) = field(&fields, "acl") {
+        headers.insert(
+            "x-amz-acl",
+            HeaderValue::from_str(acl).expect("a checked acl"),
+        );
     }
     let tags = match field(&fields, "tagging") {
         Some(xml) => Some(crate::tagging::parse_tagging(xml.as_bytes())?),
@@ -544,7 +557,7 @@ pub async fn post_object(
         }
         let mut sink = BodySink::begin(state).await?;
         loop {
-            match form.delimiter() {
+            match form.delimiter(0) {
                 Ok(end) => {
                     let rest = form.buf[..end].to_vec();
                     push_bounded(state, &mut sink, &rest, max).await?;

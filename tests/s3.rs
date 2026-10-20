@@ -2213,6 +2213,55 @@ fn form_uploads_decide_each_field_once_and_parse_the_form_strictly() {
         post_form(port, "strict", &anonymous, "a", b"x", 1000).1.0,
         204
     );
+
+    // Only what the form acts on reaches the policy: a copy source header
+    // (which a form never copies from) does not, the acl field does.
+    let conditional = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::strict/copied/*",
+         "Condition": {"StringEquals": {"s3:x-amz-copy-source": "strict/template"}}},
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::strict/owned/*",
+         "Condition": {"StringEquals": {"s3:x-amz-acl": "bucket-owner-full-control"}}}]}"#;
+    assert_eq!(
+        as_owner("PUT", "/strict", "policy", conditional.as_bytes()).0,
+        204
+    );
+    let form_of = |fields: &[(&str, &str)]| {
+        let mut body = Vec::new();
+        for (name, value) in fields {
+            body.extend_from_slice(
+                format!("--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n").as_bytes(),
+            );
+        }
+        body.extend_from_slice(
+            format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a\\b.txt\"\r\n\r\nx\r\n--{boundary}--\r\n").as_bytes(),
+        );
+        body
+    };
+    let copy_source = [("x-amz-copy-source", "strict/template")];
+    let body = form_of(&[("key", "copied/evil")]);
+    assert_eq!(
+        post_raw(port, "strict", boundary, &body, 1000, &copy_source)
+            .1
+            .0,
+        403
+    );
+    absent("/strict/copied/evil");
+    let body = form_of(&[
+        ("key", "owned/${filename}"),
+        ("acl", "bucket-owner-full-control"),
+    ]);
+    let (_, (status, reply)) = post_raw(port, "strict", boundary, &body, 1000, &[]);
+    assert_eq!(status, 204, "{reply}");
+    // A file name is taken as the browser sends it: `\` is not an escape.
+    assert_eq!(as_owner("GET", "/strict/owned/a%5Cb.txt", "", b"").0, 200);
+
+    // A boundary is at most 70 characters (RFC 2046).
+    let long = "b".repeat(71);
+    let mut body = Vec::new();
+    body.extend_from_slice(
+        format!("--{long}\r\nContent-Disposition: form-data; name=\"key\"\r\n\r\nk\r\n--{long}\r\nContent-Disposition: form-data; name=\"file\"\r\n\r\nx\r\n--{long}--\r\n").as_bytes(),
+    );
+    assert_eq!(post_raw(port, "strict", &long, &body, 1000, &[]).1.0, 400);
 }
 
 #[test]
