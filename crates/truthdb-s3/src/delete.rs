@@ -34,16 +34,13 @@ async fn delete_one(
     which: Option<VersionSel>,
 ) -> Result<Deleted, S3Error> {
     let (bucket_name, key_name) = (bucket.to_string(), key.to_string());
-    state
-        .engine
-        .run_object(move |file| {
-            file.transaction(|tx| {
-                tx.delete_object(&bucket_name, &key_name, which, now_ms(), DROP_GRACE_MS)
-            })
+    crate::scope::object(state, move |file| {
+        file.transaction(|tx| {
+            tx.delete_object(&bucket_name, &key_name, which, now_ms(), DROP_GRACE_MS)
         })
-        .await
-        .map_err(|err| S3Error::internal(err.to_string()))?
-        .map_err(|err| object_error(err, bucket, key))
+    })
+    .await?
+    .map_err(|err| object_error(err, bucket, key))
 }
 
 pub async fn delete_object(
@@ -215,11 +212,8 @@ pub async fn delete_objects(
     let (quiet, objects) = parse_delete(&body)?;
     // A missing bucket fails the request, not each key.
     let name = bucket.clone();
-    if state
-        .engine
-        .run_object(move |file| file.bucket(&name))
-        .await
-        .map_err(|err| S3Error::internal(err.to_string()))?
+    if crate::scope::object(state, move |file| file.bucket(&name))
+        .await?
         .is_none()
     {
         return Err(object_error(ObjectError::NoSuchBucket, &bucket, ""));

@@ -9,7 +9,7 @@ use quick_xml::events::Event;
 use truthdb_object::{BucketError, BucketInfo, ObjFile, Versioning};
 
 use crate::error::{S3Error, escape};
-use crate::server::{Authenticated, Body, S3State, full, read_body};
+use crate::server::{Authenticated, Body, Principal, S3State, full, read_body};
 
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
@@ -81,6 +81,11 @@ fn bucket_error(err: BucketError, bucket: &str) -> S3Error {
             "NoSuchBucket",
             format!("The bucket {bucket} does not exist"),
         ),
+        BucketError::AlreadyExists => S3Error::new(
+            409,
+            "BucketAlreadyExists",
+            format!("The bucket {bucket} already exists and belongs to another account"),
+        ),
         BucketError::AlreadyOwnedByYou => S3Error::new(
             409,
             "BucketAlreadyOwnedByYou",
@@ -102,11 +107,7 @@ where
     T: Send + 'static,
     F: FnOnce(&mut ObjFile<'_>) -> Result<T, truthdb_core::storage::StorageError> + Send + 'static,
 {
-    state
-        .engine
-        .run_object(op)
-        .await
-        .map_err(|err| S3Error::internal(err.to_string()))
+    crate::scope::object(state, op).await
 }
 
 fn now_ms() -> u64 {
@@ -133,6 +134,15 @@ fn empty(status: StatusCode) -> Response<Body> {
         .expect("a valid response")
 }
 
+/// An account's owner element: its canonical user id (the SHA-256 of the
+/// account id, in hex) and the account id as display name.
+pub(crate) fn owner_xml(account: &str) -> String {
+    format!(
+        "<Owner><ID>{}</ID><DisplayName>{account}</DisplayName></Owner>",
+        crate::sigv4::sha256_hex(account.as_bytes())
+    )
+}
+
 /// Routes an authenticated request to its operation.
 pub async fn dispatch(
     state: &S3State,
@@ -140,7 +150,50 @@ pub async fn dispatch(
     auth: Authenticated,
 ) -> Result<Response<Body>, S3Error> {
     let method = request.method().clone();
-    match (target(request.uri().path())?, method) {
+    let target = target(request.uri().path())?;
+    let principal = auth.principal.clone();
+    // Until bucket policies, a bucket is its owner's alone: the request acts
+    // only on buckets that are missing or its account's (the one it names,
+    // and a copy's source), checked in every engine call it makes (see
+    // `scope`). A bucket being created may be another account's: that is a
+    // conflict, not a denial.
+    let creating = matches!(target, Target::Bucket(_))
+        && method == Method::PUT
+        && !has_param(&request, "versioning");
+    let mut buckets = Vec::new();
+    if let Target::Bucket(bucket) | Target::Object(bucket, _) = &target
+        && !creating
+    {
+        buckets.push(bucket.clone());
+    }
+    if matches!(target, Target::Object(..))
+        && method == Method::PUT
+        && let Ok((source, _, _)) = crate::copy::copy_source(request.headers())
+    {
+        buckets.push(source);
+    }
+    let scope = crate::scope::Scope {
+        access_key: principal.access_key.clone(),
+        account: principal.account.clone(),
+        buckets,
+    };
+    crate::scope::within(scope, async move {
+        // Refused before the body is read, too.
+        crate::scope::object(state, |_| Ok(())).await?;
+        route(state, request, auth, principal, target, method).await
+    })
+    .await
+}
+
+async fn route(
+    state: &S3State,
+    request: Request<Incoming>,
+    auth: Authenticated,
+    principal: Principal,
+    target: Target,
+    method: Method,
+) -> Result<Response<Body>, S3Error> {
+    match (target, method) {
         _ if UNIMPLEMENTED.iter().any(|name| has_param(&request, name)) => {
             Err(S3Error::not_implemented(format!(
                 "{} {}?{} is not implemented",
@@ -152,7 +205,7 @@ pub async fn dispatch(
         (Target::Bucket(_), _) if has_param(&request, "tagging") => Err(S3Error::not_implemented(
             "bucket tagging is not implemented",
         )),
-        (Target::Service, Method::GET) => list_buckets(state).await,
+        (Target::Service, Method::GET) => list_buckets(state, &principal).await,
         (Target::Bucket(bucket), Method::PUT) if has_param(&request, "versioning") => {
             put_versioning(state, request, auth, bucket).await
         }
@@ -161,7 +214,7 @@ pub async fn dispatch(
         }
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "versions") => {
             let query = request.uri().query().unwrap_or("").to_string();
-            crate::listing::list_versions(state, bucket, &query).await
+            crate::listing::list_versions(state, bucket, &principal.account, &query).await
         }
         (Target::Bucket(bucket), Method::PUT) => create_bucket(state, request, auth, bucket).await,
         (Target::Bucket(bucket), Method::DELETE) => delete_bucket(state, bucket).await,
@@ -244,10 +297,12 @@ pub async fn dispatch(
     }
 }
 
-async fn list_buckets(state: &S3State) -> Result<Response<Body>, S3Error> {
+/// The principal's account's buckets.
+async fn list_buckets(state: &S3State, principal: &Principal) -> Result<Response<Body>, S3Error> {
     let buckets = object(state, |file| file.list_buckets()).await?;
     let entries: String = buckets
         .iter()
+        .filter(|bucket| bucket.owner == principal.account)
         .map(
             |BucketInfo {
                  name, created_ms, ..
@@ -263,7 +318,8 @@ async fn list_buckets(state: &S3State) -> Result<Response<Body>, S3Error> {
     Ok(xml(
         StatusCode::OK,
         format!(
-            "<ListAllMyBucketsResult xmlns=\"{XMLNS}\"><Owner><ID>truthdb</ID><DisplayName>truthdb</DisplayName></Owner><Buckets>{entries}</Buckets></ListAllMyBucketsResult>"
+            "<ListAllMyBucketsResult xmlns=\"{XMLNS}\">{}<Buckets>{entries}</Buckets></ListAllMyBucketsResult>",
+            owner_xml(&principal.account)
         ),
     ))
 }
@@ -274,6 +330,7 @@ async fn create_bucket(
     auth: Authenticated,
     bucket: String,
 ) -> Result<Response<Body>, S3Error> {
+    let owner = auth.principal.account.clone();
     let body = read_body(request, auth, 64 * 1024).await?;
     if let Some(constraint) = location_constraint(&body)?
         && !constraint.is_empty()
@@ -291,7 +348,7 @@ async fn create_bucket(
     let name = bucket.clone();
     let now = now_ms();
     match object(state, move |file| {
-        file.transaction(|tx| tx.create_bucket(&name, now))
+        file.transaction(|tx| tx.create_bucket(&name, &owner, now))
     })
     .await?
     {

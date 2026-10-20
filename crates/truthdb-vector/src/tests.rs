@@ -128,7 +128,7 @@ impl Rng {
 fn setup(storage: &Storage, metric: DistanceMetric, dimension: u16) -> IndexInfo {
     VecFile::new(&mut storage.lock())
         .transaction(|tx| {
-            tx.create_bucket("vb1", 1)?.unwrap();
+            tx.create_bucket("vb1", "111111111111", 1)?.unwrap();
             tx.create_index(
                 "vb1",
                 &NewIndex {
@@ -216,6 +216,15 @@ fn vectors_are_kept_read_back_and_survive_a_crash() {
     assert_eq!(put(&storage, &index, &vectors), 1);
     drop(storage);
     let storage = open(&path);
+    assert_eq!(
+        VecFile::new(&mut storage.lock())
+            .bucket("vb1")
+            .unwrap()
+            .unwrap()
+            .owner
+            .as_deref(),
+        Some("111111111111")
+    );
     let got = VecFile::new(&mut storage.lock())
         .get_vectors(
             &index,

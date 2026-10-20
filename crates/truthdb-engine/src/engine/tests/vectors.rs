@@ -46,13 +46,15 @@ fn vectors_live_beside_objects_and_tables_and_survive_a_reopen() {
         .unwrap();
     engine.execute("INSERT INTO t VALUES (1)").unwrap();
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("objects", 1)))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("objects", truthdb_object::DEFAULT_ACCOUNT, 1))
+        })
         .unwrap()
         .unwrap();
     let index = engine
         .vector(|file| {
             file.transaction(|tx| {
-                tx.create_bucket("vb1", 1)?.unwrap();
+                tx.create_bucket("vb1", "111111111111", 1)?.unwrap();
                 tx.create_index(
                     "vb1",
                     &NewIndex {
@@ -128,6 +130,31 @@ fn vectors_live_beside_objects_and_tables_and_survive_a_reopen() {
             .unwrap()
             .is_empty()
     );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_gated_vector_call_runs_only_when_its_gate_passes() {
+    let path = unique_temp_path("vectors-gate");
+    let engine = new_engine(&path);
+    let create = |engine: &Engine, gate: bool, name: &'static str| {
+        engine
+            .vector_gated(
+                move |_| Ok(gate),
+                move |file| file.transaction(|tx| tx.create_bucket(name, "111111111111", 1)),
+            )
+            .expect("call")
+    };
+    assert_eq!(create(&engine, false, "shut"), None);
+    assert_eq!(create(&engine, true, "open"), Some(Ok(())));
+    let names: Vec<String> = engine
+        .vector(|file| file.list_buckets(None, 10))
+        .unwrap()
+        .into_iter()
+        .map(|bucket| bucket.name)
+        .collect();
+    assert_eq!(names, ["open"], "the refused call wrote nothing");
     drop(engine);
     let _ = std::fs::remove_file(path);
 }

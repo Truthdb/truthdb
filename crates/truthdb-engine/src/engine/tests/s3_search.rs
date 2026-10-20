@@ -49,7 +49,9 @@ fn a_search_finds_ranks_and_checks_each_hit_against_the_latest_version() {
     let path = unique_temp_path("s3-search");
     let engine = new_engine(&path);
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("docs", 1_000)))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("docs", truthdb_object::DEFAULT_ACCOUNT, 1_000))
+        })
         .unwrap()
         .unwrap();
     engine.execute("s3 enable fulltext docs").unwrap();
@@ -147,7 +149,9 @@ fn a_search_finds_ranks_and_checks_each_hit_against_the_latest_version() {
 
     // Errors: no such bucket, not enabled, a malformed condition, a bad @top.
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("plain", 1_000)))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("plain", truthdb_object::DEFAULT_ACCOUNT, 1_000))
+        })
         .unwrap()
         .unwrap();
     for (query, number) in [
@@ -181,7 +185,9 @@ fn a_search_over_many_documents_returns_its_top_hits() {
     let path = unique_temp_path("s3-search-many");
     let engine = new_engine(&path);
     engine
-        .object(|file| file.transaction(|tx| tx.create_bucket("many", 1_000)))
+        .object(|file| {
+            file.transaction(|tx| tx.create_bucket("many", truthdb_object::DEFAULT_ACCOUNT, 1_000))
+        })
         .unwrap()
         .unwrap();
     engine.execute("s3 enable fulltext many").unwrap();

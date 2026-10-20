@@ -25,7 +25,7 @@ const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
 /// `x-amz-copy-source`: `bucket/key`, URL-encoded, with an optional leading
 /// `/` and `?versionId=`.
-fn copy_source(headers: &HeaderMap) -> Result<(String, String, VersionSel), S3Error> {
+pub(crate) fn copy_source(headers: &HeaderMap) -> Result<(String, String, VersionSel), S3Error> {
     let invalid = || {
         S3Error::new(
             400,
@@ -230,7 +230,8 @@ pub async fn upload_part_copy(
         engine: state.engine.clone(),
         region: state.region.clone(),
     };
-    let part = tokio::spawn(async move {
+    let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
+    let part = tokio::spawn(crate::scope::within(scope, async move {
         let state = &task_state;
         copy_part(
             state,
@@ -242,7 +243,7 @@ pub async fn upload_part_copy(
             key,
         )
         .await
-    })
+    }))
     .await
     .map_err(|err| S3Error::internal(err.to_string()))??;
     let (part, source_version) = part;
@@ -321,11 +322,15 @@ async fn copy_part(
         PartSource::Shared(part) => part,
         PartSource::Leased { body, first, len } => {
             let copied = copy_bytes(state, body, first, len).await;
-            let _ = object(state, move |file| {
-                file.release_lease(body);
-                Ok(())
-            })
-            .await;
+            // Unchecked: the lease goes even when the request's scope no
+            // longer holds (a key dropped mid-copy), or the body stays pinned.
+            let _ = state
+                .engine
+                .run_object(move |file| {
+                    file.release_lease(body);
+                    Ok(())
+                })
+                .await;
             let sealed = copied?;
             object(state, move |file| {
                 file.transaction(|tx| {

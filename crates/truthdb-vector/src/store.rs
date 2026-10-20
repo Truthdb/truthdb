@@ -66,6 +66,24 @@ pub enum VectorError {
 pub struct BucketInfo {
     pub name: String,
     pub created_ms: u64,
+    /// The account that owns the bucket; `None` for a bucket created before
+    /// buckets had owners.
+    pub owner: Option<String>,
+}
+
+/// A bucket row: creation time, then (since buckets have owners) the owning
+/// account.
+fn decode_bucket(name: String, row: &[u8]) -> Result<BucketInfo, StorageError> {
+    let (created, owner) = row
+        .split_first_chunk::<8>()
+        .ok_or_else(|| corrupt("bucket row"))?;
+    Ok(BucketInfo {
+        name,
+        created_ms: u64::from_le_bytes(*created),
+        owner: (!owner.is_empty())
+            .then(|| String::from_utf8(owner.to_vec()).map_err(|_| corrupt("bucket row")))
+            .transpose()?,
+    })
 }
 
 /// What a new index is.
@@ -256,9 +274,11 @@ pub(crate) fn check_values(index: &IndexInfo, data: &[f32]) -> Result<(), Vector
 }
 
 impl VecTxn<'_, '_> {
+    /// Creates vector bucket `name`, owned by account `owner`.
     pub fn create_bucket(
         &mut self,
         name: &str,
+        owner: &str,
         now_ms: u64,
     ) -> Result<Result<(), VectorError>, StorageError> {
         if !valid_name(name) {
@@ -270,7 +290,7 @@ impl VecTxn<'_, '_> {
             self.ctx,
             &mut OpMode::Txn(self.txn),
             name.as_bytes(),
-            &now_ms.to_le_bytes(),
+            &[&now_ms.to_le_bytes(), owner.as_bytes()].concat(),
         )?;
         Ok(match inserted {
             TreeInsert::Inserted => Ok(()),
@@ -592,16 +612,7 @@ impl VecFile<'_> {
             return Ok(None);
         };
         tree.get(&mut self.page_ctx(), name.as_bytes())?
-            .map(|row| {
-                Ok(BucketInfo {
-                    name: name.to_string(),
-                    created_ms: u64::from_le_bytes(
-                        row.as_slice()
-                            .try_into()
-                            .map_err(|_| corrupt("bucket row"))?,
-                    ),
-                })
-            })
+            .map(|row| decode_bucket(name.to_string(), &row))
             .transpose()
     }
 
@@ -618,14 +629,10 @@ impl VecFile<'_> {
         tree.scan_range_limit(&mut self.page_ctx(), lower.as_deref(), None, limit)?
             .into_iter()
             .map(|(name, row)| {
-                Ok(BucketInfo {
-                    name: String::from_utf8(name).map_err(|_| corrupt("bucket name"))?,
-                    created_ms: u64::from_le_bytes(
-                        row.as_slice()
-                            .try_into()
-                            .map_err(|_| corrupt("bucket row"))?,
-                    ),
-                })
+                decode_bucket(
+                    String::from_utf8(name).map_err(|_| corrupt("bucket name"))?,
+                    &row,
+                )
             })
             .collect()
     }
@@ -786,5 +793,17 @@ impl VecFile<'_> {
         tree.get(&mut self.page_ctx(), &seq_key(index, seq))?
             .map(|row| String::from_utf8(row).map_err(|_| corrupt("key")))
             .transpose()
+    }
+}
+
+#[cfg(test)]
+mod bucket_row_tests {
+    #[test]
+    fn a_bucket_row_from_before_owners_has_none() {
+        let old = super::decode_bucket("vb".into(), &5u64.to_le_bytes()).unwrap();
+        assert_eq!((old.created_ms, old.owner), (5, None));
+        let row = [&5u64.to_le_bytes()[..], b"111111111111"].concat();
+        let new = super::decode_bucket("vb".into(), &row).unwrap();
+        assert_eq!(new.owner.as_deref(), Some("111111111111"));
     }
 }

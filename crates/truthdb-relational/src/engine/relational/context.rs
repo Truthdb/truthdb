@@ -307,6 +307,16 @@ impl TxnContext {
         };
     }
 
+    /// Whether the session is a server administrator: a trusted connection
+    /// (login_sid 0 — the native protocol and in-process tests) or a
+    /// `sysadmin` login.
+    pub fn is_server_admin(&self, storage: &RelStorage) -> bool {
+        self.login_sid == 0
+            || storage
+                .effective_roles(self.login_sid)
+                .contains(&crate::storage::SYSADMIN_ID)
+    }
+
     /// Clears batch-scoped variables (called at the start of each batch).
     pub fn clear_variables(&mut self) {
         self.variables.clear();

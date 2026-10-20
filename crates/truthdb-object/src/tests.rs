@@ -9,7 +9,7 @@ use truthdb_core::storage::{
 use truthdb_core::wal::records::{PageOpUndo, RelRecord};
 
 use crate::body::SEGMENT_BYTES;
-use crate::{BodyLease, BodyWriter, ObjEngine, ObjFile};
+use crate::{BodyLease, BodyWriter, DEFAULT_ACCOUNT, ObjEngine, ObjFile};
 
 const RING: u64 = 8 * 1024 * 1024;
 const GRACE: u64 = 1_000;
@@ -445,38 +445,207 @@ fn access_keys_are_created_looked_up_listed_and_dropped_durably() {
     {
         let mut guard = storage.lock();
         let mut file = ObjFile::new(&mut guard);
-        assert_eq!(file.access_key_secret("A").unwrap(), None, "no keys yet");
-        file.transaction(|tx| tx.create_access_key("A", "secret-a"))
+        assert_eq!(file.access_key("A").unwrap(), None, "no keys yet");
+        file.transaction(|tx| tx.create_access_key("A", "secret-a", DEFAULT_ACCOUNT, None, 5))
+            .unwrap()
             .unwrap();
-        file.transaction(|tx| tx.create_access_key("B", "secret-b"))
+        file.transaction(|tx| tx.create_access_key("B", "secret-b", DEFAULT_ACCOUNT, None, 6))
+            .unwrap()
             .unwrap();
         let dup = file
-            .transaction(|tx| tx.create_access_key("A", "other"))
+            .transaction(|tx| tx.create_access_key("A", "other", DEFAULT_ACCOUNT, None, 7))
             .unwrap_err();
         assert!(dup.to_string().contains("already exists"), "{dup}");
-        assert!(
-            file.transaction(|tx| tx.create_access_key("", "x"))
-                .is_err(),
-            "an empty id is refused"
-        );
+        for (id, secret) in [("", "x"), ("C", "with space"), ("C", "\u{1}x")] {
+            assert!(
+                file.transaction(|tx| tx.create_access_key(id, secret, DEFAULT_ACCOUNT, None, 7))
+                    .is_err(),
+                "{id:?} {secret:?} is refused"
+            );
+        }
     }
     drop(storage); // crash
 
     let storage = open(&path);
     let mut guard = storage.lock();
     let mut file = ObjFile::new(&mut guard);
+    let (key, secret) = file.access_key("A").unwrap().expect("key A");
+    assert_eq!(secret, "secret-a");
     assert_eq!(
-        file.access_key_secret("A").unwrap().as_deref(),
-        Some("secret-a")
+        key,
+        crate::AccessKey {
+            id: "A".to_string(),
+            account: DEFAULT_ACCOUNT.to_string(),
+            user: None,
+            active: true,
+            created_ms: 5,
+        }
     );
-    assert_eq!(file.access_key_ids().unwrap(), vec!["A", "B"]);
+    let ids = |file: &mut ObjFile<'_>| -> Vec<String> {
+        file.access_keys()
+            .unwrap()
+            .into_iter()
+            .map(|key| key.id)
+            .collect()
+    };
+    assert_eq!(ids(&mut file), vec!["A", "B"]);
     file.transaction(|tx| tx.drop_access_key("A")).unwrap();
     assert!(file.transaction(|tx| tx.drop_access_key("A")).is_err());
-    assert_eq!(file.access_key_secret("A").unwrap(), None);
-    assert_eq!(file.access_key_ids().unwrap(), vec!["B"]);
+    assert_eq!(file.access_key("A").unwrap(), None);
+    assert_eq!(ids(&mut file), vec!["B"]);
     drop(guard);
     drop(storage);
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn accounts_own_users_keys_and_buckets_and_drop_only_when_empty() {
+    use crate::{AccountError, BucketError};
+    let path = temp_path("accounts");
+    let storage = create(&path);
+    {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        let mut tx = |op: &dyn Fn(
+            &mut crate::ObjTxn<'_, '_>,
+        ) -> Result<Result<(), AccountError>, StorageError>| {
+            file.transaction(op).unwrap()
+        };
+        assert_eq!(
+            tx(&|tx| tx.create_account("111111111111", "acme", 1)),
+            Ok(())
+        );
+        assert_eq!(
+            tx(&|tx| tx.create_account("111111111111", "again", 1)),
+            Err(AccountError::AccountExists)
+        );
+        assert_eq!(
+            tx(&|tx| tx.create_account(DEFAULT_ACCOUNT, "x", 1)),
+            Err(AccountError::AccountExists)
+        );
+        assert!(matches!(
+            tx(&|tx| tx.create_account("12345", "short", 1)),
+            Err(AccountError::InvalidName(_))
+        ));
+        assert!(matches!(
+            tx(&|tx| tx.create_account("222222222222", "bad name", 1)),
+            Err(AccountError::InvalidName(_))
+        ));
+        assert_eq!(
+            tx(&|tx| tx.create_user("111111111111", "alice", "AIDAALICE", 2)),
+            Ok(())
+        );
+        assert_eq!(
+            tx(&|tx| tx.create_user("111111111111", "alice", "AIDAOTHER", 2)),
+            Err(AccountError::UserExists)
+        );
+        assert_eq!(
+            tx(&|tx| tx.create_user("999999999999", "bob", "AIDABOB", 2)),
+            Err(AccountError::NoSuchAccount)
+        );
+        assert_eq!(
+            tx(&|tx| tx.create_access_key("K1", "s1", "111111111111", Some("alice"), 3)),
+            Ok(())
+        );
+        assert_eq!(
+            tx(&|tx| tx.create_access_key("K2", "s2", "111111111111", Some("carol"), 3)),
+            Err(AccountError::NoSuchUser)
+        );
+        assert_eq!(
+            tx(&|tx| tx.create_access_key("K3", "s3", "999999999999", None, 3)),
+            Err(AccountError::NoSuchAccount)
+        );
+    }
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    let bucket = |file: &mut ObjFile<'_>, name: &str, owner: &str| {
+        file.transaction(|tx| tx.create_bucket(name, owner, 4))
+            .unwrap()
+    };
+    assert_eq!(bucket(&mut file, "acme-data", "111111111111"), Ok(()));
+    assert_eq!(
+        bucket(&mut file, "acme-data", DEFAULT_ACCOUNT),
+        Err(BucketError::AlreadyExists),
+        "another account's bucket name"
+    );
+    assert_eq!(
+        bucket(&mut file, "acme-data", "111111111111"),
+        Err(BucketError::AlreadyOwnedByYou)
+    );
+    assert_eq!(
+        file.bucket("acme-data").unwrap().unwrap().owner,
+        "111111111111"
+    );
+
+    // Dropped only once its users, keys and buckets are gone.
+    let drop_account = |file: &mut ObjFile<'_>| {
+        file.transaction(|tx| tx.drop_account("111111111111"))
+            .unwrap()
+    };
+    assert_eq!(
+        drop_account(&mut file),
+        Err(AccountError::NotEmpty("users"))
+    );
+    assert_eq!(
+        file.transaction(|tx| tx.drop_user("111111111111", "alice"))
+            .unwrap(),
+        Err(AccountError::NotEmpty("access keys"))
+    );
+    file.transaction(|tx| tx.drop_access_key("K1")).unwrap();
+    assert_eq!(
+        file.transaction(|tx| tx.drop_user("111111111111", "alice"))
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        drop_account(&mut file),
+        Err(AccountError::NotEmpty("buckets"))
+    );
+    file.transaction(|tx| tx.delete_bucket("acme-data"))
+        .unwrap()
+        .unwrap();
+    file.transaction(|tx| tx.create_access_key("K4", "s4", "111111111111", None, 5))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        drop_account(&mut file),
+        Err(AccountError::NotEmpty("access keys"))
+    );
+    file.transaction(|tx| tx.drop_access_key("K4")).unwrap();
+    assert_eq!(drop_account(&mut file), Ok(()));
+    assert_eq!(
+        file.transaction(|tx| tx.drop_account(DEFAULT_ACCOUNT))
+            .unwrap(),
+        Err(AccountError::DefaultAccount)
+    );
+    let ids: Vec<String> = file.accounts().unwrap().into_iter().map(|a| a.id).collect();
+    assert_eq!(ids, vec![DEFAULT_ACCOUNT]);
+    drop(guard);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn rows_written_before_accounts_belong_to_the_default_account() {
+    // An access key row was the bare secret; a bucket row had no owner.
+    let key = crate::credentials::KeyRow::decode(b"abcSECRET+/9").unwrap();
+    assert_eq!(
+        (
+            key.account.as_str(),
+            key.user,
+            key.active,
+            key.secret.as_str()
+        ),
+        (DEFAULT_ACCOUNT, None, true, "abcSECRET+/9")
+    );
+    let mut old = 5u64.to_le_bytes().to_vec();
+    old.push(1);
+    old.extend_from_slice(&9u64.to_le_bytes());
+    for row in [&old[..9], &old[..]] {
+        let bucket = crate::buckets::BucketRow::decode(row).unwrap();
+        assert_eq!(bucket.owner, DEFAULT_ACCOUNT);
+        assert_eq!(bucket.created_ms, 5);
+    }
 }
 
 #[test]
@@ -516,14 +685,20 @@ fn buckets_are_created_listed_and_deleted_only_when_empty() {
     ) -> Result<Result<(), BucketError>, StorageError>| {
         ObjFile::new(&mut storage.lock()).transaction(op).unwrap()
     };
-    assert_eq!(in_tx(&|tx| tx.create_bucket("alpha", 5)), Ok(()));
-    assert_eq!(in_tx(&|tx| tx.create_bucket("beta", 6)), Ok(()));
     assert_eq!(
-        in_tx(&|tx| tx.create_bucket("alpha", 7)),
+        in_tx(&|tx| tx.create_bucket("alpha", DEFAULT_ACCOUNT, 5)),
+        Ok(())
+    );
+    assert_eq!(
+        in_tx(&|tx| tx.create_bucket("beta", DEFAULT_ACCOUNT, 6)),
+        Ok(())
+    );
+    assert_eq!(
+        in_tx(&|tx| tx.create_bucket("alpha", DEFAULT_ACCOUNT, 7)),
         Err(BucketError::AlreadyOwnedByYou)
     );
     assert!(matches!(
-        in_tx(&|tx| tx.create_bucket("Bad_Name", 7)),
+        in_tx(&|tx| tx.create_bucket("Bad_Name", DEFAULT_ACCOUNT, 7)),
         Err(BucketError::InvalidName(_))
     ));
     assert_eq!(
@@ -570,7 +745,7 @@ fn an_object_is_put_overwritten_and_read_back_with_its_attributes() {
     let path = temp_path("objects");
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
         .unwrap()
         .unwrap();
     let put_version = |data: &[u8], content_type: &str| {
@@ -658,7 +833,7 @@ fn listings_follow_key_order_prefixes_delimiters_and_pages() {
     let path = temp_path("listing");
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
         .unwrap()
         .unwrap();
     let keys = [
@@ -747,7 +922,7 @@ fn a_deleted_object_is_gone_and_its_body_collected() {
     let path = temp_path("delete");
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
         .unwrap()
         .unwrap();
     let put = |key: &str| {
@@ -809,7 +984,7 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
     let path = temp_path("multipart");
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
         .unwrap()
         .unwrap();
     let attrs = ObjectAttrs {
@@ -927,7 +1102,7 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
     use crate::BucketError;
     let pending = ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
-            tx.create_bucket("upl", now())?.unwrap();
+            tx.create_bucket("upl", DEFAULT_ACCOUNT, now())?.unwrap();
             tx.create_upload("upl", "k", &ObjectAttrs::default(), now())
         })
         .unwrap()
@@ -971,7 +1146,7 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
     let storage = create(&path);
     for bucket in ["src", "dst"] {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.create_bucket(bucket, now()))
+            .transaction(|tx| tx.create_bucket(bucket, DEFAULT_ACCOUNT, now()))
             .unwrap()
             .unwrap();
     }
@@ -1079,7 +1254,7 @@ fn tags_are_set_replaced_and_cleared_per_version() {
     let path = temp_path("tags");
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
         .unwrap()
         .unwrap();
     let put = |key: &str, attrs: &ObjectAttrs| {
@@ -1162,7 +1337,7 @@ fn versions_list_newest_first_with_markers_and_resume_mid_key() {
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
-            tx.create_bucket("bkt", now())?.unwrap();
+            tx.create_bucket("bkt", DEFAULT_ACCOUNT, now())?.unwrap();
             tx.set_versioning("bkt", Versioning::Enabled)
         })
         .unwrap()
@@ -1265,12 +1440,13 @@ fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
-            tx.create_bucket("bkt", now())?.unwrap();
+            tx.create_bucket("bkt", DEFAULT_ACCOUNT, now())?.unwrap();
             // Versioning on, through the row (the API to set it comes later).
             let row = BucketRow {
                 created_ms: now(),
                 versioning: Versioning::Enabled,
                 journal_from: 0,
+                owner: DEFAULT_ACCOUNT.to_string(),
             };
             tx.trees
                 .buckets()
@@ -1325,11 +1501,12 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
-            tx.create_bucket("bkt", now())?.unwrap();
+            tx.create_bucket("bkt", DEFAULT_ACCOUNT, now())?.unwrap();
             let row = BucketRow {
                 created_ms: now(),
                 versioning: Versioning::Enabled,
                 journal_from: 0,
+                owner: DEFAULT_ACCOUNT.to_string(),
             };
             tx.trees
                 .buckets()
@@ -1399,7 +1576,7 @@ fn uploads_past_their_age_are_found_oldest_first() {
     let start = |at: u64| {
         ObjFile::new(&mut storage.lock())
             .transaction(|tx| {
-                tx.create_bucket("bkt", now()).ok();
+                tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()).ok();
                 tx.create_upload("bkt", "k", &ObjectAttrs::default(), at)
             })
             .unwrap()
@@ -1458,8 +1635,8 @@ fn the_journal_records_every_change_in_its_own_transaction() {
     };
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
-            tx.create_bucket("plain", now())?.unwrap();
-            tx.create_bucket("hist", now())?.unwrap();
+            tx.create_bucket("plain", DEFAULT_ACCOUNT, now())?.unwrap();
+            tx.create_bucket("hist", DEFAULT_ACCOUNT, now())?.unwrap();
             tx.set_versioning("hist", Versioning::Enabled)
         })
         .unwrap()
@@ -1612,7 +1789,7 @@ fn the_journal_ships_to_a_standby_and_restores_from_a_log_backup() {
     primary.lock().commit_db_options(0, Some(true)).unwrap();
     let summary = primary.backup_full(&bak).unwrap();
     ObjFile::new(&mut primary.lock())
-        .transaction(|tx| tx.create_bucket("bkt", now()))
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
         .unwrap()
         .unwrap();
     for key in ["a", "b"] {
@@ -1768,7 +1945,7 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
         let storage = create(&path);
         ObjFile::new(&mut storage.lock())
             .transaction(|tx| {
-                tx.create_bucket("docs", now())?.unwrap();
+                tx.create_bucket("docs", DEFAULT_ACCOUNT, now())?.unwrap();
                 tx.enable_fulltext("docs", 1 << 20)
             })
             .unwrap()
@@ -1854,7 +2031,7 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
-            tx.create_bucket("docs", now())?.unwrap();
+            tx.create_bucket("docs", DEFAULT_ACCOUNT, now())?.unwrap();
             tx.enable_fulltext("docs", 1 << 20)
         })
         .unwrap()
@@ -1884,7 +2061,7 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
             tx.delete_bucket("docs")?.unwrap();
-            tx.create_bucket("docs", now())
+            tx.create_bucket("docs", DEFAULT_ACCOUNT, now())
         })
         .unwrap()
         .unwrap();
@@ -1937,7 +2114,7 @@ fn the_journal_is_not_trimmed_past_the_indexer_while_a_bucket_is_indexed() {
     let path = temp_path("ft-journal");
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_bucket("docs", now()))
+        .transaction(|tx| tx.create_bucket("docs", DEFAULT_ACCOUNT, now()))
         .unwrap()
         .unwrap();
     put_text(&storage, "docs", "a", "x");
@@ -1999,7 +2176,7 @@ fn the_full_text_index_ships_to_a_standby_and_restores_from_a_log_backup() {
     let summary = primary.backup_full(&bak).unwrap();
     ObjFile::new(&mut primary.lock())
         .transaction(|tx| {
-            tx.create_bucket("docs", now())?.unwrap();
+            tx.create_bucket("docs", DEFAULT_ACCOUNT, now())?.unwrap();
             tx.enable_fulltext("docs", 1 << 20)
         })
         .unwrap()
@@ -2060,7 +2237,7 @@ fn a_search_leaves_out_a_document_being_written_on_every_term() {
     let storage = create(&path);
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
-            tx.create_bucket("docs", now())?.unwrap();
+            tx.create_bucket("docs", DEFAULT_ACCOUNT, now())?.unwrap();
             tx.enable_fulltext("docs", 1 << 20)
         })
         .unwrap()

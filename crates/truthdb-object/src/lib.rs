@@ -11,6 +11,7 @@
 //! here runs one transaction start to finish inside one lock hold (see
 //! `RelCtx::allocate_extent_in_txn`).
 
+mod accounts;
 mod body;
 mod buckets;
 mod codec;
@@ -35,8 +36,10 @@ use truthdb_core::storage::{
 };
 use truthdb_core::wal::records::RelRecord;
 
+pub use accounts::{AccountError, AccountInfo, DEFAULT_ACCOUNT, UserInfo, valid_account_id};
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
+pub use credentials::AccessKey;
 pub use fulltext::{
     DEFAULT_FULLTEXT_MAX_BYTES, FtBucket, FtError, FtKey, FtState, FtStatus, MAX_FULLTEXT_BYTES,
     fulltext_status,
@@ -61,7 +64,7 @@ const SEGMENTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 2;
 const GC_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 3;
 /// (created time, body id) -> (): bodies still being written.
 const STAGING_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 4;
-/// Access key id -> secret: the S3 API's credentials.
+/// Access key id -> its owner and secret: the S3 API's credentials.
 const CREDENTIALS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 5;
 /// Bucket name -> [`buckets::BucketRow`].
 const BUCKETS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 6;
@@ -89,6 +92,10 @@ const FT_KEYS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 16;
 /// (bucket, 0, version) -> key: the key of each version the index holds, to
 /// name a search's hits.
 const FT_VERSIONS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 17;
+/// Account id -> the account (see `accounts`).
+const ACCOUNTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 18;
+/// (account, 0, user name) -> the user (see `accounts`).
+const USERS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 19;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -206,135 +213,83 @@ fn meta_tree(root: u64) -> BTree {
     }
 }
 
+/// The trees an object transaction may work on: object ids
+/// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
+const TREE_COUNT: usize = 20;
+
 /// The root pages of the trees an object transaction works on, resolved
-/// before it begins.
+/// before it begins, by object id.
 #[derive(Clone, Copy)]
 pub(crate) struct Trees {
-    meta: u64,
-    bodies: u64,
-    segments: u64,
-    gc: u64,
-    staging: u64,
-    credentials: u64,
-    buckets: u64,
-    objects: u64,
-    attrs: u64,
-    uploads: u64,
-    upload_index: u64,
-    parts: u64,
-    changes: u64,
-    ft_buckets: u64,
-    ft_docs: u64,
-    ft_postings: u64,
-    ft_keys: u64,
-    ft_versions: u64,
+    roots: [u64; TREE_COUNT],
 }
 
 impl Trees {
+    fn tree(&self, object_id: u32) -> BTree {
+        BTree {
+            object_id,
+            root: self.roots[(object_id - FIRST_ENGINE_OBJECT_ID) as usize],
+        }
+    }
     pub fn meta(&self) -> BTree {
-        meta_tree(self.meta)
+        self.tree(META_TREE)
     }
     pub fn bodies(&self) -> BTree {
-        BTree {
-            object_id: BODIES_TREE,
-            root: self.bodies,
-        }
+        self.tree(BODIES_TREE)
     }
     pub fn segments(&self) -> BTree {
-        BTree {
-            object_id: SEGMENTS_TREE,
-            root: self.segments,
-        }
+        self.tree(SEGMENTS_TREE)
     }
     pub fn gc(&self) -> BTree {
-        BTree {
-            object_id: GC_TREE,
-            root: self.gc,
-        }
+        self.tree(GC_TREE)
     }
     pub fn buckets(&self) -> BTree {
-        BTree {
-            object_id: BUCKETS_TREE,
-            root: self.buckets,
-        }
+        self.tree(BUCKETS_TREE)
     }
     pub fn objects(&self) -> BTree {
-        BTree {
-            object_id: OBJECTS_TREE,
-            root: self.objects,
-        }
+        self.tree(OBJECTS_TREE)
     }
     pub fn uploads(&self) -> BTree {
-        BTree {
-            object_id: UPLOADS_TREE,
-            root: self.uploads,
-        }
+        self.tree(UPLOADS_TREE)
     }
     pub fn upload_index(&self) -> BTree {
-        BTree {
-            object_id: UPLOAD_INDEX_TREE,
-            root: self.upload_index,
-        }
+        self.tree(UPLOAD_INDEX_TREE)
     }
     pub fn parts(&self) -> BTree {
-        BTree {
-            object_id: PARTS_TREE,
-            root: self.parts,
-        }
+        self.tree(PARTS_TREE)
     }
     pub fn changes(&self) -> BTree {
-        BTree {
-            object_id: CHANGES_TREE,
-            root: self.changes,
-        }
+        self.tree(CHANGES_TREE)
     }
     pub fn ft_buckets(&self) -> BTree {
-        BTree {
-            object_id: FT_BUCKETS_TREE,
-            root: self.ft_buckets,
-        }
+        self.tree(FT_BUCKETS_TREE)
     }
     pub fn ft_index(&self) -> truthdb_fulltext::Index {
         truthdb_fulltext::Index {
-            postings: BTree {
-                object_id: FT_POSTINGS_TREE,
-                root: self.ft_postings,
-            },
-            docs: BTree {
-                object_id: FT_DOCS_TREE,
-                root: self.ft_docs,
-            },
+            postings: self.tree(FT_POSTINGS_TREE),
+            docs: self.tree(FT_DOCS_TREE),
         }
     }
     pub fn ft_keys(&self) -> BTree {
-        BTree {
-            object_id: FT_KEYS_TREE,
-            root: self.ft_keys,
-        }
+        self.tree(FT_KEYS_TREE)
     }
     pub fn ft_versions(&self) -> BTree {
-        BTree {
-            object_id: FT_VERSIONS_TREE,
-            root: self.ft_versions,
-        }
+        self.tree(FT_VERSIONS_TREE)
     }
     pub fn attrs(&self) -> BTree {
-        BTree {
-            object_id: ATTRS_TREE,
-            root: self.attrs,
-        }
+        self.tree(ATTRS_TREE)
     }
     pub fn credentials(&self) -> BTree {
-        BTree {
-            object_id: CREDENTIALS_TREE,
-            root: self.credentials,
-        }
+        self.tree(CREDENTIALS_TREE)
     }
     pub fn staging(&self) -> BTree {
-        BTree {
-            object_id: STAGING_TREE,
-            root: self.staging,
-        }
+        self.tree(STAGING_TREE)
+    }
+    pub fn accounts(&self) -> BTree {
+        self.tree(ACCOUNTS_TREE)
+    }
+    pub fn users(&self) -> BTree {
+        self.tree(USERS_TREE)
     }
 }
 
@@ -376,26 +331,12 @@ impl<'a> ObjFile<'a> {
         body: impl FnOnce(&mut ObjTxn<'_, '_>) -> Result<T, StorageError>,
     ) -> Result<T, StorageError> {
         self.core.ensure_rel_usable()?;
-        let trees = Trees {
-            meta: self.meta()?.root,
-            bodies: self.tree(BODIES_TREE)?.root,
-            segments: self.tree(SEGMENTS_TREE)?.root,
-            gc: self.tree(GC_TREE)?.root,
-            staging: self.tree(STAGING_TREE)?.root,
-            credentials: self.tree(CREDENTIALS_TREE)?.root,
-            buckets: self.tree(BUCKETS_TREE)?.root,
-            objects: self.tree(OBJECTS_TREE)?.root,
-            attrs: self.tree(ATTRS_TREE)?.root,
-            uploads: self.tree(UPLOADS_TREE)?.root,
-            upload_index: self.tree(UPLOAD_INDEX_TREE)?.root,
-            parts: self.tree(PARTS_TREE)?.root,
-            changes: self.tree(CHANGES_TREE)?.root,
-            ft_buckets: self.tree(FT_BUCKETS_TREE)?.root,
-            ft_docs: self.tree(FT_DOCS_TREE)?.root,
-            ft_postings: self.tree(FT_POSTINGS_TREE)?.root,
-            ft_keys: self.tree(FT_KEYS_TREE)?.root,
-            ft_versions: self.tree(FT_VERSIONS_TREE)?.root,
-        };
+        let mut roots = [0; TREE_COUNT];
+        roots[0] = self.meta()?.root;
+        for (slot, object_id) in roots.iter_mut().zip(FIRST_ENGINE_OBJECT_ID..).skip(1) {
+            *slot = self.tree(object_id)?.root;
+        }
+        let trees = Trees { roots };
         self.in_txn(|ctx, txn| body(&mut ObjTxn { ctx, txn, trees }))
     }
 

@@ -9,6 +9,7 @@ pub mod listing;
 pub mod multipart;
 pub mod objects;
 pub mod payload;
+pub mod scope;
 pub mod server;
 pub mod sigv4;
 pub mod tagging;
