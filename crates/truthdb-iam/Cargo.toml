@@ -1,0 +1,10 @@
+[package]
+name = "truthdb-iam"
+version = "0.1.0"
+edition = "2024"
+description = "TruthDB access policies: the IAM policy language and AWS's evaluation of it, for the S3 API."
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+base64 = "0.22.1"

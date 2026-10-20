@@ -38,7 +38,9 @@ use truthdb_vector::{
 };
 
 use crate::error::S3Error;
-use crate::server::{Body, S3State, check_signed_headers, full, signed_request, verify_signature};
+use crate::server::{
+    Body, Connection, S3State, check_signed_headers, full, signed_request, verify_signature,
+};
 
 /// The largest request body.
 const MAX_BODY: usize = 20 << 20;
@@ -195,10 +197,24 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, VEr
             _ => return Err(VError::validation("The request body is not a JSON object.")),
         }
     };
+    let authz = crate::authz::Authz::load(
+        state,
+        &principal,
+        &parts.headers,
+        "",
+        parts.extensions.get::<Connection>().copied(),
+        Vec::new(),
+        Vec::new(),
+    )
+    .await?;
     let region = state.region.clone();
     state
         .engine
-        .run_engine(move |engine| Ok(dispatch(engine, &region, &principal, &operation, &input)))
+        .run_engine(move |engine| {
+            Ok(dispatch(
+                engine, &region, &principal, &authz, &operation, &input,
+            ))
+        })
         .await?
 }
 
@@ -604,6 +620,7 @@ fn dispatch(
     engine: &Engine,
     region: &str,
     principal: &crate::server::Principal,
+    authz: &crate::authz::Authz,
     operation: &str,
     input: &Map<String, Value>,
 ) -> Result<Value, VError> {
@@ -617,6 +634,30 @@ fn dispatch(
         | "DeleteVectors" | "QueryVectors" => Some(named_bucket(input, region, account)?),
         _ => None,
     };
+    // Authorized as `s3vectors:<Operation>` on the bucket's or the index's
+    // ARN (the caller's own account's: vector buckets have no policies).
+    let arn = match operation {
+        "CreateVectorBucket" => {
+            string(input, "vectorBucketName")?.map(|name| bucket_arn(region, account, name))
+        }
+        "ListVectorBuckets" => Some(format!("arn:aws:s3vectors:{region}:{account}:bucket/*")),
+        "GetVectorBucket" | "DeleteVectorBucket" | "CreateIndex" | "ListIndexes" => bucket
+            .as_deref()
+            .map(|bucket| bucket_arn(region, account, bucket)),
+        _ => match (bucket.as_deref(), string(input, "indexArn")?) {
+            (Some(_), Some(arn)) => Some(arn.to_string()),
+            (Some(bucket), None) => Some(index_arn(
+                region,
+                account,
+                bucket,
+                string(input, "indexName")?.unwrap_or(""),
+            )),
+            (None, _) => None,
+        },
+    };
+    if let Some(arn) = arn {
+        authz.check_arn(&format!("s3vectors:{operation}"), &arn, account)?;
+    }
     let caller = &Caller {
         engine,
         access_key: principal.access_key.clone(),

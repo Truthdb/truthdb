@@ -8,8 +8,9 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use truthdb_object::{BucketError, BucketInfo, ObjFile, Versioning};
 
+use crate::authz::Authz;
 use crate::error::{S3Error, escape};
-use crate::server::{Authenticated, Body, Principal, S3State, full, read_body};
+use crate::server::{Authenticated, Body, Connection, Principal, S3State, full, read_body};
 
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 
@@ -38,7 +39,6 @@ fn target(raw_path: &str) -> Result<Target, S3Error> {
 /// would list objects, an object GET would return its body).
 const UNIMPLEMENTED: &[&str] = &[
     "accelerate",
-    "acl",
     "analytics",
     "attributes",
     "cors",
@@ -51,9 +51,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "metrics",
     "notification",
     "object-lock",
-    "ownershipControls",
-    "policy",
-    "policyStatus",
     "publicAccessBlock",
     "replication",
     "requestPayment",
@@ -143,7 +140,8 @@ pub(crate) fn owner_xml(account: &str) -> String {
     )
 }
 
-/// Routes an authenticated request to its operation.
+/// Routes an authenticated request to its operation, authorized against
+/// the policies that apply (see `authz`).
 pub async fn dispatch(
     state: &S3State,
     request: Request<Incoming>,
@@ -152,47 +150,121 @@ pub async fn dispatch(
     let method = request.method().clone();
     let target = target(request.uri().path())?;
     let principal = auth.principal.clone();
-    // Until bucket policies, a bucket is its owner's alone: the request acts
-    // only on buckets that are missing or its account's (the one it names,
-    // and a copy's source), checked in every engine call it makes (see
-    // `scope`). A bucket being created may be another account's: that is a
-    // conflict, not a denial.
-    let creating = matches!(target, Target::Bucket(_))
-        && method == Method::PUT
-        && !has_param(&request, "versioning");
+    let raw_query = request.uri().query().unwrap_or("").to_string();
+    // A bucket being created may be another account's: that is the
+    // operation's conflict, not the scope's.
+    let creating =
+        matches!(target, Target::Bucket(_)) && method == Method::PUT && raw_query.is_empty();
     let mut buckets = Vec::new();
-    if let Target::Bucket(bucket) | Target::Object(bucket, _) = &target
-        && !creating
-    {
+    if let Target::Bucket(bucket) | Target::Object(bucket, _) = &target {
         buckets.push(bucket.clone());
     }
-    if matches!(target, Target::Object(..))
+    // Decided once, here: whether the request is a copy (a PutObjectTagging
+    // or object ACL request carrying a copy source header is not), so the
+    // source authorized against is the one the route copies from.
+    let copying = matches!(target, Target::Object(..))
         && method == Method::PUT
-        && let Ok((source, _, _)) = crate::copy::copy_source(request.headers())
+        && request.headers().contains_key("x-amz-copy-source")
+        && !has_param(&request, "tagging")
+        && !has_param(&request, "acl");
+    let copy_source = match copying {
+        true => crate::copy::copy_source(request.headers()).ok(),
+        false => None,
+    };
+    // The objects whose current tags a policy may read: the target, when
+    // the operation acts on a version of it that exists (a write makes a new
+    // one), and a copy's source.
+    let reads_existing = match method {
+        Method::GET | Method::HEAD | Method::DELETE => true,
+        Method::PUT => has_param(&request, "tagging") || has_param(&request, "acl"),
+        _ => false,
+    };
+    let mut objects = Vec::new();
+    if let Target::Object(bucket, key) = &target
+        && reads_existing
     {
-        buckets.push(source);
+        objects.push((
+            bucket.clone(),
+            key.clone(),
+            crate::objects::version_sel(&raw_query)?,
+        ));
     }
+    if let Some(source) = copy_source {
+        buckets.push(source.0.clone());
+        objects.push(source);
+    }
+    let connection = request.extensions().get::<Connection>().copied();
+    let authz = Authz::load(
+        state,
+        &principal,
+        request.headers(),
+        &raw_query,
+        connection,
+        buckets,
+        objects,
+    )
+    .await?;
     let scope = crate::scope::Scope {
         access_key: principal.access_key.clone(),
         account: principal.account.clone(),
-        buckets,
+        buckets: authz
+            .owners()
+            .into_iter()
+            .filter(|(bucket, _)| {
+                !(creating && matches!(&target, Target::Bucket(created) if created == bucket))
+            })
+            .collect(),
     };
     crate::scope::within(scope, async move {
         // Refused before the body is read, too.
         crate::scope::object(state, |_| Ok(())).await?;
-        route(state, request, auth, principal, target, method).await
+        route(
+            state, request, auth, &authz, &principal, target, method, copying,
+        )
+        .await
     })
     .await
 }
 
+/// The tags of the request's `x-amz-tagging` header, as the object will
+/// store them; `None` without the header.
+fn header_tags(request: &Request<Incoming>) -> Result<Option<Vec<(String, String)>>, S3Error> {
+    if !request.headers().contains_key("x-amz-tagging") {
+        return Ok(None);
+    }
+    crate::tagging::tags_from(request.headers()).map(Some)
+}
+
+/// The action for an object operation, on a version when the request names
+/// one (`s3:GetObject` or `s3:GetObjectVersion`).
+fn versioned(
+    request: &Request<Incoming>,
+    plain: &'static str,
+    version: &'static str,
+) -> &'static str {
+    if has_param(request, "versionId") {
+        version
+    } else {
+        plain
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn route(
     state: &S3State,
     request: Request<Incoming>,
     auth: Authenticated,
-    principal: Principal,
+    authz: &Authz,
+    principal: &Principal,
     target: Target,
     method: Method,
+    copying: bool,
 ) -> Result<Response<Body>, S3Error> {
+    use crate::authz::Resource::{Bucket, Object, Service};
+    // ACLs are disabled: a write may only grant the owner full control.
+    if matches!(method, Method::PUT | Method::POST) {
+        crate::policy::check_acl_headers(request.headers())?;
+    }
     match (target, method) {
         _ if UNIMPLEMENTED.iter().any(|name| has_param(&request, name)) => {
             Err(S3Error::not_implemented(format!(
@@ -205,21 +277,73 @@ async fn route(
         (Target::Bucket(_), _) if has_param(&request, "tagging") => Err(S3Error::not_implemented(
             "bucket tagging is not implemented",
         )),
-        (Target::Service, Method::GET) => list_buckets(state, &principal).await,
+        (Target::Service, Method::GET) => {
+            authz.check("s3:ListAllMyBuckets", Service)?;
+            list_buckets(state, principal).await
+        }
         (Target::Bucket(bucket), Method::PUT) if has_param(&request, "versioning") => {
+            authz.check("s3:PutBucketVersioning", Bucket(&bucket))?;
             put_versioning(state, request, auth, bucket).await
         }
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "versioning") => {
+            authz.check("s3:GetBucketVersioning", Bucket(&bucket))?;
             get_versioning(state, bucket).await
         }
+        (Target::Bucket(bucket), method) if has_param(&request, "policy") => {
+            let action = match method {
+                Method::GET => "s3:GetBucketPolicy",
+                Method::PUT => "s3:PutBucketPolicy",
+                Method::DELETE => "s3:DeleteBucketPolicy",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?policy"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::policy::bucket_policy(state, request, auth, bucket, method).await
+        }
+        (Target::Bucket(bucket), Method::GET) if has_param(&request, "policyStatus") => {
+            authz.check("s3:GetBucketPolicyStatus", Bucket(&bucket))?;
+            crate::policy::policy_status(state, bucket).await
+        }
+        (Target::Bucket(bucket), method) if has_param(&request, "acl") => {
+            let action = match method {
+                Method::GET => "s3:GetBucketAcl",
+                Method::PUT => "s3:PutBucketAcl",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?acl"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::policy::acl(state, request, auth, bucket, None, method).await
+        }
+        (Target::Bucket(bucket), method) if has_param(&request, "ownershipControls") => {
+            let action = match method {
+                Method::GET => "s3:GetBucketOwnershipControls",
+                Method::PUT => "s3:PutBucketOwnershipControls",
+                _ => {
+                    return Err(S3Error::not_implemented(format!(
+                        "{method} ?ownershipControls"
+                    )));
+                }
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::policy::ownership_controls(state, request, auth, bucket, method).await
+        }
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "versions") => {
+            authz.check("s3:ListBucketVersions", Bucket(&bucket))?;
             let query = request.uri().query().unwrap_or("").to_string();
             crate::listing::list_versions(state, bucket, &principal.account, &query).await
         }
-        (Target::Bucket(bucket), Method::PUT) => create_bucket(state, request, auth, bucket).await,
-        (Target::Bucket(bucket), Method::DELETE) => delete_bucket(state, bucket).await,
-        (Target::Bucket(bucket), Method::HEAD) => head_bucket(state, bucket).await,
+        (Target::Bucket(bucket), Method::PUT) => {
+            authz.check("s3:CreateBucket", Bucket(&bucket))?;
+            create_bucket(state, request, auth, bucket).await
+        }
+        (Target::Bucket(bucket), Method::DELETE) => {
+            authz.check("s3:DeleteBucket", Bucket(&bucket))?;
+            delete_bucket(state, bucket).await
+        }
+        (Target::Bucket(bucket), Method::HEAD) => {
+            authz.check("s3:ListBucket", Bucket(&bucket))?;
+            head_bucket(state, bucket).await
+        }
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "location") => {
+            authz.check("s3:GetBucketLocation", Bucket(&bucket))?;
             bucket_location(state, bucket).await
         }
         // GetObject of one part of a multipart object is not implemented.
@@ -231,60 +355,142 @@ async fn route(
             ))
         }
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "uploads") => {
+            authz.check("s3:ListBucketMultipartUploads", Bucket(&bucket))?;
             crate::multipart::list_uploads(state, request, bucket).await
         }
         (Target::Bucket(bucket), Method::POST) if has_param(&request, "delete") => {
-            crate::delete::delete_objects(state, request, auth, bucket).await
+            // Each key is authorized on its own.
+            crate::delete::delete_objects(state, request, auth, authz, bucket).await
         }
         (Target::Bucket(bucket), Method::GET) => {
+            authz.check("s3:ListBucket", Bucket(&bucket))?;
             let query = request.uri().query().unwrap_or("").to_string();
             crate::listing::list_objects(state, bucket, &query).await
         }
+        (Target::Object(bucket, key), method) if has_param(&request, "acl") => {
+            let action = match method {
+                Method::GET => versioned(&request, "s3:GetObjectAcl", "s3:GetObjectVersionAcl"),
+                Method::PUT => versioned(&request, "s3:PutObjectAcl", "s3:PutObjectVersionAcl"),
+                _ => return Err(S3Error::not_implemented(format!("{method} ?acl"))),
+            };
+            authz.check(action, Object(&bucket, &key))?;
+            crate::policy::acl(state, request, auth, bucket, Some(key), method).await
+        }
         (Target::Object(bucket, key), Method::POST) if has_param(&request, "uploads") => {
+            authz.check_storing(
+                "s3:PutObject",
+                Object(&bucket, &key),
+                header_tags(&request)?.as_deref(),
+            )?;
             crate::multipart::create_upload(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), Method::POST) if has_param(&request, "uploadId") => {
+            authz.check("s3:PutObject", Object(&bucket, &key))?;
             crate::multipart::complete_upload(state, request, auth, bucket, key).await
         }
         (Target::Object(bucket, key), Method::PUT) if has_param(&request, "tagging") => {
-            crate::tagging::put_tagging(state, request, auth, bucket, key).await
+            let action = versioned(
+                &request,
+                "s3:PutObjectTagging",
+                "s3:PutObjectVersionTagging",
+            );
+            authz.check(action, Object(&bucket, &key))?;
+            // Checked again with the body's tags.
+            crate::tagging::put_tagging(state, request, auth, authz, action, bucket, key).await
         }
         (Target::Object(bucket, key), Method::GET) if has_param(&request, "tagging") => {
+            let action = versioned(
+                &request,
+                "s3:GetObjectTagging",
+                "s3:GetObjectVersionTagging",
+            );
+            authz.check(action, Object(&bucket, &key))?;
             crate::tagging::get_tagging(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), Method::DELETE) if has_param(&request, "tagging") => {
+            let action = versioned(
+                &request,
+                "s3:DeleteObjectTagging",
+                "s3:DeleteObjectVersionTagging",
+            );
+            authz.check(action, Object(&bucket, &key))?;
             crate::tagging::delete_tagging(state, request, bucket, key).await
         }
-        (Target::Object(bucket, key), Method::PUT)
-            if has_param(&request, "uploadId")
-                && request.headers().contains_key("x-amz-copy-source") =>
-        {
-            crate::copy::upload_part_copy(state, request, bucket, key).await
-        }
-        (Target::Object(bucket, key), Method::PUT)
-            if request.headers().contains_key("x-amz-copy-source") =>
-        {
-            crate::copy::copy_object(state, request, bucket, key).await
+        (Target::Object(bucket, key), Method::PUT) if copying => {
+            // A copy stores the header's tags only when told to replace the
+            // source's.
+            let replaces_tags = request
+                .headers()
+                .get("x-amz-tagging-directive")
+                .is_some_and(|value| value.as_bytes().eq_ignore_ascii_case(b"REPLACE"));
+            let tags = match replaces_tags && !has_param(&request, "uploadId") {
+                true => header_tags(&request)?,
+                false => None,
+            };
+            authz.check_storing("s3:PutObject", Object(&bucket, &key), tags.as_deref())?;
+            let (source, source_key, which) = crate::copy::copy_source(request.headers())?;
+            let action = if matches!(which, truthdb_object::VersionSel::Latest) {
+                "s3:GetObject"
+            } else {
+                "s3:GetObjectVersion"
+            };
+            // The source's version is the copy source's, not the query's.
+            let mut context = authz.context().clone();
+            match which {
+                truthdb_object::VersionSel::Latest => context.remove("s3:VersionId"),
+                truthdb_object::VersionSel::Null => {
+                    context.set("s3:VersionId", vec!["null".to_string()])
+                }
+                truthdb_object::VersionSel::Seq(version) => {
+                    context.set("s3:VersionId", vec![version.to_string()])
+                }
+            }
+            authz.check_with(action, Object(&source, &source_key), &context)?;
+            if has_param(&request, "uploadId") {
+                crate::copy::upload_part_copy(state, request, bucket, key).await
+            } else {
+                crate::copy::copy_object(state, request, bucket, key).await
+            }
         }
         (Target::Object(bucket, key), Method::PUT) if has_param(&request, "uploadId") => {
+            authz.check("s3:PutObject", Object(&bucket, &key))?;
             crate::multipart::upload_part(state, request, auth, bucket, key).await
         }
         (Target::Object(bucket, key), Method::GET) if has_param(&request, "uploadId") => {
+            authz.check("s3:ListMultipartUploadParts", Object(&bucket, &key))?;
             crate::multipart::list_parts(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), Method::DELETE) if has_param(&request, "uploadId") => {
+            authz.check("s3:AbortMultipartUpload", Object(&bucket, &key))?;
             crate::multipart::abort_upload(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), Method::PUT) => {
+            authz.check_storing(
+                "s3:PutObject",
+                Object(&bucket, &key),
+                header_tags(&request)?.as_deref(),
+            )?;
             crate::objects::put_object(state, request, auth, bucket, key).await
         }
         (Target::Object(bucket, key), Method::GET) => {
+            authz.check(
+                versioned(&request, "s3:GetObject", "s3:GetObjectVersion"),
+                Object(&bucket, &key),
+            )?;
             crate::objects::get_object(state, request, bucket, key, false).await
         }
         (Target::Object(bucket, key), Method::HEAD) => {
+            authz.check(
+                versioned(&request, "s3:GetObject", "s3:GetObjectVersion"),
+                Object(&bucket, &key),
+            )?;
             crate::objects::get_object(state, request, bucket, key, true).await
         }
         (Target::Object(bucket, key), Method::DELETE) => {
+            authz.check(
+                versioned(&request, "s3:DeleteObject", "s3:DeleteObjectVersion"),
+                Object(&bucket, &key),
+            )?;
             crate::delete::delete_object(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), method) => Err(S3Error::not_implemented(format!(

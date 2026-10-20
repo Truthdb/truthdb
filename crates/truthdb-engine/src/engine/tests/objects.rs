@@ -352,3 +352,50 @@ fn a_failed_object_operation_still_checkpoints() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn user_policies_are_validated_kept_listed_and_deleted() {
+    let path = unique_temp_path("objects-user-policies");
+    let engine = new_engine(&path);
+    let json = |command: &str| -> serde_json::Value {
+        serde_json::from_str(&engine.execute(command).expect(command)).unwrap()
+    };
+    let account = json("s3 create account acme")["account_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    json(&format!("s3 create user {account} alice"));
+    let policy = r#"{"Version": "2012-10-17",  "Statement": {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}}"#;
+    json(&format!(
+        "s3 put user policy {account} alice read {policy};"
+    ));
+    let listed = json(&format!("s3 list user policies {account} alice"));
+    assert_eq!(listed["policies"][0]["policy_name"], "read");
+    assert_eq!(
+        listed["policies"][0]["policy_document"], policy,
+        "kept as written"
+    );
+    for bad in [
+        format!("s3 put user policy {account} alice bad {{\"Statement\": []}}"),
+        format!(
+            r#"s3 put user policy {account} alice bad {{"Statement": {{"Effect": "Allow", "Principal": "*", "Action": "s3:*", "Resource": "*"}}}}"#
+        ),
+        format!("s3 put user policy {account} nobody read {policy}"),
+    ] {
+        assert!(engine.execute(&bad).is_err(), "{bad}");
+    }
+    assert!(
+        engine
+            .execute(&format!("s3 drop user {account} alice"))
+            .is_err()
+    );
+    json(&format!("s3 delete user policy {account} alice read"));
+    assert!(
+        engine
+            .execute(&format!("s3 delete user policy {account} alice read"))
+            .is_err()
+    );
+    json(&format!("s3 drop user {account} alice"));
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}

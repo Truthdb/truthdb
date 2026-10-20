@@ -56,6 +56,14 @@ pub struct Principal {
     pub user: Option<String>,
 }
 
+/// The connection a request arrived on (in the request's extensions): the
+/// policy conditions `aws:SourceIp` and `aws:SecureTransport`.
+#[derive(Debug, Clone, Copy)]
+pub struct Connection {
+    pub peer: std::net::SocketAddr,
+    pub tls: bool,
+}
+
 /// A request that passed authentication: who sent it and how to read its body.
 pub struct Authenticated {
     pub principal: Principal,
@@ -85,7 +93,7 @@ pub async fn serve(
         };
         let stream = tokio::select! {
             accepted = listener.accept() => match accepted {
-                Ok((stream, _)) => stream,
+                Ok(accepted) => accepted,
                 Err(_) => {
                     // Out of descriptors, say: back off instead of spinning.
                     tokio::time::sleep(std::time::Duration::from_millis(100)).await;
@@ -99,29 +107,35 @@ pub async fn serve(
                 continue;
             }
         };
+        let (stream, peer) = stream;
         let state = Arc::clone(&state);
         let tls = tls.clone();
         tokio::spawn(async move {
+            let connection = Connection {
+                peer,
+                tls: tls.is_some(),
+            };
             match tls {
                 Some(acceptor) => {
                     if let Ok(Ok(stream)) =
                         tokio::time::timeout(HEAD_TIMEOUT, acceptor.accept(stream)).await
                     {
-                        serve_connection(stream, state).await;
+                        serve_connection(stream, state, connection).await;
                     }
                 }
-                None => serve_connection(stream, state).await,
+                None => serve_connection(stream, state, connection).await,
             }
             drop(slot);
         });
     }
 }
 
-async fn serve_connection<I>(io: I, state: Arc<S3State>)
+async fn serve_connection<I>(io: I, state: Arc<S3State>, connection: Connection)
 where
     I: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
-    let service = service_fn(move |request| {
+    let service = service_fn(move |mut request: Request<Incoming>| {
+        request.extensions_mut().insert(connection);
         let state = Arc::clone(&state);
         async move { Ok::<_, Infallible>(handle(&state, request).await) }
     });
@@ -407,7 +421,7 @@ fn now_secs() -> u64 {
 }
 
 /// `YYYYMMDDTHHMMSSZ` as Unix seconds.
-fn parse_amz_date(value: &str) -> Option<u64> {
+pub(crate) fn parse_amz_date(value: &str) -> Option<u64> {
     let bytes = value.as_bytes();
     if bytes.len() != 16 || bytes[8] != b'T' || bytes[15] != b'Z' {
         return None;

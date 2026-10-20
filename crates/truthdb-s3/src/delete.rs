@@ -175,10 +175,14 @@ fn parse_delete(xml: &[u8]) -> Result<(bool, Vec<ToDelete>), S3Error> {
     Ok((quiet, objects))
 }
 
+/// DeleteObjects: each key is authorized on its own (`s3:DeleteObject`, or
+/// `s3:DeleteObjectVersion` for a version), a denied one reported in the
+/// result.
 pub async fn delete_objects(
     state: &S3State,
     request: Request<Incoming>,
     auth: Authenticated,
+    authz: &crate::authz::Authz,
     bucket: String,
 ) -> Result<Response<Body>, S3Error> {
     // S3 requires an integrity check on the request body here.
@@ -235,7 +239,31 @@ pub async fn delete_objects(
                 }
             },
         };
-        match delete_one(state, &bucket, &object.key, which).await {
+        let action = if which.is_some() {
+            "s3:DeleteObjectVersion"
+        } else {
+            "s3:DeleteObject"
+        };
+        // The key's own version as it is deleted (`001` is version 1), not
+        // the request query's.
+        let mut context = authz.context().clone();
+        match which {
+            None => context.remove("s3:VersionId"),
+            Some(VersionSel::Null) => context.set("s3:VersionId", vec!["null".to_string()]),
+            Some(VersionSel::Seq(version)) => {
+                context.set("s3:VersionId", vec![version.to_string()])
+            }
+            Some(VersionSel::Latest) => {}
+        }
+        let outcome = match authz.check_with(
+            action,
+            crate::authz::Resource::Object(&bucket, &object.key),
+            &context,
+        ) {
+            Ok(()) => delete_one(state, &bucket, &object.key, which).await,
+            Err(err) => Err(err),
+        };
+        match outcome {
             Ok(deleted) => {
                 if quiet {
                     continue;

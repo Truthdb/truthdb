@@ -2,14 +2,15 @@
 //! with AWS Signature Version 4, served over the object engine.
 
 pub mod api;
+pub mod authz;
 pub mod copy;
 pub mod delete;
 pub mod error;
-pub mod iam;
 pub mod listing;
 pub mod multipart;
 pub mod objects;
 pub mod payload;
+pub mod policy;
 pub mod scope;
 pub mod server;
 pub mod sigv4;

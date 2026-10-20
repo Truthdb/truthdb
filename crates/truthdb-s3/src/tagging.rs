@@ -178,16 +178,27 @@ fn empty(status: StatusCode) -> Response<Body> {
         .expect("a valid response")
 }
 
+/// PutObjectTagging, authorized for `action` again once the body's tags are
+/// known (`s3:RequestObjectTag/...`).
 pub async fn put_tagging(
     state: &S3State,
     request: Request<Incoming>,
     auth: Authenticated,
+    authz: &crate::authz::Authz,
+    action: &str,
     bucket: String,
     key: String,
 ) -> Result<Response<Body>, S3Error> {
     let which = version_sel(request.uri().query().unwrap_or(""))?;
     let body = read_body(request, auth, 64 * 1024).await?;
     let tags = parse_tagging(&body)?;
+    let mut context = authz.context().clone();
+    crate::authz::set_request_tags(&mut context, &tags);
+    authz.check_with(
+        action,
+        crate::authz::Resource::Object(&bucket, &key),
+        &context,
+    )?;
     set_tags(state, bucket, key, which, tags, StatusCode::OK).await
 }
 

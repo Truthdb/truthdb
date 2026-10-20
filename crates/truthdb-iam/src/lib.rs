@@ -1,4 +1,4 @@
-//! S3 access policies: the IAM policy language (a bucket's policy, and the
+//! Access policies for the S3 API: the IAM policy language (a bucket's policy, and the
 //! identity policies of an account's users) and AWS's evaluation of it.
 //!
 //! Supported: `Version` 2012-10-17 (policy variables) and 2008-10-17;
@@ -68,6 +68,10 @@ pub struct Context {
 impl Context {
     pub fn set(&mut self, key: &str, values: Vec<String>) {
         self.values.insert(key.to_ascii_lowercase(), values);
+    }
+
+    pub fn remove(&mut self, key: &str) {
+        self.values.remove(&key.to_ascii_lowercase());
     }
 
     pub fn get(&self, key: &str) -> Option<&[String]> {

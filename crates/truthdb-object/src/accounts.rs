@@ -205,7 +205,7 @@ impl ObjTxn<'_, '_> {
     }
 
     /// Whether user `name` of `account` exists.
-    pub(crate) fn user_exists(&mut self, account: &str, name: &str) -> Result<bool, StorageError> {
+    pub fn user_exists(&mut self, account: &str, name: &str) -> Result<bool, StorageError> {
         Ok(self
             .trees
             .users()
@@ -248,6 +248,9 @@ impl ObjTxn<'_, '_> {
     ) -> Result<Result<(), AccountError>, StorageError> {
         if !self.user_exists(account, name)? {
             return Ok(Err(AccountError::NoSuchUser));
+        }
+        if self.user_has_policies(account, name)? {
+            return Ok(Err(AccountError::NotEmpty("policies")));
         }
         for (_, row) in self.trees.credentials().scan(self.ctx)? {
             let key = KeyRow::decode(&row)?;

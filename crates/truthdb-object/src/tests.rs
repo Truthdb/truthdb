@@ -2285,3 +2285,101 @@ fn a_search_leaves_out_a_document_being_written_on_every_term() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn bucket_configs_and_user_policies_are_kept_replaced_and_dropped() {
+    use crate::{AccountError, BUCKET_POLICY};
+    let path = temp_path("documents");
+    let storage = create(&path);
+    let big: Vec<u8> = (0..5000u32).map(|i| (i % 251) as u8).collect();
+    {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        file.transaction(|tx| {
+            tx.create_bucket("docs", DEFAULT_ACCOUNT, 1)?.unwrap();
+            tx.create_bucket("docs2", DEFAULT_ACCOUNT, 1)?.unwrap();
+            tx.put_bucket_config("docs", BUCKET_POLICY, "", &big)?;
+            tx.put_bucket_config("docs2", BUCKET_POLICY, "", b"other")?;
+            tx.create_account("111111111111", "acme", 1)?.unwrap();
+            tx.create_user("111111111111", "alice", "AIDAA", 1)?
+                .unwrap();
+            tx.create_user("111111111111", "alicia", "AIDAB", 1)?
+                .unwrap();
+            tx.put_user_policy("111111111111", "alice", "read", b"{\"r\":1}")?;
+            tx.put_user_policy("111111111111", "alice", "write", &big)?;
+            tx.put_user_policy("111111111111", "alicia", "x", b"{}")?;
+            assert!(
+                tx.put_user_policy("111111111111", "alice", "bad name", b"{}")
+                    .is_err()
+            );
+            Ok(())
+        })
+        .unwrap();
+    }
+    drop(storage); // crash
+    let storage = open(&path);
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    assert_eq!(
+        file.bucket_config("docs", BUCKET_POLICY, "").unwrap(),
+        Some(big.clone())
+    );
+    let names = |file: &mut ObjFile<'_>, user: &str| -> Vec<String> {
+        file.user_policies("111111111111", user)
+            .unwrap()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect()
+    };
+    assert_eq!(names(&mut file, "alice"), ["read", "write"]);
+    assert_eq!(
+        file.user_policies("111111111111", "alice").unwrap()[1].1,
+        big
+    );
+    assert_eq!(names(&mut file, "alicia"), ["x"]);
+    // Replaced, then gone with its bucket; the other bucket's stays.
+    file.transaction(|tx| tx.put_bucket_config("docs", BUCKET_POLICY, "", b"short"))
+        .unwrap();
+    assert_eq!(
+        file.bucket_config("docs", BUCKET_POLICY, "")
+            .unwrap()
+            .as_deref(),
+        Some(&b"short"[..])
+    );
+    file.transaction(|tx| tx.delete_bucket("docs"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(file.bucket_config("docs", BUCKET_POLICY, "").unwrap(), None);
+    assert_eq!(
+        file.bucket_config("docs2", BUCKET_POLICY, "")
+            .unwrap()
+            .as_deref(),
+        Some(&b"other"[..])
+    );
+    // A user goes only once its policies have.
+    assert_eq!(
+        file.transaction(|tx| tx.drop_user("111111111111", "alice"))
+            .unwrap(),
+        Err(AccountError::NotEmpty("policies"))
+    );
+    for name in ["read", "write"] {
+        assert!(
+            file.transaction(|tx| tx.delete_user_policy("111111111111", "alice", name))
+                .unwrap()
+        );
+    }
+    assert!(
+        !file
+            .transaction(|tx| tx.delete_user_policy("111111111111", "alice", "read"))
+            .unwrap()
+    );
+    assert_eq!(
+        file.transaction(|tx| tx.drop_user("111111111111", "alice"))
+            .unwrap(),
+        Ok(())
+    );
+    assert_eq!(names(&mut file, "alicia"), ["x"]);
+    drop(guard);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

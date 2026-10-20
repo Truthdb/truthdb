@@ -10,6 +10,7 @@ truthdb-search = { workspace = true }
 truthdb-object = { workspace = true }
 truthdb-fulltext = { workspace = true }
 truthdb-vector = { workspace = true }
+truthdb-iam = { workspace = true }
 ring = "0.17"
 truthdb-proto = { workspace = true }
 truthdb-net = { workspace = true }
