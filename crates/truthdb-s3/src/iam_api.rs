@@ -255,6 +255,16 @@ async fn serve(
     let authz = crate::authz::Authz::load(
         state,
         Some(&principal),
+        Some(crate::server::Signed {
+            auth_type: "REST-HEADER",
+            at_ms: signed
+                .parts
+                .headers
+                .get("x-amz-date")
+                .and_then(|value| value.to_str().ok())
+                .and_then(crate::server::parse_amz_date)
+                .map(|secs| secs * 1000),
+        }),
         &signed.parts.headers,
         "",
         signed.parts.extensions.get::<Connection>().copied(),

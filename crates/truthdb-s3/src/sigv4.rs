@@ -103,6 +103,76 @@ pub fn parse_authorization(value: &str) -> Result<AuthHeader, AuthError> {
     })
 }
 
+/// A presigned request's authorization, from its query string
+/// (`X-Amz-Algorithm`, `X-Amz-Credential`, `X-Amz-Date`, `X-Amz-Expires`,
+/// `X-Amz-SignedHeaders`, `X-Amz-Signature`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueryAuth {
+    pub auth: AuthHeader,
+    pub amz_date: String,
+    /// Seconds the signature is valid for, from `amz_date`.
+    pub expires: u64,
+    /// `X-Amz-Content-Sha256`, when the URL fixes the payload's hash.
+    pub content_sha256: Option<String>,
+    /// Whether it carries `X-Amz-Security-Token` (temporary credentials).
+    pub security_token: bool,
+}
+
+/// The query-string authorization of a presigned request.
+pub fn parse_query_auth(raw_query: &str) -> Result<QueryAuth, AuthError> {
+    let malformed = |why: &str| AuthError::Malformed(why.to_string());
+    let param = |name: &str| {
+        raw_query.split('&').find_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            (key == name).then(|| percent_decode_str(value).decode_utf8_lossy().into_owned())
+        })
+    };
+    if param("X-Amz-Algorithm").as_deref() != Some(ALGORITHM) {
+        return Err(malformed("X-Amz-Algorithm must be AWS4-HMAC-SHA256"));
+    }
+    let credential = param("X-Amz-Credential").ok_or_else(|| malformed("no X-Amz-Credential"))?;
+    let fields: Vec<&str> = credential.split('/').collect();
+    let [access_key, date, region, service, "aws4_request"] = fields.as_slice() else {
+        return Err(malformed(
+            "X-Amz-Credential is not KEY/date/region/service/aws4_request",
+        ));
+    };
+    let expires = param("X-Amz-Expires")
+        .ok_or_else(|| malformed("no X-Amz-Expires"))?
+        .parse::<u64>()
+        .map_err(|_| malformed("X-Amz-Expires is not a number"))?;
+    Ok(QueryAuth {
+        auth: AuthHeader {
+            credential: Credential {
+                access_key: access_key.to_string(),
+                date: date.to_string(),
+                region: region.to_string(),
+                service: service.to_string(),
+            },
+            signed_headers: param("X-Amz-SignedHeaders")
+                .ok_or_else(|| malformed("no X-Amz-SignedHeaders"))?
+                .split(';')
+                .map(str::to_string)
+                .collect(),
+            signature: param("X-Amz-Signature").ok_or_else(|| malformed("no X-Amz-Signature"))?,
+        },
+        amz_date: param("X-Amz-Date").ok_or_else(|| malformed("no X-Amz-Date"))?,
+        expires,
+        content_sha256: param("X-Amz-Content-Sha256"),
+        security_token: param("X-Amz-Security-Token").is_some(),
+    })
+}
+
+/// A presigned request's query without its `X-Amz-Signature`: what the
+/// signature covers.
+pub fn query_without_signature(raw_query: &str) -> String {
+    raw_query
+        .split('&')
+        .filter(|pair| pair.split('=').next() != Some("X-Amz-Signature"))
+        .collect::<Vec<_>>()
+        .join("&")
+}
+
 /// The canonical URI: each path segment percent-encoded once (S3 does not
 /// double-encode), from the path as the client sent it.
 pub fn canonical_uri(raw_path: &str) -> String {
@@ -474,5 +544,43 @@ mod tests {
         assert_eq!(header.signed_headers.len(), 4);
         assert!(parse_authorization("AWS AKIA:sig").is_err());
         assert!(parse_authorization("AWS4-HMAC-SHA256 Credential=a/b/c").is_err());
+    }
+
+    #[test]
+    fn a_presigned_url_from_botocore_verifies() {
+        // botocore's S3SigV4QueryAuth, at 2013-05-24T00:00:00Z, for AWS's
+        // example credentials.
+        let url_query = "response-content-type=text%2Fplain&X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential=AKIAIOSFODNN7EXAMPLE%2F20130524%2Fus-east-1%2Fs3%2Faws4_request&X-Amz-Date=20130524T000000Z&X-Amz-Expires=86400&X-Amz-SignedHeaders=host&X-Amz-Signature=be1a448068ed38fdb7ee21493440d2ff1b0c71d3f08051e3ab06ef58434c9e62";
+        let query = parse_query_auth(url_query).unwrap();
+        assert_eq!(query.expires, 86400);
+        assert_eq!(query.auth.credential.access_key, "AKIAIOSFODNN7EXAMPLE");
+        let headers = vec![("host".to_string(), "127.0.0.1:9000".to_string())];
+        let canonical = canonical_request(
+            "GET",
+            "/examplebucket/test.txt",
+            &query_without_signature(url_query),
+            &headers,
+            &query.auth.signed_headers,
+            UNSIGNED_PAYLOAD,
+        )
+        .unwrap();
+        let key = signing_key(
+            "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY",
+            &query.auth.credential,
+        );
+        let to_sign = string_to_sign(&query.amz_date, &query.auth.credential.scope(), &canonical);
+        assert!(verify(&key, &to_sign, &query.auth.signature));
+        // Any other query (a tampered override) does not.
+        let tampered = canonical_request(
+            "GET",
+            "/examplebucket/test.txt",
+            &query_without_signature(&url_query.replace("text%2Fplain", "text%2Fhtml")),
+            &headers,
+            &query.auth.signed_headers,
+            UNSIGNED_PAYLOAD,
+        )
+        .unwrap();
+        let to_sign = string_to_sign(&query.amz_date, &query.auth.credential.scope(), &tampered);
+        assert!(!verify(&key, &to_sign, &query.auth.signature));
     }
 }

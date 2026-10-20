@@ -64,10 +64,22 @@ pub struct Connection {
     pub tls: bool,
 }
 
+/// How a request was signed: in its headers (`REST-HEADER`) or its query
+/// string (`REST-QUERY-STRING`, a presigned URL), and when (from its
+/// `x-amz-date`, in ms), for the policy condition keys `s3:authType` and
+/// `s3:signatureAge`.
+#[derive(Debug, Clone, Copy)]
+pub struct Signed {
+    pub auth_type: &'static str,
+    pub at_ms: Option<u64>,
+}
+
 /// A request that passed authentication: who sent it (`None`: an anonymous
 /// request, signed by no one) and how to read its body.
 pub struct Authenticated {
     pub principal: Option<Principal>,
+    /// How it was signed (`None` when anonymous).
+    pub signed: Option<Signed>,
     pub framing: Framing,
     /// The full-body checksum header's name and (for a header checksum) value.
     pub checksum: Option<(String, Option<String>)>,
@@ -183,9 +195,26 @@ async fn route(state: &S3State, request: Request<Incoming>) -> Result<Response<B
         }
         _ => {}
     }
+    // The signature covers parameter names decoded, while operations are
+    // told apart by their names as written: a name must not be encoded, or
+    // `%74agging` would be signed as `tagging` and served as something else.
+    if request.uri().query().unwrap_or("").split('&').any(|pair| {
+        pair.split('=')
+            .next()
+            .is_some_and(|name| name.contains('%'))
+    }) {
+        return Err(S3Error::new(
+            400,
+            "InvalidArgument",
+            "A query parameter name must not be percent-encoded",
+        ));
+    }
     let auth = match anonymous(&request)? {
         Some(anonymous) => anonymous,
-        None => authenticate(state, &request).await?,
+        None if request.headers().contains_key("authorization") => {
+            authenticate(state, &request).await?
+        }
+        None => authenticate_presigned(state, &request).await?,
     };
     crate::api::dispatch(state, request, auth).await
 }
@@ -276,6 +305,7 @@ pub fn check_signed_headers(
 
 /// Verifies the request's signature over `payload_hash` against the access
 /// key's secret; returns the signing key and who the key acts for.
+#[allow(clippy::too_many_arguments)]
 pub async fn verify_signature(
     state: &S3State,
     method: &hyper::Method,
@@ -284,6 +314,7 @@ pub async fn verify_signature(
     auth: &sigv4::AuthHeader,
     amz_date: &str,
     payload_hash: &str,
+    raw_query: &str,
 ) -> Result<(ring::hmac::Key, Principal), S3Error> {
     let access_key = auth.credential.access_key.clone();
     let (key, secret) = state
@@ -312,7 +343,7 @@ pub async fn verify_signature(
         &auth.credential.service,
         method.as_str(),
         uri.path(),
-        uri.query().unwrap_or(""),
+        raw_query,
         &headers,
         &auth.signed_headers,
         payload_hash,
@@ -354,6 +385,7 @@ pub async fn authenticate(
         &auth,
         amz_date,
         &payload_hash,
+        request.uri().query().unwrap_or(""),
     )
     .await?;
     let scope = auth.credential.scope();
@@ -378,6 +410,108 @@ pub async fn authenticate(
     };
     Ok(Authenticated {
         principal: Some(principal),
+        signed: Some(Signed {
+            auth_type: "REST-HEADER",
+            at_ms: parse_amz_date(amz_date).map(|secs| secs * 1000),
+        }),
+        framing,
+        checksum: checksum_of(request),
+    })
+}
+
+/// The longest a presigned URL may be valid: seven days.
+const MAX_PRESIGNED_EXPIRES: u64 = 7 * 24 * 60 * 60;
+
+/// Checks a presigned request: its query-string SigV4 signature (over the
+/// query without `X-Amz-Signature`, and an unsigned payload unless the URL
+/// fixes its hash), within `X-Amz-Expires` (at most seven days) of its
+/// `X-Amz-Date`. The access key is looked up as the request arrives, so a
+/// dropped or deactivated key revokes its URLs.
+pub async fn authenticate_presigned(
+    state: &S3State,
+    request: &Request<Incoming>,
+) -> Result<Authenticated, S3Error> {
+    let raw_query = request.uri().query().unwrap_or("");
+    let query =
+        sigv4::parse_query_auth(raw_query).map_err(|sigv4::AuthError::Malformed(why)| {
+            S3Error::new(400, "AuthorizationQueryParametersError", why)
+        })?;
+    if query.security_token {
+        return Err(S3Error::access_denied(
+            "temporary credentials (X-Amz-Security-Token) are not supported",
+        ));
+    }
+    if !(1..=MAX_PRESIGNED_EXPIRES).contains(&query.expires) {
+        return Err(S3Error::new(
+            400,
+            "AuthorizationQueryParametersError",
+            "X-Amz-Expires must be from 1 to 604800 seconds",
+        ));
+    }
+    let signed_at = parse_amz_date(&query.amz_date).ok_or_else(|| {
+        S3Error::new(
+            400,
+            "AuthorizationQueryParametersError",
+            "X-Amz-Date is not YYYYMMDDTHHMMSSZ",
+        )
+    })?;
+    let credential = &query.auth.credential;
+    if !query.amz_date.starts_with(&credential.date)
+        || credential.service != "s3"
+        || credential.region != state.region
+    {
+        return Err(S3Error::new(
+            400,
+            "AuthorizationQueryParametersError",
+            format!(
+                "the credential scope must be {}/{}/s3/aws4_request",
+                &query.amz_date[..8.min(query.amz_date.len())],
+                state.region
+            ),
+        ));
+    }
+    let now = now_secs();
+    if signed_at > now + MAX_SKEW_SECS {
+        return Err(S3Error::access_denied("Request is not valid yet"));
+    }
+    if now > signed_at + query.expires {
+        return Err(S3Error::access_denied("Request has expired"));
+    }
+    check_signed_headers(request, &query.auth, &["host"])?;
+    let payload_hash = query
+        .content_sha256
+        .clone()
+        .unwrap_or_else(|| sigv4::UNSIGNED_PAYLOAD.to_string());
+    let framing = match payload_hash.as_str() {
+        sigv4::UNSIGNED_PAYLOAD => Framing::Unsigned,
+        hash if hash.len() == 64 && hash.bytes().all(|byte| byte.is_ascii_hexdigit()) => {
+            Framing::Sha256(hash.to_ascii_lowercase())
+        }
+        other => {
+            return Err(S3Error::new(
+                400,
+                "AuthorizationQueryParametersError",
+                format!("X-Amz-Content-Sha256 {other} is not supported in a presigned URL"),
+            ));
+        }
+    };
+    let (_, principal) = verify_signature(
+        state,
+        request.method(),
+        request.uri(),
+        request.headers(),
+        &query.auth,
+        &query.amz_date,
+        &payload_hash,
+        &sigv4::query_without_signature(raw_query),
+    )
+    .await?;
+    Ok(Authenticated {
+        principal: Some(principal),
+        signed: Some(Signed {
+            auth_type: "REST-QUERY-STRING",
+            at_ms: Some(signed_at * 1000),
+        }),
         framing,
         checksum: checksum_of(request),
     })
@@ -438,6 +572,7 @@ fn anonymous(request: &Request<Incoming>) -> Result<Option<Authenticated>, S3Err
     };
     Ok(Some(Authenticated {
         principal: None,
+        signed: None,
         framing,
         checksum: checksum_of(request),
     }))

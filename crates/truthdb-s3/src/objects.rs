@@ -486,14 +486,52 @@ pub fn version_sel(query: &str) -> Result<VersionSel, S3Error> {
     Ok(VersionSel::Latest)
 }
 
+/// The `response-*` query parameters of a GET or HEAD: header values that
+/// replace the object's own in the response (a signed request's only).
+fn response_overrides(query: &str, signed: bool) -> Result<Vec<(String, String)>, S3Error> {
+    let overrides: Vec<(String, String)> = crate::listing::query_params(query)
+        .into_iter()
+        .filter_map(|(name, value)| {
+            let header = match name.as_str() {
+                "response-content-type" => "content-type",
+                "response-content-language" => "content-language",
+                "response-expires" => "expires",
+                "response-cache-control" => "cache-control",
+                "response-content-disposition" => "content-disposition",
+                "response-content-encoding" => "content-encoding",
+                _ => return None,
+            };
+            Some((header.to_string(), value))
+        })
+        .collect();
+    if let Some((header, _)) = overrides
+        .iter()
+        .find(|(_, value)| hyper::header::HeaderValue::from_str(value).is_err())
+    {
+        return Err(S3Error::new(
+            400,
+            "InvalidArgument",
+            format!("The {header} override is not a valid header value"),
+        ));
+    }
+    if !overrides.is_empty() && !signed {
+        return Err(S3Error::invalid_request(
+            "Request specific response headers cannot be used for anonymous GET requests.",
+        ));
+    }
+    Ok(overrides)
+}
+
 pub async fn get_object(
     state: &S3State,
     request: Request<Incoming>,
     bucket: String,
     key: String,
     head_only: bool,
+    signed: bool,
 ) -> Result<Response<Body>, S3Error> {
     let which = version_sel(request.uri().query().unwrap_or(""))?;
+    let overrides = response_overrides(request.uri().query().unwrap_or(""), signed)?;
     let headers = request.headers().clone();
     // The read runs in its own task: a client that disconnects drops this
     // handler, and the task still releases the lease it takes.
@@ -503,7 +541,16 @@ pub async fn get_object(
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {
-        read_object(&task_state, &headers, bucket, key, which, head_only).await
+        read_object(
+            &task_state,
+            &headers,
+            bucket,
+            key,
+            which,
+            head_only,
+            &overrides,
+        )
+        .await
     }))
     .await
     .map_err(|err| S3Error::internal(err.to_string()))?
@@ -516,6 +563,7 @@ async fn read_object(
     key: String,
     which: VersionSel,
     head_only: bool,
+    overrides: &[(String, String)],
 ) -> Result<Response<Body>, S3Error> {
     // Resolve and lease in one lock hold, so the body cannot be collected
     // between the lookup and the lease.
@@ -534,7 +582,19 @@ async fn read_object(
         Ok((found, versioning))
     })
     .await?;
-    let info = found.map_err(|err| object_error(err, &bucket, &key))?;
+    let mut info = found.map_err(|err| object_error(err, &bucket, &key))?;
+    for (header, value) in overrides {
+        let attrs = &mut info.attrs;
+        let field = match header.as_str() {
+            "content-type" => &mut attrs.content_type,
+            "content-language" => &mut attrs.content_language,
+            "expires" => &mut attrs.expires,
+            "cache-control" => &mut attrs.cache_control,
+            "content-disposition" => &mut attrs.content_disposition,
+            _ => &mut attrs.content_encoding,
+        };
+        *field = Some(value.clone());
+    }
     if info.delete_marker {
         // The newest version is a delete marker: the key is gone. A marker
         // named by its version id cannot be read.
