@@ -2365,6 +2365,422 @@ fn vectors(
     )
 }
 
+/// An IAM or STS Query-protocol request: `POST /` with a form body, signed
+/// as AWS's SDKs sign it (for us-east-1 and `service`). Returns the status
+/// and the XML reply.
+fn query_api(
+    port: u16,
+    key: &str,
+    secret: &str,
+    service: &str,
+    params: &[(&str, &str)],
+) -> (u16, String) {
+    let encode = |text: &str| {
+        percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC).to_string()
+    };
+    let body: String = params
+        .iter()
+        .map(|(name, value)| format!("{}={}", encode(name), encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    let amz_date = amz_now();
+    let host = format!("127.0.0.1:{port}");
+    let payload = sigv4::sha256_hex(body.as_bytes());
+    let headers = vec![
+        (
+            "content-type".to_string(),
+            "application/x-www-form-urlencoded; charset=utf-8".to_string(),
+        ),
+        ("host".to_string(), host.clone()),
+        ("x-amz-date".to_string(), amz_date.clone()),
+    ];
+    let credential = sigv4::Credential {
+        access_key: key.to_string(),
+        date: amz_date[..8].to_string(),
+        region: "us-east-1".to_string(),
+        service: service.to_string(),
+    };
+    let signed: Vec<String> = headers.iter().map(|(name, _)| name.clone()).collect();
+    let canonical =
+        sigv4::canonical_request_for(service, "POST", "/", "", &headers, &signed, &payload)
+            .unwrap();
+    let signature = sigv4::sign(
+        &sigv4::signing_key(secret, &credential),
+        &sigv4::string_to_sign(&amz_date, &credential.scope(), &canonical),
+    );
+    let request = format!(
+        "POST / HTTP/1.1\r\nHost: {host}\r\nContent-Type: application/x-www-form-urlencoded; charset=utf-8\r\nx-amz-date: {amz_date}\r\nContent-Length: {}\r\nConnection: close\r\nAuthorization: AWS4-HMAC-SHA256 Credential={key}/{}, SignedHeaders={}, Signature={signature}\r\n\r\n{body}",
+        body.len(),
+        credential.scope(),
+        signed.join(";")
+    );
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream.write_all(request.as_bytes()).expect("send");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read");
+    let response = String::from_utf8(raw).expect("utf-8");
+    let status = response
+        .split_whitespace()
+        .nth(1)
+        .and_then(|code| code.parse().ok())
+        .expect("status line");
+    let (_, body) = response.split_once("\r\n\r\n").expect("a head");
+    (status, body.to_string())
+}
+
+/// The text of the first `<tag>` in `xml`.
+fn xml_value(xml: &str, tag: &str) -> String {
+    xml.split(&format!("<{tag}>"))
+        .nth(1)
+        .and_then(|rest| rest.split(&format!("</{tag}>")).next())
+        .unwrap_or_else(|| panic!("no <{tag}> in {xml}"))
+        .to_string()
+}
+
+#[test]
+fn the_iam_api_manages_users_keys_and_policies() {
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, root_key, root_secret) = account_with_key(&server, "acme");
+    let root = |params: &[(&str, &str)]| query_api(port, &root_key, &root_secret, "iam", params);
+    let ok = |reply: (u16, String)| {
+        assert_eq!(reply.0, 200, "{}", reply.1);
+        reply.1
+    };
+
+    // Users, by the account's root.
+    let created = ok(root(&[
+        ("Action", "CreateUser"),
+        ("UserName", "alice"),
+        ("Version", "2010-05-08"),
+    ]));
+    assert!(created.contains("<CreateUserResponse"), "{created}");
+    assert_eq!(
+        xml_value(&created, "Arn"),
+        format!("arn:aws:iam::{account}:user/alice")
+    );
+    assert!(xml_value(&created, "UserId").starts_with("AIDA"));
+    let (status, reply) = root(&[("Action", "CreateUser"), ("UserName", "ALICE")]);
+    assert_eq!(status, 409);
+    assert!(
+        reply.contains("<Code>EntityAlreadyExists</Code>"),
+        "{reply}"
+    );
+    assert!(ok(root(&[("Action", "ListUsers")])).contains("<UserName>alice</UserName>"));
+    let (status, reply) = root(&[("Action", "GetUser"), ("UserName", "nobody")]);
+    assert_eq!(status, 404);
+    assert!(reply.contains("<Code>NoSuchEntity</Code>"), "{reply}");
+
+    // A key of the user, which acts for it.
+    let key = ok(root(&[
+        ("Action", "CreateAccessKey"),
+        ("UserName", "alice"),
+    ]));
+    let (alice_key, alice_secret) = (
+        xml_value(&key, "AccessKeyId"),
+        xml_value(&key, "SecretAccessKey"),
+    );
+    let alice = |params: &[(&str, &str)]| query_api(port, &alice_key, &alice_secret, "iam", params);
+    let identity = query_api(
+        port,
+        &alice_key,
+        &alice_secret,
+        "sts",
+        &[("Action", "GetCallerIdentity"), ("Version", "2011-06-15")],
+    );
+    assert_eq!(identity.0, 200, "{}", identity.1);
+    assert_eq!(
+        xml_value(&identity.1, "Arn"),
+        format!("arn:aws:iam::{account}:user/alice")
+    );
+    assert_eq!(xml_value(&identity.1, "Account"), account);
+
+    // Without policies she may do nothing; an inline policy lets her list
+    // buckets.
+    let (status, reply) = alice(&[("Action", "CreateUser"), ("UserName", "bob")]);
+    assert_eq!(status, 403);
+    assert!(reply.contains("<Code>AccessDenied</Code>"), "{reply}");
+    assert_eq!(get(port, "/", &alice_key, Some(&alice_secret)).0, 403);
+    let list_buckets = r#"{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3:ListAllMyBuckets", "Resource": "*"}}"#;
+    ok(root(&[
+        ("Action", "PutUserPolicy"),
+        ("UserName", "alice"),
+        ("PolicyName", "list"),
+        ("PolicyDocument", list_buckets),
+    ]));
+    assert_eq!(get(port, "/", &alice_key, Some(&alice_secret)).0, 200);
+    let fetched = ok(root(&[
+        ("Action", "GetUserPolicy"),
+        ("UserName", "alice"),
+        ("PolicyName", "list"),
+    ]));
+    let document = percent_encoding::percent_decode_str(&xml_value(&fetched, "PolicyDocument"))
+        .decode_utf8()
+        .unwrap()
+        .into_owned();
+    assert_eq!(document, list_buckets, "returned URL-encoded, as written");
+    assert!(
+        ok(root(&[
+            ("Action", "ListUserPolicies"),
+            ("UserName", "alice")
+        ]))
+        .contains("<member>list</member>")
+    );
+    let (status, reply) = root(&[
+        ("Action", "PutUserPolicy"),
+        ("UserName", "alice"),
+        ("PolicyName", "bad"),
+        ("PolicyDocument", "{}"),
+    ]);
+    assert_eq!(status, 400);
+    assert!(
+        reply.contains("<Code>MalformedPolicyDocument</Code>"),
+        "{reply}"
+    );
+
+    // A managed policy attached to her makes her an IAM administrator.
+    let admin = r#"{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "iam:*", "Resource": "*"}}"#;
+    let created = ok(root(&[
+        ("Action", "CreatePolicy"),
+        ("PolicyName", "iam-admin"),
+        ("PolicyDocument", admin),
+    ]));
+    let arn = xml_value(&created, "Arn");
+    assert_eq!(arn, format!("arn:aws:iam::{account}:policy/iam-admin"));
+    ok(root(&[
+        ("Action", "AttachUserPolicy"),
+        ("UserName", "alice"),
+        ("PolicyArn", &arn),
+    ]));
+    assert!(
+        ok(root(&[
+            ("Action", "ListAttachedUserPolicies"),
+            ("UserName", "alice")
+        ]))
+        .contains(&arn)
+    );
+    assert_eq!(
+        xml_value(
+            &ok(root(&[("Action", "GetPolicy"), ("PolicyArn", &arn)])),
+            "AttachmentCount"
+        ),
+        "1"
+    );
+    let version = ok(root(&[
+        ("Action", "GetPolicyVersion"),
+        ("PolicyArn", &arn),
+        ("VersionId", "v1"),
+    ]));
+    assert!(
+        xml_value(&version, "Document").contains("iam%3A"),
+        "{version}"
+    );
+    assert!(
+        ok(root(&[("Action", "ListPolicies"), ("Scope", "Local")]))
+            .contains("<PolicyName>iam-admin</PolicyName>")
+    );
+    ok(alice(&[("Action", "CreateUser"), ("UserName", "bob")]));
+    let (status, reply) = root(&[("Action", "DeletePolicy"), ("PolicyArn", &arn)]);
+    assert_eq!(status, 409);
+    assert!(reply.contains("<Code>DeleteConflict</Code>"), "{reply}");
+
+    // Her own keys: listed, deactivated (and then refused), deleted.
+    let listed = ok(alice(&[("Action", "ListAccessKeys")]));
+    assert!(listed.contains(&alice_key), "{listed}");
+    ok(root(&[
+        ("Action", "UpdateAccessKey"),
+        ("UserName", "alice"),
+        ("AccessKeyId", &alice_key),
+        ("Status", "Inactive"),
+    ]));
+    assert_eq!(get(port, "/", &alice_key, Some(&alice_secret)).0, 403);
+    assert!(
+        ok(root(&[("Action", "ListAccessKeys"), ("UserName", "alice")]))
+            .contains("<Status>Inactive</Status>")
+    );
+    let (status, _) = root(&[
+        ("Action", "DeleteAccessKey"),
+        ("UserName", "bob"),
+        ("AccessKeyId", &alice_key),
+    ]);
+    assert_eq!(status, 404, "not bob's key");
+
+    // A user goes only once its keys and policies have.
+    let (status, reply) = root(&[("Action", "DeleteUser"), ("UserName", "alice")]);
+    assert_eq!(status, 409);
+    assert!(reply.contains("<Code>DeleteConflict</Code>"), "{reply}");
+    ok(root(&[
+        ("Action", "DeleteAccessKey"),
+        ("UserName", "alice"),
+        ("AccessKeyId", &alice_key),
+    ]));
+    ok(root(&[
+        ("Action", "DeleteUserPolicy"),
+        ("UserName", "alice"),
+        ("PolicyName", "list"),
+    ]));
+    ok(root(&[
+        ("Action", "DetachUserPolicy"),
+        ("UserName", "alice"),
+        ("PolicyArn", &arn),
+    ]));
+    ok(root(&[("Action", "DeleteUser"), ("UserName", "alice")]));
+    ok(root(&[("Action", "DeletePolicy"), ("PolicyArn", &arn)]));
+    let (status, reply) = root(&[("Action", "CreateGroup"), ("GroupName", "g")]);
+    assert_eq!(status, 400);
+    assert!(reply.contains("<Code>InvalidAction</Code>"), "{reply}");
+    // Another account's policy is not this one's.
+    let (status, _) = root(&[
+        ("Action", "GetPolicy"),
+        ("PolicyArn", "arn:aws:iam::222222222222:policy/iam-admin"),
+    ]);
+    assert_eq!(status, 404);
+}
+
+#[test]
+fn iam_names_are_checked_before_they_reach_storage() {
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, root_key, root_secret) = account_with_key(&server, "acme");
+    let root = |params: &[(&str, &str)]| query_api(port, &root_key, &root_secret, "iam", params);
+    let ok = |reply: (u16, String)| {
+        assert_eq!(reply.0, 200, "{}", reply.1);
+        reply.1
+    };
+    ok(root(&[("Action", "CreateUser"), ("UserName", "alice")]));
+    // A policy longer than one storage chunk, attached to alice.
+    let statements: Vec<String> = (0..40)
+        .map(|i| format!(r#"{{"Sid": "s{i}", "Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::bucket-{i}/*"}}"#))
+        .collect();
+    let big = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [{}]}}"#,
+        statements.join(", ")
+    );
+    assert!(big.len() > 1500);
+    let inline_big = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [{}]}}"#,
+        statements[..18].join(",")
+    );
+    assert!(inline_big.len() > 1500 && inline_big.len() < 2048);
+    let arn = xml_value(
+        &ok(root(&[
+            ("Action", "CreatePolicy"),
+            ("PolicyName", "big"),
+            ("PolicyDocument", &big),
+        ])),
+        "Arn",
+    );
+    ok(root(&[
+        ("Action", "AttachUserPolicy"),
+        ("UserName", "alice"),
+        ("PolicyArn", &arn),
+    ]));
+    ok(root(&[
+        ("Action", "PutUserPolicy"),
+        ("UserName", "alice"),
+        ("PolicyName", "bigin"),
+        ("PolicyDocument", &inline_big),
+    ]));
+
+    // A 0 byte in a name is refused, and nothing changes.
+    let nul_arn = format!("{arn}\0");
+    assert_eq!(
+        root(&[("Action", "DeletePolicy"), ("PolicyArn", &nul_arn)]).0,
+        404
+    );
+    assert_eq!(
+        root(&[
+            ("Action", "AttachUserPolicy"),
+            ("UserName", "alice"),
+            ("PolicyArn", &format!("{arn}2\0"))
+        ])
+        .0,
+        404
+    );
+    assert_eq!(
+        root(&[
+            ("Action", "DeleteUserPolicy"),
+            ("UserName", "alice"),
+            ("PolicyName", "bigin\0")
+        ])
+        .0,
+        400
+    );
+    assert_eq!(
+        root(&[
+            ("Action", "GetUserPolicy"),
+            ("UserName", "alice\0p"),
+            ("PolicyName", "bigin")
+        ])
+        .0,
+        400
+    );
+    let version = ok(root(&[
+        ("Action", "GetPolicyVersion"),
+        ("PolicyArn", &arn),
+        ("VersionId", "v1"),
+    ]));
+    let document = percent_encoding::percent_decode_str(&xml_value(&version, "Document"))
+        .decode_utf8()
+        .unwrap()
+        .into_owned();
+    assert_eq!(document, big, "the attached policy is whole");
+    let inline = ok(root(&[
+        ("Action", "GetUserPolicy"),
+        ("UserName", "alice"),
+        ("PolicyName", "bigin"),
+    ]));
+    assert_eq!(
+        percent_encoding::percent_decode_str(&xml_value(&inline, "PolicyDocument"))
+            .decode_utf8()
+            .unwrap(),
+        inline_big
+    );
+    assert!(
+        ok(root(&[
+            ("Action", "ListAttachedUserPolicies"),
+            ("UserName", "alice")
+        ]))
+        .matches("<member>")
+        .count()
+            == 1
+    );
+
+    // Policy names compare without case; OnlyAttached lists attached ones.
+    let small = r#"{"Version": "2012-10-17", "Statement": {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}}"#;
+    assert_eq!(
+        root(&[
+            ("Action", "CreatePolicy"),
+            ("PolicyName", "BIG"),
+            ("PolicyDocument", small)
+        ])
+        .0,
+        409
+    );
+    ok(root(&[
+        ("Action", "CreatePolicy"),
+        ("PolicyName", "unused"),
+        ("PolicyDocument", small),
+    ]));
+    let attached = ok(root(&[
+        ("Action", "ListPolicies"),
+        ("OnlyAttached", "true"),
+    ]));
+    assert!(
+        attached.contains("<PolicyName>big</PolicyName>") && !attached.contains("unused"),
+        "{attached}"
+    );
+
+    // A wrong secret is SignatureDoesNotMatch, as in AWS.
+    let (status, reply) = query_api(port, &root_key, "wrong", "iam", &[("Action", "ListUsers")]);
+    assert_eq!(status, 403);
+    assert!(
+        reply.contains("<Code>SignatureDoesNotMatch</Code>"),
+        "{reply}"
+    );
+    let _ = account;
+}
+
 #[test]
 fn the_s3_vectors_api_manages_buckets_indexes_and_vectors_and_queries_them() {
     use serde_json::json;

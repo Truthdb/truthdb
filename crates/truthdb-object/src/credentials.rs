@@ -151,6 +151,23 @@ impl ObjTxn<'_, '_> {
         Ok(Ok(()))
     }
 
+    /// Sets access key `id` active or inactive; whether it exists.
+    pub fn set_access_key_status(&mut self, id: &str, active: bool) -> Result<bool, StorageError> {
+        let credentials = self.trees.credentials();
+        let Some(row) = credentials.get(self.ctx, id.as_bytes())? else {
+            return Ok(false);
+        };
+        let mut row = KeyRow::decode(&row)?;
+        row.active = active;
+        credentials.update(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            id.as_bytes(),
+            &row.encode(),
+        )?;
+        Ok(true)
+    }
+
     pub fn drop_access_key(&mut self, id: &str) -> Result<(), StorageError> {
         let credentials = self.trees.credentials();
         credentials

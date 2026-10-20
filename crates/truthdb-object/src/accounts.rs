@@ -41,7 +41,10 @@ pub enum AccountError {
     /// The default account cannot be dropped.
     DefaultAccount,
     NoSuchUser,
+    /// A user of that name exists (names compare without case, as in IAM).
     UserExists,
+    NoSuchPolicy,
+    PolicyExists,
     /// The account or user still has these.
     NotEmpty(&'static str),
     InvalidName(&'static str),
@@ -50,6 +53,11 @@ pub enum AccountError {
 /// Whether `id` is an account id: 12 ASCII digits.
 pub fn valid_account_id(id: &str) -> bool {
     id.len() == 12 && id.bytes().all(|b| b.is_ascii_digit())
+}
+
+/// Whether `name` follows IAM's rule for user names (see [`check_name`]).
+pub(crate) fn valid_user_name(name: &str) -> bool {
+    check_name(name).is_ok()
 }
 
 /// IAM's name rules, for account and user names: 1 to 64 letters, digits and
@@ -183,6 +191,9 @@ impl ObjTxn<'_, '_> {
                 return Ok(Err(AccountError::NotEmpty("access keys")));
             }
         }
+        if self.account_has_managed_policies(id)? {
+            return Ok(Err(AccountError::NotEmpty("policies")));
+        }
         for (_, row) in self.trees.buckets().scan(self.ctx)? {
             if BucketRow::decode(&row)?.owner == id {
                 return Ok(Err(AccountError::NotEmpty("buckets")));
@@ -227,6 +238,16 @@ impl ObjTxn<'_, '_> {
         }
         if !self.account_exists(account)? {
             return Ok(Err(AccountError::NoSuchAccount));
+        }
+        let (lower, upper) = user_range(account);
+        for (key, row) in self
+            .trees
+            .users()
+            .scan_range(self.ctx, Some(&lower), Some(&upper))?
+        {
+            if decode_user(&key, &row)?.name.eq_ignore_ascii_case(name) {
+                return Ok(Err(AccountError::UserExists));
+            }
         }
         let inserted = self.trees.users().insert_unique(
             self.ctx,

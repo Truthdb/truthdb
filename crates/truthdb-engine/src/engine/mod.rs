@@ -140,6 +140,8 @@ fn account_error(err: truthdb_object::AccountError) -> EngineError {
         AccountError::DefaultAccount => "the default account cannot be dropped".to_string(),
         AccountError::NoSuchUser => "no such user".to_string(),
         AccountError::UserExists => "the user already exists".to_string(),
+        AccountError::NoSuchPolicy => "no such policy".to_string(),
+        AccountError::PolicyExists => "the policy already exists".to_string(),
         AccountError::NotEmpty(what) => format!("drop its {what} first"),
         AccountError::InvalidName(why) => format!("the name {why}"),
     })

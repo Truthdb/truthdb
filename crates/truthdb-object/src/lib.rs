@@ -41,7 +41,7 @@ pub use accounts::{AccountError, AccountInfo, DEFAULT_ACCOUNT, UserInfo, valid_a
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use credentials::AccessKey;
-pub use documents::BUCKET_POLICY;
+pub use documents::{BUCKET_POLICY, ManagedPolicy};
 pub use fulltext::{
     DEFAULT_FULLTEXT_MAX_BYTES, FtBucket, FtError, FtKey, FtState, FtStatus, MAX_FULLTEXT_BYTES,
     fulltext_status,

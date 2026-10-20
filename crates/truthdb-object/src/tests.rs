@@ -2383,3 +2383,123 @@ fn bucket_configs_and_user_policies_are_kept_replaced_and_dropped() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn managed_policies_attach_to_users_and_go_only_when_detached() {
+    use crate::AccountError;
+    let path = temp_path("managed");
+    let storage = create(&path);
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    let acct = "111111111111";
+    file.transaction(|tx| {
+        tx.create_account(acct, "acme", 1)?.unwrap();
+        tx.create_user(acct, "alice", "AIDAA", 1)?.unwrap();
+        assert_eq!(
+            tx.create_user(acct, "ALICE", "AIDAB", 1)?,
+            Err(AccountError::UserExists),
+            "names compare without case"
+        );
+        tx.create_user(acct, "bob", "AIDAC", 1)?.unwrap();
+        tx.create_managed_policy(acct, "read", "ANPAR", b"{\"r\":1}", 2)?
+            .unwrap();
+        assert_eq!(
+            tx.create_managed_policy(acct, "read", "ANPAX", b"{}", 2)?,
+            Err(AccountError::PolicyExists)
+        );
+        tx.create_managed_policy(acct, "write", "ANPAW", &vec![b'w'; 4000], 3)?
+            .unwrap();
+        tx.attach_user_policy(acct, "alice", "read")?.unwrap();
+        tx.attach_user_policy(acct, "alice", "read")?.unwrap();
+        tx.attach_user_policy(acct, "bob", "read")?.unwrap();
+        assert_eq!(
+            tx.attach_user_policy(acct, "alice", "none")?,
+            Err(AccountError::NoSuchPolicy)
+        );
+        tx.create_access_key("K1", "s1", acct, Some("bob"), 4)?
+            .unwrap();
+        Ok(())
+    })
+    .unwrap();
+    let read = file.managed_policy(acct, "read").unwrap().unwrap();
+    assert_eq!(
+        (read.policy_id.as_str(), read.created_ms, &read.document[..]),
+        ("ANPAR", 2, &b"{\"r\":1}"[..])
+    );
+    let listed: Vec<(String, u32)> = file
+        .managed_policies(acct)
+        .unwrap()
+        .into_iter()
+        .map(|(policy, count)| (policy.name, count))
+        .collect();
+    assert_eq!(listed, [("read".to_string(), 2), ("write".to_string(), 0)]);
+    assert_eq!(
+        file.managed_policy(acct, "write")
+            .unwrap()
+            .unwrap()
+            .document
+            .len(),
+        4000
+    );
+    assert_eq!(file.attached_policies(acct, "alice").unwrap(), ["read"]);
+    // A policy goes only once detached; a user only without attachments.
+    assert_eq!(
+        file.transaction(|tx| tx.delete_managed_policy(acct, "read"))
+            .unwrap(),
+        Err(AccountError::NotEmpty("attachments"))
+    );
+    assert_eq!(
+        file.transaction(|tx| tx.drop_user(acct, "alice")).unwrap(),
+        Err(AccountError::NotEmpty("policies"))
+    );
+    for user in ["alice", "bob"] {
+        assert!(
+            file.transaction(|tx| tx.detach_user_policy(acct, user, "read"))
+                .unwrap()
+        );
+    }
+    assert!(
+        !file
+            .transaction(|tx| tx.detach_user_policy(acct, "bob", "read"))
+            .unwrap()
+    );
+    assert_eq!(
+        file.transaction(|tx| tx.drop_user(acct, "alice")).unwrap(),
+        Ok(())
+    );
+    assert_eq!(
+        file.transaction(|tx| tx.delete_managed_policy(acct, "read"))
+            .unwrap(),
+        Ok(())
+    );
+    // Key status.
+    assert!(
+        file.transaction(|tx| tx.set_access_key_status("K1", false))
+            .unwrap()
+    );
+    assert!(!file.access_key("K1").unwrap().unwrap().0.active);
+    assert!(
+        !file
+            .transaction(|tx| tx.set_access_key_status("none", false))
+            .unwrap()
+    );
+    // An account with policies left is not dropped.
+    file.transaction(|tx| tx.drop_access_key("K1")).unwrap();
+    file.transaction(|tx| tx.drop_user(acct, "bob"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        file.transaction(|tx| tx.drop_account(acct)).unwrap(),
+        Err(AccountError::NotEmpty("policies"))
+    );
+    file.transaction(|tx| tx.delete_managed_policy(acct, "write"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        file.transaction(|tx| tx.drop_account(acct)).unwrap(),
+        Ok(())
+    );
+    drop(guard);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

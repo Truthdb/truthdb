@@ -1567,6 +1567,7 @@ dependencies = [
  "base64",
  "directories",
  "md-5",
+ "percent-encoding",
  "rcgen",
  "serde",
  "serde_json",

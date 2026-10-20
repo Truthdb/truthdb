@@ -173,8 +173,14 @@ pub fn full(text: impl Into<Bytes>) -> Body {
 async fn route(state: &S3State, request: Request<Incoming>) -> Result<Response<Body>, S3Error> {
     // S3 Vectors' JSON API on the same listener, told apart by the
     // service its requests are signed for.
-    if request_service(&request).as_deref() == Some("s3vectors") {
-        return Ok(crate::vectors::handle(state, request).await);
+    match request_service(&request).as_deref() {
+        Some("s3vectors") => return Ok(crate::vectors::handle(state, request).await),
+        // IAM and STS (the Query protocol), told apart the same way.
+        Some(service @ ("iam" | "sts")) => {
+            let service = service.to_string();
+            return Ok(crate::iam_api::handle(state, request, &service).await);
+        }
+        _ => {}
     }
     let auth = authenticate(state, &request).await?;
     crate::api::dispatch(state, request, auth).await
@@ -204,9 +210,13 @@ pub fn signed_request(
         .ok_or_else(|| S3Error::access_denied("the request has no x-amz-date"))?;
     let signed_at = parse_amz_date(amz_date)
         .ok_or_else(|| S3Error::access_denied("x-amz-date is not YYYYMMDDTHHMMSSZ"))?;
+    // IAM is global: the SDKs sign it (and STS's global endpoint) for
+    // us-east-1, whatever this server's region.
+    let region_ok = auth.credential.region == state.region
+        || (matches!(service, "iam" | "sts") && auth.credential.region == "us-east-1");
     if !amz_date.starts_with(&auth.credential.date)
         || auth.credential.service != service
-        || auth.credential.region != state.region
+        || !region_ok
     {
         return Err(S3Error::new(
             400,
