@@ -1193,3 +1193,514 @@ fn a_rotation_runs_its_key_command_without_the_storage_lock() {
         std::fs::remove_file(file).ok();
     }
 }
+
+/// Runs the conversion to its end, checkpointing when it asks.
+fn convert(storage: &Storage) {
+    use crate::storage::ConversionStep;
+    for _ in 0..10_000 {
+        match storage.conversion_step(64).expect("conversion step") {
+            ConversionStep::Done => return,
+            ConversionStep::Idle => panic!("no conversion under way"),
+            ConversionStep::NeedsCheckpoint => storage
+                .write_checkpoint(&MARKER.repeat(1000), 1, 2, 1)
+                .expect("checkpoint"),
+            ConversionStep::WaitingForLog => panic!("the conversion waits for the log"),
+            ConversionStep::Working => {}
+        }
+    }
+    panic!("the conversion did not finish");
+}
+
+/// A plain database (the encrypted test run makes every database it creates
+/// encrypted, so these tests run in the plain one).
+fn plain_database(label: &str) -> Option<PathBuf> {
+    if crate::encryption::test_key_source().is_some() {
+        return None;
+    }
+    Some(unique_temp_path(label))
+}
+
+#[test]
+fn encryption_enable_converts_a_database_that_holds_data() {
+    let Some(path) = plain_database("enable") else {
+        return;
+    };
+    let keys = key_file("enable-keys", &format!("main {}\n", "5e".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let storage = Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
+    let (root, blob) = fill(&storage, 300);
+    drop(storage);
+    assert!(holds_marker_in(&path), "plain before");
+
+    // Opened with the master key configured, then converted while it runs.
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    storage.enable_encryption().expect("enable");
+    let status = storage.encryption_status();
+    assert!(status.encrypted && status.converting);
+    // Written during the conversion: sealed from the start.
+    let (root2, _) = fill(&storage, 50);
+    convert(&storage);
+    let status = storage.encryption_status();
+    assert!(status.encrypted && !status.converting);
+    let fingerprint = storage.key_fingerprint();
+    drop(storage);
+    // Every page, the snapshot, the log and the free space: no plaintext.
+    assert!(!holds_marker_in(&path));
+
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    assert_eq!(storage.key_fingerprint(), fingerprint);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 300);
+    assert_eq!(rows_of(&storage, root2).expect("rows").len(), 50);
+    let mut body = vec![0u8; crate::relstore::page::BLOB_PAGE_DATA];
+    storage
+        .lock()
+        .page_ctx(0)
+        .read_blob_page(blob, &mut body)
+        .expect("blob page");
+    assert!(body.starts_with(MARKER));
+    drop(storage);
+    let Err(err) = Storage::open(path.clone(), no_engine) else {
+        panic!("a converted database opened without its key");
+    };
+    assert!(err.to_string().contains("encrypted"), "{err}");
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_conversion_cut_short_resumes_at_the_next_open() {
+    let Some(path) = plain_database("enable-crash") else {
+        return;
+    };
+    let keys = key_file("enable-crash-keys", &format!("main {}\n", "6f".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let storage = Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
+    let (root, _) = fill(&storage, 300);
+    drop(storage);
+
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    storage.enable_encryption().expect("enable");
+    for _ in 0..3 {
+        storage.conversion_step(16).expect("step");
+    }
+    drop(storage); // a crash mid-conversion
+
+    // It opens (plain and sealed pages and entries mixed) and resumes.
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    assert!(storage.encryption_status().converting);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 300);
+    convert(&storage);
+    drop(storage);
+    assert!(!holds_marker_in(&path));
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    assert!(!storage.encryption_status().converting);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 300);
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_backup_taken_mid_conversion_restores_and_finishes_there() {
+    let Some(path) = plain_database("enable-backup") else {
+        return;
+    };
+    let [bak, dst] = ["enable-backup-bak", "enable-backup-dst"].map(unique_temp_path);
+    let keys = key_file("enable-backup-keys", &format!("main {}\n", "7a".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let storage = Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
+    let (root, _) = fill(&storage, 200);
+    drop(storage);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    storage.enable_encryption().expect("enable");
+    storage.conversion_step(16).expect("step");
+    storage.backup_full(&bak).expect("backup mid-conversion");
+    drop(storage);
+
+    Storage::restore_with_keys(&dst, &bak, &[], None, false, no_engine, Some(&source))
+        .expect("restore");
+    let restored = Storage::open_with_keys(dst.clone(), no_engine, Some(&source)).expect("open");
+    assert!(restored.encryption_status().converting);
+    convert(&restored);
+    assert_eq!(rows_of(&restored, root).expect("rows").len(), 200);
+    drop(restored);
+    assert!(!holds_marker_in(&dst));
+    for file in [&path, &bak, &dst, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn encryption_enable_needs_a_plain_primary_and_a_master_key() {
+    let Some(path) = plain_database("enable-refused") else {
+        return;
+    };
+    let storage = Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
+    let Err(err) = storage.enable_encryption() else {
+        panic!("enabled without a master key");
+    };
+    assert!(err.to_string().contains("no master key"), "{err}");
+    drop(storage);
+    let keys = key_file(
+        "enable-refused-keys",
+        &format!("main {}\n", "8b".repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    storage.enable_encryption().expect("enable");
+    let Err(err) = storage.enable_encryption() else {
+        panic!("enabled twice");
+    };
+    assert!(err.to_string().contains("already encrypted"), "{err}");
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_blob_page_rewrite_lost_on_disk_is_redone_from_the_log() {
+    use std::os::unix::fs::FileExt;
+    let Some(path) = plain_database("enable-blob-redo") else {
+        return;
+    };
+    let keys = key_file(
+        "enable-blob-redo-keys",
+        &format!("main {}\n", "9c".repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    let storage = Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
+    let (_, blob) = fill(&storage, 10);
+    let offset = storage.lock().data_page_offset(blob);
+    drop(storage);
+    let read_page = || {
+        let mut page = vec![0u8; PAGE_SIZE];
+        std::fs::File::open(&path)
+            .and_then(|file| file.read_exact_at(&mut page, offset))
+            .expect("read blob page");
+        page
+    };
+    let sealed = |page: &[u8]| {
+        u16::from_le_bytes([page[18], page[19]]) & crate::encryption::PAGE_FLAG_SEALED != 0
+    };
+    let plain = read_page();
+    assert!(!sealed(&plain));
+
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    storage.enable_encryption().expect("enable");
+    while !sealed(&read_page()) {
+        storage.conversion_step(64).expect("step");
+    }
+    drop(storage);
+    // The page write lost: the plain image is back on disk.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.write_all_at(&plain, offset))
+        .expect("restore the plain image");
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    assert!(
+        sealed(&read_page()),
+        "recovery rewrote the blob page sealed"
+    );
+    let mut body = vec![0u8; crate::relstore::page::BLOB_PAGE_DATA];
+    storage
+        .lock()
+        .page_ctx(0)
+        .read_blob_page(blob, &mut body)
+        .expect("blob page");
+    assert!(body.starts_with(MARKER));
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn encryption_enable_waits_for_backups_and_standbys() {
+    let Some(path) = plain_database("enable-busy") else {
+        return;
+    };
+    let keys = key_file("enable-busy-keys", &format!("main {}\n", "ad".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    drop(Storage::create(path.clone(), test_storage_options(), no_engine).expect("create"));
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    // A backup in progress recorded the database as plain.
+    storage.lock().register_backup_hold(0);
+    let Err(err) = storage.enable_encryption() else {
+        panic!("enabled during a backup");
+    };
+    assert!(err.to_string().contains("backup is in progress"), "{err}");
+    storage.lock().release_backup_hold();
+    // A connected standby would be streamed entries it cannot open.
+    storage.try_join_repl_node(7, [0; 16]).expect("join");
+    let Err(err) = storage.enable_encryption() else {
+        panic!("enabled with a standby connected");
+    };
+    assert!(err.to_string().contains("standby is connected"), "{err}");
+    storage.leave_repl_node(7);
+    storage.enable_encryption().expect("enable");
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_page_that_is_no_readable_page_does_not_stop_the_conversion() {
+    let Some(path) = plain_database("enable-garbage") else {
+        return;
+    };
+    let keys = key_file(
+        "enable-garbage-keys",
+        &format!("main {}\n", "be".repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    drop(Storage::create(path.clone(), test_storage_options(), no_engine).expect("create"));
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let (root, _) = fill(&storage, 50);
+    // Allocated pages holding bytes that are no page (a leaked extent's old
+    // contents): one with the sealed bit clear, one with it set.
+    for flag in [0u8, 1] {
+        let mut guard = storage.lock();
+        let page = guard.allocator.allocate(1).expect("a page");
+        let mut garbage = MARKER.repeat(PAGE_SIZE / MARKER.len());
+        garbage.resize(PAGE_SIZE, 0);
+        garbage[18] = flag;
+        garbage[19] = 0;
+        guard.spill_write_page(page, &garbage).expect("write");
+    }
+    storage.enable_encryption().expect("enable");
+    convert(&storage);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 50);
+    drop(storage);
+    assert!(!holds_marker_in(&path));
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_conversion_waits_for_a_log_held_by_a_log_backup_without_spinning() {
+    use crate::storage::ConversionStep;
+    let Some(path) = plain_database("enable-full") else {
+        return;
+    };
+    let [bak, log] = ["enable-full-bak", "enable-full-log"].map(unique_temp_path);
+    let keys = key_file("enable-full-keys", &format!("main {}\n", "cf".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    drop(Storage::create(path.clone(), test_storage_options(), no_engine).expect("create"));
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    super::txn_extents::set_full(&storage);
+    storage.backup_full(&bak).expect("full backup");
+    let (root, _) = fill(&storage, 50);
+    storage.enable_encryption().expect("enable");
+    // The FULL model holds the log from the last log backup on: the
+    // conversion waits for it instead of sweeping and checkpointing on.
+    let mut checkpoints = 0;
+    let mut waiting = false;
+    for _ in 0..2000 {
+        match storage.conversion_step(64).expect("step") {
+            ConversionStep::NeedsCheckpoint => {
+                checkpoints += 1;
+                storage
+                    .write_checkpoint(&MARKER.repeat(1000), 1, 2, 1)
+                    .expect("checkpoint");
+            }
+            ConversionStep::WaitingForLog => {
+                waiting = true;
+                break;
+            }
+            ConversionStep::Done => panic!("finished with the log held"),
+            _ => {}
+        }
+    }
+    assert!(waiting && checkpoints <= 3, "checkpoints {checkpoints}");
+    assert!(storage.conversion_waits_for_log());
+    // A log backup releases it.
+    storage.backup_log(&log, true, false).expect("log backup");
+    convert(&storage);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 50);
+    drop(storage);
+    assert!(!holds_marker_in(&path));
+    for file in [&path, &bak, &log, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn the_plain_log_in_the_heads_page_is_gone_after_a_conversion() {
+    use crate::storage_layout::WAL_ENTRY_TYPE_RECORD;
+    let Some(path) = plain_database("enable-head-page") else {
+        return;
+    };
+    let keys = key_file(
+        "enable-head-page-keys",
+        &format!("main {}\n", "d0".repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    let storage = Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
+    storage
+        .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, 1, MARKER)
+        .expect("a plain entry");
+    drop(storage);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    storage.enable_encryption().expect("enable");
+    convert(&storage);
+    drop(storage);
+    assert!(!holds_marker_in(&path));
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    assert!(!storage.encryption_status().converting);
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_disabled_log_writer_leaves_every_page_as_it_was() {
+    let Some(path) = plain_database("enable-poisoned") else {
+        return;
+    };
+    let keys = key_file(
+        "enable-poisoned-keys",
+        &format!("main {}\n", "e1".repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    let storage = Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
+    let (root, _) = fill(&storage, 300);
+    drop(storage);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    storage.enable_encryption().expect("enable");
+    // A failed log write disables the writer; the sweep keeps being called.
+    storage.lock().wal.poison();
+    for _ in 0..5 {
+        assert!(storage.conversion_step(64).is_err());
+    }
+    drop(storage);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 300);
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+/// Writes the marker raw over pages `start..start + count` (old plaintext
+/// left in free space, as a freed extent leaves it).
+fn plant_marker(storage: &Storage, start: u64, count: u64) {
+    let mut page = MARKER.repeat(PAGE_SIZE / MARKER.len());
+    page.resize(PAGE_SIZE, 0);
+    let mut guard = storage.lock();
+    for at in start..start + count {
+        guard.spill_write_page(at, &page).expect("plant");
+    }
+}
+
+#[test]
+fn spill_extents_never_keep_old_plaintext_through_a_conversion() {
+    let Some(path) = plain_database("enable-spill") else {
+        return;
+    };
+    let keys = key_file("enable-spill-keys", &format!("main {}\n", "f2".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    drop(Storage::create(path.clone(), test_storage_options(), no_engine).expect("create"));
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let (root, _) = fill(&storage, 30);
+
+    // A spill extent that exists at the switch, over old plaintext.
+    let before = storage.allocate_extent(true).expect("spill extent");
+    plant_marker(&storage, before, 4);
+    // Free pages holding old plaintext, which a spill extent allocated
+    // during the conversion takes (and writes none of).
+    let probe = storage.allocate_extent(true).expect("probe");
+    storage.free_extent(probe).expect("free probe");
+    // The allocator searches on from its last allocation: plant over the
+    // next few extents' worth of free pages.
+    let window = 4 * crate::allocator::EXTENT_PAGES;
+    plant_marker(&storage, probe, window);
+
+    storage.enable_encryption().expect("enable");
+    let during = storage.allocate_extent(true).expect("spill extent during");
+    assert!(
+        (probe..probe + window).contains(&during),
+        "the planted free pages ({during} not in {probe}..)"
+    );
+    // The conversion cannot finish while the first spill extent lives.
+    for _ in 0..200 {
+        match storage.conversion_step(64).expect("step") {
+            crate::storage::ConversionStep::Done => panic!("finished over a live spill extent"),
+            crate::storage::ConversionStep::NeedsCheckpoint => storage
+                .write_checkpoint(&MARKER.repeat(1000), 1, 2, 1)
+                .expect("checkpoint"),
+            _ => {}
+        }
+    }
+    storage.free_extent(before).expect("query done");
+    convert(&storage);
+    storage.free_extent(during).expect("query done");
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 30);
+    drop(storage);
+    assert!(!holds_marker_in(&path));
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_standby_whose_handshake_predates_the_switch_cannot_join() {
+    let Some(path) = plain_database("enable-join") else {
+        return;
+    };
+    let keys = key_file("enable-join-keys", &format!("main {}\n", "a3".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    drop(Storage::create(path.clone(), test_storage_options(), no_engine).expect("create"));
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let handshake_fingerprint = storage.key_fingerprint();
+    storage.enable_encryption().expect("enable");
+    let Err(err) = storage.try_join_repl_node(4, handshake_fingerprint) else {
+        panic!("a standby of the plain database joined after the switch");
+    };
+    assert!(err.contains("key changed"), "{err}");
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_spill_extent_of_the_switch_reused_by_another_query_does_not_hold_the_conversion() {
+    let Some(path) = plain_database("enable-spill-reuse") else {
+        return;
+    };
+    let keys = key_file(
+        "enable-spill-reuse-keys",
+        &format!("main {}\n", "b4".repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    drop(Storage::create(path.clone(), test_storage_options(), no_engine).expect("create"));
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let before = storage.allocate_extent(true).expect("spill extent");
+    storage.enable_encryption().expect("enable");
+    storage.free_extent(before).expect("its query is done");
+    // Another query is handed the same extent (zeroed then) and keeps it.
+    let mut others = Vec::new();
+    loop {
+        let extent = storage.allocate_extent(true).expect("spill extent");
+        if extent == before {
+            break;
+        }
+        others.push(extent);
+    }
+    for extent in others {
+        storage.free_extent(extent).expect("free");
+    }
+    convert(&storage);
+    storage.free_extent(before).expect("free");
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}

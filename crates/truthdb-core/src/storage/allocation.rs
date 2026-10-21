@@ -15,9 +15,7 @@ impl Storage {
     pub fn spill_write_page(&self, page: u64, data: &[u8]) -> Result<(), StorageError> {
         let mut locked = self.lock();
         let mut sealed = data.to_vec();
-        locked
-            .codec
-            .seal_raw(crate::encryption::RawPage::Spill, page, 0, &mut sealed);
+        locked.spill.seal(page, &mut sealed);
         locked.spill_write_page(page, &sealed)
     }
 
@@ -25,9 +23,7 @@ impl Storage {
     pub fn spill_read_page(&self, page: u64, out: &mut [u8]) -> Result<(), StorageError> {
         let mut locked = self.lock();
         locked.spill_read_page(page, out)?;
-        locked
-            .codec
-            .open_raw(crate::encryption::RawPage::Spill, page, 0, out);
+        locked.spill.open(page, out);
         Ok(())
     }
 
@@ -142,9 +138,18 @@ impl StorageFile {
             // (a B+ tree page a delete emptied): spill writes go straight to
             // the file, so the log of those frees must reach the disk first.
             self.wal_sync_all()?;
-            return self.allocator.allocate_temp_extent().ok_or_else(|| {
+            let start = self.allocator.allocate_temp_extent().ok_or_else(|| {
                 StorageError::InvalidConfig("data region full: cannot allocate extent".to_string())
-            });
+            })?;
+            self.page_ctx(0)
+                .io
+                .zero_if_converting(start, EXTENT_PAGES)?;
+            // A spill extent of the switch handed out again was just zeroed:
+            // the conversion no longer waits for it.
+            if let Some(conversion) = &mut self.conversion {
+                conversion.forget_spill_extent(start);
+            }
+            return Ok(start);
         }
         let start = self.allocator.allocate_extent().ok_or_else(|| {
             StorageError::InvalidConfig("data region full: cannot allocate extent".to_string())
@@ -159,6 +164,9 @@ impl StorageFile {
             self.allocator.free(start, EXTENT_PAGES);
             return Err(err);
         }
+        self.page_ctx(0)
+            .io
+            .zero_if_converting(start, EXTENT_PAGES)?;
         Ok(start)
     }
 

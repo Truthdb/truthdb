@@ -107,13 +107,32 @@ impl Storage {
         active.wal_tail
     }
 
-    /// Joins the connected-standby registry (one live sender per node id).
-    /// Returns false if the id is already connected.
-    pub(crate) fn try_join_repl_node(&self, id: u32) -> bool {
-        self.repl_connected
+    /// Joins the connected-standby registry (one live sender per node id),
+    /// refused if the id is already connected or the standby's key no longer
+    /// matches (`encryption enable` ran since its handshake: it holds the
+    /// registry across the switch, so this check cannot race it).
+    pub(crate) fn try_join_repl_node(
+        &self,
+        id: u32,
+        key_fingerprint: [u8; 16],
+    ) -> Result<(), String> {
+        let mut connected = self
+            .repl_connected
             .lock()
-            .expect("repl-connected set poisoned")
-            .insert(id)
+            .expect("repl-connected set poisoned");
+        if self.key_fingerprint() != key_fingerprint {
+            return Err(
+                "this primary's database key changed since the handshake (encryption was \
+                 enabled): reseed the standby from a backup taken after it"
+                    .to_string(),
+            );
+        }
+        if !connected.insert(id) {
+            return Err(format!(
+                "node id {id} is already connected; every standby needs a distinct node_id"
+            ));
+        }
+        Ok(())
     }
 
     /// Leaves the connected-standby registry.

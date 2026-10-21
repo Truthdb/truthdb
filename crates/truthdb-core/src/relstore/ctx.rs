@@ -49,6 +49,39 @@ impl PoolIo<'_> {
     }
 }
 
+impl PoolIo<'_> {
+    /// While `encryption enable` converts the database: zeroes the pages of
+    /// a fresh allocation that hold something (old plaintext, maybe; the
+    /// conversion's own zeroing may already have passed them, and a page an
+    /// allocation never writes keeps its old bytes). The log goes to disk
+    /// first: the frees that made these pages free must be durable before
+    /// their old contents go.
+    pub(crate) fn zero_if_converting(
+        &mut self,
+        start_page: u64,
+        num_pages: u64,
+    ) -> Result<(), StorageError> {
+        if !self.codec.wal_keys().is_some_and(|keys| keys.converting()) {
+            return Ok(());
+        }
+        let mut page = AlignedPageBuf::new();
+        let zero = AlignedPageBuf::new();
+        let mut synced = false;
+        for page_no in start_page..start_page + num_pages {
+            self.read_page(page_no, &mut page)?;
+            if !page::is_zero_page(page.as_slice()) {
+                // Forced once, and only when there is something to zero.
+                if !synced {
+                    self.wal.sync_all()?;
+                    synced = true;
+                }
+                self.write_page(page_no, &zero)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl PoolBackend for PoolIo<'_> {
     fn read_page(&mut self, page_no: u64, frame: &mut AlignedPageBuf) -> Result<(), StorageError> {
         let offset = self.offset_of(page_no)?;
@@ -238,6 +271,7 @@ impl RelCtx<'_> {
             self.allocator.free(page_no, 1);
             return Err(err);
         }
+        self.io.zero_if_converting(page_no, 1)?;
         let _ = txn_id;
         Ok(page_no)
     }
@@ -354,6 +388,7 @@ impl RelCtx<'_> {
                 num_pages,
             },
         ));
+        self.io.zero_if_converting(start_page, num_pages)?;
         Ok(start_page)
     }
 
@@ -402,6 +437,26 @@ impl RelCtx<'_> {
             self.io.write_page(page_no, &image)?;
         }
         Ok(lsn)
+    }
+
+    /// Rewrites a blob page as it is (`plain`, read from disk), sealed by the
+    /// current codec and keeping the LSN it carries: a forced BLOB_REWRITE
+    /// record, then the page.
+    pub fn rewrite_blob_page(&mut self, page_no: u64, plain: &[u8]) -> Result<(), StorageError> {
+        let header = page::read_header(plain);
+        let data = &plain[page::PAGE_HEADER_SIZE..];
+        let record = RelRecord::blob_rewrite(page_no, header.page_lsn, header.object_id, data);
+        self.append(&record, true)?;
+        self.pool.discard(page_no);
+        let image = blob_page_image(
+            self.io.codec,
+            header.page_lsn,
+            header.object_id,
+            page_no,
+            data,
+        );
+        self.io.write_page(page_no, &image)?;
+        Ok(())
     }
 
     /// Reads one blob page into `out` (`BLOB_PAGE_DATA` bytes) and returns its

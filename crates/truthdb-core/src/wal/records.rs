@@ -52,6 +52,11 @@ pub const REL_KIND_CLR_FREE_EXTENT: u16 = 12;
 /// torn or older than the record. Never undone: the extent's allocation undo
 /// frees the pages.
 pub const REL_KIND_BLOB_PAGES: u16 = 13;
+/// A blob page rewritten as it is (sealed, by `encryption enable`): its page
+/// number, the LSN it carries (kept, since the body's segment row names it),
+/// its object id and body bytes. A system record (transaction 0), forced
+/// before the page is written.
+pub const REL_KIND_BLOB_REWRITE: u16 = 14;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RelRecord {
@@ -489,6 +494,36 @@ impl RelRecord {
             redo,
             undo: Vec::new(),
         }
+    }
+
+    pub fn blob_rewrite(page_no: u64, page_lsn: u64, object_id: u32, data: &[u8]) -> Self {
+        let mut redo = Vec::with_capacity(20 + data.len());
+        put_u64(&mut redo, page_no);
+        put_u64(&mut redo, page_lsn);
+        put_u32(&mut redo, object_id);
+        redo.extend_from_slice(data);
+        RelRecord {
+            prev_lsn: 0,
+            txn_id: 0,
+            kind: REL_KIND_BLOB_REWRITE,
+            flags: 0,
+            redo,
+            undo: Vec::new(),
+        }
+    }
+
+    /// Decodes a BLOB_REWRITE redo into `(page_no, page_lsn, object_id,
+    /// data)`.
+    pub fn decode_blob_rewrite(&self) -> Result<(u64, u64, u32, &[u8]), StorageError> {
+        debug_assert_eq!(self.kind, REL_KIND_BLOB_REWRITE);
+        if self.redo.len() != 20 + crate::relstore::page::BLOB_PAGE_DATA {
+            return Err(StorageError::InvalidFile(
+                "blob rewrite record has the wrong size".to_string(),
+            ));
+        }
+        let field = |at: usize| u64::from_le_bytes(self.redo[at..at + 8].try_into().unwrap());
+        let object_id = u32::from_le_bytes(self.redo[16..20].try_into().unwrap());
+        Ok((field(0), field(8), object_id, &self.redo[20..]))
     }
 
     /// Decodes a BLOB_PAGES redo into `(object_id, start_page, data)`.

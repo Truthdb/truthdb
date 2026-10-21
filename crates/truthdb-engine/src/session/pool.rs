@@ -257,6 +257,10 @@ pub(super) fn maintenance_loop(shared: &Arc<Shared>) {
         if let Err(err) = shared.engine.object_gc() {
             eprintln!("object garbage collection failed: {err}");
         }
+        // `encryption enable` under way: rewrite the next pages still plain.
+        if let Err(err) = shared.engine.encryption_conversion() {
+            eprintln!("encryption conversion failed: {err}");
+        }
         // Unconditionally, not just when something was released. Workers now
         // block indefinitely on the inbox, so a nudge that should have been
         // sent and was not is a batch parked forever rather than a batch

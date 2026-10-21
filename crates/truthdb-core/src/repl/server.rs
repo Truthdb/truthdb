@@ -20,6 +20,8 @@ pub struct AcceptedStandby {
     /// The LSN the standby has durably received — the primary resumes shipping
     /// from here.
     pub last_received_lsn: u64,
+    /// The standby's database key fingerprint (as its Hello carried it).
+    pub key_fingerprint: [u8; 16],
 }
 
 async fn write_ack<S>(stream: &mut S, ack: &HelloAck) -> io::Result<()>
@@ -84,6 +86,7 @@ where
     let standby = AcceptedStandby {
         node_id: hello.node_id,
         last_received_lsn: hello.last_received_lsn,
+        key_fingerprint: hello.key_fingerprint,
     };
     write_ack(stream, &ack).await?;
     Ok(accepted.then_some(standby))
@@ -184,6 +187,7 @@ mod tests {
             Some(AcceptedStandby {
                 node_id: 5,
                 last_received_lsn: 40_000,
+                key_fingerprint: [0; 16],
             })
         );
     }

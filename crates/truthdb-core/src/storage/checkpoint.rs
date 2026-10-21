@@ -246,15 +246,18 @@ impl StorageFile {
             Some(_) => 0,
             None => 0,
         };
-        let mut desc = SnapshotDescriptor::default();
-        desc.generation = generation;
-        desc.slot = target_slot;
-        desc.checkpoint_seq = checkpoint_seq;
-        desc.data_offset = data_write_offset;
-        desc.data_len = data.len() as u64;
-        desc.data_checksum = xxh64(data, 0);
-        desc.next_seq_no = next_seq_no;
-        desc.next_doc_id = next_doc_id;
+        let mut desc = SnapshotDescriptor {
+            generation,
+            slot: target_slot,
+            checkpoint_seq,
+            data_offset: data_write_offset,
+            data_len: data.len() as u64,
+            data_checksum: xxh64(data, 0),
+            next_seq_no,
+            next_doc_id,
+            ..SnapshotDescriptor::default()
+        };
+        desc.set_sealed(self.codec.is_encrypted());
         desc.checksum = desc.compute_checksum();
         let desc_offset =
             self.layout.snapshot_offset + (target_slot as u64) * SNAPSHOT_DESCRIPTOR_SIZE as u64;

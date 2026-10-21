@@ -74,14 +74,9 @@ where
     // other stream's shipping position (the shipped default node_id is the
     // same on every node, so this is an easy misconfiguration to hit). The
     // registry lives on Storage so the monitoring DMVs can report it.
-    let _membership = match NodeMembership::acquire(&storage, slot_id) {
-        Some(m) => m,
-        None => {
-            let msg = format!(
-                "node id {slot_id} is already connected; every standby needs a distinct node_id"
-            );
-            return refuse(&mut stream, &storage, &msg).await;
-        }
+    let _membership = match NodeMembership::acquire(&storage, slot_id, standby.key_fingerprint) {
+        Ok(m) => m,
+        Err(msg) => return refuse(&mut stream, &storage, &msg).await,
     };
     let sent = standby.last_received_lsn;
     let flushed = storage.wal_flushed_lsn();
@@ -127,8 +122,9 @@ struct NodeMembership {
 }
 
 impl NodeMembership {
-    fn acquire(storage: &Arc<Storage>, id: u32) -> Option<Self> {
-        storage.try_join_repl_node(id).then(|| NodeMembership {
+    fn acquire(storage: &Arc<Storage>, id: u32, key_fingerprint: [u8; 16]) -> Result<Self, String> {
+        storage.try_join_repl_node(id, key_fingerprint)?;
+        Ok(NodeMembership {
             storage: Arc::clone(storage),
             id,
         })
@@ -370,9 +366,12 @@ mod tests {
         }
     }
 
-    async fn refusal_message(standby: AcceptedStandby) -> (io::Result<()>, HelloAck) {
+    /// `standby` (its key fingerprint taken from the primary's storage)
+    /// against a fresh primary: the result and the notice it got.
+    async fn refusal_message(mut standby: AcceptedStandby) -> (io::Result<()>, HelloAck) {
         let (server_end, mut client_end) = tokio::io::duplex(64 * 1024);
         let (storage, path) = temp_storage("refuse");
+        standby.key_fingerprint = storage.key_fingerprint();
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
         let sender = tokio::spawn(run_sender(
             server_end,
@@ -398,6 +397,7 @@ mod tests {
         let (result, notice) = refusal_message(AcceptedStandby {
             node_id: 3,
             last_received_lsn: u64::MAX / 2,
+            key_fingerprint: [0; 16],
         })
         .await;
         assert!(result.is_err());
@@ -416,6 +416,7 @@ mod tests {
         let (result, notice) = refusal_message(AcceptedStandby {
             node_id: u64::from(u32::MAX) + 1,
             last_received_lsn: 0,
+            key_fingerprint: [0; 16],
         })
         .await;
         assert!(result.is_err());
@@ -432,6 +433,7 @@ mod tests {
     #[tokio::test]
     async fn a_duplicate_node_id_is_refused() {
         let (storage, path) = temp_storage("dup-node");
+        let key_fingerprint = storage.key_fingerprint();
         let ctx = test_ctx(storage);
         let (_shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
@@ -444,6 +446,7 @@ mod tests {
             AcceptedStandby {
                 node_id: 5,
                 last_received_lsn: 0,
+                key_fingerprint,
             },
             shutdown_rx.clone(),
         ));
@@ -457,6 +460,7 @@ mod tests {
             AcceptedStandby {
                 node_id: 5,
                 last_received_lsn: 0,
+                key_fingerprint,
             },
             shutdown_rx,
         ));

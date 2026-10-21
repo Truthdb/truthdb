@@ -104,6 +104,18 @@ impl PageAllocator {
         bitmap
     }
 
+    /// The temp (spill) extents, as `(start, pages)`.
+    pub fn temp_extents(&self) -> Vec<(u64, u64)> {
+        self.temp_extents.clone()
+    }
+
+    /// Whether `page` lies in a temp (spill) extent.
+    pub fn is_temp(&self, page: u64) -> bool {
+        self.temp_extents
+            .iter()
+            .any(|&(start, len)| (start..start + len).contains(&page))
+    }
+
     pub fn is_allocated(&self, page: u64) -> bool {
         !self.is_free(page)
     }
