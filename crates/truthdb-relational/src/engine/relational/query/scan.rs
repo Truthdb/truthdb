@@ -401,6 +401,7 @@ pub(in crate::engine::relational) fn is_sys_view(name: &str) -> bool {
                 | "sys.databases"
                 | "sys.dm_repl_replica_states"
                 | "sys.dm_repl_slots"
+                | "sys.dm_database_encryption_keys"
                 | "sys.configurations"
                 | "sys.database_principals"
                 | "sys.database_role_members"

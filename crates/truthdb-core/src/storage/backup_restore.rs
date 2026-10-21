@@ -199,8 +199,13 @@ fn apply_log_archive(
             path.display()
         )));
     }
-    // An encrypted database's log opens only under its own key.
-    if header.keys != file.key_record {
+    // An encrypted database's log opens only under its own key (the same
+    // file uuid and database key; a master key rotation rewraps the key, so
+    // the block bytes may differ).
+    let identity = |keys: &Option<crate::backup::KeyRecord>| {
+        keys.as_ref().map(|keys| (keys.file_uuid, keys.fingerprint))
+    };
+    if identity(&header.keys) != identity(&file.key_record) {
         return Err(StorageError::InvalidFile(format!(
             "{}: log archive is of a database with another encryption key (or none)",
             path.display()

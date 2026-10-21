@@ -421,6 +421,45 @@ impl Storage {
         self.lock().codec.is_encrypted()
     }
 
+    /// Rewraps the database key under the master key now current (the first
+    /// key of the key file, or the key command's `wrap`), keeping the key
+    /// itself: the pages, log, backups and standbys are unaffected. The key
+    /// file may then drop the key it replaced.
+    ///
+    /// The rewrap (which may run a key command, a KMS round trip) happens
+    /// without the storage lock; the write checks the key block is still the
+    /// one rewrapped.
+    pub fn rotate_master_key(&self) -> Result<(), StorageError> {
+        let (header, source) = self.lock().header_to_rotate()?;
+        let block =
+            crate::encryption::rewrap_key_block(header.key_block(), &source, &header.file_uuid)?;
+        self.lock().write_key_block(header.key_block(), &block)
+    }
+
+    /// The database's encryption at rest, as `encryption status` and
+    /// `sys.dm_database_encryption_keys` report it.
+    pub fn encryption_status(&self) -> EncryptionStatus {
+        let locked = self.lock();
+        match &locked.key_record {
+            Some(record) => {
+                let (encryptor_type, key_id) =
+                    crate::encryption::key_block_encryptor(&record.key_block);
+                EncryptionStatus {
+                    encrypted: true,
+                    encryptor_type,
+                    key_id,
+                    fingerprint: Some(record.fingerprint),
+                }
+            }
+            None => EncryptionStatus {
+                encrypted: false,
+                encryptor_type: "NONE",
+                key_id: None,
+                fingerprint: None,
+            },
+        }
+    }
+
     /// The database key's fingerprint (zeros when not encrypted): equal for
     /// a database, its restores and its standbys.
     pub fn key_fingerprint(&self) -> [u8; 16] {
@@ -530,6 +569,19 @@ fn read_file_header(file: &mut DirectFile) -> Result<(FileHeader, HeaderRepair),
     ))
 }
 
+/// An encrypted file's key record (which its backups carry).
+fn key_record_of(
+    header: &FileHeader,
+    codec: &crate::encryption::PageCodec,
+) -> Option<crate::backup::KeyRecord> {
+    let keys = codec.wal_keys()?;
+    Some(crate::backup::KeyRecord {
+        file_uuid: header.file_uuid,
+        key_block: header.key_block().to_vec(),
+        fingerprint: keys.fingerprint(),
+    })
+}
+
 /// The end of the layout a header describes (where its copy ends), when
 /// every region it names lies below its reserved region and that region can
 /// hold the copy.
@@ -552,7 +604,89 @@ fn layout_end(header: &FileHeader) -> Option<u64> {
     (header.reserved_size >= page).then_some(end)
 }
 
+/// What [`Storage::encryption_status`] reports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncryptionStatus {
+    pub encrypted: bool,
+    /// `KEY FILE`, `KEY COMMAND` or `NONE`.
+    pub encryptor_type: &'static str,
+    /// The master key's id, for a key file.
+    pub key_id: Option<String>,
+    pub fingerprint: Option<[u8; 16]>,
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Test fault injection: the next master key rotation stops after writing
+    /// the header copy, before the header, as a crash there would.
+    pub(crate) static CRASH_ROTATION_AFTER_COPY: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
+
 impl StorageFile {
+    /// The file header as it is on disk, checked.
+    fn header_on_disk(&mut self) -> Result<FileHeader, StorageError> {
+        let mut bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+        self.file.read_exact_at(0, &mut bytes)?;
+        let header = FileHeader::from_le_bytes(&bytes);
+        if header.header_checksum != header.compute_checksum() {
+            return Err(StorageError::InvalidFile(
+                "the file header is damaged (its copy restores it at the next open)".to_string(),
+            ));
+        }
+        Ok(header)
+    }
+
+    /// The header of an encrypted database and its master key source, for a
+    /// rotation.
+    fn header_to_rotate(
+        &mut self,
+    ) -> Result<(FileHeader, crate::encryption::KeySource), StorageError> {
+        let header = self.header_on_disk()?;
+        if !header.is_encrypted() {
+            return Err(StorageError::InvalidConfig(
+                "this database is not encrypted: it has no master key to rotate".to_string(),
+            ));
+        }
+        let source = self.key_source.clone().ok_or_else(|| {
+            StorageError::InvalidConfig("no master key is configured".to_string())
+        })?;
+        Ok((header, source))
+    }
+
+    /// Replaces the key block `old` by `block`. The new header goes to its
+    /// copy in the last page first, then to the header page, each made
+    /// durable: a crash leaves the old block or the new, and both unwrap the
+    /// same key. Refused if the block is no longer `old` (another rotation
+    /// ran meanwhile).
+    fn write_key_block(&mut self, old: &[u8], block: &[u8]) -> Result<(), StorageError> {
+        let mut header = self.header_on_disk()?;
+        if header.key_block() != old {
+            return Err(StorageError::InvalidConfig(
+                "the key block changed during the rotation (another rotation ran): retry"
+                    .to_string(),
+            ));
+        }
+        header.set_key_block(block);
+        header.header_checksum = header.compute_checksum();
+        let out = header.to_le_bytes_with_checksum();
+        let end = layout_end(&header).ok_or_else(|| {
+            StorageError::InvalidFile("the file header's regions are inconsistent".to_string())
+        })?;
+        self.file.write_all_at(end - PAGE_SIZE as u64, &out)?;
+        self.file.sync_data()?;
+        #[cfg(test)]
+        if CRASH_ROTATION_AFTER_COPY.with(|crash| crash.replace(false)) {
+            return Ok(());
+        }
+        self.file.write_all_at(0, &out)?;
+        self.file.sync_data()?;
+        if let Some(record) = &mut self.key_record {
+            record.key_block = block.to_vec();
+        }
+        Ok(())
+    }
+
     /// The current WAL tail (append position).
     pub(super) fn wal_tail(&self) -> u64 {
         self.wal.tail()
@@ -691,6 +825,8 @@ impl StorageFile {
         let last_log_backup_lsn = active_sb.last_log_backup_lsn();
         let repl_slots = active_sb.repl_slots();
         let recovery_full = active_sb.db_options() & 4 != 0;
+        let key_record = key_record_of(&header, &codec);
+        let key_source = keys.cloned();
         let core = StorageFile {
             default_collation: header.default_collation(),
             file,
@@ -712,10 +848,8 @@ impl StorageFile {
             replay_cache: scan.records,
             standby_pending_frees: Default::default(),
             codec,
-            key_record: header.is_encrypted().then(|| crate::backup::KeyRecord {
-                file_uuid: header.file_uuid,
-                key_block: header.key_block().to_vec(),
-            }),
+            key_record,
+            key_source,
         };
         let mut storage = Locked { core, engines };
         // Re-establish the FULL-model log-backup hold so a checkpoint cannot
@@ -839,6 +973,12 @@ impl StorageFile {
         }
         // An encrypted database: a fresh key, wrapped by the master key, in
         // the header; the file's uuid salts every key derived from it.
+        let key_source = match &keys {
+            super::FileKeys::New(source) | super::FileKeys::Existing(_, source) => {
+                Some((*source).clone())
+            }
+            super::FileKeys::Plain => None,
+        };
         let codec =
             match keys {
                 super::FileKeys::New(source) => {
@@ -921,6 +1061,7 @@ impl StorageFile {
             codec.wal_keys().as_deref(),
         )?;
 
+        let key_record = key_record_of(&header, &codec);
         Ok(StorageFile {
             default_collation: header.default_collation(),
             file,
@@ -942,10 +1083,8 @@ impl StorageFile {
             replay_cache: Vec::new(),
             standby_pending_frees: Default::default(),
             codec,
-            key_record: header.is_encrypted().then(|| crate::backup::KeyRecord {
-                file_uuid: header.file_uuid,
-                key_block: header.key_block().to_vec(),
-            }),
+            key_record,
+            key_source,
         })
     }
 

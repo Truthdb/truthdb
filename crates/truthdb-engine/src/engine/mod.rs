@@ -116,6 +116,28 @@ fn parse_s3_admin(input: &str) -> Option<S3Admin> {
     }
 }
 
+/// Encryption-at-rest administration: `encryption status`, `encryption
+/// rotate master key`. Gated like [`S3Admin`]: a `sysadmin` login over TDS,
+/// any connection on the (trusted) native port.
+enum EncryptionAdmin {
+    Status,
+    RotateMasterKey,
+}
+
+fn parse_encryption_admin(input: &str) -> Option<EncryptionAdmin> {
+    let input = input.trim().trim_end_matches(';');
+    let lower: Vec<String> = input
+        .split_whitespace()
+        .map(|word| word.to_ascii_lowercase())
+        .collect();
+    let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
+    match lower.as_slice() {
+        ["encryption", "status"] => Some(EncryptionAdmin::Status),
+        ["encryption", "rotate", "master", "key"] => Some(EncryptionAdmin::RotateMasterKey),
+        _ => None,
+    }
+}
+
 fn fulltext_error(bucket: &str, err: truthdb_object::FtError) -> EngineError {
     use truthdb_object::FtError;
     CommandError::InvalidCommand(match err {
@@ -319,6 +341,9 @@ impl Engine {
     pub fn execute(&self, input: &str) -> Result<String, EngineError> {
         if let Some(command) = parse_s3_admin(input) {
             return self.execute_s3_admin(command);
+        }
+        if let Some(command) = parse_encryption_admin(input) {
+            return self.execute_encryption_admin(command);
         }
         // Routing: the legacy ES commands all carry a `{` JSON body; that
         // shape routes to the frozen search path. Everything else is SQL.
@@ -587,7 +612,14 @@ impl Engine {
         emitter: &mut dyn crate::engine::BatchEmitter,
     ) -> Result<Option<truthdb_sql::error::SqlError>, EngineError> {
         if let Some(command) = parse_s3_admin(input) {
-            return Ok(self.s3_admin_batch(command, txn_ctx, emitter));
+            return Ok(self.admin_batch(|| self.execute_s3_admin(command), txn_ctx, emitter));
+        }
+        if let Some(command) = parse_encryption_admin(input) {
+            return Ok(self.admin_batch(
+                || self.execute_encryption_admin(command),
+                txn_ctx,
+                emitter,
+            ));
         }
         // Hold the execution gate shared for the whole batch: concurrent
         // relational batches run together, but a native writer is excluded (see
@@ -599,12 +631,12 @@ impl Engine {
         Ok(error)
     }
 
-    /// An S3 administration command sent as a SQL batch: run for a
-    /// `sysadmin` login only, its JSON reply returned as one row of one
+    /// An administration command (S3, encryption) sent as a SQL batch: run
+    /// for a `sysadmin` login only, its JSON reply returned as one row of one
     /// `result` column.
-    fn s3_admin_batch(
+    fn admin_batch(
         &self,
-        command: S3Admin,
+        run: impl FnOnce() -> Result<String, EngineError>,
         txn_ctx: &mut crate::engine::TxnContext,
         emitter: &mut dyn crate::engine::BatchEmitter,
     ) -> Option<truthdb_sql::error::SqlError> {
@@ -617,7 +649,7 @@ impl Engine {
                 "User does not have permission to perform this action.".to_string(),
             ));
         }
-        match self.execute_s3_admin(command) {
+        match run() {
             Ok(reply) => {
                 emitter.columns(vec![crate::engine::ResultColumn {
                     name: "result".to_string(),
@@ -635,6 +667,24 @@ impl Engine {
             }
             Err(err) => Some(SqlError::new(50000, 16, 1, err.to_string())),
         }
+    }
+
+    fn execute_encryption_admin(&self, command: EncryptionAdmin) -> Result<String, EngineError> {
+        let storage = self.storage.core_arc();
+        if let EncryptionAdmin::RotateMasterKey = command {
+            storage.rotate_master_key()?;
+        }
+        let status = storage.encryption_status();
+        let hex = |bytes: [u8; 16]| -> String {
+            bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+        };
+        Ok(serde_json::json!({
+            "encrypted": status.encrypted,
+            "encryptor_type": status.encryptor_type,
+            "key_id": status.key_id,
+            "key_fingerprint": status.fingerprint.map(hex),
+        })
+        .to_string())
     }
 
     /// Rolls back and discards a session's open transaction (connection

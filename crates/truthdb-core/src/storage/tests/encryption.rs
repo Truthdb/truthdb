@@ -991,3 +991,205 @@ fn a_standby_sent_a_shorter_range_again_keeps_the_log_it_recovered() {
         std::fs::remove_file(file).ok();
     }
 }
+
+#[test]
+fn a_master_key_rotation_rewraps_the_key_and_keeps_the_log_chain() {
+    let old = format!("old {}\n", "1a".repeat(32));
+    let new = format!("new {}\n", "2b".repeat(32));
+    let both = key_file("rot-both", &format!("{new}{old}"));
+    let only_old = key_file("rot-old", &old);
+    let only_new = key_file("rot-new", &new);
+    let [path, bak, log, dst] = ["rot", "rot-bak", "rot-log", "rot-dst"].map(unique_temp_path);
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&KeySource::File(only_old.clone())),
+    )
+    .expect("create encrypted");
+    super::txn_extents::set_full(&storage);
+    storage.backup_full(&bak).expect("full backup");
+    let (root, _) = fill(&storage, 50);
+    let fingerprint = storage.key_fingerprint();
+    drop(storage);
+
+    // The key file gains a new current key; the rotation rewraps under it.
+    let storage = Storage::open_with_keys(
+        path.clone(),
+        no_engine,
+        Some(&KeySource::File(both.clone())),
+    )
+    .expect("open");
+    assert_eq!(storage.encryption_status().key_id.as_deref(), Some("old"));
+    storage.rotate_master_key().expect("rotate");
+    let status = storage.encryption_status();
+    assert_eq!(
+        (status.encryptor_type, status.key_id.as_deref()),
+        ("KEY FILE", Some("new"))
+    );
+    assert_eq!(
+        status.fingerprint,
+        Some(fingerprint),
+        "the same database key"
+    );
+    storage
+        .backup_log(&log, true, false)
+        .expect("log backup after the rotation");
+    drop(storage);
+
+    // The old key can go; the database opens with the new one only.
+    let storage = Storage::open_with_keys(
+        path.clone(),
+        no_engine,
+        Some(&KeySource::File(only_new.clone())),
+    )
+    .expect("open with the new key");
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 50);
+    drop(storage);
+    assert!(
+        Storage::open_with_keys(
+            path.clone(),
+            no_engine,
+            Some(&KeySource::File(only_old.clone()))
+        )
+        .is_err()
+    );
+
+    // The full backup (wrapped by the old key) plus the archive taken after
+    // the rotation: one chain.
+    Storage::restore_with_keys(
+        &dst,
+        &bak,
+        std::slice::from_ref(&log),
+        None,
+        false,
+        no_engine,
+        Some(&KeySource::File(both.clone())),
+    )
+    .expect("restore across the rotation");
+    let restored =
+        Storage::open_with_keys(dst.clone(), no_engine, Some(&KeySource::File(both.clone())))
+            .expect("open restored");
+    assert_eq!(rows_of(&restored, root).expect("rows").len(), 50);
+    drop(restored);
+    for file in [&path, &bak, &log, &dst, &both, &only_old, &only_new] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_rotation_cut_short_keeps_one_key_block_or_the_other() {
+    let old = format!("old {}\n", "3c".repeat(32));
+    let new = format!("new {}\n", "4d".repeat(32));
+    let both = KeySource::File(key_file("rot-crash-both", &format!("{new}{old}")));
+    let only_new = KeySource::File(key_file("rot-crash-new", &new));
+    let path = unique_temp_path("rot-crash");
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&KeySource::File(key_file("rot-crash-old", &old))),
+    )
+    .expect("create encrypted");
+    let (root, _) = fill(&storage, 20);
+    drop(storage);
+
+    // Stopped after the copy, before the header: the old header wins (and
+    // the copy goes back to it); the database is as before the rotation.
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&both)).expect("open");
+    crate::storage::lifecycle::CRASH_ROTATION_AFTER_COPY.with(|crash| crash.set(true));
+    storage.rotate_master_key().expect("rotation stopped");
+    drop(storage);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&both)).expect("reopen");
+    assert_eq!(storage.encryption_status().key_id.as_deref(), Some("old"));
+    drop(storage);
+    assert!(
+        Storage::open_with_keys(path.clone(), no_engine, Some(&only_new)).is_err(),
+        "the rotation did not happen"
+    );
+
+    // Stopped after the copy, then the header torn: the new copy wins.
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&both)).expect("open");
+    crate::storage::lifecycle::CRASH_ROTATION_AFTER_COPY.with(|crash| crash.set(true));
+    storage.rotate_master_key().expect("rotation stopped");
+    drop(storage);
+    damage_header(&path);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&only_new))
+        .expect("the new copy opens with the new key");
+    assert_eq!(storage.encryption_status().key_id.as_deref(), Some("new"));
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 20);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_plain_database_has_no_master_key_to_rotate() {
+    let path = unique_temp_path("rot-plain");
+    let storage = Storage::create_with_keys(path.clone(), test_storage_options(), no_engine, None)
+        .expect("create");
+    if storage.encryption_status().encrypted {
+        // The encrypted test run makes every database encrypted.
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+        return;
+    }
+    let Err(err) = storage.rotate_master_key() else {
+        panic!("a plain database rotated a master key");
+    };
+    assert!(err.to_string().contains("not encrypted"), "{err}");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_rotation_runs_its_key_command_without_the_storage_lock() {
+    use std::os::unix::fs::PermissionsExt;
+    // A KMS that, once started, waits (at most 30 s) until it is released.
+    let started = unique_temp_path("rot-kms-started");
+    let release = unique_temp_path("rot-kms-release");
+    let script = unique_temp_path("rot-slow-kms").with_extension("sh");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\nread line\ntouch {}\ni=0\nwhile [ ! -e {} ] && [ $i -lt 300 ]; do \
+             sleep 0.1; i=$((i+1)); done\necho \"$line\" | rev\n",
+            started.display(),
+            release.display()
+        ),
+    )
+    .expect("script");
+    std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
+    let source = KeySource::Command(vec![script.display().to_string()]);
+    std::fs::write(&release, b"").expect("release (for the create)");
+    let path = unique_temp_path("rot-slow");
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    std::fs::remove_file(&release).expect("hold the next commands");
+    std::fs::remove_file(&started).ok();
+    std::thread::scope(|scope| {
+        let rotation = scope.spawn(|| storage.rotate_master_key());
+        // The rotation is inside its key command.
+        while !started.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let waited = std::time::Instant::now();
+        drop(storage.lock());
+        assert!(
+            waited.elapsed() < std::time::Duration::from_secs(10),
+            "the storage lock waited {:?} for the key command",
+            waited.elapsed()
+        );
+        std::fs::write(&release, b"").expect("release");
+        rotation.join().expect("rotation thread").expect("rotate");
+    });
+    drop(storage);
+    assert!(Storage::open_with_keys(path.clone(), no_engine, Some(&source)).is_ok());
+    for file in [&path, &script, &started, &release] {
+        std::fs::remove_file(file).ok();
+    }
+}
