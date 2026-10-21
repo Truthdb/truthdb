@@ -33,12 +33,6 @@ fn unique_temp_path(label: &str) -> PathBuf {
     path
 }
 
-/// Backups of an encrypted database are refused until they carry its key
-/// block: under `TRUTHDB_TEST_ENCRYPTION=1` the tests that take one stop here.
-fn backups_unsupported() -> bool {
-    crate::encryption::test_key_source().is_some()
-}
-
 /// The length a log entry with a `payload_len`-byte payload takes in the
 /// ring (sealed entries carry the writer id and tag too).
 fn stored_entry_len(payload_len: usize) -> u64 {

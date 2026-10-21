@@ -324,8 +324,9 @@ impl WalWriter {
         let (entry_version, stored) = match &self.sealer {
             Some(sealer) => {
                 let version = entry_version | crate::storage_layout::WAL_ENTRY_SEALED;
-                let aad = WalEntryHeader::new(entry_type, version, stored_len as u32, seq_no, lsn, 0)
-                    .to_le_bytes();
+                let aad =
+                    WalEntryHeader::new(entry_type, version, stored_len as u32, seq_no, lsn, 0)
+                        .to_le_bytes();
                 sealed = sealer.seal_entry(
                     lsn,
                     &aad[..crate::storage_layout::WAL_ENTRY_AAD_LEN],

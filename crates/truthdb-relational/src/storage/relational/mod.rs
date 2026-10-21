@@ -142,17 +142,20 @@ impl RelStorage {
         log_paths: &[std::path::PathBuf],
         stop_at: Option<u64>,
     ) -> Result<(), StorageError> {
-        Self::restore_full_with_logs_with(dst_path, bak_path, log_paths, stop_at, rel_engine)
+        Self::restore_full_with_logs_with(dst_path, bak_path, log_paths, stop_at, rel_engine, None)
     }
 
+    /// `keys`: where the master key of an encrypted database's backup comes
+    /// from.
     pub fn restore_full_with_logs_with(
         dst_path: &Path,
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
         stop_at: Option<u64>,
         engines: EngineFactory,
+        keys: Option<&truthdb_core::encryption::KeySource>,
     ) -> Result<(), StorageError> {
-        Storage::restore_full_with_logs(dst_path, bak_path, log_paths, stop_at, engines)
+        Storage::restore_with_keys(dst_path, bak_path, log_paths, stop_at, false, engines, keys)
     }
 
     pub fn restore_full_standby(
@@ -160,16 +163,19 @@ impl RelStorage {
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
     ) -> Result<(), StorageError> {
-        Self::restore_full_standby_with(dst_path, bak_path, log_paths, rel_engine)
+        Self::restore_full_standby_with(dst_path, bak_path, log_paths, rel_engine, None)
     }
 
+    /// `keys`: where the master key of an encrypted database's backup comes
+    /// from.
     pub fn restore_full_standby_with(
         dst_path: &Path,
         bak_path: &Path,
         log_paths: &[std::path::PathBuf],
         engines: EngineFactory,
+        keys: Option<&truthdb_core::encryption::KeySource>,
     ) -> Result<(), StorageError> {
-        Storage::restore_full_standby(dst_path, bak_path, log_paths, engines)
+        Storage::restore_with_keys(dst_path, bak_path, log_paths, None, true, engines, keys)
     }
 
     pub fn restore_full_with_wal_ranges(
@@ -182,10 +188,15 @@ impl RelStorage {
 
     /// Offline standby promotion; returns the new epoch.
     pub fn promote(path: &Path) -> Result<u64, StorageError> {
-        Self::promote_with(path, rel_engine)
+        Self::promote_with(path, rel_engine, None)
     }
 
-    pub fn promote_with(path: &Path, engines: EngineFactory) -> Result<u64, StorageError> {
-        Storage::promote(path, engines)
+    /// `keys`: where an encrypted standby's master key comes from.
+    pub fn promote_with(
+        path: &Path,
+        engines: EngineFactory,
+        keys: Option<&truthdb_core::encryption::KeySource>,
+    ) -> Result<u64, StorageError> {
+        Storage::promote_with_keys(path, engines, keys)
     }
 }

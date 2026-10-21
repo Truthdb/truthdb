@@ -312,9 +312,6 @@ fn a_freed_tree_page_reused_for_a_blob_keeps_the_blob() {
 
 #[test]
 fn a_standby_replays_the_frees_and_matches_the_primary() {
-    if super::backups_unsupported() {
-        return;
-    }
     let path = unique_temp_path("btree-free-ship-src");
     let bak = unique_temp_path("btree-free-ship-bak");
     let seed = unique_temp_path("btree-free-ship-seed");
@@ -417,9 +414,6 @@ fn a_checkpoint_snapshot_on_freed_tree_pages_is_never_overwritten() {
 
 #[test]
 fn redo_skips_pages_freed_later_in_the_log() {
-    if super::backups_unsupported() {
-        return;
-    }
     let path = unique_temp_path("btree-free-redo");
     let storage = create(&path);
     storage.lock().commit_db_options(0, Some(true)).unwrap();

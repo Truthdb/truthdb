@@ -161,14 +161,16 @@ fn promotion_finishes_recovery_bumps_the_epoch_and_fences_the_old_timeline() {
     let params = HandshakeParams {
         shared_secret: SECRET,
         cluster_uuid: UUID,
+        key_fingerprint: [0; 16],
         primary_epoch: promoted.storage().epoch(),
         primary_flushed_lsn: promoted.storage().wal_flushed_lsn(),
     };
-    let old_auth = compute_auth(SECRET, 3, &UUID, 0, mid);
+    let old_auth = compute_auth(SECRET, 3, &UUID, &[0; 16], 0, mid);
     let old_hello = crate::repl::Hello {
         protocol_version: crate::repl::REPL_PROTOCOL_VERSION,
         node_id: 3,
         cluster_uuid: UUID,
+        key_fingerprint: [0; 16],
         epoch: 0,
         last_received_lsn: mid,
         auth: old_auth,
@@ -190,11 +192,12 @@ fn promotion_finishes_recovery_bumps_the_epoch_and_fences_the_old_timeline() {
         1,
         "the seed carries the new timeline's epoch"
     );
-    let new_auth = compute_auth(SECRET, 3, &UUID, 1, reseeded.storage().wal_tail());
+    let new_auth = compute_auth(SECRET, 3, &UUID, &[0; 16], 1, reseeded.storage().wal_tail());
     let new_hello = crate::repl::Hello {
         protocol_version: crate::repl::REPL_PROTOCOL_VERSION,
         node_id: 3,
         cluster_uuid: UUID,
+        key_fingerprint: [0; 16],
         epoch: 1,
         last_received_lsn: reseeded.storage().wal_tail(),
         auth: new_auth,

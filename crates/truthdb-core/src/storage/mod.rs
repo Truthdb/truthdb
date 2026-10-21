@@ -293,6 +293,22 @@ pub struct StorageFile {
     /// How data pages, the search snapshot and spill pages are protected on
     /// disk: a checksum, or encryption under the database key.
     codec: crate::encryption::PageCodec,
+    /// An encrypted database's file uuid and key block, which its backups
+    /// carry (their pages and log are copied as stored).
+    key_record: Option<crate::backup::KeyRecord>,
+}
+
+/// Which keys a new file gets.
+pub(crate) enum FileKeys<'a> {
+    Plain,
+    /// A new database key, wrapped by this master key.
+    New(&'a crate::encryption::KeySource),
+    /// A restored database's: the backup's file uuid and key block, unwrapped
+    /// by this master key.
+    Existing(
+        &'a crate::backup::KeyRecord,
+        &'a crate::encryption::KeySource,
+    ),
 }
 
 /// What the storage mutex guards: the core file next to the page-structured

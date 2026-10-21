@@ -26,6 +26,8 @@ pub struct HandshakeParams<'a> {
     pub shared_secret: &'a [u8],
     /// This cluster's uuid.
     pub cluster_uuid: [u8; 16],
+    /// The primary's database key fingerprint (zeros when not encrypted).
+    pub key_fingerprint: [u8; 16],
     /// The primary's current replication epoch (bumped on promotion).
     pub primary_epoch: u64,
     /// The primary's current durable WAL tail — the standby cannot request log
@@ -33,17 +35,19 @@ pub struct HandshakeParams<'a> {
     pub primary_flushed_lsn: u64,
 }
 
-/// The identity bytes the HMAC binds: `node_id ‖ cluster_uuid ‖ epoch ‖
-/// last_received_lsn`.
+/// The identity bytes the HMAC binds: `node_id ‖ cluster_uuid ‖
+/// key_fingerprint ‖ epoch ‖ last_received_lsn`.
 fn auth_message(
     node_id: u64,
     cluster_uuid: &[u8; 16],
+    key_fingerprint: &[u8; 16],
     epoch: u64,
     last_received_lsn: u64,
 ) -> Vec<u8> {
-    let mut msg = Vec::with_capacity(8 + 16 + 8 + 8);
+    let mut msg = Vec::with_capacity(8 + 16 + 16 + 8 + 8);
     msg.extend_from_slice(&node_id.to_le_bytes());
     msg.extend_from_slice(cluster_uuid);
+    msg.extend_from_slice(key_fingerprint);
     msg.extend_from_slice(&epoch.to_le_bytes());
     msg.extend_from_slice(&last_received_lsn.to_le_bytes());
     msg
@@ -55,11 +59,18 @@ pub fn compute_auth(
     shared_secret: &[u8],
     node_id: u64,
     cluster_uuid: &[u8; 16],
+    key_fingerprint: &[u8; 16],
     epoch: u64,
     last_received_lsn: u64,
 ) -> Vec<u8> {
     let key = hmac::Key::new(hmac::HMAC_SHA256, shared_secret);
-    let msg = auth_message(node_id, cluster_uuid, epoch, last_received_lsn);
+    let msg = auth_message(
+        node_id,
+        cluster_uuid,
+        key_fingerprint,
+        epoch,
+        last_received_lsn,
+    );
     hmac::sign(&key, &msg).as_ref().to_vec()
 }
 
@@ -89,6 +100,7 @@ pub fn evaluate_hello(hello: &Hello, params: &HandshakeParams) -> HelloAck {
     let msg = auth_message(
         hello.node_id,
         &hello.cluster_uuid,
+        &hello.key_fingerprint,
         hello.epoch,
         hello.last_received_lsn,
     );
@@ -109,6 +121,15 @@ pub fn evaluate_hello(hello: &Hello, params: &HandshakeParams) -> HelloAck {
     //    this only differs on a shared-secret misconfiguration across clusters).
     if hello.cluster_uuid != params.cluster_uuid {
         return reject(params.primary_epoch, "cluster uuid mismatch");
+    }
+    // 3b. Database key: the log ships as stored, so a standby holding another
+    //     key (or none, or one where the primary has none) cannot open it.
+    if hello.key_fingerprint != params.key_fingerprint {
+        return reject(
+            params.primary_epoch,
+            "the standby's database key differs from this primary's: seed the standby \
+             from a backup of this primary",
+        );
     }
     // 4. Epoch fence, BOTH directions. A standby AHEAD of us means we are a
     //    stale (demoted) primary — refuse to feed it. A standby BEHIND us is
@@ -151,6 +172,7 @@ mod tests {
         HandshakeParams {
             shared_secret: SECRET,
             cluster_uuid: UUID,
+            key_fingerprint: [0; 16],
             primary_epoch: 4,
             primary_flushed_lsn: 100_000,
         }
@@ -161,17 +183,47 @@ mod tests {
             protocol_version: REPL_PROTOCOL_VERSION,
             node_id,
             cluster_uuid: UUID,
+            key_fingerprint: [0; 16],
             epoch,
             last_received_lsn,
             auth,
         }
     }
 
+    /// A standby whose database key differs (another key, or one where the
+    /// primary has none) is refused: the log ships as stored.
+    #[test]
+    fn a_standby_with_another_database_key_is_refused() {
+        let other = [7u8; 16];
+        let auth = compute_auth(SECRET, 9, &UUID, &other, 4, 50_000);
+        let hello = Hello {
+            key_fingerprint: other,
+            ..hello_with(9, 4, 50_000, auth)
+        };
+        let ack = evaluate_hello(&hello, &params());
+        assert!(!ack.accepted);
+        assert!(
+            ack.message.contains("database key differs"),
+            "{}",
+            ack.message
+        );
+        // The fingerprint is signed: claiming the primary's without the
+        // secret-bound proof for it fails authentication.
+        let forged = Hello {
+            key_fingerprint: [0; 16],
+            ..hello
+        };
+        assert_eq!(
+            evaluate_hello(&forged, &params()).message,
+            "replication handshake rejected"
+        );
+    }
+
     /// A correctly-signed, in-epoch Hello is accepted, and the ack carries the
     /// primary's epoch + durable tail.
     #[test]
     fn a_valid_hello_is_accepted() {
-        let auth = compute_auth(SECRET, 9, &UUID, 4, 50_000);
+        let auth = compute_auth(SECRET, 9, &UUID, &[0; 16], 4, 50_000);
         let hello = hello_with(9, 4, 50_000, auth);
         let ack = evaluate_hello(&hello, &params());
         assert!(ack.accepted, "{}", ack.message);
@@ -181,7 +233,7 @@ mod tests {
 
     #[test]
     fn a_wrong_secret_is_rejected_generically() {
-        let auth = compute_auth(b"the-wrong-secret", 9, &UUID, 2, 50_000);
+        let auth = compute_auth(b"the-wrong-secret", 9, &UUID, &[0; 16], 2, 50_000);
         let hello = hello_with(9, 2, 50_000, auth);
         let ack = evaluate_hello(&hello, &params());
         assert!(!ack.accepted);
@@ -197,11 +249,12 @@ mod tests {
         let p = HandshakeParams {
             shared_secret: b"",
             cluster_uuid: UUID,
+            key_fingerprint: [0; 16],
             primary_epoch: 4,
             primary_flushed_lsn: 100_000,
         };
         // Even a proof computed under the empty secret is refused.
-        let auth = compute_auth(b"", 9, &UUID, 2, 50_000);
+        let auth = compute_auth(b"", 9, &UUID, &[0; 16], 2, 50_000);
         let hello = hello_with(9, 2, 50_000, auth);
         let ack = evaluate_hello(&hello, &p);
         assert!(!ack.accepted);
@@ -212,7 +265,7 @@ mod tests {
     /// the HMAC is over the identity, so tampering breaks it.
     #[test]
     fn a_tampered_identity_breaks_the_proof() {
-        let auth = compute_auth(SECRET, 9, &UUID, 2, 50_000);
+        let auth = compute_auth(SECRET, 9, &UUID, &[0; 16], 2, 50_000);
         // Same auth, but the Hello now claims a different node_id.
         let hello = hello_with(10, 2, 50_000, auth);
         let ack = evaluate_hello(&hello, &params());
@@ -222,7 +275,7 @@ mod tests {
 
     #[test]
     fn a_version_mismatch_is_rejected_only_after_auth() {
-        let auth = compute_auth(SECRET, 9, &UUID, 2, 50_000);
+        let auth = compute_auth(SECRET, 9, &UUID, &[0; 16], 2, 50_000);
         let mut hello = hello_with(9, 2, 50_000, auth);
         hello.protocol_version = REPL_PROTOCOL_VERSION + 1;
         let ack = evaluate_hello(&hello, &params());
@@ -234,7 +287,7 @@ mod tests {
     fn a_cluster_uuid_mismatch_is_rejected() {
         // A peer that knows the secret but signs a different cluster uuid.
         let other = [9u8; 16];
-        let auth = compute_auth(SECRET, 9, &other, 2, 50_000);
+        let auth = compute_auth(SECRET, 9, &other, &[0; 16], 2, 50_000);
         let mut hello = hello_with(9, 2, 50_000, auth);
         hello.cluster_uuid = other;
         let ack = evaluate_hello(&hello, &params());
@@ -245,7 +298,7 @@ mod tests {
     /// A standby at a higher epoch means this primary was demoted (fencing).
     #[test]
     fn a_standby_ahead_in_epoch_fences_a_stale_primary() {
-        let auth = compute_auth(SECRET, 9, &UUID, 7, 50_000);
+        let auth = compute_auth(SECRET, 9, &UUID, &[0; 16], 7, 50_000);
         let hello = hello_with(9, 7, 50_000, auth); // epoch 7 > primary 4
         let ack = evaluate_hello(&hello, &params());
         assert!(!ack.accepted);
@@ -255,12 +308,12 @@ mod tests {
     #[test]
     fn only_a_standby_at_the_primary_epoch_is_accepted() {
         // Equal epoch = same timeline = a guaranteed log prefix.
-        let auth = compute_auth(SECRET, 9, &UUID, 4, 50_000);
+        let auth = compute_auth(SECRET, 9, &UUID, &[0; 16], 4, 50_000);
         let hello = hello_with(9, 4, 50_000, auth);
         assert!(evaluate_hello(&hello, &params()).accepted);
         // A LOWER epoch is an older timeline — possibly diverged; reseed.
         for epoch in [0u64, 3] {
-            let auth = compute_auth(SECRET, 9, &UUID, epoch, 50_000);
+            let auth = compute_auth(SECRET, 9, &UUID, &[0; 16], epoch, 50_000);
             let hello = hello_with(9, epoch, 50_000, auth);
             let ack = evaluate_hello(&hello, &params());
             assert!(!ack.accepted, "epoch {epoch}");

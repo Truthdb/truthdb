@@ -853,6 +853,19 @@ mod tests {
     }
 
     #[test]
+    fn a_key_block_from_before_log_encryption_is_refused() {
+        let dir = temp_dir("v1");
+        let file = key_file(&dir, "keys", &format!("k {}\n", "11".repeat(32)), 0o600);
+        let source = KeySource::File(file);
+        let (mut block, _) = new_key_block(&source, &UUID).unwrap();
+        block[0..8].copy_from_slice(b"TDBKEYS1");
+        let err = unlock_key_block(&block, &source, &UUID)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("recreate it"), "{err}");
+    }
+
+    #[test]
     fn a_key_file_must_be_private_and_well_formed() {
         let dir = temp_dir("perms");
         let open = key_file(&dir, "open", &format!("k {}\n", "11".repeat(32)), 0o644);

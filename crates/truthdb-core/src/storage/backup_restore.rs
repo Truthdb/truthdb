@@ -43,6 +43,7 @@ struct BackupPlan {
     checksum: bool,
     copy_only: bool,
     finished_at_millis: u64,
+    keys: Option<crate::backup::KeyRecord>,
 }
 
 impl BackupPlan {
@@ -70,6 +71,7 @@ impl BackupPlan {
                 copy_only: self.copy_only,
                 log_backup: false,
             },
+            keys: self.keys.clone(),
         }
     }
 }
@@ -194,6 +196,13 @@ fn apply_log_archive(
     if header.page_size as usize != PAGE_SIZE || header.wal_size != file.layout.wal_size {
         return Err(StorageError::InvalidFile(format!(
             "{}: log archive geometry does not match the restored database",
+            path.display()
+        )));
+    }
+    // An encrypted database's log opens only under its own key.
+    if header.keys != file.key_record {
+        return Err(StorageError::InvalidFile(format!(
+            "{}: log archive is of a database with another encryption key (or none)",
             path.display()
         )));
     }
@@ -334,7 +343,6 @@ impl Storage {
         checksum: bool,
         copy_only: bool,
     ) -> Result<crate::backup::BackupSummary, StorageError> {
-        self.refuse_encrypted_backup()?;
         let plan = self.lock().begin_backup(checksum, copy_only)?;
         // Release the hold on EVERY exit — normal return, an early `?` error out
         // of write_backup, or an unwind — via the guard's Drop. A leaked hold
@@ -352,7 +360,6 @@ impl Storage {
         checksum: bool,
         copy_only: bool,
     ) -> Result<crate::backup::BackupSummary, StorageError> {
-        self.refuse_encrypted_backup()?;
         // Phase 1 (locked): capture the log range + header. The OLD marker still
         // pins `[start, ...)`, so no checkpoint can truncate the range we are
         // about to ship, even after we release the lock.
@@ -375,18 +382,6 @@ impl Storage {
             log_bytes: log.len() as u64,
             finished_at_millis: header.finished_at_millis,
         })
-    }
-
-    /// The log and backups do not carry encryption yet: a backup of an
-    /// encrypted database would hold its data in clear and could not be
-    /// restored without the key block.
-    fn refuse_encrypted_backup(&self) -> Result<(), StorageError> {
-        if self.lock().codec.is_encrypted() {
-            return Err(StorageError::InvalidConfig(
-                "backups of an encrypted database are not supported yet".to_string(),
-            ));
-        }
-        Ok(())
     }
 
     fn write_backup(
@@ -461,7 +456,42 @@ impl Storage {
         stop_at: Option<u64>,
         engine: EngineFactory,
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], stop_at, false, engine)
+        Self::restore_full_inner(
+            dst_path,
+            bak_path,
+            log_paths,
+            &[],
+            stop_at,
+            false,
+            engine,
+            None,
+        )
+    }
+
+    /// A restore of a backup that may be of an encrypted database: `keys` is
+    /// where its master key comes from (the backup carries the database key
+    /// wrapped by it). `standby` seeds a replication standby, as
+    /// [`Self::restore_full_standby`] does; `stop_at` is a point in time, as
+    /// for [`Self::restore_full_with_logs`].
+    pub fn restore_with_keys(
+        dst_path: &Path,
+        bak_path: &Path,
+        log_paths: &[std::path::PathBuf],
+        stop_at: Option<u64>,
+        standby: bool,
+        engine: EngineFactory,
+        keys: Option<&crate::encryption::KeySource>,
+    ) -> Result<(), StorageError> {
+        Self::restore_full_inner(
+            dst_path,
+            bak_path,
+            log_paths,
+            &[],
+            stop_at,
+            standby,
+            engine,
+            keys,
+        )
     }
 
     /// Offline restore of a full backup (plus an optional `BACKUP LOG` chain)
@@ -479,7 +509,7 @@ impl Storage {
         log_paths: &[std::path::PathBuf],
         engine: EngineFactory,
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], None, true, engine)
+        Self::restore_full_inner(dst_path, bak_path, log_paths, &[], None, true, engine, None)
     }
 
     /// Offline restore of a full backup followed by raw shipped WAL ring ranges —
@@ -493,9 +523,19 @@ impl Storage {
         wal_ranges: &[(u64, Vec<u8>)],
         engine: EngineFactory,
     ) -> Result<(), StorageError> {
-        Self::restore_full_inner(dst_path, bak_path, &[], wal_ranges, None, false, engine)
+        Self::restore_full_inner(
+            dst_path,
+            bak_path,
+            &[],
+            wal_ranges,
+            None,
+            false,
+            engine,
+            None,
+        )
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn restore_full_inner(
         dst_path: &Path,
         bak_path: &Path,
@@ -504,8 +544,13 @@ impl Storage {
         stop_at: Option<u64>,
         standby: bool,
         engine: EngineFactory,
+        keys: Option<&crate::encryption::KeySource>,
     ) -> Result<(), StorageError> {
         assert_layout_invariants();
+        #[cfg(any(test, feature = "test-hooks"))]
+        let test_keys = crate::encryption::test_key_source();
+        #[cfg(any(test, feature = "test-hooks"))]
+        let keys = keys.or(test_keys.as_ref());
         let reader = std::io::BufReader::new(std::fs::File::open(bak_path)?);
         let (backup, header) = crate::backup::BackupReader::new(reader)?;
         if header.page_size as usize != PAGE_SIZE {
@@ -526,18 +571,32 @@ impl Storage {
                 "backup header region sizes are inconsistent".to_string(),
             ));
         }
+        // An encrypted database's pages and log are restored as stored, under
+        // its own database key: the restored file takes the backup's file uuid
+        // and key block, which the master key must unwrap.
+        let file_keys = match (&header.keys, keys) {
+            (Some(record), Some(source)) => super::FileKeys::Existing(record, source),
+            (Some(_), None) => {
+                return Err(StorageError::InvalidConfig(
+                    "this is a backup of an encrypted database: restoring it needs its \
+                     master key"
+                        .to_string(),
+                ));
+            }
+            (None, _) => super::FileKeys::Plain,
+        };
         let file = StorageFile::create_from_layout(
             dst_path.to_path_buf(),
             layout,
             header.default_collation.clone(),
             false,
-            None,
+            file_keys,
         )?;
         // The destination now exists and is ours: remove the partial file if any
         // later step fails, so a retry (which requires a fresh destination) can
         // proceed. Everything ABOVE this point errors without having created it.
         let outcome = Self::restore_body(
-            file, backup, &header, log_paths, wal_ranges, dst_path, stop_at, standby, engine,
+            file, backup, &header, log_paths, wal_ranges, dst_path, stop_at, standby, engine, keys,
         );
         if outcome.is_err() {
             let _ = std::fs::remove_file(dst_path);
@@ -560,6 +619,7 @@ impl Storage {
         stop_at: Option<u64>,
         standby: bool,
         engine: EngineFactory,
+        keys: Option<&crate::encryption::KeySource>,
     ) -> Result<(), StorageError> {
         use crate::backup::{BlockType, decode_alloc_map, decode_log_chunk, decode_page_run};
         let data_pages = header.data_size / PAGE_SIZE as u64;
@@ -665,7 +725,11 @@ impl Storage {
         // the ring already ends at the cut, and restart undo rolls back the
         // transactions still open there). Failing loudly if the restored file is
         // not recoverable.
-        drop(Storage::open(dst_path.to_path_buf(), engine)?);
+        drop(Storage::open_with_keys(
+            dst_path.to_path_buf(),
+            engine,
+            keys,
+        )?);
         Ok(())
     }
 }
@@ -847,6 +911,7 @@ impl StorageFile {
             checksum,
             copy_only,
             finished_at_millis: now_millis(),
+            keys: self.key_record.clone(),
         })
     }
 
@@ -989,6 +1054,7 @@ impl Locked {
                 copy_only,
                 log_backup: true,
             },
+            keys: self.core.key_record.clone(),
         };
         Ok((header, start, end, log))
     }

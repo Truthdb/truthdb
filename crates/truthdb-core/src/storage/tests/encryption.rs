@@ -534,3 +534,232 @@ fn grow_does_not_restore_a_damaged_header_without_the_key() {
         std::fs::remove_file(file).ok();
     }
 }
+
+fn holds_marker_in(path: &Path) -> bool {
+    holds_marker(&std::fs::read(path).expect("read file"))
+}
+
+#[test]
+fn the_log_backups_and_restores_of_an_encrypted_database_hold_no_plaintext() {
+    let keys = key_file("enc-log-keys", &format!("main {}\n", "c4".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let [path, bak, log, bak2, dst] = [
+        "enc-log",
+        "enc-log-bak",
+        "enc-log-arch",
+        "enc-log-bak2",
+        "enc-log-dst",
+    ]
+    .map(unique_temp_path);
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    super::txn_extents::set_full(&storage);
+    storage.backup_full(&bak).expect("full backup");
+    let (root, _) = fill(&storage, 400);
+    storage.backup_log(&log, true, false).expect("log backup");
+    storage.backup_full(&bak2).expect("second full backup");
+    drop(storage);
+    // The whole file (its log included), the backups and the log archive.
+    for file in [&path, &bak, &log, &bak2] {
+        assert!(!holds_marker_in(file), "{}", file.display());
+    }
+
+    // Restored elsewhere with its key: the full backup plus the log archive.
+    Storage::restore_with_keys(
+        &dst,
+        &bak,
+        &[log.clone()],
+        None,
+        false,
+        no_engine,
+        Some(&source),
+    )
+    .expect("restore");
+    assert!(!holds_marker_in(&dst));
+    let restored = Storage::open_with_keys(dst.clone(), no_engine, Some(&source)).expect("open");
+    assert_eq!(rows_of(&restored, root).expect("rows").len(), 400);
+    drop(restored);
+
+    // Without its key, or with another key under the same id: refused.
+    let other = key_file("enc-log-other", &format!("main {}\n", "4c".repeat(32)));
+    let refused = unique_temp_path("enc-log-refused");
+    let without = Storage::restore_with_keys(&refused, &bak2, &[], None, false, no_engine, None);
+    let with_other = Storage::restore_with_keys(
+        &refused,
+        &bak2,
+        &[],
+        None,
+        false,
+        no_engine,
+        Some(&KeySource::File(other.clone())),
+    );
+    assert!(without.is_err() && with_other.is_err());
+    assert!(!refused.exists(), "a refused restore leaves no file");
+
+    // A log archive of another database (another key) does not extend this
+    // chain.
+    let [path_b, bak_b, dst_b] =
+        ["enc-log-b", "enc-log-b-bak", "enc-log-b-dst"].map(unique_temp_path);
+    let b = Storage::create_with_keys(
+        path_b.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create another");
+    super::txn_extents::set_full(&b);
+    b.backup_full(&bak_b).expect("backup of the other");
+    drop(b);
+    let err = Storage::restore_with_keys(
+        &dst_b,
+        &bak_b,
+        &[log.clone()],
+        None,
+        false,
+        no_engine,
+        Some(&source),
+    )
+    .err()
+    .expect("another database's archive is refused");
+    assert!(err.to_string().contains("another encryption key"), "{err}");
+    for file in [
+        &path, &bak, &log, &bak2, &dst, &path_b, &bak_b, &keys, &other,
+    ] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_plain_databases_log_and_backup_show_the_marker() {
+    // The scans above find the marker when it is there.
+    if crate::encryption::test_key_source().is_some() {
+        return;
+    }
+    let [path, bak] = ["plain-log", "plain-log-bak"].map(unique_temp_path);
+    let storage = Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
+    fill(&storage, 400);
+    storage.backup_full(&bak).expect("backup");
+    drop(storage);
+    assert!(holds_marker_in(&path) && holds_marker_in(&bak));
+    for file in [&path, &bak] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_plaintext_log_entry_in_an_encrypted_database_ends_the_log() {
+    use crate::storage_layout::{
+        WAL_ENTRY_TYPE_RECORD, WalEntryFooter, WalEntryHeader, wal_entry_padded_len,
+        wal_payload_crc,
+    };
+    let keys = key_file("enc-forged-keys", &format!("main {}\n", "d5".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let path = unique_temp_path("enc-forged");
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    let first = b"the first entry".to_vec();
+    storage
+        .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, 1, &first)
+        .expect("append");
+    let second = storage
+        .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, 2, b"the second entry")
+        .expect("append");
+    let (wal_offset, wal_size) = {
+        let guard = storage.lock();
+        (guard.layout.wal_offset, guard.layout.wal_size)
+    };
+    drop(storage);
+
+    // A well-formed plaintext entry written over the second one.
+    let forged = b"a forged entry".to_vec();
+    let crc = wal_payload_crc(&forged);
+    let header = WalEntryHeader::new(
+        WAL_ENTRY_TYPE_RECORD,
+        1,
+        forged.len() as u32,
+        2,
+        second,
+        crc,
+    );
+    let footer = WalEntryFooter {
+        payload_len: forged.len() as u32,
+        payload_crc: crc,
+    };
+    let mut entry = [
+        header.to_le_bytes().as_slice(),
+        &forged,
+        &footer.to_le_bytes(),
+    ]
+    .concat();
+    entry.resize(wal_entry_padded_len(forged.len()), 0);
+    {
+        use std::os::unix::fs::FileExt;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.write_all_at(&entry, wal_offset + second % wal_size))
+            .expect("forge");
+    }
+
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let records = storage.replay_wal_entries().expect("replay");
+    assert_eq!(records.len(), 1, "the forged entry is not accepted");
+    assert_eq!(records[0].payload, first);
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_standby_of_an_encrypted_database_applies_its_log_and_holds_no_plaintext() {
+    let keys = key_file("enc-standby-keys", &format!("main {}\n", "e6".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let [path, bak, seed] =
+        ["enc-standby", "enc-standby-bak", "enc-standby-seed"].map(unique_temp_path);
+    let primary = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    let summary = primary.backup_full(&bak).expect("backup");
+    let (root, _) = fill(&primary, 300);
+    let delta = primary
+        .read_wal_range(summary.backup_end_lsn, primary.wal_flushed_lsn())
+        .expect("ship");
+    assert!(!holds_marker(&delta), "the shipped log is sealed");
+    let fingerprint = primary.key_fingerprint();
+    drop(primary);
+
+    Storage::restore_with_keys(&seed, &bak, &[], None, true, no_engine, Some(&source))
+        .expect("standby seed");
+    let standby = Storage::open_with_keys(seed.clone(), no_engine, Some(&source)).expect("open");
+    assert_eq!(standby.key_fingerprint(), fingerprint, "same database key");
+    standby
+        .apply_wal_stream(summary.backup_end_lsn, &delta)
+        .expect("apply");
+    assert!(standby.standby_restartpoint().expect("restartpoint"));
+    drop(standby);
+    assert!(!holds_marker_in(&seed));
+
+    // Promoted with its key, it reads the rows.
+    Storage::promote_with_keys(&seed, no_engine, Some(&source)).expect("promote");
+    let promoted = Storage::open_with_keys(seed.clone(), no_engine, Some(&source)).expect("open");
+    assert_eq!(rows_of(&promoted, root).expect("rows").len(), 300);
+    drop(promoted);
+    for file in [&path, &bak, &seed, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}

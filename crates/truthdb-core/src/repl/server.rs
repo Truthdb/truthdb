@@ -82,6 +82,7 @@ mod tests {
         HandshakeParams {
             shared_secret: SECRET,
             cluster_uuid: UUID,
+            key_fingerprint: [0; 16],
             primary_epoch: 3,
             primary_flushed_lsn: 77_000,
         }
@@ -110,6 +111,7 @@ mod tests {
             protocol_version: REPL_PROTOCOL_VERSION,
             node_id,
             cluster_uuid: UUID,
+            key_fingerprint: [0; 16],
             epoch,
             last_received_lsn,
             auth,
@@ -118,7 +120,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_valid_standby_is_accepted_over_the_wire() {
-        let auth = compute_auth(SECRET, 5, &UUID, 3, 40_000);
+        let auth = compute_auth(SECRET, 5, &UUID, &[0; 16], 3, 40_000);
         let (outcome, ack) = exchange(hello(5, 3, 40_000, auth)).await;
         assert!(ack.accepted, "{}", ack.message);
         assert_eq!(ack.primary_flushed_lsn, 77_000);
@@ -133,7 +135,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_bad_secret_is_rejected_over_the_wire() {
-        let auth = compute_auth(b"wrong", 5, &UUID, 1, 40_000);
+        let auth = compute_auth(b"wrong", 5, &UUID, &[0; 16], 1, 40_000);
         let (outcome, ack) = exchange(hello(5, 1, 40_000, auth)).await;
         assert!(!ack.accepted);
         assert_eq!(ack.message, "replication handshake rejected");

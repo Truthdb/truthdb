@@ -27,7 +27,7 @@ use crate::storage_layout::PAGE_SIZE;
 /// The magic bytes at the start of every `TDBBAK1` file.
 pub const MAGIC: &[u8; 8] = b"TDBBAK1\0";
 /// Format version — bumped on any incompatible framing/header change.
-pub const FORMAT_VERSION: u32 = 3;
+pub const FORMAT_VERSION: u32 = 4;
 
 /// The kind of a framed block.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,6 +113,18 @@ pub struct BackupHeader {
     /// Wall-clock time the backup finished, milliseconds since the Unix epoch.
     pub finished_at_millis: u64,
     pub flags: BackupFlags,
+    /// An encrypted source's file uuid and key block (v4): its pages and log
+    /// are copied as stored, so a restore needs the same key (and the master
+    /// key that unwraps it).
+    pub keys: Option<KeyRecord>,
+}
+
+/// An encrypted database's identity of its keys: the file uuid that salts
+/// every key derived from its database key, and the key block wrapping it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRecord {
+    pub file_uuid: [u8; 16],
+    pub key_block: Vec<u8>,
 }
 
 impl BackupHeader {
@@ -150,6 +162,15 @@ impl BackupHeader {
         for (engine_id, root) in &self.engine_roots {
             out.extend_from_slice(&engine_id.to_le_bytes());
             out.extend_from_slice(&root.to_le_bytes());
+        }
+        // The key block's length (0: not encrypted), the file uuid, the block.
+        match &self.keys {
+            Some(keys) => {
+                out.extend_from_slice(&(keys.key_block.len() as u32).to_le_bytes());
+                out.extend_from_slice(&keys.file_uuid);
+                out.extend_from_slice(&keys.key_block);
+            }
+            None => out.extend_from_slice(&0u32.to_le_bytes()),
         }
         out
     }
@@ -205,6 +226,20 @@ impl BackupHeader {
                 engine_roots.push((cursor.u32()?, cursor.u64()?));
             }
         }
+        let mut keys = None;
+        if format_version >= 4 {
+            let len = cursor.u32()? as usize;
+            if len > crate::encryption::KEY_BLOCK_SIZE {
+                return Err(corrupt(&format!("a {len}-byte key block in backup header")));
+            }
+            if len > 0 {
+                let file_uuid = cursor.take(16)?.try_into().expect("16 bytes");
+                keys = Some(KeyRecord {
+                    file_uuid,
+                    key_block: cursor.take(len)?.to_vec(),
+                });
+            }
+        }
         Ok(BackupHeader {
             format_version,
             page_size,
@@ -228,6 +263,7 @@ impl BackupHeader {
                 copy_only: flag_bits & 2 != 0,
                 log_backup: flag_bits & 4 != 0,
             },
+            keys,
         })
     }
 }
@@ -542,6 +578,33 @@ mod tests {
         assert_eq!(v3.engine_roots, vec![(1, 4096 * 41)]);
     }
 
+    // An encrypted source's key record round-trips (v4); a v3 header (before
+    // it) decodes with none.
+    #[test]
+    fn the_key_record_round_trips_and_a_v3_header_has_none() {
+        let keys = KeyRecord {
+            file_uuid: [9; 16],
+            key_block: vec![5; crate::encryption::KEY_BLOCK_SIZE],
+        };
+        let header = BackupHeader {
+            keys: Some(keys.clone()),
+            ..sample_header()
+        };
+        assert_eq!(
+            BackupHeader::decode(&header.encode())
+                .expect("v4 decodes")
+                .keys,
+            Some(keys)
+        );
+        let mut v3 = sample_header().encode();
+        v3.truncate(v3.len() - 4); // drop the (zero) key block length
+        v3[0..4].copy_from_slice(&3u32.to_le_bytes());
+        let decoded = BackupHeader::decode(&v3).expect("v3 decodes");
+        assert_eq!(decoded.format_version, 3);
+        assert_eq!(decoded.keys, None);
+        assert_eq!(decoded.engine_roots, vec![(1, 4096 * 41)]);
+    }
+
     fn sample_header() -> BackupHeader {
         BackupHeader {
             format_version: FORMAT_VERSION,
@@ -566,6 +629,7 @@ mod tests {
                 copy_only: false,
                 log_backup: false,
             },
+            keys: None,
         }
     }
 
