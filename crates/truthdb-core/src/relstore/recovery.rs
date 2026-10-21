@@ -277,11 +277,9 @@ fn redo_blob_rewrite(
     }
     let mut on_disk = crate::direct_io::AlignedPageBuf::new();
     ctx.io.read_page(page_no, &mut on_disk)?;
-    let sealed = u16::from_le_bytes([on_disk.as_slice()[18], on_disk.as_slice()[19]])
-        & crate::encryption::PAGE_FLAG_SEALED
-        != 0;
-    if sealed
-        && ctx.io.codec.open(page_no, on_disk.as_mut_slice())
+    // Rewritten already only if sealed under the current key (a rekeying's
+    // old key opens the page too, but it still has to be rewritten).
+    if ctx.io.codec.open_current(page_no, on_disk.as_mut_slice())
         && page::page_lsn(on_disk.as_slice()) == page_lsn
     {
         return Ok(());

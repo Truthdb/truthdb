@@ -61,7 +61,11 @@ impl PoolIo<'_> {
         start_page: u64,
         num_pages: u64,
     ) -> Result<(), StorageError> {
-        if !self.codec.wal_keys().is_some_and(|keys| keys.converting()) {
+        if !self
+            .codec
+            .wal_keys()
+            .is_some_and(|keys| keys.converting() || keys.rekeying())
+        {
             return Ok(());
         }
         let mut page = AlignedPageBuf::new();

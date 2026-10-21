@@ -15,12 +15,23 @@
 //! A restart resumes it (the key block says Converting). Standbys are not
 //! converted: the key fingerprint changes, so they are refused and reseeded;
 //! a log chain does not cross the switch.
+//!
+//! `encryption rotate database key` replaces the database key the same way:
+//! the key block (state Rekeying) holds the new key and the old one, every
+//! page and entry written from then on is sealed under the new key while the
+//! old key still opens what it sealed, and the same pass rewrites every page
+//! the old key sealed. At the end the old key leaves the key block.
 
 use super::*;
 
 /// The state of a conversion under way.
 #[derive(Debug, Clone)]
 pub(crate) struct Conversion {
+    /// A rekeying (old key to new), not a conversion from plain.
+    rekey: bool,
+    /// A rekeying's snapshot when first found otherwise done: a newer one
+    /// (written by a checkpoint since, under the new key) is needed.
+    snapshot_generation: Option<u64>,
     /// The next data page the sweep looks at.
     cursor: u64,
     /// The sweep rewrote a page since it last started.
@@ -43,14 +54,21 @@ pub(crate) struct Conversion {
 }
 
 impl Conversion {
+    /// A rekeying (not a conversion from plain).
+    pub(crate) fn is_rekey(&self) -> bool {
+        self.rekey
+    }
+
     /// A spill extent of the switch, handed out again (and zeroed): no
     /// longer one to wait for.
     pub(crate) fn forget_spill_extent(&mut self, start: u64) {
         self.spill_extents.retain(|&(extent, _)| extent != start);
     }
 
-    pub(crate) fn new(sealed_from: u64) -> Self {
+    pub(crate) fn new(sealed_from: u64, rekey: bool) -> Self {
         Conversion {
+            rekey,
+            snapshot_generation: None,
             cursor: 0,
             rewrote: false,
             sealed_from,
@@ -59,6 +77,15 @@ impl Conversion {
             zeroing: None,
             spill_extents: Vec::new(),
         }
+    }
+
+    /// The pass a database opened (or restored) with `codec` resumes, if its
+    /// key block says one is under way. Entries from `sealed_from` on are
+    /// sealed under the current key.
+    pub(crate) fn resumed(codec: &crate::encryption::PageCodec, sealed_from: u64) -> Option<Self> {
+        let keys = codec.wal_keys()?;
+        (keys.converting() || keys.rekeying())
+            .then(|| Conversion::new(sealed_from, keys.rekeying()))
     }
 }
 
@@ -106,6 +133,33 @@ impl Storage {
         }
         self.lock()
             .switch_to_encrypted(&header, file_uuid, &block, &dek)
+    }
+
+    /// `encryption rotate database key`: replaces this encrypted database's
+    /// key with a new one. Every page and log entry written from now on is
+    /// sealed under the new key; [`Self::conversion_step`] rewrites what the
+    /// old one sealed. The old key is unwrapped and the new one made (which
+    /// may run a key command) without the storage lock.
+    pub fn rotate_database_key(&self) -> Result<(), StorageError> {
+        let (header, source) = self.lock().header_to_rekey()?;
+        let old =
+            crate::encryption::unlock_key_block(header.key_block(), &source, &header.file_uuid)?;
+        let (block, dek) =
+            crate::encryption::new_rekeying_key_block(&source, &header.file_uuid, &old)?;
+        // As for `encryption enable`: a standby cannot open what the new key
+        // seals, and none joins across the switch.
+        let connected = self
+            .repl_connected
+            .lock()
+            .expect("repl-connected set poisoned");
+        if !connected.is_empty() {
+            return Err(StorageError::InvalidConfig(
+                "a standby is connected: stop the standbys first (reseed them from a backup \
+                 taken after the rotation)"
+                    .to_string(),
+            ));
+        }
+        self.lock().switch_to_rekeyed(&header, &block, &dek, &old)
     }
 
     /// One bounded step (at most `budget` pages read) of the conversion under
@@ -171,6 +225,86 @@ impl StorageFile {
         Ok((header, source))
     }
 
+    /// The header of this encrypted database and the master key source, for
+    /// `encryption rotate database key`.
+    fn header_to_rekey(
+        &mut self,
+    ) -> Result<(FileHeader, crate::encryption::KeySource), StorageError> {
+        if self.active_sb().is_standby() {
+            return Err(StorageError::InvalidConfig(
+                "a standby's key is not rotated: rotate it on the primary, then reseed the \
+                 standby from a backup taken after it"
+                    .to_string(),
+            ));
+        }
+        let header = self.header_on_disk()?;
+        if !header.is_encrypted() {
+            return Err(StorageError::InvalidConfig(
+                "this database is not encrypted: `encryption enable` first".to_string(),
+            ));
+        }
+        if self.conversion.is_some() {
+            return Err(StorageError::InvalidConfig(
+                "a conversion or key rotation is under way: rotate after it finishes".to_string(),
+            ));
+        }
+        let source = self.key_source.clone().ok_or_else(|| {
+            StorageError::InvalidConfig(
+                "no master key is configured: set [encryption] and restart first".to_string(),
+            )
+        })?;
+        Ok((header, source))
+    }
+
+    /// Writes the key block (Rekeying) and switches to sealing under the new
+    /// key: the header copy first, then the header (a crash before the
+    /// header leaves the old key in place), then pages and log entries
+    /// written from now on are sealed under the new key.
+    fn switch_to_rekeyed(
+        &mut self,
+        before: &FileHeader,
+        block: &[u8],
+        dek: &[u8; 32],
+        old: &[u8; 32],
+    ) -> Result<(), StorageError> {
+        // A backup in progress recorded the old key block: pages and log
+        // copied after the switch would be sealed under a key it lacks.
+        if self.truncation_gate.backup.is_some() || self.log_backup_in_progress {
+            return Err(StorageError::InvalidConfig(
+                "a backup is in progress: rotate the database key after it finishes".to_string(),
+            ));
+        }
+        let mut header = self.header_on_disk()?;
+        if header.to_le_bytes_with_checksum() != before.to_le_bytes_with_checksum() {
+            return Err(StorageError::InvalidConfig(
+                "the file header changed while the key was made (another rotation ran): retry"
+                    .to_string(),
+            ));
+        }
+        header.set_key_block(block);
+        header.header_checksum = header.compute_checksum();
+        let out = header.to_le_bytes_with_checksum();
+        let end = header.reserved_offset + header.reserved_size;
+        self.file.write_all_at(end - PAGE_SIZE as u64, &out)?;
+        self.file.sync_data()?;
+        self.file.write_all_at(0, &out)?;
+        self.file.sync_data()?;
+
+        let keys = crate::encryption::PageKeys::rekeying(dek, old, &header.file_uuid);
+        self.codec = crate::encryption::PageCodec::Encrypted(Box::new(keys));
+        let wal_keys = self.codec.wal_keys().expect("an encrypted codec");
+        self.wal.start_sealing(&wal_keys)?;
+        self.key_record = Some(crate::backup::KeyRecord {
+            file_uuid: header.file_uuid,
+            key_block: block.to_vec(),
+            fingerprint: wal_keys.fingerprint(),
+        });
+        let mut conversion = Conversion::new(self.wal.tail(), true);
+        conversion.spill_extents = self.allocator.temp_extents();
+        self.conversion = Some(conversion);
+        Ok(())
+    }
+
     /// Writes the key block (Converting) and switches to sealing: the header
     /// copy first, then the header (a crash before the header leaves the
     /// plain database as it was), then pages and log entries written from
@@ -216,7 +350,7 @@ impl StorageFile {
             key_block: block.to_vec(),
             fingerprint: wal_keys.fingerprint(),
         });
-        let mut conversion = Conversion::new(self.wal.tail());
+        let mut conversion = Conversion::new(self.wal.tail(), false);
         conversion.spill_extents = self.allocator.temp_extents();
         self.conversion = Some(conversion);
         Ok(())
@@ -243,7 +377,8 @@ impl StorageFile {
         Ok(step)
     }
 
-    /// Rewrites up to `budget` pages still plain on disk.
+    /// Rewrites up to `budget` pages still plain (or, rekeying, sealed under
+    /// the old key) on disk.
     fn sweep(
         &mut self,
         conversion: &mut Conversion,
@@ -273,17 +408,30 @@ impl StorageFile {
             if crate::relstore::page::is_zero_page(&page) {
                 continue;
             }
-            let flags = u16::from_le_bytes([page[18], page[19]]);
-            let sealed = flags & crate::encryption::PAGE_FLAG_SEALED != 0;
-            // A sealed page counts only if it opens (garbage can carry the bit).
-            if sealed && self.codec.open(page_no, &mut page.clone()) {
+            // Sealed under the current key: done (garbage can carry the
+            // sealed bit, so it must open).
+            if self.codec.open_current(page_no, &mut page.clone()) {
                 continue;
             }
-            let header = crate::relstore::page::read_header(&page);
-            let plain = !sealed && crate::relstore::page::verify_checksum(&page);
-            if plain && header.page_type == crate::relstore::page::PAGE_TYPE_BLOB {
-                self.page_ctx(0).rewrite_blob_page(page_no, &page)?;
-            } else if plain || self.pages.pool.contains(page_no) {
+            // The page's plaintext, when it is a readable page still to do.
+            let plain = if conversion.rekey {
+                let mut opened = page.clone();
+                self.codec
+                    .open_previous(page_no, &mut opened)
+                    .then_some(opened)
+            } else {
+                let flags = u16::from_le_bytes([page[18], page[19]]);
+                (flags & crate::encryption::PAGE_FLAG_SEALED == 0
+                    && crate::relstore::page::verify_checksum(&page))
+                .then(|| page.clone())
+            };
+            let blob = plain.as_ref().is_some_and(|plain| {
+                crate::relstore::page::read_header(plain).page_type
+                    == crate::relstore::page::PAGE_TYPE_BLOB
+            });
+            if let (Some(plain), true) = (&plain, blob) {
+                self.page_ctx(0).rewrite_blob_page(page_no, plain)?;
+            } else if plain.is_some() || self.pages.pool.contains(page_no) {
                 // Through the pool: a logged image of the page as it is (a
                 // cached frame may hold its newest version), which the next
                 // flush writes sealed.
@@ -321,6 +469,14 @@ impl StorageFile {
         conversion: &mut Conversion,
     ) -> Result<ConversionStep, StorageError> {
         let snapshot_sealed = match self.load_active_snapshot_descriptor()? {
+            // The snapshot found when the pages were done may still be under
+            // the old key: one written after it is not.
+            Some(desc) if conversion.rekey => {
+                *conversion
+                    .snapshot_generation
+                    .get_or_insert(desc.generation)
+                    < desc.generation
+            }
             Some(desc) => desc.sealed(),
             None => true,
         };
@@ -415,8 +571,9 @@ impl StorageFile {
     }
 
     /// The last step: the ring outside the live log is zeroed (old plaintext
-    /// entries), then the key block's state becomes Encrypted and plain pages
-    /// and entries are refused from then on.
+    /// entries, or entries under the old key), then the key block's state
+    /// becomes Encrypted (the old key leaves it) and plain pages and entries,
+    /// and those under the old key, are refused from then on.
     fn finish_conversion(&mut self) -> Result<(), StorageError> {
         let (head, tail) = (self.wal.head(), self.wal.tail());
         let ring = self.layout.wal_size;
@@ -445,10 +602,10 @@ impl StorageFile {
         }
         let wal_keys = self.codec.wal_keys().expect("an encrypted codec");
         let header = self.header_on_disk()?;
-        let block =
-            wal_keys.restate_key_block(header.key_block(), crate::encryption::KEY_STATE_ENCRYPTED);
+        let block = wal_keys.settle_key_block(header.key_block());
         self.write_key_block(header.key_block(), &block)?;
         wal_keys.finish_conversion();
+        self.codec.finish_rekeying();
         Ok(())
     }
 }

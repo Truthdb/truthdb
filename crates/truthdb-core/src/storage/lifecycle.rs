@@ -444,9 +444,14 @@ impl Storage {
             Some(record) => {
                 let (encryptor_type, key_id) =
                     crate::encryption::key_block_encryptor(&record.key_block);
+                let rekeying = locked
+                    .conversion
+                    .as_ref()
+                    .is_some_and(|conversion| conversion.is_rekey());
                 EncryptionStatus {
                     encrypted: true,
-                    converting: locked.conversion.is_some(),
+                    converting: locked.conversion.is_some() && !rekeying,
+                    rekeying,
                     encryptor_type,
                     key_id,
                     fingerprint: Some(record.fingerprint),
@@ -455,6 +460,7 @@ impl Storage {
             None => EncryptionStatus {
                 encrypted: false,
                 converting: false,
+                rekeying: false,
                 encryptor_type: "NONE",
                 key_id: None,
                 fingerprint: None,
@@ -612,6 +618,9 @@ pub struct EncryptionStatus {
     pub encrypted: bool,
     /// `encryption enable` is still converting the pages written before it.
     pub converting: bool,
+    /// `encryption rotate database key` is still rewriting what the old key
+    /// sealed.
+    pub rekeying: bool,
     /// `KEY FILE`, `KEY COMMAND` or `NONE`.
     pub encryptor_type: &'static str,
     /// The master key's id, for a key file.
@@ -719,15 +728,7 @@ impl StorageFile {
                         .to_string(),
                 )
             })?;
-            let dek =
-                crate::encryption::unlock_key_block(header.key_block(), source, &header.file_uuid)?;
-            let converting = crate::encryption::key_block_state(header.key_block())
-                == crate::encryption::KEY_STATE_CONVERTING;
-            crate::encryption::PageCodec::Encrypted(Box::new(crate::encryption::PageKeys::new(
-                &dek,
-                &header.file_uuid,
-                converting,
-            )?))
+            crate::encryption::codec_for_key_block(header.key_block(), source, &header.file_uuid)?
         } else {
             crate::encryption::PageCodec::Plain
         };
@@ -835,12 +836,10 @@ impl StorageFile {
         let recovery_full = active_sb.db_options() & 4 != 0;
         let key_record = key_record_of(&header, &codec);
         let key_source = keys.cloned();
-        // A conversion under way resumes; the entries scanned may be plain,
-        // the ones appended from here on are sealed.
-        let conversion = codec
-            .wal_keys()
-            .is_some_and(|keys| keys.converting())
-            .then(|| super::conversion::Conversion::new(scan.tail));
+        // A conversion or rekeying under way resumes; the entries scanned may
+        // be plain or under the old key, the ones appended from here on are
+        // sealed under the current one.
+        let conversion = super::conversion::Conversion::resumed(&codec, scan.tail);
         let core = StorageFile {
             default_collation: header.default_collation(),
             file,
@@ -1007,17 +1006,13 @@ impl StorageFile {
                 }
                 super::FileKeys::Existing(record, source) => {
                     header.file_uuid = record.file_uuid;
-                    let dek = crate::encryption::unlock_key_block(
+                    let codec = crate::encryption::codec_for_key_block(
                         &record.key_block,
                         source,
                         &record.file_uuid,
                     )?;
                     header.set_key_block(&record.key_block);
-                    let converting = crate::encryption::key_block_state(&record.key_block)
-                        == crate::encryption::KEY_STATE_CONVERTING;
-                    crate::encryption::PageCodec::Encrypted(Box::new(
-                        crate::encryption::PageKeys::new(&dek, &header.file_uuid, converting)?,
-                    ))
+                    codec
                 }
                 super::FileKeys::Plain => crate::encryption::PageCodec::Plain,
             };
@@ -1081,11 +1076,9 @@ impl StorageFile {
         file.share_sync_gate(wal.sync_gate());
 
         let key_record = key_record_of(&header, &codec);
-        // A restored file whose backup was taken mid-conversion resumes it.
-        let conversion = codec
-            .wal_keys()
-            .is_some_and(|keys| keys.converting())
-            .then(|| super::conversion::Conversion::new(0));
+        // A restored file whose backup was taken mid-conversion (or
+        // mid-rekeying) resumes it.
+        let conversion = super::conversion::Conversion::resumed(&codec, 0);
         Ok(StorageFile {
             default_collation: header.default_collation(),
             file,
@@ -1250,32 +1243,41 @@ impl StorageFile {
             None => return Ok(None),
         };
 
-        // Whole pages, as they were sealed; then the padding goes.
-        let mut data = vec![0u8; (desc.data_len as usize).div_ceil(PAGE_SIZE) * PAGE_SIZE];
-        self.file.read_exact_at(desc.data_offset, &mut data)?;
         let first_page =
             desc.data_offset.saturating_sub(self.layout.data_offset) / PAGE_SIZE as u64;
         // Sealed when its descriptor says so, or (a file created encrypted)
         // whenever the database is encrypted and not being converted.
         let sealed = desc.sealed() || self.codec.wal_keys().is_some_and(|keys| !keys.converting());
-        for (index, page) in data.chunks_mut(PAGE_SIZE).enumerate() {
-            if !sealed {
+        // While the key is being replaced, a snapshot written before holds
+        // the old key's ciphertext; raw pages carry no MAC, so the data
+        // checksum tells which key opens it.
+        let mut data = Vec::new();
+        for previous in [false, true] {
+            // Whole pages, as they were sealed; then the padding goes.
+            data = vec![0u8; (desc.data_len as usize).div_ceil(PAGE_SIZE) * PAGE_SIZE];
+            self.file.read_exact_at(desc.data_offset, &mut data)?;
+            let mut opened = true;
+            for (index, page) in data.chunks_mut(PAGE_SIZE).enumerate() {
+                if !sealed {
+                    break;
+                }
+                opened = self.codec.open_raw(
+                    crate::encryption::RawPage::Snapshot,
+                    first_page + index as u64,
+                    desc.generation,
+                    page,
+                    previous,
+                );
+            }
+            data.truncate(desc.data_len as usize);
+            if opened && xxh64(&data, 0) == desc.data_checksum {
                 break;
             }
-            self.codec.open_raw(
-                crate::encryption::RawPage::Snapshot,
-                first_page + index as u64,
-                desc.generation,
-                page,
-            );
-        }
-        data.truncate(desc.data_len as usize);
-
-        let actual_checksum = xxh64(&data, 0);
-        if actual_checksum != desc.data_checksum {
-            return Err(StorageError::InvalidFile(
-                "snapshot data checksum mismatch".to_string(),
-            ));
+            if previous || !sealed || !self.codec.rekeying() {
+                return Err(StorageError::InvalidFile(
+                    "snapshot data checksum mismatch".to_string(),
+                ));
+            }
         }
 
         Ok(Some(SnapshotData {

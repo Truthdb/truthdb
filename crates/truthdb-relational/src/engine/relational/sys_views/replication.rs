@@ -38,7 +38,8 @@ pub(in crate::engine::relational) fn sys_dm_repl_slots(storage: &RelStorage) -> 
 }
 
 /// `sys.dm_database_encryption_keys`: the database's encryption at rest, in
-/// SQL Server's columns. `encryption_state` 1 = unencrypted, 3 = encrypted.
+/// SQL Server's columns. `encryption_state` 1 = unencrypted, 2 = encryption
+/// in progress, 3 = encrypted, 4 = key change in progress.
 /// Every database of the file shares it; the row names the current one.
 pub(in crate::engine::relational) fn sys_dm_database_encryption_keys(
     storage: &RelStorage,
@@ -55,8 +56,10 @@ pub(in crate::engine::relational) fn sys_dm_database_encryption_keys(
         int_col("percent_complete"),
     ];
     let status = storage.encryption_status();
-    // SQL Server's states: 1 unencrypted, 2 encryption in progress, 3 encrypted.
+    // SQL Server's states: 1 unencrypted, 2 encryption in progress, 3
+    // encrypted, 4 key change in progress.
     let (state, percent) = match storage.conversion_percent() {
+        Some(percent) if status.rekeying => (4, percent as i32),
         Some(percent) => (2, percent as i32),
         None => (3, 0),
     };

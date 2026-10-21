@@ -193,3 +193,95 @@ fn encryption_enable_converts_the_database_in_the_maintenance_sweeps() {
         let _ = std::fs::remove_file(file);
     }
 }
+
+#[test]
+fn encryption_rotate_database_key_rekeys_in_the_maintenance_sweeps() {
+    use std::os::unix::fs::PermissionsExt;
+    // The encrypted test run creates every database encrypted.
+    if truthdb_core::encryption::test_key_source().is_some() {
+        return;
+    }
+    let path = unique_temp_path("encryption-rekey");
+    let keys = unique_temp_path("encryption-rekey-keys").with_extension("keys");
+    std::fs::write(&keys, format!("main {}\n", "2e".repeat(32))).unwrap();
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let source = truthdb_core::encryption::KeySource::File(keys.clone());
+    drop(new_engine(&path));
+    let storage = RelStorage::open_with_keys(path.clone(), crate::database_engines, Some(&source))
+        .expect("open");
+    let engine = Engine::new(storage).expect("engine");
+    for sql in [
+        "encryption enable",
+        "CREATE TABLE secrets (id INT NOT NULL PRIMARY KEY, v NVARCHAR(100))",
+        "INSERT INTO secrets VALUES (1, N'one'), (2, N'two')",
+    ] {
+        engine.execute(sql).expect(sql);
+    }
+    for _ in 0..1000 {
+        if !engine.storage().encryption_status().converting {
+            break;
+        }
+        engine.encryption_conversion().expect("sweep");
+    }
+    let state = |engine: &Engine| {
+        let mut ctx = TxnContext::default();
+        let outcome = batch(
+            engine,
+            &mut ctx,
+            "SELECT encryption_state FROM sys.dm_database_encryption_keys",
+        );
+        let [StatementResult::Rows(rows)] = &outcome.results[..] else {
+            panic!("{:?}", outcome.results);
+        };
+        rows.rows[0][0].clone()
+    };
+    assert_eq!(
+        state(&engine),
+        truthdb_relational::relstore::types::Datum::Int(3)
+    );
+    let before = engine.storage().encryption_status().fingerprint;
+
+    let status: serde_json::Value = serde_json::from_str(
+        &engine
+            .execute("encryption rotate database key")
+            .expect("rotate"),
+    )
+    .unwrap();
+    assert_eq!(
+        (status["rekeying"].clone(), status["converting"].clone()),
+        (true.into(), false.into())
+    );
+    // SQL Server's "key change in progress".
+    assert_eq!(
+        state(&engine),
+        truthdb_relational::relstore::types::Datum::Int(4)
+    );
+    engine
+        .execute("INSERT INTO secrets VALUES (3, N'three')")
+        .expect("insert during the rotation");
+    for _ in 0..1000 {
+        if !engine.storage().encryption_status().rekeying {
+            break;
+        }
+        engine.encryption_conversion().expect("sweep");
+    }
+    let status: serde_json::Value =
+        serde_json::from_str(&engine.execute("encryption status").expect("status")).unwrap();
+    assert_eq!(status["rekeying"], false);
+    assert_eq!(
+        state(&engine),
+        truthdb_relational::relstore::types::Datum::Int(3)
+    );
+    assert_ne!(engine.storage().encryption_status().fingerprint, before);
+    drop(engine);
+
+    let storage = RelStorage::open_with_keys(path.clone(), crate::database_engines, Some(&source))
+        .expect("reopen");
+    let engine = Engine::new(storage).expect("engine");
+    let (_, rows) = sql_rows(&engine, "SELECT v FROM secrets ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    drop(engine);
+    for file in [&path, &keys] {
+        let _ = std::fs::remove_file(file);
+    }
+}

@@ -120,12 +120,13 @@ fn parse_s3_admin(input: &str) -> Option<S3Admin> {
 const CONVERSION_STEP_PAGES: usize = 64;
 
 /// Encryption-at-rest administration: `encryption status`, `encryption
-/// enable`, `encryption rotate master key`. Gated like [`S3Admin`]: a `sysadmin` login over TDS,
+/// enable`, `encryption rotate master key`, `encryption rotate database key`. Gated like [`S3Admin`]: a `sysadmin` login over TDS,
 /// any connection on the (trusted) native port.
 enum EncryptionAdmin {
     Status,
     Enable,
     RotateMasterKey,
+    RotateDatabaseKey,
 }
 
 fn parse_encryption_admin(input: &str) -> Option<EncryptionAdmin> {
@@ -139,6 +140,7 @@ fn parse_encryption_admin(input: &str) -> Option<EncryptionAdmin> {
         ["encryption", "status"] => Some(EncryptionAdmin::Status),
         ["encryption", "enable"] => Some(EncryptionAdmin::Enable),
         ["encryption", "rotate", "master", "key"] => Some(EncryptionAdmin::RotateMasterKey),
+        ["encryption", "rotate", "database", "key"] => Some(EncryptionAdmin::RotateDatabaseKey),
         _ => None,
     }
 }
@@ -706,6 +708,7 @@ impl Engine {
         match command {
             EncryptionAdmin::RotateMasterKey => storage.rotate_master_key()?,
             EncryptionAdmin::Enable => storage.enable_encryption()?,
+            EncryptionAdmin::RotateDatabaseKey => storage.rotate_database_key()?,
             EncryptionAdmin::Status => {}
         }
         let status = storage.encryption_status();
@@ -718,6 +721,7 @@ impl Engine {
             "key_id": status.key_id,
             "key_fingerprint": status.fingerprint.map(hex),
             "converting": status.converting,
+            "rekeying": status.rekeying,
             "percent_complete": storage.conversion_percent(),
             "waiting_for_log_truncation": storage.conversion_waits_for_log(),
         })

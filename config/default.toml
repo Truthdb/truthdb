@@ -106,3 +106,8 @@ reserved_ratio = 0.17
 # one). Remove the old key only after every rotation reported success. A
 # backup started before the rotation succeeded still needs the old key to
 # restore, and so does anything seeded or restored from it.
+# To replace the database key itself: run `encryption rotate database key`
+# on the primary; the server rewrites everything under the new key in the
+# background (`encryption status` shows progress), and the old one is gone
+# once it finishes. As for `encryption enable`: reseed the standbys from a
+# backup taken afterwards, and start a new backup chain with a full backup.
