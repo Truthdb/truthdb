@@ -247,10 +247,13 @@ fn redo_blob_pages(
         }
         let mut on_disk = crate::direct_io::AlignedPageBuf::new();
         ctx.io.read_page(page_no, &mut on_disk)?;
-        if page::verify_checksum(on_disk.as_slice()) && page::page_lsn(on_disk.as_slice()) >= lsn {
+        if ctx.io.codec.open(page_no, on_disk.as_mut_slice())
+            && page::page_lsn(on_disk.as_slice()) >= lsn
+        {
             continue;
         }
-        let image = crate::relstore::ctx::blob_page_image(lsn, object_id, page_no, chunk);
+        let image =
+            crate::relstore::ctx::blob_page_image(ctx.io.codec, lsn, object_id, page_no, chunk);
         ctx.io.write_page(page_no, &image)?;
     }
     Ok(())

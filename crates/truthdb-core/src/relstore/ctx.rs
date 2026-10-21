@@ -33,6 +33,7 @@ const REL_WAL_ENTRY_VERSION: u16 = 2;
 pub struct PoolIo<'a> {
     pub file: &'a mut DirectFile,
     pub wal: &'a mut WalWriter,
+    pub codec: &'a crate::encryption::PageCodec,
     pub data_offset: u64,
     pub data_pages: u64,
 }
@@ -67,6 +68,10 @@ impl PoolBackend for PoolIo<'_> {
 
     fn flush_wal_to(&mut self, lsn: u64) -> Result<(), StorageError> {
         self.wal.sync_to(lsn)
+    }
+
+    fn codec(&self) -> &crate::encryption::PageCodec {
+        self.codec
     }
 }
 
@@ -393,7 +398,7 @@ impl RelCtx<'_> {
             // A cached frame of the page's previous (freed) use must never be
             // flushed over the blob.
             self.pool.discard(page_no);
-            let image = blob_page_image(lsn, object_id, page_no, chunk);
+            let image = blob_page_image(self.io.codec, lsn, object_id, page_no, chunk);
             self.io.write_page(page_no, &image)?;
         }
         Ok(lsn)
@@ -411,12 +416,10 @@ impl RelCtx<'_> {
     ) -> Result<PageHeader, StorageError> {
         let mut frame = AlignedPageBuf::new();
         self.io.read_page(page_no, &mut frame)?;
+        let opened = self.io.codec.open(page_no, frame.as_mut_slice());
         let bytes = frame.as_slice();
         let header = page::read_header(bytes);
-        if !page::verify_checksum(bytes)
-            || header.page_type != page::PAGE_TYPE_BLOB
-            || header.page_no != page_no
-        {
+        if !opened || header.page_type != page::PAGE_TYPE_BLOB || header.page_no != page_no {
             return Err(StorageError::InvalidFile(format!(
                 "page {page_no} is not a valid blob page"
             )));
@@ -703,16 +706,17 @@ pub(crate) fn apply_redo_to_page(
 }
 
 /// A whole blob page as it goes to disk: header (stamped with `lsn`), the
-/// body bytes, zero padding, checksum. Shared by the write path and redo so
-/// both produce identical pages.
+/// body bytes, zero padding, sealed by `codec`. Shared by the write path and
+/// redo so both produce identical pages.
 pub(crate) fn blob_page_image(
+    codec: &crate::encryption::PageCodec,
     lsn: u64,
     object_id: u32,
     page_no: u64,
     chunk: &[u8],
 ) -> AlignedPageBuf {
-    let mut image = AlignedPageBuf::new();
-    let bytes = image.as_mut_slice();
+    let mut plain = [0u8; crate::storage_layout::PAGE_SIZE];
+    let bytes = plain.as_mut_slice();
     page::write_header(
         bytes,
         &PageHeader {
@@ -724,6 +728,7 @@ pub(crate) fn blob_page_image(
         },
     );
     bytes[page::PAGE_HEADER_SIZE..page::PAGE_HEADER_SIZE + chunk.len()].copy_from_slice(chunk);
-    page::stamp_checksum(bytes);
+    let mut image = AlignedPageBuf::new();
+    codec.seal(page_no, &plain, image.as_mut_slice());
     image
 }

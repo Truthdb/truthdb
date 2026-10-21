@@ -134,6 +134,7 @@ impl StorageFile {
         let mut io = crate::relstore::ctx::PoolIo {
             file: &mut self.file,
             wal: &mut self.wal,
+            codec: &self.codec,
             data_offset: self.layout.data_offset,
             data_pages: self.layout.data_size / crate::storage_layout::PAGE_SIZE as u64,
         };

@@ -9,6 +9,7 @@
 use std::collections::HashMap;
 
 use crate::direct_io::AlignedPageBuf;
+use crate::encryption::PageCodec;
 use crate::relstore::page;
 use crate::storage::StorageError;
 use crate::storage_layout::PAGE_SIZE;
@@ -24,6 +25,8 @@ pub trait PoolBackend {
     fn flushed_lsn(&self) -> u64;
     /// Makes the WAL durable at least up to `lsn`.
     fn flush_wal_to(&mut self, lsn: u64) -> Result<(), StorageError>;
+    /// How pages are protected on disk.
+    fn codec(&self) -> &PageCodec;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +48,8 @@ pub struct BufferPool {
     /// Indices of frames not holding a page (never used, or vacated by a
     /// failed fetch), so misses don't scan the whole frame array.
     free: Vec<usize>,
+    /// A page as it goes to disk: the frame stays as the engine reads it.
+    scratch: AlignedPageBuf,
 }
 
 impl BufferPool {
@@ -67,6 +72,7 @@ impl BufferPool {
             frames,
             table: HashMap::new(),
             clock_hand: 0,
+            scratch: AlignedPageBuf::new(),
         }
     }
 
@@ -113,16 +119,18 @@ impl BufferPool {
         backend: &mut impl PoolBackend,
     ) -> Result<(), StorageError> {
         backend.read_page(page_no, &mut self.frames[index].buf)?;
-        let content = self.frames[index].buf.as_slice();
-        if page::is_zero_page(content) {
+        if page::is_zero_page(self.frames[index].buf.as_slice()) {
             return Ok(());
         }
-        if !page::verify_checksum(content) {
+        if !backend
+            .codec()
+            .open(page_no, self.frames[index].buf.as_mut_slice())
+        {
             return Err(StorageError::InvalidFile(format!(
                 "page {page_no} checksum mismatch"
             )));
         }
-        let header = page::read_header(content);
+        let header = page::read_header(self.frames[index].buf.as_slice());
         if header.page_no != page_no {
             return Err(StorageError::InvalidFile(format!(
                 "page {page_no} identity mismatch: header claims page {}",
@@ -256,8 +264,9 @@ impl BufferPool {
         ))
     }
 
-    /// WAL-before-data write-back: flush the WAL to the page's LSN, stamp
-    /// the page checksum, write the page. The flushed watermark counts
+    /// WAL-before-data write-back: flush the WAL to the page's LSN, seal the
+    /// page (checksum, or encryption and MAC) into the scratch frame, write
+    /// that. The flushed watermark counts
     /// covered bytes, so a record STARTING at the watermark is not durable
     /// yet — hence `>=`.
     fn write_back(
@@ -269,8 +278,13 @@ impl BufferPool {
         if lsn >= backend.flushed_lsn() && lsn > 0 {
             backend.flush_wal_to(lsn)?;
         }
-        page::stamp_checksum(self.frames[index].buf.as_mut_slice());
-        backend.write_page(self.frames[index].page_no, &self.frames[index].buf)?;
+        let page_no = self.frames[index].page_no;
+        backend.codec().seal(
+            page_no,
+            self.frames[index].buf.as_slice(),
+            self.scratch.as_mut_slice(),
+        );
+        backend.write_page(page_no, &self.scratch)?;
         self.frames[index].dirty = false;
         Ok(())
     }
@@ -340,6 +354,10 @@ mod tests {
             self.wal_flush_calls += 1;
             self.flushed_lsn = self.flushed_lsn.max(lsn);
             Ok(())
+        }
+
+        fn codec(&self) -> &PageCodec {
+            &PageCodec::Plain
         }
     }
 

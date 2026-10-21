@@ -156,6 +156,9 @@ fn a_page_that_is_not_a_blob_page_is_refused() {
 
 #[test]
 fn a_blob_ships_to_a_standby() {
+    if super::backups_unsupported() {
+        return;
+    }
     let path = unique_temp_path("blob-standby-src");
     let bak = unique_temp_path("blob-standby-bak");
     let seed = unique_temp_path("blob-standby-seed");
@@ -182,6 +185,9 @@ fn a_blob_ships_to_a_standby() {
 
 #[test]
 fn a_blob_written_after_the_full_backup_restores_from_the_log() {
+    if super::backups_unsupported() {
+        return;
+    }
     let path = unique_temp_path("blob-restore-src");
     let bak = unique_temp_path("blob-restore-bak");
     let log = unique_temp_path("blob-restore-log");
@@ -274,6 +280,9 @@ fn a_blob_write_that_redo_could_not_apply_is_refused_before_it_is_logged() {
 
 #[test]
 fn a_rolled_back_free_does_not_borrow_a_reused_txn_ids_commit() {
+    if super::backups_unsupported() {
+        return;
+    }
     let path = unique_temp_path("blob-txnid-src");
     let bak = unique_temp_path("blob-txnid-bak");
     let log1 = unique_temp_path("blob-txnid-log1");

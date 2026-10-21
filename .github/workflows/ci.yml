@@ -84,6 +84,11 @@ jobs:
       - name: Run tests
         run: cargo test --workspace -- --test-threads=1
 
+      - name: Run the storage suite with every database encrypted
+        run: cargo test -p truthdb-core --lib -- --test-threads=1
+        env:
+          TRUTHDB_TEST_ENCRYPTION: "1"
+
   build:
     name: Build
     runs-on: ubuntu-latest

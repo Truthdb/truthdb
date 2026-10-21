@@ -191,7 +191,7 @@ impl Locked {
         // Phase 1a — snapshot pages + fsync. A failure here may roll the
         // allocation back: nothing references the extent yet.
         let write_data = self
-            .write_data_pages(data_write_offset, data)
+            .write_data_pages(data_write_offset, data, generation)
             .and_then(|()| self.core.file.sync_data().map_err(StorageError::from));
         if let Err(err) = write_data {
             self.core.allocator.free(alloc_start, num_pages);
@@ -287,6 +287,7 @@ impl Locked {
             let mut io = PoolIo {
                 file: &mut self.core.file,
                 wal: &mut self.core.wal,
+                codec: &self.core.codec,
                 data_offset: self.core.layout.data_offset,
                 data_pages: self.core.layout.data_size / PAGE_SIZE as u64,
             };

@@ -127,3 +127,62 @@ fn tds_encryption_from_config_file_is_applied() {
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// Starts the server with `config`, waits until its native port answers and
+/// stops it.
+fn start_and_stop(dir: &Path, config: &str, port: u16) {
+    let config_path = dir.join("truthdb.toml");
+    std::fs::write(&config_path, config).expect("config file");
+    let log_path = dir.join("server.log");
+    let log = std::fs::File::create(&log_path).expect("log file");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_truthdb"))
+        .env("TRUTHDB_CONFIG", &config_path)
+        .stdout(Stdio::from(log.try_clone().expect("clone")))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("spawn server");
+    let deadline = Instant::now() + Duration::from_secs(60);
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        if let Some(status) = child.try_wait().expect("wait") {
+            let output = std::fs::read_to_string(&log_path).unwrap_or_default();
+            panic!("server exited ({status}):\n{output}");
+        }
+        assert!(Instant::now() < deadline, "server never came up");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+#[test]
+fn a_database_created_with_a_master_key_is_encrypted_and_needs_it_to_start() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = test_dir("encryption");
+    let keys = dir.join("master.keys");
+    std::fs::write(&keys, format!("main {}\n", "7e".repeat(32))).expect("key file");
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+    let db = dir.join("truth.db");
+    let port = free_port();
+    let base = format!(
+        "[network]\naddr = \"127.0.0.1\"\nport = {port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n",
+        db.display()
+    );
+    let with_key = format!(
+        "{base}\n[encryption]\nmaster_key_file = \"{}\"\n",
+        keys.display()
+    );
+    start_and_stop(&dir, &with_key, port);
+    let header = std::fs::read(&db).expect("database file");
+    assert_eq!(&header[..8], b"TRUTHDBE");
+    // It starts again with its key, and not without it.
+    start_and_stop(&dir, &with_key, port);
+    let (status, output) = run_server(&dir, &base);
+    assert!(!status.success(), "exit {status}:\n{output}");
+    assert!(output.contains("encrypted"), "{output}");
+    // A key file others can read is refused.
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o644)).expect("chmod");
+    let (status, output) = run_server(&dir, &with_key);
+    assert!(!status.success(), "exit {status}:\n{output}");
+    assert!(output.contains("mode 0600"), "{output}");
+    let _ = std::fs::remove_dir_all(&dir);
+}

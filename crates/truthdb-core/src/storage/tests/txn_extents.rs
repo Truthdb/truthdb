@@ -219,6 +219,9 @@ fn restore_at(dst: &Path, bak: &Path, log: &Path, stop_at: u64) -> Result<(), St
 
 #[test]
 fn a_point_in_time_cut_keeps_frees_committed_after_it() {
+    if super::backups_unsupported() {
+        return;
+    }
     let path = unique_temp_path("txn-extents-pitr");
     let bak = unique_temp_path("txn-extents-pitr-bak");
     let log = unique_temp_path("txn-extents-pitr-log");
@@ -263,6 +266,9 @@ fn a_point_in_time_cut_keeps_frees_committed_after_it() {
 
 #[test]
 fn space_freed_and_reused_after_the_cut_stays_with_its_owner_at_the_cut() {
+    if super::backups_unsupported() {
+        return;
+    }
     let path = unique_temp_path("txn-extents-pitr-reuse");
     let bak = unique_temp_path("txn-extents-pitr-reuse-bak");
     let log = unique_temp_path("txn-extents-pitr-reuse-log");
@@ -310,6 +316,9 @@ fn space_freed_and_reused_after_the_cut_stays_with_its_owner_at_the_cut() {
 
 #[test]
 fn a_stop_point_inside_the_full_backup_is_refused() {
+    if super::backups_unsupported() {
+        return;
+    }
     let path = unique_temp_path("txn-extents-pitr-early");
     let bak = unique_temp_path("txn-extents-pitr-early-bak");
     let log = unique_temp_path("txn-extents-pitr-early-log");
@@ -365,6 +374,9 @@ fn a_savepoint_rollback_cannot_take_back_a_later_free() {
 
 #[test]
 fn a_standby_lands_a_free_when_the_commit_arrives_even_across_a_reopen() {
+    if super::backups_unsupported() {
+        return;
+    }
     let path = unique_temp_path("txn-extents-standby-src");
     let bak = unique_temp_path("txn-extents-standby-bak");
     let seed = unique_temp_path("txn-extents-standby-seed");
@@ -425,6 +437,9 @@ fn a_standby_lands_a_free_when_the_commit_arrives_even_across_a_reopen() {
 
 #[test]
 fn a_restore_that_crashes_before_its_superblock_leaves_a_file_that_does_not_open() {
+    if super::backups_unsupported() {
+        return;
+    }
     let path = unique_temp_path("restore-crash-src");
     let bak = unique_temp_path("restore-crash-bak");
     let dst = unique_temp_path("restore-crash-dst");

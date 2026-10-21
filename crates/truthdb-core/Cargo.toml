@@ -14,6 +14,8 @@ io-uring = { workspace = true }
 # HMAC-SHA256 for the replication handshake. Already in the tree via rustls,
 # so this is a manifest entry only — zero new compiled crates.
 ring = "0.17"
+aes = "0.9"
+xts-mode = "0.6"
 # Mandatory TLS for the Stage 18 replication transport. Same versions/features as
 # truthdb-tds (which cannot be depended on here — it depends on truthdb-core), so
 # the small rustls ServerConfig/ClientConfig build is duplicated in `repl::tls`.
