@@ -81,8 +81,18 @@ jobs:
           path: target
           key: ${{ runner.os }}-target-test-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Show the limits io_uring is charged against
+        run: |
+          ulimit -a
+          grep -E "Cap(Eff|Prm)" /proc/self/status
+          cat /proc/sys/vm/overcommit_memory
+          free -m
+          nproc
+
       - name: Run tests
-        run: cargo test --workspace -- --test-threads=1
+        run: |
+          (while true; do echo "MEM $(date +%T) $(free -m | sed -n 2p)"; sleep 15; done) &
+          cargo test --workspace -- --test-threads=1
 
       - name: Run the storage and engine suites with every database encrypted
         run: >-
