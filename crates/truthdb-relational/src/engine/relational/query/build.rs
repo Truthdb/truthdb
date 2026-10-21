@@ -187,6 +187,7 @@ pub(in crate::engine::relational) fn build_table_source(
         "sys.databases" => sys_databases(storage),
         "sys.dm_repl_replica_states" => sys_dm_repl_replica_states(storage),
         "sys.dm_repl_slots" => sys_dm_repl_slots(storage),
+        "sys.dm_database_encryption_keys" => sys_dm_database_encryption_keys(storage),
         "sys.configurations" => sys_configurations(),
         "sys.views" => sys_views(storage, eval_ctx.database_id),
         "sys.procedures" => sys_procedures(storage, eval_ctx.database_id),

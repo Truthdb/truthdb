@@ -94,3 +94,6 @@ reserved_ratio = 0.17
 #                                               # wrap reads the database key as hex on
 #                                               # stdin and prints its wrapped form;
 #                                               # unwrap reads that and prints the hex key
+# To rotate the master key: put the new key first in the key file (keep the
+# old one), run `encryption rotate master key`, then remove the old key. A
+# backup taken before the rotation still needs the old key to restore.

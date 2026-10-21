@@ -37,6 +37,60 @@ pub(in crate::engine::relational) fn sys_dm_repl_slots(storage: &RelStorage) -> 
     }
 }
 
+/// `sys.dm_database_encryption_keys`: the database's encryption at rest, in
+/// SQL Server's columns. `encryption_state` 1 = unencrypted, 3 = encrypted.
+pub(in crate::engine::relational) fn sys_dm_database_encryption_keys(
+    storage: &RelStorage,
+) -> Source {
+    let columns = vec![
+        int_col("database_id"),
+        int_col("encryption_state"),
+        nvarchar("key_algorithm", 32),
+        int_col("key_length"),
+        nvarchar("encryptor_type", 32),
+        nvarchar("encryptor_thumbprint", 64),
+        nvarchar("key_fingerprint", 32),
+        int_col("percent_complete"),
+    ];
+    let status = storage.encryption_status();
+    let text = |value: Option<String>| value.map_or(Datum::Null, Datum::NVarChar);
+    let row = if status.encrypted {
+        vec![
+            Datum::Int(1),
+            Datum::Int(3),
+            Datum::NVarChar("AES".to_string()),
+            Datum::Int(256),
+            Datum::NVarChar(status.encryptor_type.to_string()),
+            text(status.key_id),
+            text(
+                status
+                    .fingerprint
+                    .map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect()),
+            ),
+            Datum::Int(0),
+        ]
+    } else {
+        vec![
+            Datum::Int(1),
+            Datum::Int(1),
+            Datum::Null,
+            Datum::Null,
+            Datum::NVarChar("NONE".to_string()),
+            Datum::Null,
+            Datum::Null,
+            Datum::Int(0),
+        ]
+    };
+    let collations = vec![None; columns.len()];
+    let qualifiers = vec![None; columns.len()];
+    Source {
+        columns,
+        qualifiers,
+        collations,
+        rows: SourceRows::Materialized(vec![row]),
+    }
+}
+
 /// `sys.dm_repl_replica_states` (Stage 18): this node's replication role and,
 /// on a primary, one row per replication slot with its connection and lag
 /// state; on a standby, one row describing its own applied position.

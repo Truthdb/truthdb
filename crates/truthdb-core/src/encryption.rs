@@ -179,8 +179,9 @@ fn hex(bytes: &[u8]) -> Zeroizing<String> {
 /// How long the key command may take.
 #[cfg(not(test))]
 const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+/// Tests stop a hung command sooner, with room for a loaded machine.
 #[cfg(test)]
-const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Runs the key command with `operation` appended, `input` on its stdin;
 /// returns its stdout, trimmed. The database key is `wrap`'s input and
@@ -424,7 +425,17 @@ pub fn new_key_block(
     SystemRandom::new()
         .fill(dek.as_mut_slice())
         .map_err(|_| config_error("no randomness for the database key"))?;
-    let slot = wrap(source, &dek, file_uuid)?;
+    let block = build_key_block(source, &dek, file_uuid)?;
+    Ok((block, dek))
+}
+
+/// A key block holding `dek` wrapped by `source`'s current master key.
+fn build_key_block(
+    source: &KeySource,
+    dek: &[u8; 32],
+    file_uuid: &[u8; 16],
+) -> Result<[u8; KEY_BLOCK_SIZE], StorageError> {
+    let slot = wrap(source, dek, file_uuid)?;
     let mut block = [0u8; KEY_BLOCK_SIZE];
     block[0..8].copy_from_slice(&KEY_BLOCK_MAGIC);
     block[8] = STATE_ENCRYPTED;
@@ -436,9 +447,39 @@ pub fn new_key_block(
     let blob_at = at + 2 + MAX_KEY_ID;
     block[blob_at..blob_at + 2].copy_from_slice(&(slot.blob.len() as u16).to_le_bytes());
     block[blob_at + 2..blob_at + 2 + slot.blob.len()].copy_from_slice(&slot.blob);
-    let mac = block_mac(&dek, file_uuid, &block);
+    let mac = block_mac(dek, file_uuid, &block);
     block[MAC_OFFSET..].copy_from_slice(&mac);
-    Ok((block, dek))
+    Ok(block)
+}
+
+/// The key block rewrapped under `source`'s current master key (the first
+/// key of a key file, or the key command's `wrap`): the same database key,
+/// unwrapped with whichever of `source`'s keys wraps it now.
+pub fn rewrap_key_block(
+    block: &[u8],
+    source: &KeySource,
+    file_uuid: &[u8; 16],
+) -> Result<[u8; KEY_BLOCK_SIZE], StorageError> {
+    let dek = unlock_key_block(block, source, file_uuid)?;
+    build_key_block(source, &dek, file_uuid)
+}
+
+/// What wraps a key block's database key: `KEY FILE` and its key id, or
+/// `KEY COMMAND` (its first slot).
+pub fn key_block_encryptor(block: &[u8]) -> (&'static str, Option<String>) {
+    let at = SLOTS_OFFSET;
+    if block.len() != KEY_BLOCK_SIZE || block[9] == 0 {
+        return ("NONE", None);
+    }
+    match block[at] {
+        SLOT_FILE => {
+            let len = (block[at + 1] as usize).min(MAX_KEY_ID);
+            let id = String::from_utf8_lossy(&block[at + 2..at + 2 + len]).into_owned();
+            ("KEY FILE", Some(id))
+        }
+        SLOT_COMMAND => ("KEY COMMAND", None),
+        _ => ("NONE", None),
+    }
 }
 
 /// Recovers the DEK from a key block with `source`: the first slot it

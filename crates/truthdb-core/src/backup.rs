@@ -125,6 +125,9 @@ pub struct BackupHeader {
 pub struct KeyRecord {
     pub file_uuid: [u8; 16],
     pub key_block: Vec<u8>,
+    /// The database key's fingerprint: what identifies the key across a
+    /// master key rotation (which rewraps it, changing the block).
+    pub fingerprint: [u8; 16],
 }
 
 impl BackupHeader {
@@ -169,6 +172,7 @@ impl BackupHeader {
                 out.extend_from_slice(&(keys.key_block.len() as u32).to_le_bytes());
                 out.extend_from_slice(&keys.file_uuid);
                 out.extend_from_slice(&keys.key_block);
+                out.extend_from_slice(&keys.fingerprint);
             }
             None => out.extend_from_slice(&0u32.to_le_bytes()),
         }
@@ -234,9 +238,11 @@ impl BackupHeader {
             }
             if len > 0 {
                 let file_uuid = cursor.take(16)?.try_into().expect("16 bytes");
+                let key_block = cursor.take(len)?.to_vec();
                 keys = Some(KeyRecord {
                     file_uuid,
-                    key_block: cursor.take(len)?.to_vec(),
+                    key_block,
+                    fingerprint: cursor.take(16)?.try_into().expect("16 bytes"),
                 });
             }
         }
@@ -585,6 +591,7 @@ mod tests {
         let keys = KeyRecord {
             file_uuid: [9; 16],
             key_block: vec![5; crate::encryption::KEY_BLOCK_SIZE],
+            fingerprint: [4; 16],
         };
         let header = BackupHeader {
             keys: Some(keys.clone()),

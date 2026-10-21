@@ -1,5 +1,6 @@
 mod backup_restore;
 mod coordinator;
+mod encryption;
 mod fulltext;
 mod objects;
 mod recovery;

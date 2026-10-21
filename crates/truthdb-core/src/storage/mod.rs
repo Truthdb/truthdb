@@ -30,6 +30,7 @@ mod backup_restore;
 mod checkpoint;
 mod durability;
 mod lifecycle;
+pub use lifecycle::EncryptionStatus;
 mod participant;
 mod recovery;
 mod replication;
@@ -296,6 +297,9 @@ pub struct StorageFile {
     /// An encrypted database's file uuid and key block, which its backups
     /// carry (their pages and log are copied as stored).
     key_record: Option<crate::backup::KeyRecord>,
+    /// Where the master key comes from (as opened or created), for a master
+    /// key rotation.
+    key_source: Option<crate::encryption::KeySource>,
 }
 
 /// Which keys a new file gets.
