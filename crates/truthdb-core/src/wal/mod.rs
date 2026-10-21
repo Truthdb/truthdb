@@ -67,6 +67,8 @@ pub struct WalWriter {
     /// An encrypted database's: this writer's key, under which every entry it
     /// appends is sealed.
     sealer: Option<crate::encryption::WalSealer>,
+    /// Test hook: the next fsync fails, as a dying disk's would.
+    fail_next_sync: bool,
 }
 
 impl WalWriter {
@@ -105,6 +107,7 @@ impl WalWriter {
             bytes_since_superblock: 0,
             superblock_interval: SUPERBLOCK_REWRITE_INTERVAL,
             sealer,
+            fail_next_sync: false,
         })
     }
 
@@ -134,6 +137,13 @@ impl WalWriter {
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn poison(&mut self) {
         self.poisoned = true;
+    }
+
+    /// Test hook: the next [`WalWriter::sync_all`] that has log to flush
+    /// fails.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next_sync(&mut self) {
+        self.fail_next_sync = true;
     }
 
     /// Test hook: shrink the lazy-superblock cadence so it can be exercised
@@ -231,6 +241,11 @@ impl WalWriter {
     /// Fsyncs everything appended so far.
     pub fn sync_all(&mut self) -> Result<(), StorageError> {
         if self.flushed < self.tail() {
+            if std::mem::take(&mut self.fail_next_sync) {
+                return Err(StorageError::Io(std::io::Error::other(
+                    "injected fsync failure",
+                )));
+            }
             self.file.sync_data()?;
             self.flushed = self.tail();
         }

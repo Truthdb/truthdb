@@ -412,6 +412,70 @@ fn a_checkpoint_snapshot_on_freed_tree_pages_is_never_overwritten() {
     std::fs::remove_file(&path).ok();
 }
 
+fn raw_pages(path: &Path, storage: &Storage, pages: &[u64]) -> Vec<Vec<u8>> {
+    use std::os::unix::fs::FileExt;
+    let data_offset = storage.lock().layout.data_offset;
+    let file = std::fs::File::open(path).expect("open raw");
+    pages
+        .iter()
+        .map(|&page| {
+            let mut buf = vec![0u8; PAGE_SIZE];
+            file.read_exact_at(&mut buf, data_offset + page * PAGE_SIZE as u64)
+                .expect("read raw page");
+            buf
+        })
+        .collect()
+}
+
+#[test]
+fn a_checkpoint_writes_no_snapshot_over_pages_whose_free_is_not_yet_durable() {
+    let path = unique_temp_path("btree-free-snapshot-unsynced");
+    let storage = create(&path);
+    let tree = create_tree(&storage);
+    insert(&storage, &tree, 0..3000);
+    checkpoint(&storage);
+    let in_use: Vec<u64> = {
+        let guard = storage.lock();
+        (0..guard.data_pages())
+            .filter(|&page| guard.is_page_allocated(page))
+            .collect()
+    };
+    // Committed but not yet forced: a power loss would lose these frees,
+    // and the tree would still link the pages.
+    {
+        let mut guard = storage.lock();
+        let txn_id = guard.alloc_txn_id();
+        let mut ctx = guard.page_ctx(0);
+        let mut txn = ctx.begin(txn_id).expect("begin");
+        for n in 0..2900 {
+            tree.delete(&mut ctx, &mut OpMode::Txn(&mut txn), &key(n))
+                .expect("delete");
+        }
+        ctx.commit(txn).expect("commit");
+    }
+    let freed: Vec<u64> = {
+        let guard = storage.lock();
+        in_use
+            .iter()
+            .copied()
+            .filter(|&page| !guard.is_page_allocated(page))
+            .collect()
+    };
+    assert!(freed.len() > 10);
+    let before = raw_pages(&path, &storage, &freed);
+    steer_allocations_to(&storage, &freed);
+    storage.lock().wal.fail_next_sync();
+    storage
+        .write_checkpoint(&vec![0x5A; 3 * 4096], 1, 2, 1)
+        .expect_err("the log could not be forced");
+    assert!(
+        raw_pages(&path, &storage, &freed) == before,
+        "the snapshot was written over pages the durable log still links"
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
 #[test]
 fn redo_skips_pages_freed_later_in_the_log() {
     let path = unique_temp_path("btree-free-redo");
