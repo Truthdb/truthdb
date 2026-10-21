@@ -425,8 +425,15 @@ impl Storage {
     /// key of the key file, or the key command's `wrap`), keeping the key
     /// itself: the pages, log, backups and standbys are unaffected. The key
     /// file may then drop the key it replaced.
+    ///
+    /// The rewrap (which may run a key command, a KMS round trip) happens
+    /// without the storage lock; the write checks the key block is still the
+    /// one rewrapped.
     pub fn rotate_master_key(&self) -> Result<(), StorageError> {
-        self.lock().rotate_master_key()
+        let (header, source) = self.lock().header_to_rotate()?;
+        let block =
+            crate::encryption::rewrap_key_block(header.key_block(), &source, &header.file_uuid)?;
+        self.lock().write_key_block(header.key_block(), &block)
     }
 
     /// The database's encryption at rest, as `encryption status` and
@@ -617,14 +624,26 @@ thread_local! {
 }
 
 impl StorageFile {
-    /// See [`Storage::rotate_master_key`]. The new header goes to its copy in
-    /// the last page first, then to the header page, each made durable: a
-    /// crash leaves the old block or the new, and both unwrap the same key.
-    fn rotate_master_key(&mut self) -> Result<(), StorageError> {
+    /// The file header as it is on disk, checked.
+    fn header_on_disk(&mut self) -> Result<FileHeader, StorageError> {
         let mut bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
         self.file.read_exact_at(0, &mut bytes)?;
-        let mut header = FileHeader::from_le_bytes(&bytes);
-        if !header.is_encrypted() || header.header_checksum != header.compute_checksum() {
+        let header = FileHeader::from_le_bytes(&bytes);
+        if header.header_checksum != header.compute_checksum() {
+            return Err(StorageError::InvalidFile(
+                "the file header is damaged (its copy restores it at the next open)".to_string(),
+            ));
+        }
+        Ok(header)
+    }
+
+    /// The header of an encrypted database and its master key source, for a
+    /// rotation.
+    fn header_to_rotate(
+        &mut self,
+    ) -> Result<(FileHeader, crate::encryption::KeySource), StorageError> {
+        let header = self.header_on_disk()?;
+        if !header.is_encrypted() {
             return Err(StorageError::InvalidConfig(
                 "this database is not encrypted: it has no master key to rotate".to_string(),
             ));
@@ -632,9 +651,23 @@ impl StorageFile {
         let source = self.key_source.clone().ok_or_else(|| {
             StorageError::InvalidConfig("no master key is configured".to_string())
         })?;
-        let block =
-            crate::encryption::rewrap_key_block(header.key_block(), &source, &header.file_uuid)?;
-        header.set_key_block(&block);
+        Ok((header, source))
+    }
+
+    /// Replaces the key block `old` by `block`. The new header goes to its
+    /// copy in the last page first, then to the header page, each made
+    /// durable: a crash leaves the old block or the new, and both unwrap the
+    /// same key. Refused if the block is no longer `old` (another rotation
+    /// ran meanwhile).
+    fn write_key_block(&mut self, old: &[u8], block: &[u8]) -> Result<(), StorageError> {
+        let mut header = self.header_on_disk()?;
+        if header.key_block() != old {
+            return Err(StorageError::InvalidConfig(
+                "the key block changed during the rotation (another rotation ran): retry"
+                    .to_string(),
+            ));
+        }
+        header.set_key_block(block);
         header.header_checksum = header.compute_checksum();
         let out = header.to_le_bytes_with_checksum();
         let end = layout_end(&header).ok_or_else(|| {

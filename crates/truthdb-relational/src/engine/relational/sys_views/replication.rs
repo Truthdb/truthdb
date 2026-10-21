@@ -39,8 +39,10 @@ pub(in crate::engine::relational) fn sys_dm_repl_slots(storage: &RelStorage) -> 
 
 /// `sys.dm_database_encryption_keys`: the database's encryption at rest, in
 /// SQL Server's columns. `encryption_state` 1 = unencrypted, 3 = encrypted.
+/// Every database of the file shares it; the row names the current one.
 pub(in crate::engine::relational) fn sys_dm_database_encryption_keys(
     storage: &RelStorage,
+    database_id: u32,
 ) -> Source {
     let columns = vec![
         int_col("database_id"),
@@ -56,7 +58,7 @@ pub(in crate::engine::relational) fn sys_dm_database_encryption_keys(
     let text = |value: Option<String>| value.map_or(Datum::Null, Datum::NVarChar);
     let row = if status.encrypted {
         vec![
-            Datum::Int(1),
+            Datum::Int(database_id as i32),
             Datum::Int(3),
             Datum::NVarChar("AES".to_string()),
             Datum::Int(256),
@@ -71,7 +73,7 @@ pub(in crate::engine::relational) fn sys_dm_database_encryption_keys(
         ]
     } else {
         vec![
-            Datum::Int(1),
+            Datum::Int(database_id as i32),
             Datum::Int(1),
             Datum::Null,
             Datum::Null,
