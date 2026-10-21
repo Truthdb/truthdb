@@ -350,6 +350,10 @@ async fn start_replication(
     use truthdb_core::repl::listener::{PrimaryReplContext, run_repl_listener};
     use truthdb_core::repl::receiver::{ReceiverConfig, run_standby_receiver};
 
+    // The log does not carry encryption yet: it would ship in clear.
+    if storage.is_encrypted() {
+        return Err("replication of an encrypted database is not supported yet".to_string());
+    }
     let cluster_uuid = cfg.cluster_uuid_bytes()?;
     if cfg.heartbeat_ms == 0 {
         return Err("replication.heartbeat_ms must be greater than 0".to_string());
