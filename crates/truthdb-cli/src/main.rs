@@ -107,10 +107,10 @@ struct KeyArgs {
     /// The master key file (lines `<id> <64 hex digits>`; mode 0600).
     #[arg(long, conflicts_with = "key_command")]
     key_file: Option<std::path::PathBuf>,
-    /// The key command, then its arguments: one per `--key-command` (use
-    /// `--key-command=-x` for an argument starting with `-`). It is run with
+    /// The key command, then its arguments: one per `--key-command` (write
+    /// an argument starting with `-` as `--key-command=-x`). It is run with
     /// `wrap` or `unwrap` appended.
-    #[arg(long = "key-command", allow_hyphen_values = true)]
+    #[arg(long = "key-command")]
     key_command: Vec<String>,
 }
 

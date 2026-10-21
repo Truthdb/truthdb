@@ -451,10 +451,14 @@ pub(crate) fn zero_ring_range(
 /// timeline identifiers (out of scope for Stage 1; this only follows an
 /// already-violated durability assumption).
 ///
-/// With `keys` (an encrypted database) every entry must be sealed and
-/// open under them, and its payload comes back opened (the version without
-/// the sealed bit); without, a sealed entry is not accepted. An entry that
-/// fails either way ends the log, like one that fails its checksum.
+/// With `keys` (an encrypted database) every entry must be sealed, open
+/// under them and name its own position, and its payload comes back opened
+/// (the version without the sealed bit); without, a sealed entry is not
+/// accepted. Past the trusted tail an entry that fails ends the log, like one
+/// that fails its checksum; below it, in an encrypted database, the scan
+/// returns an error instead: the durable log was changed. (This holds below
+/// an untampered superblock tail: superblocks carry a checksum, not a MAC, so
+/// lowering the recorded tail turns a refusal back into the end of the log.)
 pub(crate) fn scan_ring(
     file: &mut DirectFile,
     ring_offset: u64,
@@ -514,7 +518,25 @@ pub(crate) fn scan_ring(
         let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
         file.read_exact_at(file_pos, &mut header_bytes)?;
         if header_bytes.iter().all(|b| *b == 0) {
-            // Wrap gap: writer zero-fills to the lap end before wrapping.
+            // Wrap gap: writer zero-fills to the lap end before wrapping. Where
+            // an encrypted database's log was durable, a gap is only the
+            // writer's: zero to the lap end, with entries after it (the tail
+            // is recorded after the entry that followed the gap).
+            if trusted && keys.is_some() {
+                if trusted_tail <= cursor + bytes_to_lap_end {
+                    stop!("is zeroed where the log ends");
+                }
+                let mut rest = vec![0u8; bytes_to_lap_end.min(1 << 20) as usize];
+                let mut at = 0u64;
+                while at < bytes_to_lap_end {
+                    let len = (bytes_to_lap_end - at).min(rest.len() as u64) as usize;
+                    file.read_exact_at(file_pos + at, &mut rest[..len])?;
+                    if rest[..len].iter().any(|b| *b != 0) {
+                        stop!("is zeroed but its lap is not");
+                    }
+                    at += len as u64;
+                }
+            }
             if !trusted {
                 pending_gap_start.get_or_insert(cursor);
             }

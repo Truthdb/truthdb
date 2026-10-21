@@ -86,8 +86,10 @@ fn reject(primary_epoch: u64, message: &str) -> HelloAck {
 
 /// Authenticates and fences a standby's [`Hello`], returning the [`HelloAck`] to
 /// send back. The shared-secret proof is verified FIRST (constant-time), so an
-/// unauthenticated peer learns nothing about the version / cluster / epoch state
-/// (every pre-auth failure is one generic rejection).
+/// unauthenticated peer learns nothing about the cluster / epoch state (every
+/// pre-auth failure is one generic rejection). The protocol version, which is
+/// public, is answered before this, by `serve_handshake`: a peer of another
+/// version cannot decode or sign this version's Hello.
 pub fn evaluate_hello(hello: &Hello, params: &HandshakeParams) -> HelloAck {
     // An empty shared secret is a misconfiguration that fails OPEN — anyone could
     // compute `compute_auth(b"", …)`. Fail closed. (Config load should also

@@ -846,3 +846,97 @@ fn a_changed_byte_where_the_log_was_durable_refuses_the_open() {
     }
     std::fs::remove_file(&keys).ok();
 }
+
+#[test]
+fn a_zeroed_entry_header_where_the_log_was_durable_refuses_the_open() {
+    use crate::storage_layout::{WAL_ENTRY_HEADER_SIZE, WAL_ENTRY_TYPE_RECORD};
+    use std::os::unix::fs::FileExt;
+    let keys = key_file("enc-zeroed-keys", &format!("main {}\n", "a8".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let path = unique_temp_path("enc-zeroed");
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    storage.lock().wal.set_superblock_interval(1);
+    let mut lsns = Vec::new();
+    for seq in 1..=4u64 {
+        lsns.push(
+            storage
+                .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, seq, &[seq as u8; 100])
+                .expect("append"),
+        );
+    }
+    let (wal_offset, wal_size) = {
+        let guard = storage.lock();
+        (guard.layout.wal_offset, guard.layout.wal_size)
+    };
+    drop(storage);
+    // The second entry's header zeroed: it would pass for a wrap gap.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|file| {
+            file.write_all_at(
+                &[0u8; WAL_ENTRY_HEADER_SIZE],
+                wal_offset + lsns[1] % wal_size,
+            )
+        })
+        .expect("zero header");
+    let Err(err) = Storage::open_with_keys(path.clone(), no_engine, Some(&source)) else {
+        panic!("a zeroed durable entry header was taken for a wrap gap");
+    };
+    assert!(err.to_string().contains("does not verify"), "{err}");
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_standby_backup_after_a_failed_apply_restores() {
+    let keys = key_file(
+        "enc-failed-apply-keys",
+        &format!("main {}\n", "b9".repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    let [path, bak, seed, bak2, dst] = [
+        "enc-failed-apply",
+        "enc-failed-apply-bak",
+        "enc-failed-apply-seed",
+        "enc-failed-apply-bak2",
+        "enc-failed-apply-dst",
+    ]
+    .map(unique_temp_path);
+    let primary = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    let summary = primary.backup_full(&bak).expect("backup");
+    fill(&primary, 200);
+    let delta = primary
+        .read_wal_range(summary.backup_end_lsn, primary.wal_flushed_lsn())
+        .expect("ship");
+    drop(primary);
+    Storage::restore_with_keys(&seed, &bak, &[], None, true, no_engine, Some(&source))
+        .expect("standby seed");
+    let standby = Storage::open_with_keys(seed.clone(), no_engine, Some(&source)).expect("open");
+    // A range cut mid-entry: the apply seeds the ring, then fails to decode.
+    assert!(
+        standby
+            .apply_wal_stream(summary.backup_end_lsn, &delta[..delta.len() / 2 + 3])
+            .is_err()
+    );
+    standby.backup_full(&bak2).expect("backup on the standby");
+    drop(standby);
+    Storage::restore_with_keys(&dst, &bak2, &[], None, false, no_engine, Some(&source))
+        .expect("the standby's backup restores");
+    for file in [&path, &bak, &seed, &bak2, &dst, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
