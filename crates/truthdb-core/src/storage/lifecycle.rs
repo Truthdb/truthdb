@@ -199,10 +199,10 @@ impl Storage {
     }
 
     /// Wraps an opened/created [`StorageFile`] in a `Storage`, spawning the
-    /// group-commit log-writer over its own handle on the WAL file.
+    /// group-commit log-writer over a duplicated WAL fd.
     pub(super) fn with_log_writer(path: PathBuf, file: Locked) -> Result<Self, StorageError> {
-        let wal_fd = file.reopen_wal_file()?;
-        let (gc, log_writer) = GroupCommit::start(wal_fd);
+        let wal_fd = file.try_clone_wal_fd()?;
+        let (gc, log_writer) = GroupCommit::start(wal_fd, file.wal.sync_gate());
         Ok(Storage {
             path,
             inner: std::sync::Mutex::new(file),
@@ -696,9 +696,9 @@ impl StorageFile {
         self.wal.tail()
     }
 
-    /// Opens the WAL file again for the group-commit log-writer.
-    pub(super) fn reopen_wal_file(&self) -> Result<std::fs::File, StorageError> {
-        Ok(self.wal.reopen_file()?)
+    /// Duplicates the WAL file descriptor for the group-commit log-writer.
+    pub(super) fn try_clone_wal_fd(&self) -> Result<std::fs::File, StorageError> {
+        Ok(self.wal.try_clone_file()?)
     }
 
     pub(super) fn open_existing(

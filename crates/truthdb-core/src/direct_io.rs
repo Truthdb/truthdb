@@ -328,19 +328,13 @@ mod imp {
             Ok(())
         }
 
-        /// Opens the underlying file again as a plain [`std::fs::File`] — used
+        /// Duplicates the underlying file descriptor as a plain [`std::fs::File`]
+        /// (same open file description). The clone shares the file, so an
+        /// `fdatasync` on it flushes every write made through this handle — used
         /// by the group-commit log-writer to fsync the WAL off the storage lock,
-        /// without touching this handle's io_uring ring. An `fdatasync` on it
-        /// flushes every write made through this handle. It is a new open file
-        /// description (through /proc/self/fd, so no path lookup), not a
-        /// duplicate: Linux reports a writeback error once per open file
-        /// description, so a duplicate whose fsync saw the error first would
-        /// let this handle's next fsync succeed over writes that were lost.
-        pub fn reopen_std(&self) -> io::Result<std::fs::File> {
-            OpenOptions::new()
-                .read(true)
-                .write(true)
-                .open(format!("/proc/self/fd/{}", self.file.as_raw_fd()))
+        /// without touching this handle's io_uring ring.
+        pub fn try_clone_std(&self) -> io::Result<std::fs::File> {
+            self.file.try_clone()
         }
 
         pub fn read_page_into(
@@ -602,51 +596,6 @@ mod imp {
             _ => err,
         }
     }
-
-    #[cfg(test)]
-    mod tests {
-        use super::*;
-
-        fn status_flags(fd: i32) -> i32 {
-            unsafe { libc::fcntl(fd, libc::F_GETFL) }
-        }
-
-        /// File status flags belong to the open file description, so a
-        /// handle that shares the description (a duplicate) sees a flag set
-        /// through the other; so would a writeback error, reported once.
-        #[test]
-        fn the_reopened_handle_is_its_own_open_file_description() {
-            let path = std::env::temp_dir().join(format!(
-                "truthdb-reopen-{}-{}",
-                std::process::id(),
-                std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap()
-                    .as_nanos()
-            ));
-            let mut file =
-                DirectFile::create_new(path.clone(), 2 * PAGE_SIZE as u64).expect("create");
-            let reopened = file.reopen_std().expect("reopen");
-            let fd = reopened.as_raw_fd();
-            assert_eq!(
-                unsafe { libc::fcntl(fd, libc::F_SETFL, status_flags(fd) | libc::O_APPEND) },
-                0
-            );
-            assert_eq!(
-                status_flags(file.file.as_raw_fd()) & libc::O_APPEND,
-                0,
-                "the handle shares the log writer's open file description"
-            );
-            // The same file: a write through one is read through the other.
-            file.write_all_at(0, &[7u8; PAGE_SIZE]).expect("write");
-            let mut byte = [0u8; 1];
-            std::os::unix::fs::FileExt::read_exact_at(&reopened, &mut byte, 100).expect("read");
-            assert_eq!(byte, [7]);
-            drop(reopened);
-            drop(file);
-            std::fs::remove_file(&path).ok();
-        }
-    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -697,7 +646,7 @@ mod imp {
             Err(io::Error::other("truthdb storage requires Linux io_uring"))
         }
 
-        pub fn reopen_std(&self) -> io::Result<std::fs::File> {
+        pub fn try_clone_std(&self) -> io::Result<std::fs::File> {
             Err(io::Error::other("truthdb storage requires Linux io_uring"))
         }
 

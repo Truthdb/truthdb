@@ -29,6 +29,51 @@ use log_buffer::LogBuffer;
 /// append.
 pub(crate) const SUPERBLOCK_REWRITE_INTERVAL: u64 = 16 * MIB;
 
+/// Every fsync of the log goes through here: the writer's own and the
+/// group-commit log-writer's (another handle on the same file). After one
+/// fails, every later one fails too. A failed fsync is reported only to the
+/// call that made it (a failed device cache flush is never reported again,
+/// and a writeback error once per open file description), so a later fsync
+/// that succeeds says nothing about the log written before it. The lock
+/// spans the fsync, so none starts between a failure and its record.
+#[derive(Default)]
+pub struct LogSyncGate {
+    failed: std::sync::Mutex<bool>,
+    /// Test hook: the next fsync fails, as a dying disk's would.
+    fail_next: std::sync::atomic::AtomicBool,
+}
+
+impl LogSyncGate {
+    pub fn sync(&self, fsync: impl FnOnce() -> std::io::Result<()>) -> Result<(), StorageError> {
+        let mut failed = self.failed.lock().unwrap_or_else(|err| err.into_inner());
+        if *failed {
+            return Err(StorageError::InvalidFile(
+                "an fsync of the log failed earlier; restart to recover".to_string(),
+            ));
+        }
+        let result = if self
+            .fail_next
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            Err(std::io::Error::other("injected fsync failure"))
+        } else {
+            fsync()
+        };
+        if let Err(err) = result {
+            *failed = true;
+            return Err(err.into());
+        }
+        Ok(())
+    }
+
+    /// Test hook: the next fsync through the gate fails.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next(&self) {
+        self.fail_next
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct WalRecord {
     pub entry_type: u16,
@@ -67,8 +112,8 @@ pub struct WalWriter {
     /// An encrypted database's: this writer's key, under which every entry it
     /// appends is sealed.
     sealer: Option<crate::encryption::WalSealer>,
-    /// Test hook: the next fsync fails, as a dying disk's would.
-    fail_next_sync: bool,
+    /// Shared with the group-commit log-writer.
+    sync_gate: std::sync::Arc<LogSyncGate>,
 }
 
 impl WalWriter {
@@ -107,7 +152,7 @@ impl WalWriter {
             bytes_since_superblock: 0,
             superblock_interval: SUPERBLOCK_REWRITE_INTERVAL,
             sealer,
-            fail_next_sync: false,
+            sync_gate: Default::default(),
         })
     }
 
@@ -139,11 +184,16 @@ impl WalWriter {
         self.poisoned = true;
     }
 
-    /// Test hook: the next [`WalWriter::sync_all`] that has log to flush
-    /// fails.
+    /// Test hook: the next fsync of the log fails.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_sync(&mut self) {
-        self.fail_next_sync = true;
+        self.sync_gate.fail_next();
+    }
+
+    /// The gate every fsync of the log goes through, for the group-commit
+    /// log-writer.
+    pub fn sync_gate(&self) -> std::sync::Arc<LogSyncGate> {
+        std::sync::Arc::clone(&self.sync_gate)
     }
 
     /// Test hook: shrink the lazy-superblock cadence so it can be exercised
@@ -197,11 +247,10 @@ impl WalWriter {
         &mut self.file
     }
 
-    /// Opens the log file again as a plain [`std::fs::File`] (see
-    /// [`DirectFile::reopen_std`]), for the group-commit log-writer to fsync
-    /// off the storage lock.
-    pub fn reopen_file(&self) -> std::io::Result<std::fs::File> {
-        self.file.reopen_std()
+    /// Duplicates the log file descriptor as a plain [`std::fs::File`], for the
+    /// group-commit log-writer to fsync off the storage lock.
+    pub fn try_clone_file(&self) -> std::io::Result<std::fs::File> {
+        self.file.try_clone_std()
     }
 
     /// True once enough bytes have been appended since the last superblock
@@ -242,12 +291,8 @@ impl WalWriter {
     /// Fsyncs everything appended so far.
     pub fn sync_all(&mut self) -> Result<(), StorageError> {
         if self.flushed < self.tail() {
-            if std::mem::take(&mut self.fail_next_sync) {
-                return Err(StorageError::Io(std::io::Error::other(
-                    "injected fsync failure",
-                )));
-            }
-            self.file.sync_data()?;
+            let file = &mut self.file;
+            self.sync_gate.sync(|| file.sync_data())?;
             self.flushed = self.tail();
         }
         Ok(())
@@ -407,7 +452,8 @@ impl WalWriter {
             }
         }
         if sync {
-            self.file.sync_data()?;
+            let file = &mut self.file;
+            self.sync_gate.sync(|| file.sync_data())?;
             self.flushed = self.tail();
         }
 

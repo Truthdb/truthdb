@@ -3,7 +3,7 @@
 //! A committing transaction appends its commit record to the WAL *without*
 //! fsyncing, then calls [`GroupCommit::ensure_durable`] with the WAL tail past
 //! its commit record and blocks on a `flushed` watermark. A dedicated
-//! log-writer thread fsyncs the WAL — through its own handle on the file, so
+//! log-writer thread fsyncs the WAL — through a duplicated file descriptor, so
 //! it never touches the storage lock — and advances the watermark, waking every
 //! committer the fsync covered. One fsync thus makes every commit that landed
 //! in the window durable, instead of one fsync per commit.
@@ -20,6 +20,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
 use crate::storage::StorageError;
+use crate::wal::LogSyncGate;
 
 struct State {
     /// Highest WAL tail any committer is waiting to have fsynced.
@@ -51,9 +52,12 @@ pub(crate) struct GroupCommit {
 }
 
 impl GroupCommit {
-    /// Spawns the log-writer thread over its own handle on the WAL file and
+    /// Spawns the log-writer thread over a duplicated WAL file descriptor and
     /// returns the shared coordinator plus the thread's join handle.
-    pub(crate) fn start(wal_fd: File) -> (Arc<GroupCommit>, JoinHandle<()>) {
+    pub(crate) fn start(
+        wal_fd: File,
+        sync_gate: Arc<LogSyncGate>,
+    ) -> (Arc<GroupCommit>, JoinHandle<()>) {
         let gc = Arc::new(GroupCommit {
             state: Mutex::new(State {
                 requested: 0,
@@ -69,7 +73,7 @@ impl GroupCommit {
         let writer_gc = Arc::clone(&gc);
         let writer = std::thread::Builder::new()
             .name("truthdb-log-writer".to_string())
-            .spawn(move || writer_gc.log_writer_loop(wal_fd))
+            .spawn(move || writer_gc.log_writer_loop(wal_fd, &sync_gate))
             .expect("spawn log-writer thread");
         (gc, writer)
     }
@@ -140,7 +144,7 @@ impl GroupCommit {
             .fsyncs
     }
 
-    fn log_writer_loop(&self, wal_fd: File) {
+    fn log_writer_loop(&self, wal_fd: File, sync_gate: &LogSyncGate) {
         let mut state = self.state.lock().expect("group-commit state poisoned");
         loop {
             while !state.shutdown && !state.failed && state.requested <= state.flushed {
@@ -156,7 +160,7 @@ impl GroupCommit {
             // so committers keep appending and registering while it runs.
             let target = state.requested;
             drop(state);
-            let result = wal_fd.sync_data();
+            let result = sync_gate.sync(|| wal_fd.sync_data());
             state = self.state.lock().expect("group-commit state poisoned");
             state.fsyncs += 1;
             match result {
