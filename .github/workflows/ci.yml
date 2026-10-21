@@ -84,6 +84,50 @@ jobs:
       - name: Run tests
         run: cargo test --workspace -- --test-threads=1
 
+      # Backups (and so standbys) of an encrypted database are refused until
+      # they carry its key block: the tests that take one are skipped here
+      # (by exact name) until then.
+      - name: Run the storage and engine suites with every database encrypted
+        run: |
+          cargo test -p truthdb-core -p truthdb-relational -p truthdb-engine \
+          -p truthdb-object -p truthdb-fulltext -p truthdb-vector \
+          -- --test-threads=1 --exact \
+          --skip engine::tests::backup_restore::a_failed_backup_leaves_the_database_writable_and_backuppable \
+          --skip engine::tests::backup_restore::backup_database_statement_backs_up_and_restores \
+          --skip engine::tests::backup_restore::backup_log_ships_the_log_advances_the_marker_and_chains \
+          --skip engine::tests::backup_restore::backup_under_concurrent_write_load_restores_to_a_consistent_prefix \
+          --skip engine::tests::backup_restore::full_backup_and_offline_restore_round_trips_relational_data \
+          --skip engine::tests::backup_restore::full_recovery_holds_the_log_until_backup_log \
+          --skip engine::tests::backup_restore::log_backup_marker_and_hold_survive_reopen \
+          --skip engine::tests::backup_restore::point_in_time_restore_refuses_a_stop_point_before_a_checkpointed_backup \
+          --skip engine::tests::backup_restore::point_in_time_restore_refuses_a_stop_point_inside_the_full_backup \
+          --skip engine::tests::backup_restore::point_in_time_restore_stops_at_a_commit_timestamp \
+          --skip engine::tests::backup_restore::restore_full_plus_log_chain_recovers_post_backup_changes \
+          --skip engine::tests::backup_restore::restore_inspect_verbs_read_a_backup_without_restoring \
+          --skip engine::tests::backup_restore::restore_verifyonly_rejects_a_corrupt_or_missing_backup \
+          --skip engine::tests::backup_restore::restoring_a_full_recovery_database_opens_and_checkpoints_cleanly \
+          --skip engine::tests::replication::readable_standby::a_readable_standby_serves_only_committed_state \
+          --skip engine::tests::replication::readable_standby::readable_standby_handles_heap_cells_and_statement_rollbacks \
+          --skip engine::tests::replication::readable_standby::replication_dmvs_report_slots_lag_and_role \
+          --skip engine::tests::replication::restartpoints::a_failed_apply_never_feeds_a_restartpoint \
+          --skip engine::tests::replication::restartpoints::a_full_model_standby_still_reclaims_and_refuses_backup_log \
+          --skip engine::tests::replication::restartpoints::a_standby_reopen_is_redo_only_and_keeps_in_flight_stream_data \
+          --skip engine::tests::replication::restartpoints::a_standby_restartpoint_never_truncates_unsnapshotted_search_records \
+          --skip engine::tests::replication::restartpoints::a_standby_restartpoint_reclaims_the_ring_up_to_its_own_undo_floor \
+          --skip engine::tests::replication::restartpoints::a_standby_restartpoint_stops_at_an_unresolved_transactions_begin \
+          --skip engine::tests::replication::timelines::a_writable_restore_is_a_new_timeline_a_standby_seed_is_not \
+          --skip engine::tests::replication::timelines::promotion_finishes_recovery_bumps_the_epoch_and_fences_the_old_timeline \
+          --skip engine::tests::replication::transport::a_standby_applies_a_live_wal_stream_and_matches_the_primary \
+          --skip engine::tests::replication::transport::standby_applies_shipped_wal_ranges_and_matches_the_primary \
+          --skip engine::tests::replication::transport::the_replication_transport_streams_live_writes_to_a_standby \
+          --skip storage::tests::backup_restore::backup_is_single_flight_and_releases_its_hold \
+          --skip tests::a_body_ships_to_a_standby_and_restores_from_a_log_backup \
+          --skip tests::the_full_text_index_ships_to_a_standby_and_restores_from_a_log_backup \
+          --skip tests::the_journal_ships_to_a_standby_and_restores_from_a_log_backup \
+          --skip tests::vectors_ship_to_a_standby_and_restore_from_a_log_backup
+        env:
+          TRUTHDB_TEST_ENCRYPTION: "1"
+
   build:
     name: Build
     runs-on: ubuntu-latest

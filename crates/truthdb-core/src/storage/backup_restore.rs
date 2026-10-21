@@ -334,6 +334,7 @@ impl Storage {
         checksum: bool,
         copy_only: bool,
     ) -> Result<crate::backup::BackupSummary, StorageError> {
+        self.refuse_encrypted_backup()?;
         let plan = self.lock().begin_backup(checksum, copy_only)?;
         // Release the hold on EVERY exit — normal return, an early `?` error out
         // of write_backup, or an unwind — via the guard's Drop. A leaked hold
@@ -351,6 +352,7 @@ impl Storage {
         checksum: bool,
         copy_only: bool,
     ) -> Result<crate::backup::BackupSummary, StorageError> {
+        self.refuse_encrypted_backup()?;
         // Phase 1 (locked): capture the log range + header. The OLD marker still
         // pins `[start, ...)`, so no checkpoint can truncate the range we are
         // about to ship, even after we release the lock.
@@ -373,6 +375,18 @@ impl Storage {
             log_bytes: log.len() as u64,
             finished_at_millis: header.finished_at_millis,
         })
+    }
+
+    /// The log and backups do not carry encryption yet: a backup of an
+    /// encrypted database would hold its data in clear and could not be
+    /// restored without the key block.
+    fn refuse_encrypted_backup(&self) -> Result<(), StorageError> {
+        if self.lock().codec.is_encrypted() {
+            return Err(StorageError::InvalidConfig(
+                "backups of an encrypted database are not supported yet".to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn write_backup(
@@ -517,6 +531,7 @@ impl Storage {
             layout,
             header.default_collation.clone(),
             false,
+            None,
         )?;
         // The destination now exists and is ours: remove the partial file if any
         // later step fails, so a retry (which requires a fresh destination) can
@@ -850,7 +865,7 @@ impl StorageFile {
             self.spill_read_page(page, slot)?;
             if checksum
                 && !crate::relstore::page::is_zero_page(slot)
-                && !crate::relstore::page::verify_checksum(slot)
+                && !self.codec.open(page, &mut slot.to_vec())
                 && self.page_is_live_regular(page)?
             {
                 return Err(StorageError::InvalidFile(format!(

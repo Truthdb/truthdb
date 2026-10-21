@@ -211,8 +211,22 @@ impl Storage {
     }
 
     pub fn open(path: PathBuf, engine: EngineFactory) -> Result<Self, StorageError> {
+        Self::open_with_keys(path, engine, None)
+    }
+
+    /// Opens a database whose file may be encrypted: `keys` is where its
+    /// master key comes from (an encrypted file does not open without it).
+    pub fn open_with_keys(
+        path: PathBuf,
+        engine: EngineFactory,
+        keys: Option<&crate::encryption::KeySource>,
+    ) -> Result<Self, StorageError> {
         assert_layout_invariants();
-        let file = StorageFile::open_existing(path.clone(), engine())?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        let test_keys = crate::encryption::test_key_source();
+        #[cfg(any(test, feature = "test-hooks"))]
+        let keys = keys.or(test_keys.as_ref());
+        let file = StorageFile::open_existing(path.clone(), engine(), keys)?;
         Self::with_log_writer(path, file)
     }
 
@@ -244,12 +258,19 @@ impl Storage {
             StorageError::InvalidConfig(format!("growth of {add_gib} GiB overflows"))
         })?;
         let mut file = DirectFile::open_existing(path.to_path_buf())?;
-        let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
-        file.read_exact_at(0, &mut header_bytes)?;
-        let mut header = FileHeader::from_le_bytes(&header_bytes);
-        if header.magic != crate::storage_layout::FILE_MAGIC {
-            return Err(StorageError::InvalidFile("bad magic".to_string()));
+        let (mut header, repair) = read_file_header(&mut file)?;
+        // Offline, with no key: a header restored from its copy is not known
+        // to be this file's until a keyed open has checked it. The other
+        // repairs follow from a sound header (an unused extension cut off,
+        // the copy put in step).
+        if repair.header.is_some() {
+            return Err(StorageError::InvalidFile(
+                "the file header is damaged: open the database once (with its key) to \
+                 restore it from its copy, then grow"
+                    .to_string(),
+            ));
         }
+        repair.apply(&mut file)?;
         if header.version != crate::storage_layout::FILE_VERSION {
             return Err(StorageError::InvalidFile(format!(
                 "grow requires a v{} file, found v{}",
@@ -257,12 +278,6 @@ impl Storage {
                 header.version
             )));
         }
-        if header.header_checksum != header.compute_checksum() {
-            return Err(StorageError::InvalidFile(
-                "header checksum mismatch".to_string(),
-            ));
-        }
-
         let tail_span = header.metadata_size
             + header.allocator_size
             + header.snapshot_size
@@ -293,13 +308,25 @@ impl Storage {
         let mut descriptors = vec![0u8; 2 * PAGE_SIZE];
         file.read_exact_at(header.snapshot_offset, &mut descriptors)?;
 
-        // Extend the file (a separate buffered handle; O_DIRECT is for page
-        // I/O, not metadata), fsynced before anything lands in the extension.
+        // Extend the file, fsynced before anything lands in the extension.
+        // An encrypted file is extended by writing its copy (still of the
+        // current layout) at the new end, so its last page is a copy at every
+        // point of the grow.
         let old_total = header.reserved_offset + header.reserved_size;
-        let plain = std::fs::OpenOptions::new().write(true).open(path)?;
-        plain.set_len(old_total + delta)?;
-        plain.sync_all()?;
-        drop(plain);
+        if header.is_encrypted() {
+            file.write_all_at(
+                old_total + delta - PAGE_SIZE as u64,
+                &header.to_le_bytes_with_checksum(),
+            )?;
+            file.sync_data()?;
+        } else {
+            // A separate buffered handle: O_DIRECT is for page I/O, not
+            // metadata.
+            let plain = std::fs::OpenOptions::new().write(true).open(path)?;
+            plain.set_len(old_total + delta)?;
+            plain.sync_all()?;
+            drop(plain);
+        }
 
         // Write the relocated payloads into the extension (all beyond the
         // old file end by the size floor above). The bitmap's new bytes stay
@@ -315,6 +342,16 @@ impl Storage {
         header.snapshot_offset += delta;
         header.reserved_offset += delta;
         header.header_checksum = header.compute_checksum();
+        // An encrypted file's copy of the grown layout goes first (at the new
+        // end): if the header write tears, the copy describes the grown
+        // layout, already in place.
+        if header.is_encrypted() {
+            file.write_all_at(
+                old_total + delta - PAGE_SIZE as u64,
+                &header.to_le_bytes_with_checksum(),
+            )?;
+            file.sync_data()?;
+        }
         file.write_all_at(0, &header.to_le_bytes_with_checksum())?;
         file.sync_data()?;
         Ok(new_data_pages)
@@ -325,7 +362,18 @@ impl Storage {
         opts: StorageOptions,
         engine: EngineFactory,
     ) -> Result<Self, StorageError> {
-        Self::create_with_wal_bounds(path, opts, WAL_MIN_BYTES, WAL_MAX_BYTES, engine)
+        Self::create_with_keys(path, opts, engine, None)
+    }
+
+    /// Creates a database, encrypted under a new database key wrapped by
+    /// `keys`' master key when given.
+    pub fn create_with_keys(
+        path: PathBuf,
+        opts: StorageOptions,
+        engine: EngineFactory,
+        keys: Option<&crate::encryption::KeySource>,
+    ) -> Result<Self, StorageError> {
+        Self::create_inner(path, opts, WAL_MIN_BYTES, WAL_MAX_BYTES, engine, keys)
     }
 
     /// Test hook: create with custom WAL ring bounds so ring-wrap paths can
@@ -337,11 +385,26 @@ impl Storage {
         wal_max_bytes: u64,
         engine: EngineFactory,
     ) -> Result<Self, StorageError> {
+        Self::create_inner(path, opts, wal_min_bytes, wal_max_bytes, engine, None)
+    }
+
+    fn create_inner(
+        path: PathBuf,
+        opts: StorageOptions,
+        wal_min_bytes: u64,
+        wal_max_bytes: u64,
+        engine: EngineFactory,
+        keys: Option<&crate::encryption::KeySource>,
+    ) -> Result<Self, StorageError> {
         assert_layout_invariants();
         opts.validate()?;
+        #[cfg(any(test, feature = "test-hooks"))]
+        let test_keys = crate::encryption::test_key_source();
+        #[cfg(any(test, feature = "test-hooks"))]
+        let keys = keys.or(test_keys.as_ref());
         let engines = engine();
         validate_engines(&engines)?;
-        let core = StorageFile::create_new(path.clone(), opts, wal_min_bytes, wal_max_bytes)?;
+        let core = StorageFile::create_new(path.clone(), opts, wal_min_bytes, wal_max_bytes, keys)?;
         let file = Locked { core, engines };
         Self::with_log_writer(path, file)
     }
@@ -349,6 +412,132 @@ impl Storage {
     pub fn path(&self) -> &Path {
         &self.path
     }
+
+    /// Whether the database's pages are encrypted.
+    pub fn is_encrypted(&self) -> bool {
+        self.lock().codec.is_encrypted()
+    }
+}
+
+/// Repairs an encrypted file's header reading found, applied by the caller
+/// only once the file is known to be its own (its key block unlocked).
+#[derive(Default)]
+struct HeaderRepair {
+    /// The header page, damaged: write this copy over it.
+    header: Option<[u8; crate::storage_layout::FILE_HEADER_SIZE]>,
+    /// A grow that stopped before its header left an unused extension.
+    truncate_to: Option<u64>,
+    /// The copy in the layout's last page, missing or damaged: write it.
+    copy: Option<(u64, [u8; crate::storage_layout::FILE_HEADER_SIZE])>,
+}
+
+impl HeaderRepair {
+    fn apply(self, file: &mut DirectFile) -> Result<(), StorageError> {
+        if let Some(header) = self.header {
+            file.write_all_at(0, &header)?;
+            file.sync_data()?;
+        }
+        if let Some(len) = self.truncate_to {
+            file.set_len(len)?;
+        }
+        if let Some((offset, copy)) = self.copy {
+            file.write_all_at(offset, &copy)?;
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
+/// Reads and checks the file header. The wrapped key of an encrypted file
+/// lives only in its header, so the file also keeps a copy in its last
+/// page: when the header page is damaged, that copy is used.
+///
+/// The file's last page always holds a copy of the layout the database runs
+/// on. A grow extends the file by writing the current header's copy at the
+/// new end, then writes the grown layout's copy there, then the header. So a
+/// copy at the end whose layout ends before the file does is a grow cut
+/// short: its layout is the current one, and the extension is unused. No
+/// other page is ever taken for a copy (an older layout's copy stays behind
+/// inside the grown data region).
+fn read_file_header(file: &mut DirectFile) -> Result<(FileHeader, HeaderRepair), StorageError> {
+    let page = PAGE_SIZE as u64;
+    let mut bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+    file.read_exact_at(0, &mut bytes)?;
+    let header = FileHeader::from_le_bytes(&bytes);
+    let sound = |header: &FileHeader| {
+        header.has_known_magic() && header.header_checksum == header.compute_checksum()
+    };
+    let len = file.len();
+    if sound(&header) {
+        let mut repair = HeaderRepair::default();
+        if header.is_encrypted() {
+            let end = layout_end(&header)
+                .filter(|end| *end <= len)
+                .ok_or_else(|| {
+                    StorageError::InvalidFile(
+                        "the file header's regions are inconsistent".to_string(),
+                    )
+                })?;
+            repair.truncate_to = (len > end).then_some(end);
+            let mut copy = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+            file.read_exact_at(end - page, &mut copy)?;
+            if copy != bytes {
+                repair.copy = Some((end - page, bytes));
+            }
+        }
+        return Ok((header, repair));
+    }
+    if len >= 2 * page {
+        let mut copy_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+        file.read_exact_at(len - page, &mut copy_bytes)?;
+        let copy = FileHeader::from_le_bytes(&copy_bytes);
+        if let Some(end) = layout_end(&copy).filter(|end| *end <= len)
+            && sound(&copy)
+            && copy.is_encrypted()
+        {
+            let mut repair = HeaderRepair {
+                header: Some(copy_bytes),
+                ..HeaderRepair::default()
+            };
+            if end < len {
+                repair.truncate_to = Some(end);
+                let mut own = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+                file.read_exact_at(end - page, &mut own)?;
+                if own != copy_bytes {
+                    repair.copy = Some((end - page, copy_bytes));
+                }
+            }
+            return Ok((copy, repair));
+        }
+    }
+    if !header.has_known_magic() {
+        return Err(StorageError::InvalidFile("bad magic".to_string()));
+    }
+    Err(StorageError::InvalidFile(
+        "header checksum mismatch".to_string(),
+    ))
+}
+
+/// The end of the layout a header describes (where its copy ends), when
+/// every region it names lies below its reserved region and that region can
+/// hold the copy.
+fn layout_end(header: &FileHeader) -> Option<u64> {
+    let end = header.reserved_offset.checked_add(header.reserved_size)?;
+    let page = PAGE_SIZE as u64;
+    for (offset, size) in [
+        (header.superblock_a_offset, page),
+        (header.superblock_b_offset, page),
+        (header.wal_offset, header.wal_size),
+        (header.data_offset, header.data_size),
+        (header.metadata_offset, header.metadata_size),
+        (header.allocator_offset, header.allocator_size),
+        (header.snapshot_offset, header.snapshot_size),
+    ] {
+        if offset.checked_add(size)? > header.reserved_offset {
+            return None;
+        }
+    }
+    (header.reserved_size >= page).then_some(end)
 }
 
 impl StorageFile {
@@ -365,29 +554,38 @@ impl StorageFile {
     pub(super) fn open_existing(
         path: PathBuf,
         mut engines: Vec<Box<dyn EngineParticipant>>,
+        keys: Option<&crate::encryption::KeySource>,
     ) -> Result<Locked, StorageError> {
         validate_engines(&engines)?;
         let mut file = DirectFile::open_existing(path.clone())?;
-        let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
-        file.read_exact_at(0, &mut header_bytes)?;
-        let header = FileHeader::from_le_bytes(&header_bytes);
-
-        if header.magic != crate::storage_layout::FILE_MAGIC {
-            return Err(StorageError::InvalidFile("bad magic".to_string()));
-        }
+        let (header, repair) = read_file_header(&mut file)?;
         if header.page_size as usize != crate::storage_layout::PAGE_SIZE {
             return Err(StorageError::InvalidFile("page size mismatch".to_string()));
         }
-        if header.header_checksum != header.compute_checksum() {
-            return Err(StorageError::InvalidFile(
-                "header checksum mismatch".to_string(),
-            ));
-        }
+        let codec = if header.is_encrypted() {
+            let source = keys.ok_or_else(|| {
+                StorageError::InvalidConfig(
+                    "this database is encrypted: configure [encryption] with its master key"
+                        .to_string(),
+                )
+            })?;
+            let dek =
+                crate::encryption::unlock_key_block(header.key_block(), source, &header.file_uuid)?;
+            crate::encryption::PageCodec::Encrypted(Box::new(crate::encryption::PageKeys::new(
+                &dek,
+                &header.file_uuid,
+            )?))
+        } else {
+            crate::encryption::PageCodec::Plain
+        };
         // Validate the layout before any destructive step (the v1 upgrade
         // mutates the file; a file we cannot operate must be rejected while
-        // it is still untouched v1).
-        let layout = layout_from_header(&header, file.len());
+        // it is still untouched v1), at the length the repairs leave.
+        let layout = layout_from_header(&header, repair.truncate_to.unwrap_or(file.len()));
         validate_allocator_region(&layout)?;
+        // The key block unlocked and the layout sound: the header (or its
+        // copy) is this file's.
+        repair.apply(&mut file)?;
 
         let mut sb_a_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
         file.read_exact_at(header.superblock_a_offset, &mut sb_a_bytes)?;
@@ -498,6 +696,7 @@ impl StorageFile {
             pages: PageState::new(DEFAULT_CAPACITY_BYTES),
             replay_cache: scan.records,
             standby_pending_frees: Default::default(),
+            codec,
         };
         let mut storage = Locked { core, engines };
         // Re-establish the FULL-model log-backup hold so a checkpoint cannot
@@ -583,9 +782,10 @@ impl StorageFile {
         opts: StorageOptions,
         wal_min_bytes: u64,
         wal_max_bytes: u64,
+        keys: Option<&crate::encryption::KeySource>,
     ) -> Result<Self, StorageError> {
         let layout = compute_layout(opts.clone(), wal_min_bytes, wal_max_bytes)?;
-        Self::create_from_layout(path, layout, opts.default_collation, true)
+        Self::create_from_layout(path, layout, opts.default_collation, true, keys)
     }
 
     /// Creates a fresh file with an explicit layout. The restore path
@@ -602,6 +802,7 @@ impl StorageFile {
         layout: StorageLayout,
         default_collation: Option<String>,
         openable: bool,
+        keys: Option<&crate::encryption::KeySource>,
     ) -> Result<Self, StorageError> {
         validate_allocator_region(&layout)?;
         let mut header = FileHeader::default();
@@ -613,6 +814,20 @@ impl StorageFile {
                 .set_default_collation(name)
                 .map_err(StorageError::InvalidConfig)?;
         }
+        // An encrypted database: a fresh key, wrapped by the master key, in
+        // the header; the file's uuid salts every key derived from it.
+        let codec = match keys {
+            Some(source) => {
+                header.file_uuid = crate::encryption::random_uuid()?;
+                let (block, dek) = crate::encryption::new_key_block(source, &header.file_uuid)?;
+                header.set_key_block(&block);
+                crate::encryption::PageCodec::Encrypted(Box::new(crate::encryption::PageKeys::new(
+                    &dek,
+                    &header.file_uuid,
+                )?))
+            }
+            None => crate::encryption::PageCodec::Plain,
+        };
         header.superblock_a_offset = layout.superblock_a_offset;
         header.superblock_b_offset = layout.superblock_b_offset;
         header.wal_offset = layout.wal_offset;
@@ -642,7 +857,20 @@ impl StorageFile {
             }
         };
 
+        if header.is_encrypted() && layout.reserved_size < PAGE_SIZE as u64 {
+            return Err(StorageError::InvalidConfig(
+                "an encrypted database needs a reserved region of at least one page for the \
+                 copy of its header (storage.reserved_ratio)"
+                    .to_string(),
+            ));
+        }
         let mut file = DirectFile::create_new(path.clone(), layout.total_size)?;
+        if header.is_encrypted() {
+            file.write_all_at(
+                layout.total_size - PAGE_SIZE as u64,
+                &header.to_le_bytes_with_checksum(),
+            )?;
+        }
         file.write_all_at(layout.header_offset, &header.to_le_bytes_with_checksum())?;
         file.write_all_at(layout.superblock_a_offset, &superblock_bytes(superblock_a))?;
         file.write_all_at(layout.superblock_b_offset, &superblock_bytes(superblock_b))?;
@@ -671,6 +899,7 @@ impl StorageFile {
             pages: PageState::new(DEFAULT_CAPACITY_BYTES),
             replay_cache: Vec::new(),
             standby_pending_frees: Default::default(),
+            codec,
         })
     }
 
@@ -810,8 +1039,20 @@ impl StorageFile {
             None => return Ok(None),
         };
 
-        let mut data = vec![0u8; desc.data_len as usize];
+        // Whole pages, as they were sealed; then the padding goes.
+        let mut data = vec![0u8; (desc.data_len as usize).div_ceil(PAGE_SIZE) * PAGE_SIZE];
         self.file.read_exact_at(desc.data_offset, &mut data)?;
+        let first_page =
+            desc.data_offset.saturating_sub(self.layout.data_offset) / PAGE_SIZE as u64;
+        for (index, page) in data.chunks_mut(PAGE_SIZE).enumerate() {
+            self.codec.open_raw(
+                crate::encryption::RawPage::Snapshot,
+                first_page + index as u64,
+                desc.generation,
+                page,
+            );
+        }
+        data.truncate(desc.data_len as usize);
 
         let actual_checksum = xxh64(&data, 0);
         if actual_checksum != desc.data_checksum {

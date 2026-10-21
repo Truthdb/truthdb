@@ -19,6 +19,7 @@ impl StorageFile {
             io: PoolIo {
                 file: &mut self.file,
                 wal: &mut self.wal,
+                codec: &self.codec,
                 data_offset: self.layout.data_offset,
                 data_pages: self.layout.data_size / PAGE_SIZE as u64,
             },

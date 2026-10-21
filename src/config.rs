@@ -21,6 +21,57 @@ pub struct Config {
 
     #[serde(default)]
     pub s3: S3Config,
+
+    #[serde(default)]
+    pub encryption: EncryptionConfig,
+}
+
+/// Encryption at rest. With a master key configured, a database the server
+/// creates is encrypted; an encrypted database does not open without its key.
+#[derive(Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct EncryptionConfig {
+    /// A key file: lines `<id> <64 hex digits>`, the first key current. Mode
+    /// 0600, owned by the server's user.
+    #[serde(default)]
+    pub master_key_file: Option<PathBuf>,
+
+    /// A program and its arguments, run with `wrap` or `unwrap` appended, that
+    /// wraps and unwraps the database key (a KMS).
+    #[serde(default)]
+    pub key_command: Option<Vec<String>>,
+}
+
+/// The key command's arguments can carry credentials (a KMS token): Debug
+/// (the config is logged at startup) shows the program only.
+impl std::fmt::Debug for EncryptionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionConfig")
+            .field("master_key_file", &self.master_key_file)
+            .field(
+                "key_command",
+                &self.key_command.as_ref().map(|argv| argv.first().cloned()),
+            )
+            .finish()
+    }
+}
+
+impl EncryptionConfig {
+    /// Where the master key comes from (`None`: not configured).
+    pub fn key_source(&self) -> Result<Option<truthdb_core::encryption::KeySource>, String> {
+        use truthdb_core::encryption::KeySource;
+        match (&self.master_key_file, &self.key_command) {
+            (Some(_), Some(_)) => {
+                Err("encryption: set master_key_file or key_command, not both".to_string())
+            }
+            (Some(path), None) => Ok(Some(KeySource::File(path.clone()))),
+            (None, Some(argv)) if argv.is_empty() => {
+                Err("encryption.key_command names no program".to_string())
+            }
+            (None, Some(argv)) => Ok(Some(KeySource::Command(argv.clone()))),
+            (None, None) => Ok(None),
+        }
+    }
 }
 
 /// The S3-compatible HTTP API. Disabled by default. Requests are signed with
@@ -587,6 +638,39 @@ mod tests {
         let path = dir.join(file);
         fs::write(&path, contents).unwrap();
         path
+    }
+
+    #[test]
+    fn the_encryption_key_comes_from_one_source() {
+        use truthdb_core::encryption::KeySource;
+        let dir = test_dir("encryption-at-rest");
+        let load = |body: &str| load_layers(&[write(&dir, "enc.toml", body)]);
+        assert_eq!(load("").unwrap().encryption.key_source(), Ok(None));
+        let file = load("[encryption]\nmaster_key_file = \"/k\"\n").unwrap();
+        assert_eq!(
+            file.encryption.key_source(),
+            Ok(Some(KeySource::File(PathBuf::from("/k"))))
+        );
+        let command = load("[encryption]\nkey_command = [\"kms\", \"-v\"]\n").unwrap();
+        assert_eq!(
+            command.encryption.key_source(),
+            Ok(Some(KeySource::Command(vec!["kms".into(), "-v".into()])))
+        );
+        let both = load("[encryption]\nmaster_key_file = \"/k\"\nkey_command = [\"kms\"]\n");
+        assert!(both.unwrap().encryption.key_source().is_err());
+        assert!(
+            load("[encryption]\nkey_command = []\n")
+                .unwrap()
+                .encryption
+                .key_source()
+                .is_err()
+        );
+        assert!(
+            load("[encryption]\nmaster_key = \"x\"\n").is_err(),
+            "unknown key"
+        );
+        let token = load("[encryption]\nkey_command = [\"kms\", \"--token=secret\"]\n").unwrap();
+        assert!(!format!("{token:?}").contains("--token"));
     }
 
     #[test]

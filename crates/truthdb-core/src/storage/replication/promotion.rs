@@ -35,6 +35,11 @@ impl Storage {
             let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
             file.read_exact_at(0, &mut header_bytes)?;
             let header = FileHeader::from_le_bytes(&header_bytes);
+            if header.is_encrypted() {
+                return Err(StorageError::InvalidConfig(
+                    "promoting an encrypted database is not supported yet".to_string(),
+                ));
+            }
             if header.magic != crate::storage_layout::FILE_MAGIC {
                 return Err(StorageError::InvalidFile("bad magic".to_string()));
             }
@@ -198,12 +203,14 @@ impl Storage {
                 pages,
                 file: dfile,
                 wal,
+                codec,
                 ..
             } = &mut file.core;
             let PageState { pool, dpt, .. } = pages;
             let mut io = PoolIo {
                 file: dfile,
                 wal,
+                codec,
                 data_offset: layout_data_offset,
                 data_pages: layout_data_pages,
             };

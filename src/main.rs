@@ -4,7 +4,7 @@ compile_error!("TruthDB must be built for Linux targets. Use Docker or a Linux e
 use std::process::ExitCode;
 
 use tokio::sync::watch;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 use tracing_subscriber::EnvFilter;
 use truthdb_engine::client_listener::ClientListener;
 use truthdb_engine::engine::Engine;
@@ -76,8 +76,19 @@ async fn main() -> ExitCode {
         default_collation: config.storage.default_collation.clone(),
     };
 
+    let keys = match config.encryption.key_source() {
+        Ok(keys) => keys,
+        Err(err) => {
+            eprintln!("Invalid config: {err}");
+            return ExitCode::FAILURE;
+        }
+    };
     let storage = if storage_path.exists() {
-        match RelStorage::open_with(storage_path, truthdb_engine::database_engines) {
+        match RelStorage::open_with_keys(
+            storage_path,
+            truthdb_engine::database_engines,
+            keys.as_ref(),
+        ) {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to open storage: {err}");
@@ -85,8 +96,12 @@ async fn main() -> ExitCode {
             }
         }
     } else {
-        match RelStorage::create_with(storage_path, storage_opts, truthdb_engine::database_engines)
-        {
+        match RelStorage::create_with_keys(
+            storage_path,
+            storage_opts,
+            truthdb_engine::database_engines,
+            keys.as_ref(),
+        ) {
             Ok(storage) => storage,
             Err(err) => {
                 eprintln!("Failed to create storage: {err}");
@@ -94,6 +109,14 @@ async fn main() -> ExitCode {
             }
         }
     };
+
+    if keys.is_some() && !storage.core_arc().is_encrypted() {
+        warn!(
+            "[encryption] is configured but {} is not encrypted: only a database created \
+             with a master key is",
+            config.storage.resolved_path().display()
+        );
+    }
 
     let engine = match Engine::new(storage) {
         Ok(engine) => engine,
@@ -327,6 +350,10 @@ async fn start_replication(
     use truthdb_core::repl::listener::{PrimaryReplContext, run_repl_listener};
     use truthdb_core::repl::receiver::{ReceiverConfig, run_standby_receiver};
 
+    // The log does not carry encryption yet: it would ship in clear.
+    if storage.is_encrypted() {
+        return Err("replication of an encrypted database is not supported yet".to_string());
+    }
     let cluster_uuid = cfg.cluster_uuid_bytes()?;
     if cfg.heartbeat_ms == 0 {
         return Err("replication.heartbeat_ms must be greater than 0".to_string());

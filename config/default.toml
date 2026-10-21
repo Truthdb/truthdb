@@ -82,3 +82,15 @@ reserved_ratio = 0.17
 # region = "us-east-1"
 # tls_cert = "/etc/truthdb/s3.crt"   # both set = HTTPS
 # tls_key = "/etc/truthdb/s3.key"
+#
+# [encryption]
+# Encryption at rest: a database created while a master key is configured is
+# encrypted (its pages, search snapshot and spill pages), and it does not open
+# without that key. One of:
+# master_key_file = "/etc/truthdb/master.keys"  # lines "<id> <64 hex digits>",
+#                                               # the first key current; mode 0600,
+#                                               # owned by the server's user
+# key_command = ["/usr/local/bin/truthdb-kms"]  # run with "wrap" or "unwrap" appended:
+#                                               # wrap reads the database key as hex on
+#                                               # stdin and prints its wrapped form;
+#                                               # unwrap reads that and prints the hex key

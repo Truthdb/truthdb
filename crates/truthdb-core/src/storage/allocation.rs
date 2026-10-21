@@ -13,12 +13,22 @@ impl Storage {
     /// the spill spool over temp extents. Bypasses the buffer pool and the WAL
     /// (spill pages are query-scratch, never recovered).
     pub fn spill_write_page(&self, page: u64, data: &[u8]) -> Result<(), StorageError> {
-        self.lock().spill_write_page(page, data)
+        let mut locked = self.lock();
+        let mut sealed = data.to_vec();
+        locked
+            .codec
+            .seal_raw(crate::encryption::RawPage::Spill, page, 0, &mut sealed);
+        locked.spill_write_page(page, &sealed)
     }
 
     /// Reads one raw data-region page (`PAGE_SIZE` bytes) into `out`.
     pub fn spill_read_page(&self, page: u64, out: &mut [u8]) -> Result<(), StorageError> {
-        self.lock().spill_read_page(page, out)
+        let mut locked = self.lock();
+        locked.spill_read_page(page, out)?;
+        locked
+            .codec
+            .open_raw(crate::encryption::RawPage::Spill, page, 0, out);
+        Ok(())
     }
 
     pub fn is_page_allocated(&self, page: u64) -> bool {
@@ -191,12 +201,14 @@ impl StorageFile {
         Ok(())
     }
 
-    /// Writes `data` (zero-padded to whole pages) at a page-aligned offset
-    /// using batched page writes.
+    /// Writes the search snapshot `data` (zero-padded to whole pages, each
+    /// encrypted under `generation` when the file is) at a page-aligned
+    /// data-region offset using batched page writes.
     pub(super) fn write_data_pages(
         &mut self,
         offset: u64,
         data: &[u8],
+        generation: u64,
     ) -> Result<(), StorageError> {
         const BATCH_FRAMES: usize = 64;
         let mut frames: Vec<AlignedPageBuf> = Vec::with_capacity(BATCH_FRAMES);
@@ -207,6 +219,14 @@ impl StorageFile {
             let mut frame = AlignedPageBuf::new();
             let len = (data.len() - cursor).min(PAGE_SIZE);
             frame.as_mut_slice()[..len].copy_from_slice(&data[cursor..cursor + len]);
+            let page =
+                (offset - self.layout.data_offset) / PAGE_SIZE as u64 + (cursor / PAGE_SIZE) as u64;
+            self.codec.seal_raw(
+                crate::encryption::RawPage::Snapshot,
+                page,
+                generation,
+                frame.as_mut_slice(),
+            );
             cursor += len;
             frames.push(frame);
             if frames.len() == BATCH_FRAMES {

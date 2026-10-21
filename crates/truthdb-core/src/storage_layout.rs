@@ -3,6 +3,13 @@ use xxhash_rust::xxh64::xxh64;
 
 pub const PAGE_SIZE: usize = 4096;
 pub const FILE_MAGIC: [u8; 8] = *b"TRUTHDB\0";
+/// The magic of an encrypted database file: builds that do not know the
+/// key block refuse it (they check only the magic) rather than open it and
+/// rewrite the header without the wrapped database key.
+pub const FILE_MAGIC_ENCRYPTED: [u8; 8] = *b"TRUTHDBE";
+/// Where the encryption key block sits in the file header's reserved area
+/// (the collation name keeps the bytes before it).
+pub const KEY_BLOCK_OFFSET: usize = 512;
 pub const FILE_VERSION_V1: u32 = 1;
 pub const FILE_VERSION: u32 = 2;
 
@@ -192,16 +199,37 @@ impl FileHeader {
     /// columns under a collation nobody asked for.
     pub fn set_default_collation(&mut self, name: &str) -> Result<(), String> {
         let bytes = name.as_bytes();
-        if bytes.len() + 2 > self.reserved.len() {
+        if bytes.len() + 2 > KEY_BLOCK_OFFSET {
             return Err(format!(
                 "collation name is too long for the file header: {} bytes, room for {}",
                 bytes.len(),
-                self.reserved.len() - 2
+                KEY_BLOCK_OFFSET - 2
             ));
         }
         self.reserved[0..2].copy_from_slice(&(bytes.len() as u16).to_le_bytes());
         self.reserved[2..2 + bytes.len()].copy_from_slice(bytes);
         Ok(())
+    }
+
+    /// Whether the file is encrypted (by its magic).
+    pub fn is_encrypted(&self) -> bool {
+        self.magic == FILE_MAGIC_ENCRYPTED
+    }
+
+    /// Whether the magic is a TruthDB file's, encrypted or not.
+    pub fn has_known_magic(&self) -> bool {
+        self.magic == FILE_MAGIC || self.magic == FILE_MAGIC_ENCRYPTED
+    }
+
+    /// The encryption key block's bytes.
+    pub fn key_block(&self) -> &[u8] {
+        &self.reserved[KEY_BLOCK_OFFSET..KEY_BLOCK_OFFSET + crate::encryption::KEY_BLOCK_SIZE]
+    }
+
+    /// Stamps the encryption key block and marks the file encrypted.
+    pub fn set_key_block(&mut self, block: &[u8]) {
+        self.magic = FILE_MAGIC_ENCRYPTED;
+        self.reserved[KEY_BLOCK_OFFSET..KEY_BLOCK_OFFSET + block.len()].copy_from_slice(block);
     }
 
     pub fn compute_checksum(self) -> u64 {
@@ -721,6 +749,8 @@ pub(crate) fn assert_layout_invariants() {
     use core::mem::size_of;
 
     debug_assert_eq!(FILE_MAGIC, *b"TRUTHDB\0");
+    const _: () =
+        assert!(KEY_BLOCK_OFFSET + crate::encryption::KEY_BLOCK_SIZE <= FILE_HEADER_RESERVED_SIZE);
     debug_assert_eq!(FILE_VERSION_V1, 1);
     debug_assert_eq!(FILE_VERSION, 2);
     debug_assert_eq!(PAGE_SIZE, 4096);

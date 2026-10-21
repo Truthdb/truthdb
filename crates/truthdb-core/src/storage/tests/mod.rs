@@ -33,6 +33,12 @@ fn unique_temp_path(label: &str) -> PathBuf {
     path
 }
 
+/// Backups of an encrypted database are refused until they carry its key
+/// block: under `TRUTHDB_TEST_ENCRYPTION=1` the tests that take one stop here.
+fn backups_unsupported() -> bool {
+    crate::encryption::test_key_source().is_some()
+}
+
 fn create_small(path: &Path) -> Storage {
     Storage::create_with_wal_bounds(
         path.to_path_buf(),
@@ -46,6 +52,7 @@ fn create_small(path: &Path) -> Storage {
 
 mod blob_pages;
 mod btree_free;
+mod encryption;
 mod engines;
 mod recovery;
 mod txn_extents;

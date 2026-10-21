@@ -154,6 +154,9 @@ fn a_root_logged_for_an_unknown_engine_is_refused() {
 
 #[test]
 fn second_engine_root_survives_backup_and_restore() {
+    if super::backups_unsupported() {
+        return;
+    }
     let path = unique_temp_path("engines-backup-src");
     let bak = unique_temp_path("engines-backup-bak");
     let dst = unique_temp_path("engines-backup-dst");
@@ -176,6 +179,9 @@ fn second_engine_root_survives_backup_and_restore() {
 
 #[test]
 fn second_engine_root_ships_to_a_standby_and_survives_restartpoint_and_promotion() {
+    if super::backups_unsupported() {
+        return;
+    }
     let path = unique_temp_path("engines-standby-src");
     let bak = unique_temp_path("engines-standby-bak");
     let seed = unique_temp_path("engines-standby-seed");
@@ -339,6 +345,9 @@ impl EngineParticipant for RootedCatalog {
 
 #[test]
 fn a_standby_without_the_engine_refuses_the_range_and_moves_no_root() {
+    if super::backups_unsupported() {
+        return;
+    }
     fn rooted_two() -> Vec<Box<dyn EngineParticipant>> {
         vec![
             Box::new(RootedCatalog { root: None }),

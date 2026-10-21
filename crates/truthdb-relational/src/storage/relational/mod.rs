@@ -82,6 +82,25 @@ impl RelStorage {
         Storage::create(path, opts, engines).map(Self::from_core)
     }
 
+    /// [`Self::open_with`] for a file that may be encrypted under `keys`.
+    pub fn open_with_keys(
+        path: PathBuf,
+        engines: EngineFactory,
+        keys: Option<&truthdb_core::encryption::KeySource>,
+    ) -> Result<Self, StorageError> {
+        Storage::open_with_keys(path, engines, keys).map(Self::from_core)
+    }
+
+    /// [`Self::create_with`], encrypted under `keys` when given.
+    pub fn create_with_keys(
+        path: PathBuf,
+        opts: StorageOptions,
+        engines: EngineFactory,
+        keys: Option<&truthdb_core::encryption::KeySource>,
+    ) -> Result<Self, StorageError> {
+        Storage::create_with_keys(path, opts, engines, keys).map(Self::from_core)
+    }
+
     /// Test hook: create with custom WAL ring bounds.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn create_with_wal_bounds(

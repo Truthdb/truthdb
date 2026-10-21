@@ -290,6 +290,9 @@ pub struct StorageFile {
     /// this at CREATE TABLE and stored with it, so the column keeps the
     /// collation it was created under even if the default later changes.
     default_collation: Option<String>,
+    /// How data pages, the search snapshot and spill pages are protected on
+    /// disk: a checksum, or encryption under the database key.
+    codec: crate::encryption::PageCodec,
 }
 
 /// What the storage mutex guards: the core file next to the page-structured
