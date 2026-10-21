@@ -342,3 +342,59 @@ fn an_interrupted_grow_leaves_no_copy_that_outlives_the_header() {
         std::fs::remove_file(file).ok();
     }
 }
+
+#[test]
+fn a_damaged_copy_is_rewritten_and_a_grow_without_its_copy_still_recovers() {
+    use std::os::unix::fs::FileExt;
+    let keys = key_file("enc-copy-keys", &format!("main {}\n", "2e".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let path = unique_temp_path("enc-copy");
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    let (root, _) = fill(&storage, 40);
+    let pages = storage.lock().data_pages();
+    drop(storage);
+    let read_page = |offset: u64| {
+        let mut page = vec![0u8; PAGE_SIZE];
+        std::fs::File::open(&path)
+            .and_then(|file| file.read_exact_at(&mut page, offset))
+            .expect("read page");
+        page
+    };
+    let write_page = |offset: u64, page: &[u8]| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.write_all_at(page, offset))
+            .expect("write page");
+    };
+    let len = std::fs::metadata(&path).expect("metadata").len();
+    let header = read_page(0);
+
+    // A damaged copy under a sound header is written again on open.
+    write_page(len - PAGE_SIZE as u64, &[0x33; PAGE_SIZE]);
+    drop(Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open"));
+    assert_eq!(read_page(len - PAGE_SIZE as u64), header);
+
+    // A grow that stopped after extending the file, before its copy and its
+    // header; then the header is damaged: the copy at the old end is found.
+    Storage::grow_data_region(&path, 1).expect("grow");
+    let grown = std::fs::metadata(&path).expect("metadata").len();
+    write_page(grown - PAGE_SIZE as u64, &[0; PAGE_SIZE]);
+    write_page(0, &header);
+    damage_header(&path);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source))
+        .expect("opens from the copy at the old end");
+    assert_eq!(storage.lock().data_pages(), pages);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 40);
+    drop(storage);
+    assert_eq!(std::fs::metadata(&path).expect("metadata").len(), len);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}

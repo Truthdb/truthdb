@@ -220,8 +220,8 @@ fn run_key_command(
     let mut output =
         output.map_err(|err| config_error(format!("encryption key command {program}: {err}")))?;
     let stdout = Zeroizing::new(std::mem::take(&mut output.stdout));
+    let _stderr = Zeroizing::new(std::mem::take(&mut output.stderr));
     if !output.status.success() {
-        output.stderr.fill(0);
         return Err(config_error(format!(
             "encryption key command {program} {operation} failed ({}); its error output is \
              not shown, since it handles the database key",
