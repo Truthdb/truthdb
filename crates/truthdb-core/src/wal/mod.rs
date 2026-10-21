@@ -197,10 +197,11 @@ impl WalWriter {
         &mut self.file
     }
 
-    /// Duplicates the log file descriptor as a plain [`std::fs::File`], for the
-    /// group-commit log-writer to fsync off the storage lock.
-    pub fn try_clone_file(&self) -> std::io::Result<std::fs::File> {
-        self.file.try_clone_std()
+    /// Opens the log file again as a plain [`std::fs::File`] (see
+    /// [`DirectFile::reopen_std`]), for the group-commit log-writer to fsync
+    /// off the storage lock.
+    pub fn reopen_file(&self) -> std::io::Result<std::fs::File> {
+        self.file.reopen_std()
     }
 
     /// True once enough bytes have been appended since the last superblock

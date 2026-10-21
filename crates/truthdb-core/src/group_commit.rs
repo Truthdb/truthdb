@@ -3,7 +3,7 @@
 //! A committing transaction appends its commit record to the WAL *without*
 //! fsyncing, then calls [`GroupCommit::ensure_durable`] with the WAL tail past
 //! its commit record and blocks on a `flushed` watermark. A dedicated
-//! log-writer thread fsyncs the WAL — through a duplicated file descriptor, so
+//! log-writer thread fsyncs the WAL — through its own handle on the file, so
 //! it never touches the storage lock — and advances the watermark, waking every
 //! committer the fsync covered. One fsync thus makes every commit that landed
 //! in the window durable, instead of one fsync per commit.
@@ -51,7 +51,7 @@ pub(crate) struct GroupCommit {
 }
 
 impl GroupCommit {
-    /// Spawns the log-writer thread over a duplicated WAL file descriptor and
+    /// Spawns the log-writer thread over its own handle on the WAL file and
     /// returns the shared coordinator plus the thread's join handle.
     pub(crate) fn start(wal_fd: File) -> (Arc<GroupCommit>, JoinHandle<()>) {
         let gc = Arc::new(GroupCommit {
