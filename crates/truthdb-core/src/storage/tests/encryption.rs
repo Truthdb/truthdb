@@ -344,7 +344,7 @@ fn an_interrupted_grow_leaves_no_copy_that_outlives_the_header() {
 }
 
 #[test]
-fn a_damaged_copy_is_rewritten_and_a_grow_without_its_copy_still_recovers() {
+fn a_damaged_copy_is_rewritten_and_a_grow_cut_short_still_recovers() {
     use std::os::unix::fs::FileExt;
     let keys = key_file("enc-copy-keys", &format!("main {}\n", "2e".repeat(32)));
     let source = KeySource::File(keys.clone());
@@ -381,19 +381,72 @@ fn a_damaged_copy_is_rewritten_and_a_grow_without_its_copy_still_recovers() {
     drop(Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open"));
     assert_eq!(read_page(len - PAGE_SIZE as u64), header);
 
-    // A grow that stopped after extending the file, before its copy and its
-    // header; then the header is damaged: the copy at the old end is found.
+    // A grow that stopped after extending the file (with the current
+    // layout's copy at the new end) and before the grown copy and header;
+    // then the header is damaged: the copy at the end is of the current
+    // layout, and the unused extension goes.
     Storage::grow_data_region(&path, 1).expect("grow");
     let grown = std::fs::metadata(&path).expect("metadata").len();
-    write_page(grown - PAGE_SIZE as u64, &[0; PAGE_SIZE]);
+    write_page(grown - PAGE_SIZE as u64, &header);
     write_page(0, &header);
     damage_header(&path);
     let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source))
-        .expect("opens from the copy at the old end");
+        .expect("opens from the copy at the end");
     assert_eq!(storage.lock().data_pages(), pages);
     assert_eq!(rows_of(&storage, root).expect("rows").len(), 40);
     drop(storage);
     assert_eq!(std::fs::metadata(&path).expect("metadata").len(), len);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn an_older_layouts_copy_is_never_taken_for_the_current_one() {
+    use std::os::unix::fs::FileExt;
+    let keys = key_file("enc-stale-keys", &format!("main {}\n", "1f".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let path = unique_temp_path("enc-stale");
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    fill(&storage, 20);
+    drop(storage);
+    // A completed grow leaves the old layout's copy inside the grown data
+    // region; rows go into the grown database.
+    Storage::grow_data_region(&path, 1).expect("grow");
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let (root, _) = fill(&storage, 30);
+    drop(storage);
+    let len = std::fs::metadata(&path).expect("metadata").len();
+    let mut copy = vec![0u8; PAGE_SIZE];
+    std::fs::File::open(&path)
+        .and_then(|file| file.read_exact_at(&mut copy, len - PAGE_SIZE as u64))
+        .expect("read copy");
+
+    // The header and the current copy both damaged: refused, untouched.
+    damage_header(&path);
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.write_all_at(&[0x77; PAGE_SIZE], len - PAGE_SIZE as u64))
+        .expect("damage copy");
+    assert!(Storage::open_with_keys(path.clone(), no_engine, Some(&source)).is_err());
+    assert_eq!(std::fs::metadata(&path).expect("metadata").len(), len);
+
+    // With the current copy back, everything reads.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.write_all_at(&copy, len - PAGE_SIZE as u64))
+        .expect("restore copy");
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 30);
+    drop(storage);
     for file in [&path, &keys] {
         std::fs::remove_file(file).ok();
     }

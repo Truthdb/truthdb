@@ -258,7 +258,10 @@ impl Storage {
             StorageError::InvalidConfig(format!("growth of {add_gib} GiB overflows"))
         })?;
         let mut file = DirectFile::open_existing(path.to_path_buf())?;
-        let mut header = read_file_header(&mut file)?;
+        let (mut header, repair) = read_file_header(&mut file)?;
+        // Offline, with no key: the repairs only put the header and its copy
+        // in step and cut off an unused extension.
+        repair.apply(&mut file)?;
         if header.version != crate::storage_layout::FILE_VERSION {
             return Err(StorageError::InvalidFile(format!(
                 "grow requires a v{} file, found v{}",
@@ -296,13 +299,25 @@ impl Storage {
         let mut descriptors = vec![0u8; 2 * PAGE_SIZE];
         file.read_exact_at(header.snapshot_offset, &mut descriptors)?;
 
-        // Extend the file (a separate buffered handle; O_DIRECT is for page
-        // I/O, not metadata), fsynced before anything lands in the extension.
+        // Extend the file, fsynced before anything lands in the extension.
+        // An encrypted file is extended by writing its copy (still of the
+        // current layout) at the new end, so its last page is a copy at every
+        // point of the grow.
         let old_total = header.reserved_offset + header.reserved_size;
-        let plain = std::fs::OpenOptions::new().write(true).open(path)?;
-        plain.set_len(old_total + delta)?;
-        plain.sync_all()?;
-        drop(plain);
+        if header.is_encrypted() {
+            file.write_all_at(
+                old_total + delta - PAGE_SIZE as u64,
+                &header.to_le_bytes_with_checksum(),
+            )?;
+            file.sync_data()?;
+        } else {
+            // A separate buffered handle: O_DIRECT is for page I/O, not
+            // metadata.
+            let plain = std::fs::OpenOptions::new().write(true).open(path)?;
+            plain.set_len(old_total + delta)?;
+            plain.sync_all()?;
+            drop(plain);
+        }
 
         // Write the relocated payloads into the extension (all beyond the
         // old file end by the size floor above). The bitmap's new bytes stay
@@ -318,8 +333,9 @@ impl Storage {
         header.snapshot_offset += delta;
         header.reserved_offset += delta;
         header.header_checksum = header.compute_checksum();
-        // An encrypted file's copy goes first (at the new end): if the header
-        // write tears, the copy describes the grown layout, already in place.
+        // An encrypted file's copy of the grown layout goes first (at the new
+        // end): if the header write tears, the copy describes the grown
+        // layout, already in place.
         if header.is_encrypted() {
             file.write_all_at(
                 old_total + delta - PAGE_SIZE as u64,
@@ -394,43 +410,96 @@ impl Storage {
     }
 }
 
+/// Repairs an encrypted file's header reading found, applied by the caller
+/// only once the file is known to be its own (its key block unlocked).
+#[derive(Default)]
+struct HeaderRepair {
+    /// The header page, damaged: write this copy over it.
+    header: Option<[u8; crate::storage_layout::FILE_HEADER_SIZE]>,
+    /// A grow that stopped before its header left an unused extension.
+    truncate_to: Option<u64>,
+    /// The copy in the layout's last page, missing or damaged: write it.
+    copy: Option<(u64, [u8; crate::storage_layout::FILE_HEADER_SIZE])>,
+}
+
+impl HeaderRepair {
+    fn apply(self, file: &mut DirectFile) -> Result<(), StorageError> {
+        if let Some(header) = self.header {
+            file.write_all_at(0, &header)?;
+            file.sync_data()?;
+        }
+        if let Some(len) = self.truncate_to {
+            file.set_len(len)?;
+        }
+        if let Some((offset, copy)) = self.copy {
+            file.write_all_at(offset, &copy)?;
+            file.sync_data()?;
+        }
+        Ok(())
+    }
+}
+
 /// Reads and checks the file header. The wrapped key of an encrypted file
-/// lives only in its header, so the file also keeps a copy in the last page
-/// of its layout (the end of the unused reserved region). When the header
-/// page is damaged, the copy is used and written back over it.
+/// lives only in its header, so the file also keeps a copy in its last
+/// page: when the header page is damaged, that copy is used.
 ///
-/// The copy is looked for at the file's end and, since a grow extends the
-/// file by whole GiB and writes its copy only after its regions, a whole
-/// number of GiB before it (a grow that stopped before its copy).
-fn read_file_header(file: &mut DirectFile) -> Result<FileHeader, StorageError> {
-    const GIB: u64 = 1024 * 1024 * 1024;
+/// The file's last page always holds a copy of the layout the database runs
+/// on. A grow extends the file by writing the current header's copy at the
+/// new end, then writes the grown layout's copy there, then the header. So a
+/// copy at the end whose layout ends before the file does is a grow cut
+/// short: its layout is the current one, and the extension is unused. No
+/// other page is ever taken for a copy (an older layout's copy stays behind
+/// inside the grown data region).
+fn read_file_header(file: &mut DirectFile) -> Result<(FileHeader, HeaderRepair), StorageError> {
+    let page = PAGE_SIZE as u64;
     let mut bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
     file.read_exact_at(0, &mut bytes)?;
     let header = FileHeader::from_le_bytes(&bytes);
     let sound = |header: &FileHeader| {
         header.has_known_magic() && header.header_checksum == header.compute_checksum()
     };
+    let len = file.len();
     if sound(&header) {
+        let mut repair = HeaderRepair::default();
         if header.is_encrypted() {
-            keep_copy_in_step(file, &header, &bytes)?;
+            let end = layout_end(&header)
+                .filter(|end| *end <= len)
+                .ok_or_else(|| {
+                    StorageError::InvalidFile(
+                        "the file header's regions are inconsistent".to_string(),
+                    )
+                })?;
+            repair.truncate_to = (len > end).then_some(end);
+            let mut copy = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+            file.read_exact_at(end - page, &mut copy)?;
+            if copy != bytes {
+                repair.copy = Some((end - page, bytes));
+            }
         }
-        return Ok(header);
+        return Ok((header, repair));
     }
-    let mut end = file.len();
-    while end >= 2 * PAGE_SIZE as u64 {
+    if len >= 2 * page {
         let mut copy_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
-        file.read_exact_at(end - PAGE_SIZE as u64, &mut copy_bytes)?;
+        file.read_exact_at(len - page, &mut copy_bytes)?;
         let copy = FileHeader::from_le_bytes(&copy_bytes);
-        if sound(&copy) && copy.is_encrypted() && layout_end(&copy) == Some(end) {
-            file.write_all_at(0, &copy_bytes)?;
-            file.sync_data()?;
-            keep_copy_in_step(file, &copy, &copy_bytes)?;
-            return Ok(copy);
+        if let Some(end) = layout_end(&copy).filter(|end| *end <= len)
+            && sound(&copy)
+            && copy.is_encrypted()
+        {
+            let mut repair = HeaderRepair {
+                header: Some(copy_bytes),
+                ..HeaderRepair::default()
+            };
+            if end < len {
+                repair.truncate_to = Some(end);
+                let mut own = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+                file.read_exact_at(end - page, &mut own)?;
+                if own != copy_bytes {
+                    repair.copy = Some((end - page, copy_bytes));
+                }
+            }
+            return Ok((copy, repair));
         }
-        end = match end.checked_sub(GIB) {
-            Some(end) => end,
-            None => break,
-        };
     }
     if !header.has_known_magic() {
         return Err(StorageError::InvalidFile("bad magic".to_string()));
@@ -441,8 +510,8 @@ fn read_file_header(file: &mut DirectFile) -> Result<FileHeader, StorageError> {
 }
 
 /// The end of the layout a header describes (where its copy ends), when
-/// every region it names lies below it and the reserved region can hold the
-/// copy.
+/// every region it names lies below its reserved region and that region can
+/// hold the copy.
 fn layout_end(header: &FileHeader) -> Option<u64> {
     let end = header.reserved_offset.checked_add(header.reserved_size)?;
     let page = PAGE_SIZE as u64;
@@ -460,33 +529,6 @@ fn layout_end(header: &FileHeader) -> Option<u64> {
         }
     }
     (header.reserved_size >= page).then_some(end)
-}
-
-/// Keeps an encrypted file's copy describing the layout it runs on. A grow
-/// that stopped before its header leaves the file longer than the layout,
-/// with a copy of the grown layout at the new end: the extension is cut off
-/// (nothing in the layout uses it; growing again redoes it), and the copy in
-/// the layout's last page is rewritten when it differs from the header.
-fn keep_copy_in_step(
-    file: &mut DirectFile,
-    header: &FileHeader,
-    bytes: &[u8; crate::storage_layout::FILE_HEADER_SIZE],
-) -> Result<(), StorageError> {
-    let end = layout_end(header).ok_or_else(|| {
-        StorageError::InvalidFile("the file header's regions are inconsistent".to_string())
-    })?;
-    if file.len() > end {
-        file.set_len(end)?;
-    }
-    if file.len() == end {
-        let mut copy = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
-        file.read_exact_at(end - PAGE_SIZE as u64, &mut copy)?;
-        if copy != *bytes {
-            file.write_all_at(end - PAGE_SIZE as u64, bytes)?;
-            file.sync_data()?;
-        }
-    }
-    Ok(())
 }
 
 impl StorageFile {
@@ -507,7 +549,7 @@ impl StorageFile {
     ) -> Result<Locked, StorageError> {
         validate_engines(&engines)?;
         let mut file = DirectFile::open_existing(path.clone())?;
-        let header = read_file_header(&mut file)?;
+        let (header, repair) = read_file_header(&mut file)?;
         if header.page_size as usize != crate::storage_layout::PAGE_SIZE {
             return Err(StorageError::InvalidFile("page size mismatch".to_string()));
         }
@@ -527,6 +569,8 @@ impl StorageFile {
         } else {
             crate::encryption::PageCodec::Plain
         };
+        // The key block unlocked: the header (or its copy) is this file's.
+        repair.apply(&mut file)?;
         // Validate the layout before any destructive step (the v1 upgrade
         // mutates the file; a file we cannot operate must be rejected while
         // it is still untouched v1).
