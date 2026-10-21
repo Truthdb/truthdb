@@ -1144,15 +1144,23 @@ fn a_plain_database_has_no_master_key_to_rotate() {
 #[test]
 fn a_rotation_runs_its_key_command_without_the_storage_lock() {
     use std::os::unix::fs::PermissionsExt;
-    // A slow KMS: each wrap or unwrap takes 1.5 s.
+    // A KMS that, once started, waits (at most 30 s) until it is released.
+    let started = unique_temp_path("rot-kms-started");
+    let release = unique_temp_path("rot-kms-release");
     let script = unique_temp_path("rot-slow-kms").with_extension("sh");
     std::fs::write(
         &script,
-        "#!/bin/sh\nread line\nsleep 1.5\necho \"$line\" | rev\n",
+        format!(
+            "#!/bin/sh\nread line\ntouch {}\ni=0\nwhile [ ! -e {} ] && [ $i -lt 300 ]; do \
+             sleep 0.1; i=$((i+1)); done\necho \"$line\" | rev\n",
+            started.display(),
+            release.display()
+        ),
     )
     .expect("script");
     std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o700)).expect("chmod");
     let source = KeySource::Command(vec![script.display().to_string()]);
+    std::fs::write(&release, b"").expect("release (for the create)");
     let path = unique_temp_path("rot-slow");
     let storage = Storage::create_with_keys(
         path.clone(),
@@ -1161,21 +1169,27 @@ fn a_rotation_runs_its_key_command_without_the_storage_lock() {
         Some(&source),
     )
     .expect("create encrypted");
+    std::fs::remove_file(&release).expect("hold the next commands");
+    std::fs::remove_file(&started).ok();
     std::thread::scope(|scope| {
         let rotation = scope.spawn(|| storage.rotate_master_key());
-        std::thread::sleep(std::time::Duration::from_millis(300));
-        let started = std::time::Instant::now();
+        // The rotation is inside its key command.
+        while !started.exists() {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        let waited = std::time::Instant::now();
         drop(storage.lock());
         assert!(
-            started.elapsed() < std::time::Duration::from_millis(500),
+            waited.elapsed() < std::time::Duration::from_secs(10),
             "the storage lock waited {:?} for the key command",
-            started.elapsed()
+            waited.elapsed()
         );
+        std::fs::write(&release, b"").expect("release");
         rotation.join().expect("rotation thread").expect("rotate");
     });
     drop(storage);
     assert!(Storage::open_with_keys(path.clone(), no_engine, Some(&source)).is_ok());
-    for file in [&path, &script] {
+    for file in [&path, &script, &started, &release] {
         std::fs::remove_file(file).ok();
     }
 }
