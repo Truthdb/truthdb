@@ -21,10 +21,10 @@ use crate::relstore::page;
 use crate::relstore::slotted::SlottedRead;
 use crate::storage::StorageError;
 use crate::wal::records::{
-    PageOpRedo, PageOpUndo, REL_KIND_ALLOC_EXTENT, REL_KIND_BLOB_PAGES, REL_KIND_CLR,
-    REL_KIND_CLR_FREE_EXTENT, REL_KIND_FREE_EXTENT, REL_KIND_PAGE_IMAGE, REL_KIND_PAGE_IMAGES,
-    REL_KIND_PAGE_OP, REL_KIND_SET_CATALOG_ROOT, REL_KIND_SET_ENGINE_ROOT, REL_KIND_TXN_BEGIN,
-    REL_KIND_TXN_COMMIT, REL_KIND_TXN_END, RelRecord,
+    PageOpRedo, PageOpUndo, REL_KIND_ALLOC_EXTENT, REL_KIND_BLOB_PAGES, REL_KIND_BLOB_REWRITE,
+    REL_KIND_CLR, REL_KIND_CLR_FREE_EXTENT, REL_KIND_FREE_EXTENT, REL_KIND_PAGE_IMAGE,
+    REL_KIND_PAGE_IMAGES, REL_KIND_PAGE_OP, REL_KIND_SET_CATALOG_ROOT, REL_KIND_SET_ENGINE_ROOT,
+    REL_KIND_TXN_BEGIN, REL_KIND_TXN_COMMIT, REL_KIND_TXN_END, RelRecord,
 };
 
 pub(crate) struct AnalysisRedoOutcome {
@@ -65,6 +65,7 @@ pub(crate) fn analyze_and_redo(
             | REL_KIND_CLR
             | REL_KIND_CLR_FREE_EXTENT
             | REL_KIND_BLOB_PAGES
+            | REL_KIND_BLOB_REWRITE
             | REL_KIND_ALLOC_EXTENT
             | REL_KIND_FREE_EXTENT => {
                 // Extent records with a transaction belong to its chain; the
@@ -145,6 +146,7 @@ pub(crate) fn redo_records(
                 }
             }
             REL_KIND_BLOB_PAGES => redo_blob_pages(ctx, *lsn, record, &frees)?,
+            REL_KIND_BLOB_REWRITE => redo_blob_rewrite(ctx, *lsn, record, &frees)?,
             _ => {}
         }
     }
@@ -256,6 +258,37 @@ fn redo_blob_pages(
             crate::relstore::ctx::blob_page_image(ctx.io.codec, lsn, object_id, page_no, chunk);
         ctx.io.write_page(page_no, &image)?;
     }
+    Ok(())
+}
+
+/// Redo of a blob page rewritten sealed: the page is written again (with the
+/// LSN it carried) unless it is already sealed on disk with that LSN, or a
+/// free later in the log gave it to something else.
+fn redo_blob_rewrite(
+    ctx: &mut RelCtx<'_>,
+    lsn: u64,
+    record: &RelRecord,
+    frees: &FreedAfter,
+) -> Result<(), StorageError> {
+    let (page_no, page_lsn, object_id, data) = record.decode_blob_rewrite()?;
+    ctx.pool.discard(page_no);
+    if frees.freed_after(page_no, lsn) {
+        return Ok(());
+    }
+    let mut on_disk = crate::direct_io::AlignedPageBuf::new();
+    ctx.io.read_page(page_no, &mut on_disk)?;
+    let sealed = u16::from_le_bytes([on_disk.as_slice()[18], on_disk.as_slice()[19]])
+        & crate::encryption::PAGE_FLAG_SEALED
+        != 0;
+    if sealed
+        && ctx.io.codec.open(page_no, on_disk.as_mut_slice())
+        && page::page_lsn(on_disk.as_slice()) == page_lsn
+    {
+        return Ok(());
+    }
+    let image =
+        crate::relstore::ctx::blob_page_image(ctx.io.codec, page_lsn, object_id, page_no, data);
+    ctx.io.write_page(page_no, &image)?;
     Ok(())
 }
 

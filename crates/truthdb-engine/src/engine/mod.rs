@@ -116,11 +116,15 @@ fn parse_s3_admin(input: &str) -> Option<S3Admin> {
     }
 }
 
+/// Pages `encryption enable` reads per storage-lock hold.
+const CONVERSION_STEP_PAGES: usize = 64;
+
 /// Encryption-at-rest administration: `encryption status`, `encryption
-/// rotate master key`. Gated like [`S3Admin`]: a `sysadmin` login over TDS,
+/// enable`, `encryption rotate master key`. Gated like [`S3Admin`]: a `sysadmin` login over TDS,
 /// any connection on the (trusted) native port.
 enum EncryptionAdmin {
     Status,
+    Enable,
     RotateMasterKey,
 }
 
@@ -133,6 +137,7 @@ fn parse_encryption_admin(input: &str) -> Option<EncryptionAdmin> {
     let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
     match lower.as_slice() {
         ["encryption", "status"] => Some(EncryptionAdmin::Status),
+        ["encryption", "enable"] => Some(EncryptionAdmin::Enable),
         ["encryption", "rotate", "master", "key"] => Some(EncryptionAdmin::RotateMasterKey),
         _ => None,
     }
@@ -669,10 +674,37 @@ impl Engine {
         }
     }
 
+    /// Pages one maintenance sweep reads at most for a conversion (in steps
+    /// of [`CONVERSION_STEP_PAGES`] per storage-lock hold).
+    const CONVERSION_SWEEP_PAGES: usize = 8192;
+
+    /// One maintenance sweep's share of an `encryption enable` under way:
+    /// bounded steps under the storage lock, and a checkpoint when the
+    /// conversion needs one (pages rewritten through the pool are sealed on
+    /// disk once flushed). A no-op when no conversion is under way.
+    pub fn encryption_conversion(&self) -> Result<(), EngineError> {
+        use truthdb_relational::storage::ConversionStep;
+        let storage = self.storage.core_arc();
+        let mut converted = 0;
+        while converted < Self::CONVERSION_SWEEP_PAGES {
+            match storage.conversion_step(CONVERSION_STEP_PAGES)? {
+                ConversionStep::Idle | ConversionStep::Done => return Ok(()),
+                ConversionStep::NeedsCheckpoint => {
+                    self.checkpoint()?;
+                    return Ok(());
+                }
+                ConversionStep::Working => converted += CONVERSION_STEP_PAGES,
+            }
+        }
+        Ok(())
+    }
+
     fn execute_encryption_admin(&self, command: EncryptionAdmin) -> Result<String, EngineError> {
         let storage = self.storage.core_arc();
-        if let EncryptionAdmin::RotateMasterKey = command {
-            storage.rotate_master_key()?;
+        match command {
+            EncryptionAdmin::RotateMasterKey => storage.rotate_master_key()?,
+            EncryptionAdmin::Enable => storage.enable_encryption()?,
+            EncryptionAdmin::Status => {}
         }
         let status = storage.encryption_status();
         let hex = |bytes: [u8; 16]| -> String {
@@ -683,6 +715,8 @@ impl Engine {
             "encryptor_type": status.encryptor_type,
             "key_id": status.key_id,
             "key_fingerprint": status.fingerprint.map(hex),
+            "converting": status.converting,
+            "percent_complete": storage.conversion_percent(),
         })
         .to_string())
     }

@@ -112,8 +112,8 @@ async fn main() -> ExitCode {
 
     if keys.is_some() && !storage.core_arc().is_encrypted() {
         warn!(
-            "[encryption] is configured but {} is not encrypted: only a database created \
-             with a master key is",
+            "[encryption] is configured but {} is not encrypted: run `encryption enable` \
+             to encrypt it",
             config.storage.resolved_path().display()
         );
     }

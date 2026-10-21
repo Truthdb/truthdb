@@ -36,6 +36,9 @@ pub struct WalRecord {
     pub seq_no: u64,
     pub logical_ts: u64,
     pub payload: Vec<u8>,
+    /// Whether the entry was sealed (its stored payload is the writer id,
+    /// ciphertext and tag).
+    pub sealed: bool,
 }
 
 pub struct WalWriter {
@@ -138,6 +141,16 @@ impl WalWriter {
     /// promotion). While read-only every append is rejected.
     pub(crate) fn set_read_only(&mut self, read_only: bool) {
         self.read_only = read_only;
+    }
+
+    /// From now on, seals every entry under `keys` (a database whose
+    /// encryption was just turned on), with a writer key of its own.
+    pub(crate) fn start_sealing(
+        &mut self,
+        keys: &crate::encryption::WalKeys,
+    ) -> Result<(), StorageError> {
+        self.sealer = Some(keys.sealer()?);
+        Ok(())
     }
 
     pub fn head(&self) -> u64 {
@@ -588,6 +601,9 @@ pub(crate) fn scan_ring(
                 None => stop!("does not authenticate"),
             },
             None if !sealed => payload,
+            // While a database is converted from plain, entries written
+            // before the switch are plain.
+            Some(keys) if keys.converting() => payload,
             _ => stop!("is not sealed"),
         };
 
@@ -597,6 +613,7 @@ pub(crate) fn scan_ring(
             seq_no: header.seq_no,
             logical_ts: header.logical_ts,
             payload,
+            sealed,
         });
         pending_gap_start = None;
         cursor += entry_len;

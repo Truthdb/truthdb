@@ -28,8 +28,10 @@ pub use crate::wal::WalRecord;
 mod allocation;
 mod backup_restore;
 mod checkpoint;
+mod conversion;
 mod durability;
 mod lifecycle;
+pub use conversion::ConversionStep;
 pub use lifecycle::EncryptionStatus;
 mod participant;
 mod recovery;
@@ -302,6 +304,8 @@ pub struct StorageFile {
     key_source: Option<crate::encryption::KeySource>,
     /// Query spill pages' encryption (a random key per open, every database).
     spill: crate::encryption::SpillCodec,
+    /// `encryption enable` under way (see `conversion`).
+    conversion: Option<conversion::Conversion>,
 }
 
 /// Which keys a new file gets.

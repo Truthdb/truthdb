@@ -55,11 +55,16 @@ pub(in crate::engine::relational) fn sys_dm_database_encryption_keys(
         int_col("percent_complete"),
     ];
     let status = storage.encryption_status();
+    // SQL Server's states: 1 unencrypted, 2 encryption in progress, 3 encrypted.
+    let (state, percent) = match storage.conversion_percent() {
+        Some(percent) => (2, percent as i32),
+        None => (3, 0),
+    };
     let text = |value: Option<String>| value.map_or(Datum::Null, Datum::NVarChar);
     let row = if status.encrypted {
         vec![
             Datum::Int(database_id as i32),
-            Datum::Int(3),
+            Datum::Int(state),
             Datum::NVarChar("AES".to_string()),
             Datum::Int(256),
             Datum::NVarChar(status.encryptor_type.to_string()),
@@ -69,7 +74,7 @@ pub(in crate::engine::relational) fn sys_dm_database_encryption_keys(
                     .fingerprint
                     .map(|bytes| bytes.iter().map(|byte| format!("{byte:02x}")).collect()),
             ),
-            Datum::Int(0),
+            Datum::Int(percent),
         ]
     } else {
         vec![

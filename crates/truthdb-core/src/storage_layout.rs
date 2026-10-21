@@ -745,6 +745,15 @@ impl SnapshotDescriptor {
         xxh64(&out, 0)
     }
 
+    /// Whether the snapshot data was sealed (encrypted) when written.
+    pub fn sealed(&self) -> bool {
+        self.reserved[0] & 1 != 0
+    }
+
+    pub fn set_sealed(&mut self, sealed: bool) {
+        self.reserved[0] = u8::from(sealed);
+    }
+
     pub fn is_valid(&self) -> bool {
         self.magic == SNAPSHOT_MAGIC
             && self.checksum == self.compute_checksum()

@@ -404,6 +404,26 @@ impl RelCtx<'_> {
         Ok(lsn)
     }
 
+    /// Rewrites a blob page as it is (`plain`, read from disk), sealed by the
+    /// current codec and keeping the LSN it carries: a forced BLOB_REWRITE
+    /// record, then the page.
+    pub fn rewrite_blob_page(&mut self, page_no: u64, plain: &[u8]) -> Result<(), StorageError> {
+        let header = page::read_header(plain);
+        let data = &plain[page::PAGE_HEADER_SIZE..];
+        let record = RelRecord::blob_rewrite(page_no, header.page_lsn, header.object_id, data);
+        self.append(&record, true)?;
+        self.pool.discard(page_no);
+        let image = blob_page_image(
+            self.io.codec,
+            header.page_lsn,
+            header.object_id,
+            page_no,
+            data,
+        );
+        self.io.write_page(page_no, &image)?;
+        Ok(())
+    }
+
     /// Reads one blob page into `out` (`BLOB_PAGE_DATA` bytes) and returns its
     /// header. A page that fails its checksum, is not a blob page, or claims
     /// another page number is an error: the caller compares the header's

@@ -771,7 +771,11 @@ fn tweak(low: u64, high: u64) -> xts_mode::Array<u8, aes::cipher::consts::U16> {
 impl PageKeys {
     /// `converting`: a conversion from plain is under way (the key block's
     /// state).
-    pub fn new(dek: &[u8; 32], file_uuid: &[u8; 16], converting: bool) -> Result<Self, StorageError> {
+    pub fn new(
+        dek: &[u8; 32],
+        file_uuid: &[u8; 16],
+        converting: bool,
+    ) -> Result<Self, StorageError> {
         Ok(PageKeys {
             page: xts(&derive::<64>(dek, file_uuid, "truthdb page xts")),
             snapshot: xts(&derive::<64>(dek, file_uuid, "truthdb snapshot xts")),

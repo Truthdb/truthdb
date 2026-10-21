@@ -97,3 +97,99 @@ fn over_tds_only_a_sysadmin_runs_the_encryption_administration() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn encryption_enable_converts_the_database_in_the_maintenance_sweeps() {
+    use std::os::unix::fs::PermissionsExt;
+    // The encrypted test run creates every database encrypted.
+    if truthdb_core::encryption::test_key_source().is_some() {
+        return;
+    }
+    let path = unique_temp_path("encryption-enable");
+    let keys = unique_temp_path("encryption-enable-keys").with_extension("keys");
+    std::fs::write(&keys, format!("main {}\n", "1d".repeat(32))).unwrap();
+    std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).unwrap();
+    let source = truthdb_core::encryption::KeySource::File(keys.clone());
+    let engine = new_engine(&path);
+    for sql in [
+        "CREATE TABLE secrets (id INT NOT NULL PRIMARY KEY, v NVARCHAR(100))",
+        "INSERT INTO secrets VALUES (1, N'PLAINTEXT-CANARY-ONE'), (2, N'PLAINTEXT-CANARY-TWO')",
+    ] {
+        engine.execute(sql).expect(sql);
+    }
+    engine.checkpoint().expect("checkpoint");
+    drop(engine);
+    let utf16: Vec<u8> = "PLAINTEXT-CANARY"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    let before = std::fs::read(&path).unwrap();
+    assert!(
+        before
+            .windows(utf16.len())
+            .any(|window| window == utf16.as_slice()),
+        "the plain database holds the text"
+    );
+
+    // Restarted with a master key configured, then enabled while it runs.
+    let storage = RelStorage::open_with_keys(path.clone(), crate::database_engines, Some(&source))
+        .expect("open");
+    let engine = Engine::new(storage).expect("engine");
+    let status: serde_json::Value =
+        serde_json::from_str(&engine.execute("encryption enable").expect("enable")).unwrap();
+    assert_eq!(status["converting"], true);
+    engine
+        .execute("INSERT INTO secrets VALUES (3, N'PLAINTEXT-CANARY-THREE')")
+        .expect("insert during the conversion");
+    for _ in 0..1000 {
+        if !engine.storage().encryption_status().converting {
+            break;
+        }
+        engine.encryption_conversion().expect("sweep");
+    }
+    let status: serde_json::Value =
+        serde_json::from_str(&engine.execute("encryption status").expect("status")).unwrap();
+    assert_eq!(
+        (status["encrypted"].clone(), status["converting"].clone()),
+        (true.into(), false.into())
+    );
+    let mut ctx = TxnContext::default();
+    let outcome = batch(
+        &engine,
+        &mut ctx,
+        "SELECT encryption_state FROM sys.dm_database_encryption_keys",
+    );
+    let [StatementResult::Rows(rows)] = &outcome.results[..] else {
+        panic!("{:?}", outcome.results);
+    };
+    assert_eq!(
+        rows.rows[0][0],
+        truthdb_relational::relstore::types::Datum::Int(3)
+    );
+    drop(engine);
+    // NVARCHAR text is stored as UTF-16.
+    let file = std::fs::read(&path).unwrap();
+    let utf8 = b"PLAINTEXT-CANARY".to_vec();
+    let utf16: Vec<u8> = "PLAINTEXT-CANARY"
+        .encode_utf16()
+        .flat_map(u16::to_le_bytes)
+        .collect();
+    for needle in [&utf8, &utf16] {
+        assert!(
+            !file
+                .windows(needle.len())
+                .any(|window| window == needle.as_slice()),
+            "plaintext left in the file"
+        );
+    }
+
+    let storage = RelStorage::open_with_keys(path.clone(), crate::database_engines, Some(&source))
+        .expect("reopen");
+    let engine = Engine::new(storage).expect("engine");
+    let (_, rows) = sql_rows(&engine, "SELECT v FROM secrets ORDER BY id");
+    assert_eq!(rows.len(), 3);
+    drop(engine);
+    for file in [&path, &keys] {
+        let _ = std::fs::remove_file(file);
+    }
+}
