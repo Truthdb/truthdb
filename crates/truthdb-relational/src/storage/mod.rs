@@ -4,6 +4,7 @@
 //! relational transaction types. The shared log's storage items are
 //! re-exported, so `crate::storage` names both.
 
+pub use truthdb_core::encryption::KeySource;
 pub use truthdb_core::storage::*;
 
 use std::path::{Path, PathBuf};

@@ -47,6 +47,7 @@ impl PrimaryReplContext {
         HandshakeParams {
             shared_secret: &self.shared_secret,
             cluster_uuid: self.cluster_uuid,
+            key_fingerprint: self.storage.key_fingerprint(),
             primary_epoch: self.storage.epoch(),
             primary_flushed_lsn,
         }
@@ -148,8 +149,9 @@ mod tests {
 
     /// Spins up the listener on an ephemeral port with a self-signed cert and a
     /// real (empty) storage, then connects a real TLS standby that sends
-    /// `hello` and returns the ack it gets.
-    async fn connect_and_handshake(hello: Hello) -> HelloAck {
+    /// `hello` (built from the storage's key fingerprint) and returns the ack
+    /// it gets.
+    async fn connect_and_handshake(hello: impl FnOnce([u8; 16]) -> Hello) -> HelloAck {
         let (cert_pem, key_pem) = self_signed();
         let acceptor = TlsAcceptor::from(
             server_config_from_pem(cert_pem.as_bytes(), key_pem.as_bytes()).unwrap(),
@@ -161,6 +163,7 @@ mod tests {
         let addr = listener.local_addr().unwrap();
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let (storage, path) = temp_storage("handshake");
+        let hello = hello(storage.key_fingerprint());
         let ctx = PrimaryReplContext {
             shared_secret: Arc::new(SECRET.to_vec()),
             cluster_uuid: UUID,
@@ -192,31 +195,31 @@ mod tests {
     async fn the_listener_accepts_a_valid_standby_over_tls() {
         // A fresh (empty) primary storage: epoch 0, and the standby resumes at
         // the primary's current tail (nothing to catch up).
-        let auth = compute_auth(SECRET, 9, &UUID, 0, 0);
-        let hello = Hello {
+        let ack = connect_and_handshake(|key_fingerprint| Hello {
             protocol_version: REPL_PROTOCOL_VERSION,
             node_id: 9,
             cluster_uuid: UUID,
+            key_fingerprint,
             epoch: 0,
             last_received_lsn: 0,
-            auth,
-        };
-        let ack = connect_and_handshake(hello).await;
+            auth: compute_auth(SECRET, 9, &UUID, &key_fingerprint, 0, 0),
+        })
+        .await;
         assert!(ack.accepted, "{}", ack.message);
     }
 
     #[tokio::test]
     async fn the_listener_rejects_a_bad_secret_over_tls() {
-        let auth = compute_auth(b"wrong-secret", 9, &UUID, 0, 0);
-        let hello = Hello {
+        let ack = connect_and_handshake(|key_fingerprint| Hello {
             protocol_version: REPL_PROTOCOL_VERSION,
             node_id: 9,
             cluster_uuid: UUID,
+            key_fingerprint,
             epoch: 0,
             last_received_lsn: 0,
-            auth,
-        };
-        let ack = connect_and_handshake(hello).await;
+            auth: compute_auth(b"wrong-secret", 9, &UUID, &key_fingerprint, 0, 0),
+        })
+        .await;
         assert!(!ack.accepted);
         assert_eq!(ack.message, "replication handshake rejected");
     }

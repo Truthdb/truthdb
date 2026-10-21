@@ -127,6 +127,7 @@ mod tests {
             protocol_version: REPL_PROTOCOL_VERSION,
             node_id: 1,
             cluster_uuid: [2u8; 16],
+            key_fingerprint: [0; 16],
             epoch: 0,
             last_received_lsn: 4096,
             auth: vec![9, 9],

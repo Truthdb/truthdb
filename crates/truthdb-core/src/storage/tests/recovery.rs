@@ -244,7 +244,7 @@ fn torn_tail_is_stopped_at_and_healed_by_whole_page_flush() {
 
     // Simulate a torn write of a follow-up entry: garbage on the tail
     // page right after entry A.
-    let entry_a_len = wal_entry_padded_len(payload_a.len()) as u64;
+    let entry_a_len = super::stored_entry_len(payload_a.len());
     overwrite_bytes(&path, layout.wal_offset + entry_a_len, &[0x5Au8; 200]);
 
     // Recovery must stop at the garbage and keep A.
@@ -287,7 +287,7 @@ fn superblock_is_lazy_and_forward_scan_recovers_past_it() {
     // The on-disk superblock lags the true tail (laziness) but is not 0
     // (the cadence rewrite fired).
     let sb = read_active_superblock(&path, &layout);
-    let true_tail = lsns[3] + wal_entry_padded_len(payloads[3].len()) as u64;
+    let true_tail = lsns[3] + super::stored_entry_len(payloads[3].len());
     assert!(sb.wal_tail > 0, "cadence superblock write must have fired");
     assert!(
         sb.wal_tail < true_tail,
@@ -536,7 +536,7 @@ fn wrap_gap_without_next_lap_entry_rewinds_tail() {
 
     // Entry 9 wrapped to the ring start. Erase its lap-2 pages as if the
     // gap reached disk but the entry itself never did.
-    let entry_len = wal_entry_padded_len(8000);
+    let entry_len = super::stored_entry_len(8000) as usize;
     overwrite_bytes(&path, layout.wal_offset, &vec![0u8; entry_len]);
 
     let mut storage = Storage::open(path.clone(), super::no_engine).expect("reopen");
@@ -605,11 +605,18 @@ fn trusted_region_corruption_truncates_and_persists_corrected_tail() {
         append_search_entry(&mut storage, seq, &[seq as u8; 100]);
     }
     drop(storage);
-    let entry_len = wal_entry_padded_len(100) as u64;
+    let entry_len = super::stored_entry_len(100);
 
     // Corrupt entry 2, inside the superblock-trusted region.
     overwrite_bytes(&path, layout.wal_offset + entry_len + 8, &[0xDDu8; 32]);
 
+    // An encrypted database refuses to open instead: its durable log was
+    // changed (see `a_changed_byte_where_the_log_was_durable_refuses_the_open`).
+    if crate::encryption::test_key_source().is_some() {
+        assert!(Storage::open(path.clone(), super::no_engine).is_err());
+        let _ = std::fs::remove_file(path);
+        return;
+    }
     let mut storage =
         Storage::open(path.clone(), super::no_engine).expect("reopen after corruption");
     let records = storage.replay_wal_entries().expect("replay");

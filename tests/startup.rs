@@ -179,17 +179,6 @@ fn a_database_created_with_a_master_key_is_encrypted_and_needs_it_to_start() {
     let (status, output) = run_server(&dir, &base);
     assert!(!status.success(), "exit {status}:\n{output}");
     assert!(output.contains("encrypted"), "{output}");
-    // Replication is refused: the log would ship in clear.
-    let replicated = format!(
-        "{with_key}\n[replication]\nenabled = true\nrole = \"primary\"\nshared_secret = \"s\"\naddr = \"127.0.0.1\"\nport = {}\n",
-        free_port()
-    );
-    let (status, output) = run_server(&dir, &replicated);
-    assert!(!status.success(), "exit {status}:\n{output}");
-    assert!(
-        output.contains("replication of an encrypted database"),
-        "{output}"
-    );
     // A key file others can read is refused.
     std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o644)).expect("chmod");
     let (status, output) = run_server(&dir, &with_key);

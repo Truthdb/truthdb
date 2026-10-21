@@ -34,8 +34,8 @@
 #
 # [encryption]
 # Encryption at rest: a database created while a master key is configured is
-# encrypted (its pages, search snapshot and spill pages), and it does not open
-# without that key. One of:
+# encrypted (its pages, log, search snapshot, spill pages and backups); it, its
+# backups and its standbys do not open without that key. One of:
 # master_key_file = "/etc/truthdb/master.keys"  # lines "<id> <64 hex digits>",
 #                                               # the first key current; mode 0600,
 #                                               # owned by the server's user

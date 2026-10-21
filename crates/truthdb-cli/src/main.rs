@@ -78,6 +78,8 @@ enum Command {
         /// read-only, ready to follow a primary. Incompatible with --stopat.
         #[arg(long, conflicts_with = "stopat")]
         standby: bool,
+        #[command(flatten)]
+        keys: KeyArgs,
     },
     /// OFFLINE: promote a replication standby to a read-write primary (manual
     /// failover). The server must be stopped. Finishes recovery (redo + undo
@@ -89,11 +91,38 @@ enum Command {
         /// Path to the standby's storage file (e.g. /var/lib/truthdb/truth.db).
         #[arg(long)]
         path: std::path::PathBuf,
+        #[command(flatten)]
+        keys: KeyArgs,
     },
     /// ONLINE: show this server's replication state (role, slots, connected
     /// standbys, lag, sync-commit status) by querying the `sys.dm_repl_*`
     /// views over the native protocol.
     ReplStatus,
+}
+
+/// The master key of an encrypted database, as the server's `[encryption]`
+/// section names it (one of the two).
+#[derive(clap::Args, Debug, Clone)]
+struct KeyArgs {
+    /// The master key file (lines `<id> <64 hex digits>`; mode 0600).
+    #[arg(long, conflicts_with = "key_command")]
+    key_file: Option<std::path::PathBuf>,
+    /// The key command, then its arguments: one per `--key-command` (write
+    /// an argument starting with `-` as `--key-command=-x`). It is run with
+    /// `wrap` or `unwrap` appended.
+    #[arg(long = "key-command")]
+    key_command: Vec<String>,
+}
+
+impl KeyArgs {
+    fn source(&self) -> Result<Option<truthdb_relational::storage::KeySource>> {
+        use truthdb_relational::storage::KeySource;
+        Ok(match (&self.key_file, self.key_command.is_empty()) {
+            (Some(path), _) => Some(KeySource::File(path.clone())),
+            (None, false) => Some(KeySource::Command(self.key_command.clone())),
+            (None, true) => None,
+        })
+    }
 }
 
 #[tokio::main]
@@ -125,13 +154,26 @@ async fn main() -> Result<()> {
             log,
             stopat,
             standby,
+            keys,
         } => {
+            let keys = keys.source()?;
+            if keys.is_some()
+                && truthdb_core::backup::read_header(&full)
+                    .is_ok_and(|header| header.keys.is_none())
+            {
+                eprintln!(
+                    "note: {} is a backup of a database that is not encrypted; the restored \
+                     database is not encrypted either",
+                    full.display()
+                );
+            }
             let result = if standby {
                 truthdb_relational::storage::RelStorage::restore_full_standby_with(
                     &to,
                     &full,
                     &log,
                     truthdb_engine::database_engines,
+                    keys.as_ref(),
                 )
             } else {
                 truthdb_relational::storage::RelStorage::restore_full_with_logs_with(
@@ -140,6 +182,7 @@ async fn main() -> Result<()> {
                     &log,
                     stopat,
                     truthdb_engine::database_engines,
+                    keys.as_ref(),
                 )
             };
             match result {
@@ -165,10 +208,12 @@ async fn main() -> Result<()> {
             }
         }
         Command::ReplStatus => repl_status(&addr).await,
-        Command::Promote { path } => {
+        Command::Promote { path, keys } => {
+            let keys = keys.source()?;
             match truthdb_relational::storage::RelStorage::promote_with(
                 &path,
                 truthdb_engine::database_engines,
+                keys.as_ref(),
             ) {
                 Ok(epoch) => {
                     println!(

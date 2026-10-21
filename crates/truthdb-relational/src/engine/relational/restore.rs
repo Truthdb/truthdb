@@ -65,6 +65,9 @@ pub(super) fn restore_headeronly_rows(header: &crate::backup::BackupHeader) -> R
         int_col("DbOptions"),
         nvarchar("Collation", 128),
         bigint_col("BackupFinishDate"),
+        // SQL Server's column for an encrypted backup's algorithm (NULL: not
+        // encrypted).
+        nvarchar("KeyAlgorithm", 32),
     ];
     // BackupType: 1 = full database, 2 = transaction log (SQL Server's coding).
     let backup_type = if header.flags.log_backup { 2 } else { 1 };
@@ -83,6 +86,10 @@ pub(super) fn restore_headeronly_rows(header: &crate::backup::BackupHeader) -> R
             None => Datum::Null,
         },
         Datum::BigInt(header.finished_at_millis as i64),
+        match header.keys {
+            Some(_) => Datum::NVarChar("aes_256".to_string()),
+            None => Datum::Null,
+        },
     ];
     RowSet {
         columns,

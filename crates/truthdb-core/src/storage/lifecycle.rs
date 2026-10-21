@@ -420,6 +420,15 @@ impl Storage {
     pub fn is_encrypted(&self) -> bool {
         self.lock().codec.is_encrypted()
     }
+
+    /// The database key's fingerprint (zeros when not encrypted): equal for
+    /// a database, its restores and its standbys.
+    pub fn key_fingerprint(&self) -> [u8; 16] {
+        self.lock()
+            .codec
+            .wal_keys()
+            .map_or([0; 16], |keys| keys.fingerprint())
+    }
 }
 
 /// Repairs an encrypted file's header reading found, applied by the caller
@@ -630,12 +639,14 @@ impl StorageFile {
         // Recover the true WAL tail: trust the superblock's tail as a lower
         // bound and scan forward (CRC + LSN self-identity) past it.
         let mut log_file = DirectFile::open_existing_unlocked(path.clone())?;
+        let wal_keys = codec.wal_keys();
         let scan = scan_ring(
             &mut log_file,
             layout.wal_offset,
             layout.wal_size,
             active_sb.wal_head,
             active_sb.wal_tail,
+            wal_keys.as_deref(),
         )?;
         let wal = WalWriter::open(
             log_file,
@@ -643,6 +654,7 @@ impl StorageFile {
             layout.wal_size,
             active_sb.wal_head,
             scan.tail,
+            wal_keys.as_deref(),
         )?;
         let recorded_tail = active_sb.wal_tail;
 
@@ -700,6 +712,10 @@ impl StorageFile {
             replay_cache: scan.records,
             standby_pending_frees: Default::default(),
             codec,
+            key_record: header.is_encrypted().then(|| crate::backup::KeyRecord {
+                file_uuid: header.file_uuid,
+                key_block: header.key_block().to_vec(),
+            }),
         };
         let mut storage = Locked { core, engines };
         // Re-establish the FULL-model log-backup hold so a checkpoint cannot
@@ -788,6 +804,10 @@ impl StorageFile {
         keys: Option<&crate::encryption::KeySource>,
     ) -> Result<Self, StorageError> {
         let layout = compute_layout(opts.clone(), wal_min_bytes, wal_max_bytes)?;
+        let keys = match keys {
+            Some(source) => super::FileKeys::New(source),
+            None => super::FileKeys::Plain,
+        };
         Self::create_from_layout(path, layout, opts.default_collation, true, keys)
     }
 
@@ -805,7 +825,7 @@ impl StorageFile {
         layout: StorageLayout,
         default_collation: Option<String>,
         openable: bool,
-        keys: Option<&crate::encryption::KeySource>,
+        keys: super::FileKeys<'_>,
     ) -> Result<Self, StorageError> {
         validate_allocator_region(&layout)?;
         let mut header = FileHeader::default();
@@ -819,18 +839,30 @@ impl StorageFile {
         }
         // An encrypted database: a fresh key, wrapped by the master key, in
         // the header; the file's uuid salts every key derived from it.
-        let codec = match keys {
-            Some(source) => {
-                header.file_uuid = crate::encryption::random_uuid()?;
-                let (block, dek) = crate::encryption::new_key_block(source, &header.file_uuid)?;
-                header.set_key_block(&block);
-                crate::encryption::PageCodec::Encrypted(Box::new(crate::encryption::PageKeys::new(
-                    &dek,
-                    &header.file_uuid,
-                )?))
-            }
-            None => crate::encryption::PageCodec::Plain,
-        };
+        let codec =
+            match keys {
+                super::FileKeys::New(source) => {
+                    header.file_uuid = crate::encryption::random_uuid()?;
+                    let (block, dek) = crate::encryption::new_key_block(source, &header.file_uuid)?;
+                    header.set_key_block(&block);
+                    crate::encryption::PageCodec::Encrypted(Box::new(
+                        crate::encryption::PageKeys::new(&dek, &header.file_uuid)?,
+                    ))
+                }
+                super::FileKeys::Existing(record, source) => {
+                    header.file_uuid = record.file_uuid;
+                    let dek = crate::encryption::unlock_key_block(
+                        &record.key_block,
+                        source,
+                        &record.file_uuid,
+                    )?;
+                    header.set_key_block(&record.key_block);
+                    crate::encryption::PageCodec::Encrypted(Box::new(
+                        crate::encryption::PageKeys::new(&dek, &header.file_uuid)?,
+                    ))
+                }
+                super::FileKeys::Plain => crate::encryption::PageCodec::Plain,
+            };
         header.superblock_a_offset = layout.superblock_a_offset;
         header.superblock_b_offset = layout.superblock_b_offset;
         header.wal_offset = layout.wal_offset;
@@ -880,7 +912,14 @@ impl StorageFile {
         file.sync_data()?;
 
         let log_file = DirectFile::open_existing_unlocked(path.clone())?;
-        let wal = WalWriter::open(log_file, layout.wal_offset, layout.wal_size, 0, 0)?;
+        let wal = WalWriter::open(
+            log_file,
+            layout.wal_offset,
+            layout.wal_size,
+            0,
+            0,
+            codec.wal_keys().as_deref(),
+        )?;
 
         Ok(StorageFile {
             default_collation: header.default_collation(),
@@ -903,6 +942,10 @@ impl StorageFile {
             replay_cache: Vec::new(),
             standby_pending_frees: Default::default(),
             codec,
+            key_record: header.is_encrypted().then(|| crate::backup::KeyRecord {
+                file_uuid: header.file_uuid,
+                key_block: header.key_block().to_vec(),
+            }),
         })
     }
 

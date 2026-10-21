@@ -61,19 +61,26 @@ pub struct WalWriter {
     read_only: bool,
     bytes_since_superblock: u64,
     superblock_interval: u64,
+    /// An encrypted database's: this writer's key, under which every entry it
+    /// appends is sealed.
+    sealer: Option<crate::encryption::WalSealer>,
 }
 
 impl WalWriter {
     /// Opens a writer positioned at a recovered `(head, tail)`. Seeds the
     /// in-memory tail page from disk (prefix only; the suffix stays zero so
     /// the next flush heals any torn bytes past the tail).
+    /// With `keys` (an encrypted database), the writer draws its own sealing
+    /// key.
     pub fn open(
         mut file: DirectFile,
         ring_offset: u64,
         ring_size: u64,
         head: u64,
         tail: u64,
+        keys: Option<&crate::encryption::WalKeys>,
     ) -> Result<Self, StorageError> {
+        let sealer = keys.map(|keys| keys.sealer()).transpose()?;
         let mut buffer = LogBuffer::new_at(tail);
         if !buffer.current_page_is_empty() {
             let (page_start, _) = buffer.current_page();
@@ -94,6 +101,7 @@ impl WalWriter {
             read_only: false,
             bytes_since_superblock: 0,
             superblock_interval: SUPERBLOCK_REWRITE_INTERVAL,
+            sealer,
         })
     }
 
@@ -264,7 +272,13 @@ impl WalWriter {
                 "wal region size is zero".to_string(),
             ));
         }
-        let entry_len = wal_entry_padded_len(payload.len());
+        let stored_len = payload.len()
+            + if self.sealer.is_some() {
+                crate::encryption::WAL_SEAL_OVERHEAD
+            } else {
+                0
+            };
+        let entry_len = wal_entry_padded_len(stored_len);
         if entry_len as u64 > self.ring_size {
             return Err(StorageError::WalFull(
                 "entry larger than wal ring".to_string(),
@@ -305,22 +319,39 @@ impl WalWriter {
         }
         let lsn = self.buffer.tail();
 
-        let payload_crc = wal_payload_crc(payload);
+        // A sealed entry authenticates its header's leading fields.
+        let sealed;
+        let (entry_version, stored) = match &self.sealer {
+            Some(sealer) => {
+                let version = entry_version | crate::storage_layout::WAL_ENTRY_SEALED;
+                let aad =
+                    WalEntryHeader::new(entry_type, version, stored_len as u32, seq_no, lsn, 0)
+                        .to_le_bytes();
+                sealed = sealer.seal_entry(
+                    lsn,
+                    &aad[..crate::storage_layout::WAL_ENTRY_AAD_LEN],
+                    payload,
+                );
+                (version, sealed.as_slice())
+            }
+            None => (entry_version, payload),
+        };
+        let payload_crc = wal_payload_crc(stored);
         let header = WalEntryHeader::new(
             entry_type,
             entry_version,
-            payload.len() as u32,
+            stored.len() as u32,
             seq_no,
             lsn,
             payload_crc,
         );
         let footer = WalEntryFooter {
-            payload_len: payload.len() as u32,
+            payload_len: stored.len() as u32,
             payload_crc,
         };
         let mut entry_bytes = Vec::with_capacity(entry_len);
         entry_bytes.extend_from_slice(&header.to_le_bytes());
-        entry_bytes.extend_from_slice(payload);
+        entry_bytes.extend_from_slice(stored);
         entry_bytes.extend_from_slice(&footer.to_le_bytes());
         entry_bytes.resize(entry_len, 0);
 
@@ -419,12 +450,22 @@ pub(crate) fn zero_ring_range(
 /// resurrected — distinguishing histories at the same position would need
 /// timeline identifiers (out of scope for Stage 1; this only follows an
 /// already-violated durability assumption).
+///
+/// With `keys` (an encrypted database) every entry must be sealed, open
+/// under them and name its own position, and its payload comes back opened
+/// (the version without the sealed bit); without, a sealed entry is not
+/// accepted. Past the trusted tail an entry that fails ends the log, like one
+/// that fails its checksum; below it, in an encrypted database, the scan
+/// returns an error instead: the durable log was changed. (This holds below
+/// an untampered superblock tail: superblocks carry a checksum, not a MAC, so
+/// lowering the recorded tail turns a refusal back into the end of the log.)
 pub(crate) fn scan_ring(
     file: &mut DirectFile,
     ring_offset: u64,
     ring_size: u64,
     head: u64,
     trusted_tail: u64,
+    keys: Option<&crate::encryption::WalKeys>,
 ) -> Result<ScanResult, StorageError> {
     let mut records = Vec::new();
     let mut cursor = head;
@@ -448,6 +489,21 @@ pub(crate) fn scan_ring(
         let ring_pos = cursor % ring_size;
         let bytes_to_lap_end = ring_size - ring_pos;
         let trusted = cursor < trusted_tail;
+        // An entry that fails to verify ends the log, except where the log
+        // was durable in an encrypted database: there it was changed, and the
+        // database refuses to open rather than silently drop what follows.
+        macro_rules! stop {
+            ($why:expr) => {{
+                if trusted && keys.is_some() {
+                    return Err(StorageError::InvalidFile(format!(
+                        "the log entry at LSN {cursor} {}: the log of this encrypted \
+                         database does not verify where it was durable",
+                        $why
+                    )));
+                }
+                break;
+            }};
+        }
 
         if bytes_to_lap_end < WAL_ENTRY_HEADER_SIZE as u64 {
             // Too small for a header: implicit wrap gap.
@@ -462,7 +518,26 @@ pub(crate) fn scan_ring(
         let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
         file.read_exact_at(file_pos, &mut header_bytes)?;
         if header_bytes.iter().all(|b| *b == 0) {
-            // Wrap gap: writer zero-fills to the lap end before wrapping.
+            // Wrap gap: writer zero-fills to the lap end before wrapping. Where
+            // an encrypted database's log was durable, a gap is only the
+            // writer's: zero to the lap end, with the recorded tail past it (a
+            // writer records it after the entry that follows the gap, and a
+            // point-in-time cut at that entry ends where the gap begins).
+            if trusted && keys.is_some() {
+                if trusted_tail <= cursor + bytes_to_lap_end {
+                    stop!("is zeroed inside the log");
+                }
+                let mut rest = vec![0u8; bytes_to_lap_end.min(1 << 20) as usize];
+                let mut at = 0u64;
+                while at < bytes_to_lap_end {
+                    let len = (bytes_to_lap_end - at).min(rest.len() as u64) as usize;
+                    file.read_exact_at(file_pos + at, &mut rest[..len])?;
+                    if rest[..len].iter().any(|b| *b != 0) {
+                        stop!("is zeroed but its lap is not");
+                    }
+                    at += len as u64;
+                }
+            }
             if !trusted {
                 pending_gap_start.get_or_insert(cursor);
             }
@@ -472,23 +547,26 @@ pub(crate) fn scan_ring(
 
         let header = WalEntryHeader::from_le_bytes(&header_bytes);
         if !header.verify_header_crc() {
-            break;
+            stop!("fails its header checksum");
         }
         let payload_len = header.payload_len as usize;
         let entry_len = wal_entry_padded_len(payload_len) as u64;
         let total_len = (WAL_ENTRY_HEADER_SIZE + payload_len + WAL_ENTRY_FOOTER_SIZE) as u64;
         if total_len > bytes_to_lap_end {
             // Entries never straddle a lap boundary.
-            break;
+            stop!("straddles the end of the ring");
         }
-        if !trusted && header.logical_ts != cursor {
-            break;
+        // An encrypted database's entries all name their own position: one
+        // copied from elsewhere in the ring is refused even where the log was
+        // durable.
+        if (!trusted || keys.is_some()) && header.logical_ts != cursor {
+            stop!("names another position");
         }
 
         let mut payload = vec![0u8; payload_len];
         file.read_exact_at(file_pos + WAL_ENTRY_HEADER_SIZE as u64, &mut payload)?;
         if wal_payload_crc(&payload) != header.payload_crc {
-            break;
+            stop!("fails its payload checksum");
         }
         let mut footer_bytes = [0u8; WAL_ENTRY_FOOTER_SIZE];
         file.read_exact_at(
@@ -497,12 +575,25 @@ pub(crate) fn scan_ring(
         )?;
         let footer = WalEntryFooter::from_le_bytes(&footer_bytes);
         if footer.payload_len != header.payload_len || footer.payload_crc != header.payload_crc {
-            break;
+            stop!("does not match its footer");
         }
+        let sealed = header.entry_version & crate::storage_layout::WAL_ENTRY_SEALED != 0;
+        let payload = match keys {
+            Some(keys) if sealed => match keys.open_entry(
+                header.logical_ts,
+                &header_bytes[..crate::storage_layout::WAL_ENTRY_AAD_LEN],
+                &payload,
+            ) {
+                Some(plain) => plain,
+                None => stop!("does not authenticate"),
+            },
+            None if !sealed => payload,
+            _ => stop!("is not sealed"),
+        };
 
         records.push(WalRecord {
             entry_type: header.entry_type,
-            entry_version: header.entry_version,
+            entry_version: header.entry_version & !crate::storage_layout::WAL_ENTRY_SEALED,
             seq_no: header.seq_no,
             logical_ts: header.logical_ts,
             payload,

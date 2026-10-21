@@ -241,10 +241,6 @@ fn grow_crash_before_header_stamp_is_recoverable() {
 #[test]
 fn a_backup_after_a_grow_cut_short_restores() {
     use crate::engine::{StatementResult, TxnContext, execute_batch};
-    // Backups of an encrypted database are refused until they carry its key.
-    if truthdb_core::encryption::test_key_source().is_some() {
-        return;
-    }
     let path = unique_temp_path("grow-cut-backup");
     let bak = unique_temp_path("grow-cut-backup-bak");
     let dst = unique_temp_path("grow-cut-backup-dst");

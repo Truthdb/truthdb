@@ -30,23 +30,41 @@ impl Storage {
     ///
     /// Returns the new epoch.
     pub fn promote(path: &Path, engine: EngineFactory) -> Result<u64, StorageError> {
+        Self::promote_with_keys(path, engine, None)
+    }
+
+    /// [`Self::promote`] of a standby that may be encrypted: `keys` is where
+    /// its master key comes from.
+    pub fn promote_with_keys(
+        path: &Path,
+        engine: EngineFactory,
+        keys: Option<&crate::encryption::KeySource>,
+    ) -> Result<u64, StorageError> {
+        #[cfg(any(test, feature = "test-hooks"))]
+        let test_keys = crate::encryption::test_key_source();
+        #[cfg(any(test, feature = "test-hooks"))]
+        let keys = keys.or(test_keys.as_ref());
         let new_epoch = {
             let mut file = DirectFile::open_existing(path.to_path_buf())?;
             let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
             file.read_exact_at(0, &mut header_bytes)?;
             let header = FileHeader::from_le_bytes(&header_bytes);
-            if header.is_encrypted() {
-                return Err(StorageError::InvalidConfig(
-                    "promoting an encrypted database is not supported yet".to_string(),
-                ));
-            }
-            if header.magic != crate::storage_layout::FILE_MAGIC {
+            if !header.has_known_magic() {
                 return Err(StorageError::InvalidFile("bad magic".to_string()));
             }
             if header.header_checksum != header.compute_checksum() {
                 return Err(StorageError::InvalidFile(
                     "header checksum mismatch".to_string(),
                 ));
+            }
+            // An encrypted standby's key is checked before anything is written.
+            if header.is_encrypted() {
+                let source = keys.ok_or_else(|| {
+                    StorageError::InvalidConfig(
+                        "this database is encrypted: promoting it needs its master key".to_string(),
+                    )
+                })?;
+                crate::encryption::unlock_key_block(header.key_block(), source, &header.file_uuid)?;
             }
             if header.version != crate::storage_layout::FILE_VERSION {
                 return Err(StorageError::InvalidFile(format!(
@@ -107,7 +125,7 @@ impl Storage {
                     file.write_all_at(backup_offset, &backup.to_le_bytes_with_checksum())?;
                     file.sync_data()?;
                     drop(file);
-                    drop(Storage::open(path.to_path_buf(), engine)?);
+                    drop(Storage::open_with_keys(path.to_path_buf(), engine, keys)?);
                     return Ok(active.epoch());
                 }
                 return Err(StorageError::InvalidConfig(format!(
@@ -158,7 +176,7 @@ impl Storage {
         };
         // Validate + finalize: a full open runs redo AND undo (the standby flag
         // is gone), sealing the shipped in-flight transactions with CLRs.
-        drop(Storage::open(path.to_path_buf(), engine)?);
+        drop(Storage::open_with_keys(path.to_path_buf(), engine, keys)?);
         Ok(new_epoch)
     }
 

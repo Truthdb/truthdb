@@ -98,16 +98,19 @@ async fn connect_and_stream(cfg: &ReceiverConfig, storage: &Arc<Storage>) -> io:
     // reconnect on a 4305 gap. The overlap re-ship is idempotent.
     let last_received = storage.standby_resume_lsn();
     let epoch = storage.epoch();
+    let key_fingerprint = storage.key_fingerprint();
     let hello = Hello {
         protocol_version: REPL_PROTOCOL_VERSION,
         node_id: u64::from(cfg.node_id),
         cluster_uuid: cfg.cluster_uuid,
+        key_fingerprint,
         epoch,
         last_received_lsn: last_received,
         auth: compute_auth(
             &cfg.shared_secret,
             u64::from(cfg.node_id),
             &cfg.cluster_uuid,
+            &key_fingerprint,
             epoch,
             last_received,
         ),

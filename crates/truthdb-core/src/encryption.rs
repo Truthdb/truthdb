@@ -12,6 +12,10 @@
 //!   fails verification;
 //! - the search snapshot and spill pages: AES-256-XTS of whole pages (the
 //!   snapshot keeps its own checksum; spill pages are query scratch).
+//! - the log: each entry's payload sealed with AES-256-GCM under its
+//!   writer's key (see [`WalKeys`]), its header authenticated; backups and
+//!   standbys copy pages and log as stored, so they carry the file uuid and
+//!   key block and open under the same master key.
 //!
 //! The master key is a key file (named keys, the first one current) or an
 //! external command that wraps and unwraps the DEK (a KMS).
@@ -238,7 +242,10 @@ fn run_key_command(
 }
 
 // The key block, in the file header's reserved area.
-const KEY_BLOCK_MAGIC: [u8; 8] = *b"TDBKEYS1";
+const KEY_BLOCK_MAGIC: [u8; 8] = *b"TDBKEYS2";
+/// The key block of a database whose log was not encrypted (a development
+/// build before log encryption): such a database is refused.
+const KEY_BLOCK_MAGIC_V1: [u8; 8] = *b"TDBKEYS1";
 const STATE_ENCRYPTED: u8 = 1;
 const MAX_SLOTS: usize = 2;
 const SLOTS_OFFSET: usize = 16;
@@ -442,6 +449,13 @@ pub fn unlock_key_block(
     file_uuid: &[u8; 16],
 ) -> Result<Zeroizing<[u8; 32]>, StorageError> {
     let corrupt = |why: &str| StorageError::InvalidFile(format!("the key block {why}"));
+    if block.len() == KEY_BLOCK_SIZE && block[0..8] == KEY_BLOCK_MAGIC_V1 {
+        return Err(StorageError::InvalidFile(
+            "this encrypted database was created by a development build that did not \
+             encrypt its log; it cannot be opened: recreate it"
+                .to_string(),
+        ));
+    }
     if block.len() != KEY_BLOCK_SIZE || block[0..8] != KEY_BLOCK_MAGIC {
         return Err(corrupt("is missing"));
     }
@@ -523,6 +537,104 @@ pub struct PageKeys {
     spill: Xts128<Aes256>,
     mac: hmac::Key,
     spill_salt: u64,
+    wal: std::sync::Arc<WalKeys>,
+}
+
+/// Bytes a sealed log entry adds to its payload: the writer id and the tag.
+pub const WAL_SEAL_OVERHEAD: usize = 8 + 16;
+
+/// The keys of an encrypted database's log. Each writer (one per open of
+/// the file) seals its entries under its own key, derived from the database
+/// key and a random writer id that every entry carries; the nonce is the
+/// entry's LSN, which one writer never writes twice (a failed write poisons
+/// it until the next open). An LSN written again after a torn tail is cut,
+/// a point-in-time restore, another restore of the same backup or a
+/// promotion comes from another writer, so it is sealed under another key.
+pub struct WalKeys {
+    dek: Zeroizing<[u8; 32]>,
+    file_uuid: [u8; 16],
+    readers: std::sync::Mutex<std::collections::HashMap<u64, aead::LessSafeKey>>,
+}
+
+/// One writer's sealing key.
+pub struct WalSealer {
+    writer_id: u64,
+    key: aead::LessSafeKey,
+}
+
+fn wal_key(dek: &[u8; 32], file_uuid: &[u8; 16], writer_id: u64) -> aead::LessSafeKey {
+    let key = derive::<32>(dek, file_uuid, &format!("truthdb wal {writer_id:016x}"));
+    aead::LessSafeKey::new(
+        aead::UnboundKey::new(&aead::AES_256_GCM, key.as_slice()).expect("a 32-byte key"),
+    )
+}
+
+fn wal_nonce(lsn: u64) -> aead::Nonce {
+    let mut nonce = [0u8; 12];
+    nonce[..8].copy_from_slice(&lsn.to_le_bytes());
+    aead::Nonce::assume_unique_for_key(nonce)
+}
+
+impl WalKeys {
+    fn new(dek: &[u8; 32], file_uuid: &[u8; 16]) -> Self {
+        WalKeys {
+            dek: Zeroizing::new(*dek),
+            file_uuid: *file_uuid,
+            readers: Default::default(),
+        }
+    }
+
+    /// A new writer's sealing key, under a fresh random writer id.
+    pub fn sealer(&self) -> Result<WalSealer, StorageError> {
+        let mut id = [0u8; 8];
+        SystemRandom::new()
+            .fill(&mut id)
+            .map_err(|_| config_error("no randomness for the log writer id"))?;
+        let writer_id = u64::from_le_bytes(id);
+        Ok(WalSealer {
+            writer_id,
+            key: wal_key(&self.dek, &self.file_uuid, writer_id),
+        })
+    }
+
+    /// The plaintext of an entry sealed at `lsn` (`aad`: the entry header's
+    /// authenticated bytes); `None` if it does not open.
+    pub fn open_entry(&self, lsn: u64, aad: &[u8], stored: &[u8]) -> Option<Vec<u8>> {
+        if stored.len() < WAL_SEAL_OVERHEAD {
+            return None;
+        }
+        let writer_id = u64::from_le_bytes(stored[..8].try_into().expect("8 bytes"));
+        let mut readers = self.readers.lock().unwrap_or_else(|err| err.into_inner());
+        let key = readers
+            .entry(writer_id)
+            .or_insert_with(|| wal_key(&self.dek, &self.file_uuid, writer_id));
+        let mut sealed = stored[8..].to_vec();
+        let plain_len = key
+            .open_in_place(wal_nonce(lsn), aead::Aad::from(aad), &mut sealed)
+            .ok()?
+            .len();
+        sealed.truncate(plain_len);
+        Some(sealed)
+    }
+
+    /// Identifies the database key without revealing it: equal for two
+    /// files holding the same key (a database and its restores, standbys).
+    pub fn fingerprint(&self) -> [u8; 16] {
+        derive::<32>(&self.dek, &self.file_uuid, "truthdb key fingerprint")[..16]
+            .try_into()
+            .expect("16 bytes")
+    }
+}
+
+impl WalSealer {
+    /// `plain` sealed at `lsn`: the writer id, then the ciphertext and tag.
+    pub fn seal_entry(&self, lsn: u64, aad: &[u8], plain: &[u8]) -> Vec<u8> {
+        let mut sealed = plain.to_vec();
+        self.key
+            .seal_in_place_append_tag(wal_nonce(lsn), aead::Aad::from(aad), &mut sealed)
+            .expect("an entry within the AES-GCM length limit");
+        [self.writer_id.to_le_bytes().as_slice(), &sealed].concat()
+    }
 }
 
 fn xts(key: &[u8; 64]) -> Xts128<Aes256> {
@@ -554,6 +666,7 @@ impl PageKeys {
                 derive::<32>(dek, file_uuid, "truthdb page mac").as_slice(),
             ),
             spill_salt: u64::from_le_bytes(salt),
+            wal: std::sync::Arc::new(WalKeys::new(dek, file_uuid)),
         })
     }
 
@@ -583,6 +696,14 @@ impl std::fmt::Debug for PageCodec {
 impl PageCodec {
     pub fn is_encrypted(&self) -> bool {
         matches!(self, PageCodec::Encrypted(_))
+    }
+
+    /// The log's keys, when the database is encrypted.
+    pub fn wal_keys(&self) -> Option<std::sync::Arc<WalKeys>> {
+        match self {
+            PageCodec::Plain => None,
+            PageCodec::Encrypted(keys) => Some(std::sync::Arc::clone(&keys.wal)),
+        }
     }
 
     /// Writes `plain` (a page with its header) as it goes to disk at
@@ -733,6 +854,19 @@ mod tests {
         let missing = key_file(&dir, "missing", &format!("k9 {}\n", "11".repeat(32)), 0o600);
         let err = unlock_key_block(&block, &KeySource::File(missing), &UUID).unwrap_err();
         assert!(err.to_string().contains("key id"), "{err}");
+    }
+
+    #[test]
+    fn a_key_block_from_before_log_encryption_is_refused() {
+        let dir = temp_dir("v1");
+        let file = key_file(&dir, "keys", &format!("k {}\n", "11".repeat(32)), 0o600);
+        let source = KeySource::File(file);
+        let (mut block, _) = new_key_block(&source, &UUID).unwrap();
+        block[0..8].copy_from_slice(b"TDBKEYS1");
+        let err = unlock_key_block(&block, &source, &UUID)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("recreate it"), "{err}");
     }
 
     #[test]

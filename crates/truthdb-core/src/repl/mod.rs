@@ -23,7 +23,7 @@ pub mod server;
 pub mod tls;
 
 /// Replication protocol version. Bumped on any incompatible wire change.
-pub const REPL_PROTOCOL_VERSION: u32 = 1;
+pub const REPL_PROTOCOL_VERSION: u32 = 2;
 
 /// The frame header size: `payload_len: u32` + `msg_type: u16` + `flags: u16`.
 pub const REPL_HEADER_LEN: usize = 8;
@@ -87,6 +87,9 @@ pub struct Hello {
     pub protocol_version: u32,
     pub node_id: u64,
     pub cluster_uuid: [u8; 16],
+    /// The standby's database key fingerprint (zeros when not encrypted): the
+    /// log ships as stored, so it opens only under the same key (v2).
+    pub key_fingerprint: [u8; 16],
     /// The replication epoch the standby last saw (0 if fresh); the primary
     /// fences a stale one.
     pub epoch: u64,
@@ -218,6 +221,7 @@ mod tests {
             protocol_version: REPL_PROTOCOL_VERSION,
             node_id: 42,
             cluster_uuid: [7u8; 16],
+            key_fingerprint: [0; 16],
             epoch: 3,
             last_received_lsn: 987654321,
             auth: vec![1, 2, 3, 4],
