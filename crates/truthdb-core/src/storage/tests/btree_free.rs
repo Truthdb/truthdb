@@ -564,3 +564,80 @@ fn a_scan_resumed_on_a_page_that_is_no_longer_a_page_stops() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn after_the_log_writers_fsync_failed_no_later_fsync_of_the_log_succeeds() {
+    let path = unique_temp_path("log-writer-fsync-failed");
+    let storage = create(&path);
+    let tree = create_tree(&storage);
+    insert(&storage, &tree, 0..10);
+    // A commit left to the group-commit log-writer, whose fsync fails (a
+    // failed device cache flush is reported to that call only).
+    let tail = {
+        let mut guard = storage.lock();
+        let txn_id = guard.alloc_txn_id();
+        let mut ctx = guard.page_ctx(0);
+        let mut txn = ctx.begin(txn_id).expect("begin");
+        tree.insert_unique(&mut ctx, &mut OpMode::Txn(&mut txn), &key(10), &row(10))
+            .expect("insert");
+        ctx.commit(txn).expect("commit");
+        drop(ctx);
+        guard.wal.fail_next_sync();
+        guard.wal_tail()
+    };
+    storage
+        .ensure_durable(tail)
+        .expect_err("the log-writer's fsync failed");
+    // Before the committer wedges the store, a checkpoint's own fsync of the
+    // log must not report the lost commit durable.
+    storage
+        .write_checkpoint(b"x", 1, 2, 1)
+        .expect_err("the log is not known durable");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn after_a_data_fsync_failed_no_commit_is_reported_durable() {
+    for reopened in [false, true] {
+        data_fsync_failure_reports_no_commit_durable(reopened);
+    }
+}
+
+/// `reopened`: on a database opened again (the open path shares the gate
+/// with the data handle separately from the create path).
+fn data_fsync_failure_reports_no_commit_durable(reopened: bool) {
+    let path = unique_temp_path("data-fsync-failed");
+    let mut storage = create(&path);
+    let tree = create_tree(&storage);
+    if reopened {
+        drop(storage);
+        storage = Storage::open(path.clone(), no_engine).expect("reopen");
+    }
+    insert(&storage, &tree, 0..10);
+    // A commit waiting for the log-writer while the storage lock is free.
+    let tail = {
+        let mut guard = storage.lock();
+        let txn_id = guard.alloc_txn_id();
+        let mut ctx = guard.page_ctx(0);
+        let mut txn = ctx.begin(txn_id).expect("begin");
+        tree.insert_unique(&mut ctx, &mut OpMode::Txn(&mut txn), &key(10), &row(10))
+            .expect("insert");
+        ctx.commit(txn).expect("commit");
+        guard.wal_tail()
+    };
+    // Meanwhile a superblock write fsyncs the file through the data handle,
+    // which flushes the log's bytes too, and that fsync fails.
+    {
+        let mut guard = storage.lock();
+        guard.wal.fail_next_sync();
+        guard
+            .commit_db_options(0, Some(true))
+            .expect_err("the data handle's fsync failed");
+    }
+    storage
+        .ensure_durable(tail)
+        .expect_err("the commit's log bytes may be lost");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

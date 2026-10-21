@@ -16,7 +16,7 @@
 pub mod log_buffer;
 pub mod records;
 
-use crate::direct_io::{AlignedPageBuf, DirectFile};
+use crate::direct_io::{AlignedPageBuf, DirectFile, SyncGate};
 use crate::storage::StorageError;
 use crate::storage_layout::{
     MIB, PAGE_SIZE, WAL_ENTRY_FOOTER_SIZE, WAL_ENTRY_HEADER_SIZE, WalEntryFooter, WalEntryHeader,
@@ -67,8 +67,8 @@ pub struct WalWriter {
     /// An encrypted database's: this writer's key, under which every entry it
     /// appends is sealed.
     sealer: Option<crate::encryption::WalSealer>,
-    /// Test hook: the next fsync fails, as a dying disk's would.
-    fail_next_sync: bool,
+    /// Every fsync of the file goes through it (see [`SyncGate`]).
+    sync_gate: std::sync::Arc<SyncGate>,
 }
 
 impl WalWriter {
@@ -86,6 +86,8 @@ impl WalWriter {
         keys: Option<&crate::encryption::WalKeys>,
     ) -> Result<Self, StorageError> {
         let sealer = keys.map(|keys| keys.sealer()).transpose()?;
+        let sync_gate = std::sync::Arc::new(SyncGate::default());
+        file.share_sync_gate(std::sync::Arc::clone(&sync_gate));
         let mut buffer = LogBuffer::new_at(tail);
         if !buffer.current_page_is_empty() {
             let (page_start, _) = buffer.current_page();
@@ -107,7 +109,7 @@ impl WalWriter {
             bytes_since_superblock: 0,
             superblock_interval: SUPERBLOCK_REWRITE_INTERVAL,
             sealer,
-            fail_next_sync: false,
+            sync_gate,
         })
     }
 
@@ -139,11 +141,16 @@ impl WalWriter {
         self.poisoned = true;
     }
 
-    /// Test hook: the next [`WalWriter::sync_all`] that has log to flush
-    /// fails.
+    /// Test hook: the next fsync of the log fails.
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_sync(&mut self) {
-        self.fail_next_sync = true;
+        self.sync_gate.fail_next();
+    }
+
+    /// The gate every fsync of the file goes through, for its other handles
+    /// (the data handle, the group-commit log-writer's).
+    pub fn sync_gate(&self) -> std::sync::Arc<SyncGate> {
+        std::sync::Arc::clone(&self.sync_gate)
     }
 
     /// Test hook: shrink the lazy-superblock cadence so it can be exercised
@@ -241,11 +248,6 @@ impl WalWriter {
     /// Fsyncs everything appended so far.
     pub fn sync_all(&mut self) -> Result<(), StorageError> {
         if self.flushed < self.tail() {
-            if std::mem::take(&mut self.fail_next_sync) {
-                return Err(StorageError::Io(std::io::Error::other(
-                    "injected fsync failure",
-                )));
-            }
             self.file.sync_data()?;
             self.flushed = self.tail();
         }

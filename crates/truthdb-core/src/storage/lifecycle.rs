@@ -202,7 +202,7 @@ impl Storage {
     /// group-commit log-writer over a duplicated WAL fd.
     pub(super) fn with_log_writer(path: PathBuf, file: Locked) -> Result<Self, StorageError> {
         let wal_fd = file.try_clone_wal_fd()?;
-        let (gc, log_writer) = GroupCommit::start(wal_fd);
+        let (gc, log_writer) = GroupCommit::start(wal_fd, file.wal.sync_gate());
         Ok(Storage {
             path,
             inner: std::sync::Mutex::new(file),
@@ -797,6 +797,7 @@ impl StorageFile {
             scan.tail,
             wal_keys.as_deref(),
         )?;
+        file.share_sync_gate(wal.sync_gate());
         let recorded_tail = active_sb.wal_tail;
 
         // Every root is stored as an absolute file offset (0 = none): the
@@ -1077,6 +1078,7 @@ impl StorageFile {
             0,
             codec.wal_keys().as_deref(),
         )?;
+        file.share_sync_gate(wal.sync_gate());
 
         let key_record = key_record_of(&header, &codec);
         // A restored file whose backup was taken mid-conversion resumes it.

@@ -19,6 +19,7 @@ use std::fs::File;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+use crate::direct_io::SyncGate;
 use crate::storage::StorageError;
 
 struct State {
@@ -53,7 +54,10 @@ pub(crate) struct GroupCommit {
 impl GroupCommit {
     /// Spawns the log-writer thread over a duplicated WAL file descriptor and
     /// returns the shared coordinator plus the thread's join handle.
-    pub(crate) fn start(wal_fd: File) -> (Arc<GroupCommit>, JoinHandle<()>) {
+    pub(crate) fn start(
+        wal_fd: File,
+        sync_gate: Arc<SyncGate>,
+    ) -> (Arc<GroupCommit>, JoinHandle<()>) {
         let gc = Arc::new(GroupCommit {
             state: Mutex::new(State {
                 requested: 0,
@@ -69,7 +73,7 @@ impl GroupCommit {
         let writer_gc = Arc::clone(&gc);
         let writer = std::thread::Builder::new()
             .name("truthdb-log-writer".to_string())
-            .spawn(move || writer_gc.log_writer_loop(wal_fd))
+            .spawn(move || writer_gc.log_writer_loop(wal_fd, &sync_gate))
             .expect("spawn log-writer thread");
         (gc, writer)
     }
@@ -140,7 +144,7 @@ impl GroupCommit {
             .fsyncs
     }
 
-    fn log_writer_loop(&self, wal_fd: File) {
+    fn log_writer_loop(&self, wal_fd: File, sync_gate: &SyncGate) {
         let mut state = self.state.lock().expect("group-commit state poisoned");
         loop {
             while !state.shutdown && !state.failed && state.requested <= state.flushed {
@@ -156,7 +160,7 @@ impl GroupCommit {
             // so committers keep appending and registering while it runs.
             let target = state.requested;
             drop(state);
-            let result = wal_fd.sync_data();
+            let result = sync_gate.sync(|| wal_fd.sync_data());
             state = self.state.lock().expect("group-commit state poisoned");
             state.fsyncs += 1;
             match result {
