@@ -102,7 +102,7 @@ enum Command {
 
 /// The master key of an encrypted database, as the server's `[encryption]`
 /// section names it (one of the two).
-#[derive(clap::Args, Debug)]
+#[derive(clap::Args, Debug, Clone)]
 struct KeyArgs {
     /// The master key file (lines `<id> <64 hex digits>`; mode 0600).
     #[arg(long, conflicts_with = "key_command")]

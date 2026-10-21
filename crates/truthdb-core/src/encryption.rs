@@ -12,6 +12,10 @@
 //!   fails verification;
 //! - the search snapshot and spill pages: AES-256-XTS of whole pages (the
 //!   snapshot keeps its own checksum; spill pages are query scratch).
+//! - the log: each entry's payload sealed with AES-256-GCM under its
+//!   writer's key (see [`WalKeys`]), its header authenticated; backups and
+//!   standbys copy pages and log as stored, so they carry the file uuid and
+//!   key block and open under the same master key.
 //!
 //! The master key is a key file (named keys, the first one current) or an
 //! external command that wraps and unwraps the DEK (a KMS).

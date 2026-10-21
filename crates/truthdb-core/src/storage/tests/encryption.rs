@@ -145,9 +145,9 @@ fn an_encrypted_database_keeps_its_data_region_unreadable_and_opens_with_its_key
     );
     assert!(refused.is_err());
     if crate::encryption::test_key_source().is_none() {
-        let refused = Storage::open(path.clone(), no_engine)
-            .err()
-            .expect("no key");
+        let Err(refused) = Storage::open(path.clone(), no_engine) else {
+            panic!("an encrypted database opened without its key");
+        };
         assert!(refused.to_string().contains("encrypted"), "{refused}");
     }
     for file in [&path, &keys, &other] {
@@ -200,9 +200,7 @@ fn a_changed_byte_or_a_misplaced_page_is_refused() {
     changed[1000] ^= 1;
     file.write_all_at(&changed, root_offset).expect("tamper");
     let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
-    let err = rows_of(&storage, root)
-        .err()
-        .expect("a changed byte is refused");
+    let err = rows_of(&storage, root).expect_err("a changed byte is refused");
     assert!(err.to_string().contains("checksum mismatch"), "{err}");
     drop(storage);
 
@@ -285,9 +283,9 @@ fn a_plain_file_with_a_damaged_header_still_does_not_open() {
     let storage = Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
     drop(storage);
     damage_header(&path);
-    let err = Storage::open(path.clone(), no_engine)
-        .err()
-        .expect("refused");
+    let Err(err) = Storage::open(path.clone(), no_engine) else {
+        panic!("a damaged plain header opened");
+    };
     assert!(err.to_string().contains("bad magic"), "{err}");
     std::fs::remove_file(&path).ok();
 }
@@ -522,7 +520,7 @@ fn grow_does_not_restore_a_damaged_header_without_the_key() {
     drop(storage);
     let len = std::fs::metadata(&path).expect("metadata").len();
     damage_header(&path);
-    let err = Storage::grow_data_region(&path, 1).err().expect("refused");
+    let err = Storage::grow_data_region(&path, 1).expect_err("refused");
     assert!(err.to_string().contains("with its key"), "{err}");
     assert_eq!(std::fs::metadata(&path).expect("metadata").len(), len);
     let damaged = std::fs::read(&path).expect("read")[..8].to_vec();
@@ -573,7 +571,7 @@ fn the_log_backups_and_restores_of_an_encrypted_database_hold_no_plaintext() {
     Storage::restore_with_keys(
         &dst,
         &bak,
-        &[log.clone()],
+        std::slice::from_ref(&log),
         None,
         false,
         no_engine,
@@ -618,14 +616,13 @@ fn the_log_backups_and_restores_of_an_encrypted_database_hold_no_plaintext() {
     let err = Storage::restore_with_keys(
         &dst_b,
         &bak_b,
-        &[log.clone()],
+        std::slice::from_ref(&log),
         None,
         false,
         no_engine,
         Some(&source),
     )
-    .err()
-    .expect("another database's archive is refused");
+    .expect_err("another database's archive is refused");
     assert!(err.to_string().contains("another encryption key"), "{err}");
     for file in [
         &path, &bak, &log, &bak2, &dst, &path_b, &bak_b, &keys, &other,
