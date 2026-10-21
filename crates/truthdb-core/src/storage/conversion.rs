@@ -36,6 +36,10 @@ pub(crate) struct Conversion {
     /// The completion's free-page zeroing has reached this page (`None`: the
     /// sweep is still running).
     zeroing: Option<u64>,
+    /// Spill extents that existed at the switch: their pages the spool never
+    /// wrote may hold old plaintext, so they are zeroed once freed (extents
+    /// allocated since are zeroed when allocated).
+    spill_extents: Vec<(u64, u64)>,
 }
 
 impl Conversion {
@@ -47,6 +51,7 @@ impl Conversion {
             clean: false,
             waiting_for_log: false,
             zeroing: None,
+            spill_extents: Vec::new(),
         }
     }
 }
@@ -76,8 +81,14 @@ impl Storage {
     /// storage lock.
     pub fn enable_encryption(&self) -> Result<(), StorageError> {
         // A connected standby would be streamed sealed entries it cannot
-        // open: it is reseeded after the switch anyway.
-        if !self.repl_connected_nodes().is_empty() {
+        // open: it is reseeded after the switch anyway. The registry stays
+        // locked across the switch, so none joins in between (a join checks
+        // the key fingerprint under the same lock).
+        let connected = self
+            .repl_connected
+            .lock()
+            .expect("repl-connected set poisoned");
+        if !connected.is_empty() {
             return Err(StorageError::InvalidConfig(
                 "a standby is connected: stop the standbys first (reseed them from a backup \
                  taken after `encryption enable`)"
@@ -199,7 +210,9 @@ impl StorageFile {
             key_block: block.to_vec(),
             fingerprint: wal_keys.fingerprint(),
         });
-        self.conversion = Some(Conversion::new(self.wal.tail()));
+        let mut conversion = Conversion::new(self.wal.tail());
+        conversion.spill_extents = self.allocator.temp_extents();
+        self.conversion = Some(conversion);
         Ok(())
     }
 
@@ -264,23 +277,18 @@ impl StorageFile {
             let plain = !sealed && crate::relstore::page::verify_checksum(&page);
             if plain && header.page_type == crate::relstore::page::PAGE_TYPE_BLOB {
                 self.page_ctx(0).rewrite_blob_page(page_no, &page)?;
-            } else {
+            } else if plain || self.pages.pool.contains(page_no) {
                 // Through the pool: a logged image of the page as it is (a
                 // cached frame may hold its newest version), which the next
-                // flush writes sealed. A page that is not a readable page at
-                // all (bytes left in a leaked extent) was unreadable and stays
-                // so, without its plaintext: it is overwritten with noise.
-                match self.page_ctx(0).log_system_image(page_no) {
-                    Ok(_) => {}
-                    // Written straight to disk: nothing for a checkpoint to
-                    // flush (and a later sweep finds the noise again, as
-                    // unreadable as ever, and leaves no plaintext either).
-                    Err(StorageError::InvalidFile(_)) => {
-                        self.overwrite_unreadable(page_no)?;
-                        continue;
-                    }
-                    Err(err) => return Err(err),
-                }
+                // flush writes sealed.
+                self.page_ctx(0).log_system_image(page_no)?;
+            } else {
+                // Not a readable page at all, and not cached (bytes left in a
+                // leaked extent): it was unreadable and stays so, without its
+                // plaintext. Written straight to disk, so nothing for a
+                // checkpoint to flush; a later sweep finds the noise again.
+                self.overwrite_unreadable(page_no)?;
+                continue;
             }
             conversion.rewrote = true;
         }
@@ -370,6 +378,29 @@ impl StorageFile {
         }
         conversion.zeroing = Some(at);
         if at < data_pages {
+            return Ok(ConversionStep::Working);
+        }
+        // The spill extents of the switch, once their queries freed them.
+        let freed: Vec<(u64, u64)> = conversion
+            .spill_extents
+            .iter()
+            .copied()
+            .filter(|&(start, _)| !self.allocator.is_temp(start))
+            .collect();
+        for (start, pages) in freed {
+            for at in start..start + pages {
+                if !self.allocator.is_allocated(at) {
+                    self.spill_read_page(at, &mut page)?;
+                    if !crate::relstore::page::is_zero_page(&page) {
+                        self.spill_write_page(at, &zero)?;
+                    }
+                }
+            }
+            conversion
+                .spill_extents
+                .retain(|&extent| extent != (start, pages));
+        }
+        if !conversion.spill_extents.is_empty() {
             return Ok(ConversionStep::Working);
         }
         self.file.sync_data()?;

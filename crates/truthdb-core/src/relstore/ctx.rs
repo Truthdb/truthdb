@@ -49,6 +49,34 @@ impl PoolIo<'_> {
     }
 }
 
+impl PoolIo<'_> {
+    /// While `encryption enable` converts the database: zeroes the pages of
+    /// a fresh allocation that hold something (old plaintext, maybe; the
+    /// conversion's own zeroing may already have passed them, and a page an
+    /// allocation never writes keeps its old bytes). The log goes to disk
+    /// first: the frees that made these pages free must be durable before
+    /// their old contents go.
+    pub(crate) fn zero_if_converting(
+        &mut self,
+        start_page: u64,
+        num_pages: u64,
+    ) -> Result<(), StorageError> {
+        if !self.codec.wal_keys().is_some_and(|keys| keys.converting()) {
+            return Ok(());
+        }
+        self.wal.sync_all()?;
+        let mut page = AlignedPageBuf::new();
+        let zero = AlignedPageBuf::new();
+        for page_no in start_page..start_page + num_pages {
+            self.read_page(page_no, &mut page)?;
+            if !page::is_zero_page(page.as_slice()) {
+                self.write_page(page_no, &zero)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl PoolBackend for PoolIo<'_> {
     fn read_page(&mut self, page_no: u64, frame: &mut AlignedPageBuf) -> Result<(), StorageError> {
         let offset = self.offset_of(page_no)?;
@@ -238,6 +266,7 @@ impl RelCtx<'_> {
             self.allocator.free(page_no, 1);
             return Err(err);
         }
+        self.io.zero_if_converting(page_no, 1)?;
         let _ = txn_id;
         Ok(page_no)
     }
@@ -354,6 +383,7 @@ impl RelCtx<'_> {
                 num_pages,
             },
         ));
+        self.io.zero_if_converting(start_page, num_pages)?;
         Ok(start_page)
     }
 

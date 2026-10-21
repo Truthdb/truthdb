@@ -138,9 +138,13 @@ impl StorageFile {
             // (a B+ tree page a delete emptied): spill writes go straight to
             // the file, so the log of those frees must reach the disk first.
             self.wal_sync_all()?;
-            return self.allocator.allocate_temp_extent().ok_or_else(|| {
+            let start = self.allocator.allocate_temp_extent().ok_or_else(|| {
                 StorageError::InvalidConfig("data region full: cannot allocate extent".to_string())
-            });
+            })?;
+            self.page_ctx(0)
+                .io
+                .zero_if_converting(start, EXTENT_PAGES)?;
+            return Ok(start);
         }
         let start = self.allocator.allocate_extent().ok_or_else(|| {
             StorageError::InvalidConfig("data region full: cannot allocate extent".to_string())
@@ -155,6 +159,9 @@ impl StorageFile {
             self.allocator.free(start, EXTENT_PAGES);
             return Err(err);
         }
+        self.page_ctx(0)
+            .io
+            .zero_if_converting(start, EXTENT_PAGES)?;
         Ok(start)
     }
 

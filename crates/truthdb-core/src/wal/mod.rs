@@ -130,6 +130,12 @@ impl WalWriter {
         Ok(())
     }
 
+    /// Test hook: disables the writer as a failed page write does.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn poison(&mut self) {
+        self.poisoned = true;
+    }
+
     /// Test hook: shrink the lazy-superblock cadence so it can be exercised
     /// without appending tens of MiB.
     #[cfg(any(test, feature = "test-hooks"))]
