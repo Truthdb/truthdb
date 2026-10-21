@@ -688,7 +688,9 @@ impl Engine {
         let mut converted = 0;
         while converted < Self::CONVERSION_SWEEP_PAGES {
             match storage.conversion_step(CONVERSION_STEP_PAGES)? {
-                ConversionStep::Idle | ConversionStep::Done => return Ok(()),
+                ConversionStep::Idle | ConversionStep::Done | ConversionStep::WaitingForLog => {
+                    return Ok(());
+                }
                 ConversionStep::NeedsCheckpoint => {
                     self.checkpoint()?;
                     return Ok(());
@@ -717,6 +719,7 @@ impl Engine {
             "key_fingerprint": status.fingerprint.map(hex),
             "converting": status.converting,
             "percent_complete": storage.conversion_percent(),
+            "waiting_for_log_truncation": storage.conversion_waits_for_log(),
         })
         .to_string())
     }

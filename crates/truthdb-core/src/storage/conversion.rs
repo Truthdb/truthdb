@@ -27,6 +27,12 @@ pub(crate) struct Conversion {
     rewrote: bool,
     /// Every log entry from this LSN on is sealed.
     sealed_from: u64,
+    /// A whole sweep found nothing plain: what remains is the snapshot and
+    /// the log's head (no page written since can be plain).
+    clean: bool,
+    /// The log's head cannot move past `sealed_from` yet (a log backup, a
+    /// replication slot or a long transaction holds it).
+    waiting_for_log: bool,
     /// The completion's free-page zeroing has reached this page (`None`: the
     /// sweep is still running).
     zeroing: Option<u64>,
@@ -38,6 +44,8 @@ impl Conversion {
             cursor: 0,
             rewrote: false,
             sealed_from,
+            clean: false,
+            waiting_for_log: false,
             zeroing: None,
         }
     }
@@ -53,6 +61,9 @@ pub enum ConversionStep {
     /// Pages were rewritten through the pool (or the snapshot, or the log's
     /// head, is not sealed yet): a checkpoint must run before it can finish.
     NeedsCheckpoint,
+    /// Only the log's head is left, and it cannot move past the switch yet:
+    /// a log backup, a replication slot or a long transaction holds it.
+    WaitingForLog,
     /// The conversion finished: the database is encrypted.
     Done,
 }
@@ -64,6 +75,15 @@ impl Storage {
     /// key is made (and wrapped, which may run a key command) without the
     /// storage lock.
     pub fn enable_encryption(&self) -> Result<(), StorageError> {
+        // A connected standby would be streamed sealed entries it cannot
+        // open: it is reseeded after the switch anyway.
+        if !self.repl_connected_nodes().is_empty() {
+            return Err(StorageError::InvalidConfig(
+                "a standby is connected: stop the standbys first (reseed them from a backup \
+                 taken after `encryption enable`)"
+                    .to_string(),
+            ));
+        }
         let (header, source) = self.lock().header_to_enable()?;
         let file_uuid = crate::encryption::random_uuid()?;
         let (block, dek) = crate::encryption::new_converting_key_block(&source, &file_uuid)?;
@@ -75,6 +95,16 @@ impl Storage {
     /// way, under the storage lock.
     pub fn conversion_step(&self, budget: usize) -> Result<ConversionStep, StorageError> {
         self.lock().conversion_step(budget)
+    }
+
+    /// Whether the conversion under way waits for the log to be truncated
+    /// past the switch (a log backup, a replication slot or a long
+    /// transaction holds it).
+    pub fn conversion_waits_for_log(&self) -> bool {
+        self.lock()
+            .conversion
+            .as_ref()
+            .is_some_and(|conversion| conversion.waiting_for_log)
     }
 
     /// How far the conversion under way is, in percent (`None`: none).
@@ -135,6 +165,13 @@ impl StorageFile {
         block: &[u8],
         dek: &[u8; 32],
     ) -> Result<(), StorageError> {
+        // A backup in progress recorded the database as plain: its pages and
+        // log copied after the switch would be sealed.
+        if self.truncation_gate.backup.is_some() || self.log_backup_in_progress {
+            return Err(StorageError::InvalidConfig(
+                "a backup is in progress: enable encryption after it finishes".to_string(),
+            ));
+        }
         let mut header = self.header_on_disk()?;
         if header.to_le_bytes_with_checksum() != before.to_le_bytes_with_checksum() {
             return Err(StorageError::InvalidConfig(
@@ -176,8 +213,9 @@ impl StorageFile {
             return Ok(ConversionStep::Idle);
         }
         let step = match conversion.zeroing {
-            None => self.sweep(&mut conversion, budget)?,
             Some(_) => self.zero_free_pages(&mut conversion, budget)?,
+            None if conversion.clean => self.ready_to_finish(&mut conversion)?,
+            None => self.sweep(&mut conversion, budget)?,
         };
         self.conversion = match step {
             ConversionStep::Done => None,
@@ -217,19 +255,32 @@ impl StorageFile {
                 continue;
             }
             let flags = u16::from_le_bytes([page[18], page[19]]);
-            if flags & crate::encryption::PAGE_FLAG_SEALED != 0 {
+            let sealed = flags & crate::encryption::PAGE_FLAG_SEALED != 0;
+            // A sealed page counts only if it opens (garbage can carry the bit).
+            if sealed && self.codec.open(page_no, &mut page.clone()) {
                 continue;
             }
             let header = crate::relstore::page::read_header(&page);
-            let mut ctx = self.page_ctx(0);
-            if header.page_type == crate::relstore::page::PAGE_TYPE_BLOB
-                && crate::relstore::page::verify_checksum(&page)
-            {
-                ctx.rewrite_blob_page(page_no, &page)?;
+            let plain = !sealed && crate::relstore::page::verify_checksum(&page);
+            if plain && header.page_type == crate::relstore::page::PAGE_TYPE_BLOB {
+                self.page_ctx(0).rewrite_blob_page(page_no, &page)?;
             } else {
-                // Through the pool: a logged image of the page as it is, which
-                // the next flush writes sealed.
-                ctx.log_system_image(page_no)?;
+                // Through the pool: a logged image of the page as it is (a
+                // cached frame may hold its newest version), which the next
+                // flush writes sealed. A page that is not a readable page at
+                // all (bytes left in a leaked extent) was unreadable and stays
+                // so, without its plaintext: it is overwritten with noise.
+                match self.page_ctx(0).log_system_image(page_no) {
+                    Ok(_) => {}
+                    // Written straight to disk: nothing for a checkpoint to
+                    // flush (and a later sweep finds the noise again, as
+                    // unreadable as ever, and leaves no plaintext either).
+                    Err(StorageError::InvalidFile(_)) => {
+                        self.overwrite_unreadable(page_no)?;
+                        continue;
+                    }
+                    Err(err) => return Err(err),
+                }
             }
             conversion.rewrote = true;
         }
@@ -242,17 +293,52 @@ impl StorageFile {
         if std::mem::take(&mut conversion.rewrote) {
             return Ok(ConversionStep::NeedsCheckpoint);
         }
-        // Nothing plain left among the pages. The snapshot and the log from
-        // its head on must be sealed too.
+        // Nothing plain left among the pages, and every page written from now
+        // on is sealed: no sweep again.
+        conversion.clean = true;
+        self.ready_to_finish(conversion)
+    }
+
+    /// With the pages done: the snapshot and the log from its head on must be
+    /// sealed too. A checkpoint seals the snapshot and moves the head, unless
+    /// something holds the log where it is: then the conversion waits.
+    fn ready_to_finish(
+        &mut self,
+        conversion: &mut Conversion,
+    ) -> Result<ConversionStep, StorageError> {
         let snapshot_sealed = match self.load_active_snapshot_descriptor()? {
             Some(desc) => desc.sealed(),
             None => true,
         };
-        if !snapshot_sealed || self.wal.head() < conversion.sealed_from {
+        if !snapshot_sealed {
             return Ok(ConversionStep::NeedsCheckpoint);
         }
+        if self.wal.head() < conversion.sealed_from {
+            conversion.waiting_for_log = self.checkpoint_wal_head() < conversion.sealed_from;
+            return Ok(if conversion.waiting_for_log {
+                ConversionStep::WaitingForLog
+            } else {
+                ConversionStep::NeedsCheckpoint
+            });
+        }
+        conversion.waiting_for_log = false;
         conversion.zeroing = Some(0);
         Ok(ConversionStep::Working)
+    }
+
+    /// Overwrites an allocated page that is not a readable page (not plain,
+    /// not sealed) with noise, marked sealed: it stays unreadable, and its
+    /// bytes (old plaintext, maybe) are gone.
+    fn overwrite_unreadable(&mut self, page_no: u64) -> Result<(), StorageError> {
+        use ring::rand::SecureRandom;
+        let mut noise = vec![0u8; PAGE_SIZE];
+        ring::rand::SystemRandom::new()
+            .fill(&mut noise)
+            .map_err(|_| StorageError::InvalidConfig("no randomness".to_string()))?;
+        let flags =
+            u16::from_le_bytes([noise[18], noise[19]]) | crate::encryption::PAGE_FLAG_SEALED;
+        noise[18..20].copy_from_slice(&flags.to_le_bytes());
+        self.spill_write_page(page_no, &noise)
     }
 
     /// Zeroes up to `budget` free data pages that hold something (old
@@ -305,7 +391,20 @@ impl StorageFile {
         let to = head - head % page + ring;
         if from < to {
             crate::wal::zero_ring_range(&mut self.file, self.layout.wal_offset, ring, from, to)?;
-            self.file.sync_data()?;
+        }
+        // The head's page before the head: dead log, maybe plain. When it is
+        // also the tail's page, the writer holds its prefix in memory, so it
+        // is seated again from the zeroed disk.
+        if head % page != 0 {
+            let offset = self.layout.wal_offset + (head - head % page) % ring;
+            let mut bytes = vec![0u8; PAGE_SIZE];
+            self.file.read_exact_at(offset, &mut bytes)?;
+            bytes[..(head % page) as usize].fill(0);
+            self.file.write_all_at(offset, &bytes)?;
+        }
+        self.file.sync_data()?;
+        if head % page != 0 && head - head % page == tail - tail % page {
+            self.wal.resync_tail(tail)?;
         }
         let wal_keys = self.codec.wal_keys().expect("an encrypted codec");
         let header = self.header_on_disk()?;
