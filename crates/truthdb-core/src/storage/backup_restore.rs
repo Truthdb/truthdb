@@ -971,14 +971,7 @@ impl StorageFile {
         redo_start: u64,
     ) -> Result<(u64, Vec<u8>), StorageError> {
         self.wal.sync_all()?;
-        // A standby's live tail can run past its recorded one when an apply
-        // failed after seeding the ring: only the recorded (verified) log goes
-        // into the backup.
-        let backup_end = if self.active_sb().is_standby() {
-            self.wal.tail().min(self.active_sb().wal_tail)
-        } else {
-            self.wal.tail()
-        };
+        let backup_end = self.wal.tail();
         debug_assert!(backup_end >= redo_start);
         let len = backup_end - redo_start;
         // Cap the shipped range so the restored ring leaves the reserve free:

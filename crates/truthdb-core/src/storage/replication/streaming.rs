@@ -316,10 +316,6 @@ impl Locked {
         //    recording an un-fsynced tail would trust torn bytes on reopen.
         self.seed_ring(from_lsn, bytes)?;
         self.core.file.sync_data()?;
-        // Advance the in-memory WAL tail to match the seeded ring, so `tail()` /
-        // `flushed_lsn()` (read by a backup, and by continuity above) reflect
-        // reality — a standby never appends, so nothing else would move them.
-        self.core.wal.resync_tail(advanced)?;
 
         // 2. Decode only the newly seeded range: a scan starting at `from_lsn`
         //    self-terminates where the stale bytes past `new_end` begin (their
@@ -346,6 +342,12 @@ impl Locked {
                 scan.tail
             )));
         }
+        // Advance the in-memory WAL tail to match the seeded ring, so `tail()` /
+        // `flushed_lsn()` (read by a backup, and by continuity above) reflect
+        // reality — a standby never appends, so nothing else would move them.
+        // Only once the range decodes: a backup ships up to this tail, which
+        // must never cover bytes that do not.
+        self.core.wal.resync_tail(advanced)?;
         let records: Vec<(u64, RelRecord)> = scan
             .records
             .iter()

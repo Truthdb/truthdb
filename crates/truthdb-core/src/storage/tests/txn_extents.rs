@@ -449,3 +449,75 @@ fn a_restore_that_crashes_before_its_superblock_leaves_a_file_that_does_not_open
         std::fs::remove_file(p).ok();
     }
 }
+
+/// A point-in-time cut at the start of a lap: the commit past the stop point
+/// is the first entry of a new lap, after the writer's zero gap, so the
+/// restored log ends exactly where that gap does.
+#[test]
+fn a_point_in_time_cut_at_a_lap_start_restores() {
+    use crate::storage_layout::{
+        WAL_ENTRY_FOOTER_SIZE, WAL_ENTRY_HEADER_SIZE, WAL_ENTRY_TYPE_RECORD,
+    };
+    let [path, bak, log, dst] = [
+        "txn-extents-lap-cut",
+        "txn-extents-lap-cut-bak",
+        "txn-extents-lap-cut-log",
+        "txn-extents-lap-cut-dst",
+    ]
+    .map(unique_temp_path);
+    let storage = create_small(&path);
+    let ring = storage.lock().layout.wal_size;
+    let sealed = if crate::encryption::test_key_source().is_some() {
+        crate::encryption::WAL_SEAL_OVERHEAD as u64
+    } else {
+        0
+    };
+    let tail = |storage: &Storage| storage.lock().wal.tail();
+    // An entry of exactly `len` ring bytes (a multiple of 8).
+    let filler = |storage: &Storage, len: u64| {
+        let payload = len - (WAL_ENTRY_HEADER_SIZE + WAL_ENTRY_FOOTER_SIZE) as u64 - sealed;
+        storage
+            .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, 1, &vec![7u8; payload as usize])
+            .expect("filler");
+    };
+    // Most of the first lap, then a checkpoint frees it for the second part.
+    while tail(&storage) < ring / 2 {
+        filler(&storage, 2048);
+    }
+    storage.write_checkpoint(b"x", 1, 2, 1).expect("checkpoint");
+    set_full(&storage);
+    storage.backup_full(&bak).expect("full backup");
+    let (start, txn) = in_txn(&storage, |ctx, txn| {
+        ctx.allocate_extent_in_txn(txn, PAGES).expect("allocate")
+    });
+    // Up to 48 bytes before the lap end: too few for the commit record.
+    loop {
+        let left = ring - tail(&storage) % ring;
+        if left <= 48 {
+            break;
+        }
+        filler(&storage, (left - 48).min(2048));
+    }
+    assert_eq!(ring - tail(&storage) % ring, 48);
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    let stop_at = now_millis();
+    std::thread::sleep(std::time::Duration::from_millis(5));
+    commit(&storage, txn);
+    assert!(
+        tail(&storage) % ring < ring / 4,
+        "the commit wrapped to the lap start"
+    );
+    storage.backup_log(&log, true, false).expect("log backup");
+    drop(storage);
+
+    restore_at(&dst, &bak, &log, stop_at).expect("point-in-time restore at a lap start");
+    let restored = Storage::open(dst.clone(), no_engine).expect("open");
+    assert!(
+        !allocated(&restored, start),
+        "the allocation committed past the cut is undone"
+    );
+    drop(restored);
+    for p in [&path, &bak, &log, &dst] {
+        std::fs::remove_file(p).ok();
+    }
+}

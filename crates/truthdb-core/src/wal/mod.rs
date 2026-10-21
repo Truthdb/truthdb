@@ -520,11 +520,12 @@ pub(crate) fn scan_ring(
         if header_bytes.iter().all(|b| *b == 0) {
             // Wrap gap: writer zero-fills to the lap end before wrapping. Where
             // an encrypted database's log was durable, a gap is only the
-            // writer's: zero to the lap end, with entries after it (the tail
-            // is recorded after the entry that followed the gap).
+            // writer's: zero to the lap end, which the recorded tail reaches
+            // (a writer records it past the entry after the gap; a
+            // point-in-time cut at that entry records the lap end itself).
             if trusted && keys.is_some() {
-                if trusted_tail <= cursor + bytes_to_lap_end {
-                    stop!("is zeroed where the log ends");
+                if trusted_tail < cursor + bytes_to_lap_end {
+                    stop!("is zeroed inside the log");
                 }
                 let mut rest = vec![0u8; bytes_to_lap_end.min(1 << 20) as usize];
                 let mut at = 0u64;
