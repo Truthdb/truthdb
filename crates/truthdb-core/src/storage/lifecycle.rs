@@ -259,8 +259,17 @@ impl Storage {
         })?;
         let mut file = DirectFile::open_existing(path.to_path_buf())?;
         let (mut header, repair) = read_file_header(&mut file)?;
-        // Offline, with no key: the repairs only put the header and its copy
-        // in step and cut off an unused extension.
+        // Offline, with no key: a header restored from its copy is not known
+        // to be this file's until a keyed open has checked it. The other
+        // repairs follow from a sound header (an unused extension cut off,
+        // the copy put in step).
+        if repair.header.is_some() {
+            return Err(StorageError::InvalidFile(
+                "the file header is damaged: open the database once (with its key) to \
+                 restore it from its copy, then grow"
+                    .to_string(),
+            ));
+        }
         repair.apply(&mut file)?;
         if header.version != crate::storage_layout::FILE_VERSION {
             return Err(StorageError::InvalidFile(format!(
@@ -569,13 +578,14 @@ impl StorageFile {
         } else {
             crate::encryption::PageCodec::Plain
         };
-        // The key block unlocked: the header (or its copy) is this file's.
-        repair.apply(&mut file)?;
         // Validate the layout before any destructive step (the v1 upgrade
         // mutates the file; a file we cannot operate must be rejected while
-        // it is still untouched v1).
-        let layout = layout_from_header(&header, file.len());
+        // it is still untouched v1), at the length the repairs leave.
+        let layout = layout_from_header(&header, repair.truncate_to.unwrap_or(file.len()));
         validate_allocator_region(&layout)?;
+        // The key block unlocked and the layout sound: the header (or its
+        // copy) is this file's.
+        repair.apply(&mut file)?;
 
         let mut sb_a_bytes = [0u8; crate::storage_layout::SUPERBLOCK_SIZE];
         file.read_exact_at(header.superblock_a_offset, &mut sb_a_bytes)?;

@@ -451,3 +451,86 @@ fn an_older_layouts_copy_is_never_taken_for_the_current_one() {
         std::fs::remove_file(file).ok();
     }
 }
+
+#[test]
+fn a_grow_stopped_with_an_empty_last_page_is_cut_back_or_refused() {
+    use std::os::unix::fs::FileExt;
+    let keys = key_file("enc-empty-end-keys", &format!("main {}\n", "8c".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let path = unique_temp_path("enc-empty-end");
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    let (root, _) = fill(&storage, 25);
+    drop(storage);
+    let len = std::fs::metadata(&path).expect("metadata").len();
+    let header = std::fs::read(&path).expect("read")[..PAGE_SIZE].to_vec();
+    // The size grew but the extending write never landed: a zero last page.
+    let extend = |path: &Path| {
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .expect("open");
+        file.set_len(len + (1 << 30)).expect("extend");
+    };
+
+    // With a damaged header: refused, nothing written, by open and by grow.
+    extend(&path);
+    damage_header(&path);
+    assert!(Storage::open_with_keys(path.clone(), no_engine, Some(&source)).is_err());
+    assert!(Storage::grow_data_region(&path, 1).is_err());
+    assert_eq!(
+        std::fs::metadata(&path).expect("metadata").len(),
+        len + (1 << 30)
+    );
+
+    // With a sound header: the extension is cut off.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.write_all_at(&header, 0))
+        .expect("restore header");
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 25);
+    drop(storage);
+    assert_eq!(std::fs::metadata(&path).expect("metadata").len(), len);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn grow_does_not_restore_a_damaged_header_without_the_key() {
+    let keys = key_file(
+        "enc-grow-damaged-keys",
+        &format!("main {}\n", "9d".repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    let path = unique_temp_path("enc-grow-damaged");
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    fill(&storage, 10);
+    drop(storage);
+    let len = std::fs::metadata(&path).expect("metadata").len();
+    damage_header(&path);
+    let err = Storage::grow_data_region(&path, 1).err().expect("refused");
+    assert!(err.to_string().contains("with its key"), "{err}");
+    assert_eq!(std::fs::metadata(&path).expect("metadata").len(), len);
+    let damaged = std::fs::read(&path).expect("read")[..8].to_vec();
+    assert_eq!(damaged, vec![0x5A; 8], "the header page was not written");
+    // A keyed open restores it; then grow works.
+    drop(Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open"));
+    Storage::grow_data_region(&path, 1).expect("grow");
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}

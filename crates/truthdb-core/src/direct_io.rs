@@ -314,7 +314,8 @@ mod imp {
                 current_offset = current_offset.saturating_add(copy_len as u64);
                 written += copy_len;
             }
-
+            // A write past the end extends the file.
+            self.len = self.len.max(offset.saturating_add(data.len() as u64));
             Ok(())
         }
 
