@@ -75,9 +75,12 @@ pub(super) fn live_descriptor_slot(descriptors: &[Option<SnapshotDescriptor>; 2]
     best
 }
 
-pub(super) fn layout_from_header(header: &FileHeader, total_size: u64) -> StorageLayout {
+/// The layout a header describes. Its size is where its last region ends,
+/// not the file's length: a grow that stopped before its header leaves the
+/// file longer than the layout it runs on.
+pub(super) fn layout_from_header(header: &FileHeader) -> StorageLayout {
     StorageLayout {
-        total_size,
+        total_size: header.reserved_offset.saturating_add(header.reserved_size),
         header_offset: 0,
         superblock_a_offset: header.superblock_a_offset,
         superblock_b_offset: header.superblock_b_offset,
@@ -580,8 +583,8 @@ impl StorageFile {
         };
         // Validate the layout before any destructive step (the v1 upgrade
         // mutates the file; a file we cannot operate must be rejected while
-        // it is still untouched v1), at the length the repairs leave.
-        let layout = layout_from_header(&header, repair.truncate_to.unwrap_or(file.len()));
+        // it is still untouched v1).
+        let layout = layout_from_header(&header);
         validate_allocator_region(&layout)?;
         // The key block unlocked and the layout sound: the header (or its
         // copy) is this file's.
