@@ -144,6 +144,11 @@ impl StorageFile {
             self.page_ctx(0)
                 .io
                 .zero_if_converting(start, EXTENT_PAGES)?;
+            // A spill extent of the switch handed out again was just zeroed:
+            // the conversion no longer waits for it.
+            if let Some(conversion) = &mut self.conversion {
+                conversion.forget_spill_extent(start);
+            }
             return Ok(start);
         }
         let start = self.allocator.allocate_extent().ok_or_else(|| {

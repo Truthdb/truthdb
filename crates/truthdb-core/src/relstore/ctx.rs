@@ -64,12 +64,17 @@ impl PoolIo<'_> {
         if !self.codec.wal_keys().is_some_and(|keys| keys.converting()) {
             return Ok(());
         }
-        self.wal.sync_all()?;
         let mut page = AlignedPageBuf::new();
         let zero = AlignedPageBuf::new();
+        let mut synced = false;
         for page_no in start_page..start_page + num_pages {
             self.read_page(page_no, &mut page)?;
             if !page::is_zero_page(page.as_slice()) {
+                // Forced once, and only when there is something to zero.
+                if !synced {
+                    self.wal.sync_all()?;
+                    synced = true;
+                }
                 self.write_page(page_no, &zero)?;
             }
         }

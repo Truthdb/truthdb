@@ -43,6 +43,12 @@ pub(crate) struct Conversion {
 }
 
 impl Conversion {
+    /// A spill extent of the switch, handed out again (and zeroed): no
+    /// longer one to wait for.
+    pub(crate) fn forget_spill_extent(&mut self, start: u64) {
+        self.spill_extents.retain(|&(extent, _)| extent != start);
+    }
+
     pub(crate) fn new(sealed_from: u64) -> Self {
         Conversion {
             cursor: 0,
@@ -80,6 +86,9 @@ impl Storage {
     /// key is made (and wrapped, which may run a key command) without the
     /// storage lock.
     pub fn enable_encryption(&self) -> Result<(), StorageError> {
+        let (header, source) = self.lock().header_to_enable()?;
+        let file_uuid = crate::encryption::random_uuid()?;
+        let (block, dek) = crate::encryption::new_converting_key_block(&source, &file_uuid)?;
         // A connected standby would be streamed sealed entries it cannot
         // open: it is reseeded after the switch anyway. The registry stays
         // locked across the switch, so none joins in between (a join checks
@@ -95,9 +104,6 @@ impl Storage {
                     .to_string(),
             ));
         }
-        let (header, source) = self.lock().header_to_enable()?;
-        let file_uuid = crate::encryption::random_uuid()?;
-        let (block, dek) = crate::encryption::new_converting_key_block(&source, &file_uuid)?;
         self.lock()
             .switch_to_encrypted(&header, file_uuid, &block, &dek)
     }

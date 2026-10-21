@@ -1669,3 +1669,38 @@ fn a_standby_whose_handshake_predates_the_switch_cannot_join() {
         std::fs::remove_file(file).ok();
     }
 }
+
+#[test]
+fn a_spill_extent_of_the_switch_reused_by_another_query_does_not_hold_the_conversion() {
+    let Some(path) = plain_database("enable-spill-reuse") else {
+        return;
+    };
+    let keys = key_file(
+        "enable-spill-reuse-keys",
+        &format!("main {}\n", "b4".repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    drop(Storage::create(path.clone(), test_storage_options(), no_engine).expect("create"));
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let before = storage.allocate_extent(true).expect("spill extent");
+    storage.enable_encryption().expect("enable");
+    storage.free_extent(before).expect("its query is done");
+    // Another query is handed the same extent (zeroed then) and keeps it.
+    let mut others = Vec::new();
+    loop {
+        let extent = storage.allocate_extent(true).expect("spill extent");
+        if extent == before {
+            break;
+        }
+        others.push(extent);
+    }
+    for extent in others {
+        storage.free_extent(extent).expect("free");
+    }
+    convert(&storage);
+    storage.free_extent(before).expect("free");
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
