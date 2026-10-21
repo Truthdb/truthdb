@@ -241,6 +241,14 @@ mod imp {
             self.len
         }
 
+        /// Truncates or extends the file to `len` bytes and fsyncs it.
+        pub fn set_len(&mut self, len: u64) -> io::Result<()> {
+            self.file.set_len(len)?;
+            self.file.sync_all()?;
+            self.len = len;
+            Ok(())
+        }
+
         pub fn read_exact_at(&mut self, offset: u64, buf: &mut [u8]) -> io::Result<()> {
             if buf.is_empty() {
                 return Ok(());
@@ -619,6 +627,10 @@ mod imp {
 
         pub fn len(&self) -> u64 {
             0
+        }
+
+        pub fn set_len(&mut self, _len: u64) -> io::Result<()> {
+            Err(io::Error::other("truthdb storage requires Linux io_uring"))
         }
 
         pub fn read_exact_at(&mut self, _offset: u64, _buf: &mut [u8]) -> io::Result<()> {

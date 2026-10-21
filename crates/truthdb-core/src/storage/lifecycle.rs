@@ -399,6 +399,12 @@ impl Storage {
 /// (the end of the unused reserved region, found by the file's length): when
 /// the header page is damaged and the copy is sound, the copy is used and
 /// written back over it.
+///
+/// The copy must always describe the layout the database runs on. A grow
+/// that stopped before its header leaves the file longer than that layout,
+/// with a copy of the grown layout at the new end: the extension is cut off
+/// (nothing in the layout uses it; growing again redoes it), and the copy in
+/// the layout's last page is rewritten if it differs from the header.
 fn read_file_header(file: &mut DirectFile) -> Result<FileHeader, StorageError> {
     let mut bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
     file.read_exact_at(0, &mut bytes)?;
@@ -407,6 +413,20 @@ fn read_file_header(file: &mut DirectFile) -> Result<FileHeader, StorageError> {
         header.has_known_magic() && header.header_checksum == header.compute_checksum()
     };
     if sound(&header) {
+        if header.is_encrypted() {
+            let end = header.reserved_offset + header.reserved_size;
+            if file.len() > end {
+                file.set_len(end)?;
+            }
+            if file.len() == end && header.reserved_size >= PAGE_SIZE as u64 {
+                let mut copy = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+                file.read_exact_at(end - PAGE_SIZE as u64, &mut copy)?;
+                if copy != bytes {
+                    file.write_all_at(end - PAGE_SIZE as u64, &bytes)?;
+                    file.sync_data()?;
+                }
+            }
+        }
         return Ok(header);
     }
     let len = file.len();

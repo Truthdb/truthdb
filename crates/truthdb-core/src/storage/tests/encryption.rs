@@ -291,3 +291,54 @@ fn a_plain_file_with_a_damaged_header_still_does_not_open() {
     assert!(err.to_string().contains("bad magic"), "{err}");
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn an_interrupted_grow_leaves_no_copy_that_outlives_the_header() {
+    use std::os::unix::fs::FileExt;
+    let keys = key_file("enc-grow-keys", &format!("main {}\n", "4d".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let path = unique_temp_path("enc-grow");
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    fill(&storage, 50);
+    let pages = storage.lock().data_pages();
+    drop(storage);
+    let mut header = vec![0u8; PAGE_SIZE];
+    std::fs::File::open(&path)
+        .and_then(|file| file.read_exact_at(&mut header, 0))
+        .expect("read header");
+
+    // A grow that stops after its copy, before its header: the database
+    // goes on under the old layout.
+    Storage::grow_data_region(&path, 1).expect("grow");
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.write_all_at(&header, 0))
+        .expect("put the old header back");
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    assert_eq!(storage.lock().data_pages(), pages);
+    let (root, _) = fill(&storage, 30);
+    storage
+        .write_checkpoint(b"SECOND", 1, 2, 1)
+        .expect("checkpoint");
+    drop(storage);
+
+    // A damaged header now comes back as the layout the database runs on.
+    damage_header(&path);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source))
+        .expect("opens from the copy");
+    assert_eq!(storage.lock().data_pages(), pages);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 30);
+    let snapshot = storage.lock().load_snapshot().expect("snapshot");
+    assert_eq!(snapshot.expect("a snapshot").data, b"SECOND");
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}

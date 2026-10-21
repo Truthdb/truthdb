@@ -74,8 +74,16 @@ struct MasterKey {
 fn read_key_file(path: &Path) -> Result<Vec<MasterKey>, StorageError> {
     use std::os::unix::fs::MetadataExt;
     let what = path.display();
-    let mut file = std::fs::File::open(path)
-        .map_err(|err| config_error(format!("encryption key file {what}: {err}")))?;
+    // Non-blocking, so a FIFO at the path fails the regular-file check below
+    // instead of hanging the open.
+    let mut file = {
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(path)
+    }
+    .map_err(|err| config_error(format!("encryption key file {what}: {err}")))?;
     let meta = file
         .metadata()
         .map_err(|err| config_error(format!("encryption key file {what}: {err}")))?;
@@ -171,8 +179,9 @@ const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
 const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Runs the key command with `operation` appended, `input` on its stdin;
-/// returns its stdout, trimmed. `wrap`'s stdin is the database key, so its
-/// stderr (which could echo it) stays out of the error.
+/// returns its stdout, trimmed. The database key is `wrap`'s input and
+/// `unwrap`'s output, so the command's stderr (which could echo either)
+/// stays out of the error.
 fn run_key_command(
     argv: &[String],
     operation: &str,
@@ -212,14 +221,10 @@ fn run_key_command(
         output.map_err(|err| config_error(format!("encryption key command {program}: {err}")))?;
     let stdout = Zeroizing::new(std::mem::take(&mut output.stdout));
     if !output.status.success() {
-        let detail = if operation == "wrap" {
-            "its error output is not shown, since its input is the database key".to_string()
-        } else {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            stderr.trim().chars().take(512).collect()
-        };
+        output.stderr.fill(0);
         return Err(config_error(format!(
-            "encryption key command {program} {operation} failed ({}): {detail}",
+            "encryption key command {program} {operation} failed ({}); its error output is \
+             not shown, since it handles the database key",
             output.status
         )));
     }
@@ -349,10 +354,10 @@ fn unwrap(
                         slot.id
                     ))
                 })?;
-            let dek: [u8; 32] = dek.try_into().expect("32 bytes");
-            let dek = Zeroizing::new(dek);
+            let mut out = Zeroizing::new([0u8; 32]);
+            out.copy_from_slice(dek);
             sealed.fill(0);
-            Ok(Some(dek))
+            Ok(Some(out))
         }
         (KeySource::Command(argv), SLOT_COMMAND) => {
             let blob = String::from_utf8_lossy(&slot.blob);
@@ -374,12 +379,12 @@ impl hkdf::KeyType for Len {
     }
 }
 
-fn derive<const N: usize>(dek: &[u8; 32], file_uuid: &[u8; 16], info: &str) -> [u8; N] {
+fn derive<const N: usize>(dek: &[u8; 32], file_uuid: &[u8; 16], info: &str) -> Zeroizing<[u8; N]> {
     let prk = hkdf::Salt::new(hkdf::HKDF_SHA256, file_uuid).extract(dek);
-    let mut out = [0u8; N];
+    let mut out = Zeroizing::new([0u8; N]);
     prk.expand(&[info.as_bytes()], Len(N))
         .expect("a valid HKDF length")
-        .fill(&mut out)
+        .fill(out.as_mut_slice())
         .expect("a valid HKDF length");
     out
 }
@@ -387,7 +392,7 @@ fn derive<const N: usize>(dek: &[u8; 32], file_uuid: &[u8; 16], info: &str) -> [
 fn block_mac(dek: &[u8; 32], file_uuid: &[u8; 16], block: &[u8]) -> [u8; 32] {
     let key = hmac::Key::new(
         hmac::HMAC_SHA256,
-        &derive::<32>(dek, file_uuid, "truthdb key block mac"),
+        derive::<32>(dek, file_uuid, "truthdb key block mac").as_slice(),
     );
     let tag = hmac::sign(&key, &[file_uuid.as_slice(), &block[..MAC_OFFSET]].concat());
     tag.as_ref().try_into().expect("32 bytes")
@@ -546,7 +551,7 @@ impl PageKeys {
             spill: xts(&derive::<64>(dek, file_uuid, "truthdb spill xts")),
             mac: hmac::Key::new(
                 hmac::HMAC_SHA256,
-                &derive::<32>(dek, file_uuid, "truthdb page mac"),
+                derive::<32>(dek, file_uuid, "truthdb page mac").as_slice(),
             ),
             spill_salt: u64::from_le_bytes(salt),
         })
@@ -795,6 +800,13 @@ mod tests {
         let noisy = command("noisy.sh", "read line\necho \"bad $line\" >&2\nexit 3");
         let err = new_key_block(&noisy, &UUID).err().unwrap().to_string();
         assert!(err.contains("not shown") && !err.contains("bad"), "{err}");
+        // A key file path that is a FIFO is refused, not waited on.
+        let fifo = dir.join("fifo");
+        let c_path = std::ffi::CString::new(fifo.display().to_string()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c_path.as_ptr(), 0o600) }, 0);
+        let err = read_key_file(&fifo).err().unwrap().to_string();
+        assert!(err.contains("not a regular file"), "{err}");
         // The arguments stay out of Debug output.
         let shown = format!("{hung:?}");
         assert!(
