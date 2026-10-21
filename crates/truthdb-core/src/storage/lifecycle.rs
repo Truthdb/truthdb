@@ -797,6 +797,7 @@ impl StorageFile {
             scan.tail,
             wal_keys.as_deref(),
         )?;
+        file.share_sync_gate(wal.sync_gate());
         let recorded_tail = active_sb.wal_tail;
 
         // Every root is stored as an absolute file offset (0 = none): the
@@ -1077,6 +1078,7 @@ impl StorageFile {
             0,
             codec.wal_keys().as_deref(),
         )?;
+        file.share_sync_gate(wal.sync_gate());
 
         let key_record = key_record_of(&header, &codec);
         // A restored file whose backup was taken mid-conversion resumes it.

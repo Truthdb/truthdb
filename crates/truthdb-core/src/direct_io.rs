@@ -1,5 +1,50 @@
 use crate::storage_layout::PAGE_SIZE;
 
+/// Every fsync of a live database file goes through here: its data handle's,
+/// its log writer's and the group-commit log-writer's (each its own handle on
+/// the file; the log is a ring inside it, so any fsync flushes log bytes).
+/// After one fails, every later one fails too. A failed fsync is reported only
+/// to the call that made it (a failed device cache flush is never reported
+/// again, and a writeback error once per open file description), so a later
+/// fsync that succeeds says nothing about what was written before it. The
+/// lock spans the fsync, so none starts between a failure and its record.
+#[derive(Default)]
+pub struct SyncGate {
+    failed: std::sync::Mutex<bool>,
+    /// Test hook: the next fsync fails, as a dying disk's would.
+    fail_next: std::sync::atomic::AtomicBool,
+}
+
+impl SyncGate {
+    pub fn sync(&self, fsync: impl FnOnce() -> std::io::Result<()>) -> std::io::Result<()> {
+        let mut failed = self.failed.lock().unwrap_or_else(|err| err.into_inner());
+        if *failed {
+            return Err(std::io::Error::other(
+                "an fsync of the database file failed earlier; restart to recover",
+            ));
+        }
+        let result = if self
+            .fail_next
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            Err(std::io::Error::other("injected fsync failure"))
+        } else {
+            fsync()
+        };
+        if result.is_err() {
+            *failed = true;
+        }
+        result
+    }
+
+    /// Test hook: the next fsync through the gate fails.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn fail_next(&self) {
+        self.fail_next
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+}
+
 /// A page-sized, page-aligned, heap-allocated buffer suitable for O_DIRECT I/O.
 ///
 /// Callers own these frames (buffer pool frames, WAL tail-page images) and pass
@@ -146,6 +191,8 @@ mod imp {
         /// operations fail fast: consuming stale completions would let a
         /// later fsync acknowledge a write that never happened.
         poisoned: bool,
+        /// A live database file's handles share one (see [`SyncGate`]).
+        sync_gate: Option<std::sync::Arc<super::SyncGate>>,
     }
 
     impl DirectFile {
@@ -234,6 +281,7 @@ mod imp {
                 next_user_data: 1,
                 len,
                 poisoned: false,
+                sync_gate: None,
             })
         }
 
@@ -319,7 +367,19 @@ mod imp {
             Ok(())
         }
 
+        /// Makes every fsync of this handle go through `gate`.
+        pub fn share_sync_gate(&mut self, gate: std::sync::Arc<super::SyncGate>) {
+            self.sync_gate = Some(gate);
+        }
+
         pub fn sync_data(&mut self) -> io::Result<()> {
+            match self.sync_gate.clone() {
+                Some(gate) => gate.sync(|| self.fsync()),
+                None => self.fsync(),
+            }
+        }
+
+        fn fsync(&mut self) -> io::Result<()> {
             let entry = opcode::Fsync::new(types::Fixed(FIXED_FILE_INDEX))
                 .build()
                 .user_data(self.next_user_data());
@@ -641,6 +701,8 @@ mod imp {
         pub fn write_all_at(&mut self, _offset: u64, _data: &[u8]) -> io::Result<()> {
             Err(io::Error::other("truthdb storage requires Linux io_uring"))
         }
+
+        pub fn share_sync_gate(&mut self, _gate: std::sync::Arc<super::SyncGate>) {}
 
         pub fn sync_data(&mut self) -> io::Result<()> {
             Err(io::Error::other("truthdb storage requires Linux io_uring"))

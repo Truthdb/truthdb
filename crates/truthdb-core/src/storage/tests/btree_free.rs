@@ -596,3 +596,36 @@ fn after_the_log_writers_fsync_failed_no_later_fsync_of_the_log_succeeds() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn after_a_data_fsync_failed_no_commit_is_reported_durable() {
+    let path = unique_temp_path("data-fsync-failed");
+    let storage = create(&path);
+    let tree = create_tree(&storage);
+    insert(&storage, &tree, 0..10);
+    // A commit waiting for the log-writer while the storage lock is free.
+    let tail = {
+        let mut guard = storage.lock();
+        let txn_id = guard.alloc_txn_id();
+        let mut ctx = guard.page_ctx(0);
+        let mut txn = ctx.begin(txn_id).expect("begin");
+        tree.insert_unique(&mut ctx, &mut OpMode::Txn(&mut txn), &key(10), &row(10))
+            .expect("insert");
+        ctx.commit(txn).expect("commit");
+        guard.wal_tail()
+    };
+    // Meanwhile a superblock write fsyncs the file through the data handle,
+    // which flushes the log's bytes too, and that fsync fails.
+    {
+        let mut guard = storage.lock();
+        guard.wal.fail_next_sync();
+        guard
+            .commit_db_options(0, Some(true))
+            .expect_err("the data handle's fsync failed");
+    }
+    storage
+        .ensure_durable(tail)
+        .expect_err("the commit's log bytes may be lost");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

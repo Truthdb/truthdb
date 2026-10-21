@@ -19,8 +19,8 @@ use std::fs::File;
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 
+use crate::direct_io::SyncGate;
 use crate::storage::StorageError;
-use crate::wal::LogSyncGate;
 
 struct State {
     /// Highest WAL tail any committer is waiting to have fsynced.
@@ -56,7 +56,7 @@ impl GroupCommit {
     /// returns the shared coordinator plus the thread's join handle.
     pub(crate) fn start(
         wal_fd: File,
-        sync_gate: Arc<LogSyncGate>,
+        sync_gate: Arc<SyncGate>,
     ) -> (Arc<GroupCommit>, JoinHandle<()>) {
         let gc = Arc::new(GroupCommit {
             state: Mutex::new(State {
@@ -144,7 +144,7 @@ impl GroupCommit {
             .fsyncs
     }
 
-    fn log_writer_loop(&self, wal_fd: File, sync_gate: &LogSyncGate) {
+    fn log_writer_loop(&self, wal_fd: File, sync_gate: &SyncGate) {
         let mut state = self.state.lock().expect("group-commit state poisoned");
         loop {
             while !state.shutdown && !state.failed && state.requested <= state.flushed {
