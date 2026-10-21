@@ -792,9 +792,32 @@ impl StorageFile {
             .filter(|record| record.entry_type == WAL_ENTRY_TYPE_REL)
             .map(|record| Ok((record.logical_ts, RelRecord::decode(&record.payload)?)))
             .collect::<Result<_, StorageError>>()?;
-        let cut = rel_recovery::first_commit_past(&records, stop_at)?;
+        let mut cut = rel_recovery::first_commit_past(&records, stop_at)?;
         if cut >= tail {
             return Ok(tail);
+        }
+        // A commit that starts a lap follows the writer's zero gap: the log
+        // ends where the gap begins (the end of the entry before it), so the
+        // gap lies past the restored tail like any end of the log.
+        if cut % self.layout.wal_size == 0 {
+            let sealed = if wal_keys.is_some() {
+                crate::encryption::WAL_SEAL_OVERHEAD
+            } else {
+                0
+            };
+            if let Some(end) = scan
+                .records
+                .iter()
+                .filter(|record| record.logical_ts < cut)
+                .map(|record| {
+                    record.logical_ts
+                        + crate::storage_layout::wal_entry_padded_len(record.payload.len() + sealed)
+                            as u64
+                })
+                .max()
+            {
+                cut = cut.min(end);
+            }
         }
         if cut < full_backup_end {
             return Err(refuse(format!(

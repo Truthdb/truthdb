@@ -521,3 +521,57 @@ fn a_point_in_time_cut_at_a_lap_start_restores() {
         std::fs::remove_file(p).ok();
     }
 }
+
+/// An encrypted log whose recorded tail sits exactly on a lap end (an entry
+/// filled the lap): zeroing its last entries is refused, not taken for the
+/// writer's wrap gap. (A small ring needs `create_small`: the encrypted run
+/// covers it.)
+#[test]
+fn zeroed_entries_up_to_a_lap_end_tail_are_refused() {
+    use crate::storage_layout::{
+        WAL_ENTRY_FOOTER_SIZE, WAL_ENTRY_HEADER_SIZE, WAL_ENTRY_TYPE_RECORD,
+    };
+    use std::os::unix::fs::FileExt;
+    if crate::encryption::test_key_source().is_none() {
+        return;
+    }
+    let path = unique_temp_path("txn-extents-lap-end-zeroed");
+    let storage = create_small(&path);
+    storage.lock().wal.set_superblock_interval(1);
+    let (ring, wal_offset) = {
+        let guard = storage.lock();
+        (guard.layout.wal_size, guard.layout.wal_offset)
+    };
+    let tail = |storage: &Storage| storage.lock().wal.tail();
+    let filler = |storage: &Storage, len: u64| {
+        let payload = len
+            - (WAL_ENTRY_HEADER_SIZE + WAL_ENTRY_FOOTER_SIZE) as u64
+            - crate::encryption::WAL_SEAL_OVERHEAD as u64;
+        storage
+            .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, 1, &vec![7u8; payload as usize])
+            .expect("filler")
+    };
+    while tail(&storage) < ring / 2 {
+        filler(&storage, 2048);
+    }
+    storage.write_checkpoint(b"x", 1, 2, 1).expect("checkpoint");
+    let mut last = Vec::new();
+    while tail(&storage) < ring {
+        last.push(filler(&storage, (ring - tail(&storage)).min(1024)));
+    }
+    assert_eq!(tail(&storage), ring, "the last entry ends on the lap end");
+    drop(storage);
+    let from = last[last.len() - 2];
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|file| {
+            file.write_all_at(&vec![0u8; (ring - from) as usize], wal_offset + from % ring)
+        })
+        .expect("zero the last entries");
+    assert!(
+        Storage::open(path.clone(), no_engine).is_err(),
+        "zeroed durable entries up to the lap end were taken for a wrap gap"
+    );
+    std::fs::remove_file(&path).ok();
+}

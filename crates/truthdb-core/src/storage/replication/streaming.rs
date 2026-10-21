@@ -346,8 +346,11 @@ impl Locked {
         // `flushed_lsn()` (read by a backup, and by continuity above) reflect
         // reality — a standby never appends, so nothing else would move them.
         // Only once the range decodes: a backup ships up to this tail, which
-        // must never cover bytes that do not.
-        self.core.wal.resync_tail(advanced)?;
+        // must never cover bytes that do not. Never backwards: a reopen may
+        // have recovered (and redone) log past a range shipped again.
+        self.core
+            .wal
+            .resync_tail(advanced.max(self.core.wal.tail()))?;
         let records: Vec<(u64, RelRecord)> = scan
             .records
             .iter()

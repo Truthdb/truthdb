@@ -940,3 +940,54 @@ fn a_standby_backup_after_a_failed_apply_restores() {
         std::fs::remove_file(file).ok();
     }
 }
+
+#[test]
+fn a_standby_sent_a_shorter_range_again_keeps_the_log_it_recovered() {
+    let keys = key_file("enc-reship-keys", &format!("main {}\n", "ca".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let [path, bak, seed] =
+        ["enc-reship", "enc-reship-bak", "enc-reship-seed"].map(unique_temp_path);
+    let primary = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    let summary = primary.backup_full(&bak).expect("backup");
+    let start = summary.backup_end_lsn;
+    fill(&primary, 20);
+    let first = primary.wal_flushed_lsn();
+    fill(&primary, 200);
+    let short = primary.read_wal_range(start, first).expect("ship short");
+    let all = primary
+        .read_wal_range(start, primary.wal_flushed_lsn())
+        .expect("ship all");
+    drop(primary);
+    Storage::restore_with_keys(&seed, &bak, &[], None, true, no_engine, Some(&source))
+        .expect("standby seed");
+    // A range cut mid-entry, well past `first`: the apply fails, but the
+    // reopen recovers its decodable prefix.
+    let standby = Storage::open_with_keys(seed.clone(), no_engine, Some(&source)).expect("open");
+    assert!(
+        standby
+            .apply_wal_stream(start, &all[..all.len() - 3])
+            .is_err()
+    );
+    drop(standby);
+    let standby = Storage::open_with_keys(seed.clone(), no_engine, Some(&source)).expect("reopen");
+    let recovered = standby.lock().wal.tail();
+    assert!(
+        recovered > first,
+        "the reopen recovered past the short range"
+    );
+    // The short range again, from the recorded tail: the live tail stays.
+    standby
+        .apply_wal_stream(start, &short)
+        .expect("apply the short range");
+    assert_eq!(standby.lock().wal.tail(), recovered);
+    drop(standby);
+    for file in [&path, &bak, &seed, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
