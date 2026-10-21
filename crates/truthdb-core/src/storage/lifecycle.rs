@@ -717,9 +717,12 @@ impl StorageFile {
             })?;
             let dek =
                 crate::encryption::unlock_key_block(header.key_block(), source, &header.file_uuid)?;
+            let converting = crate::encryption::key_block_state(header.key_block())
+                == crate::encryption::KEY_STATE_CONVERTING;
             crate::encryption::PageCodec::Encrypted(Box::new(crate::encryption::PageKeys::new(
                 &dek,
                 &header.file_uuid,
+                converting,
             )?))
         } else {
             crate::encryption::PageCodec::Plain
@@ -850,6 +853,7 @@ impl StorageFile {
             codec,
             key_record,
             key_source,
+            spill: crate::encryption::SpillCodec::new()?,
         };
         let mut storage = Locked { core, engines };
         // Re-establish the FULL-model log-backup hold so a checkpoint cannot
@@ -986,7 +990,7 @@ impl StorageFile {
                     let (block, dek) = crate::encryption::new_key_block(source, &header.file_uuid)?;
                     header.set_key_block(&block);
                     crate::encryption::PageCodec::Encrypted(Box::new(
-                        crate::encryption::PageKeys::new(&dek, &header.file_uuid)?,
+                        crate::encryption::PageKeys::new(&dek, &header.file_uuid, false)?,
                     ))
                 }
                 super::FileKeys::Existing(record, source) => {
@@ -997,8 +1001,10 @@ impl StorageFile {
                         &record.file_uuid,
                     )?;
                     header.set_key_block(&record.key_block);
+                    let converting = crate::encryption::key_block_state(&record.key_block)
+                        == crate::encryption::KEY_STATE_CONVERTING;
                     crate::encryption::PageCodec::Encrypted(Box::new(
-                        crate::encryption::PageKeys::new(&dek, &header.file_uuid)?,
+                        crate::encryption::PageKeys::new(&dek, &header.file_uuid, converting)?,
                     ))
                 }
                 super::FileKeys::Plain => crate::encryption::PageCodec::Plain,
@@ -1085,6 +1091,7 @@ impl StorageFile {
             codec,
             key_record,
             key_source,
+            spill: crate::encryption::SpillCodec::new()?,
         })
     }
 

@@ -300,6 +300,8 @@ pub struct StorageFile {
     /// Where the master key comes from (as opened or created), for a master
     /// key rotation.
     key_source: Option<crate::encryption::KeySource>,
+    /// Query spill pages' encryption (a random key per open, every database).
+    spill: crate::encryption::SpillCodec,
 }
 
 /// Which keys a new file gets.

@@ -15,9 +15,7 @@ impl Storage {
     pub fn spill_write_page(&self, page: u64, data: &[u8]) -> Result<(), StorageError> {
         let mut locked = self.lock();
         let mut sealed = data.to_vec();
-        locked
-            .codec
-            .seal_raw(crate::encryption::RawPage::Spill, page, 0, &mut sealed);
+        locked.spill.seal(page, &mut sealed);
         locked.spill_write_page(page, &sealed)
     }
 
@@ -25,9 +23,7 @@ impl Storage {
     pub fn spill_read_page(&self, page: u64, out: &mut [u8]) -> Result<(), StorageError> {
         let mut locked = self.lock();
         locked.spill_read_page(page, out)?;
-        locked
-            .codec
-            .open_raw(crate::encryption::RawPage::Spill, page, 0, out);
+        locked.spill.open(page, out);
         Ok(())
     }
 

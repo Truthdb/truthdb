@@ -247,7 +247,11 @@ const KEY_BLOCK_MAGIC: [u8; 8] = *b"TDBKEYS2";
 /// The key block of a database whose log was not encrypted (a development
 /// build before log encryption): such a database is refused.
 const KEY_BLOCK_MAGIC_V1: [u8; 8] = *b"TDBKEYS1";
-const STATE_ENCRYPTED: u8 = 1;
+/// Every page and log entry is sealed.
+pub const KEY_STATE_ENCRYPTED: u8 = 1;
+/// Being converted from plain (`encryption enable`): pages and log entries
+/// may still be plain.
+pub const KEY_STATE_CONVERTING: u8 = 2;
 const MAX_SLOTS: usize = 2;
 const SLOTS_OFFSET: usize = 16;
 const MAX_KEY_ID: usize = 32;
@@ -425,8 +429,26 @@ pub fn new_key_block(
     SystemRandom::new()
         .fill(dek.as_mut_slice())
         .map_err(|_| config_error("no randomness for the database key"))?;
-    let block = build_key_block(source, &dek, file_uuid)?;
+    let block = build_key_block(source, &dek, file_uuid, KEY_STATE_ENCRYPTED)?;
     Ok((block, dek))
+}
+
+/// [`new_key_block`] for a database being converted from plain.
+pub fn new_converting_key_block(
+    source: &KeySource,
+    file_uuid: &[u8; 16],
+) -> Result<([u8; KEY_BLOCK_SIZE], Zeroizing<[u8; 32]>), StorageError> {
+    let mut dek = Zeroizing::new([0u8; 32]);
+    SystemRandom::new()
+        .fill(dek.as_mut_slice())
+        .map_err(|_| config_error("no randomness for the database key"))?;
+    let block = build_key_block(source, &dek, file_uuid, KEY_STATE_CONVERTING)?;
+    Ok((block, dek))
+}
+
+/// A key block's state ([`KEY_STATE_ENCRYPTED`] or [`KEY_STATE_CONVERTING`]).
+pub fn key_block_state(block: &[u8]) -> u8 {
+    block.get(8).copied().unwrap_or(0)
 }
 
 /// A key block holding `dek` wrapped by `source`'s current master key.
@@ -434,11 +456,12 @@ fn build_key_block(
     source: &KeySource,
     dek: &[u8; 32],
     file_uuid: &[u8; 16],
+    state: u8,
 ) -> Result<[u8; KEY_BLOCK_SIZE], StorageError> {
     let slot = wrap(source, dek, file_uuid)?;
     let mut block = [0u8; KEY_BLOCK_SIZE];
     block[0..8].copy_from_slice(&KEY_BLOCK_MAGIC);
-    block[8] = STATE_ENCRYPTED;
+    block[8] = state;
     block[9] = 1;
     let at = SLOTS_OFFSET;
     block[at] = slot.kind;
@@ -461,7 +484,7 @@ pub fn rewrap_key_block(
     file_uuid: &[u8; 16],
 ) -> Result<[u8; KEY_BLOCK_SIZE], StorageError> {
     let dek = unlock_key_block(block, source, file_uuid)?;
-    build_key_block(source, &dek, file_uuid)
+    build_key_block(source, &dek, file_uuid, key_block_state(block))
 }
 
 /// What wraps a key block's database key: `KEY FILE` and its key id, or
@@ -500,7 +523,7 @@ pub fn unlock_key_block(
     if block.len() != KEY_BLOCK_SIZE || block[0..8] != KEY_BLOCK_MAGIC {
         return Err(corrupt("is missing"));
     }
-    if block[8] != STATE_ENCRYPTED {
+    if block[8] != KEY_STATE_ENCRYPTED && block[8] != KEY_STATE_CONVERTING {
         return Err(corrupt(&format!("has unknown state {}", block[8])));
     }
     let count = block[9] as usize;
@@ -567,18 +590,43 @@ pub enum RawPage {
     /// The search snapshot's extent; the tweak's second half is the
     /// snapshot's generation.
     Snapshot,
-    /// Query spill pages; the second half is drawn at each open.
-    Spill,
 }
+
+/// Set in a page header's flags by every seal of an encrypted database:
+/// while it is being converted, a page without it is still plain.
+pub const PAGE_FLAG_SEALED: u16 = 1;
 
 /// The keys of an encrypted database.
 pub struct PageKeys {
     page: Xts128<Aes256>,
     snapshot: Xts128<Aes256>,
-    spill: Xts128<Aes256>,
     mac: hmac::Key,
-    spill_salt: u64,
     wal: std::sync::Arc<WalKeys>,
+}
+
+/// Query spill pages' encryption: XTS under a random key drawn at each open
+/// (spill never outlives the process), for every database, so turning
+/// encryption on never strands a spool written before.
+pub struct SpillCodec {
+    xts: Xts128<Aes256>,
+}
+
+impl SpillCodec {
+    pub fn new() -> Result<Self, StorageError> {
+        let mut key = Zeroizing::new([0u8; 64]);
+        SystemRandom::new()
+            .fill(key.as_mut_slice())
+            .map_err(|_| config_error("no randomness for the spill key"))?;
+        Ok(SpillCodec { xts: xts(&key) })
+    }
+
+    pub fn seal(&self, page_no: u64, page: &mut [u8]) {
+        self.xts.encrypt_sector(page, tweak(page_no, 0));
+    }
+
+    pub fn open(&self, page_no: u64, page: &mut [u8]) {
+        self.xts.decrypt_sector(page, tweak(page_no, 0));
+    }
 }
 
 /// Bytes a sealed log entry adds to its payload: the writer id and the tag.
@@ -595,6 +643,9 @@ pub struct WalKeys {
     dek: Zeroizing<[u8; 32]>,
     file_uuid: [u8; 16],
     readers: std::sync::Mutex<std::collections::HashMap<u64, aead::LessSafeKey>>,
+    /// The database is being converted from plain: plain pages and log
+    /// entries are still accepted.
+    converting: std::sync::atomic::AtomicBool,
 }
 
 /// One writer's sealing key.
@@ -617,12 +668,37 @@ fn wal_nonce(lsn: u64) -> aead::Nonce {
 }
 
 impl WalKeys {
-    fn new(dek: &[u8; 32], file_uuid: &[u8; 16]) -> Self {
+    fn new(dek: &[u8; 32], file_uuid: &[u8; 16], converting: bool) -> Self {
         WalKeys {
             dek: Zeroizing::new(*dek),
             file_uuid: *file_uuid,
             readers: Default::default(),
+            converting: std::sync::atomic::AtomicBool::new(converting),
         }
+    }
+
+    /// Whether plain pages and log entries are still accepted (a conversion
+    /// from plain is under way).
+    pub fn converting(&self) -> bool {
+        self.converting.load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    /// The conversion finished: from now on only sealed pages and entries
+    /// are accepted.
+    pub fn finish_conversion(&self) {
+        self.converting
+            .store(false, std::sync::atomic::Ordering::Release);
+    }
+
+    /// `block` with its state set to `state` (and its MAC renewed; the
+    /// wrapped key is unchanged).
+    pub fn restate_key_block(&self, block: &[u8], state: u8) -> [u8; KEY_BLOCK_SIZE] {
+        let mut out = [0u8; KEY_BLOCK_SIZE];
+        out.copy_from_slice(block);
+        out[8] = state;
+        let mac = block_mac(&self.dek, &self.file_uuid, &out);
+        out[MAC_OFFSET..].copy_from_slice(&mac);
+        out
     }
 
     /// A new writer's sealing key, under a fresh random writer id.
@@ -693,21 +769,17 @@ fn tweak(low: u64, high: u64) -> xts_mode::Array<u8, aes::cipher::consts::U16> {
 }
 
 impl PageKeys {
-    pub fn new(dek: &[u8; 32], file_uuid: &[u8; 16]) -> Result<Self, StorageError> {
-        let mut salt = [0u8; 8];
-        SystemRandom::new()
-            .fill(&mut salt)
-            .map_err(|_| config_error("no randomness for the spill key"))?;
+    /// `converting`: a conversion from plain is under way (the key block's
+    /// state).
+    pub fn new(dek: &[u8; 32], file_uuid: &[u8; 16], converting: bool) -> Result<Self, StorageError> {
         Ok(PageKeys {
             page: xts(&derive::<64>(dek, file_uuid, "truthdb page xts")),
             snapshot: xts(&derive::<64>(dek, file_uuid, "truthdb snapshot xts")),
-            spill: xts(&derive::<64>(dek, file_uuid, "truthdb spill xts")),
             mac: hmac::Key::new(
                 hmac::HMAC_SHA256,
                 derive::<32>(dek, file_uuid, "truthdb page mac").as_slice(),
             ),
-            spill_salt: u64::from_le_bytes(salt),
-            wal: std::sync::Arc::new(WalKeys::new(dek, file_uuid)),
+            wal: std::sync::Arc::new(WalKeys::new(dek, file_uuid, converting)),
         })
     }
 
@@ -756,6 +828,8 @@ impl PageCodec {
             PageCodec::Plain => page::stamp_checksum(out),
             PageCodec::Encrypted(keys) => {
                 out[0..8].fill(0);
+                let flags = u16::from_le_bytes([out[18], out[19]]) | PAGE_FLAG_SEALED;
+                out[18..20].copy_from_slice(&flags.to_le_bytes());
                 let lsn = page::page_lsn(out);
                 keys.page
                     .encrypt_sector(&mut out[page::PAGE_HEADER_SIZE..], tweak(page_no, lsn));
@@ -773,6 +847,11 @@ impl PageCodec {
         match self {
             PageCodec::Plain => page::verify_checksum(page),
             PageCodec::Encrypted(keys) => {
+                // While converting, a page not yet sealed is still plain.
+                let flags = u16::from_le_bytes([page[18], page[19]]);
+                if flags & PAGE_FLAG_SEALED == 0 && keys.wal.converting() {
+                    return page::verify_checksum(page);
+                }
                 if !equal(&keys.page_mac(page_no, page), &page[0..8]) {
                     return false;
                 }
@@ -791,9 +870,6 @@ impl PageCodec {
         if let PageCodec::Encrypted(keys) = self {
             match kind {
                 RawPage::Snapshot => keys.snapshot.encrypt_sector(page, tweak(index, generation)),
-                RawPage::Spill => keys
-                    .spill
-                    .encrypt_sector(page, tweak(index, keys.spill_salt)),
             }
         }
     }
@@ -803,9 +879,6 @@ impl PageCodec {
         if let PageCodec::Encrypted(keys) = self {
             match kind {
                 RawPage::Snapshot => keys.snapshot.decrypt_sector(page, tweak(index, generation)),
-                RawPage::Spill => keys
-                    .spill
-                    .decrypt_sector(page, tweak(index, keys.spill_salt)),
             }
         }
     }
@@ -1014,7 +1087,7 @@ mod tests {
     }
 
     fn codec() -> PageCodec {
-        PageCodec::Encrypted(Box::new(PageKeys::new(&[5; 32], &UUID).unwrap()))
+        PageCodec::Encrypted(Box::new(PageKeys::new(&[5; 32], &UUID, false).unwrap()))
     }
 
     fn sample(page_no: u64) -> Vec<u8> {
@@ -1044,6 +1117,8 @@ mod tests {
         assert!(codec.open(12, &mut opened));
         let mut expected = plain.clone();
         expected[0..8].fill(0);
+        // Sealing marks the page sealed in its header's flags.
+        expected[18..20].copy_from_slice(&PAGE_FLAG_SEALED.to_le_bytes());
         assert_eq!(opened, expected);
         // Any byte changed, the page read as another page, or another key.
         for at in [0, 7, 8, 31, 32, 100, PAGE_SIZE - 1] {
@@ -1052,7 +1127,7 @@ mod tests {
             assert!(!codec.open(12, &mut changed), "byte {at}");
         }
         assert!(!codec.open(13, &mut sealed.clone()));
-        let other = PageCodec::Encrypted(Box::new(PageKeys::new(&[6; 32], &UUID).unwrap()));
+        let other = PageCodec::Encrypted(Box::new(PageKeys::new(&[6; 32], &UUID, false).unwrap()));
         assert!(!other.open(12, &mut sealed.clone()));
         // The same content at another LSN encrypts differently.
         let mut later = plain.clone();
@@ -1076,7 +1151,7 @@ mod tests {
         codec.open_raw(RawPage::Snapshot, 4, 9, &mut page);
         assert_eq!(page, plain);
         // Plain leaves them as they are.
-        PageCodec::Plain.seal_raw(RawPage::Spill, 4, 0, &mut page);
+        PageCodec::Plain.seal_raw(RawPage::Snapshot, 4, 0, &mut page);
         assert_eq!(page, plain);
     }
 }
