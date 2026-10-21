@@ -174,6 +174,10 @@ impl Locked {
             )
             .saturating_add(1);
 
+        // The extent may be pages freed by records not yet forced to disk
+        // (a B+ tree page a delete emptied): the snapshot goes straight to
+        // the file, so the log of those frees must reach the disk first.
+        self.core.wal.sync_all()?;
         // The snapshot is an ordinary allocator extent now; the old snapshot
         // stays allocated (and readable) until the new one is durable.
         let alloc_start = self.core.allocator.allocate(num_pages).ok_or_else(|| {
