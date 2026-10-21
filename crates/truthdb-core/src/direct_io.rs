@@ -131,19 +131,39 @@ mod imp {
     }
 
     impl AlignedBuffer {
-        fn new(len: usize, alignment: usize) -> io::Result<Self> {
-            let mut ptr = ptr::null_mut();
-            let rc = unsafe { libc::posix_memalign(&mut ptr, alignment, len) };
-            if rc != 0 {
-                return Err(io::Error::from_raw_os_error(rc));
+        /// A zeroed, page-aligned buffer in an anonymous mapping of its own,
+        /// never backed by a huge page. Registering a buffer pins it, and the
+        /// kernel charges the whole (huge) page it lies in against
+        /// RLIMIT_MEMLOCK: a heap buffer inside a transparent huge page costs
+        /// 2 MiB of an 8 MiB default, per ring. MADV_NOHUGEPAGE also keeps
+        /// the kernel from merging the mapping into a neighbouring one.
+        fn new(len: usize) -> io::Result<Self> {
+            let ptr = unsafe {
+                libc::mmap(
+                    ptr::null_mut(),
+                    len,
+                    libc::PROT_READ | libc::PROT_WRITE,
+                    libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                    -1,
+                    0,
+                )
+            };
+            if ptr == libc::MAP_FAILED {
+                return Err(io::Error::last_os_error());
             }
-            unsafe {
-                ptr::write_bytes(ptr.cast::<u8>(), 0, len);
-            }
-            Ok(Self {
+            let buffer = Self {
                 ptr: ptr.cast::<u8>(),
                 len,
-            })
+            };
+            // EINVAL: a kernel without transparent huge pages, with none to
+            // keep the buffer out of.
+            if unsafe { libc::madvise(ptr, len, libc::MADV_NOHUGEPAGE) } != 0 {
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINVAL) {
+                    return Err(err);
+                }
+            }
+            Ok(buffer)
         }
 
         fn as_iovec(&self) -> iovec {
@@ -164,10 +184,8 @@ mod imp {
 
     impl Drop for AlignedBuffer {
         fn drop(&mut self) {
-            if !self.ptr.is_null() {
-                unsafe {
-                    libc::free(self.ptr.cast::<c_void>());
-                }
+            unsafe {
+                libc::munmap(self.ptr.cast::<c_void>(), self.len);
             }
         }
     }
@@ -257,7 +275,7 @@ mod imp {
 
         fn from_file(file: File, lock: Option<File>) -> io::Result<Self> {
             let len = file.metadata()?.len();
-            let buffers = vec![AlignedBuffer::new(PAGE_SIZE, PAGE_SIZE)?];
+            let buffers = vec![AlignedBuffer::new(PAGE_SIZE)?];
             let ring = IoUring::new(IO_URING_ENTRIES).map_err(annotate_io_uring_error)?;
 
             let iovecs = buffers
@@ -654,6 +672,50 @@ mod imp {
                 "io_uring is blocked in this Linux runtime (EPERM); check container seccomp or runtime restrictions",
             ),
             _ => err,
+        }
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        /// The VmFlags of the kernel mapping (from /proc/self/smaps) that
+        /// holds `addr`.
+        fn vm_flags_of(addr: usize) -> Vec<String> {
+            let smaps = std::fs::read_to_string("/proc/self/smaps").expect("smaps");
+            let mut holds = false;
+            for line in smaps.lines() {
+                let first = line.split_whitespace().next().unwrap_or("");
+                if let Some((start, end)) = first.split_once('-')
+                    && let (Ok(start), Ok(end)) = (
+                        usize::from_str_radix(start, 16),
+                        usize::from_str_radix(end, 16),
+                    )
+                {
+                    holds = (start..end).contains(&addr);
+                } else if holds && let Some(flags) = line.strip_prefix("VmFlags:") {
+                    return flags.split_whitespace().map(str::to_string).collect();
+                }
+            }
+            panic!("no mapping holds the buffer");
+        }
+
+        #[test]
+        fn the_registered_buffer_is_never_in_a_huge_page() {
+            // A large allocation first, as a busy process has, so a heap
+            // buffer would land inside a large heap mapping.
+            let heap = vec![1u8; 64 << 20];
+            let buffer = AlignedBuffer::new(PAGE_SIZE).expect("buffer");
+            // A kernel without transparent huge pages has none to avoid.
+            if std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+                assert!(
+                    vm_flags_of(buffer.ptr as usize).contains(&"nh".to_string()),
+                    "the buffer's mapping may be backed by a huge page"
+                );
+            }
+            assert_eq!(buffer.ptr as usize % PAGE_SIZE, 0);
+            assert!(buffer.as_slice().iter().all(|&byte| byte == 0));
+            drop(heap);
         }
     }
 }
