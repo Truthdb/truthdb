@@ -83,11 +83,19 @@ jobs:
 
       - name: Show the limits io_uring is charged against
         run: |
+          uname -r
           ulimit -a
           grep -E "Cap(Eff|Prm)" /proc/self/status
           cat /proc/sys/vm/overcommit_memory
           free -m
           nproc
+
+      - name: Core tests under a 2 MB locked-memory limit (diagnostic)
+        continue-on-error: true
+        run: |
+          cargo test -p truthdb-core --lib --no-run
+          sh -c 'ulimit -l 2048; cargo test -p truthdb-core --lib -- --test-threads=1' 2>&1 | tee core2mb.log | grep -E "^test result|FAILED" || true
+          echo "ENOMEM lines: $(grep -c 'Cannot allocate' core2mb.log)"
 
       - name: Run tests
         run: |
