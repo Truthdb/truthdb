@@ -235,6 +235,60 @@ fn grow_crash_before_header_stamp_is_recoverable() {
     let _ = std::fs::remove_file(&path);
 }
 
+/// A database opened after a grow that stopped before its header is longer
+/// than its layout: a backup taken then records the layout's size, not the
+/// file's, and restores.
+#[test]
+fn a_backup_after_a_grow_cut_short_restores() {
+    use crate::engine::{StatementResult, TxnContext, execute_batch};
+    // Backups of an encrypted database are refused until they carry its key.
+    if truthdb_core::encryption::test_key_source().is_some() {
+        return;
+    }
+    let path = unique_temp_path("grow-cut-backup");
+    let bak = unique_temp_path("grow-cut-backup-bak");
+    let dst = unique_temp_path("grow-cut-backup-dst");
+    let storage = RelStorage::create(path.clone(), test_storage_options()).expect("create");
+    let mut ctx = TxnContext::default();
+    for sql in [
+        "CREATE TABLE g (id INT NOT NULL PRIMARY KEY, v INT)",
+        "INSERT INTO g VALUES (1, 42)",
+    ] {
+        let outcome = execute_batch(&storage, sql, &mut ctx);
+        assert!(outcome.error.is_none(), "{sql}: {:?}", outcome.error);
+    }
+    drop(ctx);
+    drop(storage);
+    let old_header = std::fs::read(&path).expect("read")[..FILE_HEADER_SIZE].to_vec();
+    crate::storage::Storage::grow_data_region(&path, 1).expect("grow");
+    {
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .expect("open for header restore");
+        f.write_all(&old_header).expect("restore old header");
+        f.sync_all().expect("sync");
+    }
+
+    let storage = RelStorage::open(path.clone()).expect("open under the old header");
+    storage.core_arc().backup_full(&bak).expect("backup");
+    drop(storage);
+    RelStorage::restore_full(&dst, &bak).expect("restore");
+    let restored = RelStorage::open(dst.clone()).expect("open restored");
+    let mut ctx = TxnContext::default();
+    let outcome = execute_batch(&restored, "SELECT v FROM g WHERE id = 1", &mut ctx);
+    assert!(outcome.error.is_none(), "{:?}", outcome.error);
+    match &outcome.results[0] {
+        StatementResult::Rows(rowset) => assert_eq!(rowset.rows[0][0], Datum::Int(42)),
+        other => panic!("expected rows, got {other:?}"),
+    }
+    drop(ctx);
+    drop(restored);
+    for p in [&path, &bak, &dst] {
+        let _ = std::fs::remove_file(p);
+    }
+}
+
 /// REVIEW POC (teeth): the checkpointed search snapshot must survive a
 /// grow — the descriptor pages are the only pointer to it, and they move.
 /// Fails if the grow skips the descriptor copy.
