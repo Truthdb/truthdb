@@ -89,6 +89,9 @@ jobs:
           cat /proc/sys/vm/overcommit_memory
           free -m
           nproc
+          cat /sys/kernel/mm/transparent_hugepage/enabled /sys/kernel/mm/transparent_hugepage/defrag
+          grep -E "Cma|AnonHuge|Hugepagesize" /proc/meminfo
+          grep -c Movable /proc/zoneinfo || true
 
       - name: Run tests
         run: |
