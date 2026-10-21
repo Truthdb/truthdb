@@ -599,9 +599,21 @@ fn after_the_log_writers_fsync_failed_no_later_fsync_of_the_log_succeeds() {
 
 #[test]
 fn after_a_data_fsync_failed_no_commit_is_reported_durable() {
+    for reopened in [false, true] {
+        data_fsync_failure_reports_no_commit_durable(reopened);
+    }
+}
+
+/// `reopened`: on a database opened again (the open path shares the gate
+/// with the data handle separately from the create path).
+fn data_fsync_failure_reports_no_commit_durable(reopened: bool) {
     let path = unique_temp_path("data-fsync-failed");
-    let storage = create(&path);
+    let mut storage = create(&path);
     let tree = create_tree(&storage);
+    if reopened {
+        drop(storage);
+        storage = Storage::open(path.clone(), no_engine).expect("reopen");
+    }
     insert(&storage, &tree, 0..10);
     // A commit waiting for the log-writer while the storage lock is free.
     let tail = {
