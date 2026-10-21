@@ -713,12 +713,14 @@ impl StorageFile {
                 "the backup began later, at {backup_started_at} ms"
             )));
         }
+        let wal_keys = self.codec.wal_keys();
         let scan = scan_ring(
             &mut self.file,
             self.layout.wal_offset,
             self.layout.wal_size,
             redo_start,
             tail,
+            wal_keys.as_deref(),
         )?;
         let records: Vec<(u64, RelRecord)> = scan
             .records

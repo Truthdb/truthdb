@@ -324,12 +324,14 @@ impl Locked {
         // 2. Decode only the newly seeded range: a scan starting at `from_lsn`
         //    self-terminates where the stale bytes past `new_end` begin (their
         //    logical_ts no longer equals the cursor).
+        let wal_keys = self.core.codec.wal_keys();
         let scan = scan_ring(
             self.core.wal.file_mut(),
             self.core.layout.wal_offset,
             self.core.layout.wal_size,
             from_lsn,
             from_lsn,
+            wal_keys.as_deref(),
         )?;
         // The shipped range must decode END TO END. A short scan means the
         // range was cut mid-entry (a misaligned sender) or carries recycled

@@ -630,12 +630,14 @@ impl StorageFile {
         // Recover the true WAL tail: trust the superblock's tail as a lower
         // bound and scan forward (CRC + LSN self-identity) past it.
         let mut log_file = DirectFile::open_existing_unlocked(path.clone())?;
+        let wal_keys = codec.wal_keys();
         let scan = scan_ring(
             &mut log_file,
             layout.wal_offset,
             layout.wal_size,
             active_sb.wal_head,
             active_sb.wal_tail,
+            wal_keys.as_deref(),
         )?;
         let wal = WalWriter::open(
             log_file,
@@ -643,6 +645,7 @@ impl StorageFile {
             layout.wal_size,
             active_sb.wal_head,
             scan.tail,
+            wal_keys.as_deref(),
         )?;
         let recorded_tail = active_sb.wal_tail;
 
@@ -880,7 +883,14 @@ impl StorageFile {
         file.sync_data()?;
 
         let log_file = DirectFile::open_existing_unlocked(path.clone())?;
-        let wal = WalWriter::open(log_file, layout.wal_offset, layout.wal_size, 0, 0)?;
+        let wal = WalWriter::open(
+            log_file,
+            layout.wal_offset,
+            layout.wal_size,
+            0,
+            0,
+            codec.wal_keys().as_deref(),
+        )?;
 
         Ok(StorageFile {
             default_collation: header.default_collation(),

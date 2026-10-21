@@ -39,6 +39,17 @@ fn backups_unsupported() -> bool {
     crate::encryption::test_key_source().is_some()
 }
 
+/// The length a log entry with a `payload_len`-byte payload takes in the
+/// ring (sealed entries carry the writer id and tag too).
+fn stored_entry_len(payload_len: usize) -> u64 {
+    let sealed = if crate::encryption::test_key_source().is_some() {
+        crate::encryption::WAL_SEAL_OVERHEAD
+    } else {
+        0
+    };
+    wal_entry_padded_len(payload_len + sealed) as u64
+}
+
 fn create_small(path: &Path) -> Storage {
     Storage::create_with_wal_bounds(
         path.to_path_buf(),

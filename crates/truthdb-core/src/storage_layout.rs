@@ -7,6 +7,13 @@ pub const FILE_MAGIC: [u8; 8] = *b"TRUTHDB\0";
 /// key block refuse it (they check only the magic) rather than open it and
 /// rewrite the header without the wrapped database key.
 pub const FILE_MAGIC_ENCRYPTED: [u8; 8] = *b"TRUTHDBE";
+/// Set in a log entry's version when its payload is sealed (an encrypted
+/// database's entries all are): the payload is the writer id, then the
+/// AES-GCM ciphertext and tag of the entry's own payload.
+pub const WAL_ENTRY_SEALED: u16 = 0x8000;
+/// The header bytes a sealed entry authenticates: type, version, payload
+/// length, sequence number and LSN.
+pub const WAL_ENTRY_AAD_LEN: usize = 24;
 /// Where the encryption key block sits in the file header's reserved area
 /// (the collation name keeps the bytes before it).
 pub const KEY_BLOCK_OFFSET: usize = 512;
