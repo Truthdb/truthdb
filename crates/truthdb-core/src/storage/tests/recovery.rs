@@ -610,6 +610,13 @@ fn trusted_region_corruption_truncates_and_persists_corrected_tail() {
     // Corrupt entry 2, inside the superblock-trusted region.
     overwrite_bytes(&path, layout.wal_offset + entry_len + 8, &[0xDDu8; 32]);
 
+    // An encrypted database refuses to open instead: its durable log was
+    // changed (see `a_changed_byte_where_the_log_was_durable_refuses_the_open`).
+    if crate::encryption::test_key_source().is_some() {
+        assert!(Storage::open(path.clone(), super::no_engine).is_err());
+        let _ = std::fs::remove_file(path);
+        return;
+    }
     let mut storage =
         Storage::open(path.clone(), super::no_engine).expect("reopen after corruption");
     let records = storage.replay_wal_entries().expect("replay");

@@ -107,25 +107,20 @@ struct KeyArgs {
     /// The master key file (lines `<id> <64 hex digits>`; mode 0600).
     #[arg(long, conflicts_with = "key_command")]
     key_file: Option<std::path::PathBuf>,
-    /// The key command and its arguments, separated by spaces (run with
-    /// `wrap` or `unwrap` appended).
-    #[arg(long)]
-    key_command: Option<String>,
+    /// The key command, then its arguments: one per `--key-command` (use
+    /// `--key-command=-x` for an argument starting with `-`). It is run with
+    /// `wrap` or `unwrap` appended.
+    #[arg(long = "key-command", allow_hyphen_values = true)]
+    key_command: Vec<String>,
 }
 
 impl KeyArgs {
     fn source(&self) -> Result<Option<truthdb_relational::storage::KeySource>> {
         use truthdb_relational::storage::KeySource;
-        Ok(match (&self.key_file, &self.key_command) {
+        Ok(match (&self.key_file, self.key_command.is_empty()) {
             (Some(path), _) => Some(KeySource::File(path.clone())),
-            (None, Some(command)) => {
-                let argv: Vec<String> = command.split_whitespace().map(str::to_string).collect();
-                if argv.is_empty() {
-                    anyhow::bail!("--key-command names no program");
-                }
-                Some(KeySource::Command(argv))
-            }
-            (None, None) => None,
+            (None, false) => Some(KeySource::Command(self.key_command.clone())),
+            (None, true) => None,
         })
     }
 }
@@ -162,6 +157,16 @@ async fn main() -> Result<()> {
             keys,
         } => {
             let keys = keys.source()?;
+            if keys.is_some()
+                && truthdb_core::backup::read_header(&full)
+                    .is_ok_and(|header| header.keys.is_none())
+            {
+                eprintln!(
+                    "note: {} is a backup of a database that is not encrypted; the restored \
+                     database is not encrypted either",
+                    full.display()
+                );
+            }
             let result = if standby {
                 truthdb_relational::storage::RelStorage::restore_full_standby_with(
                     &to,

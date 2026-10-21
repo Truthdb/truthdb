@@ -1670,6 +1670,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "truthdb-core",
  "truthdb-engine",
  "truthdb-net",
  "truthdb-proto",

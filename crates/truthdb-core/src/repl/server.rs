@@ -56,6 +56,25 @@ where
         write_ack(stream, &ack).await?;
         return Ok(None);
     }
+    // The protocol version leads every version's Hello: a peer speaking
+    // another one is told so, rather than failing to decode or authenticate.
+    let version: u32 = frame
+        .decode()
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+    if version != REPL_PROTOCOL_VERSION {
+        let ack = HelloAck {
+            protocol_version: REPL_PROTOCOL_VERSION,
+            accepted: false,
+            primary_epoch: 0,
+            primary_flushed_lsn: 0,
+            message: format!(
+                "replication protocol version mismatch: this primary speaks version \
+                 {REPL_PROTOCOL_VERSION}, the standby {version}"
+            ),
+        };
+        write_ack(stream, &ack).await?;
+        return Ok(None);
+    }
     let hello: Hello = frame
         .decode()
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
@@ -116,6 +135,42 @@ mod tests {
             last_received_lsn,
             auth,
         }
+    }
+
+    /// A standby speaking protocol 1 (its Hello had no key fingerprint) is
+    /// told the versions differ.
+    #[tokio::test]
+    async fn a_standby_of_another_protocol_version_is_told_so() {
+        #[derive(serde::Serialize)]
+        struct HelloV1 {
+            protocol_version: u32,
+            node_id: u64,
+            cluster_uuid: [u8; 16],
+            epoch: u64,
+            last_received_lsn: u64,
+            auth: Vec<u8>,
+        }
+        let (mut client, mut server) = tokio::io::duplex(4096);
+        let server_task =
+            tokio::spawn(async move { serve_handshake(&mut server, &params()).await });
+        let old = HelloV1 {
+            protocol_version: 1,
+            node_id: 5,
+            cluster_uuid: UUID,
+            epoch: 3,
+            last_received_lsn: 40_000,
+            auth: vec![0; 32],
+        };
+        let frame = ReplFrame::encode(ReplMsgType::Hello, &old).unwrap();
+        write_repl_frame(&mut client, &frame).await.unwrap();
+        let ack: HelloAck = read_repl_frame(&mut client)
+            .await
+            .unwrap()
+            .decode()
+            .unwrap();
+        assert!(!ack.accepted);
+        assert!(ack.message.contains("version mismatch"), "{}", ack.message);
+        assert_eq!(server_task.await.unwrap().expect("io"), None);
     }
 
     #[tokio::test]

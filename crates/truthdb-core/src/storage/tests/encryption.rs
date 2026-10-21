@@ -760,3 +760,89 @@ fn a_standby_of_an_encrypted_database_applies_its_log_and_holds_no_plaintext() {
         std::fs::remove_file(file).ok();
     }
 }
+
+#[test]
+fn a_changed_byte_where_the_log_was_durable_refuses_the_open() {
+    use crate::storage_layout::{
+        WAL_ENTRY_HEADER_SIZE, WAL_ENTRY_TYPE_RECORD, WalEntryFooter, WalEntryHeader,
+        wal_payload_crc,
+    };
+    use std::os::unix::fs::FileExt;
+    let keys = key_file("enc-durable-keys", &format!("main {}\n", "f7".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    for recompute_checksums in [false, true] {
+        let path = unique_temp_path("enc-durable");
+        let storage = Storage::create_with_keys(
+            path.clone(),
+            test_storage_options(),
+            no_engine,
+            Some(&source),
+        )
+        .expect("create encrypted");
+        // The superblock records the tail after every entry: all four are
+        // where the log was durable.
+        storage.lock().wal.set_superblock_interval(1);
+        let mut lsns = Vec::new();
+        for seq in 1..=4u64 {
+            lsns.push(
+                storage
+                    .append_wal_entry(WAL_ENTRY_TYPE_RECORD, 1, seq, &[seq as u8; 100])
+                    .expect("append"),
+            );
+        }
+        let (wal_offset, wal_size) = {
+            let guard = storage.lock();
+            (guard.layout.wal_offset, guard.layout.wal_size)
+        };
+        drop(storage);
+
+        // One ciphertext byte of the second entry changed; the checksums
+        // (not a MAC) recomputed or not.
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("open");
+        let at = wal_offset + lsns[1] % wal_size;
+        let mut header_bytes = [0u8; WAL_ENTRY_HEADER_SIZE];
+        file.read_exact_at(&mut header_bytes, at)
+            .expect("read header");
+        let header = WalEntryHeader::from_le_bytes(&header_bytes);
+        let mut payload = vec![0u8; header.payload_len as usize];
+        file.read_exact_at(&mut payload, at + WAL_ENTRY_HEADER_SIZE as u64)
+            .expect("read payload");
+        payload[20] ^= 1;
+        file.write_all_at(&payload, at + WAL_ENTRY_HEADER_SIZE as u64)
+            .expect("tamper");
+        if recompute_checksums {
+            let crc = wal_payload_crc(&payload);
+            let forged = WalEntryHeader::new(
+                header.entry_type,
+                header.entry_version,
+                header.payload_len,
+                header.seq_no,
+                header.logical_ts,
+                crc,
+            );
+            file.write_all_at(&forged.to_le_bytes(), at)
+                .expect("header");
+            let footer = WalEntryFooter {
+                payload_len: header.payload_len,
+                payload_crc: crc,
+            };
+            file.write_all_at(
+                &footer.to_le_bytes(),
+                at + (WAL_ENTRY_HEADER_SIZE + payload.len()) as u64,
+            )
+            .expect("footer");
+        }
+        drop(file);
+
+        let Err(err) = Storage::open_with_keys(path.clone(), no_engine, Some(&source)) else {
+            panic!("a changed durable log entry was accepted ({recompute_checksums})");
+        };
+        assert!(err.to_string().contains("does not verify"), "{err}");
+        std::fs::remove_file(&path).ok();
+    }
+    std::fs::remove_file(&keys).ok();
+}

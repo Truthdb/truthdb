@@ -485,6 +485,21 @@ pub(crate) fn scan_ring(
         let ring_pos = cursor % ring_size;
         let bytes_to_lap_end = ring_size - ring_pos;
         let trusted = cursor < trusted_tail;
+        // An entry that fails to verify ends the log, except where the log
+        // was durable in an encrypted database: there it was changed, and the
+        // database refuses to open rather than silently drop what follows.
+        macro_rules! stop {
+            ($why:expr) => {{
+                if trusted && keys.is_some() {
+                    return Err(StorageError::InvalidFile(format!(
+                        "the log entry at LSN {cursor} {}: the log of this encrypted \
+                         database does not verify where it was durable",
+                        $why
+                    )));
+                }
+                break;
+            }};
+        }
 
         if bytes_to_lap_end < WAL_ENTRY_HEADER_SIZE as u64 {
             // Too small for a header: implicit wrap gap.
@@ -509,23 +524,26 @@ pub(crate) fn scan_ring(
 
         let header = WalEntryHeader::from_le_bytes(&header_bytes);
         if !header.verify_header_crc() {
-            break;
+            stop!("fails its header checksum");
         }
         let payload_len = header.payload_len as usize;
         let entry_len = wal_entry_padded_len(payload_len) as u64;
         let total_len = (WAL_ENTRY_HEADER_SIZE + payload_len + WAL_ENTRY_FOOTER_SIZE) as u64;
         if total_len > bytes_to_lap_end {
             // Entries never straddle a lap boundary.
-            break;
+            stop!("straddles the end of the ring");
         }
-        if !trusted && header.logical_ts != cursor {
-            break;
+        // An encrypted database's entries all name their own position: one
+        // copied from elsewhere in the ring is refused even where the log was
+        // durable.
+        if (!trusted || keys.is_some()) && header.logical_ts != cursor {
+            stop!("names another position");
         }
 
         let mut payload = vec![0u8; payload_len];
         file.read_exact_at(file_pos + WAL_ENTRY_HEADER_SIZE as u64, &mut payload)?;
         if wal_payload_crc(&payload) != header.payload_crc {
-            break;
+            stop!("fails its payload checksum");
         }
         let mut footer_bytes = [0u8; WAL_ENTRY_FOOTER_SIZE];
         file.read_exact_at(
@@ -534,7 +552,7 @@ pub(crate) fn scan_ring(
         )?;
         let footer = WalEntryFooter::from_le_bytes(&footer_bytes);
         if footer.payload_len != header.payload_len || footer.payload_crc != header.payload_crc {
-            break;
+            stop!("does not match its footer");
         }
         let sealed = header.entry_version & crate::storage_layout::WAL_ENTRY_SEALED != 0;
         let payload = match keys {
@@ -544,10 +562,10 @@ pub(crate) fn scan_ring(
                 &payload,
             ) {
                 Some(plain) => plain,
-                None => break,
+                None => stop!("does not authenticate"),
             },
             None if !sealed => payload,
-            _ => break,
+            _ => stop!("is not sealed"),
         };
 
         records.push(WalRecord {
