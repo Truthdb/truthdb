@@ -222,9 +222,9 @@ impl Storage {
         keys: Option<&crate::encryption::KeySource>,
     ) -> Result<Self, StorageError> {
         assert_layout_invariants();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let test_keys = crate::encryption::test_key_source();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let keys = keys.or(test_keys.as_ref());
         let file = StorageFile::open_existing(path.clone(), engine(), keys)?;
         Self::with_log_writer(path, file)
@@ -258,12 +258,7 @@ impl Storage {
             StorageError::InvalidConfig(format!("growth of {add_gib} GiB overflows"))
         })?;
         let mut file = DirectFile::open_existing(path.to_path_buf())?;
-        let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
-        file.read_exact_at(0, &mut header_bytes)?;
-        let mut header = FileHeader::from_le_bytes(&header_bytes);
-        if !header.has_known_magic() {
-            return Err(StorageError::InvalidFile("bad magic".to_string()));
-        }
+        let mut header = read_file_header(&mut file)?;
         if header.version != crate::storage_layout::FILE_VERSION {
             return Err(StorageError::InvalidFile(format!(
                 "grow requires a v{} file, found v{}",
@@ -271,12 +266,6 @@ impl Storage {
                 header.version
             )));
         }
-        if header.header_checksum != header.compute_checksum() {
-            return Err(StorageError::InvalidFile(
-                "header checksum mismatch".to_string(),
-            ));
-        }
-
         let tail_span = header.metadata_size
             + header.allocator_size
             + header.snapshot_size
@@ -329,6 +318,15 @@ impl Storage {
         header.snapshot_offset += delta;
         header.reserved_offset += delta;
         header.header_checksum = header.compute_checksum();
+        // An encrypted file's copy goes first (at the new end): if the header
+        // write tears, the copy describes the grown layout, already in place.
+        if header.is_encrypted() {
+            file.write_all_at(
+                old_total + delta - PAGE_SIZE as u64,
+                &header.to_le_bytes_with_checksum(),
+            )?;
+            file.sync_data()?;
+        }
         file.write_all_at(0, &header.to_le_bytes_with_checksum())?;
         file.sync_data()?;
         Ok(new_data_pages)
@@ -375,9 +373,9 @@ impl Storage {
     ) -> Result<Self, StorageError> {
         assert_layout_invariants();
         opts.validate()?;
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let test_keys = crate::encryption::test_key_source();
-        #[cfg(test)]
+        #[cfg(any(test, feature = "test-hooks"))]
         let keys = keys.or(test_keys.as_ref());
         let engines = engine();
         validate_engines(&engines)?;
@@ -394,6 +392,44 @@ impl Storage {
     pub fn is_encrypted(&self) -> bool {
         self.lock().codec.is_encrypted()
     }
+}
+
+/// Reads and checks the file header. The wrapped key of an encrypted file
+/// lives only in its header, so the file also keeps a copy in its last page
+/// (the end of the unused reserved region, found by the file's length): when
+/// the header page is damaged and the copy is sound, the copy is used and
+/// written back over it.
+fn read_file_header(file: &mut DirectFile) -> Result<FileHeader, StorageError> {
+    let mut bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+    file.read_exact_at(0, &mut bytes)?;
+    let header = FileHeader::from_le_bytes(&bytes);
+    let sound = |header: &FileHeader| {
+        header.has_known_magic() && header.header_checksum == header.compute_checksum()
+    };
+    if sound(&header) {
+        return Ok(header);
+    }
+    let len = file.len();
+    if len >= 2 * PAGE_SIZE as u64 {
+        let mut copy_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
+        file.read_exact_at(len - PAGE_SIZE as u64, &mut copy_bytes)?;
+        let copy = FileHeader::from_le_bytes(&copy_bytes);
+        if sound(&copy)
+            && copy.is_encrypted()
+            && copy.reserved_size >= PAGE_SIZE as u64
+            && copy.reserved_offset + copy.reserved_size == len
+        {
+            file.write_all_at(0, &copy_bytes)?;
+            file.sync_data()?;
+            return Ok(copy);
+        }
+    }
+    if !header.has_known_magic() {
+        return Err(StorageError::InvalidFile("bad magic".to_string()));
+    }
+    Err(StorageError::InvalidFile(
+        "header checksum mismatch".to_string(),
+    ))
 }
 
 impl StorageFile {
@@ -414,20 +450,9 @@ impl StorageFile {
     ) -> Result<Locked, StorageError> {
         validate_engines(&engines)?;
         let mut file = DirectFile::open_existing(path.clone())?;
-        let mut header_bytes = [0u8; crate::storage_layout::FILE_HEADER_SIZE];
-        file.read_exact_at(0, &mut header_bytes)?;
-        let header = FileHeader::from_le_bytes(&header_bytes);
-
-        if !header.has_known_magic() {
-            return Err(StorageError::InvalidFile("bad magic".to_string()));
-        }
+        let header = read_file_header(&mut file)?;
         if header.page_size as usize != crate::storage_layout::PAGE_SIZE {
             return Err(StorageError::InvalidFile("page size mismatch".to_string()));
-        }
-        if header.header_checksum != header.compute_checksum() {
-            return Err(StorageError::InvalidFile(
-                "header checksum mismatch".to_string(),
-            ));
         }
         let codec = if header.is_encrypted() {
             let source = keys.ok_or_else(|| {
@@ -721,7 +746,20 @@ impl StorageFile {
             }
         };
 
+        if header.is_encrypted() && layout.reserved_size < PAGE_SIZE as u64 {
+            return Err(StorageError::InvalidConfig(
+                "an encrypted database needs a reserved region of at least one page for the \
+                 copy of its header (storage.reserved_ratio)"
+                    .to_string(),
+            ));
+        }
         let mut file = DirectFile::create_new(path.clone(), layout.total_size)?;
+        if header.is_encrypted() {
+            file.write_all_at(
+                layout.total_size - PAGE_SIZE as u64,
+                &header.to_le_bytes_with_checksum(),
+            )?;
+        }
         file.write_all_at(layout.header_offset, &header.to_le_bytes_with_checksum())?;
         file.write_all_at(layout.superblock_a_offset, &superblock_bytes(superblock_a))?;
         file.write_all_at(layout.superblock_b_offset, &superblock_bytes(superblock_b))?;

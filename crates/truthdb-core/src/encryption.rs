@@ -16,14 +16,16 @@
 //! The master key is a key file (named keys, the first one current) or an
 //! external command that wraps and unwraps the DEK (a KMS).
 
-use std::io::Write as _;
+use std::io::{Read as _, Write as _};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use aes::Aes256;
 use aes::cipher::KeyInit;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::{aead, hkdf, hmac};
 use xts_mode::Xts128;
+use zeroize::Zeroizing;
 
 use crate::relstore::page;
 use crate::storage::StorageError;
@@ -45,7 +47,13 @@ impl std::fmt::Debug for KeySource {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             KeySource::File(path) => write!(f, "KeySource::File({})", path.display()),
-            KeySource::Command(argv) => write!(f, "KeySource::Command({argv:?})"),
+            // Arguments can carry credentials (a KMS token): only the program.
+            KeySource::Command(argv) => write!(
+                f,
+                "KeySource::Command({:?} and {} arguments)",
+                argv.first().map(String::as_str).unwrap_or(""),
+                argv.len().saturating_sub(1)
+            ),
         }
     }
 }
@@ -57,15 +65,19 @@ fn config_error(message: impl Into<String>) -> StorageError {
 /// One named master key of a key file.
 struct MasterKey {
     id: String,
-    key: [u8; 32],
+    key: Zeroizing<[u8; 32]>,
 }
 
 /// Reads a key file: it must be a regular file owned by this process's
-/// user with no permissions for anyone else.
+/// user with no permissions for anyone else. It is checked through the
+/// handle it is read from, so the file checked is the file read.
 fn read_key_file(path: &Path) -> Result<Vec<MasterKey>, StorageError> {
     use std::os::unix::fs::MetadataExt;
     let what = path.display();
-    let meta = std::fs::metadata(path)
+    let mut file = std::fs::File::open(path)
+        .map_err(|err| config_error(format!("encryption key file {what}: {err}")))?;
+    let meta = file
+        .metadata()
         .map_err(|err| config_error(format!("encryption key file {what}: {err}")))?;
     if !meta.is_file() {
         return Err(config_error(format!(
@@ -88,7 +100,8 @@ fn read_key_file(path: &Path) -> Result<Vec<MasterKey>, StorageError> {
             meta.uid()
         )));
     }
-    let text = std::fs::read_to_string(path)
+    let mut text = Zeroizing::new(String::new());
+    file.read_to_string(&mut text)
         .map_err(|err| config_error(format!("encryption key file {what}: {err}")))?;
     let mut keys = Vec::new();
     for (number, line) in text.lines().enumerate() {
@@ -136,24 +149,35 @@ fn valid_key_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || b"-_.".contains(&byte))
 }
 
-fn parse_hex32(text: &str) -> Option<[u8; 32]> {
+fn parse_hex32(text: &str) -> Option<Zeroizing<[u8; 32]>> {
     if text.len() != 64 {
         return None;
     }
-    let mut out = [0u8; 32];
+    let mut out = Zeroizing::new([0u8; 32]);
     for (index, byte) in out.iter_mut().enumerate() {
         *byte = u8::from_str_radix(text.get(index * 2..index * 2 + 2)?, 16).ok()?;
     }
     Some(out)
 }
 
-fn hex(bytes: &[u8]) -> String {
-    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+fn hex(bytes: &[u8]) -> Zeroizing<String> {
+    Zeroizing::new(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
+/// How long the key command may take.
+#[cfg(not(test))]
+const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
+#[cfg(test)]
+const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
+
 /// Runs the key command with `operation` appended, `input` on its stdin;
-/// returns its stdout, trimmed.
-fn run_key_command(argv: &[String], operation: &str, input: &str) -> Result<String, StorageError> {
+/// returns its stdout, trimmed. `wrap`'s stdin is the database key, so its
+/// stderr (which could echo it) stays out of the error.
+fn run_key_command(
+    argv: &[String],
+    operation: &str,
+    input: &str,
+) -> Result<Zeroizing<String>, StorageError> {
     let (program, args) = argv
         .split_first()
         .ok_or_else(|| config_error("encryption.key_command is empty"))?;
@@ -169,19 +193,38 @@ fn run_key_command(argv: &[String], operation: &str, input: &str) -> Result<Stri
         // A command that exits without reading reports through its status.
         let _ = writeln!(stdin, "{input}");
     }
-    let output = child
-        .wait_with_output()
-        .map_err(|err| config_error(format!("encryption key command {program}: {err}")))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let stderr: String = stderr.trim().chars().take(512).collect();
+    let pid = child.id();
+    let (sender, receiver) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let _ = sender.send(child.wait_with_output());
+    });
+    let Ok(output) = receiver.recv_timeout(KEY_COMMAND_TIMEOUT) else {
+        // Not reaped yet (the waiting thread reaps it once killed), so the
+        // pid is still the command's.
+        // SAFETY: kill has no memory-safety preconditions.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
         return Err(config_error(format!(
-            "encryption key command {program} {operation} failed ({}): {stderr}",
+            "encryption key command {program} {operation} did not finish within {} s",
+            KEY_COMMAND_TIMEOUT.as_secs()
+        )));
+    };
+    let mut output =
+        output.map_err(|err| config_error(format!("encryption key command {program}: {err}")))?;
+    let stdout = Zeroizing::new(std::mem::take(&mut output.stdout));
+    if !output.status.success() {
+        let detail = if operation == "wrap" {
+            "its error output is not shown, since its input is the database key".to_string()
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            stderr.trim().chars().take(512).collect()
+        };
+        return Err(config_error(format!(
+            "encryption key command {program} {operation} failed ({}): {detail}",
             output.status
         )));
     }
-    String::from_utf8(output.stdout)
-        .map(|text| text.trim().to_string())
+    std::str::from_utf8(&stdout)
+        .map(|text| Zeroizing::new(text.trim().to_string()))
         .map_err(|_| {
             config_error(format!(
                 "encryption key command {program} {operation} printed something not UTF-8"
@@ -222,7 +265,8 @@ fn wrap(source: &KeySource, dek: &[u8; 32], file_uuid: &[u8; 16]) -> Result<Slot
                 .fill(&mut nonce)
                 .map_err(|_| config_error("no randomness for the key wrap"))?;
             let key = aead::LessSafeKey::new(
-                aead::UnboundKey::new(&aead::AES_256_GCM, &current.key).expect("a 32-byte key"),
+                aead::UnboundKey::new(&aead::AES_256_GCM, current.key.as_slice())
+                    .expect("a 32-byte key"),
             );
             let mut sealed = dek.to_vec();
             key.seal_in_place_append_tag(
@@ -238,7 +282,15 @@ fn wrap(source: &KeySource, dek: &[u8; 32], file_uuid: &[u8; 16]) -> Result<Slot
             })
         }
         KeySource::Command(argv) => {
-            let blob = run_key_command(argv, "wrap", &hex(dek))?;
+            let dek_hex = hex(dek);
+            let blob = run_key_command(argv, "wrap", &dek_hex)?;
+            // A command that hands the key back unwrapped would put it in the
+            // file in clear.
+            if blob.to_ascii_lowercase().contains(dek_hex.as_str()) {
+                return Err(config_error(
+                    "encryption key command wrap printed the database key itself",
+                ));
+            }
             if blob.is_empty()
                 || blob.len() > MAX_BLOB
                 || !blob.bytes().all(|byte| byte.is_ascii_graphic())
@@ -251,7 +303,7 @@ fn wrap(source: &KeySource, dek: &[u8; 32], file_uuid: &[u8; 16]) -> Result<Slot
             Ok(Slot {
                 kind: SLOT_COMMAND,
                 id: String::new(),
-                blob: blob.into_bytes(),
+                blob: blob.as_bytes().to_vec(),
             })
         }
     }
@@ -267,7 +319,7 @@ fn unwrap(
     source: &KeySource,
     slot: &Slot,
     file_uuid: &[u8; 16],
-) -> Result<Option<[u8; 32]>, StorageError> {
+) -> Result<Option<Zeroizing<[u8; 32]>>, StorageError> {
     match (source, slot.kind) {
         (KeySource::File(path), SLOT_FILE) => {
             let keys = read_key_file(path)?;
@@ -280,7 +332,8 @@ fn unwrap(
                 ));
             }
             let key = aead::LessSafeKey::new(
-                aead::UnboundKey::new(&aead::AES_256_GCM, &master.key).expect("a 32-byte key"),
+                aead::UnboundKey::new(&aead::AES_256_GCM, master.key.as_slice())
+                    .expect("a 32-byte key"),
             );
             let nonce: [u8; 12] = slot.blob[..12].try_into().expect("12 bytes");
             let mut sealed = slot.blob[12..].to_vec();
@@ -296,12 +349,15 @@ fn unwrap(
                         slot.id
                     ))
                 })?;
-            Ok(Some(dek.try_into().expect("32 bytes")))
+            let dek: [u8; 32] = dek.try_into().expect("32 bytes");
+            let dek = Zeroizing::new(dek);
+            sealed.fill(0);
+            Ok(Some(dek))
         }
         (KeySource::Command(argv), SLOT_COMMAND) => {
             let blob = String::from_utf8_lossy(&slot.blob);
             let dek = run_key_command(argv, "unwrap", &blob)?;
-            parse_hex32(&dek).map(Some).ok_or_else(|| {
+            parse_hex32(dek.as_str()).map(Some).ok_or_else(|| {
                 config_error("encryption key command unwrap must print 64 hex digits")
             })
         }
@@ -351,10 +407,10 @@ pub fn random_uuid() -> Result<[u8; 16], StorageError> {
 pub fn new_key_block(
     source: &KeySource,
     file_uuid: &[u8; 16],
-) -> Result<([u8; KEY_BLOCK_SIZE], [u8; 32]), StorageError> {
-    let mut dek = [0u8; 32];
+) -> Result<([u8; KEY_BLOCK_SIZE], Zeroizing<[u8; 32]>), StorageError> {
+    let mut dek = Zeroizing::new([0u8; 32]);
     SystemRandom::new()
-        .fill(&mut dek)
+        .fill(dek.as_mut_slice())
         .map_err(|_| config_error("no randomness for the database key"))?;
     let slot = wrap(source, &dek, file_uuid)?;
     let mut block = [0u8; KEY_BLOCK_SIZE];
@@ -379,7 +435,7 @@ pub fn unlock_key_block(
     block: &[u8],
     source: &KeySource,
     file_uuid: &[u8; 16],
-) -> Result<[u8; 32], StorageError> {
+) -> Result<Zeroizing<[u8; 32]>, StorageError> {
     let corrupt = |why: &str| StorageError::InvalidFile(format!("the key block {why}"));
     if block.len() != KEY_BLOCK_SIZE || block[0..8] != KEY_BLOCK_MAGIC {
         return Err(corrupt("is missing"));
@@ -392,6 +448,7 @@ pub fn unlock_key_block(
         return Err(corrupt(&format!("has {count} key slots")));
     }
     let mut refused = None;
+    let mut kinds = Vec::new();
     for index in 0..count {
         let at = SLOTS_OFFSET + index * SLOT_SIZE;
         let id_len = block[at + 1] as usize;
@@ -400,6 +457,7 @@ pub fn unlock_key_block(
         if id_len > MAX_KEY_ID || blob_len > MAX_BLOB {
             return Err(corrupt("has a malformed key slot"));
         }
+        kinds.push(block[at]);
         let slot = Slot {
             kind: block[at],
             id: String::from_utf8_lossy(&block[at + 2..at + 2 + id_len]).into_owned(),
@@ -419,12 +477,23 @@ pub fn unlock_key_block(
             Err(err) => refused = Some(err),
         }
     }
-    Err(refused.unwrap_or_else(|| {
-        config_error(
-            "this database's key is not wrapped by the configured master key (check \
-             [encryption]: the key file must hold the key id the database was created with)",
-        )
-    }))
+    if let Some(err) = refused {
+        return Err(err);
+    }
+    let wanted = match source {
+        KeySource::File(_) => SLOT_FILE,
+        KeySource::Command(_) => SLOT_COMMAND,
+    };
+    Err(config_error(
+        if !kinds.contains(&wanted) && kinds.contains(&SLOT_COMMAND) {
+            "this database's key is wrapped by a key command: configure encryption.key_command"
+        } else if !kinds.contains(&wanted) {
+            "this database's key is wrapped by a key file: configure encryption.master_key_file"
+        } else {
+            "this database's key is not wrapped by any key in the configured key file (it must \
+         hold the key id the database was created with)"
+        },
+    ))
 }
 
 /// Constant-time equality.
@@ -575,21 +644,27 @@ impl PageCodec {
     }
 }
 
-/// A key file for this process's tests: `TRUTHDB_TEST_ENCRYPTION=1` makes
-/// every database a core test creates or opens without keys use it, so the
-/// storage suite runs encrypted.
-#[cfg(test)]
-pub(crate) fn test_key_source() -> Option<KeySource> {
+/// A key file for tests: `TRUTHDB_TEST_ENCRYPTION=1` makes every database a
+/// test creates or opens without keys use it, so the storage, relational and
+/// engine suites run encrypted. Its path and content are fixed, so every test
+/// process (and a reopen in another one) uses the same key. Built into test
+/// builds only (`test-hooks` is enabled by dev-dependencies alone).
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_key_source() -> Option<KeySource> {
     use std::os::unix::fs::PermissionsExt;
     static PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     if std::env::var("TRUTHDB_TEST_ENCRYPTION").as_deref() != Ok("1") {
         return None;
     }
     let path = PATH.get_or_init(|| {
-        let path = std::env::temp_dir().join(format!("truthdb-test-{}.keys", std::process::id()));
-        std::fs::write(&path, format!("test {}\n", "ab".repeat(32))).expect("a test key file");
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+        let path = std::env::temp_dir().join("truthdb-test-encryption.keys");
+        // Written whole and renamed into place: another test process may be
+        // reading it.
+        let staged = path.with_extension(format!("{}.tmp", std::process::id()));
+        std::fs::write(&staged, format!("test {}\n", "ab".repeat(32))).expect("a test key file");
+        std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o600))
             .expect("a test key file");
+        std::fs::rename(&staged, &path).expect("a test key file");
         path
     });
     Some(KeySource::File(path.clone()))
@@ -699,6 +774,56 @@ mod tests {
         let failing = KeySource::Command(vec!["false".to_string()]);
         let err = unlock_key_block(&block, &failing, &UUID).unwrap_err();
         assert!(err.to_string().contains("failed"), "{err}");
+    }
+
+    #[test]
+    fn a_key_command_is_bounded_and_kept_out_of_logs() {
+        let dir = temp_dir("command-limits");
+        let command = |name: &str, body: &str| {
+            let path = key_file(&dir, name, &format!("#!/bin/sh\n{body}\n"), 0o700);
+            KeySource::Command(vec![path.display().to_string(), "--token=secret".into()])
+        };
+        // A command that hangs is stopped.
+        let hung = command("hung.sh", "sleep 30");
+        let err = new_key_block(&hung, &UUID).err().unwrap().to_string();
+        assert!(err.contains("did not finish"), "{err}");
+        // One that hands the key back unwrapped is refused.
+        let echo = command("echo.sh", "read line\necho \"$line\"");
+        let err = new_key_block(&echo, &UUID).err().unwrap().to_string();
+        assert!(err.contains("printed the database key"), "{err}");
+        // A failed wrap's error output (which could echo its input) is not shown.
+        let noisy = command("noisy.sh", "read line\necho \"bad $line\" >&2\nexit 3");
+        let err = new_key_block(&noisy, &UUID).err().unwrap().to_string();
+        assert!(err.contains("not shown") && !err.contains("bad"), "{err}");
+        // The arguments stay out of Debug output.
+        let shown = format!("{hung:?}");
+        assert!(
+            !shown.contains("secret") && shown.contains("1 arguments"),
+            "{shown}"
+        );
+    }
+
+    #[test]
+    fn the_wrong_kind_of_key_source_says_which_one_is_needed() {
+        let dir = temp_dir("kinds");
+        let file = key_file(&dir, "keys", &format!("k {}\n", "11".repeat(32)), 0o600);
+        let script = key_file(
+            &dir,
+            "kms.sh",
+            "#!/bin/sh\nread line\necho \"$line\" | rev\n",
+            0o700,
+        );
+        let command = KeySource::Command(vec![script.display().to_string()]);
+        let (by_file, _) = new_key_block(&KeySource::File(file.clone()), &UUID).unwrap();
+        let err = unlock_key_block(&by_file, &command, &UUID)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("master_key_file"), "{err}");
+        let (by_command, _) = new_key_block(&command, &UUID).unwrap();
+        let err = unlock_key_block(&by_command, &KeySource::File(file), &UUID)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("key_command"), "{err}");
     }
 
     fn codec() -> PageCodec {

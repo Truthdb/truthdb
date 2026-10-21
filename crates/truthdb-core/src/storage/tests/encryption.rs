@@ -228,3 +228,66 @@ fn a_changed_byte_or_a_misplaced_page_is_refused() {
         std::fs::remove_file(file).ok();
     }
 }
+
+/// Overwrites the header page with garbage.
+fn damage_header(path: &Path) {
+    use std::os::unix::fs::FileExt;
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .expect("open");
+    file.write_all_at(&[0x5Au8; PAGE_SIZE], 0)
+        .expect("damage header");
+}
+
+#[test]
+fn a_damaged_header_page_is_restored_from_its_copy_in_the_last_page() {
+    let keys = key_file("enc-mirror-keys", &format!("main {}\n", "6b".repeat(32)));
+    let source = KeySource::File(keys.clone());
+    let path = unique_temp_path("enc-mirror");
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    let (root, _) = fill(&storage, 50);
+    drop(storage);
+
+    damage_header(&path);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source))
+        .expect("opens from the copy");
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 50);
+    drop(storage);
+    let header = std::fs::read(&path).expect("read")[..8].to_vec();
+    assert_eq!(header, b"TRUTHDBE", "the header page was written back");
+
+    // After a grow, the copy follows the file's new end.
+    let pages = Storage::grow_data_region(&path, 1).expect("grow");
+    damage_header(&path);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source))
+        .expect("opens from the grown copy");
+    assert_eq!(storage.lock().data_pages(), pages);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 50);
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_plain_file_with_a_damaged_header_still_does_not_open() {
+    if crate::encryption::test_key_source().is_some() {
+        return;
+    }
+    let path = unique_temp_path("plain-damaged-header");
+    let storage = Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
+    drop(storage);
+    damage_header(&path);
+    let err = Storage::open(path.clone(), no_engine)
+        .err()
+        .expect("refused");
+    assert!(err.to_string().contains("bad magic"), "{err}");
+    std::fs::remove_file(&path).ok();
+}

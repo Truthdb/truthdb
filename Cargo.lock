@@ -11,6 +11,7 @@ dependencies = [
  "cipher",
  "cpubits",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -1693,6 +1694,7 @@ dependencies = [
  "tokio-rustls",
  "xts-mode",
  "xxhash-rust",
+ "zeroize",
 ]
 
 [[package]]

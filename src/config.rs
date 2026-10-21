@@ -28,7 +28,7 @@ pub struct Config {
 
 /// Encryption at rest. With a master key configured, a database the server
 /// creates is encrypted; an encrypted database does not open without its key.
-#[derive(Debug, Default, Deserialize)]
+#[derive(Default, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EncryptionConfig {
     /// A key file: lines `<id> <64 hex digits>`, the first key current. Mode
@@ -40,6 +40,20 @@ pub struct EncryptionConfig {
     /// wraps and unwraps the database key (a KMS).
     #[serde(default)]
     pub key_command: Option<Vec<String>>,
+}
+
+/// The key command's arguments can carry credentials (a KMS token): Debug
+/// (the config is logged at startup) shows the program only.
+impl std::fmt::Debug for EncryptionConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncryptionConfig")
+            .field("master_key_file", &self.master_key_file)
+            .field(
+                "key_command",
+                &self.key_command.as_ref().map(|argv| argv.first().cloned()),
+            )
+            .finish()
+    }
 }
 
 impl EncryptionConfig {
@@ -629,7 +643,7 @@ mod tests {
     #[test]
     fn the_encryption_key_comes_from_one_source() {
         use truthdb_core::encryption::KeySource;
-        let dir = test_dir("encryption");
+        let dir = test_dir("encryption-at-rest");
         let load = |body: &str| load_layers(&[write(&dir, "enc.toml", body)]);
         assert_eq!(load("").unwrap().encryption.key_source(), Ok(None));
         let file = load("[encryption]\nmaster_key_file = \"/k\"\n").unwrap();
@@ -655,6 +669,8 @@ mod tests {
             load("[encryption]\nmaster_key = \"x\"\n").is_err(),
             "unknown key"
         );
+        let token = load("[encryption]\nkey_command = [\"kms\", \"--token=secret\"]\n").unwrap();
+        assert!(!format!("{token:?}").contains("--token"));
     }
 
     #[test]

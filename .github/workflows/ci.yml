@@ -84,8 +84,13 @@ jobs:
       - name: Run tests
         run: cargo test --workspace -- --test-threads=1
 
-      - name: Run the storage suite with every database encrypted
-        run: cargo test -p truthdb-core --lib -- --test-threads=1
+      # Backups (and so standbys) of an encrypted database are refused until
+      # they carry its key block: those tests are skipped here until then.
+      - name: Run the storage and engine suites with every database encrypted
+        run: >-
+          cargo test -p truthdb-core -p truthdb-relational -p truthdb-engine
+          -p truthdb-object -p truthdb-fulltext -p truthdb-vector
+          -- --test-threads=1 --skip backup_restore:: --skip replication:: --skip _to_a_standby
         env:
           TRUTHDB_TEST_ENCRYPTION: "1"
 
