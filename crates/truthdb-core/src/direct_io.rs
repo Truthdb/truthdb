@@ -110,8 +110,13 @@ mod imp {
                 ptr: ptr.cast::<u8>(),
                 len,
             };
+            // EINVAL: a kernel without transparent huge pages, with none to
+            // keep the buffer out of.
             if unsafe { libc::madvise(ptr, len, libc::MADV_NOHUGEPAGE) } != 0 {
-                return Err(io::Error::last_os_error());
+                let err = io::Error::last_os_error();
+                if err.raw_os_error() != Some(libc::EINVAL) {
+                    return Err(err);
+                }
             }
             Ok(buffer)
         }
@@ -641,10 +646,13 @@ mod imp {
             // buffer would land inside a large heap mapping.
             let heap = vec![1u8; 64 << 20];
             let buffer = AlignedBuffer::new(PAGE_SIZE).expect("buffer");
-            assert!(
-                vm_flags_of(buffer.ptr as usize).contains(&"nh".to_string()),
-                "the buffer's mapping may be backed by a huge page"
-            );
+            // A kernel without transparent huge pages has none to avoid.
+            if std::path::Path::new("/sys/kernel/mm/transparent_hugepage").exists() {
+                assert!(
+                    vm_flags_of(buffer.ptr as usize).contains(&"nh".to_string()),
+                    "the buffer's mapping may be backed by a huge page"
+                );
+            }
             assert_eq!(buffer.ptr as usize % PAGE_SIZE, 0);
             assert!(buffer.as_slice().iter().all(|&byte| byte == 0));
             drop(heap);
