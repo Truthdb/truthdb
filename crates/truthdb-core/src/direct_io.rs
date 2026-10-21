@@ -274,6 +274,70 @@ mod imp {
         }
 
         fn from_file(file: File, lock: Option<File>) -> io::Result<Self> {
+            // DIAGNOSTIC (never merged): on ENOMEM, report and retry after a
+            // pause, to tell a deferred ring teardown from a hard limit.
+            let mut waited_ms = 0u64;
+            loop {
+                match Self::from_file_once(&file) {
+                    Ok((ring, buffers)) => {
+                        if waited_ms > 0 {
+                            eprintln!("IOURING-DIAG ok after {waited_ms} ms");
+                        }
+                        let len = file.metadata()?.len();
+                        return Ok(Self {
+                            file,
+                            _lock: lock,
+                            ring,
+                            buffers,
+                            next_user_data: 1,
+                            len,
+                            poisoned: false,
+                            sync_gate: None,
+                        });
+                    }
+                    Err((stage, err)) if err.raw_os_error() == Some(libc::ENOMEM) && waited_ms < 30_000 => {
+                        let rings = std::fs::read_dir("/proc/self/fd")
+                            .map(|dir| {
+                                dir.filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+                                    .filter(|target| target.to_string_lossy().contains("io_uring"))
+                                    .count()
+                            })
+                            .unwrap_or(0);
+                        let threads = std::fs::read_dir("/proc/self/task").map(|d| d.count()).unwrap_or(0);
+                        eprintln!(
+                            "IOURING-DIAG ENOMEM at {stage} after {waited_ms} ms; open rings {rings}; threads {threads}"
+                        );
+                        std::thread::sleep(std::time::Duration::from_millis(500));
+                        waited_ms += 500;
+                    }
+                    Err((_, err)) => return Err(err),
+                }
+            }
+        }
+
+        #[allow(clippy::type_complexity)]
+        fn from_file_once(
+            file: &File,
+        ) -> Result<(IoUring, Vec<AlignedBuffer>), (&'static str, io::Error)> {
+            let buffers = vec![AlignedBuffer::new(PAGE_SIZE).map_err(|e| ("buffer", e))?];
+            let ring = IoUring::new(IO_URING_ENTRIES).map_err(|e| ("setup", e))?;
+            let iovecs = buffers
+                .iter()
+                .map(AlignedBuffer::as_iovec)
+                .collect::<Vec<_>>();
+            unsafe {
+                ring.submitter()
+                    .register_buffers(&iovecs)
+                    .map_err(|e| ("register_buffers", e))?;
+            }
+            ring.submitter()
+                .register_files(&[file.as_raw_fd()])
+                .map_err(|e| ("register_files", e))?;
+            Ok((ring, buffers))
+        }
+
+        #[allow(dead_code)]
+        fn from_file_original(file: File, lock: Option<File>) -> io::Result<Self> {
             let len = file.metadata()?.len();
             let buffers = vec![AlignedBuffer::new(PAGE_SIZE)?];
             let ring = IoUring::new(IO_URING_ENTRIES).map_err(annotate_io_uring_error)?;
