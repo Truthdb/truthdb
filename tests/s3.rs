@@ -8188,6 +8188,8 @@ fn the_cli_lists_copies_syncs_and_removes() {
     assert_eq!(tree(&back), tree(&src));
     assert_eq!(cli(&["sync", "s3://cli/up", back_arg]), "");
     assert_eq!(cli(&["sync", src_arg, "s3://cli/up"]), "");
+    // The downloaded copies are not taken for newer.
+    assert_eq!(cli(&["sync", back_arg, "s3://cli/up"]), "");
     // A dry run changes nothing; --delete removes what the source lacks.
     std::fs::remove_file(src.join("one.txt")).unwrap();
     let planned = cli(&["sync", "--delete", "--dryrun", src_arg, "s3://cli/up"]);
