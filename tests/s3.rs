@@ -4520,6 +4520,18 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
         ("POST", "/subs/o", "uploads&policy"),
         ("GET", "/subs/o", "uploadId=1&versioning"),
         ("DELETE", "/subs/o", "uploadId=1&versioning"),
+        ("PUT", "/subs/o", "annotation"),
+        ("DELETE", "/subs/o", "annotation"),
+        ("PUT", "/new", "abac"),
+        ("PUT", "/new", "metadataAnnotationTable"),
+        ("PUT", "/new", "metadataInventoryTable"),
+        ("PUT", "/new", "metadataJournalTable"),
+        // An operation this server does not know at all: a write naming
+        // it is never run as the plain write.
+        ("PUT", "/new", "someFutureOperation"),
+        ("DELETE", "/subs", "someFutureOperation"),
+        ("PUT", "/subs/o", "someFutureOperation"),
+        ("DELETE", "/subs/o", "someFutureOperation=1"),
     ] {
         let (status, reply) = call(method, path, query);
         assert_eq!(status, 501, "{method} {path}?{query}: {reply}");
@@ -4541,6 +4553,7 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
     assert_eq!(status, 501, "{reply}");
     // Nothing was deleted, created or overwritten.
     assert_eq!(call("HEAD", "/subs", "").0, 200);
+    assert_eq!(call("HEAD", "/new", "").0, 404);
     assert_eq!(call("GET", "/subs/o", ""), (200, "body".to_string()));
     // The plain operations still route.
     assert_eq!(call("GET", "/subs", "list-type=2").0, 200);

@@ -38,8 +38,10 @@ pub(crate) fn target(raw_path: &str) -> Result<Target, S3Error> {
 /// rather than taken for the plain operation on the same path (a bucket GET
 /// would list objects, an object GET would return its body).
 const UNIMPLEMENTED: &[&str] = &[
+    "abac",
     "accelerate",
     "analytics",
+    "annotation",
     "attributes",
     "cors",
     "intelligent-tiering",
@@ -47,7 +49,10 @@ const UNIMPLEMENTED: &[&str] = &[
     "legal-hold",
     "lifecycle",
     "logging",
+    "metadataAnnotationTable",
     "metadataConfiguration",
+    "metadataInventoryTable",
+    "metadataJournalTable",
     "metadataTable",
     "metrics",
     "notification",
@@ -89,6 +94,28 @@ fn plain(request: &Request<Incoming>, allowed: &[&str]) -> bool {
     !SUBRESOURCES
         .iter()
         .any(|name| !allowed.contains(name) && has_param(request, name))
+}
+
+/// Whether every query parameter of `request` is one a plain write takes:
+/// those in `allowed`, `x-id`, or `x-amz-*` (a presigned URL's, and headers
+/// carried in the query). A write naming anything else, such as an S3
+/// operation this server does not implement (perhaps one added since), is
+/// refused rather than run as the plain PUT or DELETE on its path.
+fn plain_write(request: &Request<Incoming>, allowed: &[&str]) -> bool {
+    request
+        .uri()
+        .query()
+        .unwrap_or("")
+        .split('&')
+        .filter(|pair| !pair.is_empty())
+        .all(|pair| {
+            let name = pair.split_once('=').map_or(pair, |(name, _)| name);
+            allowed.contains(&name)
+                || name == "x-id"
+                || name
+                    .get(..6)
+                    .is_some_and(|prefix| prefix.eq_ignore_ascii_case("x-amz-"))
+        })
 }
 
 /// The query's parameter names (sub-resources such as `location`).
@@ -465,11 +492,11 @@ async fn route(
                 .unwrap_or_default();
             crate::listing::list_versions(state, bucket, &owner, &query).await
         }
-        (Target::Bucket(bucket), Method::PUT) if plain(&request, &[]) => {
+        (Target::Bucket(bucket), Method::PUT) if plain_write(&request, &[]) => {
             authz.check("s3:CreateBucket", Bucket(&bucket))?;
             create_bucket(state, request, auth, bucket).await
         }
-        (Target::Bucket(bucket), Method::DELETE) if plain(&request, &[]) => {
+        (Target::Bucket(bucket), Method::DELETE) if plain_write(&request, &[]) => {
             authz.check("s3:DeleteBucket", Bucket(&bucket))?;
             delete_bucket(state, bucket).await
         }
@@ -558,7 +585,10 @@ async fn route(
             crate::tagging::delete_tagging(state, request, bucket, key).await
         }
         // A copy is UploadPartCopy with `?uploadId`.
-        (Target::Object(bucket, key), Method::PUT) if copying && plain(&request, &["uploadId"]) => {
+        (Target::Object(bucket, key), Method::PUT)
+            // A query versionId is ignored: the source's is in its header.
+            if copying && plain_write(&request, &["uploadId", "partNumber", "versionId"]) =>
+        {
             // A copy stores the header's tags only when told to replace the
             // source's.
             let replaces_tags = request
@@ -595,7 +625,8 @@ async fn route(
             }
         }
         (Target::Object(bucket, key), Method::PUT)
-            if has_param(&request, "uploadId") && plain(&request, &["uploadId"]) =>
+            if has_param(&request, "uploadId")
+                && plain_write(&request, &["uploadId", "partNumber"]) =>
         {
             authz.check("s3:PutObject", Object(&bucket, &key))?;
             crate::multipart::upload_part(state, request, auth, bucket, key).await
@@ -612,7 +643,7 @@ async fn route(
             authz.check("s3:AbortMultipartUpload", Object(&bucket, &key))?;
             crate::multipart::abort_upload(state, request, bucket, key).await
         }
-        (Target::Object(bucket, key), Method::PUT) if plain(&request, &[]) => {
+        (Target::Object(bucket, key), Method::PUT) if plain_write(&request, &[]) => {
             authz.check_storing(
                 "s3:PutObject",
                 Object(&bucket, &key),
@@ -635,7 +666,7 @@ async fn route(
             )?;
             crate::objects::get_object(state, request, bucket, key, true, principal.is_some()).await
         }
-        (Target::Object(bucket, key), Method::DELETE) if plain(&request, &[]) => {
+        (Target::Object(bucket, key), Method::DELETE) if plain_write(&request, &["versionId"]) => {
             authz.check(
                 versioned(&request, "s3:DeleteObject", "s3:DeleteObjectVersion"),
                 Object(&bucket, &key),
