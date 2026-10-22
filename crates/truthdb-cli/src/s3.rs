@@ -292,7 +292,10 @@ fn profile_keys(text: &str, profile: &str) -> Option<(String, String)> {
 fn client(connection: &Connection) -> Result<Client> {
     let (access_key, secret) = match (&connection.access_key, &connection.secret_key) {
         (Some(id), Some(secret)) => (id.clone(), secret.clone()),
-        _ => file_keys(&connection.profile)?.ok_or_else(|| {
+        (Some(_), None) | (None, Some(_)) => {
+            bail!("give both an access key and a secret key, or neither")
+        }
+        (None, None) => file_keys(&connection.profile)?.ok_or_else(|| {
             anyhow!(
                 "no keys: give --access-key and --secret-key, set AWS_ACCESS_KEY_ID and \
                  AWS_SECRET_ACCESS_KEY, or add profile [{}] to ~/.aws/credentials",
@@ -445,7 +448,15 @@ async fn remote_tree(
         for object in page.objects {
             let modified = iso_seconds(&object.last_modified)
                 .ok_or_else(|| anyhow!("{} has no readable date", object.key))?;
-            let relative = object.key[prefix.len()..].to_string();
+            let relative = object
+                .key
+                .strip_prefix(prefix)
+                .ok_or_else(|| anyhow!("the service listed {} under {prefix}", object.key))?
+                .to_string();
+            // A folder marker (the console's "Create folder") is no file.
+            if relative.is_empty() || relative.ends_with('/') {
+                continue;
+            }
             entries.insert(
                 relative,
                 Entry {
@@ -462,10 +473,19 @@ async fn remote_tree(
 }
 
 /// Every file under `root`, keyed by its `/`-separated path relative to it.
-fn local_tree(root: &Path) -> Result<BTreeMap<String, Entry>> {
+/// A folder that is not there is empty only when it is a destination
+/// (`required` false): a source that is not there, or not readable, is an
+/// error, or a sync with --delete would take it for empty and remove
+/// everything.
+fn local_tree(root: &Path, required: bool) -> Result<BTreeMap<String, Entry>> {
     let mut entries = BTreeMap::new();
-    if !root.exists() {
-        return Ok(entries);
+    match std::fs::metadata(root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => bail!("{} is not a folder", root.display()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound && !required => {
+            return Ok(entries);
+        }
+        Err(err) => return Err(err).with_context(|| format!("reading {}", root.display())),
     }
     let mut dirs = vec![root.to_path_buf()];
     while let Some(dir) = dirs.pop() {
@@ -582,9 +602,15 @@ async fn upload(client: &Client, path: &Path, bucket: &str, key: &str) -> Result
         use tokio::io::AsyncReadExt;
         let mut file = tokio::fs::File::open(path).await?;
         let mut parts = Vec::new();
-        for number in 1..=size.div_ceil(PART_SIZE) {
-            let mut part = Vec::with_capacity(PART_SIZE as usize);
-            (&mut file).take(PART_SIZE).read_to_end(&mut part).await?;
+        // At most 10,000 parts, as S3 allows.
+        let part_size = PART_SIZE.max(size.div_ceil(10_000));
+        for number in 1..=size.div_ceil(part_size) {
+            let wanted = part_size.min(size - (number - 1) * part_size);
+            let mut part = Vec::with_capacity(wanted as usize);
+            (&mut file).take(part_size).read_to_end(&mut part).await?;
+            if part.len() as u64 != wanted {
+                bail!("{} changed while it was uploaded", path.display());
+            }
             let etag = client
                 .upload_part(bucket, key, &upload, number as u32, Bytes::from(part))
                 .await?;
@@ -621,21 +647,64 @@ async fn download(
             .and_then(|name| name.to_str())
             .unwrap_or("download")
     ));
-    let mut download = client.get_object(bucket, key).await?;
-    let mut file = tokio::fs::File::create(&partial).await?;
-    while let Some(frame) = download.body.frame().await {
-        if let Ok(data) = frame?.into_data() {
-            file.write_all(&data).await?;
+    let written = async {
+        let mut download = client.get_object(bucket, key).await?;
+        let mut file = tokio::fs::File::create(&partial).await?;
+        while let Some(frame) = download.body.frame().await {
+            if let Ok(data) = frame?.into_data() {
+                file.write_all(&data).await?;
+            }
+        }
+        file.flush().await?;
+        drop(file);
+        if let Some(seconds) = modified {
+            let file = std::fs::File::options().write(true).open(&partial)?;
+            file.set_modified(UNIX_EPOCH + Duration::from_secs(seconds))?;
+        }
+        tokio::fs::rename(&partial, path).await?;
+        anyhow::Ok(())
+    }
+    .await;
+    if written.is_err() {
+        // No half-written file is left to be taken for a real one.
+        let _ = tokio::fs::remove_file(&partial).await;
+    }
+    written
+}
+
+/// Objects a download leaves out because their keys are no paths below
+/// the destination: each is reported, the others are still downloaded, and
+/// the run then fails.
+#[derive(Default)]
+struct Skipped(usize);
+
+impl Skipped {
+    /// Where `relative` goes under `to`, or `None` (reported) when it
+    /// cannot go anywhere there.
+    fn path(
+        &mut self,
+        to: &Path,
+        bucket: &str,
+        prefix: &str,
+        relative: &str,
+        out: &mut dyn Write,
+    ) -> Result<Option<PathBuf>> {
+        match local_path(to, relative) {
+            Ok(path) => Ok(Some(path)),
+            Err(err) => {
+                self.0 += 1;
+                writeln!(out, "skipped: s3://{bucket}/{prefix}{relative}: {err}")?;
+                Ok(None)
+            }
         }
     }
-    file.flush().await?;
-    drop(file);
-    if let Some(seconds) = modified {
-        let file = std::fs::File::options().write(true).open(&partial)?;
-        file.set_modified(UNIX_EPOCH + Duration::from_secs(seconds))?;
+
+    fn finish(self) -> Result<()> {
+        if self.0 > 0 {
+            bail!("{} object(s) were skipped", self.0);
+        }
+        Ok(())
     }
-    tokio::fs::rename(&partial, path).await?;
-    Ok(())
 }
 
 /// `relative` (a key below a prefix, or a file below a folder) under
@@ -667,7 +736,10 @@ async fn cp(
         (Location::Local(from), Location::S3 { bucket, key }) => {
             if recursive {
                 let prefix = folder(&key);
-                for relative in local_tree(&from)?.keys().filter(|path| passes(rules, path)) {
+                for relative in local_tree(&from, true)?
+                    .keys()
+                    .filter(|path| passes(rules, path))
+                {
                     writeln!(
                         out,
                         "{dry}upload: {relative} to s3://{bucket}/{prefix}{relative}"
@@ -706,11 +778,15 @@ async fn cp(
         (Location::S3 { bucket, key }, Location::Local(to)) => {
             if recursive {
                 let prefix = folder(&key);
+                let mut skipped = Skipped::default();
                 for (relative, entry) in remote_tree(client, &bucket, &prefix)
                     .await?
                     .into_iter()
                     .filter(|(path, _)| passes(rules, path))
                 {
+                    let Some(path) = skipped.path(&to, &bucket, &prefix, &relative, out)? else {
+                        continue;
+                    };
                     writeln!(
                         out,
                         "{dry}download: s3://{bucket}/{prefix}{relative} to {relative}"
@@ -720,16 +796,21 @@ async fn cp(
                             client,
                             &bucket,
                             &format!("{prefix}{relative}"),
-                            &local_path(&to, &relative)?,
+                            &path,
                             Some(entry.modified),
                         )
                         .await?;
                     }
                 }
-                return Ok(());
+                return skipped.finish();
             }
             let name = key.rsplit('/').next().unwrap_or(&key);
-            let path = if to.is_dir() { to.join(name) } else { to };
+            // A destination ending in `/` is a folder, made if need be.
+            let path = if to.is_dir() || to.as_os_str().to_string_lossy().ends_with('/') {
+                to.join(name)
+            } else {
+                to
+            };
             writeln!(
                 out,
                 "{dry}download: s3://{bucket}/{key} to {}",
@@ -758,7 +839,7 @@ async fn sync(
         (Location::Local(from), Location::S3 { bucket, key }) => {
             let prefix = folder(&key);
             let steps = plan(
-                &local_tree(&from)?,
+                &local_tree(&from, true)?,
                 &remote_tree(client, &bucket, &prefix).await?,
                 delete,
                 rules,
@@ -795,10 +876,15 @@ async fn sync(
         (Location::S3 { bucket, key }, Location::Local(to)) => {
             let prefix = folder(&key);
             let remote = remote_tree(client, &bucket, &prefix).await?;
-            let steps = plan(&remote, &local_tree(&to)?, delete, rules);
+            let steps = plan(&remote, &local_tree(&to, false)?, delete, rules);
+            let mut skipped = Skipped::default();
             for step in steps {
                 match step {
                     Step::Send(relative) => {
+                        let Some(path) = skipped.path(&to, &bucket, &prefix, &relative, out)?
+                        else {
+                            continue;
+                        };
                         writeln!(
                             out,
                             "{dry}download: s3://{bucket}/{prefix}{relative} to {relative}"
@@ -809,7 +895,7 @@ async fn sync(
                                 client,
                                 &bucket,
                                 &format!("{prefix}{relative}"),
-                                &local_path(&to, &relative)?,
+                                &path,
                                 modified,
                             )
                             .await?;
@@ -823,7 +909,7 @@ async fn sync(
                     }
                 }
             }
-            Ok(())
+            skipped.finish()
         }
         _ => bail!("sync syncs between a local folder and s3://bucket/prefix"),
     }
@@ -908,6 +994,7 @@ mod tests {
         let source = tree(&[
             ("same", 1, 5),
             ("newer", 1, 9),
+            ("older", 1, 1),
             ("resized", 2, 1),
             ("new", 1, 1),
             ("skip.log", 1, 1),
@@ -915,6 +1002,7 @@ mod tests {
         let destination = tree(&[
             ("same", 1, 5),
             ("newer", 1, 5),
+            ("older", 1, 5),
             ("resized", 1, 9),
             ("gone", 1, 1),
             ("kept.log", 1, 1),

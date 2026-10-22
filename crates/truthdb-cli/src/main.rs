@@ -97,6 +97,8 @@ enum Command {
     /// Objects of an S3 service (this server's S3 API or another), in the
     /// manner of `aws s3`: ls, mb, cp, sync, rm. `truthdb-cli s3 --help`
     /// tells more.
+    // Its own --help is the S3 commands' (see `truthdb_cli::s3`).
+    #[command(disable_help_flag = true)]
     S3 {
         #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
         args: Vec<String>,
@@ -542,4 +544,30 @@ async fn send_command(stream: &mut TcpStream, id: u64, command: &str) -> Result<
 
     let resp: CommandResp = decode_message(&resp_frame.payload)?;
     Ok(resp)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn s3_takes_every_argument_after_it_help_included() {
+        for args in [
+            &["--help"][..],
+            &["-h"],
+            &["sync", "--delete", "a", "s3://b"],
+        ] {
+            let cli = Cli::try_parse_from(
+                ["truthdb-cli", "s3"]
+                    .iter()
+                    .copied()
+                    .chain(args.iter().copied()),
+            )
+            .unwrap();
+            match cli.command {
+                Some(Command::S3 { args: given }) => assert_eq!(given, args),
+                other => panic!("{other:?}"),
+            }
+        }
+    }
 }

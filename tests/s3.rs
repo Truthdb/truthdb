@@ -8152,7 +8152,7 @@ fn the_cli_lists_copies_syncs_and_removes() {
         .enable_all()
         .build()
         .unwrap();
-    let cli = |args: &[&str]| -> String {
+    let attempt = |args: &[&str]| -> (Result<(), String>, String) {
         let mut argv: Vec<String> = vec![
             "--endpoint-url".to_string(),
             format!("http://127.0.0.1:{}", server.s3_port),
@@ -8165,10 +8165,15 @@ fn the_cli_lists_copies_syncs_and_removes() {
         ];
         argv.extend(args.iter().map(|arg| arg.to_string()));
         let mut out = Vec::new();
-        runtime
+        let result = runtime
             .block_on(truthdb_cli::s3::run(&argv, &mut out))
-            .unwrap_or_else(|err| panic!("{args:?}: {err:#}"));
-        String::from_utf8(out).unwrap()
+            .map_err(|err| format!("{err:#}"));
+        (result, String::from_utf8(out).unwrap())
+    };
+    let cli = |args: &[&str]| -> String {
+        let (result, out) = attempt(args);
+        result.unwrap_or_else(|err| panic!("{args:?}: {err:#}"));
+        out
     };
     let (src_arg, back_arg) = (src.to_str().unwrap(), back.to_str().unwrap());
     assert_eq!(cli(&["mb", "s3://cli"]), "make_bucket: cli\n");
@@ -8234,6 +8239,44 @@ fn the_cli_lists_copies_syncs_and_removes() {
     cli(&["rm", "--recursive", "s3://cli/txt"]);
     assert_eq!(cli(&["ls", "--recursive", "s3://cli/txt"]), "");
     cli(&["rm", "s3://cli/single/empty"]);
+    // A source folder that is not there is an error, not an empty folder
+    // whose sync would remove everything.
+    let missing = work.join("missing");
+    let (result, _) = attempt(&["sync", "--delete", missing.to_str().unwrap(), "s3://cli/up"]);
+    assert!(result.is_err());
+    assert!(
+        cli(&["ls", "s3://cli/up/"]).contains("big.bin"),
+        "nothing removed"
+    );
+    // A folder marker is no file; a key that is no path is reported, the
+    // rest still downloaded, and the run fails.
+    for odd in ["up/marker/", "up/odd//x"] {
+        assert_eq!(
+            send(
+                server.s3_port,
+                "PUT",
+                &format!("/cli/{odd}"),
+                "",
+                b"z",
+                &key,
+                Some(&secret)
+            )
+            .0,
+            200
+        );
+    }
+    let fresh = work.join("fresh");
+    let (result, out) = attempt(&["sync", "s3://cli/up", fresh.to_str().unwrap()]);
+    assert!(
+        result
+            .unwrap_err()
+            .to_string()
+            .contains("1 object(s) were skipped"),
+        "{out}"
+    );
+    assert!(out.contains("skipped: s3://cli/up/odd//x"), "{out}");
+    assert!(!out.contains("marker"), "{out}");
+    assert_eq!(tree(&fresh), tree(&src));
     // Help is printed, not an error.
     assert!(cli(&["--help"]).contains("sync"));
 }
