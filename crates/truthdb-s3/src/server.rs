@@ -312,7 +312,7 @@ fn hoist_query_headers(request: &mut Request<Incoming>) -> Result<(), S3Error> {
         let value = value.trim_matches([' ', '\t']);
         let name = hyper::header::HeaderName::from_bytes(lower.as_bytes())
             .map_err(|_| invalid(format!("{lower} is not a header name")))?;
-        let value = hyper::header::HeaderValue::from_str(&value)
+        let value = hyper::header::HeaderValue::from_str(value)
             .map_err(|_| invalid(format!("The {lower} parameter is not a valid header value")))?;
         if hoisted.iter().any(|(given, _)| *given == name) {
             return Err(invalid(format!("The {lower} parameter is given twice")));
