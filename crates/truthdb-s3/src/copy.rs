@@ -168,6 +168,9 @@ async fn copy_whole(
     let (src_bucket, src_key, which) = copy_source(&headers)?;
     let replace = replaces(&headers, "x-amz-metadata-directive", "metadata")?;
     let replace_tags = replaces(&headers, "x-amz-tagging-directive", "tagging")?;
+    // As S3: the copy's class is the one its request names, or STANDARD;
+    // never the source's.
+    let class = crate::objects::storage_class_from(&headers)?;
     let (source_key, target_key) = copy_keys(state, &headers, &bucket).await?;
     let target_record = target_key.as_deref().map(ProvidedKey::stored).transpose()?;
     // The copy is encrypted as the source is when neither has a key, or
@@ -205,9 +208,12 @@ async fn copy_whole(
             Err(err) => return Ok(Err(err)),
         };
         let shared = source.attrs.customer_key.is_some() == target_record.is_some() && same_keys;
-        // A copy to itself must change something: its metadata, or its
-        // encryption.
-        if !replace && shared && (src_bucket.as_str(), src_key.as_str()) == (&dst_bucket, &dst_key)
+        // A copy to itself must change something: its metadata, its
+        // storage class, or its encryption.
+        if !replace
+            && shared
+            && class == source.storage_class
+            && (src_bucket.as_str(), src_key.as_str()) == (&dst_bucket, &dst_key)
         {
             let current = file.head_object(&dst_bucket, &dst_key, VersionSel::Latest)?;
             if current.is_ok_and(|current| current.version == source.version) {
@@ -262,6 +268,7 @@ async fn copy_whole(
                 &dst_key,
                 &source,
                 &attrs,
+                class,
                 now_ms(),
                 DROP_GRACE_MS,
             )?;
@@ -326,8 +333,15 @@ async fn copy_whole(
                         Err(err) => return Ok(Err(err)),
                     };
                 let stored = file.transaction(|tx| {
-                    let stored =
-                        tx.put_object(&dst_bucket, &dst_key, &sealed, &attrs, now, DROP_GRACE_MS)?;
+                    let stored = tx.put_object(
+                        &dst_bucket,
+                        &dst_key,
+                        &sealed,
+                        &attrs,
+                        class,
+                        now,
+                        DROP_GRACE_MS,
+                    )?;
                     if let (Ok(info), Some(lock)) = (&stored, &lock) {
                         tx.set_lock(info.version, lock)?;
                     }

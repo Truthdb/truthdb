@@ -56,7 +56,8 @@ pub use journal::{JournalObject, JournalRecord, Origin, RecordType};
 pub use listing::{ListAfter, ListedObject, Listing};
 pub use locks::{EventHold, ObjectLock, Retention, RetentionChange, RetentionMode};
 pub use objects::{
-    CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, VersionSel, version_id,
+    CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, StorageClass, VersionSel,
+    version_id,
 };
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
 

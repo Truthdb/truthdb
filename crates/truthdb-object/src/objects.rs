@@ -153,6 +153,63 @@ pub fn version_id(version: u64, null_version: bool) -> String {
     }
 }
 
+/// An object version's S3 storage class (those of general-purpose buckets).
+/// It is kept with the version; what a class does to its body comes with
+/// later work, so for now every class stores the body alike.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum StorageClass {
+    #[default]
+    Standard,
+    ReducedRedundancy,
+    StandardIa,
+    OnezoneIa,
+    IntelligentTiering,
+    Glacier,
+    DeepArchive,
+    GlacierIr,
+}
+
+impl StorageClass {
+    const ALL: [StorageClass; 8] = [
+        StorageClass::Standard,
+        StorageClass::ReducedRedundancy,
+        StorageClass::StandardIa,
+        StorageClass::OnezoneIa,
+        StorageClass::IntelligentTiering,
+        StorageClass::Glacier,
+        StorageClass::DeepArchive,
+        StorageClass::GlacierIr,
+    ];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            StorageClass::Standard => "STANDARD",
+            StorageClass::ReducedRedundancy => "REDUCED_REDUNDANCY",
+            StorageClass::StandardIa => "STANDARD_IA",
+            StorageClass::OnezoneIa => "ONEZONE_IA",
+            StorageClass::IntelligentTiering => "INTELLIGENT_TIERING",
+            StorageClass::Glacier => "GLACIER",
+            StorageClass::DeepArchive => "DEEP_ARCHIVE",
+            StorageClass::GlacierIr => "GLACIER_IR",
+        }
+    }
+
+    /// The class S3 names `name`, if it is one of these.
+    pub fn parse(name: &str) -> Option<Self> {
+        Self::ALL.into_iter().find(|class| class.as_str() == name)
+    }
+
+    /// Its three bits in a row's flags (STANDARD is 0, so rows written before
+    /// classes read as STANDARD).
+    pub(crate) fn code(self) -> u8 {
+        Self::ALL.iter().position(|class| *class == self).unwrap() as u8
+    }
+
+    pub(crate) fn from_code(code: u8) -> Self {
+        Self::ALL[(code & 7) as usize]
+    }
+}
+
 /// An object version as read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectInfo {
@@ -165,6 +222,7 @@ pub struct ObjectInfo {
     /// Parts of a multipart upload (0 for a single PUT).
     pub parts: u16,
     pub mtime_ms: u64,
+    pub storage_class: StorageClass,
     pub attrs: ObjectAttrs,
 }
 
@@ -187,6 +245,7 @@ pub(crate) struct NewVersion {
     pub size: u64,
     pub md5: [u8; 16],
     pub parts: u16,
+    pub storage_class: StorageClass,
 }
 
 /// What a DeleteObject did: the version it removed or the delete marker it
@@ -259,6 +318,12 @@ pub(crate) fn version_from_key(row_key: &[u8]) -> Result<u64, StorageError> {
 const FLAG_DELETE_MARKER: u8 = 1;
 const FLAG_NULL_VERSION: u8 = 2;
 const FLAG_HAS_ATTRS: u8 = 4;
+/// Bits 3-5: the version's storage class (see [`StorageClass::code`]).
+const CLASS_SHIFT: u8 = 3;
+
+fn class_of(flags: u8) -> StorageClass {
+    StorageClass::from_code(flags >> CLASS_SHIFT)
+}
 
 /// A version's stored row.
 struct VersionRow {
@@ -410,16 +475,18 @@ impl ObjTxn<'_, '_> {
             .transpose()
     }
 
-    /// Stores `body` as the newest version of `key`: seals it (the version
-    /// holds its one reference) and, unless versioning is enabled, replaces
-    /// the key's null version (dropping its body's reference, collected after
-    /// `grace_ms`).
+    /// Stores `body` as the newest version of `key`, in `storage_class`:
+    /// seals it (the version holds its one reference) and, unless versioning
+    /// is enabled, replaces the key's null version (dropping its body's
+    /// reference, collected after `grace_ms`).
+    #[allow(clippy::too_many_arguments)]
     pub fn put_object(
         &mut self,
         bucket: &str,
         key: &str,
         body: &SealedBody,
         attrs: &ObjectAttrs,
+        storage_class: StorageClass,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<Result<ObjectInfo, ObjectError>, StorageError> {
@@ -439,6 +506,7 @@ impl ObjTxn<'_, '_> {
                 size: body.size.unwrap_or(sealed.len),
                 md5: sealed.md5,
                 parts: 0,
+                storage_class,
             },
             attrs,
             now_ms,
@@ -448,15 +516,17 @@ impl ObjTxn<'_, '_> {
     }
 
     /// Writes `source` as the newest version of `key` (S3 CopyObject), with
-    /// `attrs`: the new version shares the source's body (one more
-    /// reference), so no bytes are copied. `source` must be a version read in
-    /// the same lock hold, and not a delete marker.
+    /// `attrs`, in `storage_class`: the new version shares the source's body
+    /// (one more reference), so no bytes are copied. `source` must be a
+    /// version read in the same lock hold, and not a delete marker.
+    #[allow(clippy::too_many_arguments)]
     pub fn copy_object(
         &mut self,
         bucket: &str,
         key: &str,
         source: &ObjectInfo,
         attrs: &ObjectAttrs,
+        storage_class: StorageClass,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<Result<ObjectInfo, ObjectError>, StorageError> {
@@ -478,6 +548,7 @@ impl ObjTxn<'_, '_> {
                 size: source.size,
                 md5: source.md5,
                 parts: source.parts,
+                storage_class,
             },
             attrs,
             now_ms,
@@ -519,7 +590,8 @@ impl ObjTxn<'_, '_> {
             parts: new.parts,
             mtime_ms: now_ms,
             flags: if null_version { FLAG_NULL_VERSION } else { 0 }
-                | if has_attrs { FLAG_HAS_ATTRS } else { 0 },
+                | if has_attrs { FLAG_HAS_ATTRS } else { 0 }
+                | new.storage_class.code() << CLASS_SHIFT,
         };
         let objects = self.trees.objects();
         let inserted = objects.insert_unique(
@@ -545,6 +617,7 @@ impl ObjTxn<'_, '_> {
                     md5: new.md5,
                     parts: new.parts,
                     last_modified_ms: now_ms,
+                    storage_class: new.storage_class,
                 }),
             },
             now_ms,
@@ -558,6 +631,7 @@ impl ObjTxn<'_, '_> {
             md5: new.md5,
             parts: new.parts,
             mtime_ms: now_ms,
+            storage_class: new.storage_class,
             attrs: attrs.clone(),
         })
     }
@@ -652,6 +726,7 @@ impl ObjTxn<'_, '_> {
                     md5: row.md5,
                     parts: row.parts,
                     last_modified_ms: row.mtime_ms,
+                    storage_class: class_of(row.flags),
                 }),
             },
             now_ms,
@@ -797,6 +872,7 @@ impl ObjTxn<'_, '_> {
                     md5: [0; 16],
                     parts: 0,
                     last_modified_ms: now_ms,
+                    storage_class: StorageClass::Standard,
                 }),
             },
             now_ms,
@@ -964,6 +1040,7 @@ impl ObjFile<'_> {
             md5: row.md5,
             parts: row.parts,
             mtime_ms: row.mtime_ms,
+            storage_class: class_of(row.flags),
             attrs,
         }))
     }
@@ -1017,6 +1094,7 @@ pub(crate) fn decode_version(version: u64, row: &[u8]) -> Result<ObjectInfo, Sto
         md5: row.md5,
         parts: row.parts,
         mtime_ms: row.mtime_ms,
+        storage_class: class_of(row.flags),
         attrs: ObjectAttrs::default(),
     })
 }

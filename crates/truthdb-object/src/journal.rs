@@ -13,6 +13,7 @@ use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
 use crate::consumers::FULLTEXT_CONSUMER;
+use crate::objects::StorageClass;
 use crate::{CHANGES_TREE, NEXT_CHANGE_KEY, ObjFile, ObjTxn, next_counter};
 
 /// What a journal row records (AWS's `record_type`).
@@ -72,6 +73,7 @@ pub struct JournalObject {
     pub md5: [u8; 16],
     pub parts: u16,
     pub last_modified_ms: u64,
+    pub storage_class: StorageClass,
 }
 
 /// The type byte's flag for a row with its key's length and an origin
@@ -88,6 +90,8 @@ const FLAG_NULL_VERSION: u8 = 1;
 const FLAG_MARKER: u8 = 2;
 /// A version removed for good: no marker flag, no object columns.
 const FLAG_PERMANENT: u8 = 4;
+/// Bits 3-5: the version's storage class (STANDARD, 0, in rows from before).
+const CLASS_SHIFT: u8 = 3;
 
 fn corrupt() -> StorageError {
     StorageError::InvalidFile("corrupt journal row".to_string())
@@ -125,7 +129,9 @@ impl JournalRecord {
                 FLAG_PERMANENT
             } else {
                 0
-            },
+            } | self
+                .object
+                .map_or(0, |object| object.storage_class.code() << CLASS_SHIFT),
         );
         out.extend_from_slice(&self.timestamp_ms.to_le_bytes());
         out.extend_from_slice(&self.version.to_le_bytes());
@@ -134,6 +140,7 @@ impl JournalRecord {
             md5: [0; 16],
             parts: 0,
             last_modified_ms: 0,
+            storage_class: StorageClass::Standard,
         });
         out.extend_from_slice(&object.size.to_le_bytes());
         out.extend_from_slice(&object.md5);
@@ -214,6 +221,7 @@ impl JournalRecord {
             null_version: flags & FLAG_NULL_VERSION != 0,
             is_delete_marker: (!permanent).then_some(flags & FLAG_MARKER != 0),
             object: (!permanent).then(|| JournalObject {
+                storage_class: StorageClass::from_code(flags >> CLASS_SHIFT),
                 size: u64_at(18),
                 md5: bytes[26..42].try_into().unwrap(),
                 parts: u16::from_le_bytes([bytes[42], bytes[43]]),
@@ -433,6 +441,7 @@ mod tests {
             md5: [9; 16],
             parts: 3,
             last_modified_ms: 77,
+            storage_class: StorageClass::GlacierIr,
         };
         for record in [
             JournalRecord {
@@ -461,6 +470,7 @@ mod tests {
                     md5: [0; 16],
                     parts: 0,
                     last_modified_ms: 6,
+                    storage_class: StorageClass::Standard,
                 }),
                 origin: None,
             },

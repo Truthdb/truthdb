@@ -223,7 +223,7 @@ impl S3Rowsets {
                 bigint("size"),
                 datetime2("last_modified_date"),
                 nvarchar("e_tag", 64),
-                nvarchar("storage_class", 16),
+                nvarchar("storage_class", 32),
                 bit("is_multipart"),
                 nvarchar("requester", 12),
                 nvarchar("source_ip_address", 45),
@@ -284,7 +284,7 @@ impl S3Rowsets {
                     nvarchar_max("content_encoding"),
                     nvarchar_max("content_language"),
                     nvarchar_max("expires"),
-                    nvarchar("storage_class", 16),
+                    nvarchar("storage_class", 32),
                 ]);
                 if kind == Kind::Versions {
                     columns.extend([bit("is_latest"), bit("is_delete_marker")]);
@@ -593,7 +593,7 @@ impl ObjectStream {
                         optional(&attrs.content_encoding),
                         optional(&attrs.content_language),
                         optional(&attrs.expires),
-                        text("STANDARD"),
+                        text(info.storage_class.as_str()),
                     ]);
                 }
                 if self.kind == Kind::Versions {
@@ -675,8 +675,8 @@ fn journal_row(record: &JournalRecord) -> Vec<Datum> {
             (Some(o), Some(false)) => text(&etag(&o.md5, o.parts)),
             _ => Datum::Null,
         },
-        match record.is_delete_marker {
-            Some(false) => text("STANDARD"),
+        match (object, record.is_delete_marker) {
+            (Some(o), Some(false)) => text(o.storage_class.as_str()),
             _ => Datum::Null,
         },
         match (object, record.is_delete_marker) {

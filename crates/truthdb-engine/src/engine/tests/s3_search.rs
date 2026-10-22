@@ -16,7 +16,19 @@ fn put(engine: &Engine, bucket: &str, key: &str, text: &str) -> u64 {
         ..ObjectAttrs::default()
     };
     engine
-        .object(|file| file.transaction(|tx| tx.put_object(bucket, key, &sealed, &attrs, 2_000, 0)))
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.put_object(
+                    bucket,
+                    key,
+                    &sealed,
+                    &attrs,
+                    truthdb_object::StorageClass::Standard,
+                    2_000,
+                    0,
+                )
+            })
+        })
         .expect("put")
         .expect("put accepted")
         .version

@@ -223,6 +223,7 @@ fn context(
         ("s3:x-amz-acl", "x-amz-acl"),
         ("s3:x-amz-copy-source", "x-amz-copy-source"),
         ("s3:x-amz-metadata-directive", "x-amz-metadata-directive"),
+        ("s3:x-amz-storage-class", "x-amz-storage-class"),
         (
             "s3:x-amz-server-side-encryption",
             "x-amz-server-side-encryption",
