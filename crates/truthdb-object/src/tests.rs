@@ -758,7 +758,17 @@ fn an_object_is_put_overwritten_and_read_back_with_its_attributes() {
             ..ObjectAttrs::default()
         };
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.put_object("bkt", "dir/key.txt", &sealed, &attrs, now(), 0))
+            .transaction(|tx| {
+                tx.put_object(
+                    "bkt",
+                    "dir/key.txt",
+                    &sealed,
+                    &attrs,
+                    crate::StorageClass::Standard,
+                    now(),
+                    0,
+                )
+            })
             .unwrap()
             .unwrap()
     };
@@ -845,7 +855,17 @@ fn listings_follow_key_order_prefixes_delimiters_and_pages() {
         writer.write(&storage, key.as_bytes(), now()).unwrap();
         let sealed = writer.finish(&storage, now()).unwrap();
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .transaction(|tx| {
+                tx.put_object(
+                    "bkt",
+                    key,
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    crate::StorageClass::Standard,
+                    now(),
+                    0,
+                )
+            })
             .unwrap()
             .unwrap();
     }
@@ -930,7 +950,17 @@ fn a_deleted_object_is_gone_and_its_body_collected() {
         writer.write(&storage, key.as_bytes(), now()).unwrap();
         let sealed = writer.finish(&storage, now()).unwrap();
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .transaction(|tx| {
+                tx.put_object(
+                    "bkt",
+                    key,
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    crate::StorageClass::Standard,
+                    now(),
+                    0,
+                )
+            })
             .unwrap()
             .unwrap()
     };
@@ -992,7 +1022,15 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
         ..ObjectAttrs::default()
     };
     let upload = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_upload("bkt", "movie.mp4", &attrs, now()))
+        .transaction(|tx| {
+            tx.create_upload(
+                "bkt",
+                "movie.mp4",
+                &attrs,
+                crate::StorageClass::Standard,
+                now(),
+            )
+        })
         .unwrap()
         .unwrap();
     let send_part = |number: u32, data: &[u8]| {
@@ -1072,7 +1110,15 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
 
     // An aborted upload releases its parts.
     let aborted = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_upload("bkt", "other", &ObjectAttrs::default(), now()))
+        .transaction(|tx| {
+            tx.create_upload(
+                "bkt",
+                "other",
+                &ObjectAttrs::default(),
+                crate::StorageClass::Standard,
+                now(),
+            )
+        })
         .unwrap()
         .unwrap();
     let mut writer = BodyWriter::begin(&storage, now()).unwrap();
@@ -1103,7 +1149,13 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
     let pending = ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
             tx.create_bucket("upl", DEFAULT_ACCOUNT, now())?.unwrap();
-            tx.create_upload("upl", "k", &ObjectAttrs::default(), now())
+            tx.create_upload(
+                "upl",
+                "k",
+                &ObjectAttrs::default(),
+                crate::StorageClass::Standard,
+                now(),
+            )
         })
         .unwrap()
         .unwrap();
@@ -1159,7 +1211,17 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
         ..ObjectAttrs::default()
     };
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.put_object("src", "a", &sealed, &attrs, now(), 0))
+        .transaction(|tx| {
+            tx.put_object(
+                "src",
+                "a",
+                &sealed,
+                &attrs,
+                crate::StorageClass::Standard,
+                now(),
+                0,
+            )
+        })
         .unwrap()
         .unwrap();
     let head = |bucket: &str, key: &str| {
@@ -1170,7 +1232,17 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
     let copy = |bucket: &str, key: &str, attrs: &ObjectAttrs| {
         let source = head("src", "a").unwrap();
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.copy_object(bucket, key, &source, attrs, now(), 0))
+            .transaction(|tx| {
+                tx.copy_object(
+                    bucket,
+                    key,
+                    &source,
+                    attrs,
+                    crate::StorageClass::Standard,
+                    now(),
+                    0,
+                )
+            })
             .unwrap()
     };
     let pages = allocated_pages(&storage);
@@ -1207,7 +1279,15 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
     // A whole plain object shares its body as a part; a multipart object's
     // body is refused (composites do not nest).
     let upload = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_upload("dst", "joined", &ObjectAttrs::default(), now()))
+        .transaction(|tx| {
+            tx.create_upload(
+                "dst",
+                "joined",
+                &ObjectAttrs::default(),
+                crate::StorageClass::Standard,
+                now(),
+            )
+        })
         .unwrap()
         .unwrap();
     let mut writer = BodyWriter::begin(&storage, now()).unwrap();
@@ -1230,7 +1310,15 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
         .unwrap()
         .unwrap();
     let other = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_upload("dst", "again", &ObjectAttrs::default(), now()))
+        .transaction(|tx| {
+            tx.create_upload(
+                "dst",
+                "again",
+                &ObjectAttrs::default(),
+                crate::StorageClass::Standard,
+                now(),
+            )
+        })
         .unwrap()
         .unwrap();
     assert!(
@@ -1262,7 +1350,17 @@ fn tags_are_set_replaced_and_cleared_per_version() {
         writer.write(&storage, key.as_bytes(), now()).unwrap();
         let sealed = writer.finish(&storage, now()).unwrap();
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.put_object("bkt", key, &sealed, attrs, now(), 0))
+            .transaction(|tx| {
+                tx.put_object(
+                    "bkt",
+                    key,
+                    &sealed,
+                    attrs,
+                    crate::StorageClass::Standard,
+                    now(),
+                    0,
+                )
+            })
             .unwrap()
             .unwrap()
     };
@@ -1347,7 +1445,17 @@ fn versions_list_newest_first_with_markers_and_resume_mid_key() {
         writer.write(&storage, key.as_bytes(), now()).unwrap();
         let sealed = writer.finish(&storage, now()).unwrap();
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .transaction(|tx| {
+                tx.put_object(
+                    "bkt",
+                    key,
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    crate::StorageClass::Standard,
+                    now(),
+                    0,
+                )
+            })
             .unwrap()
             .unwrap()
             .version
@@ -1460,7 +1568,17 @@ fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
         writer.write(&storage, key.as_bytes(), now()).unwrap();
         let sealed = writer.finish(&storage, now()).unwrap();
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .transaction(|tx| {
+                tx.put_object(
+                    "bkt",
+                    key,
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    crate::StorageClass::Standard,
+                    now(),
+                    0,
+                )
+            })
             .unwrap()
             .unwrap();
     };
@@ -1521,7 +1639,17 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
         writer.write(&storage, key.as_bytes(), now()).unwrap();
         let sealed = writer.finish(&storage, now()).unwrap();
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .transaction(|tx| {
+                tx.put_object(
+                    "bkt",
+                    key,
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    crate::StorageClass::Standard,
+                    now(),
+                    0,
+                )
+            })
             .unwrap()
             .unwrap();
     }
@@ -1586,7 +1714,13 @@ fn uploads_past_their_age_are_found_oldest_first() {
         ObjFile::new(&mut storage.lock())
             .transaction(|tx| {
                 tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()).ok();
-                tx.create_upload("bkt", "k", &ObjectAttrs::default(), at)
+                tx.create_upload(
+                    "bkt",
+                    "k",
+                    &ObjectAttrs::default(),
+                    crate::StorageClass::Standard,
+                    at,
+                )
             })
             .unwrap()
             .unwrap()
@@ -1631,7 +1765,15 @@ fn the_journal_records_every_change_in_its_own_transaction() {
         let sealed = writer.finish(storage, now()).unwrap();
         ObjFile::new(&mut storage.lock())
             .transaction(|tx| {
-                tx.put_object(bucket, key, &sealed, &ObjectAttrs::default(), now(), 0)
+                tx.put_object(
+                    bucket,
+                    key,
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    crate::StorageClass::Standard,
+                    now(),
+                    0,
+                )
             })
             .unwrap()
             .unwrap()
@@ -1732,8 +1874,16 @@ fn the_journal_records_every_change_in_its_own_transaction() {
     writer.write(&storage, b"x", now()).unwrap();
     let sealed = writer.finish(&storage, now()).unwrap();
     let failed: Result<(), StorageError> = ObjFile::new(&mut storage.lock()).transaction(|tx| {
-        tx.put_object("plain", "gone", &sealed, &ObjectAttrs::default(), now(), 0)?
-            .unwrap();
+        tx.put_object(
+            "plain",
+            "gone",
+            &sealed,
+            &ObjectAttrs::default(),
+            crate::StorageClass::Standard,
+            now(),
+            0,
+        )?
+        .unwrap();
         Err(StorageError::InvalidConfig("abort".into()))
     });
     assert!(failed.is_err());
@@ -1806,7 +1956,17 @@ fn the_journal_ships_to_a_standby_and_restores_from_a_log_backup() {
         writer.write(&primary, key.as_bytes(), now()).unwrap();
         let sealed = writer.finish(&primary, now()).unwrap();
         ObjFile::new(&mut primary.lock())
-            .transaction(|tx| tx.put_object("bkt", key, &sealed, &ObjectAttrs::default(), now(), 0))
+            .transaction(|tx| {
+                tx.put_object(
+                    "bkt",
+                    key,
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    crate::StorageClass::Standard,
+                    now(),
+                    0,
+                )
+            })
             .unwrap()
             .unwrap();
     }
@@ -1851,7 +2011,17 @@ fn put_text(storage: &Storage, bucket: &str, key: &str, text: &str) -> u64 {
         ..ObjectAttrs::default()
     };
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.put_object(bucket, key, &sealed, &attrs, now(), 0))
+        .transaction(|tx| {
+            tx.put_object(
+                bucket,
+                key,
+                &sealed,
+                &attrs,
+                crate::StorageClass::Standard,
+                now(),
+                0,
+            )
+        })
         .unwrap()
         .unwrap()
         .version
@@ -2713,7 +2883,13 @@ fn an_uploads_lock_passes_to_its_object_or_goes_with_the_abort() {
         ObjFile::new(&mut storage.lock())
             .transaction(|tx| {
                 let upload = tx
-                    .create_upload("bkt", "k", &ObjectAttrs::default(), now())?
+                    .create_upload(
+                        "bkt",
+                        "k",
+                        &ObjectAttrs::default(),
+                        crate::StorageClass::Standard,
+                        now(),
+                    )?
                     .unwrap();
                 tx.set_upload_lock(upload, &held)?;
                 Ok(upload)

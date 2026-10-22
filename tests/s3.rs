@@ -6812,3 +6812,181 @@ fn every_answer_names_its_request_and_the_journal_names_who_made_each_change() {
     assert_eq!(row(0), ["CREATE", &account, "127.0.0.1", &put_id]);
     assert_eq!(row(1), ["DELETE", &account, "127.0.0.1", &delete_id]);
 }
+
+#[test]
+fn an_object_keeps_the_storage_class_it_was_written_in() {
+    use serde_json::json;
+    const CLASS: &str = "x-amz-storage-class";
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, key, secret) = account_with_key(&server, "classes");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    let class_of = |path: &str| {
+        let (head, (status, _)) = call("HEAD", path, "", &[], b"");
+        assert_eq!(status, 200, "{path}");
+        response_header(&head, CLASS)
+    };
+    assert_eq!(call("PUT", "/classes", "", &[], b"").1.0, 200);
+    assert_eq!(
+        call("PUT", "/classes/cold", "", &[(CLASS, "STANDARD_IA")], b"x")
+            .1
+            .0,
+        200
+    );
+    assert_eq!(call("PUT", "/classes/plain", "", &[], b"x").1.0, 200);
+    assert_eq!(class_of("/classes/cold").as_deref(), Some("STANDARD_IA"));
+    assert_eq!(class_of("/classes/plain"), None, "STANDARD goes unnamed");
+    let (head, _) = call("GET", "/classes/cold", "", &[], b"");
+    assert_eq!(
+        response_header(&head, CLASS).as_deref(),
+        Some("STANDARD_IA")
+    );
+    for (query, wanted) in [
+        ("list-type=2", "<Key>cold</Key>"),
+        ("", "<Key>cold</Key>"),
+        ("versions", "<Key>cold</Key>"),
+    ] {
+        let (_, (status, xml)) = call("GET", "/classes", query, &[], b"");
+        assert_eq!(status, 200);
+        let entry = &xml[xml.find(wanted).expect(wanted)..];
+        let end = entry
+            .find("</Contents>")
+            .or_else(|| entry.find("</Version>"))
+            .unwrap();
+        let entry = &entry[..end];
+        assert!(
+            entry.contains("<StorageClass>STANDARD_IA</StorageClass>"),
+            "{query}: {xml}"
+        );
+        assert!(
+            xml.contains("<StorageClass>STANDARD</StorageClass>"),
+            "{query}: the plain one: {xml}"
+        );
+    }
+    // Classes S3 does not know, or that belong to other kinds of bucket.
+    for bad in ["COLD", "standard", "OUTPOSTS", "EXPRESS_ONEZONE", "SNOW"] {
+        let (_, (status, reply)) = call("PUT", "/classes/bad", "", &[(CLASS, bad)], b"x");
+        assert_eq!(status, 400, "{bad}");
+        assert!(reply.contains("InvalidStorageClass"), "{reply}");
+    }
+    // A copy takes the class its request names, or STANDARD: never the
+    // source's. A copy onto itself may change only the class.
+    let source = [("x-amz-copy-source", "/classes/cold")];
+    assert_eq!(call("PUT", "/classes/copy", "", &source, b"").1.0, 200);
+    assert_eq!(class_of("/classes/copy"), None);
+    let mut glacier = source.to_vec();
+    glacier.push((CLASS, "GLACIER"));
+    assert_eq!(call("PUT", "/classes/copy2", "", &glacier, b"").1.0, 200);
+    assert_eq!(class_of("/classes/copy2").as_deref(), Some("GLACIER"));
+    let itself = [
+        ("x-amz-copy-source", "/classes/cold"),
+        (CLASS, "STANDARD_IA"),
+    ];
+    assert_eq!(call("PUT", "/classes/cold", "", &itself, b"").1.0, 400);
+    let itself = [
+        ("x-amz-copy-source", "/classes/cold"),
+        (CLASS, "DEEP_ARCHIVE"),
+    ];
+    let (_, (status, reply)) = call("PUT", "/classes/cold", "", &itself, b"");
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(class_of("/classes/cold").as_deref(), Some("DEEP_ARCHIVE"));
+    // A multipart upload's class is listed with it and its parts, and is
+    // its object's.
+    let (_, (status, reply)) = call(
+        "POST",
+        "/classes/mp",
+        "uploads",
+        &[(CLASS, "ONEZONE_IA")],
+        b"",
+    );
+    assert_eq!(status, 200, "{reply}");
+    let upload = reply
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|rest| rest.split("</UploadId>").next())
+        .unwrap()
+        .to_string();
+    let (_, reply) = call("GET", "/classes", "uploads", &[], b"").1;
+    assert!(
+        reply.contains("<StorageClass>ONEZONE_IA</StorageClass>"),
+        "{reply}"
+    );
+    let (head, (status, _)) = call(
+        "PUT",
+        "/classes/mp",
+        &format!("partNumber=1&uploadId={upload}"),
+        &[],
+        b"part",
+    );
+    assert_eq!(status, 200);
+    let (_, reply) = call(
+        "GET",
+        "/classes/mp",
+        &format!("uploadId={upload}"),
+        &[],
+        b"",
+    )
+    .1;
+    assert!(
+        reply.contains("<StorageClass>ONEZONE_IA</StorageClass>"),
+        "{reply}"
+    );
+    let etag = response_header(&head, "etag").unwrap();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    assert_eq!(
+        call(
+            "POST",
+            "/classes/mp",
+            &format!("uploadId={upload}"),
+            &[],
+            complete.as_bytes()
+        )
+        .1
+        .0,
+        200
+    );
+    assert_eq!(class_of("/classes/mp").as_deref(), Some("ONEZONE_IA"));
+    // A form names its class in a field.
+    let form = signed_form(
+        &key,
+        &secret,
+        "2099-01-01T00:00:00.000Z",
+        &[
+            json!({"bucket": "classes"}),
+            json!({"key": "form"}),
+            json!({CLASS: "GLACIER_IR"}),
+        ],
+        &[("key", "form"), (CLASS, "GLACIER_IR")],
+    );
+    let (_, (status, reply)) = post_form(port, "classes", &form, "f.txt", b"form", 4);
+    assert_eq!(status, 204, "{reply}");
+    assert_eq!(class_of("/classes/form").as_deref(), Some("GLACIER_IR"));
+    // Policies see the class a write asks for.
+    let policy = json!({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "s3:PutObject", "Resource": "*",
+         "Condition": {"StringEquals": {"s3:x-amz-storage-class": "DEEP_ARCHIVE"}}}
+    ]})
+    .to_string();
+    let (user_key, user_secret) = user_with_key(&server, &account, "warm", Some(&policy));
+    let user_put = |class: &str| {
+        send_with(
+            port,
+            "PUT",
+            "/classes/u",
+            "",
+            &[(CLASS, class)],
+            b"x",
+            &user_key,
+            Some(&user_secret),
+        )
+        .1
+        .0
+    };
+    assert_eq!(user_put("DEEP_ARCHIVE"), 403);
+    assert_eq!(user_put("GLACIER"), 200);
+}

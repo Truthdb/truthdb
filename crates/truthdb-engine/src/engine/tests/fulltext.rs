@@ -32,7 +32,19 @@ fn put_with(engine: &Engine, bucket: &str, key: &str, data: &[u8], attrs: Object
     }
     let sealed = writer.finish(storage, now()).expect("finish");
     engine
-        .object(|file| file.transaction(|tx| tx.put_object(bucket, key, &sealed, &attrs, now(), 0)))
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.put_object(
+                    bucket,
+                    key,
+                    &sealed,
+                    &attrs,
+                    truthdb_object::StorageClass::Standard,
+                    now(),
+                    0,
+                )
+            })
+        })
         .expect("put")
         .expect("put accepted")
         .version

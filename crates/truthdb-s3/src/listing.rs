@@ -182,11 +182,12 @@ pub async fn list_objects(
     }
     for object in &listing.objects {
         xml.push_str(&format!(
-            "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>STANDARD</StorageClass></Contents>",
+            "<Contents><Key>{}</Key><LastModified>{}</LastModified><ETag>{}</ETag><Size>{}</Size><StorageClass>{}</StorageClass></Contents>",
             encode(&object.key),
             crate::time::iso8601(object.info.mtime_ms),
             escape(&object.info.etag()),
-            object.info.size
+            object.info.size,
+            object.info.storage_class.as_str()
         ));
     }
     for common in &listing.common_prefixes {
@@ -333,9 +334,10 @@ pub async fn list_versions(
             xml.push_str(&format!("<DeleteMarker>{common}{owner}</DeleteMarker>"));
         } else {
             xml.push_str(&format!(
-                "<Version>{common}<ETag>{}</ETag><Size>{}</Size>{owner}<StorageClass>STANDARD</StorageClass></Version>",
+                "<Version>{common}<ETag>{}</ETag><Size>{}</Size>{owner}<StorageClass>{}</StorageClass></Version>",
                 escape(&info.etag()),
-                info.size
+                info.size,
+                info.storage_class.as_str()
             ));
         }
     }

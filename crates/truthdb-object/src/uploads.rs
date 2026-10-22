@@ -13,7 +13,7 @@ use truthdb_core::storage::StorageError;
 
 use crate::body::{BodyInfo, SealedBody};
 use crate::codec::BodyState;
-use crate::objects::{NewVersion, validate_key};
+use crate::objects::{NewVersion, StorageClass, validate_key};
 use crate::{
     NEXT_UPLOAD_KEY, ObjFile, ObjTxn, ObjectAttrs, ObjectError, ObjectInfo, PARTS_TREE,
     UPLOAD_INDEX_TREE, UPLOADS_TREE, next_counter,
@@ -53,6 +53,8 @@ pub struct UploadInfo {
     pub bucket: String,
     pub key: String,
     pub initiated_ms: u64,
+    /// The class the object will have.
+    pub storage_class: StorageClass,
 }
 
 /// A part as listed.
@@ -76,14 +78,23 @@ fn corrupt(what: &str) -> StorageError {
     StorageError::InvalidFile(format!("corrupt {what}"))
 }
 
-/// An upload's row: its bucket and key and when it started.
-fn encode_upload(bucket: &str, key: &str, initiated_ms: u64) -> Vec<u8> {
-    let mut out = Vec::with_capacity(11 + bucket.len() + key.len());
+/// An upload's row: its bucket and key, when it started, and (unless
+/// STANDARD, so rows from before classes read alike) its object's class.
+fn encode_upload(
+    bucket: &str,
+    key: &str,
+    initiated_ms: u64,
+    storage_class: StorageClass,
+) -> Vec<u8> {
+    let mut out = Vec::with_capacity(12 + bucket.len() + key.len());
     out.push(bucket.len() as u8);
     out.extend_from_slice(bucket.as_bytes());
     out.extend_from_slice(&(key.len() as u16).to_le_bytes());
     out.extend_from_slice(key.as_bytes());
     out.extend_from_slice(&initiated_ms.to_le_bytes());
+    if storage_class != StorageClass::Standard {
+        out.push(storage_class.code());
+    }
     out
 }
 
@@ -109,11 +120,17 @@ fn decode_upload(upload: u64, row: &[u8]) -> Result<UploadInfo, StorageError> {
             .try_into()
             .unwrap(),
     );
+    let storage_class = match row.get(at + 8) {
+        None => StorageClass::Standard,
+        Some(&code) if code < 8 => StorageClass::from_code(code),
+        Some(_) => return Err(corrupt("upload row")),
+    };
     Ok(UploadInfo {
         upload,
         bucket: String::from_utf8(bucket.to_vec()).map_err(|_| corrupt("upload bucket"))?,
         key: String::from_utf8(key.to_vec()).map_err(|_| corrupt("upload key"))?,
         initiated_ms,
+        storage_class,
     })
 }
 
@@ -191,12 +208,14 @@ impl ObjTxn<'_, '_> {
         ObjectAttrs::decode(&bytes)
     }
 
-    /// Starts an upload of `key`; `attrs` become the object's on completion.
+    /// Starts an upload of `key`; `attrs` and `storage_class` become the
+    /// object's on completion.
     pub fn create_upload(
         &mut self,
         bucket: &str,
         key: &str,
         attrs: &ObjectAttrs,
+        storage_class: StorageClass,
         now_ms: u64,
     ) -> Result<Result<u64, ObjectError>, StorageError> {
         if let Err(err) = validate_key(key) {
@@ -215,7 +234,7 @@ impl ObjTxn<'_, '_> {
             self.ctx,
             &mut OpMode::Txn(self.txn),
             &upload.to_be_bytes(),
-            &encode_upload(bucket, key, now_ms),
+            &encode_upload(bucket, key, now_ms, storage_class),
         )?;
         index.insert_unique(
             self.ctx,
@@ -462,6 +481,7 @@ impl ObjTxn<'_, '_> {
                 size: chosen.iter().map(|part| part.size).sum(),
                 md5,
                 parts: chosen.len() as u16,
+                storage_class: info.storage_class,
             },
             &attrs,
             now_ms,
@@ -597,5 +617,29 @@ impl ObjFile<'_> {
             out.push(info);
         }
         Ok((out, truncated))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn an_upload_row_keeps_its_class_and_reads_one_from_before_as_standard() {
+        let standard = encode_upload("b", "k", 5, StorageClass::Standard);
+        assert_eq!(standard.len(), 1 + 1 + 2 + 1 + 8, "the layout from before");
+        assert_eq!(
+            decode_upload(1, &standard).unwrap().storage_class,
+            StorageClass::Standard
+        );
+        let cold = encode_upload("b", "k", 5, StorageClass::DeepArchive);
+        let info = decode_upload(1, &cold).unwrap();
+        assert_eq!(
+            (info.bucket.as_str(), info.key.as_str(), info.storage_class),
+            ("b", "k", StorageClass::DeepArchive)
+        );
+        let mut bad = cold;
+        *bad.last_mut().unwrap() = 9;
+        assert!(decode_upload(1, &bad).is_err());
     }
 }

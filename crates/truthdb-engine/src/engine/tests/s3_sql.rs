@@ -31,7 +31,17 @@ fn put(engine: &Engine, bucket: &str, key: &str, data: &[u8], attrs: &ObjectAttr
                 md5: [7; 16],
                 size: None,
             };
-            file.transaction(|tx| tx.put_object(bucket, key, &sealed, attrs, 2_000, 0))
+            file.transaction(|tx| {
+                tx.put_object(
+                    bucket,
+                    key,
+                    &sealed,
+                    attrs,
+                    truthdb_object::StorageClass::Standard,
+                    2_000,
+                    0,
+                )
+            })
         })
         .expect("put")
         .expect("put accepted")
@@ -524,6 +534,45 @@ fn the_journal_consumers_read_as_a_view() {
             Some("0".into())
         ]]
     );
+    drop(engine);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn the_rowsets_and_the_journal_show_each_versions_class() {
+    let path = unique_temp_path("s3-classes");
+    let engine = new_engine(&path);
+    create_bucket(&engine, "cls", Versioning::Unversioned);
+    let storage = engine.storage();
+    let mut writer = truthdb_object::BodyWriter::begin(storage, 1).expect("begin");
+    writer.write(storage, b"cold", 1).expect("write");
+    let sealed = writer.finish(storage, 1).expect("finish");
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.put_object(
+                    "cls",
+                    "k",
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    truthdb_object::StorageClass::Glacier,
+                    2_000,
+                    0,
+                )
+            })
+        })
+        .expect("put")
+        .expect("put accepted");
+    for query in [
+        "SELECT storage_class FROM sys.s3_objects('cls')",
+        "SELECT storage_class FROM sys.s3_journal('cls')",
+    ] {
+        assert_eq!(
+            sql_rows(&engine, query).1,
+            [vec![Some("GLACIER".to_string())]],
+            "{query}"
+        );
+    }
     drop(engine);
     std::fs::remove_file(&path).ok();
 }

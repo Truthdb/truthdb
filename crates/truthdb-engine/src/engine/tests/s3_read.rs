@@ -25,7 +25,15 @@ fn put(engine: &Engine, bucket: &str, key: &str, data: &[u8]) {
     engine
         .object(|file| {
             file.transaction(|tx| {
-                tx.put_object(bucket, key, &sealed, &ObjectAttrs::default(), 2_000, 0)
+                tx.put_object(
+                    bucket,
+                    key,
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    truthdb_object::StorageClass::Standard,
+                    2_000,
+                    0,
+                )
             })
         })
         .expect("put")
@@ -260,7 +268,15 @@ fn a_prefix_reads_every_object_under_it_and_a_multipart_body_reads_whole() {
     let part2 = "7,p2\n8,p2\n";
     let upload = engine
         .object(|file| {
-            file.transaction(|tx| tx.create_upload("logs", "multi.csv", &ObjectAttrs::default(), 1))
+            file.transaction(|tx| {
+                tx.create_upload(
+                    "logs",
+                    "multi.csv",
+                    &ObjectAttrs::default(),
+                    truthdb_object::StorageClass::Standard,
+                    1,
+                )
+            })
         })
         .expect("create upload")
         .expect("upload");
@@ -1220,7 +1236,17 @@ fn an_object_with_a_customer_provided_key_is_refused_and_skipped() {
     };
     engine
         .object(|file| {
-            file.transaction(|tx| tx.put_object("vault", "a/sealed.csv", &sealed, &attrs, 2_000, 0))
+            file.transaction(|tx| {
+                tx.put_object(
+                    "vault",
+                    "a/sealed.csv",
+                    &sealed,
+                    &attrs,
+                    truthdb_object::StorageClass::Standard,
+                    2_000,
+                    0,
+                )
+            })
         })
         .expect("put")
         .expect("put accepted");

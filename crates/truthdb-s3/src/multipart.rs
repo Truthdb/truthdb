@@ -116,6 +116,7 @@ pub async fn create_upload(
     lock: Option<truthdb_object::ObjectLock>,
 ) -> Result<Response<Body>, S3Error> {
     let mut attrs = attrs_from(request.headers())?;
+    let class = crate::objects::storage_class_from(request.headers())?;
     let encrypted_at_rest = state.storage.is_encrypted();
     crate::sse::check_write(request.headers(), encrypted_at_rest)?;
     // Every part is encrypted with the key given here (and only with it).
@@ -134,7 +135,7 @@ pub async fn create_upload(
             return Ok(Err(None));
         }
         file.transaction(|tx| {
-            let upload = tx.create_upload(&bucket_name, &key_name, &attrs, now_ms())?;
+            let upload = tx.create_upload(&bucket_name, &key_name, &attrs, class, now_ms())?;
             if let (Ok(upload), Some(lock)) = (&upload, &lock) {
                 tx.set_upload_lock(*upload, lock)?;
             }
@@ -209,7 +210,7 @@ pub async fn list_parts(
 ) -> Result<Response<Body>, S3Error> {
     let params = query_params(request.uri().query().unwrap_or(""));
     let upload = upload_id(&params)?;
-    check_upload(state, upload, &bucket, &key).await?;
+    let info = check_upload(state, upload, &bucket, &key).await?;
     let after: u32 = param(&params, "part-number-marker")
         .and_then(|n| n.parse().ok())
         .unwrap_or(0);
@@ -238,7 +239,10 @@ pub async fn list_parts(
             part.size
         ));
     }
-    body.push_str("</ListPartsResult>");
+    body.push_str(&format!(
+        "<StorageClass>{}</StorageClass></ListPartsResult>",
+        info.storage_class.as_str()
+    ));
     Ok(xml(body))
 }
 
@@ -475,10 +479,11 @@ pub async fn list_uploads(
     }
     for upload in &uploads {
         body.push_str(&format!(
-            "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiated>{}</Initiated><StorageClass>STANDARD</StorageClass></Upload>",
+            "<Upload><Key>{}</Key><UploadId>{}</UploadId><Initiated>{}</Initiated><StorageClass>{}</StorageClass></Upload>",
             escape(&upload.key),
             upload.upload,
-            crate::time::iso8601(upload.initiated_ms)
+            crate::time::iso8601(upload.initiated_ms),
+            upload.storage_class.as_str()
         ));
     }
     body.push_str("</ListMultipartUploadsResult>");

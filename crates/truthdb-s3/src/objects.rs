@@ -16,8 +16,8 @@ use md5::{Digest, Md5};
 use tokio::sync::mpsc;
 use truthdb_core::storage::StorageError;
 use truthdb_object::{
-    ObjFile, ObjectAttrs, ObjectError, ObjectInfo, SEGMENT_BYTES, SealedBody, VersionSel,
-    Versioning,
+    ObjFile, ObjectAttrs, ObjectError, ObjectInfo, SEGMENT_BYTES, SealedBody, StorageClass,
+    VersionSel, Versioning,
 };
 
 use crate::error::S3Error;
@@ -89,6 +89,32 @@ pub(crate) fn header(headers: &HeaderMap, name: &str) -> Option<String> {
         .get(name)
         .and_then(|value| value.to_str().ok())
         .map(str::to_string)
+}
+
+/// The header naming a write's storage class.
+pub const STORAGE_CLASS_HEADER: &str = "x-amz-storage-class";
+
+/// The storage class a write names (STANDARD without one).
+pub fn storage_class(value: Option<&str>) -> Result<StorageClass, S3Error> {
+    match value {
+        None => Ok(StorageClass::Standard),
+        Some(name) => StorageClass::parse(name).ok_or_else(|| {
+            S3Error::new(
+                400,
+                "InvalidStorageClass",
+                "The storage class you specified is not valid",
+            )
+        }),
+    }
+}
+
+/// [`storage_class`] from a request's headers.
+pub fn storage_class_from(headers: &HeaderMap) -> Result<StorageClass, S3Error> {
+    storage_class(
+        headers
+            .get(STORAGE_CLASS_HEADER)
+            .map(|value| value.to_str().unwrap_or("")),
+    )
 }
 
 /// The system headers, user metadata and tags a PUT stores.
@@ -347,6 +373,7 @@ pub async fn put_object(
     lock: Option<truthdb_object::ObjectLock>,
 ) -> Result<Response<Body>, S3Error> {
     let mut attrs = attrs_from(request.headers())?;
+    let class = storage_class_from(request.headers())?;
     let encrypted_at_rest = state.storage.is_encrypted();
     crate::sse::check_write(request.headers(), encrypted_at_rest)?;
     let customer = crate::ssec::provided(request.headers(), false)?;
@@ -392,8 +419,15 @@ pub async fn put_object(
             Err(err) => return Ok(Err(err)),
         };
         let stored = file.transaction(|tx| {
-            let stored =
-                tx.put_object(&bucket_name, &key_name, &sealed, &attrs, now, DROP_GRACE_MS)?;
+            let stored = tx.put_object(
+                &bucket_name,
+                &key_name,
+                &sealed,
+                &attrs,
+                class,
+                now,
+                DROP_GRACE_MS,
+            )?;
             if let (Ok(info), Some(lock)) = (&stored, &lock) {
                 tx.set_lock(info.version, lock)?;
             }
@@ -572,6 +606,10 @@ fn object_headers(
     }
     if !attrs.tags.is_empty() {
         builder = builder.header("x-amz-tagging-count", attrs.tags.len().to_string());
+    }
+    // As S3: the class is named only when it is not STANDARD.
+    if info.storage_class != StorageClass::Standard {
+        builder = builder.header(STORAGE_CLASS_HEADER, info.storage_class.as_str());
     }
     builder
 }

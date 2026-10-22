@@ -503,6 +503,16 @@ pub async fn post_object(
             "The bucket does not allow ACLs",
         ));
     }
+    // The storage class it asks for, which policies see as
+    // s3:x-amz-storage-class.
+    let class_field = field(&fields, crate::objects::STORAGE_CLASS_HEADER);
+    let class = crate::objects::storage_class(class_field)?;
+    if let Some(value) = class_field {
+        headers.insert(
+            crate::objects::STORAGE_CLASS_HEADER,
+            HeaderValue::from_str(value).expect("a checked storage class"),
+        );
+    }
     if let Some(acl) = field(&fields, "acl") {
         headers.insert(
             "x-amz-acl",
@@ -644,6 +654,7 @@ pub async fn post_object(
                     &key_name,
                     &sealed,
                     &attrs,
+                    class,
                     now,
                     crate::objects::DROP_GRACE_MS,
                 )?;
