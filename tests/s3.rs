@@ -7947,3 +7947,165 @@ fn rclone_syncs_both_ways() {
     let left = rclone(&["lsf", "-R", "tdb:cloned/copy"]);
     assert!(left.lines().all(|line| line.contains("NOTICE")), "{left}");
 }
+
+/// A DER certificate as PEM.
+fn pem_of(der: &[u8]) -> Vec<u8> {
+    use base64::Engine as _;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(der);
+    let lines: Vec<&str> = encoded
+        .as_bytes()
+        .chunks(64)
+        .map(|line| std::str::from_utf8(line).unwrap())
+        .collect();
+    format!(
+        "-----BEGIN CERTIFICATE-----\n{}\n-----END CERTIFICATE-----\n",
+        lines.join("\n")
+    )
+    .into_bytes()
+}
+
+#[test]
+fn the_s3_client_works_against_this_server() {
+    use truthdb_s3client::{Client, Config, Error};
+    let server = start_server_tls(false, true);
+    let (_, key, secret) = account_with_key(&server, "client");
+    let config = |secret: &str| Config {
+        endpoint: format!("https://localhost:{}", server.s3_port),
+        region: "us-east-1".to_string(),
+        access_key: key.clone(),
+        secret: secret.to_string(),
+        ca_pem: server.cert.as_deref().map(pem_of),
+    };
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        use http_body_util::BodyExt;
+        let client = Client::new(config(&secret)).unwrap();
+        client.create_bucket("tools").await.unwrap();
+        assert!(
+            client
+                .list_buckets()
+                .await
+                .unwrap()
+                .contains(&"tools".to_string())
+        );
+        // One write, read back with its headers and metadata.
+        let key_name = "dir/a b/ünï.txt";
+        let etag = client
+            .put_object(
+                "tools",
+                key_name,
+                &[
+                    ("content-type", "text/plain".to_string()),
+                    ("x-amz-meta-origin", "client".to_string()),
+                ],
+                truthdb_s3client::Bytes::from_static(b"hello"),
+            )
+            .await
+            .unwrap();
+        let head = client
+            .head_object("tools", key_name)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(head.size, 5);
+        assert_eq!(head.etag, etag);
+        assert_eq!(head.content_type.as_deref(), Some("text/plain"));
+        assert_eq!(
+            head.metadata,
+            [("origin".to_string(), "client".to_string())]
+        );
+        let download = client.get_object("tools", key_name).await.unwrap();
+        assert_eq!(download.head.etag, etag);
+        let body = download.body.collect().await.unwrap().to_bytes();
+        assert_eq!(&body[..], b"hello");
+        // In parts.
+        let upload = client
+            .create_multipart_upload("tools", "big", &[])
+            .await
+            .unwrap();
+        let first = truthdb_s3client::Bytes::from(vec![7u8; 5 * 1024 * 1024]);
+        let mut parts = Vec::new();
+        for (number, data) in [
+            (1, first.clone()),
+            (2, truthdb_s3client::Bytes::from_static(b"tail")),
+        ] {
+            let etag = client
+                .upload_part("tools", "big", &upload, number, data)
+                .await
+                .unwrap();
+            parts.push((number, etag));
+        }
+        let etag = client
+            .complete_multipart_upload("tools", "big", &upload, &parts)
+            .await
+            .unwrap();
+        assert!(etag.ends_with("-2\""), "{etag}");
+        let body = client
+            .get_object("tools", "big")
+            .await
+            .unwrap()
+            .body
+            .collect()
+            .await
+            .unwrap()
+            .to_bytes();
+        assert_eq!(body.len(), first.len() + 4);
+        let abandoned = client
+            .create_multipart_upload("tools", "gone", &[])
+            .await
+            .unwrap();
+        client
+            .abort_multipart_upload("tools", "gone", &abandoned)
+            .await
+            .unwrap();
+        // Listings by prefix and delimiter.
+        let page = client
+            .list_objects("tools", "dir/", Some("/"), None)
+            .await
+            .unwrap();
+        assert!(page.objects.is_empty());
+        assert_eq!(page.prefixes, ["dir/a b/"]);
+        assert_eq!(page.next, None);
+        let page = client.list_objects("tools", "", None, None).await.unwrap();
+        let keys: Vec<&str> = page.objects.iter().map(|o| o.key.as_str()).collect();
+        assert_eq!(keys, ["big", key_name]);
+        // Deleted, then gone.
+        client.delete_object("tools", key_name).await.unwrap();
+        assert_eq!(client.head_object("tools", key_name).await.unwrap(), None);
+        match client.get_object("tools", key_name).await {
+            Err(Error::Service {
+                status: 404, code, ..
+            }) => assert_eq!(code, "NoSuchKey"),
+            Err(other) => panic!("{other}"),
+            Ok(_) => panic!("found a deleted object"),
+        }
+        // A wrong secret is refused by the service, by name.
+        let wrong = Client::new(config("not the secret")).unwrap();
+        match wrong.list_buckets().await {
+            Err(Error::Service {
+                status: 403, code, ..
+            }) => {
+                assert_eq!(code, "SignatureDoesNotMatch")
+            }
+            other => panic!("{:?}", other.map(|_| ())),
+        }
+        // A certificate the client does not trust fails the connection.
+        let untrusting = Client::new(Config {
+            ca_pem: Some(pem_of(
+                rcgen::generate_simple_self_signed(vec!["localhost".to_string()])
+                    .unwrap()
+                    .cert
+                    .der(),
+            )),
+            ..config(&secret)
+        })
+        .unwrap();
+        assert!(matches!(
+            untrusting.list_buckets().await,
+            Err(Error::Transport(_))
+        ));
+    });
+}
