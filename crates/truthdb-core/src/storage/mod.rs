@@ -53,7 +53,8 @@ const REL_WAL_ENTRY_VERSION: u16 = 2;
 
 #[derive(Debug, Clone)]
 pub struct StorageOptions {
-    pub size_gib: u64,
+    /// The database file's size: a whole number of pages.
+    pub size_bytes: u64,
     pub wal_ratio: f64,
     pub metadata_ratio: f64,
     pub snapshot_ratio: f64,
@@ -71,10 +72,11 @@ pub struct StorageOptions {
 
 impl StorageOptions {
     pub fn validate(&self) -> Result<(), StorageError> {
-        if self.size_gib == 0 {
-            return Err(StorageError::InvalidConfig(
-                "storage.size_gib must be > 0".to_string(),
-            ));
+        if self.size_bytes == 0 || !self.size_bytes.is_multiple_of(PAGE_SIZE as u64) {
+            return Err(StorageError::InvalidConfig(format!(
+                "the storage size must be a positive multiple of {PAGE_SIZE} bytes, not {}",
+                self.size_bytes
+            )));
         }
         for (name, value) in [
             ("wal_ratio", self.wal_ratio),

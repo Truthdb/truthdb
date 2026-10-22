@@ -89,7 +89,9 @@ fn create(path: &Path) -> Storage {
     Storage::create_with_wal_bounds(
         path.to_path_buf(),
         StorageOptions {
-            size_gib: 1,
+            // Larger than other test databases: the large-batch test needs
+            // more than a 64 MiB file's data region.
+            size_bytes: 256 << 20,
             wal_ratio: 0.05,
             metadata_ratio: 0.08,
             snapshot_ratio: 0.02,

@@ -179,9 +179,10 @@ fn hex(bytes: &[u8]) -> Zeroizing<String> {
 /// How long the key command may take.
 #[cfg(not(test))]
 const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(60);
-/// Tests stop a hung command sooner, with room for a loaded machine.
+/// Tests stop a hung command sooner (the test commands are short shell
+/// scripts), with room for a loaded machine.
 #[cfg(test)]
-const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(10);
+const KEY_COMMAND_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Runs the key command with `operation` appended, `input` on its stdin;
 /// returns its stdout, trimmed. The database key is `wrap`'s input and

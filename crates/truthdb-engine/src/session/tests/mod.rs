@@ -15,7 +15,9 @@ fn graph(edges: &[(u64, &[u64])]) -> HashMap<u64, HashSet<u64>> {
 
 fn test_storage_options() -> StorageOptions {
     StorageOptions {
-        size_gib: 1,
+        // Larger than other test databases: a 64 MiB file's log ring (a
+        // quarter of it) fills during the large-scan locking test.
+        size_bytes: 256 << 20,
         wal_ratio: 0.05,
         metadata_ratio: 0.08,
         snapshot_ratio: 0.02,

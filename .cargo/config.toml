@@ -1,0 +1,5 @@
+# Tests create their databases under the temp directory: keep them in RAM
+# (tmpfs takes the O_DIRECT I/O the storage does). A TMPDIR already set
+# wins.
+[env]
+TMPDIR = { value = "/dev/shm", force = false }

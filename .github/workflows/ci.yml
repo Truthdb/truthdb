@@ -57,11 +57,25 @@ jobs:
     runs-on: ubuntu-latest
     container:
       image: rust:1.92-bookworm
-      options: --security-opt seccomp=unconfined
+      # The tests keep their databases in RAM. Docker's /dev/shm (what
+      # .cargo/config.toml names) is 64 MB and noexec, and the encryption
+      # tests run key-command scripts they write there: a tmpfs of its own.
+      options: --security-opt seccomp=unconfined --tmpfs /ramdisk:rw,exec,size=8g
+    env:
+      TMPDIR: /ramdisk
     permissions:
       contents: read
     steps:
       - uses: actions/checkout@v4
+
+      # The storage writes with O_DIRECT, which tmpfs takes on Linux 6.6 and
+      # later: fail here, plainly, on a kernel that does not.
+      - name: Check the RAM disk takes O_DIRECT
+        run: |
+          uname -r
+          df -h "$TMPDIR"
+          dd if=/dev/zero of="$TMPDIR/odirect-probe" bs=4096 count=1 oflag=direct
+          rm "$TMPDIR/odirect-probe"
 
       - name: Cache cargo registry
         uses: actions/cache@v4

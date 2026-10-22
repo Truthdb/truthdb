@@ -66,8 +66,12 @@ async fn main() -> ExitCode {
         config.storage.size_gib
     );
 
+    let Some(size_bytes) = config.storage.size_gib.checked_mul(1 << 30) else {
+        eprintln!("Invalid config: storage.size_gib is too large");
+        return ExitCode::FAILURE;
+    };
     let storage_opts = truthdb_relational::storage::StorageOptions {
-        size_gib: config.storage.size_gib,
+        size_bytes,
         wal_ratio: config.storage.wal_ratio,
         metadata_ratio: config.storage.metadata_ratio,
         snapshot_ratio: config.storage.snapshot_ratio,
