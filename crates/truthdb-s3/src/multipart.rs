@@ -167,7 +167,9 @@ pub async fn upload_part(
     let params = query_params(request.uri().query().unwrap_or(""));
     let upload = upload_id(&params)?;
     let number = part_number(&params, &bucket, &key)?;
-    check_upload(state, upload, &bucket, &key).await?;
+    let class = check_upload(state, upload, &bucket, &key)
+        .await?
+        .storage_class;
     // A part of an upload with a customer-provided key comes with that key;
     // one of an upload without, with none.
     let customer = crate::ssec::provided(request.headers(), false)?;
@@ -182,7 +184,7 @@ pub async fn upload_part(
         let blocked = object(state, move |file| crate::sse::sse_c_blocked(file, &name)).await?;
         crate::ssec::check_write(customer.as_ref(), request.headers(), blocked)?;
     }
-    let sealed = receive_body(state, request, auth, customer.as_ref()).await?;
+    let sealed = receive_body(state, request, auth, customer.as_ref(), class).await?;
     let info = object(state, move |file| {
         file.transaction(|tx| tx.upload_part(upload, number, &sealed, now_ms(), DROP_GRACE_MS))
     })

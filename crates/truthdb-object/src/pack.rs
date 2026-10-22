@@ -84,10 +84,15 @@ pub struct PackWork {
 impl PackWork {
     /// The segment's zstd frame, when one is smaller than its bytes.
     pub fn compress(&self) -> Option<Vec<u8>> {
-        zstd::bulk::compress(&self.plain, i32::from(self.level))
-            .ok()
-            .filter(|frame| frame.len() < self.plain.len())
+        pack_segment(&self.plain, self.level)
     }
+}
+
+/// A segment's zstd frame at `level`, when one is smaller than its bytes.
+pub fn pack_segment(plain: &[u8], level: u8) -> Option<Vec<u8>> {
+    zstd::bulk::compress(plain, i32::from(level))
+        .ok()
+        .filter(|frame| frame.len() < plain.len())
 }
 
 impl ObjTxn<'_, '_> {

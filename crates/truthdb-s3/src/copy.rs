@@ -13,7 +13,7 @@ use hyper::header::HeaderMap;
 use hyper::{Request, Response};
 use tokio::sync::mpsc;
 use truthdb_core::storage::StorageError;
-use truthdb_object::{BodyInfo, ObjFile, ObjectInfo, SealedBody, VersionSel};
+use truthdb_object::{BodyInfo, ObjFile, ObjectInfo, SealedBody, StorageClass, VersionSel};
 
 use crate::error::{S3Error, escape};
 use crate::listing::query_params;
@@ -306,10 +306,10 @@ async fn copy_whole(
             let copied = copy_into(
                 state,
                 body,
-                0,
-                source.size,
+                (0, source.size),
                 source_key,
                 target_key.as_deref(),
+                class,
             )
             .await;
             // Unchecked: the lease goes even when the request's scope no
@@ -429,7 +429,9 @@ pub async fn upload_part_copy(
     let params = query_params(request.uri().query().unwrap_or(""));
     let upload = upload_id(&params)?;
     let number = part_number(&params, &bucket, &key)?;
-    check_upload(state, upload, &bucket, &key).await?;
+    let class = check_upload(state, upload, &bucket, &key)
+        .await?
+        .storage_class;
     let (src_bucket, src_key, which) = copy_source(&headers)?;
     let keys = copy_keys(state, &headers, &bucket).await?;
     // The copy runs in its own task: a client that disconnects drops this
@@ -450,8 +452,8 @@ pub async fn upload_part_copy(
             (src_bucket, src_key, which),
             headers,
             keys,
-            bucket,
-            key,
+            (bucket, key),
+            class,
         )
         .await
     }))
@@ -486,8 +488,8 @@ async fn copy_part(
     (src_bucket, src_key, which): (String, String, VersionSel),
     headers: HeaderMap,
     (source_key, target_key): (Option<Arc<ProvidedKey>>, Option<Arc<ProvidedKey>>),
-    bucket: String,
-    key: String,
+    (bucket, key): (String, String),
+    class: StorageClass,
 ) -> Result<
     (
         BodyInfo,
@@ -559,8 +561,15 @@ async fn copy_part(
     let part = match step {
         PartSource::Shared(part) => part,
         PartSource::Leased { body, first, len } => {
-            let copied =
-                copy_into(state, body, first, len, source_key, target_key.as_deref()).await;
+            let copied = copy_into(
+                state,
+                body,
+                (first, len),
+                source_key,
+                target_key.as_deref(),
+                class,
+            )
+            .await;
             // Unchecked: the lease goes even when the request's scope no
             // longer holds (a key dropped mid-copy), or the body stays pinned.
             let _ = state
@@ -591,10 +600,10 @@ async fn copy_part(
 async fn copy_into(
     state: &S3State,
     body: u64,
-    first: u64,
-    len: u64,
+    (first, len): (u64, u64),
     source_key: Option<Arc<ProvidedKey>>,
     target_key: Option<&ProvidedKey>,
+    class: StorageClass,
 ) -> Result<SealedBody, S3Error> {
     let layout = object(state, move |file| file.body_layout(body)).await?;
     let (tx, mut rx) = mpsc::channel(4);
@@ -603,7 +612,7 @@ async fn copy_into(
         crate::objects::stream_plaintext(&engine, &layout, source_key.as_deref(), first, len, &tx)
             .await
     });
-    let mut sink = BodySink::begin(state, target_key).await?;
+    let mut sink = BodySink::begin(state, target_key, class).await?;
     while let Some(chunk) = rx.recv().await {
         sink.push(state, &chunk).await?;
     }

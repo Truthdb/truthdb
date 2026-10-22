@@ -154,8 +154,8 @@ pub fn version_id(version: u64, null_version: bool) -> String {
 }
 
 /// An object version's S3 storage class (those of general-purpose buckets).
-/// It is kept with the version; what a class does to its body comes with
-/// later work, so for now every class stores the body alike.
+/// It is kept with the version; a cold class's body is stored compressed
+/// (see [`StorageClass::pack_level`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum StorageClass {
     #[default]

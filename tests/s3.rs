@@ -6992,7 +6992,7 @@ fn an_object_keeps_the_storage_class_it_was_written_in() {
 }
 
 #[test]
-fn a_cold_object_reads_back_alike_once_packed() {
+fn a_cold_object_reads_back_alike_compressed() {
     let server = start_server();
     let port = server.s3_port;
     let (_, key, secret) = account_with_key(&server, "packed");
@@ -7014,8 +7014,7 @@ fn a_cold_object_reads_back_alike_once_packed() {
         .0,
         200
     );
-    // The object jobs pack it in the background.
-    std::thread::sleep(Duration::from_secs(3));
+    // Compressed as it arrived.
     let (status, body) = call("GET", "/packed/k", &[], b"");
     assert_eq!(status, 200);
     assert!(body == latin1(&data), "the whole object");
@@ -7028,4 +7027,79 @@ fn a_cold_object_reads_back_alike_once_packed() {
             "{range}"
         );
     }
+    // A cold upload's parts: one sent, one copied by range (both written
+    // anew, so compressed as they arrive).
+    let send = |method: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            port,
+            method,
+            "/packed/parts",
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+        .1
+    };
+    let tag_of = |xml: &str, tag: &str| -> String {
+        xml.split(&format!("<{tag}>"))
+            .nth(1)
+            .and_then(|rest| rest.split(&format!("</{tag}>")).next())
+            .unwrap_or_default()
+            .to_string()
+    };
+    let (status, xml) = send(
+        "POST",
+        "uploads",
+        &[("x-amz-storage-class", "GLACIER")],
+        b"",
+    );
+    assert_eq!(status, 200, "{xml}");
+    let upload = tag_of(&xml, "UploadId");
+    let first: Vec<u8> = data
+        .iter()
+        .cycle()
+        .take(5 * 1024 * 1024 + 17)
+        .copied()
+        .collect();
+    let (status, xml) = send(
+        "PUT",
+        &format!("partNumber=1&uploadId={upload}"),
+        &[],
+        &first,
+    );
+    assert_eq!(status, 200, "{xml}");
+    let (status, copied) = send(
+        "PUT",
+        &format!("partNumber=2&uploadId={upload}"),
+        &[
+            ("x-amz-copy-source", "/packed/k"),
+            ("x-amz-copy-source-range", "bytes=1000-2500999"),
+        ],
+        b"",
+    );
+    assert_eq!(status, 200, "{copied}");
+    let (status, sent) = send("GET", &format!("uploadId={upload}"), &[], b"");
+    assert_eq!(status, 200, "{sent}");
+    let etags: Vec<String> = sent
+        .split("<ETag>")
+        .skip(1)
+        .map(|rest| rest.split("</ETag>").next().unwrap().to_string())
+        .collect();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part><Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etags[0], etags[1]
+    );
+    let (status, xml) = send(
+        "POST",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    );
+    assert_eq!(status, 200, "{xml}");
+    let (status, body) = send("GET", "", &[], b"");
+    assert_eq!(status, 200);
+    let whole = [&first[..], &data[1000..2_501_000]].concat();
+    assert!(body == latin1(&whole), "the whole upload");
 }

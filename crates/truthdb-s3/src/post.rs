@@ -613,7 +613,7 @@ pub async fn post_object(
         }
         crate::ssec::check_write(customer.as_ref(), &HeaderMap::new(), blocked)?;
         crate::object_lock::new_object_lock(lock, bucket_lock, None, 0)?;
-        let mut sink = BodySink::begin(state, customer.as_ref()).await?;
+        let mut sink = BodySink::begin(state, customer.as_ref(), class).await?;
         loop {
             match form.delimiter(0) {
                 Ok(end) => {
