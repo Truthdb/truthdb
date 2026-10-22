@@ -414,13 +414,6 @@ async fn route(
         .get::<crate::server::Connection>()
         .is_some_and(|connection| connection.tls);
     crate::ssec::check_transport(crate::ssec::any_in(request.headers()), tls)?;
-    // A copy decrypts and encrypts again with customer-provided keys: not
-    // implemented yet, so refused rather than served as if none were given.
-    if copying && crate::ssec::any_in(request.headers()) {
-        return Err(S3Error::not_implemented(
-            "copying with customer-provided keys (SSE-C) is not implemented",
-        ));
-    }
     match (target, method) {
         _ if UNIMPLEMENTED.iter().any(|name| has_param(&request, name)) => {
             Err(S3Error::not_implemented(format!(
