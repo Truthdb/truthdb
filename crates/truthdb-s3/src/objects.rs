@@ -145,6 +145,7 @@ pub fn metadata_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
         expires: header(headers, "expires"),
         user,
         tags: Vec::new(),
+        customer_key: None,
     })
 }
 
@@ -156,6 +157,7 @@ pub async fn receive_body(
     state: &S3State,
     request: Request<Incoming>,
     auth: Authenticated,
+    key: Option<&crate::ssec::ProvidedKey>,
 ) -> Result<SealedBody, S3Error> {
     let headers = request.headers().clone();
     let declared: Option<u64> =
@@ -199,7 +201,7 @@ pub async fn receive_body(
             )
         }
     };
-    let mut sink = BodySink::begin(state).await?;
+    let mut sink = BodySink::begin(state, key).await?;
     let mut decoder = PayloadDecoder::new(auth.framing, auth.checksum)?;
     let mut decoded = Vec::new();
     let mut incoming = request.into_body();
@@ -216,8 +218,8 @@ pub async fn receive_body(
         sink.push(state, &decoded).await?;
     }
     decoder.finish(declared)?;
-    let sealed = sink.finish(state).await?;
-    if content_md5.is_some_and(|expected| expected != sealed.md5) {
+    let (sealed, plain_md5) = sink.finish(state).await?;
+    if content_md5.is_some_and(|expected| expected != plain_md5) {
         return Err(S3Error::bad_digest(
             "The Content-MD5 you specified did not match what we received.",
         ));
@@ -226,22 +228,32 @@ pub async fn receive_body(
 }
 
 /// A body written into the object engine as it arrives: in segments, with
-/// its MD5. A body never finished stays staged until garbage collection
-/// reclaims it.
+/// its MD5, encrypted with a customer-provided key when given one. A body
+/// never finished stays staged until garbage collection reclaims it.
 pub struct BodySink {
     body: u64,
+    /// Of the bytes stored (the ETag's).
     md5: Md5,
+    /// Of the bytes pushed (Content-MD5's).
+    plain_md5: Md5,
+    encryptor: Option<crate::ssec::Encryptor>,
     segment: Vec<u8>,
     len: u64,
 }
 
 impl BodySink {
-    pub async fn begin(state: &S3State) -> Result<BodySink, S3Error> {
+    pub async fn begin(
+        state: &S3State,
+        key: Option<&crate::ssec::ProvidedKey>,
+    ) -> Result<BodySink, S3Error> {
+        let encryptor = key.map(|key| key.encryptor()).transpose()?;
         let now = now_ms();
         let body = object(state, move |file| file.begin_body(now)).await?;
         Ok(BodySink {
             body,
             md5: Md5::new(),
+            plain_md5: Md5::new(),
+            encryptor,
             segment: Vec::with_capacity(SEGMENT_BYTES),
             len: 0,
         })
@@ -253,8 +265,21 @@ impl BodySink {
     }
 
     pub async fn push(&mut self, state: &S3State, data: &[u8]) -> Result<(), S3Error> {
-        self.md5.update(data);
+        self.plain_md5.update(data);
         self.len += data.len() as u64;
+        match self
+            .encryptor
+            .as_mut()
+            .map(|encryptor| encryptor.push(data))
+        {
+            Some(sealed) => self.store(state, &sealed).await,
+            None => self.store(state, data).await,
+        }
+    }
+
+    /// Writes `data` as it goes to the object engine.
+    async fn store(&mut self, state: &S3State, data: &[u8]) -> Result<(), S3Error> {
+        self.md5.update(data);
         let mut rest = data;
         while !rest.is_empty() {
             let take = (SEGMENT_BYTES - self.segment.len()).min(rest.len());
@@ -273,18 +298,34 @@ impl BodySink {
         Ok(())
     }
 
-    pub async fn finish(self, state: &S3State) -> Result<SealedBody, S3Error> {
+    /// The body ready to seal, and the MD5 of the bytes pushed.
+    pub async fn finish(mut self, state: &S3State) -> Result<(SealedBody, [u8; 16]), S3Error> {
+        let size = match self.encryptor.take() {
+            Some(encryptor) => {
+                self.store(state, &encryptor.finish()).await?;
+                Some(self.len)
+            }
+            None => None,
+        };
         let BodySink {
-            body, md5, segment, ..
+            body,
+            md5,
+            plain_md5,
+            segment,
+            ..
         } = self;
         if !segment.is_empty() {
             let now = now_ms();
             object(state, move |file| file.append_segment(body, &segment, now)).await?;
         }
-        Ok(SealedBody {
-            body,
-            md5: md5.finalize().into(),
-        })
+        Ok((
+            SealedBody {
+                body,
+                md5: md5.finalize().into(),
+                size,
+            },
+            plain_md5.finalize().into(),
+        ))
     }
 }
 
@@ -295,21 +336,27 @@ pub async fn put_object(
     bucket: String,
     key: String,
 ) -> Result<Response<Body>, S3Error> {
-    let attrs = attrs_from(request.headers())?;
+    let mut attrs = attrs_from(request.headers())?;
     let encrypted_at_rest = state.storage.is_encrypted();
     crate::sse::check_write(request.headers(), encrypted_at_rest)?;
+    let customer = crate::ssec::provided(request.headers(), false)?;
     // Fail before writing anything when the bucket or key is wrong.
     {
         let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-        let check = object(state, move |file| {
-            file.head_object(&lookup_bucket, &lookup_key, VersionSel::Latest)
+        let (check, blocked) = object(state, move |file| {
+            Ok((
+                file.head_object(&lookup_bucket, &lookup_key, VersionSel::Latest)?,
+                crate::sse::sse_c_blocked(file, &lookup_bucket)?,
+            ))
         })
         .await?;
         if let Err(err @ (ObjectError::NoSuchBucket | ObjectError::InvalidKey(_))) = check {
             return Err(object_error(err, &bucket, &key));
         }
+        crate::ssec::check_write(customer.as_ref(), request.headers(), blocked)?;
     }
-    let sealed = receive_body(state, request, auth).await?;
+    attrs.customer_key = customer.as_ref().map(|key| key.stored()).transpose()?;
+    let sealed = receive_body(state, request, auth, customer.as_ref()).await?;
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let (stored, versioning) = object(state, move |file| {
         let stored = file.transaction(|tx| {
@@ -326,11 +373,15 @@ pub async fn put_object(
     })
     .await?;
     let info = stored.map_err(|err| object_error(err, &bucket, &key))?;
-    let mut response = crate::sse::with_header(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header("etag", info.etag()),
-        encrypted_at_rest,
+    let customer_key = info.attrs.customer_key.as_ref();
+    let mut response = crate::ssec::with_echo(
+        crate::sse::with_header(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("etag", info.etag()),
+            encrypted_at_rest && customer_key.is_none(),
+        ),
+        customer_key,
     );
     if let Some(version) = version_header(versioning, info.version, info.null_version) {
         response = response.header("x-amz-version-id", version);
@@ -456,7 +507,11 @@ fn object_headers(
     encrypted_at_rest: bool,
 ) -> hyper::http::response::Builder {
     let attrs = &info.attrs;
-    let mut builder = crate::sse::with_header(builder, encrypted_at_rest);
+    // An object with a customer-provided key says so, not AES256.
+    let mut builder = crate::ssec::with_echo(
+        crate::sse::with_header(builder, encrypted_at_rest && attrs.customer_key.is_none()),
+        attrs.customer_key.as_ref(),
+    );
     if let Some(version) = version_header(versioning, info.version, info.null_version) {
         builder = builder.header("x-amz-version-id", version);
     }
@@ -572,6 +627,7 @@ pub async fn get_object(
     signed: bool,
 ) -> Result<Response<Body>, S3Error> {
     crate::sse::check_read(request.headers())?;
+    let customer = crate::ssec::provided(request.headers(), false)?;
     let which = version_sel(request.uri().query().unwrap_or(""))?;
     let overrides = response_overrides(request.uri().query().unwrap_or(""), signed)?;
     let headers = request.headers().clone();
@@ -593,6 +649,7 @@ pub async fn get_object(
             which,
             head_only,
             &overrides,
+            customer,
         )
         .await
     }))
@@ -600,6 +657,7 @@ pub async fn get_object(
     .map_err(|err| S3Error::internal(err.to_string()))?
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn read_object(
     state: &S3State,
     headers: &HeaderMap,
@@ -608,6 +666,7 @@ async fn read_object(
     which: VersionSel,
     head_only: bool,
     overrides: &[(String, String)],
+    customer: Option<crate::ssec::ProvidedKey>,
 ) -> Result<Response<Body>, S3Error> {
     // Resolve and lease in one lock hold, so the body cannot be collected
     // between the lookup and the lease.
@@ -670,6 +729,14 @@ async fn read_object(
         }
     };
 
+    // An object encrypted with a customer-provided key is read with that key
+    // only; one without, with none.
+    if let Err(err) = crate::ssec::check_read(info.attrs.customer_key.as_ref(), customer.as_ref()) {
+        if !head_only {
+            release(state).await;
+        }
+        return Err(err);
+    }
     if let Some(status) = precondition(headers, "", &info) {
         if !head_only {
             release(state).await;
@@ -739,6 +806,20 @@ async fn read_object(
             return Err(err);
         }
     };
+    if let Some(customer) = customer {
+        tokio::spawn(async move {
+            stream_decrypted(&engine, &layout, &customer, first, len, &tx).await;
+            let _ = engine
+                .run_object(move |file| {
+                    file.release_lease(body);
+                    Ok(())
+                })
+                .await;
+        });
+        return Ok(builder
+            .body(ChannelBody(rx).boxed())
+            .expect("a valid response"));
+    }
     tokio::spawn(async move {
         let mut offset = first;
         let end = first + len;
@@ -776,6 +857,97 @@ async fn read_object(
     Ok(builder
         .body(ChannelBody(rx).boxed())
         .expect("a valid response"))
+}
+
+/// Sends bytes `[first, first + len)` of an object whose parts are
+/// encrypted with `customer`: each read takes whole chunks of one part and
+/// decrypts them. A part that does not decrypt ends the body early, as a
+/// failed read does: the client sees fewer bytes than Content-Length
+/// promised.
+async fn stream_decrypted(
+    engine: &truthdb_engine::session::EngineHandle,
+    layout: &[(u64, u64, u64)],
+    customer: &crate::ssec::ProvidedKey,
+    first: u64,
+    len: u64,
+    tx: &mpsc::Sender<Bytes>,
+) {
+    use crate::ssec::{CHUNK, HEADER_LEN, chunk_at, plain_len};
+    let chunk = CHUNK as u64;
+    // The parts as plaintext: (body, start, length).
+    let mut parts = Vec::with_capacity(layout.len());
+    let mut start = 0;
+    for &(part, _, stored) in layout {
+        let Some(plain) = plain_len(stored) else {
+            return;
+        };
+        parts.push((part, start, plain));
+        start += plain;
+    }
+    let mut current: Option<(u64, crate::ssec::Decryptor)> = None;
+    let (mut offset, end) = (first, first + len);
+    while offset < end {
+        let Some(&(part, start, plain)) = parts
+            .iter()
+            .find(|(_, start, len)| offset >= *start && offset < start + len)
+        else {
+            return;
+        };
+        if current.as_ref().map(|(at, _)| *at) != Some(part) {
+            let header = engine
+                .run_object(move |file| {
+                    let mut header = vec![0u8; HEADER_LEN];
+                    file.read_body(part, 0, &mut header)?;
+                    Ok(header)
+                })
+                .await;
+            let Some(decryptor) = header.ok().and_then(|header| customer.decryptor(&header)) else {
+                return;
+            };
+            current = Some((part, decryptor));
+        }
+        let Some((_, decryptor)) = &current else {
+            return;
+        };
+        // Whole chunks, up to a read's worth, covering what is wanted next.
+        let within = offset - start;
+        let wanted_end = end.min(start + plain) - start;
+        let first_chunk = within / chunk;
+        let last_chunk =
+            ((wanted_end - 1) / chunk).min(first_chunk + (READ_CHUNK / CHUNK) as u64 - 1);
+        let (at, _, _) = chunk_at(first_chunk, plain);
+        let (last_at, last_len, _) = chunk_at(last_chunk, plain);
+        let stored_len = (last_at + last_len - at) as usize;
+        let stored = engine
+            .run_object(move |file| {
+                let mut stored = vec![0u8; stored_len];
+                file.read_body(part, at, &mut stored)?;
+                Ok(stored)
+            })
+            .await;
+        let Ok(stored) = stored else {
+            return;
+        };
+        let mut plaintext = Vec::with_capacity((last_chunk + 1 - first_chunk) as usize * CHUNK);
+        for index in first_chunk..=last_chunk {
+            let (chunk_at, chunk_len, last) = chunk_at(index, plain);
+            let from = (chunk_at - at) as usize;
+            let Some(opened) =
+                decryptor.open(index, last, &stored[from..from + chunk_len as usize])
+            else {
+                return;
+            };
+            plaintext.extend(opened);
+        }
+        let covered_end = (first_chunk * chunk + plaintext.len() as u64).min(wanted_end);
+        let piece = plaintext
+            [(within - first_chunk * chunk) as usize..(covered_end - first_chunk * chunk) as usize]
+            .to_vec();
+        if tx.send(Bytes::from(piece)).await.is_err() {
+            return;
+        }
+        offset = start + covered_end;
+    }
 }
 
 #[cfg(test)]

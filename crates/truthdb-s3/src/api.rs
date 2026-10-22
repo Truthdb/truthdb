@@ -391,7 +391,6 @@ async fn route(
     if matches!(method, Method::PUT | Method::POST) {
         crate::policy::check_acl_headers(request.headers())?;
     }
-    crate::sse::refuse_customer_keys(request.headers().keys().map(|name| name.as_str()))?;
     // A write naming a query parameter no route here takes (an S3 operation
     // not implemented, perhaps one added since) is refused, whichever route
     // its other parameters would select.
@@ -409,6 +408,18 @@ async fn route(
                 request.uri().query().unwrap_or("")
             )));
         }
+    }
+    let tls = request
+        .extensions()
+        .get::<crate::server::Connection>()
+        .is_some_and(|connection| connection.tls);
+    crate::ssec::check_transport(crate::ssec::any_in(request.headers()), tls)?;
+    // A copy decrypts and encrypts again with customer-provided keys: not
+    // implemented yet, so refused rather than served as if none were given.
+    if copying && crate::ssec::any_in(request.headers()) {
+        return Err(S3Error::not_implemented(
+            "copying with customer-provided keys (SSE-C) is not implemented",
+        ));
     }
     match (target, method) {
         _ if UNIMPLEMENTED.iter().any(|name| has_param(&request, name)) => {

@@ -34,6 +34,8 @@ struct Server {
     dir: PathBuf,
     native_port: u16,
     s3_port: u16,
+    /// The S3 listener's certificate, when it serves TLS.
+    cert: Option<Vec<u8>>,
 }
 
 impl Drop for Server {
@@ -55,8 +57,14 @@ fn start_server() -> Server {
 /// [`start_server`]; `encrypted`: with a master key configured, so the
 /// database it creates is encrypted at rest.
 fn start_server_with(encrypted: bool) -> Server {
+    start_server_tls(encrypted, false)
+}
+
+/// [`start_server_with`]; `tls`: the S3 listener serves HTTPS with a
+/// self-signed certificate (see [`send_tls`]).
+fn start_server_tls(encrypted: bool, tls: bool) -> Server {
     for _ in 0..5 {
-        let server = spawn_server(encrypted);
+        let server = spawn_server(encrypted, tls);
         let deadline = Instant::now() + DEADLINE;
         let mut server = Some(server);
         while Instant::now() < deadline {
@@ -108,7 +116,7 @@ fn listens(pid: u32, port: u16) -> bool {
         })
 }
 
-fn spawn_server(encrypted: bool) -> Server {
+fn spawn_server(encrypted: bool, tls: bool) -> Server {
     let dir = std::env::temp_dir().join(format!(
         "truthdb-s3-{}-{}",
         std::process::id(),
@@ -129,10 +137,27 @@ fn spawn_server(encrypted: bool) -> Server {
     } else {
         String::new()
     };
+    let (cert, tls_config) = if tls {
+        let certified =
+            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a cert");
+        let (cert_path, key_path) = (dir.join("s3.crt"), dir.join("s3.key"));
+        std::fs::write(&cert_path, certified.cert.pem()).expect("cert");
+        std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("key");
+        (
+            Some(certified.cert.der().to_vec()),
+            format!(
+                "tls_cert = \"{}\"\ntls_key = \"{}\"\n",
+                cert_path.display(),
+                key_path.display()
+            ),
+        )
+    } else {
+        (None, String::new())
+    };
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\n{encryption}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\n{tls_config}{encryption}",
             dir.join("truth.db").display()
         ),
     )
@@ -149,6 +174,7 @@ fn spawn_server(encrypted: bool) -> Server {
         dir,
         native_port,
         s3_port,
+        cert,
     }
 }
 
@@ -284,6 +310,87 @@ fn send_paused(
     split: usize,
     pause: impl FnOnce(),
 ) -> (String, (u16, String)) {
+    let request = signed_request(port, method, path, query, extra, body, key, secret);
+    let deadline = Instant::now() + DEADLINE;
+    let mut stream = loop {
+        match std::net::TcpStream::connect(("127.0.0.1", port)) {
+            Ok(stream) => break stream,
+            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
+            Err(err) => panic!("S3 listener never came up: {err}"),
+        }
+    };
+    stream.write_all(request.as_bytes()).expect("send");
+    stream.write_all(&body[..split]).expect("send body");
+    stream.flush().expect("flush");
+    pause();
+    stream.write_all(&body[split..]).expect("send body");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read");
+    parse_response(&raw)
+}
+
+/// [`send_with`] over TLS to `server`'s HTTPS listener (trusting its
+/// self-signed certificate).
+#[allow(clippy::too_many_arguments)]
+fn send_tls(
+    server: &Server,
+    method: &str,
+    path: &str,
+    query: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+    key: &str,
+    secret: Option<&str>,
+) -> (String, (u16, String)) {
+    let mut roots = rustls::RootCertStore::empty();
+    roots
+        .add(rustls::pki_types::CertificateDer::from(
+            server.cert.clone().expect("a TLS server"),
+        ))
+        .expect("a root");
+    let config = rustls::ClientConfig::builder_with_provider(std::sync::Arc::new(
+        rustls::crypto::ring::default_provider(),
+    ))
+    .with_safe_default_protocol_versions()
+    .expect("protocol versions")
+    .with_root_certificates(roots)
+    .with_no_client_auth();
+    let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+    let connection =
+        rustls::ClientConnection::new(std::sync::Arc::new(config), name).expect("a connection");
+    let tcp = std::net::TcpStream::connect(("127.0.0.1", server.s3_port)).expect("connect");
+    let mut stream = rustls::StreamOwned::new(connection, tcp);
+    let request = signed_request(
+        server.s3_port,
+        method,
+        path,
+        query,
+        extra,
+        body,
+        key,
+        secret,
+    );
+    stream.write_all(request.as_bytes()).expect("send");
+    // The server may answer (and close) before the whole body is sent.
+    let _ = stream.write_all(body).and_then(|()| stream.flush());
+    // It may close without a TLS close_notify: what arrived counts.
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    parse_response(&raw)
+}
+
+/// A SigV4-signed request's head (the body follows it).
+#[allow(clippy::too_many_arguments)]
+fn signed_request(
+    port: u16,
+    method: &str,
+    path: &str,
+    query: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+    key: &str,
+    secret: Option<&str>,
+) -> String {
     let amz_date = amz_now();
     let host = format!("127.0.0.1:{port}");
     let payload = sigv4::sha256_hex(body);
@@ -298,7 +405,8 @@ fn send_paused(
         extra
             .iter()
             .filter(|(name, _)| !name.starts_with("unsigned-"))
-            .map(|(name, value)| (name.to_string(), value.to_string())),
+            // SigV4 signs header names in lowercase.
+            .map(|(name, value)| (name.to_ascii_lowercase(), value.to_string())),
     );
     headers.sort();
     let target = if query.is_empty() {
@@ -335,22 +443,12 @@ fn send_paused(
         ));
     }
     request.push_str("\r\n");
-    let deadline = Instant::now() + DEADLINE;
-    let mut stream = loop {
-        match std::net::TcpStream::connect(("127.0.0.1", port)) {
-            Ok(stream) => break stream,
-            Err(_) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(100)),
-            Err(err) => panic!("S3 listener never came up: {err}"),
-        }
-    };
-    stream.write_all(request.as_bytes()).expect("send");
-    stream.write_all(&body[..split]).expect("send body");
-    stream.flush().expect("flush");
-    pause();
-    stream.write_all(&body[split..]).expect("send body");
-    let mut raw = Vec::new();
-    stream.read_to_end(&mut raw).expect("read");
-    let response = latin1(&raw);
+    request
+}
+
+/// A raw response's head, status and body.
+fn parse_response(raw: &[u8]) -> (String, (u16, String)) {
+    let response = latin1(raw);
     let status = response
         .split_whitespace()
         .nth(1)
@@ -4325,8 +4423,8 @@ fn server_side_encryption_is_the_databases_encryption_at_rest() {
         call("GET", "/plain/o", "", &[(SSE, "AES256")], b"").1.0,
         400
     );
-    // Customer-provided keys are refused, not ignored: the object would be
-    // stored, and served to anyone, in the clear.
+    // Customer-provided keys are refused over plain HTTP, never ignored
+    // (the object would be stored, and served to anyone, in the clear).
     let customer = [("x-amz-server-side-encryption-customer-algorithm", "AES256")];
     let copy_customer = [
         ("x-amz-copy-source", "/plain/o"),
@@ -4343,7 +4441,7 @@ fn server_side_encryption_is_the_databases_encryption_at_rest() {
         ("PUT", "/plain/c2", "", &copy_customer[..]),
     ] {
         let (_, (status, reply)) = call(method, path, query, extra, b"x");
-        assert_eq!(status, 501, "{method} {path}?{query}: {reply}");
+        assert_eq!(status, 400, "{method} {path}?{query}: {reply}");
     }
     assert_eq!(call("GET", "/plain/c", "", &[], b"").1.0, 404);
     let form = signed_form(
@@ -4360,7 +4458,7 @@ fn server_side_encryption_is_the_databases_encryption_at_rest() {
             ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
         ],
     );
-    assert_eq!(post_form(port, "plain", &form, "f", b"x", 64).1.0, 501);
+    assert_eq!(post_form(port, "plain", &form, "f", b"x", 64).1.0, 400);
     assert_eq!(call("GET", "/plain/f", "", &[], b"").1.0, 404);
     drop(server);
 
@@ -4616,4 +4714,276 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
     // The plain operations still route.
     assert_eq!(call("GET", "/subs", "list-type=2").0, 200);
     assert_eq!(call("DELETE", "/subs/o", "").0, 204);
+}
+
+/// The three headers naming customer-provided key `key` (`prefix`
+/// `x-amz-`; a copy source's with `x-amz-copy-source-`).
+fn customer_headers(prefix: &str, key: [u8; 32]) -> Vec<(String, String)> {
+    use base64::Engine as _;
+    use md5::Digest;
+    let base64 = base64::engine::general_purpose::STANDARD;
+    vec![
+        (
+            format!("{prefix}server-side-encryption-customer-algorithm"),
+            "AES256".to_string(),
+        ),
+        (
+            format!("{prefix}server-side-encryption-customer-key"),
+            base64.encode(key),
+        ),
+        (
+            format!("{prefix}server-side-encryption-customer-key-MD5"),
+            base64.encode(md5::Md5::digest(key)),
+        ),
+    ]
+}
+
+/// `headers` as the request helpers take them.
+fn header_refs(headers: &[(String, String)]) -> Vec<(&str, &str)> {
+    headers
+        .iter()
+        .map(|(name, value)| (name.as_str(), value.as_str()))
+        .collect()
+}
+
+/// Every file under `dir`, read whole.
+fn files_hold(dir: &std::path::Path, needle: &[u8]) -> bool {
+    std::fs::read_dir(dir).expect("dir").any(|entry| {
+        let path = entry.expect("entry").path();
+        path.is_file()
+            && std::fs::read(&path)
+                .is_ok_and(|bytes| bytes.windows(needle.len()).any(|window| window == needle))
+    })
+}
+
+#[test]
+fn customer_provided_keys_encrypt_objects_only_their_key_reads() {
+    const ALGORITHM: &str = "x-amz-server-side-encryption-customer-algorithm";
+    const KEY_MD5: &str = "x-amz-server-side-encryption-customer-key-MD5";
+    let (right, wrong) = ([0x41u8; 32], [0x42u8; 32]);
+    let key_a = customer_headers("x-amz-", right);
+    let key_b = customer_headers("x-amz-", wrong);
+
+    let server = start_server_tls(false, true);
+    let (_, key, secret) = account_with_key(&server, "keys");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_tls(
+            &server,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    assert_eq!(call("PUT", "/vault", "", &[], b"").1.0, 200);
+
+    // A body over several chunks, with a marker that must not reach disk.
+    let marker = b"CUSTOMER-KEY-CANARY";
+    let mut body = Vec::new();
+    while body.len() < 3 * 65536 + 100 {
+        body.extend_from_slice(marker);
+        body.extend_from_slice(&(body.len() as u64).to_le_bytes());
+    }
+    let (head, (status, reply)) = call("PUT", "/vault/o", "", &header_refs(&key_a), &body);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(response_header(&head, ALGORITHM).as_deref(), Some("AES256"));
+    assert_eq!(
+        response_header(&head, KEY_MD5).as_deref(),
+        Some(key_a[2].1.as_str())
+    );
+    assert_eq!(response_header(&head, "x-amz-server-side-encryption"), None);
+    let etag = response_header(&head, "etag").expect("etag");
+    assert_ne!(
+        etag.trim_matches('"'),
+        md5_hex(&body),
+        "not the MD5 of the data"
+    );
+
+    // Read with its key only.
+    let (_, (status, reply)) = call("GET", "/vault/o", "", &[], b"");
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("InvalidRequest"), "{reply}");
+    assert_eq!(
+        call("GET", "/vault/o", "", &header_refs(&key_b), b"").1.0,
+        403
+    );
+    let (head, (status, got)) = call("GET", "/vault/o", "", &header_refs(&key_a), b"");
+    assert_eq!(status, 200);
+    assert_eq!(got.as_bytes(), latin1(&body).as_bytes());
+    assert_eq!(
+        response_header(&head, KEY_MD5).as_deref(),
+        Some(key_a[2].1.as_str())
+    );
+    let (head, (status, _)) = call("HEAD", "/vault/o", "", &header_refs(&key_a), b"");
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, "content-length"),
+        Some(body.len().to_string())
+    );
+    assert_eq!(call("HEAD", "/vault/o", "", &[], b"").1.0, 400);
+    // Ranges across chunk boundaries, and a suffix.
+    for (range, from, to) in [
+        ("bytes=65530-65545", 65530, 65546),
+        ("bytes=0-0", 0, 1),
+        ("bytes=131000-200000", 131000, 200001),
+    ] {
+        let mut extra = header_refs(&key_a);
+        extra.push(("range", range));
+        let (_, (status, got)) = call("GET", "/vault/o", "", &extra, b"");
+        assert_eq!(status, 206, "{range}");
+        assert_eq!(got, latin1(&body[from..to.min(body.len())]), "{range}");
+    }
+    let mut extra = header_refs(&key_a);
+    extra.push(("range", "bytes=-7"));
+    assert_eq!(
+        call("GET", "/vault/o", "", &extra, b"").1.1,
+        latin1(&body[body.len() - 7..])
+    );
+    // A key for an object without one.
+    assert_eq!(call("PUT", "/vault/plain", "", &[], b"open").1.0, 200);
+    assert_eq!(
+        call("GET", "/vault/plain", "", &header_refs(&key_a), b"")
+            .1
+            .0,
+        400
+    );
+
+    // Multipart: every part with the upload's key.
+    let (head, (status, created)) = call("POST", "/vault/m", "uploads", &header_refs(&key_a), b"");
+    assert_eq!(status, 200, "{created}");
+    assert_eq!(response_header(&head, ALGORITHM).as_deref(), Some("AES256"));
+    let upload = xml_value(&created, "UploadId");
+    let part = |number: u32, extra: &[(&str, &str)], data: &[u8]| {
+        call(
+            "PUT",
+            "/vault/m",
+            &format!("uploadId={upload}&partNumber={number}"),
+            extra,
+            data,
+        )
+    };
+    let first: Vec<u8> = (0..5 * 1024 * 1024).map(|n| (n % 253) as u8).collect();
+    let second = b"the last part".to_vec();
+    assert_eq!(part(1, &[], b"x").1.0, 400, "a part without the key");
+    assert_eq!(
+        part(1, &header_refs(&key_b), b"x").1.0,
+        403,
+        "a part with another key"
+    );
+    let mut etags = Vec::new();
+    for (number, data) in [(1, &first), (2, &second)] {
+        let (head, (status, reply)) = part(number, &header_refs(&key_a), data);
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(response_header(&head, ALGORITHM).as_deref(), Some("AES256"));
+        etags.push(response_header(&head, "etag").expect("etag"));
+    }
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etags[0], etags[1]
+    );
+    let (head, (status, reply)) = call(
+        "POST",
+        "/vault/m",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(response_header(&head, ALGORITHM), None, "not on completion");
+    let whole: Vec<u8> = [first.clone(), second.clone()].concat();
+    assert_eq!(call("GET", "/vault/m", "", &[], b"").1.0, 400);
+    let (_, (status, got)) = call("GET", "/vault/m", "", &header_refs(&key_a), b"");
+    assert_eq!(status, 200);
+    assert_eq!(got, latin1(&whole));
+    let mut extra = header_refs(&key_a);
+    let across = format!("bytes={}-{}", first.len() - 3, first.len() + 4);
+    extra.push(("range", &across));
+    assert_eq!(
+        call("GET", "/vault/m", "", &extra, b"").1.1,
+        latin1(&whole[first.len() - 3..first.len() + 5])
+    );
+    // A multipart upload without a key refuses a part with one.
+    let (_, (_, created)) = call("POST", "/vault/n", "uploads", &[], b"");
+    let plain_upload = xml_value(&created, "UploadId");
+    assert_eq!(
+        call(
+            "PUT",
+            "/vault/n",
+            &format!("uploadId={plain_upload}&partNumber=1"),
+            &header_refs(&key_a),
+            b"x",
+        )
+        .1
+        .0,
+        400
+    );
+
+    // Copies: the source's key is required, and copying with keys comes
+    // later.
+    let (_, (status, reply)) = call(
+        "PUT",
+        "/vault/c",
+        "",
+        &[("x-amz-copy-source", "/vault/o")],
+        b"",
+    );
+    assert_eq!(status, 400, "{reply}");
+    let copy_key = customer_headers("x-amz-copy-source-", right);
+    let mut extra = header_refs(&copy_key);
+    extra.push(("x-amz-copy-source", "/vault/o"));
+    let (_, (status, reply)) = call("PUT", "/vault/c", "", &extra, b"");
+    assert_eq!(status, 501, "{reply}");
+
+    // A bucket blocking SSE-C refuses new writes with keys; what it holds
+    // stays readable.
+    let block = b"<ServerSideEncryptionConfiguration><Rule><BlockedEncryptionTypes>\
+        <EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule>\
+        </ServerSideEncryptionConfiguration>";
+    assert_eq!(call("PUT", "/vault", "encryption", &[], block).1.0, 200);
+    assert_eq!(
+        call("PUT", "/vault/p", "", &header_refs(&key_a), b"x").1.0,
+        403
+    );
+    assert_eq!(
+        call("POST", "/vault/p", "uploads", &header_refs(&key_a), b"")
+            .1
+            .0,
+        403
+    );
+    assert_eq!(
+        call("GET", "/vault/o", "", &header_refs(&key_a), b"").1.0,
+        200
+    );
+
+    // Nothing of the plaintext reached the server's files (the database is
+    // not encrypted at rest: only the customer's key hides it).
+    assert!(!files_hold(&server.dir, marker));
+}
+
+#[test]
+fn customer_provided_keys_need_tls() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    assert_eq!(
+        send(port, "PUT", "/clear", "", b"", &key, Some(&secret)).0,
+        200
+    );
+    let headers = customer_headers("x-amz-", [7u8; 32]);
+    let extra = header_refs(&headers);
+    let (_, (status, reply)) = send_with(
+        port,
+        "PUT",
+        "/clear/o",
+        "",
+        &extra,
+        b"x",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("secure connection"), "{reply}");
 }

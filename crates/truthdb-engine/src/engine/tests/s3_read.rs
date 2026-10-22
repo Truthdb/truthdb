@@ -1199,3 +1199,53 @@ fn parquet_files_that_lie_about_their_layout_are_refused_before_reading() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn an_object_with_a_customer_provided_key_is_refused_and_skipped() {
+    let path = unique_temp_path("s3-read-sse-c");
+    let engine = new_engine(&path);
+    bucket(&engine, "vault");
+    put(&engine, "vault", "a/open.csv", b"v\nopen\n");
+    // Its body is ciphertext only its own requests' key opens.
+    let storage = engine.storage();
+    let mut writer = BodyWriter::begin(storage, 1).expect("begin");
+    writer.write(storage, b"v\nsealed\n", 1).expect("write");
+    let sealed = writer.finish(storage, 1).expect("finish");
+    let attrs = ObjectAttrs {
+        customer_key: Some(truthdb_object::CustomerKey {
+            key_md5: "md5".to_string(),
+            verifier: "verifier".to_string(),
+        }),
+        ..ObjectAttrs::default()
+    };
+    engine
+        .object(|file| {
+            file.transaction(|tx| tx.put_object("vault", "a/sealed.csv", &sealed, &attrs, 2_000, 0))
+        })
+        .expect("put")
+        .expect("put accepted");
+    assert_eq!(
+        sql_error_number(
+            &engine,
+            "SELECT * FROM sys.s3_read('vault', 'a/sealed.csv', 'csv')"
+        ),
+        4861
+    );
+    assert_eq!(
+        rows(
+            &engine,
+            r#"SELECT _s3_key, v FROM sys.s3_read('vault', 'a/', 'csv', '{"prefix": true}')"#
+        ),
+        [some(&["a/open.csv", "open"])]
+    );
+    let info = engine
+        .object(|file| file.head_object("vault", "a/sealed.csv", VersionSel::Latest))
+        .expect("head")
+        .expect("exists");
+    assert_eq!(
+        truthdb_object::fulltext_status(&info, u64::MAX),
+        Some(truthdb_object::FtStatus::Encrypted)
+    );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}

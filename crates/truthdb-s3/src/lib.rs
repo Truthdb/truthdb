@@ -19,6 +19,7 @@ pub mod server;
 pub mod signed_body;
 pub mod sigv4;
 pub mod sse;
+pub mod ssec;
 pub mod tagging;
 pub mod time;
 pub mod vectors;

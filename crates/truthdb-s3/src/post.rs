@@ -505,7 +505,12 @@ pub async fn post_object(
             HeaderValue::from_str(acl).expect("a checked acl"),
         );
     }
-    crate::sse::refuse_customer_keys(fields.iter().map(|(name, _)| name.as_str()))?;
+    // A customer-provided key arrives in the form's fields, over TLS only.
+    let customer = crate::ssec::provided_in_fields(|name| field(&fields, name))?;
+    crate::ssec::check_transport(
+        customer.is_some(),
+        connection.is_some_and(|connection| connection.tls),
+    )?;
     // The encryption it asks for, which policies see as
     // s3:x-amz-server-side-encryption.
     let encrypted_at_rest = state.storage.is_encrypted();
@@ -517,12 +522,14 @@ pub async fn post_object(
             HeaderValue::from_str(value).expect("a checked encryption"),
         );
     }
+    crate::ssec::check_write(customer.as_ref(), &headers, false)?;
     let tags = match field(&fields, "tagging") {
         Some(xml) => Some(crate::tagging::parse_tagging(xml.as_bytes())?),
         None => None,
     };
     let mut attrs = metadata(&fields)?;
     attrs.tags = tags.clone().unwrap_or_default();
+    attrs.customer_key = customer.as_ref().map(|key| key.stored()).transpose()?;
 
     let authz = Authz::load(
         state,
@@ -561,14 +568,18 @@ pub async fn post_object(
         let (min, max) = bounds;
         // Fail before reading the file when the bucket or key is wrong.
         let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-        let check = object(state, move |file| {
-            file.head_object(&lookup_bucket, &lookup_key, VersionSel::Latest)
+        let (check, blocked) = object(state, move |file| {
+            Ok((
+                file.head_object(&lookup_bucket, &lookup_key, VersionSel::Latest)?,
+                crate::sse::sse_c_blocked(file, &lookup_bucket)?,
+            ))
         })
         .await?;
         if let Err(err @ (ObjectError::NoSuchBucket | ObjectError::InvalidKey(_))) = check {
             return Err(object_error(err, &bucket, &key));
         }
-        let mut sink = BodySink::begin(state).await?;
+        crate::ssec::check_write(customer.as_ref(), &HeaderMap::new(), blocked)?;
+        let mut sink = BodySink::begin(state, customer.as_ref()).await?;
         loop {
             match form.delimiter(0) {
                 Ok(end) => {
@@ -593,7 +604,7 @@ pub async fn post_object(
                 "Your proposed upload is smaller than the minimum allowed size",
             ));
         }
-        let sealed = sink.finish(state).await?;
+        let (sealed, _) = sink.finish(state).await?;
         let (bucket_name, key_name) = (bucket.clone(), key.clone());
         let (stored, versioning) = object(state, move |file| {
             let stored = file.transaction(|tx| {
@@ -615,8 +626,14 @@ pub async fn post_object(
             "/{bucket}/{}",
             percent_encoding::utf8_percent_encode(&key, LOCATION)
         );
-        let mut response =
-            crate::sse::with_header(Response::builder().header("etag", &etag), encrypted_at_rest);
+        let customer_key = info.attrs.customer_key.as_ref();
+        let mut response = crate::ssec::with_echo(
+            crate::sse::with_header(
+                Response::builder().header("etag", &etag),
+                encrypted_at_rest && customer_key.is_none(),
+            ),
+            customer_key,
+        );
         if let Some(version) = version_header(versioning, info.version, info.null_version) {
             response = response.header("x-amz-version-id", version);
         }
