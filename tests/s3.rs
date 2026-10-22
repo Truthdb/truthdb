@@ -64,12 +64,13 @@ fn start_server_with(encrypted: bool) -> Server {
             if running.child.try_wait().expect("poll the server").is_some() {
                 break;
             }
-            let up = [running.native_port, running.s3_port]
+            // Listening on both ports itself: another test's server may have
+            // taken a port between choosing it and this one binding it.
+            let pid = running.child.id();
+            if [running.native_port, running.s3_port]
                 .iter()
-                .all(|&port| std::net::TcpStream::connect(("127.0.0.1", port)).is_ok());
-            // Answering on both ports and still running: the listeners are
-            // the server's own.
-            if up && running.child.try_wait().expect("poll the server").is_none() {
+                .all(|&port| listens(pid, port))
+            {
                 return server.take().unwrap();
             }
             std::thread::sleep(Duration::from_millis(50));
@@ -77,6 +78,34 @@ fn start_server_with(encrypted: bool) -> Server {
         drop(server);
     }
     panic!("the server never came up");
+}
+
+/// Whether process `pid` holds the socket listening on IPv4 `port`: an
+/// entry of /proc/net/tcp in state LISTEN whose inode is one of the
+/// process's file descriptors.
+fn listens(pid: u32, port: u16) -> bool {
+    let Ok(table) = std::fs::read_to_string("/proc/net/tcp") else {
+        return false;
+    };
+    let inodes: Vec<String> = table
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split_whitespace().collect();
+            let (_, local_port) = fields.get(1)?.split_once(':')?;
+            (u16::from_str_radix(local_port, 16).ok()? == port && *fields.get(3)? == "0A")
+                .then(|| format!("socket:[{}]", fields.get(9).unwrap_or(&"")))
+        })
+        .collect();
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return false;
+    };
+    fds.filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
+        .any(|target| {
+            inodes
+                .iter()
+                .any(|inode| target.to_string_lossy() == *inode)
+        })
 }
 
 fn spawn_server(encrypted: bool) -> Server {
