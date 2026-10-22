@@ -94,6 +94,13 @@ enum Command {
         #[command(flatten)]
         keys: KeyArgs,
     },
+    /// Objects of an S3 service (this server's S3 API or another), in the
+    /// manner of `aws s3`: ls, mb, cp, sync, rm. `truthdb-cli s3 --help`
+    /// tells more.
+    S3 {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, num_args = 0..)]
+        args: Vec<String>,
+    },
     /// ONLINE: show this server's replication state (role, slots, connected
     /// standbys, lag, sync-commit status) by querying the `sys.dm_repl_*`
     /// views over the native protocol.
@@ -208,6 +215,7 @@ async fn main() -> Result<()> {
             }
         }
         Command::ReplStatus => repl_status(&addr).await,
+        Command::S3 { args } => truthdb_cli::s3::run(&args, &mut std::io::stdout()).await,
         Command::Promote { path, keys } => {
             let keys = keys.source()?;
             match truthdb_relational::storage::RelStorage::promote_with(

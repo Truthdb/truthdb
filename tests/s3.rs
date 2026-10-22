@@ -8061,6 +8061,21 @@ fn the_s3_client_works_against_this_server() {
             .abort_multipart_upload("tools", "gone", &abandoned)
             .await
             .unwrap();
+        // An empty object.
+        client
+            .put_object("tools", "empty", &[], truthdb_s3client::Bytes::new())
+            .await
+            .unwrap();
+        assert_eq!(
+            client
+                .head_object("tools", "empty")
+                .await
+                .unwrap()
+                .unwrap()
+                .size,
+            0
+        );
+        client.delete_object("tools", "empty").await.unwrap();
         // Keys whose bytes a signer could get wrong.
         for odd in ["x+y%z~w", "a//b", "./c/../d", " lead"] {
             client
@@ -8125,4 +8140,98 @@ fn the_s3_client_works_against_this_server() {
             other => panic!("{:?}", other.map(|_| ())),
         }
     });
+}
+
+#[test]
+fn the_cli_lists_copies_syncs_and_removes() {
+    let (server, key, secret) = server_with_key();
+    let work = server.dir.join("cli");
+    let (src, back, txt) = (work.join("src"), work.join("back"), work.join("txt"));
+    sample_tree(&src);
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let cli = |args: &[&str]| -> String {
+        let mut argv: Vec<String> = vec![
+            "--endpoint-url".to_string(),
+            format!("http://127.0.0.1:{}", server.s3_port),
+            "--region".to_string(),
+            "us-east-1".to_string(),
+            "--access-key".to_string(),
+            key.clone(),
+            "--secret-key".to_string(),
+            secret.clone(),
+        ];
+        argv.extend(args.iter().map(|arg| arg.to_string()));
+        let mut out = Vec::new();
+        runtime
+            .block_on(truthdb_cli::s3::run(&argv, &mut out))
+            .unwrap_or_else(|err| panic!("{args:?}: {err:#}"));
+        String::from_utf8(out).unwrap()
+    };
+    let (src_arg, back_arg) = (src.to_str().unwrap(), back.to_str().unwrap());
+    assert_eq!(cli(&["mb", "s3://cli"]), "make_bucket: cli\n");
+    // Up (the large file in parts), then nothing more to send.
+    let sent = cli(&["sync", src_arg, "s3://cli/up"]);
+    assert_eq!(sent.lines().count(), 6, "{sent}");
+    assert_eq!(cli(&["sync", src_arg, "s3://cli/up"]), "");
+    let listed = cli(&["ls", "s3://cli/up/"]);
+    assert!(listed.contains("PRE a/"), "{listed}");
+    assert!(listed.contains("PRE space dir/"), "{listed}");
+    assert!(listed.contains(" 20000000 big.bin"), "{listed}");
+    let all = cli(&["ls", "--recursive", "s3://cli/up"]);
+    assert!(all.contains("up/a/b/deep.txt"), "{all}");
+    assert!(cli(&["ls"]).lines().any(|line| line == "cli"));
+    // Down, then nothing more to fetch (the files keep the objects' times).
+    cli(&["sync", "s3://cli/up", back_arg]);
+    assert_eq!(tree(&back), tree(&src));
+    assert_eq!(cli(&["sync", "s3://cli/up", back_arg]), "");
+    assert_eq!(cli(&["sync", src_arg, "s3://cli/up"]), "");
+    // A dry run changes nothing; --delete removes what the source lacks.
+    std::fs::remove_file(src.join("one.txt")).unwrap();
+    let planned = cli(&["sync", "--delete", "--dryrun", src_arg, "s3://cli/up"]);
+    assert_eq!(planned, "(dryrun) delete: s3://cli/up/one.txt\n");
+    assert!(cli(&["ls", "s3://cli/up/"]).contains("one.txt"));
+    cli(&["sync", "--delete", src_arg, "s3://cli/up"]);
+    assert!(!cli(&["ls", "s3://cli/up/"]).contains("one.txt"));
+    cli(&["sync", "--delete", "s3://cli/up", back_arg]);
+    assert_eq!(tree(&back), tree(&src));
+    // Filters, the later winning: only the .txt files, but not the deep one.
+    cli(&[
+        "cp",
+        "--recursive",
+        "--exclude",
+        "*",
+        "--include",
+        "*.txt",
+        "--exclude",
+        "a/b/*",
+        src_arg,
+        "s3://cli/txt",
+    ]);
+    cli(&["cp", "--recursive", "s3://cli/txt", txt.to_str().unwrap()]);
+    let names: Vec<String> = tree(&txt).into_iter().map(|(path, _)| path).collect();
+    assert_eq!(names, ["a/ünïcødé.txt", "space dir/file with space.txt"]);
+    // One file each way.
+    cli(&[
+        "cp",
+        src.join("empty").to_str().unwrap(),
+        "s3://cli/single/",
+    ]);
+    cli(&[
+        "cp",
+        "s3://cli/single/empty",
+        work.join("empty.copy").to_str().unwrap(),
+    ]);
+    assert_eq!(std::fs::read(work.join("empty.copy")).unwrap(), b"");
+    // Removed, a dry run first.
+    assert!(
+        cli(&["rm", "--recursive", "--dryrun", "s3://cli/txt"]).starts_with("(dryrun) delete:")
+    );
+    cli(&["rm", "--recursive", "s3://cli/txt"]);
+    assert_eq!(cli(&["ls", "--recursive", "s3://cli/txt"]), "");
+    cli(&["rm", "s3://cli/single/empty"]);
+    // Help is printed, not an error.
+    assert!(cli(&["--help"]).contains("sync"));
 }

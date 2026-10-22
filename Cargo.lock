@@ -1790,6 +1790,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "truthdb-cli",
  "truthdb-core",
  "truthdb-engine",
  "truthdb-net",
@@ -1818,6 +1819,7 @@ dependencies = [
  "anyhow",
  "clap",
  "directories",
+ "http-body-util",
  "serde",
  "serde_json",
  "tokio",
@@ -1827,6 +1829,7 @@ dependencies = [
  "truthdb-net",
  "truthdb-proto",
  "truthdb-relational",
+ "truthdb-s3client",
 ]
 
 [[package]]
