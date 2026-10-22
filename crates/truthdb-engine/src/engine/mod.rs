@@ -1346,6 +1346,7 @@ fn render_sql_outcome(outcome: &crate::engine::BatchOutcome) -> String {
 }
 
 mod fulltext;
+mod object_jobs;
 #[cfg(test)]
 mod relational_tests;
 mod s3_parquet;

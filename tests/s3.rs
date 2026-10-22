@@ -6990,3 +6990,42 @@ fn an_object_keeps_the_storage_class_it_was_written_in() {
     assert_eq!(user_put("DEEP_ARCHIVE"), 403);
     assert_eq!(user_put("GLACIER"), 200);
 }
+
+#[test]
+fn a_cold_object_reads_back_alike_once_packed() {
+    let server = start_server();
+    let port = server.s3_port;
+    let (_, key, secret) = account_with_key(&server, "packed");
+    let call = |method: &str, path: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, "", extra, body, &key, Some(&secret)).1
+    };
+    // Three segments' worth (a segment is 1,040,384 bytes), compressible.
+    let data: Vec<u8> = (0..3_200_000u32)
+        .map(|n| b"truthdb packs cold bodies "[(n % 26) as usize])
+        .collect();
+    assert_eq!(call("PUT", "/packed", &[], b"").0, 200);
+    assert_eq!(
+        call(
+            "PUT",
+            "/packed/k",
+            &[("x-amz-storage-class", "GLACIER")],
+            &data
+        )
+        .0,
+        200
+    );
+    // The object jobs pack it in the background.
+    std::thread::sleep(Duration::from_secs(3));
+    let (status, body) = call("GET", "/packed/k", &[], b"");
+    assert_eq!(status, 200);
+    assert!(body == latin1(&data), "the whole object");
+    for (first, last) in [(1_040_380u64, 1_040_390u64), (0, 9), (2_080_000, 3_199_999)] {
+        let range = format!("bytes={first}-{last}");
+        let (status, body) = call("GET", "/packed/k", &[("range", &range)], b"");
+        assert_eq!(status, 206, "{range}");
+        assert!(
+            body == latin1(&data[first as usize..=last as usize]),
+            "{range}"
+        );
+    }
+}

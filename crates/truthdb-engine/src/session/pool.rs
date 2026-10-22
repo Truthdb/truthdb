@@ -95,6 +95,11 @@ pub(super) fn spawn_engine_pool(
                 .name("truthdb-object-indexer".to_string())
                 .spawn(move || indexer_loop(&indexer_shared))
                 .expect("spawn indexer thread");
+            let jobs_shared = Arc::clone(&supervisor);
+            let jobs = std::thread::Builder::new()
+                .name("truthdb-object-jobs".to_string())
+                .spawn(move || object_jobs_loop(&jobs_shared))
+                .expect("spawn object jobs thread");
             let handles: Vec<_> = (0..workers)
                 .map(|i| {
                     let shared = Arc::clone(&supervisor);
@@ -119,6 +124,7 @@ pub(super) fn spawn_engine_pool(
             supervisor.wake.notify_all();
             let _ = maintenance.join();
             let _ = indexer.join();
+            let _ = jobs.join();
             let mut sched = supervisor.scheduler.lock().expect("scheduler poisoned");
             for parked in sched.parked.drain(..) {
                 parked
@@ -282,6 +288,28 @@ pub(super) fn indexer_loop(shared: &Arc<Shared>) {
         let stop = || shared.stop.load(Ordering::Acquire);
         let more = shared.engine.fulltext_pass(&stop).unwrap_or_else(|err| {
             eprintln!("full-text indexing failed: {err}");
+            false
+        });
+        if more {
+            continue;
+        }
+        let idle = shared.idle.lock().expect("idle mutex poisoned");
+        if shared.stop.load(Ordering::Acquire) {
+            break;
+        }
+        let _ = shared
+            .wake
+            .wait_timeout(idle, INDEXER_IDLE)
+            .expect("idle mutex poisoned");
+    }
+}
+
+/// The object engine's background jobs (see `engine::object_jobs`), on their
+/// own thread: a step at a time while work remains, else a sleep.
+pub(super) fn object_jobs_loop(shared: &Arc<Shared>) {
+    while !shared.stop.load(Ordering::Acquire) {
+        let more = shared.engine.object_jobs_step().unwrap_or_else(|err| {
+            eprintln!("object jobs failed: {err}");
             false
         });
         if more {

@@ -604,6 +604,11 @@ impl ObjTxn<'_, '_> {
         if has_attrs {
             self.write_attrs(version, attrs)?;
         }
+        // A cold class's body is packed (one under a customer-provided key
+        // is ciphertext: it would not shrink).
+        if attrs.customer_key.is_none() {
+            self.queue_pack(new.body, new.storage_class.pack_level())?;
+        }
         self.record_change(
             Change {
                 record_type: RecordType::Create,
