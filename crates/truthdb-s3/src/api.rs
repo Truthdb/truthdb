@@ -46,7 +46,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "cors",
     "intelligent-tiering",
     "inventory",
-    "lifecycle",
     "logging",
     "metadataAnnotationTable",
     "metadataConfiguration",
@@ -71,6 +70,7 @@ const SUBRESOURCES: &[&str] = &[
     "delete",
     "encryption",
     "legal-hold",
+    "lifecycle",
     "location",
     "object-lock",
     "ownershipControls",
@@ -484,6 +484,18 @@ async fn route(
             authz.check(action, Bucket(&bucket))?;
             crate::sse::handle(state, request, auth, bucket, method).await
         }
+        (Target::Bucket(bucket), method) if has_param(&request, "lifecycle") => {
+            let action = match method {
+                Method::GET => "s3:GetLifecycleConfiguration",
+                Method::PUT | Method::DELETE => "s3:PutLifecycleConfiguration",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?lifecycle"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::lifecycle::bucket_lifecycle(state, request, auth, bucket, method).await
+        }
+        (Target::Object(..), _) if has_param(&request, "lifecycle") => Err(
+            S3Error::not_implemented("an object has no ?lifecycle configuration"),
+        ),
         (Target::Bucket(bucket), method) if has_param(&request, "object-lock") => {
             let action = match method {
                 Method::GET => "s3:GetBucketObjectLockConfiguration",

@@ -901,6 +901,15 @@ fn a_user_without_policies_is_refused_every_operation() {
         ("PUT", "/cov", "ownershipControls", b"", &[]),
         ("GET", "/cov", "uploads", b"", &[]),
         ("GET", "/cov", "object-lock", b"", &[]),
+        ("GET", "/cov", "lifecycle", b"", &[]),
+        (
+            "PUT",
+            "/cov",
+            "lifecycle",
+            b"<LifecycleConfiguration/>",
+            &[],
+        ),
+        ("DELETE", "/cov", "lifecycle", b"", &[]),
         ("PUT", "/cov", "object-lock", b"", &[]),
         ("GET", "/cov/o", "retention", b"", &[]),
         ("PUT", "/cov/o", "retention", retention, &retention_headers),
@@ -7288,4 +7297,124 @@ fn an_archived_object_is_read_only_while_restored() {
         call("GET", "/archive/cold", "", &[], b"").1,
         (200, "frozen".to_string())
     );
+}
+
+#[test]
+fn a_lifecycle_configuration_is_kept_shown_and_applied() {
+    const MIN: &str = "x-amz-transition-default-minimum-object-size";
+    let server = start_server();
+    let port = server.s3_port;
+    let (_, key, secret) = account_with_key(&server, "rules");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    assert_eq!(call("PUT", "/rules", "", &[], b"").1.0, 200);
+    let (_, (status, reply)) = call("GET", "/rules", "lifecycle", &[], b"");
+    assert_eq!(status, 404, "{reply}");
+    assert!(
+        reply.contains("<Code>NoSuchLifecycleConfiguration</Code>"),
+        "{reply}"
+    );
+    assert_eq!(call("GET", "/none", "lifecycle", &[], b"").1.0, 404);
+    // Expired already (a date in the past) under logs/; a year off under
+    // data/.
+    let config = b"<LifecycleConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\
+        <Rule><ID>old logs</ID><Filter><Prefix>logs/</Prefix></Filter><Status>Enabled</Status>\
+        <Expiration><Date>2020-01-01T00:00:00.000Z</Date></Expiration></Rule>\
+        <Rule><ID>data</ID><Filter><Prefix>data/</Prefix></Filter><Status>Enabled</Status>\
+        <Transition><Days>30</Days><StorageClass>STANDARD_IA</StorageClass></Transition>\
+        <Expiration><Days>365</Days></Expiration></Rule></LifecycleConfiguration>";
+    let (head, (status, reply)) = call(
+        "PUT",
+        "/rules",
+        "lifecycle",
+        &[(MIN, "varies_by_storage_class")],
+        config,
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        response_header(&head, MIN).as_deref(),
+        Some("varies_by_storage_class")
+    );
+    let (head, (status, xml)) = call("GET", "/rules", "lifecycle", &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, MIN).as_deref(),
+        Some("varies_by_storage_class")
+    );
+    assert!(xml.contains("<ID>old logs</ID>"), "{xml}");
+    assert!(
+        xml.contains(
+            "<Transition><Days>30</Days><StorageClass>STANDARD_IA</StorageClass></Transition>"
+        ),
+        "{xml}"
+    );
+    // Refused as S3 refuses it, keeping what was there.
+    let (status, reply) = call(
+        "PUT",
+        "/rules",
+        "lifecycle",
+        &[],
+        b"<LifecycleConfiguration><Rule><Filter/><Status>Enabled</Status>\
+          <Expiration><Days>0</Days></Expiration></Rule></LifecycleConfiguration>",
+    )
+    .1;
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("<Code>InvalidArgument</Code>"), "{reply}");
+    assert_eq!(call("GET", "/rules", "lifecycle", &[], b"").1, (200, xml));
+
+    // The data/ object says when it expires, and by which rule.
+    let (head, (status, _)) = call("PUT", "/rules/data/a", "", &[], b"a");
+    assert_eq!(status, 200);
+    let expiration = response_header(&head, "x-amz-expiration").expect("x-amz-expiration");
+    assert!(expiration.starts_with("expiry-date=\""), "{expiration}");
+    assert!(
+        expiration.ends_with(" 00:00:00 GMT\", rule-id=\"data\""),
+        "{expiration}"
+    );
+    for method in ["HEAD", "GET"] {
+        let (head, _) = call(method, "/rules/data/a", "", &[], b"");
+        assert_eq!(
+            response_header(&head, "x-amz-expiration"),
+            Some(expiration.clone()),
+            "{method}"
+        );
+    }
+    let (head, _) = call("PUT", "/rules/other", "", &[], b"x");
+    assert_eq!(response_header(&head, "x-amz-expiration"), None);
+
+    // The server's daily pass expires logs/ (the rule's date is past).
+    let (head, (status, _)) = call("PUT", "/rules/logs/old", "", &[], b"x");
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, "x-amz-expiration"),
+        Some("expiry-date=\"Wed, 01 Jan 2020 00:00:00 GMT\", rule-id=\"old%20logs\"".to_string())
+    );
+    // A new configuration starts its pass over.
+    let (status, reply) = call(
+        "PUT",
+        "/rules",
+        "lifecycle",
+        &[(MIN, "varies_by_storage_class")],
+        config,
+    )
+    .1;
+    assert_eq!(status, 200, "{reply}");
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while call("HEAD", "/rules/logs/old", "", &[], b"").1.0 != 404 {
+        assert!(
+            Instant::now() < deadline,
+            "the lifecycle pass never expired it"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(call("HEAD", "/rules/data/a", "", &[], b"").1.0, 200);
+
+    let (status, _) = call("DELETE", "/rules", "lifecycle", &[], b"").1;
+    assert_eq!(status, 204);
+    assert_eq!(call("GET", "/rules", "lifecycle", &[], b"").1.0, 404);
+    let (head, _) = call("HEAD", "/rules/data/a", "", &[], b"");
+    assert_eq!(response_header(&head, "x-amz-expiration"), None);
+    // An object has no lifecycle configuration of its own.
+    assert_eq!(call("GET", "/rules/data/a", "lifecycle", &[], b"").1.0, 501);
 }

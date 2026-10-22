@@ -1374,3 +1374,83 @@ fn an_archived_object_is_read_only_while_restored_and_skipped_otherwise() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn the_object_jobs_apply_lifecycle_rules() {
+    use truthdb_object::{
+        Expiration, Filter, LifecycleConfig, MinTransitionSize, Rule, StorageClass, Transition,
+        When,
+    };
+    let path = unique_temp_path("s3-lifecycle-jobs");
+    let engine = new_engine(&path);
+    bucket(&engine, "aged");
+    // Written in 1970: every rule below is long due.
+    put(&engine, "aged", "old/a.csv", b"v\nold\n");
+    put(&engine, "aged", "cold/b.csv", b"v\ncold\n");
+    put(&engine, "aged", "keep/c.csv", b"v\nkeep\n");
+    let rule = |id: &str, prefix: &str| Rule {
+        id: id.to_string(),
+        enabled: true,
+        filter: Filter::Prefix(prefix.to_string()),
+        expiration: None,
+        transitions: Vec::new(),
+        noncurrent_expiration: None,
+        noncurrent_transitions: Vec::new(),
+        abort_upload_days: None,
+    };
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.put_lifecycle(
+                    "aged",
+                    &LifecycleConfig {
+                        min_size: MinTransitionSize::VariesByClass,
+                        rules: vec![
+                            Rule {
+                                expiration: Some(Expiration::At(When::Days(1))),
+                                ..rule("old", "old/")
+                            },
+                            Rule {
+                                transitions: vec![Transition {
+                                    when: When::Days(0),
+                                    class: StorageClass::Glacier,
+                                }],
+                                ..rule("cold", "cold/")
+                            },
+                        ],
+                    },
+                )
+            })
+        })
+        .expect("put lifecycle");
+    let mut steps = 0;
+    while engine.object_jobs_step().expect("step") {
+        steps += 1;
+        assert!(steps < 100, "the jobs never ended");
+    }
+    let head = |key: &str| {
+        engine
+            .object(|file| file.head_object("aged", key, VersionSel::Latest))
+            .expect("head")
+    };
+    assert_eq!(
+        head("old/a.csv").unwrap_err(),
+        truthdb_object::ObjectError::NoSuchKey
+    );
+    let cold = head("cold/b.csv").unwrap();
+    assert_eq!(cold.storage_class, StorageClass::Glacier);
+    // The transition queued its body for packing, and the same jobs
+    // worked the queue off.
+    assert!(
+        engine
+            .object(|file| file.next_pack())
+            .expect("queue")
+            .is_none()
+    );
+    assert_eq!(
+        head("keep/c.csv").unwrap().storage_class,
+        StorageClass::Standard
+    );
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
