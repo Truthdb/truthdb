@@ -638,10 +638,19 @@ async fn download(
     Ok(())
 }
 
-fn local_path(root: &Path, relative: &str) -> PathBuf {
+/// `relative` (a key below a prefix, or a file below a folder) under
+/// `root`. A key whose path would leave the folder (`..`) or that names no
+/// file (`.`, an empty segment) is refused: a service must not choose where
+/// on this machine files are written or removed.
+fn local_path(root: &Path, relative: &str) -> Result<PathBuf> {
     relative
         .split('/')
-        .fold(root.to_path_buf(), |path, part| path.join(part))
+        .try_fold(root.to_path_buf(), |path, part| {
+            if matches!(part, "" | "." | "..") {
+                bail!("{relative:?} is not a path below {}", root.display());
+            }
+            Ok(path.join(part))
+        })
 }
 
 async fn cp(
@@ -666,7 +675,7 @@ async fn cp(
                     if !dryrun {
                         upload(
                             client,
-                            &local_path(&from, relative),
+                            &local_path(&from, relative)?,
                             &bucket,
                             &format!("{prefix}{relative}"),
                         )
@@ -711,7 +720,7 @@ async fn cp(
                             client,
                             &bucket,
                             &format!("{prefix}{relative}"),
-                            &local_path(&to, &relative),
+                            &local_path(&to, &relative)?,
                             Some(entry.modified),
                         )
                         .await?;
@@ -764,7 +773,7 @@ async fn sync(
                         if !dryrun {
                             upload(
                                 client,
-                                &local_path(&from, &relative),
+                                &local_path(&from, &relative)?,
                                 &bucket,
                                 &format!("{prefix}{relative}"),
                             )
@@ -800,7 +809,7 @@ async fn sync(
                                 client,
                                 &bucket,
                                 &format!("{prefix}{relative}"),
-                                &local_path(&to, &relative),
+                                &local_path(&to, &relative)?,
                                 modified,
                             )
                             .await?;
@@ -809,7 +818,7 @@ async fn sync(
                     Step::Remove(relative) => {
                         writeln!(out, "{dry}delete: {relative}")?;
                         if !dryrun {
-                            std::fs::remove_file(local_path(&to, &relative))?;
+                            std::fs::remove_file(local_path(&to, &relative)?)?;
                         }
                     }
                 }
@@ -926,6 +935,18 @@ mod tests {
             "filtered out"
         );
         assert!(!with_delete.contains(&Step::Send("same".to_string())));
+    }
+
+    #[test]
+    fn a_key_cannot_put_a_file_outside_the_folder() {
+        let root = Path::new("/data/dest");
+        assert_eq!(
+            local_path(root, "a/b.txt").unwrap(),
+            root.join("a").join("b.txt")
+        );
+        for bad in ["../x", "a/../../x", "a//b", "./a", "a/", ""] {
+            assert!(local_path(root, bad).is_err(), "{bad}");
+        }
     }
 
     #[test]
