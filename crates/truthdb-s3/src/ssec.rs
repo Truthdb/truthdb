@@ -28,6 +28,15 @@ pub const KEY_MD5: &str = "x-amz-server-side-encryption-customer-key-MD5";
 /// (`x-amz-copy-source-server-side-encryption-customer-algorithm`).
 pub const COPY_SOURCE_PREFIX: &str = "x-amz-copy-source-";
 
+/// The headers a presigned URL need not sign (its signer does not hold the
+/// key): the key and its MD5, the object's and a copy source's, lowercased.
+pub const UNSIGNED_IN_PRESIGNED: [&str; 4] = [
+    "x-amz-server-side-encryption-customer-key",
+    "x-amz-server-side-encryption-customer-key-md5",
+    "x-amz-copy-source-server-side-encryption-customer-key",
+    "x-amz-copy-source-server-side-encryption-customer-key-md5",
+];
+
 /// Plaintext bytes per chunk.
 pub const CHUNK: usize = 64 * 1024;
 const TAG: usize = 16;

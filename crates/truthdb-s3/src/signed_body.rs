@@ -41,7 +41,7 @@ pub async fn read(
     max_body: usize,
 ) -> Result<SignedBody, S3Error> {
     let (auth, amz_date) = signed_request(state, &request, service)?;
-    check_signed_headers(&request, &auth, &["host", "x-amz-date"])?;
+    check_signed_headers(&request, &auth, &["host", "x-amz-date"], &[])?;
     // An unknown key is refused before its body is read.
     let access_key = auth.credential.access_key.clone();
     if state

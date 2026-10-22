@@ -158,6 +158,13 @@ pub async fn upload_part(
         .await?
         .customer_key;
     crate::ssec::check_read(customer_key.as_ref(), customer.as_ref())?;
+    // A bucket blocking SSE-C refuses every request that names a key, a
+    // part of an upload begun before the block included (as S3).
+    if customer.is_some() {
+        let name = bucket.clone();
+        let blocked = object(state, move |file| crate::sse::sse_c_blocked(file, &name)).await?;
+        crate::ssec::check_write(customer.as_ref(), request.headers(), blocked)?;
+    }
     let sealed = receive_body(state, request, auth, customer.as_ref()).await?;
     let info = object(state, move |file| {
         file.transaction(|tx| tx.upload_part(upload, number, &sealed, now_ms(), DROP_GRACE_MS))

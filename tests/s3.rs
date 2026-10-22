@@ -5140,3 +5140,126 @@ fn policies_see_a_form_uploads_customer_provided_key() {
     let (_, (status, reply)) = post_form_tls(&server, "nossec", &form(false), "f", b"x");
     assert_eq!(status, 204, "{reply}");
 }
+
+#[test]
+fn a_presigned_url_signs_the_customer_keys_algorithm_only() {
+    let server = start_server_tls(false, true);
+    let (_, key, secret) = account_with_key(&server, "presign");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_tls(
+            &server,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    assert_eq!(call("PUT", "/pre", "", &[], b"").1.0, 200);
+    let customer = customer_headers("x-amz-", [6u8; 32]);
+    assert_eq!(
+        call("PUT", "/pre/o", "", &header_refs(&customer), b"sealed")
+            .1
+            .0,
+        200
+    );
+    // As S3 documents: the algorithm in the signature, the key and its MD5
+    // sent with the request.
+    let get = |signed: &[&str]| {
+        let amz_date = amz_now();
+        let credential = sigv4::Credential {
+            access_key: key.clone(),
+            date: amz_date[..8].to_string(),
+            region: "us-east-1".to_string(),
+            service: "s3".to_string(),
+        };
+        let encode = |text: &str| {
+            percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC)
+                .to_string()
+        };
+        let host = format!("127.0.0.1:{}", server.s3_port);
+        let mut headers = vec![("host".to_string(), host.clone())];
+        for name in signed {
+            let value = customer
+                .iter()
+                .find(|(header, _)| header.eq_ignore_ascii_case(name))
+                .expect("a customer header")
+                .1
+                .clone();
+            headers.push((name.to_ascii_lowercase(), value));
+        }
+        headers.sort();
+        let names: Vec<String> = headers.iter().map(|(name, _)| name.clone()).collect();
+        let query = format!(
+            "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={amz_date}&X-Amz-Expires=300&X-Amz-SignedHeaders={}",
+            encode(&format!("{key}/{}", credential.scope())),
+            encode(&names.join(";"))
+        );
+        let canonical = sigv4::canonical_request(
+            "GET",
+            "/pre/o",
+            &query,
+            &headers,
+            &names,
+            sigv4::UNSIGNED_PAYLOAD,
+        )
+        .unwrap();
+        let signature = sigv4::sign(
+            &sigv4::signing_key(&secret, &credential),
+            &sigv4::string_to_sign(&amz_date, &credential.scope(), &canonical),
+        );
+        let mut request = format!(
+            "GET /pre/o?{query}&X-Amz-Signature={signature} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n"
+        );
+        for (name, value) in &customer {
+            request.push_str(&format!("{name}: {value}\r\n"));
+        }
+        request.push_str("\r\n");
+        let mut stream = tls_stream(&server);
+        stream.write_all(request.as_bytes()).expect("send");
+        let mut raw = Vec::new();
+        let _ = stream.read_to_end(&mut raw);
+        parse_response(&raw)
+    };
+    let (_, (status, reply)) = get(&["x-amz-server-side-encryption-customer-algorithm"]);
+    assert_eq!((status, reply.as_str()), (200, "sealed"));
+    // The algorithm itself must be signed.
+    let (_, (status, reply)) = get(&[]);
+    assert_eq!(status, 403, "{reply}");
+}
+
+#[test]
+fn a_bucket_blocking_customer_keys_refuses_a_part_with_one() {
+    let server = start_server_tls(false, true);
+    let (_, key, secret) = account_with_key(&server, "block");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_tls(
+            &server,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    assert_eq!(call("PUT", "/blk", "", &[], b"").1.0, 200);
+    let customer = customer_headers("x-amz-", [8u8; 32]);
+    let (_, (_, created)) = call("POST", "/blk/m", "uploads", &header_refs(&customer), b"");
+    let upload = xml_value(&created, "UploadId");
+    let block = b"<ServerSideEncryptionConfiguration><Rule><BlockedEncryptionTypes>\
+        <EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes></Rule>\
+        </ServerSideEncryptionConfiguration>";
+    assert_eq!(call("PUT", "/blk", "encryption", &[], block).1.0, 200);
+    let (_, (status, reply)) = call(
+        "PUT",
+        "/blk/m",
+        &format!("uploadId={upload}&partNumber=1"),
+        &header_refs(&customer),
+        b"part",
+    );
+    assert_eq!(status, 403, "{reply}");
+}
