@@ -1704,3 +1704,330 @@ fn a_spill_extent_of_the_switch_reused_by_another_query_does_not_hold_the_conver
         std::fs::remove_file(file).ok();
     }
 }
+
+/// The database key and file uuid `storage` seals under now.
+fn database_key(storage: &Storage, source: &KeySource) -> ([u8; 32], [u8; 16]) {
+    let guard = storage.lock();
+    let record = guard.key_record.as_ref().expect("an encrypted database");
+    let dek = crate::encryption::unlock_key_block(&record.key_block, source, &record.file_uuid)
+        .expect("unlock");
+    (*dek, record.file_uuid)
+}
+
+/// How many pages of the data region `dek` opens.
+fn pages_opening_under(path: &Path, storage: &Storage, dek: &[u8; 32], uuid: &[u8; 16]) -> usize {
+    let codec = crate::encryption::PageCodec::Encrypted(Box::new(
+        crate::encryption::PageKeys::new(dek, uuid, false).expect("keys"),
+    ));
+    data_region(path, storage)
+        .chunks(PAGE_SIZE)
+        .enumerate()
+        .filter(|(page_no, page)| codec.open(*page_no as u64, &mut page.to_vec()))
+        .count()
+}
+
+/// An encrypted database holding data (tree, blob, snapshot), with its key
+/// file; `None` in the encrypted test run, whose fixed key these tests do not
+/// use.
+fn encrypted_database(label: &str, key_hex: &str) -> (PathBuf, PathBuf, KeySource, u64, u64) {
+    let path = unique_temp_path(label);
+    let keys = key_file(
+        &format!("{label}-keys"),
+        &format!("main {}\n", key_hex.repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    let (root, blob) = fill(&storage, 300);
+    drop(storage);
+    (path, keys, source, root, blob)
+}
+
+#[test]
+fn a_database_key_rotation_rewrites_every_page_under_the_new_key() {
+    let (path, keys, source, root, blob) = encrypted_database("rekey", "c1");
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let (old, uuid) = database_key(&storage, &source);
+    let fingerprint = storage.key_fingerprint();
+    assert!(pages_opening_under(&path, &storage, &old, &uuid) > 0);
+
+    storage.rotate_database_key().expect("rotate");
+    let status = storage.encryption_status();
+    assert!(status.encrypted && status.rekeying && !status.converting);
+    assert_ne!(storage.key_fingerprint(), fingerprint, "a new key");
+    // Read and written during the rotation: old pages open, new ones are
+    // sealed under the new key.
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 300);
+    let (root2, _) = fill(&storage, 50);
+    convert(&storage);
+    assert!(!storage.encryption_status().rekeying);
+    let (new, _) = database_key(&storage, &source);
+    assert_ne!(new, old);
+    assert_eq!(
+        pages_opening_under(&path, &storage, &old, &uuid),
+        0,
+        "a page still opens under the old key"
+    );
+    assert!(pages_opening_under(&path, &storage, &new, &uuid) > 0);
+    let block = storage
+        .lock()
+        .key_record
+        .as_ref()
+        .expect("record")
+        .key_block
+        .clone();
+    assert_eq!(
+        crate::encryption::key_block_state(&block),
+        crate::encryption::KEY_STATE_ENCRYPTED
+    );
+    assert!(
+        crate::encryption::unlock_previous_key(&block, &source, &uuid)
+            .expect("unlock")
+            .is_none(),
+        "the old key left the key block"
+    );
+    let fingerprint = storage.key_fingerprint();
+    drop(storage);
+
+    // Reopened with the new key alone: rows, blob, snapshot and log.
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    assert_eq!(storage.key_fingerprint(), fingerprint);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 300);
+    assert_eq!(rows_of(&storage, root2).expect("rows").len(), 50);
+    let mut body = vec![0u8; crate::relstore::page::BLOB_PAGE_DATA];
+    storage
+        .lock()
+        .page_ctx(0)
+        .read_blob_page(blob, &mut body)
+        .expect("blob page");
+    assert!(body.starts_with(MARKER));
+    let snapshot = storage.load_snapshot().expect("snapshot");
+    assert_eq!(snapshot.expect("a snapshot").data, MARKER.repeat(1000));
+    drop(storage);
+    assert!(!holds_marker_in(&path));
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_database_key_rotation_cut_short_resumes_at_the_next_open() {
+    let (path, keys, source, root, _) = encrypted_database("rekey-crash", "c2");
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let (old, uuid) = database_key(&storage, &source);
+    storage.rotate_database_key().expect("rotate");
+    for _ in 0..3 {
+        storage.conversion_step(16).expect("step");
+    }
+    let (root2, _) = fill(&storage, 20);
+    drop(storage); // a crash mid-rotation
+
+    // It opens (pages and entries under either key) and resumes.
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    assert!(storage.encryption_status().rekeying);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 300);
+    assert_eq!(rows_of(&storage, root2).expect("rows").len(), 20);
+    let snapshot = storage.load_snapshot().expect("snapshot under either key");
+    assert!(snapshot.is_some());
+    convert(&storage);
+    assert_eq!(pages_opening_under(&path, &storage, &old, &uuid), 0);
+    drop(storage);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    assert!(!storage.encryption_status().rekeying);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 300);
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_backup_taken_mid_rotation_restores_and_finishes_there() {
+    let (path, keys, source, root, _) = encrypted_database("rekey-backup", "c3");
+    let [bak, dst] = ["rekey-backup-bak", "rekey-backup-dst"].map(unique_temp_path);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let (old, uuid) = database_key(&storage, &source);
+    storage.rotate_database_key().expect("rotate");
+    storage.conversion_step(16).expect("step");
+    storage.backup_full(&bak).expect("backup mid-rotation");
+    drop(storage);
+
+    Storage::restore_with_keys(&dst, &bak, &[], None, false, no_engine, Some(&source))
+        .expect("restore");
+    let restored = Storage::open_with_keys(dst.clone(), no_engine, Some(&source)).expect("open");
+    assert!(restored.encryption_status().rekeying);
+    convert(&restored);
+    assert_eq!(rows_of(&restored, root).expect("rows").len(), 300);
+    assert_eq!(pages_opening_under(&dst, &restored, &old, &uuid), 0);
+    drop(restored);
+    for file in [&path, &bak, &dst, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_master_key_rotation_during_a_database_key_rotation_keeps_both_keys() {
+    let (path, _, _, root, _) = encrypted_database("rekey-master", "c4");
+    let old = format!("main {}\n", "c4".repeat(32));
+    let new = format!("next {}\n", "d4".repeat(32));
+    let both = key_file("rekey-master-both", &format!("{new}{old}"));
+    let only_new = key_file("rekey-master-new", &new);
+    let storage = Storage::open_with_keys(
+        path.clone(),
+        no_engine,
+        Some(&KeySource::File(both.clone())),
+    )
+    .expect("open");
+    storage
+        .rotate_database_key()
+        .expect("rotate the database key");
+    storage.conversion_step(16).expect("step");
+    storage.rotate_master_key().expect("rotate the master key");
+    drop(storage);
+    // Mid-rotation, the new master key alone unwraps both database keys.
+    let storage = Storage::open_with_keys(
+        path.clone(),
+        no_engine,
+        Some(&KeySource::File(only_new.clone())),
+    )
+    .expect("open with the new master key");
+    assert!(storage.encryption_status().rekeying);
+    assert_eq!(rows_of(&storage, root).expect("rows").len(), 300);
+    convert(&storage);
+    drop(storage);
+    for file in [&path, &both, &only_new] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_database_key_rotation_needs_an_idle_encrypted_primary() {
+    let (path, keys, source, _, _) = encrypted_database("rekey-refused", "c5");
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    storage.lock().register_backup_hold(0);
+    let Err(err) = storage.rotate_database_key() else {
+        panic!("rotated during a backup");
+    };
+    assert!(err.to_string().contains("backup is in progress"), "{err}");
+    storage.lock().release_backup_hold();
+    storage
+        .try_join_repl_node(7, storage.key_fingerprint())
+        .expect("join");
+    let Err(err) = storage.rotate_database_key() else {
+        panic!("rotated with a standby connected");
+    };
+    assert!(err.to_string().contains("standby is connected"), "{err}");
+    storage.leave_repl_node(7);
+    storage.rotate_database_key().expect("rotate");
+    let Err(err) = storage.rotate_database_key() else {
+        panic!("rotated twice at once");
+    };
+    assert!(err.to_string().contains("under way"), "{err}");
+    let Err(err) = storage.enable_encryption() else {
+        panic!("enabled an encrypted database");
+    };
+    assert!(err.to_string().contains("already encrypted"), "{err}");
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+    if let Some(path) = plain_database("rekey-plain") {
+        let storage =
+            Storage::create(path.clone(), test_storage_options(), no_engine).expect("create");
+        let Err(err) = storage.rotate_database_key() else {
+            panic!("rotated a plain database's key");
+        };
+        assert!(err.to_string().contains("not encrypted"), "{err}");
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+    }
+}
+
+#[test]
+fn a_blob_page_rewrite_under_the_old_key_lost_on_disk_is_redone_from_the_log() {
+    use std::os::unix::fs::FileExt;
+    let (path, keys, source, _, blob) = encrypted_database("rekey-blob-redo", "c6");
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    let offset = storage.lock().data_page_offset(blob);
+    let (old, uuid) = database_key(&storage, &source);
+    let read_page = || {
+        let mut page = vec![0u8; PAGE_SIZE];
+        std::fs::File::open(&path)
+            .and_then(|file| file.read_exact_at(&mut page, offset))
+            .expect("read blob page");
+        page
+    };
+    let old_codec = crate::encryption::PageCodec::Encrypted(Box::new(
+        crate::encryption::PageKeys::new(&old, &uuid, false).expect("keys"),
+    ));
+    let under_old = |page: &[u8]| old_codec.open(blob, &mut page.to_vec());
+    let before = read_page();
+    assert!(under_old(&before));
+
+    storage.rotate_database_key().expect("rotate");
+    while under_old(&read_page()) {
+        storage.conversion_step(64).expect("step");
+    }
+    drop(storage);
+    // The page write lost: the old key's image is back on disk.
+    std::fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .and_then(|file| file.write_all_at(&before, offset))
+        .expect("restore the old image");
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    assert!(
+        !under_old(&read_page()),
+        "recovery rewrote the blob page under the new key"
+    );
+    let mut body = vec![0u8; crate::relstore::page::BLOB_PAGE_DATA];
+    storage
+        .lock()
+        .page_ctx(0)
+        .read_blob_page(blob, &mut body)
+        .expect("blob page");
+    assert!(body.starts_with(MARKER));
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}
+
+#[test]
+fn a_snapshot_from_before_the_rotation_is_rewritten_before_the_old_key_goes() {
+    let path = unique_temp_path("rekey-snapshot");
+    let keys = key_file(
+        "rekey-snapshot-keys",
+        &format!("main {}\n", "c7".repeat(32)),
+    );
+    let source = KeySource::File(keys.clone());
+    let storage = Storage::create_with_keys(
+        path.clone(),
+        test_storage_options(),
+        no_engine,
+        Some(&source),
+    )
+    .expect("create encrypted");
+    // Only a snapshot under the old key: no page for the pass to rewrite,
+    // and the log empty, so nothing else asks for a checkpoint.
+    storage
+        .write_checkpoint(&MARKER.repeat(1000), 1, 2, 1)
+        .expect("checkpoint");
+    storage.rotate_database_key().expect("rotate");
+    convert(&storage);
+    drop(storage);
+    let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("reopen");
+    let snapshot = storage
+        .load_snapshot()
+        .expect("the snapshot opens under the new key");
+    assert_eq!(snapshot.expect("a snapshot").data, MARKER.repeat(1000));
+    drop(storage);
+    for file in [&path, &keys] {
+        std::fs::remove_file(file).ok();
+    }
+}

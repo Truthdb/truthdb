@@ -252,6 +252,10 @@ pub const KEY_STATE_ENCRYPTED: u8 = 1;
 /// Being converted from plain (`encryption enable`): pages and log entries
 /// may still be plain.
 pub const KEY_STATE_CONVERTING: u8 = 2;
+/// Its key being replaced (`encryption rotate database key`): slot 0 holds
+/// the new key, slot 1 the old one, which pages and log entries may still be
+/// sealed under.
+pub const KEY_STATE_REKEYING: u8 = 3;
 const MAX_SLOTS: usize = 2;
 const SLOTS_OFFSET: usize = 16;
 const MAX_KEY_ID: usize = 32;
@@ -429,7 +433,7 @@ pub fn new_key_block(
     SystemRandom::new()
         .fill(dek.as_mut_slice())
         .map_err(|_| config_error("no randomness for the database key"))?;
-    let block = build_key_block(source, &dek, file_uuid, KEY_STATE_ENCRYPTED)?;
+    let block = build_key_block(source, &[&dek], file_uuid, KEY_STATE_ENCRYPTED)?;
     Ok((block, dek))
 }
 
@@ -442,35 +446,55 @@ pub fn new_converting_key_block(
     SystemRandom::new()
         .fill(dek.as_mut_slice())
         .map_err(|_| config_error("no randomness for the database key"))?;
-    let block = build_key_block(source, &dek, file_uuid, KEY_STATE_CONVERTING)?;
+    let block = build_key_block(source, &[&dek], file_uuid, KEY_STATE_CONVERTING)?;
     Ok((block, dek))
 }
 
-/// A key block's state ([`KEY_STATE_ENCRYPTED`] or [`KEY_STATE_CONVERTING`]).
+/// The key block of a database whose key `old` is being replaced: a fresh
+/// key in slot 0 (whose MAC covers the block), `old` in slot 1. Returns the
+/// block and the new key.
+pub fn new_rekeying_key_block(
+    source: &KeySource,
+    file_uuid: &[u8; 16],
+    old: &[u8; 32],
+) -> Result<([u8; KEY_BLOCK_SIZE], Zeroizing<[u8; 32]>), StorageError> {
+    let mut dek = Zeroizing::new([0u8; 32]);
+    SystemRandom::new()
+        .fill(dek.as_mut_slice())
+        .map_err(|_| config_error("no randomness for the database key"))?;
+    let block = build_key_block(source, &[&dek, old], file_uuid, KEY_STATE_REKEYING)?;
+    Ok((block, dek))
+}
+
+/// A key block's state ([`KEY_STATE_ENCRYPTED`], [`KEY_STATE_CONVERTING`] or
+/// [`KEY_STATE_REKEYING`]).
 pub fn key_block_state(block: &[u8]) -> u8 {
     block.get(8).copied().unwrap_or(0)
 }
 
-/// A key block holding `dek` wrapped by `source`'s current master key.
+/// A key block holding `deks` (one slot each, the first one's MAC) wrapped by
+/// `source`'s current master key.
 fn build_key_block(
     source: &KeySource,
-    dek: &[u8; 32],
+    deks: &[&[u8; 32]],
     file_uuid: &[u8; 16],
     state: u8,
 ) -> Result<[u8; KEY_BLOCK_SIZE], StorageError> {
-    let slot = wrap(source, dek, file_uuid)?;
     let mut block = [0u8; KEY_BLOCK_SIZE];
     block[0..8].copy_from_slice(&KEY_BLOCK_MAGIC);
     block[8] = state;
-    block[9] = 1;
-    let at = SLOTS_OFFSET;
-    block[at] = slot.kind;
-    block[at + 1] = slot.id.len() as u8;
-    block[at + 2..at + 2 + slot.id.len()].copy_from_slice(slot.id.as_bytes());
-    let blob_at = at + 2 + MAX_KEY_ID;
-    block[blob_at..blob_at + 2].copy_from_slice(&(slot.blob.len() as u16).to_le_bytes());
-    block[blob_at + 2..blob_at + 2 + slot.blob.len()].copy_from_slice(&slot.blob);
-    let mac = block_mac(dek, file_uuid, &block);
+    block[9] = deks.len() as u8;
+    for (index, dek) in deks.iter().enumerate() {
+        let slot = wrap(source, dek, file_uuid)?;
+        let at = SLOTS_OFFSET + index * SLOT_SIZE;
+        block[at] = slot.kind;
+        block[at + 1] = slot.id.len() as u8;
+        block[at + 2..at + 2 + slot.id.len()].copy_from_slice(slot.id.as_bytes());
+        let blob_at = at + 2 + MAX_KEY_ID;
+        block[blob_at..blob_at + 2].copy_from_slice(&(slot.blob.len() as u16).to_le_bytes());
+        block[blob_at + 2..blob_at + 2 + slot.blob.len()].copy_from_slice(&slot.blob);
+    }
+    let mac = block_mac(deks[0], file_uuid, &block);
     block[MAC_OFFSET..].copy_from_slice(&mac);
     Ok(block)
 }
@@ -484,7 +508,10 @@ pub fn rewrap_key_block(
     file_uuid: &[u8; 16],
 ) -> Result<[u8; KEY_BLOCK_SIZE], StorageError> {
     let dek = unlock_key_block(block, source, file_uuid)?;
-    build_key_block(source, &dek, file_uuid, key_block_state(block))
+    match unlock_previous_key(block, source, file_uuid)? {
+        Some(old) => build_key_block(source, &[&dek, &old], file_uuid, key_block_state(block)),
+        None => build_key_block(source, &[&dek], file_uuid, key_block_state(block)),
+    }
 }
 
 /// What wraps a key block's database key: `KEY FILE` and its key id, or
@@ -523,13 +550,25 @@ pub fn unlock_key_block(
     if block.len() != KEY_BLOCK_SIZE || block[0..8] != KEY_BLOCK_MAGIC {
         return Err(corrupt("is missing"));
     }
-    if block[8] != KEY_STATE_ENCRYPTED && block[8] != KEY_STATE_CONVERTING {
+    if ![
+        KEY_STATE_ENCRYPTED,
+        KEY_STATE_CONVERTING,
+        KEY_STATE_REKEYING,
+    ]
+    .contains(&block[8])
+    {
         return Err(corrupt(&format!("has unknown state {}", block[8])));
     }
     let count = block[9] as usize;
-    if count == 0 || count > MAX_SLOTS {
+    if count == 0 || count > MAX_SLOTS || (block[8] == KEY_STATE_REKEYING) != (count == 2) {
         return Err(corrupt(&format!("has {count} key slots")));
     }
+    // While rekeying, slot 1 holds the old key: only slot 0's opens the block.
+    let count = if block[8] == KEY_STATE_REKEYING {
+        1
+    } else {
+        count
+    };
     let mut refused = None;
     let mut kinds = Vec::new();
     for index in 0..count {
@@ -579,6 +618,56 @@ pub fn unlock_key_block(
     ))
 }
 
+/// The old key of a block being rekeyed (slot 1), `None` in any other state.
+/// The block is unlocked first: slot 1's bytes count only under a MAC the
+/// new key confirms.
+pub fn unlock_previous_key(
+    block: &[u8],
+    source: &KeySource,
+    file_uuid: &[u8; 16],
+) -> Result<Option<Zeroizing<[u8; 32]>>, StorageError> {
+    unlock_key_block(block, source, file_uuid)?;
+    if block[8] != KEY_STATE_REKEYING {
+        return Ok(None);
+    }
+    let at = SLOTS_OFFSET + SLOT_SIZE;
+    let id_len = block[at + 1] as usize;
+    let blob_at = at + 2 + MAX_KEY_ID;
+    let blob_len = u16::from_le_bytes([block[blob_at], block[blob_at + 1]]) as usize;
+    if id_len > MAX_KEY_ID || blob_len > MAX_BLOB {
+        return Err(StorageError::InvalidFile(
+            "the key block has a malformed key slot".to_string(),
+        ));
+    }
+    let slot = Slot {
+        kind: block[at],
+        id: String::from_utf8_lossy(&block[at + 2..at + 2 + id_len]).into_owned(),
+        blob: block[blob_at + 2..blob_at + 2 + blob_len].to_vec(),
+    };
+    unwrap(source, &slot, file_uuid)?.map(Some).ok_or_else(|| {
+        config_error("the configured master key does not unwrap this database's old key")
+    })
+}
+
+/// Builds the page codec of an encrypted database from its key block, in
+/// whichever state it is.
+pub fn codec_for_key_block(
+    block: &[u8],
+    source: &KeySource,
+    file_uuid: &[u8; 16],
+) -> Result<PageCodec, StorageError> {
+    let dek = unlock_key_block(block, source, file_uuid)?;
+    let keys = match key_block_state(block) {
+        KEY_STATE_CONVERTING => PageKeys::new(&dek, file_uuid, true)?,
+        KEY_STATE_REKEYING => {
+            let old = unlock_previous_key(block, source, file_uuid)?.expect("a rekeying block");
+            PageKeys::rekeying(&dek, &old, file_uuid)
+        }
+        _ => PageKeys::new(&dek, file_uuid, false)?,
+    };
+    Ok(PageCodec::Encrypted(Box::new(keys)))
+}
+
 /// Constant-time equality.
 fn equal(a: &[u8], b: &[u8]) -> bool {
     a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
@@ -596,11 +685,52 @@ pub enum RawPage {
 /// while it is being converted, a page without it is still plain.
 pub const PAGE_FLAG_SEALED: u16 = 1;
 
-/// The keys of an encrypted database.
-pub struct PageKeys {
+/// The page keys derived from one database key.
+struct PageKeySet {
     page: Xts128<Aes256>,
     snapshot: Xts128<Aes256>,
     mac: hmac::Key,
+}
+
+impl PageKeySet {
+    fn new(dek: &[u8; 32], file_uuid: &[u8; 16]) -> Self {
+        PageKeySet {
+            page: xts(&derive::<64>(dek, file_uuid, "truthdb page xts")),
+            snapshot: xts(&derive::<64>(dek, file_uuid, "truthdb snapshot xts")),
+            mac: hmac::Key::new(
+                hmac::HMAC_SHA256,
+                derive::<32>(dek, file_uuid, "truthdb page mac").as_slice(),
+            ),
+        }
+    }
+
+    fn page_mac(&self, page_no: u64, page: &[u8]) -> [u8; 8] {
+        let mut context = hmac::Context::with_key(&self.mac);
+        context.update(&page_no.to_le_bytes());
+        context.update(&page[8..]);
+        context.sign().as_ref()[..8].try_into().expect("8 bytes")
+    }
+
+    /// Verifies and decrypts a sealed page in place; false (and the page
+    /// untouched) when it was not sealed under these keys.
+    fn open(&self, page_no: u64, page: &mut [u8]) -> bool {
+        if !equal(&self.page_mac(page_no, page), &page[0..8]) {
+            return false;
+        }
+        let lsn = page::page_lsn(page);
+        self.page
+            .decrypt_sector(&mut page[page::PAGE_HEADER_SIZE..], tweak(page_no, lsn));
+        page[0..8].fill(0);
+        true
+    }
+}
+
+/// The keys of an encrypted database.
+pub struct PageKeys {
+    current: PageKeySet,
+    /// While the database key is being replaced: the old key's, which pages
+    /// not rewritten yet are still sealed under.
+    previous: Option<PageKeySet>,
     wal: std::sync::Arc<WalKeys>,
 }
 
@@ -646,6 +776,14 @@ pub struct WalKeys {
     /// The database is being converted from plain: plain pages and log
     /// entries are still accepted.
     converting: std::sync::atomic::AtomicBool,
+    /// The database's key is being replaced: entries the old key sealed.
+    previous: std::sync::Mutex<Option<PreviousWalKey>>,
+}
+
+/// The old database key of a rekeying, for the log entries it sealed.
+struct PreviousWalKey {
+    dek: Zeroizing<[u8; 32]>,
+    readers: std::collections::HashMap<u64, aead::LessSafeKey>,
 }
 
 /// One writer's sealing key.
@@ -674,6 +812,7 @@ impl WalKeys {
             file_uuid: *file_uuid,
             readers: Default::default(),
             converting: std::sync::atomic::AtomicBool::new(converting),
+            previous: Default::default(),
         }
     }
 
@@ -683,19 +822,31 @@ impl WalKeys {
         self.converting.load(std::sync::atomic::Ordering::Acquire)
     }
 
-    /// The conversion finished: from now on only sealed pages and entries
-    /// are accepted.
+    /// Whether the database's key is being replaced (entries sealed under
+    /// the old key are still accepted).
+    pub fn rekeying(&self) -> bool {
+        self.previous
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+            .is_some()
+    }
+
+    /// The conversion or rekeying finished: from now on only entries sealed
+    /// under the current key are accepted.
     pub fn finish_conversion(&self) {
         self.converting
             .store(false, std::sync::atomic::Ordering::Release);
+        *self.previous.lock().unwrap_or_else(|err| err.into_inner()) = None;
     }
 
-    /// `block` with its state set to `state` (and its MAC renewed; the
-    /// wrapped key is unchanged).
-    pub fn restate_key_block(&self, block: &[u8], state: u8) -> [u8; KEY_BLOCK_SIZE] {
+    /// `block` settled in state Encrypted: its first slot only (the current
+    /// key, the old one of a rekeying dropped), its MAC renewed.
+    pub fn settle_key_block(&self, block: &[u8]) -> [u8; KEY_BLOCK_SIZE] {
         let mut out = [0u8; KEY_BLOCK_SIZE];
         out.copy_from_slice(block);
-        out[8] = state;
+        out[8] = KEY_STATE_ENCRYPTED;
+        out[9] = 1;
+        out[SLOTS_OFFSET + SLOT_SIZE..MAC_OFFSET].fill(0);
         let mac = block_mac(&self.dek, &self.file_uuid, &out);
         out[MAC_OFFSET..].copy_from_slice(&mac);
         out
@@ -721,17 +872,23 @@ impl WalKeys {
             return None;
         }
         let writer_id = u64::from_le_bytes(stored[..8].try_into().expect("8 bytes"));
-        let mut readers = self.readers.lock().unwrap_or_else(|err| err.into_inner());
-        let key = readers
+        let opened = {
+            let mut readers = self.readers.lock().unwrap_or_else(|err| err.into_inner());
+            let key = readers
+                .entry(writer_id)
+                .or_insert_with(|| wal_key(&self.dek, &self.file_uuid, writer_id));
+            open_with(key, lsn, aad, stored)
+        };
+        if opened.is_some() {
+            return opened;
+        }
+        let mut previous = self.previous.lock().unwrap_or_else(|err| err.into_inner());
+        let previous = previous.as_mut()?;
+        let key = previous
+            .readers
             .entry(writer_id)
-            .or_insert_with(|| wal_key(&self.dek, &self.file_uuid, writer_id));
-        let mut sealed = stored[8..].to_vec();
-        let plain_len = key
-            .open_in_place(wal_nonce(lsn), aead::Aad::from(aad), &mut sealed)
-            .ok()?
-            .len();
-        sealed.truncate(plain_len);
-        Some(sealed)
+            .or_insert_with(|| wal_key(&previous.dek, &self.file_uuid, writer_id));
+        open_with(key, lsn, aad, stored)
     }
 
     /// Identifies the database key without revealing it: equal for two
@@ -741,6 +898,17 @@ impl WalKeys {
             .try_into()
             .expect("16 bytes")
     }
+}
+
+/// An entry's plaintext, if `key` opens it.
+fn open_with(key: &aead::LessSafeKey, lsn: u64, aad: &[u8], stored: &[u8]) -> Option<Vec<u8>> {
+    let mut sealed = stored[8..].to_vec();
+    let plain_len = key
+        .open_in_place(wal_nonce(lsn), aead::Aad::from(aad), &mut sealed)
+        .ok()?
+        .len();
+    sealed.truncate(plain_len);
+    Some(sealed)
 }
 
 impl WalSealer {
@@ -777,21 +945,25 @@ impl PageKeys {
         converting: bool,
     ) -> Result<Self, StorageError> {
         Ok(PageKeys {
-            page: xts(&derive::<64>(dek, file_uuid, "truthdb page xts")),
-            snapshot: xts(&derive::<64>(dek, file_uuid, "truthdb snapshot xts")),
-            mac: hmac::Key::new(
-                hmac::HMAC_SHA256,
-                derive::<32>(dek, file_uuid, "truthdb page mac").as_slice(),
-            ),
+            current: PageKeySet::new(dek, file_uuid),
+            previous: None,
             wal: std::sync::Arc::new(WalKeys::new(dek, file_uuid, converting)),
         })
     }
 
-    fn page_mac(&self, page_no: u64, page: &[u8]) -> [u8; 8] {
-        let mut context = hmac::Context::with_key(&self.mac);
-        context.update(&page_no.to_le_bytes());
-        context.update(&page[8..]);
-        context.sign().as_ref()[..8].try_into().expect("8 bytes")
+    /// The keys of a database whose key `old` is being replaced by `dek`:
+    /// everything is sealed under `dek`, and what `old` sealed still opens.
+    pub fn rekeying(dek: &[u8; 32], old: &[u8; 32], file_uuid: &[u8; 16]) -> Self {
+        let wal = WalKeys::new(dek, file_uuid, false);
+        *wal.previous.lock().unwrap_or_else(|err| err.into_inner()) = Some(PreviousWalKey {
+            dek: Zeroizing::new(*old),
+            readers: Default::default(),
+        });
+        PageKeys {
+            current: PageKeySet::new(dek, file_uuid),
+            previous: Some(PageKeySet::new(old, file_uuid)),
+            wal: std::sync::Arc::new(wal),
+        }
     }
 }
 
@@ -835,9 +1007,10 @@ impl PageCodec {
                 let flags = u16::from_le_bytes([out[18], out[19]]) | PAGE_FLAG_SEALED;
                 out[18..20].copy_from_slice(&flags.to_le_bytes());
                 let lsn = page::page_lsn(out);
-                keys.page
+                keys.current
+                    .page
                     .encrypt_sector(&mut out[page::PAGE_HEADER_SIZE..], tweak(page_no, lsn));
-                let mac = keys.page_mac(page_no, out);
+                let mac = keys.current.page_mac(page_no, out);
                 out[0..8].copy_from_slice(&mac);
             }
         }
@@ -856,15 +1029,52 @@ impl PageCodec {
                 if flags & PAGE_FLAG_SEALED == 0 && keys.wal.converting() {
                     return page::verify_checksum(page);
                 }
-                if !equal(&keys.page_mac(page_no, page), &page[0..8]) {
-                    return false;
-                }
-                let lsn = page::page_lsn(page);
-                keys.page
-                    .decrypt_sector(&mut page[page::PAGE_HEADER_SIZE..], tweak(page_no, lsn));
-                page[0..8].fill(0);
-                true
+                keys.current.open(page_no, page)
+                    || keys
+                        .previous
+                        .as_ref()
+                        .is_some_and(|previous| previous.open(page_no, page))
             }
+        }
+    }
+
+    /// [`Self::open`] for a page sealed under the current key only: false for
+    /// a plain page, or one the old key of a rekeying sealed (which a pass
+    /// still has to rewrite).
+    #[must_use]
+    pub fn open_current(&self, page_no: u64, page: &mut [u8]) -> bool {
+        assert_eq!(page.len(), PAGE_SIZE);
+        match self {
+            PageCodec::Plain => page::verify_checksum(page),
+            PageCodec::Encrypted(keys) => {
+                let flags = u16::from_le_bytes([page[18], page[19]]);
+                flags & PAGE_FLAG_SEALED != 0 && keys.current.open(page_no, page)
+            }
+        }
+    }
+
+    /// Opens a page the old key of a rekeying sealed; false in any other
+    /// case.
+    #[must_use]
+    pub fn open_previous(&self, page_no: u64, page: &mut [u8]) -> bool {
+        match self {
+            PageCodec::Encrypted(keys) => keys
+                .previous
+                .as_ref()
+                .is_some_and(|previous| previous.open(page_no, page)),
+            PageCodec::Plain => false,
+        }
+    }
+
+    /// Whether the database's key is being replaced.
+    pub fn rekeying(&self) -> bool {
+        matches!(self, PageCodec::Encrypted(keys) if keys.previous.is_some())
+    }
+
+    /// The rekeying finished: pages the old key sealed no longer open.
+    pub fn finish_rekeying(&mut self) {
+        if let PageCodec::Encrypted(keys) = self {
+            keys.previous = None;
         }
     }
 
@@ -873,18 +1083,40 @@ impl PageCodec {
     pub fn seal_raw(&self, kind: RawPage, index: u64, generation: u64, page: &mut [u8]) {
         if let PageCodec::Encrypted(keys) = self {
             match kind {
-                RawPage::Snapshot => keys.snapshot.encrypt_sector(page, tweak(index, generation)),
+                RawPage::Snapshot => keys
+                    .current
+                    .snapshot
+                    .encrypt_sector(page, tweak(index, generation)),
             }
         }
     }
 
-    /// Decrypts a raw page sealed by [`Self::seal_raw`].
-    pub fn open_raw(&self, kind: RawPage, index: u64, generation: u64, page: &mut [u8]) {
-        if let PageCodec::Encrypted(keys) = self {
-            match kind {
-                RawPage::Snapshot => keys.snapshot.decrypt_sector(page, tweak(index, generation)),
+    /// Decrypts a raw page sealed by [`Self::seal_raw`]. `previous`: under
+    /// the old key of a rekeying (raw pages carry no MAC: the caller checks
+    /// the result); false when there is none.
+    pub fn open_raw(
+        &self,
+        kind: RawPage,
+        index: u64,
+        generation: u64,
+        page: &mut [u8],
+        previous: bool,
+    ) -> bool {
+        let PageCodec::Encrypted(keys) = self else {
+            return !previous;
+        };
+        let set = if previous {
+            match &keys.previous {
+                Some(set) => set,
+                None => return false,
             }
+        } else {
+            &keys.current
+        };
+        match kind {
+            RawPage::Snapshot => set.snapshot.decrypt_sector(page, tweak(index, generation)),
         }
+        true
     }
 }
 
@@ -1150,9 +1382,9 @@ mod tests {
         codec.seal_raw(RawPage::Snapshot, 4, 9, &mut page);
         assert!(!page.windows(12).any(|w| w == b"CANARY-VALUE"));
         let mut wrong = page.clone();
-        codec.open_raw(RawPage::Snapshot, 4, 10, &mut wrong);
+        assert!(codec.open_raw(RawPage::Snapshot, 4, 10, &mut wrong, false));
         assert_ne!(wrong, plain);
-        codec.open_raw(RawPage::Snapshot, 4, 9, &mut page);
+        assert!(codec.open_raw(RawPage::Snapshot, 4, 9, &mut page, false));
         assert_eq!(page, plain);
         // Plain leaves them as they are.
         PageCodec::Plain.seal_raw(RawPage::Snapshot, 4, 0, &mut page);
