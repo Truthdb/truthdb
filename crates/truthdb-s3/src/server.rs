@@ -163,15 +163,53 @@ where
         .await;
 }
 
-async fn handle(state: &S3State, request: Request<Incoming>) -> Response<Body> {
-    let resource = request.uri().path().to_string();
-    match route(state, request).await {
-        Ok(response) => response,
-        Err(err) => error_response(&err, &resource),
+/// A request's identifiers, as S3 gives them: `x-amz-request-id` (16
+/// uppercase hex digits) and `x-amz-id-2` (the "host id", base64), on every
+/// answer and in error documents. Kept in the request's extensions.
+#[derive(Debug, Clone)]
+pub struct RequestIds {
+    pub request_id: String,
+    pub host_id: String,
+}
+
+impl RequestIds {
+    fn new() -> Self {
+        use base64::Engine as _;
+        use ring::rand::SecureRandom;
+        let mut bytes = [0u8; 8 + 24];
+        // No randomness: identifiers of zeros (they only label the request).
+        let _ = ring::rand::SystemRandom::new().fill(&mut bytes);
+        RequestIds {
+            request_id: bytes[..8]
+                .iter()
+                .map(|byte| format!("{byte:02X}"))
+                .collect(),
+            host_id: base64::engine::general_purpose::STANDARD.encode(&bytes[8..]),
+        }
     }
 }
 
-pub fn error_response(err: &S3Error, resource: &str) -> Response<Body> {
+async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Body> {
+    let resource = request.uri().path().to_string();
+    let ids = RequestIds::new();
+    request.extensions_mut().insert(ids.clone());
+    let mut response = match route(state, request).await {
+        Ok(response) => response,
+        Err(err) => error_response(&err, &resource, &ids),
+    };
+    let headers = response.headers_mut();
+    for (name, value) in [
+        ("x-amz-request-id", &ids.request_id),
+        ("x-amz-id-2", &ids.host_id),
+    ] {
+        if let Ok(value) = hyper::header::HeaderValue::from_str(value) {
+            headers.insert(name, value);
+        }
+    }
+    response
+}
+
+pub fn error_response(err: &S3Error, resource: &str, ids: &RequestIds) -> Response<Body> {
     let mut builder = Response::builder()
         .status(StatusCode::from_u16(err.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
         .header("content-type", "application/xml");
@@ -179,7 +217,7 @@ pub fn error_response(err: &S3Error, resource: &str) -> Response<Body> {
         builder = builder.header(*name, value);
     }
     builder
-        .body(full(err.to_xml(resource)))
+        .body(full(err.to_xml(resource, ids)))
         .expect("a valid response")
 }
 

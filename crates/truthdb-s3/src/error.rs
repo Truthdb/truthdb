@@ -63,12 +63,14 @@ impl S3Error {
     }
 
     /// The XML body; `resource` is the request path.
-    pub fn to_xml(&self, resource: &str) -> String {
+    pub fn to_xml(&self, resource: &str, ids: &crate::server::RequestIds) -> String {
         format!(
-            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{}</Code><Message>{}</Message><Resource>{}</Resource></Error>",
+            "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<Error><Code>{}</Code><Message>{}</Message><Resource>{}</Resource><RequestId>{}</RequestId><HostId>{}</HostId></Error>",
             self.code,
             escape(&self.message),
-            escape(resource)
+            escape(resource),
+            ids.request_id,
+            ids.host_id
         )
     }
 }
@@ -95,9 +97,14 @@ mod tests {
 
     #[test]
     fn errors_render_as_s3_xml() {
-        let xml = S3Error::access_denied("no <entry> & such").to_xml("/b/k");
+        let ids = crate::server::RequestIds {
+            request_id: "0123456789ABCDEF".into(),
+            host_id: "aG9zdA==".into(),
+        };
+        let xml = S3Error::access_denied("no <entry> & such").to_xml("/b/k", &ids);
         assert!(xml.contains("<Code>AccessDenied</Code>"));
         assert!(xml.contains("no &lt;entry&gt; &amp; such"));
         assert!(xml.contains("<Resource>/b/k</Resource>"));
+        assert!(xml.contains("<RequestId>0123456789ABCDEF</RequestId><HostId>aG9zdA==</HostId>"));
     }
 }

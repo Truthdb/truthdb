@@ -375,7 +375,7 @@ pub async fn put_object(
     let headers = request.headers().clone();
     let sealed = receive_body(state, request, auth, customer.as_ref()).await?;
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
-    let (stored, versioning) = object(state, move |file| {
+    let (stored, versioning) = crate::scope::object_as(state, "PutObject", move |file| {
         let now = now_ms();
         // Decided in the write's own lock hold: the bucket's Object Lock
         // may have changed while the body arrived (a default retention set,

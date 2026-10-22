@@ -6747,3 +6747,68 @@ fn a_fixed_date_that_ends_an_event_hold_is_authorized_as_a_release() {
     let (status, reply) = put(true, &later);
     assert_eq!(status, 200, "{reply}");
 }
+
+#[test]
+fn every_answer_names_its_request_and_the_journal_names_who_made_each_change() {
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, key, secret) = account_with_key(&server, "origins");
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_with(port, method, path, query, &[], body, &key, Some(&secret))
+    };
+    let ids = |head: &str| {
+        (
+            response_header(head, "x-amz-request-id").expect("a request id"),
+            response_header(head, "x-amz-id-2").expect("a host id"),
+        )
+    };
+    let (head, (status, _)) = call("PUT", "/origins", "", b"");
+    assert_eq!(status, 200);
+    let (bucket_id, _) = ids(&head);
+    assert_eq!(bucket_id.len(), 16);
+    assert!(
+        bucket_id
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'A'..=b'F').contains(&b)),
+        "{bucket_id}"
+    );
+    let (head, (status, _)) = call("PUT", "/origins/k", "", b"x");
+    assert_eq!(status, 200);
+    let (put_id, _) = ids(&head);
+    assert_ne!(put_id, bucket_id, "each request its own");
+    // An error names its request in its document too.
+    let (head, (status, body)) = call("GET", "/origins/missing", "", b"");
+    assert_eq!(status, 404);
+    let (error_id, host_id) = ids(&head);
+    assert!(
+        body.contains(&format!(
+            "<RequestId>{error_id}</RequestId><HostId>{host_id}</HostId>"
+        )),
+        "{body}"
+    );
+    let (head, (status, _)) = call("DELETE", "/origins/k", "", b"");
+    assert_eq!(status, 204);
+    let (delete_id, _) = ids(&head);
+    // The journal names the account, the address and the request of each
+    // change.
+    let reply = native(
+        server.native_port,
+        "SELECT record_type, requester, source_ip_address, request_id \
+         FROM sys.s3_journal('origins') ORDER BY sequence_number",
+    );
+    let rows = reply["results"][0]["rows"]
+        .as_array()
+        .expect("rows")
+        .clone();
+    let row = |i: usize| -> Vec<String> {
+        rows[i]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|cell| cell.as_str().unwrap_or("NULL").to_string())
+            .collect()
+    };
+    assert_eq!(rows.len(), 2, "{reply}");
+    assert_eq!(row(0), ["CREATE", &account, "127.0.0.1", &put_id]);
+    assert_eq!(row(1), ["DELETE", &account, "127.0.0.1", &delete_id]);
+}

@@ -27,17 +27,18 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
-/// Deletes `key` (a version of it with `which`); `bypass` lifts Object
-/// Lock's GOVERNANCE retention.
+/// Deletes `key` (a version of it with `which`) as S3 operation
+/// `operation`; `bypass` lifts Object Lock's GOVERNANCE retention.
 async fn delete_one(
     state: &S3State,
+    operation: &str,
     bucket: &str,
     key: &str,
     which: Option<VersionSel>,
     bypass: bool,
 ) -> Result<Deleted, S3Error> {
     let (bucket_name, key_name) = (bucket.to_string(), key.to_string());
-    crate::scope::object(state, move |file| {
+    crate::scope::object_as(state, operation, move |file| {
         file.transaction(|tx| {
             tx.delete_object(
                 &bucket_name,
@@ -69,7 +70,7 @@ pub async fn delete_object(
         authz,
         crate::authz::Resource::Object(&bucket, &key),
     );
-    let deleted = delete_one(state, &bucket, &key, which, bypass).await?;
+    let deleted = delete_one(state, "DeleteObject", &bucket, &key, which, bypass).await?;
     let mut response = Response::builder().status(StatusCode::NO_CONTENT);
     if let Some(version) = deleted.version {
         response = response.header(
@@ -276,7 +277,7 @@ pub async fn delete_objects(
         let outcome = match authz.check_with(action, resource, &context) {
             Ok(()) => {
                 let bypass = crate::object_lock::bypasses(&headers, authz, resource);
-                delete_one(state, &bucket, &object.key, which, bypass).await
+                delete_one(state, "DeleteObjects", &bucket, &object.key, which, bypass).await
             }
             Err(err) => Err(err),
         };

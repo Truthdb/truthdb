@@ -192,7 +192,7 @@ async fn copy_whole(
     let lookup_source_key = source_key.clone();
     // Resolve and share (or lease) in one lock hold: the source cannot
     // change between.
-    let step = object(state, move |file| {
+    let step = crate::scope::object_as(state, "CopyObject", move |file| {
         let source = match resolve_source(
             file,
             &src_bucket,
@@ -316,7 +316,7 @@ async fn copy_whole(
                 .await;
             let sealed = copied?;
             let (dst_bucket, dst_key) = (bucket.clone(), key.clone());
-            let (stored, versioning) = object(state, move |file| {
+            let (stored, versioning) = crate::scope::object_as(state, "CopyObject", move |file| {
                 let now = now_ms();
                 // Decided in the write's own lock hold (see `put_object`).
                 let (bucket_lock, default) = crate::object_lock::bucket_state(file, &dst_bucket)?;

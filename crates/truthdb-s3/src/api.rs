@@ -283,6 +283,11 @@ pub async fn dispatch(
                 !(creating && matches!(&target, Target::Bucket(created) if created == bucket))
             })
             .collect(),
+        origin: Some(crate::scope::origin(
+            request.extensions().get(),
+            connection,
+            principal.as_ref(),
+        )),
     };
     crate::scope::within(scope, async move {
         // Refused before the body is read, too.
@@ -354,6 +359,7 @@ async fn account_public_access(
     let scope = crate::scope::Scope {
         key: Some((principal.access_key.clone(), principal.account.clone())),
         buckets: Vec::new(),
+        origin: None,
     };
     let account = principal.account.clone();
     crate::scope::within(scope, async move {

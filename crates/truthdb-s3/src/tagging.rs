@@ -199,12 +199,23 @@ pub async fn put_tagging(
         crate::authz::Resource::Object(&bucket, &key),
         &context,
     )?;
-    set_tags(state, bucket, key, which, tags, StatusCode::OK).await
+    set_tags(
+        state,
+        "PutObjectTagging",
+        bucket,
+        key,
+        which,
+        tags,
+        StatusCode::OK,
+    )
+    .await
 }
 
-/// Replaces the tags and answers with `status` and the version changed.
+/// Replaces the tags as S3 operation `operation` and answers with `status`
+/// and the version changed.
 async fn set_tags(
     state: &S3State,
+    operation: &str,
     bucket: String,
     key: String,
     which: VersionSel,
@@ -212,7 +223,7 @@ async fn set_tags(
     status: StatusCode,
 ) -> Result<Response<Body>, S3Error> {
     let (tag_bucket, tag_key) = (bucket.clone(), key.clone());
-    let (changed, versioning) = object(state, move |file| {
+    let (changed, versioning) = crate::scope::object_as(state, operation, move |file| {
         let changed =
             file.transaction(|tx| tx.set_tags(&tag_bucket, &tag_key, which, tags, now_ms()))?;
         Ok((changed, versioning_of(file, &tag_bucket)?))
@@ -235,6 +246,7 @@ pub async fn delete_tagging(
     let which = version_sel(request.uri().query().unwrap_or(""))?;
     set_tags(
         state,
+        "DeleteObjectTagging",
         bucket,
         key,
         which,

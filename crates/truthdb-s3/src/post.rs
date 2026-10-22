@@ -435,6 +435,10 @@ pub async fn post_object(
     bucket: String,
 ) -> Result<Response<Body>, S3Error> {
     let connection = request.extensions().get::<Connection>().copied();
+    let ids = request
+        .extensions()
+        .get::<crate::server::RequestIds>()
+        .cloned();
     // The policy context sees only what the form acts on: the client's
     // identification here, the acl and encryption fields below (other
     // headers, such as a copy source, would satisfy conditions the upload
@@ -568,6 +572,11 @@ pub async fn post_object(
             .as_ref()
             .map(|(principal, _)| (principal.access_key.clone(), principal.account.clone())),
         buckets: authz.owners(),
+        origin: Some(crate::scope::origin(
+            ids.as_ref(),
+            connection,
+            principal.as_ref().map(|(principal, _)| principal),
+        )),
     };
     let redirect = field(&fields, "success_action_redirect").map(str::to_string);
     // Refused before the upload, not after it is stored.
@@ -621,7 +630,7 @@ pub async fn post_object(
         }
         let (sealed, _) = sink.finish(state).await?;
         let (bucket_name, key_name) = (bucket.clone(), key.clone());
-        let (stored, versioning) = object(state, move |file| {
+        let (stored, versioning) = crate::scope::object_as(state, "PostObject", move |file| {
             let now = crate::objects::now_ms();
             // Decided in the write's own lock hold (see `put_object`).
             let (bucket_lock, default) = crate::object_lock::bucket_state(file, &bucket_name)?;
