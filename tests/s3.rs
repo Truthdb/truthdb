@@ -7536,11 +7536,12 @@ fn a_presigned_urls_x_amz_parameters_are_its_headers() {
     // Spaces around a value are dropped, as around a header's.
     let target = url("/hoist/h", "x-amz-meta-pad=%20padded%20");
     assert_eq!(send_presigned(port, "PUT", &target, b"x").1.0, 200);
-    let (head, _) = send_with(port, "HEAD", "/hoist/h", "", &[], b"", &key, Some(&secret));
-    assert_eq!(
-        response_header(&head, "x-amz-meta-pad").as_deref(),
-        Some("padded")
+    // (Stored so: HTTP itself trims a header's spaces.)
+    let reply = native(
+        server.native_port,
+        "SELECT value FROM sys.s3_object_metadata('hoist', 'h') WHERE name = 'pad'",
     );
+    assert_eq!(reply["results"][0]["rows"][0][0], "padded", "{reply}");
     // A customer-provided key never travels in a URL; nor are temporary
     // credentials taken in any spelling.
     for extra in [
