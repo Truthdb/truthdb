@@ -9,6 +9,7 @@ pub mod error;
 pub mod iam_api;
 pub mod listing;
 pub mod multipart;
+pub mod object_lock;
 pub mod objects;
 pub mod payload;
 pub mod policy;

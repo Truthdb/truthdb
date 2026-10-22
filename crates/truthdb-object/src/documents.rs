@@ -23,6 +23,10 @@ pub const PUBLIC_ACCESS_BLOCK: u8 = 2;
 /// A bucket configuration: its default encryption settings (one byte, see
 /// `truthdb-s3`'s `sse`).
 pub const BUCKET_ENCRYPTION: u8 = 3;
+/// A bucket configuration: its Object Lock default retention (see
+/// `truthdb-s3`'s `object_lock`; whether Object Lock is enabled is the
+/// bucket's own).
+pub const OBJECT_LOCK_DEFAULT: u8 = 4;
 
 fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
     [prefix, &chunk.to_be_bytes()].concat()

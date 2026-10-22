@@ -106,11 +106,14 @@ pub(crate) async fn check_upload(
     }
 }
 
+/// CreateMultipartUpload. `lock` is the Object Lock its headers ask for
+/// (authorized by the caller), which the object gets on completion.
 pub async fn create_upload(
     state: &S3State,
     request: Request<Incoming>,
     bucket: String,
     key: String,
+    lock: Option<truthdb_object::ObjectLock>,
 ) -> Result<Response<Body>, S3Error> {
     let mut attrs = attrs_from(request.headers())?;
     let encrypted_at_rest = state.storage.is_encrypted();
@@ -126,10 +129,23 @@ pub async fn create_upload(
     let customer_key = attrs.customer_key.clone();
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let upload = object(state, move |file| {
-        file.transaction(|tx| tx.create_upload(&bucket_name, &key_name, &attrs, now_ms()))
+        let (bucket_lock, _) = crate::object_lock::bucket_state(file, &bucket_name)?;
+        if lock.is_some() && !bucket_lock && file.bucket(&bucket_name)?.is_some() {
+            return Ok(Err(None));
+        }
+        file.transaction(|tx| {
+            let upload = tx.create_upload(&bucket_name, &key_name, &attrs, now_ms())?;
+            if let (Ok(upload), Some(lock)) = (&upload, &lock) {
+                tx.set_upload_lock(*upload, lock)?;
+            }
+            Ok(upload.map_err(Some))
+        })
     })
     .await?
-    .map_err(|err| object_error(err, &bucket, &key))?;
+    .map_err(|err| match err {
+        Some(err) => object_error(err, &bucket, &key),
+        None => S3Error::invalid_request("Bucket is missing Object Lock Configuration"),
+    })?;
     let mut response = xml(format!(
         "<InitiateMultipartUploadResult xmlns=\"{XMLNS}\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{upload}</UploadId></InitiateMultipartUploadResult>",
         escape(&bucket),
@@ -347,8 +363,21 @@ pub async fn complete_upload(
     let listed = parse_complete(&body)?;
     let bucket_name = bucket.clone();
     let (completed, versioning) = object(state, move |file| {
-        let completed =
-            file.transaction(|tx| tx.complete_upload(upload, &listed, now_ms(), DROP_GRACE_MS))?;
+        let now = now_ms();
+        let (_, default) = crate::object_lock::bucket_state(file, &bucket_name)?;
+        let completed = file.transaction(|tx| {
+            let completed = tx.complete_upload(upload, &listed, now, DROP_GRACE_MS)?;
+            // The object has the lock its upload asked for; without a
+            // retention, the bucket's default one, from now.
+            if let (Ok(info), Some(default)) = (&completed, default) {
+                let mut lock = tx.lock_of(info.version)?;
+                if lock.retention.is_none() {
+                    lock.retention = Some(default.retention(now));
+                    tx.set_lock(info.version, &lock)?;
+                }
+            }
+            Ok(completed)
+        })?;
         Ok((completed, versioning_of(file, &bucket_name)?))
     })
     .await?;

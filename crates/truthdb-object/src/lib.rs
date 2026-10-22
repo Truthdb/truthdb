@@ -21,6 +21,7 @@ mod fulltext;
 mod gc;
 mod journal;
 mod listing;
+mod locks;
 mod objects;
 mod uploads;
 
@@ -41,7 +42,9 @@ pub use accounts::{AccountError, AccountInfo, DEFAULT_ACCOUNT, UserInfo, valid_a
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use credentials::AccessKey;
-pub use documents::{BUCKET_ENCRYPTION, BUCKET_POLICY, ManagedPolicy, PUBLIC_ACCESS_BLOCK};
+pub use documents::{
+    BUCKET_ENCRYPTION, BUCKET_POLICY, ManagedPolicy, OBJECT_LOCK_DEFAULT, PUBLIC_ACCESS_BLOCK,
+};
 pub use fulltext::{
     DEFAULT_FULLTEXT_MAX_BYTES, FtBucket, FtError, FtKey, FtState, FtStatus, MAX_FULLTEXT_BYTES,
     fulltext_status,
@@ -49,6 +52,7 @@ pub use fulltext::{
 pub use gc::GcOutcome;
 pub use journal::{JournalObject, JournalRecord, RecordType};
 pub use listing::{ListAfter, ListedObject, Listing};
+pub use locks::{ObjectLock, Retention, RetentionMode};
 pub use objects::{
     CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, VersionSel, version_id,
 };
@@ -106,6 +110,9 @@ const POLICIES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 20;
 /// (bucket, 0, kind, id, 0, chunk) -> a slice of a bucket's configuration
 /// (see `documents`).
 const BUCKET_CONFIG_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 21;
+/// Version -> its Object Lock retention and legal hold (and (1, upload) ->
+/// those an upload's object will have; see `locks`).
+const LOCKS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 22;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -225,7 +232,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 22;
+const TREE_COUNT: usize = 23;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -306,6 +313,9 @@ impl Trees {
     }
     pub fn bucket_config(&self) -> BTree {
         self.tree(BUCKET_CONFIG_TREE)
+    }
+    pub fn locks(&self) -> BTree {
+        self.tree(LOCKS_TREE)
     }
 }
 

@@ -137,7 +137,7 @@ fn a_search_finds_ranks_and_checks_each_hit_against_the_latest_version() {
     put(&engine, "docs", "recipe.txt", "A recipe for soup.");
     engine
         .object(|file| {
-            file.transaction(|tx| tx.delete_object("docs", "logs/a.log", None, 3_000, 0))
+            file.transaction(|tx| tx.delete_object("docs", "logs/a.log", None, false, 3_000, 0))
         })
         .unwrap()
         .unwrap();

@@ -307,16 +307,21 @@ impl Authz {
     /// Checks `action` on `resource` for an operation that stores the tags of
     /// an `x-amz-tagging` header (`tags`: `None` when it stores none): the
     /// tags are its `s3:RequestObjectTag/...`, and storing them also needs
-    /// `s3:PutObjectTagging`, as in AWS.
+    /// `s3:PutObjectTagging`, as in AWS. `lock` is the Object Lock the write
+    /// asks for, in its `s3:object-lock-*` keys.
     pub fn check_storing(
         &self,
         action: &str,
         resource: Resource<'_>,
         tags: Option<&[(String, String)]>,
+        lock: Option<&truthdb_object::ObjectLock>,
     ) -> Result<(), S3Error> {
         let mut context = self.context.clone();
         if let Some(tags) = tags {
             set_request_tags(&mut context, tags);
+        }
+        if let Some(lock) = lock {
+            crate::object_lock::set_condition_keys(&mut context, lock, crate::objects::now_ms());
         }
         self.check_with(action, resource, &context)?;
         if tags.is_some() {

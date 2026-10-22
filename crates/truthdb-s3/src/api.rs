@@ -46,7 +46,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "cors",
     "intelligent-tiering",
     "inventory",
-    "legal-hold",
     "lifecycle",
     "logging",
     "metadataAnnotationTable",
@@ -56,12 +55,10 @@ const UNIMPLEMENTED: &[&str] = &[
     "metadataTable",
     "metrics",
     "notification",
-    "object-lock",
     "renameObject",
     "replication",
     "requestPayment",
     "restore",
-    "retention",
     "select",
     "session",
     "torrent",
@@ -74,11 +71,14 @@ const SUBRESOURCES: &[&str] = &[
     "acl",
     "delete",
     "encryption",
+    "legal-hold",
     "location",
+    "object-lock",
     "ownershipControls",
     "policy",
     "policyStatus",
     "publicAccessBlock",
+    "retention",
     "tagging",
     "uploadId",
     "uploads",
@@ -128,7 +128,7 @@ fn has_param(request: &Request<Incoming>, name: &str) -> bool {
         .any(|pair| pair.split_once('=').map_or(pair, |(key, _)| key) == name)
 }
 
-fn bucket_error(err: BucketError, bucket: &str) -> S3Error {
+pub(crate) fn bucket_error(err: BucketError, bucket: &str) -> S3Error {
     match err {
         BucketError::NoSuchBucket => S3Error::new(
             404,
@@ -153,6 +153,7 @@ fn bucket_error(err: BucketError, bucket: &str) -> S3Error {
         BucketError::InvalidName(why) => {
             S3Error::new(400, "InvalidBucketName", format!("The bucket name {why}"))
         }
+        BucketError::InvalidBucketState(why) => S3Error::new(409, "InvalidBucketState", why),
     }
 }
 
@@ -477,6 +478,41 @@ async fn route(
             authz.check(action, Bucket(&bucket))?;
             crate::sse::handle(state, request, auth, bucket, method).await
         }
+        (Target::Bucket(bucket), method) if has_param(&request, "object-lock") => {
+            let action = match method {
+                Method::GET => "s3:GetBucketObjectLockConfiguration",
+                Method::PUT => "s3:PutBucketObjectLockConfiguration",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?object-lock"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::object_lock::bucket_configuration(state, request, auth, bucket, method).await
+        }
+        (Target::Object(bucket, key), method) if has_param(&request, "retention") => {
+            let action = match method {
+                Method::GET => "s3:GetObjectRetention",
+                Method::PUT => "s3:PutObjectRetention",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?retention"))),
+            };
+            // A PUT is checked with its body's retention, once it is read.
+            if method == Method::GET {
+                authz.check(action, Object(&bucket, &key))?;
+            }
+            crate::object_lock::retention(state, request, auth, authz, action, bucket, key, method)
+                .await
+        }
+        (Target::Object(bucket, key), method) if has_param(&request, "legal-hold") => {
+            let action = match method {
+                Method::GET => "s3:GetObjectLegalHold",
+                Method::PUT => "s3:PutObjectLegalHold",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?legal-hold"))),
+            };
+            // A PUT is checked with its body's status, once it is read.
+            if method == Method::GET {
+                authz.check(action, Object(&bucket, &key))?;
+            }
+            crate::object_lock::legal_hold(state, request, auth, authz, action, bucket, key, method)
+                .await
+        }
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "policyStatus") => {
             authz.check("s3:GetBucketPolicyStatus", Bucket(&bucket))?;
             crate::policy::policy_status(state, bucket).await
@@ -516,7 +552,28 @@ async fn route(
         }
         (Target::Bucket(bucket), Method::PUT) if plain_write(&request, &[]) => {
             authz.check("s3:CreateBucket", Bucket(&bucket))?;
-            create_bucket(state, request, auth, bucket).await
+            let object_lock = match request
+                .headers()
+                .get(crate::object_lock::ENABLED_HEADER)
+                .map(|value| value.to_str().unwrap_or("").to_ascii_lowercase())
+                .as_deref()
+            {
+                None | Some("false") => false,
+                Some("true") => true,
+                Some(_) => {
+                    return Err(S3Error::new(
+                        400,
+                        "InvalidArgument",
+                        format!("{} must be true or false", crate::object_lock::ENABLED_HEADER),
+                    ));
+                }
+            };
+            // A bucket with Object Lock has versioning enabled from the start.
+            if object_lock {
+                authz.check("s3:PutBucketObjectLockConfiguration", Bucket(&bucket))?;
+                authz.check("s3:PutBucketVersioning", Bucket(&bucket))?;
+            }
+            create_bucket(state, request, auth, bucket, object_lock).await
         }
         (Target::Bucket(bucket), Method::DELETE) if plain_write(&request, &[]) => {
             authz.check("s3:DeleteBucket", Bucket(&bucket))?;
@@ -565,12 +622,14 @@ async fn route(
         (Target::Object(bucket, key), Method::POST)
             if has_param(&request, "uploads") && plain(&request, &["uploads"]) =>
         {
+            let lock = object_lock_headers(&request, authz, &bucket, &key)?;
             authz.check_storing(
                 "s3:PutObject",
                 Object(&bucket, &key),
                 header_tags(&request)?.as_deref(),
+                lock.as_ref(),
             )?;
-            crate::multipart::create_upload(state, request, bucket, key).await
+            crate::multipart::create_upload(state, request, bucket, key, lock).await
         }
         (Target::Object(bucket, key), Method::POST)
             if has_param(&request, "uploadId") && plain(&request, &["uploadId"]) =>
@@ -621,7 +680,17 @@ async fn route(
                 true => header_tags(&request)?,
                 false => None,
             };
-            authz.check_storing("s3:PutObject", Object(&bucket, &key), tags.as_deref())?;
+            // UploadPartCopy's part takes no lock (its upload's does).
+            let lock = match has_param(&request, "uploadId") {
+                true => None,
+                false => object_lock_headers(&request, authz, &bucket, &key)?,
+            };
+            authz.check_storing(
+                "s3:PutObject",
+                Object(&bucket, &key),
+                tags.as_deref(),
+                lock.as_ref(),
+            )?;
             let (source, source_key, which) = crate::copy::copy_source(request.headers())?;
             let action = if matches!(which, truthdb_object::VersionSel::Latest) {
                 "s3:GetObject"
@@ -643,7 +712,7 @@ async fn route(
             if has_param(&request, "uploadId") {
                 crate::copy::upload_part_copy(state, request, bucket, key).await
             } else {
-                crate::copy::copy_object(state, request, bucket, key).await
+                crate::copy::copy_object(state, request, bucket, key, lock).await
             }
         }
         (Target::Object(bucket, key), Method::PUT)
@@ -666,34 +735,55 @@ async fn route(
             crate::multipart::abort_upload(state, request, bucket, key).await
         }
         (Target::Object(bucket, key), Method::PUT) if plain_write(&request, &[]) => {
+            let lock = object_lock_headers(&request, authz, &bucket, &key)?;
             authz.check_storing(
                 "s3:PutObject",
                 Object(&bucket, &key),
                 header_tags(&request)?.as_deref(),
+                lock.as_ref(),
             )?;
-            crate::objects::put_object(state, request, auth, bucket, key).await
+            crate::objects::put_object(state, request, auth, bucket, key, lock).await
         }
         (Target::Object(bucket, key), Method::GET) if plain(&request, &[]) => {
             authz.check(
                 versioned(&request, "s3:GetObject", "s3:GetObjectVersion"),
                 Object(&bucket, &key),
             )?;
-            crate::objects::get_object(state, request, bucket, key, false, principal.is_some())
-                .await
+            let lock_visible = lock_visible(authz, &bucket, &key);
+            crate::objects::get_object(
+                state,
+                request,
+                bucket,
+                key,
+                false,
+                principal.is_some(),
+                lock_visible,
+            )
+            .await
         }
         (Target::Object(bucket, key), Method::HEAD) if plain(&request, &[]) => {
             authz.check(
                 versioned(&request, "s3:GetObject", "s3:GetObjectVersion"),
                 Object(&bucket, &key),
             )?;
-            crate::objects::get_object(state, request, bucket, key, true, principal.is_some()).await
+            let lock_visible = lock_visible(authz, &bucket, &key);
+            crate::objects::get_object(
+                state,
+                request,
+                bucket,
+                key,
+                true,
+                principal.is_some(),
+                lock_visible,
+            )
+            .await
         }
         (Target::Object(bucket, key), Method::DELETE) if plain_write(&request, &["versionId"]) => {
             authz.check(
                 versioned(&request, "s3:DeleteObject", "s3:DeleteObjectVersion"),
                 Object(&bucket, &key),
             )?;
-            crate::delete::delete_object(state, request, bucket, key).await
+            crate::delete::delete_object(state, request, authz, bucket, key).await
         }
         (Target::Object(bucket, key), method) => Err(S3Error::not_implemented(format!(
             "{method} on object {key} in {bucket} is not implemented yet"
@@ -702,6 +792,30 @@ async fn route(
             "{method} {} is not implemented yet",
             request.uri().path()
         ))),
+    }
+}
+
+/// The Object Lock a write's headers ask for, authorized: setting it needs
+/// `s3:PutObjectRetention` or `s3:PutObjectLegalHold` too.
+fn object_lock_headers(
+    request: &Request<Incoming>,
+    authz: &Authz,
+    bucket: &str,
+    key: &str,
+) -> Result<Option<truthdb_object::ObjectLock>, S3Error> {
+    let lock = crate::object_lock::from_headers(request.headers(), crate::objects::now_ms())?;
+    if let Some(lock) = &lock {
+        crate::object_lock::authorize(authz, crate::authz::Resource::Object(bucket, key), lock)?;
+    }
+    Ok(lock)
+}
+
+/// Which of an object's lock headers the caller may see.
+fn lock_visible(authz: &Authz, bucket: &str, key: &str) -> crate::objects::LockVisible {
+    let object = crate::authz::Resource::Object(bucket, key);
+    crate::objects::LockVisible {
+        retention: authz.check("s3:GetObjectRetention", object).is_ok(),
+        legal_hold: authz.check("s3:GetObjectLegalHold", object).is_ok(),
     }
 }
 
@@ -737,6 +851,7 @@ async fn create_bucket(
     request: Request<Incoming>,
     auth: Authenticated,
     bucket: String,
+    object_lock: bool,
 ) -> Result<Response<Body>, S3Error> {
     // An anonymous caller's CreateBucket is denied before this.
     let owner = auth
@@ -771,6 +886,15 @@ async fn create_bucket(
                     "",
                     &[crate::public_access::ALL],
                 )?;
+                if object_lock {
+                    tx.set_versioning(&name, Versioning::Enabled)?
+                        .and(tx.enable_object_lock(&name)?)
+                        .map_err(|err| {
+                            truthdb_core::storage::StorageError::InvalidFile(format!(
+                                "a new bucket refused Object Lock: {err:?}"
+                            ))
+                        })?;
+                }
             }
             Ok(created)
         })

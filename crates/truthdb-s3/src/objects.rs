@@ -59,6 +59,12 @@ pub fn object_error(err: ObjectError, bucket: &str, key: &str) -> S3Error {
             "The specified method is not allowed against this resource.",
         ),
         ObjectError::InvalidKey(why) => S3Error::new(400, "InvalidArgument", why),
+        ObjectError::Locked => {
+            S3Error::access_denied("Access Denied because object protected by object lock.")
+        }
+        ObjectError::ObjectLockNotEnabled => {
+            S3Error::invalid_request("Bucket is missing Object Lock Configuration")
+        }
     }
 }
 
@@ -329,12 +335,15 @@ impl BodySink {
     }
 }
 
+/// PutObject. `lock` is the Object Lock its headers ask for (authorized by
+/// the caller); without one, a bucket's default retention applies.
 pub async fn put_object(
     state: &S3State,
     request: Request<Incoming>,
     auth: Authenticated,
     bucket: String,
     key: String,
+    lock: Option<truthdb_object::ObjectLock>,
 ) -> Result<Response<Body>, S3Error> {
     let mut attrs = attrs_from(request.headers())?;
     let encrypted_at_rest = state.storage.is_encrypted();
@@ -343,10 +352,11 @@ pub async fn put_object(
     // Fail before writing anything when the bucket or key is wrong.
     {
         let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-        let (check, blocked) = object(state, move |file| {
+        let (check, blocked, (bucket_lock, default)) = object(state, move |file| {
             Ok((
                 file.head_object(&lookup_bucket, &lookup_key, VersionSel::Latest)?,
                 crate::sse::sse_c_blocked(file, &lookup_bucket)?,
+                crate::object_lock::bucket_state(file, &lookup_bucket)?,
             ))
         })
         .await?;
@@ -354,24 +364,43 @@ pub async fn put_object(
             return Err(object_error(err, &bucket, &key));
         }
         crate::ssec::check_write(customer.as_ref(), request.headers(), blocked)?;
+        if let Some(lock) =
+            crate::object_lock::new_object_lock(lock, bucket_lock, default, now_ms())?
+        {
+            crate::object_lock::check_integrity(request.headers(), &lock)?;
+        }
     }
     attrs.customer_key = customer.as_ref().map(|key| key.stored()).transpose()?;
+    let headers = request.headers().clone();
     let sealed = receive_body(state, request, auth, customer.as_ref()).await?;
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let (stored, versioning) = object(state, move |file| {
+        let now = now_ms();
+        // Decided in the write's own lock hold: the bucket's Object Lock
+        // may have changed while the body arrived (a default retention set,
+        // or the bucket made again without Object Lock).
+        let (bucket_lock, default) = crate::object_lock::bucket_state(file, &bucket_name)?;
+        let lock = match crate::object_lock::new_object_lock(lock, bucket_lock, default, now)
+            .and_then(|lock| {
+                if let Some(lock) = &lock {
+                    crate::object_lock::check_integrity(&headers, lock)?;
+                }
+                Ok(lock)
+            }) {
+            Ok(lock) => lock,
+            Err(err) => return Ok(Err(err)),
+        };
         let stored = file.transaction(|tx| {
-            tx.put_object(
-                &bucket_name,
-                &key_name,
-                &sealed,
-                &attrs,
-                now_ms(),
-                DROP_GRACE_MS,
-            )
+            let stored =
+                tx.put_object(&bucket_name, &key_name, &sealed, &attrs, now, DROP_GRACE_MS)?;
+            if let (Ok(info), Some(lock)) = (&stored, &lock) {
+                tx.set_lock(info.version, lock)?;
+            }
+            Ok(stored)
         })?;
-        Ok((stored, versioning_of(file, &bucket_name)?))
+        Ok(Ok((stored, versioning_of(file, &bucket_name)?)))
     })
-    .await?;
+    .await??;
     let info = stored.map_err(|err| object_error(err, &bucket, &key))?;
     let customer_key = info.attrs.customer_key.as_ref();
     let mut response = crate::ssec::with_echo(
@@ -625,6 +654,7 @@ pub async fn get_object(
     key: String,
     head_only: bool,
     signed: bool,
+    lock_visible: LockVisible,
 ) -> Result<Response<Body>, S3Error> {
     crate::sse::check_read(request.headers())?;
     let customer = crate::ssec::provided(request.headers(), false)?;
@@ -650,11 +680,20 @@ pub async fn get_object(
             head_only,
             &overrides,
             customer,
+            lock_visible,
         )
         .await
     }))
     .await
     .map_err(|err| S3Error::internal(err.to_string()))?
+}
+
+/// Which of an object's lock headers a GET or HEAD shows: those the caller
+/// may read (`s3:GetObjectRetention`, `s3:GetObjectLegalHold`).
+#[derive(Debug, Clone, Copy)]
+pub struct LockVisible {
+    pub retention: bool,
+    pub legal_hold: bool,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -667,22 +706,27 @@ async fn read_object(
     head_only: bool,
     overrides: &[(String, String)],
     customer: Option<crate::ssec::ProvidedKey>,
+    lock_visible: LockVisible,
 ) -> Result<Response<Body>, S3Error> {
     // Resolve and lease in one lock hold, so the body cannot be collected
     // between the lookup and the lease.
     let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-    let (found, versioning) = object(state, move |file| {
+    let (found, versioning, lock) = object(state, move |file| {
         let found = file.object_version(&lookup_bucket, &lookup_key, which)?;
         // Everything that can fail comes before the lease: a failure after
         // it would leave the lease held with no one to release it.
         let versioning = versioning_of(file, &lookup_bucket)?;
+        let lock = match &found {
+            Ok(info) => file.object_lock(info.version)?,
+            Err(_) => truthdb_object::ObjectLock::default(),
+        };
         if let Ok(info) = &found
             && !head_only
             && !info.delete_marker
         {
             file.take_lease(info.body)?;
         }
-        Ok((found, versioning))
+        Ok((found, versioning, lock))
     })
     .await?;
     let mut info = found.map_err(|err| object_error(err, &bucket, &key))?;
@@ -777,11 +821,16 @@ async fn read_object(
         Some((first, last)) => (StatusCode::PARTIAL_CONTENT, first, last - first + 1),
         None => (StatusCode::OK, 0, info.size),
     };
-    let mut builder = object_headers(
-        Response::builder().status(status),
-        &info,
-        versioning,
-        state.storage.is_encrypted(),
+    let mut builder = crate::object_lock::with_headers(
+        object_headers(
+            Response::builder().status(status),
+            &info,
+            versioning,
+            state.storage.is_encrypted(),
+        ),
+        &lock,
+        lock_visible.retention,
+        lock_visible.legal_hold,
     )
     .header("content-length", len.to_string());
     if let Some((first, last)) = range {

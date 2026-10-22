@@ -936,7 +936,7 @@ fn a_deleted_object_is_gone_and_its_body_collected() {
     };
     let delete = |key: &str, which| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.delete_object("bkt", key, which, now(), 0))
+            .transaction(|tx| tx.delete_object("bkt", key, which, false, now(), 0))
             .unwrap()
     };
     put("one");
@@ -963,7 +963,7 @@ fn a_deleted_object_is_gone_and_its_body_collected() {
     assert_eq!(freed.bodies, 2, "both bodies were collected");
     assert_eq!(
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.delete_object("nope", "k", None, now(), 0))
+            .transaction(|tx| tx.delete_object("nope", "k", None, false, now(), 0))
             .unwrap(),
         Err(ObjectError::NoSuchBucket)
     );
@@ -1124,7 +1124,7 @@ fn a_multipart_upload_completes_into_a_composite_and_aborts_release_parts() {
     let storage = open(&path);
     assert_eq!(read(&storage, object.body, 0, whole.len()).unwrap(), whole);
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.delete_object("bkt", "movie.mp4", None, now(), 0))
+        .transaction(|tx| tx.delete_object("bkt", "movie.mp4", None, false, now(), 0))
         .unwrap()
         .unwrap();
     let collect = || {
@@ -1194,7 +1194,7 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
         Err(crate::ObjectError::NoSuchBucket)
     );
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.delete_object("src", "a", None, now(), 0))
+        .transaction(|tx| tx.delete_object("src", "a", None, false, now(), 0))
         .unwrap()
         .unwrap();
     let collected = ObjFile::new(&mut storage.lock())
@@ -1239,7 +1239,7 @@ fn a_copy_shares_the_body_and_outlives_its_source() {
             .is_err()
     );
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.delete_object("dst", "b", None, now(), 0))
+        .transaction(|tx| tx.delete_object("dst", "b", None, false, now(), 0))
         .unwrap()
         .unwrap();
     let whole = read(&storage, joined.body, 0, joined.size as usize).unwrap();
@@ -1355,7 +1355,7 @@ fn versions_list_newest_first_with_markers_and_resume_mid_key() {
     let a1 = put("a");
     let a2 = put("a");
     let marker = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.delete_object("bkt", "a", None, now(), 0))
+        .transaction(|tx| tx.delete_object("bkt", "a", None, false, now(), 0))
         .unwrap()
         .unwrap()
         .version
@@ -1447,6 +1447,7 @@ fn a_key_with_many_versions_neither_ends_a_listing_nor_unbounds_it() {
                 versioning: Versioning::Enabled,
                 journal_from: 0,
                 owner: DEFAULT_ACCOUNT.to_string(),
+                object_lock: false,
             };
             tx.trees
                 .buckets()
@@ -1507,6 +1508,7 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
                 versioning: Versioning::Enabled,
                 journal_from: 0,
                 owner: DEFAULT_ACCOUNT.to_string(),
+                object_lock: false,
             };
             tx.trees
                 .buckets()
@@ -1531,12 +1533,12 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
     };
     // One live key keeps the folder; delete markers on both remove it.
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.delete_object("bkt", "dir/x", None, now(), 0))
+        .transaction(|tx| tx.delete_object("bkt", "dir/x", None, false, now(), 0))
         .unwrap()
         .unwrap();
     assert_eq!(list().common_prefixes, ["dir/"]);
     ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.delete_object("bkt", "dir/y", None, now(), 0))
+        .transaction(|tx| tx.delete_object("bkt", "dir/y", None, false, now(), 0))
         .unwrap()
         .unwrap();
     let listing = list();
@@ -1554,7 +1556,14 @@ fn a_folder_whose_keys_are_all_deleted_is_not_listed() {
     let delete_version = || {
         ObjFile::new(&mut storage.lock())
             .transaction(|tx| {
-                tx.delete_object("bkt", "e", Some(crate::VersionSel::Seq(version)), now(), 0)
+                tx.delete_object(
+                    "bkt",
+                    "e",
+                    Some(crate::VersionSel::Seq(version)),
+                    false,
+                    now(),
+                    0,
+                )
             })
             .unwrap()
             .unwrap()
@@ -1629,7 +1638,7 @@ fn the_journal_records_every_change_in_its_own_transaction() {
     };
     let delete = |storage: &Storage, bucket: &str, key: &str, which| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.delete_object(bucket, key, which, now(), 0))
+            .transaction(|tx| tx.delete_object(bucket, key, which, false, now(), 0))
             .unwrap()
             .unwrap()
     };
@@ -1802,7 +1811,7 @@ fn the_journal_ships_to_a_standby_and_restores_from_a_log_backup() {
             .unwrap();
     }
     ObjFile::new(&mut primary.lock())
-        .transaction(|tx| tx.delete_object("bkt", "a", None, now(), 0))
+        .transaction(|tx| tx.delete_object("bkt", "a", None, false, now(), 0))
         .unwrap()
         .unwrap();
     let journal = |storage: &Storage| ObjFile::new(&mut storage.lock()).journal(0, 100).unwrap();
@@ -2046,7 +2055,7 @@ fn applying_full_text_holds_the_latest_version_only_and_survives_a_crash_at_any_
     assert_eq!(ft_hits(&storage, "docs", "word").len(), 10);
     for key in &keys {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.delete_object("docs", key, None, now(), 0))
+            .transaction(|tx| tx.delete_object("docs", key, None, false, now(), 0))
             .unwrap()
             .unwrap();
     }
@@ -2502,4 +2511,274 @@ fn managed_policies_attach_to_users_and_go_only_when_detached() {
     drop(guard);
     drop(storage);
     std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn object_lock_keeps_protected_versions_until_their_retention_or_hold_allows() {
+    use crate::{
+        BucketError, ObjectError, ObjectLock, Retention, RetentionMode, VersionSel, Versioning,
+    };
+    let path = temp_path("object-lock");
+    let storage = create(&path);
+    let txn = |body: &mut dyn FnMut(&mut crate::ObjTxn<'_, '_>) -> Result<_, StorageError>| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| body(tx))
+            .unwrap()
+    };
+    txn(&mut |tx| {
+        tx.create_bucket("bkt", DEFAULT_ACCOUNT, now())?.unwrap();
+        tx.create_bucket("plain", DEFAULT_ACCOUNT, now())?.unwrap();
+        Ok(Ok(()))
+    })
+    .unwrap();
+    // Object Lock needs versioning enabled, and keeps it so.
+    assert!(matches!(
+        txn(&mut |tx| tx.enable_object_lock("bkt")),
+        Err(BucketError::InvalidBucketState(_))
+    ));
+    txn(&mut |tx| tx.set_versioning("bkt", Versioning::Enabled)).unwrap();
+    txn(&mut |tx| tx.enable_object_lock("bkt")).unwrap();
+    assert!(matches!(
+        txn(&mut |tx| tx.set_versioning("bkt", Versioning::Suspended)),
+        Err(BucketError::InvalidBucketState(_))
+    ));
+    let bucket = ObjFile::new(&mut storage.lock())
+        .bucket("bkt")
+        .unwrap()
+        .unwrap();
+    assert!(bucket.object_lock);
+    assert_eq!(bucket.versioning, Versioning::Enabled);
+
+    let v1 = put_text(&storage, "bkt", "k", "one");
+    let delete = |which: Option<VersionSel>, bypass: bool, at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_object("bkt", "k", which, bypass, at, 0))
+            .unwrap()
+    };
+    let retain = |which: VersionSel, retention: Option<Retention>, bypass: bool| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_retention("bkt", "k", which, retention, bypass, now()))
+            .unwrap()
+    };
+    let governance = |until_ms| Retention {
+        mode: RetentionMode::Governance,
+        until_ms,
+    };
+    let compliance = |until_ms| Retention {
+        mode: RetentionMode::Compliance,
+        until_ms,
+    };
+    let until = now() + 1_000;
+    assert_eq!(
+        retain(VersionSel::Seq(v1), Some(governance(until)), false),
+        Ok((v1, false))
+    );
+    // A protected version stays; a delete marker may still hide it.
+    assert_eq!(
+        delete(Some(VersionSel::Seq(v1)), false, now()),
+        Err(ObjectError::Locked)
+    );
+    let marker = delete(None, false, now()).unwrap().version.unwrap();
+    delete(Some(VersionSel::Seq(marker)), false, now()).unwrap();
+    // Governance retention: shortened, removed or ignored only with bypass.
+    assert_eq!(
+        retain(VersionSel::Seq(v1), Some(governance(until - 1)), false),
+        Err(ObjectError::Locked)
+    );
+    assert_eq!(
+        retain(VersionSel::Seq(v1), Some(compliance(until)), false),
+        Err(ObjectError::Locked),
+        "a mode change alters the lock"
+    );
+    assert_eq!(
+        retain(VersionSel::Seq(v1), Some(governance(until + 5)), false),
+        Ok((v1, false)),
+        "anyone allowed to set retention may extend it"
+    );
+    assert_eq!(
+        retain(VersionSel::Seq(v1), Some(governance(until)), true),
+        Ok((v1, false))
+    );
+    // A legal hold protects whatever the retention, bypass or not.
+    let hold = |which: VersionSel, on: bool| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_legal_hold("bkt", "k", which, on))
+            .unwrap()
+    };
+    assert_eq!(hold(VersionSel::Latest, true), Ok((v1, false)));
+    assert_eq!(
+        delete(Some(VersionSel::Seq(v1)), true, now()),
+        Err(ObjectError::Locked)
+    );
+    assert_eq!(
+        delete(Some(VersionSel::Seq(v1)), true, until + 1),
+        Err(ObjectError::Locked),
+        "a legal hold outlives the retention"
+    );
+    hold(VersionSel::Latest, false).unwrap();
+    assert_eq!(
+        ObjFile::new(&mut storage.lock()).object_lock(v1).unwrap(),
+        ObjectLock {
+            retention: Some(governance(until)),
+            legal_hold: Some(false),
+        }
+    );
+    // Compliance: extended only, never bypassed.
+    let v2 = put_text(&storage, "bkt", "k", "two");
+    retain(VersionSel::Seq(v2), Some(compliance(until)), false).unwrap();
+    for retention in [
+        None,
+        Some(compliance(until - 1)),
+        Some(governance(until + 9)),
+    ] {
+        assert_eq!(
+            retain(VersionSel::Seq(v2), retention, true),
+            Err(ObjectError::Locked),
+            "{retention:?}"
+        );
+    }
+    assert_eq!(
+        delete(Some(VersionSel::Seq(v2)), true, now()),
+        Err(ObjectError::Locked)
+    );
+    // The locks hold across a restart.
+    drop(storage);
+    let storage = open(&path);
+    let delete = |which: Option<VersionSel>, bypass: bool, at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_object("bkt", "k", which, bypass, at, 0))
+            .unwrap()
+    };
+    assert_eq!(
+        delete(Some(VersionSel::Seq(v2)), true, now()),
+        Err(ObjectError::Locked)
+    );
+    // Governance is bypassed; past its date, compliance lets go too, and
+    // the lock goes with the version.
+    delete(Some(VersionSel::Seq(v1)), true, now()).unwrap();
+    assert_eq!(
+        ObjFile::new(&mut storage.lock()).object_lock(v1).unwrap(),
+        ObjectLock::default()
+    );
+    delete(Some(VersionSel::Seq(v2)), false, until).unwrap();
+    assert_eq!(
+        ObjFile::new(&mut storage.lock()).object_lock(v2).unwrap(),
+        ObjectLock::default()
+    );
+    // Lock changes need a bucket with Object Lock, and a live version.
+    put_text(&storage, "plain", "k", "x");
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_legal_hold("plain", "k", VersionSel::Latest, true))
+            .unwrap(),
+        Err(ObjectError::ObjectLockNotEnabled)
+    );
+    let marker = delete(None, false, now()).unwrap().version.unwrap();
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_legal_hold("bkt", "k", VersionSel::Seq(marker), true))
+            .unwrap(),
+        Err(ObjectError::DeleteMarker)
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn an_uploads_lock_passes_to_its_object_or_goes_with_the_abort() {
+    use crate::{ObjectAttrs, ObjectError, ObjectLock, VersionSel, Versioning};
+    let path = temp_path("upload-lock");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("bkt", DEFAULT_ACCOUNT, now())?.unwrap();
+            tx.set_versioning("bkt", Versioning::Enabled)?.unwrap();
+            tx.enable_object_lock("bkt")
+        })
+        .unwrap()
+        .unwrap();
+    let held = ObjectLock {
+        retention: None,
+        legal_hold: Some(true),
+    };
+    let start = || {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                let upload = tx
+                    .create_upload("bkt", "k", &ObjectAttrs::default(), now())?
+                    .unwrap();
+                tx.set_upload_lock(upload, &held)?;
+                Ok(upload)
+            })
+            .unwrap()
+    };
+    let aborted = start();
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.abort_upload(aborted, now(), 0))
+        .unwrap()
+        .unwrap();
+    let upload = start();
+    let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+    writer.write(&storage, b"part", now()).unwrap();
+    let sealed = writer.finish(&storage, now()).unwrap();
+    let md5 = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.upload_part(upload, 1, &sealed, now(), 0))
+        .unwrap()
+        .unwrap()
+        .md5;
+    let object = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.complete_upload(upload, &[(1, md5)], now(), 0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .object_lock(object.version)
+            .unwrap(),
+        held
+    );
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.delete_object(
+                    "bkt",
+                    "k",
+                    Some(VersionSel::Seq(object.version)),
+                    true,
+                    now(),
+                    0,
+                )
+            })
+            .unwrap(),
+        Err(ObjectError::Locked)
+    );
+    // Nothing of either upload's lock is left behind.
+    let mut guard = storage.lock();
+    let file = ObjFile::new(&mut guard);
+    let locks = file.existing_tree(crate::LOCKS_TREE).unwrap().unwrap();
+    let rows = locks.scan(&mut file.core.page_ctx(0)).unwrap();
+    assert_eq!(rows.len(), 1, "only the object's");
+    drop(guard);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_bucket_row_has_its_object_lock_byte_only_when_enabled() {
+    use crate::Versioning;
+    use crate::buckets::BucketRow;
+    let mut row = BucketRow {
+        created_ms: 1,
+        versioning: Versioning::Enabled,
+        journal_from: 2,
+        owner: DEFAULT_ACCOUNT.to_string(),
+        object_lock: false,
+    };
+    assert_eq!(row.encode().len(), 29, "readable by earlier releases");
+    assert!(!BucketRow::decode(&row.encode()).unwrap().object_lock);
+    row.object_lock = true;
+    assert_eq!(row.encode().len(), 30);
+    assert!(BucketRow::decode(&row.encode()).unwrap().object_lock);
+    let mut bad = row.encode();
+    bad[29] = 2;
+    assert!(BucketRow::decode(&bad).is_err());
 }

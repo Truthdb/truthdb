@@ -27,16 +27,26 @@ fn now_ms() -> u64 {
         .unwrap_or(0)
 }
 
+/// Deletes `key` (a version of it with `which`); `bypass` lifts Object
+/// Lock's GOVERNANCE retention.
 async fn delete_one(
     state: &S3State,
     bucket: &str,
     key: &str,
     which: Option<VersionSel>,
+    bypass: bool,
 ) -> Result<Deleted, S3Error> {
     let (bucket_name, key_name) = (bucket.to_string(), key.to_string());
     crate::scope::object(state, move |file| {
         file.transaction(|tx| {
-            tx.delete_object(&bucket_name, &key_name, which, now_ms(), DROP_GRACE_MS)
+            tx.delete_object(
+                &bucket_name,
+                &key_name,
+                which,
+                bypass,
+                now_ms(),
+                DROP_GRACE_MS,
+            )
         })
     })
     .await?
@@ -46,6 +56,7 @@ async fn delete_one(
 pub async fn delete_object(
     state: &S3State,
     request: Request<Incoming>,
+    authz: &crate::authz::Authz,
     bucket: String,
     key: String,
 ) -> Result<Response<Body>, S3Error> {
@@ -53,7 +64,12 @@ pub async fn delete_object(
         VersionSel::Latest => None,
         sel => Some(sel),
     };
-    let deleted = delete_one(state, &bucket, &key, which).await?;
+    let bypass = crate::object_lock::bypasses(
+        request.headers(),
+        authz,
+        crate::authz::Resource::Object(&bucket, &key),
+    );
+    let deleted = delete_one(state, &bucket, &key, which, bypass).await?;
     let mut response = Response::builder().status(StatusCode::NO_CONTENT);
     if let Some(version) = deleted.version {
         response = response.header(
@@ -202,6 +218,7 @@ pub async fn delete_objects(
         .get("content-md5")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
+    let headers = request.headers().clone();
     let body = read_body(request, auth, MAX_BODY).await?;
     if let Some(expected) = content_md5 {
         use base64::Engine as _;
@@ -255,12 +272,12 @@ pub async fn delete_objects(
             }
             Some(VersionSel::Latest) => {}
         }
-        let outcome = match authz.check_with(
-            action,
-            crate::authz::Resource::Object(&bucket, &object.key),
-            &context,
-        ) {
-            Ok(()) => delete_one(state, &bucket, &object.key, which).await,
+        let resource = crate::authz::Resource::Object(&bucket, &object.key);
+        let outcome = match authz.check_with(action, resource, &context) {
+            Ok(()) => {
+                let bypass = crate::object_lock::bypasses(&headers, authz, resource);
+                delete_one(state, &bucket, &object.key, which, bypass).await
+            }
             Err(err) => Err(err),
         };
         match outcome {

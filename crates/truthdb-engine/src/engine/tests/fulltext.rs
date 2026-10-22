@@ -219,7 +219,7 @@ fn the_journal_keeps_the_index_on_each_keys_latest_version() {
     assert_eq!(hits(&engine, "plain", "red"), ["b"]);
     assert_eq!(hits(&engine, "plain", "green"), ["a"]);
     engine
-        .object(|file| file.transaction(|tx| tx.delete_object("plain", "b", None, now(), 0)))
+        .object(|file| file.transaction(|tx| tx.delete_object("plain", "b", None, false, now(), 0)))
         .unwrap()
         .unwrap();
     // Overwritten with something that is not text: it leaves the index.
@@ -240,7 +240,7 @@ fn the_journal_keeps_the_index_on_each_keys_latest_version() {
     assert_eq!(hits(&engine, "hist", "draft"), ["k"]);
     assert_eq!(held(&engine, "hist", "k").unwrap().version, v2);
     let marker = engine
-        .object(|file| file.transaction(|tx| tx.delete_object("hist", "k", None, now(), 0)))
+        .object(|file| file.transaction(|tx| tx.delete_object("hist", "k", None, false, now(), 0)))
         .unwrap()
         .unwrap()
         .version
@@ -250,7 +250,7 @@ fn the_journal_keeps_the_index_on_each_keys_latest_version() {
     engine
         .object(|file| {
             file.transaction(|tx| {
-                tx.delete_object("hist", "k", Some(VersionSel::Seq(marker)), now(), 0)
+                tx.delete_object("hist", "k", Some(VersionSel::Seq(marker)), false, now(), 0)
             })
         })
         .unwrap()
@@ -260,7 +260,7 @@ fn the_journal_keeps_the_index_on_each_keys_latest_version() {
     engine
         .object(|file| {
             file.transaction(|tx| {
-                tx.delete_object("hist", "k", Some(VersionSel::Seq(v2)), now(), 0)
+                tx.delete_object("hist", "k", Some(VersionSel::Seq(v2)), false, now(), 0)
             })
         })
         .unwrap()
@@ -526,7 +526,7 @@ fn a_key_deleted_while_a_stale_pass_ran_is_removed_by_the_new_backfill() {
         .unwrap()
         .remove(0);
     engine
-        .object(|file| file.transaction(|tx| tx.delete_object("docs", "k", None, now(), 0)))
+        .object(|file| file.transaction(|tx| tx.delete_object("docs", "k", None, false, now(), 0)))
         .unwrap()
         .unwrap();
     command(&engine, "s3 enable fulltext docs");
@@ -563,7 +563,7 @@ fn a_key_deleted_while_a_stale_pass_ran_is_removed_by_the_new_backfill() {
         .unwrap()
         .remove(0);
     engine
-        .object(|file| file.transaction(|tx| tx.delete_object("docs", "k", None, now(), 0)))
+        .object(|file| file.transaction(|tx| tx.delete_object("docs", "k", None, false, now(), 0)))
         .unwrap()
         .unwrap();
     assert_eq!(

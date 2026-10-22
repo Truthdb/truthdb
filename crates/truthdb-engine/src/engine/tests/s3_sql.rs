@@ -138,7 +138,7 @@ fn the_inventory_lists_objects_versions_tags_and_metadata_live() {
     let v1 = put(&engine, "hist", "k", b"a", &ObjectAttrs::default());
     let v2 = put(&engine, "hist", "k", b"bb", &ObjectAttrs::default());
     let marker = engine
-        .object(|file| file.transaction(|tx| tx.delete_object("hist", "k", None, 3_000, 0)))
+        .object(|file| file.transaction(|tx| tx.delete_object("hist", "k", None, false, 3_000, 0)))
         .expect("delete")
         .expect("delete accepted")
         .version
@@ -353,7 +353,7 @@ fn the_journal_reads_as_a_table_from_a_sequence_on() {
         .expect("tag")
         .expect("tag accepted");
     engine
-        .object(|file| file.transaction(|tx| tx.delete_object("jour", "k", None, 5_000, 0)))
+        .object(|file| file.transaction(|tx| tx.delete_object("jour", "k", None, false, 5_000, 0)))
         .expect("delete")
         .expect("delete accepted");
     engine
@@ -363,6 +363,7 @@ fn the_journal_reads_as_a_table_from_a_sequence_on() {
                     "jour",
                     "k",
                     Some(truthdb_object::VersionSel::Seq(v1)),
+                    false,
                     6_000,
                     0,
                 )
@@ -473,7 +474,9 @@ fn an_idle_sweep_writes_nothing_and_a_new_bucket_starts_a_new_journal() {
     create_bucket(&engine, "again", Versioning::Unversioned);
     put(&engine, "again", "old", b"1", &ObjectAttrs::default());
     engine
-        .object(|file| file.transaction(|tx| tx.delete_object("again", "old", None, 3_000, 0)))
+        .object(|file| {
+            file.transaction(|tx| tx.delete_object("again", "old", None, false, 3_000, 0))
+        })
         .expect("delete")
         .expect("delete accepted");
     engine
