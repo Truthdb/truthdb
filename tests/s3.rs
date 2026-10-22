@@ -7231,8 +7231,12 @@ fn an_archived_object_is_read_only_while_restored() {
     assert_eq!(status, 400, "{reply}");
     assert!(reply.contains("<Code>MalformedXML</Code>"), "{reply}");
 
-    // An Expedited restore here is done at once: readable, then copied.
-    assert_eq!(restore("/archive/deep", "1", "Expedited").0, 202);
+    // DEEP_ARCHIVE has no Expedited tier; a Standard restore here is done
+    // at once: readable, then copied.
+    let (status, reply) = restore("/archive/deep", "1", "Expedited");
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("<Code>InvalidRequest</Code>"), "{reply}");
+    assert_eq!(restore("/archive/deep", "1", "Standard").0, 202);
     let header = restore_header("/archive/deep").expect("x-amz-restore");
     assert!(
         header.starts_with("ongoing-request=\"false\", expiry-date=\""),

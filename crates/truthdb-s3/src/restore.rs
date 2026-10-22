@@ -7,7 +7,7 @@
 
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
-use truthdb_object::{RestoreState, Restored};
+use truthdb_object::{RestoreRequest, RestoreState, Restored};
 
 use crate::error::S3Error;
 use crate::object_lock::{leaf, leaves, malformed};
@@ -116,12 +116,14 @@ pub async fn restore_object(
     let which = version_sel(request.uri().query().unwrap_or(""))?;
     let body = crate::server::read_body(request, auth, MAX_BODY).await?;
     let (days, tier) = parse(&body)?;
-    let delay_ms = state.restore_delays.of(tier).saturating_mul(1000);
+    let request = RestoreRequest {
+        days,
+        delay_ms: state.restore_delays.of(tier).saturating_mul(1000),
+        expedited: tier == Tier::Expedited,
+    };
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let restored = crate::scope::object(state, move |file| {
-        file.transaction(|tx| {
-            tx.restore_object(&bucket_name, &key_name, which, days, delay_ms, now_ms())
-        })
+        file.transaction(|tx| tx.restore_object(&bucket_name, &key_name, which, request, now_ms()))
     })
     .await?
     .map_err(|err| object_error(err, &bucket, &key))?;
@@ -198,6 +200,14 @@ mod tests {
             }))
             .unwrap(),
             "ongoing-request=\"false\", expiry-date=\"Fri, 21 Dec 2012 00:00:00 GMT\""
+        );
+        // A restore kept for millions of years still has a date to show.
+        assert_eq!(
+            header(Some(RestoreState::Restored {
+                expiry_ms: u64::MAX
+            }))
+            .unwrap(),
+            "ongoing-request=\"false\", expiry-date=\"Fri, 31 Dec 9999 23:59:59 GMT\""
         );
     }
 }

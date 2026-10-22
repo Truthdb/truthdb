@@ -64,6 +64,17 @@ impl Restore {
     }
 }
 
+/// What a RestoreObject asks for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RestoreRequest {
+    /// How long the restored copy is kept.
+    pub days: u32,
+    /// How long the restore takes.
+    pub delay_ms: u64,
+    /// The Expedited retrieval tier, which DEEP_ARCHIVE does not offer.
+    pub expedited: bool,
+}
+
 /// What a RestoreObject did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Restored {
@@ -73,10 +84,11 @@ pub enum Restored {
     Extended,
 }
 
-/// When a restore asked for at `now_ms` for `days` expires: `days` after
-/// it, rounded up to the next midnight UTC, as S3 computes it.
-pub fn restore_expiry(now_ms: u64, days: u32) -> u64 {
-    let end = now_ms.saturating_add(u64::from(days).saturating_mul(DAY_MS));
+/// When a restore kept `days` from `from_ms` expires: `days` after it,
+/// rounded up to the next midnight UTC, as S3 computes it (from when a new
+/// restore completes, or when an extension is asked for).
+pub fn restore_expiry(from_ms: u64, days: u32) -> u64 {
+    let end = from_ms.saturating_add(u64::from(days).saturating_mul(DAY_MS));
     (end / DAY_MS).saturating_add(1).saturating_mul(DAY_MS)
 }
 
@@ -94,18 +106,18 @@ pub fn unreadable(class: StorageClass, restore: Option<RestoreState>) -> bool {
 }
 
 impl ObjTxn<'_, '_> {
-    /// Restores the version `which` picks for `days` (S3 RestoreObject): it
-    /// may be read `delay_ms` from now until the expiry [`restore_expiry`]
-    /// gives. On a version already restored, only the expiry moves; one
-    /// still being restored is refused. Returns what was done, the version's
-    /// number and whether it is the null version.
+    /// Restores the version `which` picks (S3 RestoreObject): it may be
+    /// read from `delay_ms` after now until its days from then are up (see
+    /// [`restore_expiry`]). On a version already restored, only the expiry
+    /// moves, counted from now; one still being restored is refused.
+    /// Returns what was done, the version's number and whether it is the
+    /// null version.
     pub fn restore_object(
         &mut self,
         bucket: &str,
         key: &str,
         which: VersionSel,
-        days: u32,
-        delay_ms: u64,
+        request: RestoreRequest,
         now_ms: u64,
     ) -> Result<Result<(Restored, u64, bool), ObjectError>, StorageError> {
         if let Err(err) = validate_key(key) {
@@ -121,24 +133,29 @@ impl ObjTxn<'_, '_> {
         if !class.is_archived() {
             return Ok(Err(ObjectError::NotArchived));
         }
+        if request.expedited && class == StorageClass::DeepArchive {
+            return Ok(Err(ObjectError::TierUnavailable));
+        }
         let current = self.restore_of(version)?;
-        let expiry_ms = restore_expiry(now_ms, days);
         let (done, restore) = match current.and_then(|restore| restore.state(now_ms)) {
             Some(RestoreState::Ongoing) => return Ok(Err(ObjectError::RestoreInProgress)),
             Some(RestoreState::Restored { .. }) => (
                 Restored::Extended,
                 Restore {
-                    expiry_ms,
+                    expiry_ms: restore_expiry(now_ms, request.days),
                     ..current.unwrap()
                 },
             ),
-            None => (
-                Restored::Started,
-                Restore {
-                    ready_ms: now_ms.saturating_add(delay_ms),
-                    expiry_ms,
-                },
-            ),
+            None => {
+                let ready_ms = now_ms.saturating_add(request.delay_ms);
+                (
+                    Restored::Started,
+                    Restore {
+                        ready_ms,
+                        expiry_ms: restore_expiry(ready_ms, request.days),
+                    },
+                )
+            }
         };
         self.forget_restore(version)?;
         let mode = &mut OpMode::Txn(self.txn);

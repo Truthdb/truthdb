@@ -76,6 +76,9 @@ pub fn object_error(err: ObjectError, bucket: &str, key: &str) -> S3Error {
             "RestoreAlreadyInProgress",
             "Object restore is already in progress",
         ),
+        ObjectError::TierUnavailable => S3Error::invalid_request(
+            "Expedited retrievals are not available for the DEEP_ARCHIVE storage class",
+        ),
     }
 }
 
@@ -564,8 +567,14 @@ fn parse_range(value: &str, size: u64) -> Result<Option<(u64, u64)>, ()> {
     Ok(Some(range))
 }
 
+/// The last instant an HTTP date can name (9999-12-31 23:59:59 UTC): later
+/// times are written as it.
+const LAST_HTTP_DATE_MS: u64 = 253_402_300_799_000;
+
 pub(crate) fn http_date(ms: u64) -> String {
-    httpdate::fmt_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
+    httpdate::fmt_http_date(
+        std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms.min(LAST_HTTP_DATE_MS)),
+    )
 }
 
 fn parse_http_date(value: &str) -> Option<u64> {

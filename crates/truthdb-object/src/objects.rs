@@ -276,6 +276,8 @@ pub enum ObjectError {
     NotArchived,
     /// The version's restore has not completed yet.
     RestoreInProgress,
+    /// The restore's retrieval tier is not offered for the version's class.
+    TierUnavailable,
 }
 
 pub fn validate_key(key: &str) -> Result<(), ObjectError> {

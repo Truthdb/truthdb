@@ -3784,6 +3784,15 @@ fn a_damaged_body_queued_colder_meanwhile_keeps_its_new_entry() {
     std::fs::remove_file(&path).ok();
 }
 
+/// A Standard-tier restore kept `days`, taking `delay_ms`.
+fn ask(days: u32, delay_ms: u64) -> crate::RestoreRequest {
+    crate::RestoreRequest {
+        days,
+        delay_ms,
+        expedited: false,
+    }
+}
+
 #[test]
 fn an_archived_version_is_read_only_while_restored() {
     use crate::{ObjectError, Restored, StorageClass, VersionSel, Versioning, restore_expiry};
@@ -3800,7 +3809,7 @@ fn an_archived_version_is_read_only_while_restored() {
     let ir = put_classed(&storage, "bkt", "ir", b"instant", StorageClass::GlacierIr);
     let restore = |key: &str, which: VersionSel, days: u32, delay: u64, at: u64| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.restore_object("bkt", key, which, days, delay, at))
+            .transaction(|tx| tx.restore_object("bkt", key, which, ask(days, delay), at))
             .unwrap()
     };
     let unreadable = |info: &crate::ObjectInfo, at: u64| {
@@ -3821,7 +3830,13 @@ fn an_archived_version_is_read_only_while_restored() {
     );
     assert_eq!(
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.restore_object("nope", "cold", VersionSel::Latest, 1, 0, now()))
+            .transaction(|tx| tx.restore_object(
+                "nope",
+                "cold",
+                VersionSel::Latest,
+                ask(1, 0),
+                now()
+            ))
             .unwrap(),
         Err(ObjectError::NoSuchBucket)
     );
@@ -3832,7 +3847,8 @@ fn an_archived_version_is_read_only_while_restored() {
         restore("cold", VersionSel::Latest, 2, delay, now()),
         Ok((Restored::Started, cold.version, false))
     );
-    let expiry = restore_expiry(now(), 2);
+    // The days count from when the restore completes.
+    let expiry = restore_expiry(now() + delay, 2);
     assert_eq!(
         window(cold.version),
         Some(crate::Restore {
@@ -3857,6 +3873,55 @@ fn an_archived_version_is_read_only_while_restored() {
     assert!(!unreadable(&cold, extended - 1));
     assert!(unreadable(&cold, extended));
 
+    // A restore that takes longer than the days it keeps the copy is still
+    // readable for those days once it completes; DEEP_ARCHIVE has no
+    // Expedited tier.
+    let deep = put_classed(
+        &storage,
+        "bkt",
+        "deep",
+        b"deeper",
+        StorageClass::DeepArchive,
+    );
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.restore_object(
+                "bkt",
+                "deep",
+                VersionSel::Latest,
+                crate::RestoreRequest {
+                    expedited: true,
+                    ..ask(1, 0)
+                },
+                now()
+            ))
+            .unwrap(),
+        Err(ObjectError::TierUnavailable)
+    );
+    let slow = 3 * 86_400_000;
+    assert_eq!(
+        restore("deep", VersionSel::Latest, 1, slow, now())
+            .unwrap()
+            .0,
+        Restored::Started
+    );
+    assert!(unreadable(&deep, now() + slow - 1));
+    assert!(!unreadable(&deep, now() + slow));
+    assert!(!unreadable(&deep, now() + slow + 86_400_000 - 1));
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.delete_object(
+                "bkt",
+                "deep",
+                Some(VersionSel::Seq(deep.version)),
+                false,
+                now(),
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+
     // The window survives a restart; once expired it is removed, and an
     // idle sweep has nothing to do.
     drop(storage);
@@ -3878,7 +3943,7 @@ fn an_archived_version_is_read_only_while_restored() {
     // An expired restore is restored anew (202), not extended.
     let restore = |which: VersionSel, at: u64| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.restore_object("bkt", "cold", which, 1, 0, at))
+            .transaction(|tx| tx.restore_object("bkt", "cold", which, ask(1, 0), at))
             .unwrap()
     };
     assert_eq!(
@@ -3930,14 +3995,14 @@ fn a_restore_is_whole_after_a_crash_at_any_op_and_ships_to_a_standby() {
             .unwrap();
         let cold = put_classed(&storage, "bkt", "k", b"deep", StorageClass::DeepArchive);
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.restore_object("bkt", "k", VersionSel::Latest, 1, 0, now()))
+            .transaction(|tx| tx.restore_object("bkt", "k", VersionSel::Latest, ask(1, 0), now()))
             .unwrap()
             .unwrap();
         // Extending replaces the window and its timer: crash anywhere in it.
         FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(Some(crash_at)));
         let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             ft_txn(&storage, |tx| {
-                tx.restore_object("bkt", "k", VersionSel::Latest, 3, 0, now() + 1)
+                tx.restore_object("bkt", "k", VersionSel::Latest, ask(3, 0), now() + 1)
             })
         }))
         .is_err();
@@ -3998,7 +4063,7 @@ fn a_restore_is_whole_after_a_crash_at_any_op_and_ships_to_a_standby() {
         .unwrap();
     let cold = put_classed(&primary, "bkt", "k", b"deep", StorageClass::DeepArchive);
     ObjFile::new(&mut primary.lock())
-        .transaction(|tx| tx.restore_object("bkt", "k", VersionSel::Latest, 1, 0, now()))
+        .transaction(|tx| tx.restore_object("bkt", "k", VersionSel::Latest, ask(1, 0), now()))
         .unwrap()
         .unwrap();
     let window = |storage: &Storage| {

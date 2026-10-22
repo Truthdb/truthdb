@@ -62,7 +62,7 @@ pub use objects::{
     version_id,
 };
 pub use pack::{PackStep, PackWork, pack_segment};
-pub use restores::{Restore, RestoreState, Restored, restore_expiry, unreadable};
+pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
 
 /// The object engine's id on the shared log (its root lives in the
