@@ -460,40 +460,51 @@ pub async fn put_object(
     let headers = request.headers().clone();
     let sealed = receive_body(state, request, auth, customer.as_ref(), class).await?;
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
-    let (stored, versioning) = crate::scope::object_as(state, "PutObject", move |file| {
-        let now = now_ms();
-        // Decided in the write's own lock hold: the bucket's Object Lock
-        // may have changed while the body arrived (a default retention set,
-        // or the bucket made again without Object Lock).
-        let (bucket_lock, default) = crate::object_lock::bucket_state(file, &bucket_name)?;
-        let lock = match crate::object_lock::new_object_lock(lock, bucket_lock, default, now)
-            .and_then(|lock| {
-                if let Some(lock) = &lock {
-                    crate::object_lock::check_integrity(&headers, lock)?;
+    let (stored, versioning, expiration) =
+        crate::scope::object_as(state, "PutObject", move |file| {
+            let now = now_ms();
+            // Decided in the write's own lock hold: the bucket's Object Lock
+            // may have changed while the body arrived (a default retention set,
+            // or the bucket made again without Object Lock).
+            let (bucket_lock, default) = crate::object_lock::bucket_state(file, &bucket_name)?;
+            let lock = match crate::object_lock::new_object_lock(lock, bucket_lock, default, now)
+                .and_then(|lock| {
+                    if let Some(lock) = &lock {
+                        crate::object_lock::check_integrity(&headers, lock)?;
+                    }
+                    Ok(lock)
+                }) {
+                Ok(lock) => lock,
+                Err(err) => return Ok(Err(err)),
+            };
+            let stored = file.transaction(|tx| {
+                let stored = tx.put_object(
+                    &bucket_name,
+                    &key_name,
+                    &sealed,
+                    &attrs,
+                    class,
+                    now,
+                    DROP_GRACE_MS,
+                )?;
+                if let (Ok(info), Some(lock)) = (&stored, &lock) {
+                    tx.set_lock(info.version, lock)?;
                 }
-                Ok(lock)
-            }) {
-            Ok(lock) => lock,
-            Err(err) => return Ok(Err(err)),
-        };
-        let stored = file.transaction(|tx| {
-            let stored = tx.put_object(
-                &bucket_name,
-                &key_name,
-                &sealed,
-                &attrs,
-                class,
-                now,
-                DROP_GRACE_MS,
-            )?;
-            if let (Ok(info), Some(lock)) = (&stored, &lock) {
-                tx.set_lock(info.version, lock)?;
-            }
-            Ok(stored)
-        })?;
-        Ok(Ok((stored, versioning_of(file, &bucket_name)?)))
-    })
-    .await??;
+                Ok(stored)
+            })?;
+            let expiration = match &stored {
+                Ok(info) => crate::lifecycle::expiration_header(
+                    file.lifecycle(&bucket_name)?.as_ref(),
+                    &key_name,
+                    info.size,
+                    &info.attrs.tags,
+                    info.mtime_ms,
+                ),
+                Err(_) => None,
+            };
+            Ok(Ok((stored, versioning_of(file, &bucket_name)?, expiration)))
+        })
+        .await??;
     let info = stored.map_err(|err| object_error(err, &bucket, &key))?;
     let customer_key = info.attrs.customer_key.as_ref();
     let mut response = crate::ssec::with_echo(
@@ -507,6 +518,9 @@ pub async fn put_object(
     );
     if let Some(version) = version_header(versioning, info.version, info.null_version) {
         response = response.header("x-amz-version-id", version);
+    }
+    if let Some(expiration) = expiration {
+        response = response.header("x-amz-expiration", expiration);
     }
     Ok(response.body(full(Bytes::new())).expect("a valid response"))
 }
@@ -634,6 +648,7 @@ fn object_headers(
     versioning: Versioning,
     encrypted_at_rest: bool,
     restore: Option<RestoreState>,
+    expiration: Option<&str>,
 ) -> hyper::http::response::Builder {
     let attrs = &info.attrs;
     // An object with a customer-provided key says so, not AES256.
@@ -678,6 +693,9 @@ fn object_headers(
     }
     if let Some(restore) = crate::restore::header(restore) {
         builder = builder.header("x-amz-restore", restore);
+    }
+    if let Some(expiration) = expiration {
+        builder = builder.header("x-amz-expiration", expiration);
     }
     builder
 }
@@ -819,8 +837,21 @@ async fn read_object(
     // Resolve and lease in one lock hold, so the body cannot be collected
     // between the lookup and the lease.
     let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-    let (found, versioning, lock, restore) = object(state, move |file| {
+    let (found, versioning, lock, restore, expiration) = object(state, move |file| {
         let found = file.object_version(&lookup_bucket, &lookup_key, which)?;
+        // The current version's expiration, by the bucket's lifecycle rules.
+        let expiration = match &found {
+            Ok(info) if which == VersionSel::Latest && !info.delete_marker => {
+                crate::lifecycle::expiration_header(
+                    file.lifecycle(&lookup_bucket)?.as_ref(),
+                    &lookup_key,
+                    info.size,
+                    &info.attrs.tags,
+                    info.mtime_ms,
+                )
+            }
+            _ => None,
+        };
         // Everything that can fail comes before the lease: a failure after
         // it would leave the lease held with no one to release it.
         let versioning = versioning_of(file, &lookup_bucket)?;
@@ -840,7 +871,7 @@ async fn read_object(
         {
             file.take_lease(info.body)?;
         }
-        Ok((found, versioning, lock, restore))
+        Ok((found, versioning, lock, restore, expiration))
     })
     .await?;
     let mut info = found.map_err(|err| object_error(err, &bucket, &key))?;
@@ -915,6 +946,7 @@ async fn read_object(
             versioning,
             state.storage.is_encrypted(),
             restore,
+            expiration.as_deref(),
         )
         .body(full(Bytes::new()))
         .expect("a valid response"));
@@ -946,6 +978,7 @@ async fn read_object(
             versioning,
             state.storage.is_encrypted(),
             restore,
+            expiration.as_deref(),
         ),
         &lock,
         lock_visible.retention,

@@ -21,6 +21,7 @@ mod documents;
 mod fulltext;
 mod gc;
 mod journal;
+mod lifecycle;
 mod listing;
 mod locks;
 mod objects;
@@ -47,7 +48,8 @@ pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use consumers::{Consumer, FULLTEXT_CONSUMER};
 pub use credentials::AccessKey;
 pub use documents::{
-    BUCKET_ENCRYPTION, BUCKET_POLICY, ManagedPolicy, OBJECT_LOCK_DEFAULT, PUBLIC_ACCESS_BLOCK,
+    BUCKET_ENCRYPTION, BUCKET_LIFECYCLE, BUCKET_POLICY, ManagedPolicy, OBJECT_LOCK_DEFAULT,
+    PUBLIC_ACCESS_BLOCK,
 };
 pub use fulltext::{
     DEFAULT_FULLTEXT_MAX_BYTES, FtBucket, FtError, FtKey, FtState, FtStatus, MAX_FULLTEXT_BYTES,
@@ -55,6 +57,10 @@ pub use fulltext::{
 };
 pub use gc::GcOutcome;
 pub use journal::{JournalObject, JournalRecord, Origin, RecordType};
+pub use lifecycle::{
+    Expiration, Filter, LifecycleConfig, MinTransitionSize, NoncurrentExpiration,
+    NoncurrentTransition, Rule, StepBudget, Transition, When, days_after, transition_allowed,
+};
 pub use listing::{ListAfter, ListedObject, Listing};
 pub use locks::{EventHold, ObjectLock, Retention, RetentionChange, RetentionMode};
 pub use objects::{
@@ -129,6 +135,8 @@ const PACK_QUEUE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 24;
 const RESTORES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 25;
 /// (expiry time, version) -> (): restores in the order they expire.
 const RESTORE_TIMERS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 26;
+/// Bucket -> where its lifecycle pass stands (see `lifecycle`).
+const LIFECYCLE_STATE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 27;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -249,7 +257,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 27;
+const TREE_COUNT: usize = 28;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -345,6 +353,9 @@ impl Trees {
     }
     pub fn restore_timers(&self) -> BTree {
         self.tree(RESTORE_TIMERS_TREE)
+    }
+    pub fn lifecycle_state(&self) -> BTree {
+        self.tree(LIFECYCLE_STATE_TREE)
     }
 }
 
