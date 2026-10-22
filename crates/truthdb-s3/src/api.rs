@@ -392,6 +392,24 @@ async fn route(
         crate::policy::check_acl_headers(request.headers())?;
     }
     crate::sse::refuse_customer_keys(request.headers().keys().map(|name| name.as_str()))?;
+    // A write naming a query parameter no route here takes (an S3 operation
+    // not implemented, perhaps one added since) is refused, whichever route
+    // its other parameters would select.
+    if matches!(method, Method::PUT | Method::POST | Method::DELETE) {
+        let known: Vec<&str> = SUBRESOURCES
+            .iter()
+            .chain(&["versionId", "partNumber"])
+            .copied()
+            .collect();
+        if !plain_write(&request, &known) {
+            return Err(S3Error::not_implemented(format!(
+                "{} {}?{} is not implemented",
+                request.method(),
+                request.uri().path(),
+                request.uri().query().unwrap_or("")
+            )));
+        }
+    }
     match (target, method) {
         _ if UNIMPLEMENTED.iter().any(|name| has_param(&request, name)) => {
             Err(S3Error::not_implemented(format!(

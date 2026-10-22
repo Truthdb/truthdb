@@ -4536,6 +4536,35 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
         let (status, reply) = call(method, path, query);
         assert_eq!(status, 501, "{method} {path}?{query}: {reply}");
     }
+    // Neither is any other write naming an unknown operation, whichever
+    // route its other parameters select.
+    let (_, created) = call("POST", "/subs/keep", "uploads");
+    let kept = xml_value(&created, "UploadId");
+    for (method, path, query) in [
+        (
+            "DELETE",
+            "/subs/keep",
+            format!("uploadId={kept}&someFutureOperation"),
+        ),
+        (
+            "POST",
+            "/subs/keep",
+            format!("uploadId={kept}&someFutureOperation"),
+        ),
+        ("PUT", "/subs", "versioning&someFutureOperation".to_string()),
+        ("POST", "/subs", "delete&someFutureOperation".to_string()),
+    ] {
+        let (status, reply) = call(method, path, &query);
+        assert_eq!(status, 501, "{method} {path}?{query}: {reply}");
+    }
+    assert_eq!(
+        call("GET", "/subs/keep", &format!("uploadId={kept}")).0,
+        200,
+        "the upload is still there"
+    );
+    // The SDKs' x-id passes.
+    assert_eq!(call("PUT", "/subs/x", "x-id=PutObject").0, 200);
+    assert_eq!(call("DELETE", "/subs/x", "x-id=DeleteObject").0, 204);
     // A copy naming another sub-resource is refused, not taken for
     // UploadPart.
     let (_, created) = call("POST", "/subs/up", "uploads");
