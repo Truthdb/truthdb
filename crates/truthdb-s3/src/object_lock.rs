@@ -10,7 +10,8 @@ use quick_xml::Reader;
 use quick_xml::events::Event;
 use truthdb_iam::Context;
 use truthdb_object::{
-    BucketError, OBJECT_LOCK_DEFAULT, ObjectLock, Retention, RetentionMode, VersionSel,
+    BucketError, EventHold, OBJECT_LOCK_DEFAULT, ObjectLock, Retention, RetentionChange,
+    RetentionMode, VersionSel,
 };
 
 use crate::authz::{Authz, Resource};
@@ -20,13 +21,16 @@ use crate::server::{Authenticated, Body, S3State, full};
 pub const MODE_HEADER: &str = "x-amz-object-lock-mode";
 pub const UNTIL_HEADER: &str = "x-amz-object-lock-retain-until-date";
 pub const HOLD_HEADER: &str = "x-amz-object-lock-legal-hold";
+pub const EVENT_HOLD_HEADER: &str = "x-amz-object-lock-event-hold";
+pub const EVENT_DAYS_HEADER: &str = "x-amz-object-lock-event-hold-duration-days";
+pub const EVENT_YEARS_HEADER: &str = "x-amz-object-lock-event-hold-duration-years";
 pub const BYPASS_HEADER: &str = "x-amz-bypass-governance-retention";
 /// CreateBucket's header that enables Object Lock on the new bucket.
 pub const ENABLED_HEADER: &str = "x-amz-bucket-object-lock-enabled";
 
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const DAY_MS: u64 = 86_400_000;
-/// The longest default retention: 100 years, or as many days.
+/// The longest default retention or event hold: 100 years, or as many days.
 const MAX_DAYS: u32 = 36_500;
 const MAX_YEARS: u32 = 100;
 /// Largest Object Lock document read.
@@ -87,27 +91,133 @@ fn parse_hold(text: &str) -> Result<bool, S3Error> {
     }
 }
 
+/// A duration in days or in years, not both (`None` when neither is given),
+/// as `(years, count)`.
+fn parse_duration(days: Option<&str>, years: Option<&str>) -> Result<Option<(bool, u32)>, S3Error> {
+    let count = |text: &str, max: u32| {
+        text.parse::<u32>()
+            .ok()
+            .filter(|count| (1..=max).contains(count))
+            .ok_or_else(|| invalid(format!("A duration must be a whole number from 1 to {max}")))
+    };
+    match (days, years) {
+        (None, None) => Ok(None),
+        (Some(days), None) => Ok(Some((false, count(days, MAX_DAYS)?))),
+        (None, Some(years)) => Ok(Some((true, count(years, MAX_YEARS)?))),
+        (Some(_), Some(_)) => Err(invalid("A duration is in either days or years, not both")),
+    }
+}
+
+/// The retention a request asks for, from its parts (headers, or a
+/// Retention body).
+#[derive(Debug, PartialEq, Eq)]
+enum Asked {
+    None,
+    Retention(Retention),
+    /// The event hold turned off: a release, the date (if any) its minimum.
+    Release(RetentionMode, Option<u64>),
+}
+
+/// A retention from its parts: a mode with a retain-until date (fixed), or
+/// with an event hold ON and its duration (variable; a date is then its
+/// minimum). An event hold OFF without a date releases one.
+fn asked_retention(
+    mode: Option<&str>,
+    until: Option<&str>,
+    event_hold: Option<&str>,
+    duration: Option<(bool, u32)>,
+    now_ms: u64,
+) -> Result<Asked, S3Error> {
+    let event_hold = event_hold
+        .map(|text| match text {
+            "ON" => Ok(true),
+            "OFF" => Ok(false),
+            _ => Err(invalid("The event hold status must be ON or OFF")),
+        })
+        .transpose()?;
+    let required_mode = |what: &str| {
+        mode.ok_or_else(|| invalid(format!("{what} needs a retention mode")))
+            .and_then(parse_mode)
+    };
+    Ok(match event_hold {
+        Some(true) => {
+            let (years, count) =
+                duration.ok_or_else(|| invalid("An event hold that is ON needs its duration"))?;
+            Asked::Retention(Retention {
+                mode: required_mode("An event hold")?,
+                until_ms: until
+                    .map(|until| parse_until(until, now_ms))
+                    .transpose()?
+                    .unwrap_or(0),
+                event: Some(EventHold {
+                    on: true,
+                    years,
+                    count,
+                }),
+            })
+        }
+        Some(false) => {
+            if duration.is_some() {
+                return Err(invalid(
+                    "An event hold that is OFF takes no duration: the version's own applies",
+                ));
+            }
+            Asked::Release(
+                required_mode("Releasing an event hold")?,
+                until.map(|until| parse_until(until, now_ms)).transpose()?,
+            )
+        }
+        None => {
+            if duration.is_some() {
+                return Err(invalid("An event hold duration needs an event hold"));
+            }
+            match (mode, until) {
+                (None, None) => Asked::None,
+                (Some(mode), Some(until)) => Asked::Retention(Retention {
+                    mode: parse_mode(mode)?,
+                    until_ms: parse_until(until, now_ms)?,
+                    event: None,
+                }),
+                _ => {
+                    return Err(invalid(
+                        "A retention needs both a mode and a retain-until date, or an event hold",
+                    ));
+                }
+            }
+        }
+    })
+}
+
 /// The lock a write asks for in its headers (or a POST form's fields,
-/// which `field` finds by name): a mode with a retain-until date (both or
-/// neither), and a legal hold. `None` when it asks for none.
+/// which `field` finds by name): a retention (fixed, or variable with an
+/// event hold), and a legal hold. `None` when it asks for none.
 pub fn requested<'a>(
     field: impl Fn(&str) -> Option<&'a str>,
     now_ms: u64,
 ) -> Result<Option<ObjectLock>, S3Error> {
-    let (mode, until, hold) = (field(MODE_HEADER), field(UNTIL_HEADER), field(HOLD_HEADER));
-    let retention = match (mode, until) {
-        (None, None) => None,
-        (Some(mode), Some(until)) => Some(Retention {
-            mode: parse_mode(mode)?,
-            until_ms: parse_until(until, now_ms)?,
+    let retention = match asked_retention(
+        field(MODE_HEADER),
+        field(UNTIL_HEADER),
+        field(EVENT_HOLD_HEADER),
+        parse_duration(field(EVENT_DAYS_HEADER), field(EVENT_YEARS_HEADER))?,
+        now_ms,
+    )? {
+        Asked::None => None,
+        Asked::Retention(retention) => Some(retention),
+        // OFF with a date, on a new object: a fixed retention.
+        Asked::Release(mode, Some(until_ms)) => Some(Retention {
+            mode,
+            until_ms,
+            event: None,
         }),
-        _ => {
-            return Err(invalid(format!(
-                "{MODE_HEADER} and {UNTIL_HEADER} must both be supplied"
-            )));
+        Asked::Release(_, None) => {
+            return Err(invalid(
+                "A new object has no event hold to release: an event hold that is OFF needs a \
+                 retain-until date",
+            ));
         }
     };
-    let legal_hold = hold.map(parse_hold).transpose()?;
+    let legal_hold = field(HOLD_HEADER).map(parse_hold).transpose()?;
     Ok(
         (retention.is_some() || legal_hold.is_some()).then_some(ObjectLock {
             retention,
@@ -146,54 +256,90 @@ pub fn check_integrity(headers: &HeaderMap, lock: &ObjectLock) -> Result<(), S3E
     Ok(())
 }
 
-/// A bucket's default retention, as kept in its configuration:
-/// `[mode u8: 1 GOVERNANCE, 2 COMPLIANCE][unit u8: 1 days, 2 years]
+/// A bucket's default retention: a mode, with a period (a new object's
+/// retain-until date is that long after it is made), an event hold's
+/// duration (a new object starts held), or both. Durations are
+/// `(years, count)`. Kept in the bucket's configuration as
+/// `[mode u8: 1 GOVERNANCE, 2 COMPLIANCE][unit u8: 0 none, 1 days, 2 years]
+/// [count u32]`, then for an event hold `[unit u8: 1 days, 2 years]
 /// [count u32]`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DefaultRetention {
     pub mode: RetentionMode,
-    pub years: bool,
-    pub count: u32,
+    pub period: Option<(bool, u32)>,
+    pub event: Option<(bool, u32)>,
 }
 
 impl DefaultRetention {
     fn encode(&self) -> Vec<u8> {
-        let mut out = vec![
-            match self.mode {
-                RetentionMode::Governance => 1,
-                RetentionMode::Compliance => 2,
-            },
-            if self.years { 2 } else { 1 },
-        ];
-        out.extend_from_slice(&self.count.to_le_bytes());
+        let unit = |years: bool| if years { 2 } else { 1 };
+        let mut out = vec![match self.mode {
+            RetentionMode::Governance => 1,
+            RetentionMode::Compliance => 2,
+        }];
+        let (period_unit, period_count) = self.period.map_or((0, 0), |(y, c)| (unit(y), c));
+        out.push(period_unit);
+        out.extend_from_slice(&period_count.to_le_bytes());
+        if let Some((years, count)) = self.event {
+            out.push(unit(years));
+            out.extend_from_slice(&count.to_le_bytes());
+        }
         out
     }
 
     pub fn decode(bytes: &[u8]) -> Option<Self> {
-        let [mode, unit, count @ ..] = bytes else {
-            return None;
+        let duration = |unit: u8, count: &[u8]| -> Option<Option<(bool, u32)>> {
+            let count = u32::from_le_bytes(count.try_into().ok()?);
+            match unit {
+                0 => Some(None),
+                1 => Some(Some((false, count))),
+                2 => Some(Some((true, count))),
+                _ => None,
+            }
         };
+        let (mode, period, event) = match bytes {
+            [mode, unit, count @ ..] if count.len() == 4 => (mode, duration(*unit, count)?, None),
+            [mode, unit, rest @ ..] if rest.len() == 9 => (
+                mode,
+                duration(*unit, &rest[..4])?,
+                Some(duration(rest[4], &rest[5..])?.filter(|_| rest[4] != 0)?),
+            ),
+            _ => return None,
+        };
+        if period.is_none() && event.is_none() {
+            return None;
+        }
         Some(DefaultRetention {
             mode: match mode {
                 1 => RetentionMode::Governance,
                 2 => RetentionMode::Compliance,
                 _ => return None,
             },
-            years: match unit {
-                1 => false,
-                2 => true,
-                _ => return None,
-            },
-            count: u32::from_le_bytes(count.try_into().ok()?),
+            period,
+            event,
         })
     }
 
     /// The retention a new object gets at `now_ms` (a year is 365 days).
     pub fn retention(&self, now_ms: u64) -> Retention {
-        let days = u64::from(self.count) * if self.years { 365 } else { 1 };
+        let event = self.event.map(|(years, count)| EventHold {
+            on: true,
+            years,
+            count,
+        });
+        let until_ms = self.period.map_or(0, |(years, count)| {
+            now_ms
+                + EventHold {
+                    on: false,
+                    years,
+                    count,
+                }
+                .duration_ms()
+        });
         Retention {
             mode: self.mode,
-            until_ms: now_ms + days * DAY_MS,
+            until_ms,
+            event,
         }
     }
 }
@@ -245,21 +391,40 @@ pub fn set_condition_keys(context: &mut Context, lock: &ObjectLock, now_ms: u64)
             "s3:object-lock-mode",
             vec![mode_name(retention.mode).to_string()],
         );
+        let until = retention.effective_until(now_ms);
         context.set(
             "s3:object-lock-retain-until-date",
-            vec![crate::time::iso8601(retention.until_ms)],
+            vec![crate::time::iso8601(until)],
         );
         // Whole days left, a part of a day counting as one.
-        let days = retention.until_ms.saturating_sub(now_ms).div_ceil(DAY_MS);
+        let days = until.saturating_sub(now_ms).div_ceil(DAY_MS);
         context.set(
             "s3:object-lock-remaining-retention-days",
             vec![days.to_string()],
         );
+        if let Some(event) = retention.event {
+            set_event_hold_keys(context, event);
+        }
     }
     if let Some(on) = lock.legal_hold {
         context.set(
             "s3:object-lock-legal-hold",
             vec![if on { "ON" } else { "OFF" }.to_string()],
+        );
+    }
+}
+
+/// `s3:object-lock-event-hold`, and the duration in days (a year is 365)
+/// while the hold is on.
+fn set_event_hold_keys(context: &mut Context, event: EventHold) {
+    context.set(
+        "s3:object-lock-event-hold",
+        vec![if event.on { "ON" } else { "OFF" }.to_string()],
+    );
+    if event.on {
+        context.set(
+            "s3:object-lock-event-hold-duration-days",
+            vec![(event.duration_ms() / DAY_MS).to_string()],
         );
     }
 }
@@ -302,9 +467,21 @@ pub fn with_headers(
     if let Some(retention) = lock.retention
         && retention_visible
     {
+        let until = retention.effective_until(crate::objects::now_ms());
         builder = builder
             .header(MODE_HEADER, mode_name(retention.mode))
-            .header(UNTIL_HEADER, crate::time::iso8601(retention.until_ms));
+            .header(UNTIL_HEADER, crate::time::iso8601(until));
+        if let Some(event) = retention.event {
+            builder = builder.header(EVENT_HOLD_HEADER, if event.on { "ON" } else { "OFF" });
+            if event.on {
+                let unit = if event.years {
+                    EVENT_YEARS_HEADER
+                } else {
+                    EVENT_DAYS_HEADER
+                };
+                builder = builder.header(unit, event.count.to_string());
+            }
+        }
     }
     if let Some(on) = lock.legal_hold
         && hold_visible
@@ -422,11 +599,6 @@ fn parse_configuration(body: &[u8]) -> Result<Option<DefaultRetention>, S3Error>
     if leaf(&found, "ObjectLockEnabled") != Some("Enabled") {
         return Err(malformed());
     }
-    if leaf(&found, "Rule/DefaultRetention/DefaultEventHold").is_some() {
-        return Err(S3Error::not_implemented(
-            "default event holds are not implemented",
-        ));
-    }
     if leaf(&found, "Rule").is_none() {
         return Ok(None);
     }
@@ -435,43 +607,49 @@ fn parse_configuration(body: &[u8]) -> Result<Option<DefaultRetention>, S3Error>
     }
     let mode = leaf(&found, "Rule/DefaultRetention/Mode")
         .ok_or_else(|| invalid("A default retention needs a Mode"))?;
-    let count = |text: &str, max: u32| {
-        text.parse::<u32>()
-            .ok()
-            .filter(|count| (1..=max).contains(count))
-            .ok_or_else(|| {
-                invalid(format!(
-                    "The default retention period must be a whole number from 1 to {max}"
-                ))
-            })
-    };
-    let (years, count) = match (
+    let period = parse_duration(
         leaf(&found, "Rule/DefaultRetention/Days"),
         leaf(&found, "Rule/DefaultRetention/Years"),
-    ) {
-        (Some(days), None) => (false, count(days, MAX_DAYS)?),
-        (None, Some(years)) => (true, count(years, MAX_YEARS)?),
-        _ => {
-            return Err(invalid(
-                "A default retention needs either Days or Years, not both",
-            ));
-        }
-    };
+    )?;
+    let event = parse_duration(
+        leaf(&found, "Rule/DefaultRetention/DefaultEventHold/Days"),
+        leaf(&found, "Rule/DefaultRetention/DefaultEventHold/Years"),
+    )?;
+    if leaf(&found, "Rule/DefaultRetention/DefaultEventHold").is_some() && event.is_none() {
+        return Err(invalid("A default event hold needs Days or Years"));
+    }
+    if period.is_none() && event.is_none() {
+        return Err(invalid(
+            "A default retention needs a period (Days or Years), a default event hold, or both",
+        ));
+    }
     Ok(Some(DefaultRetention {
         mode: parse_mode(mode)?,
-        years,
-        count,
+        period,
+        event,
     }))
+}
+
+/// `<Days>n</Days>` or `<Years>n</Years>`.
+fn duration_xml((years, count): (bool, u32)) -> String {
+    let unit = if years { "Years" } else { "Days" };
+    format!("<{unit}>{count}</{unit}>")
 }
 
 fn render_configuration(default: Option<DefaultRetention>) -> String {
     let rule = match default {
         None => String::new(),
         Some(default) => format!(
-            "<Rule><DefaultRetention><Mode>{}</Mode><{unit}>{}</{unit}></DefaultRetention></Rule>",
+            "<Rule><DefaultRetention><Mode>{}</Mode>{}{}</DefaultRetention></Rule>",
             mode_name(default.mode),
-            default.count,
-            unit = if default.years { "Years" } else { "Days" },
+            default.period.map(duration_xml).unwrap_or_default(),
+            default
+                .event
+                .map(|event| format!(
+                    "<DefaultEventHold>{}</DefaultEventHold>",
+                    duration_xml(event)
+                ))
+                .unwrap_or_default(),
         ),
     };
     format!(
@@ -640,45 +818,119 @@ pub async fn retention(
     if method == Method::GET {
         let lock = read_lock(state, &bucket, &key, which).await?;
         let retention = lock.retention.ok_or_else(no_lock_configuration)?;
+        let event = retention
+            .event
+            .map(|event| {
+                format!(
+                    "<EventHold>{}</EventHold><EventHoldDuration>{}</EventHoldDuration>",
+                    if event.on { "ON" } else { "OFF" },
+                    duration_xml((event.years, event.count))
+                )
+            })
+            .unwrap_or_default();
         return Ok(xml(format!(
             "<Retention xmlns=\"{XMLNS}\"><Mode>{}</Mode><RetainUntilDate>{}</RetainUntilDate>\
-             </Retention>",
+             {event}</Retention>",
             mode_name(retention.mode),
-            crate::time::iso8601(retention.until_ms)
+            crate::time::iso8601(retention.effective_until(crate::objects::now_ms()))
         )));
     }
     let bypass = bypasses(request.headers(), authz, Resource::Object(&bucket, &key));
-    let now = crate::objects::now_ms();
     let body = read_checked_body(request, auth, MAX_BODY).await?;
-    let found = leaves(&body, "Retention", &["Mode", "RetainUntilDate"])?;
+    // Taken once the body is in (a slow body must not date the change
+    // early); the engine takes its own when it applies it.
+    let now = crate::objects::now_ms();
+    let found = leaves(
+        &body,
+        "Retention",
+        &[
+            "Mode",
+            "RetainUntilDate",
+            "EventHold",
+            "EventHoldDuration",
+            "EventHoldDuration/Days",
+            "EventHoldDuration/Years",
+        ],
+    )?;
+    let duration = parse_duration(
+        leaf(&found, "EventHoldDuration/Days"),
+        leaf(&found, "EventHoldDuration/Years"),
+    )?;
+    if leaf(&found, "EventHoldDuration").is_some() && duration.is_none() {
+        return Err(invalid("An event hold duration needs Days or Years"));
+    }
     // An empty Retention removes it (with bypass, for GOVERNANCE).
-    let retention = match (leaf(&found, "Mode"), leaf(&found, "RetainUntilDate")) {
-        (None, None) => None,
-        (Some(mode), Some(until)) => Some(Retention {
-            mode: parse_mode(mode)?,
-            until_ms: parse_until(until, now)?,
-        }),
-        _ => return Err(malformed()),
+    let change = match asked_retention(
+        leaf(&found, "Mode"),
+        leaf(&found, "RetainUntilDate"),
+        leaf(&found, "EventHold"),
+        duration,
+        now,
+    )? {
+        Asked::None => RetentionChange::Remove,
+        Asked::Retention(retention) => RetentionChange::Set(retention),
+        Asked::Release(mode, until) => RetentionChange::Release {
+            mode,
+            until_ms: until.unwrap_or(0),
+        },
     };
     // Authorized here, once, with the retention the body asks for (none,
     // for a removal): headers say nothing about it.
     let mut context = authz.context().clone();
-    set_condition_keys(
-        &mut context,
-        &ObjectLock {
-            retention,
-            legal_hold: None,
-        },
-        now,
-    );
-    authz.check_with(action, Resource::Object(&bucket, &key), &context)?;
+    match change {
+        RetentionChange::Set(retention) => set_condition_keys(
+            &mut context,
+            &ObjectLock {
+                retention: Some(retention),
+                legal_hold: None,
+            },
+            now,
+        ),
+        RetentionChange::Release { mode, until_ms } => {
+            context.set("s3:object-lock-mode", vec![mode_name(mode).to_string()]);
+            context.set("s3:object-lock-event-hold", vec!["OFF".to_string()]);
+            // The date it names, a minimum: the one stored may be later.
+            if until_ms > 0 {
+                context.set(
+                    "s3:object-lock-retain-until-date",
+                    vec![crate::time::iso8601(until_ms)],
+                );
+                context.set(
+                    "s3:object-lock-remaining-retention-days",
+                    vec![until_ms.saturating_sub(now).div_ceil(DAY_MS).to_string()],
+                );
+            }
+        }
+        RetentionChange::Remove => {}
+    }
+    // Authorized in the change's own lock hold: a fixed date set on a held
+    // version releases its hold, which policies see as a release
+    // (s3:object-lock-event-hold OFF), from the version as it is then.
+    let (authz, action) = (authz.clone(), action.to_string());
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     crate::scope::object(state, move |file| {
-        file.transaction(|tx| {
-            tx.put_retention(&bucket_name, &key_name, which, retention, bypass, now)
-        })
+        let fixed = matches!(change, RetentionChange::Set(retention) if retention.event.is_none());
+        if fixed && let Ok(info) = file.head_object(&bucket_name, &key_name, which)? {
+            let held = file
+                .object_lock(info.version)?
+                .retention
+                .and_then(|retention| retention.event)
+                .is_some_and(|event| event.on);
+            if held {
+                context.set("s3:object-lock-event-hold", vec!["OFF".to_string()]);
+            }
+        }
+        if let Err(err) =
+            authz.check_with(&action, Resource::Object(&bucket_name, &key_name), &context)
+        {
+            return Ok(Err(err));
+        }
+        let now = crate::objects::now_ms();
+        Ok(Ok(file.transaction(|tx| {
+            tx.put_retention(&bucket_name, &key_name, which, change, bypass, now)
+        })?))
     })
-    .await?
+    .await??
     .map_err(|err| crate::objects::object_error(err, &bucket, &key))?;
     Ok(empty())
 }
@@ -760,9 +1012,40 @@ mod tests {
             Some(Retention {
                 mode: RetentionMode::Compliance,
                 until_ms: 1_893_553_445_000,
+                event: None,
             })
         );
         assert_eq!(lock.legal_hold, Some(true));
+        // A variable retention: an event hold with its duration, and a
+        // date as its minimum, or none.
+        let held = ask(&[
+            (MODE_HEADER, "GOVERNANCE"),
+            (EVENT_HOLD_HEADER, "ON"),
+            (EVENT_YEARS_HEADER, "3"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(
+            held.retention,
+            Some(Retention {
+                mode: RetentionMode::Governance,
+                until_ms: 0,
+                event: Some(EventHold {
+                    on: true,
+                    years: true,
+                    count: 3
+                }),
+            })
+        );
+        let minimum = ask(&[
+            (MODE_HEADER, "GOVERNANCE"),
+            (EVENT_HOLD_HEADER, "ON"),
+            (EVENT_DAYS_HEADER, "30"),
+            (UNTIL_HEADER, "2030-01-02T03:04:05Z"),
+        ])
+        .unwrap()
+        .unwrap();
+        assert_eq!(minimum.retention.unwrap().until_ms, 1_893_553_445_000);
         for bad in [
             &[(MODE_HEADER, "GOVERNANCE")][..],
             &[(UNTIL_HEADER, "2030-01-02T03:04:05Z")],
@@ -776,6 +1059,35 @@ mod tests {
             ],
             &[(MODE_HEADER, "GOVERNANCE"), (UNTIL_HEADER, "1999999999")],
             &[(HOLD_HEADER, "on")],
+            // An event hold without its mode or duration, both units, a
+            // duration out of range, a duration without an event hold, and
+            // a release on a new object.
+            &[(EVENT_HOLD_HEADER, "ON"), (EVENT_DAYS_HEADER, "1")],
+            &[(MODE_HEADER, "GOVERNANCE"), (EVENT_HOLD_HEADER, "ON")],
+            &[
+                (MODE_HEADER, "GOVERNANCE"),
+                (EVENT_HOLD_HEADER, "ON"),
+                (EVENT_DAYS_HEADER, "1"),
+                (EVENT_YEARS_HEADER, "1"),
+            ],
+            &[
+                (MODE_HEADER, "GOVERNANCE"),
+                (EVENT_HOLD_HEADER, "ON"),
+                (EVENT_DAYS_HEADER, "36501"),
+            ],
+            &[(MODE_HEADER, "GOVERNANCE"), (EVENT_DAYS_HEADER, "1")],
+            &[(MODE_HEADER, "GOVERNANCE"), (EVENT_HOLD_HEADER, "OFF")],
+            &[
+                (MODE_HEADER, "GOVERNANCE"),
+                (EVENT_HOLD_HEADER, "OFF"),
+                (EVENT_DAYS_HEADER, "1"),
+                (UNTIL_HEADER, "2030-01-02T03:04:05Z"),
+            ],
+            &[
+                (MODE_HEADER, "GOVERNANCE"),
+                (EVENT_HOLD_HEADER, "on"),
+                (EVENT_DAYS_HEADER, "1"),
+            ],
         ] {
             assert_eq!(ask(bad).unwrap_err().code, "InvalidArgument", "{bad:?}");
         }
@@ -803,8 +1115,8 @@ mod tests {
             years,
             DefaultRetention {
                 mode: RetentionMode::Governance,
-                years: true,
-                count: 2
+                period: Some((true, 2)),
+                event: None,
             }
         );
         assert_eq!(DefaultRetention::decode(&years.encode()), Some(years));
@@ -817,6 +1129,50 @@ mod tests {
             parse_configuration(render_configuration(Some(years)).as_bytes()).unwrap(),
             Some(years)
         );
+        // A default event hold, with or without a period.
+        for (rule, expected) in [
+            (
+                "<DefaultEventHold><Days>90</Days></DefaultEventHold>",
+                DefaultRetention {
+                    mode: RetentionMode::Compliance,
+                    period: None,
+                    event: Some((false, 90)),
+                },
+            ),
+            (
+                "<Days>365</Days><DefaultEventHold><Years>1</Years></DefaultEventHold>",
+                DefaultRetention {
+                    mode: RetentionMode::Compliance,
+                    period: Some((false, 365)),
+                    event: Some((true, 1)),
+                },
+            ),
+        ] {
+            let parsed = parse_configuration(
+                config(&format!(
+                    "<Rule><DefaultRetention><Mode>COMPLIANCE</Mode>{rule}</DefaultRetention></Rule>"
+                ))
+                .as_bytes(),
+            )
+            .unwrap()
+            .unwrap();
+            assert_eq!(parsed, expected, "{rule}");
+            assert_eq!(DefaultRetention::decode(&parsed.encode()), Some(parsed));
+            assert_eq!(
+                parse_configuration(render_configuration(Some(parsed)).as_bytes()).unwrap(),
+                Some(parsed)
+            );
+        }
+        let held = DefaultRetention {
+            mode: RetentionMode::Compliance,
+            period: Some((false, 365)),
+            event: Some((false, 90)),
+        }
+        .retention(NOW);
+        assert_eq!(held.until_ms, NOW + 365 * DAY_MS, "the period is a minimum");
+        assert_eq!(held.effective_until(NOW), NOW + 365 * DAY_MS);
+        assert!(held.event.unwrap().on, "a new object starts held");
+        assert_eq!(DefaultRetention::decode(&[1, 0, 0, 0, 0, 0]), None);
         for (rule, code) in [
             (
                 "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode></DefaultRetention></Rule>",
@@ -853,8 +1209,16 @@ mod tests {
                 "MalformedXML",
             ),
             (
-                "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><DefaultEventHold><Days>1</Days></DefaultEventHold></DefaultRetention></Rule>",
-                "NotImplemented",
+                "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><DefaultEventHold></DefaultEventHold></DefaultRetention></Rule>",
+                "InvalidArgument",
+            ),
+            (
+                "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><DefaultEventHold><Days>0</Days></DefaultEventHold></DefaultRetention></Rule>",
+                "InvalidArgument",
+            ),
+            (
+                "<Rule><DefaultRetention><DefaultEventHold><Days>1</Days></DefaultEventHold></DefaultRetention></Rule>",
+                "InvalidArgument",
             ),
             (
                 "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention>text</Rule>",
@@ -887,8 +1251,8 @@ mod tests {
     fn new_objects_take_their_own_lock_or_the_buckets_default() {
         let default = DefaultRetention {
             mode: RetentionMode::Compliance,
-            years: false,
-            count: 3,
+            period: Some((false, 3)),
+            event: None,
         };
         let held = ObjectLock {
             retention: None,

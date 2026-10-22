@@ -2557,16 +2557,24 @@ fn object_lock_keeps_protected_versions_until_their_retention_or_hold_allows() {
     };
     let retain = |which: VersionSel, retention: Option<Retention>, bypass: bool| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.put_retention("bkt", "k", which, retention, bypass, now()))
+            .transaction(|tx| {
+                let change = match retention {
+                    Some(retention) => crate::RetentionChange::Set(retention),
+                    None => crate::RetentionChange::Remove,
+                };
+                tx.put_retention("bkt", "k", which, change, bypass, now())
+            })
             .unwrap()
     };
     let governance = |until_ms| Retention {
         mode: RetentionMode::Governance,
         until_ms,
+        event: None,
     };
     let compliance = |until_ms| Retention {
         mode: RetentionMode::Compliance,
         until_ms,
+        event: None,
     };
     let until = now() + 1_000;
     assert_eq!(
@@ -2781,4 +2789,212 @@ fn a_bucket_row_has_its_object_lock_byte_only_when_enabled() {
     let mut bad = row.encode();
     bad[29] = 2;
     assert!(BucketRow::decode(&bad).is_err());
+}
+
+#[test]
+fn an_event_hold_keeps_a_version_until_its_duration_after_release() {
+    use crate::{
+        EventHold, ObjectError, Retention, RetentionChange, RetentionMode, VersionSel, Versioning,
+    };
+    const DAY: u64 = 86_400_000;
+    let path = temp_path("event-hold");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("bkt", DEFAULT_ACCOUNT, now())?.unwrap();
+            tx.set_versioning("bkt", Versioning::Enabled)?.unwrap();
+            tx.enable_object_lock("bkt")
+        })
+        .unwrap()
+        .unwrap();
+    let held = |mode, days: u32, until_ms: u64| Retention {
+        mode,
+        until_ms,
+        event: Some(EventHold {
+            on: true,
+            years: false,
+            count: days,
+        }),
+    };
+    let change = |version: u64, change: RetentionChange, bypass: bool, at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.put_retention("bkt", "k", VersionSel::Seq(version), change, bypass, at)
+            })
+            .unwrap()
+    };
+    let retention_of = |version: u64| {
+        ObjFile::new(&mut storage.lock())
+            .object_lock(version)
+            .unwrap()
+            .retention
+            .unwrap()
+    };
+    let delete = |version: u64, bypass: bool, at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.delete_object("bkt", "k", Some(VersionSel::Seq(version)), bypass, at, 0)
+            })
+            .unwrap()
+    };
+    let t = now();
+    let v = put_text(&storage, "bkt", "k", "held");
+    // Releasing what is not held is refused.
+    assert!(matches!(
+        change(
+            v,
+            RetentionChange::Release {
+                mode: RetentionMode::Compliance,
+                until_ms: 0,
+            },
+            false,
+            t
+        ),
+        Err(ObjectError::InvalidRetention(_))
+    ));
+    change(
+        v,
+        RetentionChange::Set(held(RetentionMode::Compliance, 10, 0)),
+        false,
+        t,
+    )
+    .unwrap();
+    // Held, the version stays however late, bypass or not.
+    assert_eq!(delete(v, true, t + 1_000 * DAY), Err(ObjectError::Locked));
+    assert_eq!(retention_of(v).effective_until(t + DAY), t + 11 * DAY);
+    // A shorter duration never moves the date back.
+    change(
+        v,
+        RetentionChange::Set(held(RetentionMode::Compliance, 1, 0)),
+        false,
+        t + DAY,
+    )
+    .unwrap();
+    assert_eq!(retention_of(v).effective_until(t + DAY), t + 11 * DAY);
+    assert_eq!(retention_of(v).effective_until(t + 20 * DAY), t + 21 * DAY);
+    // Neither a mode change nor an earlier fixed date passes, bypass or not.
+    for retention in [
+        held(RetentionMode::Governance, 10, 0),
+        Retention {
+            mode: RetentionMode::Compliance,
+            until_ms: t + 5 * DAY,
+            event: None,
+        },
+    ] {
+        assert_eq!(
+            change(v, RetentionChange::Set(retention), true, t + DAY),
+            Err(ObjectError::Locked),
+            "{retention:?}"
+        );
+    }
+    assert_eq!(
+        change(v, RetentionChange::Remove, true, t + DAY),
+        Err(ObjectError::Locked)
+    );
+    // Released at day 30 (a day's duration now): kept until day 31.
+    change(
+        v,
+        RetentionChange::Release {
+            mode: RetentionMode::Compliance,
+            until_ms: 0,
+        },
+        false,
+        t + 30 * DAY,
+    )
+    .unwrap();
+    let released = retention_of(v);
+    assert_eq!(released.until_ms, t + 31 * DAY);
+    assert!(!released.event.unwrap().on);
+    assert_eq!(released.effective_until(t + 100 * DAY), t + 31 * DAY);
+    assert_eq!(delete(v, false, t + 31 * DAY - 1), Err(ObjectError::Locked));
+    delete(v, false, t + 31 * DAY).unwrap();
+
+    // A minimum date outlasts an early release; GOVERNANCE gives way to a
+    // bypass, and a fixed date at least the current one releases the hold.
+    let w = put_text(&storage, "bkt", "k", "minimum");
+    change(
+        w,
+        RetentionChange::Set(held(RetentionMode::Governance, 1, t + 50 * DAY)),
+        false,
+        t,
+    )
+    .unwrap();
+    change(
+        w,
+        RetentionChange::Release {
+            mode: RetentionMode::Governance,
+            until_ms: 0,
+        },
+        false,
+        t + 2 * DAY,
+    )
+    .unwrap();
+    assert_eq!(retention_of(w).until_ms, t + 50 * DAY);
+    let fixed = Retention {
+        mode: RetentionMode::Governance,
+        until_ms: t + 60 * DAY,
+        event: None,
+    };
+    change(w, RetentionChange::Set(fixed), false, t + 2 * DAY).unwrap();
+    assert_eq!(retention_of(w), fixed);
+    change(
+        w,
+        RetentionChange::Set(held(RetentionMode::Governance, 3, 0)),
+        false,
+        t + 2 * DAY,
+    )
+    .unwrap();
+    assert_eq!(
+        retention_of(w).until_ms,
+        t + 60 * DAY,
+        "a hold placed on a fixed date keeps the date as its minimum"
+    );
+    change(w, RetentionChange::Remove, true, t + 2 * DAY).unwrap();
+    delete(w, false, t + 2 * DAY).unwrap();
+    // A release naming a date keeps the later of it and the duration; on a
+    // version not held, the date is a fixed retention.
+    let r = put_text(&storage, "bkt", "k", "release-minimum");
+    change(
+        r,
+        RetentionChange::Set(held(RetentionMode::Governance, 30, 0)),
+        false,
+        t,
+    )
+    .unwrap();
+    let release = |until_ms| RetentionChange::Release {
+        mode: RetentionMode::Governance,
+        until_ms,
+    };
+    change(r, release(t + DAY), false, t).unwrap();
+    assert_eq!(retention_of(r).until_ms, t + 30 * DAY);
+    change(r, RetentionChange::Remove, true, t).unwrap();
+    change(
+        r,
+        RetentionChange::Set(held(RetentionMode::Governance, 30, 0)),
+        false,
+        t,
+    )
+    .unwrap();
+    change(r, release(t + 60 * DAY), false, t).unwrap();
+    assert_eq!(retention_of(r).until_ms, t + 60 * DAY);
+    change(r, RetentionChange::Remove, true, t).unwrap();
+    change(r, release(t + 5 * DAY), false, t).unwrap();
+    let fixed = retention_of(r);
+    assert_eq!((fixed.until_ms, fixed.event), (t + 5 * DAY, None));
+    change(r, RetentionChange::Remove, true, t).unwrap();
+    // Held in years: 365 days each.
+    let y = put_text(&storage, "bkt", "k", "years");
+    let years = Retention {
+        mode: RetentionMode::Governance,
+        until_ms: 0,
+        event: Some(EventHold {
+            on: true,
+            years: true,
+            count: 2,
+        }),
+    };
+    change(y, RetentionChange::Set(years), false, t).unwrap();
+    assert_eq!(retention_of(y).effective_until(t), t + 730 * DAY);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
 }

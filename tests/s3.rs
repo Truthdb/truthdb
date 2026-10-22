@@ -6390,3 +6390,360 @@ fn a_write_decides_its_lock_when_it_is_stored() {
     assert_eq!(status, 200, "{reply}");
     assert!(reply.contains("<Mode>GOVERNANCE</Mode>"), "{reply}");
 }
+
+#[test]
+fn an_event_hold_keeps_an_object_until_its_duration_after_release() {
+    use serde_json::json;
+    const MODE: &str = "x-amz-object-lock-mode";
+    const UNTIL: &str = "x-amz-object-lock-retain-until-date";
+    const EVENT: &str = "x-amz-object-lock-event-hold";
+    const DAYS: &str = "x-amz-object-lock-event-hold-duration-days";
+    const YEARS: &str = "x-amz-object-lock-event-hold-duration-years";
+    const BYPASS: &str = "x-amz-bypass-governance-retention";
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, key, secret) = account_with_key(&server, "events");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    let put_doc = |path: &str, query: &str, body: &str| {
+        let md5 = content_md5(body.as_bytes());
+        call(
+            "PUT",
+            path,
+            query,
+            &[("content-md5", &md5)],
+            body.as_bytes(),
+        )
+        .1
+    };
+    assert_eq!(
+        call(
+            "PUT",
+            "/held",
+            "",
+            &[("x-amz-bucket-object-lock-enabled", "true")],
+            b""
+        )
+        .1
+        .0,
+        200
+    );
+    let md5 = content_md5(b"x");
+    let (head, (status, reply)) = call(
+        "PUT",
+        "/held/k",
+        "",
+        &[
+            (MODE, "COMPLIANCE"),
+            (EVENT, "ON"),
+            (DAYS, "1"),
+            ("content-md5", &md5),
+        ],
+        b"x",
+    );
+    assert_eq!(status, 200, "{reply}");
+    let version = format!(
+        "versionId={}",
+        response_header(&head, "x-amz-version-id").unwrap()
+    );
+    let (head, _) = call("HEAD", "/held/k", "", &[], b"");
+    assert_eq!(response_header(&head, EVENT).as_deref(), Some("ON"));
+    assert_eq!(response_header(&head, DAYS).as_deref(), Some("1"));
+    // While held, the date is a day from now.
+    let shown = response_header(&head, UNTIL).unwrap();
+    assert!(
+        shown[..10] >= *iso_in(86_400 - 60).get(..10).unwrap(),
+        "{shown}"
+    );
+    let (_, reply) = call("GET", "/held/k", "retention", &[], b"").1;
+    assert!(
+        reply.contains(
+            "<EventHold>ON</EventHold><EventHoldDuration><Days>1</Days></EventHoldDuration>"
+        ),
+        "{reply}"
+    );
+    assert_eq!(
+        call("DELETE", "/held/k", &version, &[(BYPASS, "true")], b"")
+            .1
+            .0,
+        403
+    );
+    // A release fixes the date; there is then nothing left to release.
+    let release = "<Retention><Mode>COMPLIANCE</Mode><EventHold>OFF</EventHold></Retention>";
+    let query = format!("retention&{version}");
+    let (status, reply) = put_doc("/held/k", &query, release);
+    assert_eq!(status, 200, "{reply}");
+    let (head, _) = call("HEAD", "/held/k", "", &[], b"");
+    assert_eq!(response_header(&head, EVENT).as_deref(), Some("OFF"));
+    assert_eq!(response_header(&head, DAYS), None, "shown only while held");
+    let (status, reply) = put_doc("/held/k", &query, release);
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("InvalidRequest"), "{reply}");
+    // Still protected for the duration after release.
+    assert_eq!(
+        call("DELETE", "/held/k", &version, &[(BYPASS, "true")], b"")
+            .1
+            .0,
+        403
+    );
+    // Malformed variable retentions.
+    for body in [
+        "<Retention><Mode>COMPLIANCE</Mode><EventHold>ON</EventHold></Retention>",
+        "<Retention><EventHold>ON</EventHold><EventHoldDuration><Days>1</Days></EventHoldDuration></Retention>",
+        "<Retention><Mode>COMPLIANCE</Mode><EventHold>OFF</EventHold><EventHoldDuration><Days>1</Days></EventHoldDuration></Retention>",
+        "<Retention><Mode>COMPLIANCE</Mode><EventHold>ON</EventHold><EventHoldDuration></EventHoldDuration></Retention>",
+    ] {
+        let (status, reply) = put_doc("/held/k", &query, body);
+        assert_eq!(status, 400, "{body}: {reply}");
+    }
+
+    // A bucket's default event hold: a new object starts held.
+    let config = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                  <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><DefaultEventHold>\
+                  <Years>1</Years></DefaultEventHold></DefaultRetention></Rule>\
+                  </ObjectLockConfiguration>";
+    assert_eq!(put_doc("/held", "object-lock", config).0, 200);
+    let (_, reply) = call("GET", "/held", "object-lock", &[], b"").1;
+    assert!(
+        reply.contains("<DefaultEventHold><Years>1</Years></DefaultEventHold>"),
+        "{reply}"
+    );
+    assert_eq!(
+        call("PUT", "/held/d", "", &[("content-md5", &md5)], b"x")
+            .1
+            .0,
+        200
+    );
+    let (head, _) = call("HEAD", "/held/d", "", &[], b"");
+    assert_eq!(response_header(&head, EVENT).as_deref(), Some("ON"));
+    assert_eq!(response_header(&head, YEARS).as_deref(), Some("1"));
+
+    // Policies see the hold and its duration in days (a year is 365).
+    let policy = json!({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+        {"Effect": "Deny", "Action": ["s3:PutObject", "s3:PutObjectRetention"], "Resource": "*",
+         "Condition": {"NumericGreaterThan": {"s3:object-lock-event-hold-duration-days": "30"}}}
+    ]})
+    .to_string();
+    let (user_key, user_secret) = user_with_key(&server, &account, "short", Some(&policy));
+    let user_put = |duration: (&str, &str)| {
+        send_with(
+            port,
+            "PUT",
+            "/held/u",
+            "",
+            &[
+                (MODE, "GOVERNANCE"),
+                (EVENT, "ON"),
+                duration,
+                ("content-md5", &md5),
+            ],
+            b"x",
+            &user_key,
+            Some(&user_secret),
+        )
+        .1
+        .0
+    };
+    assert_eq!(user_put((DAYS, "31")), 403);
+    assert_eq!(user_put((YEARS, "1")), 403);
+    assert_eq!(user_put((DAYS, "30")), 200);
+}
+
+#[test]
+fn a_release_counts_its_duration_from_when_it_is_applied() {
+    const MODE: &str = "x-amz-object-lock-mode";
+    const EVENT: &str = "x-amz-object-lock-event-hold";
+    const DAYS: &str = "x-amz-object-lock-event-hold-duration-days";
+    let server = start_server();
+    let port = server.s3_port;
+    let (_, key, secret) = account_with_key(&server, "slow");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    assert_eq!(
+        call(
+            "PUT",
+            "/slow",
+            "",
+            &[("x-amz-bucket-object-lock-enabled", "true")],
+            b""
+        )
+        .1
+        .0,
+        200
+    );
+    let md5 = content_md5(b"x");
+    let held = |path: &str, days: &str| {
+        let (head, (status, reply)) = call(
+            "PUT",
+            path,
+            "",
+            &[
+                (MODE, "GOVERNANCE"),
+                (EVENT, "ON"),
+                (DAYS, days),
+                ("content-md5", &md5),
+            ],
+            b"x",
+        );
+        assert_eq!(status, 200, "{reply}");
+        format!(
+            "retention&versionId={}",
+            response_header(&head, "x-amz-version-id").unwrap()
+        )
+    };
+    let until_of = |path: &str, query: &str| {
+        let (_, reply) = call("GET", path, query, &[], b"").1;
+        reply
+            .split("<RetainUntilDate>")
+            .nth(1)
+            .and_then(|rest| rest.split("</RetainUntilDate>").next())
+            .unwrap_or_else(|| panic!("{reply}"))
+            .to_string()
+    };
+    // The body arrives three seconds after the request starts: the date is
+    // fixed a day after the release is applied, not after it began.
+    let query = held("/slow/k", "1");
+    let release = b"<Retention><Mode>GOVERNANCE</Mode><EventHold>OFF</EventHold></Retention>";
+    let release_md5 = content_md5(release);
+    let (_, (status, reply)) = send_paused(
+        port,
+        "PUT",
+        "/slow/k",
+        &query,
+        &[("content-md5", &release_md5)],
+        release,
+        &key,
+        Some(&secret),
+        10,
+        || std::thread::sleep(Duration::from_secs(3)),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let floor = iso_in(86_400 - 1);
+    let until = until_of("/slow/k", &query);
+    assert!(until[..19] >= floor[..19], "{until} is before {floor}");
+
+    // A release with a date keeps the later of the date and its duration.
+    let query = held("/slow/m", "30");
+    let body = format!(
+        "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{}</RetainUntilDate>\
+         <EventHold>OFF</EventHold></Retention>",
+        iso_in(86_400)
+    );
+    let body_md5 = content_md5(body.as_bytes());
+    let (status, reply) = call(
+        "PUT",
+        "/slow/m",
+        &query,
+        &[("content-md5", &body_md5)],
+        body.as_bytes(),
+    )
+    .1;
+    assert_eq!(status, 200, "{reply}");
+    let until = until_of("/slow/m", &query);
+    let floor = iso_in(30 * 86_400 - 60);
+    assert!(until[..19] >= floor[..19], "{until} is before {floor}");
+    let (head, _) = call("HEAD", "/slow/m", "", &[], b"");
+    assert_eq!(response_header(&head, EVENT).as_deref(), Some("OFF"));
+}
+
+#[test]
+fn a_fixed_date_that_ends_an_event_hold_is_authorized_as_a_release() {
+    use serde_json::json;
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, root_key, root_secret) = account_with_key(&server, "releaser");
+    let root = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &root_key,
+            Some(&root_secret),
+        )
+    };
+    assert_eq!(
+        root(
+            "PUT",
+            "/rel",
+            "",
+            &[("x-amz-bucket-object-lock-enabled", "true")],
+            b""
+        )
+        .1
+        .0,
+        200
+    );
+    let md5 = content_md5(b"x");
+    let (head, (status, _)) = root(
+        "PUT",
+        "/rel/k",
+        "",
+        &[
+            ("x-amz-object-lock-mode", "GOVERNANCE"),
+            ("x-amz-object-lock-event-hold", "ON"),
+            ("x-amz-object-lock-event-hold-duration-days", "1"),
+            ("content-md5", &md5),
+        ],
+        b"x",
+    );
+    assert_eq!(status, 200);
+    let query = format!(
+        "retention&versionId={}",
+        response_header(&head, "x-amz-version-id").unwrap()
+    );
+    // May change retentions, but not end an event hold.
+    let policy = json!({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "s3:PutObjectRetention", "Resource": "*",
+         "Condition": {"StringEquals": {"s3:object-lock-event-hold": "OFF"}}}
+    ]})
+    .to_string();
+    let (key, secret) = user_with_key(&server, &account, "holder", Some(&policy));
+    let put = |as_user: bool, body: &str| {
+        let md5 = content_md5(body.as_bytes());
+        let extra = [("content-md5", md5.as_str())];
+        match as_user {
+            true => send_with(
+                port,
+                "PUT",
+                "/rel/k",
+                &query,
+                &extra,
+                body.as_bytes(),
+                &key,
+                Some(&secret),
+            ),
+            false => root("PUT", "/rel/k", &query, &extra, body.as_bytes()),
+        }
+        .1
+    };
+    let fixed = format!(
+        "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>",
+        iso_in(2 * 86_400)
+    );
+    let release = "<Retention><Mode>GOVERNANCE</Mode><EventHold>OFF</EventHold></Retention>";
+    assert_eq!(put(true, &fixed).0, 403, "a fixed date ends the hold");
+    assert_eq!(put(true, release).0, 403);
+    let (head, _) = root("HEAD", "/rel/k", "", &[], b"");
+    assert_eq!(
+        response_header(&head, "x-amz-object-lock-event-hold").as_deref(),
+        Some("ON")
+    );
+    let (status, reply) = put(false, &fixed);
+    assert_eq!(status, 200, "{reply}");
+    let (head, _) = root("HEAD", "/rel/k", "", &[], b"");
+    assert_eq!(response_header(&head, "x-amz-object-lock-event-hold"), None);
+    // On a version no longer held, a fixed date ends nothing.
+    let later = format!(
+        "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>",
+        iso_in(3 * 86_400)
+    );
+    let (status, reply) = put(true, &later);
+    assert_eq!(status, 200, "{reply}");
+}

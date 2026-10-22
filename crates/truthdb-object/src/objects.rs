@@ -211,6 +211,8 @@ pub enum ObjectError {
     Locked,
     /// The operation needs Object Lock, which the bucket does not have.
     ObjectLockNotEnabled,
+    /// A retention change that does not apply to the version, and why.
+    InvalidRetention(&'static str),
 }
 
 pub fn validate_key(key: &str) -> Result<(), ObjectError> {
