@@ -13,8 +13,6 @@ use crate::codec::{self, timed_key};
 use crate::objects::{ObjectError, StorageClass, VersionSel, validate_key};
 use crate::{ObjFile, ObjTxn, RESTORE_TIMERS_TREE, RESTORES_TREE};
 
-const DAY_MS: u64 = 86_400_000;
-
 /// A version's restore window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Restore {
@@ -88,8 +86,7 @@ pub enum Restored {
 /// rounded up to the next midnight UTC, as S3 computes it (from when a new
 /// restore completes, or when an extension is asked for).
 pub fn restore_expiry(from_ms: u64, days: u32) -> u64 {
-    let end = from_ms.saturating_add(u64::from(days).saturating_mul(DAY_MS));
-    (end / DAY_MS).saturating_add(1).saturating_mul(DAY_MS)
+    crate::lifecycle::days_after(from_ms, days)
 }
 
 impl StorageClass {
@@ -278,6 +275,7 @@ impl ObjFile<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::lifecycle::DAY_MS;
 
     #[test]
     fn an_expiry_is_rounded_up_to_the_next_midnight_utc() {

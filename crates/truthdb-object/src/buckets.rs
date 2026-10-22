@@ -269,6 +269,7 @@ impl ObjTxn<'_, '_> {
         }
         buckets.delete(self.ctx, &mut OpMode::Txn(self.txn), name.as_bytes())?;
         self.delete_bucket_configs(name)?;
+        self.forget_pass(name)?;
         self.drop_fulltext(name)?;
         Ok(Ok(()))
     }

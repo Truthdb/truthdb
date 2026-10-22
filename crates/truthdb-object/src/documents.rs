@@ -27,6 +27,8 @@ pub const BUCKET_ENCRYPTION: u8 = 3;
 /// `truthdb-s3`'s `object_lock`; whether Object Lock is enabled is the
 /// bucket's own).
 pub const OBJECT_LOCK_DEFAULT: u8 = 4;
+/// A bucket configuration: its lifecycle rules (see `lifecycle`).
+pub const BUCKET_LIFECYCLE: u8 = 5;
 
 fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
     [prefix, &chunk.to_be_bytes()].concat()

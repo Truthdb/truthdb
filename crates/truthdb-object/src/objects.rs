@@ -749,6 +749,64 @@ impl ObjTxn<'_, '_> {
         Ok(Ok((version, null_version)))
     }
 
+    /// Moves a version to a colder storage class (an S3 Lifecycle
+    /// transition): its body is queued for packing at that class's level,
+    /// and the journal records the change. A version gone meanwhile, or a
+    /// delete marker, is left alone (`NoSuchVersion`).
+    pub fn transition_version(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+        class: StorageClass,
+        now_ms: u64,
+    ) -> Result<Result<(), ObjectError>, StorageError> {
+        let objects = self.trees.objects();
+        let row_key = version_key(bucket, key, version);
+        let Some(row) = objects.get(self.ctx, &row_key)? else {
+            return Ok(Err(ObjectError::NoSuchVersion));
+        };
+        let mut row = VersionRow::decode(&row)?;
+        if row.flags & FLAG_DELETE_MARKER != 0 {
+            return Ok(Err(ObjectError::NoSuchVersion));
+        }
+        row.flags = row.flags & !(7 << CLASS_SHIFT) | class.code() << CLASS_SHIFT;
+        objects.update(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &row_key,
+            &row.encode(),
+        )?;
+        // A body under a customer-provided key is ciphertext: it would not
+        // shrink.
+        let sealed_by_customer = row.flags & FLAG_HAS_ATTRS != 0
+            && read_attrs(self.ctx, &self.trees.attrs(), version)?
+                .customer_key
+                .is_some();
+        if !sealed_by_customer {
+            self.queue_pack(row.body, class.pack_level())?;
+        }
+        self.record_change(
+            Change {
+                record_type: RecordType::UpdateMetadata,
+                bucket,
+                key,
+                version,
+                null_version: row.flags & FLAG_NULL_VERSION != 0,
+                is_delete_marker: Some(false),
+                object: Some(JournalObject {
+                    size: row.size,
+                    md5: row.md5,
+                    parts: row.parts,
+                    last_modified_ms: row.mtime_ms,
+                    storage_class: class,
+                }),
+            },
+            now_ms,
+        )?;
+        Ok(Ok(()))
+    }
+
     /// Removes the key's versions that `wanted` picks: each row, its
     /// attributes, its lock, its restore and its body's reference. Returns the removed
     /// versions' numbers, or `Locked` (removing nothing) when Object Lock

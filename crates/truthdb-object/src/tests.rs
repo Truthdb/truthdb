@@ -4111,3 +4111,552 @@ fn a_restore_is_whole_after_a_crash_at_any_op_and_ships_to_a_standby() {
         std::fs::remove_file(p).ok();
     }
 }
+
+/// Puts `size` bytes as `key` in `bucket`, in `class`, written at `at`.
+fn put_at(
+    storage: &Storage,
+    bucket: &str,
+    key: &str,
+    size: usize,
+    class: crate::StorageClass,
+    at: u64,
+) -> u64 {
+    let mut writer = BodyWriter::begin(storage, at).unwrap();
+    writer.write(storage, &bytes(3, size), at).unwrap();
+    let sealed = writer.finish(storage, at).unwrap();
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.put_object(
+                bucket,
+                key,
+                &sealed,
+                &crate::ObjectAttrs::default(),
+                class,
+                at,
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap()
+        .version
+}
+
+/// Every version of every bucket (key, version, delete marker, class) and
+/// every open upload's key.
+fn lifecycle_snapshot(storage: &Storage) -> (Vec<(String, u64, bool, String)>, Vec<String>) {
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    let mut versions = Vec::new();
+    let mut uploads = Vec::new();
+    for bucket in ["ver", "unv", "lck"] {
+        // A bucket deleted meanwhile has nothing to list.
+        let Ok(listing) = file.list_versions(bucket, "", None, None, 1000).unwrap() else {
+            continue;
+        };
+        versions.extend(listing.objects.into_iter().map(|listed| {
+            (
+                format!("{bucket}/{}", listed.key),
+                listed.info.version,
+                listed.info.delete_marker,
+                listed.info.storage_class.as_str().to_string(),
+            )
+        }));
+        uploads.extend(
+            file.list_uploads(bucket, "", None, 1000)
+                .unwrap()
+                .0
+                .into_iter()
+                .map(|upload| format!("{bucket}/{}", upload.key)),
+        );
+    }
+    (versions, uploads)
+}
+
+/// Runs the lifecycle passes due at `at` to the end, `budget` a step.
+fn lifecycle_passes(storage: &Storage, at: u64, budget: crate::StepBudget) {
+    for _ in 0..10_000 {
+        if !ObjFile::new(&mut storage.lock())
+            .lifecycle_step(at, 0, budget)
+            .unwrap()
+        {
+            return;
+        }
+    }
+    panic!("the lifecycle passes never ended");
+}
+
+const DAY: u64 = 86_400_000;
+const HOUR: u64 = 3_600_000;
+/// Day 10, 01:00 UTC.
+const T0: u64 = 10 * DAY + HOUR;
+
+/// The buckets of the lifecycle tests: `ver` versioned, `unv` unversioned and
+/// `lck` with Object Lock, their objects written on day 10 and their rules.
+fn lifecycle_scene(storage: &Storage) {
+    use crate::{
+        Expiration, Filter, LifecycleConfig, MinTransitionSize, NoncurrentExpiration, ObjectLock,
+        Retention, RetentionMode, Rule, StorageClass, Transition, Versioning, When,
+    };
+    let rule = |id: &str, filter: Filter| Rule {
+        id: id.to_string(),
+        enabled: true,
+        filter,
+        expiration: None,
+        transitions: Vec::new(),
+        noncurrent_expiration: None,
+        noncurrent_transitions: Vec::new(),
+        abort_upload_days: None,
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            for bucket in ["ver", "unv", "lck"] {
+                tx.create_bucket(bucket, DEFAULT_ACCOUNT, T0)?.unwrap();
+            }
+            tx.set_versioning("ver", Versioning::Enabled)?.unwrap();
+            tx.set_versioning("lck", Versioning::Enabled)?.unwrap();
+            tx.enable_object_lock("lck")?.unwrap();
+            tx.put_lifecycle(
+                "ver",
+                &LifecycleConfig {
+                    min_size: MinTransitionSize::AllClasses128K,
+                    rules: vec![
+                        Rule {
+                            transitions: vec![Transition {
+                                when: When::Days(1),
+                                class: StorageClass::Glacier,
+                            }],
+                            expiration: Some(Expiration::At(When::Days(3))),
+                            noncurrent_expiration: Some(NoncurrentExpiration {
+                                days: 1,
+                                newer_versions: Some(1),
+                            }),
+                            ..rule("logs", Filter::Prefix("logs/".into()))
+                        },
+                        Rule {
+                            transitions: vec![Transition {
+                                when: When::Days(0),
+                                class: StorageClass::StandardIa,
+                            }],
+                            ..rule("tiny", Filter::Prefix("tiny/".into()))
+                        },
+                        Rule {
+                            expiration: Some(Expiration::ExpiredObjectDeleteMarker(true)),
+                            ..rule("gone", Filter::Prefix("gone/".into()))
+                        },
+                        Rule {
+                            abort_upload_days: Some(2),
+                            ..rule("uploads", Filter::Prefix("up/".into()))
+                        },
+                        Rule {
+                            enabled: false,
+                            expiration: Some(Expiration::At(When::Days(1))),
+                            ..rule("off", Filter::All)
+                        },
+                    ],
+                },
+            )?;
+            tx.put_lifecycle(
+                "unv",
+                &LifecycleConfig {
+                    min_size: MinTransitionSize::AllClasses128K,
+                    rules: vec![Rule {
+                        transitions: vec![Transition {
+                            when: When::Days(0),
+                            class: StorageClass::Glacier,
+                        }],
+                        expiration: Some(Expiration::At(When::Days(1))),
+                        ..rule("all", Filter::All)
+                    }],
+                },
+            )?;
+            tx.put_lifecycle(
+                "lck",
+                &LifecycleConfig {
+                    min_size: MinTransitionSize::AllClasses128K,
+                    rules: vec![Rule {
+                        noncurrent_expiration: Some(NoncurrentExpiration {
+                            days: 1,
+                            newer_versions: None,
+                        }),
+                        ..rule("old", Filter::All)
+                    }],
+                },
+            )
+        })
+        .unwrap();
+    let big = 200 * 1024;
+    put_at(storage, "ver", "logs/a", big, StorageClass::Standard, T0);
+    put_at(
+        storage,
+        "ver",
+        "logs/a",
+        big,
+        StorageClass::Standard,
+        T0 + HOUR,
+    );
+    put_at(storage, "ver", "logs/b", big, StorageClass::Standard, T0);
+    put_at(storage, "ver", "tiny/x", 10, StorageClass::Standard, T0);
+    put_at(storage, "ver", "other/z", big, StorageClass::Standard, T0);
+    let gone = put_at(storage, "ver", "gone/k", 10, StorageClass::Standard, T0);
+    put_at(storage, "unv", "k", big, StorageClass::Standard, T0);
+    let locked = put_at(storage, "lck", "k", 10, StorageClass::Standard, T0);
+    put_at(storage, "lck", "k", 10, StorageClass::Standard, T0 + HOUR);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            // gone/k: a delete marker left alone.
+            tx.delete_object("ver", "gone/k", None, false, T0, 0)?
+                .unwrap();
+            tx.delete_object(
+                "ver",
+                "gone/k",
+                Some(crate::VersionSel::Seq(gone)),
+                false,
+                T0,
+                0,
+            )?
+            .unwrap();
+            tx.set_lock(
+                locked,
+                &ObjectLock {
+                    retention: Some(Retention {
+                        mode: RetentionMode::Compliance,
+                        until_ms: u64::MAX,
+                        event: None,
+                    }),
+                    legal_hold: None,
+                },
+            )?;
+            for key in ["up/u", "other/u"] {
+                tx.create_upload(
+                    "ver",
+                    key,
+                    &crate::ObjectAttrs::default(),
+                    StorageClass::Standard,
+                    T0,
+                )?
+                .unwrap();
+            }
+            Ok(())
+        })
+        .unwrap();
+}
+
+/// What the scene holds after the passes of each day, as `(key, marker,
+/// class)` per version (newest first) and the open uploads.
+fn lifecycle_days() -> Vec<(
+    u64,
+    Vec<(&'static str, bool, &'static str)>,
+    Vec<&'static str>,
+)> {
+    let both = vec!["ver/other/u", "ver/up/u"];
+    let mut days = Vec::new();
+    // Day 10: only the lone delete marker is due (at once).
+    days.push((
+        T0 + HOUR,
+        vec![
+            ("lck/k", false, "STANDARD"),
+            ("lck/k", false, "STANDARD"),
+            ("unv/k", false, "STANDARD"),
+            ("ver/logs/a", false, "STANDARD"),
+            ("ver/logs/a", false, "STANDARD"),
+            ("ver/logs/b", false, "STANDARD"),
+            ("ver/other/z", false, "STANDARD"),
+            ("ver/tiny/x", false, "STANDARD"),
+        ],
+        both.clone(),
+    ));
+    // Day 12: a day old, the logs go cold; the unversioned object is removed (before a transition); the locked
+    // noncurrent version stays; the small object stays STANDARD; the
+    // noncurrent logs/a has no newer noncurrent version to keep.
+    days.push((
+        12 * DAY + HOUR,
+        vec![
+            ("lck/k", false, "STANDARD"),
+            ("lck/k", false, "STANDARD"),
+            ("ver/logs/a", false, "GLACIER"),
+            ("ver/logs/a", false, "STANDARD"),
+            ("ver/logs/b", false, "GLACIER"),
+            ("ver/other/z", false, "STANDARD"),
+            ("ver/tiny/x", false, "STANDARD"),
+        ],
+        both.clone(),
+    ));
+    // Day 13: the upload under up/ is aborted.
+    let mut day13 = days[1].clone();
+    day13.0 = 13 * DAY + HOUR;
+    day13.2 = vec!["ver/other/u"];
+    days.push(day13);
+    // Day 14: three days old, the logs expire: delete markers.
+    days.push((
+        14 * DAY + HOUR,
+        vec![
+            ("lck/k", false, "STANDARD"),
+            ("lck/k", false, "STANDARD"),
+            ("ver/logs/a", true, "STANDARD"),
+            ("ver/logs/a", false, "GLACIER"),
+            ("ver/logs/a", false, "STANDARD"),
+            ("ver/logs/b", true, "STANDARD"),
+            ("ver/logs/b", false, "GLACIER"),
+            ("ver/other/z", false, "STANDARD"),
+            ("ver/tiny/x", false, "STANDARD"),
+        ],
+        vec!["ver/other/u"],
+    ));
+    // Day 15: logs/a's oldest version now has a newer noncurrent one, and
+    // its successor is days old: removed.
+    days.push((
+        15 * DAY + HOUR,
+        vec![
+            ("lck/k", false, "STANDARD"),
+            ("lck/k", false, "STANDARD"),
+            ("ver/logs/a", true, "STANDARD"),
+            ("ver/logs/a", false, "GLACIER"),
+            ("ver/logs/b", true, "STANDARD"),
+            ("ver/logs/b", false, "GLACIER"),
+            ("ver/other/z", false, "STANDARD"),
+            ("ver/tiny/x", false, "STANDARD"),
+        ],
+        vec!["ver/other/u"],
+    ));
+    days
+}
+
+fn lifecycle_view(storage: &Storage) -> (Vec<(String, bool, String)>, Vec<String>) {
+    let (versions, uploads) = lifecycle_snapshot(storage);
+    (
+        versions
+            .into_iter()
+            .map(|(key, _, marker, class)| (key, marker, class))
+            .collect(),
+        uploads,
+    )
+}
+
+fn expected_view(
+    day: &(
+        u64,
+        Vec<(&'static str, bool, &'static str)>,
+        Vec<&'static str>,
+    ),
+) -> (Vec<(String, bool, String)>, Vec<String>) {
+    let mut versions: Vec<_> = day
+        .1
+        .iter()
+        .map(|(key, marker, class)| (key.to_string(), *marker, class.to_string()))
+        .collect();
+    // Listed bucket by bucket: v, u, lk.
+    versions.sort_by_key(|(key, _, _)| match &key[..4] {
+        "ver/" => 0,
+        "unv/" => 1,
+        _ => 2,
+    });
+    (versions, day.2.iter().map(|key| key.to_string()).collect())
+}
+
+#[test]
+fn lifecycle_rules_act_as_the_days_pass_once_a_day() {
+    let path = temp_path("lifecycle");
+    let storage = create(&path);
+    lifecycle_scene(&storage);
+    let budget = crate::StepBudget {
+        rows: 1000,
+        actions: 1000,
+    };
+    for day in lifecycle_days() {
+        lifecycle_passes(&storage, day.0, budget);
+        assert_eq!(
+            lifecycle_view(&storage),
+            expected_view(&day),
+            "at {}",
+            day.0
+        );
+        // A second run the same day changes nothing.
+        let journal = ObjFile::new(&mut storage.lock())
+            .journal(0, 10_000)
+            .unwrap();
+        lifecycle_passes(&storage, day.0 + HOUR, budget);
+        assert_eq!(
+            lifecycle_view(&storage),
+            expected_view(&day),
+            "at {}",
+            day.0
+        );
+        assert_eq!(
+            ObjFile::new(&mut storage.lock())
+                .journal(0, 10_000)
+                .unwrap(),
+            journal
+        );
+    }
+    // The pass's changes are in the journal, named as lifecycle's.
+    let journal = ObjFile::new(&mut storage.lock())
+        .journal(0, 10_000)
+        .unwrap();
+    let by = |operation: &str| {
+        journal
+            .iter()
+            .filter(|row| {
+                row.origin
+                    .as_ref()
+                    .is_some_and(|o| o.operation == operation)
+            })
+            .count()
+    };
+    assert_eq!(by("LifecycleTransition"), 2);
+    // The marker, the unversioned removal, two expirations, one noncurrent
+    // removal.
+    assert_eq!(by("LifecycleExpiration"), 5);
+    // A deleted configuration stops the passes; a deleted bucket takes its
+    // state along.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            assert!(tx.delete_lifecycle("ver")?);
+            assert!(!tx.delete_lifecycle("ver")?);
+            tx.delete_object("unv", "k", None, false, T0, 0)?.unwrap();
+            tx.delete_bucket("unv").map(|deleted| deleted.unwrap())
+        })
+        .unwrap();
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .lifecycle("ver")
+            .unwrap()
+            .is_none()
+    );
+    lifecycle_passes(&storage, 40 * DAY, budget);
+    let after = lifecycle_view(&storage);
+    assert!(after.0.iter().any(|(key, _, _)| key == "ver/other/z"));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_lifecycle_pass_resumes_across_restarts_and_failed_steps() {
+    let days = lifecycle_days();
+    // A step at a time, the store reopened after each: the same days.
+    let path = temp_path("lifecycle-resume");
+    let mut storage = create(&path);
+    lifecycle_scene(&storage);
+    let tiny = crate::StepBudget {
+        rows: 1,
+        actions: 1,
+    };
+    for day in &days {
+        loop {
+            let more = ObjFile::new(&mut storage.lock())
+                .lifecycle_step(day.0, 0, tiny)
+                .unwrap();
+            drop(storage);
+            storage = open(&path);
+            if !more {
+                break;
+            }
+        }
+        assert_eq!(lifecycle_view(&storage), expected_view(day), "at {}", day.0);
+    }
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+
+    // A step that fails at any of its operations changes nothing it would
+    // not redo; the passes then end where they would have.
+    let day = &days[3];
+    let mut fail_at = 0;
+    loop {
+        let path = temp_path("lifecycle-fail");
+        let storage = create(&path);
+        lifecycle_scene(&storage);
+        lifecycle_passes(&storage, days[1].0, tiny);
+        lifecycle_passes(&storage, days[2].0, tiny);
+        FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(Some(fail_at)));
+        let failed = ObjFile::new(&mut storage.lock())
+            .lifecycle_step(
+                day.0,
+                0,
+                crate::StepBudget {
+                    rows: 1000,
+                    actions: 1000,
+                },
+            )
+            .is_err();
+        let fired = FAIL_APPLY_OPS_AFTER
+            .with(|fail| fail.replace(None))
+            .is_none();
+        drop(storage);
+        let storage = open(&path);
+        lifecycle_passes(&storage, day.0, tiny);
+        assert_eq!(
+            lifecycle_view(&storage),
+            expected_view(day),
+            "failed at {fail_at}"
+        );
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+        if !failed {
+            assert!(!fired);
+            // Each expiration's operations and the pass's own write.
+            assert!(fail_at >= 3, "the step failed at only {fail_at} points");
+            break;
+        }
+        fail_at += 1;
+    }
+}
+
+#[test]
+fn a_lifecycle_pass_ships_to_a_standby_and_restores_from_a_log_backup() {
+    let path = temp_path("lifecycle-ship-src");
+    let bak = temp_path("lifecycle-ship-bak");
+    let log = temp_path("lifecycle-ship-log");
+    let seed = temp_path("lifecycle-ship-seed");
+    let dst = temp_path("lifecycle-ship-dst");
+    let primary = create(&path);
+    primary.lock().commit_db_options(0, Some(true)).unwrap();
+    let summary = primary.backup_full(&bak).unwrap();
+    lifecycle_scene(&primary);
+    let days = lifecycle_days();
+    for day in &days {
+        lifecycle_passes(
+            &primary,
+            day.0,
+            crate::StepBudget {
+                rows: 3,
+                actions: 2,
+            },
+        );
+    }
+    let expected = lifecycle_snapshot(&primary);
+    assert_eq!(
+        lifecycle_view(&primary),
+        expected_view(days.last().unwrap())
+    );
+    let delta = primary
+        .read_wal_range(summary.backup_end_lsn, primary.wal_flushed_lsn())
+        .unwrap();
+    primary.backup_log(&log, true, false).unwrap();
+    Storage::restore_full_standby(&seed, &bak, &[], engines).unwrap();
+    let standby = open(&seed);
+    standby
+        .apply_wal_stream(summary.backup_end_lsn, &delta)
+        .unwrap();
+    assert_eq!(lifecycle_snapshot(&standby), expected);
+    drop(standby);
+    Storage::restore_full_with_logs(&dst, &bak, &[log.clone()], None, engines).unwrap();
+    let restored = open(&dst);
+    assert_eq!(lifecycle_snapshot(&restored), expected);
+    // The restored store's passes are done for the day.
+    assert!(
+        !ObjFile::new(&mut restored.lock())
+            .lifecycle_step(
+                days.last().unwrap().0,
+                0,
+                crate::StepBudget {
+                    rows: 1000,
+                    actions: 1000,
+                }
+            )
+            .unwrap()
+    );
+    drop(restored);
+    drop(primary);
+    for p in [&path, &bak, &log, &seed, &dst] {
+        std::fs::remove_file(p).ok();
+    }
+}
