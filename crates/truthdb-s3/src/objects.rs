@@ -736,14 +736,17 @@ pub fn version_sel(query: &str) -> Result<VersionSel, S3Error> {
     Ok(VersionSel::Latest)
 }
 
-/// The `partNumber` a GET or HEAD names, if any: 1 to 10,000.
+/// The `partNumber` a GET or HEAD names, if any: 1 to 10,000, once.
 fn part_number(query: &str) -> Result<Option<u32>, S3Error> {
-    let Some(value) = crate::listing::query_params(query)
+    let given: Vec<String> = crate::listing::query_params(query)
         .into_iter()
-        .find(|(name, _)| name == "partNumber")
+        .filter(|(name, _)| name == "partNumber")
         .map(|(_, value)| value)
-    else {
-        return Ok(None);
+        .collect();
+    let value = match given.as_slice() {
+        [] => return Ok(None),
+        [value] => value,
+        _ => "",
     };
     match value.parse::<u32>() {
         Ok(number @ 1..=10_000) if value.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(number)),
@@ -1048,6 +1051,8 @@ async fn read_object(
         None => None,
     };
     let (status, first, len) = match (span, range) {
+        // An empty part has no byte range to name.
+        (Some((first, 0)), _) => (StatusCode::OK, first, 0),
         (Some((first, len)), _) => (StatusCode::PARTIAL_CONTENT, first, len),
         (None, Some((first, last))) => (StatusCode::PARTIAL_CONTENT, first, last - first + 1),
         (None, None) => (StatusCode::OK, 0, info.size),

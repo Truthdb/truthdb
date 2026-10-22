@@ -7687,10 +7687,50 @@ fn a_multipart_object_is_read_by_part_number() {
         "partNumber=10001",
         "partNumber=x",
         "partNumber=+1",
+        "partNumber=1&partNumber=2",
     ] {
         refused(bad, &[], "InvalidArgument");
     }
     refused("partNumber=1", &[("range", "bytes=0-1")], "InvalidRequest");
+    // An empty last part is read as such (no range to name).
+    let (_, (_, created)) = call("POST", "/parts/e", "uploads", &[], b"");
+    let upload = xml_value(&created, "UploadId");
+    let mut etags = Vec::new();
+    for (number, data) in [(1, &first[..]), (2, &b""[..])] {
+        let (head, (status, reply)) = call(
+            "PUT",
+            "/parts/e",
+            &format!("uploadId={upload}&partNumber={number}"),
+            &[],
+            data,
+        );
+        assert_eq!(status, 200, "{reply}");
+        etags.push(response_header(&head, "etag").expect("etag"));
+    }
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etags[0], etags[1]
+    );
+    let (_, (status, reply)) = call(
+        "POST",
+        "/parts/e",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (head, (status, body)) = call("GET", "/parts/e", "partNumber=2", &[], b"");
+    assert_eq!((status, body.as_str()), (200, ""));
+    assert_eq!(
+        response_header(&head, "content-length").as_deref(),
+        Some("0")
+    );
+    assert_eq!(response_header(&head, "content-range"), None);
+    assert_eq!(
+        response_header(&head, "x-amz-mp-parts-count").as_deref(),
+        Some("2")
+    );
     // An object put whole is its own part 1, and has no other.
     assert_eq!(call("PUT", "/parts/one", "", &[], b"single").1.0, 200);
     let (head, (status, body)) = call("GET", "/parts/one", "partNumber=1", &[], b"");
