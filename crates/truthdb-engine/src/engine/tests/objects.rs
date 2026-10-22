@@ -399,3 +399,24 @@ fn user_policies_are_validated_kept_listed_and_deleted() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn access_key_secrets_are_reported_in_plaintext_only_in_an_unencrypted_database() {
+    let path = unique_temp_path("plaintext-secrets");
+    let engine = new_engine(&path);
+    // The encrypted test run creates every database encrypted.
+    let encrypted = engine.storage().core_arc().is_encrypted();
+    assert!(!engine.access_key_secrets_in_plaintext().expect("check"));
+    let account: serde_json::Value =
+        serde_json::from_str(&engine.execute("s3 create account acme").expect("account")).unwrap();
+    let account_id = account["account_id"].as_str().unwrap().to_string();
+    engine
+        .execute(&format!("s3 create access key {account_id}"))
+        .expect("key");
+    assert_eq!(
+        engine.access_key_secrets_in_plaintext().expect("check"),
+        !encrypted
+    );
+    drop(engine);
+    let _ = std::fs::remove_file(&path);
+}

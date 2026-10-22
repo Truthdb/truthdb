@@ -381,7 +381,7 @@ async fn verify(
         service: "s3".to_string(),
     };
     if !crate::sigv4::verify(
-        &crate::sigv4::signing_key(&secret, &credential),
+        &state.signing_keys.signing_key(&secret, &credential),
         policy,
         signature,
     ) {

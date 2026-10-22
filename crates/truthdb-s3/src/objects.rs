@@ -573,6 +573,7 @@ pub async fn get_object(
     let task_state = S3State {
         engine: state.engine.clone(),
         region: state.region.clone(),
+        signing_keys: state.signing_keys.clone(),
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {

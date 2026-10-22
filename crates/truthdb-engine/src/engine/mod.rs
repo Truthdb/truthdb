@@ -1027,6 +1027,17 @@ impl Engine {
         render_json(&rendered).map_err(EngineError::from)
     }
 
+    /// Whether S3 access key secrets are stored in plaintext on disk: the
+    /// database holds access keys and is not encrypted. A secret is stored as
+    /// given (SigV4 needs it back), so only the database's encryption at rest
+    /// protects it, in the data file, the log, standbys and backups.
+    pub fn access_key_secrets_in_plaintext(&self) -> Result<bool, EngineError> {
+        if self.storage.core_arc().is_encrypted() {
+            return Ok(false);
+        }
+        Ok(!self.object(|file| file.access_keys())?.is_empty())
+    }
+
     /// Runs one object-engine operation under the storage lock, then takes a
     /// checkpoint if the log is filling (object bodies fill it fast).
     pub fn object<T>(

@@ -301,6 +301,52 @@ pub fn signing_key(secret: &str, credential: &Credential) -> hmac::Key {
     hmac::Key::new(hmac::HMAC_SHA256, signing.as_ref())
 }
 
+/// Most signing keys [`SigningKeyCache`] holds; full, it starts over.
+const MAX_CACHED_SIGNING_KEYS: usize = 4096;
+
+/// Derived signing keys, so that a request does not derive its key again
+/// (four HMACs) while the access key, day, region and service stay the same.
+/// An entry keeps a digest of the secret it came from: a key dropped and
+/// created again with another secret is derived anew.
+#[derive(Default)]
+pub struct SigningKeyCache {
+    keys: std::sync::Mutex<std::collections::HashMap<SigningKeyId, (digest::Digest, hmac::Key)>>,
+}
+
+/// A signing key's access key, day, region and service.
+type SigningKeyId = (String, String, String, String);
+
+impl SigningKeyCache {
+    /// [`signing_key`] for `secret` and `credential`, from the cache when it
+    /// holds it.
+    pub fn signing_key(&self, secret: &str, credential: &Credential) -> hmac::Key {
+        let secret_digest = digest::digest(&digest::SHA256, secret.as_bytes());
+        let id = (
+            credential.access_key.clone(),
+            credential.date.clone(),
+            credential.region.clone(),
+            credential.service.clone(),
+        );
+        let mut keys = self.keys.lock().unwrap_or_else(|err| err.into_inner());
+        if let Some((cached_digest, key)) = keys.get(&id)
+            && cached_digest.as_ref() == secret_digest.as_ref()
+        {
+            return key.clone();
+        }
+        let key = signing_key(secret, credential);
+        if keys.len() >= MAX_CACHED_SIGNING_KEYS {
+            keys.clear();
+        }
+        keys.insert(id, (secret_digest, key.clone()));
+        key
+    }
+
+    #[cfg(test)]
+    fn len(&self) -> usize {
+        self.keys.lock().unwrap().len()
+    }
+}
+
 pub fn sign(key: &hmac::Key, string_to_sign: &str) -> String {
     hex(hmac::sign(key, string_to_sign.as_bytes()).as_ref())
 }
@@ -582,5 +628,42 @@ mod tests {
         .unwrap();
         let to_sign = string_to_sign(&query.amz_date, &query.auth.credential.scope(), &tampered);
         assert!(!verify(&key, &to_sign, &query.auth.signature));
+    }
+
+    #[test]
+    fn a_cached_signing_key_is_the_derived_one_for_the_same_secret_only() {
+        let cache = SigningKeyCache::default();
+        let to_sign = "a string to sign";
+        let derived = sign(&signing_key(SECRET, &credential()), to_sign);
+        // Derived, then served from the cache: the same key.
+        for _ in 0..2 {
+            assert_eq!(
+                sign(&cache.signing_key(SECRET, &credential()), to_sign),
+                derived
+            );
+        }
+        assert_eq!(cache.len(), 1);
+        // The key dropped and created again with another secret.
+        let other = sign(&signing_key("another secret", &credential()), to_sign);
+        assert_ne!(other, derived);
+        assert_eq!(
+            sign(&cache.signing_key("another secret", &credential()), to_sign),
+            other
+        );
+        // Another day: another key.
+        let mut next_day = credential();
+        next_day.date = "20130525".to_string();
+        assert_eq!(
+            sign(&cache.signing_key(SECRET, &next_day), to_sign),
+            sign(&signing_key(SECRET, &next_day), to_sign)
+        );
+        assert_eq!(cache.len(), 2);
+        // Bounded.
+        for day in 0..MAX_CACHED_SIGNING_KEYS + 10 {
+            let mut credential = credential();
+            credential.date = format!("{day:08}");
+            cache.signing_key(SECRET, &credential);
+        }
+        assert!(cache.len() <= MAX_CACHED_SIGNING_KEYS);
     }
 }

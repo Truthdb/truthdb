@@ -44,6 +44,7 @@ pub type Body = BoxBody<Bytes, Infallible>;
 pub struct S3State {
     pub engine: EngineHandle,
     pub region: String,
+    pub signing_keys: std::sync::Arc<sigv4::SigningKeyCache>,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
@@ -360,7 +361,7 @@ pub async fn verify_signature(
     .map_err(|sigv4::AuthError::Malformed(why)| {
         S3Error::new(400, "AuthorizationHeaderMalformed", why)
     })?;
-    let key = sigv4::signing_key(&secret, &auth.credential);
+    let key = state.signing_keys.signing_key(&secret, &auth.credential);
     if !sigv4::verify(
         &key,
         &sigv4::string_to_sign(amz_date, &auth.credential.scope(), &canonical),

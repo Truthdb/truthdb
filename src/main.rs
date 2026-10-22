@@ -152,6 +152,15 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     }
+    match engine.access_key_secrets_in_plaintext() {
+        Ok(true) => warn!(
+            "S3 access key secrets are stored in plaintext: {} is not encrypted. Configure \
+             [encryption] and run `encryption enable` to protect them",
+            config.storage.resolved_path().display()
+        ),
+        Ok(false) => {}
+        Err(err) => warn!("Could not check the S3 access keys: {err}"),
+    }
     // The replication tasks share the storage directly (it is internally
     // synchronized); the handle must be taken before the engine moves into its
     // worker pool.
@@ -276,6 +285,7 @@ async fn main() -> ExitCode {
                 let state = std::sync::Arc::new(truthdb_s3::server::S3State {
                     engine: engine.clone(),
                     region: config.s3.region.clone(),
+                    signing_keys: Default::default(),
                 });
                 let shutdown_rx = shutdown_tx.subscribe();
                 Some(tokio::spawn(truthdb_s3::server::serve(
