@@ -1,6 +1,7 @@
-//! AWS Signature Version 4 for S3: the canonical request, the string to sign,
-//! the signing key, the `Authorization` header, and the per-chunk signatures
-//! of a streamed (`aws-chunked`) upload.
+//! AWS Signature Version 4: the canonical request, the string to sign, the
+//! signing key, the `Authorization` header (parsed by a server, made by a
+//! client), and the per-chunk signatures of a streamed (`aws-chunked`)
+//! upload.
 
 use percent_encoding::{AsciiSet, NON_ALPHANUMERIC, percent_decode_str, utf8_percent_encode};
 use ring::{digest, hmac};
@@ -307,6 +308,47 @@ pub fn string_to_sign(amz_date: &str, scope: &str, canonical_request: &str) -> S
     )
 }
 
+/// The `Authorization` header that signs a request made at `amz_date`
+/// (`YYYYMMDDTHHMMSSZ`, also sent as `x-amz-date`): every header in
+/// `headers` is signed (`host` and `x-amz-date` must be among them).
+#[allow(clippy::too_many_arguments)]
+pub fn authorization(
+    credential: &Credential,
+    secret: &str,
+    amz_date: &str,
+    method: &str,
+    raw_path: &str,
+    raw_query: &str,
+    headers: &[(String, String)],
+    payload_hash: &str,
+) -> Result<String, AuthError> {
+    let mut names: Vec<String> = headers
+        .iter()
+        .map(|(name, _)| name.to_ascii_lowercase())
+        .collect();
+    names.sort();
+    names.dedup();
+    let canonical = canonical_request_for(
+        &credential.service,
+        method,
+        raw_path,
+        raw_query,
+        headers,
+        &names,
+        payload_hash,
+    )?;
+    let signature = sign(
+        &signing_key(secret, credential),
+        &string_to_sign(amz_date, &credential.scope(), &canonical),
+    );
+    Ok(format!(
+        "{ALGORITHM} Credential={}/{},SignedHeaders={},Signature={signature}",
+        credential.access_key,
+        credential.scope(),
+        names.join(";")
+    ))
+}
+
 /// The derived signing key for one day, region and service.
 pub fn signing_key(secret: &str, credential: &Credential) -> hmac::Key {
     let step = |key: &[u8], data: &str| {
@@ -496,6 +538,40 @@ mod tests {
                 EMPTY_HASH,
             ),
             "f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+        );
+    }
+
+    #[test]
+    fn a_client_signs_the_documented_get_object_example() {
+        let headers = headers(&[
+            ("Host", "examplebucket.s3.amazonaws.com"),
+            ("Range", "bytes=0-9"),
+            ("x-amz-content-sha256", EMPTY_HASH),
+            ("x-amz-date", "20130524T000000Z"),
+        ]);
+        let value = authorization(
+            &credential(),
+            SECRET,
+            "20130524T000000Z",
+            "GET",
+            "/test.txt",
+            "",
+            &headers,
+            EMPTY_HASH,
+        )
+        .unwrap();
+        // As AWS documents it.
+        assert_eq!(
+            value,
+            "AWS4-HMAC-SHA256 Credential=AKIAIOSFODNN7EXAMPLE/20130524/us-east-1/s3/aws4_request,\
+             SignedHeaders=host;range;x-amz-content-sha256;x-amz-date,\
+             Signature=f0e8bdb87c964420e857bd35b5d6ed310bd44f0170aba48dd91039c6036bdb41"
+        );
+        let parsed = parse_authorization(&value).unwrap();
+        assert_eq!(parsed.credential, credential());
+        assert_eq!(
+            parsed.signed_headers,
+            signed("host;range;x-amz-content-sha256;x-amz-date")
         );
     }
 

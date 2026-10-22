@@ -1,0 +1,17 @@
+[package]
+name = "truthdb-s3client"
+version = "0.1.0"
+edition = "2024"
+description = "A small S3 client over hyper and rustls, signing with SigV4."
+
+[dependencies]
+truthdb-sigv4 = { workspace = true }
+bytes = "1.12.1"
+http-body-util = "0.1.5"
+hyper = { version = "1.11.1", features = ["client", "http1"] }
+hyper-util = { version = "0.1.21", features = ["client-legacy", "http1", "tokio"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "ring", "rustls-native-certs", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12"] }
+rustls-pemfile = "2.2.0"
+quick-xml = "0.37.5"
+tokio = { workspace = true }

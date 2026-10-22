@@ -20,7 +20,7 @@ pub mod restore;
 pub mod scope;
 pub mod server;
 pub mod signed_body;
-pub mod sigv4;
+pub use truthdb_sigv4 as sigv4;
 pub mod sse;
 pub mod ssec;
 pub mod tagging;
