@@ -7025,6 +7025,23 @@ fn a_cold_object_reads_back_alike_compressed() {
         .0,
         200
     );
+    // An archived object is read once restored.
+    let restore_request = b"<RestoreRequest><Days>1</Days><Tier>Expedited</Tier></RestoreRequest>";
+    assert_eq!(
+        send_with(
+            port,
+            "POST",
+            "/packed/k",
+            "restore",
+            &[],
+            restore_request,
+            &key,
+            Some(&secret)
+        )
+        .1
+        .0,
+        202
+    );
     // Compressed as it arrived.
     let (status, body) = call("GET", "/packed/k", &[], b"");
     assert_eq!(status, 200);
@@ -7109,6 +7126,7 @@ fn a_cold_object_reads_back_alike_compressed() {
         complete.as_bytes(),
     );
     assert_eq!(status, 200, "{xml}");
+    assert_eq!(send("POST", "restore", &[], restore_request).0, 202);
     let (status, body) = send("GET", "", &[], b"");
     assert_eq!(status, 200);
     let whole = [&first[..], &data[1000..2_501_000]].concat();
