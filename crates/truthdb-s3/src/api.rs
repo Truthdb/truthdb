@@ -332,6 +332,7 @@ async fn route(
     if matches!(method, Method::PUT | Method::POST) {
         crate::policy::check_acl_headers(request.headers())?;
     }
+    crate::sse::refuse_customer_keys(request.headers().keys().map(|name| name.as_str()))?;
     match (target, method) {
         _ if UNIMPLEMENTED.iter().any(|name| has_param(&request, name)) => {
             Err(S3Error::not_implemented(format!(

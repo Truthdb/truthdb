@@ -87,6 +87,30 @@ pub fn check_write_value(value: &str, encrypted_at_rest: bool) -> Result<(), S3E
     }
 }
 
+/// The header (and POST field) prefixes of customer-provided keys (SSE-C):
+/// the object's own, and a copy source's.
+const CUSTOMER_KEY_PREFIXES: [&str; 2] = [
+    "x-amz-server-side-encryption-customer-",
+    "x-amz-copy-source-server-side-encryption-customer-",
+];
+
+/// Customer-provided keys (SSE-C) are not offered yet: a request naming one
+/// is refused, never served as if the object were under it (the body would
+/// be stored, and given to anyone, in the clear).
+pub fn refuse_customer_keys<'a>(mut names: impl Iterator<Item = &'a str>) -> Result<(), S3Error> {
+    if names.any(|name| {
+        let name = name.to_ascii_lowercase();
+        CUSTOMER_KEY_PREFIXES
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
+    }) {
+        return Err(S3Error::not_implemented(
+            "server-side encryption with customer-provided keys (SSE-C) is not implemented",
+        ));
+    }
+    Ok(())
+}
+
 /// A GET or HEAD names no server-side encryption: an object's is fixed when
 /// it is written (S3 answers 400).
 pub fn check_read(headers: &HeaderMap) -> Result<(), S3Error> {
@@ -148,6 +172,11 @@ fn parse(body: &[u8], encrypted_at_rest: bool) -> Result<u8, S3Error> {
             // `<ApplyServerSideEncryptionByDefault/>` a default without its
             // algorithm.
             Event::Start(e) | Event::Empty(e) => {
+                // Text may only be a value: none before the root, between
+                // elements, or around a child.
+                if !text.trim().is_empty() {
+                    return Err(malformed());
+                }
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
                 let at: Vec<&str> = path.iter().map(String::as_str).collect();
                 match (at.as_slice(), name.as_str()) {
@@ -170,6 +199,18 @@ fn parse(body: &[u8], encrypted_at_rest: bool) -> Result<u8, S3Error> {
             Event::End(_) => {
                 let value = std::mem::take(&mut text).trim().to_string();
                 let at: Vec<&str> = path.iter().map(String::as_str).collect();
+                let leaf = matches!(
+                    at.last(),
+                    Some(
+                        &("SSEAlgorithm"
+                            | "KMSMasterKeyID"
+                            | "EncryptionType"
+                            | "BucketKeyEnabled")
+                    )
+                );
+                if !leaf && !value.is_empty() {
+                    return Err(malformed());
+                }
                 match at.as_slice() {
                     [
                         _,
@@ -200,6 +241,9 @@ fn parse(body: &[u8], encrypted_at_rest: bool) -> Result<u8, S3Error> {
             _ => {}
         }
         buf.clear();
+    }
+    if !text.trim().is_empty() {
+        return Err(malformed());
     }
     // One document, closed, with one rule: what several would mean together
     // is not defined.
@@ -326,17 +370,6 @@ pub async fn handle(
     }
 }
 
-/// Whether `bucket` blocks customer-provided keys (SSE-C).
-pub fn sse_c_blocked(
-    file: &mut truthdb_object::ObjFile<'_>,
-    bucket: &str,
-) -> Result<bool, truthdb_core::storage::StorageError> {
-    Ok(file
-        .bucket_config(bucket, BUCKET_ENCRYPTION, "")?
-        .and_then(|document| document.first().copied())
-        .is_some_and(|flags| flags & SSE_C_BLOCKED != 0))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -419,6 +452,30 @@ mod tests {
              <KMSMasterKeyID/></ApplyServerSideEncryptionByDefault>",
         );
         assert!(parse(empty_kms.as_bytes(), true).is_err());
+        // Text is a value only.
+        let rule = "<Rule/>";
+        for document in [
+            format!(
+                "<ServerSideEncryptionConfiguration>{rule}</ServerSideEncryptionConfiguration>junk"
+            ),
+            format!(
+                "junk<ServerSideEncryptionConfiguration>{rule}</ServerSideEncryptionConfiguration>"
+            ),
+            format!(
+                "<ServerSideEncryptionConfiguration>junk{rule}</ServerSideEncryptionConfiguration>"
+            ),
+            config(
+                "<ApplyServerSideEncryptionByDefault><SSEAlgorithm><x>aws:kms</x>AES256\
+                 </SSEAlgorithm></ApplyServerSideEncryptionByDefault>",
+            ),
+        ] {
+            assert!(parse(document.as_bytes(), true).is_err(), "{document}");
+        }
+        let pretty = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+            <ServerSideEncryptionConfiguration xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\">\n\
+              <Rule>\n    <BucketKeyEnabled>false</BucketKeyEnabled>\n  </Rule>\n\
+            </ServerSideEncryptionConfiguration>\n";
+        assert_eq!(parse(pretty.as_bytes(), true).unwrap(), 0);
     }
 
     #[test]

@@ -505,6 +505,7 @@ pub async fn post_object(
             HeaderValue::from_str(acl).expect("a checked acl"),
         );
     }
+    crate::sse::refuse_customer_keys(fields.iter().map(|(name, _)| name.as_str()))?;
     // The encryption it asks for, which policies see as
     // s3:x-amz-server-side-encryption.
     let encrypted_at_rest = state.storage.is_encrypted();

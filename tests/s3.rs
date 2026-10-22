@@ -4296,6 +4296,43 @@ fn server_side_encryption_is_the_databases_encryption_at_rest() {
         call("GET", "/plain/o", "", &[(SSE, "AES256")], b"").1.0,
         400
     );
+    // Customer-provided keys are refused, not ignored: the object would be
+    // stored, and served to anyone, in the clear.
+    let customer = [("x-amz-server-side-encryption-customer-algorithm", "AES256")];
+    let copy_customer = [
+        ("x-amz-copy-source", "/plain/o"),
+        (
+            "x-amz-copy-source-server-side-encryption-customer-algorithm",
+            "AES256",
+        ),
+    ];
+    for (method, path, query, extra) in [
+        ("PUT", "/plain/c", "", &customer[..]),
+        ("GET", "/plain/o", "", &customer[..]),
+        ("HEAD", "/plain/o", "", &customer[..]),
+        ("POST", "/plain/c", "uploads", &customer[..]),
+        ("PUT", "/plain/c2", "", &copy_customer[..]),
+    ] {
+        let (_, (status, reply)) = call(method, path, query, extra, b"x");
+        assert_eq!(status, 501, "{method} {path}?{query}: {reply}");
+    }
+    assert_eq!(call("GET", "/plain/c", "", &[], b"").1.0, 404);
+    let form = signed_form(
+        &key,
+        &secret,
+        "2099-01-01T00:00:00.000Z",
+        &[
+            serde_json::json!({"bucket": "plain"}),
+            serde_json::json!(["starts-with", "$key", "f"]),
+            serde_json::json!({"x-amz-server-side-encryption-customer-algorithm": "AES256"}),
+        ],
+        &[
+            ("key", "f"),
+            ("x-amz-server-side-encryption-customer-algorithm", "AES256"),
+        ],
+    );
+    assert_eq!(post_form(port, "plain", &form, "f", b"x", 64).1.0, 501);
+    assert_eq!(call("GET", "/plain/f", "", &[], b"").1.0, 404);
     drop(server);
 
     // An encrypted database: every object is AES256, and says so.
