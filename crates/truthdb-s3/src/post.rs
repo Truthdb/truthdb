@@ -523,6 +523,11 @@ pub async fn post_object(
         );
     }
     crate::ssec::check_write(customer.as_ref(), &headers, false)?;
+    // The customer-provided key it asks for, which policies see as
+    // s3:x-amz-server-side-encryption-customer-algorithm.
+    if customer.is_some() {
+        headers.insert(crate::ssec::ALGORITHM, HeaderValue::from_static("AES256"));
+    }
     let tags = match field(&fields, "tagging") {
         Some(xml) => Some(crate::tagging::parse_tagging(xml.as_bytes())?),
         None => None,

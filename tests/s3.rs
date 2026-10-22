@@ -342,6 +342,30 @@ fn send_tls(
     key: &str,
     secret: Option<&str>,
 ) -> (String, (u16, String)) {
+    let mut stream = tls_stream(server);
+    let request = signed_request(
+        server.s3_port,
+        method,
+        path,
+        query,
+        extra,
+        body,
+        key,
+        secret,
+    );
+    stream.write_all(request.as_bytes()).expect("send");
+    // The server may answer (and close) before the whole body is sent.
+    let _ = stream.write_all(body).and_then(|()| stream.flush());
+    // It may close without a TLS close_notify: what arrived counts.
+    let mut raw = Vec::new();
+    let _ = stream.read_to_end(&mut raw);
+    parse_response(&raw)
+}
+
+/// A TLS connection to `server`'s S3 listener, trusting its certificate.
+fn tls_stream(
+    server: &Server,
+) -> rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls::pki_types::CertificateDer::from(
@@ -359,21 +383,47 @@ fn send_tls(
     let connection =
         rustls::ClientConnection::new(std::sync::Arc::new(config), name).expect("a connection");
     let tcp = std::net::TcpStream::connect(("127.0.0.1", server.s3_port)).expect("connect");
-    let mut stream = rustls::StreamOwned::new(connection, tcp);
-    let request = signed_request(
-        server.s3_port,
-        method,
-        path,
-        query,
-        extra,
-        body,
-        key,
-        secret,
+    rustls::StreamOwned::new(connection, tcp)
+}
+
+/// A multipart/form-data body of `fields` and `file`, and its boundary.
+fn form_body(fields: &[(String, String)], filename: &str, file: &[u8]) -> (&'static str, Vec<u8>) {
+    let boundary = "----truthdbFormBoundary7MA4YWxk";
+    let mut body = Vec::new();
+    for (name, value) in fields {
+        body.extend_from_slice(
+            format!(
+                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(
+        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes(),
     );
-    stream.write_all(request.as_bytes()).expect("send");
-    // The server may answer (and close) before the whole body is sent.
-    let _ = stream.write_all(body).and_then(|()| stream.flush());
-    // It may close without a TLS close_notify: what arrived counts.
+    body.extend_from_slice(file);
+    body.extend_from_slice(
+        format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"submit\"\r\n\r\nUpload\r\n--{boundary}--\r\n").as_bytes(),
+    );
+    (boundary, body)
+}
+
+/// [`post_form`] over TLS to `server`'s HTTPS listener.
+fn post_form_tls(
+    server: &Server,
+    bucket: &str,
+    fields: &[(String, String)],
+    filename: &str,
+    file: &[u8],
+) -> (String, (u16, String)) {
+    let (boundary, body) = form_body(fields, filename, file);
+    let mut stream = tls_stream(server);
+    let head = format!(
+        "POST /{bucket} HTTP/1.1\r\nHost: localhost\r\nContent-Type: multipart/form-data; boundary={boundary}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    stream.write_all(head.as_bytes()).expect("send");
+    let _ = stream.write_all(&body).and_then(|()| stream.flush());
     let mut raw = Vec::new();
     let _ = stream.read_to_end(&mut raw);
     parse_response(&raw)
@@ -1916,23 +1966,7 @@ fn post_form(
     file: &[u8],
     piece: usize,
 ) -> (String, (u16, String)) {
-    let boundary = "----truthdbFormBoundary7MA4YWxk";
-    let mut body = Vec::new();
-    for (name, value) in fields {
-        body.extend_from_slice(
-            format!(
-                "--{boundary}\r\nContent-Disposition: form-data; name=\"{name}\"\r\n\r\n{value}\r\n"
-            )
-            .as_bytes(),
-        );
-    }
-    body.extend_from_slice(
-        format!("--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\nContent-Type: application/octet-stream\r\n\r\n").as_bytes(),
-    );
-    body.extend_from_slice(file);
-    body.extend_from_slice(
-        format!("\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"submit\"\r\n\r\nUpload\r\n--{boundary}--\r\n").as_bytes(),
-    );
+    let (boundary, body) = form_body(fields, filename, file);
     post_raw(port, bucket, boundary, &body, piece, &[])
 }
 
@@ -5042,4 +5076,67 @@ fn an_object_with_a_customer_provided_key_is_not_reported_aes256() {
     let (head, (status, _)) = call("HEAD", "/both/m", "", &header_refs(&customer), b"");
     assert_eq!(status, 200);
     assert_eq!(response_header(&head, SSE), None, "head");
+}
+
+#[test]
+fn policies_see_a_form_uploads_customer_provided_key() {
+    let server = start_server_tls(false, true);
+    let (_, key, secret) = account_with_key(&server, "forms");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_tls(
+            &server,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    assert_eq!(call("PUT", "/nossec", "", &[], b"").1.0, 200);
+    let deny = r#"{"Statement": {"Effect": "Deny", "Principal": "*", "Action": "s3:PutObject",
+        "Resource": "arn:aws:s3:::nossec/*", "Condition": {"StringEquals":
+        {"s3:x-amz-server-side-encryption-customer-algorithm": "AES256"}}}}"#;
+    assert_eq!(
+        call("PUT", "/nossec", "policy", &[], deny.as_bytes()).1.0,
+        204
+    );
+    let customer = customer_headers("x-amz-", [5u8; 32]);
+    assert_eq!(
+        call("PUT", "/nossec/p", "", &header_refs(&customer), b"x")
+            .1
+            .0,
+        403
+    );
+    let form = |with_key: bool| {
+        let mut conditions = vec![
+            serde_json::json!({"bucket": "nossec"}),
+            serde_json::json!(["starts-with", "$key", "f"]),
+        ];
+        let mut fields = vec![("key", "f")];
+        if with_key {
+            for (name, value) in &customer {
+                conditions.push(serde_json::json!({name.clone(): value.clone()}));
+                fields.push((name.as_str(), value.as_str()));
+            }
+        }
+        signed_form(
+            &key,
+            &secret,
+            "2099-01-01T00:00:00.000Z",
+            &conditions,
+            &fields,
+        )
+    };
+    let (_, (status, reply)) = post_form_tls(&server, "nossec", &form(true), "f", b"x");
+    assert_eq!(status, 403, "{reply}");
+    assert_eq!(
+        call("HEAD", "/nossec/f", "", &header_refs(&customer), b"")
+            .1
+            .0,
+        404
+    );
+    let (_, (status, reply)) = post_form_tls(&server, "nossec", &form(false), "f", b"x");
+    assert_eq!(status, 204, "{reply}");
 }
