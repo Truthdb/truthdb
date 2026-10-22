@@ -287,8 +287,10 @@ const QUERY_AUTH_PARAMS: [&str; 8] = [
 /// Moves a presigned URL's other `x-amz-*` query parameters into the
 /// request's headers, as S3 reads them: the SDKs' presigners carry headers
 /// such as `x-amz-meta-*`, `x-amz-tagging`, `x-amz-storage-class` and
-/// `x-amz-acl` in the query, where the signature covers them. A parameter
-/// given twice is refused.
+/// `x-amz-acl` in the query, where the signature covers them; values are
+/// trimmed as header values are. A parameter given twice, or given as a
+/// header with another value, is refused, and so is a customer-provided key
+/// (SSE-C): key material does not belong in a URL.
 fn hoist_query_headers(request: &mut Request<Incoming>) -> Result<(), S3Error> {
     let invalid = |why: String| S3Error::new(400, "InvalidArgument", why);
     let query = request.uri().query().unwrap_or("").to_string();
@@ -299,15 +301,30 @@ fn hoist_query_headers(request: &mut Request<Incoming>) -> Result<(), S3Error> {
         if !lower.starts_with("x-amz-") || QUERY_AUTH_PARAMS.contains(&lower.as_str()) {
             continue;
         }
+        if crate::ssec::UNSIGNED_IN_PRESIGNED.contains(&lower.as_str()) {
+            return Err(invalid(format!(
+                "{lower} must be sent as a header, not in the URL"
+            )));
+        }
         let value = percent_encoding::percent_decode_str(value)
             .decode_utf8()
             .map_err(|_| invalid(format!("The {lower} parameter is not UTF-8")))?;
+        let value = value.trim_matches([' ', '\t']);
         let name = hyper::header::HeaderName::from_bytes(lower.as_bytes())
             .map_err(|_| invalid(format!("{lower} is not a header name")))?;
         let value = hyper::header::HeaderValue::from_str(&value)
             .map_err(|_| invalid(format!("The {lower} parameter is not a valid header value")))?;
         if hoisted.iter().any(|(given, _)| *given == name) {
             return Err(invalid(format!("The {lower} parameter is given twice")));
+        }
+        if request
+            .headers()
+            .get(&name)
+            .is_some_and(|header| *header != value)
+        {
+            return Err(invalid(format!(
+                "{lower} is given as a header and as a different query parameter"
+            )));
         }
         hoisted.push((name, value));
     }

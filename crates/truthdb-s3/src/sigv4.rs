@@ -172,7 +172,12 @@ pub fn parse_query_auth(raw_query: &str) -> Result<QueryAuth, AuthError> {
             }
             first
         },
-        security_token: param("X-Amz-Security-Token").is_some(),
+        // In any spelling, so a token is never silently ignored.
+        security_token: raw_query.split('&').any(|pair| {
+            pair.split('=')
+                .next()
+                .is_some_and(|key| key.eq_ignore_ascii_case("x-amz-security-token"))
+        }),
     })
 }
 

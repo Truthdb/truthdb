@@ -1691,10 +1691,12 @@ fn presign(
         amz_date,
         expires,
         sigv4::UNSIGNED_PAYLOAD,
+        &[],
     )
 }
 
-/// [`presign`] signing `payload_hash` (a hash the URL fixes).
+/// [`presign`] signing `payload_hash` (a hash the URL fixes) and the
+/// headers `signed` besides the host.
 #[allow(clippy::too_many_arguments)]
 fn presign_payload(
     port: u16,
@@ -1706,6 +1708,7 @@ fn presign_payload(
     amz_date: &str,
     expires: u64,
     payload_hash: &str,
+    signed: &[(&str, &str)],
 ) -> String {
     let credential = sigv4::Credential {
         access_key: key.to_string(),
@@ -1716,23 +1719,24 @@ fn presign_payload(
     let encode = |text: &str| {
         percent_encoding::utf8_percent_encode(text, percent_encoding::NON_ALPHANUMERIC).to_string()
     };
+    let mut headers = vec![("host".to_string(), format!("127.0.0.1:{port}"))];
+    headers.extend(
+        signed
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.to_string())),
+    );
+    let mut names: Vec<String> = headers.iter().map(|(name, _)| name.clone()).collect();
+    names.sort();
     let mut query = format!(
-        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={amz_date}&X-Amz-Expires={expires}&X-Amz-SignedHeaders=host",
-        encode(&format!("{key}/{}", credential.scope()))
+        "X-Amz-Algorithm=AWS4-HMAC-SHA256&X-Amz-Credential={}&X-Amz-Date={amz_date}&X-Amz-Expires={expires}&X-Amz-SignedHeaders={}",
+        encode(&format!("{key}/{}", credential.scope())),
+        encode(&names.join(";"))
     );
     if !extra.is_empty() {
         query = format!("{extra}&{query}");
     }
-    let headers = vec![("host".to_string(), format!("127.0.0.1:{port}"))];
-    let canonical = sigv4::canonical_request(
-        method,
-        path,
-        &query,
-        &headers,
-        &["host".to_string()],
-        payload_hash,
-    )
-    .unwrap();
+    let canonical =
+        sigv4::canonical_request(method, path, &query, &headers, &names, payload_hash).unwrap();
     let signature = sigv4::sign(
         &sigv4::signing_key(secret, &credential),
         &sigv4::string_to_sign(amz_date, &credential.scope(), &canonical),
@@ -7491,7 +7495,66 @@ fn a_presigned_urls_x_amz_parameters_are_its_headers() {
     let refused = send_presigned_with(port, "PUT", &target, &[("x-amz-meta-color", "blue")], b"x");
     assert_eq!(refused.1.0, 403, "{}", refused.1.1);
     let target = url("/hoist/c", "x-amz-meta-color=blue&X-AMZ-META-COLOR=green");
-    assert_eq!(send_presigned(port, "PUT", &target, b"x").1.0, 400);
+    let (status, reply) = send_presigned(port, "PUT", &target, b"x").1;
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("given twice"), "{reply}");
+    // A header the URL signs, given in the query with another value too, is
+    // refused; with the same value it is one header.
+    let signed_too = |value: &str| {
+        presign_payload(
+            port,
+            "PUT",
+            "/hoist/g",
+            &format!("x-amz-meta-color={value}"),
+            &key,
+            &secret,
+            &now,
+            3600,
+            sigv4::UNSIGNED_PAYLOAD,
+            &[("x-amz-meta-color", "blue")],
+        )
+    };
+    let (status, reply) = send_presigned_with(
+        port,
+        "PUT",
+        &signed_too("green"),
+        &[("x-amz-meta-color", "blue")],
+        b"x",
+    )
+    .1;
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("different query parameter"), "{reply}");
+    let (status, reply) = send_presigned_with(
+        port,
+        "PUT",
+        &signed_too("blue"),
+        &[("x-amz-meta-color", "blue")],
+        b"x",
+    )
+    .1;
+    assert_eq!(status, 200, "{reply}");
+    // Spaces around a value are dropped, as around a header's.
+    let target = url("/hoist/h", "x-amz-meta-pad=%20padded%20");
+    assert_eq!(send_presigned(port, "PUT", &target, b"x").1.0, 200);
+    let (head, _) = send_with(port, "HEAD", "/hoist/h", "", &[], b"", &key, Some(&secret));
+    assert_eq!(
+        response_header(&head, "x-amz-meta-pad").as_deref(),
+        Some("padded")
+    );
+    // A customer-provided key never travels in a URL; nor are temporary
+    // credentials taken in any spelling.
+    for extra in [
+        "x-amz-server-side-encryption-customer-key=a2V5",
+        "x-amz-security-token=token",
+    ] {
+        let target = url("/hoist/i", extra);
+        let (status, reply) = send_presigned(port, "PUT", &target, b"x").1;
+        assert!(status == 400 || status == 403, "{extra}: {status} {reply}");
+        assert!(
+            reply.contains("must be sent as a header") || reply.contains("temporary credentials"),
+            "{extra}: {reply}"
+        );
+    }
     // A hoisted header is checked as one: an ACL granting more than the
     // owner is refused, and the object is not stored.
     let target = url("/hoist/d", "x-amz-acl=public-read");
@@ -7513,8 +7576,11 @@ fn a_presigned_urls_x_amz_parameters_are_its_headers() {
         &now,
         3600,
         &hash,
+        &[],
     );
-    assert_ne!(send_presigned(port, "PUT", &target, b"other").1.0, 200);
+    let (status, reply) = send_presigned(port, "PUT", &target, b"other").1;
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("XAmzContentSHA256Mismatch"), "{reply}");
     assert_eq!(send_presigned(port, "PUT", &target, b"exact").1.0, 200);
     let target = url(
         "/hoist/f",
