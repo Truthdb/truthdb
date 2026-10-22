@@ -259,6 +259,10 @@ const OBJECT_ABANDON_AFTER_MS: u64 = 60 * 60 * 1000;
 /// The change journal (`sys.s3_journal`) keeps this much history.
 const OBJECT_JOURNAL_RETENTION_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 
+/// The longest a consumer that has stopped reading (see
+/// `sys.dm_s3_journal_consumers`) holds the journal back.
+const OBJECT_JOURNAL_HOLD_CAP_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+
 /// Journal rows one trimming transaction deletes at most.
 const OBJECT_JOURNAL_TRIM_BATCH: usize = 512;
 
@@ -1191,13 +1195,18 @@ impl Engine {
         // is read first: an idle sweep writes nothing.
         for _ in 0..8 {
             let trimmed = self.object(|file| {
-                if !file.journal_due(now_ms, OBJECT_JOURNAL_RETENTION_MS)? {
+                if !file.journal_due(
+                    now_ms,
+                    OBJECT_JOURNAL_RETENTION_MS,
+                    OBJECT_JOURNAL_HOLD_CAP_MS,
+                )? {
                     return Ok(0);
                 }
                 file.transaction(|tx| {
                     tx.trim_journal(
                         now_ms,
                         OBJECT_JOURNAL_RETENTION_MS,
+                        OBJECT_JOURNAL_HOLD_CAP_MS,
                         OBJECT_JOURNAL_TRIM_BATCH,
                     )
                 })

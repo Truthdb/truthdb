@@ -19,8 +19,9 @@ use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 use truthdb_fulltext::{DocTerms, Progress};
 
+use crate::consumers::{Consumer, FULLTEXT_CONSUMER};
 use crate::objects::ObjectInfo;
-use crate::{FT_BUCKETS_TREE, FT_CURSOR_KEY, FT_KEYS_TREE, ObjFile, ObjTxn, codec};
+use crate::{FT_BUCKETS_TREE, FT_KEYS_TREE, ObjFile, ObjTxn};
 
 /// The largest object `s3 enable fulltext` indexes unless told otherwise.
 pub const DEFAULT_FULLTEXT_MAX_BYTES: u64 = 16 << 20;
@@ -259,16 +260,20 @@ impl ObjTxn<'_, '_> {
             Some(existing) => existing.generation + 1,
             None => {
                 // With no bucket indexed, nothing has held the journal back,
-                // and the cursor may point at rows long trimmed: the backfill
-                // covers everything up to now, so the cursor starts here.
+                // and the indexer's place may be at rows long trimmed: the
+                // backfill covers everything up to now, so it starts here.
                 if self
                     .trees
                     .ft_buckets()
                     .scan_range_limit(self.ctx, None, None, 1)?
                     .is_empty()
                 {
-                    let last = self.last_change()?;
-                    self.set_fulltext_cursor(last)?;
+                    let cursor = self.last_change()?;
+                    self.put_consumer(&Consumer {
+                        name: FULLTEXT_CONSUMER.to_string(),
+                        cursor,
+                        dropped: 0,
+                    })?;
                 }
                 1
             }
@@ -310,13 +315,31 @@ impl ObjTxn<'_, '_> {
         Ok(())
     }
 
-    /// Records the last journal row the indexer has applied.
+    /// Records the last journal row the indexer has applied. With no bucket
+    /// indexed (the last one purged in the same pass) there is no indexer
+    /// place to keep: nothing then holds the journal.
     pub fn set_fulltext_cursor(&mut self, sequence: u64) -> Result<(), StorageError> {
-        let meta = self.trees.meta();
-        let row = sequence.to_le_bytes();
-        let mode = &mut OpMode::Txn(self.txn);
-        if meta.update(self.ctx, mode, FT_CURSOR_KEY, &row)?.is_none() {
-            meta.insert_unique(self.ctx, mode, FT_CURSOR_KEY, &row)?;
+        if self
+            .trees
+            .ft_buckets()
+            .scan_range_limit(self.ctx, None, None, 1)?
+            .is_empty()
+        {
+            return Ok(());
+        }
+        self.advance_consumer(FULLTEXT_CONSUMER, sequence)
+    }
+
+    /// Indexes every indexed bucket anew by backfill: the indexer missed
+    /// journal rows (trimmed before it read them).
+    pub(crate) fn refill_fulltext(&mut self) -> Result<(), StorageError> {
+        for (name, row) in self.trees.ft_buckets().scan(self.ctx)? {
+            let mut bucket = decode_bucket(&name, &row)?;
+            if bucket.state != FtState::Purging {
+                bucket.state = FtState::Backfilling(None);
+                bucket.generation += 1;
+                self.put_ft_bucket(&bucket)?;
+            }
         }
         Ok(())
     }
@@ -613,27 +636,16 @@ impl ObjTxn<'_, '_> {
         self.trees
             .ft_buckets()
             .delete(self.ctx, &mut OpMode::Txn(self.txn), bucket.as_bytes())?;
-        Ok(true)
-    }
-
-    /// The indexer's cursor, when any bucket has full-text state (the
-    /// journal must then not be trimmed past it).
-    pub(crate) fn fulltext_hold(&mut self) -> Result<Option<u64>, StorageError> {
+        // The last indexed bucket gone, the journal is no longer held.
         if self
             .trees
             .ft_buckets()
             .scan_range_limit(self.ctx, None, None, 1)?
             .is_empty()
         {
-            return Ok(None);
+            self.remove_consumer(FULLTEXT_CONSUMER)?;
         }
-        let cursor = self.trees.meta().get(self.ctx, FT_CURSOR_KEY)?;
-        Ok(Some(
-            cursor
-                .map(|row| codec::u64_le(&row))
-                .transpose()?
-                .unwrap_or(0),
-        ))
+        Ok(true)
     }
 }
 
@@ -649,31 +661,13 @@ impl ObjFile<'_> {
             .collect()
     }
 
-    /// [`ObjTxn::fulltext_hold`], read outside a transaction.
-    pub(crate) fn fulltext_hold(&mut self) -> Result<Option<u64>, StorageError> {
-        let Some(tree) = self.existing_tree(FT_BUCKETS_TREE)? else {
-            return Ok(None);
-        };
-        if tree
-            .scan_range_limit(&mut self.core.page_ctx(0), None, None, 1)?
-            .is_empty()
-        {
-            return Ok(None);
-        }
-        self.fulltext_cursor().map(Some)
-    }
-
     /// The last journal row the indexer has applied.
     pub fn fulltext_cursor(&mut self) -> Result<u64, StorageError> {
-        let Some(meta) = self.eng.root.map(crate::meta_tree) else {
-            return Ok(0);
-        };
-        self.core.ensure_rel_usable()?;
-        Ok(meta
-            .get(&mut self.core.page_ctx(0), FT_CURSOR_KEY)?
-            .map(|row| codec::u64_le(&row))
-            .transpose()?
-            .unwrap_or(0))
+        Ok(self
+            .journal_consumers()?
+            .into_iter()
+            .find(|consumer| consumer.name == FULLTEXT_CONSUMER)
+            .map_or(0, |consumer| consumer.cursor))
     }
 
     /// The full-text index's trees, when they exist.

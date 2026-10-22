@@ -497,3 +497,33 @@ fn an_idle_sweep_writes_nothing_and_a_new_bucket_starts_a_new_journal() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn the_journal_consumers_read_as_a_view() {
+    let path = unique_temp_path("s3-consumers");
+    let engine = new_engine(&path);
+    create_bucket(&engine, "docs", Versioning::Unversioned);
+    let consumers = |engine: &Engine| {
+        sql_rows(
+            engine,
+            "SELECT consumer_name, last_sequence_number, pending_records, dropped_records \
+             FROM sys.dm_s3_journal_consumers",
+        )
+        .1
+    };
+    assert_eq!(consumers(&engine), Vec::<Vec<Option<String>>>::new());
+    put(&engine, "docs", "a", b"one", &ObjectAttrs::default());
+    engine.execute("s3 enable fulltext docs").unwrap();
+    put(&engine, "docs", "b", b"two", &ObjectAttrs::default());
+    assert_eq!(
+        consumers(&engine),
+        [vec![
+            Some("fulltext".into()),
+            Some("1".into()),
+            Some("1".into()),
+            Some("0".into())
+        ]]
+    );
+    drop(engine);
+    std::fs::remove_file(&path).ok();
+}

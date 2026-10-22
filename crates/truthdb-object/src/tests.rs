@@ -1751,12 +1751,12 @@ fn the_journal_records_every_change_in_its_own_transaction() {
     // Trimming at `at` with a 1 ms retention takes the rows stamped before it.
     let trim = |at: u64, limit: usize| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.trim_journal(at, 1, limit))
+            .transaction(|tx| tx.trim_journal(at, 1, u64::MAX, limit))
             .unwrap()
     };
     let due = |at: u64| {
         ObjFile::new(&mut storage.lock())
-            .journal_due(at, 1)
+            .journal_due(at, 1, u64::MAX)
             .unwrap()
     };
     assert_eq!(trim(now() + 1, 3), 3);
@@ -2139,12 +2139,12 @@ fn the_journal_is_not_trimmed_past_the_indexer_while_a_bucket_is_indexed() {
     put_text(&storage, "docs", "c", "z");
     let trim = |storage: &Storage| {
         ObjFile::new(&mut storage.lock())
-            .transaction(|tx| tx.trim_journal(now() + 1, 1, 100))
+            .transaction(|tx| tx.trim_journal(now() + 1, 1, u64::MAX, 100))
             .unwrap()
     };
     let due = |storage: &Storage| {
         ObjFile::new(&mut storage.lock())
-            .journal_due(now() + 1, 1)
+            .journal_due(now() + 1, 1, u64::MAX)
             .unwrap()
     };
     assert!(due(&storage));
@@ -2995,6 +2995,168 @@ fn an_event_hold_keeps_a_version_until_its_duration_after_release() {
     };
     change(y, RetentionChange::Set(years), false, t).unwrap();
     assert_eq!(retention_of(y).effective_until(t), t + 730 * DAY);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_consumer_that_stops_reading_holds_the_journal_only_until_the_cap() {
+    use crate::{Consumer, FULLTEXT_CONSUMER, FtState};
+    let path = temp_path("journal-cap");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("docs", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    put_text(&storage, "docs", "a", "x");
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.enable_fulltext("docs", 1 << 20))
+        .unwrap()
+        .unwrap();
+    put_text(&storage, "docs", "b", "y");
+    put_text(&storage, "docs", "c", "z");
+    let consumers = |storage: &Storage| {
+        ObjFile::new(&mut storage.lock())
+            .journal_consumers()
+            .unwrap()
+    };
+    assert_eq!(
+        consumers(&storage),
+        [Consumer {
+            name: FULLTEXT_CONSUMER.to_string(),
+            cursor: 1,
+            dropped: 0,
+        }]
+    );
+    // The indexer's backfill finishes; then it stops reading.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.set_fulltext_backfill("docs", 1, None))
+        .unwrap();
+    let trim = |storage: &Storage, at: u64, cap: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.trim_journal(at, 1, cap, 100))
+            .unwrap()
+    };
+    assert_eq!(trim(&storage, now() + 1, 100), 1, "held at the cursor");
+    assert!(
+        !ObjFile::new(&mut storage.lock())
+            .journal_due(now() + 1, 1, 100)
+            .unwrap()
+    );
+    // Past the cap the rows go anyway: the consumer is moved past them, the
+    // rows it missed counted, and the index rebuilt by backfill.
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .journal_due(now() + 100, 1, 100)
+            .unwrap()
+    );
+    assert_eq!(trim(&storage, now() + 100, 100), 2);
+    assert_eq!(
+        consumers(&storage),
+        [Consumer {
+            name: FULLTEXT_CONSUMER.to_string(),
+            cursor: 3,
+            dropped: 2,
+        }]
+    );
+    let bucket = ObjFile::new(&mut storage.lock())
+        .fulltext_buckets()
+        .unwrap();
+    assert_eq!(bucket[0].state, FtState::Backfilling(None));
+    assert_eq!(bucket[0].generation, 2);
+    // An indexer that applied rows the trim has since moved it past keeps
+    // the trim's place.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.set_fulltext_cursor(2))
+        .unwrap();
+    assert_eq!(consumers(&storage)[0].cursor, 3);
+    // The places survive a restart.
+    drop(storage);
+    let storage = open(&path);
+    assert_eq!(consumers(&storage)[0].dropped, 2);
+    // The last indexed bucket purged, nothing holds the journal.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.disable_fulltext("docs"))
+        .unwrap()
+        .unwrap();
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.purge_fulltext("docs", 100))
+            .unwrap()
+    );
+    assert_eq!(consumers(&storage), []);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn an_indexer_cursor_from_before_consumers_holds_the_journal_and_moves_to_its_row() {
+    use crate::{Consumer, FT_CURSOR_KEY, FULLTEXT_CONSUMER};
+    let path = temp_path("journal-legacy");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("docs", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    put_text(&storage, "docs", "a", "x");
+    put_text(&storage, "docs", "b", "y");
+    put_text(&storage, "docs", "c", "z");
+    // A file written before consumers: the indexer's cursor (1) in the
+    // directory tree, no consumer row.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.enable_fulltext("docs", 1 << 20)?.unwrap();
+            tx.trees.consumers().delete(
+                tx.ctx,
+                &mut OpMode::Txn(tx.txn),
+                FULLTEXT_CONSUMER.as_bytes(),
+            )?;
+            tx.trees.meta().insert_unique(
+                tx.ctx,
+                &mut OpMode::Txn(tx.txn),
+                FT_CURSOR_KEY,
+                &1u64.to_le_bytes(),
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    let legacy = Consumer {
+        name: FULLTEXT_CONSUMER.to_string(),
+        cursor: 1,
+        dropped: 0,
+    };
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .journal_consumers()
+            .unwrap(),
+        [legacy]
+    );
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.trim_journal(now() + 1, 1, u64::MAX, 100))
+            .unwrap(),
+        1,
+        "held at the old cursor"
+    );
+    // Its next step keeps its place in a consumer row, not the directory.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.set_fulltext_cursor(2))
+        .unwrap();
+    let mut guard = storage.lock();
+    let file = ObjFile::new(&mut guard);
+    let meta = crate::meta_tree(file.eng.root.unwrap());
+    assert_eq!(
+        meta.get(&mut file.core.page_ctx(0), FT_CURSOR_KEY).unwrap(),
+        None
+    );
+    drop(guard);
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .journal_consumers()
+            .unwrap()[0]
+            .cursor,
+        2
+    );
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
