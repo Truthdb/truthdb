@@ -45,6 +45,9 @@ pub struct S3State {
     pub engine: EngineHandle,
     pub region: String,
     pub signing_keys: std::sync::Arc<sigv4::SigningKeyCache>,
+    /// The database itself, for what is read without the engine (whether it
+    /// is encrypted at rest).
+    pub storage: std::sync::Arc<truthdb_core::storage::Storage>,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its

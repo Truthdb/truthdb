@@ -42,7 +42,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "analytics",
     "attributes",
     "cors",
-    "encryption",
     "intelligent-tiering",
     "inventory",
     "legal-hold",
@@ -381,6 +380,15 @@ async fn route(
             };
             authz.check(action, Bucket(&bucket))?;
             crate::public_access::handle(state, request, auth, bucket, String::new(), method).await
+        }
+        (Target::Bucket(bucket), method) if has_param(&request, "encryption") => {
+            let action = match method {
+                Method::GET => "s3:GetEncryptionConfiguration",
+                Method::PUT | Method::DELETE => "s3:PutEncryptionConfiguration",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?encryption"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::sse::handle(state, request, auth, bucket, method).await
         }
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "policyStatus") => {
             authz.check("s3:GetBucketPolicyStatus", Bucket(&bucket))?;

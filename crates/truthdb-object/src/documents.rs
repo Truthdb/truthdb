@@ -20,6 +20,9 @@ pub const BUCKET_POLICY: u8 = 1;
 /// `truthdb-s3`'s `public_access`). An account's own settings are kept as
 /// this kind under the empty bucket name, with the account id as the id.
 pub const PUBLIC_ACCESS_BLOCK: u8 = 2;
+/// A bucket configuration: its default encryption settings (one byte, see
+/// `truthdb-s3`'s `sse`).
+pub const BUCKET_ENCRYPTION: u8 = 3;
 
 fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
     [prefix, &chunk.to_be_bytes()].concat()

@@ -49,8 +49,14 @@ impl Drop for Server {
 /// and the server binding it; the server then exits, and it is started again
 /// on new ports.
 fn start_server() -> Server {
+    start_server_with(false)
+}
+
+/// [`start_server`]; `encrypted`: with a master key configured, so the
+/// database it creates is encrypted at rest.
+fn start_server_with(encrypted: bool) -> Server {
     for _ in 0..5 {
-        let server = spawn_server();
+        let server = spawn_server(encrypted);
         let deadline = Instant::now() + DEADLINE;
         let mut server = Some(server);
         while Instant::now() < deadline {
@@ -73,7 +79,7 @@ fn start_server() -> Server {
     panic!("the server never came up");
 }
 
-fn spawn_server() -> Server {
+fn spawn_server(encrypted: bool) -> Server {
     let dir = std::env::temp_dir().join(format!(
         "truthdb-s3-{}-{}",
         std::process::id(),
@@ -85,10 +91,19 @@ fn spawn_server() -> Server {
     std::fs::create_dir_all(&dir).expect("dir");
     let (native_port, s3_port) = free_ports();
     let config = dir.join("truthdb.toml");
+    let encryption = if encrypted {
+        use std::os::unix::fs::PermissionsExt;
+        let keys = dir.join("master.keys");
+        std::fs::write(&keys, format!("main {}\n", "4f".repeat(32))).expect("key file");
+        std::fs::set_permissions(&keys, std::fs::Permissions::from_mode(0o600)).expect("chmod");
+        format!("\n[encryption]\nmaster_key_file = \"{}\"\n", keys.display())
+    } else {
+        String::new()
+    };
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\n",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\n{encryption}",
             dir.join("truth.db").display()
         ),
     )
@@ -682,6 +697,15 @@ fn a_user_without_policies_is_refused_every_operation() {
         ("PUT", "/cov", "policy", b"{}", &[]),
         ("DELETE", "/cov", "policy", b"", &[]),
         ("GET", "/cov", "policyStatus", b"", &[]),
+        ("GET", "/cov", "encryption", b"", &[]),
+        (
+            "PUT",
+            "/cov",
+            "encryption",
+            b"<ServerSideEncryptionConfiguration/>",
+            &[],
+        ),
+        ("DELETE", "/cov", "encryption", b"", &[]),
         ("GET", "/cov", "acl", b"", &[]),
         ("PUT", "/cov", "acl", b"", &[]),
         ("GET", "/cov", "ownershipControls", b"", &[]),
@@ -4209,4 +4233,171 @@ fn the_s3_vectors_api_manages_buckets_indexes_and_vectors_and_queries_them() {
 
     // The S3 API on the same port is unchanged.
     assert_eq!(get(port, "/", &key, Some(&secret)).0, 200);
+}
+
+/// The XML of a ServerSideEncryptionConfiguration with one rule.
+fn encryption_config(rule: &str) -> Vec<u8> {
+    format!(
+        "<ServerSideEncryptionConfiguration><Rule>{rule}</Rule></ServerSideEncryptionConfiguration>"
+    )
+    .into_bytes()
+}
+
+#[test]
+fn server_side_encryption_is_the_databases_encryption_at_rest() {
+    const SSE: &str = "x-amz-server-side-encryption";
+    let aes_default = encryption_config(
+        "<ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
+         </ApplyServerSideEncryptionByDefault>",
+    );
+    let block_sse_c = encryption_config(
+        "<BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType></BlockedEncryptionTypes>",
+    );
+
+    // A plain database: nothing is encrypted, and nothing says it is.
+    let server = start_server_with(false);
+    let port = server.s3_port;
+    let (_, key, secret) = account_with_key(&server, "plain");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    assert_eq!(call("PUT", "/plain", "", &[], b"").1.0, 200);
+    let (_, (status, reply)) = call("PUT", "/plain/o", "", &[(SSE, "AES256")], b"x");
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("InvalidArgument"), "{reply}");
+    let (head, (status, _)) = call("PUT", "/plain/o", "", &[], b"x");
+    assert_eq!(status, 200);
+    assert_eq!(response_header(&head, SSE), None);
+    let (_, (status, reply)) = call("GET", "/plain", "encryption", &[], b"");
+    assert_eq!(status, 400);
+    assert!(
+        reply.contains("ServerSideEncryptionConfigurationNotFoundError"),
+        "{reply}"
+    );
+    assert_eq!(
+        call("PUT", "/plain", "encryption", &[], &aes_default).1.0,
+        400
+    );
+    assert_eq!(
+        call("PUT", "/plain", "encryption", &[], &block_sse_c).1.0,
+        200
+    );
+    let (_, (status, reply)) = call("GET", "/plain", "encryption", &[], b"");
+    assert_eq!(status, 200);
+    assert!(
+        reply.contains("<EncryptionType>SSE-C</EncryptionType>"),
+        "{reply}"
+    );
+    assert!(!reply.contains("SSEAlgorithm"), "{reply}");
+    assert_eq!(call("DELETE", "/plain", "encryption", &[], b"").1.0, 204);
+    assert_eq!(call("GET", "/plain", "encryption", &[], b"").1.0, 400);
+    // A read names no encryption.
+    assert_eq!(
+        call("GET", "/plain/o", "", &[(SSE, "AES256")], b"").1.0,
+        400
+    );
+    drop(server);
+
+    // An encrypted database: every object is AES256, and says so.
+    let server = start_server_with(true);
+    let port = server.s3_port;
+    let (_, key, secret) = account_with_key(&server, "sealed");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    assert_eq!(call("PUT", "/sealed", "", &[], b"").1.0, 200);
+    for extra in [&[(SSE, "AES256")][..], &[]] {
+        let (head, (status, reply)) = call("PUT", "/sealed/o", "", extra, b"secret");
+        assert_eq!(status, 200, "{reply}");
+        assert_eq!(response_header(&head, SSE).as_deref(), Some("AES256"));
+    }
+    for method in ["GET", "HEAD"] {
+        let (head, (status, _)) = call(method, "/sealed/o", "", &[], b"");
+        assert_eq!(status, 200);
+        assert_eq!(
+            response_header(&head, SSE).as_deref(),
+            Some("AES256"),
+            "{method}"
+        );
+    }
+    let (_, (status, reply)) = call("PUT", "/sealed/k", "", &[(SSE, "aws:kms")], b"x");
+    assert_eq!(status, 400, "{reply}");
+    let (head, (status, _)) = call(
+        "PUT",
+        "/sealed/c",
+        "",
+        &[("x-amz-copy-source", "/sealed/o")],
+        b"",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, SSE).as_deref(),
+        Some("AES256"),
+        "copy"
+    );
+    let (head, (status, created)) = call("POST", "/sealed/m", "uploads", &[(SSE, "AES256")], b"");
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, SSE).as_deref(),
+        Some("AES256"),
+        "create upload"
+    );
+    let upload = xml_value(&created, "UploadId");
+    let (head, (status, _)) = call(
+        "PUT",
+        "/sealed/m",
+        &format!("uploadId={upload}&partNumber=1"),
+        &[],
+        b"part",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, SSE).as_deref(),
+        Some("AES256"),
+        "upload part"
+    );
+    let etag = response_header(&head, "etag").expect("etag");
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (head, (status, reply)) = call(
+        "POST",
+        "/sealed/m",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        response_header(&head, SSE).as_deref(),
+        Some("AES256"),
+        "complete"
+    );
+    // The bucket's default is the database's: AES256.
+    let (_, (status, reply)) = call("GET", "/sealed", "encryption", &[], b"");
+    assert_eq!(status, 200);
+    assert!(
+        reply.contains("<SSEAlgorithm>AES256</SSEAlgorithm>"),
+        "{reply}"
+    );
+    assert!(
+        reply.contains("<EncryptionType>NONE</EncryptionType>"),
+        "{reply}"
+    );
+    assert_eq!(
+        call("PUT", "/sealed", "encryption", &[], &aes_default).1.0,
+        200
+    );
+    let kms = encryption_config(
+        "<ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>\
+         </ApplyServerSideEncryptionByDefault>",
+    );
+    assert_eq!(call("PUT", "/sealed", "encryption", &[], &kms).1.0, 400);
+    assert_eq!(call("DELETE", "/sealed", "encryption", &[], b"").1.0, 204);
+    let (_, (status, reply)) = call("GET", "/sealed", "encryption", &[], b"");
+    assert_eq!(status, 200);
+    assert!(
+        reply.contains("<SSEAlgorithm>AES256</SSEAlgorithm>"),
+        "{reply}"
+    );
 }

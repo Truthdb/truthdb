@@ -296,6 +296,8 @@ pub async fn put_object(
     key: String,
 ) -> Result<Response<Body>, S3Error> {
     let attrs = attrs_from(request.headers())?;
+    let encrypted_at_rest = state.storage.is_encrypted();
+    crate::sse::check_write(request.headers(), encrypted_at_rest)?;
     // Fail before writing anything when the bucket or key is wrong.
     {
         let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
@@ -324,9 +326,12 @@ pub async fn put_object(
     })
     .await?;
     let info = stored.map_err(|err| object_error(err, &bucket, &key))?;
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .header("etag", info.etag());
+    let mut response = crate::sse::with_header(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("etag", info.etag()),
+        encrypted_at_rest,
+    );
     if let Some(version) = version_header(versioning, info.version, info.null_version) {
         response = response.header("x-amz-version-id", version);
     }
@@ -448,9 +453,10 @@ fn object_headers(
     builder: hyper::http::response::Builder,
     info: &ObjectInfo,
     versioning: Versioning,
+    encrypted_at_rest: bool,
 ) -> hyper::http::response::Builder {
     let attrs = &info.attrs;
-    let mut builder = builder;
+    let mut builder = crate::sse::with_header(builder, encrypted_at_rest);
     if let Some(version) = version_header(versioning, info.version, info.null_version) {
         builder = builder.header("x-amz-version-id", version);
     }
@@ -565,6 +571,7 @@ pub async fn get_object(
     head_only: bool,
     signed: bool,
 ) -> Result<Response<Body>, S3Error> {
+    crate::sse::check_read(request.headers())?;
     let which = version_sel(request.uri().query().unwrap_or(""))?;
     let overrides = response_overrides(request.uri().query().unwrap_or(""), signed)?;
     let headers = request.headers().clone();
@@ -574,6 +581,7 @@ pub async fn get_object(
         engine: state.engine.clone(),
         region: state.region.clone(),
         signing_keys: state.signing_keys.clone(),
+        storage: state.storage.clone(),
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {
@@ -673,11 +681,14 @@ async fn read_object(
                 "At least one of the pre-conditions you specified did not hold",
             ));
         }
-        return Ok(
-            object_headers(Response::builder().status(status), &info, versioning)
-                .body(full(Bytes::new()))
-                .expect("a valid response"),
-        );
+        return Ok(object_headers(
+            Response::builder().status(status),
+            &info,
+            versioning,
+            state.storage.is_encrypted(),
+        )
+        .body(full(Bytes::new()))
+        .expect("a valid response"));
     }
     let range = match header(headers, "range") {
         Some(value) => match parse_range(&value, info.size) {
@@ -699,8 +710,13 @@ async fn read_object(
         Some((first, last)) => (StatusCode::PARTIAL_CONTENT, first, last - first + 1),
         None => (StatusCode::OK, 0, info.size),
     };
-    let mut builder = object_headers(Response::builder().status(status), &info, versioning)
-        .header("content-length", len.to_string());
+    let mut builder = object_headers(
+        Response::builder().status(status),
+        &info,
+        versioning,
+        state.storage.is_encrypted(),
+    )
+    .header("content-length", len.to_string());
     if let Some((first, last)) = range {
         builder = builder.header(
             "content-range",

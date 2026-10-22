@@ -96,6 +96,7 @@ pub async fn copy_object(
     key: String,
 ) -> Result<Response<Body>, S3Error> {
     let headers = request.headers().clone();
+    crate::sse::check_write(&headers, state.storage.is_encrypted())?;
     let (src_bucket, src_key, which) = copy_source(&headers)?;
     let replace = replaces(&headers, "x-amz-metadata-directive", "metadata")?;
     let replace_tags = replaces(&headers, "x-amz-tagging-directive", "tagging")?;
@@ -178,6 +179,7 @@ pub async fn copy_object(
     for (name, version) in versions {
         add_header(&mut response, name, version);
     }
+    crate::sse::add_header(&mut response, state.storage.is_encrypted());
     Ok(response)
 }
 
@@ -230,6 +232,7 @@ pub async fn upload_part_copy(
         engine: state.engine.clone(),
         region: state.region.clone(),
         signing_keys: state.signing_keys.clone(),
+        storage: state.storage.clone(),
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     let part = tokio::spawn(crate::scope::within(scope, async move {
@@ -256,6 +259,7 @@ pub async fn upload_part_copy(
     if let Some(version) = source_version {
         add_header(&mut response, "x-amz-copy-source-version-id", version);
     }
+    crate::sse::add_header(&mut response, state.storage.is_encrypted());
     Ok(response)
 }
 

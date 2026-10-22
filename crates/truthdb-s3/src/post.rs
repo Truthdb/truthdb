@@ -543,6 +543,10 @@ pub async fn post_object(
     {
         return Err(invalid("success_action_redirect is not a valid URL."));
     }
+    let encrypted_at_rest = state.storage.is_encrypted();
+    if let Some(value) = field(&fields, crate::sse::SSE_HEADER) {
+        crate::sse::check_write_value(value, encrypted_at_rest)?;
+    }
     let status = field(&fields, "success_action_status").map(str::to_string);
     crate::scope::within(scope, async move {
         let (min, max) = bounds;
@@ -602,7 +606,8 @@ pub async fn post_object(
             "/{bucket}/{}",
             percent_encoding::utf8_percent_encode(&key, LOCATION)
         );
-        let mut response = Response::builder().header("etag", &etag);
+        let mut response =
+            crate::sse::with_header(Response::builder().header("etag", &etag), encrypted_at_rest);
         if let Some(version) = version_header(versioning, info.version, info.null_version) {
             response = response.header("x-amz-version-id", version);
         }
