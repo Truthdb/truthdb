@@ -775,15 +775,7 @@ impl ObjTxn<'_, '_> {
         config: &LifecycleConfig,
     ) -> Result<(), StorageError> {
         self.put_bucket_config(bucket, BUCKET_LIFECYCLE, "", &config.encode())?;
-        // As if a pass had finished long ago: the next one starts today,
-        // from the start.
-        self.write_pass(
-            bucket,
-            &PassState {
-                finished: true,
-                ..PassState::default()
-            },
-        )
+        self.write_pass(bucket, &PassState::default())
     }
 
     /// Deletes the bucket's lifecycle configuration; whether it had one.
