@@ -704,7 +704,9 @@ impl LifecycleConfig {
 /// Where a bucket's pass stands.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 struct PassState {
-    /// The day (since the epoch) the latest pass started.
+    /// The day (since the epoch) the latest pass started, or, once it has
+    /// finished, the day it finished: the next pass starts the day after,
+    /// so no version gets two actions in one day (0: none has run yet).
     started_day: u64,
     finished: bool,
     /// 0: versions; 1: multipart uploads.
@@ -773,7 +775,15 @@ impl ObjTxn<'_, '_> {
         config: &LifecycleConfig,
     ) -> Result<(), StorageError> {
         self.put_bucket_config(bucket, BUCKET_LIFECYCLE, "", &config.encode())?;
-        self.write_pass(bucket, &PassState::default())
+        // As if a pass had finished long ago: the next one starts today,
+        // from the start.
+        self.write_pass(
+            bucket,
+            &PassState {
+                finished: true,
+                ..PassState::default()
+            },
+        )
     }
 
     /// Deletes the bucket's lifecycle configuration; whether it had one.
@@ -864,6 +874,10 @@ impl ObjFile<'_> {
                 || self.lifecycle_uploads(&bucket, &config, &mut state, now_ms, grace_ms, budget)?
         };
         state.finished = finished;
+        if finished {
+            // A pass that ran past midnight has acted on part of today.
+            state.started_day = today;
+        }
         let bucket_name = bucket.clone();
         self.origin = None;
         self.transaction(|tx| tx.write_pass(&bucket_name, &state))?;
@@ -939,6 +953,16 @@ impl ObjFile<'_> {
                 config.decide(&seen, versioned, now_ms)
             } else {
                 None
+            };
+            // S3 takes no action on a noncurrent version Object Lock
+            // protects (a removal is refused by the engine itself).
+            let action = match action {
+                Some(Action::Transition(_))
+                    if !current && self.object_lock(version)?.blocks_delete(now_ms, false) =>
+                {
+                    None
+                }
+                action => action,
             };
             if action.is_none() && actions >= budget.actions {
                 // Out of actions: the rest waits for the next step.

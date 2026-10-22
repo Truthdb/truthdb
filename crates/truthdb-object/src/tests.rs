@@ -4674,3 +4674,257 @@ fn a_lifecycle_pass_ships_to_a_standby_and_restores_from_a_log_backup() {
         std::fs::remove_file(p).ok();
     }
 }
+
+fn lifecycle_rule(id: &str, filter: crate::Filter) -> crate::Rule {
+    crate::Rule {
+        id: id.to_string(),
+        enabled: true,
+        filter,
+        expiration: None,
+        transitions: Vec::new(),
+        noncurrent_expiration: None,
+        noncurrent_transitions: Vec::new(),
+        abort_upload_days: None,
+    }
+}
+
+fn put_rules(storage: &Storage, bucket: &str, rules: Vec<crate::Rule>) {
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.put_lifecycle(
+                bucket,
+                &crate::LifecycleConfig {
+                    min_size: crate::MinTransitionSize::AllClasses128K,
+                    rules,
+                },
+            )
+        })
+        .unwrap();
+}
+
+/// The classes of `bucket`'s versions (`MARKER` for a delete marker),
+/// newest first per key.
+fn classes(storage: &Storage, bucket: &str) -> Vec<(String, String)> {
+    ObjFile::new(&mut storage.lock())
+        .list_versions(bucket, "", None, None, 1000)
+        .unwrap()
+        .unwrap()
+        .objects
+        .into_iter()
+        .map(|listed| {
+            (
+                listed.key,
+                if listed.info.delete_marker {
+                    "MARKER".to_string()
+                } else {
+                    listed.info.storage_class.as_str().to_string()
+                },
+            )
+        })
+        .collect()
+}
+
+#[test]
+fn a_new_configuration_or_a_pass_past_midnight_acts_once_a_day() {
+    use crate::{Expiration, Filter, StorageClass, Transition, Versioning, When};
+    let path = temp_path("lifecycle-once");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("bkt", DEFAULT_ACCOUNT, T0)?.unwrap();
+            tx.set_versioning("bkt", Versioning::Enabled)
+        })
+        .unwrap()
+        .unwrap();
+    for key in ["a", "b", "c"] {
+        put_at(&storage, "bkt", key, 200 * 1024, StorageClass::Standard, T0);
+    }
+    // Long due on day 20: a transition and an expiration; the transition
+    // comes first, the marker the next day, even with the rules just set.
+    let day = 20 * DAY + HOUR;
+    put_rules(
+        &storage,
+        "bkt",
+        vec![crate::Rule {
+            transitions: vec![Transition {
+                when: When::Days(1),
+                class: StorageClass::Glacier,
+            }],
+            expiration: Some(Expiration::At(When::Days(3))),
+            ..lifecycle_rule("r", Filter::All)
+        }],
+    );
+    let all_cold = vec![
+        ("a".to_string(), "GLACIER".to_string()),
+        ("b".to_string(), "GLACIER".to_string()),
+        ("c".to_string(), "GLACIER".to_string()),
+    ];
+    let one_row = crate::StepBudget {
+        rows: 1,
+        actions: 1,
+    };
+    // One version on day 20, the rest after midnight.
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .lifecycle_step(day, 0, one_row)
+            .unwrap()
+    );
+    lifecycle_passes(&storage, day + DAY, one_row);
+    assert_eq!(classes(&storage, "bkt"), all_cold);
+    // The pass finished on day 21: nothing more that day.
+    assert!(
+        !ObjFile::new(&mut storage.lock())
+            .lifecycle_step(day + DAY + HOUR, 0, one_row)
+            .unwrap()
+    );
+    lifecycle_passes(&storage, day + 2 * DAY, one_row);
+    let marked: Vec<_> = classes(&storage, "bkt");
+    assert_eq!(
+        marked.iter().filter(|(_, class)| class == "MARKER").count(),
+        3
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn lifecycle_passes_go_by_tags_suspended_versioning_and_noncurrent_rules() {
+    use crate::{
+        Expiration, Filter, NoncurrentExpiration, NoncurrentTransition, ObjectLock, Retention,
+        RetentionMode, StorageClass, Transition, Versioning, When,
+    };
+    let path = temp_path("lifecycle-kinds");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            for bucket in ["tag", "sus", "non"] {
+                tx.create_bucket(bucket, DEFAULT_ACCOUNT, T0)?.unwrap();
+            }
+            tx.set_versioning("non", Versioning::Enabled)?.unwrap();
+            tx.enable_object_lock("non")?.unwrap();
+            tx.set_versioning("sus", Versioning::Enabled)?.unwrap();
+            Ok(())
+        })
+        .unwrap();
+    let big = 200 * 1024;
+    // tag: only the tagged object transitions, by a date.
+    put_at(&storage, "tag", "plain", big, StorageClass::Standard, T0);
+    let tagged = put_at(&storage, "tag", "tagged", big, StorageClass::Standard, T0);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.set_tags(
+                "tag",
+                "tagged",
+                crate::VersionSel::Seq(tagged),
+                vec![("tier".to_string(), "cold".to_string())],
+                T0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    put_rules(
+        &storage,
+        "tag",
+        vec![crate::Rule {
+            transitions: vec![Transition {
+                when: When::Date(12 * DAY),
+                class: StorageClass::DeepArchive,
+            }],
+            ..lifecycle_rule("t", Filter::Tag("tier".into(), "cold".into()))
+        }],
+    );
+    // sus: a version from while versioning was on, then a null version;
+    // expiring the null current version leaves a null delete marker.
+    put_at(&storage, "sus", "k", 10, StorageClass::Standard, T0);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.set_versioning("sus", Versioning::Suspended))
+        .unwrap()
+        .unwrap();
+    put_at(&storage, "sus", "k", 10, StorageClass::Standard, T0);
+    put_rules(
+        &storage,
+        "sus",
+        vec![crate::Rule {
+            expiration: Some(Expiration::At(When::Days(1))),
+            ..lifecycle_rule("e", Filter::All)
+        }],
+    );
+    // non: five versions; the two newest noncurrent are kept, the others
+    // go colder, and the oldest (locked) stays where it is.
+    let mut versions = Vec::new();
+    for hour in 0..5 {
+        versions.push(put_at(
+            &storage,
+            "non",
+            "k",
+            big,
+            StorageClass::Standard,
+            T0 + hour * HOUR,
+        ));
+    }
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.set_lock(
+                versions[0],
+                &ObjectLock {
+                    retention: Some(Retention {
+                        mode: RetentionMode::Governance,
+                        until_ms: u64::MAX,
+                        event: None,
+                    }),
+                    legal_hold: None,
+                },
+            )
+        })
+        .unwrap();
+    put_rules(
+        &storage,
+        "non",
+        vec![crate::Rule {
+            noncurrent_transitions: vec![NoncurrentTransition {
+                days: 1,
+                newer_versions: Some(2),
+                class: StorageClass::Glacier,
+            }],
+            noncurrent_expiration: Some(NoncurrentExpiration {
+                days: 30,
+                newer_versions: None,
+            }),
+            ..lifecycle_rule("n", Filter::Prefix("k".into()))
+        }],
+    );
+    lifecycle_passes(
+        &storage,
+        12 * DAY + HOUR,
+        crate::StepBudget {
+            rows: 2,
+            actions: 1,
+        },
+    );
+    let pair = |key: &str, class: &str| (key.to_string(), class.to_string());
+    assert_eq!(
+        classes(&storage, "tag"),
+        [pair("plain", "STANDARD"), pair("tagged", "DEEP_ARCHIVE")]
+    );
+    // The null version became a null marker; the older numbered one stays.
+    let sus = ObjFile::new(&mut storage.lock())
+        .list_versions("sus", "", None, None, 10)
+        .unwrap()
+        .unwrap()
+        .objects;
+    assert_eq!(sus.len(), 2);
+    assert!(sus[0].info.delete_marker && sus[0].info.null_version);
+    assert!(!sus[1].info.delete_marker && !sus[1].info.null_version);
+    assert_eq!(
+        classes(&storage, "non"),
+        [
+            pair("k", "STANDARD"),
+            pair("k", "STANDARD"),
+            pair("k", "STANDARD"),
+            pair("k", "GLACIER"),
+            pair("k", "STANDARD"),
+        ]
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

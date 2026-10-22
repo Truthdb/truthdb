@@ -1,7 +1,8 @@
 //! A small XML element tree, for request bodies whose elements nest and
 //! repeat (a lifecycle configuration's rules, their transitions and tags).
-//! Text belongs to leaves only; a root of another name, text beside child
-//! elements, or nesting past a fixed depth is malformed.
+//! Text belongs to leaves only, kept as given (a prefix or tag may end in a
+//! space); a root of another name, text beside child elements, or nesting
+//! past a fixed depth is malformed.
 
 use quick_xml::Reader;
 use quick_xml::events::Event;
@@ -15,7 +16,7 @@ const MAX_DEPTH: usize = 16;
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Element {
     pub name: String,
-    /// A leaf's text, trimmed (empty for an element holding others).
+    /// A leaf's text as given (empty for an element holding others).
     pub text: String,
     pub children: Vec<Element>,
 }
@@ -77,11 +78,10 @@ pub(crate) fn parse(body: &[u8], root: &str) -> Result<Element, S3Error> {
 /// Closes the innermost open element: into its parent, or as the root.
 fn close(open: &mut Vec<Element>, done: &mut Option<Element>) -> Result<(), S3Error> {
     let mut element = open.pop().ok_or_else(malformed)?;
-    if element.children.is_empty() {
-        element.text = element.text.trim().to_string();
-    } else if !element.text.trim().is_empty() {
-        return Err(malformed());
-    } else {
+    if !element.children.is_empty() {
+        if !element.text.trim().is_empty() {
+            return Err(malformed());
+        }
         element.text.clear();
     }
     match open.last_mut() {
@@ -139,7 +139,7 @@ mod tests {
         .unwrap();
         let items: Vec<_> = root.all("Item").collect();
         assert_eq!(items.len(), 2);
-        assert_eq!(items[0].text_of("Name").unwrap(), Some("a"));
+        assert_eq!(items[0].text_of("Name").unwrap(), Some(" a "));
         assert_eq!(items[1].text_of("Name").unwrap(), Some("b&c"));
         assert_eq!(items[1].text_of("Empty").unwrap(), Some(""));
         assert_eq!(items[1].text_of("Missing").unwrap(), None);

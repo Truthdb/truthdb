@@ -283,6 +283,15 @@ fn rule(element: &Element) -> Result<Rule, S3Error> {
             })
         })
         .collect::<Result<Vec<_>, S3Error>>()?;
+    check_transitions(
+        &noncurrent_transitions
+            .iter()
+            .map(|transition| Transition {
+                when: When::Days(transition.days),
+                class: transition.class,
+            })
+            .collect::<Vec<_>>(),
+    )?;
     let abort_upload_days = element
         .one("AbortIncompleteMultipartUpload")?
         .map(|given| {

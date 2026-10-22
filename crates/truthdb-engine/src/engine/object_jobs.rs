@@ -26,11 +26,12 @@ impl Engine {
         if self.storage.is_standby() || !self.runs_objects() {
             return Ok(false);
         }
-        let packed = self.pack_step()?;
+        // Each job runs whatever the other's step did.
+        let packed = self.pack_step();
         let now_ms = super::now_ms();
         let lifecycle = self
-            .object(|file| file.lifecycle_step(now_ms, LIFECYCLE_DROP_GRACE_MS, LIFECYCLE_STEP))?;
-        Ok(packed || lifecycle)
+            .object(|file| file.lifecycle_step(now_ms, LIFECYCLE_DROP_GRACE_MS, LIFECYCLE_STEP));
+        Ok(packed? | lifecycle?)
     }
 
     /// One packing step; returns whether there was one.
