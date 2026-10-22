@@ -1681,6 +1681,32 @@ fn presign(
     amz_date: &str,
     expires: u64,
 ) -> String {
+    presign_payload(
+        port,
+        method,
+        path,
+        extra,
+        key,
+        secret,
+        amz_date,
+        expires,
+        sigv4::UNSIGNED_PAYLOAD,
+    )
+}
+
+/// [`presign`] signing `payload_hash` (a hash the URL fixes).
+#[allow(clippy::too_many_arguments)]
+fn presign_payload(
+    port: u16,
+    method: &str,
+    path: &str,
+    extra: &str,
+    key: &str,
+    secret: &str,
+    amz_date: &str,
+    expires: u64,
+    payload_hash: &str,
+) -> String {
     let credential = sigv4::Credential {
         access_key: key.to_string(),
         date: amz_date[..8].to_string(),
@@ -1704,7 +1730,7 @@ fn presign(
         &query,
         &headers,
         &["host".to_string()],
-        sigv4::UNSIGNED_PAYLOAD,
+        payload_hash,
     )
     .unwrap();
     let signature = sigv4::sign(
@@ -1717,9 +1743,24 @@ fn presign(
 /// Sends a request to a presigned `target` (path and query), with no
 /// Authorization header; returns the response head and the status and body.
 fn send_presigned(port: u16, method: &str, target: &str, body: &[u8]) -> (String, (u16, String)) {
+    send_presigned_with(port, method, target, &[], body)
+}
+
+/// [`send_presigned`] with extra (unsigned) headers.
+fn send_presigned_with(
+    port: u16,
+    method: &str,
+    target: &str,
+    extra: &[(&str, &str)],
+    body: &[u8],
+) -> (String, (u16, String)) {
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    let extra: String = extra
+        .iter()
+        .map(|(name, value)| format!("{name}: {value}\r\n"))
+        .collect();
     let request = format!(
-        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{port}\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n",
         body.len()
     );
     stream.write_all(request.as_bytes()).expect("send");
@@ -7403,4 +7444,81 @@ fn a_lifecycle_configuration_is_kept_shown_and_applied() {
     assert_eq!(response_header(&head, "x-amz-expiration"), None);
     // An object has no lifecycle configuration of its own.
     assert_eq!(call("GET", "/rules/data/a", "lifecycle", &[], b"").1.0, 501);
+}
+
+#[test]
+fn a_presigned_urls_x_amz_parameters_are_its_headers() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    assert_eq!(
+        send(port, "PUT", "/hoist", "", b"", &key, Some(&secret)).0,
+        200
+    );
+    let now = amz_now();
+    let url =
+        |path: &str, extra: &str| presign(port, "PUT", path, extra, &key, &secret, &now, 3600);
+    // As the JS SDK's presigner writes them: headers hoisted into the query
+    // (in their own spelling), the payload hash among them.
+    let target = url(
+        "/hoist/a",
+        "x-amz-meta-color=blue&X-Amz-Meta-Size=big&x-amz-storage-class=STANDARD_IA\
+         &x-amz-tagging=team%3Dred&x-amz-content-sha256=UNSIGNED-PAYLOAD",
+    );
+    let (_, (status, reply)) = send_presigned(port, "PUT", &target, b"hoisted");
+    assert_eq!(status, 200, "{reply}");
+    let (head, (status, _)) =
+        send_with(port, "HEAD", "/hoist/a", "", &[], b"", &key, Some(&secret));
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, "x-amz-meta-color").as_deref(),
+        Some("blue")
+    );
+    assert_eq!(
+        response_header(&head, "x-amz-meta-size").as_deref(),
+        Some("big")
+    );
+    assert_eq!(
+        response_header(&head, "x-amz-storage-class").as_deref(),
+        Some("STANDARD_IA")
+    );
+    assert_eq!(
+        response_header(&head, "x-amz-tagging-count").as_deref(),
+        Some("1")
+    );
+    // An x-amz header the URL does not sign is refused, as ever; a
+    // parameter given twice is refused.
+    let target = url("/hoist/b", "x-amz-meta-color=blue");
+    let refused = send_presigned_with(port, "PUT", &target, &[("x-amz-meta-color", "blue")], b"x");
+    assert_eq!(refused.1.0, 403, "{}", refused.1.1);
+    let target = url("/hoist/c", "x-amz-meta-color=blue&X-AMZ-META-COLOR=green");
+    assert_eq!(send_presigned(port, "PUT", &target, b"x").1.0, 400);
+    // A hoisted header is checked as one: an ACL granting more than the
+    // owner is refused, and the object is not stored.
+    let target = url("/hoist/d", "x-amz-acl=public-read");
+    let (status, reply) = send_presigned(port, "PUT", &target, b"x").1;
+    assert_eq!(status, 400, "{reply}");
+    assert_eq!(
+        send(port, "HEAD", "/hoist/d", "", b"", &key, Some(&secret)).0,
+        404
+    );
+    // A payload hash fixed by the URL in lowercase is checked too.
+    let hash = sigv4::sha256_hex(b"exact");
+    let target = presign_payload(
+        port,
+        "PUT",
+        "/hoist/e",
+        &format!("x-amz-content-sha256={hash}"),
+        &key,
+        &secret,
+        &now,
+        3600,
+        &hash,
+    );
+    assert_ne!(send_presigned(port, "PUT", &target, b"other").1.0, 200);
+    assert_eq!(send_presigned(port, "PUT", &target, b"exact").1.0, 200);
+    let target = url(
+        "/hoist/f",
+        &format!("x-amz-content-sha256={hash}&X-Amz-Content-Sha256={hash}"),
+    );
+    assert_eq!(send_presigned(port, "PUT", &target, b"exact").1.0, 400);
 }

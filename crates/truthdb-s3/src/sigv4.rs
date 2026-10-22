@@ -158,7 +158,20 @@ pub fn parse_query_auth(raw_query: &str) -> Result<QueryAuth, AuthError> {
         },
         amz_date: param("X-Amz-Date").ok_or_else(|| malformed("no X-Amz-Date"))?,
         expires,
-        content_sha256: param("X-Amz-Content-Sha256"),
+        // In any spelling (the JS SDK hoists it as `x-amz-content-sha256`),
+        // once: the body is checked against the hash the URL fixes.
+        content_sha256: {
+            let mut given = raw_query.split('&').filter_map(|pair| {
+                let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+                key.eq_ignore_ascii_case("x-amz-content-sha256")
+                    .then(|| percent_decode_str(value).decode_utf8_lossy().into_owned())
+            });
+            let first = given.next();
+            if given.next().is_some() {
+                return Err(malformed("X-Amz-Content-Sha256 is given twice"));
+            }
+            first
+        },
         security_token: param("X-Amz-Security-Token").is_some(),
     })
 }

@@ -227,7 +227,7 @@ pub fn full(text: impl Into<Bytes>) -> Body {
     Full::new(text.into()).boxed()
 }
 
-async fn route(state: &S3State, request: Request<Incoming>) -> Result<Response<Body>, S3Error> {
+async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Response<Body>, S3Error> {
     // S3 Vectors' JSON API on the same listener, told apart by the
     // service its requests are signed for.
     match request_service(&request).as_deref() {
@@ -267,9 +267,54 @@ async fn route(state: &S3State, request: Request<Incoming>) -> Result<Response<B
         None if request.headers().contains_key("authorization") => {
             authenticate(state, &request).await?
         }
-        None => authenticate_presigned(state, &request).await?,
+        None => authenticate_presigned(state, &mut request).await?,
     };
     crate::api::dispatch(state, request, auth).await
+}
+
+/// The query parameters of a presigned URL that authenticate it.
+const QUERY_AUTH_PARAMS: [&str; 8] = [
+    "x-amz-algorithm",
+    "x-amz-credential",
+    "x-amz-date",
+    "x-amz-expires",
+    "x-amz-signedheaders",
+    "x-amz-signature",
+    "x-amz-security-token",
+    "x-amz-content-sha256",
+];
+
+/// Moves a presigned URL's other `x-amz-*` query parameters into the
+/// request's headers, as S3 reads them: the SDKs' presigners carry headers
+/// such as `x-amz-meta-*`, `x-amz-tagging`, `x-amz-storage-class` and
+/// `x-amz-acl` in the query, where the signature covers them. A parameter
+/// given twice is refused.
+fn hoist_query_headers(request: &mut Request<Incoming>) -> Result<(), S3Error> {
+    let invalid = |why: String| S3Error::new(400, "InvalidArgument", why);
+    let query = request.uri().query().unwrap_or("").to_string();
+    let mut hoisted: Vec<(hyper::header::HeaderName, hyper::header::HeaderValue)> = Vec::new();
+    for pair in query.split('&') {
+        let (name, value) = pair.split_once('=').unwrap_or((pair, ""));
+        let lower = name.to_ascii_lowercase();
+        if !lower.starts_with("x-amz-") || QUERY_AUTH_PARAMS.contains(&lower.as_str()) {
+            continue;
+        }
+        let value = percent_encoding::percent_decode_str(value)
+            .decode_utf8()
+            .map_err(|_| invalid(format!("The {lower} parameter is not UTF-8")))?;
+        let name = hyper::header::HeaderName::from_bytes(lower.as_bytes())
+            .map_err(|_| invalid(format!("{lower} is not a header name")))?;
+        let value = hyper::header::HeaderValue::from_str(&value)
+            .map_err(|_| invalid(format!("The {lower} parameter is not a valid header value")))?;
+        if hoisted.iter().any(|(given, _)| *given == name) {
+            return Err(invalid(format!("The {lower} parameter is given twice")));
+        }
+        hoisted.push((name, value));
+    }
+    for (name, value) in hoisted {
+        request.headers_mut().insert(name, value);
+    }
+    Ok(())
 }
 
 fn header<'r>(request: &'r Request<Incoming>, name: &str) -> Option<&'r str> {
@@ -482,10 +527,12 @@ const MAX_PRESIGNED_EXPIRES: u64 = 7 * 24 * 60 * 60;
 /// query without `X-Amz-Signature`, and an unsigned payload unless the URL
 /// fixes its hash), within `X-Amz-Expires` (at most seven days) of its
 /// `X-Amz-Date`. The access key is looked up as the request arrives, so a
-/// dropped or deactivated key revokes its URLs.
+/// dropped or deactivated key revokes its URLs. Once verified, the signed
+/// `x-amz-*` query parameters become the request's headers (see
+/// [`hoist_query_headers`]).
 pub async fn authenticate_presigned(
     state: &S3State,
-    request: &Request<Incoming>,
+    request: &mut Request<Incoming>,
 ) -> Result<Authenticated, S3Error> {
     let raw_query = request.uri().query().unwrap_or("");
     let query =
@@ -570,6 +617,7 @@ pub async fn authenticate_presigned(
         &sigv4::query_without_signature(raw_query),
     )
     .await?;
+    hoist_query_headers(request)?;
     Ok(Authenticated {
         principal: Some(principal),
         signed: Some(Signed {
