@@ -15,6 +15,7 @@ ring = "0.17"
 percent-encoding = "2.3.2"
 base64 = "0.22.1"
 crc32fast = "1.5.1"
+crc = "3.4"
 hyper = { version = "1.11.1", features = ["server", "http1"] }
 hyper-util = { version = "0.1.21", features = ["tokio"] }
 http-body-util = "0.1.5"
