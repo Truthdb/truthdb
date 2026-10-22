@@ -60,6 +60,34 @@ const UNIMPLEMENTED: &[&str] = &[
 ];
 
 /// The query's parameter names (sub-resources such as `location`).
+/// The sub-resources the routes below implement, each for some methods and
+/// targets.
+const SUBRESOURCES: &[&str] = &[
+    "acl",
+    "delete",
+    "encryption",
+    "location",
+    "ownershipControls",
+    "policy",
+    "policyStatus",
+    "publicAccessBlock",
+    "tagging",
+    "uploadId",
+    "uploads",
+    "versioning",
+    "versions",
+];
+
+/// Whether `request` names no sub-resource but those in `allowed`: only
+/// then may it be taken for the plain operation on its path. A sub-resource
+/// with a method or target it has no route for is refused instead (DELETE
+/// `?versioning` must not delete the bucket).
+fn plain(request: &Request<Incoming>, allowed: &[&str]) -> bool {
+    !SUBRESOURCES
+        .iter()
+        .any(|name| !allowed.contains(name) && has_param(request, name))
+}
+
 fn has_param(request: &Request<Incoming>, name: &str) -> bool {
     request
         .uri()
@@ -433,15 +461,15 @@ async fn route(
                 .unwrap_or_default();
             crate::listing::list_versions(state, bucket, &owner, &query).await
         }
-        (Target::Bucket(bucket), Method::PUT) => {
+        (Target::Bucket(bucket), Method::PUT) if plain(&request, &[]) => {
             authz.check("s3:CreateBucket", Bucket(&bucket))?;
             create_bucket(state, request, auth, bucket).await
         }
-        (Target::Bucket(bucket), Method::DELETE) => {
+        (Target::Bucket(bucket), Method::DELETE) if plain(&request, &[]) => {
             authz.check("s3:DeleteBucket", Bucket(&bucket))?;
             delete_bucket(state, bucket).await
         }
-        (Target::Bucket(bucket), Method::HEAD) => {
+        (Target::Bucket(bucket), Method::HEAD) if plain(&request, &[]) => {
             authz.check("s3:ListBucket", Bucket(&bucket))?;
             head_bucket(state, bucket).await
         }
@@ -465,7 +493,7 @@ async fn route(
             // Each key is authorized on its own.
             crate::delete::delete_objects(state, request, auth, authz, bucket).await
         }
-        (Target::Bucket(bucket), Method::GET) => {
+        (Target::Bucket(bucket), Method::GET) if plain(&request, &[]) => {
             authz.check("s3:ListBucket", Bucket(&bucket))?;
             let query = request.uri().query().unwrap_or("").to_string();
             crate::listing::list_objects(state, bucket, &query).await
@@ -519,7 +547,8 @@ async fn route(
             authz.check(action, Object(&bucket, &key))?;
             crate::tagging::delete_tagging(state, request, bucket, key).await
         }
-        (Target::Object(bucket, key), Method::PUT) if copying => {
+        // A copy is UploadPartCopy with `?uploadId`.
+        (Target::Object(bucket, key), Method::PUT) if copying && plain(&request, &["uploadId"]) => {
             // A copy stores the header's tags only when told to replace the
             // source's.
             let replaces_tags = request
@@ -567,7 +596,7 @@ async fn route(
             authz.check("s3:AbortMultipartUpload", Object(&bucket, &key))?;
             crate::multipart::abort_upload(state, request, bucket, key).await
         }
-        (Target::Object(bucket, key), Method::PUT) => {
+        (Target::Object(bucket, key), Method::PUT) if plain(&request, &[]) => {
             authz.check_storing(
                 "s3:PutObject",
                 Object(&bucket, &key),
@@ -575,7 +604,7 @@ async fn route(
             )?;
             crate::objects::put_object(state, request, auth, bucket, key).await
         }
-        (Target::Object(bucket, key), Method::GET) => {
+        (Target::Object(bucket, key), Method::GET) if plain(&request, &[]) => {
             authz.check(
                 versioned(&request, "s3:GetObject", "s3:GetObjectVersion"),
                 Object(&bucket, &key),
@@ -583,14 +612,14 @@ async fn route(
             crate::objects::get_object(state, request, bucket, key, false, principal.is_some())
                 .await
         }
-        (Target::Object(bucket, key), Method::HEAD) => {
+        (Target::Object(bucket, key), Method::HEAD) if plain(&request, &[]) => {
             authz.check(
                 versioned(&request, "s3:GetObject", "s3:GetObjectVersion"),
                 Object(&bucket, &key),
             )?;
             crate::objects::get_object(state, request, bucket, key, true, principal.is_some()).await
         }
-        (Target::Object(bucket, key), Method::DELETE) => {
+        (Target::Object(bucket, key), Method::DELETE) if plain(&request, &[]) => {
             authz.check(
                 versioned(&request, "s3:DeleteObject", "s3:DeleteObjectVersion"),
                 Object(&bucket, &key),
