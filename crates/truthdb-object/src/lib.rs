@@ -24,6 +24,7 @@ mod journal;
 mod listing;
 mod locks;
 mod objects;
+mod pack;
 mod uploads;
 
 #[cfg(test)]
@@ -59,6 +60,7 @@ pub use objects::{
     CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, StorageClass, VersionSel,
     version_id,
 };
+pub use pack::{PackStep, PackWork};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
 
 /// The object engine's id on the shared log (its root lives in the
@@ -118,6 +120,9 @@ const BUCKET_CONFIG_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 21;
 const LOCKS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 22;
 /// Consumer name -> its place in the change journal (see `consumers`).
 const CONSUMERS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 23;
+/// Body -> the zstd level it is to be packed at and its next segment (see
+/// `pack`).
+const PACK_QUEUE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 24;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -238,7 +243,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 24;
+const TREE_COUNT: usize = 25;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -325,6 +330,9 @@ impl Trees {
     }
     pub fn consumers(&self) -> BTree {
         self.tree(CONSUMERS_TREE)
+    }
+    pub fn pack_queue(&self) -> BTree {
+        self.tree(PACK_QUEUE_TREE)
     }
 }
 

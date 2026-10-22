@@ -944,8 +944,13 @@ async fn stream_plain(
         else {
             return false;
         };
-        let take = ((end.min(part_start + part_len) - offset) as usize).min(READ_CHUNK);
         let at = offset - part_start;
+        // Up to the end of the body's segment: a packed segment is one zstd
+        // frame, inflated whole for each read.
+        let segment_left = SEGMENT_BYTES - (at % SEGMENT_BYTES as u64) as usize;
+        let take = ((end.min(part_start + part_len) - offset) as usize)
+            .min(READ_CHUNK)
+            .min(segment_left);
         let chunk = engine
             .run_object(move |file| {
                 let mut out = vec![0u8; take];

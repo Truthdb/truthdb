@@ -41,7 +41,7 @@ impl ObjTxn<'_, '_> {
         load_body(self.ctx, &self.trees.bodies(), body)
     }
 
-    fn store_body(&mut self, body: u64, row: &BodyRow) -> Result<(), StorageError> {
+    pub(crate) fn store_body(&mut self, body: u64, row: &BodyRow) -> Result<(), StorageError> {
         let bodies = self.trees.bodies();
         bodies.update(
             self.ctx,
@@ -62,6 +62,7 @@ impl ObjTxn<'_, '_> {
             segments: 0,
             touched_ms: now_ms,
             md5: [0; 16],
+            pack_level: 0,
         };
         let (bodies, staging) = (self.trees.bodies(), self.trees.staging());
         let inserted = bodies.insert_unique(
@@ -119,6 +120,7 @@ impl ObjTxn<'_, '_> {
             pages: pages as u32,
             len: data.len() as u32,
             lsn,
+            zstd: false,
         };
         let (segments, staging) = (self.trees.segments(), self.trees.staging());
         segments.insert_unique(
@@ -234,6 +236,7 @@ impl ObjTxn<'_, '_> {
             segments: children.len() as u64,
             touched_ms: now_ms,
             md5,
+            pack_level: 0,
         };
         let bodies = self.trees.bodies();
         bodies.insert_unique(
@@ -405,6 +408,16 @@ fn read_plain(
                 StorageError::InvalidFile(format!("body {body} lost segment {index}"))
             })?;
         let segment = SegmentRow::decode(&segment)?;
+        if segment.zstd {
+            // A packed segment is one zstd frame: read it whole, inflate it,
+            // and copy out what is wanted.
+            let plain_len = (row.len - index * SEGMENT_BYTES as u64).min(SEGMENT_BYTES as u64);
+            let plain = read_frame(ctx, body, &segment, plain_len as usize)?;
+            let take = (plain.len() - in_segment).min(out.len() - done);
+            out[done..done + take].copy_from_slice(&plain[in_segment..in_segment + take]);
+            done += take;
+            continue;
+        }
         let page_no = segment.start_page + (in_segment / BLOB_PAGE_DATA) as u64;
         let header = ctx.read_blob_page(page_no, &mut page)?;
         if header.object_id != BODY_PAGES_OBJECT || header.page_lsn != segment.lsn {
@@ -418,6 +431,48 @@ fn read_plain(
         done += take;
     }
     Ok(())
+}
+
+/// A segment's stored bytes (its `len` bytes over its pages), each page
+/// checked as [`read_plain`] checks one.
+pub(crate) fn read_segment(
+    ctx: &mut RelCtx<'_>,
+    body: u64,
+    segment: &SegmentRow,
+) -> Result<Vec<u8>, StorageError> {
+    let mut stored = vec![0u8; segment.len as usize];
+    let mut page = vec![0u8; BLOB_PAGE_DATA];
+    for (index, chunk) in stored.chunks_mut(BLOB_PAGE_DATA).enumerate() {
+        let page_no = segment.start_page + index as u64;
+        let header = ctx.read_blob_page(page_no, &mut page)?;
+        if header.object_id != BODY_PAGES_OBJECT || header.page_lsn != segment.lsn {
+            return Err(StorageError::InvalidFile(format!(
+                "page {page_no} of body {body} was overwritten"
+            )));
+        }
+        chunk.copy_from_slice(&page[..chunk.len()]);
+    }
+    Ok(stored)
+}
+
+/// A packed segment's bytes: its zstd frame, inflated to `plain_len`.
+pub(crate) fn read_frame(
+    ctx: &mut RelCtx<'_>,
+    body: u64,
+    segment: &SegmentRow,
+    plain_len: usize,
+) -> Result<Vec<u8>, StorageError> {
+    let frame = read_segment(ctx, body, segment)?;
+    let plain = zstd::bulk::decompress(&frame, plain_len).map_err(|err| {
+        StorageError::InvalidFile(format!("a packed segment of body {body}: {err}"))
+    })?;
+    if plain.len() != plain_len {
+        return Err(StorageError::InvalidFile(format!(
+            "a packed segment of body {body} holds {} bytes, not {plain_len}",
+            plain.len()
+        )));
+    }
+    Ok(plain)
 }
 
 pub(crate) fn load_body(

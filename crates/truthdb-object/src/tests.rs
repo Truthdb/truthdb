@@ -3336,3 +3336,377 @@ fn an_indexer_cursor_from_before_consumers_holds_the_journal_and_moves_to_its_ro
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+/// Bytes zstd cannot shrink (a xorshift stream).
+fn noise(seed: u64, len: usize) -> Vec<u8> {
+    let mut state = seed | 1;
+    (0..len)
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state as u8
+        })
+        .collect()
+}
+
+/// Runs the pack queue dry, as the object jobs do; returns the steps taken.
+fn pack_all(storage: &Storage) -> usize {
+    use crate::PackStep;
+    let mut steps = 0;
+    loop {
+        let step = ObjFile::new(&mut storage.lock()).next_pack().unwrap();
+        match step {
+            None => return steps,
+            Some(PackStep::Finish { body, level }) => {
+                ObjFile::new(&mut storage.lock())
+                    .transaction(|tx| tx.finish_pack(body, level))
+                    .unwrap();
+            }
+            Some(PackStep::Unreadable {
+                body, level, index, ..
+            }) => {
+                ObjFile::new(&mut storage.lock())
+                    .transaction(|tx| tx.drop_pack(body, level, index))
+                    .unwrap();
+            }
+            Some(PackStep::Segment(work)) => {
+                let frame = work.compress();
+                ObjFile::new(&mut storage.lock())
+                    .transaction(|tx| tx.apply_pack(&work, frame))
+                    .unwrap();
+            }
+        }
+        // The log is small in these tests.
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+        steps += 1;
+    }
+}
+
+fn put_classed(
+    storage: &Storage,
+    bucket: &str,
+    key: &str,
+    data: &[u8],
+    class: crate::StorageClass,
+) -> crate::ObjectInfo {
+    let mut writer = BodyWriter::begin(storage, now()).unwrap();
+    for chunk in data.chunks(300_000) {
+        writer.write(storage, chunk, now()).unwrap();
+    }
+    let sealed = writer.finish(storage, now()).unwrap();
+    storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.put_object(
+                bucket,
+                key,
+                &sealed,
+                &crate::ObjectAttrs::default(),
+                class,
+                now(),
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap()
+}
+
+#[test]
+fn a_cold_body_is_packed_in_place_and_reads_back_whole_and_by_range() {
+    use crate::{StorageClass, VersionSel};
+    let path = temp_path("pack");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    // Two segments that shrink, one that does not, and a short tail.
+    let seg = SEGMENT_BYTES;
+    let data: Vec<u8> = [bytes(1, seg), noise(7, seg), bytes(2, seg), bytes(3, 1234)].concat();
+    let warm = put_classed(&storage, "bkt", "warm", &data, StorageClass::Standard);
+    assert_eq!(pack_all(&storage), 0, "STANDARD is not packed");
+    let before = allocated_pages(&storage);
+    let cold = put_classed(&storage, "bkt", "cold", &data, StorageClass::Glacier);
+    let written = allocated_pages(&storage) - before;
+    assert_eq!(pack_all(&storage), 4, "a step per segment");
+    let packed = allocated_pages(&storage) - before;
+    assert!(
+        packed < written / 2,
+        "{packed} pages packed, {written} written"
+    );
+    for (offset, len) in [
+        (0, data.len()),
+        (0, 10),
+        (seg as u64 - 5, 10),
+        (2 * seg as u64 - 3, seg + 6),
+        (3 * seg as u64 + 1000, 234),
+    ] {
+        assert_eq!(
+            read(&storage, cold.body, offset, len).unwrap(),
+            data[offset as usize..offset as usize + len],
+            "{offset}+{len}"
+        );
+    }
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    assert_eq!(
+        file.head_object("bkt", "cold", VersionSel::Latest)
+            .unwrap()
+            .unwrap()
+            .storage_class,
+        StorageClass::Glacier
+    );
+    drop(guard);
+    // The warm copy was never touched.
+    assert_eq!(read(&storage, warm.body, 0, data.len()).unwrap(), data);
+    // A packed body is not packed again at a lower level; a colder class
+    // packs it again.
+    copy_classed(&storage, "ia", StorageClass::StandardIa);
+    assert_eq!(pack_all(&storage), 0);
+    copy_classed(&storage, "deep", StorageClass::DeepArchive);
+    assert_eq!(pack_all(&storage), 4);
+    assert_eq!(read(&storage, cold.body, 0, data.len()).unwrap(), data);
+    // The packed pages survive a restart.
+    drop(storage);
+    let storage = open(&path);
+    assert_eq!(read(&storage, cold.body, 0, data.len()).unwrap(), data);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+/// Copies `bkt/cold` to `bkt/<key>` in `class`, sharing its body.
+fn copy_classed(storage: &Storage, key: &str, class: crate::StorageClass) {
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    let source = file
+        .head_object("bkt", "cold", crate::VersionSel::Latest)
+        .unwrap()
+        .unwrap();
+    file.transaction(|tx| {
+        tx.copy_object(
+            "bkt",
+            key,
+            &source,
+            &crate::ObjectAttrs::default(),
+            class,
+            now(),
+            0,
+        )
+    })
+    .unwrap()
+    .unwrap();
+}
+
+#[test]
+fn a_pack_step_left_behind_by_a_change_or_a_restart_does_no_harm() {
+    use crate::{CustomerKey, ObjectAttrs, PackStep, StorageClass};
+    let path = temp_path("pack-stale");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    let data = [bytes(4, SEGMENT_BYTES), bytes(5, 99)].concat();
+    let cold = put_classed(&storage, "bkt", "cold", &data, StorageClass::StandardIa);
+    // A step read, then the work applied twice: the second finds its segment
+    // changed and does nothing.
+    let Some(PackStep::Segment(work)) = ObjFile::new(&mut storage.lock()).next_pack().unwrap()
+    else {
+        panic!("a segment to pack");
+    };
+    let frame = work.compress();
+    for _ in 0..2 {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.apply_pack(&work, frame.clone()))
+            .unwrap();
+    }
+    // A restart mid-body: the queue resumes where it was.
+    drop(storage);
+    let storage = open(&path);
+    assert_eq!(pack_all(&storage), 1, "the second segment only");
+    assert_eq!(read(&storage, cold.body, 0, data.len()).unwrap(), data);
+    // A body deleted while queued: its entry goes, nothing else.
+    let gone = put_classed(&storage, "bkt", "gone", &data, StorageClass::OnezoneIa);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("bkt", "gone", None, false, now(), 0))
+        .unwrap()
+        .unwrap();
+    assert_eq!(pack_all(&storage), 1, "finished, not packed");
+    let _ = gone;
+    // A body under a customer-provided key is not queued.
+    let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+    writer.write(&storage, &data, now()).unwrap();
+    let sealed = writer.finish(&storage, now()).unwrap();
+    let attrs = ObjectAttrs {
+        customer_key: Some(CustomerKey {
+            key_md5: "m".into(),
+            verifier: "v".into(),
+        }),
+        ..ObjectAttrs::default()
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.put_object(
+                "bkt",
+                "keyed",
+                &sealed,
+                &attrs,
+                StorageClass::Glacier,
+                now(),
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(pack_all(&storage), 0);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_cold_multipart_objects_parts_are_packed() {
+    use crate::{MIN_PART_BYTES, ObjectAttrs, StorageClass};
+    let path = temp_path("pack-parts");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    let upload = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_upload(
+                "bkt",
+                "mp",
+                &ObjectAttrs::default(),
+                StorageClass::DeepArchive,
+                now(),
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let parts = [bytes(6, MIN_PART_BYTES as usize), bytes(7, 4321)];
+    let mut listed = Vec::new();
+    for (number, data) in parts.iter().enumerate() {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        for chunk in data.chunks(300_000) {
+            writer.write(&storage, chunk, now()).unwrap();
+        }
+        let sealed = writer.finish(&storage, now()).unwrap();
+        let info = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.upload_part(upload, number as u32 + 1, &sealed, now(), 0))
+            .unwrap()
+            .unwrap();
+        listed.push((number as u32 + 1, info.md5));
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+    }
+    let object = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.complete_upload(upload, &listed, now(), 0))
+        .unwrap()
+        .unwrap();
+    let before = allocated_pages(&storage);
+    assert!(pack_all(&storage) > 0);
+    assert!(allocated_pages(&storage) < before / 2);
+    let whole = parts.concat();
+    assert_eq!(read(&storage, object.body, 0, whole.len()).unwrap(), whole);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn an_unreadable_body_leaves_the_pack_queue_to_the_bodies_after_it() {
+    use crate::StorageClass;
+    use crate::codec::SegmentRow;
+    let path = temp_path("pack-unreadable");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    let data = bytes(8, 5000);
+    let first = put_classed(&storage, "bkt", "first", &data, StorageClass::Glacier);
+    let second = put_classed(&storage, "bkt", "second", &data, StorageClass::Glacier);
+    // The first body's segment names an LSN its pages do not carry.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            let segments = tx.trees.segments();
+            let key = crate::codec::segment_key(first.body, 0);
+            let mut row = SegmentRow::decode(&segments.get(tx.ctx, &key)?.unwrap())?;
+            row.lsn += 1;
+            segments.update(tx.ctx, &mut OpMode::Txn(tx.txn), &key, &row.encode())?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(
+        pack_all(&storage),
+        2,
+        "the first dropped, the second packed"
+    );
+    assert_eq!(read(&storage, second.body, 0, data.len()).unwrap(), data);
+    let packed = |body: u64| {
+        let mut guard = storage.lock();
+        let file = ObjFile::new(&mut guard);
+        let bodies = file.existing_tree(crate::BODIES_TREE).unwrap().unwrap();
+        crate::body::load_body(&mut file.core.page_ctx(0), &bodies, body)
+            .unwrap()
+            .pack_level
+    };
+    assert_eq!(packed(second.body), 9);
+    assert_eq!(packed(first.body), 0, "left as it was");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_damaged_body_queued_colder_meanwhile_keeps_its_new_entry() {
+    use crate::codec::SegmentRow;
+    use crate::{PackStep, StorageClass};
+    let path = temp_path("pack-requeued");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    let cold = put_classed(
+        &storage,
+        "bkt",
+        "cold",
+        &bytes(8, 5000),
+        StorageClass::Glacier,
+    );
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            let segments = tx.trees.segments();
+            let key = crate::codec::segment_key(cold.body, 0);
+            let mut row = SegmentRow::decode(&segments.get(tx.ctx, &key)?.unwrap())?;
+            row.lsn += 1;
+            segments.update(tx.ctx, &mut OpMode::Txn(tx.txn), &key, &row.encode())?;
+            Ok(())
+        })
+        .unwrap();
+    let Some(PackStep::Unreadable {
+        body, level, index, ..
+    }) = ObjFile::new(&mut storage.lock()).next_pack().unwrap()
+    else {
+        panic!("the damaged body is unreadable");
+    };
+    // Between the step's read and its drop, a colder class queues the body.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.queue_pack(body, StorageClass::DeepArchive.pack_level())?;
+            tx.drop_pack(body, level, index)
+        })
+        .unwrap();
+    let mut guard = storage.lock();
+    let file = ObjFile::new(&mut guard);
+    let queue = file.existing_tree(crate::PACK_QUEUE_TREE).unwrap().unwrap();
+    let queued = queue
+        .get(&mut file.core.page_ctx(0), &crate::codec::body_key(body))
+        .unwrap();
+    let mut restarted = vec![19];
+    restarted.extend(0u64.to_le_bytes());
+    assert_eq!(queued, Some(restarted), "level 19 from segment 0");
+    drop(guard);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
