@@ -40,7 +40,7 @@ fn invalid(message: impl Into<String>) -> S3Error {
     S3Error::new(400, "InvalidArgument", message)
 }
 
-fn malformed() -> S3Error {
+pub(crate) fn malformed() -> S3Error {
     S3Error::new(
         400,
         "MalformedXML",
@@ -495,7 +495,11 @@ pub fn with_headers(
 /// Child` path below the root, text; empty for an element holding others).
 /// Elements outside `allowed`, text outside a leaf, and an element given
 /// twice are malformed.
-fn leaves(body: &[u8], root: &str, allowed: &[&str]) -> Result<Vec<(String, String)>, S3Error> {
+pub(crate) fn leaves(
+    body: &[u8],
+    root: &str,
+    allowed: &[&str],
+) -> Result<Vec<(String, String)>, S3Error> {
     let mut reader = Reader::from_reader(body);
     let mut path: Vec<String> = Vec::new();
     // Whether each open element has held another.
@@ -571,7 +575,7 @@ fn leaves(body: &[u8], root: &str, allowed: &[&str]) -> Result<Vec<(String, Stri
     Ok(out)
 }
 
-fn leaf<'a>(leaves: &'a [(String, String)], path: &str) -> Option<&'a str> {
+pub(crate) fn leaf<'a>(leaves: &'a [(String, String)], path: &str) -> Option<&'a str> {
     leaves
         .iter()
         .find(|(name, _)| name == path)

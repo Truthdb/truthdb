@@ -75,6 +75,10 @@ const KEY_COLUMN: &str = "_s3_key";
 /// requests carry the key, so it is not read here (skipped in prefix mode).
 const ENCRYPTED_OBJECT: i32 = 4861;
 
+/// An archived object (GLACIER, DEEP_ARCHIVE) not restored: S3 does not
+/// read it either (skipped in prefix mode). The same "cannot open" number.
+const ARCHIVED_OBJECT: i32 = 4861;
+
 pub(super) fn read_error(message: impl Into<String>) -> SqlError {
     SqlError::new(4864, 16, 1, message)
 }
@@ -191,6 +195,21 @@ impl BodyReader {
                 format!(
                     "The object '{key}' in bucket '{bucket}' is encrypted with a \
                      customer-provided key (SSE-C) and cannot be read here."
+                ),
+            ));
+        }
+        if file
+            .archived_unreadable(info.version, info.storage_class, super::now_ms())
+            .map_err(super::s3_sql::storage_error)?
+        {
+            return Err(SqlError::new(
+                ARCHIVED_OBJECT,
+                16,
+                1,
+                format!(
+                    "The object '{key}' in bucket '{bucket}' is in the {} storage class \
+                     and must be restored before it is read.",
+                    info.storage_class.as_str()
                 ),
             ));
         }
@@ -750,7 +769,13 @@ impl ReadStream {
             check_cancelled()?;
             match self.open_object(&key) {
                 Ok(()) => return Ok(()),
-                Err(err) if err.number == 208 || err.number == ENCRYPTED_OBJECT => continue,
+                Err(err)
+                    if err.number == 208
+                        || err.number == ENCRYPTED_OBJECT
+                        || err.number == ARCHIVED_OBJECT =>
+                {
+                    continue;
+                }
                 Err(err) => return Err(err),
             }
         }

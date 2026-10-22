@@ -243,7 +243,7 @@ impl ObjTxn<'_, '_> {
         if !bucket_row.object_lock {
             return Ok(Err(ObjectError::ObjectLockNotEnabled));
         }
-        let (version, null_version) = match self.find_live(bucket, key, which)? {
+        let (version, null_version, _) = match self.find_live(bucket, key, which)? {
             Ok(found) => found,
             Err(err) => return Ok(Err(err)),
         };

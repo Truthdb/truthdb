@@ -100,6 +100,23 @@ pub struct S3Config {
     /// PEM private key path (paired with `tls_cert`).
     #[serde(default)]
     pub tls_key: Option<String>,
+
+    /// How long a restore of an archived object (RestoreObject) takes.
+    #[serde(default)]
+    pub restore_seconds: RestoreSeconds,
+}
+
+/// Seconds a restore takes per retrieval tier: S3 takes minutes to hours;
+/// 0 (the default) makes the object readable at once.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestoreSeconds {
+    #[serde(default)]
+    pub expedited: u64,
+    #[serde(default)]
+    pub standard: u64,
+    #[serde(default)]
+    pub bulk: u64,
 }
 
 impl Default for S3Config {
@@ -111,6 +128,7 @@ impl Default for S3Config {
             region: default_s3_region(),
             tls_cert: None,
             tls_key: None,
+            restore_seconds: RestoreSeconds::default(),
         }
     }
 }

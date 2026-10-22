@@ -58,7 +58,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "renameObject",
     "replication",
     "requestPayment",
-    "restore",
     "select",
     "session",
     "torrent",
@@ -78,6 +77,7 @@ const SUBRESOURCES: &[&str] = &[
     "policy",
     "policyStatus",
     "publicAccessBlock",
+    "restore",
     "retention",
     "tagging",
     "uploadId",
@@ -636,6 +636,12 @@ async fn route(
                 lock.as_ref(),
             )?;
             crate::multipart::create_upload(state, request, bucket, key, lock).await
+        }
+        (Target::Object(bucket, key), Method::POST)
+            if has_param(&request, "restore") && plain(&request, &["restore"]) =>
+        {
+            authz.check("s3:RestoreObject", Object(&bucket, &key))?;
+            crate::restore::restore_object(state, request, auth, bucket, key).await
         }
         (Target::Object(bucket, key), Method::POST)
             if has_param(&request, "uploadId") && plain(&request, &["uploadId"]) =>

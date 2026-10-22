@@ -272,6 +272,12 @@ pub enum ObjectError {
     ObjectLockNotEnabled,
     /// A retention change that does not apply to the version, and why.
     InvalidRetention(&'static str),
+    /// The version is not in an archive class, so it cannot be restored.
+    NotArchived,
+    /// The version's restore has not completed yet.
+    RestoreInProgress,
+    /// The restore's retrieval tier is not offered for the version's class.
+    TierUnavailable,
 }
 
 pub fn validate_key(key: &str) -> Result<(), ObjectError> {
@@ -446,13 +452,13 @@ impl ObjTxn<'_, '_> {
     }
 
     /// The version `which` picks, unless it is missing or a delete marker:
-    /// its number and whether it is the null version.
+    /// its number, whether it is the null version and its storage class.
     pub(crate) fn find_live(
         &mut self,
         bucket: &str,
         key: &str,
         which: VersionSel,
-    ) -> Result<Result<(u64, bool), ObjectError>, StorageError> {
+    ) -> Result<Result<(u64, bool, StorageClass), ObjectError>, StorageError> {
         let found = find_version(self.ctx, &self.trees.objects(), bucket, key, which)?;
         Ok(match found {
             None => Err(match which {
@@ -463,7 +469,11 @@ impl ObjTxn<'_, '_> {
                 VersionSel::Latest => ObjectError::NoSuchKey,
                 _ => ObjectError::DeleteMarker,
             }),
-            Some((_, version, row)) => Ok((version, row.flags & FLAG_NULL_VERSION != 0)),
+            Some((_, version, row)) => Ok((
+                version,
+                row.flags & FLAG_NULL_VERSION != 0,
+                class_of(row.flags),
+            )),
         })
     }
 
@@ -740,7 +750,7 @@ impl ObjTxn<'_, '_> {
     }
 
     /// Removes the key's versions that `wanted` picks: each row, its
-    /// attributes, its lock and its body's reference. Returns the removed
+    /// attributes, its lock, its restore and its body's reference. Returns the removed
     /// versions' numbers, or `Locked` (removing nothing) when Object Lock
     /// protects one of them; `bypass` lifts GOVERNANCE retention. With
     /// `only`, reads that version's row alone instead of every version of
@@ -790,6 +800,7 @@ impl ObjTxn<'_, '_> {
         for (row_key, version, row) in chosen {
             objects.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
             self.set_lock(version, &crate::ObjectLock::default())?;
+            self.forget_restore(version)?;
             if row.flags & FLAG_HAS_ATTRS != 0 {
                 self.remove_attrs(version)?;
             }

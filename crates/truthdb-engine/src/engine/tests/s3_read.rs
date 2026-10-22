@@ -1275,3 +1275,102 @@ fn an_object_with_a_customer_provided_key_is_refused_and_skipped() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn an_archived_object_is_read_only_while_restored_and_skipped_otherwise() {
+    let path = unique_temp_path("s3-read-archived");
+    let engine = new_engine(&path);
+    bucket(&engine, "cold");
+    put(&engine, "cold", "a/warm.csv", b"v\nwarm\n");
+    let storage = engine.storage();
+    let mut writer = BodyWriter::begin(storage, 1).expect("begin");
+    writer.write(storage, b"v\nfrozen\n", 1).expect("write");
+    let sealed = writer.finish(storage, 1).expect("finish");
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.put_object(
+                    "cold",
+                    "a/frozen.csv",
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    truthdb_object::StorageClass::DeepArchive,
+                    2_000,
+                    0,
+                )
+            })
+        })
+        .expect("put")
+        .expect("put accepted");
+    let read_one = "SELECT v FROM sys.s3_read('cold', 'a/frozen.csv', 'csv')";
+    let read_all = r#"SELECT _s3_key, v FROM sys.s3_read('cold', 'a/', 'csv', '{"prefix": true}')"#;
+    assert_eq!(sql_error_number(&engine, read_one), 4861);
+    assert_eq!(rows(&engine, read_all), [some(&["a/warm.csv", "warm"])]);
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.restore_object(
+                    "cold",
+                    "a/frozen.csv",
+                    VersionSel::Latest,
+                    truthdb_object::RestoreRequest {
+                        days: 1,
+                        delay_ms: 0,
+                        expedited: false,
+                    },
+                    now,
+                )
+            })
+        })
+        .expect("restore")
+        .expect("restore accepted");
+    assert_eq!(rows(&engine, read_one), [some(&["frozen"])]);
+    assert_eq!(
+        rows(&engine, read_all),
+        [
+            some(&["a/frozen.csv", "frozen"]),
+            some(&["a/warm.csv", "warm"])
+        ]
+    );
+    // A restore asked for long ago has expired: unreadable again, and the
+    // maintenance sweep removes it.
+    let version = engine
+        .object(|file| file.head_object("cold", "a/frozen.csv", VersionSel::Latest))
+        .expect("head")
+        .expect("exists")
+        .version;
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.expire_restores(u64::MAX, 10)?;
+                tx.restore_object(
+                    "cold",
+                    "a/frozen.csv",
+                    VersionSel::Latest,
+                    truthdb_object::RestoreRequest {
+                        days: 1,
+                        delay_ms: 0,
+                        expedited: false,
+                    },
+                    1_000,
+                )
+            })
+        })
+        .expect("restore")
+        .expect("restore accepted");
+    assert_eq!(sql_error_number(&engine, read_one), 4861);
+    assert!(
+        engine
+            .object(|file| file.restore(version))
+            .unwrap()
+            .is_some()
+    );
+    engine.object_gc().expect("sweep");
+    assert_eq!(engine.object(|file| file.restore(version)).unwrap(), None);
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
