@@ -47,19 +47,22 @@ const UNIMPLEMENTED: &[&str] = &[
     "legal-hold",
     "lifecycle",
     "logging",
+    "metadataConfiguration",
+    "metadataTable",
     "metrics",
     "notification",
     "object-lock",
+    "renameObject",
     "replication",
     "requestPayment",
     "restore",
     "retention",
     "select",
+    "session",
     "torrent",
     "website",
 ];
 
-/// The query's parameter names (sub-resources such as `location`).
 /// The sub-resources the routes below implement, each for some methods and
 /// targets.
 const SUBRESOURCES: &[&str] = &[
@@ -88,6 +91,7 @@ fn plain(request: &Request<Incoming>, allowed: &[&str]) -> bool {
         .any(|name| !allowed.contains(name) && has_param(request, name))
 }
 
+/// The query's parameter names (sub-resources such as `location`).
 fn has_param(request: &Request<Incoming>, name: &str) -> bool {
     request
         .uri()
@@ -485,7 +489,9 @@ async fn route(
                 "GetObject by partNumber is not implemented",
             ))
         }
-        (Target::Bucket(bucket), Method::GET) if has_param(&request, "uploads") => {
+        (Target::Bucket(bucket), Method::GET)
+            if has_param(&request, "uploads") && plain(&request, &["uploads"]) =>
+        {
             authz.check("s3:ListBucketMultipartUploads", Bucket(&bucket))?;
             crate::multipart::list_uploads(state, request, bucket).await
         }
@@ -507,7 +513,9 @@ async fn route(
             authz.check(action, Object(&bucket, &key))?;
             crate::policy::acl(state, request, auth, bucket, Some(key), method).await
         }
-        (Target::Object(bucket, key), Method::POST) if has_param(&request, "uploads") => {
+        (Target::Object(bucket, key), Method::POST)
+            if has_param(&request, "uploads") && plain(&request, &["uploads"]) =>
+        {
             authz.check_storing(
                 "s3:PutObject",
                 Object(&bucket, &key),
@@ -515,7 +523,9 @@ async fn route(
             )?;
             crate::multipart::create_upload(state, request, bucket, key).await
         }
-        (Target::Object(bucket, key), Method::POST) if has_param(&request, "uploadId") => {
+        (Target::Object(bucket, key), Method::POST)
+            if has_param(&request, "uploadId") && plain(&request, &["uploadId"]) =>
+        {
             authz.check("s3:PutObject", Object(&bucket, &key))?;
             crate::multipart::complete_upload(state, request, auth, bucket, key).await
         }
@@ -584,15 +594,21 @@ async fn route(
                 crate::copy::copy_object(state, request, bucket, key).await
             }
         }
-        (Target::Object(bucket, key), Method::PUT) if has_param(&request, "uploadId") => {
+        (Target::Object(bucket, key), Method::PUT)
+            if has_param(&request, "uploadId") && plain(&request, &["uploadId"]) =>
+        {
             authz.check("s3:PutObject", Object(&bucket, &key))?;
             crate::multipart::upload_part(state, request, auth, bucket, key).await
         }
-        (Target::Object(bucket, key), Method::GET) if has_param(&request, "uploadId") => {
+        (Target::Object(bucket, key), Method::GET)
+            if has_param(&request, "uploadId") && plain(&request, &["uploadId"]) =>
+        {
             authz.check("s3:ListMultipartUploadParts", Object(&bucket, &key))?;
             crate::multipart::list_parts(state, request, bucket, key).await
         }
-        (Target::Object(bucket, key), Method::DELETE) if has_param(&request, "uploadId") => {
+        (Target::Object(bucket, key), Method::DELETE)
+            if has_param(&request, "uploadId") && plain(&request, &["uploadId"]) =>
+        {
             authz.check("s3:AbortMultipartUpload", Object(&bucket, &key))?;
             crate::multipart::abort_upload(state, request, bucket, key).await
         }

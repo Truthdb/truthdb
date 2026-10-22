@@ -4513,10 +4513,32 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
         ("PUT", "/subs/o", "versioning"),
         ("PUT", "/subs/o", "ownershipControls"),
         ("HEAD", "/subs/o", "tagging"),
+        ("DELETE", "/subs", "metadataTable"),
+        ("DELETE", "/subs", "metadataConfiguration"),
+        ("PUT", "/subs/o", "renameObject"),
+        ("GET", "/subs", "uploads&delete"),
+        ("POST", "/subs/o", "uploads&policy"),
+        ("GET", "/subs/o", "uploadId=1&versioning"),
+        ("DELETE", "/subs/o", "uploadId=1&versioning"),
     ] {
         let (status, reply) = call(method, path, query);
         assert_eq!(status, 501, "{method} {path}?{query}: {reply}");
     }
+    // A copy naming another sub-resource is refused, not taken for
+    // UploadPart.
+    let (_, created) = call("POST", "/subs/up", "uploads");
+    let upload = xml_value(&created, "UploadId");
+    let (_, (status, reply)) = send_with(
+        port,
+        "PUT",
+        "/subs/up",
+        &format!("partNumber=1&uploadId={upload}&versioning"),
+        &[("x-amz-copy-source", "/subs/o")],
+        b"",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 501, "{reply}");
     // Nothing was deleted, created or overwritten.
     assert_eq!(call("HEAD", "/subs", "").0, 200);
     assert_eq!(call("GET", "/subs/o", ""), (200, "body".to_string()));
