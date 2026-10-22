@@ -7740,3 +7740,210 @@ fn a_multipart_object_is_read_by_part_number() {
     assert_eq!(status, 400, "{reply}");
     assert!(reply.contains("<Code>InvalidPart</Code>"), "{reply}");
 }
+
+/// A client tool for the compatibility tests: the path in `env`, or `name`
+/// on the PATH; `None` (the test is skipped) when it is not installed.
+fn client_tool(env: &str, name: &str) -> Option<PathBuf> {
+    if let Some(path) = std::env::var_os(env) {
+        return Some(PathBuf::from(path));
+    }
+    std::env::split_paths(&std::env::var_os("PATH")?)
+        .map(|dir| dir.join(name))
+        .find(|path| path.is_file())
+}
+
+/// Every file under `root` as (path relative to it, contents).
+fn tree(root: &std::path::Path) -> Vec<(String, Vec<u8>)> {
+    let mut out = Vec::new();
+    let mut dirs = vec![root.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        for entry in std::fs::read_dir(&dir).expect("read dir") {
+            let path = entry.expect("entry").path();
+            if path.is_dir() {
+                dirs.push(path);
+            } else {
+                let relative = path
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned();
+                out.push((relative, std::fs::read(&path).expect("read file")));
+            }
+        }
+    }
+    out.sort();
+    out
+}
+
+/// A local tree to sync: nested folders, spaces, non-ASCII names, an empty
+/// file, and one large enough for the tools to upload in parts.
+fn sample_tree(root: &std::path::Path) {
+    for (path, contents) in [
+        ("one.txt", b"one".to_vec()),
+        ("a/b/deep.txt", b"deep".to_vec()),
+        ("space dir/file with space.txt", b"spaced".to_vec()),
+        ("a/ünïcødé.txt", b"unicode".to_vec()),
+        ("empty", Vec::new()),
+        (
+            "big.bin",
+            (0..20_000_000u32).map(|n| (n % 251) as u8).collect(),
+        ),
+    ] {
+        let path = root.join(path);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+}
+
+/// Runs `tool` with `args` in `env`; panics with its output unless it
+/// succeeds.
+fn run_tool(tool: &std::path::Path, env: &[(&str, String)], args: &[&str]) -> String {
+    let output = Command::new(tool)
+        .args(args)
+        .envs(env.iter().map(|(name, value)| (*name, value.as_str())))
+        .output()
+        .expect("run the tool");
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(output.status.success(), "{tool:?} {args:?}: {text}");
+    text
+}
+
+#[test]
+fn the_aws_cli_syncs_both_ways() {
+    let Some(aws) = client_tool("TRUTHDB_TEST_AWS", "aws") else {
+        eprintln!("skipped: the AWS CLI is not installed");
+        return;
+    };
+    let (server, key, secret) = server_with_key();
+    let work = server.dir.join("aws");
+    let (src, back, copied) = (work.join("src"), work.join("back"), work.join("copied"));
+    sample_tree(&src);
+    let env = [
+        ("AWS_ACCESS_KEY_ID", key.clone()),
+        ("AWS_SECRET_ACCESS_KEY", secret.clone()),
+        ("AWS_DEFAULT_REGION", "us-east-1".to_string()),
+        (
+            "AWS_ENDPOINT_URL",
+            format!("http://127.0.0.1:{}", server.s3_port),
+        ),
+        ("AWS_CONFIG_FILE", work.join("none").display().to_string()),
+        (
+            "AWS_SHARED_CREDENTIALS_FILE",
+            work.join("none").display().to_string(),
+        ),
+        ("AWS_PAGER", String::new()),
+    ];
+    let aws = |args: &[&str]| run_tool(&aws, &env, args);
+    let (src_arg, back_arg) = (src.to_str().unwrap(), back.to_str().unwrap());
+    aws(&["s3", "mb", "s3://synced"]);
+    // Up, with the default (CRC64NVME) checksums and a multipart upload.
+    aws(&["s3", "sync", src_arg, "s3://synced/up"]);
+    // Nothing changed: nothing to send.
+    let again = aws(&["s3", "sync", src_arg, "s3://synced/up"]);
+    assert!(!again.contains("upload:"), "{again}");
+    aws(&["s3", "sync", "s3://synced/up", back_arg]);
+    assert_eq!(tree(&back), tree(&src));
+    // A change and a removal, with --delete, both ways.
+    std::fs::remove_file(src.join("one.txt")).unwrap();
+    std::fs::write(src.join("a/b/deep.txt"), b"deeper").unwrap();
+    aws(&["s3", "sync", "--delete", src_arg, "s3://synced/up"]);
+    aws(&["s3", "sync", "--delete", "s3://synced/up", back_arg]);
+    assert_eq!(tree(&back), tree(&src));
+    // Copies within the store, a move, and a recursive copy down.
+    aws(&["s3", "sync", "s3://synced/up", "s3://synced/copy"]);
+    aws(&[
+        "s3",
+        "mv",
+        "s3://synced/copy/empty",
+        "s3://synced/copy/moved",
+    ]);
+    aws(&[
+        "s3",
+        "cp",
+        "--recursive",
+        "s3://synced/copy",
+        copied.to_str().unwrap(),
+    ]);
+    let mut expected = tree(&src);
+    for entry in &mut expected {
+        if entry.0 == "empty" {
+            entry.0 = "moved".to_string();
+        }
+    }
+    expected.sort();
+    assert_eq!(tree(&copied), expected);
+    aws(&["s3", "rm", "--recursive", "s3://synced/copy"]);
+    let left = aws(&["s3", "ls", "--recursive", "s3://synced"]);
+    assert!(!left.contains("copy/"), "{left}");
+}
+
+#[test]
+fn rclone_syncs_both_ways() {
+    let Some(rclone) = client_tool("TRUTHDB_TEST_RCLONE", "rclone") else {
+        eprintln!("skipped: rclone is not installed");
+        return;
+    };
+    let (server, key, secret) = server_with_key();
+    assert_eq!(
+        send(
+            server.s3_port,
+            "PUT",
+            "/cloned",
+            "",
+            b"",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        200
+    );
+    let work = server.dir.join("rclone");
+    let (src, back) = (work.join("src"), work.join("back"));
+    sample_tree(&src);
+    let env = [
+        ("RCLONE_CONFIG", work.join("none").display().to_string()),
+        ("RCLONE_CONFIG_TDB_TYPE", "s3".to_string()),
+        ("RCLONE_CONFIG_TDB_PROVIDER", "Other".to_string()),
+        ("RCLONE_CONFIG_TDB_ACCESS_KEY_ID", key.clone()),
+        ("RCLONE_CONFIG_TDB_SECRET_ACCESS_KEY", secret.clone()),
+        (
+            "RCLONE_CONFIG_TDB_ENDPOINT",
+            format!("http://127.0.0.1:{}", server.s3_port),
+        ),
+        ("RCLONE_CONFIG_TDB_REGION", "us-east-1".to_string()),
+    ];
+    let rclone = |args: &[&str]| run_tool(&rclone, &env, args);
+    let (src_arg, back_arg) = (src.to_str().unwrap(), back.to_str().unwrap());
+    rclone(&["sync", src_arg, "tdb:cloned/up"]);
+    // Sizes and digests (multipart objects included) agree.
+    let checked = rclone(&["check", src_arg, "tdb:cloned/up"]);
+    assert!(checked.contains("0 differences found"), "{checked}");
+    rclone(&["sync", "tdb:cloned/up", back_arg]);
+    assert_eq!(tree(&back), tree(&src));
+    // A change and a removal, both ways.
+    std::fs::remove_file(src.join("one.txt")).unwrap();
+    std::fs::write(src.join("a/ünïcødé.txt"), b"changed").unwrap();
+    rclone(&["sync", src_arg, "tdb:cloned/up"]);
+    rclone(&["sync", "tdb:cloned/up", back_arg]);
+    assert_eq!(tree(&back), tree(&src));
+    // Server-side copies and moves.
+    let copied = rclone(&["copy", "-v", "tdb:cloned/up", "tdb:cloned/copy"]);
+    assert!(copied.contains("server-side copy"), "{copied}");
+    rclone(&[
+        "moveto",
+        "tdb:cloned/copy/big.bin",
+        "tdb:cloned/copy/big2.bin",
+    ]);
+    let listed = rclone(&["lsf", "-R", "tdb:cloned/copy"]);
+    assert!(
+        listed.contains("big2.bin") && !listed.contains("big.bin\n"),
+        "{listed}"
+    );
+    rclone(&["purge", "tdb:cloned/copy"]);
+    let left = rclone(&["lsf", "-R", "tdb:cloned/copy"]);
+    assert!(left.lines().all(|line| line.contains("NOTICE")), "{left}");
+}

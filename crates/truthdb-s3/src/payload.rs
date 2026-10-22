@@ -35,9 +35,16 @@ pub enum Framing {
     UnsignedTrailer,
 }
 
+/// CRC-32C (Castagnoli), S3's `CRC32C`.
+static CRC32C: crc::Crc<u32> = crc::Crc::<u32>::new(&crc::CRC_32_ISCSI);
+/// CRC-64/NVME, S3's `CRC64NVME` (the AWS SDKs' default).
+static CRC64NVME: crc::Crc<u64> = crc::Crc::<u64>::new(&crc::CRC_64_NVME);
+
 /// A full-body checksum to verify.
 pub enum Checksum {
     Crc32(crc32fast::Hasher),
+    Crc32c(crc::Digest<'static, u32>),
+    Crc64Nvme(crc::Digest<'static, u64>),
     Sha1(digest::Context),
     Sha256(digest::Context),
 }
@@ -48,12 +55,14 @@ impl Checksum {
     pub fn for_header(name: &str) -> Result<Self, S3Error> {
         match name.to_ascii_lowercase().as_str() {
             "x-amz-checksum-crc32" => Ok(Checksum::Crc32(crc32fast::Hasher::new())),
+            "x-amz-checksum-crc32c" => Ok(Checksum::Crc32c(CRC32C.digest())),
+            "x-amz-checksum-crc64nvme" => Ok(Checksum::Crc64Nvme(CRC64NVME.digest())),
             "x-amz-checksum-sha1" => Ok(Checksum::Sha1(digest::Context::new(
                 &digest::SHA1_FOR_LEGACY_USE_ONLY,
             ))),
             "x-amz-checksum-sha256" => Ok(Checksum::Sha256(digest::Context::new(&digest::SHA256))),
             other => Err(S3Error::not_implemented(format!(
-                "checksum {other} is not supported; use CRC32, SHA1 or SHA256"
+                "checksum {other} is not supported"
             ))),
         }
     }
@@ -61,6 +70,8 @@ impl Checksum {
     fn update(&mut self, bytes: &[u8]) {
         match self {
             Checksum::Crc32(hasher) => hasher.update(bytes),
+            Checksum::Crc32c(digest) => digest.update(bytes),
+            Checksum::Crc64Nvme(digest) => digest.update(bytes),
             Checksum::Sha1(context) | Checksum::Sha256(context) => context.update(bytes),
         }
     }
@@ -69,6 +80,8 @@ impl Checksum {
     fn finish(self) -> String {
         let bytes = match self {
             Checksum::Crc32(hasher) => hasher.finalize().to_be_bytes().to_vec(),
+            Checksum::Crc32c(digest) => digest.finalize().to_be_bytes().to_vec(),
+            Checksum::Crc64Nvme(digest) => digest.finalize().to_be_bytes().to_vec(),
             Checksum::Sha1(context) | Checksum::Sha256(context) => {
                 context.finish().as_ref().to_vec()
             }
@@ -423,6 +436,25 @@ mod tests {
         );
     }
 
+    #[test]
+    fn every_checksum_s3_names_is_computed_as_s3_does() {
+        let b64 = |bytes: &[u8]| base64::engine::general_purpose::STANDARD.encode(bytes);
+        // The catalogue's check values over "123456789".
+        for (name, check) in [
+            ("x-amz-checksum-crc32", b64(&0xcbf43926u32.to_be_bytes())),
+            ("x-amz-checksum-crc32c", b64(&0xe3069283u32.to_be_bytes())),
+            (
+                "x-amz-checksum-crc64nvme",
+                b64(&0xae8b14860a799888u64.to_be_bytes()),
+            ),
+        ] {
+            let mut checksum = Checksum::for_header(name).unwrap();
+            checksum.update(b"1234");
+            checksum.update(b"56789");
+            assert_eq!(checksum.finish(), check, "{name}");
+        }
+    }
+
     fn crc32_b64(bytes: &[u8]) -> String {
         base64::engine::general_purpose::STANDARD.encode(crc32fast::hash(bytes).to_be_bytes())
     }
@@ -472,10 +504,7 @@ mod tests {
         assert!(
             PayloadDecoder::new(
                 Framing::Unsigned,
-                Some((
-                    "x-amz-checksum-crc64nvme".to_string(),
-                    Some("x".to_string())
-                ))
+                Some(("x-amz-checksum-xxhash".to_string(), Some("x".to_string())))
             )
             .is_err(),
             "an unsupported checksum is refused up front"
