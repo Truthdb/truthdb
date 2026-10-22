@@ -107,7 +107,12 @@ pub async fn handle(state: &S3State, request: Request<Incoming>, service: &str) 
     } else {
         IAM_XMLNS
     };
-    let request_id = request_id();
+    // The request's own id (also its x-amz-request-id).
+    let request_id = request
+        .extensions()
+        .get::<crate::server::RequestIds>()
+        .map(|ids| ids.request_id.clone())
+        .unwrap_or_default();
     let (status, body) = match serve(state, request, service).await {
         Ok((action, result)) => (
             200,
@@ -136,11 +141,6 @@ pub async fn handle(state: &S3State, request: Request<Incoming>, service: &str) 
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n{body}"
         )))
         .expect("a valid response")
-}
-
-/// A random request id.
-fn request_id() -> String {
-    random(16, b"0123456789abcdef")
 }
 
 /// `len` characters from `alphabet` (16, 32 or 64 symbols, so a random byte
@@ -284,6 +284,7 @@ async fn serve(
     let scope = crate::scope::Scope {
         key: Some((principal.access_key.clone(), principal.account.clone())),
         buckets: Vec::new(),
+        origin: None,
     };
     let result = crate::scope::within(scope, async {
         if service == "sts" {

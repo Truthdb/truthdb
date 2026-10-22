@@ -362,25 +362,26 @@ pub async fn complete_upload(
     let body = read_body(request, auth, MAX_COMPLETE_BODY).await?;
     let listed = parse_complete(&body)?;
     let bucket_name = bucket.clone();
-    let (completed, versioning) = object(state, move |file| {
-        let now = now_ms();
-        let (_, default) = crate::object_lock::bucket_state(file, &bucket_name)?;
-        let completed = file.transaction(|tx| {
-            let completed = tx.complete_upload(upload, &listed, now, DROP_GRACE_MS)?;
-            // The object has the lock its upload asked for; without a
-            // retention, the bucket's default one, from now.
-            if let (Ok(info), Some(default)) = (&completed, default) {
-                let mut lock = tx.lock_of(info.version)?;
-                if lock.retention.is_none() {
-                    lock.retention = Some(default.retention(now));
-                    tx.set_lock(info.version, &lock)?;
+    let (completed, versioning) =
+        crate::scope::object_as(state, "CompleteMultipartUpload", move |file| {
+            let now = now_ms();
+            let (_, default) = crate::object_lock::bucket_state(file, &bucket_name)?;
+            let completed = file.transaction(|tx| {
+                let completed = tx.complete_upload(upload, &listed, now, DROP_GRACE_MS)?;
+                // The object has the lock its upload asked for; without a
+                // retention, the bucket's default one, from now.
+                if let (Ok(info), Some(default)) = (&completed, default) {
+                    let mut lock = tx.lock_of(info.version)?;
+                    if lock.retention.is_none() {
+                        lock.retention = Some(default.retention(now));
+                        tx.set_lock(info.version, &lock)?;
+                    }
                 }
-            }
-            Ok(completed)
-        })?;
-        Ok((completed, versioning_of(file, &bucket_name)?))
-    })
-    .await?;
+                Ok(completed)
+            })?;
+            Ok((completed, versioning_of(file, &bucket_name)?))
+        })
+        .await?;
     let info = completed.map_err(|err| upload_error(err, &bucket, &key))?;
     let mut response = xml(format!(
         "<CompleteMultipartUploadResult xmlns=\"{XMLNS}\"><Location>/{}/{}</Location><Bucket>{}</Bucket><Key>{}</Key><ETag>{}</ETag></CompleteMultipartUploadResult>",

@@ -225,6 +225,9 @@ impl S3Rowsets {
                 nvarchar("e_tag", 64),
                 nvarchar("storage_class", 16),
                 bit("is_multipart"),
+                nvarchar("requester", 12),
+                nvarchar("source_ip_address", 45),
+                nvarchar("request_id", 16),
             ],
             rows: Box::new(JournalStream {
                 core: Arc::clone(&self.core),
@@ -657,6 +660,7 @@ fn etag(md5: &[u8; 16], parts: u16) -> String {
 
 fn journal_row(record: &JournalRecord) -> Vec<Datum> {
     let object = record.object.as_ref();
+    let origin = record.origin.as_ref();
     vec![
         text(&record.bucket),
         text(&record.key),
@@ -679,6 +683,15 @@ fn journal_row(record: &JournalRecord) -> Vec<Datum> {
             (Some(o), Some(false)) => Datum::Bit(o.parts > 0),
             _ => Datum::Null,
         },
+        // Who made the change: the account (as S3 Metadata's requester), and
+        // where from; none for a change made without a request.
+        origin
+            .and_then(|o| o.account.as_deref())
+            .map_or(Datum::Null, text),
+        origin
+            .and_then(|o| o.source_ip.as_deref())
+            .map_or(Datum::Null, text),
+        origin.map_or(Datum::Null, |o| text(&o.request_id)),
     ]
 }
 

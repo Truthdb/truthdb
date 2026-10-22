@@ -5,7 +5,9 @@
 //! marker (`is_delete_marker` TRUE) or a version removed for good (the
 //! flag NULL). Replacing a key's null version in place (an overwrite in an
 //! unversioned bucket, or a delete in a suspended one) records only the new
-//! version or marker. Rows older than a retention period are trimmed.
+//! version or marker. Rows older than a retention period are trimmed. A row
+//! made by a request carries its origin: the operation, the request id, the
+//! account (and user) that made it, and the address it came from.
 
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
@@ -47,6 +49,21 @@ pub struct JournalRecord {
     /// The version's size, digest, part count and modification time; `None`
     /// for a version removed for good.
     pub object: Option<JournalObject>,
+    /// Who made the change; `None` for one made without a request.
+    pub origin: Option<Origin>,
+}
+
+/// The request a change came from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct Origin {
+    /// The S3 operation (`PutObject`, `DeleteObject`, ...).
+    pub operation: String,
+    pub request_id: String,
+    /// The account the request acted for, and its user (none for the
+    /// account's root); both none for an anonymous request.
+    pub account: Option<String>,
+    pub user: Option<String>,
+    pub source_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +73,16 @@ pub struct JournalObject {
     pub parts: u16,
     pub last_modified_ms: u64,
 }
+
+/// The type byte's flag for a row with its key's length and an origin
+/// (rows without one keep the original layout).
+const TYPE_WITH_ORIGIN: u8 = 0x80;
+/// The origin's fields, as `[tag u8][len u16][bytes]` after the key.
+const TAG_OPERATION: u8 = 1;
+const TAG_REQUEST_ID: u8 = 2;
+const TAG_ACCOUNT: u8 = 3;
+const TAG_USER: u8 = 4;
+const TAG_SOURCE_IP: u8 = 5;
 
 const FLAG_NULL_VERSION: u8 = 1;
 const FLAG_MARKER: u8 = 2;
@@ -69,14 +96,22 @@ fn corrupt() -> StorageError {
 impl JournalRecord {
     /// `[type][flags][time][version][size][md5][parts][mtime][bucket len]
     /// [bucket][key]`: at most 1,140 bytes (a 63-byte bucket name and a
-    /// 1,024-byte key), within a tree cell.
+    /// 1,024-byte key), within a tree cell. With an origin, the type byte
+    /// has `TYPE_WITH_ORIGIN` set and the key is `[len u16][key]`, followed by
+    /// the origin's fields: about 200 bytes more at most.
     fn encode(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(60 + self.bucket.len() + self.key.len());
-        out.push(match self.record_type {
-            RecordType::Create => 0,
-            RecordType::UpdateMetadata => 1,
-            RecordType::Delete => 2,
-        });
+        out.push(
+            match self.record_type {
+                RecordType::Create => 0,
+                RecordType::UpdateMetadata => 1,
+                RecordType::Delete => 2,
+            } | if self.origin.is_some() {
+                TYPE_WITH_ORIGIN
+            } else {
+                0
+            },
+        );
         out.push(
             if self.null_version {
                 FLAG_NULL_VERSION
@@ -106,7 +141,25 @@ impl JournalRecord {
         out.extend_from_slice(&object.last_modified_ms.to_le_bytes());
         out.push(self.bucket.len() as u8);
         out.extend_from_slice(self.bucket.as_bytes());
+        let Some(origin) = &self.origin else {
+            out.extend_from_slice(self.key.as_bytes());
+            return out;
+        };
+        out.extend_from_slice(&(self.key.len() as u16).to_le_bytes());
         out.extend_from_slice(self.key.as_bytes());
+        for (tag, value) in [
+            (TAG_OPERATION, Some(&origin.operation)),
+            (TAG_REQUEST_ID, Some(&origin.request_id)),
+            (TAG_ACCOUNT, origin.account.as_ref()),
+            (TAG_USER, origin.user.as_ref()),
+            (TAG_SOURCE_IP, origin.source_ip.as_ref()),
+        ] {
+            if let Some(value) = value.filter(|value| !value.is_empty()) {
+                out.push(tag);
+                out.extend_from_slice(&(value.len() as u16).to_le_bytes());
+                out.extend_from_slice(value.as_bytes());
+            }
+        }
         out
     }
 
@@ -115,7 +168,8 @@ impl JournalRecord {
             return Err(corrupt());
         }
         let u64_at = |at: usize| u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap());
-        let record_type = match bytes[0] {
+        let with_origin = bytes[0] & TYPE_WITH_ORIGIN != 0;
+        let record_type = match bytes[0] & !TYPE_WITH_ORIGIN {
             0 => RecordType::Create,
             1 => RecordType::UpdateMetadata,
             2 => RecordType::Delete,
@@ -128,6 +182,29 @@ impl JournalRecord {
             return Err(corrupt());
         }
         let text = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| corrupt());
+        let rest = &names[bucket_len..];
+        let (key, origin) = if with_origin {
+            let (key, mut fields) = sized(rest).ok_or_else(corrupt)?;
+            let mut origin = Origin::default();
+            while !fields.is_empty() {
+                let tag = fields[0];
+                let (value, after) = sized(&fields[1..]).ok_or_else(corrupt)?;
+                let value = text(value)?;
+                match tag {
+                    TAG_OPERATION => origin.operation = value,
+                    TAG_REQUEST_ID => origin.request_id = value,
+                    TAG_ACCOUNT => origin.account = Some(value),
+                    TAG_USER => origin.user = Some(value),
+                    TAG_SOURCE_IP => origin.source_ip = Some(value),
+                    // A field a later release added.
+                    _ => {}
+                }
+                fields = after;
+            }
+            (text(key)?, Some(origin))
+        } else {
+            (text(rest)?, None)
+        };
         let permanent = flags & FLAG_PERMANENT != 0;
         Ok(JournalRecord {
             sequence,
@@ -143,9 +220,17 @@ impl JournalRecord {
                 last_modified_ms: u64_at(44),
             }),
             bucket: text(&names[..bucket_len])?,
-            key: text(&names[bucket_len..])?,
+            key,
+            origin,
         })
     }
+}
+
+/// `[len u16][bytes]` at the head of `bytes`: the bytes, and what follows.
+fn sized(bytes: &[u8]) -> Option<(&[u8], &[u8])> {
+    let len = u16::from_le_bytes(bytes.get(..2)?.try_into().unwrap()) as usize;
+    let value = bytes.get(2..2 + len)?;
+    Some((value, &bytes[2 + len..]))
 }
 
 /// A journal row's fields, numbered when written.
@@ -185,6 +270,7 @@ impl ObjTxn<'_, '_> {
             null_version: change.null_version,
             is_delete_marker: change.is_delete_marker,
             object: change.object,
+            origin: self.origin.clone(),
         };
         self.trees.changes().insert_unique(
             self.ctx,
@@ -359,6 +445,7 @@ mod tests {
                 null_version: true,
                 is_delete_marker: Some(false),
                 object: Some(object),
+                origin: None,
             },
             JournalRecord {
                 sequence: 2,
@@ -375,6 +462,7 @@ mod tests {
                     parts: 0,
                     last_modified_ms: 6,
                 }),
+                origin: None,
             },
             JournalRecord {
                 sequence: 3,
@@ -386,14 +474,82 @@ mod tests {
                 null_version: false,
                 is_delete_marker: None,
                 object: None,
+                origin: None,
             },
         ] {
             let bytes = record.encode();
             assert!(bytes.len() <= 1140);
             assert_eq!(
+                bytes[0] & TYPE_WITH_ORIGIN,
+                0,
+                "no origin: the first layout"
+            );
+            assert_eq!(
                 JournalRecord::decode(record.sequence, &bytes).unwrap(),
                 record
             );
         }
+    }
+
+    #[test]
+    fn a_record_with_its_origin_round_trips_within_a_tree_cell() {
+        let full = Origin {
+            operation: "CompleteMultipartUpload".into(),
+            request_id: "0123456789ABCDEF".into(),
+            account: Some("123456789012".into()),
+            user: Some("u".repeat(64)),
+            source_ip: Some("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255".into()),
+        };
+        let anonymous = Origin {
+            operation: "PostObject".into(),
+            request_id: "FEDCBA9876543210".into(),
+            account: None,
+            user: None,
+            source_ip: Some("192.0.2.1".into()),
+        };
+        for origin in [full, anonymous] {
+            let record = JournalRecord {
+                sequence: 9,
+                record_type: RecordType::Delete,
+                timestamp_ms: 7,
+                bucket: "b".repeat(63),
+                key: "x".repeat(1024),
+                version: 40,
+                null_version: false,
+                is_delete_marker: None,
+                object: None,
+                origin: Some(origin),
+            };
+            let bytes = record.encode();
+            assert!(
+                bytes.len() + 8 <= truthdb_core::relstore::btree::TREE_MAX_CELL,
+                "{} bytes",
+                bytes.len()
+            );
+            assert_eq!(JournalRecord::decode(9, &bytes).unwrap(), record);
+        }
+        // A field a later release added is skipped; a field cut short is
+        // corrupt.
+        let record = JournalRecord {
+            sequence: 1,
+            record_type: RecordType::Create,
+            timestamp_ms: 5,
+            bucket: "a".into(),
+            key: "k".into(),
+            version: 1,
+            null_version: false,
+            is_delete_marker: Some(false),
+            object: None,
+            origin: Some(Origin {
+                operation: "PutObject".into(),
+                ..Origin::default()
+            }),
+        };
+        let mut bytes = record.encode();
+        bytes.extend_from_slice(&[99, 2, 0, b'z', b'z']);
+        let decoded = JournalRecord::decode(1, &bytes).unwrap();
+        assert_eq!(decoded.origin, record.origin);
+        bytes.truncate(bytes.len() - 1);
+        assert!(JournalRecord::decode(1, &bytes).is_err());
     }
 }

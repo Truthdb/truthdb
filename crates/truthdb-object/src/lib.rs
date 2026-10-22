@@ -52,7 +52,7 @@ pub use fulltext::{
     fulltext_status,
 };
 pub use gc::GcOutcome;
-pub use journal::{JournalObject, JournalRecord, RecordType};
+pub use journal::{JournalObject, JournalRecord, Origin, RecordType};
 pub use listing::{ListAfter, ListedObject, Listing};
 pub use locks::{EventHold, ObjectLock, Retention, RetentionChange, RetentionMode};
 pub use objects::{
@@ -333,6 +333,8 @@ pub struct ObjTxn<'t, 'c> {
     pub(crate) ctx: &'t mut RelCtx<'c>,
     pub(crate) txn: &'t mut TxnLink,
     pub(crate) trees: Trees,
+    /// The request the transaction's changes come from (see `journal`).
+    pub(crate) origin: Option<Origin>,
 }
 
 /// The object engine's view of the locked storage: the core file and the
@@ -340,6 +342,9 @@ pub struct ObjTxn<'t, 'c> {
 pub struct ObjFile<'a> {
     core: &'a mut StorageFile,
     eng: &'a mut ObjEngine,
+    /// The request this engine call is for: its transactions' changes carry
+    /// it in the journal.
+    origin: Option<Origin>,
 }
 
 impl<'a> ObjFile<'a> {
@@ -347,14 +352,27 @@ impl<'a> ObjFile<'a> {
     /// If the storage was opened without the object engine.
     pub fn new(locked: &'a mut Locked) -> Self {
         let (core, eng) = locked.engine_parts::<ObjEngine>();
-        ObjFile { core, eng }
+        ObjFile {
+            core,
+            eng,
+            origin: None,
+        }
     }
 
     /// [`Self::new`], or `None` when the storage was opened without the
     /// object engine.
     pub fn try_new(locked: &'a mut Locked) -> Option<Self> {
         let (core, eng) = locked.try_engine_parts::<ObjEngine>()?;
-        Some(ObjFile { core, eng })
+        Some(ObjFile {
+            core,
+            eng,
+            origin: None,
+        })
+    }
+
+    /// Records `origin` as the request this engine call is for.
+    pub fn set_origin(&mut self, origin: Origin) {
+        self.origin = Some(origin);
     }
 
     /// Runs `body` as one transaction over the engine's trees (created the
@@ -371,7 +389,15 @@ impl<'a> ObjFile<'a> {
             *slot = self.tree(object_id)?.root;
         }
         let trees = Trees { roots };
-        self.in_txn(|ctx, txn| body(&mut ObjTxn { ctx, txn, trees }))
+        let origin = self.origin.clone();
+        self.in_txn(|ctx, txn| {
+            body(&mut ObjTxn {
+                ctx,
+                txn,
+                trees,
+                origin,
+            })
+        })
     }
 
     /// The tree with this object id if it exists, for reads: a read never
