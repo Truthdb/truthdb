@@ -45,12 +45,31 @@ pub fn check_write(headers: &HeaderMap, encrypted_at_rest: bool) -> Result<(), S
     if let Some(value) = headers.get(SSE_HEADER) {
         check_write_value(value.to_str().unwrap_or(""), encrypted_at_rest)?;
     }
-    if headers.contains_key("x-amz-server-side-encryption-aws-kms-key-id")
-        || headers.contains_key("x-amz-server-side-encryption-context")
-    {
+    if KMS_HEADERS.iter().any(|name| headers.contains_key(*name)) {
         return Err(not_offered("aws:kms"));
     }
     Ok(())
+}
+
+/// Headers (and POST form fields) that only KMS encryption takes.
+pub const KMS_HEADERS: [&str; 2] = [
+    "x-amz-server-side-encryption-aws-kms-key-id",
+    "x-amz-server-side-encryption-context",
+];
+
+/// [`check_write`] for a POST form's fields (`field` finds one by name).
+pub fn check_write_fields<'a>(
+    field: impl Fn(&str) -> Option<&'a str>,
+    encrypted_at_rest: bool,
+) -> Result<Option<&'a str>, S3Error> {
+    if KMS_HEADERS.iter().any(|name| field(name).is_some()) {
+        return Err(not_offered("aws:kms"));
+    }
+    let value = field(SSE_HEADER);
+    if let Some(value) = value {
+        check_write_value(value, encrypted_at_rest)?;
+    }
+    Ok(value)
 }
 
 /// [`check_write`] for a value (a POST form's field).
@@ -114,9 +133,11 @@ fn parse(body: &[u8], encrypted_at_rest: bool) -> Result<u8, S3Error> {
         )
     };
     let mut reader = Reader::from_reader(body);
+    // The open elements, and the text of the innermost one so far.
     let mut path: Vec<String> = Vec::new();
-    let (mut root, mut rules, mut flags) = (false, 0, 0u8);
-    let (mut default_seen, mut algorithm) = (false, None::<String>);
+    let mut text = String::new();
+    let (mut roots, mut rules, mut flags) = (0, 0, 0u8);
+    let (mut default_seen, mut algorithm, mut bucket_key) = (false, None::<String>, None::<bool>);
     let mut blocked: Vec<String> = Vec::new();
     let mut buf = Vec::new();
     loop {
@@ -128,18 +149,26 @@ fn parse(body: &[u8], encrypted_at_rest: bool) -> Result<u8, S3Error> {
             // algorithm.
             Event::Start(e) | Event::Empty(e) => {
                 let name = String::from_utf8_lossy(e.local_name().as_ref()).into_owned();
-                match (path.len(), name.as_str()) {
-                    (0, "ServerSideEncryptionConfiguration") => root = true,
-                    (1, "Rule") => rules += 1,
-                    (2, "ApplyServerSideEncryptionByDefault") => default_seen = true,
+                let at: Vec<&str> = path.iter().map(String::as_str).collect();
+                match (at.as_slice(), name.as_str()) {
+                    ([], "ServerSideEncryptionConfiguration") => roots += 1,
+                    ([], _) => return Err(malformed()),
+                    ([_], "Rule") => rules += 1,
+                    ([_, "Rule"], "ApplyServerSideEncryptionByDefault") => default_seen = true,
+                    ([_, "Rule", "ApplyServerSideEncryptionByDefault"], "KMSMasterKeyID") => {
+                        return Err(not_offered("aws:kms"));
+                    }
                     _ => {}
                 }
+                text.clear();
                 if !empty {
                     path.push(name);
                 }
             }
-            Event::Text(text) => {
-                let text = text.unescape().map_err(|_| malformed())?.trim().to_string();
+            Event::Text(t) => text.push_str(&t.unescape().map_err(|_| malformed())?),
+            Event::CData(t) => text.push_str(std::str::from_utf8(&t).map_err(|_| malformed())?),
+            Event::End(_) => {
+                let value = std::mem::take(&mut text).trim().to_string();
                 let at: Vec<&str> = path.iter().map(String::as_str).collect();
                 match at.as_slice() {
                     [
@@ -147,25 +176,24 @@ fn parse(body: &[u8], encrypted_at_rest: bool) -> Result<u8, S3Error> {
                         "Rule",
                         "ApplyServerSideEncryptionByDefault",
                         "SSEAlgorithm",
-                    ] => algorithm = Some(text),
-                    [
-                        _,
-                        "Rule",
-                        "ApplyServerSideEncryptionByDefault",
-                        "KMSMasterKeyID",
                     ] => {
-                        return Err(not_offered("aws:kms"));
+                        if algorithm.replace(value).is_some() {
+                            return Err(malformed());
+                        }
                     }
-                    [_, "Rule", "BlockedEncryptionTypes", "EncryptionType"] => blocked.push(text),
-                    [_, "Rule", "BucketKeyEnabled"] => match text.to_ascii_lowercase().as_str() {
-                        "true" => flags |= BUCKET_KEY_ENABLED,
-                        "false" => {}
-                        _ => return Err(malformed()),
-                    },
+                    [_, "Rule", "BlockedEncryptionTypes", "EncryptionType"] => blocked.push(value),
+                    [_, "Rule", "BucketKeyEnabled"] => {
+                        let enabled = match value.to_ascii_lowercase().as_str() {
+                            "true" => true,
+                            "false" => false,
+                            _ => return Err(malformed()),
+                        };
+                        if bucket_key.replace(enabled).is_some() {
+                            return Err(malformed());
+                        }
+                    }
                     _ => {}
                 }
-            }
-            Event::End(_) => {
                 path.pop();
             }
             Event::Eof => break,
@@ -173,8 +201,9 @@ fn parse(body: &[u8], encrypted_at_rest: bool) -> Result<u8, S3Error> {
         }
         buf.clear();
     }
-    // One rule: what several would mean together is not defined.
-    if !root || rules != 1 {
+    // One document, closed, with one rule: what several would mean together
+    // is not defined.
+    if roots != 1 || !path.is_empty() || rules != 1 {
         return Err(malformed());
     }
     if default_seen {
@@ -182,6 +211,9 @@ fn parse(body: &[u8], encrypted_at_rest: bool) -> Result<u8, S3Error> {
             algorithm.as_deref().ok_or_else(malformed)?,
             encrypted_at_rest,
         )?;
+    }
+    if bucket_key == Some(true) {
+        flags |= BUCKET_KEY_ENABLED;
     }
     match blocked
         .iter()
@@ -359,6 +391,34 @@ mod tests {
             .is_err()
         );
         assert!(parse(b"<Other><Rule/></Other>", true).is_err());
+        // One closed document, each value once; CDATA and comments are text.
+        let blocked_rule = "<Rule><BlockedEncryptionTypes><EncryptionType>SSE-C</EncryptionType>\
+                            </BlockedEncryptionTypes></Rule>";
+        let two_roots =
+            format!("<ServerSideEncryptionConfiguration/><Other>{blocked_rule}</Other>");
+        assert!(parse(two_roots.as_bytes(), true).is_err());
+        assert!(parse(b"<ServerSideEncryptionConfiguration><Rule>", true).is_err());
+        let twice = config(
+            "<ApplyServerSideEncryptionByDefault><SSEAlgorithm>aws:kms</SSEAlgorithm>\
+             <SSEAlgorithm>AES256</SSEAlgorithm></ApplyServerSideEncryptionByDefault>",
+        );
+        assert!(parse(twice.as_bytes(), true).is_err());
+        let key_twice = config(
+            "<BucketKeyEnabled>true</BucketKeyEnabled><BucketKeyEnabled>false</BucketKeyEnabled>",
+        );
+        assert!(parse(key_twice.as_bytes(), true).is_err());
+        for algorithm in ["<![CDATA[AES256]]>", "AES<!-- -->256"] {
+            let rule = config(&format!(
+                "<ApplyServerSideEncryptionByDefault><SSEAlgorithm>{algorithm}</SSEAlgorithm>\
+                 </ApplyServerSideEncryptionByDefault>"
+            ));
+            assert_eq!(parse(rule.as_bytes(), true).unwrap(), 0, "{algorithm}");
+        }
+        let empty_kms = config(
+            "<ApplyServerSideEncryptionByDefault><SSEAlgorithm>AES256</SSEAlgorithm>\
+             <KMSMasterKeyID/></ApplyServerSideEncryptionByDefault>",
+        );
+        assert!(parse(empty_kms.as_bytes(), true).is_err());
     }
 
     #[test]

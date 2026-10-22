@@ -381,6 +381,11 @@ async fn route(
             authz.check(action, Bucket(&bucket))?;
             crate::public_access::handle(state, request, auth, bucket, String::new(), method).await
         }
+        // An object has no `?encryption` of its own: refused, rather than
+        // taken for the plain object operation.
+        (Target::Object(..), _) if has_param(&request, "encryption") => Err(
+            S3Error::not_implemented("an object has no ?encryption configuration"),
+        ),
         (Target::Bucket(bucket), method) if has_param(&request, "encryption") => {
             let action = match method {
                 Method::GET => "s3:GetEncryptionConfiguration",

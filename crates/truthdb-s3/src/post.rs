@@ -436,8 +436,9 @@ pub async fn post_object(
 ) -> Result<Response<Body>, S3Error> {
     let connection = request.extensions().get::<Connection>().copied();
     // The policy context sees only what the form acts on: the client's
-    // identification here, the acl field below (other headers, such as a
-    // copy source, would satisfy conditions the upload never honours).
+    // identification here, the acl and encryption fields below (other
+    // headers, such as a copy source, would satisfy conditions the upload
+    // never honours).
     let mut headers = HeaderMap::new();
     for name in [hyper::header::USER_AGENT, hyper::header::REFERER] {
         if let Some(value) = request.headers().get(&name) {
@@ -504,6 +505,17 @@ pub async fn post_object(
             HeaderValue::from_str(acl).expect("a checked acl"),
         );
     }
+    // The encryption it asks for, which policies see as
+    // s3:x-amz-server-side-encryption.
+    let encrypted_at_rest = state.storage.is_encrypted();
+    if let Some(value) =
+        crate::sse::check_write_fields(|name| field(&fields, name), encrypted_at_rest)?
+    {
+        headers.insert(
+            crate::sse::SSE_HEADER,
+            HeaderValue::from_str(value).expect("a checked encryption"),
+        );
+    }
     let tags = match field(&fields, "tagging") {
         Some(xml) => Some(crate::tagging::parse_tagging(xml.as_bytes())?),
         None => None,
@@ -542,10 +554,6 @@ pub async fn post_object(
         && HeaderValue::from_str(redirect).is_err()
     {
         return Err(invalid("success_action_redirect is not a valid URL."));
-    }
-    let encrypted_at_rest = state.storage.is_encrypted();
-    if let Some(value) = field(&fields, crate::sse::SSE_HEADER) {
-        crate::sse::check_write_value(value, encrypted_at_rest)?;
     }
     let status = field(&fields, "success_action_status").map(str::to_string);
     crate::scope::within(scope, async move {

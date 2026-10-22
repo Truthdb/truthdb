@@ -4400,4 +4400,55 @@ fn server_side_encryption_is_the_databases_encryption_at_rest() {
         reply.contains("<SSEAlgorithm>AES256</SSEAlgorithm>"),
         "{reply}"
     );
+
+    // An object has no ?encryption: refused, never taken for the plain
+    // object operation.
+    for method in ["GET", "PUT", "DELETE"] {
+        let (_, (status, reply)) = call(method, "/sealed/o", "encryption", &[], b"over");
+        assert_eq!(status, 501, "{method}: {reply}");
+    }
+    assert_eq!(call("GET", "/sealed/o", "", &[], b"").1.1, "secret");
+
+    // A policy requiring AES256 sees a form's encryption field.
+    let require = r#"{"Statement": {"Effect": "Deny", "Principal": "*", "Action": "s3:PutObject",
+        "Resource": "arn:aws:s3:::sealed/*",
+        "Condition": {"StringNotEquals": {"s3:x-amz-server-side-encryption": "AES256"}}}}"#;
+    assert_eq!(
+        call("PUT", "/sealed", "policy", &[], require.as_bytes())
+            .1
+            .0,
+        204
+    );
+    assert_eq!(call("PUT", "/sealed/p", "", &[], b"x").1.0, 403);
+    assert_eq!(
+        call("PUT", "/sealed/p", "", &[(SSE, "AES256")], b"x").1.0,
+        200
+    );
+    let form = |encryption: Option<&str>| {
+        let mut conditions = vec![
+            serde_json::json!({"bucket": "sealed"}),
+            serde_json::json!(["starts-with", "$key", "f"]),
+        ];
+        let mut fields = vec![("key", "f")];
+        if let Some(value) = encryption {
+            conditions.push(serde_json::json!({SSE: value}));
+            fields.push((SSE, value));
+        }
+        signed_form(
+            &key,
+            &secret,
+            "2099-01-01T00:00:00.000Z",
+            &conditions,
+            &fields,
+        )
+    };
+    let (head, (status, reply)) = post_form(port, "sealed", &form(Some("AES256")), "f", b"x", 64);
+    assert_eq!(status, 204, "{reply}");
+    assert_eq!(
+        response_header(&head, SSE).as_deref(),
+        Some("AES256"),
+        "post"
+    );
+    let (_, (status, reply)) = post_form(port, "sealed", &form(None), "f", b"x", 64);
+    assert_eq!(status, 403, "{reply}");
 }
