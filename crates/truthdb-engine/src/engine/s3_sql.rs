@@ -87,6 +87,9 @@ impl ExternalRowsets for S3Rowsets {
             "sys.s3_object_tags" => Some(Kind::Tags),
             "sys.s3_object_metadata" => Some(Kind::Metadata),
             "sys.s3_journal" => return Some(self.open_journal(name, args, caller)),
+            "sys.dm_s3_journal_consumers" => {
+                return Some(open_consumers(&self.core, name, args, caller));
+            }
             "sys.s3_search" => return Some(self.open_search(name, args, caller)),
             "sys.s3_read" => {
                 return Some(
@@ -414,6 +417,64 @@ pub(super) fn object_error(err: ObjectError, bucket: &str) -> SqlError {
 
 pub(super) fn no_object_engine() -> SqlError {
     SqlError::new(50000, 16, 1, "this database does not run the object store")
+}
+
+/// `sys.dm_s3_journal_consumers`: each journal consumer's place, how many
+/// rows it has yet to read, and how many were trimmed before it read them.
+fn open_consumers(
+    core: &Arc<Storage>,
+    name: &str,
+    args: &[SqlValue],
+    caller: ExternalCaller,
+) -> Result<ExternalRowset, SqlError> {
+    check_admin(name, caller)?;
+    check_arg_count(name, args, 0, 0)?;
+    Ok(ExternalRowset {
+        columns: vec![
+            nvarchar("consumer_name", 64),
+            bigint("last_sequence_number"),
+            bigint("pending_records"),
+            bigint("dropped_records"),
+        ],
+        rows: Box::new(ConsumerStream {
+            core: Arc::clone(core),
+            done: false,
+        }),
+    })
+}
+
+struct ConsumerStream {
+    core: Arc<Storage>,
+    done: bool,
+}
+
+impl ExternalStream for ConsumerStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let (consumers, last) = {
+            let mut guard = self.core.lock();
+            let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+            (
+                file.journal_consumers().map_err(storage_error)?,
+                file.last_change().map_err(storage_error)?,
+            )
+        };
+        let rows: Vec<Vec<Datum>> = consumers
+            .into_iter()
+            .map(|consumer| {
+                vec![
+                    text(&consumer.name),
+                    Datum::BigInt(consumer.cursor as i64),
+                    Datum::BigInt(last.saturating_sub(consumer.cursor) as i64),
+                    Datum::BigInt(consumer.dropped as i64),
+                ]
+            })
+            .collect();
+        Ok((!rows.is_empty()).then_some(rows))
+    }
 }
 
 /// `sys.s3_buckets`: one slice, the whole (small) bucket list.

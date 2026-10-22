@@ -15,6 +15,7 @@ mod accounts;
 mod body;
 mod buckets;
 mod codec;
+mod consumers;
 mod credentials;
 mod documents;
 mod fulltext;
@@ -41,6 +42,7 @@ use truthdb_core::wal::records::RelRecord;
 pub use accounts::{AccountError, AccountInfo, DEFAULT_ACCOUNT, UserInfo, valid_account_id};
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
+pub use consumers::{Consumer, FULLTEXT_CONSUMER};
 pub use credentials::AccessKey;
 pub use documents::{
     BUCKET_ENCRYPTION, BUCKET_POLICY, ManagedPolicy, OBJECT_LOCK_DEFAULT, PUBLIC_ACCESS_BLOCK,
@@ -113,6 +115,8 @@ const BUCKET_CONFIG_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 21;
 /// Version -> its Object Lock retention and legal hold (and (1, upload) ->
 /// those an upload's object will have; see `locks`).
 const LOCKS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 22;
+/// Consumer name -> its place in the change journal (see `consumers`).
+const CONSUMERS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 23;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -129,7 +133,8 @@ const NEXT_VERSION_KEY: &[u8] = b"next_version";
 const NEXT_UPLOAD_KEY: &[u8] = b"next_upload";
 /// META key of the journal's next sequence number.
 const NEXT_CHANGE_KEY: &[u8] = b"next_change";
-/// META key of the last journal row the full-text indexer has applied.
+/// META key of the last journal row the full-text indexer has applied, in a
+/// file written before journal consumers (see `consumers`).
 const FT_CURSOR_KEY: &[u8] = b"ft_cursor";
 
 /// The object engine's in-memory state under the storage lock.
@@ -232,7 +237,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 23;
+const TREE_COUNT: usize = 24;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -316,6 +321,9 @@ impl Trees {
     }
     pub fn locks(&self) -> BTree {
         self.tree(LOCKS_TREE)
+    }
+    pub fn consumers(&self) -> BTree {
+        self.tree(CONSUMERS_TREE)
     }
 }
 

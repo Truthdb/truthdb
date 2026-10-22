@@ -183,6 +183,9 @@ fn enabling_backfills_text_objects_and_skips_the_rest() {
     assert!(engine.execute("s3 disable fulltext docs").is_err());
     index(&engine);
     assert!(states(&engine).is_empty());
+    // With no bucket indexed, nothing holds the journal.
+    let consumers = engine.object(|file| file.journal_consumers()).unwrap();
+    assert!(consumers.is_empty(), "{consumers:?}");
     assert!(hits(&engine, "docs", "common").is_empty());
     assert!(held(&engine, "docs", "note/001").is_none());
     drop(engine);

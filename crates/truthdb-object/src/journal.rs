@@ -10,6 +10,7 @@
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
+use crate::consumers::FULLTEXT_CONSUMER;
 use crate::{CHANGES_TREE, NEXT_CHANGE_KEY, ObjFile, ObjTxn, next_counter};
 
 /// What a journal row records (AWS's `record_type`).
@@ -199,27 +200,44 @@ impl ObjTxn<'_, '_> {
     /// order, so a row recorded before an expired one is at least as old,
     /// whatever its timestamp says (the clock may have stepped back since):
     /// everything up to the last expired row in a window from the head goes.
-    /// While any bucket has full-text state, no row the indexer has yet to
-    /// apply goes.
+    /// No row a consumer has yet to apply goes, unless it is past `cap_ms`
+    /// too: a consumer still before it is then moved past it, the rows it
+    /// missed counted (and the full-text index rebuilt).
     pub fn trim_journal(
         &mut self,
         now_ms: u64,
         retention_ms: u64,
+        cap_ms: u64,
         limit: usize,
     ) -> Result<usize, StorageError> {
         let changes = self.trees.changes();
         let window = changes.scan_range_limit(self.ctx, None, None, trim_window(limit))?;
-        let hold = self.fulltext_hold()?;
-        let Some(last) = last_expired(&window, now_ms, retention_ms, hold)? else {
+        let consumers = self.consumers()?;
+        let hold = consumers.iter().map(|consumer| consumer.cursor).min();
+        let Some(last) = last_expired(&window, now_ms, retention_ms, cap_ms, hold)? else {
             return Ok(0);
         };
-        let mut trimmed = 0;
-        for (key, _) in window.iter().take((last + 1).min(limit)) {
+        let take = (last + 1).min(limit);
+        for (key, _) in window.iter().take(take) {
             changes.delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
-            trimmed += 1;
         }
-        Ok(trimmed)
+        let through = sequence_of(&window[take - 1].0)?;
+        for mut consumer in consumers {
+            if consumer.cursor < through {
+                consumer.dropped += through - consumer.cursor;
+                consumer.cursor = through;
+                self.put_consumer(&consumer)?;
+                if consumer.name == FULLTEXT_CONSUMER {
+                    self.refill_fulltext()?;
+                }
+            }
+        }
+        Ok(take)
     }
+}
+
+fn sequence_of(key: &[u8]) -> Result<u64, StorageError> {
+    Ok(u64::from_be_bytes(key.try_into().map_err(|_| corrupt())?))
 }
 
 /// Rows a trim looks at from the head to find the last expired one: a few
@@ -229,22 +247,24 @@ fn trim_window(limit: usize) -> usize {
     limit.saturating_mul(4).max(64)
 }
 
-/// The index of the last row in `rows` (journal rows from the head) past
-/// `retention_ms` at `now_ms`, and numbered at most `hold` when one is given.
+/// The index of the last row in `rows` (journal rows from the head) that
+/// may go at `now_ms`: past `retention_ms` and numbered at most `hold` when
+/// one is given, or past `cap_ms` whatever the hold.
 fn last_expired(
     rows: &[(Vec<u8>, Vec<u8>)],
     now_ms: u64,
     retention_ms: u64,
+    cap_ms: u64,
     hold: Option<u64>,
 ) -> Result<Option<usize>, StorageError> {
     let mut last = None;
     for (index, (key, row)) in rows.iter().enumerate() {
-        let sequence = u64::from_be_bytes(key.as_slice().try_into().map_err(|_| corrupt())?);
-        if hold.is_some_and(|hold| sequence > hold) {
-            break;
-        }
+        let sequence = sequence_of(key)?;
         let record = JournalRecord::decode(sequence, row)?;
-        if record.timestamp_ms.saturating_add(retention_ms) <= now_ms {
+        let held = hold.is_some_and(|hold| sequence > hold);
+        let expired = record.timestamp_ms.saturating_add(retention_ms) <= now_ms;
+        let capped = record.timestamp_ms.saturating_add(cap_ms) <= now_ms;
+        if (expired && !held) || capped {
             last = Some(index);
         }
     }
@@ -252,16 +272,39 @@ fn last_expired(
 }
 
 impl ObjFile<'_> {
+    /// The journal's last sequence number handed out (0 before any).
+    pub fn last_change(&mut self) -> Result<u64, StorageError> {
+        let Some(meta) = self.eng.root.map(crate::meta_tree) else {
+            return Ok(0);
+        };
+        self.core.ensure_rel_usable()?;
+        Ok(
+            match meta.get(&mut self.core.page_ctx(0), NEXT_CHANGE_KEY)? {
+                Some(next) => crate::codec::u64_le(&next)?.saturating_sub(1),
+                None => 0,
+            },
+        )
+    }
+
     /// Whether a trim at `now_ms` would delete anything: a read, so a sweep
     /// with nothing to trim writes nothing (not even the log).
-    pub fn journal_due(&mut self, now_ms: u64, retention_ms: u64) -> Result<bool, StorageError> {
+    pub fn journal_due(
+        &mut self,
+        now_ms: u64,
+        retention_ms: u64,
+        cap_ms: u64,
+    ) -> Result<bool, StorageError> {
         let Some(changes) = self.existing_tree(CHANGES_TREE)? else {
             return Ok(false);
         };
         let window =
             changes.scan_range_limit(&mut self.core.page_ctx(0), None, None, trim_window(1))?;
-        let hold = self.fulltext_hold()?;
-        Ok(last_expired(&window, now_ms, retention_ms, hold)?.is_some())
+        let hold = self
+            .journal_consumers()?
+            .iter()
+            .map(|consumer| consumer.cursor)
+            .min();
+        Ok(last_expired(&window, now_ms, retention_ms, cap_ms, hold)?.is_some())
     }
 
     /// Up to `limit` journal rows numbered after `after`, oldest first.
