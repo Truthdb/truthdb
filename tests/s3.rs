@@ -5408,3 +5408,69 @@ fn copies_decrypt_and_encrypt_again_as_their_keys_say() {
     let expected = [&big[..5 * 1024 * 1024], &data[65530..65546]].concat();
     assert_eq!(read("/copies/m", Some(a)), (200, latin1(&expected)));
 }
+
+#[test]
+fn a_copy_whose_client_leaves_still_finishes_and_lets_its_source_go() {
+    let server = start_server_tls(false, true);
+    let (_, key, secret) = account_with_key(&server, "leaver");
+    let call = |method: &str, path: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_tls(&server, method, path, "", extra, body, &key, Some(&secret)).1
+    };
+    let (a, b) = ([0x5au8; 32], [0x6bu8; 32]);
+    // Large enough that the copy (decrypted and encrypted again) is still
+    // running when the client goes.
+    let data: Vec<u8> = (0..48u32 << 20).map(|n| (n % 253) as u8).collect();
+    assert_eq!(call("PUT", "/leave", &[], b"").0, 200);
+    let source_key = customer_headers("x-amz-", a);
+    assert_eq!(
+        call("PUT", "/leave/src", &header_refs(&source_key), &data).0,
+        200
+    );
+    // The copy is sent and the connection dropped before the answer.
+    let mut headers = vec![("x-amz-copy-source".to_string(), "/leave/src".to_string())];
+    headers.extend(customer_headers("x-amz-copy-source-", a));
+    headers.extend(customer_headers("x-amz-", b));
+    let request = signed_request(
+        server.s3_port,
+        "PUT",
+        "/leave/dst",
+        "",
+        &header_refs(&headers),
+        b"",
+        &key,
+        Some(&secret),
+    );
+    let mut stream = tls_stream(&server);
+    stream.write_all(request.as_bytes()).expect("send");
+    stream.flush().expect("flush");
+    std::thread::sleep(Duration::from_millis(50));
+    drop(stream);
+    // The copy runs to its end (releasing what it holds on the source), so
+    // the object appears.
+    let target_key = customer_headers("x-amz-", b);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    loop {
+        let (status, _) = call("HEAD", "/leave/dst", &header_refs(&target_key), b"");
+        if status == 200 {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "the copy never finished after its client left: {status}"
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    let (status, body) = send_tls(
+        &server,
+        "GET",
+        "/leave/dst",
+        "",
+        &header_refs(&target_key),
+        b"",
+        &key,
+        Some(&secret),
+    )
+    .1;
+    assert_eq!(status, 200);
+    assert!(body == latin1(&data), "the copy holds the source's bytes");
+}

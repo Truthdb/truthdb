@@ -136,6 +136,29 @@ pub async fn copy_object(
     key: String,
 ) -> Result<Response<Body>, S3Error> {
     let headers = request.headers().clone();
+    // The copy runs in its own task: a client that disconnects drops this
+    // handler, and the task still releases the lease it takes on a source
+    // it streams.
+    let task_state = S3State {
+        engine: state.engine.clone(),
+        region: state.region.clone(),
+        signing_keys: state.signing_keys.clone(),
+        storage: state.storage.clone(),
+    };
+    let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
+    tokio::spawn(crate::scope::within(scope, async move {
+        copy_whole(&task_state, headers, bucket, key).await
+    }))
+    .await
+    .map_err(|err| S3Error::internal(err.to_string()))?
+}
+
+async fn copy_whole(
+    state: &S3State,
+    headers: HeaderMap,
+    bucket: String,
+    key: String,
+) -> Result<Response<Body>, S3Error> {
     crate::sse::check_write(&headers, state.storage.is_encrypted())?;
     let (src_bucket, src_key, which) = copy_source(&headers)?;
     let replace = replaces(&headers, "x-amz-metadata-directive", "metadata")?;
