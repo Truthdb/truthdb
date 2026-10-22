@@ -95,9 +95,37 @@ impl ObjTxn<'_, '_> {
         data: &[u8],
         now_ms: u64,
     ) -> Result<(), StorageError> {
-        if data.is_empty() || data.len() > SEGMENT_BYTES {
+        self.append_stored(body, data, data.len(), false, now_ms)
+    }
+
+    /// [`Self::append_segment`] for a segment of `plain_len` bytes stored as
+    /// the zstd `frame` of them (see [`crate::pack_segment`]).
+    pub fn append_packed_segment(
+        &mut self,
+        body: u64,
+        frame: &[u8],
+        plain_len: usize,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        self.append_stored(body, frame, plain_len, true, now_ms)
+    }
+
+    fn append_stored(
+        &mut self,
+        body: u64,
+        data: &[u8],
+        plain_len: usize,
+        zstd: bool,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        if plain_len == 0 || plain_len > SEGMENT_BYTES {
             return Err(invalid(format!(
-                "a body segment is 1..={SEGMENT_BYTES} bytes, got {}",
+                "a body segment is 1..={SEGMENT_BYTES} bytes, got {plain_len}"
+            )));
+        }
+        if data.is_empty() || data.len() > plain_len {
+            return Err(invalid(format!(
+                "a segment of {plain_len} bytes is stored in 1..={plain_len}, got {}",
                 data.len()
             )));
         }
@@ -120,7 +148,7 @@ impl ObjTxn<'_, '_> {
             pages: pages as u32,
             len: data.len() as u32,
             lsn,
-            zstd: false,
+            zstd,
         };
         let (segments, staging) = (self.trees.segments(), self.trees.staging());
         segments.insert_unique(
@@ -140,7 +168,7 @@ impl ObjTxn<'_, '_> {
             &codec::timed_key(now_ms, body),
             &[],
         )?;
-        row.len += data.len() as u64;
+        row.len += plain_len as u64;
         row.segments += 1;
         row.touched_ms = now_ms;
         self.store_body(body, &row)
@@ -149,6 +177,17 @@ impl ObjTxn<'_, '_> {
     /// Seals a staging body with its digest and one reference: the reference
     /// held by whatever row the caller writes in this same transaction.
     pub fn seal_body(&mut self, body: u64, md5: [u8; 16]) -> Result<BodyInfo, StorageError> {
+        self.seal_packed_body(body, md5, 0)
+    }
+
+    /// [`Self::seal_body`] for a body whose segments were packed at
+    /// `pack_level` as they were written (see [`SealedBody::pack_level`]).
+    fn seal_packed_body(
+        &mut self,
+        body: u64,
+        md5: [u8; 16],
+        pack_level: u8,
+    ) -> Result<BodyInfo, StorageError> {
         let mut row = self.load_body(body)?;
         if row.state != BodyState::Staging {
             return Err(invalid(format!("body {body} is already sealed")));
@@ -162,6 +201,7 @@ impl ObjTxn<'_, '_> {
         row.state = BodyState::Sealed;
         row.refcount = 1;
         row.md5 = md5;
+        row.pack_level = pack_level;
         self.store_body(body, &row)?;
         Ok(BodyInfo {
             body,
@@ -263,6 +303,16 @@ impl ObjFile<'_> {
         now_ms: u64,
     ) -> Result<(), StorageError> {
         self.transaction(|tx| tx.append_segment(body, data, now_ms))
+    }
+
+    pub fn append_packed_segment(
+        &mut self,
+        body: u64,
+        frame: &[u8],
+        plain_len: usize,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        self.transaction(|tx| tx.append_packed_segment(body, frame, plain_len, now_ms))
     }
 
     /// The sealed body's length and digest.
@@ -609,6 +659,7 @@ impl BodyWriter {
             body: self.body,
             md5: self.md5.finalize().into(),
             size: None,
+            pack_level: 0,
         })
     }
 }
@@ -621,10 +672,13 @@ pub struct SealedBody {
     /// The object's (or part's) length when it is not the body's: a body
     /// encrypted with a customer-provided key stores more than it holds.
     pub size: Option<u64>,
+    /// The zstd level every segment was offered at as it was written (0:
+    /// none), so the body is not queued to be packed again at that level.
+    pub pack_level: u8,
 }
 
 impl SealedBody {
     pub fn seal_in(&self, tx: &mut ObjTxn<'_, '_>) -> Result<BodyInfo, StorageError> {
-        tx.seal_body(self.body, self.md5)
+        tx.seal_packed_body(self.body, self.md5, self.pack_level)
     }
 }

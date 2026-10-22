@@ -30,6 +30,7 @@ fn put(engine: &Engine, bucket: &str, key: &str, data: &[u8], attrs: &ObjectAttr
                 body,
                 md5: [7; 16],
                 size: None,
+                pack_level: 0,
             };
             file.transaction(|tx| {
                 tx.put_object(

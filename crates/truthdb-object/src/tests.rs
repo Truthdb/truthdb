@@ -3614,6 +3614,79 @@ fn a_cold_multipart_objects_parts_are_packed() {
 }
 
 #[test]
+fn a_body_packed_as_it_is_written_reads_back_and_is_not_packed_again() {
+    use crate::{SealedBody, StorageClass, pack_segment};
+    let path = temp_path("pack-inline");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    let seg = SEGMENT_BYTES;
+    let data: Vec<u8> = [bytes(1, seg), noise(7, seg), bytes(3, 1234)].concat();
+    let level = StorageClass::DeepArchive.pack_level();
+    let before = allocated_pages(&storage);
+    let body = ObjFile::new(&mut storage.lock()).begin_body(now()).unwrap();
+    for segment in data.chunks(seg) {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        match pack_segment(segment, level) {
+            Some(frame) => file.append_packed_segment(body, &frame, segment.len(), now()),
+            None => file.append_segment(body, segment, now()),
+        }
+        .unwrap();
+    }
+    let sealed = SealedBody {
+        body,
+        md5: [7; 16],
+        size: None,
+        pack_level: level,
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.put_object(
+                "bkt",
+                "k",
+                &sealed,
+                &crate::ObjectAttrs::default(),
+                StorageClass::DeepArchive,
+                now(),
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    let written = allocated_pages(&storage) - before;
+    assert!(
+        written < (seg + 1234) as u64 / 4096 + 10,
+        "{written} pages: the noise segment whole, the others packed"
+    );
+    assert_eq!(pack_all(&storage), 0, "packed at its class's level already");
+    drop(storage); // crash
+    let storage = open(&path);
+    for (offset, len) in [
+        (0, data.len()),
+        (seg as u64 - 5, 10),
+        (2 * seg as u64 + 7, 100),
+    ] {
+        assert_eq!(
+            read(&storage, body, offset, len).unwrap(),
+            data[offset as usize..offset as usize + len],
+            "{offset}+{len}"
+        );
+    }
+    // A segment stored larger than its bytes is refused.
+    let staged = ObjFile::new(&mut storage.lock()).begin_body(now()).unwrap();
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .append_packed_segment(staged, &[0; 11], 10, now())
+            .is_err()
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn an_unreadable_body_leaves_the_pack_queue_to_the_bodies_after_it() {
     use crate::StorageClass;
     use crate::codec::SegmentRow;

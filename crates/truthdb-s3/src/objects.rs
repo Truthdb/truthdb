@@ -191,6 +191,7 @@ pub async fn receive_body(
     request: Request<Incoming>,
     auth: Authenticated,
     key: Option<&crate::ssec::ProvidedKey>,
+    class: StorageClass,
 ) -> Result<SealedBody, S3Error> {
     let headers = request.headers().clone();
     let declared: Option<u64> =
@@ -234,7 +235,7 @@ pub async fn receive_body(
             )
         }
     };
-    let mut sink = BodySink::begin(state, key).await?;
+    let mut sink = BodySink::begin(state, key, class).await?;
     let mut decoder = PayloadDecoder::new(auth.framing, auth.checksum)?;
     let mut decoded = Vec::new();
     let mut incoming = request.into_body();
@@ -261,7 +262,8 @@ pub async fn receive_body(
 }
 
 /// A body written into the object engine as it arrives: in segments, with
-/// its MD5, encrypted with a customer-provided key when given one. A body
+/// its MD5, encrypted with a customer-provided key when given one, else
+/// compressed as its storage class asks (off the async threads). A body
 /// never finished stays staged until garbage collection reclaims it.
 pub struct BodySink {
     body: u64,
@@ -270,6 +272,8 @@ pub struct BodySink {
     /// Of the bytes pushed (Content-MD5's).
     plain_md5: Md5,
     encryptor: Option<crate::ssec::Encryptor>,
+    /// The zstd level each segment is offered at (0: stored as it is).
+    pack_level: u8,
     segment: Vec<u8>,
     len: u64,
 }
@@ -278,8 +282,11 @@ impl BodySink {
     pub async fn begin(
         state: &S3State,
         key: Option<&crate::ssec::ProvidedKey>,
+        class: StorageClass,
     ) -> Result<BodySink, S3Error> {
         let encryptor = key.map(|key| key.encryptor()).transpose()?;
+        // Ciphertext does not shrink.
+        let pack_level = if key.is_some() { 0 } else { class.pack_level() };
         let now = now_ms();
         let body = object(state, move |file| file.begin_body(now)).await?;
         Ok(BodySink {
@@ -287,6 +294,7 @@ impl BodySink {
             md5: Md5::new(),
             plain_md5: Md5::new(),
             encryptor,
+            pack_level,
             segment: Vec::with_capacity(SEGMENT_BYTES),
             len: 0,
         })
@@ -321,11 +329,7 @@ impl BodySink {
             if self.segment.len() == SEGMENT_BYTES {
                 let full_segment =
                     std::mem::replace(&mut self.segment, Vec::with_capacity(SEGMENT_BYTES));
-                let (body, now) = (self.body, now_ms());
-                object(state, move |file| {
-                    file.append_segment(body, &full_segment, now)
-                })
-                .await?;
+                append_segment(state, self.body, self.pack_level, full_segment).await?;
             }
         }
         Ok(())
@@ -344,22 +348,63 @@ impl BodySink {
             body,
             md5,
             plain_md5,
+            pack_level,
             segment,
             ..
         } = self;
         if !segment.is_empty() {
-            let now = now_ms();
-            object(state, move |file| file.append_segment(body, &segment, now)).await?;
+            append_segment(state, body, pack_level, segment).await?;
         }
         Ok((
             SealedBody {
                 body,
                 md5: md5.finalize().into(),
                 size,
+                pack_level,
             },
             plain_md5.finalize().into(),
         ))
     }
+}
+
+/// Compressions of cold uploads under way at once: one per CPU. A level-19
+/// segment costs about 70 ms and 20 MB; uploads past the limit wait (and so
+/// are read more slowly) instead of filling the blocking pool.
+fn compressing() -> &'static tokio::sync::Semaphore {
+    static LIMIT: std::sync::OnceLock<tokio::sync::Semaphore> = std::sync::OnceLock::new();
+    LIMIT.get_or_init(|| {
+        tokio::sync::Semaphore::new(std::thread::available_parallelism().map_or(1, |n| n.get()))
+    })
+}
+
+/// Appends `segment` to `body`, as a zstd frame at `pack_level` when one is
+/// smaller (compressed on a blocking thread, outside the storage lock).
+async fn append_segment(
+    state: &S3State,
+    body: u64,
+    pack_level: u8,
+    segment: Vec<u8>,
+) -> Result<(), S3Error> {
+    let (frame, segment) = if pack_level == 0 {
+        (None, segment)
+    } else {
+        let permit = compressing()
+            .acquire()
+            .await
+            .map_err(|err| S3Error::internal(err.to_string()))?;
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            (truthdb_object::pack_segment(&segment, pack_level), segment)
+        })
+        .await
+        .map_err(|err| S3Error::internal(err.to_string()))?
+    };
+    let now = now_ms();
+    object(state, move |file| match frame {
+        Some(frame) => file.append_packed_segment(body, &frame, segment.len(), now),
+        None => file.append_segment(body, &segment, now),
+    })
+    .await
 }
 
 /// PutObject. `lock` is the Object Lock its headers ask for (authorized by
@@ -400,7 +445,7 @@ pub async fn put_object(
     }
     attrs.customer_key = customer.as_ref().map(|key| key.stored()).transpose()?;
     let headers = request.headers().clone();
-    let sealed = receive_body(state, request, auth, customer.as_ref()).await?;
+    let sealed = receive_body(state, request, auth, customer.as_ref(), class).await?;
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let (stored, versioning) = crate::scope::object_as(state, "PutObject", move |file| {
         let now = now_ms();

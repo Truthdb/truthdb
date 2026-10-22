@@ -60,7 +60,7 @@ pub use objects::{
     CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, StorageClass, VersionSel,
     version_id,
 };
-pub use pack::{PackStep, PackWork};
+pub use pack::{PackStep, PackWork, pack_segment};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
 
 /// The object engine's id on the shared log (its root lives in the
