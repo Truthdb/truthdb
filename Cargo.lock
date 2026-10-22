@@ -1859,6 +1859,7 @@ dependencies = [
  "truthdb-engine",
  "truthdb-iam",
  "truthdb-object",
+ "truthdb-sigv4",
  "truthdb-vector",
  "zeroize",
 ]
@@ -1871,6 +1872,14 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+]
+
+[[package]]
+name = "truthdb-sigv4"
+version = "0.1.0"
+dependencies = [
+ "percent-encoding",
+ "ring",
 ]
 
 [[package]]
