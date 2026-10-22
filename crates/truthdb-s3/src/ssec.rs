@@ -246,6 +246,15 @@ impl ProvidedKey {
         })
     }
 
+    /// Whether `other` is the same key (in constant time).
+    pub fn same_key(&self, other: &ProvidedKey) -> bool {
+        self.key
+            .iter()
+            .zip(other.key.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+    }
+
     /// Whether this is the key `stored` was kept of.
     pub fn matches(&self, stored: &CustomerKey) -> bool {
         let Ok(verifier) = base64().decode(&stored.verifier) else {

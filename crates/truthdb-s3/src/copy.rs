@@ -1,24 +1,30 @@
-//! Copies. CopyObject shares the source's body, so no bytes are copied.
-//! UploadPartCopy shares a whole plain source as the part; a range, or a
-//! multipart source, has its bytes copied into a new part body (a multipart
-//! object's body cannot be a part: composites do not nest).
+//! Copies. CopyObject shares the source's body, so no bytes are copied, when
+//! the copy is encrypted as the source is (no customer-provided key, or the
+//! same one); otherwise the source is decrypted and encrypted again as it
+//! streams into a new body. UploadPartCopy shares a whole plain source as
+//! the part; a range, a multipart source, or a customer-provided key has its
+//! bytes copied into a new part body (a multipart object's body cannot be a
+//! part: composites do not nest).
+
+use std::sync::Arc;
 
 use hyper::body::Incoming;
 use hyper::header::HeaderMap;
 use hyper::{Request, Response};
-use md5::{Digest, Md5};
+use tokio::sync::mpsc;
 use truthdb_core::storage::StorageError;
-use truthdb_object::{BodyInfo, ObjFile, ObjectInfo, SEGMENT_BYTES, SealedBody, VersionSel};
+use truthdb_object::{BodyInfo, ObjFile, ObjectInfo, SealedBody, VersionSel};
 
 use crate::error::{S3Error, escape};
 use crate::listing::query_params;
 use crate::multipart::{check_upload, part_number, upload_error, upload_id, xml};
 use crate::objects::{
-    DROP_GRACE_MS, MAX_PUT_BYTES, add_header, header, metadata_from, now_ms, object, object_error,
-    precondition, version_header, version_sel, versioning_of,
+    BodySink, DROP_GRACE_MS, MAX_PUT_BYTES, add_header, header, metadata_from, now_ms, object,
+    object_error, precondition, version_header, version_sel, versioning_of,
 };
 use crate::server::Body;
 use crate::server::S3State;
+use crate::ssec::ProvidedKey;
 use crate::time::iso8601;
 
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -54,6 +60,7 @@ fn resolve_source(
     key: &str,
     which: VersionSel,
     headers: &HeaderMap,
+    source_key: Option<&ProvidedKey>,
 ) -> Result<Result<ObjectInfo, S3Error>, StorageError> {
     let source = match file.head_object(bucket, key, which)? {
         Ok(source) => source,
@@ -66,9 +73,8 @@ fn resolve_source(
             "The source of a copy request may not specifically refer to a delete marker by version id.",
         )));
     }
-    // A source with a customer-provided key is copied with that key (copying
-    // with one is refused before this, until it is implemented).
-    if let Err(err) = crate::ssec::check_read(source.attrs.customer_key.as_ref(), None) {
+    // A source with a customer-provided key is read with that key only.
+    if let Err(err) = crate::ssec::check_read(source.attrs.customer_key.as_ref(), source_key) {
         return Ok(Err(err));
     }
     if precondition(headers, "x-amz-copy-source-", &source).is_some() {
@@ -94,6 +100,35 @@ fn replaces(headers: &HeaderMap, name: &str, what: &str) -> Result<bool, S3Error
     }
 }
 
+/// The customer-provided keys of a copy: the source's
+/// (`x-amz-copy-source-…`) and the copy's; a copy with one is refused in a
+/// bucket blocking SSE-C.
+async fn copy_keys(
+    state: &S3State,
+    headers: &HeaderMap,
+    bucket: &str,
+) -> Result<(Option<Arc<ProvidedKey>>, Option<Arc<ProvidedKey>>), S3Error> {
+    let source_key = crate::ssec::provided(headers, true)?.map(Arc::new);
+    let target_key = crate::ssec::provided(headers, false)?.map(Arc::new);
+    if target_key.is_some() {
+        let name = bucket.to_string();
+        let blocked = object(state, move |file| crate::sse::sse_c_blocked(file, &name)).await?;
+        crate::ssec::check_write(target_key.as_deref(), headers, blocked)?;
+    }
+    Ok((source_key, target_key))
+}
+
+/// What a copy found under the lock: done (the body shared), or a source to
+/// stream (leased) into a new body.
+enum CopyStep {
+    Shared(ObjectInfo, Vec<(&'static str, String)>),
+    Stream {
+        source: ObjectInfo,
+        attrs: Box<truthdb_object::ObjectAttrs>,
+        source_version: Option<String>,
+    },
+}
+
 pub async fn copy_object(
     state: &S3State,
     request: Request<Incoming>,
@@ -105,6 +140,15 @@ pub async fn copy_object(
     let (src_bucket, src_key, which) = copy_source(&headers)?;
     let replace = replaces(&headers, "x-amz-metadata-directive", "metadata")?;
     let replace_tags = replaces(&headers, "x-amz-tagging-directive", "tagging")?;
+    let (source_key, target_key) = copy_keys(state, &headers, &bucket).await?;
+    let target_record = target_key.as_deref().map(ProvidedKey::stored).transpose()?;
+    // The copy is encrypted as the source is when neither has a key, or
+    // both the same one (the source's key is checked against it below).
+    let same_keys = match (&source_key, &target_key) {
+        (Some(source), Some(target)) => source.same_key(target),
+        (None, None) => true,
+        _ => false,
+    };
     // Only what a directive replaces is read from the request.
     let new_metadata = if replace {
         metadata_from(&headers)?
@@ -116,14 +160,27 @@ pub async fn copy_object(
     } else {
         Vec::new()
     };
-    let (dst_bucket, dst_key) = (bucket, key);
-    // Resolve and copy in one lock hold: the source cannot change between.
-    let info = object(state, move |file| {
-        let source = match resolve_source(file, &src_bucket, &src_key, which, &headers)? {
+    let (dst_bucket, dst_key) = (bucket.clone(), key.clone());
+    let lookup_source_key = source_key.clone();
+    // Resolve and share (or lease) in one lock hold: the source cannot
+    // change between.
+    let step = object(state, move |file| {
+        let source = match resolve_source(
+            file,
+            &src_bucket,
+            &src_key,
+            which,
+            &headers,
+            lookup_source_key.as_deref(),
+        )? {
             Ok(source) => source,
             Err(err) => return Ok(Err(err)),
         };
-        if !replace && (src_bucket.as_str(), src_key.as_str()) == (&dst_bucket, &dst_key) {
+        let shared = source.attrs.customer_key.is_some() == target_record.is_some() && same_keys;
+        // A copy to itself must change something: its metadata, or its
+        // encryption.
+        if !replace && shared && (src_bucket.as_str(), src_key.as_str()) == (&dst_bucket, &dst_key)
+        {
             let current = file.head_object(&dst_bucket, &dst_key, VersionSel::Latest)?;
             if current.is_ok_and(|current| current.version == source.version) {
                 return Ok(Err(S3Error::new(
@@ -143,6 +200,26 @@ pub async fn copy_object(
         } else {
             source.attrs.tags.clone()
         };
+        let source_version = version_header(
+            versioning_of(file, &src_bucket)?,
+            source.version,
+            source.null_version,
+        );
+        if !shared {
+            attrs.customer_key = target_record;
+            if source.size > MAX_PUT_BYTES {
+                return Ok(Err(too_large_source()));
+            }
+            // The lease keeps the bytes while they are copied outside the
+            // lock.
+            file.take_lease(source.body)?;
+            return Ok(Ok(CopyStep::Stream {
+                source,
+                attrs: Box::new(attrs),
+                source_version,
+            }));
+        }
+        attrs.customer_key = source.attrs.customer_key.clone();
         let copied = file.transaction(|tx| {
             tx.copy_object(
                 &dst_bucket,
@@ -158,11 +235,7 @@ pub async fn copy_object(
             Err(err) => return Ok(Err(object_error(err, &dst_bucket, &dst_key))),
         };
         let mut versions = Vec::new();
-        if let Some(version) = version_header(
-            versioning_of(file, &src_bucket)?,
-            source.version,
-            source.null_version,
-        ) {
+        if let Some(version) = source_version {
             versions.push(("x-amz-copy-source-version-id", version));
         }
         if let Some(version) = version_header(
@@ -172,10 +245,62 @@ pub async fn copy_object(
         ) {
             versions.push(("x-amz-version-id", version));
         }
-        Ok(Ok((copied, versions)))
+        Ok(Ok(CopyStep::Shared(copied, versions)))
     })
     .await??;
-    let (info, versions) = info;
+    let (info, versions) = match step {
+        CopyStep::Shared(info, versions) => (info, versions),
+        CopyStep::Stream {
+            source,
+            attrs,
+            source_version,
+        } => {
+            let body = source.body;
+            let copied = copy_into(
+                state,
+                body,
+                0,
+                source.size,
+                source_key,
+                target_key.as_deref(),
+            )
+            .await;
+            // Unchecked: the lease goes even when the request's scope no
+            // longer holds, or the body stays pinned.
+            let _ = state
+                .engine
+                .run_object(move |file| {
+                    file.release_lease(body);
+                    Ok(())
+                })
+                .await;
+            let sealed = copied?;
+            let (dst_bucket, dst_key) = (bucket.clone(), key.clone());
+            let (stored, versioning) = object(state, move |file| {
+                let stored = file.transaction(|tx| {
+                    tx.put_object(
+                        &dst_bucket,
+                        &dst_key,
+                        &sealed,
+                        &attrs,
+                        now_ms(),
+                        DROP_GRACE_MS,
+                    )
+                })?;
+                Ok((stored, versioning_of(file, &dst_bucket)?))
+            })
+            .await?;
+            let info = stored.map_err(|err| object_error(err, &bucket, &key))?;
+            let mut versions = Vec::new();
+            if let Some(version) = source_version {
+                versions.push(("x-amz-copy-source-version-id", version));
+            }
+            if let Some(version) = version_header(versioning, info.version, info.null_version) {
+                versions.push(("x-amz-version-id", version));
+            }
+            (info, versions)
+        }
+    };
     let mut response = xml(format!(
         "<CopyObjectResult xmlns=\"{XMLNS}\"><ETag>{}</ETag><LastModified>{}</LastModified></CopyObjectResult>",
         escape(&info.etag()),
@@ -184,8 +309,23 @@ pub async fn copy_object(
     for (name, version) in versions {
         add_header(&mut response, name, version);
     }
-    crate::sse::add_header(&mut response, state.storage.is_encrypted());
+    let customer_key = info.attrs.customer_key.as_ref();
+    crate::sse::add_header(
+        &mut response,
+        state.storage.is_encrypted() && customer_key.is_none(),
+    );
+    crate::ssec::add_echo(&mut response, customer_key);
     Ok(response)
+}
+
+fn too_large_source() -> S3Error {
+    S3Error::new(
+        400,
+        "InvalidRequest",
+        format!(
+            "The specified copy source is larger than the maximum allowable size for a copy source: {MAX_PUT_BYTES}"
+        ),
+    )
 }
 
 /// `x-amz-copy-source-range: bytes=first-last`, inside a source of `size`:
@@ -231,6 +371,7 @@ pub async fn upload_part_copy(
     let number = part_number(&params, &bucket, &key)?;
     check_upload(state, upload, &bucket, &key).await?;
     let (src_bucket, src_key, which) = copy_source(&headers)?;
+    let keys = copy_keys(state, &headers, &bucket).await?;
     // The copy runs in its own task: a client that disconnects drops this
     // handler, and the task still releases the lease it takes on the source.
     let task_state = S3State {
@@ -248,6 +389,7 @@ pub async fn upload_part_copy(
             number,
             (src_bucket, src_key, which),
             headers,
+            keys,
             bucket,
             key,
         )
@@ -255,7 +397,7 @@ pub async fn upload_part_copy(
     }))
     .await
     .map_err(|err| S3Error::internal(err.to_string()))??;
-    let (part, source_version) = part;
+    let (part, source_version, customer_key) = part;
     let etag: String = part.md5.iter().map(|b| format!("{b:02x}")).collect();
     let mut response = xml(format!(
         "<CopyPartResult xmlns=\"{XMLNS}\"><ETag>&quot;{etag}&quot;</ETag><LastModified>{}</LastModified></CopyPartResult>",
@@ -264,33 +406,55 @@ pub async fn upload_part_copy(
     if let Some(version) = source_version {
         add_header(&mut response, "x-amz-copy-source-version-id", version);
     }
-    crate::sse::add_header(&mut response, state.storage.is_encrypted());
+    crate::sse::add_header(
+        &mut response,
+        state.storage.is_encrypted() && customer_key.is_none(),
+    );
+    crate::ssec::add_echo(&mut response, customer_key.as_ref());
     Ok(response)
 }
 
 /// Stores part `number` of `upload` from the copy source: shared, or with its
-/// bytes copied under a lease released before returning. Returns the part and
-/// the source's `x-amz-copy-source-version-id`.
+/// bytes copied (decrypted and encrypted again as the keys say) under a lease
+/// released before returning. Returns the part, the source's
+/// `x-amz-copy-source-version-id` and the upload's customer-provided key.
+#[allow(clippy::too_many_arguments)]
 async fn copy_part(
     state: &S3State,
     upload: u64,
     number: u32,
     (src_bucket, src_key, which): (String, String, VersionSel),
     headers: HeaderMap,
+    (source_key, target_key): (Option<Arc<ProvidedKey>>, Option<Arc<ProvidedKey>>),
     bucket: String,
     key: String,
-) -> Result<(BodyInfo, Option<String>), S3Error> {
+) -> Result<
+    (
+        BodyInfo,
+        Option<String>,
+        Option<truthdb_object::CustomerKey>,
+    ),
+    S3Error,
+> {
     let (part_bucket, part_key) = (bucket.clone(), key.clone());
-    let (step, source_version) = object(state, move |file| {
-        // A part of an upload with a customer-provided key is encrypted with
-        // it: copying one in is not implemented yet.
-        if file.upload_attrs(upload)?.customer_key.is_some() {
-            return Ok(Err(S3Error::not_implemented(
-                "copying a part into an upload with a customer-provided key (SSE-C) is not \
-                 implemented",
-            )));
+    let (lookup_source_key, lookup_target_key) = (source_key.clone(), target_key.clone());
+    let (step, source_version, customer_key) = object(state, move |file| {
+        // The part is encrypted with the upload's key, which the request
+        // names (or none for an upload without).
+        let customer_key = file.upload_attrs(upload)?.customer_key;
+        if let Err(err) =
+            crate::ssec::check_read(customer_key.as_ref(), lookup_target_key.as_deref())
+        {
+            return Ok(Err(err));
         }
-        let source = match resolve_source(file, &src_bucket, &src_key, which, &headers)? {
+        let source = match resolve_source(
+            file,
+            &src_bucket,
+            &src_key,
+            which,
+            &headers,
+            lookup_source_key.as_deref(),
+        )? {
             Ok(source) => source,
             Err(err) => return Ok(Err(err)),
         };
@@ -306,23 +470,18 @@ async fn copy_part(
             },
             None => None,
         };
-        if span.is_none() && source.parts == 0 {
+        let plain = source.attrs.customer_key.is_none() && customer_key.is_none();
+        if span.is_none() && source.parts == 0 && plain {
             return Ok(file
                 .transaction(|tx| {
                     tx.upload_part_shared(upload, number, source.body, now_ms(), DROP_GRACE_MS)
                 })?
-                .map(|part| (PartSource::Shared(part), source_version))
+                .map(|part| (PartSource::Shared(part), source_version, customer_key))
                 .map_err(|err| upload_error(err, &part_bucket, &part_key)));
         }
         let (first, len) = span.unwrap_or((0, source.size));
         if len > MAX_PUT_BYTES {
-            return Ok(Err(S3Error::new(
-                400,
-                "InvalidRequest",
-                format!(
-                    "The specified copy source is larger than the maximum allowable size for a copy source: {MAX_PUT_BYTES}"
-                ),
-            )));
+            return Ok(Err(too_large_source()));
         }
         // The lease keeps the bytes while they are copied outside the lock.
         file.take_lease(source.body)?;
@@ -333,13 +492,15 @@ async fn copy_part(
                 len,
             },
             source_version,
+            customer_key,
         )))
     })
     .await??;
     let part = match step {
         PartSource::Shared(part) => part,
         PartSource::Leased { body, first, len } => {
-            let copied = copy_bytes(state, body, first, len).await;
+            let copied =
+                copy_into(state, body, first, len, source_key, target_key.as_deref()).await;
             // Unchecked: the lease goes even when the request's scope no
             // longer holds (a key dropped mid-copy), or the body stays pinned.
             let _ = state
@@ -359,54 +520,42 @@ async fn copy_part(
             .map_err(|err| upload_error(err, &bucket, &key))?
         }
     };
-    Ok((part, source_version))
+    Ok((part, source_version, customer_key))
 }
 
-/// Copies `len` bytes of the leased `body` from `first` into a new staging
-/// body, segment by segment, and returns it ready to seal. A body left behind
-/// by a failure stays staging and garbage collection reclaims it.
-async fn copy_bytes(
+/// Copies plaintext bytes `[first, first + len)` of the leased `body`
+/// (decrypted with `source_key` when it has one) into a new staging body
+/// (encrypted with `target_key` when given) and returns it ready to seal. A
+/// body left behind by a failure stays staging and garbage collection
+/// reclaims it.
+async fn copy_into(
     state: &S3State,
     body: u64,
     first: u64,
     len: u64,
+    source_key: Option<Arc<ProvidedKey>>,
+    target_key: Option<&ProvidedKey>,
 ) -> Result<SealedBody, S3Error> {
-    // The source as plain parts (one, or a multipart object's parts),
-    // resolved once: each read then goes straight to the part holding it.
     let layout = object(state, move |file| file.body_layout(body)).await?;
-    let now = now_ms();
-    let copy = object(state, move |file| file.begin_body(now)).await?;
-    let mut md5 = Md5::new();
-    let mut segment = Vec::with_capacity(SEGMENT_BYTES);
-    let (mut offset, end) = (first, first + len);
-    while offset < end {
-        let &(part, part_start, part_len) = layout
-            .iter()
-            .find(|(_, start, len)| offset >= *start && offset < start + len)
-            .ok_or_else(|| S3Error::internal(format!("offset {offset} is outside body {body}")))?;
-        let take = (end.min(part_start + part_len) - offset)
-            .min((SEGMENT_BYTES - segment.len()) as u64) as usize;
-        let at = offset - part_start;
-        let chunk = object(state, move |file| {
-            let mut out = vec![0u8; take];
-            file.read_body(part, at, &mut out)?;
-            Ok(out)
-        })
-        .await?;
-        md5.update(&chunk);
-        segment.extend_from_slice(&chunk);
-        offset += take as u64;
-        if segment.len() == SEGMENT_BYTES || offset == end {
-            let full = std::mem::replace(&mut segment, Vec::with_capacity(SEGMENT_BYTES));
-            let now = now_ms();
-            object(state, move |file| file.append_segment(copy, &full, now)).await?;
-        }
+    let (tx, mut rx) = mpsc::channel(4);
+    let engine = state.engine.clone();
+    let reader = tokio::spawn(async move {
+        crate::objects::stream_plaintext(&engine, &layout, source_key.as_deref(), first, len, &tx)
+            .await
+    });
+    let mut sink = BodySink::begin(state, target_key).await?;
+    while let Some(chunk) = rx.recv().await {
+        sink.push(state, &chunk).await?;
     }
-    Ok(SealedBody {
-        body: copy,
-        md5: md5.finalize().into(),
-        size: None,
-    })
+    let complete = reader
+        .await
+        .map_err(|err| S3Error::internal(err.to_string()))?;
+    if !complete || sink.pushed() != len {
+        return Err(S3Error::internal(format!(
+            "the copy source (body {body}) could not be read whole"
+        )));
+    }
+    Ok(sink.finish(state).await?.0)
 }
 
 #[cfg(test)]

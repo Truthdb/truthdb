@@ -4956,8 +4956,7 @@ fn customer_provided_keys_encrypt_objects_only_their_key_reads() {
         400
     );
 
-    // Copies: the source's key is required, and copying with keys comes
-    // later.
+    // A copy needs the source's key (see the copy test).
     let (_, (status, reply)) = call(
         "PUT",
         "/vault/c",
@@ -4966,11 +4965,6 @@ fn customer_provided_keys_encrypt_objects_only_their_key_reads() {
         b"",
     );
     assert_eq!(status, 400, "{reply}");
-    let copy_key = customer_headers("x-amz-copy-source-", right);
-    let mut extra = header_refs(&copy_key);
-    extra.push(("x-amz-copy-source", "/vault/o"));
-    let (_, (status, reply)) = call("PUT", "/vault/c", "", &extra, b"");
-    assert_eq!(status, 501, "{reply}");
 
     // A bucket blocking SSE-C refuses new writes with keys; what it holds
     // stays readable.
@@ -5262,4 +5256,155 @@ fn a_bucket_blocking_customer_keys_refuses_a_part_with_one() {
         b"part",
     );
     assert_eq!(status, 403, "{reply}");
+}
+
+#[test]
+fn copies_decrypt_and_encrypt_again_as_their_keys_say() {
+    let server = start_server_tls(false, true);
+    let (_, key, secret) = account_with_key(&server, "copier");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_tls(
+            &server,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    let (a, b) = ([0xa1u8; 32], [0xb2u8; 32]);
+    let target = |key: [u8; 32]| customer_headers("x-amz-", key);
+    let source = |key: [u8; 32]| customer_headers("x-amz-copy-source-", key);
+    // Several chunks, so the copies cross chunk boundaries.
+    let data: Vec<u8> = (0..200_000u32).map(|n| (n % 241) as u8).collect();
+    assert_eq!(call("PUT", "/copies", "", &[], b"").1.0, 200);
+    assert_eq!(
+        call("PUT", "/copies/o", "", &header_refs(&target(a)), &data)
+            .1
+            .0,
+        200
+    );
+    assert_eq!(call("PUT", "/copies/plain", "", &[], &data).1.0, 200);
+    let copy = |to: &str, from: &str, headers: &[Vec<(String, String)>]| {
+        let mut extra: Vec<(&str, &str)> = vec![("x-amz-copy-source", from)];
+        for set in headers {
+            extra.extend(header_refs(set));
+        }
+        call("PUT", to, "", &extra, b"")
+    };
+    let read = |path: &str, key: Option<[u8; 32]>| {
+        let headers = key.map(target).unwrap_or_default();
+        call("GET", path, "", &header_refs(&headers), b"").1
+    };
+    let whole = latin1(&data);
+
+    // Keyed to plain, plain to keyed, one key to another, the same key.
+    let (_, (status, reply)) = copy("/copies/c1", "/copies/o", &[source(a)]);
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(read("/copies/c1", None), (200, whole.clone()));
+    assert_eq!(read("/copies/c1", Some(a)).0, 400);
+    let (head, (status, _)) = copy("/copies/c2", "/copies/plain", &[target(b)]);
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, "x-amz-server-side-encryption-customer-key-MD5").as_deref(),
+        Some(target(b)[2].1.as_str())
+    );
+    assert_eq!(read("/copies/c2", Some(b)), (200, whole.clone()));
+    assert_eq!(read("/copies/c2", None).0, 400);
+    assert_eq!(
+        copy("/copies/c3", "/copies/o", &[source(a), target(b)]).1.0,
+        200
+    );
+    assert_eq!(read("/copies/c3", Some(b)), (200, whole.clone()));
+    assert_eq!(read("/copies/c3", Some(a)).0, 403);
+    assert_eq!(
+        copy("/copies/c4", "/copies/o", &[source(a), target(a)]).1.0,
+        200
+    );
+    assert_eq!(read("/copies/c4", Some(a)), (200, whole.clone()));
+    // The source's key: required, and the right one.
+    assert_eq!(copy("/copies/c5", "/copies/o", &[]).1.0, 400);
+    assert_eq!(copy("/copies/c5", "/copies/o", &[source(b)]).1.0, 403);
+    // A copy onto itself with another key rotates it; with the same, and
+    // nothing else changed, it is refused.
+    assert_eq!(
+        copy("/copies/o", "/copies/o", &[source(a), target(a)]).1.0,
+        400
+    );
+    assert_eq!(
+        copy("/copies/o", "/copies/o", &[source(a), target(b)]).1.0,
+        200
+    );
+    assert_eq!(read("/copies/o", Some(b)), (200, whole.clone()));
+    assert_eq!(read("/copies/o", Some(a)).0, 403);
+
+    // Parts copied into an upload with a key: ranges of a keyed and a plain
+    // source, each encrypted with the upload's key.
+    let (_, (_, created)) = call(
+        "POST",
+        "/copies/m",
+        "uploads",
+        &header_refs(&target(a)),
+        b"",
+    );
+    let upload = xml_value(&created, "UploadId");
+    let part = |number: u32, from: &str, range: &str, headers: &[Vec<(String, String)>]| {
+        let mut extra: Vec<(&str, &str)> = vec![
+            ("x-amz-copy-source", from),
+            ("x-amz-copy-source-range", range),
+        ];
+        for set in headers {
+            extra.extend(header_refs(set));
+        }
+        call(
+            "PUT",
+            "/copies/m",
+            &format!("uploadId={upload}&partNumber={number}"),
+            &extra,
+            b"",
+        )
+    };
+    let first_range = format!("bytes=0-{}", 5 * 1024 * 1024 - 1);
+    // A source long enough for a first part: the plain object, repeated.
+    let big: Vec<u8> = (0..5 * 1024 * 1024 + 10).map(|n| (n % 239) as u8).collect();
+    assert_eq!(
+        call("PUT", "/copies/big", "", &header_refs(&target(b)), &big)
+            .1
+            .0,
+        200
+    );
+    assert_eq!(
+        part(1, "/copies/big", &first_range, &[source(b)]).1.0,
+        400,
+        "without the upload's key"
+    );
+    let (head1, (status, reply1)) = part(1, "/copies/big", &first_range, &[source(b), target(a)]);
+    assert_eq!(status, 200, "{reply1}");
+    let (head2, (status, reply2)) = part(2, "/copies/plain", "bytes=65530-65545", &[target(a)]);
+    assert_eq!(status, 200, "{reply2}");
+    for head in [&head1, &head2] {
+        assert_eq!(
+            response_header(head, "x-amz-server-side-encryption-customer-algorithm").as_deref(),
+            Some("AES256")
+        );
+    }
+    let part_etag = |reply: &str| xml_value(reply, "ETag").replace("&quot;", "\"");
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        part_etag(&reply1),
+        part_etag(&reply2)
+    );
+    let (_, (status, reply)) = call(
+        "POST",
+        "/copies/m",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let expected = [&big[..5 * 1024 * 1024], &data[65530..65546]].concat();
+    assert_eq!(read("/copies/m", Some(a)), (200, latin1(&expected)));
 }

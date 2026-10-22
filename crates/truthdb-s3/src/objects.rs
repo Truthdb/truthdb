@@ -806,47 +806,10 @@ async fn read_object(
             return Err(err);
         }
     };
-    if let Some(customer) = customer {
-        tokio::spawn(async move {
-            stream_decrypted(&engine, &layout, &customer, first, len, &tx).await;
-            let _ = engine
-                .run_object(move |file| {
-                    file.release_lease(body);
-                    Ok(())
-                })
-                .await;
-        });
-        return Ok(builder
-            .body(ChannelBody(rx).boxed())
-            .expect("a valid response"));
-    }
     tokio::spawn(async move {
-        let mut offset = first;
-        let end = first + len;
-        while offset < end {
-            let Some(&(part, part_start, part_len)) = layout
-                .iter()
-                .find(|(_, start, len)| offset >= *start && offset < start + len)
-            else {
-                break;
-            };
-            let take = ((end.min(part_start + part_len) - offset) as usize).min(READ_CHUNK);
-            let at = offset - part_start;
-            let chunk = engine
-                .run_object(move |file| {
-                    let mut out = vec![0u8; take];
-                    file.read_body(part, at, &mut out)?;
-                    Ok(out)
-                })
-                .await;
-            // A failed read ends the body early: the client sees fewer bytes
-            // than Content-Length promised and fails the download.
-            let Ok(chunk) = chunk else { break };
-            if tx.send(Bytes::from(chunk)).await.is_err() {
-                break;
-            }
-            offset += take as u64;
-        }
+        // A failed read ends the body early: the client sees fewer bytes than
+        // Content-Length promised and fails the download.
+        stream_plaintext(&engine, &layout, customer.as_ref(), first, len, &tx).await;
         let _ = engine
             .run_object(move |file| {
                 file.release_lease(body);
@@ -859,11 +822,62 @@ async fn read_object(
         .expect("a valid response"))
 }
 
-/// Sends bytes `[first, first + len)` of an object whose parts are
-/// encrypted with `customer`: each read takes whole chunks of one part and
-/// decrypts them. A part that does not decrypt ends the body early, as a
-/// failed read does: the client sees fewer bytes than Content-Length
-/// promised.
+/// Sends the plaintext bytes `[first, first + len)` of a body laid out as
+/// `layout` (its parts encrypted with `customer`, if given) into `tx`, a
+/// read's worth at a time. Whether every byte was sent: a failed read, a
+/// part that does not decrypt, or a receiver gone ends it early.
+pub(crate) async fn stream_plaintext(
+    engine: &truthdb_engine::session::EngineHandle,
+    layout: &[(u64, u64, u64)],
+    customer: Option<&crate::ssec::ProvidedKey>,
+    first: u64,
+    len: u64,
+    tx: &mpsc::Sender<Bytes>,
+) -> bool {
+    match customer {
+        Some(customer) => stream_decrypted(engine, layout, customer, first, len, tx).await,
+        None => stream_plain(engine, layout, first, len, tx).await,
+    }
+}
+
+/// [`stream_plaintext`] of a body stored as it is.
+async fn stream_plain(
+    engine: &truthdb_engine::session::EngineHandle,
+    layout: &[(u64, u64, u64)],
+    first: u64,
+    len: u64,
+    tx: &mpsc::Sender<Bytes>,
+) -> bool {
+    let (mut offset, end) = (first, first + len);
+    while offset < end {
+        let Some(&(part, part_start, part_len)) = layout
+            .iter()
+            .find(|(_, start, len)| offset >= *start && offset < start + len)
+        else {
+            return false;
+        };
+        let take = ((end.min(part_start + part_len) - offset) as usize).min(READ_CHUNK);
+        let at = offset - part_start;
+        let chunk = engine
+            .run_object(move |file| {
+                let mut out = vec![0u8; take];
+                file.read_body(part, at, &mut out)?;
+                Ok(out)
+            })
+            .await;
+        let Ok(chunk) = chunk else {
+            return false;
+        };
+        if tx.send(Bytes::from(chunk)).await.is_err() {
+            return false;
+        }
+        offset += take as u64;
+    }
+    true
+}
+
+/// [`stream_plaintext`] of a body whose parts are encrypted with `customer`:
+/// each read takes whole chunks of one part and decrypts them.
 async fn stream_decrypted(
     engine: &truthdb_engine::session::EngineHandle,
     layout: &[(u64, u64, u64)],
@@ -871,7 +885,7 @@ async fn stream_decrypted(
     first: u64,
     len: u64,
     tx: &mpsc::Sender<Bytes>,
-) {
+) -> bool {
     use crate::ssec::{CHUNK, HEADER_LEN, chunk_at, plain_len};
     let chunk = CHUNK as u64;
     // The parts as plaintext: (body, start, length).
@@ -879,7 +893,7 @@ async fn stream_decrypted(
     let mut start = 0;
     for &(part, _, stored) in layout {
         let Some(plain) = plain_len(stored) else {
-            return;
+            return false;
         };
         parts.push((part, start, plain));
         start += plain;
@@ -891,7 +905,7 @@ async fn stream_decrypted(
             .iter()
             .find(|(_, start, len)| offset >= *start && offset < start + len)
         else {
-            return;
+            return false;
         };
         if current.as_ref().map(|(at, _)| *at) != Some(part) {
             let header = engine
@@ -902,12 +916,12 @@ async fn stream_decrypted(
                 })
                 .await;
             let Some(decryptor) = header.ok().and_then(|header| customer.decryptor(&header)) else {
-                return;
+                return false;
             };
             current = Some((part, decryptor));
         }
         let Some((_, decryptor)) = &current else {
-            return;
+            return false;
         };
         // Whole chunks, up to a read's worth, covering what is wanted next.
         let within = offset - start;
@@ -926,7 +940,7 @@ async fn stream_decrypted(
             })
             .await;
         let Ok(stored) = stored else {
-            return;
+            return false;
         };
         let mut plaintext = Vec::with_capacity((last_chunk + 1 - first_chunk) as usize * CHUNK);
         for index in first_chunk..=last_chunk {
@@ -935,7 +949,7 @@ async fn stream_decrypted(
             let Some(opened) =
                 decryptor.open(index, last, &stored[from..from + chunk_len as usize])
             else {
-                return;
+                return false;
             };
             plaintext.extend(opened);
         }
@@ -944,10 +958,11 @@ async fn stream_decrypted(
             [(within - first_chunk * chunk) as usize..(covered_end - first_chunk * chunk) as usize]
             .to_vec();
         if tx.send(Bytes::from(piece)).await.is_err() {
-            return;
+            return false;
         }
         offset = start + covered_end;
     }
+    true
 }
 
 #[cfg(test)]
