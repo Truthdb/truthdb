@@ -4987,3 +4987,59 @@ fn customer_provided_keys_need_tls() {
     assert_eq!(status, 400, "{reply}");
     assert!(reply.contains("secure connection"), "{reply}");
 }
+
+#[test]
+fn an_object_with_a_customer_provided_key_is_not_reported_aes256() {
+    // Encrypted at rest too: every other object says AES256.
+    let server = start_server_tls(true, true);
+    let (_, key, secret) = account_with_key(&server, "both");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_tls(
+            &server,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    const SSE: &str = "x-amz-server-side-encryption";
+    let customer = customer_headers("x-amz-", [9u8; 32]);
+    assert_eq!(call("PUT", "/both", "", &[], b"").1.0, 200);
+    let (head, _) = call("PUT", "/both/plain", "", &[], b"x");
+    assert_eq!(response_header(&head, SSE).as_deref(), Some("AES256"));
+    let (head, (status, _)) = call("PUT", "/both/o", "", &header_refs(&customer), b"x");
+    assert_eq!(status, 200);
+    assert_eq!(response_header(&head, SSE), None, "put");
+    let (head, (_, created)) = call("POST", "/both/m", "uploads", &header_refs(&customer), b"");
+    assert_eq!(response_header(&head, SSE), None, "create upload");
+    let upload = xml_value(&created, "UploadId");
+    let (head, (status, _)) = call(
+        "PUT",
+        "/both/m",
+        &format!("uploadId={upload}&partNumber=1"),
+        &header_refs(&customer),
+        b"only part",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(response_header(&head, SSE), None, "upload part");
+    let etag = response_header(&head, "etag").expect("etag");
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part>\
+         </CompleteMultipartUpload>"
+    );
+    let (head, (status, reply)) = call(
+        "POST",
+        "/both/m",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(response_header(&head, SSE), None, "complete");
+    let (head, (status, _)) = call("HEAD", "/both/m", "", &header_refs(&customer), b"");
+    assert_eq!(status, 200);
+    assert_eq!(response_header(&head, SSE), None, "head");
+}

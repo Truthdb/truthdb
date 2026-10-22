@@ -357,7 +357,12 @@ pub async fn complete_upload(
     if let Some(version) = version_header(versioning, info.version, info.null_version) {
         add_header(&mut response, "x-amz-version-id", version);
     }
-    crate::sse::add_header(&mut response, state.storage.is_encrypted());
+    // An object with a customer-provided key is not AES256 (and the key is
+    // not echoed here, as S3 does not).
+    crate::sse::add_header(
+        &mut response,
+        state.storage.is_encrypted() && info.attrs.customer_key.is_none(),
+    );
     Ok(response)
 }
 
