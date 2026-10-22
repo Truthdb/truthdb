@@ -333,8 +333,9 @@ impl ObjTxn<'_, '_> {
         Ok(())
     }
 
-    /// Removes the upload, its index entry, its attributes and its part rows,
-    /// returning the parts (their references not yet released).
+    /// Removes the upload, its index entry, its attributes, its requested
+    /// lock and its part rows, returning the parts (their references not yet
+    /// released).
     fn remove_upload(&mut self, info: &UploadInfo) -> Result<Vec<PartInfo>, StorageError> {
         let upload = info.upload;
         let (uploads, index, parts, attrs_tree) = (
@@ -367,6 +368,7 @@ impl ObjTxn<'_, '_> {
             &index_key(&info.bucket, &info.key, upload),
         )?;
         uploads.delete(self.ctx, &mut OpMode::Txn(self.txn), &upload.to_be_bytes())?;
+        self.take_upload_lock(upload)?;
         Ok(removed)
     }
 
@@ -428,6 +430,7 @@ impl ObjTxn<'_, '_> {
             return Ok(Err(UploadError::EntityTooLarge));
         }
         let attrs = self.upload_attrs(upload)?;
+        let lock = self.take_upload_lock(upload)?;
         let all = self.remove_upload(&info)?;
         for part in &all {
             // `chosen` is in ascending part order (checked above).
@@ -464,6 +467,7 @@ impl ObjTxn<'_, '_> {
             now_ms,
             grace_ms,
         )?;
+        self.set_lock(object.version, &lock)?;
         Ok(Ok(object))
     }
 }

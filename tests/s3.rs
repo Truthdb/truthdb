@@ -844,6 +844,14 @@ fn a_user_without_policies_is_refused_every_operation() {
         base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(delete_body))
     };
     let tagging = b"<Tagging><TagSet><Tag><Key>a</Key><Value>b</Value></Tag></TagSet></Tagging>";
+    // Well-formed lock documents: these are authorized once their body is
+    // read.
+    let retention = b"<Retention/>";
+    let retention_md5 = content_md5(retention);
+    let retention_headers = [("content-md5", retention_md5.as_str())];
+    let legal_hold = b"<LegalHold><Status>ON</Status></LegalHold>";
+    let legal_hold_md5 = content_md5(legal_hold);
+    let legal_hold_headers = [("content-md5", legal_hold_md5.as_str())];
     let upload_part = format!("uploadId={upload_id}&partNumber=1");
     let upload_query = format!("uploadId={upload_id}");
     // Method, path, query, body, extra headers.
@@ -888,6 +896,18 @@ fn a_user_without_policies_is_refused_every_operation() {
         ("GET", "/cov", "ownershipControls", b"", &[]),
         ("PUT", "/cov", "ownershipControls", b"", &[]),
         ("GET", "/cov", "uploads", b"", &[]),
+        ("GET", "/cov", "object-lock", b"", &[]),
+        ("PUT", "/cov", "object-lock", b"", &[]),
+        ("GET", "/cov/o", "retention", b"", &[]),
+        ("PUT", "/cov/o", "retention", retention, &retention_headers),
+        ("GET", "/cov/o", "legal-hold", b"", &[]),
+        (
+            "PUT",
+            "/cov/o",
+            "legal-hold",
+            legal_hold,
+            &legal_hold_headers,
+        ),
         ("PUT", "/cov/o", "", b"x", &[]),
         ("GET", "/cov/o", "", b"", &[]),
         ("HEAD", "/cov/o", "", b"", &[]),
@@ -2900,11 +2920,7 @@ fn listings_page_through_keys_and_common_prefixes() {
     }
     // A sub-resource that is not implemented is refused, not answered with
     // a listing or an object body.
-    for (path, query) in [
-        ("/lst", "website"),
-        ("/lst", "cors"),
-        ("/lst/a", "retention"),
-    ] {
+    for (path, query) in [("/lst", "website"), ("/lst", "cors"), ("/lst/a", "restore")] {
         let (status, body) = call("GET", path, query, b"");
         assert_eq!(status, 501, "{path}?{query}: {body}");
     }
@@ -3536,7 +3552,7 @@ fn versioned_buckets_keep_versions_markers_and_null_versions() {
 
     // Sub-resources that are not implemented are refused, not misrouted.
     assert_eq!(call("PUT", "/vers", "tagging", b"").1.0, 501);
-    assert_eq!(call("GET", "/vers/k", "legal-hold", b"").1.0, 501);
+    assert_eq!(call("GET", "/vers/k", "torrent", b"").1.0, 501);
 }
 
 #[test]
@@ -4683,6 +4699,14 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
         ("DELETE", "/subs/o", "uploadId=1&versioning"),
         ("PUT", "/subs/o", "annotation"),
         ("DELETE", "/subs/o", "annotation"),
+        ("DELETE", "/subs", "object-lock"),
+        ("GET", "/subs/o", "object-lock"),
+        ("DELETE", "/subs/o", "object-lock"),
+        ("PUT", "/subs", "retention"),
+        ("DELETE", "/subs/o", "retention"),
+        ("GET", "/subs", "legal-hold"),
+        ("DELETE", "/subs/o", "legal-hold"),
+        ("HEAD", "/subs/o", "retention"),
         ("PUT", "/new", "abac"),
         ("PUT", "/new", "metadataAnnotationTable"),
         ("PUT", "/new", "metadataInventoryTable"),
@@ -5473,4 +5497,896 @@ fn a_copy_whose_client_leaves_still_finishes_and_lets_its_source_go() {
     .1;
     assert_eq!(status, 200);
     assert!(body == latin1(&data), "the copy holds the source's bytes");
+}
+
+/// The time `secs` from now as an ISO 8601 date and time (a retain-until
+/// date).
+fn iso_in(secs: i64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let basic = sigv4_date((now + secs) as u64);
+    format!(
+        "{}-{}-{}T{}:{}:{}Z",
+        &basic[..4],
+        &basic[4..6],
+        &basic[6..8],
+        &basic[9..11],
+        &basic[11..13],
+        &basic[13..15]
+    )
+}
+
+fn content_md5(body: &[u8]) -> String {
+    use base64::Engine as _;
+    use md5::Digest;
+    base64::engine::general_purpose::STANDARD.encode(md5::Md5::digest(body))
+}
+
+#[test]
+fn object_lock_keeps_versions_its_retention_and_legal_hold_protect() {
+    const MODE: &str = "x-amz-object-lock-mode";
+    const UNTIL: &str = "x-amz-object-lock-retain-until-date";
+    const HOLD: &str = "x-amz-object-lock-legal-hold";
+    const BYPASS: &str = "x-amz-bypass-governance-retention";
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    // A document sent with its Content-MD5, as S3 requires for these.
+    let put_doc = |path: &str, query: &str, extra: &[(&str, &str)], body: &str| {
+        let md5 = content_md5(body.as_bytes());
+        let mut headers = extra.to_vec();
+        headers.push(("content-md5", &md5));
+        call("PUT", path, query, &headers, body.as_bytes()).1
+    };
+    let lock_config = |rule: &str| {
+        format!(
+            "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>{rule}\
+             </ObjectLockConfiguration>"
+        )
+    };
+    let retention = |mode: &str, until: &str| {
+        format!(
+            "<Retention><Mode>{mode}</Mode><RetainUntilDate>{until}</RetainUntilDate></Retention>"
+        )
+    };
+    let version_of = |head: &str| response_header(head, "x-amz-version-id").expect("a version");
+
+    // A bucket without Object Lock has no configuration, takes none while
+    // unversioned, and refuses lock headers.
+    assert_eq!(call("PUT", "/plain", "", &[], b"").1.0, 200);
+    let (status, reply) = call("GET", "/plain", "object-lock", &[], b"").1;
+    assert_eq!(status, 404, "{reply}");
+    assert!(
+        reply.contains("ObjectLockConfigurationNotFoundError"),
+        "{reply}"
+    );
+    let (status, reply) = put_doc("/plain", "object-lock", &[], &lock_config(""));
+    assert_eq!(status, 409, "{reply}");
+    assert!(reply.contains("InvalidBucketState"), "{reply}");
+    let (status, reply) = call("PUT", "/plain/o", "", &[(HOLD, "ON")], b"x").1;
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("InvalidRequest"), "{reply}");
+    assert_eq!(call("PUT", "/plain/o", "", &[], b"x").1.0, 200);
+    let (status, reply) = put_doc(
+        "/plain/o",
+        "legal-hold",
+        &[],
+        "<LegalHold><Status>ON</Status></LegalHold>",
+    );
+    assert_eq!(status, 400, "{reply}");
+
+    // Created with Object Lock: versioning is enabled, and stays so.
+    assert_eq!(
+        call(
+            "PUT",
+            "/locked",
+            "",
+            &[("x-amz-bucket-object-lock-enabled", "true")],
+            b""
+        )
+        .1
+        .0,
+        200
+    );
+    let (_, reply) = call("GET", "/locked", "versioning", &[], b"").1;
+    assert!(reply.contains("<Status>Enabled</Status>"), "{reply}");
+    let (status, reply) = call(
+        "PUT",
+        "/locked",
+        "versioning",
+        &[],
+        b"<VersioningConfiguration><Status>Suspended</Status></VersioningConfiguration>",
+    )
+    .1;
+    assert_eq!(status, 409, "{reply}");
+    let (status, reply) = call("GET", "/locked", "object-lock", &[], b"").1;
+    assert_eq!(status, 200, "{reply}");
+    assert!(
+        reply.contains("<ObjectLockEnabled>Enabled</ObjectLockEnabled>"),
+        "{reply}"
+    );
+    assert!(!reply.contains("<Rule>"), "{reply}");
+
+    // A default retention: the configuration needs its Content-MD5, and
+    // every write after it an integrity check of its body.
+    let governance_day = lock_config(
+        "<Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention></Rule>",
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/locked",
+            "object-lock",
+            &[],
+            governance_day.as_bytes()
+        )
+        .1
+        .0,
+        400
+    );
+    assert_eq!(
+        put_doc("/locked", "object-lock", &[], &governance_day).0,
+        200
+    );
+    let (_, reply) = call("GET", "/locked", "object-lock", &[], b"").1;
+    assert!(
+        reply.contains("<Mode>GOVERNANCE</Mode><Days>1</Days>"),
+        "{reply}"
+    );
+    let (status, reply) = call("PUT", "/locked/d", "", &[], b"data").1;
+    assert_eq!(status, 400, "{reply}");
+    let md5 = content_md5(b"data");
+    let (head, (status, _)) = call("PUT", "/locked/d", "", &[("content-md5", &md5)], b"data");
+    assert_eq!(status, 200);
+    let d = version_of(&head);
+    let (head, (status, _)) = call("HEAD", "/locked/d", "", &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(response_header(&head, MODE).as_deref(), Some("GOVERNANCE"));
+    assert!(response_header(&head, UNTIL).is_some(), "{head}");
+    assert_eq!(response_header(&head, HOLD), None, "no hold was ever set");
+    let (_, reply) = call("GET", "/locked/d", "retention", &[], b"").1;
+    assert!(reply.contains("<Mode>GOVERNANCE</Mode>"), "{reply}");
+
+    // Protected: the version stays; a delete marker may still hide it, and
+    // a GOVERNANCE retention gives way to a bypass.
+    let version = format!("versionId={d}");
+    let (status, reply) = call("DELETE", "/locked/d", &version, &[], b"").1;
+    assert_eq!(status, 403, "{reply}");
+    assert!(reply.contains("AccessDenied"), "{reply}");
+    let (head, (status, _)) = call("DELETE", "/locked/d", "", &[], b"");
+    assert_eq!(status, 204);
+    assert_eq!(
+        response_header(&head, "x-amz-delete-marker").as_deref(),
+        Some("true")
+    );
+    assert_eq!(
+        call("DELETE", "/locked/d", &version, &[(BYPASS, "true")], b"")
+            .1
+            .0,
+        204
+    );
+
+    // COMPLIANCE: extended only, never bypassed.
+    assert_eq!(
+        put_doc("/locked", "object-lock", &[], &lock_config("")).0,
+        200
+    );
+    let until = iso_in(3600);
+    let md5 = content_md5(b"kept");
+    let (status, reply) = call(
+        "PUT",
+        "/locked/c",
+        "",
+        &[(MODE, "COMPLIANCE"), (UNTIL, &until)],
+        b"kept",
+    )
+    .1;
+    assert_eq!(status, 400, "a retention needs an integrity check: {reply}");
+    let (head, (status, reply)) = call(
+        "PUT",
+        "/locked/c",
+        "",
+        &[(MODE, "COMPLIANCE"), (UNTIL, &until), ("content-md5", &md5)],
+        b"kept",
+    );
+    assert_eq!(status, 200, "{reply}");
+    let c = format!("versionId={}", version_of(&head));
+    assert_eq!(
+        call("DELETE", "/locked/c", &c, &[(BYPASS, "true")], b"")
+            .1
+            .0,
+        403
+    );
+    for (mode, until) in [("COMPLIANCE", iso_in(60)), ("GOVERNANCE", iso_in(7200))] {
+        let (status, reply) = put_doc(
+            "/locked/c",
+            &format!("retention&{c}"),
+            &[(BYPASS, "true")],
+            &retention(mode, &until),
+        );
+        assert_eq!(status, 403, "{mode} {until}: {reply}");
+    }
+    let (status, reply) = put_doc(
+        "/locked/c",
+        &format!("retention&{c}"),
+        &[],
+        &retention("COMPLIANCE", &iso_in(7200)),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (_, reply) = call("GET", "/locked/c", &format!("retention&{c}"), &[], b"").1;
+    assert!(reply.contains("<Mode>COMPLIANCE</Mode>"), "{reply}");
+    // An empty Retention removes nothing COMPLIANCE keeps.
+    let (status, _) = put_doc(
+        "/locked/c",
+        &format!("retention&{c}"),
+        &[(BYPASS, "true")],
+        "<Retention/>",
+    );
+    assert_eq!(status, 403);
+
+    // A legal hold protects whatever the retention, bypass or not.
+    let (head, (status, reply)) = call("PUT", "/locked/h", "", &[(HOLD, "ON")], b"held");
+    assert_eq!(
+        status, 200,
+        "a hold alone needs no integrity check: {reply}"
+    );
+    let h = format!("versionId={}", version_of(&head));
+    let (_, reply) = call("GET", "/locked/h", "legal-hold", &[], b"").1;
+    assert!(reply.contains("<Status>ON</Status>"), "{reply}");
+    let (status, reply) = call("GET", "/locked/h", "retention", &[], b"").1;
+    assert_eq!(status, 404, "{reply}");
+    assert!(reply.contains("NoSuchObjectLockConfiguration"), "{reply}");
+    assert_eq!(
+        call("DELETE", "/locked/h", &h, &[(BYPASS, "true")], b"")
+            .1
+            .0,
+        403
+    );
+    let batch = format!(
+        "<Delete><Object><Key>h</Key><VersionId>{}</VersionId></Object></Delete>",
+        &h["versionId=".len()..]
+    );
+    let (status, reply) = call(
+        "POST",
+        "/locked",
+        "delete",
+        &[
+            ("content-md5", &content_md5(batch.as_bytes())),
+            (BYPASS, "true"),
+        ],
+        batch.as_bytes(),
+    )
+    .1;
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply.contains("<Code>AccessDenied</Code>"), "{reply}");
+    let (status, reply) = put_doc(
+        "/locked/h",
+        &format!("legal-hold&{h}"),
+        &[],
+        "<LegalHold><Status>OFF</Status></LegalHold>",
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(call("DELETE", "/locked/h", &h, &[], b"").1.0, 204);
+
+    // Malformed requests.
+    for (query, body) in [
+        ("retention", retention("WORM", &iso_in(60))),
+        ("retention", retention("GOVERNANCE", &iso_in(-60))),
+        (
+            "legal-hold",
+            "<LegalHold><Status>on</Status></LegalHold>".to_string(),
+        ),
+    ] {
+        let (status, reply) = put_doc("/locked/c", query, &[], &body);
+        assert_eq!(status, 400, "{query} {body}: {reply}");
+    }
+    let (status, reply) = call("PUT", "/locked/x", "", &[(MODE, "GOVERNANCE")], b"x").1;
+    assert_eq!(status, 400, "a mode needs its date: {reply}");
+    drop(server);
+}
+
+#[test]
+fn object_lock_follows_policies_and_reaches_uploads_and_forms() {
+    use serde_json::json;
+    const MODE: &str = "x-amz-object-lock-mode";
+    const UNTIL: &str = "x-amz-object-lock-retain-until-date";
+    const HOLD: &str = "x-amz-object-lock-legal-hold";
+    const BYPASS: &str = "x-amz-bypass-governance-retention";
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, root_key, root_secret) = account_with_key(&server, "lockers");
+    let root = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &root_key,
+            Some(&root_secret),
+        )
+    };
+    assert_eq!(
+        root(
+            "PUT",
+            "/vault",
+            "",
+            &[("x-amz-bucket-object-lock-enabled", "true")],
+            b""
+        )
+        .1
+        .0,
+        200
+    );
+    // A user who may do anything but bypass GOVERNANCE retention, or keep
+    // an object more than ten days.
+    let policy = json!({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "s3:BypassGovernanceRetention", "Resource": "*"},
+        {"Effect": "Deny", "Action": ["s3:PutObject", "s3:PutObjectRetention"], "Resource": "*",
+         "Condition": {"NumericGreaterThan": {"s3:object-lock-remaining-retention-days": "10"}}}
+    ]})
+    .to_string();
+    let (user_key, user_secret) = user_with_key(&server, &account, "clerk", Some(&policy));
+    let user = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &user_key,
+            Some(&user_secret),
+        )
+    };
+    // A reader who may read objects but not their locks.
+    let reader_policy = json!({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "*"}
+    ]})
+    .to_string();
+    let (reader_key, reader_secret) =
+        user_with_key(&server, &account, "reader", Some(&reader_policy));
+
+    let md5 = content_md5(b"x");
+    let in_days = |days: i64| iso_in(days * 86_400);
+    let (status, reply) = user(
+        "PUT",
+        "/vault/long",
+        "",
+        &[
+            (MODE, "GOVERNANCE"),
+            (UNTIL, &in_days(30)),
+            ("content-md5", &md5),
+        ],
+        b"x",
+    )
+    .1;
+    assert_eq!(status, 403, "thirty days is past the policy's ten: {reply}");
+    let (head, (status, reply)) = user(
+        "PUT",
+        "/vault/g",
+        "",
+        &[
+            (MODE, "GOVERNANCE"),
+            (UNTIL, &in_days(5)),
+            ("content-md5", &md5),
+        ],
+        b"x",
+    );
+    assert_eq!(status, 200, "{reply}");
+    let version = format!(
+        "versionId={}",
+        response_header(&head, "x-amz-version-id").unwrap()
+    );
+    let retention = |days: i64| {
+        format!(
+            "<Retention><Mode>GOVERNANCE</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>",
+            in_days(days)
+        )
+    };
+    let put_retention = |as_user: bool, days: i64| {
+        let body = retention(days);
+        let md5 = content_md5(body.as_bytes());
+        let extra = [("content-md5", md5.as_str())];
+        let query = format!("retention&{version}");
+        if as_user {
+            user("PUT", "/vault/g", &query, &extra, body.as_bytes()).1
+        } else {
+            root("PUT", "/vault/g", &query, &extra, body.as_bytes()).1
+        }
+    };
+    assert_eq!(
+        put_retention(true, 30).0,
+        403,
+        "the body's retention is checked"
+    );
+    assert_eq!(put_retention(true, 8).0, 200);
+    // The user's bypass is denied: the version stays. The root's is not.
+    assert_eq!(
+        user("DELETE", "/vault/g", &version, &[(BYPASS, "true")], b"")
+            .1
+            .0,
+        403
+    );
+    // The reader sees the object, not its lock.
+    let (head, (status, _)) = send_with(
+        port,
+        "HEAD",
+        "/vault/g",
+        "",
+        &[],
+        b"",
+        &reader_key,
+        Some(&reader_secret),
+    );
+    assert_eq!(status, 200);
+    assert_eq!(response_header(&head, MODE), None, "{head}");
+    assert_eq!(response_header(&head, UNTIL), None, "{head}");
+    let (head, _) = user("HEAD", "/vault/g", "", &[], b"");
+    assert_eq!(response_header(&head, MODE).as_deref(), Some("GOVERNANCE"));
+    assert_eq!(
+        root("DELETE", "/vault/g", &version, &[(BYPASS, "true")], b"")
+            .1
+            .0,
+        204
+    );
+
+    // A multipart upload's lock is the object's when it completes.
+    let (_, (status, reply)) = root("POST", "/vault/mp", "uploads", &[(HOLD, "ON")], b"");
+    assert_eq!(status, 200, "{reply}");
+    let upload = reply
+        .split("<UploadId>")
+        .nth(1)
+        .and_then(|rest| rest.split("</UploadId>").next())
+        .unwrap()
+        .to_string();
+    let (head, (status, _)) = root(
+        "PUT",
+        "/vault/mp",
+        &format!("partNumber=1&uploadId={upload}"),
+        &[],
+        b"part",
+    );
+    assert_eq!(status, 200);
+    let etag = response_header(&head, "etag").unwrap();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (_, (status, reply)) = root(
+        "POST",
+        "/vault/mp",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (_, reply) = root("GET", "/vault/mp", "legal-hold", &[], b"").1;
+    assert!(reply.contains("<Status>ON</Status>"), "{reply}");
+    // A bucket without Object Lock refuses an upload asking for one.
+    assert_eq!(root("PUT", "/open", "", &[], b"").1.0, 200);
+    assert_eq!(
+        root("POST", "/open/mp", "uploads", &[(HOLD, "ON")], b"")
+            .1
+            .0,
+        400
+    );
+
+    // A form upload asks in its fields.
+    let later = "2099-01-01T00:00:00.000Z";
+    let form = signed_form(
+        &root_key,
+        &root_secret,
+        later,
+        &[
+            json!({"bucket": "vault"}),
+            json!({"key": "form"}),
+            json!({HOLD: "ON"}),
+        ],
+        &[("key", "form"), (HOLD, "ON")],
+    );
+    let (_, (status, reply)) = post_form(port, "vault", &form, "f.txt", b"form", 4);
+    assert_eq!(status, 204, "{reply}");
+    let (_, reply) = root("GET", "/vault/form", "legal-hold", &[], b"").1;
+    assert!(reply.contains("<Status>ON</Status>"), "{reply}");
+    let form = signed_form(
+        &root_key,
+        &root_secret,
+        later,
+        &[
+            json!({"bucket": "open"}),
+            json!({"key": "form"}),
+            json!({HOLD: "ON"}),
+        ],
+        &[("key", "form"), (HOLD, "ON")],
+    );
+    let (_, (status, reply)) = post_form(port, "open", &form, "f.txt", b"form", 4);
+    assert_eq!(status, 400, "{reply}");
+    assert_eq!(root("GET", "/open/form", "", &[], b"").1.0, 404);
+}
+
+#[test]
+fn a_copy_takes_the_lock_it_asks_for_or_its_buckets_default_not_its_sources() {
+    const HOLD: &str = "x-amz-object-lock-legal-hold";
+    let server = start_server_tls(false, true);
+    let (_, key, secret) = account_with_key(&server, "copylock");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_tls(
+            &server,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+        .1
+    };
+    let lock_enabled = [("x-amz-bucket-object-lock-enabled", "true")];
+    assert_eq!(call("PUT", "/clock", "", &lock_enabled, b"").0, 200);
+    let customer = customer_headers("x-amz-", [0x77u8; 32]);
+    let mut keyed = header_refs(&customer);
+    keyed.push((HOLD, "ON"));
+    assert_eq!(call("PUT", "/clock/held", "", &keyed, b"secret").0, 200);
+    assert_eq!(
+        call("PUT", "/clock/plain", "", &[(HOLD, "ON")], b"open").0,
+        200
+    );
+    let hold_of = |path: &str| call("GET", path, "legal-hold", &[], b"");
+    // A copy does not inherit its source's lock, on either path: the body
+    // shared (plain to plain) or streamed (keyed to plain).
+    let source_key = customer_headers("x-amz-copy-source-", [0x77u8; 32]);
+    let mut streamed = header_refs(&source_key);
+    streamed.push(("x-amz-copy-source", "/clock/held"));
+    assert_eq!(call("PUT", "/clock/streamed", "", &streamed, b"").0, 200);
+    assert_eq!(
+        call(
+            "PUT",
+            "/clock/shared",
+            "",
+            &[("x-amz-copy-source", "/clock/plain")],
+            b""
+        )
+        .0,
+        200
+    );
+    for path in ["/clock/streamed", "/clock/shared"] {
+        assert_eq!(hold_of(path).0, 404, "{path}");
+    }
+    // It takes the one its headers ask for, on either path.
+    streamed.push((HOLD, "ON"));
+    assert_eq!(call("PUT", "/clock/streamed2", "", &streamed, b"").0, 200);
+    assert_eq!(
+        call(
+            "PUT",
+            "/clock/shared2",
+            "",
+            &[("x-amz-copy-source", "/clock/plain"), (HOLD, "ON")],
+            b""
+        )
+        .0,
+        200
+    );
+    for path in ["/clock/streamed2", "/clock/shared2"] {
+        let (status, reply) = hold_of(path);
+        assert_eq!(status, 200, "{path}: {reply}");
+        assert!(reply.contains("<Status>ON</Status>"), "{path}: {reply}");
+    }
+    // Or the bucket's default retention.
+    let config = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                  <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days>\
+                  </DefaultRetention></Rule></ObjectLockConfiguration>";
+    let md5 = content_md5(config.as_bytes());
+    assert_eq!(
+        call(
+            "PUT",
+            "/clock",
+            "object-lock",
+            &[("content-md5", &md5)],
+            config.as_bytes()
+        )
+        .0,
+        200
+    );
+    streamed.pop();
+    assert_eq!(call("PUT", "/clock/streamed3", "", &streamed, b"").0, 200);
+    assert_eq!(
+        call(
+            "PUT",
+            "/clock/shared3",
+            "",
+            &[("x-amz-copy-source", "/clock/plain")],
+            b""
+        )
+        .0,
+        200
+    );
+    for path in ["/clock/streamed3", "/clock/shared3"] {
+        let (status, reply) = call("GET", path, "retention", &[], b"");
+        assert_eq!(status, 200, "{path}: {reply}");
+        assert!(reply.contains("<Mode>GOVERNANCE</Mode>"), "{path}: {reply}");
+    }
+    // A bucket without Object Lock refuses a copy asking for one.
+    assert_eq!(call("PUT", "/cplain", "", &[], b"").0, 200);
+    let (status, reply) = call(
+        "PUT",
+        "/cplain/c",
+        "",
+        &[("x-amz-copy-source", "/clock/plain"), (HOLD, "ON")],
+        b"",
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert_eq!(call("GET", "/cplain/c", "", &[], b"").0, 404);
+}
+
+#[test]
+fn a_retention_change_is_judged_by_its_body_not_by_lock_headers() {
+    use serde_json::json;
+    const MODE: &str = "x-amz-object-lock-mode";
+    const UNTIL: &str = "x-amz-object-lock-retain-until-date";
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, root_key, root_secret) = account_with_key(&server, "judged");
+    let root = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &root_key,
+            Some(&root_secret),
+        )
+    };
+    assert_eq!(
+        root(
+            "PUT",
+            "/judged",
+            "",
+            &[("x-amz-bucket-object-lock-enabled", "true")],
+            b""
+        )
+        .1
+        .0,
+        200
+    );
+    let md5 = content_md5(b"x");
+    let (head, (status, _)) = root(
+        "PUT",
+        "/judged/k",
+        "",
+        &[
+            (MODE, "GOVERNANCE"),
+            (UNTIL, &iso_in(86_400)),
+            ("content-md5", &md5),
+        ],
+        b"x",
+    );
+    assert_eq!(status, 200);
+    let query = format!(
+        "retention&versionId={}",
+        response_header(&head, "x-amz-version-id").unwrap()
+    );
+    // May set or extend a retention, and bypass, but never remove one.
+    let keeper = json!({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:*", "Resource": "*"},
+        {"Effect": "Deny", "Action": "s3:PutObjectRetention", "Resource": "*",
+         "Condition": {"Null": {"s3:object-lock-mode": "true"}}}
+    ]})
+    .to_string();
+    let (key, secret) = user_with_key(&server, &account, "keeper", Some(&keeper));
+    let remove = |extra: &[(&str, &str)]| {
+        let body = b"<Retention/>";
+        let md5 = content_md5(body);
+        let mut headers = vec![
+            ("content-md5", md5.as_str()),
+            ("x-amz-bypass-governance-retention", "true"),
+        ];
+        headers.extend_from_slice(extra);
+        send_with(
+            port,
+            "PUT",
+            "/judged/k",
+            &query,
+            &headers,
+            body,
+            &key,
+            Some(&secret),
+        )
+        .1
+    };
+    assert_eq!(remove(&[]).0, 403);
+    let until = iso_in(86_400);
+    assert_eq!(
+        remove(&[(MODE, "GOVERNANCE"), (UNTIL, &until)]).0,
+        403,
+        "lock headers do not stand in for the body"
+    );
+    let (_, reply) = root("GET", "/judged/k", &query, &[], b"").1;
+    assert!(reply.contains("<Mode>GOVERNANCE</Mode>"), "{reply}");
+    // A policy allowing only GOVERNANCE retentions sees the body's mode.
+    let governance_only = json!({"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": "s3:PutObjectRetention", "Resource": "*",
+         "Condition": {"StringEquals": {"s3:object-lock-mode": "GOVERNANCE"}}}
+    ]})
+    .to_string();
+    let (key, secret) = user_with_key(&server, &account, "extender", Some(&governance_only));
+    let extend = |mode: &str| {
+        let body = format!(
+            "<Retention><Mode>{mode}</Mode><RetainUntilDate>{}</RetainUntilDate></Retention>",
+            iso_in(2 * 86_400)
+        );
+        let md5 = content_md5(body.as_bytes());
+        send_with(
+            port,
+            "PUT",
+            "/judged/k",
+            &query,
+            &[("content-md5", &md5)],
+            body.as_bytes(),
+            &key,
+            Some(&secret),
+        )
+        .1
+    };
+    assert_eq!(extend("COMPLIANCE").0, 403);
+    let (status, reply) = extend("GOVERNANCE");
+    assert_eq!(status, 200, "{reply}");
+}
+
+#[test]
+fn a_write_decides_its_lock_when_it_is_stored() {
+    const HOLD: &str = "x-amz-object-lock-legal-hold";
+    let server = start_server_tls(false, true);
+    let (_, key, secret) = account_with_key(&server, "decider");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_tls(
+            &server,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+        .1
+    };
+    let lock_enabled = [("x-amz-bucket-object-lock-enabled", "true")];
+    // Plain HTTP: the request is sent in two pieces.
+    let plain = start_server();
+    let (_, plain_key, plain_secret) = account_with_key(&plain, "decider");
+    let plain_call = |method: &str, path: &str, extra: &[(&str, &str)]| {
+        send_with(
+            plain.s3_port,
+            method,
+            path,
+            "",
+            extra,
+            b"",
+            &plain_key,
+            Some(&plain_secret),
+        )
+        .1
+    };
+    // The bucket is made again without Object Lock while a PUT asking for a
+    // legal hold sends its body: the PUT is refused, not stored unlocked.
+    assert_eq!(plain_call("PUT", "/racy", &lock_enabled).0, 200);
+    let (_, (status, reply)) = send_paused(
+        plain.s3_port,
+        "PUT",
+        "/racy/k",
+        "",
+        &[(HOLD, "ON")],
+        b"0123456789",
+        &plain_key,
+        Some(&plain_secret),
+        5,
+        || {
+            assert_eq!(
+                send(
+                    plain.s3_port,
+                    "DELETE",
+                    "/racy",
+                    "",
+                    b"",
+                    &plain_key,
+                    Some(&plain_secret)
+                )
+                .0,
+                204
+            );
+            assert_eq!(
+                send(
+                    plain.s3_port,
+                    "PUT",
+                    "/racy",
+                    "",
+                    b"",
+                    &plain_key,
+                    Some(&plain_secret)
+                )
+                .0,
+                200
+            );
+        },
+    );
+    assert_eq!(status, 403, "the request's bucket is gone: {reply}");
+    assert_eq!(plain_call("GET", "/racy/k", &[]).0, 404);
+    // A default retention set while a PUT without an integrity check sends
+    // its body applies to it, so the PUT is refused as if sent after it.
+    assert_eq!(plain_call("PUT", "/late", &lock_enabled).0, 200);
+    let (_, (status, reply)) = send_paused(
+        plain.s3_port,
+        "PUT",
+        "/late/k",
+        "",
+        &[],
+        b"0123456789",
+        &plain_key,
+        Some(&plain_secret),
+        5,
+        || {
+            let config = b"<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days></DefaultRetention>\
+                </Rule></ObjectLockConfiguration>";
+            let md5 = content_md5(config);
+            let (_, (status, reply)) = send_with(
+                plain.s3_port,
+                "PUT",
+                "/late",
+                "object-lock",
+                &[("content-md5", &md5)],
+                config,
+                &plain_key,
+                Some(&plain_secret),
+            );
+            assert_eq!(status, 200, "{reply}");
+        },
+    );
+    assert_eq!(status, 400, "{reply}");
+    assert_eq!(plain_call("GET", "/late/k", &[]).0, 404);
+
+    // A default retention set while a streamed copy runs is the copy's.
+    assert_eq!(call("PUT", "/later", "", &lock_enabled, b"").0, 200);
+    let customer = customer_headers("x-amz-", [0x3cu8; 32]);
+    let data: Vec<u8> = (0..48u32 << 20).map(|n| (n % 251) as u8).collect();
+    assert_eq!(
+        call("PUT", "/later/src", "", &header_refs(&customer), &data).0,
+        200
+    );
+    let mut copy_headers = vec![("x-amz-copy-source".to_string(), "/later/src".to_string())];
+    copy_headers.extend(customer_headers("x-amz-copy-source-", [0x3cu8; 32]));
+    let copier = std::thread::scope(|scope| {
+        let copier =
+            scope.spawn(|| call("PUT", "/later/dst", "", &header_refs(&copy_headers), b""));
+        std::thread::sleep(Duration::from_millis(300));
+        let config = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                      <Rule><DefaultRetention><Mode>GOVERNANCE</Mode><Days>1</Days>\
+                      </DefaultRetention></Rule></ObjectLockConfiguration>";
+        let md5 = content_md5(config.as_bytes());
+        assert_eq!(
+            call(
+                "PUT",
+                "/later",
+                "object-lock",
+                &[("content-md5", &md5)],
+                config.as_bytes()
+            )
+            .0,
+            200
+        );
+        copier.join().unwrap()
+    });
+    assert_eq!(copier.0, 200, "{}", copier.1);
+    let (status, reply) = call("GET", "/later/dst", "retention", &[], b"");
+    assert_eq!(status, 200, "{reply}");
+    assert!(reply.contains("<Mode>GOVERNANCE</Mode>"), "{reply}");
 }

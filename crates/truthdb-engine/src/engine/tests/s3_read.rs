@@ -48,7 +48,7 @@ fn assert_collectable(engine: &Engine, bucket: &str, key: &str) {
         .expect("exists")
         .body;
     engine
-        .object(|file| file.transaction(|tx| tx.delete_object(bucket, key, None, 3_000, 0)))
+        .object(|file| file.transaction(|tx| tx.delete_object(bucket, key, None, false, 3_000, 0)))
         .expect("delete")
         .expect("delete accepted");
     engine.object_gc().expect("collect");

@@ -207,6 +207,10 @@ pub enum ObjectError {
     /// The version named is a delete marker, which the operation cannot act on.
     DeleteMarker,
     InvalidKey(&'static str),
+    /// Object Lock protects the version (its retention or legal hold).
+    Locked,
+    /// The operation needs Object Lock, which the bucket does not have.
+    ObjectLockNotEnabled,
 }
 
 pub fn validate_key(key: &str) -> Result<(), ObjectError> {
@@ -374,6 +378,28 @@ impl ObjTxn<'_, '_> {
         .map(|(_, version, _)| version))
     }
 
+    /// The version `which` picks, unless it is missing or a delete marker:
+    /// its number and whether it is the null version.
+    pub(crate) fn find_live(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        which: VersionSel,
+    ) -> Result<Result<(u64, bool), ObjectError>, StorageError> {
+        let found = find_version(self.ctx, &self.trees.objects(), bucket, key, which)?;
+        Ok(match found {
+            None => Err(match which {
+                VersionSel::Latest => ObjectError::NoSuchKey,
+                _ => ObjectError::NoSuchVersion,
+            }),
+            Some((_, _, row)) if row.flags & FLAG_DELETE_MARKER != 0 => Err(match which {
+                VersionSel::Latest => ObjectError::NoSuchKey,
+                _ => ObjectError::DeleteMarker,
+            }),
+            Some((_, version, row)) => Ok((version, row.flags & FLAG_NULL_VERSION != 0)),
+        })
+    }
+
     pub(crate) fn bucket_row(&mut self, bucket: &str) -> Result<Option<BucketRow>, StorageError> {
         self.trees
             .buckets()
@@ -474,7 +500,13 @@ impl ObjTxn<'_, '_> {
         let null_version = versioning != Versioning::Enabled;
         if null_version {
             // Replaced in place: the journal records the new version only.
-            self.remove_null_version(bucket, key, false, now_ms, grace_ms)?;
+            // A bucket with Object Lock keeps versioning enabled, so no
+            // locked version is replaced here.
+            if let Err(err) = self.remove_null_version(bucket, key, false, now_ms, grace_ms)? {
+                return Err(StorageError::InvalidFile(format!(
+                    "a write would replace a protected null version: {err:?}"
+                )));
+            }
         }
         let version = next_counter(self, NEXT_VERSION_KEY)?;
         let has_attrs = !attrs.is_empty();
@@ -626,10 +658,12 @@ impl ObjTxn<'_, '_> {
     }
 
     /// Removes the key's versions that `wanted` picks: each row, its
-    /// attributes and its body's reference. Returns the removed versions'
-    /// numbers. With `only`, reads that version's row alone instead of every
-    /// version of the key. With `journal`, each removal is recorded as a
-    /// permanent delete.
+    /// attributes, its lock and its body's reference. Returns the removed
+    /// versions' numbers, or `Locked` (removing nothing) when Object Lock
+    /// protects one of them; `bypass` lifts GOVERNANCE retention. With
+    /// `only`, reads that version's row alone instead of every version of
+    /// the key. With `journal`, each removal is recorded as a permanent
+    /// delete.
     #[allow(clippy::too_many_arguments)]
     fn remove_versions(
         &mut self,
@@ -637,10 +671,11 @@ impl ObjTxn<'_, '_> {
         key: &str,
         only: Option<u64>,
         journal: bool,
+        bypass: bool,
         now_ms: u64,
         grace_ms: u64,
         mut wanted: impl FnMut(u64, &VersionRow) -> bool,
-    ) -> Result<Vec<u64>, StorageError> {
+    ) -> Result<Result<Vec<u64>, ObjectError>, StorageError> {
         let objects = self.trees.objects();
         let (lower, upper) = match only {
             Some(version) => {
@@ -654,14 +689,25 @@ impl ObjTxn<'_, '_> {
                 (prefix, upper)
             }
         };
-        let mut removed = Vec::new();
+        let mut chosen = Vec::new();
         for (row_key, row) in objects.scan_range(self.ctx, Some(&lower), Some(&upper))? {
             let row = VersionRow::decode(&row)?;
             let version = version_from_key(&row_key)?;
             if !wanted(version, &row) {
                 continue;
             }
+            // A delete marker has no lock.
+            if row.flags & FLAG_DELETE_MARKER == 0
+                && self.lock_of(version)?.blocks_delete(now_ms, bypass)
+            {
+                return Ok(Err(ObjectError::Locked));
+            }
+            chosen.push((row_key, version, row));
+        }
+        let mut removed = Vec::new();
+        for (row_key, version, row) in chosen {
             objects.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
+            self.set_lock(version, &crate::ObjectLock::default())?;
             if row.flags & FLAG_HAS_ATTRS != 0 {
                 self.remove_attrs(version)?;
             }
@@ -684,11 +730,12 @@ impl ObjTxn<'_, '_> {
             }
             removed.push(version);
         }
-        Ok(removed)
+        Ok(Ok(removed))
     }
 
-    /// Removes the key's null version, if any, recording it in the journal
-    /// when `journal` (not when a new null version or marker replaces it).
+    /// Removes the key's null version, if any (unless Object Lock protects
+    /// it), recording it in the journal when `journal` (not when a new null
+    /// version or marker replaces it).
     fn remove_null_version(
         &mut self,
         bucket: &str,
@@ -696,11 +743,19 @@ impl ObjTxn<'_, '_> {
         journal: bool,
         now_ms: u64,
         grace_ms: u64,
-    ) -> Result<(), StorageError> {
-        self.remove_versions(bucket, key, None, journal, now_ms, grace_ms, |_, row| {
-            row.flags & FLAG_NULL_VERSION != 0
-        })?;
-        Ok(())
+    ) -> Result<Result<(), ObjectError>, StorageError> {
+        Ok(self
+            .remove_versions(
+                bucket,
+                key,
+                None,
+                journal,
+                false,
+                now_ms,
+                grace_ms,
+                |_, row| row.flags & FLAG_NULL_VERSION != 0,
+            )?
+            .map(|_| ()))
     }
 
     /// Adds a delete marker as the key's newest version.
@@ -751,12 +806,14 @@ impl ObjTxn<'_, '_> {
     /// for good. Without one: an unversioned bucket removes the key; a
     /// versioned bucket adds a delete marker; a suspended bucket replaces the
     /// null version with a null delete marker. Deleting what is not there
-    /// succeeds, as in S3.
+    /// succeeds, as in S3. A version Object Lock protects is not removed
+    /// (`Locked`); `bypass` lifts GOVERNANCE retention.
     pub fn delete_object(
         &mut self,
         bucket: &str,
         key: &str,
         which: Option<VersionSel>,
+        bypass: bool,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<Result<Deleted, ObjectError>, StorageError> {
@@ -769,7 +826,11 @@ impl ObjTxn<'_, '_> {
         Ok(Ok(match which {
             Some(VersionSel::Latest) | None => match bucket_row.versioning {
                 Versioning::Unversioned => {
-                    self.remove_null_version(bucket, key, true, now_ms, grace_ms)?;
+                    if let Err(err) =
+                        self.remove_null_version(bucket, key, true, now_ms, grace_ms)?
+                    {
+                        return Ok(Err(err));
+                    }
                     Deleted::default()
                 }
                 Versioning::Enabled => Deleted {
@@ -779,7 +840,11 @@ impl ObjTxn<'_, '_> {
                 },
                 Versioning::Suspended => {
                     // Replaced by a null marker, which the journal records.
-                    self.remove_null_version(bucket, key, false, now_ms, grace_ms)?;
+                    if let Err(err) =
+                        self.remove_null_version(bucket, key, false, now_ms, grace_ms)?
+                    {
+                        return Ok(Err(err));
+                    }
                     Deleted {
                         version: Some(self.add_delete_marker(bucket, key, true, now_ms)?),
                         null_version: true,
@@ -793,11 +858,12 @@ impl ObjTxn<'_, '_> {
                     _ => None,
                 };
                 let mut marker = false;
-                let removed = self.remove_versions(
+                let removed = match self.remove_versions(
                     bucket,
                     key,
                     only,
                     true,
+                    bypass,
                     now_ms,
                     grace_ms,
                     |version, row| {
@@ -811,7 +877,10 @@ impl ObjTxn<'_, '_> {
                         }
                         hit
                     },
-                )?;
+                )? {
+                    Ok(removed) => removed,
+                    Err(err) => return Ok(Err(err)),
+                };
                 Deleted {
                     version: removed.first().copied(),
                     null_version: sel == VersionSel::Null,

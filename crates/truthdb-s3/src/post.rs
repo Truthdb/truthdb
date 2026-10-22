@@ -528,6 +528,10 @@ pub async fn post_object(
     if customer.is_some() {
         headers.insert(crate::ssec::ALGORITHM, HeaderValue::from_static("AES256"));
     }
+    // The Object Lock it asks for, which policies see in the lock's
+    // condition keys.
+    let lock =
+        crate::object_lock::requested(|name| field(&fields, name), crate::objects::now_ms())?;
     let tags = match field(&fields, "tagging") {
         Some(xml) => Some(crate::tagging::parse_tagging(xml.as_bytes())?),
         None => None,
@@ -554,7 +558,11 @@ pub async fn post_object(
         "s3:PutObject",
         Resource::Object(&bucket, &key),
         tags.as_deref(),
+        lock.as_ref(),
     )?;
+    if let Some(lock) = &lock {
+        crate::object_lock::authorize(&authz, Resource::Object(&bucket, &key), lock)?;
+    }
     let scope = crate::scope::Scope {
         key: principal
             .as_ref()
@@ -573,10 +581,11 @@ pub async fn post_object(
         let (min, max) = bounds;
         // Fail before reading the file when the bucket or key is wrong.
         let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-        let (check, blocked) = object(state, move |file| {
+        let (check, blocked, (bucket_lock, _)) = object(state, move |file| {
             Ok((
                 file.head_object(&lookup_bucket, &lookup_key, VersionSel::Latest)?,
                 crate::sse::sse_c_blocked(file, &lookup_bucket)?,
+                crate::object_lock::bucket_state(file, &lookup_bucket)?,
             ))
         })
         .await?;
@@ -584,6 +593,7 @@ pub async fn post_object(
             return Err(object_error(err, &bucket, &key));
         }
         crate::ssec::check_write(customer.as_ref(), &HeaderMap::new(), blocked)?;
+        crate::object_lock::new_object_lock(lock, bucket_lock, None, 0)?;
         let mut sink = BodySink::begin(state, customer.as_ref()).await?;
         loop {
             match form.delimiter(0) {
@@ -612,19 +622,33 @@ pub async fn post_object(
         let (sealed, _) = sink.finish(state).await?;
         let (bucket_name, key_name) = (bucket.clone(), key.clone());
         let (stored, versioning) = object(state, move |file| {
+            let now = crate::objects::now_ms();
+            // Decided in the write's own lock hold (see `put_object`).
+            let (bucket_lock, default) = crate::object_lock::bucket_state(file, &bucket_name)?;
+            let lock = match crate::object_lock::new_object_lock(lock, bucket_lock, default, now) {
+                Ok(lock) => lock,
+                Err(err) => return Ok(Err(err)),
+            };
             let stored = file.transaction(|tx| {
-                tx.put_object(
+                let stored = tx.put_object(
                     &bucket_name,
                     &key_name,
                     &sealed,
                     &attrs,
-                    crate::objects::now_ms(),
+                    now,
                     crate::objects::DROP_GRACE_MS,
-                )
+                )?;
+                if let (Ok(info), Some(lock)) = (&stored, &lock) {
+                    tx.set_lock(info.version, lock)?;
+                }
+                Ok(stored)
             })?;
-            Ok((stored, crate::objects::versioning_of(file, &bucket_name)?))
+            Ok(Ok((
+                stored,
+                crate::objects::versioning_of(file, &bucket_name)?,
+            )))
         })
-        .await?;
+        .await??;
         let info = stored.map_err(|err| object_error(err, &bucket, &key))?;
         let etag = info.etag();
         let location = format!(

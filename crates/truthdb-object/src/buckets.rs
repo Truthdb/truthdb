@@ -1,7 +1,7 @@
 //! Buckets: one flat namespace of names (AWS general-purpose naming rules),
-//! each with its owning account, creation time and versioning state. A
-//! bucket is deleted only when it holds no object key and no multipart
-//! upload.
+//! each with its owning account, creation time, versioning state and
+//! whether Object Lock is enabled. A bucket is deleted only when it holds no
+//! object key and no multipart upload.
 
 use truthdb_core::relstore::btree::TreeInsert;
 use truthdb_core::relstore::ctx::OpMode;
@@ -30,6 +30,9 @@ pub struct BucketInfo {
     /// created: its rows numbered after this are this bucket's (a bucket
     /// deleted and created again does not inherit the old one's history).
     pub journal_from: u64,
+    /// Whether Object Lock is enabled (see `locks`): versioning then stays
+    /// enabled.
+    pub object_lock: bool,
 }
 
 /// Why a bucket operation was refused (the storage itself worked).
@@ -41,15 +44,19 @@ pub enum BucketError {
     AlreadyExists,
     NotEmpty,
     InvalidName(&'static str),
+    /// The bucket's state does not allow the change (Object Lock and
+    /// versioning), and why.
+    InvalidBucketState(&'static str),
 }
 
 /// A bucket's stored row: creation time, versioning state, where its journal
-/// starts, and its owning account.
+/// starts, its owning account, and whether Object Lock is enabled.
 pub(crate) struct BucketRow {
     pub created_ms: u64,
     pub versioning: Versioning,
     pub journal_from: u64,
     pub owner: String,
+    pub object_lock: bool,
 }
 
 impl BucketRow {
@@ -62,6 +69,11 @@ impl BucketRow {
         });
         out.extend_from_slice(&self.journal_from.to_le_bytes());
         out.extend_from_slice(self.owner.as_bytes());
+        // Only a bucket with Object Lock has the byte: the others stay
+        // readable by a release from before it.
+        if self.object_lock {
+            out.push(1);
+        }
         out
     }
 
@@ -69,8 +81,9 @@ impl BucketRow {
         let corrupt = || StorageError::InvalidFile("corrupt bucket row".to_string());
         // A row written before the journal has no journal start: all of the
         // journal is the bucket's. A row written before accounts has no owner:
-        // the default account owns it.
-        if ![9, 17, 29].contains(&bytes.len()) {
+        // the default account owns it. Only a row with Object Lock enabled
+        // has its flag byte.
+        if ![9, 17, 29, 30].contains(&bytes.len()) {
             return Err(corrupt());
         }
         Ok(BucketRow {
@@ -88,6 +101,11 @@ impl BucketRow {
             owner: match bytes.get(17..29) {
                 Some(owner) => String::from_utf8(owner.to_vec()).map_err(|_| corrupt())?,
                 None => DEFAULT_ACCOUNT.to_string(),
+            },
+            object_lock: match bytes.get(29) {
+                None => false,
+                Some(1) => true,
+                Some(_) => return Err(corrupt()),
             },
         })
     }
@@ -162,6 +180,7 @@ impl ObjTxn<'_, '_> {
             versioning: Versioning::Unversioned,
             journal_from: self.last_change()?,
             owner: owner.to_string(),
+            object_lock: false,
         };
         let buckets = self.trees.buckets();
         let inserted = buckets.insert_unique(
@@ -181,7 +200,7 @@ impl ObjTxn<'_, '_> {
 
     /// Sets the bucket's versioning (S3 PutBucketVersioning) to `Enabled` or
     /// `Suspended`: a bucket that had versioning never returns to
-    /// unversioned.
+    /// unversioned, and one with Object Lock keeps it enabled.
     pub fn set_versioning(
         &mut self,
         name: &str,
@@ -191,6 +210,11 @@ impl ObjTxn<'_, '_> {
         let Some(mut row) = self.bucket_row(name)? else {
             return Ok(Err(BucketError::NoSuchBucket));
         };
+        if row.object_lock && versioning != Versioning::Enabled {
+            return Ok(Err(BucketError::InvalidBucketState(
+                "Object Lock is enabled on the bucket, so its versioning cannot be suspended",
+            )));
+        }
         row.versioning = versioning;
         self.trees.buckets().update(
             self.ctx,
@@ -198,6 +222,32 @@ impl ObjTxn<'_, '_> {
             name.as_bytes(),
             &row.encode(),
         )?;
+        Ok(Ok(()))
+    }
+
+    /// Enables Object Lock on the bucket, which must have versioning
+    /// enabled; it cannot be disabled again.
+    pub fn enable_object_lock(
+        &mut self,
+        name: &str,
+    ) -> Result<Result<(), BucketError>, StorageError> {
+        let Some(mut row) = self.bucket_row(name)? else {
+            return Ok(Err(BucketError::NoSuchBucket));
+        };
+        if row.versioning != Versioning::Enabled {
+            return Ok(Err(BucketError::InvalidBucketState(
+                "Versioning must be enabled on the bucket to enable Object Lock",
+            )));
+        }
+        if !row.object_lock {
+            row.object_lock = true;
+            self.trees.buckets().update(
+                self.ctx,
+                &mut OpMode::Txn(self.txn),
+                name.as_bytes(),
+                &row.encode(),
+            )?;
+        }
         Ok(Ok(()))
     }
 
@@ -241,6 +291,7 @@ impl ObjFile<'_> {
                     created_ms: row.created_ms,
                     versioning: row.versioning,
                     journal_from: row.journal_from,
+                    object_lock: row.object_lock,
                 })
             })
             .transpose()
@@ -265,6 +316,7 @@ impl ObjFile<'_> {
                     created_ms: row.created_ms,
                     versioning: row.versioning,
                     journal_from: row.journal_from,
+                    object_lock: row.object_lock,
                 })
             })
             .collect()

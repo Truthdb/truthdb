@@ -129,11 +129,15 @@ enum CopyStep {
     },
 }
 
+/// CopyObject. `lock` is the Object Lock its headers ask for (authorized by
+/// the caller); without one, the target bucket's default retention applies.
+/// The source's own lock is not copied.
 pub async fn copy_object(
     state: &S3State,
     request: Request<Incoming>,
     bucket: String,
     key: String,
+    lock: Option<truthdb_object::ObjectLock>,
 ) -> Result<Response<Body>, S3Error> {
     let headers = request.headers().clone();
     // The copy runs in its own task: a client that disconnects drops this
@@ -147,7 +151,7 @@ pub async fn copy_object(
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {
-        copy_whole(&task_state, headers, bucket, key).await
+        copy_whole(&task_state, headers, bucket, key, lock).await
     }))
     .await
     .map_err(|err| S3Error::internal(err.to_string()))?
@@ -158,6 +162,7 @@ async fn copy_whole(
     headers: HeaderMap,
     bucket: String,
     key: String,
+    lock: Option<truthdb_object::ObjectLock>,
 ) -> Result<Response<Body>, S3Error> {
     crate::sse::check_write(&headers, state.storage.is_encrypted())?;
     let (src_bucket, src_key, which) = copy_source(&headers)?;
@@ -228,6 +233,14 @@ async fn copy_whole(
             source.version,
             source.null_version,
         );
+        // Checked before anything is copied; a streamed copy decides its lock
+        // again when it writes.
+        let (bucket_lock, default) = crate::object_lock::bucket_state(file, &dst_bucket)?;
+        let shared_lock =
+            match crate::object_lock::new_object_lock(lock, bucket_lock, default, now_ms()) {
+                Ok(lock) => lock,
+                Err(err) => return Ok(Err(err)),
+            };
         if !shared {
             attrs.customer_key = target_record;
             if source.size > MAX_PUT_BYTES {
@@ -244,14 +257,18 @@ async fn copy_whole(
         }
         attrs.customer_key = source.attrs.customer_key.clone();
         let copied = file.transaction(|tx| {
-            tx.copy_object(
+            let copied = tx.copy_object(
                 &dst_bucket,
                 &dst_key,
                 &source,
                 &attrs,
                 now_ms(),
                 DROP_GRACE_MS,
-            )
+            )?;
+            if let (Ok(copied), Some(lock)) = (&copied, &shared_lock) {
+                tx.set_lock(copied.version, lock)?;
+            }
+            Ok(copied)
         })?;
         let copied = match copied {
             Ok(copied) => copied,
@@ -300,19 +317,25 @@ async fn copy_whole(
             let sealed = copied?;
             let (dst_bucket, dst_key) = (bucket.clone(), key.clone());
             let (stored, versioning) = object(state, move |file| {
+                let now = now_ms();
+                // Decided in the write's own lock hold (see `put_object`).
+                let (bucket_lock, default) = crate::object_lock::bucket_state(file, &dst_bucket)?;
+                let lock =
+                    match crate::object_lock::new_object_lock(lock, bucket_lock, default, now) {
+                        Ok(lock) => lock,
+                        Err(err) => return Ok(Err(err)),
+                    };
                 let stored = file.transaction(|tx| {
-                    tx.put_object(
-                        &dst_bucket,
-                        &dst_key,
-                        &sealed,
-                        &attrs,
-                        now_ms(),
-                        DROP_GRACE_MS,
-                    )
+                    let stored =
+                        tx.put_object(&dst_bucket, &dst_key, &sealed, &attrs, now, DROP_GRACE_MS)?;
+                    if let (Ok(info), Some(lock)) = (&stored, &lock) {
+                        tx.set_lock(info.version, lock)?;
+                    }
+                    Ok(stored)
                 })?;
-                Ok((stored, versioning_of(file, &dst_bucket)?))
+                Ok(Ok((stored, versioning_of(file, &dst_bucket)?)))
             })
-            .await?;
+            .await??;
             let info = stored.map_err(|err| object_error(err, &bucket, &key))?;
             let mut versions = Vec::new();
             if let Some(version) = source_version {
