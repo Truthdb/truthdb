@@ -3908,6 +3908,24 @@ fn an_archived_version_is_read_only_while_restored() {
     assert!(unreadable(&deep, now() + slow - 1));
     assert!(!unreadable(&deep, now() + slow));
     assert!(!unreadable(&deep, now() + slow + 86_400_000 - 1));
+    // Extending it retrieves nothing, so any tier is accepted.
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.restore_object(
+                "bkt",
+                "deep",
+                VersionSel::Latest,
+                crate::RestoreRequest {
+                    expedited: true,
+                    ..ask(2, 0)
+                },
+                now() + slow
+            ))
+            .unwrap()
+            .unwrap()
+            .0,
+        Restored::Extended
+    );
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
             tx.delete_object(

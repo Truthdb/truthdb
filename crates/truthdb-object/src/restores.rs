@@ -133,9 +133,6 @@ impl ObjTxn<'_, '_> {
         if !class.is_archived() {
             return Ok(Err(ObjectError::NotArchived));
         }
-        if request.expedited && class == StorageClass::DeepArchive {
-            return Ok(Err(ObjectError::TierUnavailable));
-        }
         let current = self.restore_of(version)?;
         let (done, restore) = match current.and_then(|restore| restore.state(now_ms)) {
             Some(RestoreState::Ongoing) => return Ok(Err(ObjectError::RestoreInProgress)),
@@ -146,6 +143,10 @@ impl ObjTxn<'_, '_> {
                     ..current.unwrap()
                 },
             ),
+            // Only a new restore retrieves anything, so only it has a tier.
+            None if request.expedited && class == StorageClass::DeepArchive => {
+                return Ok(Err(ObjectError::TierUnavailable));
+            }
             None => {
                 let ready_ms = now_ms.saturating_add(request.delay_ms);
                 (
