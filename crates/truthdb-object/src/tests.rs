@@ -4254,6 +4254,7 @@ fn lifecycle_scene(storage: &Storage) {
                         },
                     ],
                 },
+                T0,
             )?;
             tx.put_lifecycle(
                 "unv",
@@ -4268,6 +4269,7 @@ fn lifecycle_scene(storage: &Storage) {
                         ..rule("all", Filter::All)
                     }],
                 },
+                T0,
             )?;
             tx.put_lifecycle(
                 "lck",
@@ -4281,6 +4283,7 @@ fn lifecycle_scene(storage: &Storage) {
                         ..rule("old", Filter::All)
                     }],
                 },
+                T0,
             )
         })
         .unwrap();
@@ -4697,6 +4700,7 @@ fn put_rules(storage: &Storage, bucket: &str, rules: Vec<crate::Rule>) {
                     min_size: crate::MinTransitionSize::AllClasses128K,
                     rules,
                 },
+                T0,
             )
         })
         .unwrap();
@@ -4742,18 +4746,15 @@ fn a_new_configuration_or_a_pass_past_midnight_acts_once_a_day() {
     // Long due on day 20: a transition and an expiration; the transition
     // comes first, the marker the next day, even with the rules just set.
     let day = 20 * DAY + HOUR;
-    put_rules(
-        &storage,
-        "bkt",
-        vec![crate::Rule {
-            transitions: vec![Transition {
-                when: When::Days(1),
-                class: StorageClass::Glacier,
-            }],
-            expiration: Some(Expiration::At(When::Days(3))),
-            ..lifecycle_rule("r", Filter::All)
+    let rules = vec![crate::Rule {
+        transitions: vec![Transition {
+            when: When::Days(1),
+            class: StorageClass::Glacier,
         }],
-    );
+        expiration: Some(Expiration::At(When::Days(3))),
+        ..lifecycle_rule("r", Filter::All)
+    }];
+    put_rules(&storage, "bkt", rules.clone());
     let all_cold = vec![
         ("a".to_string(), "GLACIER".to_string()),
         ("b".to_string(), "GLACIER".to_string()),
@@ -4777,6 +4778,25 @@ fn a_new_configuration_or_a_pass_past_midnight_acts_once_a_day() {
             .lifecycle_step(day + DAY + HOUR, 0, one_row)
             .unwrap()
     );
+    // Rules set again on day 21 wait for day 22: the day's pass has acted.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.put_lifecycle(
+                "bkt",
+                &crate::LifecycleConfig {
+                    min_size: crate::MinTransitionSize::AllClasses128K,
+                    rules: rules.clone(),
+                },
+                day + DAY + 2 * HOUR,
+            )
+        })
+        .unwrap();
+    assert!(
+        !ObjFile::new(&mut storage.lock())
+            .lifecycle_step(day + DAY + 3 * HOUR, 0, one_row)
+            .unwrap()
+    );
+    assert_eq!(classes(&storage, "bkt"), all_cold);
     lifecycle_passes(&storage, day + 2 * DAY, one_row);
     let marked: Vec<_> = classes(&storage, "bkt");
     assert_eq!(

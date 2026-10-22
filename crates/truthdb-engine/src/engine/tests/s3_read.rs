@@ -1419,6 +1419,7 @@ fn the_object_jobs_apply_lifecycle_rules() {
                             },
                         ],
                     },
+                    0,
                 )
             })
         })

@@ -582,7 +582,7 @@ pub async fn bucket_lifecycle(
                 if file.bucket(&name)?.is_none() {
                     return Ok(Err(()));
                 }
-                file.transaction(|tx| tx.put_lifecycle(&name, &config))?;
+                file.transaction(|tx| tx.put_lifecycle(&name, &config, crate::objects::now_ms()))?;
                 Ok(Ok(()))
             })
             .await?

@@ -768,14 +768,35 @@ pub struct StepBudget {
 
 impl ObjTxn<'_, '_> {
     /// Sets the bucket's lifecycle configuration (the caller checks the
-    /// bucket exists), and has its pass start over.
+    /// bucket exists) at `now_ms`. Its pass starts over at once, unless a
+    /// pass ran today or is under way: that one may have acted on versions
+    /// today, so the new rules wait for tomorrow's pass (no version gets two
+    /// actions in one day).
     pub fn put_lifecycle(
         &mut self,
         bucket: &str,
         config: &LifecycleConfig,
+        now_ms: u64,
     ) -> Result<(), StorageError> {
         self.put_bucket_config(bucket, BUCKET_LIFECYCLE, "", &config.encode())?;
-        self.write_pass(bucket, &PassState::default())
+        let today = now_ms / DAY_MS;
+        let ran_today = self
+            .trees
+            .lifecycle_state()
+            .get(self.ctx, bucket.as_bytes())?
+            .map(|row| PassState::decode(&row))
+            .transpose()?
+            .is_some_and(|state| !state.finished || state.started_day >= today);
+        let state = if ran_today {
+            PassState {
+                started_day: today,
+                finished: true,
+                ..PassState::default()
+            }
+        } else {
+            PassState::default()
+        };
+        self.write_pass(bucket, &state)
     }
 
     /// Deletes the bucket's lifecycle configuration; whether it had one.
