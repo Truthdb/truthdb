@@ -62,7 +62,7 @@ fn grow_refuses_below_the_safe_minimum() {
     let path = unique_temp_path("grow-min");
     // 4 GiB file: the tail regions span ~1.16 GiB, so +1 GiB is unsafe.
     let mut opts = test_storage_options();
-    opts.size_gib = 4;
+    opts.size_bytes = 4 << 30;
     let storage = RelStorage::create(path.clone(), opts).expect("create");
     drop(storage);
     let err = crate::storage::Storage::grow_data_region(&path, 1).expect_err("must refuse");

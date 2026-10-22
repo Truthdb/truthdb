@@ -22,7 +22,7 @@ fn temp_path(label: &str) -> PathBuf {
 
 fn new_engine(path: &Path) -> Engine {
     let opts = StorageOptions {
-        size_gib: 1,
+        size_bytes: 64 << 20,
         wal_ratio: 0.05,
         metadata_ratio: 0.08,
         snapshot_ratio: 0.02,

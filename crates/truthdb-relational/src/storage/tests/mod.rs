@@ -9,7 +9,7 @@ const TEST_WAL_BYTES: u64 = 64 * 1024;
 
 fn test_storage_options() -> StorageOptions {
     StorageOptions {
-        size_gib: 1,
+        size_bytes: 64 << 20,
         wal_ratio: 0.05,
         metadata_ratio: 0.08,
         snapshot_ratio: 0.02,

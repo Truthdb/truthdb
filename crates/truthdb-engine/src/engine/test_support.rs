@@ -7,7 +7,9 @@ use crate::storage::{RelStorage, StorageOptions};
 
 pub(in crate::engine) fn test_storage_options() -> StorageOptions {
     StorageOptions {
-        size_gib: 1,
+        // Larger than other test databases: the spill tests need more temp
+        // extents than a 64 MiB file's data region holds.
+        size_bytes: 256 << 20,
         wal_ratio: 0.05,
         metadata_ratio: 0.08,
         snapshot_ratio: 0.02,

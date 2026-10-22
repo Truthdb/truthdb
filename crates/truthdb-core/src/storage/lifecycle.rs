@@ -115,20 +115,20 @@ pub(super) fn compute_layout(
     wal_min_bytes: u64,
     wal_max_bytes: u64,
 ) -> Result<StorageLayout, StorageError> {
-    let total_size = opts
-        .size_gib
-        .checked_mul(crate::storage_layout::GIB)
-        .ok_or_else(|| StorageError::InvalidConfig("storage.size_gib overflow".to_string()))?;
+    let total_size = opts.size_bytes;
 
     let page = crate::storage_layout::PAGE_SIZE as u64;
     let fixed_size = page * 3;
     if total_size <= fixed_size {
         return Err(StorageError::InvalidConfig(
-            "storage.size_gib too small for header/superblocks".to_string(),
+            "the storage size is too small for the header and superblocks".to_string(),
         ));
     }
 
     let wal_raw = (total_size as f64 * opts.wal_ratio) as u64;
+    // The minimum ring never takes more than a quarter of the file (any file
+    // of a GiB or more keeps the full minimum).
+    let wal_min_bytes = wal_min_bytes.min(total_size / 4);
     let wal_clamped = wal_raw.clamp(wal_min_bytes, wal_max_bytes);
     let wal_size = align_down(wal_clamped, page);
 
@@ -151,6 +151,15 @@ pub(super) fn compute_layout(
         return Err(StorageError::InvalidConfig(
             "storage ratios leave no space for data region".to_string(),
         ));
+    }
+    // A data region holds whole extents, and the snapshot region at least
+    // the two pages of its descriptors.
+    let extent_bytes = crate::allocator::EXTENT_PAGES * page;
+    if remaining < extent_bytes || snapshot_size < 2 * page {
+        return Err(StorageError::InvalidConfig(format!(
+            "the storage size ({total_size} bytes) is too small: its data region must hold an \
+             extent ({extent_bytes} bytes) and its snapshot region two pages"
+        )));
     }
 
     let reserved_size = total_size
