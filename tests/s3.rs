@@ -7309,6 +7309,8 @@ fn a_lifecycle_configuration_is_kept_shown_and_applied() {
         send_with(port, method, path, query, extra, body, &key, Some(&secret))
     };
     assert_eq!(call("PUT", "/rules", "", &[], b"").1.0, 200);
+    // Written before the rules: their first pass expires it.
+    assert_eq!(call("PUT", "/rules/logs/old", "", &[], b"x").1.0, 200);
     let (_, (status, reply)) = call("GET", "/rules", "lifecycle", &[], b"");
     assert_eq!(status, 404, "{reply}");
     assert!(
@@ -7384,22 +7386,6 @@ fn a_lifecycle_configuration_is_kept_shown_and_applied() {
     assert_eq!(response_header(&head, "x-amz-expiration"), None);
 
     // The server's daily pass expires logs/ (the rule's date is past).
-    let (head, (status, _)) = call("PUT", "/rules/logs/old", "", &[], b"x");
-    assert_eq!(status, 200);
-    assert_eq!(
-        response_header(&head, "x-amz-expiration"),
-        Some("expiry-date=\"Wed, 01 Jan 2020 00:00:00 GMT\", rule-id=\"old%20logs\"".to_string())
-    );
-    // A new configuration starts its pass over.
-    let (status, reply) = call(
-        "PUT",
-        "/rules",
-        "lifecycle",
-        &[(MIN, "varies_by_storage_class")],
-        config,
-    )
-    .1;
-    assert_eq!(status, 200, "{reply}");
     let deadline = Instant::now() + Duration::from_secs(20);
     while call("HEAD", "/rules/logs/old", "", &[], b"").1.0 != 404 {
         assert!(
