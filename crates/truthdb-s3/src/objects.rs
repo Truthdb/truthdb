@@ -65,6 +65,7 @@ pub fn object_error(err: ObjectError, bucket: &str, key: &str) -> S3Error {
         ObjectError::ObjectLockNotEnabled => {
             S3Error::invalid_request("Bucket is missing Object Lock Configuration")
         }
+        ObjectError::InvalidRetention(why) => S3Error::invalid_request(why),
     }
 }
 

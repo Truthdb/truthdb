@@ -9,6 +9,10 @@
 //! mode can be shortened, removed or ignored by a request that bypasses it
 //! (the caller decides who may). A legal hold protects until it is released,
 //! whatever the retention.
+//!
+//! A retention may be variable: while its event hold is on, the version is
+//! kept until its duration after now (and at least until its date), so the
+//! date moves forward; releasing the hold fixes it there.
 
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
@@ -22,10 +26,60 @@ pub enum RetentionMode {
     Compliance,
 }
 
+const DAY_MS: u64 = 86_400_000;
+
+/// A variable retention's event hold and its duration (in days, or in years
+/// of 365 days).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventHold {
+    pub on: bool,
+    pub years: bool,
+    pub count: u32,
+}
+
+impl EventHold {
+    pub fn duration_ms(&self) -> u64 {
+        u64::from(self.count)
+            .saturating_mul(if self.years { 365 } else { 1 })
+            .saturating_mul(DAY_MS)
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Retention {
     pub mode: RetentionMode,
+    /// The retain-until date; with an event hold, the earliest it may be
+    /// (0: none).
     pub until_ms: u64,
+    /// `None` for a fixed retention.
+    pub event: Option<EventHold>,
+}
+
+impl Retention {
+    /// The retain-until date at `now_ms`: while an event hold is on, its
+    /// duration from now, or the date when that is later.
+    pub fn effective_until(&self, now_ms: u64) -> u64 {
+        match self.event {
+            Some(event) if event.on => self
+                .until_ms
+                .max(now_ms.saturating_add(event.duration_ms())),
+            _ => self.until_ms,
+        }
+    }
+}
+
+/// A PutObjectRetention change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RetentionChange {
+    Set(Retention),
+    /// Turns the event hold off, fixing the date at its duration from now,
+    /// or at `until_ms` when that is later. On a version not held, a date
+    /// makes a fixed retention (0: none, and the release is refused).
+    Release {
+        mode: RetentionMode,
+        until_ms: u64,
+    },
+    Remove,
 }
 
 /// A version's Object Lock settings.
@@ -46,15 +100,17 @@ impl ObjectLock {
     pub fn blocks_delete(&self, now_ms: u64, bypass: bool) -> bool {
         self.legal_hold == Some(true)
             || self.retention.is_some_and(|retention| {
-                retention.until_ms > now_ms
+                retention.effective_until(now_ms) > now_ms
                     && !(retention.mode == RetentionMode::Governance && bypass)
             })
     }
 
     /// `[mode u8: 0 none, 1 GOVERNANCE, 2 COMPLIANCE][retain-until ms u64]
-    /// [legal hold u8: 0 never set, 1 off, 2 on]`.
+    /// [legal hold u8: 0 never set, 1 off, 2 on]`, then for a variable
+    /// retention `[event hold u8: 1 on, 2 off][unit u8: 1 days, 2 years]
+    /// [count u32]`.
     fn encode(&self) -> Vec<u8> {
-        let mut out = Vec::with_capacity(10);
+        let mut out = Vec::with_capacity(16);
         match self.retention {
             None => out.extend_from_slice(&[0; 9]),
             Some(retention) => {
@@ -70,22 +126,48 @@ impl ObjectLock {
             Some(false) => 1,
             Some(true) => 2,
         });
+        if let Some(event) = self.retention.and_then(|retention| retention.event) {
+            out.push(if event.on { 1 } else { 2 });
+            out.push(if event.years { 2 } else { 1 });
+            out.extend_from_slice(&event.count.to_le_bytes());
+        }
         out
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         let corrupt = || StorageError::InvalidFile("corrupt object lock".to_string());
-        if bytes.len() != 10 {
+        if bytes.len() != 10 && bytes.len() != 16 {
             return Err(corrupt());
         }
         let until_ms = u64::from_le_bytes(bytes[1..9].try_into().unwrap());
+        let event = match bytes.get(10..16) {
+            None => None,
+            Some(&[on, unit, ref count @ ..]) => Some(EventHold {
+                on: match on {
+                    1 => true,
+                    2 => false,
+                    _ => return Err(corrupt()),
+                },
+                years: match unit {
+                    1 => false,
+                    2 => true,
+                    _ => return Err(corrupt()),
+                },
+                count: u32::from_le_bytes(count.try_into().unwrap()),
+            }),
+            Some(_) => return Err(corrupt()),
+        };
         let retention = match bytes[0] {
-            0 => None,
+            0 if event.is_none() => None,
             1 => Some(RetentionMode::Governance),
             2 => Some(RetentionMode::Compliance),
             _ => return Err(corrupt()),
         }
-        .map(|mode| Retention { mode, until_ms });
+        .map(|mode| Retention {
+            mode,
+            until_ms,
+            event,
+        });
         let legal_hold = match bytes[9] {
             0 => None,
             1 => Some(false),
@@ -168,17 +250,19 @@ impl ObjTxn<'_, '_> {
         Ok(Ok((version, null_version, self.lock_of(version)?)))
     }
 
-    /// Sets the retention of the version `which` picks (S3
-    /// PutObjectRetention; `None` removes it). An active COMPLIANCE retention
-    /// may only be extended in the same mode; an active GOVERNANCE retention
-    /// likewise, unless `bypass`. Returns the version's number and whether
-    /// it is the null version.
+    /// Changes the retention of the version `which` picks (S3
+    /// PutObjectRetention). An active COMPLIANCE retention may only be kept
+    /// or extended in the same mode; an active GOVERNANCE retention likewise,
+    /// unless `bypass`. Kept means its date never moves earlier: a variable
+    /// retention's new date is at least the current one, and a fixed one
+    /// earlier than that is refused. Returns the version's number and
+    /// whether it is the null version.
     pub fn put_retention(
         &mut self,
         bucket: &str,
         key: &str,
         which: VersionSel,
-        retention: Option<Retention>,
+        change: RetentionChange,
         bypass: bool,
         now_ms: u64,
     ) -> Result<Result<(u64, bool), ObjectError>, StorageError> {
@@ -186,14 +270,47 @@ impl ObjTxn<'_, '_> {
             Ok(found) => found,
             Err(err) => return Ok(Err(err)),
         };
-        if let Some(current) = lock.retention
-            && current.until_ms > now_ms
-        {
-            let extends = retention
-                .is_some_and(|new| new.mode == current.mode && new.until_ms >= current.until_ms);
+        let mut retention = match change {
+            RetentionChange::Set(retention) => Some(retention),
+            RetentionChange::Remove => None,
+            RetentionChange::Release { mode, until_ms } => {
+                let held = lock.retention.and_then(|current| {
+                    current
+                        .event
+                        .filter(|event| event.on)
+                        .map(|event| (current, event))
+                });
+                match held {
+                    Some((current, event)) => Some(Retention {
+                        mode,
+                        until_ms: until_ms.max(current.effective_until(now_ms)),
+                        event: Some(EventHold { on: false, ..event }),
+                    }),
+                    None if until_ms > 0 => Some(Retention {
+                        mode,
+                        until_ms,
+                        event: None,
+                    }),
+                    None => {
+                        return Ok(Err(ObjectError::InvalidRetention(
+                            "the object version has no event hold to release",
+                        )));
+                    }
+                }
+            }
+        };
+        if let Some(current) = lock.retention {
+            let floor = current.effective_until(now_ms);
             let bypassed = bypass && current.mode == RetentionMode::Governance;
-            if !extends && !bypassed {
-                return Ok(Err(ObjectError::Locked));
+            if floor > now_ms && !bypassed {
+                match &mut retention {
+                    Some(new) if new.mode == current.mode => match new.event {
+                        Some(event) if event.on => new.until_ms = new.until_ms.max(floor),
+                        _ if new.until_ms < floor => return Ok(Err(ObjectError::Locked)),
+                        _ => {}
+                    },
+                    _ => return Ok(Err(ObjectError::Locked)),
+                }
             }
         }
         lock.retention = retention;
@@ -243,6 +360,7 @@ mod tests {
             retention: Some(Retention {
                 mode: RetentionMode::Governance,
                 until_ms: 1_000,
+                event: None,
             }),
             legal_hold: None,
         };
@@ -252,6 +370,7 @@ mod tests {
                 retention: Some(Retention {
                     mode: RetentionMode::Compliance,
                     until_ms: u64::MAX,
+                    event: None,
                 }),
                 legal_hold: Some(false),
             },
@@ -262,6 +381,24 @@ mod tests {
         ] {
             assert_eq!(ObjectLock::decode(&lock.encode()).unwrap(), lock);
         }
+        let variable = ObjectLock {
+            retention: Some(Retention {
+                mode: RetentionMode::Compliance,
+                until_ms: 0,
+                event: Some(EventHold {
+                    on: true,
+                    years: true,
+                    count: 7,
+                }),
+            }),
+            legal_hold: None,
+        };
+        assert_eq!(variable.encode().len(), 16);
+        assert_eq!(ObjectLock::decode(&variable.encode()).unwrap(), variable);
+        let mut bad = variable.encode();
+        bad[10] = 3;
+        assert!(ObjectLock::decode(&bad).is_err());
+        assert!(ObjectLock::decode(&variable.encode()[..12]).is_err());
         assert!(ObjectLock::decode(&[3; 10]).is_err());
         assert!(ObjectLock::decode(&[0; 9]).is_err());
         assert!(governance.blocks_delete(999, false));
@@ -271,6 +408,7 @@ mod tests {
             retention: Some(Retention {
                 mode: RetentionMode::Compliance,
                 until_ms: 1_000,
+                event: None,
             }),
             legal_hold: None,
         };

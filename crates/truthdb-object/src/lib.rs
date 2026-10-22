@@ -52,7 +52,7 @@ pub use fulltext::{
 pub use gc::GcOutcome;
 pub use journal::{JournalObject, JournalRecord, RecordType};
 pub use listing::{ListAfter, ListedObject, Listing};
-pub use locks::{ObjectLock, Retention, RetentionMode};
+pub use locks::{EventHold, ObjectLock, Retention, RetentionChange, RetentionMode};
 pub use objects::{
     CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, VersionSel, version_id,
 };
