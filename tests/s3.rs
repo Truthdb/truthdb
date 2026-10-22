@@ -8061,6 +8061,23 @@ fn the_s3_client_works_against_this_server() {
             .abort_multipart_upload("tools", "gone", &abandoned)
             .await
             .unwrap();
+        // Keys whose bytes a signer could get wrong.
+        for odd in ["x+y%z~w", "a//b", "./c/../d", " lead"] {
+            client
+                .put_object(
+                    "tools",
+                    odd,
+                    &[],
+                    truthdb_s3client::Bytes::from_static(b"o"),
+                )
+                .await
+                .unwrap_or_else(|err| panic!("{odd}: {err}"));
+            assert!(
+                client.head_object("tools", odd).await.unwrap().is_some(),
+                "{odd}"
+            );
+            client.delete_object("tools", odd).await.unwrap();
+        }
         // Listings by prefix and delimiter.
         let page = client
             .list_objects("tools", "dir/", Some("/"), None)
@@ -8103,9 +8120,9 @@ fn the_s3_client_works_against_this_server() {
             ..config(&secret)
         })
         .unwrap();
-        assert!(matches!(
-            untrusting.list_buckets().await,
-            Err(Error::Transport(_))
-        ));
+        match untrusting.list_buckets().await {
+            Err(Error::Transport(why)) => assert!(why.contains("certificate"), "{why}"),
+            other => panic!("{:?}", other.map(|_| ())),
+        }
     });
 }

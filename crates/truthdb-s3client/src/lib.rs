@@ -108,8 +108,15 @@ fn invalid(why: impl Into<String>) -> Error {
     Error::Invalid(why.into())
 }
 
-fn transport(err: impl std::fmt::Display) -> Error {
-    Error::Transport(err.to_string())
+/// A transport error with its causes (hyper's own message hides them).
+fn transport(err: impl std::error::Error) -> Error {
+    let mut text = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        text.push_str(&format!(": {cause}"));
+        source = cause.source();
+    }
+    Error::Transport(text)
 }
 
 /// `YYYYMMDDTHHMMSSZ` for seconds since the epoch (Howard Hinnant's
@@ -161,6 +168,11 @@ fn texts(xml: &[u8], path: &str) -> Result<Vec<String>, Error> {
                     current.push_str(&text.unescape().map_err(transport)?);
                 }
             }
+            Event::CData(text) => {
+                if let Some(current) = &mut current {
+                    current.push_str(std::str::from_utf8(&text).map_err(transport)?);
+                }
+            }
             Event::End(_) => {
                 if open.len() > 1
                     && open[1..].join("/") == path
@@ -205,6 +217,79 @@ fn listed(xml: &[u8]) -> Result<Vec<Listed>, Error> {
         .collect()
 }
 
+/// What a client may send as a bucket name: S3's characters, so the path
+/// signed is the path sent.
+fn check_bucket(bucket: &str) -> Result<(), Error> {
+    if bucket.is_empty()
+        || !bucket
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-')
+    {
+        return Err(invalid(format!("{bucket:?} is not a bucket name")));
+    }
+    Ok(())
+}
+
+/// The `Host` a request to `base` carries, as hyper writes it: the port
+/// only when it is not the scheme's own.
+fn host_of(base: &Uri) -> Result<String, Error> {
+    let authority = base
+        .authority()
+        .ok_or_else(|| invalid("the endpoint has no host"))?;
+    if authority.as_str().contains('@') {
+        return Err(invalid("the endpoint must not name a user"));
+    }
+    let default = match base.scheme_str() {
+        Some("https") => 443,
+        _ => 80,
+    };
+    Ok(match authority.port_u16() {
+        Some(port) if port != default => format!("{}:{port}", authority.host()),
+        _ => authority.host().to_string(),
+    })
+}
+
+/// A ListObjectsV2 answer as a page.
+fn page_of(body: &[u8]) -> Result<Page, Error> {
+    let truncated = texts(body, "IsTruncated")?.first().map(String::as_str) == Some("true");
+    let next = texts(body, "NextContinuationToken")?.into_iter().next();
+    if truncated && next.is_none() {
+        // Ending here would leave the rest of the listing out unnoticed.
+        return Err(Error::Transport(
+            "a truncated listing has no continuation token".to_string(),
+        ));
+    }
+    Ok(Page {
+        objects: listed(body)?,
+        prefixes: texts(body, "CommonPrefixes/Prefix")?,
+        next: if truncated { next } else { None },
+    })
+}
+
+/// A CompleteMultipartUpload answer's ETag; S3 may report a failure in a
+/// 200 answer.
+fn completed(body: &[u8]) -> Result<String, Error> {
+    if let Some(code) = texts(body, "Code")?.into_iter().next()
+        && texts(body, "ETag")?.is_empty()
+    {
+        return Err(Error::Service {
+            status: 200,
+            code,
+            message: texts(body, "Message")?
+                .into_iter()
+                .next()
+                .unwrap_or_default(),
+        });
+    }
+    texts(body, "ETag")?
+        .into_iter()
+        .next()
+        .ok_or_else(|| Error::Transport("no ETag in the answer".to_string()))
+}
+
+/// The most of an error answer's body that is read.
+const MAX_ERROR_BODY: usize = 64 * 1024;
+
 /// `value` encoded for a query string.
 fn query_value(value: &str) -> String {
     encode_key(value).replace('/', "%2F")
@@ -216,7 +301,7 @@ impl Client {
             .endpoint
             .parse()
             .map_err(|_| invalid(format!("{} is not a URL", config.endpoint)))?;
-        let (Some(scheme), Some(authority)) = (base.scheme_str(), base.authority()) else {
+        let (Some(scheme), Some(_)) = (base.scheme_str(), base.authority()) else {
             return Err(invalid(
                 "the endpoint must be http:// or https://host[:port]",
             ));
@@ -226,7 +311,7 @@ impl Client {
                 "the endpoint must be http:// or https://host[:port]",
             ));
         }
-        let host = authority.to_string();
+        let host = host_of(&base)?;
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let builder = hyper_rustls::HttpsConnectorBuilder::new();
         let builder = match &config.ca_pem {
@@ -329,11 +414,10 @@ impl Client {
             return Ok(response);
         }
         let status = response.status().as_u16();
-        let body = response
-            .into_body()
+        let body = http_body_util::Limited::new(response.into_body(), MAX_ERROR_BODY)
             .collect()
             .await
-            .map_err(transport)?
+            .map_err(|err| Error::Transport(err.to_string()))?
             .to_bytes();
         // A HEAD answer has no body to name the error.
         let code = texts(&body, "Code")
@@ -371,8 +455,18 @@ impl Client {
         Ok((headers, body))
     }
 
-    fn object_path(bucket: &str, key: &str) -> String {
-        format!("/{bucket}/{}", encode_key(key))
+    /// An object's path; an empty key would name the bucket itself.
+    fn object_path(bucket: &str, key: &str) -> Result<String, Error> {
+        check_bucket(bucket)?;
+        if key.is_empty() {
+            return Err(invalid("an object key must not be empty"));
+        }
+        Ok(format!("/{bucket}/{}", encode_key(key)))
+    }
+
+    fn bucket_path(bucket: &str) -> Result<String, Error> {
+        check_bucket(bucket)?;
+        Ok(format!("/{bucket}"))
     }
 
     pub async fn list_buckets(&self) -> Result<Vec<String>, Error> {
@@ -381,9 +475,15 @@ impl Client {
     }
 
     pub async fn create_bucket(&self, bucket: &str) -> Result<(), Error> {
-        self.call(Method::PUT, &format!("/{bucket}"), "", &[], Bytes::new())
-            .await
-            .map(|_| ())
+        self.call(
+            Method::PUT,
+            &Self::bucket_path(bucket)?,
+            "",
+            &[],
+            Bytes::new(),
+        )
+        .await
+        .map(|_| ())
     }
 
     /// One page of the objects whose keys start with `prefix` (with
@@ -409,30 +509,22 @@ impl Client {
         let (_, body) = self
             .call(
                 Method::GET,
-                &format!("/{bucket}"),
+                &Self::bucket_path(bucket)?,
                 &query.join("&"),
                 &[],
                 Bytes::new(),
             )
             .await?;
-        let truncated = texts(&body, "IsTruncated")?.first().map(String::as_str) == Some("true");
-        Ok(Page {
-            objects: listed(&body)?,
-            prefixes: texts(&body, "CommonPrefixes/Prefix")?,
-            next: if truncated {
-                texts(&body, "NextContinuationToken")?.into_iter().next()
-            } else {
-                None
-            },
-        })
+        page_of(&body)
     }
 
-    /// The object's headers; `None` when there is no such object.
+    /// The object's headers; `None` when there is no such object (or no such
+    /// bucket: a HEAD answer has no body to tell them apart).
     pub async fn head_object(&self, bucket: &str, key: &str) -> Result<Option<Head>, Error> {
         match self
             .call(
                 Method::HEAD,
-                &Self::object_path(bucket, key),
+                &Self::object_path(bucket, key)?,
                 "",
                 &[],
                 Bytes::new(),
@@ -449,7 +541,7 @@ impl Client {
         let response = self
             .send(
                 Method::GET,
-                &Self::object_path(bucket, key),
+                &Self::object_path(bucket, key)?,
                 "",
                 &[],
                 Bytes::new(),
@@ -473,7 +565,7 @@ impl Client {
         let (headers, _) = self
             .call(
                 Method::PUT,
-                &Self::object_path(bucket, key),
+                &Self::object_path(bucket, key)?,
                 "",
                 headers,
                 body,
@@ -492,7 +584,7 @@ impl Client {
         let (_, body) = self
             .call(
                 Method::POST,
-                &Self::object_path(bucket, key),
+                &Self::object_path(bucket, key)?,
                 "uploads=",
                 headers,
                 Bytes::new(),
@@ -516,7 +608,7 @@ impl Client {
         let (headers, _) = self
             .call(
                 Method::PUT,
-                &Self::object_path(bucket, key),
+                &Self::object_path(bucket, key)?,
                 &format!("partNumber={number}&uploadId={}", query_value(upload)),
                 &[],
                 body,
@@ -547,29 +639,13 @@ impl Client {
         let (_, body) = self
             .call(
                 Method::POST,
-                &Self::object_path(bucket, key),
+                &Self::object_path(bucket, key)?,
                 &format!("uploadId={}", query_value(upload)),
                 &[],
                 Bytes::from(xml),
             )
             .await?;
-        // S3 may report a failure in a 200 answer.
-        if let Some(code) = texts(&body, "Code")?.into_iter().next()
-            && texts(&body, "ETag")?.is_empty()
-        {
-            return Err(Error::Service {
-                status: 200,
-                code,
-                message: texts(&body, "Message")?
-                    .into_iter()
-                    .next()
-                    .unwrap_or_default(),
-            });
-        }
-        texts(&body, "ETag")?
-            .into_iter()
-            .next()
-            .ok_or_else(|| Error::Transport("no ETag in the answer".to_string()))
+        completed(&body)
     }
 
     pub async fn abort_multipart_upload(
@@ -580,7 +656,7 @@ impl Client {
     ) -> Result<(), Error> {
         self.call(
             Method::DELETE,
-            &Self::object_path(bucket, key),
+            &Self::object_path(bucket, key)?,
             &format!("uploadId={}", query_value(upload)),
             &[],
             Bytes::new(),
@@ -592,7 +668,7 @@ impl Client {
     pub async fn delete_object(&self, bucket: &str, key: &str) -> Result<(), Error> {
         self.call(
             Method::DELETE,
-            &Self::object_path(bucket, key),
+            &Self::object_path(bucket, key)?,
             "",
             &[],
             Bytes::new(),
@@ -663,6 +739,59 @@ mod tests {
         assert_eq!(texts(xml, "CommonPrefixes/Prefix").unwrap(), ["d/"]);
         assert_eq!(texts(xml, "NextContinuationToken").unwrap(), ["t"]);
         assert!(listed(b"<R><Contents><Key>k</Key></Contents></R>").is_err());
+    }
+
+    #[test]
+    fn pages_and_completions_read_as_s3_writes_them() {
+        let page = page_of(
+            b"<R><IsTruncated>true</IsTruncated><NextContinuationToken>t+1</NextContinuationToken>\
+              <Contents><Key><![CDATA[c&d]]></Key><LastModified>x</LastModified>\
+              <ETag>e</ETag><Size>1</Size></Contents></R>",
+        )
+        .unwrap();
+        assert_eq!(page.next.as_deref(), Some("t+1"));
+        assert_eq!(page.objects[0].key, "c&d");
+        assert!(page_of(b"<R><IsTruncated>true</IsTruncated></R>").is_err());
+        assert_eq!(
+            page_of(b"<R><IsTruncated>false</IsTruncated></R>").unwrap(),
+            Page::default()
+        );
+        assert_eq!(
+            completed(
+                b"<CompleteMultipartUploadResult><ETag>\"e-2\"</ETag>\
+                  </CompleteMultipartUploadResult>"
+            )
+            .unwrap(),
+            "\"e-2\""
+        );
+        assert_eq!(
+            completed(b"<Error><Code>InternalError</Code><Message>m</Message></Error>"),
+            Err(Error::Service {
+                status: 200,
+                code: "InternalError".to_string(),
+                message: "m".to_string(),
+            })
+        );
+        assert_eq!(query_value("a/b c+d"), "a%2Fb%20c%2Bd");
+    }
+
+    #[test]
+    fn the_host_signed_is_the_host_hyper_sends() {
+        let host = |endpoint: &str| host_of(&endpoint.parse().unwrap());
+        assert_eq!(host("https://s3.example:443").unwrap(), "s3.example");
+        assert_eq!(host("http://s3.example:80").unwrap(), "s3.example");
+        assert_eq!(host("https://s3.example:80").unwrap(), "s3.example:80");
+        assert_eq!(host("http://[::1]:9000").unwrap(), "[::1]:9000");
+        assert!(host("https://user@s3.example").is_err());
+    }
+
+    #[test]
+    fn a_bucket_or_key_that_would_name_something_else_is_refused() {
+        assert!(Client::object_path("b", "").is_err());
+        assert!(Client::object_path("b?x", "k").is_err());
+        assert!(Client::bucket_path("").is_err());
+        assert!(Client::bucket_path("UPPER").is_err());
+        assert_eq!(Client::object_path("b.1-x", "k").unwrap(), "/b.1-x/k");
     }
 
     #[test]
