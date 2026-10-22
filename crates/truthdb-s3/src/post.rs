@@ -436,8 +436,9 @@ pub async fn post_object(
 ) -> Result<Response<Body>, S3Error> {
     let connection = request.extensions().get::<Connection>().copied();
     // The policy context sees only what the form acts on: the client's
-    // identification here, the acl field below (other headers, such as a
-    // copy source, would satisfy conditions the upload never honours).
+    // identification here, the acl and encryption fields below (other
+    // headers, such as a copy source, would satisfy conditions the upload
+    // never honours).
     let mut headers = HeaderMap::new();
     for name in [hyper::header::USER_AGENT, hyper::header::REFERER] {
         if let Some(value) = request.headers().get(&name) {
@@ -502,6 +503,18 @@ pub async fn post_object(
         headers.insert(
             "x-amz-acl",
             HeaderValue::from_str(acl).expect("a checked acl"),
+        );
+    }
+    crate::sse::refuse_customer_keys(fields.iter().map(|(name, _)| name.as_str()))?;
+    // The encryption it asks for, which policies see as
+    // s3:x-amz-server-side-encryption.
+    let encrypted_at_rest = state.storage.is_encrypted();
+    if let Some(value) =
+        crate::sse::check_write_fields(|name| field(&fields, name), encrypted_at_rest)?
+    {
+        headers.insert(
+            crate::sse::SSE_HEADER,
+            HeaderValue::from_str(value).expect("a checked encryption"),
         );
     }
     let tags = match field(&fields, "tagging") {
@@ -602,7 +615,8 @@ pub async fn post_object(
             "/{bucket}/{}",
             percent_encoding::utf8_percent_encode(&key, LOCATION)
         );
-        let mut response = Response::builder().header("etag", &etag);
+        let mut response =
+            crate::sse::with_header(Response::builder().header("etag", &etag), encrypted_at_rest);
         if let Some(version) = version_header(versioning, info.version, info.null_version) {
             response = response.header("x-amz-version-id", version);
         }

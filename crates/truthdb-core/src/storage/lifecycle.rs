@@ -202,6 +202,7 @@ impl Storage {
     /// group-commit log-writer over a duplicated WAL fd.
     pub(super) fn with_log_writer(path: PathBuf, file: Locked) -> Result<Self, StorageError> {
         let wal_fd = file.try_clone_wal_fd()?;
+        let encrypted = std::sync::atomic::AtomicBool::new(file.codec.is_encrypted());
         let (gc, log_writer) = GroupCommit::start(wal_fd, file.wal.sync_gate());
         Ok(Storage {
             path,
@@ -210,6 +211,7 @@ impl Storage {
             sync_commit: SyncCommitState::default(),
             repl_connected: std::sync::Mutex::new(std::collections::HashSet::new()),
             log_writer: Some(log_writer),
+            encrypted,
         })
     }
 
@@ -416,9 +418,10 @@ impl Storage {
         &self.path
     }
 
-    /// Whether the database's pages are encrypted.
+    /// Whether the database's pages are encrypted (without the storage
+    /// lock).
     pub fn is_encrypted(&self) -> bool {
-        self.lock().codec.is_encrypted()
+        self.encrypted.load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// Rewraps the database key under the master key now current (the first

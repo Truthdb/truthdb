@@ -42,7 +42,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "analytics",
     "attributes",
     "cors",
-    "encryption",
     "intelligent-tiering",
     "inventory",
     "legal-hold",
@@ -333,6 +332,7 @@ async fn route(
     if matches!(method, Method::PUT | Method::POST) {
         crate::policy::check_acl_headers(request.headers())?;
     }
+    crate::sse::refuse_customer_keys(request.headers().keys().map(|name| name.as_str()))?;
     match (target, method) {
         _ if UNIMPLEMENTED.iter().any(|name| has_param(&request, name)) => {
             Err(S3Error::not_implemented(format!(
@@ -381,6 +381,20 @@ async fn route(
             };
             authz.check(action, Bucket(&bucket))?;
             crate::public_access::handle(state, request, auth, bucket, String::new(), method).await
+        }
+        // An object has no `?encryption` of its own: refused, rather than
+        // taken for the plain object operation.
+        (Target::Object(..), _) if has_param(&request, "encryption") => Err(
+            S3Error::not_implemented("an object has no ?encryption configuration"),
+        ),
+        (Target::Bucket(bucket), method) if has_param(&request, "encryption") => {
+            let action = match method {
+                Method::GET => "s3:GetEncryptionConfiguration",
+                Method::PUT | Method::DELETE => "s3:PutEncryptionConfiguration",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?encryption"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::sse::handle(state, request, auth, bucket, method).await
         }
         (Target::Bucket(bucket), Method::GET) if has_param(&request, "policyStatus") => {
             authz.check("s3:GetBucketPolicyStatus", Bucket(&bucket))?;

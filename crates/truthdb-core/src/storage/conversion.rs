@@ -132,7 +132,10 @@ impl Storage {
             ));
         }
         self.lock()
-            .switch_to_encrypted(&header, file_uuid, &block, &dek)
+            .switch_to_encrypted(&header, file_uuid, &block, &dek)?;
+        self.encrypted
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
     }
 
     /// `encryption rotate database key`: replaces this encrypted database's

@@ -163,6 +163,10 @@ pub struct Storage {
     repl_connected: std::sync::Mutex<std::collections::HashSet<u32>>,
     /// The log-writer thread's join handle, taken in `Drop` after signalling it.
     log_writer: Option<JoinHandle<()>>,
+    /// Whether the database is encrypted at rest, readable without the
+    /// storage lock (an S3 request reports it on every object). Set at open
+    /// and by `encryption enable`; it never turns off.
+    encrypted: std::sync::atomic::AtomicBool,
 }
 
 // The point of the mutex: `Storage` is shareable across worker threads. Assert

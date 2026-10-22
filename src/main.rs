@@ -286,6 +286,7 @@ async fn main() -> ExitCode {
                     engine: engine.clone(),
                     region: config.s3.region.clone(),
                     signing_keys: Default::default(),
+                    storage: storage_arc.clone(),
                 });
                 let shutdown_rx = shutdown_tx.subscribe();
                 Some(tokio::spawn(truthdb_s3::server::serve(

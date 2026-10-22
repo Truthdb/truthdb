@@ -1234,7 +1234,9 @@ fn encryption_enable_converts_a_database_that_holds_data() {
 
     // Opened with the master key configured, then converted while it runs.
     let storage = Storage::open_with_keys(path.clone(), no_engine, Some(&source)).expect("open");
+    assert!(!storage.is_encrypted());
     storage.enable_encryption().expect("enable");
+    assert!(storage.is_encrypted());
     let status = storage.encryption_status();
     assert!(status.encrypted && status.converting);
     // Written during the conversion: sealed from the start.

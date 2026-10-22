@@ -113,17 +113,21 @@ pub async fn create_upload(
     key: String,
 ) -> Result<Response<Body>, S3Error> {
     let attrs = attrs_from(request.headers())?;
+    let encrypted_at_rest = state.storage.is_encrypted();
+    crate::sse::check_write(request.headers(), encrypted_at_rest)?;
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let upload = object(state, move |file| {
         file.transaction(|tx| tx.create_upload(&bucket_name, &key_name, &attrs, now_ms()))
     })
     .await?
     .map_err(|err| object_error(err, &bucket, &key))?;
-    Ok(xml(format!(
+    let mut response = xml(format!(
         "<InitiateMultipartUploadResult xmlns=\"{XMLNS}\"><Bucket>{}</Bucket><Key>{}</Key><UploadId>{upload}</UploadId></InitiateMultipartUploadResult>",
         escape(&bucket),
         escape(&key)
-    )))
+    ));
+    crate::sse::add_header(&mut response, encrypted_at_rest);
+    Ok(response)
 }
 
 pub async fn upload_part(
@@ -144,11 +148,14 @@ pub async fn upload_part(
     .await?
     .map_err(|err| upload_error(err, &bucket, &key))?;
     let etag: String = info.md5.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(Response::builder()
-        .status(StatusCode::OK)
-        .header("etag", format!("\"{etag}\""))
-        .body(full(Bytes::new()))
-        .expect("a valid response"))
+    Ok(crate::sse::with_header(
+        Response::builder()
+            .status(StatusCode::OK)
+            .header("etag", format!("\"{etag}\"")),
+        state.storage.is_encrypted(),
+    )
+    .body(full(Bytes::new()))
+    .expect("a valid response"))
 }
 
 pub async fn list_parts(
@@ -330,6 +337,7 @@ pub async fn complete_upload(
     if let Some(version) = version_header(versioning, info.version, info.null_version) {
         add_header(&mut response, "x-amz-version-id", version);
     }
+    crate::sse::add_header(&mut response, state.storage.is_encrypted());
     Ok(response)
 }
 
