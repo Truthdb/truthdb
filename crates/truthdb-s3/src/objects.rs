@@ -736,6 +736,62 @@ pub fn version_sel(query: &str) -> Result<VersionSel, S3Error> {
     Ok(VersionSel::Latest)
 }
 
+/// The `partNumber` a GET or HEAD names, if any: 1 to 10,000, once.
+fn part_number(query: &str) -> Result<Option<u32>, S3Error> {
+    let given: Vec<String> = crate::listing::query_params(query)
+        .into_iter()
+        .filter(|(name, _)| name == "partNumber")
+        .map(|(_, value)| value)
+        .collect();
+    let value = match given.as_slice() {
+        [] => return Ok(None),
+        [value] => value,
+        _ => "",
+    };
+    match value.parse::<u32>() {
+        Ok(number @ 1..=10_000) if value.bytes().all(|b| b.is_ascii_digit()) => Ok(Some(number)),
+        _ => Err(S3Error::new(
+            400,
+            "InvalidArgument",
+            "Part number must be an integer between 1 and 10000, inclusive",
+        )),
+    }
+}
+
+/// Part `number` of `info` as plaintext bytes `(first, len)`: `None` for
+/// part 1 of an object not uploaded in parts (the whole object, read as
+/// usual); `Err` when there is no such part.
+fn part_span(
+    file: &mut ObjFile<'_>,
+    info: &ObjectInfo,
+    number: u32,
+) -> Result<Result<Option<(u64, u64)>, ()>, StorageError> {
+    if info.parts == 0 {
+        return Ok(if number == 1 { Ok(None) } else { Err(()) });
+    }
+    let layout = file.body_layout(info.body)?;
+    if number as usize > layout.len() {
+        return Ok(Err(()));
+    }
+    // A part under a customer-provided key is stored encrypted: its
+    // plaintext is shorter.
+    let mut first = 0;
+    for (index, &(_, _, stored)) in layout.iter().enumerate() {
+        let len = if info.attrs.customer_key.is_some() {
+            crate::ssec::plain_len(stored).ok_or_else(|| {
+                StorageError::InvalidFile(format!("body {} has a corrupt part", info.body))
+            })?
+        } else {
+            stored
+        };
+        if index + 1 == number as usize {
+            return Ok(Ok(Some((first, len))));
+        }
+        first += len;
+    }
+    unreachable!("the part number is within the layout")
+}
+
 /// The `response-*` query parameters of a GET or HEAD: header values that
 /// replace the object's own in the response (a signed request's only).
 fn response_overrides(query: &str, signed: bool) -> Result<Vec<(String, String)>, S3Error> {
@@ -784,6 +840,12 @@ pub async fn get_object(
     crate::sse::check_read(request.headers())?;
     let customer = crate::ssec::provided(request.headers(), false)?;
     let which = version_sel(request.uri().query().unwrap_or(""))?;
+    let part = part_number(request.uri().query().unwrap_or(""))?;
+    if part.is_some() && request.headers().contains_key("range") {
+        return Err(S3Error::invalid_request(
+            "Cannot specify both Range header and partNumber query parameter",
+        ));
+    }
     let overrides = response_overrides(request.uri().query().unwrap_or(""), signed)?;
     let headers = request.headers().clone();
     // The read runs in its own task: a client that disconnects drops this
@@ -803,6 +865,7 @@ pub async fn get_object(
             bucket,
             key,
             which,
+            part,
             head_only,
             &overrides,
             customer,
@@ -829,6 +892,7 @@ async fn read_object(
     bucket: String,
     key: String,
     which: VersionSel,
+    part: Option<u32>,
     head_only: bool,
     overrides: &[(String, String)],
     customer: Option<crate::ssec::ProvidedKey>,
@@ -837,7 +901,7 @@ async fn read_object(
     // Resolve and lease in one lock hold, so the body cannot be collected
     // between the lookup and the lease.
     let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-    let (found, versioning, lock, restore, expiration) = object(state, move |file| {
+    let (found, versioning, lock, restore, expiration, span) = object(state, move |file| {
         let found = file.object_version(&lookup_bucket, &lookup_key, which)?;
         // The current version's expiration, by the bucket's lifecycle rules.
         let expiration = match &found {
@@ -863,15 +927,22 @@ async fn read_object(
             ),
             Err(_) => (truthdb_object::ObjectLock::default(), None),
         };
-        // An archived version not restored is not read: no lease.
+        // The part asked for, as plaintext bytes.
+        let span = match (&found, part) {
+            (Ok(info), Some(number)) if !info.delete_marker => part_span(file, info, number)?,
+            _ => Ok(None),
+        };
+        // An archived version not restored is not read, nor a part that is
+        // not there: no lease.
         if let Ok(info) = &found
             && !head_only
             && !info.delete_marker
             && !truthdb_object::unreadable(info.storage_class, restore)
+            && span.is_ok()
         {
             file.take_lease(info.body)?;
         }
-        Ok((found, versioning, lock, restore, expiration))
+        Ok((found, versioning, lock, restore, expiration, span))
     })
     .await?;
     let mut info = found.map_err(|err| object_error(err, &bucket, &key))?;
@@ -908,6 +979,14 @@ async fn read_object(
     if !head_only && truthdb_object::unreadable(info.storage_class, restore) {
         return Err(crate::restore::invalid_object_state());
     }
+    // No lease was taken for a part that is not there.
+    let span = span.map_err(|()| {
+        S3Error::new(
+            400,
+            "InvalidPart",
+            "The requested partnumber is not satisfiable",
+        )
+    })?;
     let release = |state: &S3State| {
         let engine = state.engine.clone();
         let body = info.body;
@@ -952,6 +1031,10 @@ async fn read_object(
         .expect("a valid response"));
     }
     let range = match header(headers, "range") {
+        // A part is a range of its own (never given with a Range header).
+        _ if span.is_some() => {
+            span.and_then(|(first, len)| (len > 0).then(|| (first, first + len - 1)))
+        }
         Some(value) => match parse_range(&value, info.size) {
             Ok(range) => range,
             Err(()) => {
@@ -967,9 +1050,12 @@ async fn read_object(
         },
         None => None,
     };
-    let (status, first, len) = match range {
-        Some((first, last)) => (StatusCode::PARTIAL_CONTENT, first, last - first + 1),
-        None => (StatusCode::OK, 0, info.size),
+    let (status, first, len) = match (span, range) {
+        // An empty part has no byte range to name.
+        (Some((first, 0)), _) => (StatusCode::OK, first, 0),
+        (Some((first, len)), _) => (StatusCode::PARTIAL_CONTENT, first, len),
+        (None, Some((first, last))) => (StatusCode::PARTIAL_CONTENT, first, last - first + 1),
+        (None, None) => (StatusCode::OK, 0, info.size),
     };
     let mut builder = crate::object_lock::with_headers(
         object_headers(
@@ -990,6 +1076,10 @@ async fn read_object(
             "content-range",
             format!("bytes {first}-{last}/{}", info.size),
         );
+    }
+    // A part of a multipart object says how many parts there are.
+    if span.is_some() {
+        builder = builder.header("x-amz-mp-parts-count", info.parts.to_string());
     }
     if head_only {
         return Ok(builder.body(full(Bytes::new())).expect("a valid response"));
