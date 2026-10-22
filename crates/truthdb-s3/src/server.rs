@@ -299,12 +299,14 @@ pub fn check_signed_headers(
     request: &Request<Incoming>,
     auth: &sigv4::AuthHeader,
     required: &[&str],
+    may_be_unsigned: &[&str],
 ) -> Result<(), S3Error> {
     for name in request
         .headers()
         .keys()
         .map(|name| name.as_str())
         .filter(|name| *name == "host" || name.starts_with("x-amz-"))
+        .filter(|name| !may_be_unsigned.contains(name))
         .chain(required.iter().copied())
     {
         if !auth.signed_headers.iter().any(|signed| signed == name) {
@@ -389,6 +391,7 @@ pub async fn authenticate(
         request,
         &auth,
         &["host", "x-amz-date", "x-amz-content-sha256"],
+        &[],
     )?;
     let (key, principal) = verify_signature(
         state,
@@ -490,7 +493,15 @@ pub async fn authenticate_presigned(
     if now > signed_at + query.expires {
         return Err(S3Error::access_denied("Request has expired"));
     }
-    check_signed_headers(request, &query.auth, &["host"])?;
+    // A presigned URL is made without the customer-provided key: only its
+    // algorithm is signed, the key and its MD5 come with the request (as S3
+    // documents), and the key is checked against the object's own.
+    check_signed_headers(
+        request,
+        &query.auth,
+        &["host"],
+        &crate::ssec::UNSIGNED_IN_PRESIGNED,
+    )?;
     let payload_hash = query
         .content_sha256
         .clone()

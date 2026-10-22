@@ -35,6 +35,19 @@ pub struct ObjectAttrs {
     pub expires: Option<String>,
     pub user: Vec<(String, String)>,
     pub tags: Vec<(String, String)>,
+    /// The customer-provided key (SSE-C) the body is encrypted with.
+    pub customer_key: Option<CustomerKey>,
+}
+
+/// What is kept of a customer-provided key (SSE-C): its MD5 as the client
+/// sent it (returned in answers) and a verifier that tells the key again;
+/// never the key.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CustomerKey {
+    /// Base64 of the key's MD5.
+    pub key_md5: String,
+    /// Base64 of a salt and a keyed digest of it under the key.
+    pub verifier: String,
 }
 
 impl ObjectAttrs {
@@ -71,6 +84,10 @@ impl ObjectAttrs {
             field(9, name);
             field(10, value);
         }
+        if let Some(key) = &self.customer_key {
+            field(11, &key.key_md5);
+            field(12, &key.verifier);
+        }
         out
     }
 
@@ -104,6 +121,13 @@ impl ObjectAttrs {
                 10 => attrs
                     .tags
                     .push((pending_name.take().ok_or_else(corrupt)?, value)),
+                11 => pending_name = Some(value),
+                12 => {
+                    attrs.customer_key = Some(CustomerKey {
+                        key_md5: pending_name.take().ok_or_else(corrupt)?,
+                        verifier: value,
+                    })
+                }
                 _ => return Err(corrupt()),
             }
         }
@@ -384,7 +408,7 @@ impl ObjTxn<'_, '_> {
             bucket_row.versioning,
             NewVersion {
                 body: sealed.body,
-                size: sealed.len,
+                size: body.size.unwrap_or(sealed.len),
                 md5: sealed.md5,
                 parts: 0,
             },
@@ -892,6 +916,10 @@ mod tests {
                 ("b".to_string(), "two".to_string()),
             ],
             tags: vec![("project".to_string(), "blue sky".to_string())],
+            customer_key: Some(CustomerKey {
+                key_md5: "kMd5==".to_string(),
+                verifier: "salt+mac".to_string(),
+            }),
         };
         assert_eq!(ObjectAttrs::decode(&attrs.encode()).unwrap(), attrs);
         assert!(ObjectAttrs::default().is_empty());

@@ -251,7 +251,8 @@ impl ObjTxn<'_, '_> {
             return Ok(Err(UploadError::NoSuchUpload));
         }
         let sealed = body.seal_in(self)?;
-        self.store_part(upload, number, sealed, now_ms, grace_ms)?;
+        let size = body.size.unwrap_or(sealed.len);
+        self.store_part(upload, number, sealed, size, now_ms, grace_ms)?;
         Ok(Ok(sealed))
     }
 
@@ -285,24 +286,25 @@ impl ObjTxn<'_, '_> {
             len: row.len,
             md5: row.md5,
         };
-        self.store_part(upload, number, shared, now_ms, grace_ms)?;
+        self.store_part(upload, number, shared, row.len, now_ms, grace_ms)?;
         Ok(Ok(shared))
     }
 
-    /// Records `sealed` (holding a reference for the part) as part `number`,
-    /// releasing the body of a part it replaces.
+    /// Records `sealed` (holding a reference for the part) as part `number`
+    /// of `size` bytes, releasing the body of a part it replaces.
     fn store_part(
         &mut self,
         upload: u64,
         number: u32,
         sealed: BodyInfo,
+        size: u64,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<(), StorageError> {
         let part = PartInfo {
             number,
             body: sealed.body,
-            size: sealed.len,
+            size,
             md5: sealed.md5,
             mtime_ms: now_ms,
         };
@@ -441,7 +443,12 @@ impl ObjTxn<'_, '_> {
             digest.update(part.md5);
         }
         let md5: [u8; 16] = digest.finalize().into();
-        let children: Vec<(u64, u64)> = chosen.iter().map(|p| (p.body, p.size)).collect();
+        // The composite holds the parts' bodies as stored (an encrypted
+        // part's body is longer than the part); the object is the parts.
+        let mut children = Vec::with_capacity(chosen.len());
+        for part in &chosen {
+            children.push((part.body, self.load_body(part.body)?.len));
+        }
         let body = self.compose_body(&children, md5, now_ms)?;
         let object = self.insert_version(
             &info.bucket,
@@ -449,7 +456,7 @@ impl ObjTxn<'_, '_> {
             bucket_row.versioning,
             NewVersion {
                 body,
-                size: children.iter().map(|(_, len)| len).sum(),
+                size: chosen.iter().map(|part| part.size).sum(),
                 md5,
                 parts: chosen.len() as u16,
             },
@@ -471,6 +478,23 @@ impl ObjFile<'_> {
             .get(&mut self.core.page_ctx(0), &upload.to_be_bytes())?
             .map(|row| decode_upload(upload, &row))
             .transpose()
+    }
+
+    /// The attributes the upload's object will have (its customer-provided
+    /// key's record among them).
+    pub fn upload_attrs(&mut self, upload: u64) -> Result<ObjectAttrs, StorageError> {
+        let Some(attrs_tree) = self.existing_tree(crate::ATTRS_TREE)? else {
+            return Ok(ObjectAttrs::default());
+        };
+        let mut bytes = Vec::new();
+        for (_, chunk) in attrs_tree.scan_range(
+            &mut self.core.page_ctx(0),
+            Some(&attrs_key(upload, 0)),
+            Some(&attrs_key(upload, u16::MAX)),
+        )? {
+            bytes.extend_from_slice(&chunk);
+        }
+        ObjectAttrs::decode(&bytes)
     }
 
     /// Up to `max` uploads started before `before_ms`, oldest first. Upload

@@ -76,6 +76,9 @@ pub enum FtStatus {
     /// transaction at a time (and a crash may have left it so). Its part is
     /// never a search hit, and the key's next sync removes it.
     Partial,
+    /// It is encrypted with a customer-provided key (SSE-C), which only its
+    /// requests carry.
+    Encrypted,
 }
 
 impl FtStatus {
@@ -87,6 +90,7 @@ impl FtStatus {
             FtStatus::TooLarge => 3,
             FtStatus::Failed => 4,
             FtStatus::Partial => 5,
+            FtStatus::Encrypted => 6,
         }
     }
 
@@ -98,6 +102,7 @@ impl FtStatus {
             3 => FtStatus::TooLarge,
             4 => FtStatus::Failed,
             5 => FtStatus::Partial,
+            6 => FtStatus::Encrypted,
             _ => return Err(corrupt("full-text key row")),
         })
     }
@@ -115,9 +120,13 @@ fn corrupt(what: &str) -> StorageError {
 }
 
 /// Why `info` is not indexed in a bucket indexing objects up to `max_bytes`,
-/// or `None` when it is: a text content type (`text/*`, JSON, XML, NDJSON
-/// and the `+json` and `+xml` types), no content encoding, within the size.
+/// or `None` when it is: no customer-provided key, a text content type
+/// (`text/*`, JSON, XML, NDJSON and the `+json` and `+xml` types), no content
+/// encoding, within the size.
 pub fn fulltext_status(info: &ObjectInfo, max_bytes: u64) -> Option<FtStatus> {
+    if info.attrs.customer_key.is_some() {
+        return Some(FtStatus::Encrypted);
+    }
     if info
         .attrs
         .content_encoding

@@ -553,6 +553,7 @@ impl BodyWriter {
         Ok(SealedBody {
             body: self.body,
             md5: self.md5.finalize().into(),
+            size: None,
         })
     }
 }
@@ -562,6 +563,9 @@ impl BodyWriter {
 pub struct SealedBody {
     pub body: u64,
     pub md5: [u8; 16],
+    /// The object's (or part's) length when it is not the body's: a body
+    /// encrypted with a customer-provided key stores more than it holds.
+    pub size: Option<u64>,
 }
 
 impl SealedBody {

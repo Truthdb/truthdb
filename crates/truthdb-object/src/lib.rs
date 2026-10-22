@@ -49,7 +49,9 @@ pub use fulltext::{
 pub use gc::GcOutcome;
 pub use journal::{JournalObject, JournalRecord, RecordType};
 pub use listing::{ListAfter, ListedObject, Listing};
-pub use objects::{Deleted, ObjectAttrs, ObjectError, ObjectInfo, VersionSel, version_id};
+pub use objects::{
+    CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, VersionSel, version_id,
+};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
 
 /// The object engine's id on the shared log (its root lives in the

@@ -71,6 +71,10 @@ const LIST_KEYS: usize = 1024;
 /// The key column a prefix read adds.
 const KEY_COLUMN: &str = "_s3_key";
 
+/// An object encrypted with a customer-provided key (SSE-C): only its own
+/// requests carry the key, so it is not read here (skipped in prefix mode).
+const ENCRYPTED_OBJECT: i32 = 4861;
+
 pub(super) fn read_error(message: impl Into<String>) -> SqlError {
     SqlError::new(4864, 16, 1, message)
 }
@@ -179,6 +183,17 @@ impl BodyReader {
             Err(ObjectError::NoSuchKey) => return Err(no_such_object(bucket, key)),
             Err(err) => return Err(super::s3_sql::object_error(err, bucket)),
         };
+        if info.attrs.customer_key.is_some() {
+            return Err(SqlError::new(
+                ENCRYPTED_OBJECT,
+                16,
+                1,
+                format!(
+                    "The object '{key}' in bucket '{bucket}' is encrypted with a \
+                     customer-provided key (SSE-C) and cannot be read here."
+                ),
+            ));
+        }
         let layout = file
             .body_layout(info.body)
             .map_err(super::s3_sql::storage_error)?;
@@ -735,7 +750,7 @@ impl ReadStream {
             check_cancelled()?;
             match self.open_object(&key) {
                 Ok(()) => return Ok(()),
-                Err(err) if err.number == 208 => continue,
+                Err(err) if err.number == 208 || err.number == ENCRYPTED_OBJECT => continue,
                 Err(err) => return Err(err),
             }
         }

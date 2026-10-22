@@ -26,7 +26,11 @@ fn put(engine: &Engine, bucket: &str, key: &str, data: &[u8], attrs: &ObjectAttr
         .object(|file| {
             let body = file.begin_body(1)?;
             file.append_segment(body, data, 1)?;
-            let sealed = SealedBody { body, md5: [7; 16] };
+            let sealed = SealedBody {
+                body,
+                md5: [7; 16],
+                size: None,
+            };
             file.transaction(|tx| tx.put_object(bucket, key, &sealed, attrs, 2_000, 0))
         })
         .expect("put")

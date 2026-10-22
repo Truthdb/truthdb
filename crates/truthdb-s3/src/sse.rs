@@ -87,30 +87,6 @@ pub fn check_write_value(value: &str, encrypted_at_rest: bool) -> Result<(), S3E
     }
 }
 
-/// The header (and POST field) prefixes of customer-provided keys (SSE-C):
-/// the object's own, and a copy source's.
-const CUSTOMER_KEY_PREFIXES: [&str; 2] = [
-    "x-amz-server-side-encryption-customer-",
-    "x-amz-copy-source-server-side-encryption-customer-",
-];
-
-/// Customer-provided keys (SSE-C) are not offered yet: a request naming one
-/// is refused, never served as if the object were under it (the body would
-/// be stored, and given to anyone, in the clear).
-pub fn refuse_customer_keys<'a>(mut names: impl Iterator<Item = &'a str>) -> Result<(), S3Error> {
-    if names.any(|name| {
-        let name = name.to_ascii_lowercase();
-        CUSTOMER_KEY_PREFIXES
-            .iter()
-            .any(|prefix| name.starts_with(prefix))
-    }) {
-        return Err(S3Error::not_implemented(
-            "server-side encryption with customer-provided keys (SSE-C) is not implemented",
-        ));
-    }
-    Ok(())
-}
-
 /// A GET or HEAD names no server-side encryption: an object's is fixed when
 /// it is written (S3 answers 400).
 pub fn check_read(headers: &HeaderMap) -> Result<(), S3Error> {
@@ -368,6 +344,17 @@ pub async fn handle(
             Ok(empty(StatusCode::NO_CONTENT))
         }
     }
+}
+
+/// Whether `bucket` blocks customer-provided keys (SSE-C).
+pub fn sse_c_blocked(
+    file: &mut truthdb_object::ObjFile<'_>,
+    bucket: &str,
+) -> Result<bool, truthdb_core::storage::StorageError> {
+    Ok(file
+        .bucket_config(bucket, BUCKET_ENCRYPTION, "")?
+        .and_then(|document| document.first().copied())
+        .is_some_and(|flags| flags & SSE_C_BLOCKED != 0))
 }
 
 #[cfg(test)]

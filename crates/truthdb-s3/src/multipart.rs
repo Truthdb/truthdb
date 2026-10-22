@@ -112,9 +112,18 @@ pub async fn create_upload(
     bucket: String,
     key: String,
 ) -> Result<Response<Body>, S3Error> {
-    let attrs = attrs_from(request.headers())?;
+    let mut attrs = attrs_from(request.headers())?;
     let encrypted_at_rest = state.storage.is_encrypted();
     crate::sse::check_write(request.headers(), encrypted_at_rest)?;
+    // Every part is encrypted with the key given here (and only with it).
+    let customer = crate::ssec::provided(request.headers(), false)?;
+    if customer.is_some() {
+        let name = bucket.clone();
+        let blocked = object(state, move |file| crate::sse::sse_c_blocked(file, &name)).await?;
+        crate::ssec::check_write(customer.as_ref(), request.headers(), blocked)?;
+    }
+    attrs.customer_key = customer.as_ref().map(|key| key.stored()).transpose()?;
+    let customer_key = attrs.customer_key.clone();
     let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let upload = object(state, move |file| {
         file.transaction(|tx| tx.create_upload(&bucket_name, &key_name, &attrs, now_ms()))
@@ -126,7 +135,8 @@ pub async fn create_upload(
         escape(&bucket),
         escape(&key)
     ));
-    crate::sse::add_header(&mut response, encrypted_at_rest);
+    crate::sse::add_header(&mut response, encrypted_at_rest && customer_key.is_none());
+    crate::ssec::add_echo(&mut response, customer_key.as_ref());
     Ok(response)
 }
 
@@ -141,18 +151,35 @@ pub async fn upload_part(
     let upload = upload_id(&params)?;
     let number = part_number(&params, &bucket, &key)?;
     check_upload(state, upload, &bucket, &key).await?;
-    let sealed = receive_body(state, request, auth).await?;
+    // A part of an upload with a customer-provided key comes with that key;
+    // one of an upload without, with none.
+    let customer = crate::ssec::provided(request.headers(), false)?;
+    let customer_key = object(state, move |file| file.upload_attrs(upload))
+        .await?
+        .customer_key;
+    crate::ssec::check_read(customer_key.as_ref(), customer.as_ref())?;
+    // A bucket blocking SSE-C refuses every request that names a key, a
+    // part of an upload begun before the block included (as S3).
+    if customer.is_some() {
+        let name = bucket.clone();
+        let blocked = object(state, move |file| crate::sse::sse_c_blocked(file, &name)).await?;
+        crate::ssec::check_write(customer.as_ref(), request.headers(), blocked)?;
+    }
+    let sealed = receive_body(state, request, auth, customer.as_ref()).await?;
     let info = object(state, move |file| {
         file.transaction(|tx| tx.upload_part(upload, number, &sealed, now_ms(), DROP_GRACE_MS))
     })
     .await?
     .map_err(|err| upload_error(err, &bucket, &key))?;
     let etag: String = info.md5.iter().map(|b| format!("{b:02x}")).collect();
-    Ok(crate::sse::with_header(
-        Response::builder()
-            .status(StatusCode::OK)
-            .header("etag", format!("\"{etag}\"")),
-        state.storage.is_encrypted(),
+    Ok(crate::ssec::with_echo(
+        crate::sse::with_header(
+            Response::builder()
+                .status(StatusCode::OK)
+                .header("etag", format!("\"{etag}\"")),
+            state.storage.is_encrypted() && customer_key.is_none(),
+        ),
+        customer_key.as_ref(),
     )
     .body(full(Bytes::new()))
     .expect("a valid response"))
@@ -337,7 +364,12 @@ pub async fn complete_upload(
     if let Some(version) = version_header(versioning, info.version, info.null_version) {
         add_header(&mut response, "x-amz-version-id", version);
     }
-    crate::sse::add_header(&mut response, state.storage.is_encrypted());
+    // An object with a customer-provided key is not AES256 (and the key is
+    // not echoed here, as S3 does not).
+    crate::sse::add_header(
+        &mut response,
+        state.storage.is_encrypted() && info.attrs.customer_key.is_none(),
+    );
     Ok(response)
 }
 

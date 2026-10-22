@@ -66,6 +66,11 @@ fn resolve_source(
             "The source of a copy request may not specifically refer to a delete marker by version id.",
         )));
     }
+    // A source with a customer-provided key is copied with that key (copying
+    // with one is refused before this, until it is implemented).
+    if let Err(err) = crate::ssec::check_read(source.attrs.customer_key.as_ref(), None) {
+        return Ok(Err(err));
+    }
     if precondition(headers, "x-amz-copy-source-", &source).is_some() {
         return Ok(Err(S3Error::new(
             412,
@@ -277,6 +282,14 @@ async fn copy_part(
 ) -> Result<(BodyInfo, Option<String>), S3Error> {
     let (part_bucket, part_key) = (bucket.clone(), key.clone());
     let (step, source_version) = object(state, move |file| {
+        // A part of an upload with a customer-provided key is encrypted with
+        // it: copying one in is not implemented yet.
+        if file.upload_attrs(upload)?.customer_key.is_some() {
+            return Ok(Err(S3Error::not_implemented(
+                "copying a part into an upload with a customer-provided key (SSE-C) is not \
+                 implemented",
+            )));
+        }
         let source = match resolve_source(file, &src_bucket, &src_key, which, &headers)? {
             Ok(source) => source,
             Err(err) => return Ok(Err(err)),
@@ -392,6 +405,7 @@ async fn copy_bytes(
     Ok(SealedBody {
         body: copy,
         md5: md5.finalize().into(),
+        size: None,
     })
 }
 

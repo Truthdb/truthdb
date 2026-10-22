@@ -1633,6 +1633,7 @@ dependencies = [
  "md-5",
  "percent-encoding",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "tokio",
@@ -1807,6 +1808,7 @@ dependencies = [
  "truthdb-iam",
  "truthdb-object",
  "truthdb-vector",
+ "zeroize",
 ]
 
 [[package]]
