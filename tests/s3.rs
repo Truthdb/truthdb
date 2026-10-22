@@ -5029,6 +5029,19 @@ fn customer_provided_keys_encrypt_objects_only_their_key_reads() {
         call("GET", "/vault/m", "", &extra, b"").1.1,
         latin1(&whole[first.len() - 3..first.len() + 5])
     );
+    // By part: each part's plaintext, at its plaintext offset.
+    let (head, (status, got)) = call("GET", "/vault/m", "partNumber=2", &header_refs(&key_a), b"");
+    assert_eq!(status, 206);
+    assert_eq!(got, latin1(&second));
+    assert_eq!(
+        response_header(&head, "content-range"),
+        Some(format!(
+            "bytes {}-{}/{}",
+            first.len(),
+            whole.len() - 1,
+            whole.len()
+        ))
+    );
     // A multipart upload without a key refuses a part with one.
     let (_, (_, created)) = call("POST", "/vault/n", "uploads", &[], b"");
     let plain_upload = xml_value(&created, "UploadId");
@@ -7588,4 +7601,102 @@ fn a_presigned_urls_x_amz_parameters_are_its_headers() {
         &format!("x-amz-content-sha256={hash}&X-Amz-Content-Sha256={hash}"),
     );
     assert_eq!(send_presigned(port, "PUT", &target, b"exact").1.0, 400);
+}
+
+#[test]
+fn a_multipart_object_is_read_by_part_number() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    assert_eq!(call("PUT", "/parts", "", &[], b"").1.0, 200);
+    let (_, (_, created)) = call("POST", "/parts/m", "uploads", &[], b"");
+    let upload = xml_value(&created, "UploadId");
+    let first: Vec<u8> = (0..5 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
+    let second = b"the second part".to_vec();
+    let mut etags = Vec::new();
+    for (number, data) in [(1, &first), (2, &second)] {
+        let (head, (status, reply)) = call(
+            "PUT",
+            "/parts/m",
+            &format!("uploadId={upload}&partNumber={number}"),
+            &[],
+            data,
+        );
+        assert_eq!(status, 200, "{reply}");
+        etags.push(response_header(&head, "etag").expect("etag"));
+    }
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{}</ETag></Part>\
+         <Part><PartNumber>2</PartNumber><ETag>{}</ETag></Part></CompleteMultipartUpload>",
+        etags[0], etags[1]
+    );
+    let (_, (status, reply)) = call(
+        "POST",
+        "/parts/m",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let total = first.len() + second.len();
+    let (whole_head, _) = call("HEAD", "/parts/m", "", &[], b"");
+    let etag = response_header(&whole_head, "etag").expect("etag");
+    assert!(etag.ends_with("-2\""), "{etag}");
+    assert_eq!(response_header(&whole_head, "x-amz-mp-parts-count"), None);
+    for (number, data, start) in [(1, &first, 0), (2, &second, first.len())] {
+        let query = format!("partNumber={number}");
+        for method in ["GET", "HEAD"] {
+            let (head, (status, body)) = call(method, "/parts/m", &query, &[], b"");
+            assert_eq!(status, 206, "{method} {query}");
+            assert_eq!(
+                response_header(&head, "etag"),
+                Some(etag.clone()),
+                "the whole object's"
+            );
+            assert_eq!(
+                response_header(&head, "x-amz-mp-parts-count").as_deref(),
+                Some("2")
+            );
+            assert_eq!(
+                response_header(&head, "content-length"),
+                Some(data.len().to_string())
+            );
+            assert_eq!(
+                response_header(&head, "content-range"),
+                Some(format!("bytes {start}-{}/{total}", start + data.len() - 1))
+            );
+            if method == "GET" {
+                assert!(body == latin1(data), "{query}");
+            }
+        }
+    }
+    // A part that is not there; a number that is not one; a Range as well.
+    let refused = |query: &str, extra: &[(&str, &str)], code: &str| {
+        let (_, (status, reply)) = call("GET", "/parts/m", query, extra, b"");
+        assert_eq!(status, 400, "{query}: {reply}");
+        assert!(
+            reply.contains(&format!("<Code>{code}</Code>")),
+            "{query}: {reply}"
+        );
+    };
+    refused("partNumber=3", &[], "InvalidPart");
+    for bad in [
+        "partNumber=0",
+        "partNumber=10001",
+        "partNumber=x",
+        "partNumber=+1",
+    ] {
+        refused(bad, &[], "InvalidArgument");
+    }
+    refused("partNumber=1", &[("range", "bytes=0-1")], "InvalidRequest");
+    // An object put whole is its own part 1, and has no other.
+    assert_eq!(call("PUT", "/parts/one", "", &[], b"single").1.0, 200);
+    let (head, (status, body)) = call("GET", "/parts/one", "partNumber=1", &[], b"");
+    assert_eq!((status, body.as_str()), (200, "single"));
+    assert_eq!(response_header(&head, "x-amz-mp-parts-count"), None);
+    let (status, reply) = call("GET", "/parts/one", "partNumber=2", &[], b"").1;
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("<Code>InvalidPart</Code>"), "{reply}");
 }
