@@ -266,6 +266,9 @@ const OBJECT_JOURNAL_HOLD_CAP_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// Journal rows one trimming transaction deletes at most.
 const OBJECT_JOURNAL_TRIM_BATCH: usize = 512;
 
+/// Expired restores one transaction removes at most.
+const OBJECT_RESTORE_EXPIRY_BATCH: usize = 512;
+
 /// A multipart upload left open this long is abandoned: garbage collection
 /// aborts it, releasing its parts (as an S3 lifecycle rule would).
 const OBJECT_UPLOAD_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
@@ -1167,7 +1170,8 @@ impl Engine {
     }
 
     /// The maintenance-thread garbage collection of object bodies: frees
-    /// unreferenced bodies whose grace is up and abandoned uploads. A standby
+    /// unreferenced bodies whose grace is up and abandoned uploads, and
+    /// removes expired restores. A standby
     /// never collects (its log is the primary's).
     pub(crate) fn object_gc(&self) -> Result<(), EngineError> {
         if self.storage.is_standby() || !self.runs_objects() {
@@ -1189,6 +1193,19 @@ impl Engine {
             // Gone meanwhile (completed or aborted) is fine.
             let _ =
                 self.object(|file| file.transaction(|tx| tx.abort_upload(upload, now_ms, 0)))?;
+        }
+        // Expired restores, a bounded batch per transaction and per sweep;
+        // an idle sweep writes nothing.
+        for _ in 0..8 {
+            let expired = self.object(|file| {
+                if !file.restores_due(now_ms)? {
+                    return Ok(0);
+                }
+                file.transaction(|tx| tx.expire_restores(now_ms, OBJECT_RESTORE_EXPIRY_BATCH))
+            })?;
+            if expired < OBJECT_RESTORE_EXPIRY_BATCH {
+                break;
+            }
         }
         // Journal rows past their retention, a bounded batch per transaction
         // and a bounded number of batches per sweep. Whether anything is due

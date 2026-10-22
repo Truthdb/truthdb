@@ -116,6 +116,10 @@ fn listens(pid: u32, port: u16) -> bool {
         })
 }
 
+/// How long the test servers take to restore an archived object, per tier:
+/// Bulk restores stay under way for a while.
+const RESTORE_SECONDS: &str = "restore_seconds = { expedited = 0, standard = 0, bulk = 2 }\n";
+
 fn spawn_server(encrypted: bool, tls: bool) -> Server {
     let dir = std::env::temp_dir().join(format!(
         "truthdb-s3-{}-{}",
@@ -157,7 +161,7 @@ fn spawn_server(encrypted: bool, tls: bool) -> Server {
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\n{tls_config}{encryption}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\n{RESTORE_SECONDS}{tls_config}{encryption}",
             dir.join("truth.db").display()
         ),
     )
@@ -917,6 +921,13 @@ fn a_user_without_policies_is_refused_every_operation() {
         ("DELETE", "/cov/o", "tagging", b"", &[]),
         ("GET", "/cov/o", "acl", b"", &[]),
         ("PUT", "/cov/o", "acl", b"", &[]),
+        (
+            "POST",
+            "/cov/o",
+            "restore",
+            b"<RestoreRequest><Days>1</Days></RestoreRequest>",
+            &[],
+        ),
         ("POST", "/cov/up", "uploads", b"", &[]),
         ("PUT", "/cov/up", &upload_part, b"part", &[]),
         ("GET", "/cov/up", &upload_query, b"", &[]),
@@ -7102,4 +7113,157 @@ fn a_cold_object_reads_back_alike_compressed() {
     assert_eq!(status, 200);
     let whole = [&first[..], &data[1000..2_501_000]].concat();
     assert!(body == latin1(&whole), "the whole upload");
+}
+
+#[test]
+fn an_archived_object_is_read_only_while_restored() {
+    const CLASS: &str = "x-amz-storage-class";
+    let server = start_server();
+    let port = server.s3_port;
+    let (_, key, secret) = account_with_key(&server, "archive");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    let restore = |path: &str, days: &str, tier: &str| {
+        call(
+            "POST",
+            path,
+            "restore",
+            &[],
+            format!(
+                "<RestoreRequest><Days>{days}</Days><GlacierJobParameters><Tier>{tier}</Tier>\
+                 </GlacierJobParameters></RestoreRequest>"
+            )
+            .as_bytes(),
+        )
+        .1
+    };
+    let restore_header = |path: &str| {
+        let (head, (status, _)) = call("HEAD", path, "", &[], b"");
+        assert_eq!(status, 200, "{path}");
+        response_header(&head, "x-amz-restore")
+    };
+    assert_eq!(call("PUT", "/archive", "", &[], b"").1.0, 200);
+    assert_eq!(
+        call("PUT", "/archive/cold", "", &[(CLASS, "GLACIER")], b"frozen")
+            .1
+            .0,
+        200
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/archive/deep",
+            "",
+            &[(CLASS, "DEEP_ARCHIVE")],
+            b"deeper"
+        )
+        .1
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/archive/ir",
+            "",
+            &[(CLASS, "GLACIER_IR")],
+            b"instant"
+        )
+        .1
+        .0,
+        200
+    );
+
+    // Not restored: HEAD works, GET and copies are refused.
+    let (head, (status, _)) = call("HEAD", "/archive/cold", "", &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(response_header(&head, CLASS).as_deref(), Some("GLACIER"));
+    assert_eq!(response_header(&head, "x-amz-restore"), None);
+    for (method, path, extra) in [
+        ("GET", "/archive/cold", &[][..]),
+        ("GET", "/archive/cold", &[("range", "bytes=0-1")][..]),
+        (
+            "PUT",
+            "/archive/copy",
+            &[("x-amz-copy-source", "/archive/cold")][..],
+        ),
+    ] {
+        let (status, reply) = call(method, path, "", extra, b"").1;
+        assert_eq!(status, 403, "{method} {path}: {reply}");
+        assert!(reply.contains("<Code>InvalidObjectState</Code>"), "{reply}");
+    }
+    // GLACIER_IR is read directly and is not restored.
+    assert_eq!(
+        call("GET", "/archive/ir", "", &[], b"").1,
+        (200, "instant".to_string())
+    );
+    let (status, reply) = restore("/archive/ir", "1", "Standard");
+    assert_eq!(status, 403, "{reply}");
+    assert!(
+        reply.contains("<Code>ObjectAlreadyInActiveTierError</Code>"),
+        "{reply}"
+    );
+    let (status, reply) = restore("/archive/none", "1", "Standard");
+    assert_eq!(status, 404, "{reply}");
+    assert!(reply.contains("<Code>NoSuchKey</Code>"), "{reply}");
+    let (status, reply) = restore("/archive/cold", "0", "Standard");
+    assert_eq!(status, 400, "{reply}");
+    let (status, reply) = restore("/archive/cold", "1", "Glacial");
+    assert_eq!(status, 400, "{reply}");
+    assert!(reply.contains("<Code>MalformedXML</Code>"), "{reply}");
+
+    // An Expedited restore here is done at once: readable, then copied.
+    assert_eq!(restore("/archive/deep", "1", "Expedited").0, 202);
+    let header = restore_header("/archive/deep").expect("x-amz-restore");
+    assert!(
+        header.starts_with("ongoing-request=\"false\", expiry-date=\""),
+        "{header}"
+    );
+    assert!(header.ends_with(" 00:00:00 GMT\""), "{header}");
+    let (head, (status, body)) = call("GET", "/archive/deep", "", &[], b"");
+    assert_eq!((status, body.as_str()), (200, "deeper"));
+    assert_eq!(
+        response_header(&head, "x-amz-restore"),
+        Some(header.clone())
+    );
+    let (status, reply) = call(
+        "PUT",
+        "/archive/thawed",
+        "",
+        &[("x-amz-copy-source", "/archive/deep"), (CLASS, "STANDARD")],
+        b"",
+    )
+    .1;
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(
+        call("GET", "/archive/thawed", "", &[], b"").1,
+        (200, "deeper".to_string())
+    );
+    // Asked again, the restore is extended: 200.
+    assert_eq!(restore("/archive/deep", "30", "Standard").0, 200);
+    assert_ne!(restore_header("/archive/deep"), Some(header));
+
+    // A Bulk restore stays under way (2 s on these servers).
+    assert_eq!(restore("/archive/cold", "1", "Bulk").0, 202);
+    assert_eq!(
+        restore_header("/archive/cold").as_deref(),
+        Some("ongoing-request=\"true\"")
+    );
+    let (status, reply) = restore("/archive/cold", "1", "Bulk");
+    assert_eq!(status, 409, "{reply}");
+    assert!(
+        reply.contains("<Code>RestoreAlreadyInProgress</Code>"),
+        "{reply}"
+    );
+    assert_eq!(call("GET", "/archive/cold", "", &[], b"").1.0, 403);
+    let deadline = Instant::now() + Duration::from_secs(10);
+    while restore_header("/archive/cold").as_deref() == Some("ongoing-request=\"true\"") {
+        assert!(Instant::now() < deadline, "the restore never completed");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(
+        call("GET", "/archive/cold", "", &[], b"").1,
+        (200, "frozen".to_string())
+    );
 }

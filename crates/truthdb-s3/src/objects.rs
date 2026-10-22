@@ -16,8 +16,8 @@ use md5::{Digest, Md5};
 use tokio::sync::mpsc;
 use truthdb_core::storage::StorageError;
 use truthdb_object::{
-    ObjFile, ObjectAttrs, ObjectError, ObjectInfo, SEGMENT_BYTES, SealedBody, StorageClass,
-    VersionSel, Versioning,
+    ObjFile, ObjectAttrs, ObjectError, ObjectInfo, RestoreState, SEGMENT_BYTES, SealedBody,
+    StorageClass, VersionSel, Versioning,
 };
 
 use crate::error::S3Error;
@@ -66,6 +66,16 @@ pub fn object_error(err: ObjectError, bucket: &str, key: &str) -> S3Error {
             S3Error::invalid_request("Bucket is missing Object Lock Configuration")
         }
         ObjectError::InvalidRetention(why) => S3Error::invalid_request(why),
+        ObjectError::NotArchived => S3Error::new(
+            403,
+            "ObjectAlreadyInActiveTierError",
+            "This action is not allowed against this storage tier.",
+        ),
+        ObjectError::RestoreInProgress => S3Error::new(
+            409,
+            "RestoreAlreadyInProgress",
+            "Object restore is already in progress",
+        ),
     }
 }
 
@@ -554,7 +564,7 @@ fn parse_range(value: &str, size: u64) -> Result<Option<(u64, u64)>, ()> {
     Ok(Some(range))
 }
 
-fn http_date(ms: u64) -> String {
+pub(crate) fn http_date(ms: u64) -> String {
     httpdate::fmt_http_date(std::time::UNIX_EPOCH + std::time::Duration::from_millis(ms))
 }
 
@@ -614,6 +624,7 @@ fn object_headers(
     info: &ObjectInfo,
     versioning: Versioning,
     encrypted_at_rest: bool,
+    restore: Option<RestoreState>,
 ) -> hyper::http::response::Builder {
     let attrs = &info.attrs;
     // An object with a customer-provided key says so, not AES256.
@@ -655,6 +666,9 @@ fn object_headers(
     // As S3: the class is named only when it is not STANDARD.
     if info.storage_class != StorageClass::Standard {
         builder = builder.header(STORAGE_CLASS_HEADER, info.storage_class.as_str());
+    }
+    if let Some(restore) = crate::restore::header(restore) {
+        builder = builder.header("x-amz-restore", restore);
     }
     builder
 }
@@ -752,6 +766,7 @@ pub async fn get_object(
         region: state.region.clone(),
         signing_keys: state.signing_keys.clone(),
         storage: state.storage.clone(),
+        restore_delays: state.restore_delays,
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {
@@ -795,22 +810,28 @@ async fn read_object(
     // Resolve and lease in one lock hold, so the body cannot be collected
     // between the lookup and the lease.
     let (lookup_bucket, lookup_key) = (bucket.clone(), key.clone());
-    let (found, versioning, lock) = object(state, move |file| {
+    let (found, versioning, lock, restore) = object(state, move |file| {
         let found = file.object_version(&lookup_bucket, &lookup_key, which)?;
         // Everything that can fail comes before the lease: a failure after
         // it would leave the lease held with no one to release it.
         let versioning = versioning_of(file, &lookup_bucket)?;
-        let lock = match &found {
-            Ok(info) => file.object_lock(info.version)?,
-            Err(_) => truthdb_object::ObjectLock::default(),
+        let (lock, restore) = match &found {
+            Ok(info) => (
+                file.object_lock(info.version)?,
+                file.restore(info.version)?
+                    .and_then(|restore| restore.state(now_ms())),
+            ),
+            Err(_) => (truthdb_object::ObjectLock::default(), None),
         };
+        // An archived version not restored is not read: no lease.
         if let Ok(info) = &found
             && !head_only
             && !info.delete_marker
+            && !truthdb_object::unreadable(info.storage_class, restore)
         {
             file.take_lease(info.body)?;
         }
-        Ok((found, versioning, lock))
+        Ok((found, versioning, lock, restore))
     })
     .await?;
     let mut info = found.map_err(|err| object_error(err, &bucket, &key))?;
@@ -843,6 +864,9 @@ async fn read_object(
             "x-amz-version-id",
             truthdb_object::version_id(info.version, info.null_version),
         ));
+    }
+    if !head_only && truthdb_object::unreadable(info.storage_class, restore) {
+        return Err(crate::restore::invalid_object_state());
     }
     let release = |state: &S3State| {
         let engine = state.engine.clone();
@@ -881,6 +905,7 @@ async fn read_object(
             &info,
             versioning,
             state.storage.is_encrypted(),
+            restore,
         )
         .body(full(Bytes::new()))
         .expect("a valid response"));
@@ -911,6 +936,7 @@ async fn read_object(
             &info,
             versioning,
             state.storage.is_encrypted(),
+            restore,
         ),
         &lock,
         lock_visible.retention,

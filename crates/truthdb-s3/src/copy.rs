@@ -73,6 +73,14 @@ fn resolve_source(
             "The source of a copy request may not specifically refer to a delete marker by version id.",
         )));
     }
+    // An archived source is copied only while restored.
+    if file.archived_unreadable(
+        source.version,
+        source.storage_class,
+        crate::objects::now_ms(),
+    )? {
+        return Ok(Err(crate::restore::invalid_object_state()));
+    }
     // A source with a customer-provided key is read with that key only.
     if let Err(err) = crate::ssec::check_read(source.attrs.customer_key.as_ref(), source_key) {
         return Ok(Err(err));
@@ -148,6 +156,7 @@ pub async fn copy_object(
         region: state.region.clone(),
         signing_keys: state.signing_keys.clone(),
         storage: state.storage.clone(),
+        restore_delays: state.restore_delays,
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {
@@ -441,6 +450,7 @@ pub async fn upload_part_copy(
         region: state.region.clone(),
         signing_keys: state.signing_keys.clone(),
         storage: state.storage.clone(),
+        restore_delays: state.restore_delays,
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     let part = tokio::spawn(crate::scope::within(scope, async move {

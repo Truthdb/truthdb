@@ -291,6 +291,11 @@ async fn main() -> ExitCode {
                     region: config.s3.region.clone(),
                     signing_keys: Default::default(),
                     storage: storage_arc.clone(),
+                    restore_delays: truthdb_s3::restore::RestoreDelays {
+                        expedited: config.s3.restore_seconds.expedited,
+                        standard: config.s3.restore_seconds.standard,
+                        bulk: config.s3.restore_seconds.bulk,
+                    },
                 });
                 let shutdown_rx = shutdown_tx.subscribe();
                 Some(tokio::spawn(truthdb_s3::server::serve(

@@ -25,6 +25,7 @@ mod listing;
 mod locks;
 mod objects;
 mod pack;
+mod restores;
 mod uploads;
 
 #[cfg(test)]
@@ -61,6 +62,7 @@ pub use objects::{
     version_id,
 };
 pub use pack::{PackStep, PackWork, pack_segment};
+pub use restores::{Restore, RestoreState, Restored, restore_expiry, unreadable};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
 
 /// The object engine's id on the shared log (its root lives in the
@@ -123,6 +125,10 @@ const CONSUMERS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 23;
 /// Body -> the zstd level it is to be packed at and its next segment (see
 /// `pack`).
 const PACK_QUEUE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 24;
+/// Version -> its restore window (see `restores`).
+const RESTORES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 25;
+/// (expiry time, version) -> (): restores in the order they expire.
+const RESTORE_TIMERS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 26;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -243,7 +249,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 25;
+const TREE_COUNT: usize = 27;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -333,6 +339,12 @@ impl Trees {
     }
     pub fn pack_queue(&self) -> BTree {
         self.tree(PACK_QUEUE_TREE)
+    }
+    pub fn restores(&self) -> BTree {
+        self.tree(RESTORES_TREE)
+    }
+    pub fn restore_timers(&self) -> BTree {
+        self.tree(RESTORE_TIMERS_TREE)
     }
 }
 

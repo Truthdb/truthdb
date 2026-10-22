@@ -48,6 +48,8 @@ pub struct S3State {
     /// The database itself, for what is read without the engine (whether it
     /// is encrypted at rest).
     pub storage: std::sync::Arc<truthdb_core::storage::Storage>,
+    /// How long a restore of an archived object takes, per retrieval tier.
+    pub restore_delays: crate::restore::RestoreDelays,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
