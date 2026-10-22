@@ -722,7 +722,7 @@ impl Engine {
             "key_fingerprint": status.fingerprint.map(hex),
             "converting": status.converting,
             "rekeying": status.rekeying,
-            "percent_complete": storage.conversion_percent(),
+            "percent_complete": status.percent_complete,
             "waiting_for_log_truncation": storage.conversion_waits_for_log(),
         })
         .to_string())

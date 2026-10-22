@@ -452,6 +452,7 @@ impl Storage {
                     encrypted: true,
                     converting: locked.conversion.is_some() && !rekeying,
                     rekeying,
+                    percent_complete: locked.conversion_percent(),
                     encryptor_type,
                     key_id,
                     fingerprint: Some(record.fingerprint),
@@ -461,6 +462,7 @@ impl Storage {
                 encrypted: false,
                 converting: false,
                 rekeying: false,
+                percent_complete: None,
                 encryptor_type: "NONE",
                 key_id: None,
                 fingerprint: None,
@@ -621,6 +623,8 @@ pub struct EncryptionStatus {
     /// `encryption rotate database key` is still rewriting what the old key
     /// sealed.
     pub rekeying: bool,
+    /// How far the conversion or rekeying is (`None`: neither under way).
+    pub percent_complete: Option<u32>,
     /// `KEY FILE`, `KEY COMMAND` or `NONE`.
     pub encryptor_type: &'static str,
     /// The master key's id, for a key file.

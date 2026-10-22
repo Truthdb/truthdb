@@ -46,8 +46,8 @@
 # To encrypt an existing database: configure a master key here, restart, and
 # run `encryption enable`; the server converts it in the background
 # (`encryption status` shows progress). Standbys cannot follow the change:
-# reseed them from a backup taken afterwards, and start a new backup chain
-# with a full backup.
+# reseed them from a backup taken after `encryption status` shows it
+# finished, and start a new backup chain with a full backup.
 # To rotate the master key: put the new key first in the key file (keep the
 # old one) and run `encryption rotate master key` on the primary and on every
 # standby (each file holds its own copy of the wrapped key; a standby seeded
@@ -59,4 +59,6 @@
 # on the primary; the server rewrites everything under the new key in the
 # background (`encryption status` shows progress), and the old one is gone
 # once it finishes. As for `encryption enable`: reseed the standbys from a
-# backup taken afterwards, and start a new backup chain with a full backup.
+# backup taken after `encryption status` shows it finished, and start a new
+# backup chain with a full backup. A point-in-time restore cannot cross the
+# rotation: take a log backup just before it.

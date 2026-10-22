@@ -58,7 +58,7 @@ pub(in crate::engine::relational) fn sys_dm_database_encryption_keys(
     let status = storage.encryption_status();
     // SQL Server's states: 1 unencrypted, 2 encryption in progress, 3
     // encrypted, 4 key change in progress.
-    let (state, percent) = match storage.conversion_percent() {
+    let (state, percent) = match status.percent_complete {
         Some(percent) if status.rekeying => (4, percent as i32),
         Some(percent) => (2, percent as i32),
         None => (3, 0),

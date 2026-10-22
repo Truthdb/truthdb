@@ -177,21 +177,21 @@ impl Storage {
             .as_ref()
             .is_some_and(|conversion| conversion.waiting_for_log)
     }
+}
 
-    /// How far the conversion under way is, in percent (`None`: none).
-    pub fn conversion_percent(&self) -> Option<u32> {
-        let locked = self.lock();
-        let conversion = locked.conversion.as_ref()?;
-        let pages = (locked.layout.data_size / PAGE_SIZE as u64).max(1);
+impl StorageFile {
+    /// How far the conversion or rekeying under way is, in percent (`None`:
+    /// none).
+    pub(super) fn conversion_percent(&self) -> Option<u32> {
+        let conversion = self.conversion.as_ref()?;
+        let pages = (self.layout.data_size / PAGE_SIZE as u64).max(1);
         let done = match conversion.zeroing {
             Some(_) => pages,
             None => conversion.cursor,
         };
         Some((done * 100 / pages).min(99) as u32)
     }
-}
 
-impl StorageFile {
     /// The header of this plain database and the master key source, for
     /// `encryption enable`.
     fn header_to_enable(
@@ -243,7 +243,12 @@ impl StorageFile {
                 "this database is not encrypted: `encryption enable` first".to_string(),
             ));
         }
-        if self.conversion.is_some() {
+        // The key block on disk decides too: a second rotation over one not
+        // settled would drop the old key that pages still need.
+        if self.conversion.is_some()
+            || crate::encryption::key_block_state(header.key_block())
+                != crate::encryption::KEY_STATE_ENCRYPTED
+        {
             return Err(StorageError::InvalidConfig(
                 "a conversion or key rotation is under way: rotate after it finishes".to_string(),
             ));
