@@ -4462,8 +4462,17 @@ fn lifecycle_rules_act_as_the_days_pass_once_a_day() {
         rows: 1000,
         actions: 1000,
     };
+    let packs_queued = || {
+        ObjFile::new(&mut storage.lock())
+            .next_pack()
+            .unwrap()
+            .is_some()
+    };
     for day in lifecycle_days() {
+        // Only the transitions of day 12 queue bodies for packing.
+        assert_eq!(packs_queued(), day.0 >= 13 * DAY, "at {}", day.0);
         lifecycle_passes(&storage, day.0, budget);
+        assert_eq!(packs_queued(), day.0 >= 12 * DAY, "at {}", day.0);
         assert_eq!(
             lifecycle_view(&storage),
             expected_view(&day),
@@ -4507,11 +4516,12 @@ fn lifecycle_rules_act_as_the_days_pass_once_a_day() {
     // removal.
     assert_eq!(by("LifecycleExpiration"), 5);
     // A deleted configuration stops the passes; a deleted bucket takes its
-    // state along.
+    // state along: with neither left, no pass is due.
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
             assert!(tx.delete_lifecycle("ver")?);
             assert!(!tx.delete_lifecycle("ver")?);
+            assert!(tx.delete_lifecycle("lck")?);
             tx.delete_object("unv", "k", None, false, T0, 0)?.unwrap();
             tx.delete_bucket("unv").map(|deleted| deleted.unwrap())
         })
@@ -4522,7 +4532,11 @@ fn lifecycle_rules_act_as_the_days_pass_once_a_day() {
             .unwrap()
             .is_none()
     );
-    lifecycle_passes(&storage, 40 * DAY, budget);
+    assert!(
+        !ObjFile::new(&mut storage.lock())
+            .lifecycle_step(40 * DAY, 0, budget)
+            .unwrap()
+    );
     let after = lifecycle_view(&storage);
     assert!(after.0.iter().any(|(key, _, _)| key == "ver/other/z"));
     drop(storage);
