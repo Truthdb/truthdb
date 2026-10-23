@@ -210,7 +210,16 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                 .authority()
                 .map(|authority| authority.as_str())
         });
-    if let Some(bucket) = host.and_then(|host| crate::api::host_bucket(host, &state.domains)) {
+    // A bucket's website endpoint, else virtual-hosted addressing. A
+    // bucket named `<name>.s3-website` is therefore not addressed by its
+    // host under a domain (path-style requests reach it).
+    if let Some(bucket) = host.and_then(|host| crate::website::website_bucket(host, &state.domains))
+    {
+        request
+            .extensions_mut()
+            .insert(crate::website::WebsiteHost(bucket));
+    } else if let Some(bucket) = host.and_then(|host| crate::api::host_bucket(host, &state.domains))
+    {
         request
             .extensions_mut()
             .insert(crate::api::VirtualHost(bucket));
@@ -220,22 +229,26 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
     // A cross-origin request (not a preflight, which answers for itself):
     // its answer, an error too, carries the CORS headers its bucket's
     // configuration allows.
-    let cross_origin = (request.method() != hyper::Method::OPTIONS)
-        .then(|| {
-            request
-                .headers()
-                .get("origin")?
-                .to_str()
-                .ok()
-                .map(str::to_string)
-        })
-        .flatten()
-        .and_then(|origin| match crate::api::target(&request).ok()? {
-            crate::api::Target::Bucket(bucket) | crate::api::Target::Object(bucket, _) => {
-                Some((bucket, origin, request.method().clone()))
-            }
-            crate::api::Target::Service => None,
-        });
+    let cross_origin = (request.method() != hyper::Method::OPTIONS
+        && request
+            .extensions()
+            .get::<crate::website::WebsiteHost>()
+            .is_none())
+    .then(|| {
+        request
+            .headers()
+            .get("origin")?
+            .to_str()
+            .ok()
+            .map(str::to_string)
+    })
+    .flatten()
+    .and_then(|origin| match crate::api::target(&request).ok()? {
+        crate::api::Target::Bucket(bucket) | crate::api::Target::Object(bucket, _) => {
+            Some((bucket, origin, request.method().clone()))
+        }
+        crate::api::Target::Service => None,
+    });
     let mut response = match route(state, request).await {
         Ok(response) => response,
         Err(err) => error_response(&err, &resource, &ids),
@@ -290,6 +303,10 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
         return Err(S3Error::invalid_request(
             "the request target's host is not the Host header",
         ));
+    }
+    // A website endpoint answers for itself, anonymously.
+    if let Some(crate::website::WebsiteHost(bucket)) = request.extensions().get().cloned() {
+        return Ok(crate::website::serve(state, request, bucket).await);
     }
     // S3 Vectors' JSON API on the same listener, told apart by the
     // service its requests are signed for.

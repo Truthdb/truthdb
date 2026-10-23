@@ -922,7 +922,7 @@ pub struct LockVisible {
 }
 
 #[allow(clippy::too_many_arguments)]
-async fn read_object(
+pub(crate) async fn read_object(
     state: &S3State,
     headers: &HeaderMap,
     bucket: String,

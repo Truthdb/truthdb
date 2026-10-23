@@ -12113,3 +12113,254 @@ fn a_bucket_keeps_its_website_configuration() {
     assert_eq!(call("GET", "/site", "website", &[], b"").0, 404);
     assert_eq!(call("GET", "/site/k", "website", &[], b"").0, 501);
 }
+
+#[test]
+fn a_website_endpoint_serves_public_objects_anonymously() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret)).1
+    };
+    let md5_put = |path: &str, query: &str, body: &str| {
+        let md5 = content_md5(body.as_bytes());
+        call(
+            "PUT",
+            path,
+            query,
+            &[("content-md5", &md5)],
+            body.as_bytes(),
+        )
+    };
+    let host = |bucket: &str| format!("{bucket}.s3-website.s3.test:{port}");
+    // Unsigned (or signed: the endpoint takes every request as anonymous).
+    let visit = |bucket: &str, method: &str, path: &str, extra: &[(&str, &str)], signed: bool| {
+        let site = host(bucket);
+        let mut headers = vec![("host", site.as_str())];
+        headers.extend_from_slice(extra);
+        let (head, (status, body)) = if signed {
+            send_with(port, method, path, "", &headers, b"", &key, Some(&secret))
+        } else {
+            send_with(port, method, path, "", &headers, b"", "", None)
+        };
+        (status, head, body)
+    };
+    let get = |bucket: &str, path: &str| visit(bucket, "GET", path, &[], false);
+    let location = |head: &str| response_header(head, "location").unwrap_or_default();
+
+    // No bucket; a bucket without a website configuration.
+    let (status, head, body) = get("nosuch", "/");
+    assert_eq!(status, 404);
+    assert!(body.contains("<li>Code: NoSuchBucket</li>"), "{body}");
+    assert_eq!(
+        response_header(&head, "x-amz-error-code").as_deref(),
+        Some("NoSuchBucket")
+    );
+    assert_eq!(call("PUT", "/site", "", &[], b"").0, 200);
+    let (status, _, body) = get("site", "/");
+    assert_eq!(status, 404);
+    assert!(
+        body.contains("<li>Code: NoSuchWebsiteConfiguration</li>"),
+        "{body}"
+    );
+
+    // A public site.
+    let html = [("content-type", "text/html")];
+    for (name, content) in [
+        ("index.html", "home page"),
+        ("sub/index.html", "sub page"),
+        ("error.html", "custom error page"),
+        ("private/secret", "secret"),
+        ("private/index.html", "private index"),
+        ("docs/a", "old doc"),
+    ] {
+        assert_eq!(
+            call(
+                "PUT",
+                &format!("/site/{name}"),
+                "",
+                &html,
+                content.as_bytes()
+            )
+            .0,
+            200
+        );
+    }
+    assert_eq!(
+        call(
+            "PUT",
+            "/site/moved",
+            "",
+            &[("x-amz-website-redirect-location", "/elsewhere")],
+            b"x"
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/site",
+            "publicAccessBlock",
+            &[],
+            b"<PublicAccessBlockConfiguration/>"
+        )
+        .0,
+        200
+    );
+    let policy = |extra: &str| {
+        format!(
+            r#"{{"Version": "2012-10-17", "Statement": [
+            {{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::site/*"}},
+            {{"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::site/private/*"}}{extra}]}}"#
+        )
+    };
+    assert_eq!(
+        call("PUT", "/site", "policy", &[], policy("").as_bytes()).0,
+        204
+    );
+    let config = "<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument>\
+        <ErrorDocument><Key>error.html</Key></ErrorDocument><RoutingRules>\
+        <RoutingRule><Condition><KeyPrefixEquals>docs/</KeyPrefixEquals></Condition>\
+        <Redirect><ReplaceKeyPrefixWith>documents/</ReplaceKeyPrefixWith></Redirect></RoutingRule>\
+        <RoutingRule><Condition><KeyPrefixEquals>images/</KeyPrefixEquals>\
+        <HttpErrorCodeReturnedEquals>404</HttpErrorCodeReturnedEquals></Condition>\
+        <Redirect><HostName>example.com</HostName><HttpRedirectCode>302</HttpRedirectCode>\
+        <ReplaceKeyPrefixWith>report-404/</ReplaceKeyPrefixWith></Redirect></RoutingRule>\
+        </RoutingRules></WebsiteConfiguration>";
+    assert_eq!(md5_put("/site", "website", config).0, 200);
+
+    // Index documents; a folder named without its slash is redirected.
+    let (status, head, body) = get("site", "/");
+    assert_eq!((status, body.as_str()), (200, "home page"));
+    assert_eq!(
+        response_header(&head, "content-type").as_deref(),
+        Some("text/html")
+    );
+    assert_eq!(get("site", "/sub/").2, "sub page");
+    let (status, head, body) = get("site", "/sub");
+    assert_eq!(
+        (status, location(&head).as_str(), body.as_str()),
+        (302, "/sub/", "")
+    );
+    let (status, _, body) = visit("site", "GET", "/", &[("range", "bytes=0-3")], false);
+    assert_eq!((status, body.as_str()), (206, "home"));
+    let (status, _, body) = visit("site", "HEAD", "/", &[], false);
+    assert_eq!((status, body.as_str()), (200, ""));
+
+    // A missing key: 403 unless the public may list the bucket, with the
+    // error document; a denied object: 403 too, signed or not.
+    let (status, head, body) = get("site", "/missing");
+    assert_eq!((status, body.as_str()), (403, "custom error page"));
+    assert_eq!(
+        response_header(&head, "content-type").as_deref(),
+        Some("text/html")
+    );
+    // A folder whose index the public may not read is not redirected to.
+    let (status, head, body) = get("site", "/private");
+    assert_eq!(
+        (status, body.as_str()),
+        (403, "custom error page"),
+        "{head}"
+    );
+    for signed in [false, true] {
+        let (status, _, body) = visit("site", "GET", "/private/secret", &[], signed);
+        assert_eq!(
+            (status, body.as_str()),
+            (403, "custom error page"),
+            "signed: {signed}"
+        );
+    }
+    let listable = r#",
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::site"}"#;
+    assert_eq!(
+        call("PUT", "/site", "policy", &[], policy(listable).as_bytes()).0,
+        204
+    );
+    let (status, _, body) = get("site", "/missing");
+    assert_eq!((status, body.as_str()), (404, "custom error page"));
+    // An error document the public may not read is not shown.
+    let hidden = r#",
+        {"Effect": "Allow", "Principal": "*", "Action": "s3:ListBucket", "Resource": "arn:aws:s3:::site"},
+        {"Effect": "Deny", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::site/error.html"}"#;
+    assert_eq!(
+        call("PUT", "/site", "policy", &[], policy(hidden).as_bytes()).0,
+        204
+    );
+    let (status, head, body) = get("site", "/missing");
+    assert_eq!(status, 404);
+    assert!(body.contains("<li>Code: NoSuchKey</li>"), "{body}");
+    assert!(body.contains("<li>Key: missing</li>"), "{body}");
+    assert!(!body.contains("custom error page"));
+    assert_eq!(
+        response_header(&head, "content-type").as_deref(),
+        Some("text/html; charset=utf-8")
+    );
+    // What a key holds is escaped in the page.
+    let (_, _, body) = get("site", "/%3Cscript%3Ealert(1)%3C%2Fscript%3E");
+    assert!(body.contains("&lt;script&gt;"), "{body}");
+    assert!(!body.contains("<script>"), "{body}");
+
+    // Redirects: a routing rule on the key, one on the error, an object's.
+    let (status, head, body) = get("site", "/docs/a");
+    assert_eq!(
+        (status, location(&head), body.as_str()),
+        (301, format!("http://{}/documents/a", host("site")), "")
+    );
+    let (status, head, _) = get("site", "/images/x%20y.png");
+    assert_eq!(
+        (status, location(&head)),
+        (302, "http://example.com/report-404/x%20y.png".to_string())
+    );
+    let (status, head, _) = get("site", "/moved");
+    assert_eq!((status, location(&head)), (301, "/elsewhere".to_string()));
+
+    // Only GET and HEAD.
+    let (status, _, body) = visit("site", "PUT", "/new", &[], true);
+    assert_eq!(status, 405);
+    assert!(body.contains("<li>Code: MethodNotAllowed</li>"), "{body}");
+    assert_eq!(call("GET", "/site/new", "", &[], b"").0, 404);
+
+    // Every request redirected.
+    assert_eq!(call("PUT", "/moving", "", &[], b"").0, 200);
+    let all = "<WebsiteConfiguration><RedirectAllRequestsTo><HostName>www.example.com</HostName>\
+        <Protocol>https</Protocol></RedirectAllRequestsTo></WebsiteConfiguration>";
+    assert_eq!(md5_put("/moving", "website", all).0, 200);
+    let (status, head, _) = get("moving", "/a/b.html");
+    assert_eq!(
+        (status, location(&head)),
+        (301, "https://www.example.com/a/b.html".to_string())
+    );
+
+    // A website path is a key, not a bucket's: no other bucket's CORS
+    // configuration answers for it.
+    assert_eq!(call("PUT", "/open", "", &[], b"").0, 200);
+    let cors = "<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin>\
+        <AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>";
+    assert_eq!(md5_put("/open", "cors", cors).0, 200);
+    let (_, head, _) = visit(
+        "site",
+        "GET",
+        "/open/k",
+        &[("origin", "https://a.example")],
+        false,
+    );
+    assert_eq!(
+        response_header(&head, "access-control-allow-origin"),
+        None,
+        "{head}"
+    );
+
+    // Blocking public access closes the site.
+    let block = "<PublicAccessBlockConfiguration><RestrictPublicBuckets>true</RestrictPublicBuckets>\
+        </PublicAccessBlockConfiguration>";
+    assert_eq!(
+        call("PUT", "/site", "publicAccessBlock", &[], block.as_bytes()).0,
+        200
+    );
+    let (status, _, body) = get("site", "/");
+    assert_eq!(status, 403);
+    assert!(body.contains("<li>Code: AccessDenied</li>"), "{body}");
+    // The REST endpoint is unchanged.
+    let (status, body) = call("GET", "/site/index.html", "", &[], b"");
+    assert_eq!((status, body.as_str()), (200, "home page"));
+}
