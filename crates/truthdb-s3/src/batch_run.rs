@@ -242,6 +242,29 @@ fn job_spec(file: &mut ObjFile<'_>, job: &Job) -> Result<Option<Spec>, StorageEr
         .ok())
 }
 
+/// Whether the user that created `job` still exists (the same user: a user
+/// of its name made since is another). A job whose creator is gone fails.
+fn creator_holds(file: &mut ObjFile<'_>, job: &Job) -> Result<bool, StorageError> {
+    let Some(name) = &job.user else {
+        return Ok(true);
+    };
+    Ok(file
+        .users(&job.account)?
+        .iter()
+        .any(|user| &user.name == name && user.user_id == job.user_id))
+}
+
+const CREATOR_GONE: &str = "The user that created the job no longer exists";
+
+/// The canonical version id of a version selector (`None`: the latest).
+fn version_key(which: VersionSel) -> Option<String> {
+    match which {
+        VersionSel::Latest => None,
+        VersionSel::Null => Some("null".to_string()),
+        VersionSel::Seq(version) => Some(version.to_string()),
+    }
+}
+
 /// The user that created `job`, as a principal (for its authorization).
 fn creator(job: &Job) -> Principal {
     Principal {
@@ -339,6 +362,9 @@ async fn prepare(state: &S3State, number: u64) -> Result<(), String> {
                 "The job's request cannot be read",
             );
         };
+        if !creator_holds(file, &job)? {
+            return finish_failed(file, number, "AccessDenied", CREATOR_GONE);
+        }
         let owned = |file: &mut ObjFile<'_>, bucket: &str| -> Result<bool, StorageError> {
             Ok(file
                 .bucket(bucket)?
@@ -391,6 +417,10 @@ async fn prepare(state: &S3State, number: u64) -> Result<(), String> {
                     vec![(manifest.bucket.clone(), manifest.key.clone(), which)],
                     now,
                 )?;
+                let authz = match version_key(which) {
+                    Some(version) => authz.with_keys(&[("s3:VersionId", version)]),
+                    None => authz,
+                };
                 if authz
                     .check(action, Resource::Object(&manifest.bucket, &manifest.key))
                     .is_err()
@@ -611,6 +641,11 @@ fn plan(
     )?;
     let object = Resource::Object(bucket, key);
     let versioned = version.is_some();
+    // The keys the equivalent request would carry: the version it names.
+    let authz = match version_key(which) {
+        Some(version) => authz.with_keys(&[("s3:VersionId", version)]),
+        None => authz,
+    };
     let copy = match operation {
         Operation::PutTagging(tags) => {
             let action = if versioned {
@@ -691,7 +726,23 @@ fn plan(
     let lock = crate::object_lock::new_object_lock(None, bucket_lock, default, now)
         .ok()
         .flatten();
-    if let Err(err) = authz.check_storing(
+    // A CopyObject's keys: its source, the class and the metadata
+    // directive; its version id is the source's, not the target's.
+    let mut source_id = format!("{bucket}/{key}");
+    if let Some(version) = version_key(which) {
+        source_id.push_str(&format!("?versionId={version}"));
+    }
+    let directive = match copy.metadata {
+        Some(_) => "REPLACE",
+        None => "COPY",
+    };
+    let target_authz = Authz::load_now(file, creator, vec![copy.bucket.clone()], Vec::new(), now)?
+        .with_keys(&[
+            ("s3:x-amz-copy-source", source_id),
+            ("s3:x-amz-storage-class", copy.class.as_str().to_string()),
+            ("s3:x-amz-metadata-directive", directive.to_string()),
+        ]);
+    if let Err(err) = target_authz.check_storing(
         "s3:PutObject",
         Resource::Object(&copy.bucket, &target),
         copy.tags.as_deref(),
@@ -740,6 +791,9 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
                 "The job's request cannot be read",
             );
         };
+        if !creator_holds(file, &job)? {
+            return finish_failed(file, number, "AccessDenied", CREATOR_GONE);
+        }
         let Some(version) = job.manifest_version else {
             return finish_failed(
                 file,
@@ -999,6 +1053,9 @@ async fn finish(state: &S3State, job: Job) -> Result<(), String> {
         let lock = crate::object_lock::new_object_lock(None, bucket_lock, default, now)
             .ok()
             .flatten();
+        if written.is_some() && problem.is_none() && !creator_holds(file, &job)? {
+            problem = Some(("AccessDenied", CREATOR_GONE));
+        }
         if let (Some(files), None) = (&written, problem) {
             let authz = Authz::load_now(
                 file,

@@ -664,6 +664,16 @@ async fn create(
     };
     let now = crate::objects::now_ms();
     let (job, made) = crate::scope::object(state, move |file| {
+        let mut job = job;
+        if let Some(name) = &job.user {
+            // Its id, so that a user of the same name made later is not it.
+            job.user_id = file
+                .users(&job.account)?
+                .into_iter()
+                .find(|user| &user.name == name)
+                .map(|user| user.user_id)
+                .unwrap_or_default();
+        }
         let mine: Vec<Job> = file
             .jobs()?
             .into_iter()

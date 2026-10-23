@@ -100,6 +100,9 @@ pub struct Job {
     /// The account's user that created it (`None`: the account's root): its
     /// tasks are authorized as that user's requests would be.
     pub user: Option<String>,
+    /// That user's unique id (empty for the root): a user of the same name
+    /// made since is another.
+    pub user_id: String,
     /// Its operation's name and its description, as ListJobs shows them.
     pub operation: String,
     pub description: String,
@@ -135,6 +138,7 @@ impl Job {
             token: token.to_string(),
             fingerprint,
             user: user.map(str::to_string),
+            user_id: String::new(),
             operation: String::new(),
             description: String::new(),
             priority: 0,
@@ -191,6 +195,7 @@ impl Job {
             }
             None => out.u8(0),
         }
+        out.str(&self.user_id);
         out.str(&self.operation);
         out.str(&self.description);
         out.u32(self.priority);
@@ -239,6 +244,7 @@ impl Job {
         } else {
             None
         };
+        let user_id = input.str()?;
         let (operation, description) = (input.str()?, input.str()?);
         let priority = input.u32()?;
         let status = *STATUSES
@@ -255,6 +261,7 @@ impl Job {
             token,
             fingerprint,
             user,
+            user_id,
             operation,
             description,
             priority,

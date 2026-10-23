@@ -10028,6 +10028,65 @@ fn batch_job_tasks_are_authorized_as_the_user_that_created_the_job() {
         code(job_body("meta-3", &spaced)),
         (400, "InvalidRequest".to_string())
     );
+
+    // A bucket policy's Deny on the copy's storage class holds for a batch
+    // copy as for a PUT.
+    let deny = r#"{"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": "*",
+        "Action": "s3:PutObject", "Resource": "arn:aws:s3:::mine/*",
+        "Condition": {"StringEquals": {"s3:x-amz-storage-class": "GLACIER"}}}]}"#;
+    assert_eq!(root("PUT", "/mine", "policy", deny.as_bytes()).1.0, 204);
+    let glacier = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::mine</TargetResource>\
+                   <TargetKeyPrefix>cold/</TargetKeyPrefix><StorageClass>GLACIER</StorageClass></S3PutObjectCopy>";
+    let described = run(job_body("auth-glacier", glacier));
+    assert_eq!(
+        xml_value(&described, "NumberOfTasksSucceeded"),
+        "0",
+        "{described}"
+    );
+    assert_eq!(root("GET", "/mine/cold/m1", "", b"").1.0, 404);
+    assert_eq!(root("DELETE", "/mine", "policy", b"").1.0, 204);
+
+    // A job whose creator is gone fails, even when a user of the same name
+    // is made again before it runs.
+    let waiting = job_body("auth-gone", tagging).replace(
+        "</CreateJobRequest>",
+        "<ConfirmationRequired>true</ConfirmationRequired></CreateJobRequest>",
+    );
+    let (status, answer) = eve("POST", "/v20180820/jobs", "", waiting.as_bytes());
+    assert_eq!(status, 200, "{answer}");
+    let gone = xml_value(&answer, "JobId");
+    let deadline = Instant::now() + DEADLINE;
+    while xml_value(
+        &root("GET", &format!("/v20180820/jobs/{gone}"), "", b"").1.1,
+        "Status",
+    ) != "Suspended"
+    {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    native(server.native_port, &format!("s3 drop access key {eve_key}"));
+    native(
+        server.native_port,
+        &format!("s3 delete user policy {account} eve p"),
+    );
+    native(server.native_port, &format!("s3 drop user {account} eve"));
+    user_with_key(&server, &account, "eve", Some(&policy));
+    root(
+        "POST",
+        &format!("/v20180820/jobs/{gone}/status"),
+        "requestedJobStatus=Ready",
+        b"",
+    );
+    let deadline = Instant::now() + DEADLINE;
+    loop {
+        let described = root("GET", &format!("/v20180820/jobs/{gone}"), "", b"").1.1;
+        if xml_value(&described, "Status") == "Failed" {
+            assert_eq!(xml_value(&described, "FailureCode"), "AccessDenied");
+            break;
+        }
+        assert!(Instant::now() < deadline, "{described}");
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 #[test]

@@ -325,6 +325,16 @@ impl Authz {
         })
     }
 
+    /// This authorization with condition keys set as the equivalent request
+    /// would carry them (for work done outside a request).
+    pub fn with_keys(&self, keys: &[(&str, String)]) -> Authz {
+        let mut authz = self.clone();
+        for (key, value) in keys {
+            authz.context.set(key, vec![value.clone()]);
+        }
+        authz
+    }
+
     /// Checks `action` on `resource` with `tags` as its
     /// `s3:RequestObjectTag/...` keys (a tag set being stored).
     pub fn check_tags(
