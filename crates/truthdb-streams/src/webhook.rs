@@ -485,14 +485,16 @@ impl StreamFile<'_> {
 
     /// Up to `limit` records due for delivery at `now_ms`: each webhook
     /// partition's next one, once its wait is over, taken in turn from the
-    /// `round`th webhook partition on (so a step that cannot take them all
-    /// leaves out different ones each round). A record retention removed is
+    /// `round`th webhook partition on (so a turn that cannot take them all
+    /// leaves out different ones each round), those `take` accepts (it is
+    /// asked before the record is read). A record retention removed is
     /// passed over.
     pub fn webhook_due(
         &mut self,
         now_ms: u64,
         limit: usize,
         round: usize,
+        take: &mut dyn FnMut(&Webhook, u32) -> bool,
     ) -> Result<Vec<Delivery>, StorageError> {
         let webhooks = self.webhooks()?;
         let (Some(records), Some(_)) = (
@@ -523,7 +525,13 @@ impl StreamFile<'_> {
         candidates.rotate_left(first);
         let mut out = Vec::new();
         let mut ctx = self.page_ctx();
-        for (webhook, partition, offset) in candidates.into_iter().take(limit) {
+        for (webhook, partition, offset) in candidates {
+            if out.len() == limit {
+                break;
+            }
+            if !take(webhook, partition) {
+                continue;
+            }
             let record = read_record(&mut ctx, &records, webhook.topic_id, partition, offset)?
                 .ok_or_else(|| corrupt("partition missing a record"))?;
             out.push(Delivery {

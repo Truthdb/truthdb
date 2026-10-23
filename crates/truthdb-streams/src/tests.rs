@@ -962,7 +962,7 @@ fn a_webhook_delivers_in_order_retries_and_dead_letters() {
     );
     let due = |now: u64| {
         StreamFile::new(&mut storage.lock())
-            .webhook_due(now, 10, 0)
+            .webhook_due(now, 10, 0, &mut |_, _| true)
             .unwrap()
     };
     let at = |deliveries: &[crate::Delivery]| -> Vec<(u32, u64)> {
@@ -1052,7 +1052,7 @@ fn a_webhook_delivers_in_order_retries_and_dead_letters() {
     .unwrap();
     let take = |round| {
         at(&StreamFile::new(&mut storage.lock())
-            .webhook_due(now, 1, round)
+            .webhook_due(now, 1, round, &mut |_, _| true)
             .unwrap())
     };
     assert_eq!((take(0), take(1)), (vec![(0, 2)], vec![(1, 1)]));

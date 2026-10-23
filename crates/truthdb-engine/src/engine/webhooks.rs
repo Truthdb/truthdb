@@ -16,8 +16,11 @@ use truthdb_streams::{Delivery, StreamFile};
 
 use super::{Engine, EngineError};
 
-/// POSTs in flight at most (one per webhook partition).
+/// POSTs in flight at most (one per webhook partition), and at most to one
+/// endpoint (host and port): an endpoint that hangs holds no more slots than
+/// that, however many topics post to it.
 const MAX_IN_FLIGHT: usize = 64;
+const MAX_IN_FLIGHT_PER_ENDPOINT: usize = 8;
 /// How long a pump waits for a POST in flight to finish.
 const WAIT_FOR_ONE: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -28,6 +31,19 @@ pub(crate) struct WebhookPosts {
     posts: tokio::task::JoinSet<Result<(), String>>,
     of: HashMap<tokio::task::Id, Delivery>,
     busy: HashSet<(u32, u32)>,
+    /// POSTs in flight to each endpoint.
+    to: HashMap<String, usize>,
+}
+
+/// The endpoint (host and port) a URL posts to.
+fn endpoint(url: &str) -> String {
+    truthdb_s3client::post_target(url)
+        .ok()
+        .and_then(|uri| {
+            uri.authority()
+                .map(|authority| authority.as_str().to_ascii_lowercase())
+        })
+        .unwrap_or_default()
 }
 
 /// The signature header's value for `body` posted as `delivery` at `secs`.
@@ -72,17 +88,20 @@ impl Engine {
         let room = MAX_IN_FLIGHT - posts.busy.len();
         if room > 0 {
             let now_ms = super::now_ms();
-            let due =
-                self.streams(|file| file.webhook_due(now_ms, room + posts.busy.len(), round))?;
-            let starting: Vec<Delivery> = due
-                .into_iter()
-                .filter(|delivery| {
-                    !posts
-                        .busy
-                        .contains(&(delivery.topic_id, delivery.partition))
-                })
-                .take(room)
-                .collect();
+            // Chosen before their records are read: not a partition with a
+            // POST in flight, nor an endpoint at its share.
+            let mut to = posts.to.clone();
+            let busy = &posts.busy;
+            let mut take = |webhook: &truthdb_streams::Webhook, partition: u32| {
+                let count = to.entry(endpoint(&webhook.url)).or_default();
+                let taken = !busy.contains(&(webhook.topic_id, partition))
+                    && *count < MAX_IN_FLIGHT_PER_ENDPOINT;
+                if taken {
+                    *count += 1;
+                }
+                taken
+            };
+            let starting = self.streams(|file| file.webhook_due(now_ms, room, round, &mut take))?;
             for delivery in starting {
                 let (poster, sent) = (Arc::clone(poster), delivery.clone());
                 // On the thread's runtime (this is outside it).
@@ -90,6 +109,7 @@ impl Engine {
                     .posts
                     .spawn_on(async move { post(&poster, &sent).await }, runtime.handle());
                 posts.busy.insert((delivery.topic_id, delivery.partition));
+                *posts.to.entry(endpoint(&delivery.url)).or_default() += 1;
                 posts.of.insert(task.id(), delivery);
             }
         }
@@ -117,6 +137,13 @@ impl Engine {
                 continue;
             };
             posts.busy.remove(&(delivery.topic_id, delivery.partition));
+            let key = endpoint(&delivery.url);
+            if let Some(count) = posts.to.get_mut(&key) {
+                *count -= 1;
+                if *count == 0 {
+                    posts.to.remove(&key);
+                }
+            }
             let recorded = self.streams(|file| {
                 file.transaction(|tx| match &outcome {
                     Ok(()) => tx.webhook_delivered(&delivery),

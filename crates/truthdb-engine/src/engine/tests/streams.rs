@@ -553,9 +553,12 @@ fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
             }
         }
     });
-    for (topic, port) in [("hang", hang_port), ("ok", ok_port)] {
+    // The hanging endpoint has more partitions waiting than its share.
+    for (topic, port, partitions) in [("hang", hang_port, 16), ("ok", ok_port, 1)] {
         engine
-            .execute(&format!("stream create topic {topic} retention 0"))
+            .execute(&format!(
+                "stream create topic {topic} partitions {partitions} retention 0"
+            ))
             .unwrap();
         engine
             .execute(&format!(
@@ -568,10 +571,14 @@ fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
                 value: b"{}".to_vec(),
             })
             .collect();
-        engine
-            .streams(|file| file.transaction(|tx| tx.append(topic, 0, &records, None, 1)))
-            .unwrap()
-            .unwrap();
+        for partition in 0..partitions {
+            engine
+                .streams(|file| {
+                    file.transaction(|tx| tx.append(topic, partition, &records, None, 1))
+                })
+                .unwrap()
+                .unwrap();
+        }
     }
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -604,8 +611,20 @@ fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
             .offset
     };
     assert_eq!((offset("ok"), offset("hang")), (3, 0));
-    // One POST in flight for the hanging partition, not one per turn.
-    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
+    // One POST in flight per hanging partition, and no more than the
+    // endpoint's share of them, however many turns go by.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut turns_after = 0;
+    while turns_after < 10 && std::time::Instant::now() < deadline {
+        round += 1;
+        engine
+            .webhook_pump(&runtime, &poster, &mut posts, round)
+            .unwrap();
+        if connections.load(std::sync::atomic::Ordering::SeqCst) >= 8 {
+            turns_after += 1;
+        }
+    }
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 8);
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
