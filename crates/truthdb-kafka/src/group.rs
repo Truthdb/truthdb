@@ -27,11 +27,14 @@ const MAX_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 /// The longest a rebalance waits for members to rejoin, or to sync, whatever
 /// the members ask (Kafka takes their `max.poll.interval.ms`).
 const MAX_REBALANCE_TIMEOUT: Duration = MAX_SESSION_TIMEOUT;
-/// The memory one account's groups may take: member ids and protocol
-/// metadata, with an allowance per entry. A join past it is refused with
-/// GROUP_MAX_SIZE_REACHED.
+/// The memory one account's groups may take: what clients send that is
+/// kept (ids, protocol types and names, metadata, assignments), with an
+/// allowance per member and protocol and a larger one per group (which
+/// bounds the account's groups to 16 Ki). A join or an assignment past it
+/// is refused with GROUP_MAX_SIZE_REACHED.
 const MAX_ACCOUNT_BYTES: usize = 16 << 20;
 const ENTRY_BYTES: usize = 128;
+const GROUP_BYTES: usize = 1024;
 /// The bytes of a client id kept in the member ids made from it.
 const MAX_CLIENT_ID_IN_MEMBER_ID: usize = 128;
 
@@ -98,14 +101,34 @@ struct Group {
 }
 
 impl Group {
-    fn bytes(&self) -> usize {
+    fn new(now: Instant) -> Self {
+        Group {
+            state: State::Empty,
+            generation: 0,
+            protocol_type: String::new(),
+            protocol: String::new(),
+            leader: String::new(),
+            members: BTreeMap::new(),
+            pending: HashMap::new(),
+            sync_deadline: now,
+        }
+    }
+
+    /// What it takes, its id (`id`) included.
+    fn bytes(&self, id: &str) -> usize {
         let members: usize = self
             .members
             .iter()
             .map(|(id, member)| member.bytes(id))
             .sum();
         let pending: usize = self.pending.keys().map(|id| ENTRY_BYTES + id.len()).sum();
-        members + pending
+        GROUP_BYTES
+            + id.len()
+            + self.protocol_type.len()
+            + self.protocol.len()
+            + self.leader.len()
+            + members
+            + pending
     }
 }
 
@@ -170,14 +193,28 @@ pub enum Answer<T> {
     Later(oneshot::Receiver<T>),
 }
 
+/// Each account's groups, by group id.
+type Groups = HashMap<String, HashMap<String, Group>>;
+
 #[derive(Default)]
 pub struct Coordinator {
-    groups: Mutex<HashMap<String, Group>>,
+    groups: Mutex<Groups>,
+}
+
+/// The group, if `account` has one by that id.
+fn group_mut<'g>(groups: &'g mut Groups, account: &str, group_id: &str) -> Option<&'g mut Group> {
+    groups.get_mut(account)?.get_mut(group_id)
+}
+
+/// The memory `account`'s groups take.
+fn account_bytes(groups: &Groups, account: &str) -> usize {
+    groups.get(account).map_or(0, |groups| {
+        groups.iter().map(|(id, group)| group.bytes(id)).sum()
+    })
 }
 
 impl Coordinator {
-    /// A JoinGroup to group `group_id` of `account` (whose groups are those
-    /// with ids starting `<account>:`).
+    /// A JoinGroup to group `group_id` of `account`.
     pub fn join(
         &self,
         account: &str,
@@ -202,20 +239,26 @@ impl Coordinator {
             ));
         }
         let mut groups = self.groups.lock().expect("groups poisoned");
-        // What the member takes already (a rejoin replaces its ids and
-        // protocols; its assignment stays).
-        let existing =
-            groups
-                .get(group_id)
-                .map_or(0, |group| match group.members.get(&request.member_id) {
+        // What the join replaces: the member's ids and protocols (its
+        // assignment stays) and the group's protocol type; or, for a new
+        // group, what the group itself takes.
+        let (replaced, group_adds) = match groups.get(account).and_then(|g| g.get(group_id)) {
+            Some(group) => {
+                let member = match group.members.get(&request.member_id) {
                     Some(member) => member.bytes(&request.member_id) - member.assignment.len(),
                     None if group.pending.contains_key(&request.member_id) => {
                         ENTRY_BYTES + request.member_id.len()
                     }
                     None => 0,
-                });
-        let used = account_bytes(&groups, account).saturating_sub(existing);
-        let adding = ENTRY_BYTES
+                };
+                (member + group.protocol_type.len(), 0)
+            }
+            None => (0, GROUP_BYTES + group_id.len()),
+        };
+        let used = account_bytes(&groups, account).saturating_sub(replaced);
+        let adding = group_adds
+            + request.protocol_type.len()
+            + ENTRY_BYTES
             + request.member_id.len().max(MAX_CLIENT_ID_IN_MEMBER_ID + 33)
             + request
                 .protocols
@@ -225,16 +268,11 @@ impl Coordinator {
         if used + adding > MAX_ACCOUNT_BYTES {
             return Answer::Now(Joined::error(GROUP_MAX_SIZE_REACHED, &request.member_id));
         }
-        let group = groups.entry(group_id.to_string()).or_insert_with(|| Group {
-            state: State::Empty,
-            generation: 0,
-            protocol_type: String::new(),
-            protocol: String::new(),
-            leader: String::new(),
-            members: BTreeMap::new(),
-            pending: HashMap::new(),
-            sync_deadline: now,
-        });
+        let group = groups
+            .entry(account.to_string())
+            .or_default()
+            .entry(group_id.to_string())
+            .or_insert_with(|| Group::new(now));
         let others = group
             .members
             .iter()
@@ -291,7 +329,7 @@ impl Coordinator {
         Answer::Later(answer)
     }
 
-    /// A SyncGroup to group `group_id` of `account` (see [`Self::join`]).
+    /// A SyncGroup to group `group_id` of `account`.
     #[allow(clippy::too_many_arguments)]
     pub fn sync(
         &self,
@@ -304,7 +342,7 @@ impl Coordinator {
     ) -> Answer<Synced> {
         let mut groups = self.groups.lock().expect("groups poisoned");
         let used = account_bytes(&groups, account);
-        let Some(group) = groups.get_mut(group_id) else {
+        let Some(group) = group_mut(&mut groups, account, group_id) else {
             return Answer::Now(Synced::error(UNKNOWN_MEMBER_ID));
         };
         if !group.members.contains_key(member_id) {
@@ -315,17 +353,18 @@ impl Coordinator {
         }
         let member = group.members.get_mut(member_id).expect("checked above");
         member.last_seen = now;
-        if matches!(group.state, State::Completing | State::Stable) {
-            member.pending_sync = false;
-        }
         match group.state {
             State::Empty => Answer::Now(Synced::error(UNKNOWN_MEMBER_ID)),
             State::Preparing { .. } => Answer::Now(Synced::error(REBALANCE_IN_PROGRESS)),
-            State::Stable => Answer::Now(Synced {
-                error: NONE,
-                assignment: member.assignment.clone(),
-            }),
+            State::Stable => {
+                member.pending_sync = false;
+                Answer::Now(Synced {
+                    error: NONE,
+                    assignment: member.assignment.clone(),
+                })
+            }
             State::Completing if group.leader != member_id => {
+                member.pending_sync = false;
                 let (reply, answer) = oneshot::channel();
                 member.sync = Some(reply);
                 Answer::Later(answer)
@@ -339,8 +378,13 @@ impl Coordinator {
                 // count against the account's memory as the joins do.
                 let replaced: usize = group.members.values().map(|m| m.assignment.len()).sum();
                 let new: usize = assignments.values().map(Vec::len).sum();
+                // Refused, the leader stays to sync: dropped at the sync
+                // deadline, which rebalances the group.
                 if used.saturating_sub(replaced) + new > MAX_ACCOUNT_BYTES {
                     return Answer::Now(Synced::error(GROUP_MAX_SIZE_REACHED));
+                }
+                if let Some(leader) = group.members.get_mut(member_id) {
+                    leader.pending_sync = false;
                 }
                 for (id, member) in &mut group.members {
                     member.assignment = assignments.remove(id).unwrap_or_default();
@@ -360,9 +404,16 @@ impl Coordinator {
         }
     }
 
-    pub fn heartbeat(&self, group_id: &str, generation: i32, member_id: &str, now: Instant) -> i16 {
+    pub fn heartbeat(
+        &self,
+        account: &str,
+        group_id: &str,
+        generation: i32,
+        member_id: &str,
+        now: Instant,
+    ) -> i16 {
         let mut groups = self.groups.lock().expect("groups poisoned");
-        let Some(group) = groups.get_mut(group_id) else {
+        let Some(group) = group_mut(&mut groups, account, group_id) else {
             return UNKNOWN_MEMBER_ID;
         };
         let Some(member) = group.members.get_mut(member_id) else {
@@ -380,9 +431,15 @@ impl Coordinator {
     }
 
     /// Removes members; the error for each.
-    pub fn leave(&self, group_id: &str, member_ids: &[String], now: Instant) -> Vec<i16> {
+    pub fn leave(
+        &self,
+        account: &str,
+        group_id: &str,
+        member_ids: &[String],
+        now: Instant,
+    ) -> Vec<i16> {
         let mut groups = self.groups.lock().expect("groups poisoned");
-        let Some(group) = groups.get_mut(group_id) else {
+        let Some(group) = group_mut(&mut groups, account, group_id) else {
             return vec![UNKNOWN_MEMBER_ID; member_ids.len()];
         };
         let errors = member_ids
@@ -404,13 +461,14 @@ impl Coordinator {
     /// member's accepted commit counts as its heartbeat.
     pub fn may_commit(
         &self,
+        account: &str,
         group_id: &str,
         generation: i32,
         member_id: &str,
         now: Instant,
     ) -> i16 {
         let mut groups = self.groups.lock().expect("groups poisoned");
-        let Some(group) = groups.get_mut(group_id) else {
+        let Some(group) = group_mut(&mut groups, account, group_id) else {
             return if generation < 0 {
                 NONE
             } else {
@@ -440,7 +498,7 @@ impl Coordinator {
     /// groups left with nothing.
     pub fn expire(&self, now: Instant) {
         let mut groups = self.groups.lock().expect("groups poisoned");
-        for group in groups.values_mut() {
+        for group in groups.values_mut().flat_map(HashMap::values_mut) {
             group.pending.retain(|_, until| *until > now);
             let before = group.members.len();
             group.members.retain(|_, member| {
@@ -469,18 +527,11 @@ impl Coordinator {
                 }
             }
         }
-        groups.retain(|_, group| !(group.members.is_empty() && group.pending.is_empty()));
+        for account in groups.values_mut() {
+            account.retain(|_, group| !(group.members.is_empty() && group.pending.is_empty()));
+        }
+        groups.retain(|_, account| !account.is_empty());
     }
-}
-
-/// The memory `account`'s groups take (those with ids `<account>:...`).
-fn account_bytes(groups: &HashMap<String, Group>, account: &str) -> usize {
-    let prefix = format!("{account}:");
-    groups
-        .iter()
-        .filter(|(id, _)| id.starts_with(&prefix))
-        .map(|(_, group)| group.bytes())
-        .sum()
 }
 
 fn new_member_id(client_id: &str) -> String {
@@ -652,9 +703,9 @@ mod tests {
         protocols: &[&str],
         now: Instant,
     ) -> (String, oneshot::Receiver<Joined>) {
-        let first = now_answer(coordinator.join("a", "a:g", join("", protocols), now));
+        let first = now_answer(coordinator.join("a", "g", join("", protocols), now));
         assert_eq!(first.error, MEMBER_ID_REQUIRED);
-        let rx = later(coordinator.join("a", "a:g", join(&first.member_id, protocols), now));
+        let rx = later(coordinator.join("a", "g", join(&first.member_id, protocols), now));
         (first.member_id, rx)
     }
 
@@ -667,20 +718,20 @@ mod tests {
         assert_eq!((joined.generation, joined.leader.as_str()), (1, a.as_str()));
         assert_eq!(joined.members, vec![(a.clone(), b"range".to_vec())]);
         let synced =
-            now_answer(coordinator.sync("a", "a:g", 1, &a, vec![(a.clone(), b"all".to_vec())], t));
+            now_answer(coordinator.sync("a", "g", 1, &a, vec![(a.clone(), b"all".to_vec())], t));
         assert_eq!(synced.assignment, b"all");
 
         // A second member: the first learns of the rebalance from its
         // heartbeat and rejoins; the join completes with both.
-        let first = now_answer(coordinator.join("a", "a:g", join("", &["range"]), t));
+        let first = now_answer(coordinator.join("a", "g", join("", &["range"]), t));
         let b = first.member_id;
-        let mut b_join = later(coordinator.join("a", "a:g", join(&b, &["range"]), t));
+        let mut b_join = later(coordinator.join("a", "g", join(&b, &["range"]), t));
         assert!(b_join.try_recv().is_err(), "waits for the first member");
         assert_eq!(
-            coordinator.heartbeat("a:g", 1, &a, t),
+            coordinator.heartbeat("a", "g", 1, &a, t),
             REBALANCE_IN_PROGRESS
         );
-        let mut a_join = later(coordinator.join("a", "a:g", join(&a, &["range"]), t));
+        let mut a_join = later(coordinator.join("a", "g", join(&a, &["range"]), t));
         let (a_joined, b_joined) = (a_join.try_recv().unwrap(), b_join.try_recv().unwrap());
         assert_eq!(a_joined.generation, 2);
         assert_eq!(a_joined.leader, a, "the leader stays");
@@ -691,37 +742,43 @@ mod tests {
         );
 
         // The follower's sync waits for the leader's.
-        let mut b_sync = later(coordinator.sync("a", "a:g", 2, &b, Vec::new(), t));
+        let mut b_sync = later(coordinator.sync("a", "g", 2, &b, Vec::new(), t));
         assert_eq!(
-            coordinator.may_commit("a:g", 2, &b, t),
+            coordinator.may_commit("a", "g", 2, &b, t),
             REBALANCE_IN_PROGRESS
         );
         now_answer(coordinator.sync(
             "a",
-            "a:g",
+            "g",
             2,
             &a,
             vec![(a.clone(), b"p0".to_vec()), (b.clone(), b"p1".to_vec())],
             t,
         ));
         assert_eq!(b_sync.try_recv().unwrap().assignment, b"p1");
-        assert_eq!(coordinator.may_commit("a:g", 2, &b, t), NONE);
-        assert_eq!(coordinator.may_commit("a:g", 1, &b, t), ILLEGAL_GENERATION);
-        assert_eq!(coordinator.may_commit("a:g", -1, "", t), UNKNOWN_MEMBER_ID);
+        assert_eq!(coordinator.may_commit("a", "g", 2, &b, t), NONE);
+        assert_eq!(
+            coordinator.may_commit("a", "g", 1, &b, t),
+            ILLEGAL_GENERATION
+        );
+        assert_eq!(
+            coordinator.may_commit("a", "g", -1, "", t),
+            UNKNOWN_MEMBER_ID
+        );
 
         // The leader leaves: the follower rejoins alone and leads.
         assert_eq!(
-            coordinator.leave("a:g", &[a.clone(), "x".into()], t),
+            coordinator.leave("a", "g", &[a.clone(), "x".into()], t),
             vec![NONE, UNKNOWN_MEMBER_ID]
         );
         assert_eq!(
-            coordinator.heartbeat("a:g", 2, &b, t),
+            coordinator.heartbeat("a", "g", 2, &b, t),
             REBALANCE_IN_PROGRESS
         );
-        let mut b_join = later(coordinator.join("a", "a:g", join(&b, &["range"]), t));
+        let mut b_join = later(coordinator.join("a", "g", join(&b, &["range"]), t));
         let joined = b_join.try_recv().unwrap();
         assert_eq!((joined.generation, joined.leader), (3, b.clone()));
-        assert_eq!(coordinator.heartbeat("a:g", 3, &a, t), UNKNOWN_MEMBER_ID);
+        assert_eq!(coordinator.heartbeat("a", "g", 3, &a, t), UNKNOWN_MEMBER_ID);
     }
 
     #[test]
@@ -730,7 +787,7 @@ mod tests {
         let t = Instant::now();
         let (a, mut a_join) = join_new(&coordinator, &["range"], t);
         a_join.try_recv().unwrap();
-        now_answer(coordinator.sync("a", "a:g", 1, &a, Vec::new(), t));
+        now_answer(coordinator.sync("a", "g", 1, &a, Vec::new(), t));
         let (b, mut b_join) = join_new(&coordinator, &["range"], t);
         // The first member keeps sending heartbeats but never rejoins: at
         // the rebalance deadline (its 30 s rebalance timeout) the join
@@ -739,7 +796,7 @@ mod tests {
         assert!(b_join.try_recv().is_err());
         let beat = t + Duration::from_secs(25);
         assert_eq!(
-            coordinator.heartbeat("a:g", 1, &a, beat),
+            coordinator.heartbeat("a", "g", 1, &a, beat),
             REBALANCE_IN_PROGRESS
         );
         coordinator.expire(t + Duration::from_secs(29));
@@ -747,27 +804,33 @@ mod tests {
         coordinator.expire(t + Duration::from_secs(31));
         let joined = b_join.try_recv().unwrap();
         assert_eq!((joined.generation, joined.leader.as_str()), (2, b.as_str()));
-        assert_eq!(coordinator.heartbeat("a:g", 2, &a, t), UNKNOWN_MEMBER_ID);
+        assert_eq!(coordinator.heartbeat("a", "g", 2, &a, t), UNKNOWN_MEMBER_ID);
 
         // Stable, then silent past its session timeout: dropped, and the
         // group forgotten.
-        now_answer(coordinator.sync("a", "a:g", 2, &b, Vec::new(), t));
+        now_answer(coordinator.sync("a", "g", 2, &b, Vec::new(), t));
         let late = t + Duration::from_secs(31);
-        assert_eq!(coordinator.heartbeat("a:g", 2, &b, late), NONE);
+        assert_eq!(coordinator.heartbeat("a", "g", 2, &b, late), NONE);
         coordinator.expire(late + Duration::from_secs(9));
         assert_eq!(
-            coordinator.heartbeat("a:g", 2, &b, late),
+            coordinator.heartbeat("a", "g", 2, &b, late),
             NONE,
             "within 10 s"
         );
         coordinator.expire(late + Duration::from_secs(11));
-        assert_eq!(coordinator.heartbeat("a:g", 2, &b, late), UNKNOWN_MEMBER_ID);
         assert_eq!(
-            coordinator.may_commit("a:g", -1, "", t),
+            coordinator.heartbeat("a", "g", 2, &b, late),
+            UNKNOWN_MEMBER_ID
+        );
+        assert_eq!(
+            coordinator.may_commit("a", "g", -1, "", t),
             NONE,
             "group forgotten"
         );
-        assert_eq!(coordinator.may_commit("a:g", 2, &b, t), ILLEGAL_GENERATION);
+        assert_eq!(
+            coordinator.may_commit("a", "g", 2, &b, t),
+            ILLEGAL_GENERATION
+        );
     }
 
     #[test]
@@ -777,32 +840,32 @@ mod tests {
         let mut short = join("", &["range"]);
         short.session_timeout_ms = 1000;
         assert_eq!(
-            now_answer(coordinator.join("a", "a:g", short, t)).error,
+            now_answer(coordinator.join("a", "g", short, t)).error,
             INVALID_SESSION_TIMEOUT
         );
         assert_eq!(
-            now_answer(coordinator.join("a", "a:g", join("unknown", &["range"]), t)).error,
+            now_answer(coordinator.join("a", "g", join("unknown", &["range"]), t)).error,
             UNKNOWN_MEMBER_ID
         );
         let (_, mut a_join) = join_new(&coordinator, &["range", "roundrobin"], t);
         a_join.try_recv().unwrap();
-        let first = now_answer(coordinator.join("a", "a:g", join("", &["sticky"]), t));
+        let first = now_answer(coordinator.join("a", "g", join("", &["sticky"]), t));
         assert_eq!(
             first.error, INCONSISTENT_GROUP_PROTOCOL,
             "no common protocol"
         );
         // A pending member id expires after the session timeout.
-        let first = now_answer(coordinator.join("a", "a:g", join("", &["roundrobin"]), t));
+        let first = now_answer(coordinator.join("a", "g", join("", &["roundrobin"]), t));
         coordinator.expire(t + Duration::from_secs(11));
         assert_eq!(
-            now_answer(coordinator.join("a", "a:g", join(&first.member_id, &["roundrobin"]), t))
+            now_answer(coordinator.join("a", "g", join(&first.member_id, &["roundrobin"]), t))
                 .error,
             UNKNOWN_MEMBER_ID
         );
         // Before v4 a member gets its id with its first join.
         let mut old = join("", &["range"]);
         old.require_member_id = false;
-        later(coordinator.join("a", "a:h", old, t))
+        later(coordinator.join("a", "h", old, t))
             .try_recv()
             .unwrap();
     }
@@ -815,7 +878,7 @@ mod tests {
         a_join.try_recv().unwrap();
         let (_, mut b_join) = join_new(&coordinator, &["roundrobin", "range"], t);
         let mut a_join =
-            later(coordinator.join("a", "a:g", join(&a, &["sticky", "range", "roundrobin"]), t));
+            later(coordinator.join("a", "g", join(&a, &["sticky", "range", "roundrobin"]), t));
         let joined = a_join.try_recv().unwrap();
         assert_eq!(joined.protocol, "range");
         assert_eq!(b_join.try_recv().unwrap().protocol, "range");
@@ -833,23 +896,23 @@ mod tests {
         let t = Instant::now();
         let (a, mut a_join) = join_new(&coordinator, &["range"], t);
         a_join.try_recv().unwrap();
-        now_answer(coordinator.sync("a", "a:g", 1, &a, Vec::new(), t));
+        now_answer(coordinator.sync("a", "g", 1, &a, Vec::new(), t));
         let (b, mut b_join) = join_new(&coordinator, &["range"], t);
-        let mut a_join = later(coordinator.join("a", "a:g", join(&a, &["range"]), t));
+        let mut a_join = later(coordinator.join("a", "g", join(&a, &["range"]), t));
         assert_eq!(a_join.try_recv().unwrap().leader, a);
         b_join.try_recv().unwrap();
         // The follower syncs and waits; the leader keeps sending heartbeats
         // but never syncs.
-        let mut b_sync = later(coordinator.sync("a", "a:g", 2, &b, Vec::new(), t));
+        let mut b_sync = later(coordinator.sync("a", "g", 2, &b, Vec::new(), t));
         for secs in [5, 10, 15, 20, 25] {
             let at = t + Duration::from_secs(secs);
-            assert_eq!(coordinator.heartbeat("a:g", 2, &a, at), NONE);
+            assert_eq!(coordinator.heartbeat("a", "g", 2, &a, at), NONE);
             coordinator.expire(at);
         }
         assert!(b_sync.try_recv().is_err(), "still waiting");
         coordinator.expire(t + Duration::from_secs(30));
         assert_eq!(b_sync.try_recv().unwrap().error, REBALANCE_IN_PROGRESS);
-        assert_eq!(coordinator.heartbeat("a:g", 2, &a, t), UNKNOWN_MEMBER_ID);
+        assert_eq!(coordinator.heartbeat("a", "g", 2, &a, t), UNKNOWN_MEMBER_ID);
     }
 
     #[test]
@@ -862,16 +925,15 @@ mod tests {
             ..join(member_id, &["range"])
         };
         // At most 64 tries: without a cap this ends instead of eating memory.
-        let refused =
-            (0..64).find(
-                |n| match coordinator.join("a", &format!("a:{n}"), big(""), t) {
-                    Answer::Later(_) => false,
-                    Answer::Now(refused) => {
-                        assert_eq!(refused.error, GROUP_MAX_SIZE_REACHED);
-                        true
-                    }
-                },
-            );
+        let refused = (0..64).find(
+            |n| match coordinator.join("a", &format!("{n}"), big(""), t) {
+                Answer::Later(_) => false,
+                Answer::Now(refused) => {
+                    assert_eq!(refused.error, GROUP_MAX_SIZE_REACHED);
+                    true
+                }
+            },
+        );
         let joined = refused.expect("refused within 64 joins");
         assert_eq!(joined, 15, "16 MiB of 1 MiB members, with their allowance");
         // Another account is not held back.
@@ -897,7 +959,7 @@ mod tests {
         // account's share until the next is refused.
         let mut refused = None;
         for n in 0..64 {
-            let group = format!("a:{n}");
+            let group = format!("{n}");
             let mut lone = join("", &["range"]);
             lone.require_member_id = false;
             let joined = later(coordinator.join("a", &group, lone, t))
@@ -925,13 +987,104 @@ mod tests {
             require_member_id: false,
             ..join(member_id, &["range"])
         };
-        let joined = later(coordinator.join("a", "a:g", big(""), t))
+        let joined = later(coordinator.join("a", "g", big(""), t))
             .try_recv()
             .unwrap();
-        let rejoined = later(coordinator.join("a", "a:g", big(&joined.member_id), t))
+        let rejoined = later(coordinator.join("a", "g", big(&joined.member_id), t))
             .try_recv()
             .unwrap();
         assert_eq!(rejoined.error, NONE);
         assert_eq!(rejoined.generation, 2);
+    }
+
+    /// A lone member with nothing but `protocol_type`, joined to group
+    /// `group` of `account` (before v4, so at once).
+    fn lone(coordinator: &Coordinator, account: &str, group: &str, protocol_type: &str) -> Joined {
+        let mut request = join("", &["range"]);
+        request.require_member_id = false;
+        request.protocol_type = protocol_type.to_string();
+        match coordinator.join(account, group, request, Instant::now()) {
+            Answer::Now(refused) => refused,
+            Answer::Later(mut rx) => rx.try_recv().unwrap(),
+        }
+    }
+
+    #[test]
+    fn protocol_types_count_against_the_accounts_memory() {
+        let coordinator = Coordinator::default();
+        let long = "x".repeat(32767);
+        let refused =
+            (0..1000).find(|n| lone(&coordinator, "a", &n.to_string(), &long).error != NONE);
+        // 16 MiB over about 34 KiB a group.
+        let n = refused.expect("refused within 1000 groups");
+        assert!((480..=500).contains(&n), "{n}");
+        assert_eq!(
+            lone(&coordinator, "a", "more", &long).error,
+            GROUP_MAX_SIZE_REACHED
+        );
+        assert_eq!(
+            lone(&coordinator, "b", "0", &long).error,
+            NONE,
+            "another account"
+        );
+    }
+
+    #[test]
+    fn accounts_have_their_own_groups_by_the_same_id() {
+        let coordinator = Coordinator::default();
+        let (a, b) = (
+            lone(&coordinator, "a", "g", "consumer"),
+            lone(&coordinator, "b", "g", "consumer"),
+        );
+        assert_eq!(
+            (a.generation, b.generation),
+            (1, 1),
+            "two groups, each alone"
+        );
+        let t = Instant::now();
+        assert_eq!(
+            coordinator.heartbeat("a", "g", 1, &b.member_id, t),
+            UNKNOWN_MEMBER_ID
+        );
+        assert_eq!(coordinator.heartbeat("b", "g", 1, &b.member_id, t), NONE);
+    }
+
+    #[test]
+    fn a_leader_refused_its_assignments_is_dropped_at_the_sync_deadline() {
+        let coordinator = Coordinator::default();
+        let t = Instant::now();
+        // The account nearly full: 15 groups of 1 MiB of metadata.
+        for n in 0..15 {
+            let mut request = join("", &["range"]);
+            request.require_member_id = false;
+            request.protocols[0].1 = vec![0; 1 << 20];
+            assert!(matches!(
+                coordinator.join("a", &n.to_string(), request, t),
+                Answer::Later(_)
+            ));
+        }
+        let (a, mut a_join) = join_new(&coordinator, &["range"], t);
+        a_join.try_recv().unwrap();
+        now_answer(coordinator.sync("a", "g", 1, &a, Vec::new(), t));
+        let (b, mut b_join) = join_new(&coordinator, &["range"], t);
+        let mut a_join = later(coordinator.join("a", "g", join(&a, &["range"]), t));
+        a_join.try_recv().unwrap();
+        b_join.try_recv().unwrap();
+        let mut b_sync = later(coordinator.sync("a", "g", 2, &b, Vec::new(), t));
+        let assignment = vec![(b.clone(), vec![0; 1 << 20])];
+        let refused = now_answer(coordinator.sync("a", "g", 2, &a, assignment, t));
+        assert_eq!(refused.error, GROUP_MAX_SIZE_REACHED);
+        // The leader keeps sending heartbeats (the last 2 s before the
+        // deadline, well within its session); at the sync deadline (30 s)
+        // it is dropped and the follower told to rejoin.
+        for secs in [10, 20, 28] {
+            let at = t + Duration::from_secs(secs);
+            assert_eq!(coordinator.heartbeat("a", "g", 2, &a, at), NONE);
+            coordinator.expire(at);
+        }
+        assert!(b_sync.try_recv().is_err());
+        coordinator.expire(t + Duration::from_secs(30));
+        assert_eq!(b_sync.try_recv().unwrap().error, REBALANCE_IN_PROGRESS);
+        assert_eq!(coordinator.heartbeat("a", "g", 2, &a, t), UNKNOWN_MEMBER_ID);
     }
 }

@@ -818,7 +818,8 @@ async fn offset_commit(
         INVALID_GROUP_ID
     } else {
         state.coordinator.may_commit(
-            &stored_group(session, &group),
+            &session.account,
+            &group,
             generation,
             &member_id,
             Instant::now(),
@@ -1037,12 +1038,9 @@ async fn join_group(
             protocols,
             require_member_id: version >= 4,
         };
-        let answer = state.coordinator.join(
-            &session.account,
-            &stored_group(session, &group),
-            request,
-            Instant::now(),
-        );
+        let answer = state
+            .coordinator
+            .join(&session.account, &group, request, Instant::now());
         match answer {
             Answer::Now(joined) => joined,
             Answer::Later(rx) => rx.await.unwrap_or(crate::group::Joined {
@@ -1095,7 +1093,7 @@ async fn sync_group(
     } else {
         match state.coordinator.sync(
             &session.account,
-            &stored_group(session, &group),
+            &group,
             generation,
             &member_id,
             assignments,
@@ -1130,7 +1128,8 @@ fn heartbeat(
     }
     let error = if valid_group(&group) {
         state.coordinator.heartbeat(
-            &stored_group(session, &group),
+            &session.account,
+            &group,
             generation,
             &member_id,
             Instant::now(),
@@ -1165,7 +1164,7 @@ fn leave_group(
     let errors = if valid_group(&group) {
         state
             .coordinator
-            .leave(&stored_group(session, &group), &members, Instant::now())
+            .leave(&session.account, &group, &members, Instant::now())
     } else {
         vec![INVALID_GROUP_ID; members.len()]
     };
