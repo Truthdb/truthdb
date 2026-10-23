@@ -510,17 +510,23 @@ fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
     let engine = new_engine(&path);
     // One endpoint takes connections and never answers; one answers 200
     // and counts the POSTs.
-    let hanging = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let hang_port = hanging.local_addr().unwrap().port();
-    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let accepted = std::sync::Arc::clone(&connections);
-    std::thread::spawn(move || {
-        let mut held = Vec::new();
-        for stream in hanging.incoming() {
-            accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-            held.push(stream);
-        }
-    });
+    let hang = || {
+        let hanging = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = hanging.local_addr().unwrap().port();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = std::sync::Arc::clone(&connections);
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in hanging.incoming() {
+                accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        (port, connections)
+    };
+    let (hang_port, connections) = hang();
+    // A second one, below its share: one POST in flight for its partition.
+    let (lone_port, lone_connections) = hang();
     let healthy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let ok_port = healthy.local_addr().unwrap().port();
     let posted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -554,7 +560,11 @@ fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
         }
     });
     // The hanging endpoint has more partitions waiting than its share.
-    for (topic, port, partitions) in [("hang", hang_port, 16), ("ok", ok_port, 1)] {
+    for (topic, port, partitions) in [
+        ("hang", hang_port, 16),
+        ("lone", lone_port, 1),
+        ("ok", ok_port, 1),
+    ] {
         engine
             .execute(&format!(
                 "stream create topic {topic} partitions {partitions} retention 0"
@@ -625,6 +635,10 @@ fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
         }
     }
     assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 8);
+    assert_eq!(
+        lone_connections.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
