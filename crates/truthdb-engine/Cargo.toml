@@ -11,6 +11,7 @@ truthdb-object = { workspace = true }
 truthdb-fulltext = { workspace = true }
 truthdb-vector = { workspace = true }
 truthdb-streams = { workspace = true }
+md-5 = "0.10.6"
 truthdb-iam = { workspace = true }
 ring = "0.17"
 truthdb-proto = { workspace = true }

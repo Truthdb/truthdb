@@ -800,3 +800,30 @@ fn a_receive_and_an_ack_are_whole_or_absent_after_a_crash_at_any_op() {
     }
     assert!(crashes > 3, "{crashes} crash points");
 }
+
+#[test]
+fn a_busy_partition_does_not_keep_the_others_waiting() {
+    let path = temp_path("queue-partitions");
+    let storage = create(&path);
+    in_txn(&storage, |tx| tx.create_topic("q", 2, 0, None, 1)).unwrap();
+    in_txn(&storage, |tx| {
+        tx.append("q", 0, &["a", "b", "c"].map(record), None, 1)
+    })
+    .unwrap();
+    in_txn(&storage, |tx| tx.append("q", 1, &[record("z")], None, 1)).unwrap();
+    // A receive at an odd time starts at partition 1.
+    let first = receive(&storage, 1, 1_000, 11);
+    assert_eq!(
+        (first[0].partition, first[0].value.as_slice()),
+        (1, &b"z"[..])
+    );
+    let rest = receive(&storage, 10, 1_000, 12);
+    assert_eq!(
+        rest.iter()
+            .map(|m| (m.partition, m.offset))
+            .collect::<Vec<_>>(),
+        [(0, 0), (0, 1), (0, 2)]
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

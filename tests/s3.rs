@@ -8860,3 +8860,67 @@ fn restores_and_retention_changes_send_their_events() {
     .collect();
     assert_eq!(types, ["CREATE"]);
 }
+
+#[test]
+fn bucket_events_are_received_from_a_sql_queue() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "queuer");
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send(
+            server.s3_port,
+            method,
+            path,
+            query,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    native(
+        server.native_port,
+        &format!("stream create topic jobs retention 0 account {account}"),
+    );
+    assert_eq!(call("PUT", "/inbox", "", b"").0, 200);
+    let config = format!(
+        "<NotificationConfiguration><QueueConfiguration><Id>work</Id>\
+         <Queue>arn:aws:sqs:us-east-1:{account}:jobs</Queue>\
+         <Event>s3:ObjectCreated:*</Event></QueueConfiguration></NotificationConfiguration>"
+    );
+    assert_eq!(
+        call("PUT", "/inbox", "notification", config.as_bytes()).0,
+        200
+    );
+    let (_, reply) = call("GET", "/inbox", "notification", b"");
+    assert!(
+        reply.contains(&format!(
+            "<Queue>arn:aws:sqs:us-east-1:{account}:jobs</Queue>"
+        )),
+        "{reply}"
+    );
+    assert_eq!(call("PUT", "/inbox/order%201.json", "", b"{}").0, 200);
+    let receive = "EXEC sys.sp_s3_queue_receive @queue = N'jobs', @max_messages = 10";
+    // The test event first, then the object's.
+    let deadline = Instant::now() + DEADLINE;
+    let mut bodies = Vec::new();
+    let mut receipts = Vec::new();
+    while bodies.len() < 2 && Instant::now() < deadline {
+        for row in sql_rows(server.native_port, receive) {
+            receipts.push(row[1].clone());
+            bodies.push(serde_json::from_str::<serde_json::Value>(&row[2]).unwrap());
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert_eq!(bodies.len(), 2, "{bodies:?}");
+    assert_eq!(bodies[0]["Event"], "s3:TestEvent");
+    let event = &bodies[1]["Records"][0];
+    assert_eq!(event["eventName"], "ObjectCreated:Put");
+    assert_eq!(event["s3"]["configurationId"], "work");
+    assert_eq!(event["s3"]["object"]["key"], "order+1.json");
+    for receipt in &receipts {
+        native(
+            server.native_port,
+            &format!("EXEC sys.sp_s3_queue_ack N'jobs', N'{receipt}'"),
+        );
+    }
+    assert!(sql_rows(server.native_port, receive).is_empty());
+}

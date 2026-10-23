@@ -4,6 +4,7 @@ mod encryption;
 mod fulltext;
 mod notifications;
 mod objects;
+mod queue;
 mod recovery;
 mod replication;
 mod s3_read;

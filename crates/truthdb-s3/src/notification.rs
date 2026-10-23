@@ -5,9 +5,11 @@
 //! (`stream create topic <topic> account <account>`); an event to any other
 //! topic is dropped. The topic must exist unless
 //! `x-amz-skip-destination-validation` is true; each topic a configuration
-//! names gets S3's test event. Queue and Lambda destinations
-//! and EventBridge are not offered. The object engine keeps the
-//! configuration and sends the events (see
+//! names gets S3's test event. A queue configuration's events go the same
+//! way to the topic its SQS queue ARN names (`arn:aws:sqs:...`), read as a
+//! queue (`sys.sp_s3_queue_*`). Lambda destinations and EventBridge are not
+//! offered. The object engine keeps the configuration and sends the events
+//! (see
 //! `truthdb_object::NotificationConfig`).
 
 use std::collections::BTreeSet;
@@ -43,13 +45,40 @@ fn new_id() -> Result<String, S3Error> {
     Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
 }
 
-/// `arn:aws:sns:<region>:<account>:<topic>`, in this server's region.
-fn topic_arn(arn: &str, region: &str) -> Result<Destination, S3Error> {
+/// A destination's kind: its configuration element, its ARN element and
+/// the service its ARNs name.
+#[derive(Clone, Copy)]
+enum Kind {
+    Topic,
+    Queue,
+}
+
+impl Kind {
+    fn names(self) -> (&'static str, &'static str, &'static str) {
+        match self {
+            Kind::Topic => ("TopicConfiguration", "Topic", "sns"),
+            Kind::Queue => ("QueueConfiguration", "Queue", "sqs"),
+        }
+    }
+
+    fn of(destination: &Destination) -> Self {
+        match destination {
+            Destination::Topic(_) => Kind::Topic,
+            Destination::Queue(_) => Kind::Queue,
+        }
+    }
+}
+
+/// `arn:aws:<sns|sqs>:<region>:<account>:<topic>`, in this server's region.
+fn destination_arn(arn: &str, region: &str, kind: Kind) -> Result<Destination, S3Error> {
     let fields: Vec<&str> = arn.split(':').collect();
     let refused = || invalid(format!("The ARN is not well formed: {arn}"));
-    let ["arn", "aws", "sns", arn_region, account, topic] = fields.as_slice() else {
+    let ["arn", "aws", service, arn_region, account, topic] = fields.as_slice() else {
         return Err(refused());
     };
+    if *service != kind.names().2 {
+        return Err(refused());
+    }
     if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
         return Err(refused());
     }
@@ -59,11 +88,15 @@ fn topic_arn(arn: &str, region: &str) -> Result<Destination, S3Error> {
         )));
     }
     truthdb_streams::valid_topic_name(topic).map_err(|_| refused())?;
-    Ok(Destination::Topic(arn.to_string()))
+    Ok(match kind {
+        Kind::Topic => Destination::Topic(arn.to_string()),
+        Kind::Queue => Destination::Queue(arn.to_string()),
+    })
 }
 
-fn rule(element: &Element, region: &str) -> Result<NotificationRule, S3Error> {
-    element.only(&["Id", "Topic", "Event", "Filter"])?;
+fn rule(element: &Element, region: &str, kind: Kind) -> Result<NotificationRule, S3Error> {
+    let arn_element = kind.names().1;
+    element.only(&["Id", arn_element, "Event", "Filter"])?;
     let id = match element.text_of("Id")? {
         Some(id) if id.len() > MAX_VALUE => {
             return Err(invalid("A configuration id is at most 1024 characters"));
@@ -71,7 +104,11 @@ fn rule(element: &Element, region: &str) -> Result<NotificationRule, S3Error> {
         Some(id) if !id.is_empty() => id.to_string(),
         _ => new_id()?,
     };
-    let destination = topic_arn(element.text_of("Topic")?.ok_or_else(malformed)?, region)?;
+    let destination = destination_arn(
+        element.text_of(arn_element)?.ok_or_else(malformed)?,
+        region,
+        kind,
+    )?;
     let mut events = Vec::new();
     for event in element.all("Event") {
         if !EVENT_TYPES.contains(&event.text.as_str()) {
@@ -127,7 +164,7 @@ fn rule(element: &Element, region: &str) -> Result<NotificationRule, S3Error> {
     })
 }
 
-/// Reads a `NotificationConfiguration` (topic configurations only).
+/// Reads a `NotificationConfiguration` (topic and queue configurations).
 pub fn parse(body: &[u8], region: &str) -> Result<NotificationConfig, S3Error> {
     let root = crate::xml::parse(body, "NotificationConfiguration")?;
     root.only(&[
@@ -137,7 +174,6 @@ pub fn parse(body: &[u8], region: &str) -> Result<NotificationConfig, S3Error> {
         "EventBridgeConfiguration",
     ])?;
     for (name, what) in [
-        ("QueueConfiguration", "queue destinations"),
         ("CloudFunctionConfiguration", "Lambda function destinations"),
         ("EventBridgeConfiguration", "EventBridge"),
     ] {
@@ -147,9 +183,10 @@ pub fn parse(body: &[u8], region: &str) -> Result<NotificationConfig, S3Error> {
             )));
         }
     }
-    let rules = root
-        .all("TopicConfiguration")
-        .map(|element| rule(element, region))
+    let rules = [Kind::Topic, Kind::Queue]
+        .into_iter()
+        .flat_map(|kind| root.all(kind.names().0).map(move |element| (element, kind)))
+        .map(|(element, kind)| rule(element, region, kind))
         .collect::<Result<Vec<_>, _>>()?;
     let mut ids = BTreeSet::new();
     if let Some(repeated) = rules.iter().find(|rule| !ids.insert(&rule.id)) {
@@ -173,10 +210,11 @@ pub fn parse(body: &[u8], region: &str) -> Result<NotificationConfig, S3Error> {
 pub fn render(config: Option<&NotificationConfig>) -> String {
     let mut out = format!("<NotificationConfiguration xmlns=\"{XMLNS}\">");
     for rule in config.map_or(&[][..], |config| &config.rules) {
-        out.push_str("<TopicConfiguration>");
+        let (element, arn_element, _) = Kind::of(&rule.destination).names();
+        out.push_str(&format!("<{element}>"));
         out.push_str(&format!("<Id>{}</Id>", escape(&rule.id)));
         out.push_str(&format!(
-            "<Topic>{}</Topic>",
+            "<{arn_element}>{}</{arn_element}>",
             escape(rule.destination.arn())
         ));
         for event in &rule.events {
@@ -194,7 +232,7 @@ pub fn render(config: Option<&NotificationConfig>) -> String {
             }
             out.push_str("</S3Key></Filter>");
         }
-        out.push_str("</TopicConfiguration>");
+        out.push_str(&format!("</{element}>"));
     }
     out.push_str("</NotificationConfiguration>");
     out
@@ -379,9 +417,16 @@ mod tests {
             "logs",
             &["s3:ObjectCreated:Put"],
             "<Filter><S3Key><FilterRule><Name>prefix</Name><Value>logs/</Value></FilterRule></S3Key></Filter>",
-        );
+        ) + "<QueueConfiguration><Id>work</Id>\
+             <Queue>arn:aws:sqs:us-east-1:123456789012:jobs</Queue>\
+             <Event>s3:ObjectRemoved:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name>\
+             <Value>jobs/</Value></FilterRule></S3Key></Filter></QueueConfiguration>";
         let parsed = config(&xml).unwrap();
-        assert_eq!(parsed.rules.len(), 2);
+        assert_eq!(parsed.rules.len(), 3);
+        assert_eq!(
+            parsed.rules[2].destination,
+            Destination::Queue("arn:aws:sqs:us-east-1:123456789012:jobs".into())
+        );
         assert_eq!(parsed.rules[0].prefix.as_deref(), Some("images/"));
         assert_eq!(parsed.rules[0].suffix.as_deref(), Some(".jpg & more"));
         assert_eq!(parsed.rules[0].destination.topic(), "events");
@@ -460,8 +505,15 @@ mod tests {
                 "InvalidArgument",
             ),
             (
-                "<QueueConfiguration><Queue>arn:aws:sqs:us-east-1:123456789012:q</Queue>\
+                "<QueueConfiguration><Queue>arn:aws:sns:us-east-1:123456789012:q</Queue>\
                  <Event>s3:ObjectCreated:*</Event></QueueConfiguration>"
+                    .to_string(),
+                "InvalidArgument",
+            ),
+            (
+                "<CloudFunctionConfiguration><CloudFunction>arn:aws:lambda:us-east-1:\
+                 123456789012:function:f</CloudFunction><Event>s3:ObjectCreated:*</Event>\
+                 </CloudFunctionConfiguration>"
                     .to_string(),
                 "NotImplemented",
             ),
