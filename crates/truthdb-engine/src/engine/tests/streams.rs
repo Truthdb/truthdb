@@ -187,6 +187,8 @@ fn topics_are_created_read_as_views_dropped_and_purged() {
     );
     for (query, number) in [
         ("SELECT * FROM sys.stream_read('missing', 0)", 208),
+        ("SELECT * FROM sys.stream_read('missing', 0, 0, 0)", 208),
+        ("SELECT * FROM sys.stream_read('events', 2, 0, 0)", 50000),
         ("SELECT * FROM sys.stream_read('events', 2)", 50000),
         ("SELECT * FROM sys.stream_read('events', NULL)", 50000),
         ("SELECT * FROM sys.stream_read('events', -1)", 206),
@@ -254,7 +256,10 @@ fn the_sweep_trims_records_past_retention() {
         .unwrap();
     let now = super::super::now_ms();
     let two_hours_ago = now - 2 * 3_600_000;
-    append(&engine, "hourly", 0, &["old1", "old2"], two_hours_ago);
+    // More than one trim transaction's worth: one sweep takes several.
+    let old: Vec<String> = (0..600).map(|i| format!("old{i}")).collect();
+    let old: Vec<&str> = old.iter().map(String::as_str).collect();
+    append(&engine, "hourly", 0, &old, two_hours_ago);
     append(&engine, "hourly", 0, &["new"], now);
     append(&engine, "kept", 0, &["old"], two_hours_ago);
     engine.streams_maintenance().unwrap();
@@ -264,7 +269,7 @@ fn the_sweep_trims_records_past_retention() {
             "SELECT offset FROM sys.stream_read('hourly', 0)",
             0
         ),
-        [2]
+        [600]
     );
     assert_eq!(
         sql_column_i64(&engine, "SELECT offset FROM sys.stream_read('kept', 0)", 0),
@@ -276,7 +281,7 @@ fn the_sweep_trims_records_past_retention() {
             "SELECT start_offset FROM sys.stream_topics WHERE topic_name = 'hourly'",
             0
         ),
-        [2]
+        [600]
     );
     drop(engine);
     let _ = std::fs::remove_file(path);
