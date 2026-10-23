@@ -8925,15 +8925,13 @@ fn bucket_events_are_received_from_a_sql_queue() {
     assert!(sql_rows(server.native_port, receive).is_empty());
 }
 
+/// The requests a webhook receiver got: (headers, body) each.
+type Received = std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, Vec<u8>)>>>;
+
 /// A webhook receiver on a free port: answers each POST with the next of
 /// `statuses` (the last one again once they run out), and keeps the
-/// requests as (headers, body).
-fn webhook_receiver(
-    statuses: Vec<u16>,
-) -> (
-    u16,
-    std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, Vec<u8>)>>>,
-) {
+/// requests.
+fn webhook_receiver(statuses: Vec<u16>) -> (u16, Received) {
     use std::io::{BufRead, BufReader, Read, Write};
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
     let port = listener.local_addr().unwrap().port();
