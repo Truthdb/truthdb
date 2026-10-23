@@ -37,6 +37,9 @@ pub struct ObjectAttrs {
     pub tags: Vec<(String, String)>,
     /// The customer-provided key (SSE-C) the body is encrypted with.
     pub customer_key: Option<CustomerKey>,
+    /// Where a website endpoint redirects requests for the object
+    /// (`x-amz-website-redirect-location`).
+    pub website_redirect: Option<String>,
 }
 
 /// What is kept of a customer-provided key (SSE-C): its MD5 as the client
@@ -88,6 +91,9 @@ impl ObjectAttrs {
             field(11, &key.key_md5);
             field(12, &key.verifier);
         }
+        if let Some(location) = &self.website_redirect {
+            field(13, location);
+        }
         out
     }
 
@@ -128,6 +134,7 @@ impl ObjectAttrs {
                         verifier: value,
                     })
                 }
+                13 => attrs.website_redirect = Some(value),
                 _ => return Err(corrupt()),
             }
         }
@@ -1195,6 +1202,7 @@ mod tests {
                 ("b".to_string(), "two".to_string()),
             ],
             tags: vec![("project".to_string(), "blue sky".to_string())],
+            website_redirect: Some("/moved.html".to_string()),
             customer_key: Some(CustomerKey {
                 key_md5: "kMd5==".to_string(),
                 verifier: "salt+mac".to_string(),

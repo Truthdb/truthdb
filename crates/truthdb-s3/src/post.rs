@@ -409,6 +409,7 @@ fn metadata(fields: &[(String, String)]) -> Result<truthdb_object::ObjectAttrs, 
             "content-encoding",
             "content-language",
             "expires",
+            "x-amz-website-redirect-location",
         ]
         .contains(&lower.as_str())
             || lower.starts_with("x-amz-meta-");
