@@ -925,3 +925,108 @@ fn a_receive_stops_at_the_log_budget_dropping_removed_messages_leases() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_webhook_delivers_in_order_retries_and_dead_letters() {
+    use crate::{MAX_ATTEMPTS, WebhookError, dead_letter_topic};
+    let path = temp_path("webhook");
+    let storage = create(&path);
+    in_txn(&storage, |tx| {
+        tx.create_topic("events", 2, 1_000, Some("123456789012"), 1)
+    })
+    .unwrap();
+    in_txn(&storage, |tx| {
+        tx.append("events", 0, &["a", "b"].map(record), None, 5)
+    })
+    .unwrap();
+    in_txn(&storage, |tx| {
+        tx.append("events", 1, &[record("z")], None, 5)
+    })
+    .unwrap();
+    let create = |topic: &str| {
+        in_txn(&storage, |tx| {
+            tx.create_webhook(topic, "http://h/x", "k", 5)
+        })
+    };
+    create("events").unwrap();
+    assert_eq!(create("events"), Err(WebhookError::WebhookExists));
+    assert_eq!(create("missing"), Err(WebhookError::NoSuchTopic));
+    // Its dead-letter topic, like the topic.
+    let (dead, _) = StreamFile::new(&mut storage.lock())
+        .topic(&dead_letter_topic("events"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (dead.partitions, dead.account.as_deref()),
+        (2, Some("123456789012"))
+    );
+    let due = |now: u64| {
+        StreamFile::new(&mut storage.lock())
+            .webhook_due(now, 10)
+            .unwrap()
+    };
+    let at = |deliveries: &[crate::Delivery]| -> Vec<(u32, u64)> {
+        deliveries.iter().map(|d| (d.partition, d.offset)).collect()
+    };
+    let first = due(10);
+    assert_eq!(at(&first), [(0, 0), (1, 0)]);
+    assert_eq!(first[0].value, b"a");
+    in_txn(&storage, |tx| tx.webhook_delivered(&first[0]));
+    // Recorded twice (a crash before the first record's outcome was seen
+    // again): once.
+    in_txn(&storage, |tx| tx.webhook_delivered(&first[0]));
+    assert_eq!(at(&due(10)), [(0, 1), (1, 0)]);
+    // A failure holds back its partition only, for a growing wait.
+    assert!(!in_txn(&storage, |tx| tx.webhook_failed(&first[1], "HTTP 500", 10)));
+    assert_eq!(at(&due(1_009)), [(0, 1)]);
+    assert_eq!(at(&due(1_010)), [(0, 1), (1, 0)]);
+    let mut now = 1_010;
+    for attempt in 2..MAX_ATTEMPTS {
+        assert!(!in_txn(&storage, |tx| tx.webhook_failed(&first[1], "HTTP 503", now)));
+        now += 1_000 << (attempt - 1);
+        assert_eq!(at(&due(now)), [(0, 1), (1, 0)], "attempt {attempt}");
+    }
+    // The last try: dead-lettered (once), and the partition goes on.
+    assert!(in_txn(&storage, |tx| tx.webhook_failed(&first[1], "HTTP 503", now)));
+    assert!(!in_txn(&storage, |tx| tx.webhook_failed(&first[1], "HTTP 503", now)));
+    assert_eq!(at(&due(now)), [(0, 1)]);
+    assert_eq!(
+        values(&storage, &dead_letter_topic("events"), 1, 0),
+        [(0, "z".into())]
+    );
+    let webhooks = StreamFile::new(&mut storage.lock()).webhooks().unwrap();
+    assert_eq!(
+        (
+            webhooks[0].delivered,
+            webhooks[0].dead_lettered,
+            webhooks[0].last_error.as_str()
+        ),
+        (1, 1, "HTTP 503")
+    );
+    // Records retention removed are passed over.
+    assert_eq!(in_txn(&storage, |tx| tx.trim_step(5_000, 100)).0, 3);
+    in_txn(&storage, |tx| {
+        tx.append("events", 0, &[record("c")], None, 6_000)
+    })
+    .unwrap();
+    let later = due(now);
+    assert_eq!(at(&later), [(0, 2)]);
+    in_txn(&storage, |tx| tx.webhook_delivered(&later[0]));
+    assert!(due(now).is_empty());
+    // Dropped with its topic; made again, an old delivery changes nothing.
+    in_txn(&storage, |tx| tx.drop_webhook("events")).unwrap();
+    assert_eq!(
+        in_txn(&storage, |tx| tx.drop_webhook("events")),
+        Err(WebhookError::NoSuchWebhook)
+    );
+    create("events").unwrap();
+    in_txn(&storage, |tx| tx.drop_topic("events")).unwrap();
+    assert!(
+        StreamFile::new(&mut storage.lock())
+            .webhooks()
+            .unwrap()
+            .is_empty()
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
