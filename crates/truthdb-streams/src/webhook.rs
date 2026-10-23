@@ -265,8 +265,8 @@ impl StreamTxn<'_, '_> {
 
     /// Records that posting `delivery` failed with `error` at `now_ms`: it
     /// is tried again after a wait, or after [`MAX_ATTEMPTS`] goes to the
-    /// dead-letter topic (once, whatever crash follows) and its partition
-    /// goes on. Returns whether it was dead-lettered.
+    /// dead-letter topic and its partition goes on (in one transaction: once,
+    /// whatever crash follows). Returns whether it was dead-lettered.
     pub fn webhook_failed(
         &mut self,
         delivery: &Delivery,
@@ -296,7 +296,7 @@ impl StreamTxn<'_, '_> {
                 &dead_letter_topic(&delivery.topic),
                 delivery.partition,
                 &[record],
-                Some(("webhook", delivery.offset + 1)),
+                None,
                 now_ms,
             )?;
         } else {
