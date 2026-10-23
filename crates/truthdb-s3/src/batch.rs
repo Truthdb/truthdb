@@ -1508,7 +1508,7 @@ mod tests {
             "InvalidRequest"
         );
         assert_eq!(
-            code(request("<LambdaInvoke/>", MANIFEST, REPORT)),
+            code(request("<S3ReplicateObject/>", MANIFEST, REPORT)),
             "NotImplemented"
         );
         let no_fields = MANIFEST.replace("<member>Bucket</member>", "");
