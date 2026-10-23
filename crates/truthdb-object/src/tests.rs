@@ -5492,8 +5492,8 @@ fn usage_counts_follow_every_change_and_a_backfill_counts_what_came_before() {
         writer.finish(&storage, now()).unwrap()
     };
     // A file the engine never wrote is not counted (nor made to hold the
-    // engine); once it holds buckets, counting starts when the backfill
-    // has run (with nothing to count yet, at once).
+    // engine by the backfill); one the engine starts in is counted from its
+    // first write, with nothing to backfill.
     assert!(
         !ObjFile::new(&mut storage.lock())
             .usage_backfill(100)
@@ -5507,12 +5507,12 @@ fn usage_counts_follow_every_change_and_a_backfill_counts_what_came_before() {
                 .unwrap();
         });
     }
+    assert!(ObjFile::new(&mut storage.lock()).usage_complete().unwrap());
     assert!(
         !ObjFile::new(&mut storage.lock())
             .usage_backfill(100)
             .unwrap()
     );
-    assert!(ObjFile::new(&mut storage.lock()).usage_complete().unwrap());
     // A deterministic mix of every kind of change, checked after each.
     let mut seed = 7u64;
     let mut next = |below: u64| {

@@ -61,8 +61,9 @@ pub struct BucketUsage {
 
 /// META key of the backfill's position: the keys before it are counted.
 const CURSOR_KEY: &[u8] = b"usage_cursor";
-/// META key set once the backfill has counted every key.
-const DONE_KEY: &[u8] = b"usage_done";
+/// META key set once the backfill has counted every key (or, in a file the
+/// engine starts in, when it starts: there is nothing to count).
+pub(crate) const DONE_KEY: &[u8] = b"usage_done";
 
 fn usage_key(bucket: &str, kind: UsageKind, class: u8) -> Vec<u8> {
     let mut out = Vec::with_capacity(bucket.len() + 3);

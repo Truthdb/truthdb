@@ -549,6 +549,12 @@ impl<'a> ObjFile<'a> {
             true,
         )?;
         self.eng.root = Some(tree.root);
+        // A new engine holds nothing: its storage usage is counted from the
+        // start, with no backfill.
+        self.in_txn(|ctx, txn| {
+            tree.insert_unique(ctx, &mut OpMode::Txn(txn), usage::DONE_KEY, &[1])?;
+            Ok(())
+        })?;
         Ok(tree)
     }
 
