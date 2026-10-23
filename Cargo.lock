@@ -1881,6 +1881,7 @@ dependencies = [
  "truthdb-s3client",
  "truthdb-search",
  "truthdb-sql",
+ "truthdb-streams",
  "truthdb-vector",
 ]
 

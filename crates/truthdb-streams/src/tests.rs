@@ -326,11 +326,9 @@ fn retention_trims_the_oldest_records() {
             Ok(())
         })
         .unwrap();
-    assert!(
-        StreamFile::new(&mut storage.lock())
-            .trim_possible()
-            .unwrap()
-    );
+    let due = |now| StreamFile::new(&mut storage.lock()).trim_due(now).unwrap();
+    assert!(!due(1_500), "nothing older than the retention yet");
+    assert!(due(3_500));
     let removed = StreamFile::new(&mut storage.lock())
         .transaction(|tx| tx.trim_step(3_500, 1))
         .unwrap();
@@ -347,6 +345,7 @@ fn retention_trims_the_oldest_records() {
         .unwrap()
         .1[0];
     assert_eq!((state.start, state.next), (2, 3));
+    assert!(!due(3_500), "trimmed up to the retention");
     assert_eq!(
         StreamFile::new(&mut storage.lock())
             .transaction(|tx| tx.trim_step(3_500, 100))

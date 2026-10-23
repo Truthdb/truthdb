@@ -8,4 +8,5 @@ mod replication;
 mod s3_read;
 mod s3_search;
 mod s3_sql;
+mod streams;
 mod vectors;

@@ -94,6 +94,9 @@ impl ExternalRowsets for S3Rowsets {
                 return Some(open_imports(&self.core, name, args, caller));
             }
             "sys.s3_search" => return Some(self.open_search(name, args, caller)),
+            "sys.stream_topics" | "sys.stream_read" => {
+                return Some(super::stream_sql::open(&self.core, name, args, caller));
+            }
             "sys.s3_read" => {
                 return Some(
                     check_admin(name, caller)
@@ -311,7 +314,7 @@ impl S3Rowsets {
 }
 
 /// Buckets are server-wide: only a server administrator reads them.
-fn check_admin(name: &str, caller: ExternalCaller) -> Result<(), SqlError> {
+pub(super) fn check_admin(name: &str, caller: ExternalCaller) -> Result<(), SqlError> {
     if caller.server_admin {
         return Ok(());
     }
@@ -365,14 +368,14 @@ pub(super) fn string_arg(name: &str, value: &SqlValue) -> Result<String, SqlErro
     }
 }
 
-fn column(name: &str, column_type: ColumnType) -> ResultColumn {
+pub(super) fn column(name: &str, column_type: ColumnType) -> ResultColumn {
     ResultColumn {
         name: name.to_string(),
         column_type,
     }
 }
 
-fn nvarchar(name: &str, max_len: u16) -> ResultColumn {
+pub(super) fn nvarchar(name: &str, max_len: u16) -> ResultColumn {
     column(name, ColumnType::NVarChar { max_len })
 }
 
@@ -380,7 +383,7 @@ fn nvarchar_max(name: &str) -> ResultColumn {
     column(name, ColumnType::NVarCharMax)
 }
 
-fn bigint(name: &str) -> ResultColumn {
+pub(super) fn bigint(name: &str) -> ResultColumn {
     column(name, ColumnType::BigInt)
 }
 
@@ -388,19 +391,19 @@ fn bit(name: &str) -> ResultColumn {
     column(name, ColumnType::Bit)
 }
 
-fn datetime2(name: &str) -> ResultColumn {
+pub(super) fn datetime2(name: &str) -> ResultColumn {
     column(name, ColumnType::DateTime2)
 }
 
 /// Milliseconds since the Unix epoch as a `datetime2`.
-fn datetime(ms: u64) -> Datum {
+pub(super) fn datetime(ms: u64) -> Datum {
     Datum::DateTime2(
         (ms / MS_PER_DAY + DAYS_0001_TO_1970) as u32,
         (ms % MS_PER_DAY) * 10_000,
     )
 }
 
-fn text(value: &str) -> Datum {
+pub(super) fn text(value: &str) -> Datum {
     Datum::NVarChar(value.to_string())
 }
 

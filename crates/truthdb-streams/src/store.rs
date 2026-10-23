@@ -671,12 +671,28 @@ impl StreamFile<'_> {
         Ok(!purge.scan_range_limit(&mut ctx, None, None, 1)?.is_empty())
     }
 
-    /// Whether any topic keeps records for a limited time (so trimming may
-    /// have work).
-    pub fn trim_possible(&mut self) -> Result<bool, StorageError> {
-        Ok(self.topics()?.iter().any(|(topic, partitions)| {
-            topic.retention_ms > 0 && partitions.iter().any(|state| state.start < state.next)
-        }))
+    /// Whether a partition's oldest record is past its topic's retention at
+    /// `now_ms` (so [`StreamTxn::trim_step`] has work).
+    pub fn trim_due(&mut self, now_ms: u64) -> Result<bool, StorageError> {
+        let topics = self.topics()?;
+        let Some(records) = self.existing_tree(RECORDS_TREE)? else {
+            return Ok(false);
+        };
+        let mut ctx = self.page_ctx();
+        for (topic, partitions) in topics.iter().filter(|(topic, _)| topic.retention_ms > 0) {
+            let cutoff = now_ms.saturating_sub(topic.retention_ms);
+            for (partition, state) in (0..).zip(partitions) {
+                if state.start == state.next {
+                    continue;
+                }
+                let oldest = read_record(&mut ctx, &records, topic.id, partition, state.start)?
+                    .ok_or_else(|| corrupt("partition missing a record"))?;
+                if oldest.timestamp_ms < cutoff {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
     }
 }
 
