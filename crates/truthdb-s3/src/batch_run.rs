@@ -102,18 +102,46 @@ pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
     // fail).
     let poster = Poster::new(None)
         .inspect_err(|err| eprintln!("batch operations: no HTTP client: {err}"))
-        .ok();
+        .ok()
+        .map(Arc::new);
+    let invoking = Invoking::default();
     loop {
         if *shutdown.borrow() {
             return;
         }
-        let more = !state.storage.is_standby() && step(&state, &mut waits, poster.as_ref()).await;
+        let more = !state.storage.is_standby()
+            && step(&state, &mut waits, poster.as_ref(), &invoking).await;
         if !more {
             tokio::select! {
                 _ = tokio::time::sleep(IDLE) => {}
                 _ = shutdown.changed() => {}
             }
         }
+    }
+}
+
+/// The LambdaInvoke jobs whose invocations are under way, each in a task of
+/// its own (so a slow endpoint holds up only its own job): the runner does
+/// nothing else with them meanwhile.
+#[derive(Default, Clone)]
+struct Invoking(Arc<std::sync::Mutex<std::collections::HashSet<u64>>>);
+
+/// Jobs invoking at once, at most.
+const MAX_INVOKING: usize = 32;
+
+impl Invoking {
+    fn has(&self, number: u64) -> bool {
+        self.0.lock().expect("invoking poisoned").contains(&number)
+    }
+
+    /// Takes a place for job `number`, unless every place is taken.
+    fn take(&self, number: u64) -> bool {
+        let mut set = self.0.lock().expect("invoking poisoned");
+        set.len() < MAX_INVOKING && set.insert(number)
+    }
+
+    fn release(&self, number: u64) {
+        self.0.lock().expect("invoking poisoned").remove(&number);
     }
 }
 
@@ -144,11 +172,16 @@ enum Work {
 /// The next work of a job not waiting: ended jobs' cleanup first, then New,
 /// Preparing, ending, Ready jobs, then the Active job of the highest
 /// priority (the oldest of those).
-fn next_work<'j>(jobs: &'j [Job], waits: &Waits, now_ms: u64) -> Option<(&'j Job, Work)> {
+fn next_work<'j>(
+    jobs: &'j [Job],
+    waits: &Waits,
+    invoking: &Invoking,
+    now_ms: u64,
+) -> Option<(&'j Job, Work)> {
     let now = Instant::now();
     let ready: Vec<&Job> = jobs
         .iter()
-        .filter(|job| waits.ready(job.number, now))
+        .filter(|job| waits.ready(job.number, now) && !invoking.has(job.number))
         .collect();
     for job in ready.iter().filter(|job| job.status.is_terminal()) {
         if job.results_left {
@@ -188,7 +221,12 @@ fn next_work<'j>(jobs: &'j [Job], waits: &Waits, now_ms: u64) -> Option<(&'j Job
 }
 
 /// One step of whichever job has work; whether there may be more now.
-async fn step(state: &S3State, waits: &mut Waits, poster: Option<&Poster>) -> bool {
+async fn step(
+    state: &Arc<S3State>,
+    waits: &mut Waits,
+    poster: Option<&Arc<Poster>>,
+    invoking: &Invoking,
+) -> bool {
     let jobs = match object(state, |file| file.jobs()).await {
         Ok(jobs) => jobs,
         Err(err) => {
@@ -199,7 +237,7 @@ async fn step(state: &S3State, waits: &mut Waits, poster: Option<&Poster>) -> bo
     waits
         .0
         .retain(|number, _| jobs.iter().any(|job| job.number == *number));
-    let Some((job, work)) = next_work(&jobs, waits, now_ms()) else {
+    let Some((job, work)) = next_work(&jobs, waits, invoking, now_ms()) else {
         return false;
     };
     let number = job.number;
@@ -239,7 +277,7 @@ async fn step(state: &S3State, waits: &mut Waits, poster: Option<&Poster>) -> bo
             })
             .await
         }
-        Work::Run => run_tasks(state, number, poster).await,
+        Work::Run => run_tasks(state, number, poster, invoking).await,
     };
     match outcome {
         Ok(()) => {
@@ -1202,7 +1240,12 @@ fn cut(text: &str, max: usize) -> String {
 /// of its CSV manifest, or the objects its generated one lists. A
 /// LambdaInvoke job's tasks invoke their function outside the storage lock
 /// (see [`run_invocations`]).
-async fn run_tasks(state: &S3State, number: u64, poster: Option<&Poster>) -> Result<(), String> {
+async fn run_tasks(
+    state: &Arc<S3State>,
+    number: u64,
+    poster: Option<&Arc<Poster>>,
+    invoking: &Invoking,
+) -> Result<(), String> {
     let now = now_ms();
     let delays = state.restore_delays;
     let lambda = object(state, move |file| {
@@ -1270,8 +1313,19 @@ async fn run_tasks(state: &S3State, number: u64, poster: Option<&Poster>) -> Res
         Ok(None)
     })
     .await?;
-    if let Some((job, lambda, report)) = lambda {
-        run_invocations(state, poster, job, lambda, report).await?;
+    // Invoked in a task of its own (when a place is free; else the job
+    // waits for the next step).
+    if let Some((job, lambda, report)) = lambda
+        && invoking.take(number)
+    {
+        let (state, poster, invoking) = (Arc::clone(state), poster.cloned(), invoking.clone());
+        tokio::spawn(async move {
+            if let Err(err) = run_invocations(&state, poster.as_deref(), job, lambda, report).await
+            {
+                eprintln!("batch operations: job {number}: {err}");
+            }
+            invoking.release(number);
+        });
     }
     Ok(())
 }
@@ -1279,9 +1333,10 @@ async fn run_tasks(state: &S3State, number: u64, poster: Option<&Poster>) -> Res
 /// LambdaInvoke tasks a step invokes at most, and the times one is tried
 /// (a TemporaryFailure, or no answer, is tried again after 1 s, then 2 s).
 const INVOCATIONS_PER_STEP: usize = 16;
-/// How long a step of invocations runs at most: the runner, which runs every
-/// job, is then free for the others. An invocation cut short is not
-/// recorded, and is invoked again by the next step.
+/// How long a step of invocations starts new ones: none starts after it
+/// (one under way runs to its end, so none is cut short and invoked
+/// again); the step's results are then recorded, and a cancel or a change
+/// of priority seen.
 const INVOCATION_STEP_BUDGET: Duration = Duration::from_secs(60);
 const INVOCATION_TRIES: u32 = 3;
 /// The largest answer a function may give.
@@ -1425,13 +1480,10 @@ async fn run_invocations(
     };
     let mut results = Vec::new();
     let began = std::time::Instant::now();
-    // The step's first invocation runs to its end (the client's timeouts
-    // and the tries bound it), so every step records one; the rest share
-    // what is left of the budget.
-    let mut invoked_one = false;
     for item in items {
-        let left = INVOCATION_STEP_BUDGET.checked_sub(began.elapsed());
-        if invoked_one && left.is_none() {
+        // Past the budget no invocation starts (the step has recorded one at
+        // least: the first always starts).
+        if began.elapsed() >= INVOCATION_STEP_BUDGET && !results.is_empty() {
             break;
         }
         let result = match &item.object {
@@ -1463,15 +1515,9 @@ async fn run_invocations(
                     key,
                     version.as_deref(),
                 );
-                let invoked = match left.filter(|_| invoked_one) {
-                    Some(left) => tokio::time::timeout(left, invocation).await.ok(),
-                    None => Some(invocation.await),
-                };
-                // Out of time: this task and the rest wait for the next step.
-                let Some((succeeded, code, message)) = invoked else {
-                    break;
-                };
-                invoked_one = true;
+                // Runs to its end (the client's timeouts and the tries bound
+                // it).
+                let (succeeded, code, message) = invocation.await;
                 Some(JobResult {
                     bucket: cut(bucket, MAX_RESULT_TEXT),
                     key: cut(key, MAX_RESULT_KEY),
@@ -2207,7 +2253,9 @@ mod tests {
             job(3, JobStatus::Active, 9),
         ];
         let mut waits = Waits::default();
-        let picked = |waits: &Waits| next_work(&jobs, waits, 0).map(|(job, _)| job.number);
+        let invoking = Invoking::default();
+        let picked =
+            |waits: &Waits| next_work(&jobs, waits, &invoking, 0).map(|(job, _)| job.number);
         assert_eq!(picked(&waits), Some(1), "preparing first");
         let now = Instant::now();
         waits.failed(1, now);
@@ -2216,6 +2264,23 @@ mod tests {
         assert_eq!(picked(&waits), Some(2));
         waits.failed(2, now);
         assert_eq!(picked(&waits), None, "every job waits");
+        // A job invoking is passed over until its invocations end.
+        let mut fresh = Waits::default();
+        let invoking = Invoking::default();
+        let pick = |waits: &Waits, invoking: &Invoking| {
+            next_work(&jobs, waits, invoking, 0).map(|(job, _)| job.number)
+        };
+        fresh.failed(1, now);
+        assert!(invoking.take(3));
+        assert_eq!(pick(&fresh, &invoking), Some(2));
+        invoking.release(3);
+        assert_eq!(pick(&fresh, &invoking), Some(3));
+        // At most MAX_INVOKING at once.
+        for n in 100..100 + MAX_INVOKING as u64 {
+            assert!(invoking.take(n));
+        }
+        assert!(!invoking.take(3));
+
         // The wait doubles, to a limit.
         for _ in 0..20 {
             waits.failed(1, now);

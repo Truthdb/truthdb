@@ -11035,3 +11035,75 @@ fn batch_jobs_invoke_a_function_for_each_object() {
         400
     );
 }
+
+#[test]
+fn a_slow_function_holds_up_no_other_batch_job() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "batchslow");
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            &[("x-amz-account-id", account.as_str())],
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    for bucket in ["/src", "/data", "/reports"] {
+        assert_eq!(call("PUT", bucket, "", b"").1.0, 200);
+    }
+    assert_eq!(call("PUT", "/data/a", "", b"x").1.0, 200);
+    // A function taking 2 s an invocation.
+    let (port, _) = function_receiver(|event| {
+        std::thread::sleep(Duration::from_secs(2));
+        let result = serde_json::json!({
+            "results": [{"taskId": event["tasks"][0]["taskId"], "resultCode": "Succeeded", "resultString": ""}],
+        });
+        (200, result.to_string())
+    });
+    native(
+        server.native_port,
+        &format!("stream create topic slow account {account}"),
+    );
+    native(
+        server.native_port,
+        &format!("stream create webhook slow url http://127.0.0.1:{port}/ secret s3cret"),
+    );
+    let manifest = |name: &str, lines: &str| {
+        let (head, (status, _)) = call("PUT", &format!("/src/{name}"), "", lines.as_bytes());
+        assert_eq!(status, 200);
+        response_header(&head, "etag").unwrap()
+    };
+    let slow_lines: String = (0..16).map(|_| "data,a\n").collect();
+    let etag = manifest("slow.csv", &slow_lines);
+    let invoke = "<LambdaInvoke><FunctionArn>slow</FunctionArn></LambdaInvoke>";
+    let body = create_job_body("slow-1", invoke, "slow.csv", &etag, "")
+        .replace("<Priority>10</Priority>", "<Priority>99</Priority>");
+    assert_eq!(
+        call("POST", "/v20180820/jobs", "", body.as_bytes()).1.0,
+        200
+    );
+    // Once the slow job invokes, a tagging job still runs to its end.
+    std::thread::sleep(Duration::from_secs(1));
+    let etag = manifest("tag.csv", "data,a\n");
+    let tagging = "<S3PutObjectTagging><TagSet><S3Tag><Key>k</Key><Value>v</Value></S3Tag></TagSet></S3PutObjectTagging>";
+    let body = create_job_body("tag-1", tagging, "tag.csv", &etag, "");
+    let (_, (status, answer)) = call("POST", "/v20180820/jobs", "", body.as_bytes());
+    assert_eq!(status, 200, "{answer}");
+    let job = xml_value(&answer, "JobId");
+    let began = Instant::now();
+    loop {
+        let described = call("GET", &format!("/v20180820/jobs/{job}"), "", b"").1.1;
+        if xml_value(&described, "Status") == "Complete" {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "held up by the slow job: {described}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
