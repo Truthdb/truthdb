@@ -350,11 +350,12 @@ pub(super) fn import_loop(shared: &Arc<Shared>) {
             return;
         }
     };
+    let mut waits = crate::engine::ImportWaits::default();
     while !shared.stop.load(Ordering::Acquire) {
         let stopping = || shared.stop.load(Ordering::Acquire);
         let more = shared
             .engine
-            .import_step(&runtime, &stopping)
+            .import_step(&runtime, &stopping, &mut waits)
             .unwrap_or_else(|err| {
                 eprintln!("import failed: {err}");
                 false

@@ -13,6 +13,8 @@
 //! tried again later from the same place. A storage error ends the step
 //! without moving on. A standby imports nothing.
 
+use std::collections::HashMap;
+
 use truthdb_object::{
     BodyWriter, Import, ImportState, ObjectAttrs, ObjectError, Origin, StorageClass, VersionSel,
 };
@@ -26,6 +28,32 @@ const STEP_OBJECTS: usize = 100;
 
 /// How long a dropped object's body outlives a version an import replaced.
 const IMPORT_DROP_GRACE_MS: u64 = 15 * 60 * 1000;
+
+/// How long an import whose source could not be reached waits before it is
+/// tried again (others run meanwhile), doubled on each failure in a row up
+/// to the most: a source that stays down costs the others less and less
+/// (the thread waits through each of its tries' timeouts).
+const RETRY_WAIT_MS: u64 = 5_000;
+const MAX_RETRY_WAIT_MS: u64 = 5 * 60 * 1000;
+
+/// Tries of one object before it is recorded as failed and passed over.
+const MAX_TRIES: u32 = 5;
+
+/// S3's limits on an object's headers and user metadata, which imported
+/// values are held to as uploads are (they also keep every stored attribute
+/// within what its encoding allows).
+const MAX_HEADER_BYTES: usize = 8 * 1024;
+const MAX_USER_METADATA: usize = 2 * 1024;
+
+/// What the import thread remembers between steps (a restart starts
+/// afresh).
+#[derive(Default)]
+pub(crate) struct ImportWaits {
+    /// Import -> when it may be tried again, and how long it waited last.
+    until: HashMap<u64, (u64, u64)>,
+    /// Import -> the source key it last had to try again, and how often.
+    tries: HashMap<u64, (String, u32)>,
+}
 
 /// What became of one source object.
 enum Outcome {
@@ -46,33 +74,43 @@ enum Outcome {
 }
 
 /// Whether a source error will not clear by waiting: anything but a
-/// transport failure or a 5xx answer.
+/// transport failure, a 5xx answer, a timeout (408), throttling (429) or a
+/// clock skew.
 fn permanent(err: &S3Error) -> bool {
     match err {
         S3Error::Invalid(_) => true,
-        S3Error::Service { status, .. } => *status < 500,
+        S3Error::Service { status, code, .. } => {
+            *status < 500 && !matches!(*status, 408 | 429) && code != "RequestTimeTooSkewed"
+        }
         S3Error::Transport(_) => false,
     }
 }
 
 impl Engine {
-    /// One step of the running import that waited longest; returns whether
-    /// more steps are wanted at once. `stopping` says when the server is
-    /// shutting down.
+    /// One step of the running import that waited longest (of those not
+    /// waiting to be tried again); returns whether to step again at once.
+    /// `stopping` says when the server is shutting down.
     pub(crate) fn import_step(
         &self,
         runtime: &tokio::runtime::Runtime,
         stopping: &dyn Fn() -> bool,
+        waits: &mut ImportWaits,
     ) -> Result<bool, EngineError> {
         if self.storage.is_standby() || !self.runs_objects() {
             return Ok(false);
         }
-        // Turn by turn: one that keeps waiting for its source does not hold
-        // the others back.
+        let now = super::now_ms();
+        // Turn by turn: one that waits for its source holds no other back.
         let Some(mut import) = self
             .object(|file| file.imports())?
             .into_iter()
             .filter(|import| import.state == ImportState::Running)
+            .filter(|import| {
+                waits
+                    .until
+                    .get(&import.id)
+                    .is_none_or(|(until, _)| now >= *until)
+            })
             .min_by_key(|import| import.updated_ms)
         else {
             return Ok(false);
@@ -96,8 +134,10 @@ impl Engine {
             Err(err) if permanent(&err) => {
                 return self.end_import(import, ImportState::Failed, err.to_string());
             }
-            Err(err) => return self.wait_import(import, err.to_string()),
+            Err(err) => return self.wait_import(import, err.to_string(), waits),
         };
+        // Reached: its waits start over.
+        waits.until.remove(&import.id);
         if page.objects.is_empty() && page.next.is_some() {
             return self.end_import(
                 import,
@@ -113,13 +153,35 @@ impl Engine {
                 let error = format!("the source listed {} out of order", object.key);
                 return self.end_import(import, ImportState::Failed, error);
             }
-            match self.import_object(runtime, &client, &import, object, stopping)? {
+            let outcome = match self.import_object(runtime, &client, &import, object, stopping) {
+                Ok(outcome) => outcome,
+                // Kept on the import, and tried again after a while.
+                Err(err) => return self.wait_import(import, format!("storage: {err}"), waits),
+            };
+            // Tried too often, an object is passed over as failed.
+            let outcome = match outcome {
+                Outcome::Retry(error) => {
+                    let tries = match waits.tries.get(&import.id) {
+                        Some((key, tries)) if *key == object.key => tries + 1,
+                        _ => 1,
+                    };
+                    if tries >= MAX_TRIES {
+                        waits.tries.remove(&import.id);
+                        Outcome::Failed(format!("{error} (after {tries} tries)"))
+                    } else {
+                        waits.tries.insert(import.id, (object.key.clone(), tries));
+                        Outcome::Retry(error)
+                    }
+                }
+                outcome => outcome,
+            };
+            match outcome {
                 Outcome::Copied(copied) => import = *copied,
                 Outcome::Dropped => return Ok(true),
                 Outcome::Fatal(error) => {
                     return self.end_import(import, ImportState::Failed, error);
                 }
-                Outcome::Retry(error) => return self.wait_import(import, error),
+                Outcome::Retry(error) => return self.wait_import(import, error, waits),
                 Outcome::Stopped => {
                     import.updated_ms = super::now_ms();
                     self.save_import(&import)?;
@@ -198,6 +260,21 @@ impl Engine {
                 Err(err) if permanent(&err) => return Ok(Outcome::Failed(err.to_string())),
                 Err(err) => return Ok(Outcome::Retry(err.to_string())),
             };
+        // Held to the limits an upload is.
+        let user_bytes: usize = download
+            .head
+            .metadata
+            .iter()
+            .map(|(name, value)| name.len() + value.len())
+            .sum();
+        let header_bytes = user_bytes
+            + download.head.metadata.len() * "x-amz-meta-".len()
+            + download.head.content_type.as_ref().map_or(0, String::len);
+        if user_bytes > MAX_USER_METADATA || header_bytes > MAX_HEADER_BYTES {
+            return Ok(Outcome::Failed(
+                "its metadata exceeds the size S3 allows".to_string(),
+            ));
+        }
         // A storage error ends the step (the staging body it leaves is
         // collected as abandoned).
         let storage: &truthdb_core::storage::Storage = &self.storage;
@@ -313,13 +390,26 @@ impl Engine {
         Ok(())
     }
 
-    /// Records why the import waits, and lets the thread rest before the
-    /// next try.
-    fn wait_import(&self, mut import: Import, error: String) -> Result<bool, EngineError> {
+    /// Records why the import waits, and leaves it be for a while (the
+    /// others go on).
+    fn wait_import(
+        &self,
+        mut import: Import,
+        error: String,
+        waits: &mut ImportWaits,
+    ) -> Result<bool, EngineError> {
         import.error = error;
         import.updated_ms = super::now_ms();
-        self.save_import(&import)?;
-        Ok(false)
+        let wait = waits
+            .until
+            .get(&import.id)
+            .map_or(RETRY_WAIT_MS, |(_, last)| (last * 2).min(MAX_RETRY_WAIT_MS));
+        waits
+            .until
+            .insert(import.id, (import.updated_ms + wait, wait));
+        // Saved if the store can (a storage error may be why it waits).
+        let _ = self.save_import(&import);
+        Ok(true)
     }
 
     fn end_import(
@@ -334,6 +424,30 @@ impl Engine {
         }
         import.updated_ms = super::now_ms();
         self.save_import(&import)?;
-        Ok(false)
+        // Another import may be waiting its turn.
+        Ok(true)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_lasting_refusals_are_permanent() {
+        let service = |status: u16, code: &str| S3Error::Service {
+            status,
+            code: code.to_string(),
+            message: String::new(),
+        };
+        assert!(permanent(&S3Error::Invalid("x".into())));
+        assert!(permanent(&service(403, "AccessDenied")));
+        assert!(permanent(&service(404, "NoSuchBucket")));
+        assert!(permanent(&service(301, "PermanentRedirect")));
+        assert!(!permanent(&service(403, "RequestTimeTooSkewed")));
+        assert!(!permanent(&service(408, "RequestTimeout")));
+        assert!(!permanent(&service(429, "SlowDown")));
+        assert!(!permanent(&service(503, "SlowDown")));
+        assert!(!permanent(&S3Error::Transport("reset".into())));
     }
 }

@@ -316,6 +316,9 @@ const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 /// than holding its caller forever.
 const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
 
+/// The slowest sending a request body is allowed, in bytes a second.
+const MIN_SEND_RATE: u64 = 32 * 1024;
+
 /// The most of an error answer's body that is read.
 const MAX_ERROR_BODY: usize = 64 * 1024;
 
@@ -437,13 +440,17 @@ impl Client {
                 request = request.header(name.as_str(), value.as_str());
             }
         }
+        let body_len = body.len() as u64;
         // Stated even when empty: hyper leaves it out of an empty PUT.
         let request = request
             .header("authorization", authorization)
-            .header("content-length", body.len())
+            .header("content-length", body_len)
             .body(Full::new(body))
             .map_err(|err| invalid(err.to_string()))?;
-        let response = tokio::time::timeout(ANSWER_TIMEOUT, self.http.request(request))
+        // The answer follows the body: a large one takes longer to send.
+        let answer_within =
+            ANSWER_TIMEOUT + std::time::Duration::from_secs(body_len / MIN_SEND_RATE);
+        let response = tokio::time::timeout(answer_within, self.http.request(request))
             .await
             .map_err(|_| Error::Transport("the service did not answer in time".to_string()))?
             .map_err(transport)?;
