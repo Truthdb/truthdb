@@ -400,14 +400,16 @@ impl ObjTxn<'_, '_> {
         )?;
         uploads.delete(self.ctx, &mut OpMode::Txn(self.txn), &upload.to_be_bytes())?;
         self.take_upload_lock(upload)?;
-        let bytes: i64 = removed.iter().map(|part| part.size as i64).sum();
-        self.count_parts(
-            &info.bucket,
-            &info.key,
-            info.storage_class,
-            -(removed.len() as i64),
-            -bytes,
-        )?;
+        if !removed.is_empty() {
+            let bytes: i64 = removed.iter().map(|part| part.size as i64).sum();
+            self.count_parts(
+                &info.bucket,
+                &info.key,
+                info.storage_class,
+                -(removed.len() as i64),
+                -bytes,
+            )?;
+        }
         Ok(removed)
     }
 

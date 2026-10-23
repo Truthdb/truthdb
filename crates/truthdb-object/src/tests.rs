@@ -5491,14 +5491,15 @@ fn usage_counts_follow_every_change_and_a_backfill_counts_what_came_before() {
         writer.write(&storage, &bytes(seed, len), now()).unwrap();
         writer.finish(&storage, now()).unwrap()
     };
-    // Counting starts once the backfill has run (on a new file, at once).
-    assert!(!ObjFile::new(&mut storage.lock()).usage_complete().unwrap());
+    // A file the engine never wrote is not counted (nor made to hold the
+    // engine); once it holds buckets, counting starts when the backfill
+    // has run (with nothing to count yet, at once).
     assert!(
         !ObjFile::new(&mut storage.lock())
             .usage_backfill(100)
             .unwrap()
     );
-    assert!(ObjFile::new(&mut storage.lock()).usage_complete().unwrap());
+    assert!(!ObjFile::new(&mut storage.lock()).usage_complete().unwrap());
     for bucket in ["one", "two"] {
         txn(&mut |tx| {
             tx.create_bucket(bucket, DEFAULT_ACCOUNT, now())
@@ -5506,6 +5507,12 @@ fn usage_counts_follow_every_change_and_a_backfill_counts_what_came_before() {
                 .unwrap();
         });
     }
+    assert!(
+        !ObjFile::new(&mut storage.lock())
+            .usage_backfill(100)
+            .unwrap()
+    );
+    assert!(ObjFile::new(&mut storage.lock()).usage_complete().unwrap());
     // A deterministic mix of every kind of change, checked after each.
     let mut seed = 7u64;
     let mut next = |below: u64| {
@@ -5745,15 +5752,17 @@ fn usage_counts_survive_a_crash_at_any_op_of_a_change() {
         let path = temp_path("usage-crash");
         let storage = create(&path);
         ObjFile::new(&mut storage.lock())
-            .usage_backfill(10)
-            .unwrap();
-        ObjFile::new(&mut storage.lock())
             .transaction(|tx| {
                 tx.create_bucket("bkt", DEFAULT_ACCOUNT, now())?.unwrap();
                 tx.set_versioning("bkt", Versioning::Enabled)
             })
             .unwrap()
             .unwrap();
+        // Counted from here on.
+        ObjFile::new(&mut storage.lock())
+            .usage_backfill(10)
+            .unwrap();
+        assert!(ObjFile::new(&mut storage.lock()).usage_complete().unwrap());
         let body = |seed: u8| {
             let mut writer = BodyWriter::begin(&storage, now()).unwrap();
             writer.write(&storage, &bytes(seed, 100), now()).unwrap();
@@ -5811,4 +5820,82 @@ fn usage_counts_survive_a_crash_at_any_op_of_a_change() {
         }
         crash_at += 1;
     }
+}
+
+#[test]
+fn a_usage_backfill_counts_every_key_once_whatever_its_step() {
+    use crate::{ObjectAttrs, StorageClass, Versioning};
+    let path = temp_path("usage-backfill");
+    let storage = create(&path);
+    let sealed = |seed: u8, len: usize| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, &bytes(seed, len), now()).unwrap();
+        writer.finish(&storage, now()).unwrap()
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_bucket("bkt", DEFAULT_ACCOUNT, now())?.unwrap();
+            tx.set_versioning("bkt", Versioning::Enabled)
+        })
+        .unwrap()
+        .unwrap();
+    // Keys holding only uploads before, between and after keys holding
+    // versions; a key with two uploads; a key with three versions.
+    for (key, versions) in [("b", 1), ("d", 3)] {
+        for version in 0..versions {
+            let body = sealed(version, 10 + version as usize);
+            ObjFile::new(&mut storage.lock())
+                .transaction(|tx| {
+                    tx.put_object(
+                        "bkt",
+                        key,
+                        &body,
+                        &ObjectAttrs::default(),
+                        StorageClass::Standard,
+                        now(),
+                        0,
+                    )
+                })
+                .unwrap()
+                .unwrap();
+        }
+    }
+    for (index, key) in ["a1", "a2", "a3", "c", "c", "e", "z"]
+        .into_iter()
+        .enumerate()
+    {
+        let part = sealed(index as u8, 5 + index);
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                let upload = tx
+                    .create_upload(
+                        "bkt",
+                        key,
+                        &ObjectAttrs::default(),
+                        StorageClass::Glacier,
+                        now(),
+                    )?
+                    .unwrap();
+                tx.upload_part(upload, 1, &part, now(), 0).map(|_| ())
+            })
+            .unwrap();
+    }
+    let expected = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.recount_usage())
+        .unwrap();
+    for step in 1..=4 {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.reset_usage())
+            .unwrap();
+        while ObjFile::new(&mut storage.lock())
+            .usage_backfill(step)
+            .unwrap()
+        {}
+        assert_eq!(
+            ObjFile::new(&mut storage.lock()).bucket_usage().unwrap(),
+            expected,
+            "steps of {step}"
+        );
+    }
+    std::fs::remove_file(&path).ok();
 }

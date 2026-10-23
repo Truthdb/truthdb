@@ -257,23 +257,43 @@ impl ObjTxn<'_, '_> {
             return Ok(false);
         }
         let cursor = meta.get(self.ctx, CURSOR_KEY)?;
+        let start = cursor.clone().unwrap_or_default();
+        let limit = rows.max(1);
+        // The keys the next `limit` version rows and the next `limit` upload
+        // index entries belong to; the step ends after the last key both
+        // scans reached, and counts each key before it whole (its versions
+        // and its uploads), however many rows it has.
         let objects = self.trees.objects();
-        let found = objects.scan_range_limit(self.ctx, cursor.as_deref(), None, rows.max(1))?;
-        // The keys found, each counted whole (the last may have more rows
-        // than were found).
+        let found = objects.scan_range_limit(self.ctx, Some(&start), None, limit)?;
+        let object_end = (found.len() >= limit)
+            .then(|| {
+                found
+                    .last()
+                    .map(|(row_key, _)| after_key(&row_key[..row_key.len() - 8]))
+            })
+            .flatten();
+        let index = self.trees.upload_index();
+        let listed =
+            index.scan_range_limit(self.ctx, Some(&start), object_end.as_deref(), limit)?;
+        let upload_end = (listed.len() >= limit)
+            .then(|| {
+                listed
+                    .last()
+                    .map(|(key, _)| after_key(&key[..key.len() - 8]))
+            })
+            .flatten();
+        let end = match (object_end, upload_end) {
+            (Some(objects), Some(uploads)) => Some(objects.min(uploads)),
+            (objects, uploads) => objects.or(uploads),
+        };
+        let before_end = |prefix: &[u8]| end.as_deref().is_none_or(|end| prefix < end);
         let mut prefixes: Vec<Vec<u8>> = Vec::new();
         for (row_key, _) in &found {
             let prefix = row_key[..row_key.len() - 8].to_vec();
-            if prefixes.last() != Some(&prefix) {
+            if prefixes.last() != Some(&prefix) && before_end(&prefix) {
                 prefixes.push(prefix);
             }
         }
-        let last = found.len() < rows.max(1);
-        let end = match (last, prefixes.last()) {
-            (true, _) => None,
-            (false, Some(prefix)) => Some(after_key(prefix)),
-            (false, None) => None,
-        };
         for prefix in &prefixes {
             let mut upper = prefix.clone();
             upper.extend_from_slice(&[0xFF; 8]);
@@ -294,38 +314,47 @@ impl ObjTxn<'_, '_> {
                 self.add_usage(&bucket, kind_of(&row, index == 0), 1, size)?;
             }
         }
-        // The uploads of the same keys (their index keys on the same prefix).
-        let index = self.trees.upload_index();
-        let start = cursor.clone().unwrap_or_default();
-        let uploads = index.scan_range(self.ctx, Some(&start), end.as_deref())?;
-        for (index_key, _) in uploads {
-            let upload = u64::from_be_bytes(
-                index_key[index_key.len() - 8..]
-                    .try_into()
-                    .map_err(|_| codec::corrupt("upload index"))?,
-            );
-            let Some(row) = self.trees.uploads().get(self.ctx, &upload.to_be_bytes())? else {
-                continue;
-            };
-            let info = decode_upload(upload, &row)?;
-            let parts = self.trees.parts().scan_range(
-                self.ctx,
-                Some(&part_key(upload, 0)),
-                Some(&part_key(upload, u32::MAX)),
-            )?;
-            for (key, row) in parts {
-                let number = u32::from_be_bytes(
-                    key[8..]
+        // The uploads of the keys listed (their index keys on the same
+        // prefixes; all before the end), each key's whole.
+        let mut upload_prefixes: Vec<Vec<u8>> = Vec::new();
+        for (key, _) in &listed {
+            let prefix = key[..key.len() - 8].to_vec();
+            if upload_prefixes.last() != Some(&prefix) {
+                upload_prefixes.push(prefix);
+            }
+        }
+        for prefix in &upload_prefixes {
+            for (index_key, _) in
+                index.scan_range(self.ctx, Some(prefix), Some(&after_key(prefix)))?
+            {
+                let upload = u64::from_be_bytes(
+                    index_key[index_key.len() - 8..]
                         .try_into()
-                        .map_err(|_| codec::corrupt("part key"))?,
+                        .map_err(|_| codec::corrupt("upload index"))?,
                 );
-                let part = decode_part(number, &row)?;
-                self.add_usage(
-                    &info.bucket,
-                    (UsageKind::UploadParts, info.storage_class.code()),
-                    1,
-                    part.size as i64,
+                let Some(row) = self.trees.uploads().get(self.ctx, &upload.to_be_bytes())? else {
+                    continue;
+                };
+                let info = decode_upload(upload, &row)?;
+                let parts = self.trees.parts().scan_range(
+                    self.ctx,
+                    Some(&part_key(upload, 0)),
+                    Some(&part_key(upload, u32::MAX)),
                 )?;
+                for (key, row) in parts {
+                    let number = u32::from_be_bytes(
+                        key[8..]
+                            .try_into()
+                            .map_err(|_| codec::corrupt("part key"))?,
+                    );
+                    let part = decode_part(number, &row)?;
+                    self.add_usage(
+                        &info.bucket,
+                        (UsageKind::UploadParts, info.storage_class.code()),
+                        1,
+                        part.size as i64,
+                    )?;
+                }
             }
         }
         let mode = &mut OpMode::Txn(self.txn);
@@ -350,7 +379,9 @@ impl ObjFile<'_> {
     /// One step of the usage backfill, in a transaction of its own; returns
     /// whether keys remain.
     pub fn usage_backfill(&mut self, rows: usize) -> Result<bool, StorageError> {
-        if self.usage_complete()? {
+        // A file the engine never wrote has nothing to count, and is not
+        // made to hold the engine by counting it.
+        if self.eng.root.is_none() || self.usage_complete()? {
             return Ok(false);
         }
         self.transaction(|tx| tx.usage_backfill_step(rows))
