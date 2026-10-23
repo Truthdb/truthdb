@@ -5241,6 +5241,41 @@ fn a_restore_notes_its_start_completion_and_expiry() {
         crate::time::iso8601(restore_expiry(start + 1_500, 1))
     );
     assert_ne!(cold.version, gone.version);
+    // Expired with no sweep since it was ready, then restored again: the
+    // earlier restore's completion and expiry are noted first.
+    let again = start + 10 * crate::lifecycle::DAY_MS;
+    restore("cold", again);
+    let late = restore_expiry(again + 1_000, 1) + 5;
+    restore("cold", late);
+    let events: Vec<String> = notices()
+        .into_iter()
+        .skip(4)
+        .map(|(_, event, _)| event)
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "s3:ObjectRestore:Post",
+            "s3:ObjectRestore:Completed",
+            "s3:ObjectRestore:Delete",
+            "s3:ObjectRestore:Post",
+        ]
+    );
+    // An expiry reached before the completion (a backlog): both, in order.
+    let expired = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.expire_restores(restore_expiry(late + 1_000, 1), 100))
+        .unwrap();
+    assert_eq!(expired, 1);
+    let events: Vec<String> = notices()
+        .into_iter()
+        .skip(8)
+        .map(|(_, event, _)| event)
+        .collect();
+    assert_eq!(
+        events,
+        ["s3:ObjectRestore:Completed", "s3:ObjectRestore:Delete"]
+    );
+    assert_eq!(step(u64::MAX / 2), (0, 0), "nothing left to send");
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

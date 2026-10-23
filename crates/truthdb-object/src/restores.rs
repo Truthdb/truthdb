@@ -155,7 +155,12 @@ impl ObjTxn<'_, '_> {
         if !class.is_archived() {
             return Ok(Err(ObjectError::NotArchived));
         }
-        let current = self.restore_of(version)?;
+        let mut current = self.restore_of(version)?;
+        // One expired that no sweep has removed yet: its events first.
+        if current.is_some_and(|restore| restore.state(now_ms).is_none()) {
+            self.retire_restore(version, now_ms)?;
+            current = None;
+        }
         let (done, restore) = match current.and_then(|restore| restore.state(now_ms)) {
             Some(RestoreState::Ongoing) => return Ok(Err(ObjectError::RestoreInProgress)),
             Some(RestoreState::Restored { .. }) => (
@@ -267,27 +272,73 @@ impl ObjTxn<'_, '_> {
                 continue;
             };
             if let (restore, Some((bucket, object_key))) = decode_row(&row)? {
-                let class = self.class_of_version(&bucket, &object_key, version)?;
-                let detail = serde_json::json!({
-                    "glacierEventData": {
-                        "restoreEventData": {
-                            "lifecycleRestorationExpiryTime":
-                                crate::time::iso8601(restore.expiry_ms),
-                            "lifecycleRestoreStorageClass": class.map(StorageClass::as_str),
-                        },
-                    },
-                });
-                self.note_event(
-                    &bucket,
-                    &object_key,
-                    version,
-                    "s3:ObjectRestore:Completed",
-                    Some(detail.to_string()),
-                    now_ms,
-                )?;
+                self.send_completed(version, restore, &bucket, &object_key, now_ms)?;
             }
         }
         Ok(due.len())
+    }
+
+    /// Notes a restore's `s3:ObjectRestore:Completed`.
+    fn send_completed(
+        &mut self,
+        version: u64,
+        restore: Restore,
+        bucket: &str,
+        key: &str,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        let class = self.class_of_version(bucket, key, version)?;
+        let detail = serde_json::json!({
+            "glacierEventData": {
+                "restoreEventData": {
+                    "lifecycleRestorationExpiryTime": crate::time::iso8601(restore.expiry_ms),
+                    "lifecycleRestoreStorageClass": class.map(StorageClass::as_str),
+                },
+            },
+        });
+        self.note_event(
+            bucket,
+            key,
+            version,
+            "s3:ObjectRestore:Completed",
+            Some(detail.to_string()),
+            now_ms,
+        )
+    }
+
+    /// Removes an expired restore of `version` (its row and timers),
+    /// noting its completion if not yet sent, and its
+    /// `s3:ObjectRestore:Delete`.
+    fn retire_restore(&mut self, version: u64, now_ms: u64) -> Result<(), StorageError> {
+        let Some(row) = self
+            .trees
+            .restores()
+            .get(self.ctx, &version.to_be_bytes())?
+        else {
+            return Ok(());
+        };
+        let (restore, names) = decode_row(&row)?;
+        let ready_key = timed_key(restore.ready_ms, version);
+        let pending = self
+            .trees
+            .restore_ready()
+            .get(self.ctx, &ready_key)?
+            .is_some();
+        self.forget_restore(version)?;
+        if let Some((bucket, object_key)) = names {
+            if pending {
+                self.send_completed(version, restore, &bucket, &object_key, now_ms)?;
+            }
+            self.note_event(
+                &bucket,
+                &object_key,
+                version,
+                "s3:ObjectRestore:Delete",
+                None,
+                now_ms,
+            )?;
+        }
+        Ok(())
     }
 
     /// Removes up to `limit` restores expired by `now_ms`. Returns how many.
@@ -310,28 +361,8 @@ impl ObjTxn<'_, '_> {
             else {
                 continue;
             };
-            let (restore, names) = decode_row(&row)?;
-            if restore.expiry_ms == expiry_ms {
-                self.trees.restores().delete(
-                    self.ctx,
-                    &mut OpMode::Txn(self.txn),
-                    &version.to_be_bytes(),
-                )?;
-                self.trees.restore_ready().delete(
-                    self.ctx,
-                    &mut OpMode::Txn(self.txn),
-                    &timed_key(restore.ready_ms, version),
-                )?;
-                if let Some((bucket, object_key)) = names {
-                    self.note_event(
-                        &bucket,
-                        &object_key,
-                        version,
-                        "s3:ObjectRestore:Delete",
-                        None,
-                        now_ms,
-                    )?;
-                }
+            if decode_row(&row)?.0.expiry_ms == expiry_ms {
+                self.retire_restore(version, now_ms)?;
             }
         }
         Ok(due.len())

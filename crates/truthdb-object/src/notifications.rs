@@ -289,9 +289,10 @@ pub fn event_message(
     use serde_json::{Map, Value, json};
     let origin = record.origin.clone().unwrap_or_default();
     // A lifecycle action is S3's own, as is a notice made without a request
-    // (a restore completing, or expiring).
+    // (a restore completing, or expiring): one with no request id (an
+    // anonymous request has one, and no account).
     let by_s3 = event.starts_with("s3:Lifecycle")
-        || (record.record_type == RecordType::Notice && origin.account.is_none());
+        || (record.record_type == RecordType::Notice && origin.request_id.is_empty());
     let principal = match (&origin.account, &origin.user) {
         _ if by_s3 => "s3.amazonaws.com".to_string(),
         (Some(account), Some(user)) => format!("{account}:{user}"),
@@ -327,13 +328,16 @@ pub fn event_message(
         json!(format!("{:016X}", record.sequence)),
     );
     // 2.1 for creations, removals and restores; 2.3 for the event types
-    // added with it (lifecycle, tagging, a restored copy expiring).
+    // added with it (lifecycle, tagging, a restored copy expiring); a
+    // retention change only exists in the unified schema (2.4 on), 2.6 now.
     let version = if event.starts_with("s3:ObjectCreated")
         || event.starts_with("s3:ObjectRemoved")
         || event == "s3:ObjectRestore:Post"
         || event == "s3:ObjectRestore:Completed"
     {
         "2.1"
+    } else if event == "s3:ObjectRetention:Put" {
+        "2.6"
     } else {
         "2.3"
     };
@@ -1020,6 +1024,20 @@ mod tests {
             message["Records"][0]["userIdentity"]["principalId"],
             "123456789012:alice"
         );
+        // An anonymous request's: no account, but a request id and address.
+        posted.origin.as_mut().unwrap().account = None;
+        posted.origin.as_mut().unwrap().user = None;
+        let message: serde_json::Value = serde_json::from_str(&event_message(
+            &posted,
+            "s3:ObjectRestore:Post",
+            &config,
+            &config.rules[0],
+            "123456789012",
+        ))
+        .unwrap();
+        let event = &message["Records"][0];
+        assert_eq!(event["userIdentity"]["principalId"], "ANONYMOUS");
+        assert_eq!(event["requestParameters"]["sourceIPAddress"], "10.0.0.1");
         // An event no configuration may name is none.
         posted.notice.as_mut().unwrap().event = "s3:Nope".into();
         assert_eq!(event_type(&posted), None);

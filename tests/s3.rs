@@ -8843,6 +8843,7 @@ fn restores_and_retention_changes_send_their_events() {
         "{restore}"
     );
     let retained = named("ObjectRetention:Put");
+    assert_eq!(retained["eventVersion"], "2.6");
     assert_eq!(retained["objectRetentionEventData"]["mode"], "GOVERNANCE");
     assert_eq!(
         retained["objectRetentionEventData"]["retainUntilDate"],
