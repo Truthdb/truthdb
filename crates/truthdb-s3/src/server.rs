@@ -277,6 +277,20 @@ pub fn full(text: impl Into<Bytes>) -> Body {
 }
 
 async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Response<Body>, S3Error> {
+    // A request target in absolute form names its host, which must be the
+    // Host header (signed, and read for the bucket): a proxy in front would
+    // route by the one, this server by the other.
+    if let (Some(authority), Some(host)) = (
+        request.uri().authority(),
+        request.headers().get(hyper::header::HOST),
+    ) && !host
+        .as_bytes()
+        .eq_ignore_ascii_case(authority.as_str().as_bytes())
+    {
+        return Err(S3Error::invalid_request(
+            "the request target's host is not the Host header",
+        ));
+    }
     // S3 Vectors' JSON API on the same listener, told apart by the
     // service its requests are signed for.
     match request_service(&request).as_deref() {

@@ -73,7 +73,8 @@ reserved_ratio = 0.17
 # reconnect_delay_ms = 1000
 #
 # [s3]
-# S3-compatible HTTP API (path-style addressing). Requests are signed with
+# S3-compatible HTTP API (path-style addressing, and virtual-hosted under
+# `domains`). Requests are signed with
 # AWS SigV4 using access keys created over the native protocol:
 #   truthdb-cli> s3 create access key
 # enabled = true
@@ -83,6 +84,7 @@ reserved_ratio = 0.17
 # tls_cert = "/etc/truthdb/s3.crt"   # both set = HTTPS
 # tls_key = "/etc/truthdb/s3.key"
 # restore_seconds = { expedited = 0, standard = 0, bulk = 0 }  # RestoreObject delay per tier
+# domains = ["s3.example.com"]   # photos.s3.example.com/key = bucket photos, key "key"
 #
 # [kafka]
 # Kafka-compatible listener for consumers of stream topics (TLS only). Clients

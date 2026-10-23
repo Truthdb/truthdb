@@ -11421,6 +11421,34 @@ fn a_bucket_is_named_by_the_host_under_a_configured_domain() {
         assert_eq!(status, 200, "{host}: {jobs}");
         assert!(jobs.contains("<ListJobsResult"), "{jobs}");
     }
+    // A request target in absolute form must name the Host header's host.
+    let absolute = |target_host: &str| {
+        let request = signed_request(
+            port,
+            "GET",
+            "/a/b.txt",
+            "",
+            &[("host", virtual_host.as_str())],
+            b"",
+            &key,
+            Some(&secret),
+        );
+        let request = request.replacen(
+            "GET /a/b.txt ",
+            &format!("GET http://{target_host}/a/b.txt "),
+            1,
+        );
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.write_all(request.as_bytes()).expect("send");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("answer");
+        answer
+    };
+    let answer = absolute(&format!("other.s3.test:{port}"));
+    assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+    let answer = absolute(&virtual_host.to_uppercase());
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert!(answer.ends_with("hosted body"), "{answer}");
     // Errors carry the host's bucket.
     let (_, (status, missing)) = call(&format!("absent.s3.test:{port}"), "GET", "/k", "", &[], b"");
     assert_eq!(status, 404);

@@ -37,6 +37,8 @@ pub(crate) fn host_bucket(host: &str, domains: &[String]) -> Option<String> {
         Some((name, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => name,
         _ => &host,
     };
+    // A fully qualified name's root dot.
+    let host = host.strip_suffix('.').unwrap_or(host);
     if domains.iter().any(|domain| domain == host) {
         return None;
     }
@@ -1215,6 +1217,7 @@ mod tests {
         assert_eq!(bucket("a.s3.test"), Some("a".to_string()));
         assert_eq!(bucket("my.dotted.s3.test"), Some("my.dotted".to_string()));
         assert_eq!(bucket("other.test"), Some("other".to_string()));
+        assert_eq!(bucket("photos.s3.test.:9000"), Some("photos".to_string()));
         // A domain itself, though a subdomain of another: no bucket.
         assert_eq!(bucket("s3.test:9000"), None);
         // A name merely ending in a domain, an address: no bucket.

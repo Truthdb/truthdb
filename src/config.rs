@@ -115,6 +115,31 @@ pub struct S3Config {
     pub domains: Vec<String>,
 }
 
+impl S3Config {
+    /// `domains` in lowercase, each a host name: not empty, no leading or
+    /// trailing dot, no port.
+    pub fn domain_names(&self) -> Result<Vec<String>, String> {
+        self.domains
+            .iter()
+            .map(|domain| {
+                let valid = !domain.is_empty()
+                    && !domain.starts_with('.')
+                    && !domain.ends_with('.')
+                    && domain
+                        .bytes()
+                        .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'.');
+                if valid {
+                    Ok(domain.to_ascii_lowercase())
+                } else {
+                    Err(format!(
+                        "s3.domains: {domain:?} is not a host name (letters, digits, '-' and '.', no leading or trailing dot, no port)"
+                    ))
+                }
+            })
+            .collect()
+    }
+}
+
 /// Seconds a restore takes per retrieval tier: S3 takes minutes to hours;
 /// 0 (the default) makes the object readable at once.
 #[derive(Debug, Default, Deserialize)]
@@ -804,6 +829,22 @@ mod tests {
         assert_eq!(config.s3.region, "eu-north-1");
         assert_eq!(config.s3.tls_cert, None);
         fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn s3_domains_are_host_names() {
+        let mut config = S3Config {
+            domains: vec!["S3.Example.com".to_string(), "s3-test".to_string()],
+            ..S3Config::default()
+        };
+        assert_eq!(
+            config.domain_names().unwrap(),
+            ["s3.example.com", "s3-test"]
+        );
+        for domain in ["", ".s3.test", "s3.test.", "s3.test:9000", "s3 test"] {
+            config.domains = vec![domain.to_string()];
+            assert!(config.domain_names().is_err(), "{domain:?}");
+        }
     }
 
     #[test]
