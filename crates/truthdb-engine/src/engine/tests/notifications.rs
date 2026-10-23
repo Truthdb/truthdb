@@ -172,7 +172,47 @@ fn changes_send_their_events_once_even_when_a_batch_is_sent_again() {
         .unwrap();
     assert_eq!(cursor, Some(last));
 
+    // A bucket made again under its name: the earlier bucket's changes
+    // not yet sent are not the new configuration's.
+    engine
+        .execute("stream create topic events partitions 2 retention 0")
+        .unwrap();
+    put(&engine, "photos", "in/old.jpg");
+    for key in [
+        "in/2.txt",
+        "in/4.jpg",
+        "in/old.jpg",
+        "in/before.jpg",
+        "out/3.txt",
+    ] {
+        let _ = engine.object(|file| {
+            file.transaction(|tx| tx.delete_object("photos", key, None, false, 3_000, 0))
+        });
+    }
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.delete_bucket("photos")?.expect("dropped");
+                tx.create_bucket("photos", truthdb_object::DEFAULT_ACCOUNT, 1_000)?
+                    .expect("made again");
+                Ok(())
+            })
+        })
+        .unwrap();
+    configure(
+        &engine,
+        vec![rule("created", "s3:ObjectCreated:*", Some("in/"), None)],
+    );
+    put(&engine, "photos", "in/new.jpg");
+    drain(&engine);
+    let names: Vec<String> = events(&engine)
+        .into_iter()
+        .map(|(_, _, key, _)| key)
+        .collect();
+    assert_eq!(names, ["in%2Fnew.jpg"]);
+
     // No configurations: no events.
+    engine.execute("stream drop topic events").unwrap();
     engine
         .execute("stream create topic events partitions 2 retention 0")
         .unwrap();
