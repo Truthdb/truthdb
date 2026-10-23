@@ -1068,6 +1068,35 @@ fn a_webhook_delivers_in_order_retries_and_dead_letters() {
         long("http://h", &"s".repeat(crate::MAX_SECRET_BYTES + 1)),
         Err(WebhookError::SecretTooLong)
     );
+    // A dead letter that cannot go: noted first, whatever the error.
+    let lost: Vec<_> = due(now)
+        .into_iter()
+        .filter(|delivery| delivery.partition == 0)
+        .collect();
+    assert_eq!(at(&lost), [(0, 2)]);
+    in_txn(&storage, |tx| tx.drop_topic(&dead_letter_topic("events"))).unwrap();
+    for _ in 0..MAX_ATTEMPTS {
+        in_txn(&storage, |tx| {
+            tx.webhook_failed(&lost[0], &"€".repeat(500), now)
+        });
+    }
+    let webhooks = StreamFile::new(&mut storage.lock()).webhooks().unwrap();
+    assert!(
+        webhooks[0]
+            .last_error
+            .starts_with("the dead-letter topic is gone"),
+        "{}",
+        webhooks[0].last_error
+    );
+    in_txn(&storage, |tx| {
+        tx.create_topic(&dead_letter_topic("events"), 2, 0, None, 1)
+    })
+    .unwrap();
+    assert_eq!(
+        in_txn(&storage, |tx| tx
+            .create_webhook("other", "http://h", "k;", 5)),
+        Err(WebhookError::InvalidSecret)
+    );
     in_txn(&storage, |tx| tx.drop_topic("events")).unwrap();
     in_txn(&storage, |tx| tx.create_topic("events", 3, 0, None, 1)).unwrap();
     assert_eq!(create("events"), Err(WebhookError::DeadLetterTooSmall));

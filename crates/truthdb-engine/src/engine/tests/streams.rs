@@ -488,12 +488,119 @@ fn webhooks_are_set_on_topics_and_shown() {
     );
     let message = command_error(&engine, "stream drop webhook events");
     assert!(message.contains("has no webhook"), "{message}");
-    // The command's own `;` goes, a secret's stays.
+    // A secret is base64- or hex-like (a command's `;` cannot be part of it).
+    let message = command_error(
+        &engine,
+        "stream create webhook events url https://h/x secret k;q",
+    );
+    assert!(message.contains("letters, digits"), "{message}");
     engine
-        .execute("stream create webhook events url https://h/x secret k;;")
+        .execute("stream create webhook events url https://h/x secret a+b/c=_-9;;")
         .unwrap();
     let webhooks = engine.streams(|file| file.webhooks()).unwrap();
-    assert_eq!(webhooks[0].secret, "k;");
+    assert_eq!(webhooks[0].secret, "a+b/c=_-9");
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let path = unique_temp_path("streams-hang");
+    let engine = new_engine(&path);
+    // One endpoint takes connections and never answers; one answers 200
+    // and counts the POSTs.
+    let hanging = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let hang_port = hanging.local_addr().unwrap().port();
+    std::thread::spawn(move || {
+        let mut held = Vec::new();
+        for stream in hanging.incoming() {
+            held.push(stream);
+        }
+    });
+    let healthy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ok_port = healthy.local_addr().unwrap().port();
+    let posted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&posted);
+    std::thread::spawn(move || {
+        for stream in healthy.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let mut len = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    let header = header.trim_end().to_ascii_lowercase();
+                    if header.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header.strip_prefix("content-length:") {
+                        len = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+            }
+        }
+    });
+    for (topic, port) in [("hang", hang_port), ("ok", ok_port)] {
+        engine
+            .execute(&format!("stream create topic {topic} retention 0"))
+            .unwrap();
+        engine
+            .execute(&format!(
+                "stream create webhook {topic} url http://127.0.0.1:{port}/ secret k"
+            ))
+            .unwrap();
+        let records: Vec<NewRecord> = (0..3)
+            .map(|_| NewRecord {
+                key: None,
+                value: b"{}".to_vec(),
+            })
+            .collect();
+        engine
+            .streams(|file| file.transaction(|tx| tx.append(topic, 0, &records, None, 1)))
+            .unwrap()
+            .unwrap();
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let poster = std::sync::Arc::new(
+        runtime
+            .block_on(async { truthdb_s3client::Poster::new(None) })
+            .unwrap(),
+    );
+    let mut posts = crate::engine::WebhookPosts::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut round = 0;
+    while posted.load(std::sync::atomic::Ordering::SeqCst) < 3
+        && std::time::Instant::now() < deadline
+    {
+        round += 1;
+        engine
+            .webhook_pump(&runtime, &poster, &mut posts, round)
+            .unwrap();
+    }
+    assert_eq!(posted.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let webhooks = engine.streams(|file| file.webhooks()).unwrap();
+    let offset = |topic: &str| {
+        webhooks
+            .iter()
+            .find(|webhook| webhook.topic == topic)
+            .unwrap()
+            .partitions[0]
+            .offset
+    };
+    assert_eq!((offset("ok"), offset("hang")), (3, 0));
     drop(engine);
     let _ = std::fs::remove_file(path);
 }

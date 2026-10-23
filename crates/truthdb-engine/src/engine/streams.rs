@@ -46,9 +46,8 @@ pub(super) enum StreamAdmin {
 }
 
 pub(super) fn parse_stream_admin(input: &str) -> Option<StreamAdmin> {
-    // The CLI ends every command with `;` (one: a secret may end in one).
-    let input = input.trim();
-    let input = input.strip_suffix(';').unwrap_or(input);
+    // The CLI ends every command with `;` (no name or secret ends in one).
+    let input = input.trim().trim_end_matches(';');
     let words: Vec<&str> = input.split_whitespace().collect();
     let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
     let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
@@ -109,6 +108,9 @@ fn webhook_error(topic: &str, err: truthdb_streams::WebhookError) -> EngineError
             "a webhook secret is at most {} bytes",
             truthdb_streams::MAX_SECRET_BYTES
         ),
+        WebhookError::InvalidSecret => {
+            "a webhook secret is letters, digits and + / = _ -".to_string()
+        }
     })
     .into()
 }

@@ -391,12 +391,12 @@ pub(super) fn import_loop(shared: &Arc<Shared>) {
     }
 }
 
-/// How long the webhook thread waits when nothing was delivered (a retry's
-/// wait is at least this).
+/// How long the webhook thread waits when nothing is in flight or was
+/// delivered (a retry's wait is at least this).
 const WEBHOOK_IDLE: Duration = Duration::from_secs(1);
 
-/// Webhook delivery (see `engine::webhooks`), on its own thread: a step at
-/// a time while records go out, else a sleep. Its runtime runs the HTTP
+/// Webhook delivery (see `engine::webhooks`), on its own thread: a turn at
+/// a time while POSTs are in flight or records go out, else a sleep. Its runtime runs the HTTP
 /// client.
 pub(super) fn webhook_loop(shared: &Arc<Shared>) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -418,13 +418,16 @@ pub(super) fn webhook_loop(shared: &Arc<Shared>) {
             return;
         }
     };
-    // Each step starts further on, so no webhook keeps the others waiting.
+    // Each turn starts further on, so no webhook keeps the others waiting.
+    // POSTs still in flight at shutdown are dropped: their records are
+    // posted again after the restart.
+    let mut posts = crate::engine::WebhookPosts::default();
     let mut round = 0usize;
     while !shared.stop.load(Ordering::Acquire) {
         round = round.wrapping_add(1);
         let more = shared
             .engine
-            .webhook_step(&runtime, &poster, round)
+            .webhook_pump(&runtime, &poster, &mut posts, round)
             .unwrap_or_else(|err| {
                 eprintln!("webhook delivery failed: {err}");
                 false

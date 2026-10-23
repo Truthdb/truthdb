@@ -75,6 +75,8 @@ pub enum WebhookError {
     DeadLetterTooSmall,
     UrlTooLong,
     SecretTooLong,
+    /// A secret is letters, digits and `+ / = _ -` (base64 or hex).
+    InvalidSecret,
 }
 
 /// A record due for delivery.
@@ -215,6 +217,12 @@ impl StreamTxn<'_, '_> {
         }
         if secret.len() > MAX_SECRET_BYTES {
             return Ok(Err(WebhookError::SecretTooLong));
+        }
+        if !secret
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"+/=_-".contains(&b))
+        {
+            return Ok(Err(WebhookError::InvalidSecret));
         }
         let Some(row) = self.topic_row(topic)? else {
             return Ok(Err(WebhookError::NoSuchTopic));
@@ -411,8 +419,9 @@ impl StreamTxn<'_, '_> {
         head: &mut Head,
     ) -> Result<(), StorageError> {
         let topic = dead_letter_topic(&delivery.topic);
+        // First, so cutting the error to size cannot drop it.
         let note = |head: &mut Head, why: &str| {
-            head.last_error = cut(&format!("{}; {why}", head.last_error), MAX_ERROR_BYTES);
+            head.last_error = cut(&format!("{why}; {}", head.last_error), MAX_ERROR_BYTES);
         };
         let Some(row) = self.topic_row(&topic)? else {
             note(head, "the dead-letter topic is gone");

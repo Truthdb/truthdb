@@ -1,7 +1,6 @@
 //! Webhook delivery (see `truthdb_streams::Webhook`), on a thread of its
-//! own (see `session::pool`): each step posts the records due (one per
-//! webhook partition, from a partition further on each round) at once, and
-//! records each outcome. A POST carries the record as its JSON body (an S3
+//! own (see `session::pool`): POSTs go out concurrently, one at a time per
+//! webhook partition, and each outcome is recorded as it comes. A POST carries the record as its JSON body (an S3
 //! event message: `{"Records":[...]}`), names it in `x-truthdb-delivery:
 //! <topic>/<partition>/<offset>` (the same on a retry, so a receiver can drop
 //! a repeat), and is signed: `x-truthdb-signature: t=<unix seconds>,v1=<hex
@@ -9,13 +8,27 @@
 //! time when it is sent. A 2xx answer delivers it; anything else, or no
 //! answer, is a failed try.
 
+use std::collections::{HashMap, HashSet};
+use std::sync::Arc;
+
 use truthdb_s3client::{Bytes, Poster};
 use truthdb_streams::{Delivery, StreamFile};
 
 use super::{Engine, EngineError};
 
-/// Records one step posts at most.
-const STEP_DELIVERIES: usize = 16;
+/// POSTs in flight at most (one per webhook partition).
+const MAX_IN_FLIGHT: usize = 64;
+/// How long a pump waits for a POST in flight to finish.
+const WAIT_FOR_ONE: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// The POSTs in flight, and the webhook partitions they are of: a
+/// partition has one at a time, so its records go out in order.
+#[derive(Default)]
+pub(crate) struct WebhookPosts {
+    posts: tokio::task::JoinSet<Result<(), String>>,
+    of: HashMap<tokio::task::Id, Delivery>,
+    busy: HashSet<(u32, u32)>,
+}
 
 /// The signature header's value for `body` posted as `delivery` at `secs`.
 pub(crate) fn signature(secret: &str, secs: u64, delivery: &str, body: &[u8]) -> String {
@@ -33,12 +46,16 @@ pub(crate) fn signature(secret: &str, secs: u64, delivery: &str, body: &[u8]) ->
 }
 
 impl Engine {
-    /// One step of webhook delivery; returns whether one was delivered
-    /// (more may be due at once).
-    pub(crate) fn webhook_step(
+    /// One turn of webhook delivery: records the outcome of each POST that
+    /// has finished (waiting a little for one), and starts those due on
+    /// partitions with none in flight, from a partition further on each
+    /// `round`. A slow endpoint holds up only its own partitions. Returns
+    /// whether a POST is in flight or one was delivered.
+    pub(crate) fn webhook_pump(
         &self,
         runtime: &tokio::runtime::Runtime,
-        poster: &std::sync::Arc<Poster>,
+        poster: &Arc<Poster>,
+        posts: &mut WebhookPosts,
         round: usize,
     ) -> Result<bool, EngineError> {
         if self.storage.is_standby() {
@@ -52,31 +69,59 @@ impl Engine {
         if !runs {
             return Ok(false);
         }
-        let now_ms = super::now_ms();
-        let due = self.streams(|file| file.webhook_due(now_ms, STEP_DELIVERIES, round))?;
-        // All at once: a slow endpoint holds the step up by its own wait,
-        // not by its own times the others'.
-        let outcomes = runtime.block_on(async {
-            let mut posts = tokio::task::JoinSet::new();
-            for (at, delivery) in due.iter().enumerate() {
-                let (poster, delivery) = (std::sync::Arc::clone(poster), delivery.clone());
-                posts.spawn(async move { (at, post(&poster, &delivery).await) });
+        let room = MAX_IN_FLIGHT - posts.busy.len();
+        if room > 0 {
+            let now_ms = super::now_ms();
+            let due =
+                self.streams(|file| file.webhook_due(now_ms, room + posts.busy.len(), round))?;
+            let starting: Vec<Delivery> = due
+                .into_iter()
+                .filter(|delivery| {
+                    !posts
+                        .busy
+                        .contains(&(delivery.topic_id, delivery.partition))
+                })
+                .take(room)
+                .collect();
+            for delivery in starting {
+                let (poster, sent) = (Arc::clone(poster), delivery.clone());
+                // On the thread's runtime (this is outside it).
+                let task = posts
+                    .posts
+                    .spawn_on(async move { post(&poster, &sent).await }, runtime.handle());
+                posts.busy.insert((delivery.topic_id, delivery.partition));
+                posts.of.insert(task.id(), delivery);
             }
-            let mut outcomes = vec![Err("not posted".to_string()); due.len()];
-            while let Some(done) = posts.join_next().await {
-                if let Ok((at, outcome)) = done {
-                    outcomes[at] = outcome;
+        }
+        let mut finished = Vec::new();
+        if !posts.posts.is_empty() {
+            runtime.block_on(async {
+                if let Ok(Some(done)) =
+                    tokio::time::timeout(WAIT_FOR_ONE, posts.posts.join_next_with_id()).await
+                {
+                    finished.push(done);
                 }
-            }
-            outcomes
-        });
+                while let Some(done) = posts.posts.try_join_next_with_id() {
+                    finished.push(done);
+                }
+            });
+        }
         let mut delivered = false;
-        for (delivery, outcome) in due.iter().zip(&outcomes) {
+        for done in finished {
+            // A task that panicked is a failed try of its record.
+            let (id, outcome) = match done {
+                Ok((id, outcome)) => (id, outcome),
+                Err(err) => (err.id(), Err(format!("the delivery failed: {err}"))),
+            };
+            let Some(delivery) = posts.of.remove(&id) else {
+                continue;
+            };
+            posts.busy.remove(&(delivery.topic_id, delivery.partition));
             let recorded = self.streams(|file| {
-                file.transaction(|tx| match outcome {
-                    Ok(()) => tx.webhook_delivered(delivery),
+                file.transaction(|tx| match &outcome {
+                    Ok(()) => tx.webhook_delivered(&delivery),
                     Err(error) => tx
-                        .webhook_failed(delivery, error, super::now_ms())
+                        .webhook_failed(&delivery, error, super::now_ms())
                         .map(|_| ()),
                 })
             });
@@ -87,7 +132,7 @@ impl Engine {
             }
             delivered |= outcome.is_ok();
         }
-        Ok(delivered)
+        Ok(delivered || !posts.posts.is_empty())
     }
 }
 
