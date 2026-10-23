@@ -405,8 +405,10 @@ impl Client {
                 request = request.header(name.as_str(), value.as_str());
             }
         }
+        // Stated even when empty: hyper leaves it out of an empty PUT.
         let request = request
             .header("authorization", authorization)
+            .header("content-length", body.len())
             .body(Full::new(body))
             .map_err(|err| invalid(err.to_string()))?;
         let response = self.http.request(request).await.map_err(transport)?;
