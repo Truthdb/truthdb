@@ -370,6 +370,10 @@ impl StreamTxn<'_, '_> {
         )? {
             sources.delete(self.ctx, mode, &key)?;
         }
+        // Its webhook goes with it (its dead-letter topic stays).
+        self.trees
+            .webhooks()
+            .delete(self.ctx, mode, &topic.id.to_be_bytes())?;
         self.trees.purge().insert_unique(
             self.ctx,
             mode,
@@ -572,6 +576,7 @@ impl StreamTxn<'_, '_> {
             self.trees.queue_leases(),
             self.trees.queue_frontiers(),
             self.trees.queue_times(),
+            self.trees.webhook_partitions(),
         ] {
             if !finished {
                 break;

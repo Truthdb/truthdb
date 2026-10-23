@@ -407,6 +407,7 @@ pub(in crate::engine::relational) fn is_sys_view(name: &str) -> bool {
                 | "sys.dm_s3_import_failures"
                 | "sys.stream_topics"
                 | "sys.stream_read"
+                | "sys.dm_s3_webhooks"
                 | "sys.configurations"
                 | "sys.database_principals"
                 | "sys.database_role_members"

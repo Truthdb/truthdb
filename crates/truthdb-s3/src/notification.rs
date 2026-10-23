@@ -7,8 +7,9 @@
 //! `x-amz-skip-destination-validation` is true; each topic a configuration
 //! names gets S3's test event. A queue configuration's events go the same
 //! way to the topic its SQS queue ARN names (`arn:aws:sqs:...`), read as a
-//! queue (`sys.sp_s3_queue_*`). Lambda destinations and EventBridge are not
-//! offered. The object engine keeps the configuration and sends the events
+//! queue (`sys.sp_s3_queue_*`), and a Lambda function configuration's to
+//! the topic named by its function ARN's function name, which a webhook
+//! delivers (`stream create webhook`). EventBridge is not offered. The object engine keeps the configuration and sends the events
 //! (see
 //! `truthdb_object::NotificationConfig`).
 
@@ -51,6 +52,7 @@ fn new_id() -> Result<String, S3Error> {
 enum Kind {
     Topic,
     Queue,
+    Function,
 }
 
 impl Kind {
@@ -58,6 +60,7 @@ impl Kind {
         match self {
             Kind::Topic => ("TopicConfiguration", "Topic", "sns"),
             Kind::Queue => ("QueueConfiguration", "Queue", "sqs"),
+            Kind::Function => ("CloudFunctionConfiguration", "CloudFunction", "lambda"),
         }
     }
 
@@ -65,6 +68,7 @@ impl Kind {
         match destination {
             Destination::Topic(_) => Kind::Topic,
             Destination::Queue(_) => Kind::Queue,
+            Destination::Function(_) => Kind::Function,
         }
     }
 }
@@ -73,16 +77,37 @@ impl Kind {
 fn destination_arn(arn: &str, region: &str, kind: Kind) -> Result<Destination, S3Error> {
     let fields: Vec<&str> = arn.split(':').collect();
     let refused = || invalid(format!("The ARN is not well formed: {arn}"));
-    let ["arn", "aws", service, arn_region, account, topic] = fields.as_slice() else {
-        return Err(refused());
+    let (service, arn_region, account, topic) = match fields.as_slice() {
+        ["arn", "aws", "lambda", region, account, "function", name] => {
+            ("lambda", *region, *account, *name)
+        }
+        [
+            "arn",
+            "aws",
+            "lambda",
+            region,
+            account,
+            "function",
+            name,
+            qualifier,
+        ] if !qualifier.is_empty() => ("lambda", *region, *account, *name),
+        [
+            "arn",
+            "aws",
+            service @ ("sns" | "sqs"),
+            region,
+            account,
+            topic,
+        ] => (*service, *region, *account, *topic),
+        _ => return Err(refused()),
     };
-    if *service != kind.names().2 {
+    if service != kind.names().2 {
         return Err(refused());
     }
     if account.len() != 12 || !account.bytes().all(|b| b.is_ascii_digit()) {
         return Err(refused());
     }
-    if *arn_region != region {
+    if arn_region != region {
         return Err(invalid(format!(
             "The notification destination service region is not valid for the bucket location constraint: {arn}"
         )));
@@ -91,6 +116,7 @@ fn destination_arn(arn: &str, region: &str, kind: Kind) -> Result<Destination, S
     Ok(match kind {
         Kind::Topic => Destination::Topic(arn.to_string()),
         Kind::Queue => Destination::Queue(arn.to_string()),
+        Kind::Function => Destination::Function(arn.to_string()),
     })
 }
 
@@ -164,7 +190,8 @@ fn rule(element: &Element, region: &str, kind: Kind) -> Result<NotificationRule,
     })
 }
 
-/// Reads a `NotificationConfiguration` (topic and queue configurations).
+/// Reads a `NotificationConfiguration` (topic, queue and Lambda function
+/// configurations).
 pub fn parse(body: &[u8], region: &str) -> Result<NotificationConfig, S3Error> {
     let root = crate::xml::parse(body, "NotificationConfiguration")?;
     root.only(&[
@@ -173,17 +200,12 @@ pub fn parse(body: &[u8], region: &str) -> Result<NotificationConfig, S3Error> {
         "CloudFunctionConfiguration",
         "EventBridgeConfiguration",
     ])?;
-    for (name, what) in [
-        ("CloudFunctionConfiguration", "Lambda function destinations"),
-        ("EventBridgeConfiguration", "EventBridge"),
-    ] {
-        if root.all(name).next().is_some() {
-            return Err(S3Error::not_implemented(format!(
-                "Event notifications to {what} are not supported"
-            )));
-        }
+    if root.all("EventBridgeConfiguration").next().is_some() {
+        return Err(S3Error::not_implemented(
+            "Event notifications to EventBridge are not supported",
+        ));
     }
-    let rules = [Kind::Topic, Kind::Queue]
+    let rules = [Kind::Topic, Kind::Queue, Kind::Function]
         .into_iter()
         .flat_map(|kind| root.all(kind.names().0).map(move |element| (element, kind)))
         .map(|(element, kind)| rule(element, region, kind))
@@ -420,9 +442,13 @@ mod tests {
         ) + "<QueueConfiguration><Id>work</Id>\
              <Queue>arn:aws:sqs:us-east-1:123456789012:jobs</Queue>\
              <Event>s3:ObjectRemoved:*</Event><Filter><S3Key><FilterRule><Name>prefix</Name>\
-             <Value>jobs/</Value></FilterRule></S3Key></Filter></QueueConfiguration>";
+             <Value>jobs/</Value></FilterRule></S3Key></Filter></QueueConfiguration>\
+             <CloudFunctionConfiguration><Id>hook</Id>\
+             <CloudFunction>arn:aws:lambda:us-east-1:123456789012:function:hooked:live\
+             </CloudFunction><Event>s3:ObjectTagging:*</Event></CloudFunctionConfiguration>";
         let parsed = config(&xml).unwrap();
-        assert_eq!(parsed.rules.len(), 3);
+        assert_eq!(parsed.rules.len(), 4);
+        assert_eq!(parsed.rules[3].destination.topic(), "hooked");
         assert_eq!(
             parsed.rules[2].destination,
             Destination::Queue("arn:aws:sqs:us-east-1:123456789012:jobs".into())
@@ -511,11 +537,32 @@ mod tests {
                 "InvalidArgument",
             ),
             (
-                "<CloudFunctionConfiguration><CloudFunction>arn:aws:lambda:us-east-1:\
-                 123456789012:function:f</CloudFunction><Event>s3:ObjectCreated:*</Event>\
+                "<CloudFunctionConfiguration><CloudFunction>arn:aws:sqs:us-east-1:\
+                 123456789012:f</CloudFunction><Event>s3:ObjectCreated:*</Event>\
                  </CloudFunctionConfiguration>"
                     .to_string(),
-                "NotImplemented",
+                "InvalidArgument",
+            ),
+            (
+                "<CloudFunctionConfiguration><CloudFunction>arn:aws:lambda:us-east-1:\
+                 123456789012:layer:f</CloudFunction><Event>s3:ObjectCreated:*</Event>\
+                 </CloudFunctionConfiguration>"
+                    .to_string(),
+                "InvalidArgument",
+            ),
+            (
+                "<CloudFunctionConfiguration><CloudFunction>arn:aws:lambda:us-east-1:\
+                 123456789012:fn</CloudFunction><Event>s3:ObjectCreated:*</Event>\
+                 </CloudFunctionConfiguration>"
+                    .to_string(),
+                "InvalidArgument",
+            ),
+            (
+                "<CloudFunctionConfiguration><CloudFunction>arn:aws:lambda:us-east-1:\
+                 123456789012:function:fn:</CloudFunction><Event>s3:ObjectCreated:*</Event>\
+                 </CloudFunctionConfiguration>"
+                    .to_string(),
+                "InvalidArgument",
             ),
             ("<EventBridgeConfiguration/>".to_string(), "NotImplemented"),
             ("<Other/>".to_string(), "MalformedXML"),

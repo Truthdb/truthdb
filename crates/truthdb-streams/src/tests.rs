@@ -925,3 +925,203 @@ fn a_receive_stops_at_the_log_budget_dropping_removed_messages_leases() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_webhook_delivers_in_order_retries_and_dead_letters() {
+    use crate::{MAX_ATTEMPTS, WebhookError, dead_letter_topic};
+    let path = temp_path("webhook");
+    let storage = create(&path);
+    in_txn(&storage, |tx| {
+        tx.create_topic("events", 2, 1_000, Some("123456789012"), 1)
+    })
+    .unwrap();
+    in_txn(&storage, |tx| {
+        tx.append("events", 0, &["a", "b"].map(record), None, 5)
+    })
+    .unwrap();
+    in_txn(&storage, |tx| {
+        tx.append("events", 1, &[record("z")], None, 5)
+    })
+    .unwrap();
+    let create = |topic: &str| {
+        in_txn(&storage, |tx| {
+            tx.create_webhook(topic, "http://h/x", "k", 5)
+        })
+    };
+    create("events").unwrap();
+    assert_eq!(create("events"), Err(WebhookError::WebhookExists));
+    assert_eq!(create("missing"), Err(WebhookError::NoSuchTopic));
+    // Its dead-letter topic, like the topic.
+    let (dead, _) = StreamFile::new(&mut storage.lock())
+        .topic(&dead_letter_topic("events"))
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        (dead.partitions, dead.account.as_deref()),
+        (2, Some("123456789012"))
+    );
+    let due = |now: u64| {
+        StreamFile::new(&mut storage.lock())
+            .webhook_due(now, 10, 0, &mut |_, _| true)
+            .unwrap()
+    };
+    let at = |deliveries: &[crate::Delivery]| -> Vec<(u32, u64)> {
+        deliveries.iter().map(|d| (d.partition, d.offset)).collect()
+    };
+    let first = due(10);
+    assert_eq!(at(&first), [(0, 0), (1, 0)]);
+    assert_eq!(first[0].value, b"a");
+    in_txn(&storage, |tx| tx.webhook_delivered(&first[0]));
+    // Recorded twice (a crash before the first record's outcome was seen
+    // again): once.
+    in_txn(&storage, |tx| tx.webhook_delivered(&first[0]));
+    assert_eq!(at(&due(10)), [(0, 1), (1, 0)]);
+    // A failure holds back its partition only, for a growing wait.
+    assert!(!in_txn(&storage, |tx| tx.webhook_failed(&first[1], "HTTP 500", 10)));
+    assert_eq!(at(&due(1_009)), [(0, 1)]);
+    assert_eq!(at(&due(1_010)), [(0, 1), (1, 0)]);
+    let mut now = 1_010;
+    for attempt in 2..MAX_ATTEMPTS {
+        assert!(!in_txn(&storage, |tx| tx.webhook_failed(&first[1], "HTTP 503", now)));
+        now += 1_000 << (attempt - 1);
+        assert_eq!(at(&due(now)), [(0, 1), (1, 0)], "attempt {attempt}");
+    }
+    // The last try: dead-lettered (once), and the partition goes on.
+    assert!(in_txn(&storage, |tx| tx.webhook_failed(&first[1], "HTTP 503", now)));
+    assert!(!in_txn(&storage, |tx| tx.webhook_failed(&first[1], "HTTP 503", now)));
+    assert_eq!(at(&due(now)), [(0, 1)]);
+    assert_eq!(
+        values(&storage, &dead_letter_topic("events"), 1, 0),
+        [(0, "z".into())]
+    );
+    let webhooks = StreamFile::new(&mut storage.lock()).webhooks().unwrap();
+    assert_eq!(
+        (
+            webhooks[0].delivered,
+            webhooks[0].dead_lettered,
+            webhooks[0].last_error.as_str()
+        ),
+        (1, 1, "HTTP 503")
+    );
+    // Records retention removed are passed over; a failing one's tries are
+    // not the next one's.
+    let failing = due(now);
+    assert_eq!(at(&failing), [(0, 1)]);
+    for _ in 0..MAX_ATTEMPTS - 1 {
+        in_txn(&storage, |tx| {
+            tx.webhook_failed(&failing[0], "HTTP 502", now)
+        });
+    }
+    assert_eq!(in_txn(&storage, |tx| tx.trim_step(5_000, 100)).0, 3);
+    in_txn(&storage, |tx| {
+        tx.append("events", 0, &[record("c")], None, 6_000)
+    })
+    .unwrap();
+    now += 10 * 60_000;
+    let later = due(now);
+    assert_eq!(at(&later), [(0, 2)]);
+    assert!(!in_txn(&storage, |tx| tx.webhook_failed(&later[0], "HTTP 502", now)));
+    now += 10 * 60_000;
+    in_txn(&storage, |tx| tx.webhook_delivered(&later[0]));
+    assert!(due(now).is_empty());
+    let webhooks = StreamFile::new(&mut storage.lock()).webhooks().unwrap();
+    assert_eq!(
+        webhooks[0].last_error, "",
+        "a delivery clears the last error"
+    );
+    // Made again: an outcome of the earlier one changes nothing.
+    in_txn(&storage, |tx| tx.drop_webhook("events")).unwrap();
+    create("events").unwrap();
+    in_txn(&storage, |tx| {
+        tx.append("events", 0, &[record("d")], None, 6_000)
+    })
+    .unwrap();
+    assert_eq!(at(&due(now)), [(0, 2)]);
+    in_txn(&storage, |tx| tx.webhook_delivered(&later[0]));
+    in_txn(&storage, |tx| tx.webhook_failed(&later[0], "HTTP 500", now));
+    assert_eq!(at(&due(now)), [(0, 2)]);
+    let webhooks = StreamFile::new(&mut storage.lock()).webhooks().unwrap();
+    assert_eq!(
+        (webhooks[0].delivered, webhooks[0].partitions[0].attempts),
+        (0, 0)
+    );
+    // Each round starts further on.
+    in_txn(&storage, |tx| {
+        tx.append("events", 1, &[record("y")], None, 6_000)
+    })
+    .unwrap();
+    let take = |now: u64, round| {
+        at(&StreamFile::new(&mut storage.lock())
+            .webhook_due(now, 1, round, &mut |_, _| true)
+            .unwrap())
+    };
+    assert_eq!((take(now, 0), take(now, 1)), (vec![(0, 2)], vec![(1, 1)]));
+    // One failing and one not, room for one: the one not failing, whatever
+    // the round.
+    let both = due(now);
+    assert!(!in_txn(&storage, |tx| tx.webhook_failed(&both[0], "HTTP 500", now)));
+    now += 60_000;
+    assert_eq!((take(now, 0), take(now, 1)), (vec![(1, 1)], vec![(1, 1)]));
+    // Too long, and a dead-letter topic too small for the topic.
+    in_txn(&storage, |tx| tx.create_topic("other", 1, 0, None, 1)).unwrap();
+    let long =
+        |url: &str, secret: &str| in_txn(&storage, |tx| tx.create_webhook("other", url, secret, 5));
+    assert_eq!(
+        long(&"u".repeat(crate::MAX_URL_BYTES + 1), "k"),
+        Err(WebhookError::UrlTooLong)
+    );
+    assert_eq!(
+        long("http://h", &"s".repeat(crate::MAX_SECRET_BYTES + 1)),
+        Err(WebhookError::SecretTooLong)
+    );
+    // A dead letter that cannot go: noted first, whatever the error.
+    let lost: Vec<_> = due(now)
+        .into_iter()
+        .filter(|delivery| delivery.partition == 0)
+        .collect();
+    assert_eq!(at(&lost), [(0, 2)]);
+    in_txn(&storage, |tx| tx.drop_topic(&dead_letter_topic("events"))).unwrap();
+    for _ in 0..MAX_ATTEMPTS {
+        in_txn(&storage, |tx| {
+            tx.webhook_failed(&lost[0], &"€".repeat(500), now)
+        });
+    }
+    let webhooks = StreamFile::new(&mut storage.lock()).webhooks().unwrap();
+    assert!(
+        webhooks[0]
+            .last_error
+            .starts_with("the dead-letter topic is gone"),
+        "{}",
+        webhooks[0].last_error
+    );
+    in_txn(&storage, |tx| {
+        tx.create_topic(&dead_letter_topic("events"), 2, 0, None, 1)
+    })
+    .unwrap();
+    assert_eq!(
+        in_txn(&storage, |tx| tx
+            .create_webhook("other", "http://h", "k;", 5)),
+        Err(WebhookError::InvalidSecret)
+    );
+    in_txn(&storage, |tx| tx.drop_topic("events")).unwrap();
+    in_txn(&storage, |tx| tx.create_topic("events", 3, 0, None, 1)).unwrap();
+    assert_eq!(create("events"), Err(WebhookError::DeadLetterTooSmall));
+    // Dropped with its topic, its partitions' rows purged after it.
+    assert_eq!(
+        in_txn(&storage, |tx| tx.drop_webhook("events")),
+        Err(WebhookError::NoSuchWebhook)
+    );
+    in_txn(&storage, |tx| tx.drop_topic(&dead_letter_topic("events"))).unwrap();
+    create("events").unwrap();
+    in_txn(&storage, |tx| tx.drop_topic("events")).unwrap();
+    while !in_txn(&storage, |tx| tx.purge_step(100)) {}
+    assert!(
+        StreamFile::new(&mut storage.lock())
+            .webhooks()
+            .unwrap()
+            .is_empty()
+    );
+    assert_eq!(queue_rows(&storage, crate::WEBHOOK_PARTITIONS_TREE), 0);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

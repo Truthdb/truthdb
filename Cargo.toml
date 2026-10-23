@@ -82,6 +82,7 @@ base64 = "0.22.1"
 percent-encoding = "2.3.2"
 truthdb-s3client = { workspace = true }
 http-body-util = "0.1.5"
+ring = "0.17"
 truthdb-cli = { path = "crates/truthdb-cli" }
 
 [profile.dev.package."*"]

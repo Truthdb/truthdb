@@ -105,6 +105,11 @@ pub(super) fn spawn_engine_pool(
                 .name("truthdb-object-import".to_string())
                 .spawn(move || import_loop(&import_shared))
                 .expect("spawn import thread");
+            let webhook_shared = Arc::clone(&supervisor);
+            let webhooks = std::thread::Builder::new()
+                .name("truthdb-webhooks".to_string())
+                .spawn(move || webhook_loop(&webhook_shared))
+                .expect("spawn webhook thread");
             let handles: Vec<_> = (0..workers)
                 .map(|i| {
                     let shared = Arc::clone(&supervisor);
@@ -131,6 +136,7 @@ pub(super) fn spawn_engine_pool(
             let _ = indexer.join();
             let _ = jobs.join();
             let _ = imports.join();
+            let _ = webhooks.join();
             let mut sched = supervisor.scheduler.lock().expect("scheduler poisoned");
             for parked in sched.parked.drain(..) {
                 parked
@@ -381,6 +387,61 @@ pub(super) fn import_loop(shared: &Arc<Shared>) {
         let _ = shared
             .wake
             .wait_timeout(idle, IMPORT_IDLE)
+            .expect("idle mutex poisoned");
+    }
+}
+
+/// How long the webhook thread waits when nothing is in flight or was
+/// delivered (a retry's wait is at least this).
+const WEBHOOK_IDLE: Duration = Duration::from_secs(1);
+
+/// Webhook delivery (see `engine::webhooks`), on its own thread: a turn at
+/// a time while POSTs are in flight or records go out, else a sleep. Its runtime runs the HTTP
+/// client.
+pub(super) fn webhook_loop(shared: &Arc<Shared>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("webhooks cannot run: {err}");
+            return;
+        }
+    };
+    // The HTTP client's connection pool lives in the runtime it was made
+    // in.
+    let poster = match runtime.block_on(async { truthdb_s3client::Poster::new(None) }) {
+        Ok(poster) => Arc::new(poster),
+        Err(err) => {
+            eprintln!("webhooks cannot run: {err}");
+            return;
+        }
+    };
+    // Each turn starts further on, so no webhook keeps the others waiting.
+    // POSTs still in flight at shutdown are dropped: their records are
+    // posted again after the restart.
+    let mut posts = crate::engine::WebhookPosts::default();
+    let mut round = 0usize;
+    while !shared.stop.load(Ordering::Acquire) {
+        round = round.wrapping_add(1);
+        let more = shared
+            .engine
+            .webhook_pump(&runtime, &poster, &mut posts, round)
+            .unwrap_or_else(|err| {
+                eprintln!("webhook delivery failed: {err}");
+                false
+            });
+        if more {
+            continue;
+        }
+        let idle = shared.idle.lock().expect("idle mutex poisoned");
+        if shared.stop.load(Ordering::Acquire) {
+            break;
+        }
+        let _ = shared
+            .wake
+            .wait_timeout(idle, WEBHOOK_IDLE)
             .expect("idle mutex poisoned");
     }
 }

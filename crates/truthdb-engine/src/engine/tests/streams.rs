@@ -407,3 +407,260 @@ fn an_account_that_owns_topics_is_not_dropped() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn webhooks_are_set_on_topics_and_shown() {
+    let path = unique_temp_path("streams-webhooks");
+    let engine = new_engine(&path);
+    engine
+        .execute("stream create topic events partitions 2")
+        .unwrap();
+    let reply: Value = serde_json::from_str(
+        &engine
+            .execute("stream create webhook events url https://hooks.example/s3 secret k;")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reply["dead_letter_topic"], "events.dead-letter");
+    for (command, error) in [
+        (
+            "stream create webhook events url https://h/x secret k",
+            "already has a webhook",
+        ),
+        (
+            "stream create webhook missing url https://h/x secret k",
+            "no topic 'missing'",
+        ),
+        (
+            "stream create webhook events url ftp://h/x secret k",
+            "not an http",
+        ),
+        (
+            "stream create webhook events url nonsense secret k",
+            "not an http",
+        ),
+        ("stream drop webhook missing", "no topic 'missing'"),
+        (
+            &*format!(
+                "stream create webhook events url https://h/{} secret k",
+                "x".repeat(1100)
+            ),
+            "at most 1024 bytes",
+        ),
+    ] {
+        let message = command_error(&engine, command);
+        assert!(message.contains(error), "{command}: {message}");
+    }
+    let (columns, rows) = sql_rows(&engine, "SELECT * FROM sys.dm_s3_webhooks");
+    assert_eq!(
+        columns,
+        [
+            "topic_name",
+            "url",
+            "partition_id",
+            "next_offset",
+            "pending_records",
+            "attempts",
+            "next_attempt_time",
+            "delivered",
+            "dead_lettered",
+            "last_error"
+        ]
+    );
+    assert_eq!(rows.len(), 2, "one row per partition");
+    assert_eq!(
+        rows[1][..6],
+        [
+            Some("events".to_string()),
+            Some("https://hooks.example/s3".to_string()),
+            Some("1".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string())
+        ]
+    );
+    assert_eq!((rows[1][6].clone(), rows[1][9].clone()), (None, None));
+    engine.execute("stream drop webhook events").unwrap();
+    assert!(
+        sql_rows(&engine, "SELECT * FROM sys.dm_s3_webhooks")
+            .1
+            .is_empty()
+    );
+    let message = command_error(&engine, "stream drop webhook events");
+    assert!(message.contains("has no webhook"), "{message}");
+    // A secret is base64- or hex-like (a command's `;` cannot be part of it).
+    let message = command_error(
+        &engine,
+        "stream create webhook events url https://h/x secret k;q",
+    );
+    assert!(message.contains("letters, digits"), "{message}");
+    engine
+        .execute("stream create webhook events url https://h/x secret a+b/c=_-9;;")
+        .unwrap();
+    let webhooks = engine.streams(|file| file.webhooks()).unwrap();
+    assert_eq!(webhooks[0].secret, "a+b/c=_-9");
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let path = unique_temp_path("streams-hang");
+    let engine = new_engine(&path);
+    // One endpoint takes connections and never answers; one answers 200
+    // and counts the POSTs.
+    let hang = || {
+        let hanging = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = hanging.local_addr().unwrap().port();
+        let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let accepted = std::sync::Arc::clone(&connections);
+        std::thread::spawn(move || {
+            let mut held = Vec::new();
+            for stream in hanging.incoming() {
+                accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                held.push(stream);
+            }
+        });
+        (port, connections)
+    };
+    let (hang_port, connections) = hang();
+    // A second one, below its share: one POST in flight for its partition.
+    let (lone_port, lone_connections) = hang();
+    let healthy = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    let ok_port = healthy.local_addr().unwrap().port();
+    let posted = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let counter = std::sync::Arc::clone(&posted);
+    std::thread::spawn(move || {
+        for stream in healthy.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let mut len = 0;
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    let header = header.trim_end().to_ascii_lowercase();
+                    if header.is_empty() {
+                        break;
+                    }
+                    if let Some(value) = header.strip_prefix("content-length:") {
+                        len = value.trim().parse().unwrap();
+                    }
+                }
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let _ = write!(stream, "HTTP/1.1 200 OK\r\ncontent-length: 0\r\n\r\n");
+            }
+        }
+    });
+    // The hanging endpoint has more partitions waiting than its share.
+    for (topic, port, partitions) in [
+        ("hang", hang_port, 16),
+        ("lone", lone_port, 1),
+        ("ok", ok_port, 1),
+    ] {
+        engine
+            .execute(&format!(
+                "stream create topic {topic} partitions {partitions} retention 0"
+            ))
+            .unwrap();
+        engine
+            .execute(&format!(
+                "stream create webhook {topic} url http://127.0.0.1:{port}/ secret k"
+            ))
+            .unwrap();
+        let records: Vec<NewRecord> = (0..3)
+            .map(|_| NewRecord {
+                key: None,
+                value: b"{}".to_vec(),
+            })
+            .collect();
+        for partition in 0..partitions {
+            engine
+                .streams(|file| {
+                    file.transaction(|tx| tx.append(topic, partition, &records, None, 1))
+                })
+                .unwrap()
+                .unwrap();
+        }
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .unwrap();
+    let poster = std::sync::Arc::new(
+        runtime
+            .block_on(async { truthdb_s3client::Poster::new(None) })
+            .unwrap(),
+    );
+    let mut posts = crate::engine::WebhookPosts::default();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut round = 0;
+    while posted.load(std::sync::atomic::Ordering::SeqCst) < 3
+        && std::time::Instant::now() < deadline
+    {
+        round += 1;
+        engine
+            .webhook_pump(&runtime, &poster, &mut posts, round)
+            .unwrap();
+    }
+    assert_eq!(posted.load(std::sync::atomic::Ordering::SeqCst), 3);
+    let webhooks = engine.streams(|file| file.webhooks()).unwrap();
+    let offset = |topic: &str| {
+        webhooks
+            .iter()
+            .find(|webhook| webhook.topic == topic)
+            .unwrap()
+            .partitions[0]
+            .offset
+    };
+    assert_eq!((offset("ok"), offset("hang")), (3, 0));
+    // One POST in flight per hanging partition, and no more than the
+    // endpoint's share of them, however many turns go by.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut turns_after = 0;
+    while turns_after < 10 && std::time::Instant::now() < deadline {
+        round += 1;
+        engine
+            .webhook_pump(&runtime, &poster, &mut posts, round)
+            .unwrap();
+        if connections.load(std::sync::atomic::Ordering::SeqCst) >= 8 {
+            turns_after += 1;
+        }
+    }
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 8);
+    assert_eq!(
+        lone_connections.load(std::sync::atomic::Ordering::SeqCst),
+        1
+    );
+    // A POST that gets no answer fails at its timeout (shortened here) and
+    // waits its backoff, freeing its slot.
+    let mut posts =
+        crate::engine::WebhookPosts::with_timeout(std::time::Duration::from_millis(300));
+    let tried = |engine: &Engine| {
+        engine
+            .streams(|file| file.webhooks())
+            .unwrap()
+            .into_iter()
+            .find(|webhook| webhook.topic == "lone")
+            .unwrap()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tried(&engine).partitions[0].attempts == 0 && std::time::Instant::now() < deadline {
+        round += 1;
+        engine
+            .webhook_pump(&runtime, &poster, &mut posts, round)
+            .unwrap();
+    }
+    let lone = tried(&engine);
+    assert_eq!(lone.partitions[0].attempts, 1);
+    assert_eq!(lone.last_error, "no answer in time");
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}

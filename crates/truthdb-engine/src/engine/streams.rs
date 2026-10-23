@@ -25,8 +25,10 @@ const DEFAULT_RETENTION_HOURS: u64 = 168;
 
 /// Streams administration: `stream create topic <name> [partitions <n>]
 /// [retention <hours>] [account <S3 account id>]` (retention 0: for ever;
-/// the account: whose buckets may send it their event notifications) and
-/// `stream drop topic <name>`. Gated like the S3 administration commands: a
+/// the account: whose buckets may send it their event notifications),
+/// `stream drop topic <name>`, `stream create webhook <topic> url <url>
+/// secret <secret>` (see `truthdb_streams::Webhook`) and `stream drop
+/// webhook <topic>`. Gated like the S3 administration commands: a
 /// `sysadmin` login over TDS, any connection on the (trusted) native port.
 pub(super) enum StreamAdmin {
     CreateTopic {
@@ -35,10 +37,16 @@ pub(super) enum StreamAdmin {
         options: Vec<String>,
     },
     DropTopic(String),
+    CreateWebhook {
+        topic: String,
+        url: String,
+        secret: String,
+    },
+    DropWebhook(String),
 }
 
 pub(super) fn parse_stream_admin(input: &str) -> Option<StreamAdmin> {
-    // The CLI ends every command with `;`.
+    // The CLI ends every command with `;` (no name or secret ends in one).
     let input = input.trim().trim_end_matches(';');
     let words: Vec<&str> = input.split_whitespace().collect();
     let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
@@ -49,6 +57,14 @@ pub(super) fn parse_stream_admin(input: &str) -> Option<StreamAdmin> {
             options: words[4..].iter().map(|word| word.to_string()).collect(),
         }),
         ["stream", "drop", "topic", _] => Some(StreamAdmin::DropTopic(words[3].to_string())),
+        ["stream", "create", "webhook", _, "url", _, "secret", _] => {
+            Some(StreamAdmin::CreateWebhook {
+                topic: words[3].to_string(),
+                url: words[5].to_string(),
+                secret: words[7].to_string(),
+            })
+        }
+        ["stream", "drop", "webhook", _] => Some(StreamAdmin::DropWebhook(words[3].to_string())),
         _ => None,
     }
 }
@@ -68,6 +84,33 @@ fn stream_error(topic: &str, err: StreamError) -> EngineError {
             format!("a topic has 1 to {MAX_PARTITIONS} partitions")
         }
         StreamError::TooLarge => "the records are too large".to_string(),
+    })
+    .into()
+}
+
+fn webhook_error(topic: &str, err: truthdb_streams::WebhookError) -> EngineError {
+    use truthdb_streams::WebhookError;
+    CommandError::InvalidCommand(match err {
+        WebhookError::NoSuchTopic => format!("no topic '{topic}'"),
+        WebhookError::WebhookExists => format!("topic '{topic}' already has a webhook"),
+        WebhookError::NoSuchWebhook => format!("topic '{topic}' has no webhook"),
+        WebhookError::NameTooLong => {
+            format!("the dead-letter topic of '{topic}' would be named past 249 characters")
+        }
+        WebhookError::DeadLetterTooSmall => format!(
+            "the dead-letter topic of '{topic}' has fewer partitions than it; drop it first"
+        ),
+        WebhookError::UrlTooLong => format!(
+            "a webhook URL is at most {} bytes",
+            truthdb_streams::MAX_URL_BYTES
+        ),
+        WebhookError::SecretTooLong => format!(
+            "a webhook secret is at most {} bytes",
+            truthdb_streams::MAX_SECRET_BYTES
+        ),
+        WebhookError::InvalidSecret => {
+            "a webhook secret is letters, digits and + / = _ -".to_string()
+        }
     })
     .into()
 }
@@ -151,6 +194,26 @@ impl Engine {
                 self.streams(move |file| file.transaction(|tx| tx.drop_topic(&topic)))?
                     .map_err(|err| stream_error(&name, err))?;
                 json!({ "topic": name, "dropped": true })
+            }
+            StreamAdmin::CreateWebhook { topic, url, secret } => {
+                truthdb_s3client::post_target(&url).map_err(|err| invalid(err.to_string()))?;
+                let now_ms = super::now_ms();
+                let (name, target) = (topic.clone(), url.clone());
+                self.streams(move |file| {
+                    file.transaction(|tx| tx.create_webhook(&name, &target, &secret, now_ms))
+                })?
+                .map_err(|err| webhook_error(&topic, err))?;
+                json!({
+                    "topic": topic,
+                    "url": url,
+                    "dead_letter_topic": truthdb_streams::dead_letter_topic(&topic),
+                })
+            }
+            StreamAdmin::DropWebhook(topic) => {
+                let name = topic.clone();
+                self.streams(move |file| file.transaction(|tx| tx.drop_webhook(&name)))?
+                    .map_err(|err| webhook_error(&topic, err))?;
+                json!({ "topic": topic, "webhook_dropped": true })
             }
         };
         render_json(&rendered).map_err(EngineError::from)

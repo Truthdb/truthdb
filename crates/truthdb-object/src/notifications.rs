@@ -63,18 +63,25 @@ pub enum Destination {
     /// `arn:aws:sqs:<region>:<account>:<name>`: the stream topic `name`,
     /// read as a queue (`sys.sp_s3_queue_*`).
     Queue(String),
+    /// `arn:aws:lambda:<region>:<account>:function:<name>[:<qualifier>]`:
+    /// the stream topic `name`, which a webhook delivers.
+    Function(String),
 }
 
 impl Destination {
     pub fn arn(&self) -> &str {
         match self {
-            Destination::Topic(arn) | Destination::Queue(arn) => arn,
+            Destination::Topic(arn) | Destination::Queue(arn) | Destination::Function(arn) => arn,
         }
     }
 
-    /// The stream topic the ARN names (its last field).
+    /// The stream topic the ARN names (a topic's or queue's last field, a
+    /// function's name).
     pub fn topic(&self) -> &str {
-        self.arn().rsplit(':').next().unwrap_or_default()
+        match self {
+            Destination::Function(arn) => arn.split(':').nth(6).unwrap_or_default(),
+            _ => self.arn().rsplit(':').next().unwrap_or_default(),
+        }
     }
 }
 
@@ -134,6 +141,10 @@ impl NotificationConfig {
                     out.u8(1);
                     out.str(arn);
                 }
+                Destination::Function(arn) => {
+                    out.u8(2);
+                    out.str(arn);
+                }
             }
         }
         out.0
@@ -163,6 +174,7 @@ impl NotificationConfig {
             let destination = match input.u8()? {
                 0 => Destination::Topic(input.str()?),
                 1 => Destination::Queue(input.str()?),
+                2 => Destination::Function(input.str()?),
                 _ => return Err(corrupt()),
             };
             rules.push(NotificationRule {
@@ -703,6 +715,14 @@ mod tests {
             ],
         };
         assert_eq!(config.rules[1].destination.topic(), "work");
+        let mut config = config;
+        config.rules.push(NotificationRule {
+            destination: Destination::Function(
+                "arn:aws:lambda:us-east-1:123456789012:function:hooked:live".into(),
+            ),
+            ..rule("c", &["s3:ObjectTagging:*"], None, None)
+        });
+        assert_eq!(config.rules[2].destination.topic(), "hooked");
         let bytes = config.encode();
         assert_eq!(NotificationConfig::decode(&bytes).unwrap(), config);
         for cut in 0..bytes.len() {

@@ -118,6 +118,104 @@ impl Download {
     }
 }
 
+/// The HTTP client every request goes through: TLS by rustls, trusting
+/// `ca_pem` instead of the system's roots when given; no proxies.
+fn http_client(
+    ca_pem: Option<&[u8]>,
+) -> Result<HttpClient<HttpsConnector<HttpConnector>, Full<Bytes>>, Error> {
+    let provider = Arc::new(rustls::crypto::ring::default_provider());
+    let builder = hyper_rustls::HttpsConnectorBuilder::new();
+    let builder = match ca_pem {
+        Some(pem) => {
+            let mut roots = rustls::RootCertStore::empty();
+            for cert in rustls_pemfile::certs(&mut &pem[..]) {
+                roots
+                    .add(cert.map_err(|err| invalid(format!("CA certificate: {err}")))?)
+                    .map_err(|err| invalid(format!("CA certificate: {err}")))?;
+            }
+            if roots.is_empty() {
+                return Err(invalid("no certificate in the CA PEM"));
+            }
+            let tls = rustls::ClientConfig::builder_with_provider(provider)
+                .with_safe_default_protocol_versions()
+                .map_err(|err| invalid(format!("TLS: {err}")))?
+                .with_root_certificates(roots)
+                .with_no_client_auth();
+            builder.with_tls_config(tls)
+        }
+        None => builder
+            .with_provider_and_native_roots(provider)
+            .map_err(|err| invalid(format!("TLS roots: {err}")))?,
+    };
+    let mut http = HttpConnector::new();
+    http.enforce_http(false);
+    http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+    let connector = builder.https_or_http().enable_http1().wrap_connector(http);
+    Ok(HttpClient::builder(hyper_util::rt::TokioExecutor::new()).build(connector))
+}
+
+/// `url` as a POST target: an `http://` or `https://` URL with a host.
+pub fn post_target(url: &str) -> Result<Uri, Error> {
+    let uri: Uri = url
+        .parse()
+        .map_err(|_| invalid(format!("{url} is not a URL")))?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+        return Err(invalid(format!("{url} is not an http:// or https:// URL")));
+    }
+    Ok(uri)
+}
+
+/// Posts bodies to URLs (webhooks), over the same HTTP stack: no proxies,
+/// and redirects are not followed.
+pub struct Poster {
+    http: HttpClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
+}
+
+impl Poster {
+    pub fn new(ca_pem: Option<&[u8]>) -> Result<Poster, Error> {
+        Ok(Poster {
+            http: http_client(ca_pem)?,
+        })
+    }
+
+    /// POSTs `body` to `url` (`http://` or `https://`) with `headers`, and
+    /// returns the answer's status, whatever it is; fails when the request
+    /// cannot be made, the connection fails or no answer comes in time.
+    pub async fn post(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        body: Bytes,
+    ) -> Result<u16, Error> {
+        let uri = post_target(url)?;
+        let body_len = body.len() as u64;
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-length", body_len);
+        for (name, value) in headers {
+            request = request.header(*name, value.as_str());
+        }
+        let request = request
+            .body(Full::new(body))
+            .map_err(|err| invalid(err.to_string()))?;
+        let answer_within =
+            ANSWER_TIMEOUT + std::time::Duration::from_secs(body_len / MIN_SEND_RATE);
+        let response = tokio::time::timeout(answer_within, self.http.request(request))
+            .await
+            .map_err(|_| Error::Transport("no answer in time".to_string()))?
+            .map_err(transport)?;
+        let status = response.status().as_u16();
+        // Read (a bounded part of) the answer, so the connection is free.
+        let _ = tokio::time::timeout(
+            ANSWER_TIMEOUT,
+            http_body_util::Limited::new(response.into_body(), MAX_ERROR_BODY).collect(),
+        )
+        .await;
+        Ok(status)
+    }
+}
+
 pub struct Client {
     http: HttpClient<HttpsConnector<HttpConnector>, Full<Bytes>>,
     /// The endpoint's scheme and authority.
@@ -344,35 +442,7 @@ impl Client {
             ));
         }
         let host = host_of(&base)?;
-        let provider = Arc::new(rustls::crypto::ring::default_provider());
-        let builder = hyper_rustls::HttpsConnectorBuilder::new();
-        let builder = match &config.ca_pem {
-            Some(pem) => {
-                let mut roots = rustls::RootCertStore::empty();
-                for cert in rustls_pemfile::certs(&mut pem.as_slice()) {
-                    roots
-                        .add(cert.map_err(|err| invalid(format!("CA certificate: {err}")))?)
-                        .map_err(|err| invalid(format!("CA certificate: {err}")))?;
-                }
-                if roots.is_empty() {
-                    return Err(invalid("no certificate in the CA PEM"));
-                }
-                let tls = rustls::ClientConfig::builder_with_provider(provider)
-                    .with_safe_default_protocol_versions()
-                    .map_err(|err| invalid(format!("TLS: {err}")))?
-                    .with_root_certificates(roots)
-                    .with_no_client_auth();
-                builder.with_tls_config(tls)
-            }
-            None => builder
-                .with_provider_and_native_roots(provider)
-                .map_err(|err| invalid(format!("TLS roots: {err}")))?,
-        };
-        let mut http = HttpConnector::new();
-        http.enforce_http(false);
-        http.set_connect_timeout(Some(CONNECT_TIMEOUT));
-        let connector = builder.https_or_http().enable_http1().wrap_connector(http);
-        let http = HttpClient::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
+        let http = http_client(config.ca_pem.as_deref())?;
         Ok(Client {
             http,
             base,
