@@ -61,6 +61,9 @@ pub(crate) struct CopySpec {
     pub class: StorageClass,
     pub metadata: Option<ObjectAttrs>,
     pub tags: Option<Vec<(String, String)>>,
+    /// Whether it asks for SSE-S3 (SSEAlgorithm AES256), as a CopyObject's
+    /// `x-amz-server-side-encryption`.
+    pub sse: bool,
 }
 
 /// A manifest column.
@@ -328,6 +331,21 @@ fn copy(element: &Element) -> Result<CopySpec, S3Error> {
         Some("REPLACE") => true,
         Some(_) => return Err(invalid("MetadataDirective is COPY or REPLACE")),
     };
+    // SSE-S3 is asked for whatever the directive (as a CopyObject header).
+    let sse = match element
+        .one("NewObjectMetadata")?
+        .map(|given| given.text_of("SSEAlgorithm"))
+        .transpose()?
+        .flatten()
+    {
+        None => false,
+        Some("AES256") => true,
+        Some(other) => {
+            return Err(S3Error::not_implemented(format!(
+                "SSEAlgorithm {other} in a batch copy"
+            )));
+        }
+    };
     let metadata = match (replace, element.one("NewObjectMetadata")?) {
         (true, Some(given)) => Some(metadata(given)?),
         (true, None) => Some(ObjectAttrs::default()),
@@ -347,6 +365,7 @@ fn copy(element: &Element) -> Result<CopySpec, S3Error> {
         class,
         metadata,
         tags,
+        sse,
     })
 }
 
@@ -642,6 +661,17 @@ async fn create(
     let body = crate::server::read_body(request, auth, MAX_REQUEST_BYTES).await?;
     let parsed = xml::parse(&body, "CreateJobRequest")?;
     let spec = spec(&parsed)?;
+    // As a CopyObject asking for it: SSE-S3 only on an encrypted database.
+    if let Operation::Copy(copy) = &spec.operation
+        && copy.sse
+    {
+        let mut headers = hyper::HeaderMap::new();
+        headers.insert(
+            "x-amz-server-side-encryption",
+            hyper::header::HeaderValue::from_static("AES256"),
+        );
+        crate::sse::check_write(&headers, state.storage.is_encrypted())?;
+    }
     let mut rendered = String::new();
     render(&parsed, &mut rendered);
     let fingerprint = ring::digest::digest(&ring::digest::SHA256, rendered.as_bytes())

@@ -9761,6 +9761,17 @@ fn batch_jobs_tag_and_copy_what_a_manifest_lists_once_across_a_crash() {
         assert_eq!((status, copied.as_str()), (200, "body"));
     }
 
+    // SSE-S3 on a database not encrypted at rest: refused, as CopyObject
+    // refuses it.
+    let sse = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::dst</TargetResource>\
+               <NewObjectMetadata><SSEAlgorithm>AES256</SSEAlgorithm></NewObjectMetadata></S3PutObjectCopy>";
+    let body = create_job_body("sse-1", sse, "lists/copy.csv", &etag, "");
+    let (_, (status, refused)) = call(&server, "POST", "/v20180820/jobs", "", body.as_bytes());
+    assert_eq!(
+        (status, xml_value(&refused, "Code").as_str()),
+        (400, "InvalidArgument")
+    );
+
     // A manifest changed since its ETag was taken: the job fails.
     let body = create_job_body("stale-1", tagging, "lists/copy.csv", "\"0123\"", "");
     let (_, (_, answer)) = call(&server, "POST", "/v20180820/jobs", "", body.as_bytes());
@@ -9918,7 +9929,8 @@ fn batch_jobs_tag_and_copy_what_a_manifest_lists_once_across_a_crash() {
 
 #[test]
 fn batch_job_tasks_are_authorized_as_the_user_that_created_the_job() {
-    let server = start_server();
+    // Encrypted at rest, so a copy may ask for SSE-S3.
+    let server = start_server_with(true);
     let (account, key, secret) = account_with_key(&server, "batchauth");
     let root = |method: &str, path: &str, query: &str, body: &[u8]| {
         send_with(
@@ -10069,6 +10081,99 @@ fn batch_job_tasks_are_authorized_as_the_user_that_created_the_job() {
         "a plain read still goes"
     );
     assert_eq!(root("DELETE", "/mine", "policy", b"").1.0, 204);
+
+    // The root's jobs, for what follows.
+    let run_root = |body: String| -> String {
+        let (status, answer) = root("POST", "/v20180820/jobs", "", body.as_bytes()).1;
+        assert_eq!(status, 200, "{answer}");
+        let job = xml_value(&answer, "JobId");
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let described = root("GET", &format!("/v20180820/jobs/{job}"), "", b"").1.1;
+            if xml_value(&described, "Status") == "Complete" {
+                return described;
+            }
+            assert!(Instant::now() < deadline, "{described}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    // A copy asking for SSE-S3 carries its key: a policy refusing
+    // unencrypted writes lets it through.
+    let encrypted_only = r#"{"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": "*",
+        "Action": "s3:PutObject", "Resource": "arn:aws:s3:::mine/*",
+        "Condition": {"Null": {"s3:x-amz-server-side-encryption": "true"}}}]}"#;
+    assert_eq!(
+        root("PUT", "/mine", "policy", encrypted_only.as_bytes())
+            .1
+            .0,
+        204
+    );
+    let sse = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::mine</TargetResource>\
+               <TargetKeyPrefix>sse/</TargetKeyPrefix>\
+               <NewObjectMetadata><SSEAlgorithm>AES256</SSEAlgorithm></NewObjectMetadata></S3PutObjectCopy>";
+    let described = run_root(job_body("root-sse", sse));
+    assert_eq!(
+        xml_value(&described, "NumberOfTasksSucceeded"),
+        "2",
+        "{described}"
+    );
+    assert_eq!(root("DELETE", "/mine", "policy", b"").1.0, 204);
+    // A bucket's default retention is not what a copy asks for: a policy
+    // refusing COMPLIANCE requests lets the copy through, which then gets
+    // the default.
+    assert_eq!(
+        send_with(
+            server.s3_port,
+            "PUT",
+            "/vault",
+            "",
+            &[("x-amz-bucket-object-lock-enabled", "true")],
+            b"",
+            &key,
+            Some(&secret)
+        )
+        .1
+        .0,
+        200
+    );
+    let config = "<ObjectLockConfiguration><ObjectLockEnabled>Enabled</ObjectLockEnabled>\
+                  <Rule><DefaultRetention><Mode>COMPLIANCE</Mode><Days>1</Days></DefaultRetention></Rule>\
+                  </ObjectLockConfiguration>";
+    let md5 = content_md5(config.as_bytes());
+    assert_eq!(
+        send_with(
+            server.s3_port,
+            "PUT",
+            "/vault",
+            "object-lock",
+            &[("content-md5", &md5)],
+            config.as_bytes(),
+            &key,
+            Some(&secret)
+        )
+        .1
+        .0,
+        200
+    );
+    let no_compliance = r#"{"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": "*",
+        "Action": "s3:PutObject", "Resource": "arn:aws:s3:::vault/*",
+        "Condition": {"StringEquals": {"s3:object-lock-mode": "COMPLIANCE"}}}]}"#;
+    assert_eq!(
+        root("PUT", "/vault", "policy", no_compliance.as_bytes())
+            .1
+            .0,
+        204
+    );
+    let into_vault =
+        "<S3PutObjectCopy><TargetResource>arn:aws:s3:::vault</TargetResource></S3PutObjectCopy>";
+    let described = run_root(job_body("root-vault", into_vault));
+    assert_eq!(
+        xml_value(&described, "NumberOfTasksSucceeded"),
+        "2",
+        "{described}"
+    );
+    let (_, (_, retention)) = root("GET", "/vault/m1", "retention", b"");
+    assert!(retention.contains("<Mode>COMPLIANCE</Mode>"), "{retention}");
 
     // A job whose creator is gone fails, even when a user of the same name
     // is made again before it runs.

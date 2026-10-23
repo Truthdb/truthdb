@@ -682,11 +682,14 @@ fn plan(
         Some(_) => "REPLACE",
         None => "COPY",
     };
-    let copy_keys = [
+    let mut copy_keys = vec![
         ("s3:x-amz-copy-source", source_id),
         ("s3:x-amz-storage-class", copy.class.as_str().to_string()),
         ("s3:x-amz-metadata-directive", directive.to_string()),
     ];
+    if copy.sse {
+        copy_keys.push(("s3:x-amz-server-side-encryption", "AES256".to_string()));
+    }
     let read = if versioned {
         "s3:GetObjectVersion"
     } else {
@@ -748,7 +751,9 @@ fn plan(
         "s3:PutObject",
         Resource::Object(&copy.bucket, &target),
         copy.tags.as_deref(),
-        lock.as_ref(),
+        // As a CopyObject asking for no lock: the bucket's default retention
+        // applies to the write, not to its authorization.
+        None,
     ) {
         return Ok(Err(err));
     }
@@ -1072,7 +1077,7 @@ async fn finish(state: &S3State, job: Job) -> Result<(), String> {
                         "s3:PutObject",
                         Resource::Object(&files.bucket, key),
                         None,
-                        lock.as_ref(),
+                        None,
                     )
                     .is_err()
             }) {
