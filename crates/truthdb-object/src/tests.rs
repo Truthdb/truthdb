@@ -5899,3 +5899,95 @@ fn a_usage_backfill_counts_every_key_once_whatever_its_step() {
     }
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn stored_bodies_tell_their_use_logical_stored_and_allocated_bytes() {
+    use crate::{BodyUse, ObjectAttrs, StorageClass};
+    use truthdb_core::storage_layout::PAGE_SIZE;
+    let path = temp_path("stored");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    let put_object = |key: &str, data: &[u8], class: StorageClass| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, data, now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.put_object(
+                    "bkt",
+                    key,
+                    &sealed,
+                    &ObjectAttrs::default(),
+                    class,
+                    now(),
+                    0,
+                )
+            })
+            .unwrap()
+            .unwrap()
+    };
+    let plain = bytes(1, 300_000);
+    put_object("plain", &plain, StorageClass::Standard);
+    // Compressible: packed for GLACIER to a fraction of it.
+    let cold = vec![b'a'; 2 * SEGMENT_BYTES as usize];
+    put_object("cold", &cold, StorageClass::Glacier);
+    pack_all(&storage);
+    put_object("gone", &bytes(2, 5_000), StorageClass::Standard);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("bkt", "gone", None, false, now(), GRACE))
+        .unwrap()
+        .unwrap();
+    // A body still being written: its first segment stored, the rest held
+    // by the writer.
+    let mut staging = BodyWriter::begin(&storage, now()).unwrap();
+    staging
+        .write(&storage, &bytes(3, SEGMENT_BYTES as usize + 70_000), now())
+        .unwrap();
+    // Read a body at a time, as a view pages through them.
+    let mut all = Vec::new();
+    let mut after = None;
+    loop {
+        let (page, last) = ObjFile::new(&mut storage.lock())
+            .stored_bodies(after, 1)
+            .unwrap();
+        all.extend(page);
+        match last {
+            Some(last) => after = Some(last),
+            None => break,
+        }
+    }
+    let find = |body_use: BodyUse| {
+        all.iter()
+            .filter(|body| body.body_use == body_use)
+            .copied()
+            .collect::<Vec<_>>()
+    };
+    let live = find(BodyUse::Live);
+    assert_eq!(live.len(), 2, "{all:?}");
+    let plain_body = live.iter().find(|body| body.pack_level == 0).unwrap();
+    assert_eq!(plain_body.logical, plain.len() as u64);
+    assert_eq!(plain_body.stored, plain.len() as u64);
+    assert!(plain_body.allocated >= plain_body.stored);
+    assert_eq!(plain_body.allocated % PAGE_SIZE as u64, 0);
+    let cold_body = live.iter().find(|body| body.pack_level == 9).unwrap();
+    assert_eq!(cold_body.logical, cold.len() as u64);
+    assert!(cold_body.stored * 100 < cold_body.logical, "{cold_body:?}");
+    assert!(
+        cold_body.allocated < cold_body.logical / 10,
+        "{cold_body:?}"
+    );
+    let collectable = find(BodyUse::Collectable);
+    assert_eq!(collectable.len(), 1, "{all:?}");
+    assert_eq!(collectable[0].logical, 5_000);
+    let staged = find(BodyUse::Staging);
+    assert_eq!(staged.len(), 1, "{all:?}");
+    assert!(
+        staged[0].stored > 0 && staged[0].allocated > 0,
+        "{staged:?}"
+    );
+    drop(staging);
+    std::fs::remove_file(&path).ok();
+}

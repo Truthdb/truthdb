@@ -40,8 +40,8 @@ use truthdb_core::storage::{Storage, StorageError};
 
 use truthdb_fulltext::{Hit, Search, SearchError};
 use truthdb_object::{
-    FtState, JournalRecord, ListAfter, Listing, ObjFile, ObjectAttrs, ObjectError, ObjectInfo,
-    VersionSel, Versioning, version_id,
+    BodyUse, FtState, JournalRecord, ListAfter, Listing, ObjFile, ObjectAttrs, ObjectError,
+    ObjectInfo, VersionSel, Versioning, version_id,
 };
 use truthdb_relational::engine::{
     ExternalCaller, ExternalRowset, ExternalRowsets, ExternalStream, ResultColumn, check_cancelled,
@@ -100,6 +100,7 @@ impl ExternalRowsets for S3Rowsets {
             "sys.dm_s3_bucket_usage" => {
                 return Some(open_bucket_usage(&self.core, name, args, caller));
             }
+            "sys.dm_s3_storage" => return Some(open_storage(&self.core, name, args, caller)),
             "sys.s3_search" => return Some(self.open_search(name, args, caller)),
             "sys.stream_topics" | "sys.stream_read" | "sys.dm_s3_webhooks" => {
                 return Some(super::stream_sql::open(&self.core, name, args, caller));
@@ -723,6 +724,92 @@ impl ExternalStream for BucketUsageStream {
                     Datum::Bit(complete),
                 ]
             })
+            .collect();
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// How many bodies `sys.dm_s3_storage` reads per storage-lock hold.
+const STORAGE_BODIES_PER_HOLD: usize = 1024;
+
+/// `sys.dm_s3_storage`: what object bodies take on disk, by their use (live,
+/// collectable, staging) and the zstd level they were packed at: how many,
+/// their bytes as written, as stored and as allocated pages, and the bytes
+/// packing saved.
+fn open_storage(
+    core: &Arc<Storage>,
+    name: &str,
+    args: &[SqlValue],
+    caller: ExternalCaller,
+) -> Result<ExternalRowset, SqlError> {
+    check_admin(name, caller)?;
+    check_arg_count(name, args, 0, 0)?;
+    Ok(ExternalRowset {
+        columns: vec![
+            nvarchar("body_state", 16),
+            bigint("pack_level"),
+            bigint("body_count"),
+            bigint("logical_bytes"),
+            bigint("stored_bytes"),
+            bigint("allocated_bytes"),
+            bigint("saved_bytes"),
+        ],
+        rows: Box::new(StorageStream {
+            core: Arc::clone(core),
+            done: false,
+        }),
+    })
+}
+
+struct StorageStream {
+    core: Arc<Storage>,
+    done: bool,
+}
+
+impl ExternalStream for StorageStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        // (use, level) -> bodies, logical, stored, allocated; summed over
+        // the bodies a batch at a time, each batch under a hold of its own.
+        let mut totals: std::collections::BTreeMap<(BodyUse, u8), [u64; 4]> = Default::default();
+        let mut after = None;
+        loop {
+            let (bodies, last) = {
+                let mut guard = self.core.lock();
+                let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+                file.stored_bodies(after, STORAGE_BODIES_PER_HOLD)
+                    .map_err(storage_error)?
+            };
+            for body in bodies {
+                let total = totals.entry((body.body_use, body.pack_level)).or_default();
+                total[0] += 1;
+                total[1] += body.logical;
+                total[2] += body.stored;
+                total[3] += body.allocated;
+            }
+            match last {
+                Some(last) => after = Some(last),
+                None => break,
+            }
+        }
+        let rows: Vec<Vec<Datum>> = totals
+            .into_iter()
+            .map(
+                |((body_use, level), [bodies, logical, stored, allocated])| {
+                    vec![
+                        text(body_use.as_str()),
+                        Datum::BigInt(i64::from(level)),
+                        Datum::BigInt(bodies as i64),
+                        Datum::BigInt(logical as i64),
+                        Datum::BigInt(stored as i64),
+                        Datum::BigInt(allocated as i64),
+                        Datum::BigInt(logical as i64 - stored as i64),
+                    ]
+                },
+            )
             .collect();
         Ok((!rows.is_empty()).then_some(rows))
     }
