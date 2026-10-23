@@ -1,7 +1,8 @@
 //! The object engine's background work beyond the maintenance sweep: packing
 //! bodies of cold storage classes (see `truthdb_object::PackStep`), a segment
 //! per step, and the buckets' daily lifecycle passes (see
-//! `truthdb_object::LifecycleConfig`), a bounded batch per step. A packing
+//! `truthdb_object::LifecycleConfig`), a bounded batch per step, and the
+//! backfill of storage usage counts in a file written before them. A packing
 //! step reads its segment under the storage lock, compresses it without the
 //! lock, and applies the frame in a transaction of its own. A standby does
 //! none of it (its log is the primary's).
@@ -15,6 +16,10 @@ const LIFECYCLE_STEP: StepBudget = StepBudget {
     rows: 512,
     actions: 16,
 };
+
+/// The version rows one step of the usage backfill counts (see
+/// `truthdb_object::UsageKind`), about.
+const USAGE_BACKFILL_ROWS: usize = 512;
 
 /// How long a body that a lifecycle expiration dropped outlives it: readers
 /// that resolved the version just before may still be reading.
@@ -31,7 +36,8 @@ impl Engine {
         let now_ms = super::now_ms();
         let lifecycle = self
             .object(|file| file.lifecycle_step(now_ms, LIFECYCLE_DROP_GRACE_MS, LIFECYCLE_STEP));
-        Ok(packed? | lifecycle?)
+        let usage = self.object(|file| file.usage_backfill(USAGE_BACKFILL_ROWS));
+        Ok(packed? | lifecycle? | usage?)
     }
 
     /// One packing step; returns whether there was one.

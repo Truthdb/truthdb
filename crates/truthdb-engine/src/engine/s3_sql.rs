@@ -97,6 +97,9 @@ impl ExternalRowsets for S3Rowsets {
                 return Some(open_imports(&self.core, name, args, caller));
             }
             "sys.dm_s3_batch_jobs" => return Some(open_batch_jobs(&self.core, name, args, caller)),
+            "sys.dm_s3_bucket_usage" => {
+                return Some(open_bucket_usage(&self.core, name, args, caller));
+            }
             "sys.s3_search" => return Some(self.open_search(name, args, caller)),
             "sys.stream_topics" | "sys.stream_read" | "sys.dm_s3_webhooks" => {
                 return Some(super::stream_sql::open(&self.core, name, args, caller));
@@ -657,6 +660,67 @@ impl ExternalStream for BatchJobStream {
                     job.terminated_ms.map_or(Datum::Null, datetime),
                     text(&job.status_reason),
                     text(&failure),
+                ]
+            })
+            .collect();
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// `sys.dm_s3_bucket_usage`: each bucket's versions, delete markers and
+/// upload parts, current and noncurrent, per storage class: how many and
+/// their bytes. `complete` is false while a file written before usage was
+/// counted is still being counted.
+fn open_bucket_usage(
+    core: &Arc<Storage>,
+    name: &str,
+    args: &[SqlValue],
+    caller: ExternalCaller,
+) -> Result<ExternalRowset, SqlError> {
+    check_admin(name, caller)?;
+    check_arg_count(name, args, 0, 0)?;
+    Ok(ExternalRowset {
+        columns: vec![
+            nvarchar("bucket_name", 63),
+            nvarchar("version_kind", 16),
+            nvarchar("storage_class", 32),
+            bigint("object_count"),
+            bigint("size_bytes"),
+            bit("complete"),
+        ],
+        rows: Box::new(BucketUsageStream {
+            core: Arc::clone(core),
+            done: false,
+        }),
+    })
+}
+
+struct BucketUsageStream {
+    core: Arc<Storage>,
+    done: bool,
+}
+
+impl ExternalStream for BucketUsageStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let mut guard = self.core.lock();
+        let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+        let complete = file.usage_complete().map_err(storage_error)?;
+        let rows: Vec<Vec<Datum>> = file
+            .bucket_usage()
+            .map_err(storage_error)?
+            .into_iter()
+            .map(|usage| {
+                vec![
+                    text(&usage.bucket),
+                    text(usage.kind.as_str()),
+                    text(usage.storage_class.as_str()),
+                    Datum::BigInt(usage.objects as i64),
+                    Datum::BigInt(usage.bytes as i64),
+                    Datum::Bit(complete),
                 ]
             })
             .collect();

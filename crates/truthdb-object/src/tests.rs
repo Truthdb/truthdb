@@ -5465,3 +5465,350 @@ fn batch_jobs_are_kept_found_by_token_and_reported_durably() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn usage_counts_follow_every_change_and_a_backfill_counts_what_came_before() {
+    use crate::{ObjectAttrs, StorageClass, VersionSel, Versioning};
+    let path = temp_path("usage");
+    let storage = create(&path);
+    let txn = |f: &mut dyn FnMut(&mut crate::ObjTxn<'_, '_>)| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                f(tx);
+                Ok(())
+            })
+            .unwrap()
+    };
+    let check = |what: &str| {
+        let counted = ObjFile::new(&mut storage.lock()).bucket_usage().unwrap();
+        let expected = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.recount_usage())
+            .unwrap();
+        assert_eq!(counted, expected, "after {what}");
+    };
+    let sealed = |seed: u8, len: usize| {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, &bytes(seed, len), now()).unwrap();
+        writer.finish(&storage, now()).unwrap()
+    };
+    // Counting starts once the backfill has run (on a new file, at once).
+    assert!(!ObjFile::new(&mut storage.lock()).usage_complete().unwrap());
+    assert!(
+        !ObjFile::new(&mut storage.lock())
+            .usage_backfill(100)
+            .unwrap()
+    );
+    assert!(ObjFile::new(&mut storage.lock()).usage_complete().unwrap());
+    for bucket in ["one", "two"] {
+        txn(&mut |tx| {
+            tx.create_bucket(bucket, DEFAULT_ACCOUNT, now())
+                .unwrap()
+                .unwrap();
+        });
+    }
+    // A deterministic mix of every kind of change, checked after each.
+    let mut seed = 7u64;
+    let mut next = |below: u64| {
+        seed = seed
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        (seed >> 33) % below
+    };
+    let classes = [
+        StorageClass::Standard,
+        StorageClass::Glacier,
+        StorageClass::StandardIa,
+    ];
+    let mut uploads: Vec<u64> = Vec::new();
+    for step in 0..300 {
+        let bucket = ["one", "two"][next(2) as usize];
+        let key = format!("k{}", next(6));
+        let op = next(9);
+        let what = format!("step {step}: op {op} on {bucket}/{key}");
+        match op {
+            0 | 1 => {
+                let body = sealed(step as u8, 1 + next(5000) as usize);
+                let class = classes[next(3) as usize];
+                txn(&mut |tx| {
+                    let _ = tx
+                        .put_object(
+                            bucket,
+                            &key,
+                            &body,
+                            &ObjectAttrs::default(),
+                            class,
+                            now(),
+                            0,
+                        )
+                        .unwrap();
+                });
+            }
+            2 => txn(&mut |tx| {
+                let _ = tx
+                    .delete_object(bucket, &key, None, false, now(), 0)
+                    .unwrap();
+            }),
+            3 => {
+                // A version by number: the newest, or the oldest.
+                let listing = ObjFile::new(&mut storage.lock())
+                    .list_versions(bucket, &key, None, None, 100)
+                    .unwrap()
+                    .unwrap();
+                let versions: Vec<u64> = listing
+                    .objects
+                    .into_iter()
+                    .filter(|entry| entry.key == key)
+                    .map(|entry| entry.info.version)
+                    .collect();
+                if let Some(&version) = if next(2) == 0 {
+                    versions.first()
+                } else {
+                    versions.last()
+                } {
+                    txn(&mut |tx| {
+                        let _ = tx
+                            .delete_object(
+                                bucket,
+                                &key,
+                                Some(VersionSel::Seq(version)),
+                                true,
+                                now(),
+                                0,
+                            )
+                            .unwrap();
+                    });
+                }
+            }
+            4 => {
+                let versioning = [Versioning::Enabled, Versioning::Suspended][next(2) as usize];
+                txn(&mut |tx| {
+                    tx.set_versioning(bucket, versioning).unwrap().unwrap();
+                });
+            }
+            5 => {
+                let info = ObjFile::new(&mut storage.lock())
+                    .head_object(bucket, &key, VersionSel::Latest)
+                    .unwrap();
+                if let Ok(info) = info
+                    && !info.delete_marker
+                {
+                    let class = classes[next(3) as usize];
+                    txn(&mut |tx| {
+                        let _ = tx
+                            .transition_version(bucket, &key, info.version, class, now())
+                            .unwrap();
+                    });
+                }
+            }
+            6 => {
+                let class = classes[next(3) as usize];
+                txn(&mut |tx| {
+                    let upload = tx
+                        .create_upload(bucket, &key, &ObjectAttrs::default(), class, now())
+                        .unwrap()
+                        .unwrap();
+                    uploads.push(upload);
+                });
+            }
+            7 => {
+                if !uploads.is_empty() {
+                    let upload = uploads[next(uploads.len() as u64) as usize];
+                    let body = sealed(step as u8, 1 + next(3000) as usize);
+                    let number = 1 + next(3) as u32;
+                    txn(&mut |tx| {
+                        let _ = tx.upload_part(upload, number, &body, now(), 0).unwrap();
+                    });
+                }
+            }
+            _ => {
+                if !uploads.is_empty() {
+                    let upload = uploads.remove(next(uploads.len() as u64) as usize);
+                    if next(2) == 0 {
+                        txn(&mut |tx| {
+                            tx.abort_upload(upload, now(), 0).unwrap().unwrap();
+                        });
+                    } else {
+                        let parts = ObjFile::new(&mut storage.lock())
+                            .list_parts(upload, 0, 1000)
+                            .unwrap()
+                            .0;
+                        let listed: Vec<(u32, [u8; 16])> = parts
+                            .iter()
+                            .rev()
+                            .take(1)
+                            .map(|part| (part.number, part.md5))
+                            .collect();
+                        txn(&mut |tx| {
+                            if tx
+                                .complete_upload(upload, &listed, now(), 0)
+                                .unwrap()
+                                .is_err()
+                            {
+                                tx.abort_upload(upload, now(), 0).unwrap().unwrap();
+                            }
+                        });
+                    }
+                }
+            }
+        }
+        storage.write_checkpoint(b"x", 1, 2, 1).unwrap();
+        check(&what);
+        // Part-way, the counts are forgotten, as in a file written before
+        // them: a backfill in small steps, between further changes, counts
+        // them again.
+        if step == 150 {
+            // An upload with a part, counted by the backfill and changed
+            // while it runs.
+            let mut pending = 0;
+            txn(&mut |tx| {
+                pending = tx
+                    .create_upload(
+                        "two",
+                        "k3",
+                        &ObjectAttrs::default(),
+                        StorageClass::Glacier,
+                        now(),
+                    )
+                    .unwrap()
+                    .unwrap();
+            });
+            let part = sealed(3, 700);
+            txn(&mut |tx| {
+                tx.upload_part(pending, 1, &part, now(), 0)
+                    .unwrap()
+                    .unwrap();
+            });
+            uploads.push(pending);
+            txn(&mut |tx| tx.reset_usage().unwrap());
+            while ObjFile::new(&mut storage.lock())
+                .usage_backfill(1 + next(3) as usize)
+                .unwrap()
+            {
+                let part = sealed(4, 1 + next(900) as usize);
+                let number = 1 + next(2) as u32;
+                txn(&mut |tx| {
+                    tx.upload_part(pending, number, &part, now(), 0)
+                        .unwrap()
+                        .unwrap();
+                });
+                let body = sealed(1, 10);
+                let key = format!("k{}", next(6));
+                txn(&mut |tx| {
+                    let _ = tx
+                        .put_object(
+                            "one",
+                            &key,
+                            &body,
+                            &ObjectAttrs::default(),
+                            StorageClass::Standard,
+                            now(),
+                            0,
+                        )
+                        .unwrap();
+                });
+            }
+            check("the backfill");
+        }
+    }
+    let counted = ObjFile::new(&mut storage.lock()).bucket_usage().unwrap();
+    assert!(
+        counted
+            .iter()
+            .any(|row| row.kind == crate::UsageKind::Noncurrent)
+    );
+    assert!(
+        counted
+            .iter()
+            .any(|row| row.kind == crate::UsageKind::DeleteMarkers)
+    );
+    assert!(
+        counted
+            .iter()
+            .any(|row| row.kind == crate::UsageKind::UploadParts)
+    );
+    assert!(
+        counted
+            .iter()
+            .any(|row| row.storage_class == StorageClass::Glacier)
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn usage_counts_survive_a_crash_at_any_op_of_a_change() {
+    use crate::{ObjectAttrs, StorageClass, Versioning};
+    // An overwrite in a versioned bucket (one version on, one off the head)
+    // and a backfill step crash after each of their page operations in
+    // turn; after every crash the counts agree with the rows.
+    let mut crash_at = 0;
+    loop {
+        let path = temp_path("usage-crash");
+        let storage = create(&path);
+        ObjFile::new(&mut storage.lock())
+            .usage_backfill(10)
+            .unwrap();
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_bucket("bkt", DEFAULT_ACCOUNT, now())?.unwrap();
+                tx.set_versioning("bkt", Versioning::Enabled)
+            })
+            .unwrap()
+            .unwrap();
+        let body = |seed: u8| {
+            let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+            writer.write(&storage, &bytes(seed, 100), now()).unwrap();
+            writer.finish(&storage, now()).unwrap()
+        };
+        let first = body(1);
+        ft_txn(&storage, |tx| {
+            tx.put_object(
+                "bkt",
+                "k",
+                &first,
+                &ObjectAttrs::default(),
+                StorageClass::Standard,
+                now(),
+                0,
+            )
+        })
+        .unwrap();
+        let second = body(2);
+        FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(Some(crash_at)));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ft_txn(&storage, |tx| {
+                tx.put_object(
+                    "bkt",
+                    "k",
+                    &second,
+                    &ObjectAttrs::default(),
+                    StorageClass::Glacier,
+                    now(),
+                    0,
+                )
+            })
+            .unwrap();
+            // A backfill step's position, after its counts.
+            ft_txn(&storage, |tx| {
+                tx.reset_usage()?;
+                tx.usage_backfill_step(1)
+            });
+        }))
+        .is_err();
+        FAIL_APPLY_OPS_AFTER.with(|fail| fail.replace(None));
+        drop(storage);
+        let storage = open(&path);
+        while ObjFile::new(&mut storage.lock()).usage_backfill(1).unwrap() {}
+        let counted = ObjFile::new(&mut storage.lock()).bucket_usage().unwrap();
+        let expected = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.recount_usage())
+            .unwrap();
+        assert_eq!(counted, expected, "crash at {crash_at}");
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+        if !crashed {
+            assert!(crash_at > 3, "the change crashed at every op it has");
+            break;
+        }
+        crash_at += 1;
+    }
+}
