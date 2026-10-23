@@ -26,7 +26,7 @@ const IMPORT_DROP_GRACE_MS: u64 = 15 * 60 * 1000;
 /// What became of one source object.
 enum Outcome {
     /// Copied: the import as it now stands.
-    Copied(Import),
+    Copied(Box<Import>),
     Skipped,
     Failed(String),
     /// The destination bucket is gone: the import cannot go on.
@@ -90,7 +90,7 @@ impl Engine {
         let last_page = page.next.is_none() && page.objects.len() <= STEP_OBJECTS;
         for object in page.objects.iter().take(STEP_OBJECTS) {
             match self.import_object(runtime, &client, &import, object)? {
-                Outcome::Copied(copied) => import = copied,
+                Outcome::Copied(copied) => import = *copied,
                 // Dropped meanwhile: nothing more to do.
                 Outcome::Dropped => return Ok(true),
                 Outcome::NoBucket => {
@@ -237,7 +237,7 @@ impl Engine {
         })?;
         Ok(match stored {
             None => Outcome::Dropped,
-            Some(Ok(_)) => Outcome::Copied(moved),
+            Some(Ok(_)) => Outcome::Copied(Box::new(moved)),
             Some(Err(ObjectError::NoSuchBucket)) => Outcome::NoBucket,
             Some(Err(err)) => Outcome::Failed(format!("{err:?}")),
         })
