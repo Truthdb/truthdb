@@ -6,6 +6,8 @@
 //! is the primary's).
 
 use serde_json::json;
+use truthdb_core::storage::Locked;
+use truthdb_object::ObjFile;
 use truthdb_relational::storage::StorageError;
 use truthdb_streams::{MAX_PARTITIONS, StreamError, StreamFile};
 
@@ -49,6 +51,11 @@ pub(super) fn parse_stream_admin(input: &str) -> Option<StreamAdmin> {
         ["stream", "drop", "topic", _] => Some(StreamAdmin::DropTopic(words[3].to_string())),
         _ => None,
     }
+}
+
+/// A database without one of its engines.
+pub(super) fn no_engine() -> StorageError {
+    StorageError::InvalidConfig("this database does not run every engine".to_string())
 }
 
 fn stream_error(topic: &str, err: StreamError) -> EngineError {
@@ -102,20 +109,36 @@ impl Engine {
                     // Shown as a `bigint` in `sys.stream_topics`.
                     .filter(|ms| i64::try_from(*ms).is_ok())
                     .ok_or_else(|| invalid(format!("a retention of {retention_hours} hours")))?;
-                if let Some(id) = &account {
-                    let id = id.clone();
-                    if self.object(move |file| file.account(&id))?.is_none() {
-                        return Err(invalid(format!("no S3 account '{}'", account.unwrap())));
-                    }
-                }
                 let now_ms = super::now_ms();
-                let (topic, owner) = (name.clone(), account.clone());
-                self.streams(move |file| {
-                    file.transaction(|tx| {
-                        tx.create_topic(&topic, partitions, retention_ms, owner.as_deref(), now_ms)
-                    })
+                // The account checked and the topic made in one hold: an
+                // account dropped meanwhile cannot end up owning it.
+                self.locked(|guard| {
+                    if let Some(id) = &account {
+                        let mut objects = ObjFile::try_new(guard).ok_or_else(no_engine)?;
+                        if objects.account(id)?.is_none() {
+                            return Ok(Err(None));
+                        }
+                    }
+                    StreamFile::try_new(guard)
+                        .ok_or_else(no_engine)?
+                        .transaction(|tx| {
+                            tx.create_topic(
+                                &name,
+                                partitions,
+                                retention_ms,
+                                account.as_deref(),
+                                now_ms,
+                            )
+                        })
+                        .map(|created| created.map_err(Some))
                 })?
-                .map_err(|err| stream_error(&name, err))?;
+                .map_err(|err| match err {
+                    None => invalid(format!(
+                        "no S3 account '{}'",
+                        account.as_deref().unwrap_or_default()
+                    )),
+                    Some(err) => stream_error(&name, err),
+                })?;
                 json!({
                     "topic": name,
                     "partitions": partitions,
@@ -131,6 +154,26 @@ impl Engine {
             }
         };
         render_json(&rendered).map_err(EngineError::from)
+    }
+
+    /// Runs `op` under the storage lock (for an operation on more than one
+    /// engine in one hold), then checkpoints if the log is filling.
+    pub(super) fn locked<T>(
+        &self,
+        op: impl FnOnce(&mut Locked) -> Result<T, StorageError>,
+    ) -> Result<T, EngineError> {
+        let out = {
+            let core = self.storage.core_arc();
+            let mut guard = core.lock();
+            op(&mut guard)
+        };
+        if !self.storage.is_standby() {
+            let meta = self.meta.read().expect("engine meta poisoned");
+            if let Err(err) = self.checkpoint_at(&meta, OBJECT_CHECKPOINT_THRESHOLD) {
+                eprintln!("checkpoint failed: {err}");
+            }
+        }
+        Ok(out?)
     }
 
     /// Runs `op` on the streams engine under the storage lock, then
