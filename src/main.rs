@@ -374,6 +374,44 @@ async fn main() -> ExitCode {
         None
     };
 
+    // Optional admin listener: metrics, health and readiness.
+    let admin_task = if config.admin.enabled {
+        if config.admin.token.as_deref() == Some("") {
+            eprintln!("admin.token must not be empty (leave it out for no token)");
+            return ExitCode::FAILURE;
+        }
+        match tokio::net::TcpListener::bind((config.admin.addr.as_str(), config.admin.port)).await {
+            Ok(listener) => {
+                info!(
+                    "Admin listener on {}:{}{}",
+                    config.admin.addr,
+                    config.admin.port,
+                    if config.admin.token.is_some() {
+                        " (metrics need the token)"
+                    } else {
+                        ""
+                    }
+                );
+                let state = std::sync::Arc::new(truthdb_s3::admin::AdminState {
+                    storage: storage_arc.clone(),
+                    request_metrics: request_metrics.clone(),
+                    token: config.admin.token.clone(),
+                });
+                Some(tokio::spawn(truthdb_s3::admin::serve(
+                    listener,
+                    state,
+                    shutdown_tx.subscribe(),
+                )))
+            }
+            Err(err) => {
+                eprintln!("Failed to start the admin listener: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
     // Optional physical replication (Stage 18): a primary's listener + senders,
     // or a standby's receiver.
     let repl_task = if config.replication.enabled {
@@ -407,6 +445,9 @@ async fn main() -> ExitCode {
     }
     if let Some(kafka_task) = kafka_task {
         let _ = kafka_task.await;
+    }
+    if let Some(admin_task) = admin_task {
+        let _ = admin_task.await;
     }
     // Stop the engine thread and wait for it to drain/exit.
     engine.shutdown();

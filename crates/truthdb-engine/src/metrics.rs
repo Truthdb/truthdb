@@ -42,10 +42,12 @@ const LATENCY_BOUNDS_MS: [u64; 21] = [
     262144, 524288, 1048576,
 ];
 
-/// Requests counted by latency, one count per bound and one past them.
+/// Requests counted by latency, one count per bound and one past them, and
+/// their latencies' sum.
 #[derive(Debug, Default)]
 pub struct Histogram {
     counts: [AtomicU64; LATENCY_BOUNDS_MS.len() + 1],
+    sum_micros: AtomicU64,
 }
 
 impl Histogram {
@@ -56,6 +58,29 @@ impl Histogram {
             .position(|bound| ms <= *bound)
             .unwrap_or(LATENCY_BOUNDS_MS.len());
         self.counts[index].fetch_add(1, Ordering::Relaxed);
+        self.sum_micros.fetch_add(
+            latency.as_micros().min(u128::from(u64::MAX)) as u64,
+            Ordering::Relaxed,
+        );
+    }
+
+    /// Each bound (`None`: past the last) and its count, every one.
+    pub fn counts(&self) -> Vec<(Option<u64>, u64)> {
+        self.counts
+            .iter()
+            .enumerate()
+            .map(|(index, count)| {
+                (
+                    LATENCY_BOUNDS_MS.get(index).copied(),
+                    count.load(Ordering::Relaxed),
+                )
+            })
+            .collect()
+    }
+
+    /// The latencies recorded, summed.
+    pub fn sum(&self) -> Duration {
+        Duration::from_micros(self.sum_micros.load(Ordering::Relaxed))
     }
 
     /// Each bound (`None`: past the last) and its count, for the bounds
@@ -242,6 +267,11 @@ mod tests {
             [(Some(1), 1), (Some(4), 1), (None, 1)]
         );
         assert_eq!(bucket.total.snapshot(), [(Some(16), 1)]);
+        assert_eq!(bucket.total.sum(), Duration::from_millis(9));
+        assert_eq!(
+            bucket.first_byte.sum(),
+            Duration::from_secs(2_000) + Duration::from_micros(3_010)
+        );
     }
 
     #[test]

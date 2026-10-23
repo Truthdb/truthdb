@@ -26,7 +26,48 @@ pub struct Config {
     pub kafka: KafkaConfig,
 
     #[serde(default)]
+    pub admin: AdminConfig,
+
+    #[serde(default)]
     pub encryption: EncryptionConfig,
+}
+
+/// The admin listener: Prometheus `/metrics`, `/healthz` and `/readyz`.
+/// Disabled by default; on the loopback address unless told otherwise.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdminConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_admin_addr")]
+    pub addr: String,
+
+    #[serde(default = "default_admin_port")]
+    pub port: u16,
+
+    /// A bearer token `/metrics` needs (`Authorization: Bearer <token>`).
+    #[serde(default)]
+    pub token: Option<String>,
+}
+
+impl Default for AdminConfig {
+    fn default() -> Self {
+        AdminConfig {
+            enabled: false,
+            addr: default_admin_addr(),
+            port: default_admin_port(),
+            token: None,
+        }
+    }
+}
+
+fn default_admin_addr() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_admin_port() -> u16 {
+    9625
 }
 
 /// Encryption at rest. With a master key configured, a database the server
