@@ -5100,7 +5100,7 @@ fn the_notification_history_keeps_what_unsent_changes_need() {
     };
     let rows = || {
         let mut guard = storage.lock();
-        let mut file = ObjFile::new(&mut guard);
+        let file = ObjFile::new(&mut guard);
         let Some(tree) = file.existing_tree(crate::NOTIFY_HISTORY_TREE).unwrap() else {
             return 0;
         };
@@ -5127,6 +5127,31 @@ fn the_notification_history_keeps_what_unsent_changes_need() {
     let last = ObjFile::new(&mut storage.lock()).last_change().unwrap();
     assert_eq!(at(last), None, "turned off then");
     assert_eq!(at(last + 1), Some((1, DEFAULT_ACCOUNT.to_string())));
+    // A configuration larger than a tree row.
+    configure(30);
+    assert!(config(30).encode().len() > 2_100);
+    assert_eq!(at(last + 1), Some((30, DEFAULT_ACCOUNT.to_string())));
+    // A dropped bucket's history goes once the consumer is past the drop:
+    // not before (a change made before it is still to be sent).
+    {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        file.transaction(|tx| {
+            tx.delete_object("bkt", "k", None, false, now(), 0)?
+                .unwrap();
+            tx.delete_bucket("bkt")?.unwrap();
+            Ok(())
+        })
+        .unwrap();
+    }
+    assert!(rows() > 0, "the delete is not sent yet");
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            let last = tx.last_change()?;
+            tx.advance_notifications(last)
+        })
+        .unwrap();
+    assert_eq!(rows(), 0);
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

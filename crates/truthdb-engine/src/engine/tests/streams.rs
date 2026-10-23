@@ -389,3 +389,21 @@ fn a_standby_refuses_to_read_topics() {
         let _ = std::fs::remove_file(path);
     }
 }
+
+#[test]
+fn an_account_that_owns_topics_is_not_dropped() {
+    let path = unique_temp_path("streams-account");
+    let engine = new_engine(&path);
+    let created: Value =
+        serde_json::from_str(&engine.execute("s3 create account tenant").unwrap()).unwrap();
+    let id = created["account_id"].as_str().unwrap().to_string();
+    engine
+        .execute(&format!("stream create topic events account {id}"))
+        .unwrap();
+    let message = command_error(&engine, &format!("s3 drop account {id}"));
+    assert!(message.contains("stream topics"), "{message}");
+    engine.execute("stream drop topic events").unwrap();
+    engine.execute(&format!("s3 drop account {id}")).unwrap();
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}

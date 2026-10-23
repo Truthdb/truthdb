@@ -145,7 +145,11 @@ fn managed_names(
 }
 
 /// The chunks under `prefix`, in order.
-fn chunks(ctx: &mut RelCtx<'_>, tree: &BTree, prefix: &[u8]) -> Result<Vec<KeyRow>, StorageError> {
+pub(crate) fn chunks(
+    ctx: &mut RelCtx<'_>,
+    tree: &BTree,
+    prefix: &[u8],
+) -> Result<Vec<KeyRow>, StorageError> {
     tree.scan_range(
         ctx,
         Some(&chunk_key(prefix, 0)),
@@ -153,7 +157,7 @@ fn chunks(ctx: &mut RelCtx<'_>, tree: &BTree, prefix: &[u8]) -> Result<Vec<KeyRo
     )
 }
 
-fn read(
+pub(crate) fn read(
     ctx: &mut RelCtx<'_>,
     tree: &BTree,
     prefix: &[u8],
@@ -164,7 +168,7 @@ fn read(
 
 impl ObjTxn<'_, '_> {
     /// Replaces the document under `prefix` with `document`.
-    fn put_document(
+    pub(crate) fn put_document(
         &mut self,
         tree: BTree,
         prefix: &[u8],
@@ -183,7 +187,11 @@ impl ObjTxn<'_, '_> {
     }
 
     /// Deletes the document under `prefix`; whether there was one.
-    fn delete_document(&mut self, tree: &BTree, prefix: &[u8]) -> Result<bool, StorageError> {
+    pub(crate) fn delete_document(
+        &mut self,
+        tree: &BTree,
+        prefix: &[u8],
+    ) -> Result<bool, StorageError> {
         let chunks = chunks(self.ctx, tree, prefix)?;
         for (key, _) in &chunks {
             tree.delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;

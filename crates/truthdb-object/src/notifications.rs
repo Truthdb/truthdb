@@ -10,9 +10,10 @@ use truthdb_core::storage::StorageError;
 
 use crate::codec::{Reader, Writer};
 use crate::consumers::Consumer;
-use crate::documents::BUCKET_NOTIFICATION;
+use crate::documents::{BUCKET_NOTIFICATION, read};
 use crate::journal::{JournalRecord, RecordType};
-use truthdb_core::relstore::ctx::OpMode;
+use truthdb_core::relstore::btree::BTree;
+use truthdb_core::relstore::ctx::{OpMode, RelCtx};
 
 use crate::{NOTIFY_HISTORY_TREE, ObjFile, ObjTxn};
 
@@ -370,9 +371,43 @@ pub fn test_message(bucket: &str, request_id: &str, host_id: &str, now_ms: u64) 
     .to_string()
 }
 
-/// `(bucket, 0, journal position)`.
-fn history_key(bucket: &str, position: u64) -> Vec<u8> {
-    [bucket.as_bytes(), &[0], &position.to_be_bytes()].concat()
+/// A history entry's document prefix: `(bucket, 0, journal position, 0)`
+/// (its chunks follow, see `documents`).
+fn history_prefix(bucket: &str, position: u64) -> Vec<u8> {
+    [bucket.as_bytes(), &[0], &position.to_be_bytes(), &[0]].concat()
+}
+
+/// The positions of `bucket`'s history entries up to `last`, oldest first.
+fn history_positions(
+    ctx: &mut RelCtx<'_>,
+    tree: &BTree,
+    bucket: &str,
+    last: u64,
+) -> Result<Vec<u64>, StorageError> {
+    let at = bucket.len() + 1;
+    let mut positions: Vec<u64> = Vec::new();
+    for (key, _) in tree.scan_range(
+        ctx,
+        Some(&history_prefix(bucket, 0)),
+        Some(&[&history_prefix(bucket, last)[..], &u16::MAX.to_be_bytes()].concat()),
+    )? {
+        let position = key
+            .get(at..at + 8)
+            .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
+            .ok_or_else(corrupt)?;
+        if positions.last() != Some(&position) {
+            positions.push(position);
+        }
+    }
+    Ok(positions)
+}
+
+/// A bucket dropped while it had a history, at a journal position: once
+/// the consumer is past it, its history up to it goes. Keyed
+/// `(1, position, bucket)`, apart from every bucket's entries (a bucket
+/// name starts with a letter or digit).
+fn ended_key(position: u64, bucket: &str) -> Vec<u8> {
+    [&[1u8][..], &position.to_be_bytes(), bucket.as_bytes()].concat()
 }
 
 /// `[owner][0: none | 1: configuration]`.
@@ -437,29 +472,44 @@ impl ObjTxn<'_, '_> {
     }
 
     /// A bucket being dropped: no configuration from now on (its changes
-    /// before are sent as configured when made).
+    /// before are sent as configured when made), and its history forgotten
+    /// once they are.
     pub(crate) fn end_notifications(&mut self, bucket: &str) -> Result<(), StorageError> {
-        if self.has_notification_history(bucket)? {
-            let owner = self
-                .bucket_row(bucket)?
-                .map(|row| row.owner)
-                .unwrap_or_default();
-            self.record_history(bucket, &owner, None)?;
+        if !self.has_notification_history(bucket)? {
+            return Ok(());
         }
-        Ok(())
+        let owner = self
+            .bucket_row(bucket)?
+            .map(|row| row.owner)
+            .unwrap_or_default();
+        self.record_history(bucket, &owner, None)?;
+        let position = self.last_change()?;
+        // Dropped again at the same position (made again with no change
+        // between): one mark.
+        let tree = self.trees.notify_history();
+        let mode = &mut OpMode::Txn(self.txn);
+        tree.delete(self.ctx, mode, &ended_key(position, bucket))?;
+        tree.insert_unique(self.ctx, mode, &ended_key(position, bucket), &[])?;
+        let cursor = self.notifications_place()?;
+        self.forget_ended(cursor)
     }
 
     fn has_notification_history(&mut self, bucket: &str) -> Result<bool, StorageError> {
-        Ok(!self
-            .trees
-            .notify_history()
-            .scan_range_limit(
-                self.ctx,
-                Some(&history_key(bucket, 0)),
-                Some(&history_key(bucket, u64::MAX)),
-                1,
-            )?
-            .is_empty())
+        let tree = self.trees.notify_history();
+        Ok(!history_positions(self.ctx, &tree, bucket, u64::MAX)?.is_empty())
+    }
+
+    /// The notifications consumer's cursor (the journal's end when there is
+    /// none yet).
+    fn notifications_place(&mut self) -> Result<u64, StorageError> {
+        match self
+            .consumers()?
+            .into_iter()
+            .find(|consumer| consumer.name == NOTIFICATIONS_CONSUMER)
+        {
+            Some(consumer) => Ok(consumer.cursor),
+            None => self.last_change(),
+        }
     }
 
     /// Records `bucket`'s configuration from the journal's end on, and
@@ -473,36 +523,64 @@ impl ObjTxn<'_, '_> {
         config: Option<&NotificationConfig>,
     ) -> Result<(), StorageError> {
         let position = self.last_change()?;
-        let cursor = self
-            .consumers()?
-            .into_iter()
-            .find(|consumer| consumer.name == NOTIFICATIONS_CONSUMER)
-            .map_or(position, |consumer| consumer.cursor);
+        let cursor = self.notifications_place()?;
         let tree = self.trees.notify_history();
-        let mode = &mut OpMode::Txn(self.txn);
-        let past = tree.scan_range(
-            self.ctx,
-            Some(&history_key(bucket, 0)),
-            Some(&history_key(bucket, cursor.min(position))),
-        )?;
-        if let Some(((newest, row), older)) = past.split_last() {
-            for (key, _) in older {
-                tree.delete(self.ctx, mode, key)?;
+        let past = history_positions(self.ctx, &tree, bucket, cursor.min(position))?;
+        if let Some((&newest, older)) = past.split_last() {
+            for &at in older {
+                self.delete_document(&tree, &history_prefix(bucket, at))?;
             }
-            if decode_history(row)?.is_none() {
-                tree.delete(self.ctx, mode, newest)?;
+            let row =
+                read(self.ctx, &tree, &history_prefix(bucket, newest))?.ok_or_else(corrupt)?;
+            if decode_history(&row)?.is_none() {
+                self.delete_document(&tree, &history_prefix(bucket, newest))?;
             }
         }
-        let key = history_key(bucket, position);
-        tree.delete(self.ctx, mode, &key)?;
-        tree.insert_unique(self.ctx, mode, &key, &encode_history(owner, config))?;
+        self.put_document(
+            tree,
+            &history_prefix(bucket, position),
+            &encode_history(owner, config),
+        )
+    }
+
+    /// Forgets the history of each dropped bucket the consumer is past
+    /// (`cursor`): its entries before the drop, and the none it ended with
+    /// (a bucket made again since has entries from then on).
+    fn forget_ended(&mut self, cursor: u64) -> Result<(), StorageError> {
+        let tree = self.trees.notify_history();
+        let ended = tree.scan_range(
+            self.ctx,
+            Some(&ended_key(0, "")),
+            Some(&[&ended_key(cursor, "")[..], &[0xFF]].concat()),
+        )?;
+        for (key, _) in ended {
+            let position = key
+                .get(1..9)
+                .map(|bytes| u64::from_be_bytes(bytes.try_into().unwrap()))
+                .ok_or_else(corrupt)?;
+            let bucket = std::str::from_utf8(&key[9..])
+                .map_err(|_| corrupt())?
+                .to_string();
+            for at in history_positions(self.ctx, &tree, &bucket, position)? {
+                let prefix = history_prefix(&bucket, at);
+                let none = at == position
+                    && decode_history(&read(self.ctx, &tree, &prefix)?.ok_or_else(corrupt)?)?
+                        .is_none();
+                if at < position || none {
+                    self.delete_document(&tree, &prefix)?;
+                }
+            }
+            tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &key)?;
+        }
         Ok(())
     }
 
     /// Records that the notifications consumer has sent the events of every
     /// change up to `sequence`.
     pub fn advance_notifications(&mut self, sequence: u64) -> Result<(), StorageError> {
-        self.advance_consumer(NOTIFICATIONS_CONSUMER, sequence)
+        self.advance_consumer(NOTIFICATIONS_CONSUMER, sequence)?;
+        let cursor = self.notifications_place()?;
+        self.forget_ended(cursor)
     }
 }
 
@@ -530,15 +608,13 @@ impl ObjFile<'_> {
         let Some(before) = sequence.checked_sub(1) else {
             return Ok(None);
         };
-        let entries = tree.scan_range(
-            &mut self.core.page_ctx(0),
-            Some(&history_key(bucket, 0)),
-            Some(&history_key(bucket, before)),
-        )?;
-        match entries.last() {
-            Some((_, row)) => decode_history(row),
-            None => Ok(None),
-        }
+        let mut ctx = self.core.page_ctx(0);
+        let Some(&newest) = history_positions(&mut ctx, &tree, bucket, before)?.last() else {
+            return Ok(None);
+        };
+        decode_history(
+            &read(&mut ctx, &tree, &history_prefix(bucket, newest))?.ok_or_else(corrupt)?,
+        )
     }
 
     /// The last change the notifications consumer has sent the events of;
