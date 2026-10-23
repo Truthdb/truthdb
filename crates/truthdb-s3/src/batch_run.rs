@@ -28,11 +28,13 @@ use truthdb_object::{
 
 use crate::authz::{Authz, Resource};
 use crate::batch::{
-    Field, GeneratorSpec, ManifestSpec, Operation, OutputSpec, Spec, spec, stored_request,
+    Field, GeneratorSpec, LambdaSpec, ManifestSpec, Operation, OutputSpec, Spec, spec,
+    stored_request,
 };
 use crate::error::S3Error;
 use crate::objects::{DROP_GRACE_MS, now_ms, object_error};
 use crate::server::{Principal, S3State};
+use truthdb_s3client::Poster;
 
 /// How long the runner waits when no job has work.
 const IDLE: Duration = Duration::from_secs(1);
@@ -96,11 +98,16 @@ impl Waits {
 /// the primary's).
 pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
     let mut waits = Waits::default();
+    // LambdaInvoke's POSTs (none, should the client not build: those jobs
+    // fail).
+    let poster = Poster::new(None)
+        .inspect_err(|err| eprintln!("batch operations: no HTTP client: {err}"))
+        .ok();
     loop {
         if *shutdown.borrow() {
             return;
         }
-        let more = !state.storage.is_standby() && step(&state, &mut waits).await;
+        let more = !state.storage.is_standby() && step(&state, &mut waits, poster.as_ref()).await;
         if !more {
             tokio::select! {
                 _ = tokio::time::sleep(IDLE) => {}
@@ -181,7 +188,7 @@ fn next_work<'j>(jobs: &'j [Job], waits: &Waits, now_ms: u64) -> Option<(&'j Job
 }
 
 /// One step of whichever job has work; whether there may be more now.
-async fn step(state: &S3State, waits: &mut Waits) -> bool {
+async fn step(state: &S3State, waits: &mut Waits, poster: Option<&Poster>) -> bool {
     let jobs = match object(state, |file| file.jobs()).await {
         Ok(jobs) => jobs,
         Err(err) => {
@@ -232,7 +239,7 @@ async fn step(state: &S3State, waits: &mut Waits) -> bool {
             })
             .await
         }
-        Work::Run => run_tasks(state, number).await,
+        Work::Run => run_tasks(state, number, poster).await,
     };
     match outcome {
         Ok(()) => {
@@ -1072,6 +1079,10 @@ fn plan(
             }
             return Ok(Ok(Planned::LegalHold(which, *on)));
         }
+        // Invoked outside the lock, not planned here.
+        Operation::Lambda(_) => {
+            return Ok(Err(S3Error::internal("a LambdaInvoke task is not planned")));
+        }
         Operation::Copy(copy) => copy,
     };
     // A CopyObject's keys: its source, the class and the metadata
@@ -1188,27 +1199,34 @@ fn cut(text: &str, max: usize) -> String {
 }
 
 /// Runs up to [`TASKS_PER_STEP`] tasks of Active job `number`: the lines
-/// of its CSV manifest, or the objects its generated one lists.
-async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
+/// of its CSV manifest, or the objects its generated one lists. A
+/// LambdaInvoke job's tasks invoke their function outside the storage lock
+/// (see [`run_invocations`]).
+async fn run_tasks(state: &S3State, number: u64, poster: Option<&Poster>) -> Result<(), String> {
     let now = now_ms();
     let delays = state.restore_delays;
-    object(state, move |file| {
+    let lambda = object(state, move |file| {
         let Some(job) = file.job(number)? else {
-            return Ok(());
+            return Ok(None);
         };
         if job.status != JobStatus::Active {
-            return Ok(());
+            return Ok(None);
         }
         let Some(spec) = job_spec(file, &job)? else {
-            return finish_failed(
+            finish_failed(
                 file,
                 number,
                 "InvalidJob",
                 "The job's request cannot be read",
-            );
+            )?;
+            return Ok(None);
         };
         if !creator_holds(file, &job)? {
-            return finish_failed(file, number, "AccessDenied", CREATOR_GONE);
+            finish_failed(file, number, "AccessDenied", CREATOR_GONE)?;
+            return Ok(None);
+        }
+        if let Operation::Lambda(lambda) = &spec.operation {
+            return Ok(Some((job, (**lambda).clone(), spec.report.clone())));
         }
         file.set_origin(Origin {
             operation: match spec.operation {
@@ -1218,6 +1236,7 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
                 Operation::Restore { .. } => "RestoreObject",
                 Operation::Retention { .. } => "PutObjectRetention",
                 Operation::LegalHold(_) => "PutObjectLegalHold",
+                Operation::Lambda(_) => "",
             }
             .to_string(),
             request_id: job.id(),
@@ -1231,13 +1250,352 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
             who: creator(&job),
             spec: &spec,
         };
-        match (&spec.manifest, &spec.generator) {
-            (Some(manifest), _) => run_lines(file, &job, &task, manifest),
-            (None, Some(generator)) => run_listed(file, &job, &task, &generator.bucket),
-            (None, None) => finish_failed(file, number, "InvalidJob", "The job names no manifest"),
+        match next_items(file, &job, &spec, TASKS_PER_STEP)? {
+            Next::Complete(cursor) => complete(file, number, cursor)?,
+            Next::Failed(code, reason) => finish_failed(file, number, code, &reason)?,
+            Next::Items(items) => {
+                for item in items {
+                    let moved_on = match item.object {
+                        None => moved(
+                            file.transaction(|tx| advance(tx, number, item.start, item.end, None)),
+                        )?,
+                        Some(object) => run_one(file, &task, item.start, item.end, object)?,
+                    };
+                    if moved_on {
+                        break;
+                    }
+                }
+            }
+        }
+        Ok(None)
+    })
+    .await?;
+    if let Some((job, lambda, report)) = lambda {
+        run_invocations(state, poster, job, lambda, report).await?;
+    }
+    Ok(())
+}
+
+/// LambdaInvoke tasks a step invokes at most, and the times one is tried
+/// (a TemporaryFailure, or no answer, is tried again after 1 s, then 2 s).
+const INVOCATIONS_PER_STEP: usize = 16;
+const INVOCATION_TRIES: u32 = 3;
+/// The largest answer a function may give.
+const MAX_INVOCATION_ANSWER: usize = 1 << 20;
+
+/// A step of a LambdaInvoke job: its next tasks taken (and checked: the
+/// creator may invoke the function, the objects are the account's) in one
+/// lock hold, each invoked outside it, then their results recorded in
+/// order, each with the job's place. A crash between an invocation and its
+/// record invokes it again: tasks are invoked at least once, as AWS
+/// invokes them.
+async fn run_invocations(
+    state: &S3State,
+    poster: Option<&Poster>,
+    job: Job,
+    lambda: LambdaSpec,
+    report: Option<crate::batch::ReportSpec>,
+) -> Result<(), String> {
+    let number = job.number;
+    let Some(poster) = poster else {
+        return object(state, move |file| {
+            finish_failed(
+                file,
+                number,
+                "InternalError",
+                "No HTTP client to invoke with",
+            )
+        })
+        .await;
+    };
+    // The function: a topic of the job's account with a webhook.
+    let account = job.account.clone();
+    let function = lambda.function.clone();
+    let webhook = state
+        .engine
+        .run_engine(move |engine| {
+            engine.streams(|file| {
+                let owned = file
+                    .topic(&function)?
+                    .is_some_and(|(topic, _)| topic.account.as_deref() == Some(account.as_str()));
+                Ok(file
+                    .webhooks()?
+                    .into_iter()
+                    .find(|webhook| owned && webhook.topic == function)
+                    .map(|webhook| (webhook.url, webhook.secret)))
+            })
+        })
+        .await
+        .map_err(|err| err.to_string())?;
+    let found = webhook.filter(|_| {
+        lambda
+            .account
+            .as_ref()
+            .is_none_or(|named| *named == job.account)
+    });
+    let Some((url, secret)) = found else {
+        return object(state, move |file| {
+            finish_failed(
+                file,
+                number,
+                "LambdaFunctionNotFound",
+                "The function names no topic of the job's account with a webhook",
+            )
+        })
+        .await;
+    };
+    let now = now_ms();
+    let arn = lambda.arn.clone();
+    let taken = object(state, move |file| {
+        let Some(job) = file.job(number)? else {
+            return Ok(None);
+        };
+        if job.status != JobStatus::Active {
+            return Ok(None);
+        }
+        let Some(spec) = job_spec(file, &job)? else {
+            return Ok(None);
+        };
+        let authz = Authz::load_now(file, &creator(&job), Vec::new(), Vec::new(), now)?;
+        if authz
+            .check_arn("lambda:InvokeFunction", &arn, &job.account)
+            .is_err()
+        {
+            finish_failed(
+                file,
+                number,
+                "AccessDenied",
+                "The job's creator may not invoke the function",
+            )?;
+            return Ok(None);
+        }
+        match next_items(file, &job, &spec, INVOCATIONS_PER_STEP)? {
+            Next::Complete(cursor) => {
+                complete(file, number, cursor)?;
+                Ok(None)
+            }
+            Next::Failed(code, reason) => {
+                finish_failed(file, number, code, &reason)?;
+                Ok(None)
+            }
+            Next::Items(items) => {
+                // Only the account's own buckets' objects are sent.
+                let mut checked = Vec::new();
+                for item in items {
+                    let object = match item.object {
+                        Some(Ok((bucket, key, version))) => {
+                            let owned = file
+                                .bucket(&bucket)?
+                                .is_some_and(|info| info.owner == job.account);
+                            Some(if owned {
+                                Ok((bucket, key, version))
+                            } else {
+                                Err((bucket, "Access Denied".to_string()))
+                            })
+                        }
+                        other => other,
+                    };
+                    checked.push(Item {
+                        start: item.start,
+                        end: item.end,
+                        object,
+                    });
+                }
+                Ok(Some(checked))
+            }
         }
     })
+    .await?;
+    let Some(items) = taken else {
+        return Ok(());
+    };
+    let mut results = Vec::new();
+    for item in items {
+        let result = match &item.object {
+            None => None,
+            Some(Err((text, why))) => Some(JobResult {
+                bucket: cut(text, MAX_RESULT_TEXT),
+                key: String::new(),
+                version_id: String::new(),
+                succeeded: false,
+                http_status: if why == "Access Denied" { 403 } else { 400 },
+                error_code: if why == "Access Denied" {
+                    "AccessDenied"
+                } else {
+                    "InvalidRequest"
+                }
+                .to_string(),
+                message: cut(why, MAX_RESULT_TEXT),
+            }),
+            Some(Ok((bucket, key, version))) => {
+                let task_id = format!("{}-{}", job.id(), item.start);
+                let (succeeded, code, message) = invoke(
+                    poster,
+                    &url,
+                    &secret,
+                    &job,
+                    &lambda,
+                    &task_id,
+                    bucket,
+                    key,
+                    version.as_deref(),
+                )
+                .await;
+                Some(JobResult {
+                    bucket: cut(bucket, MAX_RESULT_TEXT),
+                    key: cut(key, MAX_RESULT_KEY),
+                    version_id: cut(version.as_deref().unwrap_or(""), MAX_RESULT_TEXT),
+                    succeeded,
+                    http_status: 200,
+                    error_code: code,
+                    message: cut(&message, MAX_RESULT_TEXT),
+                })
+            }
+        };
+        results.push((item.start, item.end, result));
+    }
+    object(state, move |file| {
+        for (start, end, result) in results {
+            let keep = |result: &JobResult| {
+                report
+                    .as_ref()
+                    .is_some_and(|report| !report.failed_only || !result.succeeded)
+            };
+            let result = result.map(|result| {
+                let kept = keep(&result);
+                (result, kept)
+            });
+            if moved(file.transaction(|tx| advance(tx, number, start, end, result)))? {
+                break;
+            }
+        }
+        Ok(())
+    })
     .await
+}
+
+/// Invokes the function with one task (as AWS's LambdaInvoke event,
+/// schema 1.0 or 2.0) by a signed POST to its webhook: whether it
+/// succeeded, its error code (empty, PermanentFailure or
+/// TemporaryFailure) and its result string or message.
+#[allow(clippy::too_many_arguments)]
+async fn invoke(
+    poster: &Poster,
+    url: &str,
+    secret: &str,
+    job: &Job,
+    lambda: &LambdaSpec,
+    task_id: &str,
+    bucket: &str,
+    key: &str,
+    version: Option<&str>,
+) -> (bool, String, String) {
+    let encoded_key = percent_encoding::utf8_percent_encode(key, REPORT_KEY).to_string();
+    let mut task = serde_json::json!({
+        "taskId": task_id,
+        "s3Key": encoded_key,
+        "s3VersionId": version,
+    });
+    let mut job_part = serde_json::json!({ "id": job.id() });
+    if lambda.schema_two {
+        task["s3Bucket"] = serde_json::json!(bucket);
+        let arguments: serde_json::Map<String, serde_json::Value> = lambda
+            .user_arguments
+            .iter()
+            .map(|(key, value)| (key.clone(), serde_json::json!(value)))
+            .collect();
+        job_part["userArguments"] = serde_json::Value::Object(arguments);
+    } else {
+        task["s3BucketArn"] = serde_json::json!(format!("arn:aws:s3:::{bucket}"));
+    }
+    let invocation_id = format!("{}-{}", task_id, now_ms());
+    let event = serde_json::json!({
+        "invocationSchemaVersion": if lambda.schema_two { "2.0" } else { "1.0" },
+        "invocationId": invocation_id,
+        "job": job_part,
+        "tasks": [task],
+    })
+    .to_string();
+    let delivery = format!("batch/{task_id}");
+    let mut last = (false, "TemporaryFailure".to_string(), String::new());
+    for attempt in 0..INVOCATION_TRIES {
+        if attempt > 0 {
+            tokio::time::sleep(Duration::from_secs(1 << (attempt - 1))).await;
+        }
+        let secs = now_ms() / 1000;
+        let headers = [
+            ("content-type", "application/json".to_string()),
+            ("x-truthdb-delivery", delivery.clone()),
+            (
+                "x-truthdb-signature",
+                truthdb_s3client::webhook_signature(secret, secs, &delivery, event.as_bytes()),
+            ),
+        ];
+        let answer = poster
+            .post_answer(
+                url,
+                &headers,
+                bytes::Bytes::from(event.clone()),
+                MAX_INVOCATION_ANSWER,
+            )
+            .await;
+        let (status, body) = match answer {
+            Ok(answer) => answer,
+            Err(err) => {
+                last = (
+                    false,
+                    "TemporaryFailure".to_string(),
+                    format!("Lambda invocation failed: {err}"),
+                );
+                continue;
+            }
+        };
+        if status == 429 || status >= 500 {
+            last = (
+                false,
+                "TemporaryFailure".to_string(),
+                format!("Lambda returned function error: HTTP {status}"),
+            );
+            continue;
+        }
+        if !(200..300).contains(&status) {
+            return (
+                false,
+                "PermanentFailure".to_string(),
+                format!("Lambda returned function error: HTTP {status}"),
+            );
+        }
+        let Ok(answer) = serde_json::from_slice::<serde_json::Value>(&body) else {
+            return (
+                false,
+                "PermanentFailure".to_string(),
+                "Invalid JSON returned in Lambda payload".to_string(),
+            );
+        };
+        let result = answer["results"]
+            .as_array()
+            .and_then(|results| results.iter().find(|result| result["taskId"] == task_id));
+        let code = match result {
+            Some(result) => result["resultCode"].as_str().unwrap_or("").to_string(),
+            None => answer["treatMissingKeysAs"]
+                .as_str()
+                .unwrap_or("TemporaryFailure")
+                .to_string(),
+        };
+        let text = result
+            .and_then(|result| result["resultString"].as_str())
+            .unwrap_or("")
+            .to_string();
+        match code.as_str() {
+            "Succeeded" => return (true, String::new(), text),
+            "TemporaryFailure" => {
+                last = (false, "TemporaryFailure".to_string(), text);
+                continue;
+            }
+            _ => return (false, "PermanentFailure".to_string(), text),
+        }
+    }
+    last
 }
 
 /// What every task of a step shares.
@@ -1264,33 +1622,69 @@ fn complete(file: &mut ObjFile<'_>, number: u64, cursor: u64) -> Result<(), Stor
     })
 }
 
-/// A step of a CSV manifest's lines (the job's cursor a byte offset).
-fn run_lines(
+/// A manifest line's or a listed object's place: from `start` to `end` of
+/// the job's cursor, and its object (`None`: a blank line, no task; an
+/// error: a line that names no object, and why).
+struct Item {
+    start: u64,
+    end: u64,
+    object: Option<TaskObject>,
+}
+
+type TaskObject = Result<(String, String, Option<String>), (String, String)>;
+
+/// The next tasks of a job: up to `max` items, or that it is done (at
+/// that cursor), or why it cannot go on.
+enum Next {
+    Items(Vec<Item>),
+    Complete(u64),
+    Failed(&'static str, String),
+}
+
+fn next_items(
     file: &mut ObjFile<'_>,
     job: &Job,
-    task: &Task<'_>,
-    manifest: &ManifestSpec,
-) -> Result<(), StorageError> {
-    let number = job.number;
-    let Some(version) = job.manifest_version else {
-        return finish_failed(
-            file,
-            number,
+    spec: &Spec,
+    max: usize,
+) -> Result<Next, StorageError> {
+    match (&spec.manifest, &spec.generator) {
+        (Some(manifest), _) => next_lines(file, job, manifest, max),
+        (None, Some(generator)) => next_listed(file, job, &generator.bucket, max),
+        (None, None) => Ok(Next::Failed(
             "InvalidJob",
-            "The job's manifest was never prepared",
-        );
+            "The job names no manifest".into(),
+        )),
+    }
+}
+
+/// The next lines of a CSV manifest (the job's cursor a byte offset).
+fn next_lines(
+    file: &mut ObjFile<'_>,
+    job: &Job,
+    manifest: &ManifestSpec,
+    max: usize,
+) -> Result<Next, StorageError> {
+    let Some(version) = job.manifest_version else {
+        return Ok(Next::Failed(
+            "InvalidJob",
+            "The job's manifest was never prepared".into(),
+        ));
     };
     let (bytes, size) = match read_manifest(file, manifest, version, job.cursor, TASK_BYTES)? {
         Ok(read) => read,
-        Err((code, reason)) => return finish_failed(file, number, code, &reason),
+        Err((code, reason)) => return Ok(Next::Failed(code, reason)),
     };
+    let mut items = Vec::new();
     let mut at = 0usize;
-    let mut ran = 0;
-    while ran < TASKS_PER_STEP {
+    let mut tasks = 0;
+    while tasks < max {
         let start = job.cursor + at as u64;
         if start >= size {
             // Every line done: the job completes (a manifest of none, at once).
-            return complete(file, number, start);
+            if items.is_empty() {
+                return Ok(Next::Complete(start));
+            }
+            break;
         }
         let rest = &bytes[at..];
         let (line, next) = match rest.iter().position(|&byte| byte == b'\n') {
@@ -1299,59 +1693,61 @@ fn run_lines(
             // The rest of the line is past what was read: the next step.
             None if at > 0 => break,
             None => {
-                return finish_failed(
-                    file,
-                    number,
+                return Ok(Next::Failed(
                     "ManifestLineTooLong",
-                    "A manifest line is longer than 64 KiB",
-                );
+                    "A manifest line is longer than 64 KiB".into(),
+                ));
             }
         };
         at = next;
         let end = job.cursor + at as u64;
-        let text = String::from_utf8_lossy(line);
-        let text = text.trim_end_matches('\r');
-        // The same test as Preparing's count.
+        // The same test as Preparing's count: a blank line is no task, only
+        // the place moves.
         if blank(line) {
-            // A blank line is no task: only the place moves.
-            if moved(file.transaction(|tx| advance(tx, number, start, end, None)))? {
-                return Ok(());
-            }
+            items.push(Item {
+                start,
+                end,
+                object: None,
+            });
             continue;
         }
-        ran += 1;
-        let object = parse_line(text, &manifest.fields).map_err(|why| (text.to_string(), why));
-        if run_one(file, task, start, end, object)? {
-            return Ok(());
-        }
+        tasks += 1;
+        let text = String::from_utf8_lossy(line);
+        let text = text.trim_end_matches('\r');
+        items.push(Item {
+            start,
+            end,
+            object: Some(parse_line(text, &manifest.fields).map_err(|why| (text.to_string(), why))),
+        });
     }
-    Ok(())
+    Ok(Next::Items(items))
 }
 
-/// A step of a generated manifest's objects (the job's cursor a task
+/// The next objects of a generated manifest (the job's cursor a task
 /// number).
-fn run_listed(
+fn next_listed(
     file: &mut ObjFile<'_>,
     job: &Job,
-    task: &Task<'_>,
     bucket: &str,
-) -> Result<(), StorageError> {
+    max: usize,
+) -> Result<Next, StorageError> {
     if job.cursor >= job.total {
-        return complete(file, job.number, job.cursor);
+        return Ok(Next::Complete(job.cursor));
     }
-    for (seq, key, version_id) in file.job_tasks(job.number, job.cursor, TASKS_PER_STEP)? {
-        let version = (!version_id.is_empty()).then_some(version_id);
-        if run_one(
-            file,
-            task,
-            seq,
-            seq + 1,
-            Ok((bucket.to_string(), key, version)),
-        )? {
-            return Ok(());
-        }
-    }
-    Ok(())
+    Ok(Next::Items(
+        file.job_tasks(job.number, job.cursor, max)?
+            .into_iter()
+            .map(|(seq, key, version_id)| Item {
+                start: seq,
+                end: seq + 1,
+                object: Some(Ok((
+                    bucket.to_string(),
+                    key,
+                    (!version_id.is_empty()).then_some(version_id),
+                ))),
+            })
+            .collect(),
+    ))
 }
 
 /// Runs one task (from `start` to `end` of the job's cursor) on `object`

@@ -83,20 +83,9 @@ fn endpoint(url: &str) -> String {
     format!("{host}:{port}")
 }
 
-/// The signature header's value for `body` posted as `delivery` at `secs`.
-pub(crate) fn signature(secret: &str, secs: u64, delivery: &str, body: &[u8]) -> String {
-    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
-    let mut context = ring::hmac::Context::with_key(&key);
-    context.update(format!("{secs}.{delivery}.").as_bytes());
-    context.update(body);
-    let digest: String = context
-        .sign()
-        .as_ref()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect();
-    format!("t={secs},v1={digest}")
-}
+/// The signature header's value for `body` posted as `delivery` at `secs`
+/// (shared with the S3 API's batch jobs that invoke webhooks).
+pub(crate) use truthdb_s3client::webhook_signature as signature;
 
 impl Engine {
     /// One turn of webhook delivery: records the outcome of each POST that

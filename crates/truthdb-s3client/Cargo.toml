@@ -5,6 +5,7 @@ edition = "2024"
 description = "A small S3 client over hyper and rustls, signing with SigV4."
 
 [dependencies]
+ring = "0.17"
 truthdb-sigv4 = { workspace = true }
 bytes = "1.12.1"
 http-body-util = "0.1.5"

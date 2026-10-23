@@ -165,6 +165,22 @@ pub fn post_target(url: &str) -> Result<Uri, Error> {
     Ok(uri)
 }
 
+/// A webhook POST's `x-truthdb-signature` value: `t=<unix seconds>,v1=<hex
+/// HMAC-SHA256 under the webhook's secret of "<secs>.<delivery id>.<body>">`.
+pub fn webhook_signature(secret: &str, secs: u64, delivery: &str, body: &[u8]) -> String {
+    let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
+    let mut context = ring::hmac::Context::with_key(&key);
+    context.update(format!("{secs}.{delivery}.").as_bytes());
+    context.update(body);
+    let digest: String = context
+        .sign()
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect();
+    format!("t={secs},v1={digest}")
+}
+
 /// Posts bodies to URLs (webhooks), over the same HTTP stack: no proxies,
 /// and redirects are not followed.
 pub struct Poster {
@@ -213,6 +229,45 @@ impl Poster {
         )
         .await;
         Ok(status)
+    }
+
+    /// [`Self::post`], returning the answer's body too (at most `max`
+    /// bytes: a longer one fails).
+    pub async fn post_answer(
+        &self,
+        url: &str,
+        headers: &[(&str, String)],
+        body: Bytes,
+        max: usize,
+    ) -> Result<(u16, Bytes), Error> {
+        let uri = post_target(url)?;
+        let body_len = body.len() as u64;
+        let mut request = Request::builder()
+            .method(Method::POST)
+            .uri(uri)
+            .header("content-length", body_len);
+        for (name, value) in headers {
+            request = request.header(*name, value.as_str());
+        }
+        let request = request
+            .body(Full::new(body))
+            .map_err(|err| invalid(err.to_string()))?;
+        let answer_within =
+            ANSWER_TIMEOUT + std::time::Duration::from_secs(body_len / MIN_SEND_RATE);
+        let response = tokio::time::timeout(answer_within, self.http.request(request))
+            .await
+            .map_err(|_| Error::Transport("no answer in time".to_string()))?
+            .map_err(transport)?;
+        let status = response.status().as_u16();
+        let answer = tokio::time::timeout(
+            ANSWER_TIMEOUT,
+            http_body_util::Limited::new(response.into_body(), max).collect(),
+        )
+        .await
+        .map_err(|_| Error::Transport("the answer did not come in time".to_string()))?
+        .map_err(|err| Error::Transport(format!("the answer could not be read: {err}")))?
+        .to_bytes();
+        Ok((status, answer))
     }
 }
 
