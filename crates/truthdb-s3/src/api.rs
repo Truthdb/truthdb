@@ -96,7 +96,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "select",
     "session",
     "torrent",
-    "website",
 ];
 
 /// The sub-resources the routes below implement, each for some methods and
@@ -122,6 +121,7 @@ const SUBRESOURCES: &[&str] = &[
     "uploads",
     "versioning",
     "versions",
+    "website",
 ];
 
 /// Whether `request` names no sub-resource but those in `allowed`: only
@@ -547,6 +547,19 @@ async fn route(
         (Target::Object(..), _) if has_param(&request, "cors") => Err(S3Error::not_implemented(
             "an object has no ?cors configuration",
         )),
+        (Target::Bucket(bucket), method) if has_param(&request, "website") => {
+            let action = match method {
+                Method::GET => "s3:GetBucketWebsite",
+                Method::PUT => "s3:PutBucketWebsite",
+                Method::DELETE => "s3:DeleteBucketWebsite",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?website"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::website::bucket_website(state, request, auth, bucket, method).await
+        }
+        (Target::Object(..), _) if has_param(&request, "website") => Err(
+            S3Error::not_implemented("an object has no ?website configuration"),
+        ),
         (Target::Bucket(bucket), method) if has_param(&request, "lifecycle") => {
             let action = match method {
                 Method::GET => "s3:GetLifecycleConfiguration",
