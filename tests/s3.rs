@@ -12643,6 +12643,73 @@ fn requests_are_counted_per_bucket_by_kind_bytes_errors_and_latency() {
         ),
         404
     );
+    // A copy source on what is not a copy takes nothing, though the
+    // request succeeds.
+    let tagging = b"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>";
+    let tagging_md5 = content_md5(tagging);
+    assert_eq!(
+        call(
+            "PUT",
+            "/meters/a",
+            "tagging",
+            &[
+                ("content-md5", &tagging_md5),
+                ("x-amz-copy-source", "/not-a-copy-source/k")
+            ],
+            tagging
+        ),
+        200
+    );
+    // A form upload is a POST, and a preflight (to a bucket with a CORS
+    // configuration) a request.
+    let form = signed_form(
+        &key,
+        &secret,
+        "2099-01-01T00:00:00.000Z",
+        &[
+            serde_json::json!({"bucket": "meters"}),
+            serde_json::json!({"key": "formed"}),
+        ],
+        &[("key", "formed")],
+    );
+    let (_, form_bytes) = form_body(&form, "f.txt", b"form");
+    let (_, (status, reply)) = post_form(port, "meters", &form, "f.txt", b"form", 1000);
+    assert_eq!(status, 204, "{reply}");
+    let (count, up, down) = sent.get();
+    sent.set((
+        count + 1,
+        up + form_bytes.len() as u64,
+        down + reply.len() as u64,
+    ));
+    let cors = b"<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin>\
+        <AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>";
+    let cors_md5 = content_md5(cors);
+    assert_eq!(
+        call(
+            "PUT",
+            "/meters",
+            "cors",
+            &[("content-md5", &cors_md5)],
+            cors
+        ),
+        200
+    );
+    let (_, (status, reply)) = send_with(
+        port,
+        "OPTIONS",
+        "/meters/a",
+        "",
+        &[
+            ("origin", "https://a.example"),
+            ("access-control-request-method", "GET"),
+        ],
+        b"",
+        "",
+        None,
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (count, up, down) = sent.get();
+    sent.set((count + 1, up, down + reply.len() as u64));
     // An aws-chunked upload counts its payload, not its framing.
     let (status, reply) = put_chunked(
         port,
@@ -12710,10 +12777,10 @@ fn requests_are_counted_per_bucket_by_kind_bytes_errors_and_latency() {
         [
             count as i64 - 1,
             3,
-            3,
+            4,
             2,
             1,
-            0,
+            1,
             1,
             down as i64,
             up as i64,

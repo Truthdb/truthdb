@@ -270,8 +270,8 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
             response.status().as_u16(),
             started.elapsed(),
         );
-        // The source of a copy made (so it exists, and could be read).
-        if let Some(source) = metered.copy_source
+        // The source of a copy made (one the route copied from, and read).
+        if let Some(source) = seen.copy_source()
             && response.status().is_success()
         {
             state.request_metrics.bucket(&source).copied_from();

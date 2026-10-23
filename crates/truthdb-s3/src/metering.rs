@@ -4,8 +4,8 @@
 //! sent.
 
 use std::pin::Pin;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -17,22 +17,50 @@ use truthdb_engine::metrics::{BucketRequests, RequestKind};
 use crate::api::{Target, has_param, plain};
 use crate::server::Body;
 
-/// Whether the bucket a request names exists, in its extensions: set by the
-/// route that loads the bucket to authorize the request (or, on a website
-/// endpoint, to read its configuration). Only a bucket that exists is
-/// counted: a name anyone may send must not take memory, nor crowd out the
-/// buckets there are.
+/// What the route found of a request's buckets, in its extensions: whether
+/// the bucket it names exists (set where the route loads the bucket to
+/// authorize the request, or, on a website endpoint, to read its
+/// configuration), and the bucket a copy reads, when the route copies from
+/// one that exists. Only buckets that exist are counted: a name anyone may
+/// send must not take memory, nor crowd out the buckets there are.
 #[derive(Clone, Default)]
-pub(crate) struct BucketSeen(Arc<AtomicBool>);
+pub(crate) struct BucketSeen(Arc<Seen>);
+
+#[derive(Default)]
+struct Seen {
+    bucket: AtomicBool,
+    copy_source: Mutex<Option<String>>,
+}
 
 impl BucketSeen {
     pub(crate) fn mark(&self) {
-        self.0.store(true, Ordering::Relaxed);
+        self.0.bucket.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn seen(&self) -> bool {
-        self.0.load(Ordering::Relaxed)
+        self.0.bucket.load(Ordering::Relaxed)
     }
+
+    pub(crate) fn mark_copy_source(&self, bucket: &str) {
+        *self
+            .0
+            .copy_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bucket.to_string());
+    }
+
+    pub(crate) fn copy_source(&self) -> Option<String> {
+        self.0
+            .copy_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+}
+
+/// The record of what the route finds, from `request`'s extensions.
+pub(crate) fn seen_of<B>(request: &Request<B>) -> Option<BucketSeen> {
+    request.extensions().get::<BucketSeen>().cloned()
 }
 
 /// Marks, in `request`'s extensions, that the bucket it names exists.
@@ -42,12 +70,10 @@ pub(crate) fn mark_seen<B>(request: &Request<B>) {
     }
 }
 
-/// What a request counts as: its bucket, its kind, and the bucket a copy
-/// reads (S3 counts a GET there too, once the copy is made).
+/// What a request counts as: its bucket and its kind.
 pub(crate) struct Metered {
     pub bucket: String,
     pub kind: RequestKind,
-    pub copy_source: Option<String>,
 }
 
 /// What `request` counts as, if it is for a bucket: not for the service
@@ -63,7 +89,6 @@ pub(crate) fn metered(request: &Request<Incoming>) -> Option<Metered> {
         return Some(Metered {
             bucket: bucket.clone(),
             kind,
-            copy_source: None,
         });
     }
     if matches!(
@@ -88,15 +113,7 @@ pub(crate) fn metered(request: &Request<Incoming>) -> Option<Metered> {
         (false, Method::GET) if plain(request, &["versions", "uploads"]) => RequestKind::List,
         _ => RequestKind::Other,
     };
-    let copy_source = (object && *method == Method::PUT)
-        .then(|| crate::copy::copy_source(request.headers()).ok())
-        .flatten()
-        .map(|(bucket, _, _)| bucket);
-    Some(Metered {
-        bucket,
-        kind,
-        copy_source,
-    })
+    Some(Metered { bucket, kind })
 }
 
 /// The bytes a request's head says its payload has: an aws-chunked body's
