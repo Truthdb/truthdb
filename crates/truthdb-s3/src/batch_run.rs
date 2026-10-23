@@ -136,8 +136,9 @@ struct Invoking(Arc<std::sync::Mutex<InvokingSets>>);
 struct InvokingSets {
     /// Jobs invoking now.
     jobs: std::collections::HashSet<u64>,
-    /// Jobs whose invocations ended in an error, for the runner to back off.
-    failed: Vec<u64>,
+    /// Jobs whose invocation steps ended (and whether in an error), for the
+    /// runner to clear or back off their waits.
+    ended: Vec<(u64, bool)>,
 }
 
 /// Jobs invoking at once, at most.
@@ -163,14 +164,12 @@ impl Invoking {
     fn release(&self, number: u64, failed: bool) {
         let mut sets = self.0.lock().expect("invoking poisoned");
         sets.jobs.remove(&number);
-        if failed {
-            sets.failed.push(number);
-        }
+        sets.ended.push((number, failed));
     }
 
-    /// The jobs whose invocations failed since last asked.
-    fn take_failed(&self) -> Vec<u64> {
-        std::mem::take(&mut self.0.lock().expect("invoking poisoned").failed)
+    /// The jobs whose invocation steps ended since last asked.
+    fn take_ended(&self) -> Vec<(u64, bool)> {
+        std::mem::take(&mut self.0.lock().expect("invoking poisoned").ended)
     }
 }
 
@@ -249,6 +248,18 @@ fn next_work<'j>(
         .map(|job| (job, Work::Run))
 }
 
+/// Jobs whose invocation steps ended in their own task: a failure backed
+/// off as a failing step is, a success clearing the wait.
+fn ended_invocations(waits: &mut Waits, invoking: &Invoking, now: Instant) {
+    for (number, failed) in invoking.take_ended() {
+        if failed {
+            waits.failed(number, now);
+        } else {
+            waits.0.remove(&number);
+        }
+    }
+}
+
 /// One step of whichever job has work; whether there may be more now.
 async fn step(
     state: &Arc<S3State>,
@@ -266,11 +277,7 @@ async fn step(
     waits
         .0
         .retain(|number, _| jobs.iter().any(|job| job.number == *number));
-    // Jobs whose invocations failed in their own task: backed off as a
-    // failing step is.
-    for number in invoking.take_failed() {
-        waits.failed(number, Instant::now());
-    }
+    ended_invocations(waits, invoking, Instant::now());
     let Some((job, work)) = next_work(&jobs, waits, invoking, now_ms()) else {
         return false;
     };
@@ -312,12 +319,15 @@ async fn step(
             .await
         }
         Work::Run => match run_tasks(state, number, poster, invoking).await {
+            Ok(Ran::Here) => Ok(()),
+            // Invoking in its own task: its wait is decided when it ends.
+            Ok(Ran::Invoking) => return true,
             // No place to invoke: the job waits a moment, others go on.
-            Ok(false) => {
+            Ok(Ran::NoPlace) => {
                 waits.pause(number, Instant::now());
                 return true;
             }
-            outcome => outcome.map(|_| ()),
+            Err(err) => Err(err),
         },
     };
     match outcome {
@@ -1286,7 +1296,7 @@ async fn run_tasks(
     number: u64,
     poster: Option<&Arc<Poster>>,
     invoking: &Invoking,
-) -> Result<bool, String> {
+) -> Result<Ran, String> {
     let now = now_ms();
     let delays = state.restore_delays;
     let lambda = object(state, move |file| {
@@ -1354,11 +1364,10 @@ async fn run_tasks(
         Ok(None)
     })
     .await?;
-    // Invoked in a task of its own, when a place is free (else: false,
-    // the job waits a moment).
+    // Invoked in a task of its own, when a place is free.
     if let Some((job, lambda, report)) = lambda {
         if !invoking.take(number) {
-            return Ok(false);
+            return Ok(Ran::NoPlace);
         }
         let (state, poster, invoking) = (Arc::clone(state), poster.cloned(), invoking.clone());
         tokio::spawn(async move {
@@ -1368,8 +1377,9 @@ async fn run_tasks(
             }
             invoking.release(number, outcome.is_err());
         });
+        return Ok(Ran::Invoking);
     }
-    Ok(true)
+    Ok(Ran::Here)
 }
 
 /// LambdaInvoke tasks a step invokes at most, and the times one is tried
@@ -1715,6 +1725,14 @@ async fn invoke(
         }
     }
     last
+}
+
+/// How a job's step ran: here, in a task of its own (invoking), or not at
+/// all (no place to invoke was free).
+enum Ran {
+    Here,
+    Invoking,
+    NoPlace,
 }
 
 /// What every task of a step shares.
@@ -2316,8 +2334,12 @@ mod tests {
         assert!(invoking.take(3));
         assert_eq!(pick(&fresh, &invoking), Some(2));
         invoking.release(3, true);
-        assert_eq!(invoking.take_failed(), vec![3], "a failure to back off");
-        assert!(invoking.take_failed().is_empty());
+        assert_eq!(
+            invoking.take_ended(),
+            vec![(3, true)],
+            "a failure to back off"
+        );
+        assert!(invoking.take_ended().is_empty());
         assert_eq!(pick(&fresh, &invoking), Some(3));
         // At most MAX_INVOKING at once.
         for n in 100..100 + MAX_INVOKING as u64 {
@@ -2330,6 +2352,19 @@ mod tests {
             waits.failed(1, now);
         }
         assert_eq!(waits.0[&1].1, MAX_WAIT);
+        // Invocation steps ending: failures one after another grow the wait,
+        // a success clears it.
+        let (mut backoff, ending) = (Waits::default(), Invoking::default());
+        for expected in [IDLE, IDLE * 2, IDLE * 4] {
+            assert!(ending.take(7));
+            ending.release(7, true);
+            ended_invocations(&mut backoff, &ending, now);
+            assert_eq!(backoff.0[&7].1, expected);
+        }
+        ending.release(7, false);
+        ended_invocations(&mut backoff, &ending, now);
+        assert!(!backoff.0.contains_key(&7));
+
         // A pause does not grow; a failure after one waits a second at least.
         waits.pause(5, now);
         assert_eq!(waits.0[&5].1, Duration::ZERO);
