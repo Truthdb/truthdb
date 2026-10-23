@@ -180,7 +180,7 @@ fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\n{RESTORE_SECONDS}{tls_config}{encryption}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\n{RESTORE_SECONDS}{tls_config}{encryption}",
             dir.join("truth.db").display()
         ),
     )
@@ -481,7 +481,12 @@ fn signed_request(
     secret: Option<&str>,
 ) -> String {
     let amz_date = amz_now();
-    let host = format!("127.0.0.1:{port}");
+    // A `host` among the extra headers replaces the listener's address.
+    let host = extra
+        .iter()
+        .find(|(name, _)| *name == "host")
+        .map_or_else(|| format!("127.0.0.1:{port}"), |(_, host)| host.to_string());
+    let extra: Vec<&(&str, &str)> = extra.iter().filter(|(name, _)| *name != "host").collect();
     let payload = sigv4::sha256_hex(body);
     // Extra headers are signed too (SigV4 lists signed headers sorted), except
     // the ones named `unsigned-<name>`, sent as `<name>` without a signature.
@@ -11320,4 +11325,195 @@ fn cors_preflights_and_cross_origin_answers_follow_the_bucket_configuration() {
     assert_eq!(call("DELETE", "/web", "cors", &[], b"").1.0, 204);
     assert_eq!(call("GET", "/web", "cors", &[], b"").1.0, 404);
     assert_eq!(preflight("/web", &asking).1.0, 403);
+}
+
+#[test]
+fn a_bucket_is_named_by_the_host_under_a_configured_domain() {
+    // The test servers take `s3.test` for their domain.
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, key, secret) = account_with_key(&server, "hosted");
+    let virtual_host = format!("vbucket.s3.test:{port}");
+    let call =
+        |host: &str, method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+            let mut headers = vec![("host", host)];
+            headers.extend_from_slice(extra);
+            send_with(
+                port,
+                method,
+                path,
+                query,
+                &headers,
+                body,
+                &key,
+                Some(&secret),
+            )
+        };
+    // CreateBucket and PutObject addressed by the host: the path is the
+    // whole key, slashes and all.
+    let (_, (status, _)) = call(&virtual_host, "PUT", "/", "", &[], b"");
+    assert_eq!(status, 200);
+    let (_, (status, _)) = call(&virtual_host, "PUT", "/a/b.txt", "", &[], b"hosted body");
+    assert_eq!(status, 200);
+    // Path-style, on the domain itself or another host, reads it back.
+    for host in [format!("s3.test:{port}"), format!("127.0.0.1:{port}")] {
+        let (_, (status, body)) = call(&host, "GET", "/vbucket/a/b.txt", "", &[], b"");
+        assert_eq!((status, body.as_str()), (200, "hosted body"), "{host}");
+    }
+    // A bucket of the host: listed, and the host's case does not matter.
+    let (_, (status, listed)) = call(
+        &format!("VBucket.S3.Test:{port}"),
+        "GET",
+        "/",
+        "list-type=2",
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200, "{listed}");
+    assert_eq!(xml_value(&listed, "Key"), "a/b.txt");
+    // A dotted bucket name is the whole leading part of the host.
+    let (_, (status, _)) = call(
+        &format!("dotted.name.s3.test:{port}"),
+        "PUT",
+        "/",
+        "",
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let (_, (status, _)) = call(
+        &format!("127.0.0.1:{port}"),
+        "HEAD",
+        "/dotted.name",
+        "",
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    // An object at an S3 Control path in a bucket named by the host is that
+    // object, header or not: the host names a bucket, not the account.
+    let account_header = [("x-amz-account-id", account.as_str())];
+    let (_, (status, _)) = call(
+        &virtual_host,
+        "PUT",
+        "/v20180820/jobs",
+        "",
+        &account_header,
+        b"job",
+    );
+    assert_eq!(status, 200);
+    let (_, (status, body)) = call(
+        &format!("127.0.0.1:{port}"),
+        "GET",
+        "/vbucket/v20180820/jobs",
+        "",
+        &[],
+        b"",
+    );
+    assert_eq!((status, body.as_str()), (200, "job"));
+    // S3 Control with the account as the host's first label (as the SDKs
+    // address it), and path-style.
+    for host in [
+        format!("{account}.s3.test:{port}"),
+        format!("127.0.0.1:{port}"),
+    ] {
+        let (_, (status, jobs)) = call(&host, "GET", "/v20180820/jobs", "", &account_header, b"");
+        assert_eq!(status, 200, "{host}: {jobs}");
+        assert!(jobs.contains("<ListJobsResult"), "{jobs}");
+    }
+    // A request target in absolute form must name the Host header's host.
+    let absolute = |target_host: &str| {
+        let request = signed_request(
+            port,
+            "GET",
+            "/a/b.txt",
+            "",
+            &[("host", virtual_host.as_str())],
+            b"",
+            &key,
+            Some(&secret),
+        );
+        let request = request.replacen(
+            "GET /a/b.txt ",
+            &format!("GET http://{target_host}/a/b.txt "),
+            1,
+        );
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+        stream.write_all(request.as_bytes()).expect("send");
+        let mut answer = String::new();
+        stream.read_to_string(&mut answer).expect("answer");
+        answer
+    };
+    let answer = absolute(&format!("other.s3.test:{port}"));
+    assert!(answer.starts_with("HTTP/1.1 400"), "{answer}");
+    let answer = absolute(&virtual_host.to_uppercase());
+    assert!(answer.starts_with("HTTP/1.1 200"), "{answer}");
+    assert!(answer.ends_with("hosted body"), "{answer}");
+    // Errors carry the host's bucket.
+    let (_, (status, missing)) = call(&format!("absent.s3.test:{port}"), "GET", "/k", "", &[], b"");
+    assert_eq!(status, 404);
+    assert_eq!(xml_value(&missing, "Code"), "NoSuchBucket");
+    assert_eq!(
+        xml_value(&missing, "Message"),
+        "The bucket absent does not exist"
+    );
+}
+
+#[test]
+fn boto3_addresses_buckets_by_host() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, key, secret) = account_with_key(&server, "boto");
+    let script = server.dir.join("virtual.py");
+    std::fs::write(
+        &script,
+        r#"
+import socket, sys, urllib.request
+import boto3, botocore.config
+port, account, key, secret = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[4]
+# Every *.s3.test name is the local listener.
+resolve = socket.getaddrinfo
+socket.getaddrinfo = lambda host, *rest, **kw: resolve("127.0.0.1", *rest, **kw)
+sent = []
+def client(service, **config):
+    made = boto3.client(service, endpoint_url=f"http://s3.test:{port}", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret, config=botocore.config.Config(**config))
+    made.meta.events.register("before-send", lambda request, **kw: sent.append(request.url))
+    return made
+s3 = client("s3", s3={"addressing_style": "virtual"}, signature_version="s3v4")
+s3.create_bucket(Bucket="hosted")
+s3.put_object(Bucket="hosted", Key="dir/one.txt", Body=b"one")
+assert s3.get_object(Bucket="hosted", Key="dir/one.txt")["Body"].read() == b"one"
+listed = s3.list_objects_v2(Bucket="hosted", Prefix="dir/")
+assert [item["Key"] for item in listed["Contents"]] == ["dir/one.txt"], listed
+url = s3.generate_presigned_url("get_object", Params={"Bucket": "hosted", "Key": "dir/one.txt"})
+assert url.startswith(f"http://hosted.s3.test:{port}/dir/one.txt?"), url
+assert urllib.request.urlopen(url).read() == b"one"
+s3.delete_object(Bucket="hosted", Key="dir/one.txt")
+s3.delete_bucket(Bucket="hosted")
+assert all(url.startswith(f"http://hosted.s3.test:{port}/") for url in sent), sent
+control = client("s3control")
+jobs = control.list_jobs(AccountId=account)
+assert jobs["Jobs"] == [], jobs
+assert sent[-1].startswith(f"http://{account}.s3.test:{port}/v20180820/jobs"), sent
+print("ok")
+"#,
+    )
+    .expect("script");
+    let output = Command::new(python)
+        .arg(&script)
+        .args([&port.to_string(), &account, &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }

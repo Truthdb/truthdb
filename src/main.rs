@@ -278,6 +278,13 @@ async fn main() -> ExitCode {
                 return ExitCode::FAILURE;
             }
         };
+        let domains = match config.s3.domain_names() {
+            Ok(domains) => domains,
+            Err(err) => {
+                eprintln!("{err}");
+                return ExitCode::FAILURE;
+            }
+        };
         match tokio::net::TcpListener::bind((config.s3.addr.as_str(), config.s3.port)).await {
             Ok(listener) => {
                 info!(
@@ -296,6 +303,7 @@ async fn main() -> ExitCode {
                         standard: config.s3.restore_seconds.standard,
                         bulk: config.s3.restore_seconds.bulk,
                     },
+                    domains,
                 });
                 let shutdown_rx = shutdown_tx.subscribe();
                 Some(tokio::spawn(truthdb_s3::server::serve(

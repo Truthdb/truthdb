@@ -50,6 +50,9 @@ pub struct S3State {
     pub storage: std::sync::Arc<truthdb_core::storage::Storage>,
     /// How long a restore of an archived object takes, per retrieval tier.
     pub restore_delays: crate::restore::RestoreDelays,
+    /// The domains whose subdomains name buckets (virtual-hosted
+    /// addressing), in lowercase.
+    pub domains: Vec<String>,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
@@ -195,6 +198,23 @@ impl RequestIds {
 
 async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Body> {
     let resource = request.uri().path().to_string();
+    // Virtual-hosted addressing: the bucket named by the Host, decided once
+    // for every reader of the request's target.
+    let host = request
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .or_else(|| {
+            request
+                .uri()
+                .authority()
+                .map(|authority| authority.as_str())
+        });
+    if let Some(bucket) = host.and_then(|host| crate::api::host_bucket(host, &state.domains)) {
+        request
+            .extensions_mut()
+            .insert(crate::api::VirtualHost(bucket));
+    }
     let ids = RequestIds::new();
     request.extensions_mut().insert(ids.clone());
     // A cross-origin request (not a preflight, which answers for itself):
@@ -210,7 +230,7 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                 .map(str::to_string)
         })
         .flatten()
-        .and_then(|origin| match crate::api::target(&resource).ok()? {
+        .and_then(|origin| match crate::api::target(&request).ok()? {
             crate::api::Target::Bucket(bucket) | crate::api::Target::Object(bucket, _) => {
                 Some((bucket, origin, request.method().clone()))
             }
@@ -257,6 +277,20 @@ pub fn full(text: impl Into<Bytes>) -> Body {
 }
 
 async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Response<Body>, S3Error> {
+    // A request target in absolute form names its host, which must be the
+    // Host header (signed, and read for the bucket): a proxy in front would
+    // route by the one, this server by the other.
+    if let (Some(authority), Some(host)) = (
+        request.uri().authority(),
+        request.headers().get(hyper::header::HOST),
+    ) && !host
+        .as_bytes()
+        .eq_ignore_ascii_case(authority.as_str().as_bytes())
+    {
+        return Err(S3Error::invalid_request(
+            "the request target's host is not the Host header",
+        ));
+    }
     // S3 Vectors' JSON API on the same listener, told apart by the
     // service its requests are signed for.
     match request_service(&request).as_deref() {
@@ -292,7 +326,7 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
         && request.uri().query().is_none()
         && !request.headers().contains_key("authorization")
         && crate::post::is_form(&request)
-        && let crate::api::Target::Bucket(bucket) = crate::api::target(request.uri().path())?
+        && let crate::api::Target::Bucket(bucket) = crate::api::target(&request)?
     {
         return crate::post::post_object(state, request, bucket).await;
     }
