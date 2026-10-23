@@ -1,14 +1,18 @@
 //! Imports from another S3 service (`s3 create import`), run on a thread of
-//! their own (see `session::pool`): each step takes the oldest running
-//! import a little further. It lists the source after the import's place;
-//! an object the destination already holds with the same size and ETag is
-//! skipped; any other is read from the source and written as a new object,
-//! its place moving in the same transaction (see `truthdb_object::Import`).
-//! An object that cannot be copied is recorded and passed over; a source
-//! that refuses the import itself (its keys, its bucket) fails it; a source
-//! that cannot be reached is tried again later. A standby imports nothing.
+//! their own (see `session::pool`): each step takes the running import that
+//! waited longest a little further. It lists the source after the import's
+//! place; an object the destination already holds with the same size and
+//! ETag is skipped; any other is read from the source and written as a new
+//! object, its place moving in the same transaction (see
+//! `truthdb_object::Import`).
+//!
+//! An object the source refuses (gone, forbidden) is recorded and passed
+//! over. A source that refuses the import itself (its keys, its bucket, a
+//! redirect), or that lists out of order, fails it. A source that cannot be
+//! reached or answers 5xx, while listing or while sending an object, is
+//! tried again later from the same place. A storage error ends the step
+//! without moving on. A standby imports nothing.
 
-use http_body_util::BodyExt;
 use truthdb_object::{
     BodyWriter, Import, ImportState, ObjectAttrs, ObjectError, Origin, StorageClass, VersionSel,
 };
@@ -28,27 +32,48 @@ enum Outcome {
     /// Copied: the import as it now stands.
     Copied(Box<Import>),
     Skipped,
+    /// The source refused this object: recorded and passed over.
     Failed(String),
-    /// The destination bucket is gone: the import cannot go on.
-    NoBucket,
+    /// The source could not be reached: the same object, later.
+    Retry(String),
+    /// The import cannot go on (its destination is gone or has Object
+    /// Lock).
+    Fatal(String),
     /// The import was dropped meanwhile.
     Dropped,
+    /// The server is stopping.
+    Stopped,
+}
+
+/// Whether a source error will not clear by waiting: anything but a
+/// transport failure or a 5xx answer.
+fn permanent(err: &S3Error) -> bool {
+    match err {
+        S3Error::Invalid(_) => true,
+        S3Error::Service { status, .. } => *status < 500,
+        S3Error::Transport(_) => false,
+    }
 }
 
 impl Engine {
-    /// One step of the oldest running import; returns whether one is
-    /// running (more steps are wanted).
+    /// One step of the running import that waited longest; returns whether
+    /// more steps are wanted at once. `stopping` says when the server is
+    /// shutting down.
     pub(crate) fn import_step(
         &self,
         runtime: &tokio::runtime::Runtime,
+        stopping: &dyn Fn() -> bool,
     ) -> Result<bool, EngineError> {
         if self.storage.is_standby() || !self.runs_objects() {
             return Ok(false);
         }
+        // Turn by turn: one that keeps waiting for its source does not hold
+        // the others back.
         let Some(mut import) = self
             .object(|file| file.imports())?
             .into_iter()
-            .find(|import| import.state == ImportState::Running)
+            .filter(|import| import.state == ImportState::Running)
+            .min_by_key(|import| import.updated_ms)
         else {
             return Ok(false);
         };
@@ -68,34 +93,37 @@ impl Engine {
             &import.after,
         )) {
             Ok(page) => page,
-            // Refused for good (keys, bucket): the import fails.
-            Err(S3Error::Service {
-                status,
-                code,
-                message,
-            }) if (400..500).contains(&status) => {
-                return self.end_import(
-                    import,
-                    ImportState::Failed,
-                    format!("{code} ({status}): {message}"),
-                );
+            Err(err) if permanent(&err) => {
+                return self.end_import(import, ImportState::Failed, err.to_string());
             }
-            // Not reached: tried again on a later step.
-            Err(err) => {
-                import.error = err.to_string();
-                self.save_import(&import)?;
-                return Ok(false);
-            }
+            Err(err) => return self.wait_import(import, err.to_string()),
         };
+        if page.objects.is_empty() && page.next.is_some() {
+            return self.end_import(
+                import,
+                ImportState::Failed,
+                "the source listed an empty page with more to come".to_string(),
+            );
+        }
         let last_page = page.next.is_none() && page.objects.len() <= STEP_OBJECTS;
         for object in page.objects.iter().take(STEP_OBJECTS) {
-            match self.import_object(runtime, &client, &import, object)? {
+            // Keys come in order, after the place: else the import would
+            // never end (or count objects twice).
+            if !import.after.is_empty() && object.key <= import.after {
+                let error = format!("the source listed {} out of order", object.key);
+                return self.end_import(import, ImportState::Failed, error);
+            }
+            match self.import_object(runtime, &client, &import, object, stopping)? {
                 Outcome::Copied(copied) => import = *copied,
-                // Dropped meanwhile: nothing more to do.
                 Outcome::Dropped => return Ok(true),
-                Outcome::NoBucket => {
-                    let error = format!("the bucket {} is gone", import.bucket);
+                Outcome::Fatal(error) => {
                     return self.end_import(import, ImportState::Failed, error);
+                }
+                Outcome::Retry(error) => return self.wait_import(import, error),
+                Outcome::Stopped => {
+                    import.updated_ms = super::now_ms();
+                    self.save_import(&import)?;
+                    return Ok(false);
                 }
                 // Saved with the next write (a crash only skips it again).
                 Outcome::Skipped => {
@@ -140,6 +168,7 @@ impl Engine {
         client: &Client,
         import: &Import,
         object: &Listed,
+        stopping: &dyn Fn() -> bool,
     ) -> Result<Outcome, EngineError> {
         let Some(relative) = object.key.strip_prefix(&import.source.prefix) else {
             return Ok(Outcome::Failed(format!(
@@ -155,53 +184,61 @@ impl Engine {
             Ok(info) if info.size == object.size && info.etag() == object.etag => {
                 return Ok(Outcome::Skipped);
             }
-            Err(ObjectError::NoSuchBucket) => return Ok(Outcome::NoBucket),
+            Err(ObjectError::NoSuchBucket) => {
+                return Ok(Outcome::Fatal(format!(
+                    "the bucket {} is gone",
+                    import.bucket
+                )));
+            }
             _ => {}
         }
+        let mut download =
+            match runtime.block_on(client.get_object(&import.source.bucket, &object.key)) {
+                Ok(download) => download,
+                Err(err) if permanent(&err) => return Ok(Outcome::Failed(err.to_string())),
+                Err(err) => return Ok(Outcome::Retry(err.to_string())),
+            };
+        // A storage error ends the step (the staging body it leaves is
+        // collected as abandoned).
         let storage: &truthdb_core::storage::Storage = &self.storage;
-        let now = super::now_ms();
-        let written = runtime.block_on(async {
-            let mut download = client
-                .get_object(&import.source.bucket, &object.key)
-                .await
-                .map_err(|err| err.to_string())?;
-            let mut writer = BodyWriter::begin(storage, now).map_err(|err| err.to_string())?;
-            let mut size = 0u64;
-            while let Some(frame) = download.body.frame().await {
-                let frame = frame.map_err(|err| err.to_string())?;
-                if let Ok(data) = frame.into_data() {
-                    size += data.len() as u64;
-                    writer
-                        .write(storage, &data, super::now_ms())
-                        .map_err(|err| err.to_string())?;
-                }
+        let mut writer = BodyWriter::begin(storage, super::now_ms())?;
+        let mut size = 0u64;
+        loop {
+            if stopping() {
+                return Ok(Outcome::Stopped);
             }
-            let sealed = writer
-                .finish(storage, super::now_ms())
-                .map_err(|err| err.to_string())?;
-            Ok::<_, String>((sealed, size, download.head))
-        });
-        let (sealed, size, head) = match written {
-            Ok(written) => written,
-            // The staging body it leaves is collected as abandoned.
-            Err(error) => return Ok(Outcome::Failed(error)),
-        };
-        // An ETag that is an MD5 (not a multipart one) must be the bytes'.
-        let etag = object.etag.trim_matches('"');
+            match runtime.block_on(download.next_chunk()) {
+                Ok(Some(data)) => {
+                    size += data.len() as u64;
+                    writer.write(storage, &data, super::now_ms())?;
+                }
+                Ok(None) => break,
+                Err(err) => return Ok(Outcome::Retry(err.to_string())),
+            }
+        }
+        let sealed = writer.finish(storage, super::now_ms())?;
+        // An ETag that is an MD5 (not a multipart one, nor one of an object
+        // under a KMS key, which is not) must be the bytes'.
+        let etag = object.etag.trim_matches('"').to_ascii_lowercase();
+        let kms = download
+            .head
+            .server_side_encryption
+            .as_deref()
+            .is_some_and(|algorithm| algorithm.starts_with("aws:kms"));
         let md5: String = sealed
             .md5
             .iter()
             .map(|byte| format!("{byte:02x}"))
             .collect();
-        if size != object.size || (etag.len() == 32 && !etag.contains('-') && etag != md5) {
+        if size != object.size || (!kms && etag.len() == 32 && !etag.contains('-') && etag != md5) {
             return Ok(Outcome::Failed(format!(
                 "the bytes read ({size}, MD5 {md5}) are not the object listed ({}, ETag {})",
                 object.size, object.etag
             )));
         }
         let attrs = ObjectAttrs {
-            content_type: head.content_type,
-            user: head.metadata,
+            content_type: download.head.content_type,
+            user: download.head.metadata,
             ..ObjectAttrs::default()
         };
         let mut moved = import.clone();
@@ -210,7 +247,20 @@ impl Engine {
         moved.after = object.key.clone();
         moved.updated_ms = super::now_ms();
         let saved = moved.clone();
+        enum Stored {
+            Dropped,
+            Locked,
+            Put(Result<truthdb_object::ObjectInfo, ObjectError>),
+        }
         let stored = self.object(move |file| {
+            // Decided in the write's own lock hold: an import does not give
+            // objects a bucket's default retention.
+            if file
+                .bucket(&saved.bucket)?
+                .is_some_and(|bucket| bucket.object_lock)
+            {
+                return Ok(Stored::Locked);
+            }
             file.set_origin(Origin {
                 operation: "Import".to_string(),
                 ..Origin::default()
@@ -218,7 +268,7 @@ impl Engine {
             file.transaction(|tx| {
                 // Dropped meanwhile: nothing is written.
                 if tx.import(saved.id)?.is_none() {
-                    return Ok(None);
+                    return Ok(Stored::Dropped);
                 }
                 let stored = tx.put_object(
                     &saved.bucket,
@@ -232,14 +282,20 @@ impl Engine {
                 if stored.is_ok() {
                     tx.update_import(&saved)?;
                 }
-                Ok(Some(stored))
+                Ok(Stored::Put(stored))
             })
         })?;
         Ok(match stored {
-            None => Outcome::Dropped,
-            Some(Ok(_)) => Outcome::Copied(Box::new(moved)),
-            Some(Err(ObjectError::NoSuchBucket)) => Outcome::NoBucket,
-            Some(Err(err)) => Outcome::Failed(format!("{err:?}")),
+            Stored::Dropped => Outcome::Dropped,
+            Stored::Locked => Outcome::Fatal(format!(
+                "the bucket {} has Object Lock; imports into it are not offered",
+                import.bucket
+            )),
+            Stored::Put(Ok(_)) => Outcome::Copied(Box::new(moved)),
+            Stored::Put(Err(ObjectError::NoSuchBucket)) => {
+                Outcome::Fatal(format!("the bucket {} is gone", import.bucket))
+            }
+            Stored::Put(Err(err)) => Outcome::Failed(format!("{err:?}")),
         })
     }
 
@@ -255,6 +311,15 @@ impl Engine {
             })
         })?;
         Ok(())
+    }
+
+    /// Records why the import waits, and lets the thread rest before the
+    /// next try.
+    fn wait_import(&self, mut import: Import, error: String) -> Result<bool, EngineError> {
+        import.error = error;
+        import.updated_ms = super::now_ms();
+        self.save_import(&import)?;
+        Ok(false)
     }
 
     fn end_import(

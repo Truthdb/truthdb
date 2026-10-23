@@ -351,10 +351,14 @@ pub(super) fn import_loop(shared: &Arc<Shared>) {
         }
     };
     while !shared.stop.load(Ordering::Acquire) {
-        let more = shared.engine.import_step(&runtime).unwrap_or_else(|err| {
-            eprintln!("import failed: {err}");
-            false
-        });
+        let stopping = || shared.stop.load(Ordering::Acquire);
+        let more = shared
+            .engine
+            .import_step(&runtime, &stopping)
+            .unwrap_or_else(|err| {
+                eprintln!("import failed: {err}");
+                false
+            });
         if more {
             continue;
         }

@@ -1043,7 +1043,17 @@ impl Engine {
                 let location = |text: &str| {
                     text.strip_prefix("s3://")
                         .map(|rest| rest.split_once('/').unwrap_or((rest, "")))
-                        .filter(|(bucket, _)| !bucket.is_empty())
+                        // S3's characters: a name the client refuses would
+                        // keep the import waiting for ever.
+                        .filter(|(bucket, _)| {
+                            !bucket.is_empty()
+                                && bucket.bytes().all(|b| {
+                                    b.is_ascii_lowercase()
+                                        || b.is_ascii_digit()
+                                        || b == b'.'
+                                        || b == b'-'
+                                })
+                        })
                         .map(|(bucket, prefix)| (bucket.to_string(), prefix.to_string()))
                         .ok_or_else(|| invalid(format!("{text} is not s3://bucket[/prefix]")))
                 };

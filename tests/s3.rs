@@ -8369,6 +8369,20 @@ fn an_import_copies_another_servers_objects_and_goes_on_after_a_crash() {
         b"not imported",
     );
     put(&target, &key, &secret, "/dst", b"");
+    // Versioned: a version written twice would show.
+    assert_eq!(
+        send(
+            target.s3_port,
+            "PUT",
+            "/dst",
+            "versioning",
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        200
+    );
     // Already there alike (skipped), and there unlike (replaced).
     put(&target, &key, &secret, "/dst/in/obj-000", &body(0));
     put(&target, &key, &secret, "/dst/in/obj-001", b"stale");
@@ -8389,11 +8403,18 @@ fn an_import_copies_another_servers_objects_and_goes_on_after_a_crash() {
         "s3 create import nonsense us-east-1 k s s3://src/ s3://dst/",
         "s3 create import http://127.0.0.1:1 us-east-1 k s src s3://dst/",
         "s3 create import http://127.0.0.1:1 us-east-1 k s s3://src/ s3://nowhere/",
+        "s3 create import http://127.0.0.1:1 us-east-1 k s s3://My_Bucket/ s3://dst/",
     ] {
         let reply = native_text(target.native_port, bad);
         assert!(!reply.contains("import_id"), "{bad}: {reply}");
     }
 
+    // One whose source cannot be reached waits, and holds no other back.
+    let unreachable = native(
+        target.native_port,
+        "s3 create import http://127.0.0.1:1 us-east-1 k s s3://src/ s3://dst/never/",
+    );
+    let unreachable_id = unreachable["import_id"].as_u64().unwrap();
     let created = native(
         target.native_port,
         &format!(
@@ -8458,6 +8479,15 @@ fn an_import_copies_another_servers_objects_and_goes_on_after_a_crash() {
         "SELECT COUNT(*) FROM sys.s3_objects('dst', 'in/')",
     );
     assert_eq!(listed[0][0], count.to_string());
+    // Each object written once: its one version, and the stale one's two.
+    let versions = sql_rows(
+        target.native_port,
+        "SELECT COUNT(*) FROM sys.s3_object_versions('dst', 'in/')",
+    );
+    assert_eq!(versions[0][0], (count + 1).to_string());
+    let waiting = state(&target, unreachable_id);
+    assert_eq!(waiting[0], "RUNNING", "{waiting:?}");
+    assert!(!waiting[5].is_empty(), "the error is kept: {waiting:?}");
     assert_eq!(get(target.s3_port, "/dst/in/x", &key, Some(&secret)).0, 404);
 
     // The refused import failed, naming why.

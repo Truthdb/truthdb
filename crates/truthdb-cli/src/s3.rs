@@ -650,10 +650,8 @@ async fn download(
     let written = async {
         let mut download = client.get_object(bucket, key).await?;
         let mut file = tokio::fs::File::create(&partial).await?;
-        while let Some(frame) = download.body.frame().await {
-            if let Ok(data) = frame?.into_data() {
-                file.write_all(&data).await?;
-            }
+        while let Some(data) = download.next_chunk().await? {
+            file.write_all(&data).await?;
         }
         file.flush().await?;
         drop(file);

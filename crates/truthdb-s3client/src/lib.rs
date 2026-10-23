@@ -88,12 +88,34 @@ pub struct Head {
     pub content_type: Option<String>,
     /// `x-amz-meta-*`, without the prefix.
     pub metadata: Vec<(String, String)>,
+    /// `x-amz-server-side-encryption` (`AES256`, `aws:kms`, ...).
+    pub server_side_encryption: Option<String>,
 }
 
 /// An object being read: its headers, and its body as it arrives.
 pub struct Download {
     pub head: Head,
     pub body: Incoming,
+}
+
+impl Download {
+    /// The body's next bytes (`None` at its end); a service that sends
+    /// nothing for a while fails the read.
+    pub async fn next_chunk(&mut self) -> Result<Option<Bytes>, Error> {
+        loop {
+            let frame = tokio::time::timeout(ANSWER_TIMEOUT, self.body.frame())
+                .await
+                .map_err(|_| Error::Transport("the body stalled".to_string()))?;
+            match frame {
+                None => return Ok(None),
+                Some(frame) => {
+                    if let Ok(data) = frame.map_err(transport)?.into_data() {
+                        return Ok(Some(data));
+                    }
+                }
+            }
+        }
+    }
 }
 
 pub struct Client {
@@ -287,6 +309,13 @@ fn completed(body: &[u8]) -> Result<String, Error> {
         .ok_or_else(|| Error::Transport("no ETag in the answer".to_string()))
 }
 
+/// How long connecting may take.
+const CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// How long the service may take to answer (its headers), and to send the
+/// next piece of a body: a service that stalls fails the request rather
+/// than holding its caller forever.
+const ANSWER_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// The most of an error answer's body that is read.
 const MAX_ERROR_BODY: usize = 64 * 1024;
 
@@ -336,7 +365,10 @@ impl Client {
                 .with_provider_and_native_roots(provider)
                 .map_err(|err| invalid(format!("TLS roots: {err}")))?,
         };
-        let connector = builder.https_or_http().enable_http1().build();
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        http.set_connect_timeout(Some(CONNECT_TIMEOUT));
+        let connector = builder.https_or_http().enable_http1().wrap_connector(http);
         let http = HttpClient::builder(hyper_util::rt::TokioExecutor::new()).build(connector);
         Ok(Client {
             http,
@@ -411,16 +443,22 @@ impl Client {
             .header("content-length", body.len())
             .body(Full::new(body))
             .map_err(|err| invalid(err.to_string()))?;
-        let response = self.http.request(request).await.map_err(transport)?;
+        let response = tokio::time::timeout(ANSWER_TIMEOUT, self.http.request(request))
+            .await
+            .map_err(|_| Error::Transport("the service did not answer in time".to_string()))?
+            .map_err(transport)?;
         if response.status().is_success() {
             return Ok(response);
         }
         let status = response.status().as_u16();
-        let body = http_body_util::Limited::new(response.into_body(), MAX_ERROR_BODY)
-            .collect()
-            .await
-            .map_err(|err| Error::Transport(err.to_string()))?
-            .to_bytes();
+        let body = tokio::time::timeout(
+            ANSWER_TIMEOUT,
+            http_body_util::Limited::new(response.into_body(), MAX_ERROR_BODY).collect(),
+        )
+        .await
+        .map_err(|_| Error::Transport("the body stalled".to_string()))?
+        .map_err(|err| Error::Transport(err.to_string()))?
+        .to_bytes();
         // A HEAD answer has no body to name the error.
         let code = texts(&body, "Code")
             .ok()
@@ -448,10 +486,10 @@ impl Client {
     ) -> Result<(hyper::HeaderMap, Bytes), Error> {
         let response = self.send(method, path, query, headers, body).await?;
         let headers = response.headers().clone();
-        let body = response
-            .into_body()
-            .collect()
+        // Answers read whole are small (listings, XML results).
+        let body = tokio::time::timeout(ANSWER_TIMEOUT, response.into_body().collect())
             .await
+            .map_err(|_| Error::Transport("the body stalled".to_string()))?
             .map_err(transport)?
             .to_bytes();
         Ok((headers, body))
@@ -731,6 +769,7 @@ fn head_of(headers: &hyper::HeaderMap) -> Result<Head, Error> {
         etag: etag_of(headers)?,
         last_modified: header(headers, "last-modified").unwrap_or_default(),
         content_type: header(headers, "content-type"),
+        server_side_encryption: header(headers, "x-amz-server-side-encryption"),
         metadata: headers
             .iter()
             .filter_map(|(name, value)| {
