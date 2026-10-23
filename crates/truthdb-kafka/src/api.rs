@@ -549,6 +549,7 @@ async fn list_offsets(
 }
 
 /// One partition a fetch asks for.
+#[derive(Clone, Copy)]
 struct FetchPartition {
     index: i32,
     offset: i64,
@@ -659,6 +660,9 @@ async fn fetch(
     Ok(out.bytes)
 }
 
+/// One round of a fetch: each topic's partitions read in one hold of the
+/// storage lock (so a fetch listing many partitions takes it once per
+/// topic, however often it polls).
 async fn fetch_round(
     state: &KafkaState,
     session: &Session,
@@ -669,59 +673,74 @@ async fn fetch_round(
     let mut returned_any = false;
     let mut out = Vec::new();
     for (name, partitions) in topics.iter() {
-        let mut answers = Vec::new();
-        for partition in partitions {
-            let want = (partition.max_bytes.max(0) as usize).min(left);
-            let (account, topic, index, offset) = (
-                session.account.clone(),
-                name.clone(),
-                partition.index,
-                partition.offset,
-            );
-            // The first partition with records gets at least one record,
-            // whatever the limits (so a large record is not stuck); after
-            // it, the limits hold.
-            let first = !returned_any;
-            let fetched = streams(&state.engine, move |file| {
-                read_partition(file, &account, &topic, index, offset, want, first)
-            })
-            .await
-            .unwrap_or(Fetched {
-                index,
-                error: UNKNOWN_SERVER_ERROR,
-                state: Partition::default(),
-                records: Vec::new(),
-            });
-            left = left.saturating_sub(fetched.records.len());
-            returned_any |= !fetched.records.is_empty();
-            answers.push(fetched);
-        }
+        let (account, topic, asked) = (session.account.clone(), name.clone(), partitions.clone());
+        let read = streams(&state.engine, move |file| {
+            let owned = owned_topic(file, &account, &topic)?.map(|(_, states)| states);
+            let mut answers = Vec::new();
+            for partition in asked {
+                // The first partition with records gets at least one
+                // record, whatever the limits (so a large record is not
+                // stuck); after it, the limits hold.
+                let want = (partition.max_bytes.max(0) as usize).min(left);
+                let fetched = read_partition(
+                    file,
+                    owned.as_deref(),
+                    &topic,
+                    partition,
+                    want,
+                    !returned_any,
+                )?;
+                left = left.saturating_sub(fetched.records.len());
+                returned_any |= !fetched.records.is_empty();
+                answers.push(fetched);
+            }
+            Ok((answers, left, returned_any))
+        })
+        .await;
+        let answers = match read {
+            Some((answers, now_left, now_returned)) => {
+                (left, returned_any) = (now_left, now_returned);
+                answers
+            }
+            None => partitions
+                .iter()
+                .map(|partition| Fetched {
+                    index: partition.index,
+                    error: UNKNOWN_SERVER_ERROR,
+                    state: Partition::default(),
+                    records: Vec::new(),
+                })
+                .collect(),
+        };
         out.push((name.clone(), answers));
     }
     out
 }
 
+/// Reads one partition of a topic the account owns (`owned`: its
+/// partitions, looked at in the caller's hold of the storage lock; `None`
+/// when the topic is not the account's).
 fn read_partition(
     file: &mut StreamFile<'_>,
-    account: &str,
+    owned: Option<&[Partition]>,
     topic: &str,
-    index: i32,
-    offset: i64,
+    partition: FetchPartition,
     max_bytes: usize,
     first: bool,
 ) -> Result<Fetched, truthdb_core::storage::StorageError> {
+    let (index, offset) = (partition.index, partition.offset);
     let fetched = |error, state, records| Fetched {
         index,
         error,
         state,
         records,
     };
-    let partition = owned_topic(file, account, topic)?.and_then(|(_, states)| {
+    let state = owned.and_then(|states| {
         usize::try_from(index)
             .ok()
             .and_then(|i| states.get(i).copied())
     });
-    let Some(state) = partition else {
+    let Some(state) = state else {
         return Ok(fetched(
             UNKNOWN_TOPIC_OR_PARTITION,
             Partition::default(),
@@ -1075,6 +1094,7 @@ async fn sync_group(
         }
     } else {
         match state.coordinator.sync(
+            &session.account,
             &stored_group(session, &group),
             generation,
             &member_id,
