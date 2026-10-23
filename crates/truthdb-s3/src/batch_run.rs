@@ -103,11 +103,11 @@ async fn step(state: &S3State) -> Result<bool, String> {
         if job.results_left {
             object(state, move |file| {
                 file.transaction(|tx| {
-                    if tx.drop_job_results(number, RESULT_PAGE)? {
-                        if let Some(mut job) = tx.job(number)? {
-                            job.results_left = false;
-                            tx.put_job(&job)?;
-                        }
+                    if tx.drop_job_results(number, RESULT_PAGE)?
+                        && let Some(mut job) = tx.job(number)?
+                    {
+                        job.results_left = false;
+                        tx.put_job(&job)?;
                     }
                     Ok(())
                 })

@@ -9905,5 +9905,13 @@ fn batch_jobs_tag_and_copy_what_a_manifest_lists_once_across_a_crash() {
         "SELECT job_id, status, succeeded_tasks, failed_tasks FROM sys.dm_s3_batch_jobs",
     );
     assert_eq!(rows.len(), 5);
-    assert!(rows.contains(&vec![job.clone(), "Complete".into(), "3".into(), "2".into()]), "{rows:?}");
+    assert!(
+        rows.contains(&vec![
+            job.clone(),
+            "Complete".into(),
+            "3".into(),
+            "2".into()
+        ]),
+        "{rows:?}"
+    );
 }

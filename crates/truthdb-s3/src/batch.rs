@@ -34,7 +34,7 @@ const MAX_JOB_TAGS: usize = 50;
 /// What a job does to each object of its manifest.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Operation {
-    Copy(CopySpec),
+    Copy(Box<CopySpec>),
     PutTagging(Vec<(String, String)>),
     DeleteTagging,
 }
@@ -277,7 +277,7 @@ fn operation(element: &Element) -> Result<Operation, S3Error> {
             crate::tagging::validate(&tags)?;
             Ok(Operation::PutTagging(tags))
         }
-        "S3PutObjectCopy" => copy(chosen).map(Operation::Copy),
+        "S3PutObjectCopy" => copy(chosen).map(|copy| Operation::Copy(Box::new(copy))),
         other => Err(S3Error::not_implemented(format!(
             "The batch operation {other}"
         ))),
