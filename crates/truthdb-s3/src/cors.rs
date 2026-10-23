@@ -364,6 +364,12 @@ pub async fn bucket_cors(
         Method::PUT => {
             let body = read_checked_body(request, auth, MAX_BODY).await?;
             let document = render(&parse(&body)?);
+            // Stored as rendered (escaped, so possibly larger than the
+            // body), and read for every request with an Origin: held to
+            // the same limit.
+            if document.len() > MAX_BODY {
+                return Err(invalid("The CORS configuration is too large"));
+            }
             crate::scope::object(state, move |file| {
                 file.transaction(|tx| {
                     tx.put_bucket_config(&bucket, BUCKET_CORS, "", document.as_bytes())

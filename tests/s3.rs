@@ -11173,6 +11173,21 @@ fn cors_preflights_and_cross_origin_answers_follow_the_bucket_configuration() {
         config.as_bytes(),
     );
     assert_eq!(status, 200, "{body}");
+    // A configuration whose stored form (escaped) would pass the limit.
+    let quoted = format!(
+        "<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod>\
+         <AllowedHeader>{}</AllowedHeader></CORSRule></CORSConfiguration>",
+        "\"".repeat(20_000)
+    );
+    let quoted_md5 = content_md5(quoted.as_bytes());
+    let (_, (status, _)) = call(
+        "PUT",
+        "/web",
+        "cors",
+        &[("content-md5", &quoted_md5)],
+        quoted.as_bytes(),
+    );
+    assert_eq!(status, 400, "too large once stored");
     let (_, (status, shown)) = call("GET", "/web", "cors", &[], b"");
     assert_eq!(status, 200);
     assert!(
