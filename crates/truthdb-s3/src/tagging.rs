@@ -29,7 +29,7 @@ fn invalid_tag(message: impl Into<String>) -> S3Error {
 }
 
 /// Checks a tag set against S3's limits.
-fn validate(tags: &[(String, String)]) -> Result<(), S3Error> {
+pub(crate) fn validate(tags: &[(String, String)]) -> Result<(), S3Error> {
     if tags.len() > MAX_TAGS {
         return Err(S3Error::new(
             400,

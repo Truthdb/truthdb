@@ -3,7 +3,7 @@
 
 use truthdb_core::storage::StorageError;
 
-fn corrupt(what: &str) -> StorageError {
+pub(crate) fn corrupt(what: &str) -> StorageError {
     StorageError::InvalidFile(format!("corrupt object engine {what}"))
 }
 

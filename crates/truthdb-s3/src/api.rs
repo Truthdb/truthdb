@@ -215,6 +215,13 @@ pub async fn dispatch(
     {
         return account_public_access(state, request, auth, method).await;
     }
+    // S3 Control's Batch Operations jobs, the same way.
+    let path = request.uri().path();
+    if (path == "/v20180820/jobs" || path.starts_with("/v20180820/jobs/"))
+        && request.headers().contains_key("x-amz-account-id")
+    {
+        return crate::batch::handle(state, request, auth, method).await;
+    }
     let target = target(request.uri().path())?;
     let principal = auth.principal.clone();
     let raw_query = request.uri().query().unwrap_or("").to_string();
