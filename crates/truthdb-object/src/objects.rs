@@ -11,7 +11,7 @@ use truthdb_core::storage::StorageError;
 
 use crate::body::SealedBody;
 use crate::buckets::BucketRow;
-use crate::journal::{Change, JournalObject, RecordType};
+use crate::journal::{Change, JournalObject, Notice, RecordType};
 use crate::{
     ATTRS_TREE, BUCKETS_TREE, NEXT_VERSION_KEY, OBJECTS_TREE, ObjFile, ObjTxn, Versioning,
     next_counter,
@@ -805,6 +805,63 @@ impl ObjTxn<'_, '_> {
             now_ms,
         )?;
         Ok(Ok(()))
+    }
+
+    /// The storage class of version `version` of `bucket`'s `key`, if it is
+    /// there.
+    pub(crate) fn class_of_version(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+    ) -> Result<Option<StorageClass>, StorageError> {
+        self.trees
+            .objects()
+            .get(self.ctx, &version_key(bucket, key, version))?
+            .map(|row| Ok(class_of(VersionRow::decode(&row)?.flags)))
+            .transpose()
+    }
+
+    /// Records a notice of `event` of version `version` of `bucket`'s `key`
+    /// (with `detail`, see [`Notice`]); nothing when the version is gone.
+    pub(crate) fn note_event(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+        event: &str,
+        detail: Option<String>,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        let Some(row) = self
+            .trees
+            .objects()
+            .get(self.ctx, &version_key(bucket, key, version))?
+        else {
+            return Ok(());
+        };
+        let row = VersionRow::decode(&row)?;
+        if row.flags & FLAG_DELETE_MARKER != 0 {
+            return Ok(());
+        }
+        self.record_notice(
+            bucket,
+            key,
+            version,
+            row.flags & FLAG_NULL_VERSION != 0,
+            Some(JournalObject {
+                size: row.size,
+                md5: row.md5,
+                parts: row.parts,
+                last_modified_ms: row.mtime_ms,
+                storage_class: class_of(row.flags),
+            }),
+            Notice {
+                event: event.to_string(),
+                detail,
+            },
+            now_ms,
+        )
     }
 
     /// Removes the key's versions that `wanted` picks: each row, its

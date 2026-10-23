@@ -16,12 +16,15 @@ use crate::consumers::FULLTEXT_CONSUMER;
 use crate::objects::StorageClass;
 use crate::{CHANGES_TREE, NEXT_CHANGE_KEY, ObjFile, ObjTxn, next_counter};
 
-/// What a journal row records (AWS's `record_type`).
+/// What a journal row records (AWS's `record_type`), or a notice: an
+/// event of an object that is not a change S3 Metadata's journal shows (a
+/// restore, a retention change), kept for the event notifications.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecordType {
     Create,
     UpdateMetadata,
     Delete,
+    Notice,
 }
 
 impl RecordType {
@@ -30,6 +33,7 @@ impl RecordType {
             RecordType::Create => "CREATE",
             RecordType::UpdateMetadata => "UPDATE_METADATA",
             RecordType::Delete => "DELETE",
+            RecordType::Notice => "NOTICE",
         }
     }
 }
@@ -52,6 +56,18 @@ pub struct JournalRecord {
     pub object: Option<JournalObject>,
     /// Who made the change; `None` for one made without a request.
     pub origin: Option<Origin>,
+    /// A notice's event; `None` for every other row.
+    pub notice: Option<Notice>,
+}
+
+/// The event a notice row records.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Notice {
+    /// The event type (`s3:ObjectRestore:Post`, ...).
+    pub event: String,
+    /// The event message's fields particular to it, as a JSON object
+    /// (`glacierEventData`, ...).
+    pub detail: Option<String>,
 }
 
 /// The request a change came from.
@@ -85,6 +101,10 @@ const TAG_REQUEST_ID: u8 = 2;
 const TAG_ACCOUNT: u8 = 3;
 const TAG_USER: u8 = 4;
 const TAG_SOURCE_IP: u8 = 5;
+/// A notice's event and detail (a notice row always has the origin layout,
+/// its origin fields empty when it was made without a request).
+const TAG_EVENT: u8 = 6;
+const TAG_DETAIL: u8 = 7;
 
 const FLAG_NULL_VERSION: u8 = 1;
 const FLAG_MARKER: u8 = 2;
@@ -110,7 +130,8 @@ impl JournalRecord {
                 RecordType::Create => 0,
                 RecordType::UpdateMetadata => 1,
                 RecordType::Delete => 2,
-            } | if self.origin.is_some() {
+                RecordType::Notice => 3,
+            } | if self.origin.is_some() || self.notice.is_some() {
                 TYPE_WITH_ORIGIN
             } else {
                 0
@@ -148,10 +169,11 @@ impl JournalRecord {
         out.extend_from_slice(&object.last_modified_ms.to_le_bytes());
         out.push(self.bucket.len() as u8);
         out.extend_from_slice(self.bucket.as_bytes());
-        let Some(origin) = &self.origin else {
+        if self.origin.is_none() && self.notice.is_none() {
             out.extend_from_slice(self.key.as_bytes());
             return out;
-        };
+        }
+        let origin = self.origin.clone().unwrap_or_default();
         out.extend_from_slice(&(self.key.len() as u16).to_le_bytes());
         out.extend_from_slice(self.key.as_bytes());
         for (tag, value) in [
@@ -160,6 +182,13 @@ impl JournalRecord {
             (TAG_ACCOUNT, origin.account.as_ref()),
             (TAG_USER, origin.user.as_ref()),
             (TAG_SOURCE_IP, origin.source_ip.as_ref()),
+            (TAG_EVENT, self.notice.as_ref().map(|notice| &notice.event)),
+            (
+                TAG_DETAIL,
+                self.notice
+                    .as_ref()
+                    .and_then(|notice| notice.detail.as_ref()),
+            ),
         ] {
             if let Some(value) = value.filter(|value| !value.is_empty()) {
                 out.push(tag);
@@ -180,6 +209,7 @@ impl JournalRecord {
             0 => RecordType::Create,
             1 => RecordType::UpdateMetadata,
             2 => RecordType::Delete,
+            3 => RecordType::Notice,
             _ => return Err(corrupt()),
         };
         let flags = bytes[1];
@@ -190,6 +220,8 @@ impl JournalRecord {
         }
         let text = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| corrupt());
         let rest = &names[bucket_len..];
+        let mut event = None;
+        let mut detail = None;
         let (key, origin) = if with_origin {
             let (key, mut fields) = sized(rest).ok_or_else(corrupt)?;
             let mut origin = Origin::default();
@@ -203,6 +235,8 @@ impl JournalRecord {
                     TAG_ACCOUNT => origin.account = Some(value),
                     TAG_USER => origin.user = Some(value),
                     TAG_SOURCE_IP => origin.source_ip = Some(value),
+                    TAG_EVENT => event = Some(value),
+                    TAG_DETAIL => detail = Some(value),
                     // A field a later release added.
                     _ => {}
                 }
@@ -230,6 +264,11 @@ impl JournalRecord {
             bucket: text(&names[..bucket_len])?,
             key,
             origin,
+            notice: match (record_type, event) {
+                (RecordType::Notice, Some(event)) => Some(Notice { event, detail }),
+                (RecordType::Notice, None) => return Err(corrupt()),
+                _ => None,
+            },
         })
     }
 }
@@ -279,7 +318,43 @@ impl ObjTxn<'_, '_> {
             is_delete_marker: change.is_delete_marker,
             object: change.object,
             origin: self.origin.clone(),
+            notice: None,
         };
+        self.append_record(&record)
+    }
+
+    /// Records a notice of an event of `bucket`'s `key` (version `version`)
+    /// as the journal's next row, in this transaction.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn record_notice(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+        null_version: bool,
+        object: Option<JournalObject>,
+        notice: Notice,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        let sequence = next_counter(self, NEXT_CHANGE_KEY)?;
+        let record = JournalRecord {
+            sequence,
+            record_type: RecordType::Notice,
+            timestamp_ms: now_ms,
+            bucket: bucket.to_string(),
+            key: key.to_string(),
+            version,
+            null_version,
+            is_delete_marker: Some(false),
+            object,
+            origin: self.origin.clone(),
+            notice: Some(notice),
+        };
+        self.append_record(&record)
+    }
+
+    fn append_record(&mut self, record: &JournalRecord) -> Result<(), StorageError> {
+        let sequence = record.sequence;
         self.trees.changes().insert_unique(
             self.ctx,
             &mut OpMode::Txn(self.txn),
@@ -455,6 +530,7 @@ mod tests {
                 is_delete_marker: Some(false),
                 object: Some(object),
                 origin: None,
+                notice: None,
             },
             JournalRecord {
                 sequence: 2,
@@ -473,6 +549,7 @@ mod tests {
                     storage_class: StorageClass::Standard,
                 }),
                 origin: None,
+                notice: None,
             },
             JournalRecord {
                 sequence: 3,
@@ -485,6 +562,7 @@ mod tests {
                 is_delete_marker: None,
                 object: None,
                 origin: None,
+                notice: None,
             },
         ] {
             let bytes = record.encode();
@@ -529,6 +607,7 @@ mod tests {
                 is_delete_marker: None,
                 object: None,
                 origin: Some(origin),
+                notice: None,
             };
             let bytes = record.encode();
             assert!(
@@ -554,6 +633,7 @@ mod tests {
                 operation: "PutObject".into(),
                 ..Origin::default()
             }),
+            notice: None,
         };
         let mut bytes = record.encode();
         bytes.extend_from_slice(&[99, 2, 0, b'z', b'z']);
@@ -561,5 +641,70 @@ mod tests {
         assert_eq!(decoded.origin, record.origin);
         bytes.truncate(bytes.len() - 1);
         assert!(JournalRecord::decode(1, &bytes).is_err());
+    }
+
+    #[test]
+    fn a_notice_round_trips_with_or_without_a_request() {
+        for origin in [
+            None,
+            Some(Origin {
+                operation: "RestoreObject".into(),
+                request_id: "0123456789ABCDEF".into(),
+                account: Some("123456789012".into()),
+                user: None,
+                source_ip: Some("10.0.0.1".into()),
+            }),
+        ] {
+            let record = JournalRecord {
+                sequence: 3,
+                record_type: RecordType::Notice,
+                timestamp_ms: 5,
+                bucket: "b".into(),
+                key: "k".into(),
+                version: 2,
+                null_version: true,
+                is_delete_marker: Some(false),
+                object: Some(JournalObject {
+                    size: 9,
+                    md5: [1; 16],
+                    parts: 0,
+                    last_modified_ms: 4,
+                    storage_class: StorageClass::Glacier,
+                }),
+                origin: origin.clone(),
+                notice: Some(Notice {
+                    event: "s3:ObjectRestore:Completed".into(),
+                    detail: Some("{\"glacierEventData\":{}}".into()),
+                }),
+            };
+            let decoded = JournalRecord::decode(3, &record.encode()).unwrap();
+            // A notice made without a request reads back with empty origin
+            // fields.
+            assert_eq!(decoded.origin, Some(origin.unwrap_or_default()));
+            assert_eq!(decoded.notice, record.notice);
+            assert_eq!(decoded.object, record.object);
+        }
+        // A notice row without its event is corrupt.
+        let mut bare = JournalRecord::decode(
+            1,
+            &JournalRecord {
+                sequence: 1,
+                record_type: RecordType::Create,
+                timestamp_ms: 5,
+                bucket: "b".into(),
+                key: "k".into(),
+                version: 1,
+                null_version: false,
+                is_delete_marker: Some(false),
+                object: None,
+                origin: Some(Origin::default()),
+                notice: None,
+            }
+            .encode(),
+        )
+        .unwrap()
+        .encode();
+        bare[0] = 3 | TYPE_WITH_ORIGIN;
+        assert!(JournalRecord::decode(1, &bare).is_err());
     }
 }

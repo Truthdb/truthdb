@@ -8742,3 +8742,121 @@ fn bucket_notifications_reach_a_stream_topic_once_across_a_crash() {
     let (_, reply) = call(&server, "GET", "/photos", "notification", b"");
     assert!(!reply.contains("TopicConfiguration"), "{reply}");
 }
+
+#[test]
+fn restores_and_retention_changes_send_their_events() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "noticer");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+        .1
+    };
+    native(
+        server.native_port,
+        &format!("stream create topic events partitions 2 retention 0 account {account}"),
+    );
+    let lock_enabled = [("x-amz-bucket-object-lock-enabled", "true")];
+    assert_eq!(call("PUT", "/vault", "", &lock_enabled, b"").0, 200);
+    let config = format!(
+        "<NotificationConfiguration><TopicConfiguration><Id>vault</Id>\
+         <Topic>arn:aws:sns:us-east-1:{account}:events</Topic>\
+         <Event>s3:ObjectRestore:*</Event><Event>s3:ObjectRetention:Put</Event>\
+         </TopicConfiguration></NotificationConfiguration>"
+    );
+    assert_eq!(
+        call("PUT", "/vault", "notification", &[], config.as_bytes()).0,
+        200
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/vault/cold",
+            "",
+            &[("x-amz-storage-class", "GLACIER")],
+            b"frozen"
+        )
+        .0,
+        200
+    );
+    // A Standard restore completes at once (the test servers' delay).
+    let (status, reply) = call(
+        "POST",
+        "/vault/cold",
+        "restore",
+        &[],
+        b"<RestoreRequest><Days>1</Days><GlacierJobParameters><Tier>Standard</Tier>\
+          </GlacierJobParameters></RestoreRequest>",
+    );
+    assert_eq!(status, 202, "{reply}");
+    let retention = b"<Retention><Mode>GOVERNANCE</Mode>\
+        <RetainUntilDate>2099-01-01T00:00:00.000Z</RetainUntilDate></Retention>";
+    let md5 = content_md5(retention);
+    let (status, reply) = call(
+        "PUT",
+        "/vault/cold",
+        "retention",
+        &[("content-md5", md5.as_str())],
+        retention,
+    );
+    assert_eq!(status, 200, "{reply}");
+
+    let deadline = Instant::now() + DEADLINE;
+    let events = loop {
+        let events: Vec<serde_json::Value> = stream_events(server.native_port, "events")
+            .into_iter()
+            .filter(|event| event.get("Records").is_some())
+            .map(|event| event["Records"][0].clone())
+            .collect();
+        if events.len() >= 3 || Instant::now() > deadline {
+            break events;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let named = |name: &str| {
+        events
+            .iter()
+            .find(|event| event["eventName"] == name)
+            .unwrap_or_else(|| panic!("no {name} in {events:?}"))
+    };
+    let posted = named("ObjectRestore:Post");
+    assert_eq!(posted["userIdentity"]["principalId"], account.as_str());
+    assert_eq!(posted["s3"]["object"]["key"], "cold");
+    assert_eq!(posted["s3"]["object"]["size"], 6);
+    let completed = named("ObjectRestore:Completed");
+    assert_eq!(completed["userIdentity"]["principalId"], "s3.amazonaws.com");
+    let restore = &completed["glacierEventData"]["restoreEventData"];
+    assert_eq!(restore["lifecycleRestoreStorageClass"], "GLACIER");
+    assert!(
+        restore["lifecycleRestorationExpiryTime"]
+            .as_str()
+            .unwrap()
+            .ends_with("T00:00:00.000Z"),
+        "{restore}"
+    );
+    let retained = named("ObjectRetention:Put");
+    assert_eq!(retained["eventVersion"], "2.6");
+    assert_eq!(retained["objectRetentionEventData"]["mode"], "GOVERNANCE");
+    assert_eq!(
+        retained["objectRetentionEventData"]["retainUntilDate"],
+        "2099-01-01T00:00:00.000Z"
+    );
+    assert_eq!(events.len(), 3, "{events:?}");
+    // The journal table shows S3 Metadata's records only.
+    let types: Vec<String> = sql_rows(
+        server.native_port,
+        "SELECT record_type FROM sys.s3_journal('vault')",
+    )
+    .into_iter()
+    .map(|row| row[0].clone())
+    .collect();
+    assert_eq!(types, ["CREATE"]);
+}

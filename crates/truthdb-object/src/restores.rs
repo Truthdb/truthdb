@@ -5,13 +5,20 @@
 //! restores tree under the version's number, and the restore timers tree
 //! orders the windows by expiry, so expired ones are removed in the
 //! background. A window past its expiry no longer counts, removed or not.
+//!
+//! A restore's events are journal notices (see `notifications`):
+//! `s3:ObjectRestore:Post` when it begins, `s3:ObjectRestore:Completed`
+//! when it is ready (the restore ready tree orders the restores yet to
+//! complete), and `s3:ObjectRestore:Delete` when its copy expires. So the
+//! background passes can name the object, a restore's row keeps its bucket
+//! and key.
 
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
 use crate::codec::{self, timed_key};
 use crate::objects::{ObjectError, StorageClass, VersionSel, validate_key};
-use crate::{ObjFile, ObjTxn, RESTORE_TIMERS_TREE, RESTORES_TREE};
+use crate::{ObjFile, ObjTxn, RESTORE_READY_TREE, RESTORE_TIMERS_TREE, RESTORES_TREE};
 
 /// A version's restore window.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,23 +50,41 @@ impl Restore {
         }
     }
 
-    /// `[ready ms u64][expiry ms u64]`.
-    fn encode(&self) -> [u8; 16] {
-        let mut out = [0u8; 16];
-        out[..8].copy_from_slice(&self.ready_ms.to_le_bytes());
-        out[8..].copy_from_slice(&self.expiry_ms.to_le_bytes());
-        out
+    /// `[ready ms u64][expiry ms u64][bucket len u8][bucket][key]` (rows
+    /// written before restores had events end after the expiry).
+    fn encode(&self, bucket: &str, key: &str) -> Vec<u8> {
+        [
+            &self.ready_ms.to_le_bytes()[..],
+            &self.expiry_ms.to_le_bytes(),
+            &[bucket.len() as u8],
+            bucket.as_bytes(),
+            key.as_bytes(),
+        ]
+        .concat()
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        if bytes.len() != 16 {
-            return Err(StorageError::InvalidFile("corrupt restore".to_string()));
-        }
-        Ok(Restore {
-            ready_ms: codec::u64_le(&bytes[..8])?,
-            expiry_ms: codec::u64_le(&bytes[8..])?,
-        })
+        Ok(decode_row(bytes)?.0)
     }
+}
+
+/// A restore row: the restore, and its object's bucket and key (none in a
+/// row written before restores had events).
+fn decode_row(bytes: &[u8]) -> Result<(Restore, Option<(String, String)>), StorageError> {
+    let corrupt = || StorageError::InvalidFile("corrupt restore".to_string());
+    let restore = Restore {
+        ready_ms: codec::u64_le(bytes.get(..8).ok_or_else(corrupt)?)?,
+        expiry_ms: codec::u64_le(bytes.get(8..16).ok_or_else(corrupt)?)?,
+    };
+    let names = match bytes.get(16..) {
+        None | Some([]) => None,
+        Some([len, rest @ ..]) => {
+            let (bucket, key) = rest.split_at_checked(*len as usize).ok_or_else(corrupt)?;
+            let text = |b: &[u8]| String::from_utf8(b.to_vec()).map_err(|_| corrupt());
+            Some((text(bucket)?, text(key)?))
+        }
+    };
+    Ok((restore, names))
 }
 
 /// What a RestoreObject asks for.
@@ -130,7 +155,12 @@ impl ObjTxn<'_, '_> {
         if !class.is_archived() {
             return Ok(Err(ObjectError::NotArchived));
         }
-        let current = self.restore_of(version)?;
+        let mut current = self.restore_of(version)?;
+        // One expired that no sweep has removed yet: its events first.
+        if current.is_some_and(|restore| restore.state(now_ms).is_none()) {
+            self.retire_restore(version, now_ms)?;
+            current = None;
+        }
         let (done, restore) = match current.and_then(|restore| restore.state(now_ms)) {
             Some(RestoreState::Ongoing) => return Ok(Err(ObjectError::RestoreInProgress)),
             Some(RestoreState::Restored { .. }) => (
@@ -155,13 +185,22 @@ impl ObjTxn<'_, '_> {
                 )
             }
         };
+        // An extension keeps a completion not yet sent.
+        let pending = match current {
+            Some(current) => self
+                .trees
+                .restore_ready()
+                .get(self.ctx, &timed_key(current.ready_ms, version))?
+                .is_some(),
+            None => false,
+        };
         self.forget_restore(version)?;
         let mode = &mut OpMode::Txn(self.txn);
         self.trees.restores().insert_unique(
             self.ctx,
             mode,
             &version.to_be_bytes(),
-            &restore.encode(),
+            &restore.encode(bucket, key),
         )?;
         self.trees.restore_timers().insert_unique(
             self.ctx,
@@ -169,6 +208,17 @@ impl ObjTxn<'_, '_> {
             &timed_key(restore.expiry_ms, version),
             &[],
         )?;
+        if done == Restored::Started || pending {
+            self.trees.restore_ready().insert_unique(
+                self.ctx,
+                mode,
+                &timed_key(restore.ready_ms, version),
+                &[],
+            )?;
+        }
+        if done == Restored::Started {
+            self.note_event(bucket, key, version, "s3:ObjectRestore:Post", None, now_ms)?;
+        }
         Ok(Ok((done, version, null_version)))
     }
 
@@ -194,7 +244,107 @@ impl ObjTxn<'_, '_> {
             mode,
             &timed_key(restore.expiry_ms, version),
         )?;
+        self.trees
+            .restore_ready()
+            .delete(self.ctx, mode, &timed_key(restore.ready_ms, version))?;
         Ok(())
+    }
+
+    /// Sends up to `limit` restores ready by `now_ms` their
+    /// `s3:ObjectRestore:Completed` event. Returns how many.
+    pub fn complete_restores(&mut self, now_ms: u64, limit: usize) -> Result<usize, StorageError> {
+        let due = self.trees.restore_ready().scan_range_limit(
+            self.ctx,
+            None,
+            Some(&timed_key(now_ms, u64::MAX)),
+            limit,
+        )?;
+        for (key, _) in &due {
+            let (_, version) = codec::decode_timed_key(key)?;
+            self.trees
+                .restore_ready()
+                .delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
+            let Some(row) = self
+                .trees
+                .restores()
+                .get(self.ctx, &version.to_be_bytes())?
+            else {
+                continue;
+            };
+            if let (restore, Some((bucket, object_key))) = decode_row(&row)? {
+                self.send_completed(version, restore, &bucket, &object_key, now_ms)?;
+            }
+        }
+        Ok(due.len())
+    }
+
+    /// Notes a restore's `s3:ObjectRestore:Completed`.
+    fn send_completed(
+        &mut self,
+        version: u64,
+        restore: Restore,
+        bucket: &str,
+        key: &str,
+        now_ms: u64,
+    ) -> Result<(), StorageError> {
+        let class = self.class_of_version(bucket, key, version)?;
+        let detail = serde_json::json!({
+            "glacierEventData": {
+                "restoreEventData": {
+                    "lifecycleRestorationExpiryTime": crate::time::iso8601(restore.expiry_ms),
+                    "lifecycleRestoreStorageClass": class.map(StorageClass::as_str),
+                },
+            },
+        });
+        self.note_event(
+            bucket,
+            key,
+            version,
+            "s3:ObjectRestore:Completed",
+            Some(detail.to_string()),
+            now_ms,
+        )
+    }
+
+    /// Removes an expired restore of `version` (its row and timers),
+    /// noting its completion if not yet sent, and its
+    /// `s3:ObjectRestore:Delete`.
+    fn retire_restore(&mut self, version: u64, now_ms: u64) -> Result<(), StorageError> {
+        let Some(row) = self
+            .trees
+            .restores()
+            .get(self.ctx, &version.to_be_bytes())?
+        else {
+            return Ok(());
+        };
+        let (restore, names) = decode_row(&row)?;
+        let ready_key = timed_key(restore.ready_ms, version);
+        let pending = self
+            .trees
+            .restore_ready()
+            .get(self.ctx, &ready_key)?
+            .is_some();
+        self.forget_restore(version)?;
+        let Some((bucket, object_key)) = names else {
+            return Ok(());
+        };
+        // S3's own events, whatever request came upon them.
+        let origin = self.origin.take();
+        let noted = (|| {
+            if pending {
+                self.send_completed(version, restore, &bucket, &object_key, now_ms)?;
+            }
+            self.note_event(
+                &bucket,
+                &object_key,
+                version,
+                "s3:ObjectRestore:Delete",
+                None,
+                now_ms,
+            )
+        })();
+        self.origin = origin;
+        noted
     }
 
     /// Removes up to `limit` restores expired by `now_ms`. Returns how many.
@@ -210,15 +360,15 @@ impl ObjTxn<'_, '_> {
             self.trees
                 .restore_timers()
                 .delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
-            if self
-                .restore_of(version)?
-                .is_some_and(|restore| restore.expiry_ms == expiry_ms)
-            {
-                self.trees.restores().delete(
-                    self.ctx,
-                    &mut OpMode::Txn(self.txn),
-                    &version.to_be_bytes(),
-                )?;
+            let Some(row) = self
+                .trees
+                .restores()
+                .get(self.ctx, &version.to_be_bytes())?
+            else {
+                continue;
+            };
+            if decode_row(&row)?.0.expiry_ms == expiry_ms {
+                self.retire_restore(version, now_ms)?;
             }
         }
         Ok(due.len())
@@ -253,6 +403,22 @@ impl ObjFile<'_> {
             class,
             restore.and_then(|restore| restore.state(now_ms)),
         ))
+    }
+
+    /// Whether any restore has become ready by `now_ms` without its event
+    /// (read first, so an idle sweep writes nothing).
+    pub fn restores_ready(&mut self, now_ms: u64) -> Result<bool, StorageError> {
+        let Some(ready) = self.existing_tree(RESTORE_READY_TREE)? else {
+            return Ok(false);
+        };
+        Ok(!ready
+            .scan_range_limit(
+                &mut self.core.page_ctx(0),
+                None,
+                Some(&timed_key(now_ms, u64::MAX)),
+                1,
+            )?
+            .is_empty())
     }
 
     /// Whether any restore has expired by `now_ms` (read first, so an idle
@@ -294,8 +460,18 @@ mod tests {
             ready_ms: 100,
             expiry_ms: 200,
         };
-        assert_eq!(Restore::decode(&restore.encode()).unwrap(), restore);
+        assert_eq!(Restore::decode(&restore.encode("b", "k")).unwrap(), restore);
+        assert_eq!(
+            decode_row(&restore.encode("bkt", "dir/key")).unwrap().1,
+            Some(("bkt".into(), "dir/key".into()))
+        );
+        // A row from before restores had events.
+        assert_eq!(
+            decode_row(&restore.encode("b", "k")[..16]).unwrap(),
+            (restore, None)
+        );
         assert!(Restore::decode(&[0; 15]).is_err());
+        assert!(decode_row(&[&restore.encode("b", "k")[..16], &[9, b'x']].concat()).is_err());
         assert_eq!(restore.state(99), Some(RestoreState::Ongoing));
         assert_eq!(
             restore.state(100),

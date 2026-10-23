@@ -60,7 +60,7 @@ pub use fulltext::{
 };
 pub use gc::GcOutcome;
 pub use imports::{Import, ImportFailure, ImportSource, ImportState};
-pub use journal::{JournalObject, JournalRecord, Origin, RecordType};
+pub use journal::{JournalObject, JournalRecord, Notice, Origin, RecordType};
 pub use lifecycle::{
     Expiration, Filter, LifecycleConfig, MinTransitionSize, NoncurrentExpiration,
     NoncurrentTransition, Rule, StepBudget, Transition, When, days_after, transition_allowed,
@@ -152,6 +152,9 @@ const IMPORT_FAILURES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 29;
 /// (bucket, 0, journal position) -> the bucket's notification configuration
 /// (or none) and owner from that position on (see `notifications`).
 const NOTIFY_HISTORY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 30;
+/// (ready time, version) -> (): restores yet to complete, for their
+/// `s3:ObjectRestore:Completed` events (see `restores`).
+const RESTORE_READY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 31;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -274,7 +277,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 31;
+const TREE_COUNT: usize = 32;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -382,6 +385,9 @@ impl Trees {
     }
     pub fn notify_history(&self) -> BTree {
         self.tree(NOTIFY_HISTORY_TREE)
+    }
+    pub fn restore_ready(&self) -> BTree {
+        self.tree(RESTORE_READY_TREE)
     }
 }
 
