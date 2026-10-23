@@ -11010,6 +11010,23 @@ fn batch_jobs_invoke_a_function_for_each_object() {
         "AccessDenied",
         "{described}"
     );
+    // A Deny on the function's ARN holds however the job names it: here by
+    // its bare name.
+    let deny = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+        {{"Effect": "Allow", "Action": ["s3:CreateJob", "s3:GetObject", "s3:PutObject", "lambda:InvokeFunction"], "Resource": "*"}},
+        {{"Effect": "Deny", "Action": "lambda:InvokeFunction", "Resource": "arn:aws:lambda:*:{account}:function:fn"}}]}}"#
+    )
+    .replace('\n', " ");
+    let (denied_key, denied_secret) = user_with_key(&server, &account, "denied", Some(&deny));
+    let bare = "<LambdaInvoke><FunctionArn>fn</FunctionArn></LambdaInvoke>";
+    let described = run(&denied_key, &denied_secret, "fn-5", bare);
+    assert_eq!(
+        xml_value(&described, "FailureCode"),
+        "AccessDenied",
+        "{described}"
+    );
+
     // User arguments need schema 2.0.
     let old = invoke("fn").replace("2.0", "1.0");
     let body = create_job_body("fn-4", &old, "fn.csv", &etag, "");

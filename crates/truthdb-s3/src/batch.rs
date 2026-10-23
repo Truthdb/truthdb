@@ -64,6 +64,8 @@ pub(crate) enum Operation {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct LambdaSpec {
     pub function: String,
+    /// The version or alias it names, if any.
+    pub qualifier: Option<String>,
     pub account: Option<String>,
     pub arn: String,
     pub schema_two: bool,
@@ -72,8 +74,8 @@ pub(crate) struct LambdaSpec {
 
 /// A function ARN (`arn:<partition>:lambda:<region>:<account>:function:
 /// <name>[:<qualifier>]`) or a bare name (`<name>[:<qualifier>]`): the
-/// name and the account named.
-fn function_name(arn: &str) -> Option<(String, Option<String>)> {
+/// name, its qualifier and the account named.
+fn function_name(arn: &str) -> Option<(String, Option<String>, Option<String>)> {
     let (account, rest) = match arn.strip_prefix("arn:") {
         Some(rest) => {
             let parts: Vec<&str> = rest.splitn(6, ':').collect();
@@ -86,11 +88,21 @@ fn function_name(arn: &str) -> Option<(String, Option<String>)> {
         }
         None => (None, arn),
     };
-    let name = rest.split(':').next()?;
-    if rest.split(':').count() > 2 || truthdb_streams::valid_topic_name(name).is_err() {
+    let mut parts = rest.split(':');
+    let name = parts.next()?;
+    let qualifier = parts.next().map(str::to_string);
+    if parts.next().is_some()
+        || qualifier.as_deref().is_some_and(|qualifier| {
+            qualifier.is_empty()
+                || !qualifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"$-_".contains(&byte))
+        })
+        || truthdb_streams::valid_topic_name(name).is_err()
+    {
         return None;
     }
-    Some((name.to_string(), account))
+    Some((name.to_string(), qualifier, account))
 }
 
 impl Operation {
@@ -600,9 +612,10 @@ fn operation(element: &Element) -> Result<Operation, S3Error> {
             let arn = chosen
                 .text_of("FunctionArn")?
                 .ok_or_else(|| invalid("LambdaInvoke needs its FunctionArn"))?;
-            let (function, account) = function_name(arn)
-                .filter(|_| arn.len() <= 1024)
-                .ok_or_else(|| invalid("FunctionArn is not a function ARN"))?;
+            let (function, qualifier, account) =
+                function_name(arn)
+                    .filter(|_| arn.len() <= 1024)
+                    .ok_or_else(|| invalid("FunctionArn is not a function ARN"))?;
             let schema_two = match chosen.text_of("InvocationSchemaVersion")? {
                 None | Some("1.0") => false,
                 Some("2.0") => true,
@@ -631,6 +644,7 @@ fn operation(element: &Element) -> Result<Operation, S3Error> {
             }
             Ok(Operation::Lambda(Box::new(LambdaSpec {
                 function,
+                qualifier,
                 account,
                 arn: arn.to_string(),
                 schema_two,

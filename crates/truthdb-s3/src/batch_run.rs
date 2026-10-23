@@ -1279,6 +1279,10 @@ async fn run_tasks(state: &S3State, number: u64, poster: Option<&Poster>) -> Res
 /// LambdaInvoke tasks a step invokes at most, and the times one is tried
 /// (a TemporaryFailure, or no answer, is tried again after 1 s, then 2 s).
 const INVOCATIONS_PER_STEP: usize = 16;
+/// How long a step of invocations runs at most: the runner, which runs every
+/// job, is then free for the others. An invocation cut short is not
+/// recorded, and is invoked again by the next step.
+const INVOCATION_STEP_BUDGET: Duration = Duration::from_secs(60);
 const INVOCATION_TRIES: u32 = 3;
 /// The largest answer a function may give.
 const MAX_INVOCATION_ANSWER: usize = 1 << 20;
@@ -1345,7 +1349,17 @@ async fn run_invocations(
         .await;
     };
     let now = now_ms();
-    let arn = lambda.arn.clone();
+    // Authorized on the function invoked, named canonically (the way the
+    // ARN was written does not matter): this server's region, the job's
+    // account.
+    let mut arn = format!(
+        "arn:aws:lambda:{}:{}:function:{}",
+        state.region, job.account, lambda.function
+    );
+    if let Some(qualifier) = &lambda.qualifier {
+        arn.push(':');
+        arn.push_str(qualifier);
+    }
     let taken = object(state, move |file| {
         let Some(job) = file.job(number)? else {
             return Ok(None);
@@ -1410,7 +1424,11 @@ async fn run_invocations(
         return Ok(());
     };
     let mut results = Vec::new();
+    let began = std::time::Instant::now();
     for item in items {
+        let Some(left) = INVOCATION_STEP_BUDGET.checked_sub(began.elapsed()) else {
+            break;
+        };
         let result = match &item.object {
             None => None,
             Some(Err((text, why))) => Some(JobResult {
@@ -1429,18 +1447,25 @@ async fn run_invocations(
             }),
             Some(Ok((bucket, key, version))) => {
                 let task_id = format!("{}-{}", job.id(), item.start);
-                let (succeeded, code, message) = invoke(
-                    poster,
-                    &url,
-                    &secret,
-                    &job,
-                    &lambda,
-                    &task_id,
-                    bucket,
-                    key,
-                    version.as_deref(),
+                let invoked = tokio::time::timeout(
+                    left,
+                    invoke(
+                        poster,
+                        &url,
+                        &secret,
+                        &job,
+                        &lambda,
+                        &task_id,
+                        bucket,
+                        key,
+                        version.as_deref(),
+                    ),
                 )
                 .await;
+                // Out of time: this task and the rest wait for the next step.
+                let Ok((succeeded, code, message)) = invoked else {
+                    break;
+                };
                 Some(JobResult {
                     bucket: cut(bucket, MAX_RESULT_TEXT),
                     key: cut(key, MAX_RESULT_KEY),
