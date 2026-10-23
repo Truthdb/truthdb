@@ -11,7 +11,7 @@
 //! SyncGroup by the rebalance timeout after the join completed.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::oneshot;
@@ -193,24 +193,31 @@ pub enum Answer<T> {
     Later(oneshot::Receiver<T>),
 }
 
-/// Each account's groups, by group id.
-type Groups = HashMap<String, HashMap<String, Group>>;
+/// An account's groups, by group id, under the account's own lock: what
+/// one account's requests cost (a join or a sync adds up what the
+/// account's groups take) holds up only that account's.
+type Groups = HashMap<String, Group>;
+type Shard = Arc<Mutex<Groups>>;
 
 #[derive(Default)]
 pub struct Coordinator {
-    groups: Mutex<Groups>,
+    accounts: Mutex<HashMap<String, Shard>>,
 }
 
-/// The group, if `account` has one by that id.
-fn group_mut<'g>(groups: &'g mut Groups, account: &str, group_id: &str) -> Option<&'g mut Group> {
-    groups.get_mut(account)?.get_mut(group_id)
+/// The memory an account's groups take.
+fn account_bytes(groups: &Groups) -> usize {
+    groups.iter().map(|(id, group)| group.bytes(id)).sum()
 }
 
-/// The memory `account`'s groups take.
-fn account_bytes(groups: &Groups, account: &str) -> usize {
-    groups.get(account).map_or(0, |groups| {
-        groups.iter().map(|(id, group)| group.bytes(id)).sum()
-    })
+impl Coordinator {
+    /// `account`'s groups (made the first time when `create`).
+    fn shard(&self, account: &str, create: bool) -> Option<Shard> {
+        let mut accounts = self.accounts.lock().expect("accounts poisoned");
+        if create {
+            return Some(Arc::clone(accounts.entry(account.to_string()).or_default()));
+        }
+        accounts.get(account).cloned()
+    }
 }
 
 impl Coordinator {
@@ -238,11 +245,12 @@ impl Coordinator {
                 &request.member_id,
             ));
         }
-        let mut groups = self.groups.lock().expect("groups poisoned");
+        let shard = self.shard(account, true).expect("made");
+        let mut groups = shard.lock().expect("groups poisoned");
         // What the join replaces: the member's ids and protocols (its
         // assignment stays) and the group's protocol type; or, for a new
         // group, what the group itself takes.
-        let (replaced, group_adds) = match groups.get(account).and_then(|g| g.get(group_id)) {
+        let (replaced, group_adds) = match groups.get(group_id) {
             Some(group) => {
                 let member = match group.members.get(&request.member_id) {
                     Some(member) => member.bytes(&request.member_id) - member.assignment.len(),
@@ -255,7 +263,7 @@ impl Coordinator {
             }
             None => (0, GROUP_BYTES + group_id.len()),
         };
-        let used = account_bytes(&groups, account).saturating_sub(replaced);
+        let used = account_bytes(&groups).saturating_sub(replaced);
         let adding = group_adds
             + request.protocol_type.len()
             + ENTRY_BYTES
@@ -269,8 +277,6 @@ impl Coordinator {
             return Answer::Now(Joined::error(GROUP_MAX_SIZE_REACHED, &request.member_id));
         }
         let group = groups
-            .entry(account.to_string())
-            .or_default()
             .entry(group_id.to_string())
             .or_insert_with(|| Group::new(now));
         let others = group
@@ -340,9 +346,22 @@ impl Coordinator {
         assignments: Vec<(String, Vec<u8>)>,
         now: Instant,
     ) -> Answer<Synced> {
-        let mut groups = self.groups.lock().expect("groups poisoned");
-        let used = account_bytes(&groups, account);
-        let Some(group) = group_mut(&mut groups, account, group_id) else {
+        let Some(shard) = self.shard(account, false) else {
+            return Answer::Now(Synced::error(UNKNOWN_MEMBER_ID));
+        };
+        let mut groups = shard.lock().expect("groups poisoned");
+        // Added up only when the leader's assignments are to be stored.
+        let leader_completing = groups.get(group_id).is_some_and(|group| {
+            group.state == State::Completing
+                && group.leader == member_id
+                && group.generation == generation
+        });
+        let used = if leader_completing {
+            account_bytes(&groups)
+        } else {
+            0
+        };
+        let Some(group) = groups.get_mut(group_id) else {
             return Answer::Now(Synced::error(UNKNOWN_MEMBER_ID));
         };
         if !group.members.contains_key(member_id) {
@@ -412,8 +431,11 @@ impl Coordinator {
         member_id: &str,
         now: Instant,
     ) -> i16 {
-        let mut groups = self.groups.lock().expect("groups poisoned");
-        let Some(group) = group_mut(&mut groups, account, group_id) else {
+        let shard = self.shard(account, false);
+        let mut groups = shard
+            .as_ref()
+            .map(|shard| shard.lock().expect("groups poisoned"));
+        let Some(group) = groups.as_mut().and_then(|groups| groups.get_mut(group_id)) else {
             return UNKNOWN_MEMBER_ID;
         };
         let Some(member) = group.members.get_mut(member_id) else {
@@ -438,8 +460,11 @@ impl Coordinator {
         member_ids: &[String],
         now: Instant,
     ) -> Vec<i16> {
-        let mut groups = self.groups.lock().expect("groups poisoned");
-        let Some(group) = group_mut(&mut groups, account, group_id) else {
+        let shard = self.shard(account, false);
+        let mut groups = shard
+            .as_ref()
+            .map(|shard| shard.lock().expect("groups poisoned"));
+        let Some(group) = groups.as_mut().and_then(|groups| groups.get_mut(group_id)) else {
             return vec![UNKNOWN_MEMBER_ID; member_ids.len()];
         };
         let errors = member_ids
@@ -467,8 +492,11 @@ impl Coordinator {
         member_id: &str,
         now: Instant,
     ) -> i16 {
-        let mut groups = self.groups.lock().expect("groups poisoned");
-        let Some(group) = group_mut(&mut groups, account, group_id) else {
+        let shard = self.shard(account, false);
+        let mut groups = shard
+            .as_ref()
+            .map(|shard| shard.lock().expect("groups poisoned"));
+        let Some(group) = groups.as_mut().and_then(|groups| groups.get_mut(group_id)) else {
             return if generation < 0 {
                 NONE
             } else {
@@ -497,41 +525,60 @@ impl Coordinator {
     /// past theirs, completes rebalances past their deadline, and forgets
     /// groups left with nothing.
     pub fn expire(&self, now: Instant) {
-        let mut groups = self.groups.lock().expect("groups poisoned");
-        for group in groups.values_mut().flat_map(HashMap::values_mut) {
-            group.pending.retain(|_, until| *until > now);
-            let before = group.members.len();
-            group.members.retain(|_, member| {
-                member.awaiting_join()
-                    || member.awaiting_sync()
-                    || member.last_seen + member.session_timeout > now
+        let shards: Vec<Shard> = self
+            .accounts
+            .lock()
+            .expect("accounts poisoned")
+            .values()
+            .cloned()
+            .collect();
+        for shard in shards {
+            let mut groups = shard.lock().expect("groups poisoned");
+            expire_groups(&mut groups, now);
+        }
+        // An account left with no groups is forgotten, unless a request
+        // holds it meanwhile (it took it before this; it may add to it).
+        self.accounts
+            .lock()
+            .expect("accounts poisoned")
+            .retain(|_, shard| {
+                Arc::strong_count(shard) > 1 || !shard.lock().expect("groups poisoned").is_empty()
             });
-            if group.members.len() < before {
-                member_left(group, now);
-            }
-            // Joined but never synced: dropped at the sync deadline (as
-            // Kafka's expirePendingSync does), which rebalances the rest.
-            if matches!(group.state, State::Completing | State::Stable)
-                && now >= group.sync_deadline
-                && group.members.values().any(|member| member.pending_sync)
-            {
-                group.members.retain(|_, member| !member.pending_sync);
-                member_left(group, now);
-            }
-            // A pending member id that expired may be what it waited for.
-            if let State::Preparing { deadline } = group.state {
-                if now >= deadline {
-                    complete_join(group, now);
-                } else {
-                    try_complete_join(group, now);
-                }
-            }
-        }
-        for account in groups.values_mut() {
-            account.retain(|_, group| !(group.members.is_empty() && group.pending.is_empty()));
-        }
-        groups.retain(|_, account| !account.is_empty());
     }
+}
+
+/// [`Coordinator::expire`] for one account's groups.
+fn expire_groups(groups: &mut Groups, now: Instant) {
+    for group in groups.values_mut() {
+        group.pending.retain(|_, until| *until > now);
+        let before = group.members.len();
+        group.members.retain(|_, member| {
+            member.awaiting_join()
+                || member.awaiting_sync()
+                || member.last_seen + member.session_timeout > now
+        });
+        if group.members.len() < before {
+            member_left(group, now);
+        }
+        // Joined but never synced: dropped at the sync deadline (as
+        // Kafka's expirePendingSync does), which rebalances the rest.
+        if matches!(group.state, State::Completing | State::Stable)
+            && now >= group.sync_deadline
+            && group.members.values().any(|member| member.pending_sync)
+        {
+            group.members.retain(|_, member| !member.pending_sync);
+            member_left(group, now);
+        }
+        // A pending member id that expired may be what it waited for.
+        if let State::Preparing { deadline } = group.state {
+            if now >= deadline {
+                complete_join(group, now);
+            } else {
+                try_complete_join(group, now);
+            }
+        }
+    }
+    groups.retain(|_, group| !(group.members.is_empty() && group.pending.is_empty()));
 }
 
 fn new_member_id(client_id: &str) -> String {
@@ -1086,5 +1133,26 @@ mod tests {
         coordinator.expire(t + Duration::from_secs(30));
         assert_eq!(b_sync.try_recv().unwrap().error, REBALANCE_IN_PROGRESS);
         assert_eq!(coordinator.heartbeat("a", "g", 2, &a, t), UNKNOWN_MEMBER_ID);
+    }
+
+    #[test]
+    fn an_account_with_no_groups_left_is_forgotten() {
+        let coordinator = Coordinator::default();
+        let t = Instant::now();
+        let joined = lone(&coordinator, "a", "g", "consumer");
+        assert_eq!(
+            coordinator.leave("a", "g", &[joined.member_id], t),
+            vec![NONE]
+        );
+        assert_eq!(coordinator.accounts.lock().unwrap().len(), 1);
+        coordinator.expire(t);
+        assert!(coordinator.accounts.lock().unwrap().is_empty());
+        // A sync or a heartbeat to an account never seen makes nothing.
+        now_answer(coordinator.sync("b", "g", 1, "m", Vec::new(), t));
+        assert_eq!(
+            coordinator.heartbeat("b", "g", 1, "m", t),
+            UNKNOWN_MEMBER_ID
+        );
+        assert!(coordinator.accounts.lock().unwrap().is_empty());
     }
 }
