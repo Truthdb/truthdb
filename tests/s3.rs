@@ -8475,6 +8475,35 @@ fn an_import_copies_another_servers_objects_and_goes_on_after_a_crash() {
     let dropped = native(target.native_port, &format!("s3 drop import {refused_id}"));
     assert_eq!(dropped["dropped"], true, "{dropped}");
     assert!(state(&target, refused_id).is_empty());
+    // Dropped while it runs, an import stops writing.
+    let again = native(
+        target.native_port,
+        &format!(
+            "s3 create import http://127.0.0.1:{} us-east-1 {source_key} {source_secret} s3://src/data/ s3://dst/again/",
+            source.s3_port
+        ),
+    );
+    let again_id = again["import_id"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while state(&target, again_id)
+        .get(1)
+        .is_none_or(|copied| copied == "0")
+    {
+        assert!(Instant::now() < deadline, "the second import never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        native(target.native_port, &format!("s3 drop import {again_id}"))["dropped"],
+        true
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    let copied_after = sql_rows(
+        target.native_port,
+        "SELECT COUNT(*) FROM sys.s3_objects('dst', 'again/')",
+    )[0][0]
+        .parse::<usize>()
+        .unwrap();
+    assert!(copied_after < 10, "it went on: {copied_after} objects");
     // The secret is not shown.
     let shown = native(target.native_port, "SELECT * FROM sys.dm_s3_imports");
     assert!(!shown.to_string().contains(&source_secret), "{shown}");
