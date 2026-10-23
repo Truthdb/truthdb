@@ -17,6 +17,7 @@
 //! covers all of it); its size limits keep it within that budget on the
 //! smallest log ring.
 
+mod queue;
 mod store;
 
 #[cfg(test)]
@@ -32,6 +33,7 @@ use truthdb_core::storage::{
 };
 use truthdb_core::wal::records::RelRecord;
 
+pub use queue::{MAX_VISIBILITY_MS, QueueError, QueueMessage};
 pub use store::{
     Appended, MAX_APPEND_CHUNKS, MAX_PARTITIONS, MAX_RECORD_BYTES, NewRecord, Partition, Record,
     StreamError, Topic, valid_topic_name,
@@ -54,11 +56,17 @@ const RECORDS_TREE: u32 = FIRST + 3;
 /// (topic, partition, source) -> the last sequence number that source
 /// appended (so it appends each at most once).
 const SOURCES_TREE: u32 = FIRST + 4;
-/// (group, 0, topic, partition) -> the offset the group has committed.
+/// (topic, partition, group) -> the offset the group has committed.
 const GROUP_OFFSETS_TREE: u32 = FIRST + 5;
 /// Topic id -> its partition count: dropped topics whose records are being
 /// removed.
 const PURGE_TREE: u32 = FIRST + 6;
+/// (topic, partition, offset) -> a queue message's lease: when it is
+/// visible again, how often it was received, and whether it is done (see
+/// `queue`).
+pub(crate) const QUEUE_LEASES_TREE: u32 = FIRST + 7;
+/// (topic, partition) -> the queue's head: every message before it is done.
+pub(crate) const QUEUE_HEADS_TREE: u32 = FIRST + 8;
 
 /// The object ids this engine owns.
 const OBJECT_ID_SPAN: u32 = 0x1000;
@@ -169,6 +177,8 @@ pub(crate) struct Trees {
     sources: u64,
     group_offsets: u64,
     purge: u64,
+    queue_leases: u64,
+    queue_heads: u64,
 }
 
 macro_rules! tree_accessors {
@@ -188,6 +198,8 @@ tree_accessors!(
     sources => SOURCES_TREE,
     group_offsets => GROUP_OFFSETS_TREE,
     purge => PURGE_TREE,
+    queue_leases => QUEUE_LEASES_TREE,
+    queue_heads => QUEUE_HEADS_TREE,
 );
 
 impl Trees {
@@ -281,6 +293,8 @@ impl<'a> StreamFile<'a> {
             sources: self.tree(SOURCES_TREE)?.root,
             group_offsets: self.tree(GROUP_OFFSETS_TREE)?.root,
             purge: self.tree(PURGE_TREE)?.root,
+            queue_leases: self.tree(QUEUE_LEASES_TREE)?.root,
+            queue_heads: self.tree(QUEUE_HEADS_TREE)?.root,
         };
         self.in_txn(|ctx, txn| body(&mut StreamTxn { ctx, txn, trees }))
     }

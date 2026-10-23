@@ -83,6 +83,9 @@ pub struct RelStorage {
     /// installed once by the code that runs both engines; absent when the
     /// relational engine runs alone.
     external: std::sync::OnceLock<Arc<dyn crate::engine::ExternalRowsets>>,
+    /// Another engine's built-in procedures (the object store's
+    /// `sys.sp_s3_*`), installed like `external`.
+    external_procedures: std::sync::OnceLock<Arc<dyn crate::engine::ExternalProcedures>>,
     /// Scan slices read, so a test can prove a scan stopped early rather than
     /// reading the table and discarding the rest. On the instance and not in a
     /// `static`: the suite runs in parallel in one binary, so a static would

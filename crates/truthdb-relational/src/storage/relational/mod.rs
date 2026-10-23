@@ -29,6 +29,22 @@ impl RelStorage {
         self.external.get()
     }
 
+    /// Installs another engine's built-in procedures (once; a second call
+    /// is ignored).
+    pub fn set_external_procedures(&self, provider: Arc<dyn crate::engine::ExternalProcedures>) {
+        let _ = self.external_procedures.set(provider);
+    }
+
+    /// The provider of procedure `name` (lowercased), if one serves it.
+    pub(crate) fn external_procedure(
+        &self,
+        name: &str,
+    ) -> Option<&Arc<dyn crate::engine::ExternalProcedures>> {
+        self.external_procedures
+            .get()
+            .filter(|provider| provider.handles(name))
+    }
+
     /// Wraps an opened core, seeding the lock-free option mirrors from the
     /// recovered state.
     fn from_core(core: Storage) -> Self {
@@ -47,6 +63,7 @@ impl RelStorage {
             security_version: std::sync::atomic::AtomicU64::new(0),
             membership: std::sync::Mutex::new(MembershipCache::default()),
             external: std::sync::OnceLock::new(),
+            external_procedures: std::sync::OnceLock::new(),
             #[cfg(any(test, feature = "test-hooks"))]
             scan_slices: std::sync::atomic::AtomicUsize::new(0),
             #[cfg(any(test, feature = "test-hooks"))]

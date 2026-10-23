@@ -7,7 +7,7 @@
 use truthdb_sql::error::SqlError;
 use truthdb_sql::value::SqlValue;
 
-use super::api::ResultColumn;
+use super::api::{ResultColumn, RowSet};
 use crate::relstore::types::Datum;
 
 /// Who is asking: a provider whose data is server-wide refuses anyone short of
@@ -28,6 +28,26 @@ pub trait ExternalRowsets: Send + Sync {
         args: &[SqlValue],
         caller: ExternalCaller,
     ) -> Option<Result<ExternalRowset, SqlError>>;
+}
+
+/// The built-in procedures of another engine (the object store's
+/// `sys.sp_s3_*`). One runs outside the caller's transaction, in
+/// transactions of its own: a rollback does not undo it. It takes the
+/// storage lock itself, so it is never called under that lock.
+pub trait ExternalProcedures: Send + Sync {
+    /// Whether `name` (lowercased, schema included) is one of this
+    /// provider's.
+    fn handles(&self, name: &str) -> bool;
+
+    /// Runs procedure `name` with `args`, each named (`@x` as `x`,
+    /// lowercased) or positional, in order. Returns its result set, if it
+    /// has one.
+    fn run(
+        &self,
+        name: &str,
+        args: &[(Option<String>, SqlValue)],
+        caller: ExternalCaller,
+    ) -> Result<Option<RowSet>, SqlError>;
 }
 
 /// An opened rowset: its columns and the stream of its rows.

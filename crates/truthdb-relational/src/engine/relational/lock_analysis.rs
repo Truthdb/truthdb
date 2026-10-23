@@ -701,6 +701,15 @@ pub(super) fn analyze_statements_locks(
             // runs — lock the database exclusively rather than under-lock
             // (2PL acquires the full set up front).
             Statement::Exec(exec) => {
+                // Another engine's built-in procedure locks nothing here: it
+                // runs in transactions of its own (as `run_exec` routes it,
+                // ahead of the catalog).
+                if storage
+                    .external_procedure(&exec.proc.value.to_ascii_lowercase())
+                    .is_some()
+                {
+                    continue;
+                }
                 // A user procedure: its stored body analyzes like literal
                 // inner text, parsed with the IN-PROCEDURE grammar — a plain
                 // parse would reject `RETURN <value>` (178), yield no locks,
