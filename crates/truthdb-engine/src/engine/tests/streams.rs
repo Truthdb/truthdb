@@ -93,6 +93,11 @@ fn topics_are_created_read_as_views_dropped_and_purged() {
             "stream create topic other partitions 2 partitions 3",
             "given twice",
         ),
+        // Past `bigint`'s range in milliseconds.
+        (
+            "stream create topic other retention 2562047788016",
+            "retention of",
+        ),
         ("stream create topic a/b", "letters, digits"),
         ("stream drop topic missing", "no topic 'missing'"),
     ] {
@@ -312,4 +317,39 @@ fn a_read_streams_past_one_slice_and_topics_survive_a_reopen() {
     assert_eq!(offsets, (100..1_200).collect::<Vec<i64>>());
     drop(engine);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_standby_refuses_to_read_topics() {
+    let primary_path = unique_temp_path("streams-primary");
+    let bak = unique_temp_path("streams-bak");
+    let standby_path = unique_temp_path("streams-standby");
+    let primary = new_engine(&primary_path);
+    primary.execute("stream create topic events").unwrap();
+    append(&primary, "events", 0, &["a"], 1);
+    primary.storage().backup_full(&bak).expect("backup");
+    RelStorage::restore_full_standby_with(&standby_path, &bak, &[], crate::database_engines, None)
+        .expect("seed");
+    let standby = Engine::new(
+        RelStorage::open_with(standby_path.clone(), crate::database_engines).expect("open"),
+    )
+    .expect("engine");
+    for query in [
+        "SELECT * FROM sys.stream_topics",
+        "SELECT * FROM sys.stream_read('events', 0)",
+    ] {
+        let env = sql(&standby, query);
+        assert_eq!(env["error"]["number"], 50000, "{query}: {env}");
+        assert!(
+            env["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("read on the primary"),
+            "{env}"
+        );
+    }
+    drop((primary, standby));
+    for path in [primary_path, bak, standby_path] {
+        let _ = std::fs::remove_file(path);
+    }
 }

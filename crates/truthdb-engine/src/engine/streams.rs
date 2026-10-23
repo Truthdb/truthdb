@@ -91,6 +91,8 @@ impl Engine {
                 let retention_hours = retention_hours.unwrap_or(DEFAULT_RETENTION_HOURS);
                 let retention_ms = retention_hours
                     .checked_mul(3_600_000)
+                    // Shown as a `bigint` in `sys.stream_topics`.
+                    .filter(|ms| i64::try_from(*ms).is_ok())
                     .ok_or_else(|| invalid(format!("a retention of {retention_hours} hours")))?;
                 let now_ms = super::now_ms();
                 let topic = name.clone();
@@ -164,10 +166,10 @@ impl Engine {
         let now_ms = super::now_ms();
         if self.streams(|file| file.trim_due(now_ms))? {
             for _ in 0..STREAM_MAINTENANCE_STEPS {
-                let removed = self.streams(|file| {
+                let (_, more) = self.streams(|file| {
                     file.transaction(|tx| tx.trim_step(now_ms, STREAM_STEP_ROWS))
                 })?;
-                if removed < STREAM_STEP_ROWS {
+                if !more {
                     break;
                 }
             }

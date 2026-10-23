@@ -10,6 +10,9 @@
 //!
 //! Records stream a slice at a time, each slice under its own storage-lock
 //! hold. Topics are server-wide: only a server administrator may read them.
+//! A standby refuses both: it applies the primary's log as it arrives,
+//! transactions still open included, and the streams engine keeps no row
+//! versions to hide those from a reader.
 
 use std::sync::Arc;
 
@@ -99,6 +102,14 @@ fn with_streams<T>(
     core: &Arc<Storage>,
     op: impl FnOnce(&mut StreamFile<'_>) -> Result<T, StorageError>,
 ) -> Result<T, SqlError> {
+    if core.is_standby() {
+        return Err(SqlError::new(
+            50000,
+            16,
+            1,
+            "Streams are read on the primary: a standby holds its open transactions' changes.",
+        ));
+    }
     let mut guard = core.lock();
     let mut file = StreamFile::try_new(&mut guard).ok_or_else(|| {
         SqlError::new(

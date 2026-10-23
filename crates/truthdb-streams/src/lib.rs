@@ -12,8 +12,10 @@
 //! of its trees to its root page; trees are created the first time they are
 //! needed. Every transaction stops writing once it has written an eighth of
 //! the log's compensation reserve, so its rollback, or recovery's undo,
-//! fits the log: a large append, trim or purge runs over as many
-//! transactions as that takes.
+//! fits the log: a large trim or purge runs over as many transactions as
+//! that takes. An append is one transaction (a source's sequence number
+//! covers all of it); its size limits keep it within that budget on the
+//! smallest log ring.
 
 mod store;
 

@@ -114,6 +114,16 @@ fn in_txn<T>(
         .unwrap()
 }
 
+/// The rows of the group-offsets tree, of every topic.
+fn group_offset_rows(storage: &Storage) -> usize {
+    let mut guard = storage.lock();
+    let mut file = StreamFile::new(&mut guard);
+    let Some(tree) = file.existing_tree(crate::GROUP_OFFSETS_TREE).unwrap() else {
+        return 0;
+    };
+    tree.scan(&mut file.page_ctx()).unwrap().len()
+}
+
 fn record(value: &str) -> NewRecord {
     NewRecord {
         key: None,
@@ -163,7 +173,7 @@ fn topics_take_appends_in_order_once_per_source_and_go_when_dropped() {
         tx.append("events", 0, &[record("a"), record("b")], None, 5_000)
     })
     .unwrap();
-    assert_eq!((appended.offset, appended.written), (0, true));
+    assert_eq!((appended.offset, appended.written), (Some(0), true));
     in_txn(&storage, |tx| {
         tx.append("events", 0, &[record("c")], None, 4_000)
     })
@@ -235,16 +245,26 @@ fn topics_take_appends_in_order_once_per_source_and_go_when_dropped() {
             .unwrap()
             .unwrap()
     };
-    assert!(by_source(10, "s10").written);
-    assert!(!by_source(10, "again").written);
-    assert!(!by_source(9, "older").written);
-    assert!(by_source(11, "s11").written);
+    let appended = |seq: u64, value: &str| {
+        let appended = by_source(seq, value);
+        (appended.offset, appended.written)
+    };
+    assert_eq!(appended(10, "s10"), (Some(1), true));
+    assert_eq!(
+        appended(10, "again"),
+        (Some(1), false),
+        "the original offset"
+    );
+    assert_eq!(appended(9, "older"), (None, false));
+    assert_eq!(appended(11, "s11"), (Some(2), true));
     assert_eq!(
         values(&storage, "events", 1, 0),
         [(0, "x".into()), (1, "s10".into()), (2, "s11".into())]
     );
-    // Group offsets.
-    in_txn(&storage, |tx| tx.commit_offset("readers", "events", 1, 2)).unwrap();
+    // Group offsets (more groups than a purge step removes).
+    for group in ["readers", "a", "b", "c"] {
+        in_txn(&storage, |tx| tx.commit_offset(group, "events", 1, 2)).unwrap();
+    }
     assert_eq!(
         StreamFile::new(&mut storage.lock())
             .committed_offset("readers", "events", 1)
@@ -287,6 +307,11 @@ fn topics_take_appends_in_order_once_per_source_and_go_when_dropped() {
         assert!(steps < 100);
     }
     assert!(steps >= 2, "{steps} steps");
+    assert_eq!(
+        group_offset_rows(&storage),
+        0,
+        "its groups' offsets went too"
+    );
     assert!(
         !StreamFile::new(&mut storage.lock())
             .purge_pending()
@@ -329,14 +354,14 @@ fn retention_trims_the_oldest_records() {
     let due = |now| StreamFile::new(&mut storage.lock()).trim_due(now).unwrap();
     assert!(!due(1_500), "nothing older than the retention yet");
     assert!(due(3_500));
-    let removed = StreamFile::new(&mut storage.lock())
+    let trimmed = StreamFile::new(&mut storage.lock())
         .transaction(|tx| tx.trim_step(3_500, 1))
         .unwrap();
-    assert_eq!(removed, 1, "the limit");
-    let removed = StreamFile::new(&mut storage.lock())
+    assert_eq!(trimmed, (1, true), "the limit");
+    let trimmed = StreamFile::new(&mut storage.lock())
         .transaction(|tx| tx.trim_step(3_500, 100))
         .unwrap();
-    assert_eq!(removed, 1);
+    assert_eq!(trimmed, (1, false));
     assert_eq!(values(&storage, "short", 0, 0), [(2, "c".into())]);
     assert_eq!(values(&storage, "forever", 0, 0).len(), 3);
     let state = StreamFile::new(&mut storage.lock())
@@ -350,7 +375,7 @@ fn retention_trims_the_oldest_records() {
         StreamFile::new(&mut storage.lock())
             .transaction(|tx| tx.trim_step(3_500, 100))
             .unwrap(),
-        0
+        (0, false)
     );
     drop(storage);
     std::fs::remove_file(&path).ok();
@@ -482,4 +507,75 @@ fn topics_ship_to_a_standby_and_restore_from_a_log_backup() {
     for p in [&path, &bak, &log, &seed, &dst] {
         std::fs::remove_file(p).ok();
     }
+}
+
+#[test]
+fn a_trim_stopped_by_the_log_budget_says_more_is_due() {
+    let path = temp_path("trim-budget");
+    let storage = create(&path);
+    in_txn(&storage, |tx| tx.create_topic("big", 1, 1_000, 0)).unwrap();
+    let value = vec![7u8; 16 * 1024];
+    for _ in 0..16 {
+        let records = vec![
+            NewRecord {
+                key: None,
+                value: value.clone(),
+            };
+            8
+        ];
+        in_txn(&storage, |tx| tx.append("big", 0, &records, None, 1)).unwrap();
+        // As the engine does when the log fills.
+        storage.write_checkpoint(b"x", 1, 2, 1).expect("checkpoint");
+    }
+    let mut steps = 0;
+    let mut removed = 0;
+    loop {
+        let (count, more) = in_txn(&storage, |tx| tx.trim_step(5_000, usize::MAX));
+        storage.write_checkpoint(b"x", 1, 2, 1).expect("checkpoint");
+        removed += count;
+        steps += 1;
+        if !more {
+            break;
+        }
+        assert!(count > 0 && steps < 100, "{steps} steps");
+    }
+    assert_eq!(removed, 128);
+    assert!(steps >= 2, "the budget stopped a step: {steps} steps");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn the_largest_append_fits_a_transactions_budget_on_the_smallest_ring() {
+    let path = temp_path("largest-append");
+    let storage = Storage::create_with_wal_bounds(
+        path.to_path_buf(),
+        StorageOptions {
+            size_bytes: 1 << 30,
+            wal_ratio: 0.25,
+            metadata_ratio: 0.08,
+            snapshot_ratio: 0.02,
+            allocator_ratio: 0.02,
+            reserved_ratio: 0.17,
+            default_collation: None,
+        },
+        truthdb_core::storage_layout::WAL_MIN_BYTES,
+        truthdb_core::storage_layout::WAL_MIN_BYTES,
+        engines,
+    )
+    .expect("create");
+    in_txn(&storage, |tx| tx.create_topic("big", 1, 0, 0)).unwrap();
+    let largest = NewRecord {
+        key: None,
+        value: vec![7u8; crate::MAX_RECORD_BYTES],
+    };
+    let records = vec![largest; crate::MAX_APPEND_BYTES / crate::MAX_RECORD_BYTES];
+    let (written, budget) = in_txn(&storage, |tx| {
+        let start = tx.log_tail();
+        tx.append("big", 0, &records, None, 1)?.unwrap();
+        Ok((tx.log_since(start), tx.log_budget()))
+    });
+    assert!(written <= budget, "{written} bytes of log, budget {budget}");
+    drop(storage);
+    std::fs::remove_file(&path).ok();
 }

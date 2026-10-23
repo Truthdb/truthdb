@@ -19,8 +19,11 @@ use crate::{
 /// Partitions a topic may have.
 pub const MAX_PARTITIONS: u32 = 64;
 /// The largest record (its key and value), and the most one append writes.
-pub const MAX_RECORD_BYTES: usize = 1024 * 1024;
-pub const MAX_APPEND_BYTES: usize = 4 * 1024 * 1024;
+/// An append is one transaction, and the log it writes is several times its
+/// size (chunks, and the images of the pages they split), so these keep the
+/// largest within a transaction's log budget on the smallest log ring.
+pub const MAX_RECORD_BYTES: usize = 256 * 1024;
+pub const MAX_APPEND_BYTES: usize = 512 * 1024;
 /// Bytes per stored chunk of a record.
 const CHUNK: usize = 1500;
 
@@ -62,8 +65,10 @@ pub struct Record {
 /// What an append did.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Appended {
-    /// The first record's offset.
-    pub offset: u64,
+    /// The first record's offset: for a repeat of the source's latest
+    /// append, that append's; `None` for a repeat of an older one (its
+    /// offset is not kept).
+    pub offset: Option<u64>,
     /// False when the source had appended this sequence number already
     /// (nothing was written).
     pub written: bool,
@@ -224,9 +229,9 @@ fn decode_record(offset: u64, bytes: &[u8]) -> Result<Record, StorageError> {
     })
 }
 
-/// `(group, 0, topic, partition)`.
+/// `(topic, partition, group)`.
 fn group_key(group: &str, topic: u32, partition: u32) -> Vec<u8> {
-    [group.as_bytes(), &[0], &partition_key(topic, partition)].concat()
+    [&partition_key(topic, partition)[..], group.as_bytes()].concat()
 }
 
 /// `(topic, partition, source)`.
@@ -380,19 +385,27 @@ impl StreamTxn<'_, '_> {
         if let Some((name, sequence)) = source {
             let key = source_key(topic.id, partition, name);
             let sources = self.trees.sources();
+            // `[sequence u64][first offset u64]` of the source's latest
+            // append.
             let last = sources
                 .get(self.ctx, &key)?
-                .map(|row| u64_at(&row, 0))
+                .map(|row| {
+                    if row.len() != 16 {
+                        return Err(corrupt("source"));
+                    }
+                    Ok((u64_at(&row, 0)?, u64_at(&row, 8)?))
+                })
                 .transpose()?;
-            if last.is_some_and(|last| sequence <= last) {
+            if let Some((last, offset)) = last.filter(|(last, _)| sequence <= *last) {
                 return Ok(Ok(Appended {
-                    offset: state.next,
+                    offset: (sequence == last).then_some(offset),
                     written: false,
                 }));
             }
+            let row = [sequence.to_le_bytes(), state.next.to_le_bytes()].concat();
             let mode = &mut OpMode::Txn(self.txn);
             sources.delete(self.ctx, mode, &key)?;
-            sources.insert_unique(self.ctx, mode, &key, &sequence.to_le_bytes())?;
+            sources.insert_unique(self.ctx, mode, &key, &row)?;
         }
         let first = state.next;
         let timestamp_ms = now_ms.max(state.last_ms);
@@ -419,7 +432,7 @@ impl StreamTxn<'_, '_> {
             )?;
         }
         Ok(Ok(Appended {
-            offset: first,
+            offset: Some(first),
             written: true,
         }))
     }
@@ -448,8 +461,9 @@ impl StreamTxn<'_, '_> {
 
     /// Removes up to `limit` records past their topic's retention at
     /// `now_ms`, oldest first, and stops at the log budget. Returns how
-    /// many it removed.
-    pub fn trim_step(&mut self, now_ms: u64, limit: usize) -> Result<usize, StorageError> {
+    /// many it removed, and whether it stopped at the limit or the budget
+    /// (so more may be due).
+    pub fn trim_step(&mut self, now_ms: u64, limit: usize) -> Result<(usize, bool), StorageError> {
         let start_tail = self.log_tail();
         let budget = self.log_budget();
         let topics: Vec<Topic> = self
@@ -498,7 +512,8 @@ impl StreamTxn<'_, '_> {
                 }
             }
         }
-        Ok(removed)
+        let more = removed >= limit || self.log_since(start_tail) >= budget;
+        Ok((removed, more))
     }
 
     /// Removes up to `limit` rows of the first dropped topic (stopping at
@@ -522,12 +537,29 @@ impl StreamTxn<'_, '_> {
             Some(&record_key(topic, u32::MAX, u64::MAX, u16::MAX)),
             limit,
         )?;
-        let finished = rows.len() < limit;
+        let mut finished = rows.len() < limit;
         for (key, _) in rows {
             if self.log_since(start_tail) >= budget {
                 return Ok(false);
             }
             records.delete(self.ctx, &mut OpMode::Txn(self.txn), &key)?;
+        }
+        // Then the offsets consumer groups committed in it.
+        if finished {
+            let offsets = self.trees.group_offsets();
+            let rows = offsets.scan_range_limit(
+                self.ctx,
+                Some(&partition_key(topic, 0)),
+                Some(&[&partition_key(topic, u32::MAX)[..], &[0xFF]].concat()),
+                limit,
+            )?;
+            finished = rows.len() < limit;
+            for (key, _) in rows {
+                if self.log_since(start_tail) >= budget {
+                    return Ok(false);
+                }
+                offsets.delete(self.ctx, &mut OpMode::Txn(self.txn), &key)?;
+            }
         }
         if finished {
             purge.delete(self.ctx, &mut OpMode::Txn(self.txn), &id_key)?;
