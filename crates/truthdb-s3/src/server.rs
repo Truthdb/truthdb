@@ -197,10 +197,37 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
     let resource = request.uri().path().to_string();
     let ids = RequestIds::new();
     request.extensions_mut().insert(ids.clone());
+    // A cross-origin request (not a preflight, which answers for itself):
+    // its answer, an error too, carries the CORS headers its bucket's
+    // configuration allows.
+    let cross_origin = (request.method() != hyper::Method::OPTIONS)
+        .then(|| {
+            request
+                .headers()
+                .get("origin")?
+                .to_str()
+                .ok()
+                .map(str::to_string)
+        })
+        .flatten()
+        .and_then(|origin| match crate::api::target(&resource).ok()? {
+            crate::api::Target::Bucket(bucket) | crate::api::Target::Object(bucket, _) => {
+                Some((bucket, origin, request.method().clone()))
+            }
+            crate::api::Target::Service => None,
+        });
     let mut response = match route(state, request).await {
         Ok(response) => response,
         Err(err) => error_response(&err, &resource, &ids),
     };
+    if let Some((bucket, origin, method)) = cross_origin {
+        let headers = response.headers_mut();
+        for (name, value) in crate::cors::answer_headers(state, &bucket, &origin, &method).await {
+            if let Ok(value) = hyper::header::HeaderValue::from_str(&value) {
+                headers.insert(name, value);
+            }
+        }
+    }
     let headers = response.headers_mut();
     for (name, value) in [
         ("x-amz-request-id", &ids.request_id),
@@ -254,6 +281,11 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
             "InvalidArgument",
             "A query parameter name must not be percent-encoded",
         ));
+    }
+    // A CORS preflight: answered from the bucket's configuration, before
+    // (and without) any authentication, as a browser sends it.
+    if request.method() == hyper::Method::OPTIONS {
+        return crate::cors::preflight(state, &request).await;
     }
     // A form upload (POST Object) carries its signature in the form.
     if request.method() == hyper::Method::POST

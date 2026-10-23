@@ -31,6 +31,8 @@ pub const OBJECT_LOCK_DEFAULT: u8 = 4;
 pub const BUCKET_LIFECYCLE: u8 = 5;
 /// A bucket configuration: its event notifications (see `notifications`).
 pub const BUCKET_NOTIFICATION: u8 = 6;
+/// Bucket configuration: its CORS configuration (the rendered XML).
+pub const BUCKET_CORS: u8 = 7;
 
 fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
     [prefix, &chunk.to_be_bytes()].concat()
