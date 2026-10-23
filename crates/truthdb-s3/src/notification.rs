@@ -78,11 +78,27 @@ fn destination_arn(arn: &str, region: &str, kind: Kind) -> Result<Destination, S
     let fields: Vec<&str> = arn.split(':').collect();
     let refused = || invalid(format!("The ARN is not well formed: {arn}"));
     let (service, arn_region, account, topic) = match fields.as_slice() {
-        ["arn", "aws", "lambda", region, account, "function", name]
-        | ["arn", "aws", "lambda", region, account, "function", name, _] => {
+        ["arn", "aws", "lambda", region, account, "function", name] => {
             ("lambda", *region, *account, *name)
         }
-        ["arn", "aws", service, region, account, topic] => (*service, *region, *account, *topic),
+        [
+            "arn",
+            "aws",
+            "lambda",
+            region,
+            account,
+            "function",
+            name,
+            qualifier,
+        ] if !qualifier.is_empty() => ("lambda", *region, *account, *name),
+        [
+            "arn",
+            "aws",
+            service @ ("sns" | "sqs"),
+            region,
+            account,
+            topic,
+        ] => (*service, *region, *account, *topic),
         _ => return Err(refused()),
     };
     if service != kind.names().2 {
@@ -530,6 +546,20 @@ mod tests {
             (
                 "<CloudFunctionConfiguration><CloudFunction>arn:aws:lambda:us-east-1:\
                  123456789012:layer:f</CloudFunction><Event>s3:ObjectCreated:*</Event>\
+                 </CloudFunctionConfiguration>"
+                    .to_string(),
+                "InvalidArgument",
+            ),
+            (
+                "<CloudFunctionConfiguration><CloudFunction>arn:aws:lambda:us-east-1:\
+                 123456789012:fn</CloudFunction><Event>s3:ObjectCreated:*</Event>\
+                 </CloudFunctionConfiguration>"
+                    .to_string(),
+                "InvalidArgument",
+            ),
+            (
+                "<CloudFunctionConfiguration><CloudFunction>arn:aws:lambda:us-east-1:\
+                 123456789012:function:fn:</CloudFunction><Event>s3:ObjectCreated:*</Event>\
                  </CloudFunctionConfiguration>"
                     .to_string(),
                 "InvalidArgument",

@@ -46,8 +46,9 @@ pub(super) enum StreamAdmin {
 }
 
 pub(super) fn parse_stream_admin(input: &str) -> Option<StreamAdmin> {
-    // The CLI ends every command with `;`.
-    let input = input.trim().trim_end_matches(';');
+    // The CLI ends every command with `;` (one: a secret may end in one).
+    let input = input.trim();
+    let input = input.strip_suffix(';').unwrap_or(input);
     let words: Vec<&str> = input.split_whitespace().collect();
     let lower: Vec<String> = words.iter().map(|word| word.to_ascii_lowercase()).collect();
     let lower: Vec<&str> = lower.iter().map(String::as_str).collect();
@@ -97,6 +98,17 @@ fn webhook_error(topic: &str, err: truthdb_streams::WebhookError) -> EngineError
         WebhookError::NameTooLong => {
             format!("the dead-letter topic of '{topic}' would be named past 249 characters")
         }
+        WebhookError::DeadLetterTooSmall => format!(
+            "the dead-letter topic of '{topic}' has fewer partitions than it; drop it first"
+        ),
+        WebhookError::UrlTooLong => format!(
+            "a webhook URL is at most {} bytes",
+            truthdb_streams::MAX_URL_BYTES
+        ),
+        WebhookError::SecretTooLong => format!(
+            "a webhook secret is at most {} bytes",
+            truthdb_streams::MAX_SECRET_BYTES
+        ),
     })
     .into()
 }

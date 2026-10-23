@@ -1,12 +1,13 @@
 //! Webhook delivery (see `truthdb_streams::Webhook`), on a thread of its
-//! own (see `session::pool`): each step posts the records due, one per
-//! webhook partition, and records each outcome. A POST carries the record
-//! as its JSON body (an S3 event message: `{"Records":[...]}`), signed:
-//! `x-truthdb-signature: t=<unix seconds>,v1=<hex HMAC-SHA256 of
-//! "<t>.<body>" under the webhook's secret>`, and names the record in
-//! `x-truthdb-delivery: <topic>/<partition>/<offset>` (the same on a
-//! retry, so a receiver can drop a repeat). A 2xx answer delivers it;
-//! anything else, or no answer, is a failed try.
+//! own (see `session::pool`): each step posts the records due (one per
+//! webhook partition, from a partition further on each round) at once, and
+//! records each outcome. A POST carries the record as its JSON body (an S3
+//! event message: `{"Records":[...]}`), names it in `x-truthdb-delivery:
+//! <topic>/<partition>/<offset>` (the same on a retry, so a receiver can drop
+//! a repeat), and is signed: `x-truthdb-signature: t=<unix seconds>,v1=<hex
+//! HMAC-SHA256 of "<t>.<delivery>.<body>" under the webhook's secret>`, the
+//! time when it is sent. A 2xx answer delivers it; anything else, or no
+//! answer, is a failed try.
 
 use truthdb_s3client::{Bytes, Poster};
 use truthdb_streams::{Delivery, StreamFile};
@@ -16,11 +17,11 @@ use super::{Engine, EngineError};
 /// Records one step posts at most.
 const STEP_DELIVERIES: usize = 16;
 
-/// The signature header's value for `body` at `secs`.
-pub(crate) fn signature(secret: &str, secs: u64, body: &[u8]) -> String {
+/// The signature header's value for `body` posted as `delivery` at `secs`.
+pub(crate) fn signature(secret: &str, secs: u64, delivery: &str, body: &[u8]) -> String {
     let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, secret.as_bytes());
     let mut context = ring::hmac::Context::with_key(&key);
-    context.update(format!("{secs}.").as_bytes());
+    context.update(format!("{secs}.{delivery}.").as_bytes());
     context.update(body);
     let digest: String = context
         .sign()
@@ -37,8 +38,8 @@ impl Engine {
     pub(crate) fn webhook_step(
         &self,
         runtime: &tokio::runtime::Runtime,
-        poster: &Poster,
-        stopping: &dyn Fn() -> bool,
+        poster: &std::sync::Arc<Poster>,
+        round: usize,
     ) -> Result<bool, EngineError> {
         if self.storage.is_standby() {
             return Ok(false);
@@ -52,21 +53,38 @@ impl Engine {
             return Ok(false);
         }
         let now_ms = super::now_ms();
-        let due = self.streams(|file| file.webhook_due(now_ms, STEP_DELIVERIES))?;
-        let mut delivered = false;
-        for delivery in &due {
-            if stopping() {
-                break;
+        let due = self.streams(|file| file.webhook_due(now_ms, STEP_DELIVERIES, round))?;
+        // All at once: a slow endpoint holds the step up by its own wait,
+        // not by its own times the others'.
+        let outcomes = runtime.block_on(async {
+            let mut posts = tokio::task::JoinSet::new();
+            for (at, delivery) in due.iter().enumerate() {
+                let (poster, delivery) = (std::sync::Arc::clone(poster), delivery.clone());
+                posts.spawn(async move { (at, post(&poster, &delivery).await) });
             }
-            let outcome = runtime.block_on(post(poster, delivery, now_ms / 1000));
-            self.streams(|file| {
-                file.transaction(|tx| match &outcome {
+            let mut outcomes = vec![Err("not posted".to_string()); due.len()];
+            while let Some(done) = posts.join_next().await {
+                if let Ok((at, outcome)) = done {
+                    outcomes[at] = outcome;
+                }
+            }
+            outcomes
+        });
+        let mut delivered = false;
+        for (delivery, outcome) in due.iter().zip(&outcomes) {
+            let recorded = self.streams(|file| {
+                file.transaction(|tx| match outcome {
                     Ok(()) => tx.webhook_delivered(delivery),
                     Err(error) => tx
                         .webhook_failed(delivery, error, super::now_ms())
                         .map(|_| ()),
                 })
-            })?;
+            });
+            // One outcome that cannot be recorded does not hold back the
+            // others'.
+            if let Err(err) = recorded {
+                eprintln!("webhook outcome of {}: {err}", delivery.topic);
+            }
             delivered |= outcome.is_ok();
         }
         Ok(delivered)
@@ -74,21 +92,20 @@ impl Engine {
 }
 
 /// Posts `delivery`; why it failed, if it did.
-async fn post(poster: &Poster, delivery: &Delivery, secs: u64) -> Result<(), String> {
+async fn post(poster: &Poster, delivery: &Delivery) -> Result<(), String> {
+    let secs = super::now_ms() / 1000;
+    let id = format!(
+        "{}/{}/{}",
+        delivery.topic, delivery.partition, delivery.offset
+    );
     let headers = [
         ("content-type", "application/json".to_string()),
         ("user-agent", "truthdb-webhooks".to_string()),
         (
             "x-truthdb-signature",
-            signature(&delivery.secret, secs, &delivery.value),
+            signature(&delivery.secret, secs, &id, &delivery.value),
         ),
-        (
-            "x-truthdb-delivery",
-            format!(
-                "{}/{}/{}",
-                delivery.topic, delivery.partition, delivery.offset
-            ),
-        ),
+        ("x-truthdb-delivery", id),
     ];
     match poster
         .post(&delivery.url, &headers, Bytes::from(delivery.value.clone()))
@@ -106,16 +123,22 @@ mod tests {
 
     #[test]
     fn a_signature_is_the_hmac_of_the_time_and_the_body() {
-        // HMAC-SHA256("key", "1.{}"), computed independently.
+        // HMAC-SHA256("key", "1.t/0/2.{}"), computed independently.
         let expected = {
             let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"key");
-            let tag = ring::hmac::sign(&key, b"1.{}");
+            let tag = ring::hmac::sign(&key, b"1.t/0/2.{}");
             tag.as_ref()
                 .iter()
                 .map(|byte| format!("{byte:02x}"))
                 .collect::<String>()
         };
-        assert_eq!(signature("key", 1, b"{}"), format!("t=1,v1={expected}"));
-        assert_ne!(signature("key", 2, b"{}"), signature("key", 1, b"{}"));
+        assert_eq!(
+            signature("key", 1, "t/0/2", b"{}"),
+            format!("t=1,v1={expected}")
+        );
+        assert_ne!(
+            signature("key", 1, "t/0/3", b"{}"),
+            signature("key", 1, "t/0/2", b"{}")
+        );
     }
 }

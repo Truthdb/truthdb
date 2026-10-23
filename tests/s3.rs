@@ -9035,7 +9035,7 @@ fn bucket_events_reach_a_webhook_signed_and_retried() {
     assert_eq!(event["Records"][0]["eventName"], "ObjectCreated:Put");
     assert_eq!(event["Records"][0]["s3"]["configurationId"], "fn");
     assert_eq!(header(2, "content-type"), "application/json");
-    // Signed with the secret over the time and the body.
+    // Signed with the secret over the time, the delivery and the body.
     for (at, (_, body)) in seen.iter().enumerate() {
         let signature = header(at, "x-truthdb-signature");
         let (time, mac) = signature
@@ -9043,12 +9043,16 @@ fn bucket_events_reach_a_webhook_signed_and_retried() {
             .and_then(|rest| rest.split_once(",v1="))
             .unwrap();
         let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"topsecret");
-        let expected: String =
-            ring::hmac::sign(&key, &[format!("{time}.").as_bytes(), body].concat())
-                .as_ref()
-                .iter()
-                .map(|byte| format!("{byte:02x}"))
-                .collect();
+        let signed = [
+            format!("{time}.{}.", header(at, "x-truthdb-delivery")).as_bytes(),
+            body,
+        ]
+        .concat();
+        let expected: String = ring::hmac::sign(&key, &signed)
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
         assert_eq!(mac, expected, "request {at}");
     }
     let rows = sql_rows(
@@ -9056,5 +9060,6 @@ fn bucket_events_reach_a_webhook_signed_and_retried() {
         "SELECT topic_name, next_offset, pending_records, delivered, dead_lettered, last_error \
          FROM sys.dm_s3_webhooks",
     );
-    assert_eq!(rows, [["hooked", "2", "0", "2", "0", "HTTP 500"]]);
+    // Delivered since its last failure: no error shown.
+    assert_eq!(rows, [["hooked", "2", "0", "2", "0", "null"]]);
 }

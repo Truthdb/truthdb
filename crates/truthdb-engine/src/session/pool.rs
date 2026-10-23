@@ -412,17 +412,19 @@ pub(super) fn webhook_loop(shared: &Arc<Shared>) {
     // The HTTP client's connection pool lives in the runtime it was made
     // in.
     let poster = match runtime.block_on(async { truthdb_s3client::Poster::new(None) }) {
-        Ok(poster) => poster,
+        Ok(poster) => Arc::new(poster),
         Err(err) => {
             eprintln!("webhooks cannot run: {err}");
             return;
         }
     };
+    // Each step starts further on, so no webhook keeps the others waiting.
+    let mut round = 0usize;
     while !shared.stop.load(Ordering::Acquire) {
-        let stopping = || shared.stop.load(Ordering::Acquire);
+        round = round.wrapping_add(1);
         let more = shared
             .engine
-            .webhook_step(&runtime, &poster, &stopping)
+            .webhook_step(&runtime, &poster, round)
             .unwrap_or_else(|err| {
                 eprintln!("webhook delivery failed: {err}");
                 false

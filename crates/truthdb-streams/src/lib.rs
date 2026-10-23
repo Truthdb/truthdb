@@ -40,8 +40,8 @@ pub use store::{
     StreamError, Topic, valid_topic_name,
 };
 pub use webhook::{
-    DEAD_LETTER_SUFFIX, Delivery, MAX_ATTEMPTS, Webhook, WebhookError, WebhookPartition,
-    dead_letter_topic,
+    DEAD_LETTER_SUFFIX, Delivery, MAX_ATTEMPTS, MAX_SECRET_BYTES, MAX_URL_BYTES, Webhook,
+    WebhookError, WebhookPartition, dead_letter_topic,
 };
 
 /// The streams engine's id on the shared log.
@@ -75,15 +75,19 @@ pub(crate) const QUEUE_FRONTIERS_TREE: u32 = FIRST + 8;
 /// (topic, partition, visible ms, offset) -> (): the leases by when their
 /// messages are visible again.
 pub(crate) const QUEUE_TIMES_TREE: u32 = FIRST + 9;
-/// Topic id -> its webhook: where it posts and how far it has delivered
-/// (see `webhook`).
+/// Topic id -> its webhook: where it posts, its secret and counts (see
+/// `webhook`).
 const WEBHOOKS_TREE: u32 = FIRST + 10;
+/// (topic, partition) -> how far its webhook has delivered the partition.
+pub(crate) const WEBHOOK_PARTITIONS_TREE: u32 = FIRST + 11;
 
 /// The object ids this engine owns.
 const OBJECT_ID_SPAN: u32 = 0x1000;
 
 /// META key of the next topic id to hand out.
 const NEXT_TOPIC_KEY: &[u8] = b"next_topic";
+/// META key of the next webhook generation to hand out.
+const NEXT_WEBHOOK_KEY: &[u8] = b"next_webhook";
 
 /// The streams engine's in-memory state under the storage lock.
 #[derive(Default)]
@@ -192,6 +196,7 @@ pub(crate) struct Trees {
     queue_frontiers: u64,
     queue_times: u64,
     webhooks: u64,
+    webhook_partitions: u64,
 }
 
 macro_rules! tree_accessors {
@@ -215,6 +220,7 @@ tree_accessors!(
     queue_frontiers => QUEUE_FRONTIERS_TREE,
     queue_times => QUEUE_TIMES_TREE,
     webhooks => WEBHOOKS_TREE,
+    webhook_partitions => WEBHOOK_PARTITIONS_TREE,
 );
 
 impl Trees {
@@ -312,6 +318,7 @@ impl<'a> StreamFile<'a> {
             queue_frontiers: self.tree(QUEUE_FRONTIERS_TREE)?.root,
             queue_times: self.tree(QUEUE_TIMES_TREE)?.root,
             webhooks: self.tree(WEBHOOKS_TREE)?.root,
+            webhook_partitions: self.tree(WEBHOOK_PARTITIONS_TREE)?.root,
         };
         self.in_txn(|ctx, txn| body(&mut StreamTxn { ctx, txn, trees }))
     }

@@ -576,6 +576,7 @@ impl StreamTxn<'_, '_> {
             self.trees.queue_leases(),
             self.trees.queue_frontiers(),
             self.trees.queue_times(),
+            self.trees.webhook_partitions(),
         ] {
             if !finished {
                 break;

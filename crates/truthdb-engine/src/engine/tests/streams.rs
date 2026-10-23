@@ -440,6 +440,13 @@ fn webhooks_are_set_on_topics_and_shown() {
             "not an http",
         ),
         ("stream drop webhook missing", "no topic 'missing'"),
+        (
+            &*format!(
+                "stream create webhook events url https://h/{} secret k",
+                "x".repeat(1100)
+            ),
+            "at most 1024 bytes",
+        ),
     ] {
         let message = command_error(&engine, command);
         assert!(message.contains(error), "{command}: {message}");
