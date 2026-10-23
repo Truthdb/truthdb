@@ -310,7 +310,6 @@ pub async fn dispatch(
         true => crate::copy::copy_source(request.headers()).ok(),
         false => None,
     };
-    let copy_bucket = copy_source.as_ref().map(|(bucket, _, _)| bucket.clone());
     // The objects whose current tags a policy may read: the target, when
     // the operation acts on a version of it that exists (a write makes a new
     // one), and a copy's source.
@@ -353,17 +352,6 @@ pub async fn dispatch(
             .any(|(name, owner)| name == bucket && owner.is_some())
     {
         crate::metering::mark_seen(&request);
-        // A copy's source, when its bucket exists: S3 counts a GET there
-        // once the copy is made.
-        if let Some(source) = &copy_bucket
-            && authz
-                .owners()
-                .iter()
-                .any(|(name, owner)| name == source && owner.is_some())
-            && let Some(seen) = crate::metering::seen_of(&request)
-        {
-            seen.mark_copy_source(source);
-        }
     }
     let scope = crate::scope::Scope {
         key: principal
@@ -855,6 +843,16 @@ async fn route(
                 }
             }
             authz.check_with(action, Object(&source, &source_key), &context)?;
+            // A copy reads its source (whose bucket exists): S3 counts a GET
+            // there once the copy is made.
+            if authz
+                .owners()
+                .iter()
+                .any(|(name, owner)| *name == source && owner.is_some())
+                && let Some(seen) = crate::metering::seen_of(&request)
+            {
+                seen.mark_copy_source(&source);
+            }
             if has_param(&request, "uploadId") {
                 crate::copy::upload_part_copy(state, request, bucket, key).await
             } else {

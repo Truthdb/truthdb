@@ -12660,6 +12660,37 @@ fn requests_are_counted_per_bucket_by_kind_bytes_errors_and_latency() {
         ),
         200
     );
+    // Nor does it on a write that is no copy, to a bucket that exists: a
+    // legal hold set does not read "other".
+    let lock = [("x-amz-bucket-object-lock-enabled", "true")];
+    assert_eq!(
+        send_with(port, "PUT", "/held", "", &lock, b"", &key, Some(&secret))
+            .1
+            .0,
+        200
+    );
+    assert_eq!(
+        send_with(port, "PUT", "/held/k", "", &[], b"x", &key, Some(&secret))
+            .1
+            .0,
+        200
+    );
+    let hold = b"<LegalHold><Status>ON</Status></LegalHold>";
+    let hold_md5 = content_md5(hold);
+    let (_, (status, reply)) = send_with(
+        port,
+        "PUT",
+        "/held/k",
+        "legal-hold",
+        &[
+            ("content-md5", &hold_md5),
+            ("x-amz-copy-source", "/other/copy"),
+        ],
+        hold,
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 200, "{reply}");
     // A form upload is a POST, and a preflight (to a bucket with a CORS
     // configuration) a request.
     let form = signed_form(
@@ -12796,7 +12827,7 @@ fn requests_are_counted_per_bucket_by_kind_bytes_errors_and_latency() {
         server.native_port,
         "SELECT bucket_name FROM sys.dm_s3_requests ORDER BY bucket_name",
     );
-    assert_eq!(buckets, [["meters"], ["other"]]);
+    assert_eq!(buckets, [["held"], ["meters"], ["other"]]);
     // Each request's latencies, until its answer starts and until it ends.
     let latencies = sql_rows(
         server.native_port,
