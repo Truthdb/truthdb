@@ -570,7 +570,8 @@ impl StreamTxn<'_, '_> {
         for tree in [
             self.trees.group_offsets(),
             self.trees.queue_leases(),
-            self.trees.queue_heads(),
+            self.trees.queue_frontiers(),
+            self.trees.queue_times(),
         ] {
             if !finished {
                 break;

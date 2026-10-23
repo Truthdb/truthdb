@@ -31,6 +31,7 @@ fn received(engine: &Engine, sql: &str) -> Vec<(String, String, String)> {
             "message_id",
             "receipt_handle",
             "body",
+            "body_bytes",
             "md5_of_body",
             "receive_count",
             "sent_time",
@@ -42,7 +43,7 @@ fn received(engine: &Engine, sql: &str) -> Vec<(String, String, String)> {
             (
                 row[2].clone().unwrap(),
                 row[1].clone().unwrap(),
-                row[4].clone().unwrap(),
+                row[5].clone().unwrap(),
             )
         })
         .collect()
@@ -66,8 +67,9 @@ fn a_queue_is_received_acknowledged_and_hidden_through_exec() {
     let (_, rows) = sql_rows(&engine, "EXEC sys.sp_s3_queue_receive N'q', 10, 0");
     assert_eq!(rows.len(), 1, "positional; the rest in flight");
     assert_eq!(rows[0][0].as_deref(), Some("0-2"));
+    assert_eq!(rows[0][3].as_deref(), Some("0x63"));
     assert_eq!(
-        rows[0][3].as_deref(),
+        rows[0][4].as_deref(),
         Some("4a8a08f09d37b73795649038408b5f33"),
         "MD5 of 'c'"
     );
@@ -104,7 +106,11 @@ fn a_queue_is_received_acknowledged_and_hidden_through_exec() {
         .find_map(|result| result["rows"].as_array())
         .unwrap_or_else(|| panic!("no rowset: {env}"));
     let bodies: Vec<&str> = rows.iter().map(|row| row[2].as_str().unwrap()).collect();
-    assert_eq!(bodies, ["b", "c"], "b made visible, c's timeout of 0 over");
+    assert_eq!(
+        bodies,
+        ["c", "b"],
+        "in the order they became visible: c's timeout of 0, then b made so"
+    );
     assert!(
         received(&engine, "EXEC sys.sp_s3_queue_receive N'q'").is_empty(),
         "the rollback returned nothing"
@@ -120,6 +126,8 @@ fn a_queue_is_received_acknowledged_and_hidden_through_exec() {
         ("EXEC sys.sp_s3_queue_receive N'q', @queue = N'q'", 8143),
         ("EXEC sys.sp_s3_queue_receive @queue = N'q', 1", 119),
         ("EXEC sys.sp_s3_queue_receive N'q', 11", 50000),
+        ("EXEC sys.sp_s3_queue_receive N'q', N'x'", 245),
+        ("EXEC sys.sp_s3_queue_receive N'q', 10.5, 43201", 50000),
         ("EXEC sys.sp_s3_queue_receive N'q', 1, 43201", 50000),
         ("EXEC sys.sp_s3_queue_receive 5", 206),
         ("EXEC sys.sp_s3_queue_receive N'missing'", 50000),
@@ -140,6 +148,31 @@ fn a_queue_is_received_acknowledged_and_hidden_through_exec() {
         Value::from("The queue 'missing' does not exist.")
     );
 
+    // Numbers given as a decimal or a string convert as to `int`; a body
+    // that is not UTF-8 is NULL text beside its bytes.
+    engine
+        .streams(|file| {
+            file.transaction(|tx| {
+                tx.append(
+                    "q",
+                    0,
+                    &[NewRecord {
+                        key: None,
+                        value: vec![0xFF, 0x00],
+                    }],
+                    None,
+                    1_000,
+                )
+            })
+        })
+        .unwrap()
+        .unwrap();
+    let (_, rows) = sql_rows(&engine, "EXEC sys.sp_s3_queue_receive N'q', 2.9, N' 30 '");
+    assert_eq!(rows.len(), 1);
+    assert_eq!(
+        (rows[0][2].as_deref(), rows[0][3].as_deref()),
+        (None, Some("0xFF00"))
+    );
     // Locks nothing: it runs in transactions of its own.
     let needs = crate::engine::analyze_locks(
         engine.storage(),
@@ -173,4 +206,39 @@ fn a_queue_is_received_acknowledged_and_hidden_through_exec() {
     assert_eq!(outcome.error.as_ref().map(|e| e.number), Some(229));
     drop(engine);
     let _ = std::fs::remove_file(path);
+}
+
+#[test]
+fn a_standby_refuses_the_queue() {
+    let primary_path = unique_temp_path("queue-primary");
+    let bak = unique_temp_path("queue-bak");
+    let standby_path = unique_temp_path("queue-standby");
+    let primary = new_engine(&primary_path);
+    primary.execute("stream create topic q").unwrap();
+    primary.storage().backup_full(&bak).expect("backup");
+    crate::storage::RelStorage::restore_full_standby_with(
+        &standby_path,
+        &bak,
+        &[],
+        crate::database_engines,
+        None,
+    )
+    .expect("seed");
+    let standby = Engine::new(
+        crate::storage::RelStorage::open_with(standby_path.clone(), crate::database_engines)
+            .expect("open"),
+    )
+    .expect("engine");
+    let env = sql(&standby, "EXEC sys.sp_s3_queue_receive N'q'");
+    assert!(
+        env["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("on the primary"),
+        "{env}"
+    );
+    drop((primary, standby));
+    for path in [primary_path, bak, standby_path] {
+        let _ = std::fs::remove_file(path);
+    }
 }

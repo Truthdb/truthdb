@@ -4,7 +4,9 @@
 //! - `sys.sp_s3_queue_receive @queue, [@max_messages = 1], [@visibility_timeout = 30]`:
 //!   up to `@max_messages` (1 to 10) visible messages, each hidden for
 //!   `@visibility_timeout` seconds (0 to 43,200), as a result set with a
-//!   receipt handle per message, new with each receive.
+//!   receipt handle per message, new with each receive. A trigger's result
+//!   sets are discarded, as SQL Server discards them: a receive there hides
+//!   messages for their visibility timeout without handing them to anyone.
 //! - `sys.sp_s3_queue_ack @queue, @receipt_handle`: the message is done. A
 //!   receipt of an earlier receive changes nothing.
 //! - `sys.sp_s3_queue_change_visibility @queue, @receipt_handle, @visibility_timeout`:
@@ -14,7 +16,7 @@
 //! Each runs in a streams transaction of its own, outside the caller's: a
 //! rollback does not return a received message to the queue (its
 //! visibility timeout does). Queues are server-wide: only a server
-//! administrator may use them.
+//! administrator may use them, and only on a primary.
 
 use std::sync::Arc;
 
@@ -26,7 +28,9 @@ use truthdb_sql::error::SqlError;
 use truthdb_sql::value::SqlValue;
 use truthdb_streams::{QueueError, QueueMessage, StreamFile};
 
-use super::s3_sql::{bigint, datetime, datetime2, nvarchar, nvarchar_max, text};
+use truthdb_relational::relstore::types::ColumnType;
+
+use super::s3_sql::{bigint, column, datetime, datetime2, nvarchar, nvarchar_max, text};
 
 const RECEIVE: &str = "sys.sp_s3_queue_receive";
 const ACK: &str = "sys.sp_s3_queue_ack";
@@ -131,6 +135,14 @@ impl QueueProcedures {
             &mut truthdb_streams::StreamTxn<'_, '_>,
         ) -> Result<Result<T, QueueError>, StorageError>,
     ) -> Result<T, SqlError> {
+        if self.core.is_standby() {
+            return Err(SqlError::new(
+                50000,
+                16,
+                1,
+                "The SQL queue is used on the primary: a standby's log is the primary's.",
+            ));
+        }
         let mut guard = self.core.lock();
         let mut file = StreamFile::try_new(&mut guard).ok_or_else(|| {
             SqlError::new(
@@ -226,7 +238,8 @@ fn string_param(name: &str, param: &str, value: Option<&SqlValue>) -> Result<Str
 }
 
 /// An integer parameter within `min..=max` (`default` when not given or
-/// NULL).
+/// NULL). A decimal or a string converts as SQL Server converts it to
+/// `int` (a decimal truncated).
 fn int_param(
     name: &str,
     param: &str,
@@ -235,22 +248,38 @@ fn int_param(
     min: i64,
     max: i64,
 ) -> Result<i64, SqlError> {
-    match value {
-        None | Some(SqlValue::Null) => Ok(default),
-        Some(SqlValue::Int(value)) if (min..=max).contains(value) => Ok(*value),
-        Some(SqlValue::Int(value)) => Err(SqlError::new(
+    let value = match value {
+        None | Some(SqlValue::Null) => return Ok(default),
+        Some(SqlValue::Int(value)) => *value,
+        Some(SqlValue::Decimal(decimal)) => {
+            i64::try_from(decimal.value / 10i128.pow(u32::from(decimal.scale))).unwrap_or(i64::MAX)
+        }
+        Some(SqlValue::Str(text)) => text.trim().parse().map_err(|_| {
+            SqlError::new(
+                245,
+                16,
+                1,
+                format!("Conversion failed when converting the nvarchar value '{text}' to data type int."),
+            )
+        })?,
+        Some(_) => {
+            return Err(SqlError::new(
+                206,
+                16,
+                2,
+                format!("Operand type clash: @{param} of {name} must be an integer."),
+            ));
+        }
+    };
+    if !(min..=max).contains(&value) {
+        return Err(SqlError::new(
             50000,
             16,
             1,
             format!("@{param} of {name} must be from {min} to {max}, not {value}."),
-        )),
-        Some(_) => Err(SqlError::new(
-            206,
-            16,
-            2,
-            format!("Operand type clash: @{param} of {name} must be an integer."),
-        )),
+        ));
     }
+    Ok(value)
 }
 
 fn rowset(messages: Vec<QueueMessage>) -> RowSet {
@@ -259,6 +288,7 @@ fn rowset(messages: Vec<QueueMessage>) -> RowSet {
             nvarchar("message_id", 64),
             nvarchar("receipt_handle", 64),
             nvarchar_max("body"),
+            column("body_bytes", ColumnType::VarBinaryMax),
             nvarchar("md5_of_body", 32),
             bigint("receive_count"),
             datetime2("sent_time"),
@@ -274,7 +304,10 @@ fn rowset(messages: Vec<QueueMessage>) -> RowSet {
                 vec![
                     text(&format!("{}-{}", message.partition, message.offset)),
                     text(&message.receipt),
-                    text(&String::from_utf8_lossy(&message.value)),
+                    // As text when it is UTF-8 (NULL otherwise); as given
+                    // in `body_bytes`, which the MD5 is of.
+                    std::str::from_utf8(&message.value).map_or(Datum::Null, text),
+                    Datum::VarBinary(message.value.clone()),
                     text(&md5),
                     Datum::BigInt(i64::from(message.receives)),
                     datetime(message.timestamp_ms),

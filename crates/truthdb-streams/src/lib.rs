@@ -61,12 +61,15 @@ const GROUP_OFFSETS_TREE: u32 = FIRST + 5;
 /// Topic id -> its partition count: dropped topics whose records are being
 /// removed.
 const PURGE_TREE: u32 = FIRST + 6;
-/// (topic, partition, offset) -> a queue message's lease: when it is
-/// visible again, how often it was received, and whether it is done (see
-/// `queue`).
+/// (topic, partition, offset) -> the lease of a queue message in flight:
+/// when it is visible again and how often it was received (see `queue`).
 pub(crate) const QUEUE_LEASES_TREE: u32 = FIRST + 7;
-/// (topic, partition) -> the queue's head: every message before it is done.
-pub(crate) const QUEUE_HEADS_TREE: u32 = FIRST + 8;
+/// (topic, partition) -> the queue's frontier: the first offset never
+/// received.
+pub(crate) const QUEUE_FRONTIERS_TREE: u32 = FIRST + 8;
+/// (topic, partition, visible ms, offset) -> (): the leases by when their
+/// messages are visible again.
+pub(crate) const QUEUE_TIMES_TREE: u32 = FIRST + 9;
 
 /// The object ids this engine owns.
 const OBJECT_ID_SPAN: u32 = 0x1000;
@@ -178,7 +181,8 @@ pub(crate) struct Trees {
     group_offsets: u64,
     purge: u64,
     queue_leases: u64,
-    queue_heads: u64,
+    queue_frontiers: u64,
+    queue_times: u64,
 }
 
 macro_rules! tree_accessors {
@@ -199,7 +203,8 @@ tree_accessors!(
     group_offsets => GROUP_OFFSETS_TREE,
     purge => PURGE_TREE,
     queue_leases => QUEUE_LEASES_TREE,
-    queue_heads => QUEUE_HEADS_TREE,
+    queue_frontiers => QUEUE_FRONTIERS_TREE,
+    queue_times => QUEUE_TIMES_TREE,
 );
 
 impl Trees {
@@ -294,7 +299,8 @@ impl<'a> StreamFile<'a> {
             group_offsets: self.tree(GROUP_OFFSETS_TREE)?.root,
             purge: self.tree(PURGE_TREE)?.root,
             queue_leases: self.tree(QUEUE_LEASES_TREE)?.root,
-            queue_heads: self.tree(QUEUE_HEADS_TREE)?.root,
+            queue_frontiers: self.tree(QUEUE_FRONTIERS_TREE)?.root,
+            queue_times: self.tree(QUEUE_TIMES_TREE)?.root,
         };
         self.in_txn(|ctx, txn| body(&mut StreamTxn { ctx, txn, trees }))
     }

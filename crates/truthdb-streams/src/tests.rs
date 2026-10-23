@@ -667,8 +667,12 @@ fn a_queue_hides_redelivers_and_acknowledges_its_messages() {
         change(&again[0].receipt, 5, 1_100),
         Err(QueueError::NotInFlight)
     );
-    let third = receive(&storage, 1, 1_000, 1_100);
-    assert_eq!((offsets(&third), third[0].receives), (vec![1], 3));
+    // Visible again in the order they became so: 2 to 4 at 1,020, 1 at
+    // 1,100.
+    let back = receive(&storage, 10, 1_000, 1_100);
+    assert_eq!(offsets(&back), [2, 3, 4, 1]);
+    let third = vec![back[3].clone()];
+    assert_eq!(third[0].receives, 3);
     assert_eq!(
         change(&third[0].receipt, crate::MAX_VISIBILITY_MS, 1_100),
         Err(QueueError::TooLong)
@@ -689,8 +693,8 @@ fn a_queue_hides_redelivers_and_acknowledges_its_messages() {
         in_txn(&storage, |tx| tx.queue_receive("missing", 1, 1_000, 5)),
         Err(QueueError::NoSuchTopic)
     );
-    // Acknowledged out of order: done, yet past the head until those
-    // before it are.
+    // Acknowledged out of order: done, whatever is still in flight before
+    // it.
     let later = receive(&storage, 10, 1_000, 2_100);
     assert_eq!(offsets(&later), [2, 3, 4]);
     ack(&later[1].receipt).unwrap();
@@ -698,11 +702,14 @@ fn a_queue_hides_redelivers_and_acknowledges_its_messages() {
         change(&later[1].receipt, 5, 2_200),
         Err(QueueError::NotInFlight)
     );
-    assert_eq!(queue_rows(&storage, crate::QUEUE_LEASES_TREE), 5);
+    // Leases only for what is in flight (1, 2 and 4, and the other
+    // queue's), each indexed by when it is visible again.
+    assert_eq!(queue_rows(&storage, crate::QUEUE_LEASES_TREE), 4);
+    assert_eq!(queue_rows(&storage, crate::QUEUE_TIMES_TREE), 4);
     for message in [&third[0], &later[0], &later[2]] {
         ack(&message.receipt).unwrap();
     }
-    // All done: every lease gone, the head past them.
+    // All done: every lease gone.
     assert!(receive(&storage, 10, 1_000, 1_000_000).is_empty());
     let leases_of_q = queue_rows(&storage, crate::QUEUE_LEASES_TREE);
     assert_eq!(leases_of_q, 1, "only the other queue's");
@@ -714,7 +721,8 @@ fn a_queue_hides_redelivers_and_acknowledges_its_messages() {
     in_txn(&storage, |tx| tx.drop_topic("q")).unwrap();
     while !in_txn(&storage, |tx| tx.purge_step(2)) {}
     assert_eq!(queue_rows(&storage, crate::QUEUE_LEASES_TREE), 0);
-    assert_eq!(queue_rows(&storage, crate::QUEUE_HEADS_TREE), 0);
+    assert_eq!(queue_rows(&storage, crate::QUEUE_FRONTIERS_TREE), 0);
+    assert_eq!(queue_rows(&storage, crate::QUEUE_TIMES_TREE), 0);
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
@@ -741,7 +749,7 @@ fn a_queue_passes_over_messages_retention_removed() {
     assert_eq!(
         queue_rows(&storage, crate::QUEUE_LEASES_TREE),
         1,
-        "the trimmed message's lease went with the acknowledgement"
+        "the trimmed message's lease was dropped when it came due"
     );
     drop(storage);
     std::fs::remove_file(&path).ok();
@@ -824,6 +832,50 @@ fn a_busy_partition_does_not_keep_the_others_waiting() {
             .collect::<Vec<_>>(),
         [(0, 0), (0, 1), (0, 2)]
     );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn an_acknowledgement_settles_one_message_whatever_is_done_behind_it() {
+    let path = temp_path("queue-poison");
+    let storage = create(&path);
+    in_txn(&storage, |tx| tx.create_topic("q", 1, 0, None, 1)).unwrap();
+    let checkpoint = || storage.write_checkpoint(b"x", 1, 2, 1).expect("checkpoint");
+    for _ in 0..30 {
+        let records: Vec<NewRecord> = (0..100).map(|_| record("m")).collect();
+        in_txn(&storage, |tx| tx.append("q", 0, &records, None, 1)).unwrap();
+        checkpoint();
+    }
+    let mut received = Vec::new();
+    for _ in 0..300 {
+        received.extend(receive(&storage, 10, 60_000, 10));
+        if received.len() % 500 == 0 {
+            checkpoint();
+        }
+    }
+    assert_eq!(received.len(), 3_000);
+    // Everything but the first acknowledged.
+    for (at, message) in received.iter().enumerate().skip(1) {
+        in_txn(&storage, |tx| tx.queue_ack("q", &message.receipt)).unwrap();
+        if at % 500 == 0 {
+            checkpoint();
+        }
+    }
+    checkpoint();
+    let (written, budget) = in_txn(&storage, |tx| {
+        let start = tx.log_tail();
+        tx.queue_ack("q", &received[0].receipt)?.unwrap();
+        Ok((tx.log_since(start), tx.log_budget()))
+    });
+    // A lease and its index entry (with the first images of their pages
+    // after the checkpoint), not the 2,999 messages done behind it.
+    assert!(
+        written < 32 * 1024 && written < budget,
+        "{written} bytes of log"
+    );
+    assert_eq!(queue_rows(&storage, crate::QUEUE_LEASES_TREE), 0);
+    assert_eq!(queue_rows(&storage, crate::QUEUE_TIMES_TREE), 0);
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
