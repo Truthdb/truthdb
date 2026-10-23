@@ -221,14 +221,22 @@ impl NotificationRule {
     }
 }
 
-/// The event a journal row is: by the operation that made the change (a
-/// change without one, by its kind). `None` for a change no event names.
-pub fn event_type(record: &JournalRecord) -> Option<&'static str> {
+/// The event a journal row is: a notice's own; a change's by the operation
+/// that made it (a change without one, by its kind). `None` for a change
+/// no event names.
+pub fn event_type(record: &JournalRecord) -> Option<&str> {
     let operation = record
         .origin
         .as_ref()
         .map_or("", |origin| origin.operation.as_str());
     Some(match (record.record_type, record.is_delete_marker) {
+        (RecordType::Notice, _) => {
+            return record
+                .notice
+                .as_ref()
+                .map(|notice| notice.event.as_str())
+                .filter(|event| EVENT_TYPES.contains(event));
+        }
         (RecordType::Create, _) => match operation {
             "PostObject" => "s3:ObjectCreated:Post",
             "CopyObject" => "s3:ObjectCreated:Copy",
@@ -280,8 +288,10 @@ pub fn event_message(
 ) -> String {
     use serde_json::{Map, Value, json};
     let origin = record.origin.clone().unwrap_or_default();
-    // A lifecycle action is S3's own.
-    let by_s3 = event.starts_with("s3:Lifecycle");
+    // A lifecycle action is S3's own, as is a notice made without a request
+    // (a restore completing, or expiring).
+    let by_s3 = event.starts_with("s3:Lifecycle")
+        || (record.record_type == RecordType::Notice && origin.account.is_none());
     let principal = match (&origin.account, &origin.user) {
         _ if by_s3 => "s3.amazonaws.com".to_string(),
         (Some(account), Some(user)) => format!("{account}:{user}"),
@@ -316,9 +326,12 @@ pub fn event_message(
         "sequencer".into(),
         json!(format!("{:016X}", record.sequence)),
     );
-    // 2.1 for creations and removals; 2.3 for the event types added with
-    // it (lifecycle, tagging).
-    let version = if event.starts_with("s3:ObjectCreated") || event.starts_with("s3:ObjectRemoved")
+    // 2.1 for creations, removals and restores; 2.3 for the event types
+    // added with it (lifecycle, tagging, a restored copy expiring).
+    let version = if event.starts_with("s3:ObjectCreated")
+        || event.starts_with("s3:ObjectRemoved")
+        || event == "s3:ObjectRestore:Post"
+        || event == "s3:ObjectRestore:Completed"
     {
         "2.1"
     } else {
@@ -346,6 +359,16 @@ pub fn event_message(
             },
         }],
     });
+    if let Some(Value::Object(fields)) = record
+        .notice
+        .as_ref()
+        .and_then(|notice| notice.detail.as_deref())
+        .and_then(|detail| serde_json::from_str(detail).ok())
+    {
+        for (name, value) in fields {
+            message["Records"][0][name] = value;
+        }
+    }
     if event == "s3:LifecycleTransition"
         && let Some(version) = &record.object
     {
@@ -751,6 +774,7 @@ mod tests {
                 user: Some("alice".into()),
                 source_ip: Some("10.0.0.1".into()),
             }),
+            notice: None,
         }
     }
 
@@ -950,5 +974,54 @@ mod tests {
                 .get("lifecycleEventData")
                 .is_none()
         );
+    }
+
+    #[test]
+    fn a_notice_is_its_own_event_with_its_detail() {
+        let config = NotificationConfig {
+            region: "eu-west-1".into(),
+            rules: vec![rule("cfg", &["s3:ObjectRestore:*"], None, None)],
+        };
+        let mut completed = record(RecordType::Notice, Some(false), "");
+        completed.origin = Some(Origin::default());
+        completed.notice = Some(crate::journal::Notice {
+            event: "s3:ObjectRestore:Completed".into(),
+            detail: Some(r#"{"glacierEventData":{"restoreEventData":{"x":1}}}"#.into()),
+        });
+        assert_eq!(event_type(&completed), Some("s3:ObjectRestore:Completed"));
+        let message: serde_json::Value = serde_json::from_str(&event_message(
+            &completed,
+            "s3:ObjectRestore:Completed",
+            &config,
+            &config.rules[0],
+            "123456789012",
+        ))
+        .unwrap();
+        let event = &message["Records"][0];
+        assert_eq!(event["eventVersion"], "2.1");
+        assert_eq!(event["userIdentity"]["principalId"], "s3.amazonaws.com");
+        assert_eq!(event["glacierEventData"]["restoreEventData"]["x"], 1);
+        assert_eq!(event["s3"]["object"]["size"], 1024);
+        // Made by a request: its requester.
+        let mut posted = record(RecordType::Notice, Some(false), "RestoreObject");
+        posted.notice = Some(crate::journal::Notice {
+            event: "s3:ObjectRestore:Post".into(),
+            detail: None,
+        });
+        let message: serde_json::Value = serde_json::from_str(&event_message(
+            &posted,
+            "s3:ObjectRestore:Post",
+            &config,
+            &config.rules[0],
+            "123456789012",
+        ))
+        .unwrap();
+        assert_eq!(
+            message["Records"][0]["userIdentity"]["principalId"],
+            "123456789012:alice"
+        );
+        // An event no configuration may name is none.
+        posted.notice.as_mut().unwrap().event = "s3:Nope".into();
+        assert_eq!(event_type(&posted), None);
     }
 }

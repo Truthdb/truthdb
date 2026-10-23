@@ -5155,3 +5155,88 @@ fn the_notification_history_keeps_what_unsent_changes_need() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_restore_notes_its_start_completion_and_expiry() {
+    use crate::{RecordType, StorageClass, VersionSel, restore_expiry};
+    let path = temp_path("restore-notices");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    let cold = put_classed(&storage, "bkt", "cold", b"frozen", StorageClass::Glacier);
+    let gone = put_classed(&storage, "bkt", "gone", b"melted", StorageClass::Glacier);
+    let start = now();
+    let restore = |key: &str, at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.restore_object("bkt", key, VersionSel::Latest, ask(1, 1_000), at))
+            .unwrap()
+            .unwrap()
+    };
+    let notices = || {
+        ObjFile::new(&mut storage.lock())
+            .journal(0, 1_000)
+            .unwrap()
+            .into_iter()
+            .filter(|row| row.record_type == RecordType::Notice)
+            .map(|row| {
+                let notice = row.notice.unwrap();
+                (row.key, notice.event, notice.detail)
+            })
+            .collect::<Vec<_>>()
+    };
+    restore("cold", start);
+    restore("gone", start);
+    // A version removed before its restore is ready: no completion.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.delete_object("bkt", "gone", None, false, start, 0))
+        .unwrap()
+        .unwrap();
+    let step = |at: u64| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| Ok((tx.complete_restores(at, 100)?, tx.expire_restores(at, 100)?)))
+            .unwrap()
+    };
+    assert!(
+        !ObjFile::new(&mut storage.lock())
+            .restores_ready(start + 999)
+            .unwrap()
+    );
+    assert_eq!(step(start + 999), (0, 0), "not ready yet");
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .restores_ready(start + 1_000)
+            .unwrap()
+    );
+    assert_eq!(step(start + 1_000), (1, 0));
+    // Extended once restored: no second start.
+    restore("cold", start + 2_000);
+    let expiry = restore_expiry(start + 2_000, 1);
+    assert_eq!(step(expiry), (0, 1));
+    let events: Vec<(String, String)> = notices()
+        .iter()
+        .map(|(key, event, _)| (key.clone(), event.clone()))
+        .collect();
+    let event = |key: &str, name: &str| (key.to_string(), name.to_string());
+    assert_eq!(
+        events,
+        [
+            event("cold", "s3:ObjectRestore:Post"),
+            event("gone", "s3:ObjectRestore:Post"),
+            event("cold", "s3:ObjectRestore:Completed"),
+            event("cold", "s3:ObjectRestore:Delete"),
+        ]
+    );
+    let detail: serde_json::Value =
+        serde_json::from_str(notices()[2].2.as_deref().unwrap()).unwrap();
+    let data = &detail["glacierEventData"]["restoreEventData"];
+    assert_eq!(data["lifecycleRestoreStorageClass"], "GLACIER");
+    assert_eq!(
+        data["lifecycleRestorationExpiryTime"],
+        crate::time::iso8601(restore_expiry(start + 1_000, 1))
+    );
+    assert_ne!(cold.version, gone.version);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

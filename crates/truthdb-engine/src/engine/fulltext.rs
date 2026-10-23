@@ -93,9 +93,11 @@ impl Engine {
                 outcome = Ok(true);
                 break;
             }
-            if let Some(bucket) = buckets
-                .iter()
-                .find(|bucket| bucket.name == record.bucket && bucket.state != FtState::Purging)
+            // A notice changes nothing the index holds.
+            if record.record_type != truthdb_object::RecordType::Notice
+                && let Some(bucket) = buckets
+                    .iter()
+                    .find(|bucket| bucket.name == record.bucket && bucket.state != FtState::Purging)
             {
                 match self.fulltext_sync(bucket, &record.key, stop) {
                     Ok(true) => {}

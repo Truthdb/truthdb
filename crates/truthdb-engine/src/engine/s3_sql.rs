@@ -13,7 +13,10 @@
 //! - `sys.s3_journal(@bucket [, @after_sequence])`: the change journal's rows
 //!   for `bucket` numbered after `@after_sequence`, oldest first (S3
 //!   Metadata's journal table): only the current bucket's, not those of a
-//!   deleted bucket of the same name. A restore to an earlier point rewinds
+//!   deleted bucket of the same name. The numbers are not consecutive: the
+//!   journal also keeps notices of events that are not S3 Metadata records
+//!   (restores, retention changes, for event notifications), which are
+//!   left out. A restore to an earlier point rewinds
 //!   the numbering with everything else, so a reader resuming from a number
 //!   seen before the restore reads the numbers handed out again after it.
 //! - `sys.s3_search(@bucket, @condition [, @top])`: full-text search over
@@ -822,7 +825,11 @@ impl ExternalStream for JournalStream {
             rows.extend(
                 records
                     .iter()
-                    .filter(|record| record.bucket == self.bucket)
+                    // A notice is not one of S3 Metadata's records.
+                    .filter(|record| {
+                        record.bucket == self.bucket
+                            && record.record_type != truthdb_object::RecordType::Notice
+                    })
                     .map(journal_row),
             );
         }

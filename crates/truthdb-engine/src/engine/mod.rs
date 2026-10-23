@@ -274,7 +274,8 @@ const OBJECT_JOURNAL_HOLD_CAP_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 /// Journal rows one trimming transaction deletes at most.
 const OBJECT_JOURNAL_TRIM_BATCH: usize = 512;
 
-/// Expired restores one transaction removes at most.
+/// Expired restores one transaction removes (and ready ones it sends the
+/// events of) at most.
 const OBJECT_RESTORE_EXPIRY_BATCH: usize = 512;
 
 /// A multipart upload left open this long is abandoned: garbage collection
@@ -1294,6 +1295,18 @@ impl Engine {
             // Gone meanwhile (completed or aborted) is fine.
             let _ =
                 self.object(|file| file.transaction(|tx| tx.abort_upload(upload, now_ms, 0)))?;
+        }
+        // Restores become ready: their `s3:ObjectRestore:Completed` events.
+        for _ in 0..8 {
+            let completed = self.object(|file| {
+                if !file.restores_ready(now_ms)? {
+                    return Ok(0);
+                }
+                file.transaction(|tx| tx.complete_restores(now_ms, OBJECT_RESTORE_EXPIRY_BATCH))
+            })?;
+            if completed < OBJECT_RESTORE_EXPIRY_BATCH {
+                break;
+            }
         }
         // Expired restores, a bounded batch per transaction and per sweep;
         // an idle sweep writes nothing.

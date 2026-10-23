@@ -315,6 +315,33 @@ impl ObjTxn<'_, '_> {
         }
         lock.retention = retention;
         self.set_lock(version, &lock)?;
+        // The retention after the change (none after a removal).
+        let detail = retention.map(|retention| {
+            let mut data = serde_json::json!({
+                "mode": match retention.mode {
+                    RetentionMode::Governance => "GOVERNANCE",
+                    RetentionMode::Compliance => "COMPLIANCE",
+                },
+                "retainUntilDate": crate::time::iso8601(retention.effective_until(now_ms)),
+            });
+            if let Some(event) = retention.event {
+                data["eventHold"] = (if event.on { "ON" } else { "OFF" }).into();
+                data["eventHoldDuration"] = if event.years {
+                    serde_json::json!({ "years": event.count })
+                } else {
+                    serde_json::json!({ "days": event.count })
+                };
+            }
+            serde_json::json!({ "objectRetentionEventData": data }).to_string()
+        });
+        self.note_event(
+            bucket,
+            key,
+            version,
+            "s3:ObjectRetention:Put",
+            detail,
+            now_ms,
+        )?;
         Ok(Ok((version, null_version)))
     }
 
