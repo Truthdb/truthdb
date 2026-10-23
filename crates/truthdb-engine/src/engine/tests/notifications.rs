@@ -214,6 +214,9 @@ fn changes_send_their_events_once_even_when_a_batch_is_sent_again() {
             })
         })
         .unwrap();
+    // Made again, the bucket is not configured until it is.
+    put(&engine, "photos", "in/between.jpg");
+    delete(&engine, "photos", "in/between.jpg");
     configure(
         &engine,
         vec![rule("created", "s3:ObjectCreated:*", Some("in/"), None)],

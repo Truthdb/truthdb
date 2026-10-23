@@ -5048,3 +5048,85 @@ fn imports_and_their_failures_are_kept_shipped_and_dropped() {
         std::fs::remove_file(p).ok();
     }
 }
+
+#[test]
+fn the_notification_history_keeps_what_unsent_changes_need() {
+    use crate::{Destination, NotificationConfig, NotificationRule, ObjectAttrs};
+    let path = temp_path("notify-history");
+    let storage = create(&path);
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.create_bucket("bkt", DEFAULT_ACCOUNT, now()))
+        .unwrap()
+        .unwrap();
+    let config = |rules: usize| NotificationConfig {
+        region: "us-east-1".into(),
+        rules: (0..rules)
+            .map(|at| NotificationRule {
+                id: format!("r{at}"),
+                events: vec!["s3:ObjectCreated:*".into()],
+                prefix: Some(format!("p{at}/")),
+                suffix: None,
+                destination: Destination::Topic("arn:aws:sns:us-east-1:000000000000:events".into()),
+            })
+            .collect(),
+    };
+    let configure = |rules: usize| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_notification("bkt", &config(rules)))
+            .unwrap();
+    };
+    // A change, the consumer caught up past it.
+    let change_sent = || {
+        let mut writer = BodyWriter::begin(&storage, now()).unwrap();
+        writer.write(&storage, b"x", now()).unwrap();
+        let sealed = writer.finish(&storage, now()).unwrap();
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        file.transaction(|tx| {
+            tx.put_object(
+                "bkt",
+                "k",
+                &sealed,
+                &ObjectAttrs::default(),
+                crate::StorageClass::Standard,
+                now(),
+                0,
+            )?
+            .unwrap();
+            let last = tx.last_change()?;
+            tx.advance_notifications(last)
+        })
+        .unwrap();
+    };
+    let rows = || {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        let Some(tree) = file.existing_tree(crate::NOTIFY_HISTORY_TREE).unwrap() else {
+            return 0;
+        };
+        tree.scan(&mut file.core.page_ctx(0)).unwrap().len()
+    };
+    configure(1);
+    for rules in 2..6 {
+        change_sent();
+        configure(rules);
+        // The configuration the consumer is past, and the new one.
+        assert_eq!(rows(), 2, "{rules} rules");
+    }
+    // Turned off: once the consumer is past that, nothing is kept.
+    configure(0);
+    change_sent();
+    configure(1);
+    assert_eq!(rows(), 1);
+    let at = |sequence| {
+        ObjFile::new(&mut storage.lock())
+            .notification_at("bkt", sequence)
+            .unwrap()
+            .map(|(config, owner)| (config.rules.len(), owner))
+    };
+    let last = ObjFile::new(&mut storage.lock()).last_change().unwrap();
+    assert_eq!(at(last), None, "turned off then");
+    assert_eq!(at(last + 1), Some((1, DEFAULT_ACCOUNT.to_string())));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
