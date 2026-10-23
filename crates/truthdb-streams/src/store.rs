@@ -122,11 +122,11 @@ pub fn valid_topic_name(name: &str) -> Result<(), StreamError> {
     Ok(())
 }
 
-fn corrupt(what: &str) -> StorageError {
+pub(crate) fn corrupt(what: &str) -> StorageError {
     StorageError::InvalidFile(format!("corrupt streams {what}"))
 }
 
-fn u64_at(bytes: &[u8], at: usize) -> Result<u64, StorageError> {
+pub(crate) fn u64_at(bytes: &[u8], at: usize) -> Result<u64, StorageError> {
     bytes
         .get(at..at + 8)
         .map(|b| u64::from_le_bytes(b.try_into().unwrap()))
@@ -187,7 +187,7 @@ fn decode_partition(row: &[u8]) -> Result<Partition, StorageError> {
     })
 }
 
-fn partition_key(topic: u32, partition: u32) -> [u8; 8] {
+pub(crate) fn partition_key(topic: u32, partition: u32) -> [u8; 8] {
     let mut key = [0u8; 8];
     key[..4].copy_from_slice(&topic.to_be_bytes());
     key[4..].copy_from_slice(&partition.to_be_bytes());
@@ -256,7 +256,7 @@ fn source_key(topic: u32, partition: u32, source: &str) -> Vec<u8> {
 }
 
 /// Reads one record's chunks from `records`.
-fn read_record(
+pub(crate) fn read_record(
     ctx: &mut truthdb_core::relstore::ctx::RelCtx<'_>,
     records: &BTree,
     topic: u32,
@@ -276,7 +276,7 @@ fn read_record(
 }
 
 impl StreamTxn<'_, '_> {
-    fn topic_row(&mut self, name: &str) -> Result<Option<Topic>, StorageError> {
+    pub(crate) fn topic_row(&mut self, name: &str) -> Result<Option<Topic>, StorageError> {
         self.trees
             .topics()
             .get(self.ctx, name.as_bytes())?
@@ -284,7 +284,11 @@ impl StreamTxn<'_, '_> {
             .transpose()
     }
 
-    fn partition_row(&mut self, topic: u32, partition: u32) -> Result<Partition, StorageError> {
+    pub(crate) fn partition_row(
+        &mut self,
+        topic: u32,
+        partition: u32,
+    ) -> Result<Partition, StorageError> {
         self.trees
             .partitions()
             .get(self.ctx, &partition_key(topic, partition))?
@@ -561,10 +565,18 @@ impl StreamTxn<'_, '_> {
             }
             records.delete(self.ctx, &mut OpMode::Txn(self.txn), &key)?;
         }
-        // Then the offsets consumer groups committed in it.
-        if finished {
-            let offsets = self.trees.group_offsets();
-            let rows = offsets.scan_range_limit(
+        // Then the offsets consumer groups committed in it, and its queue
+        // state (each keyed by topic and partition first).
+        for tree in [
+            self.trees.group_offsets(),
+            self.trees.queue_leases(),
+            self.trees.queue_frontiers(),
+            self.trees.queue_times(),
+        ] {
+            if !finished {
+                break;
+            }
+            let rows = tree.scan_range_limit(
                 self.ctx,
                 Some(&partition_key(topic, 0)),
                 Some(&[&partition_key(topic, u32::MAX)[..], &[0xFF]].concat()),
@@ -575,7 +587,7 @@ impl StreamTxn<'_, '_> {
                 if self.log_since(start_tail) >= budget {
                     return Ok(false);
                 }
-                offsets.delete(self.ctx, &mut OpMode::Txn(self.txn), &key)?;
+                tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &key)?;
             }
         }
         if finished {

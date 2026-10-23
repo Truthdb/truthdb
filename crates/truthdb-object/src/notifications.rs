@@ -60,19 +60,21 @@ pub const EVENT_TYPES: &[&str] = &[
 pub enum Destination {
     /// `arn:aws:sns:<region>:<account>:<name>`: the stream topic `name`.
     Topic(String),
+    /// `arn:aws:sqs:<region>:<account>:<name>`: the stream topic `name`,
+    /// read as a queue (`sys.sp_s3_queue_*`).
+    Queue(String),
 }
 
 impl Destination {
     pub fn arn(&self) -> &str {
         match self {
-            Destination::Topic(arn) => arn,
+            Destination::Topic(arn) | Destination::Queue(arn) => arn,
         }
     }
 
-    /// The stream topic a topic ARN names (its last field).
+    /// The stream topic the ARN names (its last field).
     pub fn topic(&self) -> &str {
-        let Destination::Topic(arn) = self;
-        arn.rsplit(':').next().unwrap_or_default()
+        self.arn().rsplit(':').next().unwrap_or_default()
     }
 }
 
@@ -128,6 +130,10 @@ impl NotificationConfig {
                     out.u8(0);
                     out.str(arn);
                 }
+                Destination::Queue(arn) => {
+                    out.u8(1);
+                    out.str(arn);
+                }
             }
         }
         out.0
@@ -156,6 +162,7 @@ impl NotificationConfig {
             let (prefix, suffix) = (affix()?, affix()?);
             let destination = match input.u8()? {
                 0 => Destination::Topic(input.str()?),
+                1 => Destination::Queue(input.str()?),
                 _ => return Err(corrupt()),
             };
             rules.push(NotificationRule {
@@ -682,14 +689,20 @@ mod tests {
             region: "us-east-1".into(),
             rules: vec![
                 rule("a", &["s3:ObjectCreated:*"], Some("logs/"), None),
-                rule(
-                    "b",
-                    &["s3:ObjectRemoved:Delete", "s3:ObjectTagging:Put"],
-                    None,
-                    Some(".png"),
-                ),
+                NotificationRule {
+                    destination: Destination::Queue(
+                        "arn:aws:sqs:us-east-1:123456789012:work".into(),
+                    ),
+                    ..rule(
+                        "b",
+                        &["s3:ObjectRemoved:Delete", "s3:ObjectTagging:Put"],
+                        None,
+                        Some(".png"),
+                    )
+                },
             ],
         };
+        assert_eq!(config.rules[1].destination.topic(), "work");
         let bytes = config.encode();
         assert_eq!(NotificationConfig::decode(&bytes).unwrap(), config);
         for cut in 0..bytes.len() {

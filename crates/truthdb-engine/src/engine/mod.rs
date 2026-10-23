@@ -340,6 +340,10 @@ impl Engine {
         storage.set_external_rowsets(Arc::new(s3_sql::S3Rowsets {
             core: storage.core_arc(),
         }));
+        // The SQL queue (`sys.sp_s3_queue_*`).
+        storage.set_external_procedures(Arc::new(queue_sql::QueueProcedures {
+            core: storage.core_arc(),
+        }));
         Ok(Engine {
             storage: Arc::new(storage),
             meta: RwLock::new(meta),
@@ -1481,6 +1485,7 @@ mod import;
 mod notifications;
 pub(crate) use import::ImportWaits;
 mod object_jobs;
+mod queue_sql;
 #[cfg(test)]
 mod relational_tests;
 mod s3_parquet;

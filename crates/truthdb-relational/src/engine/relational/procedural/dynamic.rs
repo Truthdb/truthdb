@@ -7,6 +7,11 @@ pub(in crate::engine::relational) fn run_exec(
     run: &mut BatchRun<'_>,
     in_try: bool,
 ) -> Result<(), ExecError> {
+    // Another engine's built-in procedure, ahead of the catalog.
+    let lowered = exec.proc.value.to_ascii_lowercase();
+    if let Some(provider) = storage.external_procedure(&lowered) {
+        return run_external_procedure(storage, provider.as_ref(), &lowered, exec, txn_ctx, run);
+    }
     if !strip_schema(&exec.proc.value).eq_ignore_ascii_case("sp_executesql") {
         // A user procedure, if the catalog has one; 2812 otherwise.
         if let Some(def) = resolve_table(storage, txn_ctx.database_id(), &exec.proc.value)
@@ -164,4 +169,91 @@ pub(in crate::engine::relational) fn run_exec(
     // agreement with the lock analysis that resolved the OUTER batch.
     txn_ctx.set_current_database(outer_database, outer_database_id);
     result
+}
+
+/// `EXEC` of another engine's built-in procedure: its arguments evaluated in
+/// the caller's scope, its result set (if any) emitted as a statement's, its
+/// return status 0.
+fn run_external_procedure(
+    storage: &RelStorage,
+    provider: &dyn crate::engine::ExternalProcedures,
+    name: &str,
+    exec: &ExecStatement,
+    txn_ctx: &mut TxnContext,
+    run: &mut BatchRun<'_>,
+) -> Result<(), ExecError> {
+    let own = |txn_ctx: &mut TxnContext, error: SqlError| -> ExecError {
+        ExecError::Own(doom_per_rule(txn_ctx, error.at(exec.proc.span)))
+    };
+    let eval_ctx = txn_ctx.eval_context();
+    let mut args: Vec<(Option<String>, SqlValue)> = Vec::new();
+    for (arg_index, arg) in exec.args.iter().enumerate() {
+        if arg.name.is_none() && args.iter().any(|(name, _)| name.is_some()) {
+            let error = SqlError::new(
+                119,
+                15,
+                1,
+                format!(
+                    "Must pass parameter number {} and subsequent parameters as '@name = value'. \
+                     After the form '@name = value' has been used, all subsequent parameters must \
+                     be passed in the form '@name = value'.",
+                    arg_index + 1
+                ),
+            );
+            return Err(own(txn_ctx, error));
+        }
+        // None of these procedures has an OUTPUT parameter.
+        if arg.output {
+            let error = SqlError::new(
+                8162,
+                16,
+                2,
+                format!(
+                    "The formal parameter \"{}\" was not declared as an OUTPUT parameter, but the \
+                     actual parameter passed in requested output.",
+                    arg.name
+                        .as_ref()
+                        .map_or_else(|| format!("#{}", arg_index + 1), |n| n.value.clone())
+                ),
+            );
+            return Err(own(txn_ctx, error));
+        }
+        let value = eval_constant(&arg.value, &eval_ctx).map_err(|e| own(txn_ctx, e))?;
+        let arg_name = arg
+            .name
+            .as_ref()
+            .map(|n| n.value.trim_start_matches('@').to_ascii_lowercase());
+        args.push((arg_name, value));
+    }
+    if let Some(rc) = &exec.return_var
+        && !txn_ctx.variables.contains_key(rc)
+    {
+        let error = undeclared_variable_err(rc);
+        return Err(own(txn_ctx, error));
+    }
+    let caller = crate::engine::ExternalCaller {
+        server_admin: txn_ctx.security.server_admin,
+    };
+    let result = provider
+        .run(name, &args, caller)
+        .map_err(|e| own(txn_ctx, e))?;
+    let in_transaction = txn_ctx.in_txn();
+    let count = result.as_ref().map_or(0, |rowset| rowset.rows.len() as u64);
+    if let Some(rowset) = result {
+        run.flush(storage).map_err(ExecError::Own)?;
+        run.open_rowset(rowset.columns);
+        run.rows(rowset.rows);
+        run.done(
+            (!txn_ctx.nocount).then_some(count),
+            in_transaction,
+            DoneCommand::Select,
+        );
+    }
+    txn_ctx.rowcount = count as i64;
+    if let Some(rc) = &exec.return_var {
+        txn_ctx
+            .variables
+            .insert(rc.clone(), (ColumnType::Int, SqlValue::Int(0)));
+    }
+    Ok(())
 }

@@ -2,9 +2,10 @@ mod relational;
 
 pub use relational::{
     BatchEmitter, BatchOutcome, CancelScope, Collector, DoneCommand, ExternalCaller,
-    ExternalRowset, ExternalRowsets, ExternalStream, FATAL_SEVERITY, Isolation, ResultColumn,
-    RowSet, RpcParam, SqlStatement, StatementResult, TxnContext, analyze_locks, check_cancelled,
-    decl_names, describe_first_result_set, execute_batch, execute_batch_streamed, render_cell,
+    ExternalProcedures, ExternalRowset, ExternalRowsets, ExternalStream, FATAL_SEVERITY, Isolation,
+    ResultColumn, RowSet, RpcParam, SqlStatement, StatementResult, TxnContext, analyze_locks,
+    check_cancelled, decl_names, describe_first_result_set, execute_batch, execute_batch_streamed,
+    render_cell,
 };
 #[cfg(any(test, feature = "test-hooks"))]
 pub use relational::{

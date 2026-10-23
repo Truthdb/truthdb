@@ -382,7 +382,7 @@ pub(super) fn nvarchar(name: &str, max_len: u16) -> ResultColumn {
     column(name, ColumnType::NVarChar { max_len })
 }
 
-fn nvarchar_max(name: &str) -> ResultColumn {
+pub(super) fn nvarchar_max(name: &str) -> ResultColumn {
     column(name, ColumnType::NVarCharMax)
 }
 

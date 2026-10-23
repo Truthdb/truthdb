@@ -604,3 +604,324 @@ fn the_largest_append_fits_a_transactions_budget_on_the_smallest_ring() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+/// Receives up to `max` messages of queue `q` at `now`, hidden `visibility`.
+fn receive(storage: &Storage, max: usize, visibility: u64, now: u64) -> Vec<crate::QueueMessage> {
+    in_txn(storage, |tx| tx.queue_receive("q", max, visibility, now)).unwrap()
+}
+
+fn offsets(messages: &[crate::QueueMessage]) -> Vec<u64> {
+    messages.iter().map(|message| message.offset).collect()
+}
+
+/// The rows of a queue tree, of every topic.
+fn queue_rows(storage: &Storage, object_id: u32) -> usize {
+    let mut guard = storage.lock();
+    let mut file = StreamFile::new(&mut guard);
+    let Some(tree) = file.existing_tree(object_id).unwrap() else {
+        return 0;
+    };
+    tree.scan(&mut file.page_ctx()).unwrap().len()
+}
+
+#[test]
+fn a_queue_hides_redelivers_and_acknowledges_its_messages() {
+    use crate::QueueError;
+    let path = temp_path("queue");
+    let storage = create(&path);
+    in_txn(&storage, |tx| tx.create_topic("q", 1, 0, None, 1)).unwrap();
+    in_txn(&storage, |tx| tx.create_topic("other", 1, 0, None, 1)).unwrap();
+    in_txn(&storage, |tx| {
+        tx.append("q", 0, &["a", "b", "c", "d", "e"].map(record), None, 1)
+    })
+    .unwrap();
+    let first = receive(&storage, 2, 1_000, 10);
+    assert_eq!(offsets(&first), [0, 1]);
+    assert_eq!(first[0].value, b"a");
+    assert_eq!((first[0].receives, first[0].first_receive_ms), (1, 10));
+    assert_eq!(offsets(&receive(&storage, 10, 1_000, 20)), [2, 3, 4]);
+    assert!(receive(&storage, 10, 1_000, 30).is_empty(), "all in flight");
+
+    let ack = |receipt: &str| in_txn(&storage, |tx| tx.queue_ack("q", receipt));
+    let change = |receipt: &str, visibility: u64, now: u64| {
+        in_txn(&storage, |tx| {
+            tx.queue_change_visibility("q", receipt, visibility, now)
+        })
+    };
+    ack(&first[0].receipt).unwrap();
+    ack(&first[0].receipt).unwrap();
+    // Hidden time over: received again, with a new receipt.
+    let again = receive(&storage, 10, 1_000, 1_011);
+    assert_eq!(offsets(&again), [1]);
+    assert_eq!((again[0].receives, again[0].first_receive_ms), (2, 10));
+    assert_ne!(again[0].receipt, first[1].receipt);
+    // The earlier receipt acknowledges nothing, and changes nothing.
+    ack(&first[1].receipt).unwrap();
+    assert_eq!(
+        change(&first[1].receipt, 5, 1_100),
+        Err(QueueError::InvalidReceipt)
+    );
+    // Visible at once, then hidden past the 12-hour limit: refused.
+    change(&again[0].receipt, 0, 1_100).unwrap();
+    assert_eq!(
+        change(&again[0].receipt, 5, 1_100),
+        Err(QueueError::NotInFlight)
+    );
+    // Visible again in the order they became so: 2 to 4 at 1,020, 1 at
+    // 1,100.
+    let back = receive(&storage, 10, 1_000, 1_100);
+    assert_eq!(offsets(&back), [2, 3, 4, 1]);
+    let third = vec![back[3].clone()];
+    assert_eq!(third[0].receives, 3);
+    assert_eq!(
+        change(&third[0].receipt, crate::MAX_VISIBILITY_MS, 1_100),
+        Err(QueueError::TooLong)
+    );
+    change(&third[0].receipt, crate::MAX_VISIBILITY_MS - 1_090, 1_100).unwrap();
+    for bad in ["", "x", "1-0-1-0", "1-9-1-1", "999-0-1-1"] {
+        assert_eq!(ack(bad), Err(QueueError::InvalidReceipt), "{bad}");
+    }
+    // Another queue's receipt, and a queue that does not exist.
+    let other = in_txn(&storage, |tx| {
+        tx.append("other", 0, &[record("x")], None, 1)
+    })
+    .unwrap();
+    assert_eq!(other.offset, Some(0));
+    let theirs = in_txn(&storage, |tx| tx.queue_receive("other", 1, 1_000, 5)).unwrap();
+    assert_eq!(ack(&theirs[0].receipt), Err(QueueError::InvalidReceipt));
+    assert_eq!(
+        in_txn(&storage, |tx| tx.queue_receive("missing", 1, 1_000, 5)),
+        Err(QueueError::NoSuchTopic)
+    );
+    // Acknowledged out of order: done, whatever is still in flight before
+    // it.
+    let later = receive(&storage, 10, 1_000, 2_100);
+    assert_eq!(offsets(&later), [2, 3, 4]);
+    ack(&later[1].receipt).unwrap();
+    assert_eq!(
+        change(&later[1].receipt, 5, 2_200),
+        Err(QueueError::NotInFlight)
+    );
+    // Leases only for what is in flight (1, 2 and 4, and the other
+    // queue's), each indexed by when it is visible again.
+    assert_eq!(queue_rows(&storage, crate::QUEUE_LEASES_TREE), 4);
+    assert_eq!(queue_rows(&storage, crate::QUEUE_TIMES_TREE), 4);
+    for message in [&third[0], &later[0], &later[2]] {
+        ack(&message.receipt).unwrap();
+    }
+    // All done: every lease gone.
+    assert!(receive(&storage, 10, 1_000, 1_000_000).is_empty());
+    let leases_of_q = queue_rows(&storage, crate::QUEUE_LEASES_TREE);
+    assert_eq!(leases_of_q, 1, "only the other queue's");
+    // Survives a restart; a dropped topic takes its queue state along.
+    drop(storage);
+    let storage = open(&path);
+    assert!(receive(&storage, 10, 1_000, 1_000_000).is_empty());
+    in_txn(&storage, |tx| tx.drop_topic("other")).unwrap();
+    in_txn(&storage, |tx| tx.drop_topic("q")).unwrap();
+    while !in_txn(&storage, |tx| tx.purge_step(2)) {}
+    assert_eq!(queue_rows(&storage, crate::QUEUE_LEASES_TREE), 0);
+    assert_eq!(queue_rows(&storage, crate::QUEUE_FRONTIERS_TREE), 0);
+    assert_eq!(queue_rows(&storage, crate::QUEUE_TIMES_TREE), 0);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_queue_passes_over_messages_retention_removed() {
+    let path = temp_path("queue-trim");
+    let storage = create(&path);
+    in_txn(&storage, |tx| tx.create_topic("q", 1, 1_000, None, 1)).unwrap();
+    in_txn(&storage, |tx| {
+        tx.append("q", 0, &["old1", "old2"].map(record), None, 1_000)
+    })
+    .unwrap();
+    in_txn(&storage, |tx| {
+        tx.append("q", 0, &[record("new")], None, 5_000)
+    })
+    .unwrap();
+    let held = receive(&storage, 1, 100, 1_000);
+    assert_eq!(offsets(&held), [0]);
+    assert_eq!(in_txn(&storage, |tx| tx.trim_step(5_500, 100)), (2, false));
+    // The message received before the trim is gone; the rest is served.
+    assert_eq!(offsets(&receive(&storage, 10, 100, 6_000)), [2]);
+    in_txn(&storage, |tx| tx.queue_ack("q", &held[0].receipt)).unwrap();
+    assert_eq!(
+        queue_rows(&storage, crate::QUEUE_LEASES_TREE),
+        1,
+        "the trimmed message's lease was dropped when it came due"
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_receive_and_an_ack_are_whole_or_absent_after_a_crash_at_any_op() {
+    let mut crash_at = 0;
+    let mut crashes = 0;
+    loop {
+        let path = temp_path("queue-crash");
+        let storage = create(&path);
+        in_txn(&storage, |tx| tx.create_topic("q", 1, 0, None, 1)).unwrap();
+        in_txn(&storage, |tx| {
+            tx.append("q", 0, &["a", "b", "c"].map(record), None, 1)
+        })
+        .unwrap();
+        let first = receive(&storage, 1, 1_000, 10);
+        FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(Some(crash_at)));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            StreamFile::new(&mut storage.lock())
+                .transaction(|tx| {
+                    tx.queue_ack("q", &first[0].receipt)?
+                        .unwrap_or_else(|err| panic!("crash: {err:?}"));
+                    Ok(tx
+                        .queue_receive("q", 2, 1_000, 20)?
+                        .unwrap_or_else(|err| panic!("crash: {err:?}")))
+                })
+                .unwrap_or_else(|err| panic!("crash: {err}"))
+        }))
+        .is_err();
+        let fired = FAIL_APPLY_OPS_AFTER
+            .with(|fail| fail.replace(None))
+            .is_none();
+        drop(storage);
+        let storage = open(&path);
+        // Either nothing happened (offset 0 still hidden until 1010, then
+        // 1 and 2 free), or all of it (0 done, 1 and 2 hidden until 1020).
+        let visible = offsets(&receive(&storage, 10, 1_000, 1_015));
+        if crashed {
+            assert!(fired);
+            crashes += 1;
+            assert!(
+                visible == [0, 1, 2] || visible.is_empty(),
+                "crash at {crash_at}: {visible:?}"
+            );
+        } else {
+            assert!(visible.is_empty(), "{visible:?}");
+            drop(storage);
+            std::fs::remove_file(&path).ok();
+            break;
+        }
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+        crash_at += 1;
+    }
+    assert!(crashes > 3, "{crashes} crash points");
+}
+
+#[test]
+fn a_busy_partition_does_not_keep_the_others_waiting() {
+    let path = temp_path("queue-partitions");
+    let storage = create(&path);
+    in_txn(&storage, |tx| tx.create_topic("q", 2, 0, None, 1)).unwrap();
+    in_txn(&storage, |tx| {
+        tx.append("q", 0, &["a", "b", "c"].map(record), None, 1)
+    })
+    .unwrap();
+    in_txn(&storage, |tx| tx.append("q", 1, &[record("z")], None, 1)).unwrap();
+    // A receive at an odd time starts at partition 1.
+    let first = receive(&storage, 1, 1_000, 11);
+    assert_eq!(
+        (first[0].partition, first[0].value.as_slice()),
+        (1, &b"z"[..])
+    );
+    let rest = receive(&storage, 10, 1_000, 12);
+    assert_eq!(
+        rest.iter()
+            .map(|m| (m.partition, m.offset))
+            .collect::<Vec<_>>(),
+        [(0, 0), (0, 1), (0, 2)]
+    );
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn an_acknowledgement_settles_one_message_whatever_is_done_behind_it() {
+    let path = temp_path("queue-poison");
+    let storage = create(&path);
+    in_txn(&storage, |tx| tx.create_topic("q", 1, 0, None, 1)).unwrap();
+    let checkpoint = || storage.write_checkpoint(b"x", 1, 2, 1).expect("checkpoint");
+    for _ in 0..30 {
+        let records: Vec<NewRecord> = (0..100).map(|_| record("m")).collect();
+        in_txn(&storage, |tx| tx.append("q", 0, &records, None, 1)).unwrap();
+        checkpoint();
+    }
+    let mut received = Vec::new();
+    for _ in 0..300 {
+        received.extend(receive(&storage, 10, 60_000, 10));
+        if received.len() % 500 == 0 {
+            checkpoint();
+        }
+    }
+    assert_eq!(received.len(), 3_000);
+    // Everything but the first acknowledged.
+    for (at, message) in received.iter().enumerate().skip(1) {
+        in_txn(&storage, |tx| tx.queue_ack("q", &message.receipt)).unwrap();
+        if at % 500 == 0 {
+            checkpoint();
+        }
+    }
+    checkpoint();
+    let (written, budget) = in_txn(&storage, |tx| {
+        let start = tx.log_tail();
+        tx.queue_ack("q", &received[0].receipt)?.unwrap();
+        Ok((tx.log_since(start), tx.log_budget()))
+    });
+    // A lease and its index entry (with the first images of their pages
+    // after the checkpoint), not the 2,999 messages done behind it.
+    assert!(
+        written < 32 * 1024 && written < budget,
+        "{written} bytes of log"
+    );
+    assert_eq!(queue_rows(&storage, crate::QUEUE_LEASES_TREE), 0);
+    assert_eq!(queue_rows(&storage, crate::QUEUE_TIMES_TREE), 0);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_receive_stops_at_the_log_budget_dropping_removed_messages_leases() {
+    let path = temp_path("queue-garbage");
+    let storage = create(&path);
+    in_txn(&storage, |tx| tx.create_topic("q", 8, 1_000, None, 1)).unwrap();
+    let checkpoint = || storage.write_checkpoint(b"x", 1, 2, 1).expect("checkpoint");
+    for partition in 0..8 {
+        let records: Vec<NewRecord> = (0..200).map(|_| record("m")).collect();
+        in_txn(&storage, |tx| tx.append("q", partition, &records, None, 1)).unwrap();
+        checkpoint();
+    }
+    // All received, then all removed by retention while in flight.
+    let mut received = 0;
+    while received < 1_600 {
+        received += receive(&storage, 10, 100, 10).len();
+        if received % 200 == 0 {
+            checkpoint();
+        }
+    }
+    while in_txn(&storage, |tx| tx.trim_step(5_000, 500)).1 {
+        checkpoint();
+    }
+    checkpoint();
+    let mut receives = 0;
+    while queue_rows(&storage, crate::QUEUE_LEASES_TREE) > 0 {
+        let (handed, written, budget) = in_txn(&storage, |tx| {
+            let start = tx.log_tail();
+            let handed = tx.queue_receive("q", 10, 100, 6_000)?.unwrap().len();
+            Ok((handed, tx.log_since(start), tx.log_budget()))
+        });
+        assert_eq!(handed, 0);
+        // Past the budget by the last lease dropped at most.
+        assert!(
+            written < budget + 8 * 1024,
+            "{written} bytes, budget {budget}"
+        );
+        checkpoint();
+        receives += 1;
+        assert!(receives < 100);
+    }
+    assert!(receives > 1, "the budget stopped a receive: {receives}");
+    assert_eq!(queue_rows(&storage, crate::QUEUE_TIMES_TREE), 0);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
