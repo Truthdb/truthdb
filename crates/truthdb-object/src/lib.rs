@@ -25,9 +25,11 @@ mod journal;
 mod lifecycle;
 mod listing;
 mod locks;
+mod notifications;
 mod objects;
 mod pack;
 mod restores;
+pub mod time;
 mod uploads;
 
 #[cfg(test)]
@@ -65,6 +67,10 @@ pub use lifecycle::{
 };
 pub use listing::{ListAfter, ListedObject, Listing};
 pub use locks::{EventHold, ObjectLock, Retention, RetentionChange, RetentionMode};
+pub use notifications::{
+    Destination, EVENT_TYPES, NOTIFICATIONS_CONSUMER, NotificationConfig, NotificationRule,
+    event_message, event_type, test_message,
+};
 pub use objects::{
     CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, StorageClass, VersionSel,
     version_id,
@@ -143,6 +149,9 @@ const LIFECYCLE_STATE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 27;
 const IMPORTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 28;
 /// (import, 0, source key) -> why that object was not copied.
 const IMPORT_FAILURES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 29;
+/// (bucket, 0, journal position) -> the bucket's notification configuration
+/// (or none) and owner from that position on (see `notifications`).
+const NOTIFY_HISTORY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 30;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -265,7 +274,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 30;
+const TREE_COUNT: usize = 31;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -370,6 +379,9 @@ impl Trees {
     }
     pub fn import_failures(&self) -> BTree {
         self.tree(IMPORT_FAILURES_TREE)
+    }
+    pub fn notify_history(&self) -> BTree {
+        self.tree(NOTIFY_HISTORY_TREE)
     }
 }
 

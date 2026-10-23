@@ -2,6 +2,7 @@ mod backup_restore;
 mod coordinator;
 mod encryption;
 mod fulltext;
+mod notifications;
 mod objects;
 mod recovery;
 mod replication;

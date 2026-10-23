@@ -900,8 +900,23 @@ impl Engine {
                         _ => break,
                     }
                 }
-                self.object(|file| file.transaction(|tx| tx.drop_account(&id)))?
-                    .map_err(account_error)?;
+                // Its stream topics (an account made again under its id
+                // would have them) checked in the hold of the drop, as a
+                // topic is made for an account in the hold that checks it.
+                self.locked(|guard| {
+                    let owns_topics = truthdb_streams::StreamFile::try_new(guard)
+                        .ok_or_else(streams::no_engine)?
+                        .topics()?
+                        .iter()
+                        .any(|(topic, _)| topic.account.as_deref() == Some(id.as_str()));
+                    if owns_topics {
+                        return Ok(Err(truthdb_object::AccountError::NotEmpty("stream topics")));
+                    }
+                    truthdb_object::ObjFile::try_new(guard)
+                        .ok_or_else(streams::no_engine)?
+                        .transaction(|tx| tx.drop_account(&id))
+                })?
+                .map_err(account_error)?;
                 json!({ "dropped": id })
             }
             S3Admin::CreateUser(account, name) => {
@@ -1450,6 +1465,7 @@ fn render_sql_outcome(outcome: &crate::engine::BatchOutcome) -> String {
 
 mod fulltext;
 mod import;
+mod notifications;
 pub(crate) use import::ImportWaits;
 mod object_jobs;
 #[cfg(test)]

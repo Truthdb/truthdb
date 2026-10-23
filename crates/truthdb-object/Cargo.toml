@@ -9,6 +9,7 @@ truthdb-core = { workspace = true }
 truthdb-fulltext = { workspace = true }
 md-5 = "0.10.6"
 zstd = "0.13"
+serde_json = { workspace = true }
 
 [dev-dependencies]
 truthdb-core = { workspace = true, features = ["test-hooks"] }

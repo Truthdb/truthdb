@@ -39,6 +39,9 @@ pub struct Topic {
     /// How long records are kept (0: for ever).
     pub retention_ms: u64,
     pub created_ms: u64,
+    /// The S3 account whose buckets may send it their event
+    /// notifications (none: no bucket may).
+    pub account: Option<String>,
 }
 
 /// Where a partition's log stands: records at offsets `[start, next)`.
@@ -55,6 +58,13 @@ pub struct Partition {
 pub struct NewRecord {
     pub key: Option<Vec<u8>>,
     pub value: Vec<u8>,
+}
+
+impl NewRecord {
+    /// The chunks it is stored in (what [`MAX_APPEND_CHUNKS`] counts).
+    pub fn chunks(&self) -> usize {
+        (self.key.as_ref().map_or(0, Vec::len) + self.value.len() + RECORD_HEADER).div_ceil(CHUNK)
+    }
 }
 
 /// A record as read.
@@ -130,27 +140,29 @@ fn u32_at(bytes: &[u8], at: usize) -> Result<u32, StorageError> {
         .ok_or_else(|| corrupt("row"))
 }
 
-/// `[id u32][partitions u32][retention ms u64][created ms u64]`.
+/// `[id u32][partitions u32][retention ms u64][created ms u64][account]`.
 fn encode_topic(topic: &Topic) -> Vec<u8> {
     [
         &topic.id.to_le_bytes()[..],
         &topic.partitions.to_le_bytes(),
         &topic.retention_ms.to_le_bytes(),
         &topic.created_ms.to_le_bytes(),
+        topic.account.as_deref().unwrap_or_default().as_bytes(),
     ]
     .concat()
 }
 
 fn decode_topic(name: &[u8], row: &[u8]) -> Result<Topic, StorageError> {
-    if row.len() != 24 {
-        return Err(corrupt("topic"));
-    }
+    let account = row.get(24..).ok_or_else(|| corrupt("topic"))?;
     Ok(Topic {
         id: u32_at(row, 0)?,
         name: String::from_utf8(name.to_vec()).map_err(|_| corrupt("topic name"))?,
         partitions: u32_at(row, 4)?,
         retention_ms: u64_at(row, 8)?,
         created_ms: u64_at(row, 16)?,
+        account: (!account.is_empty())
+            .then(|| String::from_utf8(account.to_vec()).map_err(|_| corrupt("topic")))
+            .transpose()?,
     })
 }
 
@@ -282,12 +294,14 @@ impl StreamTxn<'_, '_> {
     }
 
     /// Creates a topic of `partitions` partitions, keeping records for
-    /// `retention_ms` (0: for ever).
+    /// `retention_ms` (0: for ever), whose events `account`'s buckets may
+    /// send it.
     pub fn create_topic(
         &mut self,
         name: &str,
         partitions: u32,
         retention_ms: u64,
+        account: Option<&str>,
         now_ms: u64,
     ) -> Result<Result<Topic, StreamError>, StorageError> {
         if let Err(err) = valid_topic_name(name) {
@@ -307,6 +321,7 @@ impl StreamTxn<'_, '_> {
             partitions,
             retention_ms,
             created_ms: now_ms,
+            account: account.map(str::to_string),
         };
         let mode = &mut OpMode::Txn(self.txn);
         self.trees.topics().insert_unique(
@@ -377,14 +392,9 @@ impl StreamTxn<'_, '_> {
         if partition >= topic.partitions {
             return Ok(Err(StreamError::InvalidPartition));
         }
-        let sizes = records
-            .iter()
-            .map(|record| record.key.as_ref().map_or(0, Vec::len) + record.value.len());
-        if sizes.clone().any(|size| size > MAX_RECORD_BYTES)
-            || sizes
-                .map(|size| (size + RECORD_HEADER).div_ceil(CHUNK))
-                .sum::<usize>()
-                > MAX_APPEND_CHUNKS
+        if records.iter().any(|record| {
+            record.key.as_ref().map_or(0, Vec::len) + record.value.len() > MAX_RECORD_BYTES
+        }) || records.iter().map(NewRecord::chunks).sum::<usize>() > MAX_APPEND_CHUNKS
         {
             return Ok(Err(StreamError::TooLarge));
         }

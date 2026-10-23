@@ -290,9 +290,11 @@ pub(super) fn maintenance_loop(shared: &Arc<Shared>) {
 /// How long the full-text indexer sleeps when it has nothing to do.
 const INDEXER_IDLE: Duration = Duration::from_secs(1);
 
-/// The full-text indexer (see `engine::fulltext`), on its own thread so a
-/// backlog of large objects never delays the maintenance sweeps: a pass at a
-/// time while work remains, else a sleep.
+/// The change journal's consumers, the full-text indexer (see
+/// `engine::fulltext`) and event notifications (see
+/// `engine::notifications`), on their own thread so a backlog of large
+/// objects never delays the maintenance sweeps: a pass at a time while work
+/// remains, else a sleep.
 pub(super) fn indexer_loop(shared: &Arc<Shared>) {
     while !shared.stop.load(Ordering::Acquire) {
         let stop = || shared.stop.load(Ordering::Acquire);
@@ -300,7 +302,12 @@ pub(super) fn indexer_loop(shared: &Arc<Shared>) {
             eprintln!("full-text indexing failed: {err}");
             false
         });
-        if more {
+        // The journal's other consumer: event notifications.
+        let notifying = shared.engine.notifications_step().unwrap_or_else(|err| {
+            eprintln!("event notifications failed: {err}");
+            false
+        });
+        if more || notifying {
             continue;
         }
         let idle = shared.idle.lock().expect("idle mutex poisoned");

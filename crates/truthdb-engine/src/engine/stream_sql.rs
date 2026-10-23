@@ -50,6 +50,7 @@ pub(super) fn open(
                 datetime2("last_record_time"),
                 bigint("retention_ms"),
                 datetime2("created"),
+                nvarchar("account_id", 12),
             ],
             rows: Box::new(TopicStream {
                 core: Arc::clone(core),
@@ -165,6 +166,7 @@ impl ExternalStream for TopicStream {
                         },
                         Datum::BigInt(topic.retention_ms as i64),
                         datetime(topic.created_ms),
+                        topic.account.as_deref().map_or(Datum::Null, text),
                     ]
                 })
             })

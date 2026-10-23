@@ -917,6 +917,14 @@ fn a_user_without_policies_is_refused_every_operation() {
             &[],
         ),
         ("DELETE", "/cov", "lifecycle", b"", &[]),
+        ("GET", "/cov", "notification", b"", &[]),
+        (
+            "PUT",
+            "/cov",
+            "notification",
+            b"<NotificationConfiguration/>",
+            &[],
+        ),
         ("PUT", "/cov", "object-lock", b"", &[]),
         ("GET", "/cov/o", "retention", b"", &[]),
         ("PUT", "/cov/o", "retention", retention, &retention_headers),
@@ -8537,4 +8545,200 @@ fn an_import_copies_another_servers_objects_and_goes_on_after_a_crash() {
     // The secret is not shown.
     let shown = native(target.native_port, "SELECT * FROM sys.dm_s3_imports");
     assert!(!shown.to_string().contains(&source_secret), "{shown}");
+}
+
+/// Every event message in stream topic `topic` (partitions 0 and 1), as
+/// JSON.
+fn stream_events(port: u16, topic: &str) -> Vec<serde_json::Value> {
+    let mut out = Vec::new();
+    for partition in 0..2 {
+        for row in sql_rows(
+            port,
+            &format!("SELECT value FROM sys.stream_read('{topic}', {partition})"),
+        ) {
+            let hex = row[0].trim_start_matches("0x");
+            let bytes: Vec<u8> = (0..hex.len())
+                .step_by(2)
+                .map(|at| u8::from_str_radix(&hex[at..at + 2], 16).unwrap())
+                .collect();
+            out.push(serde_json::from_slice(&bytes).unwrap());
+        }
+    }
+    out
+}
+
+#[test]
+fn bucket_notifications_reach_a_stream_topic_once_across_a_crash() {
+    let mut server = start_server();
+    let (account, key, secret) = account_with_key(&server, "notifier");
+    let call = |server: &Server, method: &str, path: &str, query: &str, body: &[u8]| {
+        send(
+            server.s3_port,
+            method,
+            path,
+            query,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    native(
+        server.native_port,
+        &format!("stream create topic events partitions 2 retention 0 account {account}"),
+    );
+    native(server.native_port, "stream create topic theirs");
+    assert_eq!(call(&server, "PUT", "/photos", "", b"").0, 200);
+    let config = |topic: &str| {
+        format!(
+            "<NotificationConfiguration><TopicConfiguration><Id>images</Id>\
+             <Topic>arn:aws:sns:us-east-1:{account}:{topic}</Topic>\
+             <Event>s3:ObjectCreated:*</Event><Event>s3:ObjectRemoved:*</Event>\
+             <Filter><S3Key><FilterRule><Name>prefix</Name><Value>in/</Value></FilterRule>\
+             </S3Key></Filter></TopicConfiguration></NotificationConfiguration>"
+        )
+    };
+    // A topic that does not exist, or is not the bucket owner's, is
+    // refused, unless validation is skipped; an ARN of another account
+    // always is.
+    for topic in ["nope", "theirs"] {
+        let (status, reply) = call(
+            &server,
+            "PUT",
+            "/photos",
+            "notification",
+            config(topic).as_bytes(),
+        );
+        assert_eq!(status, 400, "{reply}");
+        assert!(reply.contains("InvalidArgument"), "{reply}");
+    }
+    let foreign = config("events").replace(&format!(":{account}:"), ":999999999999:");
+    let (_, (status, reply)) = send_with(
+        server.s3_port,
+        "PUT",
+        "/photos",
+        "notification",
+        &[("x-amz-skip-destination-validation", "true")],
+        foreign.as_bytes(),
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 400, "{reply}");
+    let (_, (status, reply)) = send_with(
+        server.s3_port,
+        "PUT",
+        "/photos",
+        "notification",
+        &[("x-amz-skip-destination-validation", "true")],
+        config("nope").as_bytes(),
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert!(stream_events(server.native_port, "events").is_empty());
+    let (status, reply) = call(
+        &server,
+        "PUT",
+        "/photos",
+        "notification",
+        config("events").as_bytes(),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (status, reply) = call(&server, "GET", "/photos", "notification", b"");
+    assert_eq!(status, 200);
+    assert!(
+        reply.contains(&format!(
+            "<Topic>arn:aws:sns:us-east-1:{account}:events</Topic>"
+        )) && reply.contains("<Id>images</Id>")
+            && reply.contains("<Name>prefix</Name><Value>in/</Value>"),
+        "{reply}"
+    );
+    // The topic got S3's test event.
+    let sent = stream_events(server.native_port, "events");
+    assert_eq!(sent.len(), 1);
+    assert_eq!(sent[0]["Event"], "s3:TestEvent");
+    assert_eq!(sent[0]["Bucket"], "photos");
+
+    // Changes, a crash part way through, more changes.
+    for at in 0..10 {
+        let path = format!("/photos/in/{at}.txt");
+        assert_eq!(call(&server, "PUT", &path, "", b"x").0, 200);
+    }
+    assert_eq!(call(&server, "PUT", "/photos/out/x.txt", "", b"x").0, 200);
+    crash_and_restart(&mut server);
+    for at in 10..20 {
+        let path = format!("/photos/in/{at}.txt");
+        assert_eq!(call(&server, "PUT", &path, "", b"x").0, 200);
+    }
+    assert_eq!(call(&server, "DELETE", "/photos/in/0.txt", "", b"").0, 204);
+    let deadline = Instant::now() + DEADLINE;
+    let events = loop {
+        let events: Vec<serde_json::Value> = stream_events(server.native_port, "events")
+            .into_iter()
+            .filter(|event| event.get("Records").is_some())
+            .collect();
+        if events.len() >= 21 || Instant::now() > deadline {
+            break events;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+    let mut seen: Vec<(String, String)> = events
+        .iter()
+        .map(|event| {
+            let record = &event["Records"][0];
+            assert_eq!(record["eventSource"], "aws:s3");
+            assert_eq!(record["awsRegion"], "us-east-1");
+            assert_eq!(record["s3"]["configurationId"], "images");
+            assert_eq!(
+                record["s3"]["bucket"]["ownerIdentity"]["principalId"],
+                account.as_str()
+            );
+            assert_eq!(record["userIdentity"]["principalId"], account.as_str());
+            (
+                record["eventName"].as_str().unwrap().to_string(),
+                record["s3"]["object"]["key"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect();
+    seen.sort();
+    let mut expected: Vec<(String, String)> = (0..20)
+        .map(|at| ("ObjectCreated:Put".to_string(), format!("in%2F{at}.txt")))
+        .chain([("ObjectRemoved:Delete".to_string(), "in%2F0.txt".to_string())])
+        .collect();
+    expected.sort();
+    assert_eq!(seen, expected, "each change once, none lost");
+    let sequencers: std::collections::BTreeSet<&str> = events
+        .iter()
+        .map(|event| {
+            event["Records"][0]["s3"]["object"]["sequencer"]
+                .as_str()
+                .unwrap()
+        })
+        .collect();
+    assert_eq!(sequencers.len(), 21);
+
+    // Another account may not read or change the configuration.
+    let (_, other_key, other_secret) = account_with_key(&server, "stranger");
+    for (method, body) in [("GET", &b""[..]), ("PUT", config("events").as_bytes())] {
+        let (status, reply) = send(
+            server.s3_port,
+            method,
+            "/photos",
+            "notification",
+            body,
+            &other_key,
+            Some(&other_secret),
+        );
+        assert_eq!(status, 403, "{method}: {reply}");
+    }
+    // An empty configuration turns notifications off.
+    let (status, _) = call(
+        &server,
+        "PUT",
+        "/photos",
+        "notification",
+        b"<NotificationConfiguration/>",
+    );
+    assert_eq!(status, 200);
+    let (_, reply) = call(&server, "GET", "/photos", "notification", b"");
+    assert!(!reply.contains("TopicConfiguration"), "{reply}");
 }
