@@ -4948,3 +4948,103 @@ fn lifecycle_passes_go_by_tags_suspended_versioning_and_noncurrent_rules() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn imports_and_their_failures_are_kept_shipped_and_dropped() {
+    use crate::{ImportSource, ImportState};
+    let path = temp_path("imports-src");
+    let bak = temp_path("imports-bak");
+    let log = temp_path("imports-log");
+    let seed = temp_path("imports-seed");
+    let primary = create(&path);
+    primary.lock().commit_db_options(0, Some(true)).unwrap();
+    let summary = primary.backup_full(&bak).unwrap();
+    let source = ImportSource {
+        endpoint: "http://127.0.0.1:1".into(),
+        region: "us-east-1".into(),
+        access_key: "AK".into(),
+        secret: "SK".into(),
+        bucket: "src".into(),
+        prefix: "p/".into(),
+    };
+    let (first, second) = ObjFile::new(&mut primary.lock())
+        .transaction(|tx| {
+            Ok((
+                tx.create_import(source.clone(), "dst", "in/", now())?,
+                tx.create_import(source.clone(), "dst", "", now())?,
+            ))
+        })
+        .unwrap();
+    assert_eq!((first, second), (1, 2));
+    ObjFile::new(&mut primary.lock())
+        .transaction(|tx| {
+            let mut import = tx.import(first)?.unwrap();
+            import.after = "p/k".into();
+            import.copied = 3;
+            import.state = ImportState::Done;
+            tx.update_import(&import)?;
+            tx.record_import_failure(first, "p/bad", "403")?;
+            tx.record_import_failure(first, "p/bad", "500")?;
+            tx.record_import_failure(second, "p/other", "x")
+        })
+        .unwrap();
+    let view = |storage: &Storage| {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        let imports = file.imports().unwrap();
+        let failures: Vec<_> = imports
+            .iter()
+            .map(|import| file.import_failures(import.id).unwrap())
+            .collect();
+        (imports, failures)
+    };
+    let expected = view(&primary);
+    assert_eq!(expected.0.len(), 2);
+    assert_eq!(expected.0[0].state, ImportState::Done);
+    assert_eq!(expected.0[0].after, "p/k");
+    assert_eq!(
+        expected.1[0],
+        [crate::ImportFailure {
+            key: "p/bad".into(),
+            error: "500".into()
+        }]
+    );
+    // Shipped to a standby and kept in a log backup.
+    let delta = primary
+        .read_wal_range(summary.backup_end_lsn, primary.wal_flushed_lsn())
+        .unwrap();
+    primary.backup_log(&log, true, false).unwrap();
+    Storage::restore_full_standby(&seed, &bak, &[], engines).unwrap();
+    let standby = open(&seed);
+    standby
+        .apply_wal_stream(summary.backup_end_lsn, &delta)
+        .unwrap();
+    assert_eq!(view(&standby), expected);
+    drop(standby);
+    // Dropped with its failures, the other untouched; kept across a reopen.
+    ObjFile::new(&mut primary.lock())
+        .transaction(|tx| {
+            assert!(tx.drop_import(first)?);
+            assert!(!tx.drop_import(first)?);
+            Ok(())
+        })
+        .unwrap();
+    drop(primary);
+    let reopened = open(&path);
+    let (imports, failures) = view(&reopened);
+    assert_eq!(
+        imports.iter().map(|import| import.id).collect::<Vec<_>>(),
+        [2]
+    );
+    assert_eq!(failures[0].len(), 1);
+    assert!(
+        ObjFile::new(&mut reopened.lock())
+            .import_failures(first)
+            .unwrap()
+            .is_empty()
+    );
+    drop(reopened);
+    for p in [&path, &bak, &log, &seed] {
+        std::fs::remove_file(p).ok();
+    }
+}
