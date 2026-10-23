@@ -86,12 +86,15 @@ fn lease_key(topic: u32, partition: u32, offset: u64) -> [u8; 16] {
     key
 }
 
+/// What a receipt names: the topic id, partition, offset and receive count.
+type Receipt = (u32, u32, u64, u32);
+
 /// `topic-partition-offset-receives`.
 fn receipt(topic: u32, partition: u32, offset: u64, receives: u32) -> String {
     format!("{topic}-{partition}-{offset}-{receives}")
 }
 
-fn parse_receipt(text: &str) -> Option<(u32, u32, u64, u32)> {
+fn parse_receipt(text: &str) -> Option<Receipt> {
     let mut fields = text.split('-');
     let parsed = (
         fields.next()?.parse().ok()?,
@@ -241,7 +244,7 @@ impl StreamTxn<'_, '_> {
         &mut self,
         topic: &str,
         receipt: &str,
-    ) -> Result<Result<(u32, u32, u64, u32), QueueError>, StorageError> {
+    ) -> Result<Result<Receipt, QueueError>, StorageError> {
         let Some(row) = self.topic_row(topic)? else {
             return Ok(Err(QueueError::NoSuchTopic));
         };
