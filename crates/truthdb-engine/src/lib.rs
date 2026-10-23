@@ -4,6 +4,7 @@
 pub mod client_listener;
 pub mod dispatcher;
 pub mod engine;
+pub mod metrics;
 pub mod session;
 
 // Core modules under their old `crate::` paths, so the moved engine and

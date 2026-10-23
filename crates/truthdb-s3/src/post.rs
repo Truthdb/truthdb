@@ -436,6 +436,7 @@ pub async fn post_object(
     bucket: String,
 ) -> Result<Response<Body>, S3Error> {
     let connection = request.extensions().get::<Connection>().copied();
+    let seen = crate::metering::seen_of(&request);
     let ids = request
         .extensions()
         .get::<crate::server::RequestIds>()
@@ -569,6 +570,15 @@ pub async fn post_object(
         Vec::new(),
     )
     .await?;
+    // The bucket exists: the upload counts in the request metrics.
+    if let Some(seen) = &seen
+        && authz
+            .owners()
+            .iter()
+            .any(|(name, owner)| *name == bucket && owner.is_some())
+    {
+        seen.mark();
+    }
     authz.check_storing(
         "s3:PutObject",
         Resource::Object(&bucket, &key),

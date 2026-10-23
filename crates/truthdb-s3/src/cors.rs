@@ -300,6 +300,9 @@ pub async fn preflight(
     let Some(config) = load(state, &bucket).await? else {
         return Err(forbidden("CORS is not enabled for this bucket."));
     };
+    // A bucket with a CORS configuration exists: the preflight counts in
+    // the request metrics.
+    crate::metering::mark_seen(request);
     let Some(rule) = config.rule_for(origin, method, &requested) else {
         return Err(forbidden("This CORS request is not allowed."));
     };

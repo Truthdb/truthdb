@@ -486,6 +486,7 @@ async fn read(
         storage: state.storage.clone(),
         restore_delays: state.restore_delays,
         domains: state.domains.clone(),
+        request_metrics: state.request_metrics.clone(),
     };
     let (headers, bucket) = (headers.clone(), bucket.to_string());
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
@@ -554,6 +555,10 @@ pub async fn serve(state: &S3State, request: Request<Incoming>, bucket: String) 
             ))
         })
         .await;
+    // The bucket exists: the request counts in the request metrics.
+    if let Ok((true, _)) = &loaded {
+        crate::metering::mark_seen(&request);
+    }
     let config = match loaded {
         Ok((false, _)) => {
             let err = S3Error::new(404, "NoSuchBucket", "The specified bucket does not exist");

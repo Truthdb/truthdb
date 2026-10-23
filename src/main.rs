@@ -169,6 +169,8 @@ async fn main() -> ExitCode {
     // synchronized); the handle must be taken before the engine moves into its
     // worker pool.
     let storage_arc = engine.storage_arc().core_arc();
+    // The S3 listener records its requests where the SQL views read them.
+    let request_metrics = engine.request_metrics();
     // The engine runs on its own thread behind a message channel; the async
     // listeners talk to it through a cloneable handle.
     let (engine, engine_join) = truthdb_engine::session::spawn_engine(engine);
@@ -304,6 +306,7 @@ async fn main() -> ExitCode {
                         bulk: config.s3.restore_seconds.bulk,
                     },
                     domains,
+                    request_metrics: request_metrics.clone(),
                 });
                 let shutdown_rx = shutdown_tx.subscribe();
                 Some(tokio::spawn(truthdb_s3::server::serve(

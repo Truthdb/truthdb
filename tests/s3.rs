@@ -12569,3 +12569,276 @@ fn storage_shows_what_bodies_take_and_packing_saves() {
     );
     assert_eq!(shown["LIVE 0"][..3], [1, 8, 8], "{shown:?}");
 }
+
+#[test]
+fn requests_are_counted_per_bucket_by_kind_bytes_errors_and_latency() {
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, key, secret) = account_with_key(&server, "metered");
+    // Every request to "meters", and the bytes each way as the client saw
+    // them.
+    let sent = std::cell::Cell::new((0u64, 0u64, 0u64));
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        let (head, (status, reply)) =
+            send_with(port, method, path, query, extra, body, &key, Some(&secret));
+        if path.starts_with("/meters") {
+            let (count, up, down) = sent.get();
+            sent.set((count + 1, up + body.len() as u64, down + reply.len() as u64));
+        }
+        let _ = head;
+        status
+    };
+    assert_eq!(call("PUT", "/meters", "", &[], b""), 200);
+    assert_eq!(call("PUT", "/other", "", &[], b""), 200);
+    assert_eq!(call("PUT", "/meters/a", "", &[], b"0123456789"), 200);
+    assert_eq!(call("GET", "/meters/a", "", &[], b""), 200);
+    assert_eq!(call("HEAD", "/meters/a", "", &[], b""), 200);
+    assert_eq!(call("GET", "/meters/missing", "", &[], b""), 404);
+    assert_eq!(call("GET", "/meters", "list-type=2", &[], b""), 200);
+    assert_eq!(call("GET", "/meters", "versioning", &[], b""), 200);
+    // A copy is a PUT where it goes and a GET where it comes from.
+    assert_eq!(
+        call(
+            "PUT",
+            "/other/copy",
+            "",
+            &[("x-amz-copy-source", "/meters/a")],
+            b""
+        ),
+        200
+    );
+    // Only buckets that exist count, and a copy's source only when the
+    // copy is made: names anyone may send take nothing.
+    assert_eq!(
+        send(
+            port,
+            "GET",
+            &format!("/{}/k", "x".repeat(60_000)),
+            "",
+            b"",
+            "",
+            None
+        )
+        .0,
+        404
+    );
+    assert_eq!(send(port, "GET", "/ghost/k", "", b"", "", None).0, 404);
+    assert_eq!(
+        call(
+            "PUT",
+            "/other/failed",
+            "",
+            &[("x-amz-copy-source", "/meters/missing")],
+            b""
+        ),
+        404
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/meters/from-ghost",
+            "",
+            &[("x-amz-copy-source", "/ghost/k")],
+            b""
+        ),
+        404
+    );
+    // A copy source on what is not a copy takes nothing, though the
+    // request succeeds.
+    let tagging = b"<Tagging><TagSet><Tag><Key>k</Key><Value>v</Value></Tag></TagSet></Tagging>";
+    let tagging_md5 = content_md5(tagging);
+    assert_eq!(
+        call(
+            "PUT",
+            "/meters/a",
+            "tagging",
+            &[
+                ("content-md5", &tagging_md5),
+                ("x-amz-copy-source", "/not-a-copy-source/k")
+            ],
+            tagging
+        ),
+        200
+    );
+    // Nor does it on a write that is no copy, to a bucket that exists: a
+    // legal hold set does not read "other".
+    let lock = [("x-amz-bucket-object-lock-enabled", "true")];
+    assert_eq!(
+        send_with(port, "PUT", "/held", "", &lock, b"", &key, Some(&secret))
+            .1
+            .0,
+        200
+    );
+    assert_eq!(
+        send_with(port, "PUT", "/held/k", "", &[], b"x", &key, Some(&secret))
+            .1
+            .0,
+        200
+    );
+    let hold = b"<LegalHold><Status>ON</Status></LegalHold>";
+    let hold_md5 = content_md5(hold);
+    let (_, (status, reply)) = send_with(
+        port,
+        "PUT",
+        "/held/k",
+        "legal-hold",
+        &[
+            ("content-md5", &hold_md5),
+            ("x-amz-copy-source", "/other/copy"),
+        ],
+        hold,
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 200, "{reply}");
+    // A form upload is a POST, and a preflight (to a bucket with a CORS
+    // configuration) a request.
+    let form = signed_form(
+        &key,
+        &secret,
+        "2099-01-01T00:00:00.000Z",
+        &[
+            serde_json::json!({"bucket": "meters"}),
+            serde_json::json!({"key": "formed"}),
+        ],
+        &[("key", "formed")],
+    );
+    let (_, form_bytes) = form_body(&form, "f.txt", b"form");
+    let (_, (status, reply)) = post_form(port, "meters", &form, "f.txt", b"form", 1000);
+    assert_eq!(status, 204, "{reply}");
+    let (count, up, down) = sent.get();
+    sent.set((
+        count + 1,
+        up + form_bytes.len() as u64,
+        down + reply.len() as u64,
+    ));
+    let cors = b"<CORSConfiguration><CORSRule><AllowedOrigin>*</AllowedOrigin>\
+        <AllowedMethod>GET</AllowedMethod></CORSRule></CORSConfiguration>";
+    let cors_md5 = content_md5(cors);
+    assert_eq!(
+        call(
+            "PUT",
+            "/meters",
+            "cors",
+            &[("content-md5", &cors_md5)],
+            cors
+        ),
+        200
+    );
+    let (_, (status, reply)) = send_with(
+        port,
+        "OPTIONS",
+        "/meters/a",
+        "",
+        &[
+            ("origin", "https://a.example"),
+            ("access-control-request-method", "GET"),
+        ],
+        b"",
+        "",
+        None,
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (count, up, down) = sent.get();
+    sent.set((count + 1, up, down + reply.len() as u64));
+    // An aws-chunked upload counts its payload, not its framing.
+    let (status, reply) = put_chunked(
+        port,
+        "/meters/chunked",
+        &[7u8; 1000],
+        300,
+        &key,
+        &secret,
+        false,
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (count, up, down) = sent.get();
+    sent.set((count + 1, up + 1000, down + reply.len() as u64));
+    let delete = b"<Delete><Object><Key>gone</Key></Object></Delete>";
+    let md5 = content_md5(delete);
+    assert_eq!(
+        call(
+            "POST",
+            "/meters",
+            "delete",
+            &[("content-md5", &md5)],
+            delete
+        ),
+        200
+    );
+    assert_eq!(call("DELETE", "/meters/a", "", &[], b""), 204);
+    // S3 Control is not a bucket's.
+    assert_eq!(
+        call(
+            "GET",
+            "/v20180820/jobs",
+            "",
+            &[("x-amz-account-id", &account)],
+            b""
+        ),
+        200
+    );
+    let (count, up, down) = sent.get();
+    let row = |bucket: &str| -> Vec<i64> {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let rows = sql_rows(
+                server.native_port,
+                &format!(
+                    "SELECT all_requests, get_requests, put_requests, delete_requests, head_requests, \
+                     post_requests, list_requests, bytes_downloaded, bytes_uploaded, errors_4xx, errors_5xx \
+                     FROM sys.dm_s3_requests WHERE bucket_name = '{bucket}'"
+                ),
+            );
+            let row: Vec<i64> = rows
+                .first()
+                .map(|row| row.iter().map(|cell| cell.parse().unwrap()).collect())
+                .unwrap_or_default();
+            // The last answer's body is counted once it is sent.
+            if bucket != "meters" || row.get(7) == Some(&(down as i64)) || Instant::now() > deadline
+            {
+                return row;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert_eq!(
+        row("meters"),
+        // Not its creation: the bucket did not exist yet.
+        [
+            count as i64 - 1,
+            3,
+            4,
+            2,
+            1,
+            1,
+            1,
+            down as i64,
+            up as i64,
+            2,
+            0
+        ],
+        "all, get (the copy's source too), put, delete (a multi-object one too), head, post, list, \
+         bytes down, bytes up, 4xx, 5xx"
+    );
+    let other = row("other");
+    assert_eq!(other[..3], [2, 0, 2], "{other:?}");
+    let buckets = sql_rows(
+        server.native_port,
+        "SELECT bucket_name FROM sys.dm_s3_requests ORDER BY bucket_name",
+    );
+    assert_eq!(buckets, [["held"], ["meters"], ["other"]]);
+    // Each request's latencies, until its answer starts and until it ends.
+    let latencies = sql_rows(
+        server.native_port,
+        "SELECT latency, SUM(request_count) FROM sys.dm_s3_request_latency \
+         WHERE bucket_name = 'meters' GROUP BY latency ORDER BY latency",
+    );
+    assert_eq!(
+        latencies,
+        [
+            ["FIRST_BYTE".to_string(), (count - 1).to_string()],
+            ["TOTAL".to_string(), (count - 1).to_string()]
+        ]
+    );
+}

@@ -66,6 +66,7 @@ const MS_PER_DAY: u64 = 86_400_000;
 /// The object store's rowsets, over the storage the engine runs on.
 pub(crate) struct S3Rowsets {
     pub(crate) core: Arc<Storage>,
+    pub(crate) request_metrics: Arc<crate::metrics::RequestMetrics>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +102,9 @@ impl ExternalRowsets for S3Rowsets {
                 return Some(open_bucket_usage(&self.core, name, args, caller));
             }
             "sys.dm_s3_storage" => return Some(open_storage(&self.core, name, args, caller)),
+            "sys.dm_s3_requests" | "sys.dm_s3_request_latency" => {
+                return Some(open_requests(&self.request_metrics, name, args, caller));
+            }
             "sys.s3_search" => return Some(self.open_search(name, args, caller)),
             "sys.stream_topics" | "sys.stream_read" | "sys.dm_s3_webhooks" => {
                 return Some(super::stream_sql::open(&self.core, name, args, caller));
@@ -726,6 +730,103 @@ impl ExternalStream for BucketUsageStream {
             })
             .collect();
         Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// `sys.dm_s3_requests`: each bucket's S3 requests since the server started,
+/// by kind, their bytes and errors; `sys.dm_s3_request_latency`: their
+/// latencies (until the answer starts, until its last byte), as counts per
+/// upper bound in milliseconds (NULL: past the last bound). Requests to
+/// buckets past the ones kept apart count under an empty name.
+fn open_requests(
+    metrics: &Arc<crate::metrics::RequestMetrics>,
+    name: &str,
+    args: &[SqlValue],
+    caller: ExternalCaller,
+) -> Result<ExternalRowset, SqlError> {
+    check_admin(name, caller)?;
+    check_arg_count(name, args, 0, 0)?;
+    let snapshot = metrics.snapshot();
+    let (columns, rows): (Vec<ResultColumn>, Vec<Vec<Datum>>) = if name == "sys.dm_s3_requests" {
+        (
+            vec![
+                nvarchar("bucket_name", 63),
+                bigint("all_requests"),
+                bigint("get_requests"),
+                bigint("put_requests"),
+                bigint("delete_requests"),
+                bigint("head_requests"),
+                bigint("post_requests"),
+                bigint("list_requests"),
+                bigint("bytes_downloaded"),
+                bigint("bytes_uploaded"),
+                bigint("errors_4xx"),
+                bigint("errors_5xx"),
+            ],
+            snapshot
+                .iter()
+                .map(|(bucket, counters)| {
+                    let counts = counters.counts();
+                    let mut row = vec![text(bucket)];
+                    row.extend(
+                        [
+                            counts.all,
+                            counts.get,
+                            counts.put,
+                            counts.delete,
+                            counts.head,
+                            counts.post,
+                            counts.list,
+                            counts.bytes_downloaded,
+                            counts.bytes_uploaded,
+                            counts.errors_4xx,
+                            counts.errors_5xx,
+                        ]
+                        .map(|count| Datum::BigInt(count as i64)),
+                    );
+                    row
+                })
+                .collect(),
+        )
+    } else {
+        let mut rows = Vec::new();
+        for (bucket, counters) in &snapshot {
+            for (latency, histogram) in [
+                ("FIRST_BYTE", &counters.first_byte),
+                ("TOTAL", &counters.total),
+            ] {
+                for (bound, count) in histogram.snapshot() {
+                    rows.push(vec![
+                        text(bucket),
+                        text(latency),
+                        bound.map_or(Datum::Null, |bound| Datum::BigInt(bound as i64)),
+                        Datum::BigInt(count as i64),
+                    ]);
+                }
+            }
+        }
+        (
+            vec![
+                nvarchar("bucket_name", 63),
+                nvarchar("latency", 16),
+                bigint("upper_bound_ms"),
+                bigint("request_count"),
+            ],
+            rows,
+        )
+    };
+    Ok(ExternalRowset {
+        columns,
+        rows: Box::new(Rows(Some(rows))),
+    })
+}
+
+/// Rows read up front, in one slice.
+struct Rows(Option<Vec<Vec<Datum>>>);
+
+impl ExternalStream for Rows {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        Ok(self.0.take().filter(|rows| !rows.is_empty()))
     }
 }
 

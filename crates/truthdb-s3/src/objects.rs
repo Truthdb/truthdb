@@ -892,6 +892,7 @@ pub async fn get_object(
         storage: state.storage.clone(),
         restore_delays: state.restore_delays,
         domains: state.domains.clone(),
+        request_metrics: state.request_metrics.clone(),
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {
