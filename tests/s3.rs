@@ -12459,3 +12459,113 @@ fn bucket_usage_counts_versions_markers_and_upload_parts() {
         ]
     );
 }
+
+#[test]
+fn storage_shows_what_bodies_take_and_packing_saves() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, "", extra, body, &key, Some(&secret)).1
+    };
+    let storage = || {
+        sql_rows(
+            server.native_port,
+            "SELECT body_state, pack_level, body_count, logical_bytes, stored_bytes, \
+             allocated_bytes, saved_bytes FROM sys.dm_s3_storage ORDER BY body_state, pack_level",
+        )
+        .into_iter()
+        .map(|row| {
+            let number = |at: usize| row[at].parse::<i64>().unwrap();
+            (
+                format!("{} {}", row[0], row[1]),
+                [number(2), number(3), number(4), number(5), number(6)],
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>()
+    };
+    assert_eq!(call("PUT", "/stored", &[], b"").0, 200);
+    let plain: Vec<u8> = (0..300_000u32)
+        .map(|i| (i.wrapping_mul(2654435761) >> 13) as u8)
+        .collect();
+    assert_eq!(call("PUT", "/stored/plain", &[], &plain).0, 200);
+    // Compressible, and packed as it is written for GLACIER.
+    let cold = vec![b'z'; 3_000_000];
+    assert_eq!(
+        call(
+            "PUT",
+            "/stored/cold",
+            &[("x-amz-storage-class", "GLACIER")],
+            &cold
+        )
+        .0,
+        200
+    );
+    let shown = storage();
+    let [bodies, logical, stored, allocated, saved] = shown["LIVE 0"];
+    assert_eq!(
+        (bodies, logical, stored),
+        (1, 300_000, 300_000),
+        "{shown:?}"
+    );
+    assert!(allocated >= stored && allocated % 4096 == 0, "{shown:?}");
+    assert_eq!(saved, 0);
+    let [bodies, logical, stored, allocated, saved] = shown["LIVE 9"];
+    assert_eq!((bodies, logical), (1, 3_000_000), "{shown:?}");
+    assert!(
+        stored < logical / 100 && allocated < logical / 50,
+        "{shown:?}"
+    );
+    assert_eq!(saved, logical - stored);
+    // A multipart object's parts are its bodies; the body made of them
+    // takes nothing of its own.
+    let started = send_with(
+        port,
+        "POST",
+        "/stored/parts",
+        "uploads",
+        &[],
+        b"",
+        &key,
+        Some(&secret),
+    )
+    .1
+    .1;
+    let upload = xml_value(&started, "UploadId");
+    let (head, (status, _)) = send_with(
+        port,
+        "PUT",
+        "/stored/parts",
+        &format!("partNumber=1&uploadId={upload}"),
+        &[],
+        b"one part",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 200);
+    let etag = response_header(&head, "etag").unwrap();
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (_, (status, reply)) = send_with(
+        port,
+        "POST",
+        "/stored/parts",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 200, "{reply}");
+    let shown = storage();
+    assert_eq!(shown["LIVE 0"][..3], [2, 300_008, 300_008], "{shown:?}");
+    // A deleted object's body waits for collection.
+    assert_eq!(call("DELETE", "/stored/plain", &[], b"").0, 204);
+    let shown = storage();
+    assert_eq!(
+        shown["COLLECTABLE 0"][..3],
+        [1, 300_000, 300_000],
+        "{shown:?}"
+    );
+    assert_eq!(shown["LIVE 0"][..3], [1, 8, 8], "{shown:?}");
+}

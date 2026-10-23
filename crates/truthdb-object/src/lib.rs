@@ -30,6 +30,7 @@ mod notifications;
 mod objects;
 mod pack;
 mod restores;
+mod stored;
 pub mod time;
 mod uploads;
 mod usage;
@@ -80,6 +81,7 @@ pub use objects::{
 };
 pub use pack::{PackStep, PackWork, pack_segment};
 pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
+pub use stored::{BodyUse, StoredBody};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
 pub use usage::{BucketUsage, UsageKind};
 
