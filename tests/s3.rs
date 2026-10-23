@@ -11243,6 +11243,20 @@ fn cors_preflights_and_cross_origin_answers_follow_the_bucket_configuration() {
     }
     let (_, (status, _)) = preflight("/web/page.html", &[("origin", "https://app.example")]);
     assert_eq!(status, 400, "no requested method");
+    // A preflight asking for more headers than any answer would list.
+    let many: String = (0..65)
+        .map(|n| format!("x-amz-h{n}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let (_, (status, _)) = preflight(
+        "/web/page.html",
+        &[
+            ("origin", "https://app.example"),
+            ("access-control-request-method", "PUT"),
+            ("access-control-request-headers", &many),
+        ],
+    );
+    assert_eq!(status, 403, "too many headers asked for");
 
     // Cross-origin requests: the headers on their answers, errors too.
     let (head, (status, _)) = call(

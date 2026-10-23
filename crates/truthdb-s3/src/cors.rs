@@ -22,6 +22,9 @@ const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
 const MAX_BODY: usize = 64 * 1024;
 const MAX_RULES: usize = 100;
 const METHODS: [&str; 5] = ["GET", "PUT", "HEAD", "POST", "DELETE"];
+/// The headers a preflight may ask for at most (matching them against
+/// every rule is paid for by an unauthenticated request).
+const MAX_REQUESTED_HEADERS: usize = 64;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct CorsRule {
@@ -103,6 +106,20 @@ fn rule(element: &Element) -> Result<CorsRule, S3Error> {
         return Err(malformed());
     }
     let allowed_headers = texts(element, "AllowedHeader");
+    let expose_headers = texts(element, "ExposeHeader");
+    // Each is answered in a header: it must be one.
+    for (what, values) in [
+        ("AllowedOrigin", &allowed_origins),
+        ("AllowedHeader", &allowed_headers),
+        ("ExposeHeader", &expose_headers),
+    ] {
+        if values
+            .iter()
+            .any(|value| hyper::header::HeaderValue::from_str(value).is_err())
+        {
+            return Err(invalid(format!("{what} is not a valid header value")));
+        }
+    }
     for (what, values) in [
         ("AllowedOrigin", &allowed_origins),
         ("AllowedHeader", &allowed_headers),
@@ -122,7 +139,7 @@ fn rule(element: &Element) -> Result<CorsRule, S3Error> {
         allowed_headers,
         allowed_methods,
         allowed_origins,
-        expose_headers: texts(element, "ExposeHeader"),
+        expose_headers,
         max_age_seconds,
     })
 }
@@ -158,17 +175,27 @@ impl CorsConfig {
     /// The first rule allowing `origin`, `method` and every header of
     /// `headers` (case-insensitively).
     pub fn rule_for(&self, origin: &str, method: &str, headers: &[String]) -> Option<&CorsRule> {
+        let headers: Vec<String> = headers
+            .iter()
+            .map(|header| header.to_ascii_lowercase())
+            .collect();
         self.rules.iter().find(|rule| {
-            rule.allowed_origins
+            if !(rule
+                .allowed_origins
                 .iter()
                 .any(|pattern| matches(pattern, origin))
-                && rule.allowed_methods.iter().any(|allowed| allowed == method)
-                && headers.iter().all(|header| {
-                    let header = header.to_ascii_lowercase();
-                    rule.allowed_headers
-                        .iter()
-                        .any(|pattern| matches(&pattern.to_ascii_lowercase(), &header))
-                })
+                && rule.allowed_methods.iter().any(|allowed| allowed == method))
+            {
+                return false;
+            }
+            let patterns: Vec<String> = rule
+                .allowed_headers
+                .iter()
+                .map(|pattern| pattern.to_ascii_lowercase())
+                .collect();
+            headers
+                .iter()
+                .all(|header| patterns.iter().any(|pattern| matches(pattern, header)))
         })
     }
 }
@@ -267,21 +294,26 @@ pub async fn preflight(
                 .collect()
         })
         .unwrap_or_default();
+    if requested.len() > MAX_REQUESTED_HEADERS {
+        return Err(forbidden("This CORS request is not allowed."));
+    }
     let Some(config) = load(state, &bucket).await? else {
         return Err(forbidden("CORS is not enabled for this bucket."));
     };
     let Some(rule) = config.rule_for(origin, method, &requested) else {
         return Err(forbidden("This CORS request is not allowed."));
     };
-    let mut response = Response::builder()
-        .status(StatusCode::OK)
-        .header("vary", VARY);
+    let mut response = Response::new(full(bytes::Bytes::new()));
+    let headers = response.headers_mut();
+    headers.insert("vary", hyper::header::HeaderValue::from_static(VARY));
+    // A value that cannot be a header (none is stored since checked) is
+    // left out rather than failing the answer.
     for (name, value) in rule_headers(rule, origin, &requested) {
-        response = response.header(name, value);
+        if let Ok(value) = hyper::header::HeaderValue::from_str(&value) {
+            headers.insert(name, value);
+        }
     }
-    Ok(response
-        .body(full(bytes::Bytes::new()))
-        .expect("a valid response"))
+    Ok(response)
 }
 
 /// The CORS headers of the answer to a request with an `Origin`, when its
@@ -482,6 +514,14 @@ mod tests {
             .map(|_| "<CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin></CORSRule>")
             .collect();
         assert_eq!(code(&many), "InvalidRequest", "over 100 rules");
+        assert_eq!(
+            code(
+                "<CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin>\
+                 <ExposeHeader>a&#10;b</ExposeHeader></CORSRule>"
+            ),
+            "InvalidRequest",
+            "not a header value"
+        );
         assert_eq!(
             code(
                 "<CORSRule><AllowedMethod>GET</AllowedMethod><AllowedOrigin>*</AllowedOrigin>\
