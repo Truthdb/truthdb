@@ -297,6 +297,8 @@ const OBJECT_UPLOAD_EXPIRY_MS: u64 = 7 * 24 * 60 * 60 * 1000;
 pub struct Engine {
     storage: Arc<RelStorage>,
     meta: RwLock<EngineMeta>,
+    /// The S3 API's request metrics, recorded by its listener.
+    request_metrics: Arc<crate::metrics::RequestMetrics>,
 }
 
 impl Engine {
@@ -337,8 +339,10 @@ impl Engine {
         }
 
         // The object store's inventory, readable from SQL (`sys.s3_*`).
+        let request_metrics = Arc::new(crate::metrics::RequestMetrics::default());
         storage.set_external_rowsets(Arc::new(s3_sql::S3Rowsets {
             core: storage.core_arc(),
+            request_metrics: Arc::clone(&request_metrics),
         }));
         // The SQL queue (`sys.sp_s3_queue_*`).
         storage.set_external_procedures(Arc::new(queue_sql::QueueProcedures {
@@ -347,7 +351,13 @@ impl Engine {
         Ok(Engine {
             storage: Arc::new(storage),
             meta: RwLock::new(meta),
+            request_metrics,
         })
+    }
+
+    /// The S3 API's request metrics, for its listener to record into.
+    pub fn request_metrics(&self) -> Arc<crate::metrics::RequestMetrics> {
+        Arc::clone(&self.request_metrics)
     }
 
     /// A shared handle to the underlying storage, for subsystems that run

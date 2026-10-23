@@ -53,6 +53,8 @@ pub struct S3State {
     /// The domains whose subdomains name buckets (virtual-hosted
     /// addressing), in lowercase.
     pub domains: Vec<String>,
+    /// The requests counted per bucket (`sys.dm_s3_requests`).
+    pub request_metrics: std::sync::Arc<truthdb_engine::metrics::RequestMetrics>,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
@@ -197,6 +199,7 @@ impl RequestIds {
 }
 
 async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Body> {
+    let started = std::time::Instant::now();
     let resource = request.uri().path().to_string();
     // Virtual-hosted addressing: the bucket named by the Host, decided once
     // for every reader of the request's target.
@@ -249,10 +252,27 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         }
         crate::api::Target::Service => None,
     });
+    // What the request counts as in the request metrics.
+    let metered = crate::metering::metered(&request);
+    let uploaded = crate::metering::uploaded(&request);
     let mut response = match route(state, request).await {
         Ok(response) => response,
         Err(err) => error_response(&err, &resource, &ids),
     };
+    if let Some(metered) = metered {
+        let counters = state.request_metrics.bucket(&metered.bucket);
+        counters.answered(
+            metered.kind,
+            uploaded,
+            response.status().as_u16(),
+            started.elapsed(),
+        );
+        if let Some(source) = metered.copy_source {
+            state.request_metrics.bucket(&source).copied_from();
+        }
+        response =
+            response.map(|body| crate::metering::MeteredBody::new(body, counters, started).boxed());
+    }
     if let Some((bucket, origin, method)) = cross_origin {
         let headers = response.headers_mut();
         for (name, value) in crate::cors::answer_headers(state, &bucket, &origin, &method).await {

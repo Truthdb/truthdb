@@ -72,6 +72,40 @@ pub(crate) fn target<B>(request: &Request<B>) -> Result<Target, S3Error> {
     })
 }
 
+/// An S3 Control operation: the account's Block Public Access, or Batch
+/// Operations jobs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ControlRoute {
+    PublicAccessBlock,
+    Jobs,
+}
+
+/// The S3 Control operation a request is for, if any. S3 Control carries
+/// the account in a header, and in its host's first label when the host
+/// names one (virtual-hosted addressing). A path-style request to an object
+/// of a bucket named `v20180820` at an S3 Control path, carrying that
+/// header, is taken for S3 Control: only the host would tell them apart.
+pub(crate) fn control_route<B>(request: &Request<B>) -> Option<ControlRoute> {
+    let s3_control = request
+        .headers()
+        .get("x-amz-account-id")
+        .and_then(|account| account.to_str().ok())
+        .is_some_and(|account| match request.extensions().get::<VirtualHost>() {
+            Some(VirtualHost(bucket)) => bucket == account,
+            None => true,
+        });
+    let path = request.uri().path();
+    if !s3_control {
+        None
+    } else if path == "/v20180820/configuration/publicAccessBlock" {
+        Some(ControlRoute::PublicAccessBlock)
+    } else if path == "/v20180820/jobs" || path.starts_with("/v20180820/jobs/") {
+        Some(ControlRoute::Jobs)
+    } else {
+        None
+    }
+}
+
 /// Sub-resources of buckets and objects that are not implemented: refused,
 /// rather than taken for the plain operation on the same path (a bucket GET
 /// would list objects, an object GET would return its body).
@@ -128,7 +162,7 @@ const SUBRESOURCES: &[&str] = &[
 /// then may it be taken for the plain operation on its path. A sub-resource
 /// with a method or target it has no route for is refused instead (DELETE
 /// `?versioning` must not delete the bucket).
-fn plain(request: &Request<Incoming>, allowed: &[&str]) -> bool {
+pub(crate) fn plain(request: &Request<Incoming>, allowed: &[&str]) -> bool {
     !SUBRESOURCES
         .iter()
         .any(|name| !allowed.contains(name) && has_param(request, name))
@@ -157,7 +191,7 @@ fn plain_write(request: &Request<Incoming>, allowed: &[&str]) -> bool {
 }
 
 /// The query's parameter names (sub-resources such as `location`).
-fn has_param(request: &Request<Incoming>, name: &str) -> bool {
+pub(crate) fn has_param(request: &Request<Incoming>, name: &str) -> bool {
     request
         .uri()
         .query()
@@ -244,27 +278,14 @@ pub async fn dispatch(
     auth: Authenticated,
 ) -> Result<Response<Body>, S3Error> {
     let method = request.method().clone();
-    // S3 Control carries the account in a header, and in its host's first
-    // label when the host names one (virtual-hosted addressing). A
-    // path-style request to an object of a bucket named `v20180820` at an
-    // S3 Control path, carrying that header, is taken for S3 Control: only
-    // the host would tell them apart.
-    let s3_control = request
-        .headers()
-        .get("x-amz-account-id")
-        .and_then(|account| account.to_str().ok())
-        .is_some_and(|account| match request.extensions().get::<VirtualHost>() {
-            Some(VirtualHost(bucket)) => bucket == account,
-            None => true,
-        });
-    // S3 Control's account-level Block Public Access.
-    if s3_control && request.uri().path() == "/v20180820/configuration/publicAccessBlock" {
-        return account_public_access(state, request, auth, method).await;
-    }
-    // S3 Control's Batch Operations jobs.
-    let path = request.uri().path();
-    if s3_control && (path == "/v20180820/jobs" || path.starts_with("/v20180820/jobs/")) {
-        return crate::batch::handle(state, request, auth, method).await;
+    match control_route(&request) {
+        Some(ControlRoute::PublicAccessBlock) => {
+            return account_public_access(state, request, auth, method).await;
+        }
+        Some(ControlRoute::Jobs) => {
+            return crate::batch::handle(state, request, auth, method).await;
+        }
+        None => {}
     }
     let target = target(&request)?;
     let principal = auth.principal.clone();

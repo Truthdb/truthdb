@@ -486,6 +486,7 @@ async fn read(
         storage: state.storage.clone(),
         restore_delays: state.restore_delays,
         domains: state.domains.clone(),
+        request_metrics: state.request_metrics.clone(),
     };
     let (headers, bucket) = (headers.clone(), bucket.to_string());
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;

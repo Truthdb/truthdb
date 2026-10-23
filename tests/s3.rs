@@ -12569,3 +12569,116 @@ fn storage_shows_what_bodies_take_and_packing_saves() {
     );
     assert_eq!(shown["LIVE 0"][..3], [1, 8, 8], "{shown:?}");
 }
+
+#[test]
+fn requests_are_counted_per_bucket_by_kind_bytes_errors_and_latency() {
+    let server = start_server();
+    let port = server.s3_port;
+    let (account, key, secret) = account_with_key(&server, "metered");
+    // Every request to "meters", and the bytes each way as the client saw
+    // them.
+    let sent = std::cell::Cell::new((0u64, 0u64, 0u64));
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        let (head, (status, reply)) =
+            send_with(port, method, path, query, extra, body, &key, Some(&secret));
+        if path.starts_with("/meters") {
+            let (count, up, down) = sent.get();
+            sent.set((count + 1, up + body.len() as u64, down + reply.len() as u64));
+        }
+        let _ = head;
+        status
+    };
+    assert_eq!(call("PUT", "/meters", "", &[], b""), 200);
+    assert_eq!(call("PUT", "/other", "", &[], b""), 200);
+    assert_eq!(call("PUT", "/meters/a", "", &[], b"0123456789"), 200);
+    assert_eq!(call("GET", "/meters/a", "", &[], b""), 200);
+    assert_eq!(call("HEAD", "/meters/a", "", &[], b""), 200);
+    assert_eq!(call("GET", "/meters/missing", "", &[], b""), 404);
+    assert_eq!(call("GET", "/meters", "list-type=2", &[], b""), 200);
+    assert_eq!(call("GET", "/meters", "versioning", &[], b""), 200);
+    // A copy is a PUT where it goes and a GET where it comes from.
+    assert_eq!(
+        call(
+            "PUT",
+            "/other/copy",
+            "",
+            &[("x-amz-copy-source", "/meters/a")],
+            b""
+        ),
+        200
+    );
+    let delete = b"<Delete><Object><Key>gone</Key></Object></Delete>";
+    let md5 = content_md5(delete);
+    assert_eq!(
+        call(
+            "POST",
+            "/meters",
+            "delete",
+            &[("content-md5", &md5)],
+            delete
+        ),
+        200
+    );
+    assert_eq!(call("DELETE", "/meters/a", "", &[], b""), 204);
+    // S3 Control is not a bucket's.
+    assert_eq!(
+        call(
+            "GET",
+            "/v20180820/jobs",
+            "",
+            &[("x-amz-account-id", &account)],
+            b""
+        ),
+        200
+    );
+    let (count, up, down) = sent.get();
+    let row = |bucket: &str| -> Vec<i64> {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let rows = sql_rows(
+                server.native_port,
+                &format!(
+                    "SELECT all_requests, get_requests, put_requests, delete_requests, head_requests, \
+                     post_requests, list_requests, bytes_downloaded, bytes_uploaded, errors_4xx, errors_5xx \
+                     FROM sys.dm_s3_requests WHERE bucket_name = '{bucket}'"
+                ),
+            );
+            let row: Vec<i64> = rows
+                .first()
+                .map(|row| row.iter().map(|cell| cell.parse().unwrap()).collect())
+                .unwrap_or_default();
+            // The last answer's body is counted once it is sent.
+            if bucket != "meters" || row.get(7) == Some(&(down as i64)) || Instant::now() > deadline
+            {
+                return row;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    };
+    assert_eq!(
+        row("meters"),
+        [count as i64, 3, 1, 2, 1, 0, 1, down as i64, up as i64, 1, 0],
+        "all, get (the copy's source too), put, delete (a multi-object one too), head, post, list, \
+         bytes down, bytes up, 4xx, 5xx"
+    );
+    let other = row("other");
+    assert_eq!(other[..3], [2, 0, 1], "{other:?}");
+    let buckets = sql_rows(
+        server.native_port,
+        "SELECT bucket_name FROM sys.dm_s3_requests ORDER BY bucket_name",
+    );
+    assert_eq!(buckets, [["meters"], ["other"]]);
+    // Each request's latencies, until its answer starts and until it ends.
+    let latencies = sql_rows(
+        server.native_port,
+        "SELECT latency, SUM(request_count) FROM sys.dm_s3_request_latency \
+         WHERE bucket_name = 'meters' GROUP BY latency ORDER BY latency",
+    );
+    assert_eq!(
+        latencies,
+        [
+            ["FIRST_BYTE".to_string(), count.to_string()],
+            ["TOTAL".to_string(), count.to_string()]
+        ]
+    );
+}
