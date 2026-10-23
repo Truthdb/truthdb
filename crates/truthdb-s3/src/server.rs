@@ -210,7 +210,9 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                 .authority()
                 .map(|authority| authority.as_str())
         });
-    // A bucket's website endpoint, else virtual-hosted addressing.
+    // A bucket's website endpoint, else virtual-hosted addressing. A
+    // bucket named `<name>.s3-website` is therefore not addressed by its
+    // host under a domain (path-style requests reach it).
     if let Some(bucket) = host.and_then(|host| crate::website::website_bucket(host, &state.domains))
     {
         request

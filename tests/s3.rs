@@ -12170,6 +12170,7 @@ fn a_website_endpoint_serves_public_objects_anonymously() {
         ("sub/index.html", "sub page"),
         ("error.html", "custom error page"),
         ("private/secret", "secret"),
+        ("private/index.html", "private index"),
         ("docs/a", "old doc"),
     ] {
         assert_eq!(
@@ -12253,6 +12254,13 @@ fn a_website_endpoint_serves_public_objects_anonymously() {
     assert_eq!(
         response_header(&head, "content-type").as_deref(),
         Some("text/html")
+    );
+    // A folder whose index the public may not read is not redirected to.
+    let (status, head, body) = get("site", "/private");
+    assert_eq!(
+        (status, body.as_str()),
+        (403, "custom error page"),
+        "{head}"
     );
     for signed in [false, true] {
         let (status, _, body) = visit("site", "GET", "/private/secret", &[], signed);

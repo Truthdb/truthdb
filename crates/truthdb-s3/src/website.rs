@@ -597,7 +597,12 @@ pub async fn serve(state: &S3State, request: Request<Incoming>, bucket: String) 
     } else {
         path_key.clone()
     };
+    // The folder's index a missing key may be redirected to.
+    let folder_index = (key == path_key && !key.is_empty()).then(|| format!("{key}/{suffix}"));
     let mut objects = vec![(bucket.clone(), key.clone(), VersionSel::Latest)];
+    if let Some(index) = &folder_index {
+        objects.push((bucket.clone(), index.clone(), VersionSel::Latest));
+    }
     if let Some(error_key) = &config.error_key {
         objects.push((bucket.clone(), error_key.clone(), VersionSel::Latest));
     }
@@ -638,9 +643,14 @@ pub async fn serve(state: &S3State, request: Request<Incoming>, bucket: String) 
                     read(state, &headers, &bucket, key.clone(), head_only).await
                 }
                 _ => {
-                    // A folder named without its slash, whose index exists.
-                    if key == path_key && !key.is_empty() {
-                        let index = format!("{key}/{suffix}");
+                    // A folder named without its slash, whose index exists
+                    // and the public may read (else its existence is not
+                    // told).
+                    if let Some(index) = &folder_index
+                        && authz
+                            .check("s3:GetObject", Resource::Object(&bucket, index))
+                            .is_ok()
+                    {
                         let (name, wanted) = (bucket.clone(), index.clone());
                         let folder = crate::scope::object(state, move |file| {
                             file.head_object(&name, &wanted, VersionSel::Latest)
