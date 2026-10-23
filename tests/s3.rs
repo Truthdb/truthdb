@@ -8924,3 +8924,139 @@ fn bucket_events_are_received_from_a_sql_queue() {
     }
     assert!(sql_rows(server.native_port, receive).is_empty());
 }
+
+/// A webhook receiver on a free port: answers each POST with the next of
+/// `statuses` (the last one again once they run out), and keeps the
+/// requests as (headers, body).
+fn webhook_receiver(
+    statuses: Vec<u16>,
+) -> (
+    u16,
+    std::sync::Arc<std::sync::Mutex<Vec<(Vec<(String, String)>, Vec<u8>)>>>,
+) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let mut headers = Vec::new();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    let header = header.trim_end();
+                    if header.is_empty() {
+                        break;
+                    }
+                    let (name, value) = header.split_once(':').unwrap();
+                    headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+                }
+                let len: usize = headers
+                    .iter()
+                    .find(|(name, _)| name == "content-length")
+                    .map_or(0, |(_, value)| value.parse().unwrap());
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                let status = {
+                    let mut seen = kept.lock().unwrap();
+                    seen.push((headers, body));
+                    statuses[(seen.len() - 1).min(statuses.len() - 1)]
+                };
+                let _ = write!(stream, "HTTP/1.1 {status} X\r\ncontent-length: 0\r\n\r\n");
+            }
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn bucket_events_reach_a_webhook_signed_and_retried() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "hooker");
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send(
+            server.s3_port,
+            method,
+            path,
+            query,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    // Refuses the first POST, then takes them.
+    let (port, seen) = webhook_receiver(vec![500, 200]);
+    native(
+        server.native_port,
+        &format!("stream create topic hooked retention 0 account {account}"),
+    );
+    let created = native(
+        server.native_port,
+        &format!("stream create webhook hooked url http://127.0.0.1:{port}/hook secret topsecret"),
+    );
+    assert_eq!(created["dead_letter_topic"], "hooked.dead-letter");
+    assert_eq!(call("PUT", "/photos", "", b"").0, 200);
+    let config = format!(
+        "<NotificationConfiguration><CloudFunctionConfiguration><Id>fn</Id>\
+         <CloudFunction>arn:aws:lambda:us-east-1:{account}:function:hooked</CloudFunction>\
+         <Event>s3:ObjectCreated:*</Event></CloudFunctionConfiguration></NotificationConfiguration>"
+    );
+    assert_eq!(
+        call("PUT", "/photos", "notification", config.as_bytes()).0,
+        200
+    );
+    assert_eq!(call("PUT", "/photos/a.jpg", "", b"x").0, 200);
+    let deadline = Instant::now() + DEADLINE;
+    while seen.lock().unwrap().len() < 3 && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let seen = seen.lock().unwrap().clone();
+    assert_eq!(seen.len(), 3, "{seen:?}");
+    let header = |at: usize, name: &str| {
+        seen[at]
+            .0
+            .iter()
+            .find(|(header, _)| header == name)
+            .map(|(_, value)| value.clone())
+            .unwrap_or_else(|| panic!("no {name}"))
+    };
+    // The test event refused, then sent again under the same delivery id.
+    assert_eq!(header(0, "x-truthdb-delivery"), "hooked/0/0");
+    assert_eq!(header(1, "x-truthdb-delivery"), "hooked/0/0");
+    let test_event: serde_json::Value = serde_json::from_slice(&seen[1].1).unwrap();
+    assert_eq!(test_event["Event"], "s3:TestEvent");
+    let event: serde_json::Value = serde_json::from_slice(&seen[2].1).unwrap();
+    assert_eq!(event["Records"][0]["eventName"], "ObjectCreated:Put");
+    assert_eq!(event["Records"][0]["s3"]["configurationId"], "fn");
+    assert_eq!(header(2, "content-type"), "application/json");
+    // Signed with the secret over the time and the body.
+    for (at, (_, body)) in seen.iter().enumerate() {
+        let signature = header(at, "x-truthdb-signature");
+        let (time, mac) = signature
+            .strip_prefix("t=")
+            .and_then(|rest| rest.split_once(",v1="))
+            .unwrap();
+        let key = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"topsecret");
+        let expected: String =
+            ring::hmac::sign(&key, &[format!("{time}.").as_bytes(), body].concat())
+                .as_ref()
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect();
+        assert_eq!(mac, expected, "request {at}");
+    }
+    let rows = sql_rows(
+        server.native_port,
+        "SELECT topic_name, next_offset, pending_records, delivered, dead_lettered, last_error \
+         FROM sys.dm_s3_webhooks",
+    );
+    assert_eq!(rows, [["hooked", "2", "0", "2", "0", "HTTP 500"]]);
+}

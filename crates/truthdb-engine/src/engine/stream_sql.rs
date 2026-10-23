@@ -8,6 +8,9 @@
 //!   and NULL: its oldest), up to `@max_records` (default and NULL: all),
 //!   oldest first. Records trimmed meanwhile are passed over.
 //!
+//! - `sys.dm_s3_webhooks`: one row per partition of each webhook: where its
+//!   delivery stands, its backlog, its tries and its counts.
+//!
 //! Records stream a slice at a time, each slice under its own storage-lock
 //! hold. Topics are server-wide: only a server administrator may read them.
 //! A standby refuses both: it applies the primary's log as it arrives,
@@ -24,7 +27,8 @@ use truthdb_sql::value::SqlValue;
 use truthdb_streams::{StreamError, StreamFile};
 
 use super::s3_sql::{
-    bigint, check_admin, check_arg_count, column, datetime, datetime2, nvarchar, string_arg, text,
+    bigint, check_admin, check_arg_count, column, datetime, datetime2, nvarchar, nvarchar_max,
+    string_arg, text,
 };
 
 /// Records one slice reads at most, and the key and value bytes it stops
@@ -39,6 +43,27 @@ pub(super) fn open(
     caller: ExternalCaller,
 ) -> Result<ExternalRowset, SqlError> {
     check_admin(name, caller)?;
+    if name == "sys.dm_s3_webhooks" {
+        check_arg_count(name, args, 0, 0)?;
+        return Ok(ExternalRowset {
+            columns: vec![
+                nvarchar("topic_name", 249),
+                nvarchar_max("url"),
+                bigint("partition_id"),
+                bigint("next_offset"),
+                bigint("pending_records"),
+                bigint("attempts"),
+                datetime2("next_attempt_time"),
+                bigint("delivered"),
+                bigint("dead_lettered"),
+                nvarchar_max("last_error"),
+            ],
+            rows: Box::new(WebhookStream {
+                core: Arc::clone(core),
+                done: false,
+            }),
+        });
+    }
     if name == "sys.stream_topics" {
         check_arg_count(name, args, 0, 0)?;
         return Ok(ExternalRowset {
@@ -171,6 +196,58 @@ impl ExternalStream for TopicStream {
                 })
             })
             .collect();
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// `sys.dm_s3_webhooks`: one row per webhook partition (its secret is not
+/// shown).
+struct WebhookStream {
+    core: Arc<Storage>,
+    done: bool,
+}
+
+impl ExternalStream for WebhookStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let (webhooks, topics) =
+            with_streams(&self.core, |file| Ok((file.webhooks()?, file.topics()?)))?;
+        let mut rows = Vec::new();
+        for webhook in webhooks {
+            let logs = topics
+                .iter()
+                .find(|(topic, _)| topic.id == webhook.topic_id)
+                .map(|(_, partitions)| partitions.as_slice())
+                .unwrap_or_default();
+            for (id, state) in webhook.partitions.iter().enumerate() {
+                let pending = logs.get(id).map_or(0, |log| {
+                    log.next.saturating_sub(state.offset.max(log.start))
+                });
+                rows.push(vec![
+                    text(&webhook.topic),
+                    text(&webhook.url),
+                    Datum::BigInt(id as i64),
+                    Datum::BigInt(state.offset as i64),
+                    Datum::BigInt(pending as i64),
+                    Datum::BigInt(i64::from(state.attempts)),
+                    if state.attempts == 0 {
+                        Datum::Null
+                    } else {
+                        datetime(state.next_attempt_ms)
+                    },
+                    Datum::BigInt(webhook.delivered as i64),
+                    Datum::BigInt(webhook.dead_lettered as i64),
+                    if webhook.last_error.is_empty() {
+                        Datum::Null
+                    } else {
+                        text(&webhook.last_error)
+                    },
+                ]);
+            }
+        }
         Ok((!rows.is_empty()).then_some(rows))
     }
 }

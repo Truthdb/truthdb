@@ -1783,6 +1783,7 @@ dependencies = [
  "md-5",
  "percent-encoding",
  "rcgen",
+ "ring",
  "rustls",
  "serde",
  "serde_json",

@@ -154,6 +154,17 @@ fn http_client(
     Ok(HttpClient::builder(hyper_util::rt::TokioExecutor::new()).build(connector))
 }
 
+/// `url` as a POST target: an `http://` or `https://` URL with a host.
+pub fn post_target(url: &str) -> Result<Uri, Error> {
+    let uri: Uri = url
+        .parse()
+        .map_err(|_| invalid(format!("{url} is not a URL")))?;
+    if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
+        return Err(invalid(format!("{url} is not an http:// or https:// URL")));
+    }
+    Ok(uri)
+}
+
 /// Posts bodies to URLs (webhooks), over the same HTTP stack: no proxies,
 /// and redirects are not followed.
 pub struct Poster {
@@ -176,12 +187,7 @@ impl Poster {
         headers: &[(&str, String)],
         body: Bytes,
     ) -> Result<u16, Error> {
-        let uri: Uri = url
-            .parse()
-            .map_err(|_| invalid(format!("{url} is not a URL")))?;
-        if !matches!(uri.scheme_str(), Some("http" | "https")) || uri.authority().is_none() {
-            return Err(invalid(format!("{url} is not an http:// or https:// URL")));
-        }
+        let uri = post_target(url)?;
         let body_len = body.len() as u64;
         let mut request = Request::builder()
             .method(Method::POST)

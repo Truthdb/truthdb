@@ -407,3 +407,80 @@ fn an_account_that_owns_topics_is_not_dropped() {
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
+
+#[test]
+fn webhooks_are_set_on_topics_and_shown() {
+    let path = unique_temp_path("streams-webhooks");
+    let engine = new_engine(&path);
+    engine
+        .execute("stream create topic events partitions 2")
+        .unwrap();
+    let reply: Value = serde_json::from_str(
+        &engine
+            .execute("stream create webhook events url https://hooks.example/s3 secret k;")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reply["dead_letter_topic"], "events.dead-letter");
+    for (command, error) in [
+        (
+            "stream create webhook events url https://h/x secret k",
+            "already has a webhook",
+        ),
+        (
+            "stream create webhook missing url https://h/x secret k",
+            "no topic 'missing'",
+        ),
+        (
+            "stream create webhook events url ftp://h/x secret k",
+            "not an http",
+        ),
+        (
+            "stream create webhook events url nonsense secret k",
+            "not an http",
+        ),
+        ("stream drop webhook missing", "no topic 'missing'"),
+    ] {
+        let message = command_error(&engine, command);
+        assert!(message.contains(error), "{command}: {message}");
+    }
+    let (columns, rows) = sql_rows(&engine, "SELECT * FROM sys.dm_s3_webhooks");
+    assert_eq!(
+        columns,
+        [
+            "topic_name",
+            "url",
+            "partition_id",
+            "next_offset",
+            "pending_records",
+            "attempts",
+            "next_attempt_time",
+            "delivered",
+            "dead_lettered",
+            "last_error"
+        ]
+    );
+    assert_eq!(rows.len(), 2, "one row per partition");
+    assert_eq!(
+        rows[1][..6],
+        [
+            Some("events".to_string()),
+            Some("https://hooks.example/s3".to_string()),
+            Some("1".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string()),
+            Some("0".to_string())
+        ]
+    );
+    assert_eq!((rows[1][6].clone(), rows[1][9].clone()), (None, None));
+    engine.execute("stream drop webhook events").unwrap();
+    assert!(
+        sql_rows(&engine, "SELECT * FROM sys.dm_s3_webhooks")
+            .1
+            .is_empty()
+    );
+    let message = command_error(&engine, "stream drop webhook events");
+    assert!(message.contains("has no webhook"), "{message}");
+    drop(engine);
+    let _ = std::fs::remove_file(path);
+}

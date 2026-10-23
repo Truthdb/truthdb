@@ -97,7 +97,7 @@ impl ExternalRowsets for S3Rowsets {
                 return Some(open_imports(&self.core, name, args, caller));
             }
             "sys.s3_search" => return Some(self.open_search(name, args, caller)),
-            "sys.stream_topics" | "sys.stream_read" => {
+            "sys.stream_topics" | "sys.stream_read" | "sys.dm_s3_webhooks" => {
                 return Some(super::stream_sql::open(&self.core, name, args, caller));
             }
             "sys.s3_read" => {
