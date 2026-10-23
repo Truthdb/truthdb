@@ -3,12 +3,13 @@
 //! of every request to another host.
 
 use hyper::body::Incoming;
-use hyper::{Method, Request, Response, StatusCode};
-use truthdb_object::BUCKET_WEBSITE;
+use hyper::{HeaderMap, Method, Request, Response, StatusCode};
+use truthdb_object::{BUCKET_WEBSITE, VersionSel};
 
+use crate::authz::{Authz, Resource};
 use crate::error::{S3Error, escape};
 use crate::object_lock::{malformed, read_checked_body};
-use crate::server::{Authenticated, Body, S3State, full};
+use crate::server::{Authenticated, Body, Connection, RequestIds, S3State, full};
 use crate::xml::{self, Element};
 
 const XMLNS: &str = "http://s3.amazonaws.com/doc/2006-03-01/";
@@ -367,6 +368,339 @@ pub async fn bucket_website(
         }
         other => Err(S3Error::not_implemented(format!("{other} ?website"))),
     }
+}
+
+/// What a key keeps unencoded in a redirect's Location.
+const LOCATION: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'.')
+    .remove(b'_')
+    .remove(b'~')
+    .remove(b'/');
+
+/// The bucket a request to its website endpoint
+/// (`<bucket>.s3-website.<domain>`) is for, in the request's extensions.
+#[derive(Clone)]
+pub struct WebsiteHost(pub String);
+
+/// The bucket `host` names as `<bucket>.s3-website.<domain>`.
+pub fn website_bucket(host: &str, domains: &[String]) -> Option<String> {
+    let website: Vec<String> = domains
+        .iter()
+        .map(|domain| format!("s3-website.{domain}"))
+        .collect();
+    crate::api::host_bucket(host, &website)
+}
+
+fn reason(status: u16) -> &'static str {
+    StatusCode::from_u16(status)
+        .ok()
+        .and_then(|status| status.canonical_reason())
+        .unwrap_or("Error")
+}
+
+/// An error as the website endpoint answers it: an HTML page.
+fn page(err: &S3Error, key: Option<&str>, ids: &RequestIds, head_only: bool) -> Response<Body> {
+    let title = format!("{} {}", err.status, reason(err.status));
+    let mut items = vec![
+        format!("<li>Code: {}</li>", escape(err.code)),
+        format!("<li>Message: {}</li>", escape(&err.message)),
+    ];
+    if let Some(key) = key {
+        items.push(format!("<li>Key: {}</li>", escape(key)));
+    }
+    items.push(format!("<li>RequestId: {}</li>", escape(&ids.request_id)));
+    items.push(format!("<li>HostId: {}</li>", escape(&ids.host_id)));
+    let body = format!(
+        "<html>\n<head><title>{title}</title></head>\n<body>\n<h1>{title}</h1>\n<ul>\n{}\n</ul>\n<hr/>\n</body>\n</html>\n",
+        items.join("\n")
+    );
+    Response::builder()
+        .status(StatusCode::from_u16(err.status).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR))
+        .header("content-type", "text/html; charset=utf-8")
+        .header("x-amz-error-code", err.code)
+        .body(full(if head_only { String::new() } else { body }))
+        .expect("a valid response")
+}
+
+fn redirect(status: u16, location: &str) -> Response<Body> {
+    Response::builder()
+        .status(StatusCode::from_u16(status).unwrap_or(StatusCode::MOVED_PERMANENTLY))
+        .header("location", location)
+        .body(full(bytes::Bytes::new()))
+        .expect("a valid response")
+}
+
+/// Where a request for `key` that a routing rule matched goes.
+fn rule_location(rule: &RoutingRule, key: &str, protocol: &str, host: &str) -> String {
+    let redirect = &rule.redirect;
+    let new_key = match (&redirect.replace_key, &redirect.replace_key_prefix) {
+        (Some(replacement), _) => replacement.clone(),
+        (None, Some(prefix)) => {
+            let rest = key
+                .strip_prefix(rule.key_prefix.as_deref().unwrap_or(""))
+                .unwrap_or(key);
+            format!("{prefix}{rest}")
+        }
+        (None, None) => key.to_string(),
+    };
+    format!(
+        "{}://{}/{}",
+        redirect.protocol.as_deref().unwrap_or(protocol),
+        redirect.host.as_deref().unwrap_or(host),
+        percent_encoding::utf8_percent_encode(&new_key, LOCATION)
+    )
+}
+
+/// The first routing rule for `key` when the request would be answered
+/// with `error` (none: before it is looked up).
+fn rule_for<'c>(
+    config: &'c WebsiteConfig,
+    key: &str,
+    error: Option<u16>,
+) -> Option<&'c RoutingRule> {
+    config.rules.iter().find(|rule| {
+        rule.error_code == error
+            && rule
+                .key_prefix
+                .as_deref()
+                .is_none_or(|prefix| key.starts_with(prefix))
+    })
+}
+
+/// An object's answer, as a GET or HEAD reads it (its conditions and
+/// Range from `headers`). The read runs in its own task, as GetObject's
+/// does: a client that disconnects drops this handler, and the task still
+/// releases the lease it takes.
+async fn read(
+    state: &S3State,
+    headers: &HeaderMap,
+    bucket: &str,
+    key: String,
+    head_only: bool,
+) -> Result<Response<Body>, S3Error> {
+    let task_state = S3State {
+        engine: state.engine.clone(),
+        region: state.region.clone(),
+        signing_keys: state.signing_keys.clone(),
+        storage: state.storage.clone(),
+        restore_delays: state.restore_delays,
+        domains: state.domains.clone(),
+    };
+    let (headers, bucket) = (headers.clone(), bucket.to_string());
+    let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
+    tokio::spawn(crate::scope::within(scope, async move {
+        crate::objects::read_object(
+            &task_state,
+            &headers,
+            bucket,
+            key,
+            VersionSel::Latest,
+            None,
+            head_only,
+            &[],
+            None,
+            crate::objects::LockVisible {
+                retention: false,
+                legal_hold: false,
+            },
+        )
+        .await
+    }))
+    .await
+    .map_err(|err| S3Error::internal(err.to_string()))?
+}
+
+/// A request to a bucket's website endpoint: GET and HEAD only, always
+/// anonymous (what it reads must be public), answered from the bucket's
+/// website configuration with HTML error pages.
+pub async fn serve(state: &S3State, request: Request<Incoming>, bucket: String) -> Response<Body> {
+    let ids = request
+        .extensions()
+        .get::<RequestIds>()
+        .cloned()
+        .expect("handle sets the request ids");
+    let head_only = match *request.method() {
+        Method::GET => false,
+        Method::HEAD => true,
+        _ => {
+            let err = S3Error::new(
+                405,
+                "MethodNotAllowed",
+                "The specified method is not allowed against this resource.",
+            );
+            return page(&err, None, &ids, false);
+        }
+    };
+    let connection = request.extensions().get::<Connection>().copied();
+    let protocol = if connection.is_some_and(|connection| connection.tls) {
+        "https"
+    } else {
+        "http"
+    };
+    let host = request
+        .headers()
+        .get(hyper::header::HOST)
+        .and_then(|host| host.to_str().ok())
+        .unwrap_or_default()
+        .to_string();
+    let name = bucket.clone();
+    let loaded = state
+        .engine
+        .run_object(move |file| {
+            Ok((
+                file.bucket(&name)?.is_some(),
+                file.bucket_config(&name, BUCKET_WEBSITE, "")?,
+            ))
+        })
+        .await;
+    let config = match loaded {
+        Ok((false, _)) => {
+            let err = S3Error::new(404, "NoSuchBucket", "The specified bucket does not exist");
+            return page(&err, None, &ids, head_only);
+        }
+        Ok((true, None)) => {
+            let err = S3Error::new(
+                404,
+                "NoSuchWebsiteConfiguration",
+                "The specified bucket does not have a website configuration",
+            );
+            return page(&err, None, &ids, head_only);
+        }
+        Ok((true, Some(document))) => match parse(&document) {
+            Ok(config) => config,
+            Err(err) => return page(&err, None, &ids, head_only),
+        },
+        Err(err) => return page(&S3Error::internal(err.to_string()), None, &ids, head_only),
+    };
+    if let Some(all) = &config.redirect_all {
+        let location = format!(
+            "{}://{}{}",
+            all.protocol.as_deref().unwrap_or(protocol),
+            all.host,
+            request.uri().path()
+        );
+        return redirect(301, &location);
+    }
+    let Some(path_key) = crate::sigv4::decode_path(request.uri().path()) else {
+        let err = S3Error::invalid_request("the path is not UTF-8");
+        return page(&err, None, &ids, head_only);
+    };
+    let path_key = path_key.strip_prefix('/').unwrap_or(&path_key).to_string();
+    if let Some(rule) = rule_for(&config, &path_key, None) {
+        let code = rule.redirect.code.unwrap_or(301);
+        return redirect(code, &rule_location(rule, &path_key, protocol, &host));
+    }
+    let suffix = config.index_suffix.clone().unwrap_or_default();
+    let key = if path_key.is_empty() || path_key.ends_with('/') {
+        format!("{path_key}{suffix}")
+    } else {
+        path_key.clone()
+    };
+    let mut objects = vec![(bucket.clone(), key.clone(), VersionSel::Latest)];
+    if let Some(error_key) = &config.error_key {
+        objects.push((bucket.clone(), error_key.clone(), VersionSel::Latest));
+    }
+    let authz = match Authz::load(
+        state,
+        None,
+        None,
+        request.headers(),
+        "",
+        connection,
+        vec![bucket.clone()],
+        objects,
+    )
+    .await
+    {
+        Ok(authz) => authz,
+        Err(err) => return page(&err, Some(&key), &ids, head_only),
+    };
+    let scope = crate::scope::Scope {
+        key: None,
+        buckets: authz.owners(),
+        origin: None,
+    };
+    let headers = request.headers().clone();
+    crate::scope::within(scope, async move {
+        let answer = async {
+            authz.check("s3:GetObject", Resource::Object(&bucket, &key))?;
+            let (name, wanted) = (bucket.clone(), key.clone());
+            let found = crate::scope::object(state, move |file| {
+                file.head_object(&name, &wanted, VersionSel::Latest)
+            })
+            .await?;
+            match found {
+                Ok(info) if !info.delete_marker => {
+                    if let Some(location) = &info.attrs.website_redirect {
+                        return Ok(redirect(301, location));
+                    }
+                    read(state, &headers, &bucket, key.clone(), head_only).await
+                }
+                _ => {
+                    // A folder named without its slash, whose index exists.
+                    if key == path_key && !key.is_empty() {
+                        let index = format!("{key}/{suffix}");
+                        let (name, wanted) = (bucket.clone(), index.clone());
+                        let folder = crate::scope::object(state, move |file| {
+                            file.head_object(&name, &wanted, VersionSel::Latest)
+                        })
+                        .await?;
+                        if folder.is_ok_and(|info| !info.delete_marker) {
+                            let location = format!(
+                                "/{}/",
+                                percent_encoding::utf8_percent_encode(&key, LOCATION)
+                            );
+                            return Ok(redirect(302, &location));
+                        }
+                    }
+                    // Whether a key is missing is told only to those who
+                    // may list the bucket.
+                    Err(
+                        if authz
+                            .check("s3:ListBucket", Resource::Bucket(&bucket))
+                            .is_ok()
+                        {
+                            S3Error::new(404, "NoSuchKey", "The specified key does not exist.")
+                        } else {
+                            S3Error::access_denied("Access Denied")
+                        },
+                    )
+                }
+            }
+        }
+        .await;
+        let err = match answer {
+            Ok(response) => return response,
+            Err(err) => err,
+        };
+        if let Some(rule) = rule_for(&config, &path_key, Some(err.status)) {
+            let code = rule.redirect.code.unwrap_or(301);
+            return redirect(code, &rule_location(rule, &path_key, protocol, &host));
+        }
+        // A 4xx answers with the error document, when the public may read it.
+        if (400..500).contains(&err.status)
+            && let Some(error_key) = &config.error_key
+            && authz
+                .check("s3:GetObject", Resource::Object(&bucket, error_key))
+                .is_ok()
+            && let Ok(mut response) = read(
+                state,
+                &HeaderMap::new(),
+                &bucket,
+                error_key.clone(),
+                head_only,
+            )
+            .await
+            && response.status() == StatusCode::OK
+        {
+            *response.status_mut() =
+                StatusCode::from_u16(err.status).unwrap_or(StatusCode::NOT_FOUND);
+            return response;
+        }
+        page(&err, Some(&key), &ids, head_only)
+    })
+    .await
 }
 
 #[cfg(test)]
