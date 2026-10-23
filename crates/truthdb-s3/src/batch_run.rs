@@ -1425,10 +1425,15 @@ async fn run_invocations(
     };
     let mut results = Vec::new();
     let began = std::time::Instant::now();
+    // The step's first invocation runs to its end (the client's timeouts
+    // and the tries bound it), so every step records one; the rest share
+    // what is left of the budget.
+    let mut invoked_one = false;
     for item in items {
-        let Some(left) = INVOCATION_STEP_BUDGET.checked_sub(began.elapsed()) else {
+        let left = INVOCATION_STEP_BUDGET.checked_sub(began.elapsed());
+        if invoked_one && left.is_none() {
             break;
-        };
+        }
         let result = match &item.object {
             None => None,
             Some(Err((text, why))) => Some(JobResult {
@@ -1447,25 +1452,26 @@ async fn run_invocations(
             }),
             Some(Ok((bucket, key, version))) => {
                 let task_id = format!("{}-{}", job.id(), item.start);
-                let invoked = tokio::time::timeout(
-                    left,
-                    invoke(
-                        poster,
-                        &url,
-                        &secret,
-                        &job,
-                        &lambda,
-                        &task_id,
-                        bucket,
-                        key,
-                        version.as_deref(),
-                    ),
-                )
-                .await;
+                let invocation = invoke(
+                    poster,
+                    &url,
+                    &secret,
+                    &job,
+                    &lambda,
+                    &task_id,
+                    bucket,
+                    key,
+                    version.as_deref(),
+                );
+                let invoked = match left.filter(|_| invoked_one) {
+                    Some(left) => tokio::time::timeout(left, invocation).await.ok(),
+                    None => Some(invocation.await),
+                };
                 // Out of time: this task and the rest wait for the next step.
-                let Ok((succeeded, code, message)) = invoked else {
+                let Some((succeeded, code, message)) = invoked else {
                     break;
                 };
+                invoked_one = true;
                 Some(JobResult {
                     bucket: cut(bucket, MAX_RESULT_TEXT),
                     key: cut(key, MAX_RESULT_KEY),
