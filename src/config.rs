@@ -23,6 +23,9 @@ pub struct Config {
     pub s3: S3Config,
 
     #[serde(default)]
+    pub kafka: KafkaConfig,
+
+    #[serde(default)]
     pub encryption: EncryptionConfig,
 }
 
@@ -139,6 +142,57 @@ fn default_s3_port() -> u16 {
 
 fn default_s3_region() -> String {
     "us-east-1".to_string()
+}
+
+/// The Kafka-compatible listener for consumers of the streams engine's
+/// topics. Disabled by default; TLS only (`tls_cert` and `tls_key` are
+/// required), clients authenticating with SASL PLAIN as an S3 account's
+/// root access key (key id and secret). Clients are told to connect to
+/// `advertised_host` and `port`.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KafkaConfig {
+    #[serde(default)]
+    pub enabled: bool,
+
+    #[serde(default = "default_addr")]
+    pub addr: String,
+
+    #[serde(default = "default_kafka_port")]
+    pub port: u16,
+
+    /// The host name clients reach the listener by (in its certificate).
+    #[serde(default = "default_advertised_host")]
+    pub advertised_host: String,
+
+    /// PEM certificate chain path (required when enabled).
+    #[serde(default)]
+    pub tls_cert: Option<String>,
+
+    /// PEM private key path (required when enabled).
+    #[serde(default)]
+    pub tls_key: Option<String>,
+}
+
+impl Default for KafkaConfig {
+    fn default() -> Self {
+        KafkaConfig {
+            enabled: false,
+            addr: default_addr(),
+            port: default_kafka_port(),
+            advertised_host: default_advertised_host(),
+            tls_cert: None,
+            tls_key: None,
+        }
+    }
+}
+
+fn default_kafka_port() -> u16 {
+    9093
+}
+
+fn default_advertised_host() -> String {
+    "localhost".to_string()
 }
 
 /// Physical replication (Stage 18). Disabled by default. A `primary` runs the
@@ -742,6 +796,22 @@ mod tests {
         assert_eq!(config.s3.port, 9100);
         assert_eq!(config.s3.region, "eu-north-1");
         assert_eq!(config.s3.tls_cert, None);
+        fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn file_sets_kafka() {
+        let dir = test_dir("kafka");
+        let path = write(
+            &dir,
+            "a.toml",
+            "[kafka]\nenabled = true\nadvertised_host = \"db.example\"\ntls_cert = \"k.crt\"\ntls_key = \"k.key\"\n",
+        );
+        let config = load_layers(&[path]).unwrap();
+        assert!(config.kafka.enabled);
+        assert_eq!(config.kafka.port, 9093);
+        assert_eq!(config.kafka.advertised_host, "db.example");
+        assert_eq!(config.kafka.tls_key.as_deref(), Some("k.key"));
         fs::remove_dir_all(&dir).ok();
     }
 

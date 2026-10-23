@@ -84,6 +84,18 @@ reserved_ratio = 0.17
 # tls_key = "/etc/truthdb/s3.key"
 # restore_seconds = { expedited = 0, standard = 0, bulk = 0 }  # RestoreObject delay per tier
 #
+# [kafka]
+# Kafka-compatible listener for consumers of stream topics (TLS only). Clients
+# authenticate with SASL PLAIN: username = an S3 account root's access key id,
+# password = its secret; they see the topics that account owns
+# (stream create topic <name> account <id>).
+# enabled = true
+# addr = "0.0.0.0"
+# port = 9093
+# advertised_host = "localhost"   # the host clients connect to (in the cert)
+# tls_cert = "/etc/truthdb/kafka.crt"   # required
+# tls_key = "/etc/truthdb/kafka.key"    # required
+#
 # [encryption]
 # Encryption at rest: a database created while a master key is configured is
 # encrypted (its pages, log, search snapshot, spill pages and backups); it, its

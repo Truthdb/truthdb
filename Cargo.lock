@@ -1794,6 +1794,7 @@ dependencies = [
  "truthdb-cli",
  "truthdb-core",
  "truthdb-engine",
+ "truthdb-kafka",
  "truthdb-net",
  "truthdb-proto",
  "truthdb-relational",
@@ -1902,6 +1903,20 @@ dependencies = [
  "base64",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "truthdb-kafka"
+version = "0.1.0"
+dependencies = [
+ "crc",
+ "ring",
+ "tokio",
+ "tokio-rustls",
+ "truthdb-core",
+ "truthdb-engine",
+ "truthdb-object",
+ "truthdb-streams",
 ]
 
 [[package]]
