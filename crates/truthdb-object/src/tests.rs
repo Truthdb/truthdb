@@ -5209,7 +5209,11 @@ fn a_restore_notes_its_start_completion_and_expiry() {
             .restores_ready(start + 1_000)
             .unwrap()
     );
-    assert_eq!(step(start + 1_000), (1, 0));
+    // Extended once ready, before the sweep came to it: it still
+    // completes, once.
+    restore("cold", start + 1_500);
+    assert_eq!(step(start + 1_500), (1, 0));
+    assert_eq!(step(start + 1_600), (0, 0));
     // Extended once restored: no second start.
     restore("cold", start + 2_000);
     let expiry = restore_expiry(start + 2_000, 1);
@@ -5234,7 +5238,7 @@ fn a_restore_notes_its_start_completion_and_expiry() {
     assert_eq!(data["lifecycleRestoreStorageClass"], "GLACIER");
     assert_eq!(
         data["lifecycleRestorationExpiryTime"],
-        crate::time::iso8601(restore_expiry(start + 1_000, 1))
+        crate::time::iso8601(restore_expiry(start + 1_500, 1))
     );
     assert_ne!(cold.version, gone.version);
     drop(storage);

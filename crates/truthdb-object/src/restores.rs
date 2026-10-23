@@ -180,6 +180,15 @@ impl ObjTxn<'_, '_> {
                 )
             }
         };
+        // An extension keeps a completion not yet sent.
+        let pending = match current {
+            Some(current) => self
+                .trees
+                .restore_ready()
+                .get(self.ctx, &timed_key(current.ready_ms, version))?
+                .is_some(),
+            None => false,
+        };
         self.forget_restore(version)?;
         let mode = &mut OpMode::Txn(self.txn);
         self.trees.restores().insert_unique(
@@ -194,13 +203,15 @@ impl ObjTxn<'_, '_> {
             &timed_key(restore.expiry_ms, version),
             &[],
         )?;
-        if done == Restored::Started {
+        if done == Restored::Started || pending {
             self.trees.restore_ready().insert_unique(
                 self.ctx,
                 mode,
                 &timed_key(restore.ready_ms, version),
                 &[],
             )?;
+        }
+        if done == Restored::Started {
             self.note_event(bucket, key, version, "s3:ObjectRestore:Post", None, now_ms)?;
         }
         Ok(Ok((done, version, null_version)))
@@ -244,7 +255,7 @@ impl ObjTxn<'_, '_> {
             limit,
         )?;
         for (key, _) in &due {
-            let (ready_ms, version) = codec::decode_timed_key(key)?;
+            let (_, version) = codec::decode_timed_key(key)?;
             self.trees
                 .restore_ready()
                 .delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
@@ -255,9 +266,7 @@ impl ObjTxn<'_, '_> {
             else {
                 continue;
             };
-            if let (restore, Some((bucket, object_key))) = decode_row(&row)?
-                && restore.ready_ms == ready_ms
-            {
+            if let (restore, Some((bucket, object_key))) = decode_row(&row)? {
                 let class = self.class_of_version(&bucket, &object_key, version)?;
                 let detail = serde_json::json!({
                     "glacierEventData": {
