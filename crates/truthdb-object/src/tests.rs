@@ -5330,7 +5330,8 @@ fn batch_jobs_are_kept_found_by_token_and_reported_durably() {
     let (first, made) = ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
             tx.create_job(
-                Job::new("111122223333", "token-1", vec![1, 2], request.clone()),
+                Job::new("111122223333", Some("alice"), "token-1", vec![1, 2]),
+                &request,
                 0xabc,
                 10,
             )
@@ -5344,13 +5345,25 @@ fn batch_jobs_are_kept_found_by_token_and_reported_durably() {
     // The same token: the same job; another account's: another job.
     let (again, made) = ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
-            tx.create_job(Job::new("111122223333", "token-1", vec![9], vec![]), 1, 20)
+            tx.create_job(
+                Job::new("111122223333", None, "token-1", vec![9]),
+                &[],
+                1,
+                20,
+            )
         })
         .unwrap();
     assert!(!made);
     assert_eq!(again, first);
     let (other, made) = ObjFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_job(Job::new("444455556666", "token-1", vec![], vec![]), 2, 30))
+        .transaction(|tx| {
+            tx.create_job(
+                Job::new("444455556666", None, "token-1", vec![]),
+                b"x",
+                2,
+                30,
+            )
+        })
         .unwrap();
     assert!(made);
     assert_eq!(other.number, 2);
@@ -5390,7 +5403,9 @@ fn batch_jobs_are_kept_found_by_token_and_reported_durably() {
     let jobs = file.jobs().unwrap();
     assert_eq!(jobs.len(), 2);
     let job = &jobs[0];
-    assert_eq!(job.request, request);
+    assert_eq!(job.user.as_deref(), Some("alice"));
+    assert_eq!(file.job_request(1).unwrap().as_deref(), Some(&request[..]));
+    assert_eq!(file.job_request(2).unwrap().as_deref(), Some(&b"x"[..]));
     assert_eq!(job.status, JobStatus::Active);
     assert_eq!((job.succeeded, job.failed, job.next_result), (2, 1, 3));
     let results = file.job_results(1, 1, 10).unwrap();
@@ -5407,8 +5422,20 @@ fn batch_jobs_are_kept_found_by_token_and_reported_durably() {
     assert!(file.transaction(|tx| tx.drop_job_results(1, 2)).unwrap());
     file.transaction(|tx| tx.drop_job(&job)).unwrap();
     assert_eq!(file.job(1).unwrap(), None);
+    assert_eq!(
+        file.job_request(1).unwrap(),
+        None,
+        "its request went with it"
+    );
     let (fresh, made) = file
-        .transaction(|tx| tx.create_job(Job::new("111122223333", "token-1", vec![], vec![]), 3, 40))
+        .transaction(|tx| {
+            tx.create_job(
+                Job::new("111122223333", None, "token-1", vec![]),
+                &[],
+                3,
+                40,
+            )
+        })
         .unwrap();
     assert!(made, "the token went with its job");
     assert_eq!(fresh.number, 3);

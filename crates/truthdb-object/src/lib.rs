@@ -163,6 +163,8 @@ const JOBS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 32;
 const JOB_TOKENS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 33;
 /// (job number, task sequence) -> the task's result, for the report.
 const JOB_RESULTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 34;
+/// Job number -> the job's CreateJob request, chunked.
+const JOB_REQUESTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 35;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -287,7 +289,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 35;
+const TREE_COUNT: usize = 36;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -407,6 +409,9 @@ impl Trees {
     }
     pub fn job_results(&self) -> BTree {
         self.tree(JOB_RESULTS_TREE)
+    }
+    pub fn job_requests(&self) -> BTree {
+        self.tree(JOB_REQUESTS_TREE)
     }
 }
 

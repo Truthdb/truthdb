@@ -5,16 +5,20 @@
 //! are written in one transaction, so a job resumed after a crash runs each
 //! task once.
 //!
-//! A job is a chunked document keyed by its number; its client request
-//! token maps to it, so a repeated CreateJob finds the job it made; its
-//! results are rows keyed by (job, task sequence).
+//! A job's progress is a chunked document keyed by its number, small and
+//! rewritten as it runs; its request, written once, is another, in a tree
+//! of its own (so what is read of every job each step stays small). Its
+//! client request token maps to it, so a repeated CreateJob finds the job
+//! it made; its results are rows keyed by (job, task sequence).
 
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
 use crate::codec::{Reader, Writer};
 use crate::documents::read;
-use crate::{JOB_RESULTS_TREE, JOBS_TREE, NEXT_JOB_KEY, ObjFile, ObjTxn, next_counter};
+use crate::{
+    JOB_REQUESTS_TREE, JOB_RESULTS_TREE, JOBS_TREE, NEXT_JOB_KEY, ObjFile, ObjTxn, next_counter,
+};
 
 /// A job's status, as S3 Batch Operations names them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,8 +84,8 @@ impl JobStatus {
     }
 }
 
-/// A job: its request (`request`: what the S3 API needs to describe and run
-/// it, in its own form) and its progress.
+/// A job's progress (its request is kept apart: see
+/// [`ObjTxn::create_job`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Job {
     /// Its number (in its id, and the order jobs are listed in).
@@ -93,7 +97,12 @@ pub struct Job {
     /// A digest of the CreateJob request, to tell a repeat from another
     /// request with the same token.
     pub fingerprint: Vec<u8>,
-    pub request: Vec<u8>,
+    /// The account's user that created it (`None`: the account's root): its
+    /// tasks are authorized as that user's requests would be.
+    pub user: Option<String>,
+    /// Its operation's name and its description, as ListJobs shows them.
+    pub operation: String,
+    pub description: String,
     pub priority: u32,
     pub status: JobStatus,
     pub status_reason: String,
@@ -118,14 +127,16 @@ pub struct Job {
 
 impl Job {
     /// A job in status New.
-    pub fn new(account: &str, token: &str, fingerprint: Vec<u8>, request: Vec<u8>) -> Self {
+    pub fn new(account: &str, user: Option<&str>, token: &str, fingerprint: Vec<u8>) -> Self {
         Job {
             number: 0,
             tag: 0,
             account: account.to_string(),
             token: token.to_string(),
             fingerprint,
-            request,
+            user: user.map(str::to_string),
+            operation: String::new(),
+            description: String::new(),
             priority: 0,
             status: JobStatus::New,
             status_reason: String::new(),
@@ -173,8 +184,15 @@ impl Job {
         out.str(&self.token);
         out.u32(self.fingerprint.len() as u32);
         out.0.extend_from_slice(&self.fingerprint);
-        out.u32(self.request.len() as u32);
-        out.0.extend_from_slice(&self.request);
+        match &self.user {
+            Some(user) => {
+                out.u8(1);
+                out.str(user);
+            }
+            None => out.u8(0),
+        }
+        out.str(&self.operation);
+        out.str(&self.description);
         out.u32(self.priority);
         out.u8(self.status.code());
         out.str(&self.status_reason);
@@ -216,7 +234,12 @@ impl Job {
             Ok(taken)
         };
         let fingerprint = bytes(&mut input)?;
-        let request = bytes(&mut input)?;
+        let user = if input.present()? {
+            Some(input.str()?)
+        } else {
+            None
+        };
+        let (operation, description) = (input.str()?, input.str()?);
         let priority = input.u32()?;
         let status = *STATUSES
             .get(input.u8()? as usize)
@@ -231,7 +254,9 @@ impl Job {
             account,
             token,
             fingerprint,
-            request,
+            user,
+            operation,
+            description,
             priority,
             status,
             status_reason,
@@ -307,12 +332,13 @@ fn result_key(number: u64, seq: u64) -> Vec<u8> {
 }
 
 impl ObjTxn<'_, '_> {
-    /// Creates `job` (numbered here; `tag` is its id's random part), unless
-    /// its account made one with its token already: then that job, and
-    /// whether it was made now.
+    /// Creates `job` with its request `request` (numbered here; `tag` is
+    /// its id's random part), unless its account made one with its token
+    /// already: then that job, and whether it was made now.
     pub fn create_job(
         &mut self,
         mut job: Job,
+        request: &[u8],
         tag: u64,
         now_ms: u64,
     ) -> Result<(Job, bool), StorageError> {
@@ -338,6 +364,8 @@ impl ObjTxn<'_, '_> {
             &job.number.to_be_bytes(),
         )?;
         self.put_job(&job)?;
+        let requests = self.trees.job_requests();
+        self.put_document(requests, &job.number.to_be_bytes(), request)?;
         Ok((job, true))
     }
 
@@ -345,6 +373,11 @@ impl ObjTxn<'_, '_> {
         read(self.ctx, &self.trees.jobs(), &number.to_be_bytes())?
             .map(|bytes| Job::decode(number, &bytes))
             .transpose()
+    }
+
+    /// A job's request, as it was created with.
+    pub fn job_request(&mut self, number: u64) -> Result<Option<Vec<u8>>, StorageError> {
+        read(self.ctx, &self.trees.job_requests(), &number.to_be_bytes())
     }
 
     /// Writes `job` as it now stands.
@@ -393,6 +426,8 @@ impl ObjTxn<'_, '_> {
         )?;
         let jobs = self.trees.jobs();
         self.delete_document(&jobs, &job.number.to_be_bytes())?;
+        let requests = self.trees.job_requests();
+        self.delete_document(&requests, &job.number.to_be_bytes())?;
         Ok(())
     }
 }
@@ -437,6 +472,15 @@ impl ObjFile<'_> {
         read(&mut ctx, &tree, &number.to_be_bytes())?
             .map(|bytes| Job::decode(number, &bytes))
             .transpose()
+    }
+
+    /// A job's request, as it was created with.
+    pub fn job_request(&mut self, number: u64) -> Result<Option<Vec<u8>>, StorageError> {
+        let Some(tree) = self.existing_tree(JOB_REQUESTS_TREE)? else {
+            return Ok(None);
+        };
+        let mut ctx = self.core.page_ctx(0);
+        read(&mut ctx, &tree, &number.to_be_bytes())
     }
 
     /// Up to `limit` of a job's results from sequence `from`.

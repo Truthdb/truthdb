@@ -10,10 +10,14 @@
 //! its end a job writes its completion report (when it asked for one and a
 //! task ran), then drops its results; it is forgotten 90 days after.
 //!
-//! Tasks act for the job's account: on its own buckets only.
+//! Tasks act for the user that created the job (its account's root, or one
+//! of its users): each is authorized as that user's own request would be,
+//! on the account's own buckets only. A job whose step fails (a storage
+//! error) waits before it is tried again, so it holds up no other job.
 
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
 use truthdb_core::storage::StorageError;
@@ -22,10 +26,11 @@ use truthdb_object::{
     SealedBody, StorageClass, VersionSel, time::iso8601,
 };
 
+use crate::authz::{Authz, Resource};
 use crate::batch::{Field, Operation, Spec, spec, stored_request};
 use crate::error::S3Error;
 use crate::objects::{DROP_GRACE_MS, now_ms, object_error};
-use crate::server::S3State;
+use crate::server::{Principal, S3State};
 
 /// How long the runner waits when no job has work.
 const IDLE: Duration = Duration::from_secs(1);
@@ -53,24 +58,37 @@ const MOVED: &str = "the batch job moved";
 const REPORT_SCHEMA: &str =
     "Bucket, Key, VersionId, TaskStatus, ErrorCode, HTTPStatusCode, ResultMessage";
 
+/// The longest a failing job waits before it is tried again.
+const MAX_WAIT: Duration = Duration::from_secs(300);
+
+/// Jobs whose last step failed: when each is tried again, and its wait
+/// (doubling from a second).
+#[derive(Default)]
+struct Waits(HashMap<u64, (Instant, Duration)>);
+
+impl Waits {
+    fn ready(&self, number: u64, now: Instant) -> bool {
+        self.0.get(&number).is_none_or(|(at, _)| *at <= now)
+    }
+
+    fn failed(&mut self, number: u64, now: Instant) {
+        let wait = self
+            .0
+            .get(&number)
+            .map_or(IDLE, |(_, wait)| (*wait * 2).min(MAX_WAIT));
+        self.0.insert(number, (now + wait, wait));
+    }
+}
+
 /// Runs jobs until `shutdown` turns true. A standby runs none (its log is
 /// the primary's).
 pub async fn run(state: Arc<S3State>, mut shutdown: watch::Receiver<bool>) {
+    let mut waits = Waits::default();
     loop {
         if *shutdown.borrow() {
             return;
         }
-        let more = if state.storage.is_standby() {
-            false
-        } else {
-            match step(&state).await {
-                Ok(more) => more,
-                Err(err) => {
-                    eprintln!("batch operations: {err}");
-                    false
-                }
-            }
-        };
+        let more = !state.storage.is_standby() && step(&state, &mut waits).await;
         if !more {
             tokio::select! {
                 _ = tokio::time::sleep(IDLE) => {}
@@ -93,14 +111,81 @@ where
         .map_err(|err| err.to_string())
 }
 
-/// One step of whichever job has work; whether there may be more now.
-async fn step(state: &S3State) -> Result<bool, String> {
-    let jobs = object(state, |file| file.jobs()).await?;
-    let now = now_ms();
-    // Ended jobs: their results go, then (after 90 days) the jobs.
-    for job in jobs.iter().filter(|job| job.status.is_terminal()) {
-        let number = job.number;
+/// What a step does to a job.
+enum Work {
+    DropResults,
+    Forget,
+    Begin,
+    Prepare,
+    Finish,
+    Activate,
+    Run,
+}
+
+/// The next work of a job not waiting: ended jobs' cleanup first, then New,
+/// Preparing, ending, Ready jobs, then the Active job of the highest
+/// priority (the oldest of those).
+fn next_work<'j>(jobs: &'j [Job], waits: &Waits, now_ms: u64) -> Option<(&'j Job, Work)> {
+    let now = Instant::now();
+    let ready: Vec<&Job> = jobs
+        .iter()
+        .filter(|job| waits.ready(job.number, now))
+        .collect();
+    for job in ready.iter().filter(|job| job.status.is_terminal()) {
         if job.results_left {
+            return Some((job, Work::DropResults));
+        }
+        if job
+            .terminated_ms
+            .is_some_and(|at| at + KEEP_ENDED_MS < now_ms)
+        {
+            return Some((job, Work::Forget));
+        }
+    }
+    let first = |status: JobStatus| ready.iter().copied().find(|job| job.status == status);
+    if let Some(job) = first(JobStatus::New) {
+        return Some((job, Work::Begin));
+    }
+    if let Some(job) = first(JobStatus::Preparing) {
+        return Some((job, Work::Prepare));
+    }
+    if let Some(job) = ready.iter().copied().find(|job| {
+        matches!(
+            job.status,
+            JobStatus::Completing | JobStatus::Cancelling | JobStatus::Failing
+        )
+    }) {
+        return Some((job, Work::Finish));
+    }
+    if let Some(job) = first(JobStatus::Ready) {
+        return Some((job, Work::Activate));
+    }
+    ready
+        .iter()
+        .copied()
+        .filter(|job| job.status == JobStatus::Active)
+        .max_by_key(|job| (job.priority, std::cmp::Reverse(job.number)))
+        .map(|job| (job, Work::Run))
+}
+
+/// One step of whichever job has work; whether there may be more now.
+async fn step(state: &S3State, waits: &mut Waits) -> bool {
+    let jobs = match object(state, |file| file.jobs()).await {
+        Ok(jobs) => jobs,
+        Err(err) => {
+            eprintln!("batch operations: {err}");
+            return false;
+        }
+    };
+    waits
+        .0
+        .retain(|number, _| jobs.iter().any(|job| job.number == *number));
+    let Some((job, work)) = next_work(&jobs, waits, now_ms()) else {
+        return false;
+    };
+    let number = job.number;
+    let outcome = match work {
+        Work::DropResults => {
             object(state, move |file| {
                 file.transaction(|tx| {
                     if tx.drop_job_results(number, RESULT_PAGE)?
@@ -112,54 +197,58 @@ async fn step(state: &S3State) -> Result<bool, String> {
                     Ok(())
                 })
             })
-            .await?;
-            return Ok(true);
+            .await
         }
-        if job.terminated_ms.is_some_and(|at| at + KEEP_ENDED_MS < now) {
+        Work::Forget => {
             let job = job.clone();
-            object(state, move |file| file.transaction(|tx| tx.drop_job(&job))).await?;
-            return Ok(true);
+            object(state, move |file| file.transaction(|tx| tx.drop_job(&job))).await
+        }
+        Work::Begin => {
+            move_job(state, number, JobStatus::New, |job, _| {
+                job.status = JobStatus::Preparing;
+            })
+            .await
+        }
+        Work::Prepare => prepare(state, number).await,
+        Work::Finish => finish(state, job.clone()).await,
+        Work::Activate => {
+            move_job(state, number, JobStatus::Ready, |job, now| {
+                job.status = JobStatus::Active;
+                job.active_since_ms.get_or_insert(now);
+            })
+            .await
+        }
+        Work::Run => run_tasks(state, number).await,
+    };
+    match outcome {
+        Ok(()) => {
+            waits.0.remove(&number);
+        }
+        Err(err) => {
+            eprintln!("batch operations: job {}: {err}", job.id());
+            waits.failed(number, Instant::now());
         }
     }
-    let by_status = |status: JobStatus| jobs.iter().find(|job| job.status == status);
-    if let Some(job) = by_status(JobStatus::New) {
-        move_job(state, job.number, JobStatus::New, |job, _| {
-            job.status = JobStatus::Preparing;
-        })
-        .await?;
-        return Ok(true);
+    true
+}
+
+/// The job's request, read; `None` when it is missing or unreadable.
+fn job_spec(file: &mut ObjFile<'_>, job: &Job) -> Result<Option<Spec>, StorageError> {
+    let Some(request) = file.job_request(job.number)? else {
+        return Ok(None);
+    };
+    Ok(stored_request(job, &request)
+        .and_then(|request| spec(&request))
+        .ok())
+}
+
+/// The user that created `job`, as a principal (for its authorization).
+fn creator(job: &Job) -> Principal {
+    Principal {
+        access_key: String::new(),
+        account: job.account.clone(),
+        user: job.user.clone(),
     }
-    if let Some(job) = by_status(JobStatus::Preparing) {
-        prepare(state, job.number).await?;
-        return Ok(true);
-    }
-    if let Some(job) = jobs.iter().find(|job| {
-        matches!(
-            job.status,
-            JobStatus::Completing | JobStatus::Cancelling | JobStatus::Failing
-        )
-    }) {
-        finish(state, job.clone()).await?;
-        return Ok(true);
-    }
-    if let Some(job) = by_status(JobStatus::Ready) {
-        move_job(state, job.number, JobStatus::Ready, |job, now| {
-            job.status = JobStatus::Active;
-            job.active_since_ms.get_or_insert(now);
-        })
-        .await?;
-        return Ok(true);
-    }
-    // The Active job of the highest priority; the oldest of those.
-    if let Some(job) = jobs
-        .iter()
-        .filter(|job| job.status == JobStatus::Active)
-        .max_by_key(|job| (job.priority, std::cmp::Reverse(job.number)))
-    {
-        run_tasks(state, job.number).await?;
-        return Ok(true);
-    }
-    Ok(false)
 }
 
 /// Changes job `number` by `change` if it is still in `from`.
@@ -242,7 +331,7 @@ async fn prepare(state: &S3State, number: u64) -> Result<(), String> {
         let Some(job) = file.job(number)? else {
             return Ok(());
         };
-        let Ok(spec) = stored_request(&job).and_then(|request| spec(&request)) else {
+        let Some(spec) = job_spec(file, &job)? else {
             return finish_failed(
                 file,
                 number,
@@ -291,6 +380,28 @@ async fn prepare(state: &S3State, number: u64) -> Result<(), String> {
                         }
                     },
                 };
+                let action = match manifest.version_id {
+                    Some(_) => "s3:GetObjectVersion",
+                    None => "s3:GetObject",
+                };
+                let authz = Authz::load_now(
+                    file,
+                    &creator(&job),
+                    vec![manifest.bucket.clone()],
+                    vec![(manifest.bucket.clone(), manifest.key.clone(), which)],
+                    now,
+                )?;
+                if authz
+                    .check(action, Resource::Object(&manifest.bucket, &manifest.key))
+                    .is_err()
+                {
+                    return finish_failed(
+                        file,
+                        number,
+                        "AccessDenied",
+                        "The job's creator may not read the manifest",
+                    );
+                }
                 let info = match file.head_object(&manifest.bucket, &manifest.key, which)? {
                     Ok(info) => info,
                     Err(_) => {
@@ -346,7 +457,7 @@ async fn prepare(state: &S3State, number: u64) -> Result<(), String> {
         };
         let lines = bytes[..taken]
             .split(|&byte| byte == b'\n')
-            .filter(|line| !line.iter().all(|byte| byte.is_ascii_whitespace()))
+            .filter(|line| !blank(line))
             .count() as u64;
         let (cursor, confirmation) = (job.cursor, spec.confirmation);
         file.transaction(|tx| {
@@ -448,7 +559,7 @@ enum Planned {
 /// Reads what a task needs; the error it ends with otherwise.
 fn plan(
     file: &mut ObjFile<'_>,
-    account: &str,
+    creator: &Principal,
     operation: &Operation,
     bucket: &str,
     key: &str,
@@ -476,18 +587,63 @@ fn plan(
                     "NoSuchBucket",
                     format!("The bucket {bucket} does not exist"),
                 )),
-                Some(info) if info.owner != account => Err(S3Error::access_denied("Access Denied")),
+                Some(info) if info.owner != creator.account => {
+                    Err(S3Error::access_denied("Access Denied"))
+                }
                 Some(_) => Ok(()),
             })
         };
     if let Err(err) = owned(file, bucket)? {
         return Ok(Err(err));
     }
+    // Authorized as the creator's own request, before anything of the
+    // object is looked at (a denied task tells nothing of it).
+    let mut buckets = vec![bucket.to_string()];
+    if let Operation::Copy(copy) = operation {
+        buckets.push(copy.bucket.clone());
+    }
+    let authz = Authz::load_now(
+        file,
+        creator,
+        buckets,
+        vec![(bucket.to_string(), key.to_string(), which)],
+        now,
+    )?;
+    let object = Resource::Object(bucket, key);
+    let versioned = version.is_some();
     let copy = match operation {
-        Operation::PutTagging(tags) => return Ok(Ok(Planned::Tags(which, tags.clone()))),
-        Operation::DeleteTagging => return Ok(Ok(Planned::Tags(which, Vec::new()))),
+        Operation::PutTagging(tags) => {
+            let action = if versioned {
+                "s3:PutObjectVersionTagging"
+            } else {
+                "s3:PutObjectTagging"
+            };
+            if let Err(err) = authz.check_tags(action, object, tags) {
+                return Ok(Err(err));
+            }
+            return Ok(Ok(Planned::Tags(which, tags.clone())));
+        }
+        Operation::DeleteTagging => {
+            let action = if versioned {
+                "s3:DeleteObjectVersionTagging"
+            } else {
+                "s3:DeleteObjectTagging"
+            };
+            if let Err(err) = authz.check(action, object) {
+                return Ok(Err(err));
+            }
+            return Ok(Ok(Planned::Tags(which, Vec::new())));
+        }
         Operation::Copy(copy) => copy,
     };
+    let read = if versioned {
+        "s3:GetObjectVersion"
+    } else {
+        "s3:GetObject"
+    };
+    if let Err(err) = authz.check(read, object) {
+        return Ok(Err(err));
+    }
     let source = match file.head_object(bucket, key, which)? {
         Ok(source) => source,
         Err(err) => return Ok(Err(object_error(err, bucket, key))),
@@ -535,6 +691,14 @@ fn plan(
     let lock = crate::object_lock::new_object_lock(None, bucket_lock, default, now)
         .ok()
         .flatten();
+    if let Err(err) = authz.check_storing(
+        "s3:PutObject",
+        Resource::Object(&copy.bucket, &target),
+        copy.tags.as_deref(),
+        lock.as_ref(),
+    ) {
+        return Ok(Err(err));
+    }
     Ok(Ok(Planned::Copy {
         source: Box::new(source),
         bucket: copy.bucket.clone(),
@@ -543,6 +707,11 @@ fn plan(
         class: copy.class,
         lock,
     }))
+}
+
+/// Whether a manifest line holds no task.
+fn blank(line: &[u8]) -> bool {
+    line.iter().all(u8::is_ascii_whitespace)
 }
 
 fn cut(text: &str, max: usize) -> String {
@@ -563,7 +732,7 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
         if job.status != JobStatus::Active {
             return Ok(());
         }
-        let Ok(spec) = stored_request(&job).and_then(|request| spec(&request)) else {
+        let Some(spec) = job_spec(file, &job)? else {
             return finish_failed(
                 file,
                 number,
@@ -594,6 +763,7 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
             account: Some(job.account.clone()),
             ..Origin::default()
         });
+        let who = creator(&job);
         let mut at = 0usize;
         let mut ran = 0;
         while ran < TASKS_PER_STEP {
@@ -630,7 +800,8 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
             let end = job.cursor + at as u64;
             let text = String::from_utf8_lossy(line);
             let text = text.trim_end_matches('\r');
-            if text.trim().is_empty() {
+            // The same test as Preparing's count.
+            if blank(line) {
                 // A blank line is no task: only the place moves.
                 if moved(file.transaction(|tx| advance(tx, number, start, end, None)))? {
                     return Ok(());
@@ -646,15 +817,18 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
                     Err(S3Error::invalid_request(why)),
                 ),
                 Ok((bucket, key, version)) => {
+                    // What cannot be read of this object fails this task,
+                    // not the job.
                     let planned = plan(
                         file,
-                        &job.account,
+                        &who,
                         &spec.operation,
                         &bucket,
                         &key,
                         version.as_deref(),
                         now,
-                    )?;
+                    )
+                    .unwrap_or_else(|err| Err(S3Error::internal(err.to_string())));
                     (bucket, key, version.unwrap_or_default(), planned)
                 }
             };
@@ -778,10 +952,12 @@ fn advance(
 async fn finish(state: &S3State, job: Job) -> Result<(), String> {
     let number = job.number;
     let from = job.status;
-    let report = stored_request(&job)
-        .and_then(|request| spec(&request))
-        .ok()
-        .and_then(|spec| spec.report);
+    let report = object(state, {
+        let job = job.clone();
+        move |file| job_spec(file, &job)
+    })
+    .await?
+    .and_then(|spec| spec.report);
     let written = match report {
         Some(report) if job.succeeded + job.failed > 0 => {
             let storage = Arc::clone(&state.storage);
@@ -823,6 +999,27 @@ async fn finish(state: &S3State, job: Job) -> Result<(), String> {
         let lock = crate::object_lock::new_object_lock(None, bucket_lock, default, now)
             .ok()
             .flatten();
+        if let (Some(files), None) = (&written, problem) {
+            let authz = Authz::load_now(
+                file,
+                &creator(&job),
+                vec![files.bucket.clone()],
+                Vec::new(),
+                now,
+            )?;
+            if files.objects.iter().any(|(key, _, _)| {
+                authz
+                    .check_storing(
+                        "s3:PutObject",
+                        Resource::Object(&files.bucket, key),
+                        None,
+                        lock.as_ref(),
+                    )
+                    .is_err()
+            }) {
+                problem = Some(("AccessDenied", "The job's creator may not write the report"));
+            }
+        }
         file.set_origin(Origin {
             operation: "PutObject".to_string(),
             request_id: job.id(),
@@ -1013,5 +1210,37 @@ mod tests {
         assert_eq!(version_sel("null"), Some(VersionSel::Null));
         assert_eq!(version_sel("12"), Some(VersionSel::Seq(12)));
         assert_eq!(version_sel("x"), None);
+    }
+
+    #[test]
+    fn a_failing_job_waits_and_holds_up_no_other() {
+        let job = |number: u64, status: JobStatus, priority: u32| {
+            let mut job = Job::new("111122223333", None, &number.to_string(), Vec::new());
+            job.number = number;
+            job.status = status;
+            job.priority = priority;
+            job.results_left = false;
+            job
+        };
+        let jobs = [
+            job(1, JobStatus::Preparing, 0),
+            job(2, JobStatus::Active, 5),
+            job(3, JobStatus::Active, 9),
+        ];
+        let mut waits = Waits::default();
+        let picked = |waits: &Waits| next_work(&jobs, waits, 0).map(|(job, _)| job.number);
+        assert_eq!(picked(&waits), Some(1), "preparing first");
+        let now = Instant::now();
+        waits.failed(1, now);
+        assert_eq!(picked(&waits), Some(3), "then the highest priority");
+        waits.failed(3, now);
+        assert_eq!(picked(&waits), Some(2));
+        waits.failed(2, now);
+        assert_eq!(picked(&waits), None, "every job waits");
+        // The wait doubles, to a limit.
+        for _ in 0..20 {
+            waits.failed(1, now);
+        }
+        assert_eq!(waits.0[&1].1, MAX_WAIT);
     }
 }

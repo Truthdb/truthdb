@@ -25,7 +25,9 @@ use crate::xml::{self, Element};
 
 pub(crate) const XMLNS: &str = "http://awss3control.amazonaws.com/doc/2018-08-20/";
 /// The largest CreateJob request body taken.
-const MAX_REQUEST_BYTES: usize = 256 * 1024;
+const MAX_REQUEST_BYTES: usize = 64 * 1024;
+/// Jobs an account keeps at most (ended ones are kept 90 days).
+const MAX_ACCOUNT_JOBS: usize = 1000;
 /// Jobs one ListJobs page lists at most (and by default).
 const MAX_LIST: usize = 1000;
 /// Tags a job may carry at most.
@@ -313,6 +315,9 @@ fn copy(element: &Element) -> Result<CopySpec, S3Error> {
         .text_of("TargetKeyPrefix")?
         .unwrap_or("")
         .to_string();
+    if prefix.len() > 1024 {
+        return Err(invalid("TargetKeyPrefix is at most 1024 bytes"));
+    }
     let class = match element.text_of("StorageClass")? {
         Some(name) => StorageClass::parse(name)
             .ok_or_else(|| invalid("The storage class you specified is not valid"))?,
@@ -367,33 +372,39 @@ fn metadata(element: &Element) -> Result<ObjectAttrs, S3Error> {
             )));
         }
     }
-    let text = |name: &str| -> Result<Option<String>, S3Error> {
-        Ok(element.text_of(name)?.map(str::to_string))
-    };
-    let mut user = Vec::new();
+    // Taken as the headers a PUT would carry them in, with a PUT's rules:
+    // valid header names and values, and its size limits.
+    let mut headers = hyper::HeaderMap::new();
+    let invalid_header = || invalid("The new object metadata is not valid as HTTP headers");
+    for (element_name, header) in [
+        ("CacheControl", "cache-control"),
+        ("ContentDisposition", "content-disposition"),
+        ("ContentEncoding", "content-encoding"),
+        ("ContentLanguage", "content-language"),
+        ("ContentType", "content-type"),
+        ("HttpExpiresDate", "expires"),
+    ] {
+        if let Some(value) = element.text_of(element_name)? {
+            headers.insert(
+                header,
+                hyper::header::HeaderValue::from_str(value).map_err(|_| invalid_header())?,
+            );
+        }
+    }
     if let Some(entries) = element.one("UserMetadata")? {
         entries.only(&["entry"])?;
         for entry in entries.all("entry") {
             entry.only(&["key", "value"])?;
             let key = entry.text_of("key")?.ok_or_else(malformed)?;
-            user.push((
-                key.to_ascii_lowercase(),
-                entry.text_of("value")?.unwrap_or("").to_string(),
-            ));
+            let name =
+                hyper::header::HeaderName::from_bytes(format!("x-amz-meta-{key}").as_bytes())
+                    .map_err(|_| invalid_header())?;
+            let value = hyper::header::HeaderValue::from_str(entry.text_of("value")?.unwrap_or(""))
+                .map_err(|_| invalid_header())?;
+            headers.append(name, value);
         }
     }
-    Ok(ObjectAttrs {
-        content_type: text("ContentType")?,
-        cache_control: text("CacheControl")?,
-        content_disposition: text("ContentDisposition")?,
-        content_encoding: text("ContentEncoding")?,
-        content_language: text("ContentLanguage")?,
-        expires: element
-            .text_of("HttpExpiresDate")?
-            .map(|date| date.to_string()),
-        user,
-        ..ObjectAttrs::default()
-    })
+    crate::objects::metadata_from(&headers)
 }
 
 fn manifest(element: &Element) -> Result<ManifestSpec, S3Error> {
@@ -491,8 +502,8 @@ fn report(element: &Element) -> Result<Option<ReportSpec>, S3Error> {
         Some(_) => return Err(invalid("ReportScope is AllTasks or FailedTasksOnly")),
     };
     let prefix = element.text_of("Prefix")?.unwrap_or("");
-    if prefix.chars().count() > 512 {
-        return Err(invalid("The report Prefix is at most 512 characters"));
+    if prefix.len() > 512 {
+        return Err(invalid("The report Prefix is at most 512 bytes"));
     }
     Ok(Some(ReportSpec {
         bucket,
@@ -518,8 +529,8 @@ pub(crate) fn render(element: &Element, out: &mut String) {
 }
 
 /// A job's stored request, as elements.
-pub(crate) fn stored_request(job: &Job) -> Result<Element, S3Error> {
-    xml::parse(&job.request, "CreateJobRequest")
+pub(crate) fn stored_request(job: &Job, request: &[u8]) -> Result<Element, S3Error> {
+    xml::parse(request, "CreateJobRequest")
         .map_err(|_| S3Error::internal(format!("job {} has a corrupt request", job.id())))
 }
 
@@ -600,6 +611,7 @@ pub async fn handle(
     .await?;
     authz.check(action, crate::authz::Resource::Service)?;
     let account = principal.account.clone();
+    let user = principal.user.clone();
     let job_id = job_id.map(str::to_string);
     let scope = crate::scope::Scope {
         key: Some((principal.access_key.clone(), principal.account.clone())),
@@ -608,7 +620,9 @@ pub async fn handle(
     };
     crate::scope::within(scope, async move {
         match (job_id, sub) {
-            (None, _) if method == Method::POST => create(state, request, auth, account).await,
+            (None, _) if method == Method::POST => {
+                create(state, request, auth, account, user).await
+            }
             (None, _) => list(state, &account, &query).await,
             (Some(id), "") => describe(state, &account, &id).await,
             (Some(id), "status") => update_status(state, &account, &id, &query).await,
@@ -623,6 +637,7 @@ async fn create(
     request: Request<Incoming>,
     auth: Authenticated,
     account: String,
+    user: Option<String>,
 ) -> Result<Response<Body>, S3Error> {
     let body = crate::server::read_body(request, auth, MAX_REQUEST_BYTES).await?;
     let parsed = xml::parse(&body, "CreateJobRequest")?;
@@ -632,13 +647,13 @@ async fn create(
     let fingerprint = ring::digest::digest(&ring::digest::SHA256, rendered.as_bytes())
         .as_ref()
         .to_vec();
-    let mut job = Job::new(
-        &account,
-        &spec.token,
-        fingerprint.clone(),
-        rendered.into_bytes(),
-    );
+    let mut job = Job::new(&account, user.as_deref(), &spec.token, fingerprint.clone());
     job.priority = spec.priority;
+    job.operation = spec.operation.name().to_string();
+    job.description = parsed
+        .text_of("Description")?
+        .unwrap_or_default()
+        .to_string();
     let tag = {
         use ring::rand::SecureRandom;
         let mut bytes = [0u8; 8];
@@ -649,9 +664,25 @@ async fn create(
     };
     let now = crate::objects::now_ms();
     let (job, made) = crate::scope::object(state, move |file| {
-        file.transaction(|tx| tx.create_job(job, tag, now))
+        let mine: Vec<Job> = file
+            .jobs()?
+            .into_iter()
+            .filter(|kept| kept.account == job.account)
+            .collect();
+        if mine.len() >= MAX_ACCOUNT_JOBS && !mine.iter().any(|kept| kept.token == job.token) {
+            return Ok(None);
+        }
+        file.transaction(|tx| tx.create_job(job, rendered.as_bytes(), tag, now))
+            .map(Some)
     })
-    .await?;
+    .await?
+    .ok_or_else(|| {
+        S3Error::new(
+            400,
+            "TooManyRequestsException",
+            format!("An account keeps at most {MAX_ACCOUNT_JOBS} jobs"),
+        )
+    })?;
     if !made && job.fingerprint != fingerprint {
         return Err(S3Error::new(
             400,
@@ -675,6 +706,21 @@ async fn find(state: &S3State, account: &str, id: &str) -> Result<Job, S3Error> 
         .ok_or_else(not_found)
 }
 
+/// The account's job with id `id`, and its request.
+async fn find_with_request(
+    state: &S3State,
+    account: &str,
+    id: &str,
+) -> Result<(Job, Element), S3Error> {
+    let job = find(state, account, id).await?;
+    let number = job.number;
+    let request = crate::scope::object(state, move |file| file.job_request(number))
+        .await?
+        .ok_or_else(not_found)?;
+    let request = stored_request(&job, &request)?;
+    Ok((job, request))
+}
+
 fn progress(job: &Job, now_ms: u64) -> String {
     let active_secs = job.active_since_ms.map_or(0, |since| {
         job.terminated_ms.unwrap_or(now_ms).saturating_sub(since) / 1000
@@ -689,8 +735,7 @@ fn progress(job: &Job, now_ms: u64) -> String {
 }
 
 async fn describe(state: &S3State, account: &str, id: &str) -> Result<Response<Body>, S3Error> {
-    let job = find(state, account, id).await?;
-    let request = stored_request(&job)?;
+    let (job, request) = find_with_request(state, account, id).await?;
     let spec = spec(&request)?;
     let now = crate::objects::now_ms();
     let mut out = format!("<DescribeJobResult xmlns=\"{XMLNS}\"><Job>");
@@ -803,22 +848,20 @@ async fn list(state: &S3State, account: &str, query: &str) -> Result<Response<Bo
     let now = crate::objects::now_ms();
     let mut out = format!("<ListJobsResult xmlns=\"{XMLNS}\"><Jobs>");
     for job in &page {
-        let request = stored_request(job)?;
-        let operation = spec(&request)?.operation;
         out.push_str(&format!(
             "<JobListDescriptor><CreationTime>{}</CreationTime>",
             iso8601(job.created_ms)
         ));
-        if let Some(description) = request.text_of("Description")? {
+        if !job.description.is_empty() {
             out.push_str(&format!(
                 "<Description>{}</Description>",
-                escape(description)
+                escape(&job.description)
             ));
         }
         out.push_str(&format!(
             "<JobId>{}</JobId><Operation>{}</Operation><Priority>{}</Priority>{}<Status>{}</Status>",
             job.id(),
-            operation.name(),
+            job.operation,
             job.priority,
             progress(job, now),
             job.status.as_str()

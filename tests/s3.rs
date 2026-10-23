@@ -9915,3 +9915,158 @@ fn batch_jobs_tag_and_copy_what_a_manifest_lists_once_across_a_crash() {
         "{rows:?}"
     );
 }
+
+#[test]
+fn batch_job_tasks_are_authorized_as_the_user_that_created_the_job() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "batchauth");
+    let root = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            &[("x-amz-account-id", &account)],
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    for bucket in ["/secret", "/mine", "/reports"] {
+        assert_eq!(root("PUT", bucket, "", b"").1.0, 200);
+    }
+    assert_eq!(root("PUT", "/secret/s1", "", b"hidden").1.0, 200);
+    assert_eq!(root("PUT", "/mine/m1", "", b"open").1.0, 200);
+    let (head, (status, _)) = root("PUT", "/mine/lists/m.csv", "", b"secret,s1\nmine,m1\n");
+    assert_eq!(status, 200);
+    let etag = response_header(&head, "etag").unwrap();
+    let policy = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:CreateJob", "s3:DescribeJob"], "Resource": "*"},
+        {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:PutObjectTagging"],
+         "Resource": ["arn:aws:s3:::mine/*", "arn:aws:s3:::reports/*"]}]}"#
+        .replace('\n', " ");
+    let (eve_key, eve_secret) = user_with_key(&server, &account, "eve", Some(&policy));
+    let eve = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            &[("x-amz-account-id", &account)],
+            body,
+            &eve_key,
+            Some(&eve_secret),
+        )
+        .1
+    };
+    let job_body = |token: &str, operation: &str| {
+        create_job_body(token, operation, "lists/m.csv", &etag, "").replace(
+            "arn:aws:s3:::src/lists/m.csv",
+            "arn:aws:s3:::mine/lists/m.csv",
+        )
+    };
+    let run = |body: String| -> String {
+        let (status, answer) = eve("POST", "/v20180820/jobs", "", body.as_bytes());
+        assert_eq!(status, 200, "{answer}");
+        let job = xml_value(&answer, "JobId");
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let (_, described) = eve("GET", &format!("/v20180820/jobs/{job}"), "", b"");
+            if xml_value(&described, "Status") == "Complete" {
+                return described;
+            }
+            assert!(Instant::now() < deadline, "{described}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    // Tagging: her own bucket's object only.
+    let tagging = "<S3PutObjectTagging><TagSet><S3Tag><Key>k</Key><Value>v</Value></S3Tag></TagSet></S3PutObjectTagging>";
+    let described = run(job_body("auth-tag", tagging));
+    assert_eq!(xml_value(&described, "NumberOfTasksSucceeded"), "1");
+    assert_eq!(xml_value(&described, "NumberOfTasksFailed"), "1");
+    let (_, (_, tags)) = root("GET", "/secret/s1", "tagging", b"");
+    assert!(!tags.contains("<Key>k</Key>"), "{tags}");
+    // A copy out of a bucket she may not read: refused, and nothing copied.
+    let copy = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::mine</TargetResource>\
+                <TargetKeyPrefix>copies/</TargetKeyPrefix></S3PutObjectCopy>";
+    let described = run(job_body("auth-copy", copy));
+    assert_eq!(xml_value(&described, "NumberOfTasksFailed"), "1");
+    assert_eq!(root("GET", "/mine/copies/s1", "", b"").1.0, 404);
+    assert_eq!(root("GET", "/mine/copies/m1", "", b"").1.0, 200);
+    // Her report says why, as AccessDenied, whether the object exists or not.
+    let (_, (_, listed)) = root("GET", "/reports", "list-type=2&prefix=rep/", b"");
+    assert!(listed.contains("manifest.json"), "{listed}");
+
+    // New metadata is held to a PUT's rules.
+    let replacing = |metadata: &str| {
+        format!(
+            "<S3PutObjectCopy><TargetResource>arn:aws:s3:::mine</TargetResource>\
+             <MetadataDirective>REPLACE</MetadataDirective><NewObjectMetadata>{metadata}</NewObjectMetadata>\
+             </S3PutObjectCopy>"
+        )
+    };
+    let code = |body: String| {
+        let (status, answer) = root("POST", "/v20180820/jobs", "", body.as_bytes()).1;
+        (status, xml_value(&answer, "Code"))
+    };
+    let line_break = replacing("<ContentType>text/plain&#13;&#10;x-evil: 1</ContentType>");
+    assert_eq!(
+        code(job_body("meta-1", &line_break)),
+        (400, "InvalidRequest".to_string())
+    );
+    let big = replacing(&format!(
+        "<UserMetadata><entry><key>big</key><value>{}</value></entry></UserMetadata>",
+        "v".repeat(3000)
+    ));
+    assert_eq!(
+        code(job_body("meta-2", &big)),
+        (400, "MetadataTooLarge".to_string())
+    );
+    let spaced =
+        replacing("<UserMetadata><entry><key>a b</key><value>1</value></entry></UserMetadata>");
+    assert_eq!(
+        code(job_body("meta-3", &spaced)),
+        (400, "InvalidRequest".to_string())
+    );
+}
+
+#[test]
+fn an_account_keeps_a_bounded_number_of_batch_jobs() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "manyjobs");
+    let call = |body: &str| {
+        let (status, answer) = send_with(
+            server.s3_port,
+            "POST",
+            "/v20180820/jobs",
+            "",
+            &[("x-amz-account-id", &account)],
+            body.as_bytes(),
+            &key,
+            Some(&secret),
+        )
+        .1;
+        (status, answer)
+    };
+    // Jobs whose manifest bucket does not exist: they fail at once, and stay.
+    let body = |n: usize| {
+        create_job_body(
+            &format!("t{n}"),
+            "<S3DeleteObjectTagging/>",
+            "m.csv",
+            "\"e\"",
+            "",
+        )
+    };
+    for n in 0..1000 {
+        assert_eq!(call(&body(n)).0, 200, "job {n}");
+    }
+    let (status, answer) = call(&body(1000));
+    assert_eq!(
+        (status, xml_value(&answer, "Code").as_str()),
+        (400, "TooManyRequestsException")
+    );
+    // A repeat of a kept job's request still finds it.
+    let (status, answer) = call(&body(7));
+    assert_eq!(status, 200, "{answer}");
+}
