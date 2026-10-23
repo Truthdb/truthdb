@@ -344,6 +344,15 @@ pub async fn dispatch(
         objects,
     )
     .await?;
+    // The request's bucket exists: it counts in the request metrics.
+    if let Target::Bucket(bucket) | Target::Object(bucket, _) = &target
+        && authz
+            .owners()
+            .iter()
+            .any(|(name, owner)| name == bucket && owner.is_some())
+    {
+        crate::metering::mark_seen(&request);
+    }
     let scope = crate::scope::Scope {
         key: principal
             .as_ref()

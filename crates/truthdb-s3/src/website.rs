@@ -555,6 +555,10 @@ pub async fn serve(state: &S3State, request: Request<Incoming>, bucket: String) 
             ))
         })
         .await;
+    // The bucket exists: the request counts in the request metrics.
+    if let Ok((true, _)) = &loaded {
+        crate::metering::mark_seen(&request);
+    }
     let config = match loaded {
         Ok((false, _)) => {
             let err = S3Error::new(404, "NoSuchBucket", "The specified bucket does not exist");

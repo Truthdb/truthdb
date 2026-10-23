@@ -252,14 +252,17 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         }
         crate::api::Target::Service => None,
     });
-    // What the request counts as in the request metrics.
+    // What the request counts as in the request metrics, if its bucket
+    // turns out to exist.
     let metered = crate::metering::metered(&request);
     let uploaded = crate::metering::uploaded(&request);
+    let seen = crate::metering::BucketSeen::default();
+    request.extensions_mut().insert(seen.clone());
     let mut response = match route(state, request).await {
         Ok(response) => response,
         Err(err) => error_response(&err, &resource, &ids),
     };
-    if let Some(metered) = metered {
+    if let Some(metered) = metered.filter(|_| seen.seen()) {
         let counters = state.request_metrics.bucket(&metered.bucket);
         counters.answered(
             metered.kind,
@@ -267,7 +270,10 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
             response.status().as_u16(),
             started.elapsed(),
         );
-        if let Some(source) = metered.copy_source {
+        // The source of a copy made (so it exists, and could be read).
+        if let Some(source) = metered.copy_source
+            && response.status().is_success()
+        {
             state.request_metrics.bucket(&source).copied_from();
         }
         response =

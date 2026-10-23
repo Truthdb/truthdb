@@ -5,6 +5,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::task::{Context, Poll};
 use std::time::Instant;
 
@@ -16,8 +17,33 @@ use truthdb_engine::metrics::{BucketRequests, RequestKind};
 use crate::api::{Target, has_param, plain};
 use crate::server::Body;
 
+/// Whether the bucket a request names exists, in its extensions: set by the
+/// route that loads the bucket to authorize the request (or, on a website
+/// endpoint, to read its configuration). Only a bucket that exists is
+/// counted: a name anyone may send must not take memory, nor crowd out the
+/// buckets there are.
+#[derive(Clone, Default)]
+pub(crate) struct BucketSeen(Arc<AtomicBool>);
+
+impl BucketSeen {
+    pub(crate) fn mark(&self) {
+        self.0.store(true, Ordering::Relaxed);
+    }
+
+    pub(crate) fn seen(&self) -> bool {
+        self.0.load(Ordering::Relaxed)
+    }
+}
+
+/// Marks, in `request`'s extensions, that the bucket it names exists.
+pub(crate) fn mark_seen<B>(request: &Request<B>) {
+    if let Some(seen) = request.extensions().get::<BucketSeen>() {
+        seen.mark();
+    }
+}
+
 /// What a request counts as: its bucket, its kind, and the bucket a copy
-/// reads (S3 counts a GET there too).
+/// reads (S3 counts a GET there too, once the copy is made).
 pub(crate) struct Metered {
     pub bucket: String,
     pub kind: RequestKind,
@@ -73,13 +99,19 @@ pub(crate) fn metered(request: &Request<Incoming>) -> Option<Metered> {
     })
 }
 
-/// The bytes a request's head says its body has.
+/// The bytes a request's head says its payload has: an aws-chunked body's
+/// decoded length (its chunk framing and signatures left out), else its
+/// Content-Length.
 pub(crate) fn uploaded(request: &Request<Incoming>) -> u64 {
-    request
-        .headers()
-        .get(hyper::header::CONTENT_LENGTH)
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.parse().ok())
+    ["x-amz-decoded-content-length", "content-length"]
+        .iter()
+        .find_map(|name| {
+            request
+                .headers()
+                .get(*name)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse().ok())
+        })
         .unwrap_or(0)
 }
 

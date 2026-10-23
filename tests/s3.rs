@@ -12607,6 +12607,55 @@ fn requests_are_counted_per_bucket_by_kind_bytes_errors_and_latency() {
         ),
         200
     );
+    // Only buckets that exist count, and a copy's source only when the
+    // copy is made: names anyone may send take nothing.
+    assert_eq!(
+        send(
+            port,
+            "GET",
+            &format!("/{}/k", "x".repeat(60_000)),
+            "",
+            b"",
+            "",
+            None
+        )
+        .0,
+        404
+    );
+    assert_eq!(send(port, "GET", "/ghost/k", "", b"", "", None).0, 404);
+    assert_eq!(
+        call(
+            "PUT",
+            "/other/failed",
+            "",
+            &[("x-amz-copy-source", "/meters/missing")],
+            b""
+        ),
+        404
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/meters/from-ghost",
+            "",
+            &[("x-amz-copy-source", "/ghost/k")],
+            b""
+        ),
+        404
+    );
+    // An aws-chunked upload counts its payload, not its framing.
+    let (status, reply) = put_chunked(
+        port,
+        "/meters/chunked",
+        &[7u8; 1000],
+        300,
+        &key,
+        &secret,
+        false,
+    );
+    assert_eq!(status, 200, "{reply}");
+    let (count, up, down) = sent.get();
+    sent.set((count + 1, up + 1000, down + reply.len() as u64));
     let delete = b"<Delete><Object><Key>gone</Key></Object></Delete>";
     let md5 = content_md5(delete);
     assert_eq!(
@@ -12657,12 +12706,25 @@ fn requests_are_counted_per_bucket_by_kind_bytes_errors_and_latency() {
     };
     assert_eq!(
         row("meters"),
-        [count as i64, 3, 1, 2, 1, 0, 1, down as i64, up as i64, 1, 0],
+        // Not its creation: the bucket did not exist yet.
+        [
+            count as i64 - 1,
+            3,
+            3,
+            2,
+            1,
+            0,
+            1,
+            down as i64,
+            up as i64,
+            2,
+            0
+        ],
         "all, get (the copy's source too), put, delete (a multi-object one too), head, post, list, \
          bytes down, bytes up, 4xx, 5xx"
     );
     let other = row("other");
-    assert_eq!(other[..3], [2, 0, 1], "{other:?}");
+    assert_eq!(other[..3], [2, 0, 2], "{other:?}");
     let buckets = sql_rows(
         server.native_port,
         "SELECT bucket_name FROM sys.dm_s3_requests ORDER BY bucket_name",
@@ -12677,8 +12739,8 @@ fn requests_are_counted_per_bucket_by_kind_bytes_errors_and_latency() {
     assert_eq!(
         latencies,
         [
-            ["FIRST_BYTE".to_string(), count.to_string()],
-            ["TOTAL".to_string(), count.to_string()]
+            ["FIRST_BYTE".to_string(), (count - 1).to_string()],
+            ["TOTAL".to_string(), (count - 1).to_string()]
         ]
     );
 }
