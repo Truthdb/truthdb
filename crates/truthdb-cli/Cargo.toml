@@ -19,7 +19,6 @@ tokio = { workspace = true }
 truthdb-proto = { workspace = true }
 truthdb-net = { workspace = true }
 truthdb-s3client = { workspace = true }
-http-body-util = "0.1.5"
 
 [package.metadata.deb]
 name = "truthdb-cli"

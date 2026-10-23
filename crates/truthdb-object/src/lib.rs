@@ -20,6 +20,7 @@ mod credentials;
 mod documents;
 mod fulltext;
 mod gc;
+mod imports;
 mod journal;
 mod lifecycle;
 mod listing;
@@ -56,6 +57,7 @@ pub use fulltext::{
     fulltext_status,
 };
 pub use gc::GcOutcome;
+pub use imports::{Import, ImportFailure, ImportSource, ImportState};
 pub use journal::{JournalObject, JournalRecord, Origin, RecordType};
 pub use lifecycle::{
     Expiration, Filter, LifecycleConfig, MinTransitionSize, NoncurrentExpiration,
@@ -137,6 +139,10 @@ const RESTORES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 25;
 const RESTORE_TIMERS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 26;
 /// Bucket -> where its lifecycle pass stands (see `lifecycle`).
 const LIFECYCLE_STATE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 27;
+/// Import id -> the import (see `imports`).
+const IMPORTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 28;
+/// (import, 0, source key) -> why that object was not copied.
+const IMPORT_FAILURES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 29;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -153,6 +159,8 @@ const NEXT_VERSION_KEY: &[u8] = b"next_version";
 const NEXT_UPLOAD_KEY: &[u8] = b"next_upload";
 /// META key of the journal's next sequence number.
 const NEXT_CHANGE_KEY: &[u8] = b"next_change";
+/// META key of the next import id to hand out.
+const NEXT_IMPORT_KEY: &[u8] = b"next_import";
 /// META key of the last journal row the full-text indexer has applied, in a
 /// file written before journal consumers (see `consumers`).
 const FT_CURSOR_KEY: &[u8] = b"ft_cursor";
@@ -257,7 +265,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 28;
+const TREE_COUNT: usize = 30;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -356,6 +364,12 @@ impl Trees {
     }
     pub fn lifecycle_state(&self) -> BTree {
         self.tree(LIFECYCLE_STATE_TREE)
+    }
+    pub fn imports(&self) -> BTree {
+        self.tree(IMPORTS_TREE)
+    }
+    pub fn import_failures(&self) -> BTree {
+        self.tree(IMPORT_FAILURES_TREE)
     }
 }
 

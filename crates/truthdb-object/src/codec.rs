@@ -189,6 +189,117 @@ pub(crate) fn decode_timed_key(key: &[u8]) -> Result<(u64, u64), StorageError> {
     ))
 }
 
+/// The stored form of a record with fields of varying length: each value
+/// in order, numbers little-endian, strings `[len u32][bytes]`, options a
+/// presence byte, lists `[count u32]` then their items.
+#[derive(Default)]
+pub(crate) struct Writer(pub(crate) Vec<u8>);
+
+impl Writer {
+    pub(crate) fn u8(&mut self, value: u8) {
+        self.0.push(value);
+    }
+    pub(crate) fn u32(&mut self, value: u32) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+    pub(crate) fn u64(&mut self, value: u64) {
+        self.0.extend_from_slice(&value.to_le_bytes());
+    }
+    pub(crate) fn str(&mut self, value: &str) {
+        self.u32(value.len() as u32);
+        self.0.extend_from_slice(value.as_bytes());
+    }
+    pub(crate) fn opt_u32(&mut self, value: Option<u32>) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.u32(value);
+            }
+            None => self.u8(0),
+        }
+    }
+    pub(crate) fn opt_u64(&mut self, value: Option<u64>) {
+        match value {
+            Some(value) => {
+                self.u8(1);
+                self.u64(value);
+            }
+            None => self.u8(0),
+        }
+    }
+}
+
+/// Reads what a [`Writer`] wrote; anything short or out of place is a
+/// corrupt `what`.
+pub(crate) struct Reader<'a> {
+    bytes: &'a [u8],
+    what: &'static str,
+}
+
+impl<'a> Reader<'a> {
+    pub(crate) fn new(bytes: &'a [u8], what: &'static str) -> Self {
+        Reader { bytes, what }
+    }
+    pub(crate) fn corrupt(&self) -> StorageError {
+        corrupt(self.what)
+    }
+    /// What is left to read.
+    pub(crate) fn rest(&self) -> &'a [u8] {
+        self.bytes
+    }
+    fn take(&mut self, len: usize) -> Result<&'a [u8], StorageError> {
+        if self.bytes.len() < len {
+            return Err(self.corrupt());
+        }
+        let (head, tail) = self.bytes.split_at(len);
+        self.bytes = tail;
+        Ok(head)
+    }
+    pub(crate) fn u8(&mut self) -> Result<u8, StorageError> {
+        Ok(self.take(1)?[0])
+    }
+    pub(crate) fn u32(&mut self) -> Result<u32, StorageError> {
+        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
+    }
+    pub(crate) fn u64(&mut self) -> Result<u64, StorageError> {
+        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
+    }
+    pub(crate) fn str(&mut self) -> Result<String, StorageError> {
+        let len = self.u32()? as usize;
+        String::from_utf8(self.take(len)?.to_vec()).map_err(|_| self.corrupt())
+    }
+    pub(crate) fn present(&mut self) -> Result<bool, StorageError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(self.corrupt()),
+        }
+    }
+    pub(crate) fn opt_u32(&mut self) -> Result<Option<u32>, StorageError> {
+        Ok(if self.present()? {
+            Some(self.u32()?)
+        } else {
+            None
+        })
+    }
+    pub(crate) fn opt_u64(&mut self) -> Result<Option<u64>, StorageError> {
+        Ok(if self.present()? {
+            Some(self.u64()?)
+        } else {
+            None
+        })
+    }
+    /// A list's length: every item takes at least a byte, so a count past
+    /// the bytes left is corrupt, not a huge allocation.
+    pub(crate) fn count(&mut self) -> Result<usize, StorageError> {
+        let count = self.u32()? as usize;
+        if count > self.bytes.len() {
+            return Err(self.corrupt());
+        }
+        Ok(count)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

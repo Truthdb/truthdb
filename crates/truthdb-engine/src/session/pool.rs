@@ -100,6 +100,11 @@ pub(super) fn spawn_engine_pool(
                 .name("truthdb-object-jobs".to_string())
                 .spawn(move || object_jobs_loop(&jobs_shared))
                 .expect("spawn object jobs thread");
+            let import_shared = Arc::clone(&supervisor);
+            let imports = std::thread::Builder::new()
+                .name("truthdb-object-import".to_string())
+                .spawn(move || import_loop(&import_shared))
+                .expect("spawn import thread");
             let handles: Vec<_> = (0..workers)
                 .map(|i| {
                     let shared = Arc::clone(&supervisor);
@@ -125,6 +130,7 @@ pub(super) fn spawn_engine_pool(
             let _ = maintenance.join();
             let _ = indexer.join();
             let _ = jobs.join();
+            let _ = imports.join();
             let mut sched = supervisor.scheduler.lock().expect("scheduler poisoned");
             for parked in sched.parked.drain(..) {
                 parked
@@ -322,6 +328,48 @@ pub(super) fn object_jobs_loop(shared: &Arc<Shared>) {
         let _ = shared
             .wake
             .wait_timeout(idle, INDEXER_IDLE)
+            .expect("idle mutex poisoned");
+    }
+}
+
+/// How long the import thread waits when no import is running, or its
+/// source could not be reached.
+const IMPORT_IDLE: Duration = Duration::from_secs(5);
+
+/// Imports from other S3 services (see `engine::import`), on their own
+/// thread: a step at a time while one runs, else a sleep. Its runtime runs
+/// the S3 client.
+pub(super) fn import_loop(shared: &Arc<Shared>) {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(err) => {
+            eprintln!("imports cannot run: {err}");
+            return;
+        }
+    };
+    let mut waits = crate::engine::ImportWaits::default();
+    while !shared.stop.load(Ordering::Acquire) {
+        let stopping = || shared.stop.load(Ordering::Acquire);
+        let more = shared
+            .engine
+            .import_step(&runtime, &stopping, &mut waits)
+            .unwrap_or_else(|err| {
+                eprintln!("import failed: {err}");
+                false
+            });
+        if more {
+            continue;
+        }
+        let idle = shared.idle.lock().expect("idle mutex poisoned");
+        if shared.stop.load(Ordering::Acquire) {
+            break;
+        }
+        let _ = shared
+            .wake
+            .wait_timeout(idle, IMPORT_IDLE)
             .expect("idle mutex poisoned");
     }
 }

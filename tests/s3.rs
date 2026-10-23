@@ -184,6 +184,13 @@ fn spawn_server(encrypted: bool, tls: bool) -> Server {
 
 /// Sends one native-protocol command and returns its JSON reply.
 fn native(port: u16, command: &str) -> serde_json::Value {
+    let reply = native_text(port, command);
+    serde_json::from_str(&reply).unwrap_or_else(|_| panic!("not a JSON reply: {reply}"))
+}
+
+/// Sends one native-protocol command and returns its reply as text (an
+/// error is not JSON).
+fn native_text(port: u16, command: &str) -> String {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -224,7 +231,7 @@ fn native(port: u16, command: &str) -> serde_json::Value {
         write_frame(&mut stream, &frame).await.expect("send");
         let resp = read_frame(&mut stream).await.expect("recv");
         let resp: CommandResp = decode_message(&resp.payload).expect("decode");
-        serde_json::from_str(&resp.message).expect("json reply")
+        resp.message
     })
 }
 
@@ -8279,4 +8286,255 @@ fn the_cli_lists_copies_syncs_and_removes() {
     assert_eq!(tree(&fresh), tree(&src));
     // Help is printed, not an error.
     assert!(cli(&["--help"]).contains("sync"));
+}
+
+/// Kills the server outright (SIGKILL, as a crash) and starts it again on
+/// the same files and ports, waiting until it listens.
+fn crash_and_restart(server: &mut Server) {
+    server.child.kill().expect("kill");
+    server.child.wait().expect("wait");
+    let log = std::fs::OpenOptions::new()
+        .append(true)
+        .open(server.dir.join("server.log"))
+        .expect("log");
+    server.child = Command::new(env!("CARGO_BIN_EXE_truthdb"))
+        .env("TRUTHDB_CONFIG", server.dir.join("truthdb.toml"))
+        .stdout(Stdio::from(log.try_clone().expect("clone")))
+        .stderr(Stdio::from(log))
+        .spawn()
+        .expect("restart server");
+    let deadline = Instant::now() + DEADLINE;
+    let pid = server.child.id();
+    while ![server.native_port, server.s3_port]
+        .iter()
+        .all(|&port| listens(pid, port))
+    {
+        assert!(
+            server.child.try_wait().expect("poll").is_none(),
+            "the restarted server exited"
+        );
+        assert!(Instant::now() < deadline, "the server never came back");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The rows of a native SQL query, each a list of cells as text.
+fn sql_rows(port: u16, sql: &str) -> Vec<Vec<String>> {
+    let reply = native(port, sql);
+    reply["results"][0]["rows"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{reply}"))
+        .iter()
+        .map(|row| {
+            row.as_array()
+                .unwrap()
+                .iter()
+                .map(|cell| match cell {
+                    serde_json::Value::String(text) => text.clone(),
+                    other => other.to_string(),
+                })
+                .collect()
+        })
+        .collect()
+}
+
+#[test]
+fn an_import_copies_another_servers_objects_and_goes_on_after_a_crash() {
+    let source = start_server();
+    let (_, source_key, source_secret) = account_with_key(&source, "origin");
+    let mut target = start_server();
+    let (_, key, secret) = account_with_key(&target, "copies");
+    let put = |server: &Server, key: &str, secret: &str, path: &str, body: &[u8]| {
+        let (status, reply) = send(server.s3_port, "PUT", path, "", body, key, Some(secret));
+        assert_eq!(status, 200, "{path}: {reply}");
+    };
+    put(&source, &source_key, &source_secret, "/src", b"");
+    let count = 60;
+    let body =
+        |i: usize| -> Vec<u8> { (0..2_000_000).map(|n| ((n + i * 7) % 251) as u8).collect() };
+    for i in 0..count {
+        put(
+            &source,
+            &source_key,
+            &source_secret,
+            &format!("/src/data/obj-{i:03}"),
+            &body(i),
+        );
+    }
+    put(
+        &source,
+        &source_key,
+        &source_secret,
+        "/src/other/x",
+        b"not imported",
+    );
+    put(&target, &key, &secret, "/dst", b"");
+    // Versioned: a version written twice would show.
+    assert_eq!(
+        send(
+            target.s3_port,
+            "PUT",
+            "/dst",
+            "versioning",
+            b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        200
+    );
+    // Already there alike (skipped), and there unlike (replaced).
+    put(&target, &key, &secret, "/dst/in/obj-000", &body(0));
+    put(&target, &key, &secret, "/dst/in/obj-001", b"stale");
+
+    // A source that refuses the keys fails the import.
+    let refused = native(
+        target.native_port,
+        &format!(
+            "s3 create import http://127.0.0.1:{} us-east-1 {source_key} wrong s3://src/data/ s3://dst/x/",
+            source.s3_port
+        ),
+    );
+    let refused_id = refused["import_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{refused}"));
+    // Commands that cannot start an import.
+    for bad in [
+        "s3 create import nonsense us-east-1 k s s3://src/ s3://dst/",
+        "s3 create import http://127.0.0.1:1 us-east-1 k s src s3://dst/",
+        "s3 create import http://127.0.0.1:1 us-east-1 k s s3://src/ s3://nowhere/",
+        "s3 create import http://127.0.0.1:1 us-east-1 k s s3://My_Bucket/ s3://dst/",
+    ] {
+        let reply = native_text(target.native_port, bad);
+        assert!(!reply.contains("import_id"), "{bad}: {reply}");
+    }
+
+    // One whose source cannot be reached waits, and holds no other back.
+    let unreachable = native(
+        target.native_port,
+        "s3 create import http://127.0.0.1:1 us-east-1 k s s3://src/ s3://dst/never/",
+    );
+    let unreachable_id = unreachable["import_id"].as_u64().unwrap();
+    let created = native(
+        target.native_port,
+        &format!(
+            "s3 create import http://127.0.0.1:{} us-east-1 {source_key} {source_secret} s3://src/data/ s3://dst/in/",
+            source.s3_port
+        ),
+    );
+    let id = created["import_id"]
+        .as_u64()
+        .unwrap_or_else(|| panic!("{created}"));
+    let state = |server: &Server, id: u64| -> Vec<String> {
+        sql_rows(
+            server.native_port,
+            &format!(
+                "SELECT state, copied, skipped, failed, last_key, last_error \
+                 FROM sys.dm_s3_imports WHERE import_id = {id}"
+            ),
+        )
+        .into_iter()
+        .next()
+        .unwrap_or_default()
+    };
+    // Killed once it has copied something, then started again.
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while state(&target, id).get(1).is_none_or(|copied| copied == "0") {
+        assert!(Instant::now() < deadline, "the import never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    // Still running when it is killed: the restart must go on from its
+    // place.
+    let before = state(&target, id);
+    assert_eq!(before[0], "RUNNING", "{before:?}");
+    crash_and_restart(&mut target);
+    let deadline = Instant::now() + Duration::from_secs(120);
+    let done = loop {
+        let row = state(&target, id);
+        if row.first().map(String::as_str) == Some("DONE") {
+            break row;
+        }
+        assert!(Instant::now() < deadline, "the import never ended: {row:?}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    // Every object exactly once: what was copied before the crash is not
+    // copied again.
+    let number = |at: usize| done[at].parse::<usize>().unwrap();
+    assert_eq!(number(1) + number(2), count, "{done:?}");
+    assert!(number(2) >= 1, "obj-000 was there alike: {done:?}");
+    assert_eq!(number(3), 0, "{done:?}");
+    assert_eq!(done[4], format!("data/obj-{:03}", count - 1));
+    for i in [0, 1, 37, count - 1] {
+        let (status, got) = get(
+            target.s3_port,
+            &format!("/dst/in/obj-{i:03}"),
+            &key,
+            Some(&secret),
+        );
+        assert_eq!(status, 200);
+        assert!(got == latin1(&body(i)), "obj-{i:03}");
+    }
+    let listed = sql_rows(
+        target.native_port,
+        "SELECT COUNT(*) FROM sys.s3_objects('dst', 'in/')",
+    );
+    assert_eq!(listed[0][0], count.to_string());
+    // Each object written once: its one version, and the stale one's two.
+    let versions = sql_rows(
+        target.native_port,
+        "SELECT COUNT(*) FROM sys.s3_object_versions('dst', 'in/')",
+    );
+    assert_eq!(versions[0][0], (count + 1).to_string());
+    let waiting = state(&target, unreachable_id);
+    assert_eq!(waiting[0], "RUNNING", "{waiting:?}");
+    assert!(!waiting[5].is_empty(), "the error is kept: {waiting:?}");
+    assert_eq!(get(target.s3_port, "/dst/in/x", &key, Some(&secret)).0, 404);
+
+    // The refused import failed, naming why.
+    let failed = state(&target, refused_id);
+    assert_eq!(failed[0], "FAILED", "{failed:?}");
+    assert!(failed[5].contains("SignatureDoesNotMatch"), "{failed:?}");
+    // Nothing failed object by object; dropped, an import is gone.
+    assert!(
+        sql_rows(
+            target.native_port,
+            "SELECT * FROM sys.dm_s3_import_failures"
+        )
+        .is_empty()
+    );
+    let dropped = native(target.native_port, &format!("s3 drop import {refused_id}"));
+    assert_eq!(dropped["dropped"], true, "{dropped}");
+    assert!(state(&target, refused_id).is_empty());
+    // Dropped while it runs, an import stops writing.
+    let again = native(
+        target.native_port,
+        &format!(
+            "s3 create import http://127.0.0.1:{} us-east-1 {source_key} {source_secret} s3://src/data/ s3://dst/again/",
+            source.s3_port
+        ),
+    );
+    let again_id = again["import_id"].as_u64().unwrap();
+    let deadline = Instant::now() + Duration::from_secs(120);
+    while state(&target, again_id)
+        .get(1)
+        .is_none_or(|copied| copied == "0")
+    {
+        assert!(Instant::now() < deadline, "the second import never started");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    assert_eq!(
+        native(target.native_port, &format!("s3 drop import {again_id}"))["dropped"],
+        true
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    let copied_after = sql_rows(
+        target.native_port,
+        "SELECT COUNT(*) FROM sys.s3_objects('dst', 'again/')",
+    )[0][0]
+        .parse::<usize>()
+        .unwrap();
+    assert!(copied_after < 10, "it went on: {copied_after} objects");
+    // The secret is not shown.
+    let shown = native(target.native_port, "SELECT * FROM sys.dm_s3_imports");
+    assert!(!shown.to_string().contains(&source_secret), "{shown}");
 }

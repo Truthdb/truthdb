@@ -53,6 +53,10 @@ enum S3Admin {
     ListAccessKeys,
     EnableFulltext(String, Option<String>),
     DisableFulltext(String),
+    /// `s3 create import <endpoint> <region> <access key> <secret>
+    /// s3://source[/prefix] s3://destination[/prefix]`.
+    CreateImport([String; 6]),
+    DropImport(String),
 }
 
 fn parse_s3_admin(input: &str) -> Option<S3Admin> {
@@ -112,6 +116,10 @@ fn parse_s3_admin(input: &str) -> Option<S3Admin> {
             Some(words[4].to_string()),
         )),
         ["s3", "disable", "fulltext", _] => Some(S3Admin::DisableFulltext(words[3].to_string())),
+        ["s3", "create", "import", _, _, _, _, _, _] => Some(S3Admin::CreateImport(
+            [3, 4, 5, 6, 7, 8].map(|i| words[i].to_string()),
+        )),
+        ["s3", "drop", "import", _] => Some(S3Admin::DropImport(words[3].to_string())),
         _ => None,
     }
 }
@@ -1030,6 +1038,78 @@ impl Engine {
                     .map_err(|err| fulltext_error(&bucket, err))?;
                 json!({ "bucket": bucket, "fulltext": "purging" })
             }
+            S3Admin::CreateImport([endpoint, region, access_key, secret, source, destination]) => {
+                let invalid = |why: String| EngineError::from(CommandError::InvalidCommand(why));
+                let location = |text: &str| {
+                    text.strip_prefix("s3://")
+                        .map(|rest| rest.split_once('/').unwrap_or((rest, "")))
+                        // S3's characters: a name the client refuses would
+                        // keep the import waiting for ever.
+                        .filter(|(bucket, _)| {
+                            !bucket.is_empty()
+                                && bucket.bytes().all(|b| {
+                                    b.is_ascii_lowercase()
+                                        || b.is_ascii_digit()
+                                        || b == b'.'
+                                        || b == b'-'
+                                })
+                        })
+                        .map(|(bucket, prefix)| (bucket.to_string(), prefix.to_string()))
+                        .ok_or_else(|| invalid(format!("{text} is not s3://bucket[/prefix]")))
+                };
+                let (source_bucket, source_prefix) = location(&source)?;
+                let (bucket, prefix) = location(&destination)?;
+                // The endpoint must be one the client can reach.
+                truthdb_s3client::Client::new(truthdb_s3client::Config {
+                    endpoint: endpoint.clone(),
+                    region: region.clone(),
+                    access_key: access_key.clone(),
+                    secret: secret.clone(),
+                    ca_pem: None,
+                })
+                .map_err(|err| invalid(err.to_string()))?;
+                let target = bucket.clone();
+                let found = self.object(move |file| file.bucket(&target))?;
+                match found {
+                    None => return Err(invalid(format!("the bucket {bucket} does not exist"))),
+                    // Imported objects would not get its default retention.
+                    Some(info) if info.object_lock => {
+                        return Err(invalid(format!(
+                            "the bucket {bucket} has Object Lock; imports into it are not offered"
+                        )));
+                    }
+                    Some(_) => {}
+                }
+                let source = truthdb_object::ImportSource {
+                    endpoint: endpoint.clone(),
+                    region,
+                    access_key,
+                    secret,
+                    bucket: source_bucket.clone(),
+                    prefix: source_prefix.clone(),
+                };
+                let (target, target_prefix) = (bucket.clone(), prefix.clone());
+                let id = self.object(move |file| {
+                    file.transaction(|tx| {
+                        tx.create_import(source, &target, &target_prefix, now_ms())
+                    })
+                })?;
+                json!({
+                    "import_id": id,
+                    "from": format!("{endpoint} s3://{source_bucket}/{source_prefix}"),
+                    "to": format!("s3://{bucket}/{prefix}"),
+                    "state": "RUNNING",
+                })
+            }
+            S3Admin::DropImport(id) => {
+                let id: u64 = id.parse().map_err(|_| {
+                    EngineError::from(CommandError::InvalidCommand(format!(
+                        "{id} is not an import id"
+                    )))
+                })?;
+                let dropped = self.object(move |file| file.transaction(|tx| tx.drop_import(id)))?;
+                json!({ "import_id": id, "dropped": dropped })
+            }
         };
         render_json(&rendered).map_err(EngineError::from)
     }
@@ -1363,6 +1443,8 @@ fn render_sql_outcome(outcome: &crate::engine::BatchOutcome) -> String {
 }
 
 mod fulltext;
+mod import;
+pub(crate) use import::ImportWaits;
 mod object_jobs;
 #[cfg(test)]
 mod relational_tests;

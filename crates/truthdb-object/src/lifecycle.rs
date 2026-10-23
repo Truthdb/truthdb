@@ -14,6 +14,7 @@ use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
 use crate::buckets::Versioning;
+use crate::codec::{Reader, Writer};
 use crate::documents::BUCKET_LIFECYCLE;
 use crate::journal::Origin;
 use crate::objects::{StorageClass, VersionSel, decode_version, version_from_key};
@@ -386,46 +387,16 @@ impl LifecycleConfig {
     }
 }
 
-// The stored form: a version byte, then each value in order. Strings are
-// `[len u32][bytes]`, options a presence byte, lists `[count u32]`.
+// The stored form: a version byte, then each value in order (see
+// `codec::Writer`).
 
 const FORMAT: u8 = 1;
 
-#[derive(Default)]
-struct Writer(Vec<u8>);
+fn corrupt() -> StorageError {
+    StorageError::InvalidFile("corrupt lifecycle configuration".to_string())
+}
 
 impl Writer {
-    fn u8(&mut self, value: u8) {
-        self.0.push(value);
-    }
-    fn u32(&mut self, value: u32) {
-        self.0.extend_from_slice(&value.to_le_bytes());
-    }
-    fn u64(&mut self, value: u64) {
-        self.0.extend_from_slice(&value.to_le_bytes());
-    }
-    fn str(&mut self, value: &str) {
-        self.u32(value.len() as u32);
-        self.0.extend_from_slice(value.as_bytes());
-    }
-    fn opt_u32(&mut self, value: Option<u32>) {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.u32(value);
-            }
-            None => self.u8(0),
-        }
-    }
-    fn opt_u64(&mut self, value: Option<u64>) {
-        match value {
-            Some(value) => {
-                self.u8(1);
-                self.u64(value);
-            }
-            None => self.u8(0),
-        }
-    }
     fn tags(&mut self, tags: &[(String, String)]) {
         self.u32(tags.len() as u32);
         for (name, value) in tags {
@@ -450,64 +421,7 @@ impl Writer {
     }
 }
 
-struct Reader<'a>(&'a [u8]);
-
-fn corrupt() -> StorageError {
-    StorageError::InvalidFile("corrupt lifecycle configuration".to_string())
-}
-
 impl Reader<'_> {
-    fn take(&mut self, len: usize) -> Result<&[u8], StorageError> {
-        if self.0.len() < len {
-            return Err(corrupt());
-        }
-        let (head, tail) = self.0.split_at(len);
-        self.0 = tail;
-        Ok(head)
-    }
-    fn u8(&mut self) -> Result<u8, StorageError> {
-        Ok(self.take(1)?[0])
-    }
-    fn u32(&mut self) -> Result<u32, StorageError> {
-        Ok(u32::from_le_bytes(self.take(4)?.try_into().unwrap()))
-    }
-    fn u64(&mut self) -> Result<u64, StorageError> {
-        Ok(u64::from_le_bytes(self.take(8)?.try_into().unwrap()))
-    }
-    fn str(&mut self) -> Result<String, StorageError> {
-        let len = self.u32()? as usize;
-        String::from_utf8(self.take(len)?.to_vec()).map_err(|_| corrupt())
-    }
-    fn present(&mut self) -> Result<bool, StorageError> {
-        match self.u8()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(corrupt()),
-        }
-    }
-    fn opt_u32(&mut self) -> Result<Option<u32>, StorageError> {
-        Ok(if self.present()? {
-            Some(self.u32()?)
-        } else {
-            None
-        })
-    }
-    fn opt_u64(&mut self) -> Result<Option<u64>, StorageError> {
-        Ok(if self.present()? {
-            Some(self.u64()?)
-        } else {
-            None
-        })
-    }
-    fn count(&mut self) -> Result<usize, StorageError> {
-        let count = self.u32()? as usize;
-        // Every item takes at least a byte: a count past the bytes left is
-        // corrupt, not a huge allocation.
-        if count > self.0.len() {
-            return Err(corrupt());
-        }
-        Ok(count)
-    }
     fn tags(&mut self) -> Result<Vec<(String, String)>, StorageError> {
         (0..self.count()?)
             .map(|_| Ok((self.str()?, self.str()?)))
@@ -516,16 +430,16 @@ impl Reader<'_> {
     fn when(&mut self) -> Result<When, StorageError> {
         match self.u8()? {
             0 => Ok(When::Days(
-                u32::try_from(self.u64()?).map_err(|_| corrupt())?,
+                u32::try_from(self.u64()?).map_err(|_| self.corrupt())?,
             )),
             1 => Ok(When::Date(self.u64()?)),
-            _ => Err(corrupt()),
+            _ => Err(self.corrupt()),
         }
     }
     fn class(&mut self) -> Result<StorageClass, StorageError> {
         match self.u8()? {
             code @ 0..8 => Ok(StorageClass::from_code(code)),
-            _ => Err(corrupt()),
+            _ => Err(self.corrupt()),
         }
     }
 }
@@ -620,7 +534,7 @@ impl LifecycleConfig {
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let mut input = Reader(bytes);
+        let mut input = Reader::new(bytes, "lifecycle configuration");
         if input.u8()? != FORMAT {
             return Err(corrupt());
         }
@@ -694,7 +608,7 @@ impl LifecycleConfig {
                 abort_upload_days: input.opt_u32()?,
             });
         }
-        if !input.0.is_empty() {
+        if !input.rest().is_empty() {
             return Err(corrupt());
         }
         Ok(LifecycleConfig { min_size, rules })
@@ -737,7 +651,7 @@ impl PassState {
     }
 
     fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
-        let mut input = Reader(bytes);
+        let mut input = Reader::new(bytes, "lifecycle configuration");
         let state = PassState {
             started_day: input.u64()?,
             finished: input.present()?,
@@ -751,7 +665,7 @@ impl PassState {
             return Err(corrupt());
         }
         Ok(PassState {
-            cursor: input.0.to_vec(),
+            cursor: input.rest().to_vec(),
             ..state
         })
     }
