@@ -607,6 +607,17 @@ fn etag_matches(list: &str, etag: &str) -> bool {
     })
 }
 
+/// Whether a request's `If-Range`, when it has one, names this version: by
+/// its ETag (a weak one never matches) or by its Last-Modified date
+/// exactly (RFC 9110 13.1.5).
+fn if_range_holds(headers: &HeaderMap, info: &ObjectInfo) -> bool {
+    match header(headers, "if-range") {
+        None => true,
+        Some(value) if value.starts_with('"') => value == info.etag(),
+        Some(value) => parse_http_date(&value) == Some(info.mtime_ms / 1000),
+    }
+}
+
 /// The conditional headers' verdict: `Some(304 or 412)` stops the request.
 /// `prefix` is `""` for a GET's own headers, or `x-amz-copy-source-` for a
 /// copy's conditions on its source.
@@ -1036,6 +1047,8 @@ async fn read_object(
         _ if span.is_some() => {
             span.and_then(|(first, len)| (len > 0).then(|| (first, first + len - 1)))
         }
+        // An If-Range naming another version asks for the whole object.
+        Some(_) if !if_range_holds(headers, &info) => None,
         Some(value) => match parse_range(&value, info.size) {
             Ok(range) => range,
             Err(()) => {

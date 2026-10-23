@@ -11540,3 +11540,323 @@ print("ok")
         String::from_utf8_lossy(&output.stderr)
     );
 }
+
+#[test]
+fn reads_answer_conditional_and_range_requests_as_caches_expect() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    assert_eq!(call("PUT", "/cached", "", &[], b"").1.0, 200);
+    let versioning = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    assert_eq!(
+        call("PUT", "/cached", "versioning", &[], versioning).1.0,
+        200
+    );
+    let cache_headers = [
+        ("cache-control", "public, max-age=60"),
+        ("expires", "Thu, 01 Jan 2099 00:00:00 GMT"),
+    ];
+    let (first, _) = call("PUT", "/cached/k", "", &cache_headers, b"0123456789 first");
+    let first_version = response_header(&first, "x-amz-version-id").expect("a version");
+    let (second, _) = call("PUT", "/cached/k", "", &cache_headers, b"0123456789 second");
+    // Each version is its own representation: the current one, and the
+    // first by its version id.
+    for (query, body, put) in [
+        (String::new(), "0123456789 second", &second),
+        (
+            format!("versionId={first_version}"),
+            "0123456789 first",
+            &first,
+        ),
+    ] {
+        let etag = response_header(put, "etag").expect("an etag");
+        let (head, (status, read)) = call("GET", "/cached/k", &query, &[], b"");
+        assert_eq!((status, read.as_str()), (200, body));
+        assert_eq!(
+            response_header(&head, "etag").as_deref(),
+            Some(etag.as_str())
+        );
+        let modified = response_header(&head, "last-modified").expect("last-modified");
+        let earlier = "Mon, 01 Jan 2001 00:00:00 GMT";
+        let later = "Thu, 01 Jan 2099 00:00:00 GMT";
+        let other = "\"00000000000000000000000000000000\"";
+        // What a cache stores and revalidates with, on every answer.
+        let cached = |head: &str| {
+            assert_eq!(
+                response_header(head, "etag").as_deref(),
+                Some(etag.as_str()),
+                "{head}"
+            );
+            assert_eq!(
+                response_header(head, "last-modified").as_deref(),
+                Some(modified.as_str()),
+                "{head}"
+            );
+            assert_eq!(
+                response_header(head, "cache-control").as_deref(),
+                Some("public, max-age=60"),
+                "{head}"
+            );
+            assert_eq!(
+                response_header(head, "expires").as_deref(),
+                Some(later),
+                "{head}"
+            );
+        };
+        cached(&head);
+        assert_eq!(
+            response_header(&head, "accept-ranges").as_deref(),
+            Some("bytes")
+        );
+        // Conditions alone, then with a Range: a failed condition wins over
+        // the range, a passed one leaves it to the range.
+        let conditions: [(&[(&str, &str)], u16); 9] = [
+            (&[("if-none-match", &etag)], 304),
+            (&[("if-none-match", other)], 200),
+            (&[("if-match", &etag)], 200),
+            (&[("if-match", other)], 412),
+            (&[("if-modified-since", &modified)], 304),
+            (&[("if-modified-since", earlier)], 200),
+            (&[("if-unmodified-since", earlier)], 412),
+            // S3's documented pairs: If-Match decides over If-Unmodified-Since,
+            // If-None-Match over If-Modified-Since.
+            (
+                &[("if-match", &etag), ("if-unmodified-since", earlier)],
+                200,
+            ),
+            (
+                &[("if-none-match", &etag), ("if-modified-since", earlier)],
+                304,
+            ),
+        ];
+        for (headers, expected) in conditions {
+            for range in [None, Some("bytes=2-5")] {
+                let mut extra = headers.to_vec();
+                extra.extend(range.map(|range| ("range", range)));
+                for method in ["GET", "HEAD"] {
+                    let (head, (status, read)) = call(method, "/cached/k", &query, &extra, b"");
+                    let expected = match (expected, range) {
+                        (200, Some(_)) => 206,
+                        (status, _) => status,
+                    };
+                    assert_eq!(status, expected, "{method} {query} {extra:?}: {head}");
+                    match status {
+                        304 => {
+                            cached(&head);
+                            assert!(read.is_empty());
+                        }
+                        206 => {
+                            cached(&head);
+                            assert_eq!(
+                                response_header(&head, "content-range").as_deref(),
+                                Some(format!("bytes 2-5/{}", body.len()).as_str())
+                            );
+                            if method == "GET" {
+                                assert_eq!(read, &body[2..6]);
+                            }
+                        }
+                        200 => {
+                            cached(&head);
+                            if method == "GET" {
+                                assert_eq!(read, body);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+        // If-Range: the range of this representation, or the whole of it
+        // when the validator names another one (RFC 9110 13.1.5).
+        let weak = format!("W/{etag}");
+        for (validator, expected) in [
+            (etag.as_str(), 206),
+            (other, 200),
+            (modified.as_str(), 206),
+            (earlier, 200),
+            (weak.as_str(), 200),
+        ] {
+            let extra = [("range", "bytes=2-5"), ("if-range", validator)];
+            let (head, (status, read)) = call("GET", "/cached/k", &query, &extra, b"");
+            assert_eq!(status, expected, "If-Range {validator}: {head}");
+            assert_eq!(read, if expected == 206 { &body[2..6] } else { body });
+        }
+    }
+    // A signed GET may override the cache headers it is answered with.
+    let (head, (status, _)) = call(
+        "GET",
+        "/cached/k",
+        "response-cache-control=no-store&response-expires=Mon%2C%2001%20Jan%202001%2000%3A00%3A00%20GMT",
+        &[],
+        b"",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, "cache-control").as_deref(),
+        Some("no-store")
+    );
+    assert_eq!(
+        response_header(&head, "expires").as_deref(),
+        Some("Mon, 01 Jan 2001 00:00:00 GMT")
+    );
+}
+
+#[test]
+fn a_caching_proxy_serves_revalidates_and_slices_objects() {
+    // An nginx binary (with the slice module, as distributions build it).
+    let Some(nginx) = std::env::var_os("TRUTHDB_TEST_NGINX").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_NGINX names no nginx");
+        return;
+    };
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret)).1
+    };
+    // A bucket anyone may read: the proxy forwards unsigned requests.
+    assert_eq!(call("PUT", "/edge", "", &[], b"").0, 200);
+    let off = b"<PublicAccessBlockConfiguration/>";
+    assert_eq!(call("PUT", "/edge", "publicAccessBlock", &[], off).0, 200);
+    let public = br#"{"Version": "2012-10-17", "Statement": [{"Effect": "Allow", "Principal": "*", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::edge/*"}]}"#;
+    assert_eq!(call("PUT", "/edge", "policy", &[], public).0, 204);
+    let short = [("cache-control", "max-age=1")];
+    let long = [("cache-control", "max-age=3600")];
+    assert_eq!(
+        call("PUT", "/edge/s", "", &long, b"abcdefghijklmnopqrstuvwxyz").0,
+        200
+    );
+
+    let dir = server.dir.join("nginx");
+    std::fs::create_dir_all(dir.join("cache")).expect("dir");
+    let (proxy_port, _, _) = free_ports();
+    let d = dir.display();
+    std::fs::write(
+        dir.join("nginx.conf"),
+        format!(
+            "worker_processes 1;
+pid {d}/nginx.pid;
+events {{}}
+http {{
+  access_log off;
+  client_body_temp_path {d}/body;
+  proxy_temp_path {d}/proxy;
+  fastcgi_temp_path {d}/fastcgi;
+  uwsgi_temp_path {d}/uwsgi;
+  scgi_temp_path {d}/scgi;
+  proxy_cache_path {d}/cache levels=1 keys_zone=s3:1m;
+  server {{
+    listen 127.0.0.1:{proxy_port};
+    add_header X-Cache $upstream_cache_status always;
+    location / {{
+      proxy_pass http://127.0.0.1:{port};
+      proxy_cache s3;
+      proxy_cache_revalidate on;
+    }}
+    location /sliced/ {{
+      rewrite ^/sliced/(.*)$ /$1 break;
+      proxy_pass http://127.0.0.1:{port};
+      slice 4;
+      proxy_cache s3;
+      proxy_cache_key $uri$slice_range;
+      proxy_set_header Range $slice_range;
+      proxy_cache_valid 200 206 1h;
+    }}
+  }}
+}}
+"
+        ),
+    )
+    .expect("config");
+    struct Proxy(Child);
+    impl Drop for Proxy {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let mut proxy = Proxy(
+        Command::new(nginx)
+            .arg("-p")
+            .arg(&dir)
+            .arg("-c")
+            .arg(dir.join("nginx.conf"))
+            .arg("-e")
+            .arg(dir.join("error.log"))
+            .args(["-g", "daemon off;"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn nginx"),
+    );
+    let deadline = Instant::now() + DEADLINE;
+    // nginx listens in its master process, the one spawned.
+    while !listens(proxy.0.id(), proxy_port) {
+        assert!(
+            proxy.0.try_wait().expect("poll nginx").is_none(),
+            "nginx exited: {}",
+            std::fs::read_to_string(dir.join("error.log")).unwrap_or_default()
+        );
+        assert!(Instant::now() < deadline, "nginx never listened");
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let via = |path: &str, extra: &str| {
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", proxy_port)).expect("connect");
+        stream
+            .write_all(format!("GET {path} HTTP/1.0\r\nHost: edge\r\n{extra}\r\n").as_bytes())
+            .expect("send");
+        let mut raw = Vec::new();
+        stream.read_to_end(&mut raw).expect("read");
+        let (head, (status, body)) = parse_response(&raw);
+        let cache = response_header(&head, "x-cache").unwrap_or_default();
+        (status, body, cache)
+    };
+    let expired = || std::thread::sleep(Duration::from_millis(2100));
+
+    // Stored and served from the cache; then overwritten within the same
+    // second, so Last-Modified alone does not tell the versions apart: the
+    // revalidation's If-None-Match fails, and the new body is sent.
+    let modified = || {
+        let (head, (status, _)) =
+            send_with(port, "HEAD", "/edge/k", "", &[], b"", &key, Some(&secret));
+        assert_eq!(status, 200);
+        response_header(&head, "last-modified").expect("last-modified")
+    };
+    let millis = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .subsec_millis();
+    std::thread::sleep(Duration::from_millis(u64::from(1000 - millis)));
+    assert_eq!(call("PUT", "/edge/k", "", &short, b"first body").0, 200);
+    assert_eq!(
+        via("/edge/k", ""),
+        (200, "first body".into(), "MISS".into())
+    );
+    assert_eq!(via("/edge/k", ""), (200, "first body".into(), "HIT".into()));
+    let first = modified();
+    assert_eq!(call("PUT", "/edge/k", "", &short, b"other body").0, 200);
+    assert_eq!(modified(), first, "overwritten within the second");
+    expired();
+    assert_eq!(
+        via("/edge/k", ""),
+        (200, "other body".into(), "EXPIRED".into())
+    );
+    assert_eq!(via("/edge/k", ""), (200, "other body".into(), "HIT".into()));
+    // Unchanged: revalidated with a conditional request answered 304.
+    expired();
+    assert_eq!(
+        via("/edge/k", ""),
+        (200, "other body".into(), "REVALIDATED".into())
+    );
+
+    // Fetched in 4-byte slices with Range requests: any range, and the
+    // whole object, are put together from them.
+    let (status, body, _) = via("/sliced/edge/s", "Range: bytes=5-12\r\n");
+    assert_eq!((status, body.as_str()), (206, "fghijklm"));
+    let (status, body, _) = via("/sliced/edge/s", "");
+    assert_eq!((status, body.as_str()), (200, "abcdefghijklmnopqrstuvwxyz"));
+    let (status, body, cache) = via("/sliced/edge/s", "Range: bytes=-3\r\n");
+    assert_eq!((status, body.as_str(), cache.as_str()), (206, "xyz", "HIT"));
+    drop(proxy);
+}
