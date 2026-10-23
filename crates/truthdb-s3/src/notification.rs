@@ -1,8 +1,11 @@
 //! Bucket event notifications: PUT and GET `?notification` (validated as S3
 //! does). A topic configuration's events go to the stream topic its SNS
-//! topic ARN names (`arn:aws:sns:<region>:<account>:<topic>`), which must
-//! exist unless `x-amz-skip-destination-validation` is true; each topic a
-//! configuration names gets S3's test event. Queue and Lambda destinations
+//! topic ARN names (`arn:aws:sns:<region>:<account>:<topic>`): the account
+//! must be the bucket owner's, and the topic one created for that account
+//! (`stream create topic <topic> account <account>`); an event to any other
+//! topic is dropped. The topic must exist unless
+//! `x-amz-skip-destination-validation` is true; each topic a configuration
+//! names gets S3's test event. Queue and Lambda destinations
 //! and EventBridge are not offered. The object engine keeps the
 //! configuration and sends the events (see
 //! `truthdb_object::NotificationConfig`).
@@ -242,28 +245,43 @@ pub async fn bucket_notification(
         .ok_or_else(|| S3Error::internal("a request without its ids"))?;
     let body = crate::server::read_body(request, auth, MAX_BODY).await?;
     let config = parse(&body, &state.region)?;
+    let refused = || invalid("Unable to validate the following destination configurations");
+    // A bucket's events go only to topics its owner owns, named by ARNs of
+    // its owner's account.
+    let lookup = name.clone();
+    let owner = crate::scope::object(state, move |file| {
+        Ok(file.bucket(&lookup)?.map(|info| info.owner))
+    })
+    .await?
+    .ok_or_else(no_bucket)?;
+    if config
+        .rules
+        .iter()
+        .any(|rule| rule.destination.arn().split(':').nth(4) != Some(owner.as_str()))
+    {
+        return Err(refused());
+    }
     let topics: BTreeSet<String> = config
         .rules
         .iter()
         .map(|rule| rule.destination.topic().to_string())
         .collect();
     if !skip_validation && !topics.is_empty() {
-        let wanted = topics.clone();
-        let missing = state
+        let (wanted, account) = (topics.clone(), owner.clone());
+        let usable = state
             .engine
             .run_engine(move |engine| {
                 let existing = engine.streams(|file| file.topics())?;
-                Ok(wanted
-                    .into_iter()
-                    .filter(|topic| !existing.iter().any(|(t, _)| &t.name == topic))
-                    .collect::<Vec<_>>())
+                Ok(wanted.iter().all(|topic| {
+                    existing.iter().any(|(t, _)| {
+                        &t.name == topic && t.account.as_deref() == Some(account.as_str())
+                    })
+                }))
             })
             .await
             .map_err(|err| S3Error::internal(err.to_string()))?;
-        if !missing.is_empty() {
-            return Err(invalid(
-                "Unable to validate the following destination configurations",
-            ));
+        if !usable {
+            return Err(refused());
         }
     }
     crate::scope::object(state, move |file| {
@@ -275,8 +293,8 @@ pub async fn bucket_notification(
     })
     .await?
     .map_err(|()| no_bucket())?;
-    // S3's test event, to each topic named (a topic that is gone gets
-    // none).
+    // S3's test event, to each topic named (one gone, or no longer the
+    // owner's, gets none).
     if !skip_validation && !topics.is_empty() {
         let message = truthdb_object::test_message(
             &bucket,
@@ -288,8 +306,17 @@ pub async fn bucket_notification(
             .engine
             .run_engine(move |engine| {
                 engine.streams(|file| {
+                    let owned: Vec<String> = file
+                        .topics()?
+                        .into_iter()
+                        .filter(|(topic, _)| {
+                            topics.contains(&topic.name)
+                                && topic.account.as_deref() == Some(owner.as_str())
+                        })
+                        .map(|(topic, _)| topic.name)
+                        .collect();
                     file.transaction(|tx| {
-                        for topic in &topics {
+                        for topic in &owned {
                             let record = NewRecord {
                                 key: None,
                                 value: message.clone().into_bytes(),

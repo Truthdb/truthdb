@@ -8584,8 +8584,9 @@ fn bucket_notifications_reach_a_stream_topic_once_across_a_crash() {
     };
     native(
         server.native_port,
-        "stream create topic events partitions 2 retention 0",
+        &format!("stream create topic events partitions 2 retention 0 account {account}"),
     );
+    native(server.native_port, "stream create topic theirs");
     assert_eq!(call(&server, "PUT", "/photos", "", b"").0, 200);
     let config = |topic: &str| {
         format!(
@@ -8596,16 +8597,32 @@ fn bucket_notifications_reach_a_stream_topic_once_across_a_crash() {
              </S3Key></Filter></TopicConfiguration></NotificationConfiguration>"
         )
     };
-    // A topic that does not exist is refused, unless validation is skipped.
-    let (status, reply) = call(
-        &server,
+    // A topic that does not exist, or is not the bucket owner's, is
+    // refused, unless validation is skipped; an ARN of another account
+    // always is.
+    for topic in ["nope", "theirs"] {
+        let (status, reply) = call(
+            &server,
+            "PUT",
+            "/photos",
+            "notification",
+            config(topic).as_bytes(),
+        );
+        assert_eq!(status, 400, "{reply}");
+        assert!(reply.contains("InvalidArgument"), "{reply}");
+    }
+    let foreign = config("events").replace(&format!(":{account}:"), ":999999999999:");
+    let (_, (status, reply)) = send_with(
+        server.s3_port,
         "PUT",
         "/photos",
         "notification",
-        config("nope").as_bytes(),
+        &[("x-amz-skip-destination-validation", "true")],
+        foreign.as_bytes(),
+        &key,
+        Some(&secret),
     );
     assert_eq!(status, 400, "{reply}");
-    assert!(reply.contains("InvalidArgument"), "{reply}");
     let (_, (status, reply)) = send_with(
         server.s3_port,
         "PUT",

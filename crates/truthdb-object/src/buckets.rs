@@ -268,6 +268,8 @@ impl ObjTxn<'_, '_> {
             }
         }
         buckets.delete(self.ctx, &mut OpMode::Txn(self.txn), name.as_bytes())?;
+        // Its changes not yet sent are sent as configured when made.
+        self.end_notifications(name)?;
         self.delete_bucket_configs(name)?;
         self.forget_pass(name)?;
         self.drop_fulltext(name)?;

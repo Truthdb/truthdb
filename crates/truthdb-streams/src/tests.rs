@@ -148,7 +148,7 @@ fn topics_take_appends_in_order_once_per_source_and_go_when_dropped() {
     let storage = create(&path);
     assert_eq!(
         in_txn(&storage, |tx| tx
-            .create_topic("bad name", 1, 0, 1)
+            .create_topic("bad name", 1, 0, None, 1)
             .map(|r| r.map(|_| ()))),
         Err(StreamError::InvalidName(
             "a topic name is letters, digits, '.', '_' and '-'"
@@ -156,15 +156,18 @@ fn topics_take_appends_in_order_once_per_source_and_go_when_dropped() {
     );
     assert_eq!(
         in_txn(&storage, |tx| tx
-            .create_topic("t", 0, 0, 1)
+            .create_topic("t", 0, 0, None, 1)
             .map(|r| r.map(|_| ()))),
         Err(StreamError::InvalidPartitions)
     );
-    let topic = in_txn(&storage, |tx| tx.create_topic("events", 2, 0, 1_000)).unwrap();
+    let topic = in_txn(&storage, |tx| {
+        tx.create_topic("events", 2, 0, Some("123456789012"), 1_000)
+    })
+    .unwrap();
     assert_eq!((topic.name.as_str(), topic.partitions), ("events", 2));
     assert_eq!(
         in_txn(&storage, |tx| tx
-            .create_topic("events", 1, 0, 1)
+            .create_topic("events", 1, 0, None, 1)
             .map(|r| r.map(|_| ()))),
         Err(StreamError::TopicExists)
     );
@@ -275,6 +278,11 @@ fn topics_take_appends_in_order_once_per_source_and_go_when_dropped() {
     drop(storage);
     let storage = open(&path);
     assert_eq!(values(&storage, "events", 1, 0).len(), 3);
+    let (topic, _) = StreamFile::new(&mut storage.lock())
+        .topic("events")
+        .unwrap()
+        .unwrap();
+    assert_eq!(topic.account.as_deref(), Some("123456789012"));
     assert!(
         !StreamFile::new(&mut storage.lock())
             .transaction(|tx| tx.append("events", 1, &[record("x")], Some(("journal", 11)), 1))
@@ -319,7 +327,7 @@ fn topics_take_appends_in_order_once_per_source_and_go_when_dropped() {
     );
     // A topic of the same name starts afresh.
     StreamFile::new(&mut storage.lock())
-        .transaction(|tx| tx.create_topic("events", 1, 0, 1))
+        .transaction(|tx| tx.create_topic("events", 1, 0, None, 1))
         .unwrap()
         .unwrap();
     assert!(values(&storage, "events", 0, 0).is_empty());
@@ -340,8 +348,8 @@ fn retention_trims_the_oldest_records() {
     let storage = create(&path);
     StreamFile::new(&mut storage.lock())
         .transaction(|tx| {
-            tx.create_topic("short", 1, 1_000, 0)?.unwrap();
-            tx.create_topic("forever", 1, 0, 0)?.unwrap();
+            tx.create_topic("short", 1, 1_000, None, 0)?.unwrap();
+            tx.create_topic("forever", 1, 0, None, 0)?.unwrap();
             for (time, value) in [(1_000, "a"), (2_000, "b"), (3_000, "c")] {
                 tx.append("short", 0, &[record(value)], None, time)?
                     .unwrap();
@@ -389,7 +397,7 @@ fn a_sourced_append_is_whole_or_absent_after_a_crash_at_any_op() {
         let path = temp_path("crash");
         let storage = create(&path);
         StreamFile::new(&mut storage.lock())
-            .transaction(|tx| tx.create_topic("events", 1, 0, 1))
+            .transaction(|tx| tx.create_topic("events", 1, 0, None, 1))
             .unwrap()
             .unwrap();
         let big = NewRecord {
@@ -468,7 +476,7 @@ fn topics_ship_to_a_standby_and_restore_from_a_log_backup() {
     let summary = primary.backup_full(&bak).unwrap();
     StreamFile::new(&mut primary.lock())
         .transaction(|tx| {
-            tx.create_topic("events", 1, 0, 1)?.unwrap();
+            tx.create_topic("events", 1, 0, None, 1)?.unwrap();
             tx.append(
                 "events",
                 0,
@@ -513,7 +521,7 @@ fn topics_ship_to_a_standby_and_restore_from_a_log_backup() {
 fn a_trim_stopped_by_the_log_budget_says_more_is_due() {
     let path = temp_path("trim-budget");
     let storage = create(&path);
-    in_txn(&storage, |tx| tx.create_topic("big", 1, 1_000, 0)).unwrap();
+    in_txn(&storage, |tx| tx.create_topic("big", 1, 1_000, None, 0)).unwrap();
     let value = vec![7u8; 16 * 1024];
     for _ in 0..16 {
         let records = vec![
@@ -564,7 +572,7 @@ fn the_largest_append_fits_a_transactions_budget_on_the_smallest_ring() {
         engines,
     )
     .expect("create");
-    in_txn(&storage, |tx| tx.create_topic("big", 1, 0, 0)).unwrap();
+    in_txn(&storage, |tx| tx.create_topic("big", 1, 0, None, 0)).unwrap();
     let largest = NewRecord {
         key: None,
         value: vec![7u8; crate::MAX_RECORD_BYTES],

@@ -1,7 +1,8 @@
 //! Bucket event notifications: the journal consumer sends each matching
 //! change's event to its topic once, even when a batch is sent again (a
-//! crash between the append and the consumer's move), drops the events of
-//! a topic that is gone, and starts at the journal's end.
+//! crash between the append and the consumer's move), as its bucket was
+//! configured when the change was made; drops the events of a topic that is
+//! gone or not the bucket owner's; and starts at the journal's end.
 
 use crate::engine::test_support::*;
 use crate::engine::*;
@@ -49,17 +50,21 @@ fn rule(id: &str, event: &str, prefix: Option<&str>, suffix: Option<&str>) -> No
         events: vec![event.into()],
         prefix: prefix.map(str::to_string),
         suffix: suffix.map(str::to_string),
-        destination: Destination::Topic("arn:aws:sns:us-east-1:123456789012:events".into()),
+        destination: Destination::Topic("arn:aws:sns:us-east-1:000000000000:events".into()),
     }
 }
 
 fn configure(engine: &Engine, rules: Vec<NotificationRule>) {
+    configure_bucket(engine, "photos", rules);
+}
+
+fn configure_bucket(engine: &Engine, bucket: &str, rules: Vec<NotificationRule>) {
     let config = NotificationConfig {
         region: "us-east-1".into(),
         rules,
     };
     engine
-        .object(|file| file.transaction(|tx| tx.put_notification("photos", &config)))
+        .object(|file| file.transaction(|tx| tx.put_notification(bucket, &config)))
         .expect("configure");
 }
 
@@ -97,7 +102,7 @@ fn changes_send_their_events_once_even_when_a_batch_is_sent_again() {
     let path = unique_temp_path("notifications");
     let engine = new_engine(&path);
     engine
-        .execute("stream create topic events partitions 2 retention 0")
+        .execute("stream create topic events partitions 2 retention 0 account 000000000000")
         .unwrap();
     engine
         .object(|file| {
@@ -172,22 +177,32 @@ fn changes_send_their_events_once_even_when_a_batch_is_sent_again() {
         .unwrap();
     assert_eq!(cursor, Some(last));
 
-    // A bucket made again under its name: the earlier bucket's changes
-    // not yet sent are not the new configuration's.
+    // A change is sent as its bucket was configured when it was made: a
+    // bucket configured after its change, a configuration replaced, and a
+    // bucket emptied and dropped (then made again) before the consumer
+    // came to their changes.
     engine
-        .execute("stream create topic events partitions 2 retention 0")
+        .execute("stream create topic events partitions 2 retention 0 account 000000000000")
         .unwrap();
+    engine
+        .object(|file| {
+            file.transaction(|tx| {
+                tx.create_bucket("other", truthdb_object::DEFAULT_ACCOUNT, 1_000)?
+                    .expect("bucket");
+                Ok(())
+            })
+        })
+        .unwrap();
+    put(&engine, "other", "in/early.jpg");
+    configure_bucket(
+        &engine,
+        "other",
+        vec![rule("created", "s3:ObjectCreated:*", None, None)],
+    );
+    put(&engine, "other", "in/late.jpg");
     put(&engine, "photos", "in/old.jpg");
-    for key in [
-        "in/2.txt",
-        "in/4.jpg",
-        "in/old.jpg",
-        "in/before.jpg",
-        "out/3.txt",
-    ] {
-        let _ = engine.object(|file| {
-            file.transaction(|tx| tx.delete_object("photos", key, None, false, 3_000, 0))
-        });
+    for key in ["in/2.txt", "in/4.jpg", "in/old.jpg", "in/before.jpg"] {
+        delete(&engine, "photos", key);
     }
     engine
         .object(|file| {
@@ -204,17 +219,40 @@ fn changes_send_their_events_once_even_when_a_batch_is_sent_again() {
         vec![rule("created", "s3:ObjectCreated:*", Some("in/"), None)],
     );
     put(&engine, "photos", "in/new.jpg");
+    delete(&engine, "photos", "in/new.jpg");
     drain(&engine);
-    let names: Vec<String> = events(&engine)
+    let mut sent = events(&engine);
+    sent.sort_by(|a, b| a.3.cmp(&b.3));
+    let names: Vec<(String, String)> = sent
         .into_iter()
-        .map(|(_, _, key, _)| key)
+        .map(|(_, name, key, _)| (name, key))
         .collect();
-    assert_eq!(names, ["in%2Fnew.jpg"]);
+    let event = |name: &str, key: &str| (name.to_string(), key.to_string());
+    assert_eq!(
+        names,
+        [
+            event("ObjectCreated:Put", "in%2Flate.jpg"),
+            event("ObjectCreated:Put", "in%2Fold.jpg"),
+            event("ObjectRemoved:Delete", "in%2F4.jpg"),
+            event("ObjectRemoved:Delete", "in%2Fold.jpg"),
+            event("ObjectRemoved:Delete", "in%2Fbefore.jpg"),
+            event("ObjectCreated:Put", "in%2Fnew.jpg"),
+        ]
+    );
+
+    // A topic the bucket's owner does not own gets none of its events.
+    engine.execute("stream drop topic events").unwrap();
+    engine
+        .execute("stream create topic events partitions 2 retention 0")
+        .unwrap();
+    put(&engine, "photos", "in/foreign.jpg");
+    drain(&engine);
+    assert!(events(&engine).is_empty());
 
     // No configurations: no events.
     engine.execute("stream drop topic events").unwrap();
     engine
-        .execute("stream create topic events partitions 2 retention 0")
+        .execute("stream create topic events partitions 2 retention 0 account 000000000000")
         .unwrap();
     configure(&engine, Vec::new());
     put(&engine, "photos", "in/5.jpg");

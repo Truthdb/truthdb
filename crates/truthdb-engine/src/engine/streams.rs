@@ -22,9 +22,10 @@ const STREAM_STEP_ROWS: usize = 256;
 const DEFAULT_RETENTION_HOURS: u64 = 168;
 
 /// Streams administration: `stream create topic <name> [partitions <n>]
-/// [retention <hours>]` (retention 0: for ever) and `stream drop topic
-/// <name>`. Gated like the S3 administration commands: a `sysadmin` login
-/// over TDS, any connection on the (trusted) native port.
+/// [retention <hours>] [account <S3 account id>]` (retention 0: for ever;
+/// the account: whose buckets may send it their event notifications) and
+/// `stream drop topic <name>`. Gated like the S3 administration commands: a
+/// `sysadmin` login over TDS, any connection on the (trusted) native port.
 pub(super) enum StreamAdmin {
     CreateTopic {
         name: String,
@@ -69,7 +70,7 @@ impl Engine {
         let invalid = |why: String| EngineError::from(CommandError::InvalidCommand(why));
         let rendered = match command {
             StreamAdmin::CreateTopic { name, options } => {
-                let (mut partitions, mut retention_hours) = (None, None);
+                let (mut partitions, mut retention_hours, mut account) = (None, None, None);
                 for pair in options.chunks(2) {
                     let [option, value] = pair else {
                         return Err(invalid(format!("'{}' has no value", pair[0])));
@@ -77,6 +78,13 @@ impl Engine {
                     let slot = match option.to_ascii_lowercase().as_str() {
                         "partitions" => &mut partitions,
                         "retention" => &mut retention_hours,
+                        "account" if account.is_some() => {
+                            return Err(invalid(format!("'{option}' is given twice")));
+                        }
+                        "account" => {
+                            account = Some(value.clone());
+                            continue;
+                        }
                         _ => return Err(invalid(format!("unknown topic option '{option}'"))),
                     };
                     if slot.is_some() {
@@ -94,16 +102,25 @@ impl Engine {
                     // Shown as a `bigint` in `sys.stream_topics`.
                     .filter(|ms| i64::try_from(*ms).is_ok())
                     .ok_or_else(|| invalid(format!("a retention of {retention_hours} hours")))?;
+                if let Some(id) = &account {
+                    let id = id.clone();
+                    if self.object(move |file| file.account(&id))?.is_none() {
+                        return Err(invalid(format!("no S3 account '{}'", account.unwrap())));
+                    }
+                }
                 let now_ms = super::now_ms();
-                let topic = name.clone();
+                let (topic, owner) = (name.clone(), account.clone());
                 self.streams(move |file| {
-                    file.transaction(|tx| tx.create_topic(&topic, partitions, retention_ms, now_ms))
+                    file.transaction(|tx| {
+                        tx.create_topic(&topic, partitions, retention_ms, owner.as_deref(), now_ms)
+                    })
                 })?
                 .map_err(|err| stream_error(&name, err))?;
                 json!({
                     "topic": name,
                     "partitions": partitions,
                     "retention_hours": retention_hours,
+                    "account": account,
                 })
             }
             StreamAdmin::DropTopic(name) => {

@@ -25,6 +25,15 @@ fn append(engine: &Engine, topic: &str, partition: u32, values: &[&str], now_ms:
     }
 }
 
+/// `account_id` of `topic` in `sys.stream_topics`.
+fn rows_of(engine: &Engine, topic: &str) -> Vec<Vec<Option<String>>> {
+    sql_rows(
+        engine,
+        &format!("SELECT account_id FROM sys.stream_topics WHERE topic_name = '{topic}'"),
+    )
+    .1
+}
+
 fn hex(text: &str) -> String {
     let digits: String = text.bytes().map(|b| format!("{b:02X}")).collect();
     format!("0x{digits}")
@@ -70,6 +79,7 @@ fn topics_are_created_read_as_views_dropped_and_purged() {
         serde_json::from_str(&engine.execute("stream create topic plain").unwrap()).unwrap();
     assert_eq!(reply["partitions"], 1);
     assert_eq!(reply["retention_hours"], 168, "Kafka's default retention");
+    assert_eq!(reply["account"], Value::Null);
 
     for (command, error) in [
         ("stream create topic events", "already exists"),
@@ -102,6 +112,14 @@ fn topics_are_created_read_as_views_dropped_and_purged() {
             "retention of",
         ),
         ("stream create topic a/b", "letters, digits"),
+        (
+            "stream create topic other account 999999999999",
+            "no S3 account",
+        ),
+        (
+            "stream create topic other account 000000000000 account 000000000000",
+            "given twice",
+        ),
         ("stream drop topic missing", "no topic 'missing'"),
     ] {
         let message = command_error(&engine, command);
@@ -127,7 +145,8 @@ fn topics_are_created_read_as_views_dropped_and_purged() {
             "next_offset",
             "last_record_time",
             "retention_ms",
-            "created"
+            "created",
+            "account_id"
         ]
     );
     let summary: Vec<_> = rows
@@ -159,6 +178,20 @@ fn topics_are_created_read_as_views_dropped_and_purged() {
             row("plain", "0", "0", false, "604800000"),
         ]
     );
+    // A topic for an S3 account's event notifications.
+    let reply: Value = serde_json::from_str(
+        &engine
+            .execute("stream create topic owned account 000000000000")
+            .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(reply["account"], "000000000000");
+    assert_eq!(
+        rows_of(&engine, "owned"),
+        [[Some("000000000000".to_string())]]
+    );
+    assert_eq!(rows_of(&engine, "plain"), [[None]]);
+    engine.execute("stream drop topic owned").unwrap();
 
     let (columns, rows) = sql_rows(&engine, "SELECT * FROM sys.stream_read('events', 1)");
     assert_eq!(columns, ["offset", "timestamp", "key", "value"]);

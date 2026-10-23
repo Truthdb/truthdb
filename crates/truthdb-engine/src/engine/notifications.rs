@@ -2,19 +2,21 @@
 //! sent by the journal consumer `notifications` on the indexer thread: each
 //! step reads a batch of changes, appends the event message of every
 //! configuration a change matches to that configuration's stream topic, and
-//! then moves the consumer past the batch.
+//! then moves the consumer past the batch. A change is sent as its bucket
+//! was configured when the change was made.
 //!
 //! The appends and the consumer's place are two transactions (of two
 //! engines). Each event is appended under the source `s3-notifications`
 //! with its change's sequence number, so a batch appended again after a
 //! crash between the two writes nothing twice. An event whose topic is
-//! gone is dropped. A partition is chosen by the event's bucket and key, so
-//! one key's events stay in order.
+//! gone, or is not owned by the bucket's owner, is dropped. A partition is
+//! chosen by the event's bucket and key, so one key's events stay in
+//! order.
 
 use std::collections::BTreeMap;
 
-use truthdb_object::{BucketInfo, NotificationConfig, event_message, event_type};
-use truthdb_streams::{MAX_APPEND_CHUNKS, NewRecord};
+use truthdb_object::{event_message, event_type};
+use truthdb_streams::{MAX_APPEND_CHUNKS, NewRecord, Topic};
 
 use super::{Engine, EngineError};
 
@@ -56,70 +58,62 @@ impl Engine {
         &self,
         cursor: u64,
     ) -> Result<Option<(u64, bool)>, EngineError> {
-        // The changes, and the configuration and owner of their buckets
-        // (a change of a bucket since dropped, or of an earlier bucket of
-        // the same name, has none).
-        let (records, buckets) = self.object(|file| {
-            let records = file.journal(cursor, NOTIFY_BATCH)?;
-            let mut buckets: BTreeMap<String, Option<(BucketInfo, NotificationConfig)>> =
-                BTreeMap::new();
-            for record in &records {
-                if buckets.contains_key(&record.bucket) {
-                    continue;
-                }
-                let found = match file.bucket(&record.bucket)? {
-                    Some(info) => file
-                        .notification(&record.bucket)?
-                        .map(|config| (info, config)),
-                    None => None,
-                };
-                buckets.insert(record.bucket.clone(), found);
-            }
-            Ok((records, buckets))
+        // The changes, each with the notification configuration and owner
+        // its bucket had when it was made.
+        let changes = self.object(|file| {
+            file.journal(cursor, NOTIFY_BATCH)?
+                .into_iter()
+                .map(|record| {
+                    let config = file.notification_at(&record.bucket, record.sequence)?;
+                    Ok((record, config))
+                })
+                .collect::<Result<Vec<_>, _>>()
         })?;
-        let Some(last) = records.last().map(|record| record.sequence) else {
+        let Some(last) = changes.last().map(|(record, _)| record.sequence) else {
             return Ok(None);
         };
         // Per change, its events by topic and partition, stopping at an
         // append's worth of chunks (so the transaction's log stays within
         // its budget), with at least one change.
-        let topics: BTreeMap<String, u32> = self.streams(|file| {
+        let topics: BTreeMap<String, Topic> = self.streams(|file| {
             Ok(file
                 .topics()?
                 .into_iter()
-                .map(|(topic, _)| (topic.name, topic.partitions))
+                .map(|(topic, _)| (topic.name.clone(), topic))
                 .collect())
         })?;
         let mut appends: BTreeMap<(u64, String, u32), Vec<NewRecord>> = BTreeMap::new();
         let mut chunks = 0;
         let mut through = last;
-        for record in &records {
+        for (record, config) in &changes {
             if chunks >= MAX_APPEND_CHUNKS {
                 through = record.sequence - 1;
                 break;
             }
-            let Some(Some((info, config))) = buckets.get(&record.bucket) else {
+            let Some((config, owner)) = config else {
                 continue;
             };
             let Some(event) = event_type(record) else {
                 continue;
             };
-            if record.sequence <= info.journal_from {
-                continue;
-            }
             for rule in config
                 .rules
                 .iter()
                 .filter(|rule| rule.matches(event, &record.key))
             {
-                // A topic since dropped: the event is dropped.
+                // A topic since dropped, or not the bucket owner's: the
+                // event is dropped.
                 let topic = rule.destination.topic();
-                let Some(&partitions) = topics.get(topic) else {
+                let Some(partitions) = topics
+                    .get(topic)
+                    .filter(|topic| topic.account.as_deref() == Some(owner.as_str()))
+                    .map(|topic| topic.partitions)
+                else {
                     continue;
                 };
                 let message = NewRecord {
                     key: Some(format!("{}/{}", record.bucket, record.key).into_bytes()),
-                    value: event_message(record, event, config, rule, &info.owner).into_bytes(),
+                    value: event_message(record, event, config, rule, owner).into_bytes(),
                 };
                 chunks += message.chunks();
                 // One append per change and partition: a second append of
@@ -155,7 +149,7 @@ impl Engine {
         }
         Ok(Some((
             through,
-            records.len() == NOTIFY_BATCH || through < last,
+            changes.len() == NOTIFY_BATCH || through < last,
         )))
     }
 }

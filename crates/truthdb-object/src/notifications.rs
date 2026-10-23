@@ -12,7 +12,9 @@ use crate::codec::{Reader, Writer};
 use crate::consumers::Consumer;
 use crate::documents::BUCKET_NOTIFICATION;
 use crate::journal::{JournalRecord, RecordType};
-use crate::{ObjFile, ObjTxn};
+use truthdb_core::relstore::ctx::OpMode;
+
+use crate::{NOTIFY_HISTORY_TREE, ObjFile, ObjTxn};
 
 /// The journal consumer that sends event notifications.
 pub const NOTIFICATIONS_CONSUMER: &str = "notifications";
@@ -277,14 +279,27 @@ pub fn event_message(
 ) -> String {
     use serde_json::{Map, Value, json};
     let origin = record.origin.clone().unwrap_or_default();
+    // A lifecycle action is S3's own.
+    let by_s3 = event.starts_with("s3:Lifecycle");
     let principal = match (&origin.account, &origin.user) {
+        _ if by_s3 => "s3.amazonaws.com".to_string(),
         (Some(account), Some(user)) => format!("{account}:{user}"),
         (Some(account), None) => account.clone(),
         (None, _) => "ANONYMOUS".to_string(),
     };
+    let source_ip = match origin.source_ip {
+        _ if by_s3 => "s3.amazonaws.com".to_string(),
+        ip => ip.unwrap_or_default(),
+    };
     let mut object = Map::new();
     object.insert("key".into(), json!(form_encode(&record.key)));
-    if let Some(version) = &record.object {
+    // A removal names the version only (a delete marker's size and digest
+    // are not an object's).
+    if let Some(version) = record
+        .object
+        .as_ref()
+        .filter(|_| record.record_type != RecordType::Delete)
+    {
         object.insert("size".into(), json!(version.size));
         let md5: String = version.md5.iter().map(|b| format!("{b:02x}")).collect();
         let etag = match version.parts {
@@ -308,7 +323,7 @@ pub fn event_message(
     } else {
         "2.3"
     };
-    let message = json!({
+    let mut message = json!({
         "Records": [{
             "eventVersion": version,
             "eventSource": "aws:s3",
@@ -316,9 +331,7 @@ pub fn event_message(
             "eventTime": crate::time::iso8601(record.timestamp_ms),
             "eventName": event.trim_start_matches("s3:"),
             "userIdentity": { "principalId": principal },
-            "requestParameters": {
-                "sourceIPAddress": origin.source_ip.unwrap_or_default(),
-            },
+            "requestParameters": { "sourceIPAddress": source_ip },
             "responseElements": { "x-amz-request-id": origin.request_id },
             "s3": {
                 "s3SchemaVersion": "1.0",
@@ -332,6 +345,15 @@ pub fn event_message(
             },
         }],
     });
+    if event == "s3:LifecycleTransition"
+        && let Some(version) = &record.object
+    {
+        message["Records"][0]["lifecycleEventData"] = json!({
+            "transitionEventData": {
+                "destinationStorageClass": version.storage_class.as_str(),
+            },
+        });
+    }
     message.to_string()
 }
 
@@ -348,17 +370,54 @@ pub fn test_message(bucket: &str, request_id: &str, host_id: &str, now_ms: u64) 
     .to_string()
 }
 
+/// `(bucket, 0, journal position)`.
+fn history_key(bucket: &str, position: u64) -> Vec<u8> {
+    [bucket.as_bytes(), &[0], &position.to_be_bytes()].concat()
+}
+
+/// `[owner][0: none | 1: configuration]`.
+fn encode_history(owner: &str, config: Option<&NotificationConfig>) -> Vec<u8> {
+    let mut out = Writer::default();
+    out.str(owner);
+    match config {
+        None => out.u8(0),
+        Some(config) => {
+            out.u8(1);
+            out.0.extend_from_slice(&config.encode());
+        }
+    }
+    out.0
+}
+
+fn decode_history(bytes: &[u8]) -> Result<Option<(NotificationConfig, String)>, StorageError> {
+    let mut input = Reader::new(bytes, "notification history");
+    let owner = input.str()?;
+    match input.u8()? {
+        0 if input.rest().is_empty() => Ok(None),
+        1 => Ok(Some((NotificationConfig::decode(input.rest())?, owner))),
+        _ => Err(corrupt()),
+    }
+}
+
 impl ObjTxn<'_, '_> {
     /// Keeps `config` as `bucket`'s notification configuration (no
-    /// configurations: removes it). The first one starts the consumer at
-    /// the journal's end: only changes after it are sent.
+    /// configurations: removes it), for the changes made from now on. The
+    /// first one starts the consumer at the journal's end: only changes
+    /// after it are sent.
     pub fn put_notification(
         &mut self,
         bucket: &str,
         config: &NotificationConfig,
     ) -> Result<(), StorageError> {
+        let owner = self
+            .bucket_row(bucket)?
+            .ok_or_else(|| StorageError::InvalidConfig(format!("no bucket {bucket}")))?
+            .owner;
         if config.rules.is_empty() {
             self.delete_bucket_config(bucket, BUCKET_NOTIFICATION, "")?;
+            if self.has_notification_history(bucket)? {
+                self.record_history(bucket, &owner, None)?;
+            }
             return Ok(());
         }
         self.put_bucket_config(bucket, BUCKET_NOTIFICATION, "", &config.encode())?;
@@ -374,6 +433,69 @@ impl ObjTxn<'_, '_> {
                 dropped: 0,
             })?;
         }
+        self.record_history(bucket, &owner, Some(config))
+    }
+
+    /// A bucket being dropped: no configuration from now on (its changes
+    /// before are sent as configured when made).
+    pub(crate) fn end_notifications(&mut self, bucket: &str) -> Result<(), StorageError> {
+        if self.has_notification_history(bucket)? {
+            let owner = self
+                .bucket_row(bucket)?
+                .map(|row| row.owner)
+                .unwrap_or_default();
+            self.record_history(bucket, &owner, None)?;
+        }
+        Ok(())
+    }
+
+    fn has_notification_history(&mut self, bucket: &str) -> Result<bool, StorageError> {
+        Ok(!self
+            .trees
+            .notify_history()
+            .scan_range_limit(
+                self.ctx,
+                Some(&history_key(bucket, 0)),
+                Some(&history_key(bucket, u64::MAX)),
+                1,
+            )?
+            .is_empty())
+    }
+
+    /// Records `bucket`'s configuration from the journal's end on, and
+    /// forgets those no change left to send can use: of the entries the
+    /// consumer is past, all but the newest (and that one too when it is
+    /// none).
+    fn record_history(
+        &mut self,
+        bucket: &str,
+        owner: &str,
+        config: Option<&NotificationConfig>,
+    ) -> Result<(), StorageError> {
+        let position = self.last_change()?;
+        let cursor = self
+            .consumers()?
+            .into_iter()
+            .find(|consumer| consumer.name == NOTIFICATIONS_CONSUMER)
+            .map_or(position, |consumer| consumer.cursor);
+        let tree = self.trees.notify_history();
+        let mode = &mut OpMode::Txn(self.txn);
+        let past = tree.scan_range(
+            self.ctx,
+            Some(&history_key(bucket, 0)),
+            Some(&history_key(bucket, cursor.min(position))),
+        )?;
+        if let Some(((newest, row), older)) = past.split_last() {
+            for (key, _) in older {
+                tree.delete(self.ctx, mode, key)?;
+            }
+            if decode_history(row)?.is_none() {
+                tree.delete(self.ctx, mode, newest)?;
+            }
+        }
+        let key = history_key(bucket, position);
+        tree.delete(self.ctx, mode, &key)?;
+        tree.insert_unique(self.ctx, mode, &key, &encode_history(owner, config))?;
         Ok(())
     }
 
@@ -393,6 +515,30 @@ impl ObjFile<'_> {
         self.bucket_config(bucket, BUCKET_NOTIFICATION, "")?
             .map(|bytes| NotificationConfig::decode(&bytes))
             .transpose()
+    }
+
+    /// The notification configuration and owner `bucket` had when change
+    /// `sequence` was made, if it had one.
+    pub fn notification_at(
+        &mut self,
+        bucket: &str,
+        sequence: u64,
+    ) -> Result<Option<(NotificationConfig, String)>, StorageError> {
+        let Some(tree) = self.existing_tree(NOTIFY_HISTORY_TREE)? else {
+            return Ok(None);
+        };
+        let Some(before) = sequence.checked_sub(1) else {
+            return Ok(None);
+        };
+        let entries = tree.scan_range(
+            &mut self.core.page_ctx(0),
+            Some(&history_key(bucket, 0)),
+            Some(&history_key(bucket, before)),
+        )?;
+        match entries.last() {
+            Some((_, row)) => decode_history(row),
+            None => Ok(None),
+        }
     }
 
     /// The last change the notifications consumer has sent the events of;
@@ -668,5 +814,65 @@ mod tests {
         let mut fields: Vec<&str> = object.keys().map(String::as_str).collect();
         fields.sort();
         assert_eq!(fields, ["key", "sequencer"]);
+        // A delete marker: its version, no size or ETag.
+        let mut marker = record(RecordType::Delete, Some(true), "DeleteObject");
+        marker.object = Some(JournalObject {
+            size: 0,
+            md5: [0; 16],
+            parts: 0,
+            last_modified_ms: 5,
+            storage_class: StorageClass::Standard,
+        });
+        let message: serde_json::Value = serde_json::from_str(&event_message(
+            &marker,
+            "s3:ObjectRemoved:DeleteMarkerCreated",
+            &config,
+            &config.rules[0],
+            "123456789012",
+        ))
+        .unwrap();
+        let object = message["Records"][0]["s3"]["object"].as_object().unwrap();
+        let mut fields: Vec<&str> = object.keys().map(String::as_str).collect();
+        fields.sort();
+        assert_eq!(fields, ["key", "sequencer", "versionId"]);
+        // A lifecycle transition is S3's, and names the class it went to.
+        let mut moved = record(
+            RecordType::UpdateMetadata,
+            Some(false),
+            "LifecycleTransition",
+        );
+        moved.object.as_mut().unwrap().storage_class = StorageClass::Glacier;
+        let message: serde_json::Value = serde_json::from_str(&event_message(
+            &moved,
+            "s3:LifecycleTransition",
+            &config,
+            &config.rules[0],
+            "123456789012",
+        ))
+        .unwrap();
+        let event = &message["Records"][0];
+        assert_eq!(event["eventVersion"], "2.3");
+        assert_eq!(event["userIdentity"]["principalId"], "s3.amazonaws.com");
+        assert_eq!(
+            event["requestParameters"]["sourceIPAddress"],
+            "s3.amazonaws.com"
+        );
+        assert_eq!(
+            event["lifecycleEventData"]["transitionEventData"]["destinationStorageClass"],
+            "GLACIER"
+        );
+        let created_event: serde_json::Value = serde_json::from_str(&event_message(
+            &created,
+            "s3:ObjectCreated:Put",
+            &config,
+            &config.rules[0],
+            "123456789012",
+        ))
+        .unwrap();
+        assert!(
+            created_event["Records"][0]
+                .get("lifecycleEventData")
+                .is_none()
+        );
     }
 }
