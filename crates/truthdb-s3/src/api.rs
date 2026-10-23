@@ -43,7 +43,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "analytics",
     "annotation",
     "attributes",
-    "cors",
     "intelligent-tiering",
     "inventory",
     "logging",
@@ -66,6 +65,7 @@ const UNIMPLEMENTED: &[&str] = &[
 /// targets.
 const SUBRESOURCES: &[&str] = &[
     "acl",
+    "cors",
     "delete",
     "encryption",
     "legal-hold",
@@ -491,6 +491,18 @@ async fn route(
             authz.check(action, Bucket(&bucket))?;
             crate::sse::handle(state, request, auth, bucket, method).await
         }
+        (Target::Bucket(bucket), method) if has_param(&request, "cors") => {
+            let action = match method {
+                Method::GET => "s3:GetBucketCORS",
+                Method::PUT | Method::DELETE => "s3:PutBucketCORS",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?cors"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::cors::bucket_cors(state, request, auth, bucket, method).await
+        }
+        (Target::Object(..), _) if has_param(&request, "cors") => Err(S3Error::not_implemented(
+            "an object has no ?cors configuration",
+        )),
         (Target::Bucket(bucket), method) if has_param(&request, "lifecycle") => {
             let action = match method {
                 Method::GET => "s3:GetLifecycleConfiguration",

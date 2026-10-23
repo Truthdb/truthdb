@@ -6,6 +6,7 @@ pub mod authz;
 pub mod batch;
 pub mod batch_run;
 pub mod copy;
+pub mod cors;
 pub mod delete;
 pub mod error;
 pub mod iam_api;

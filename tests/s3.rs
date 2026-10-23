@@ -945,6 +945,9 @@ fn a_user_without_policies_is_refused_every_operation() {
             &[],
         ),
         ("DELETE", "/cov", "lifecycle", b"", &[]),
+        ("GET", "/cov", "cors", b"", &[]),
+        ("PUT", "/cov", "cors", b"<CORSConfiguration/>", &[]),
+        ("DELETE", "/cov", "cors", b"", &[]),
         ("GET", "/cov", "notification", b"", &[]),
         (
             "PUT",
@@ -3028,7 +3031,11 @@ fn listings_page_through_keys_and_common_prefixes() {
     }
     // A sub-resource that is not implemented is refused, not answered with
     // a listing or an object body.
-    for (path, query) in [("/lst", "website"), ("/lst", "cors"), ("/lst/a", "restore")] {
+    for (path, query) in [
+        ("/lst", "website"),
+        ("/lst/a", "cors"),
+        ("/lst/a", "restore"),
+    ] {
         let (status, body) = call("GET", path, query, b"");
         assert_eq!(status, 501, "{path}?{query}: {body}");
     }
@@ -11106,4 +11113,182 @@ fn a_slow_function_holds_up_no_other_batch_job() {
         );
         std::thread::sleep(Duration::from_millis(100));
     }
+}
+
+#[test]
+fn cors_preflights_and_cross_origin_answers_follow_the_bucket_configuration() {
+    let server = start_server();
+    let created = native(server.native_port, "s3 create access key");
+    let key = created["access_key_id"].as_str().unwrap().to_string();
+    let secret = created["secret_access_key"].as_str().unwrap().to_string();
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            extra,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    // A browser's preflight: unsigned.
+    let preflight = |path: &str, extra: &[(&str, &str)]| {
+        send_with(server.s3_port, "OPTIONS", path, "", extra, b"", "", None)
+    };
+    assert_eq!(call("PUT", "/web", "", &[], b"").1.0, 200);
+    assert_eq!(
+        call("PUT", "/web/page.html", "", &[], b"<p>hi</p>").1.0,
+        200
+    );
+    let ask = [
+        ("origin", "https://app.example"),
+        ("access-control-request-method", "PUT"),
+    ];
+    let (_, (status, body)) = preflight("/web/page.html", &ask);
+    assert_eq!(status, 403, "no configuration yet: {body}");
+    assert!(
+        body.contains("CORS is not enabled for this bucket"),
+        "{body}"
+    );
+    let (_, (status, _)) = call("GET", "/web", "cors", &[], b"");
+    assert_eq!(status, 404);
+
+    let config = "<CORSConfiguration><CORSRule><ID>app</ID><AllowedOrigin>https://*.example</AllowedOrigin>\
+        <AllowedMethod>GET</AllowedMethod><AllowedMethod>PUT</AllowedMethod>\
+        <AllowedHeader>content-type</AllowedHeader><AllowedHeader>x-amz-*</AllowedHeader>\
+        <ExposeHeader>ETag</ExposeHeader><MaxAgeSeconds>600</MaxAgeSeconds></CORSRule>\
+        <CORSRule><AllowedOrigin>*</AllowedOrigin><AllowedMethod>GET</AllowedMethod></CORSRule>\
+        </CORSConfiguration>";
+    // The configuration needs its Content-MD5.
+    let (_, (status, _)) = call("PUT", "/web", "cors", &[], config.as_bytes());
+    assert_eq!(status, 400);
+    let md5 = content_md5(config.as_bytes());
+    let (_, (status, body)) = call(
+        "PUT",
+        "/web",
+        "cors",
+        &[("content-md5", &md5)],
+        config.as_bytes(),
+    );
+    assert_eq!(status, 200, "{body}");
+    let (_, (status, shown)) = call("GET", "/web", "cors", &[], b"");
+    assert_eq!(status, 200);
+    assert!(
+        shown.contains("<ID>app</ID>") && shown.contains("<MaxAgeSeconds>600</MaxAgeSeconds>"),
+        "{shown}"
+    );
+
+    // A preflight the first rule allows.
+    let asking = [
+        ("origin", "https://app.example"),
+        ("access-control-request-method", "PUT"),
+        ("access-control-request-headers", "Content-Type, X-Amz-Date"),
+    ];
+    let (head, (status, _)) = preflight("/web/page.html", &asking);
+    assert_eq!(status, 200, "{head}");
+    assert_eq!(
+        response_header(&head, "access-control-allow-origin").as_deref(),
+        Some("https://app.example")
+    );
+    assert_eq!(
+        response_header(&head, "access-control-allow-methods").as_deref(),
+        Some("GET, PUT")
+    );
+    assert_eq!(
+        response_header(&head, "access-control-allow-headers").as_deref(),
+        Some("Content-Type, X-Amz-Date")
+    );
+    assert_eq!(
+        response_header(&head, "access-control-max-age").as_deref(),
+        Some("600")
+    );
+    assert_eq!(
+        response_header(&head, "access-control-expose-headers").as_deref(),
+        Some("ETag")
+    );
+    assert!(response_header(&head, "vary").unwrap().contains("Origin"));
+    // The second rule: any origin, GET only, answered with "*".
+    let (head, (status, _)) = preflight(
+        "/web",
+        &[
+            ("origin", "https://other.site"),
+            ("access-control-request-method", "GET"),
+        ],
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, "access-control-allow-origin").as_deref(),
+        Some("*")
+    );
+    // Refused: a method no rule allows that origin, a header not allowed,
+    // a preflight missing what it asks for.
+    let refused = [
+        vec![
+            ("origin", "https://other.site"),
+            ("access-control-request-method", "PUT"),
+        ],
+        vec![
+            ("origin", "https://app.example"),
+            ("access-control-request-method", "PUT"),
+            ("access-control-request-headers", "authorization"),
+        ],
+    ];
+    for headers in &refused {
+        let (head, (status, body)) = preflight("/web/page.html", headers);
+        assert_eq!(status, 403, "{headers:?}: {body}");
+        assert!(body.contains("This CORS request is not allowed"), "{body}");
+        assert!(response_header(&head, "access-control-allow-origin").is_none());
+    }
+    let (_, (status, _)) = preflight("/web/page.html", &[("origin", "https://app.example")]);
+    assert_eq!(status, 400, "no requested method");
+
+    // Cross-origin requests: the headers on their answers, errors too.
+    let (head, (status, _)) = call(
+        "GET",
+        "/web/page.html",
+        "",
+        &[("origin", "https://app.example")],
+        b"",
+    );
+    assert_eq!(status, 200);
+    assert_eq!(
+        response_header(&head, "access-control-allow-origin").as_deref(),
+        Some("https://app.example")
+    );
+    assert_eq!(
+        response_header(&head, "access-control-expose-headers").as_deref(),
+        Some("ETag")
+    );
+    let (head, (status, _)) = call(
+        "GET",
+        "/web/missing",
+        "",
+        &[("origin", "https://app.example")],
+        b"",
+    );
+    assert_eq!(status, 404);
+    assert!(
+        response_header(&head, "access-control-allow-origin").is_some(),
+        "on an error too"
+    );
+    // An origin no rule allows for DELETE: the request goes on, without them.
+    let (head, (status, _)) = call(
+        "DELETE",
+        "/web/page.html",
+        "",
+        &[("origin", "https://other.site")],
+        b"",
+    );
+    assert_eq!(status, 204);
+    assert!(response_header(&head, "access-control-allow-origin").is_none());
+    // Without an Origin: none.
+    let (head, _) = call("GET", "/web", "", &[], b"");
+    assert!(response_header(&head, "access-control-allow-origin").is_none());
+
+    // Deleted: gone, and preflights refused again.
+    assert_eq!(call("DELETE", "/web", "cors", &[], b"").1.0, 204);
+    assert_eq!(call("GET", "/web", "cors", &[], b"").1.0, 404);
+    assert_eq!(preflight("/web", &asking).1.0, 403);
 }
