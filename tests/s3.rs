@@ -975,6 +975,15 @@ fn a_user_without_policies_is_refused_every_operation() {
         ("GET", "/cov", "cors", b"", &[]),
         ("PUT", "/cov", "cors", b"<CORSConfiguration/>", &[]),
         ("DELETE", "/cov", "cors", b"", &[]),
+        ("GET", "/cov", "website", b"", &[]),
+        (
+            "PUT",
+            "/cov",
+            "website",
+            b"<WebsiteConfiguration><IndexDocument><Suffix>i</Suffix></IndexDocument></WebsiteConfiguration>",
+            &[],
+        ),
+        ("DELETE", "/cov", "website", b"", &[]),
         ("GET", "/cov", "notification", b"", &[]),
         (
             "PUT",
@@ -3059,7 +3068,7 @@ fn listings_page_through_keys_and_common_prefixes() {
     // A sub-resource that is not implemented is refused, not answered with
     // a listing or an object body.
     for (path, query) in [
-        ("/lst", "website"),
+        ("/lst/a", "website"),
         ("/lst/a", "cors"),
         ("/lst/a", "restore"),
     ] {
@@ -12031,4 +12040,76 @@ fn objects_keep_the_website_redirect_location_their_write_names() {
         redirect("/hops/formed").as_deref(),
         Some("https://example.com/form")
     );
+}
+
+#[test]
+fn a_bucket_keeps_its_website_configuration() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret)).1
+    };
+    let put = |bucket: &str, config: &str| {
+        let md5 = content_md5(config.as_bytes());
+        call(
+            "PUT",
+            bucket,
+            "website",
+            &[("content-md5", &md5)],
+            config.as_bytes(),
+        )
+    };
+    let site = "<WebsiteConfiguration><IndexDocument><Suffix>index.html</Suffix></IndexDocument>\
+        <ErrorDocument><Key>error.html</Key></ErrorDocument><RoutingRules><RoutingRule>\
+        <Condition><KeyPrefixEquals>docs/</KeyPrefixEquals></Condition>\
+        <Redirect><ReplaceKeyPrefixWith>documents/</ReplaceKeyPrefixWith></Redirect>\
+        </RoutingRule></RoutingRules></WebsiteConfiguration>";
+    assert_eq!(put("/nosuch", site).0, 404);
+    assert_eq!(call("PUT", "/site", "", &[], b"").0, 200);
+    let (status, missing) = call("GET", "/site", "website", &[], b"");
+    assert_eq!(status, 404);
+    assert_eq!(xml_value(&missing, "Code"), "NoSuchWebsiteConfiguration");
+    // The configuration needs its Content-MD5 (or a checksum).
+    assert_eq!(call("PUT", "/site", "website", &[], site.as_bytes()).0, 400);
+    let (status, body) = put("/site", site);
+    assert_eq!(status, 200, "{body}");
+    let (status, shown) = call("GET", "/site", "website", &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(xml_value(&shown, "Suffix"), "index.html");
+    assert_eq!(xml_value(&shown, "Key"), "error.html");
+    assert_eq!(xml_value(&shown, "KeyPrefixEquals"), "docs/");
+    assert_eq!(xml_value(&shown, "ReplaceKeyPrefixWith"), "documents/");
+    // A refused configuration leaves the stored one.
+    let (status, refused) = put(
+        "/site",
+        "<WebsiteConfiguration><IndexDocument><Suffix>a/b</Suffix></IndexDocument></WebsiteConfiguration>",
+    );
+    assert_eq!(status, 400);
+    assert_eq!(xml_value(&refused, "Code"), "InvalidArgument");
+    // One whose stored form (escaped) would pass the limit.
+    let quoted = format!(
+        "<WebsiteConfiguration><IndexDocument><Suffix>{}</Suffix></IndexDocument></WebsiteConfiguration>",
+        "\"".repeat(30_000)
+    );
+    assert_eq!(put("/site", &quoted).0, 400);
+    assert_eq!(
+        xml_value(&call("GET", "/site", "website", &[], b"").1, "Suffix"),
+        "index.html"
+    );
+    // Replaced by a redirect of every request.
+    let all = "<WebsiteConfiguration><RedirectAllRequestsTo><HostName>www.example.com</HostName>\
+        <Protocol>https</Protocol></RedirectAllRequestsTo></WebsiteConfiguration>";
+    assert_eq!(put("/site", all).0, 200);
+    let (_, shown) = call("GET", "/site", "website", &[], b"");
+    assert_eq!(xml_value(&shown, "HostName"), "www.example.com");
+    assert!(!shown.contains("IndexDocument"), "{shown}");
+    assert_eq!(call("DELETE", "/site", "website", &[], b"").0, 204);
+    assert_eq!(call("GET", "/site", "website", &[], b"").0, 404);
+    assert_eq!(call("DELETE", "/site", "website", &[], b"").0, 204);
+    // Gone with its bucket.
+    assert_eq!(put("/site", site).0, 200);
+    assert_eq!(call("DELETE", "/site", "", &[], b"").0, 204);
+    assert_eq!(call("PUT", "/site", "", &[], b"").0, 200);
+    assert_eq!(call("GET", "/site", "website", &[], b"").0, 404);
+    assert_eq!(call("GET", "/site/k", "website", &[], b"").0, 501);
 }

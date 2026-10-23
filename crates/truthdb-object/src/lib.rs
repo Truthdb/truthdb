@@ -52,7 +52,7 @@ pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use consumers::{Consumer, FULLTEXT_CONSUMER};
 pub use credentials::AccessKey;
 pub use documents::{
-    BUCKET_CORS, BUCKET_ENCRYPTION, BUCKET_LIFECYCLE, BUCKET_POLICY, ManagedPolicy,
+    BUCKET_CORS, BUCKET_ENCRYPTION, BUCKET_LIFECYCLE, BUCKET_POLICY, BUCKET_WEBSITE, ManagedPolicy,
     OBJECT_LOCK_DEFAULT, PUBLIC_ACCESS_BLOCK,
 };
 pub use fulltext::{
