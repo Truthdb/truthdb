@@ -314,6 +314,55 @@ async fn main() -> ExitCode {
         None
     };
 
+    // Optional Kafka-compatible listener (TLS only) for the streams engine.
+    let kafka_task = if config.kafka.enabled {
+        let (Some(cert_path), Some(key_path)) = (&config.kafka.tls_cert, &config.kafka.tls_key)
+        else {
+            eprintln!("The Kafka listener needs tls_cert and tls_key");
+            return ExitCode::FAILURE;
+        };
+        let acceptor = std::fs::read(cert_path).and_then(|cert| {
+            let key = std::fs::read(key_path)?;
+            truthdb_core::repl::tls::acceptor_from_pem(&cert, &key)
+        });
+        let tls = match acceptor {
+            Ok(acceptor) => acceptor,
+            Err(err) => {
+                eprintln!("Failed to load Kafka TLS certificate/key: {err}");
+                return ExitCode::FAILURE;
+            }
+        };
+        match tokio::net::TcpListener::bind((config.kafka.addr.as_str(), config.kafka.port)).await {
+            Ok(listener) => {
+                info!(
+                    "Kafka listener on {}:{} (TLS), advertised as {}:{}",
+                    config.kafka.addr,
+                    config.kafka.port,
+                    config.kafka.advertised_host,
+                    config.kafka.port
+                );
+                let state = std::sync::Arc::new(truthdb_kafka::KafkaState {
+                    engine: engine.clone(),
+                    host: config.kafka.advertised_host.clone(),
+                    port: config.kafka.port,
+                    coordinator: Default::default(),
+                });
+                Some(tokio::spawn(truthdb_kafka::serve(
+                    listener,
+                    state,
+                    tls,
+                    shutdown_tx.subscribe(),
+                )))
+            }
+            Err(err) => {
+                eprintln!("Failed to start the Kafka listener: {err}");
+                return ExitCode::FAILURE;
+            }
+        }
+    } else {
+        None
+    };
+
     // Optional physical replication (Stage 18): a primary's listener + senders,
     // or a standby's receiver.
     let repl_task = if config.replication.enabled {
@@ -344,6 +393,9 @@ async fn main() -> ExitCode {
     }
     if let Some(s3_task) = s3_task {
         let _ = s3_task.await;
+    }
+    if let Some(kafka_task) = kafka_task {
+        let _ = kafka_task.await;
     }
     // Stop the engine thread and wait for it to drain/exit.
     engine.shutdown();

@@ -18,15 +18,13 @@ use truthdb_s3::sigv4;
 
 const DEADLINE: Duration = Duration::from_secs(60);
 
-/// Two distinct free ports: both are held until both are chosen, so the
-/// second cannot be the first one released.
-fn free_ports() -> (u16, u16) {
+/// Three distinct free ports: all are held until all are chosen, so none
+/// can be one released before.
+fn free_ports() -> (u16, u16, u16) {
     let bind = || std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
-    let (first, second) = (bind(), bind());
-    (
-        first.local_addr().expect("addr").port(),
-        second.local_addr().expect("addr").port(),
-    )
+    let (first, second, third) = (bind(), bind(), bind());
+    let port = |listener: &std::net::TcpListener| listener.local_addr().expect("addr").port();
+    (port(&first), port(&second), port(&third))
 }
 
 struct Server {
@@ -36,6 +34,9 @@ struct Server {
     s3_port: u16,
     /// The S3 listener's certificate, when it serves TLS.
     cert: Option<Vec<u8>>,
+    /// The Kafka listener's port, when it runs (with the S3 listener's
+    /// certificate).
+    kafka_port: Option<u16>,
 }
 
 impl Drop for Server {
@@ -63,8 +64,14 @@ fn start_server_with(encrypted: bool) -> Server {
 /// [`start_server_with`]; `tls`: the S3 listener serves HTTPS with a
 /// self-signed certificate (see [`send_tls`]).
 fn start_server_tls(encrypted: bool, tls: bool) -> Server {
+    start_server_full(encrypted, tls, false)
+}
+
+/// [`start_server_tls`]; `kafka`: the Kafka listener runs too (it needs
+/// `tls`).
+fn start_server_full(encrypted: bool, tls: bool, kafka: bool) -> Server {
     for _ in 0..5 {
-        let server = spawn_server(encrypted, tls);
+        let server = spawn_server(encrypted, tls, kafka);
         let deadline = Instant::now() + DEADLINE;
         let mut server = Some(server);
         while Instant::now() < deadline {
@@ -76,8 +83,9 @@ fn start_server_tls(encrypted: bool, tls: bool) -> Server {
             // taken a port between choosing it and this one binding it.
             let pid = running.child.id();
             if [running.native_port, running.s3_port]
-                .iter()
-                .all(|&port| listens(pid, port))
+                .into_iter()
+                .chain(running.kafka_port)
+                .all(|port| listens(pid, port))
             {
                 return server.take().unwrap();
             }
@@ -120,7 +128,7 @@ fn listens(pid: u32, port: u16) -> bool {
 /// Bulk restores stay under way for a while.
 const RESTORE_SECONDS: &str = "restore_seconds = { expedited = 0, standard = 0, bulk = 2 }\n";
 
-fn spawn_server(encrypted: bool, tls: bool) -> Server {
+fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
     let dir = std::env::temp_dir().join(format!(
         "truthdb-s3-{}-{}",
         std::process::id(),
@@ -130,7 +138,7 @@ fn spawn_server(encrypted: bool, tls: bool) -> Server {
             .as_nanos()
     ));
     std::fs::create_dir_all(&dir).expect("dir");
-    let (native_port, s3_port) = free_ports();
+    let (native_port, s3_port, kafka_port) = free_ports();
     let config = dir.join("truthdb.toml");
     let encryption = if encrypted {
         use std::os::unix::fs::PermissionsExt;
@@ -142,18 +150,29 @@ fn spawn_server(encrypted: bool, tls: bool) -> Server {
         String::new()
     };
     let (cert, tls_config) = if tls {
-        let certified =
-            rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a cert");
+        let certified = rcgen::generate_simple_self_signed(vec![
+            "localhost".to_string(),
+            "127.0.0.1".to_string(),
+        ])
+        .expect("a cert");
         let (cert_path, key_path) = (dir.join("s3.crt"), dir.join("s3.key"));
         std::fs::write(&cert_path, certified.cert.pem()).expect("cert");
         std::fs::write(&key_path, certified.key_pair.serialize_pem()).expect("key");
+        let tls_files = format!(
+            "tls_cert = \"{}\"\ntls_key = \"{}\"\n",
+            cert_path.display(),
+            key_path.display()
+        );
+        let kafka_config = if kafka {
+            format!(
+                "\n[kafka]\nenabled = true\naddr = \"127.0.0.1\"\nport = {kafka_port}\nadvertised_host = \"127.0.0.1\"\n{tls_files}"
+            )
+        } else {
+            String::new()
+        };
         (
             Some(certified.cert.der().to_vec()),
-            format!(
-                "tls_cert = \"{}\"\ntls_key = \"{}\"\n",
-                cert_path.display(),
-                key_path.display()
-            ),
+            format!("{tls_files}{kafka_config}"),
         )
     } else {
         (None, String::new())
@@ -179,6 +198,7 @@ fn spawn_server(encrypted: bool, tls: bool) -> Server {
         native_port,
         s3_port,
         cert,
+        kafka_port: kafka.then_some(kafka_port),
     }
 }
 
@@ -9062,4 +9082,234 @@ fn bucket_events_reach_a_webhook_signed_and_retried() {
     );
     // Delivered since its last failure: no error shown.
     assert_eq!(rows, [["hooked", "2", "0", "2", "0", "null"]]);
+}
+
+/// The Kafka client test script: `<mode> <port> <key id> <secret> <CA file>
+/// [args]`, printing one JSON line.
+const KAFKA_CLIENT: &str = r#"
+import json, sys, time
+from kafka import KafkaConsumer, TopicPartition
+
+mode, port, key, secret, cafile = sys.argv[1:6]
+common = dict(
+    bootstrap_servers=f"127.0.0.1:{port}",
+    security_protocol="SASL_SSL",
+    sasl_mechanism="PLAIN",
+    sasl_plain_username=key,
+    sasl_plain_password=secret,
+    ssl_cafile=cafile,
+)
+
+def read(consumer, count, deadline):
+    out = []
+    while len(out) < count and time.time() < deadline:
+        for records in consumer.poll(timeout_ms=200).values():
+            out.extend(records)
+    # Anything past what was expected.
+    end = time.time() + 1
+    while time.time() < end:
+        for records in consumer.poll(timeout_ms=200).values():
+            out.extend(records)
+    return out
+
+if mode == "read":
+    group, count = sys.argv[6], int(sys.argv[7])
+    consumer = KafkaConsumer("events", group_id=group, auto_offset_reset="earliest",
+                             enable_auto_commit=False, **common)
+    records = read(consumer, count, time.time() + 60)
+    consumer.commit()
+    consumer.close()
+    print(json.dumps([[r.partition, r.offset, r.key and r.key.decode(), json.loads(r.value)]
+                      for r in records]))
+elif mode == "offsets":
+    consumer = KafkaConsumer(**common)
+    parts = [TopicPartition("events", p) for p in (0, 1)]
+    begin = consumer.beginning_offsets(parts)
+    end = consumer.end_offsets(parts)
+    at_zero = consumer.offsets_for_times({p: 0 for p in parts})
+    future = consumer.offsets_for_times({p: 2 ** 62 for p in parts})
+    print(json.dumps({
+        "topics": sorted(consumer.topics()),
+        "begin": [begin[p] for p in parts],
+        "end": [end[p] for p in parts],
+        "at_zero": [at_zero[p] and at_zero[p].offset for p in parts],
+        "future": [future[p] for p in parts],
+    }))
+    consumer.close()
+elif mode == "group":
+    consumer = KafkaConsumer("events", group_id=sys.argv[6], auto_offset_reset="earliest",
+                             **common)
+    deadline, since, last = time.time() + 90, time.time(), None
+    while time.time() < deadline:
+        consumer.poll(timeout_ms=200)
+        now = sorted(p.partition for p in consumer.assignment())
+        if now != last:
+            since, last = time.time(), now
+        elif len(now) == 1 and time.time() - since > 4:
+            break
+    # Holds its partition a while, so the other member settles too.
+    end = time.time() + 4
+    while time.time() < end:
+        consumer.poll(timeout_ms=200)
+    consumer.close()
+    print(json.dumps(last))
+elif mode == "connect":
+    try:
+        consumer = KafkaConsumer(**common)
+        print(json.dumps(sorted(consumer.topics())))
+        consumer.close()
+    except Exception as err:
+        print(json.dumps(type(err).__name__))
+"#;
+
+/// Runs [`KAFKA_CLIENT`] with the Python that has kafka-python; its JSON
+/// line.
+fn kafka_client(python: &std::path::Path, server: &Server, args: &[&str]) -> serde_json::Value {
+    let script = server.dir.join("kafka_client.py");
+    std::fs::write(&script, KAFKA_CLIENT).expect("script");
+    let output = Command::new(python)
+        .arg("-I")
+        .arg(&script)
+        .args(args)
+        .output()
+        .expect("run the Kafka client");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().last().unwrap_or_default();
+    serde_json::from_str(line).unwrap_or_else(|_| {
+        panic!(
+            "the Kafka client failed: {stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        )
+    })
+}
+
+#[test]
+fn kafka_consumers_read_bucket_events_in_groups() {
+    // A Python with kafka-python installed (pip install kafka-python).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_KAFKA_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_KAFKA_PYTHON names no Python with kafka-python");
+        return;
+    };
+    let server = start_server_full(false, true, true);
+    let port = server.kafka_port.unwrap().to_string();
+    let ca = server.dir.join("s3.crt");
+    let ca = ca.to_str().unwrap();
+    let (account, key, secret) = account_with_key(&server, "streamer");
+    let (_, other_key, other_secret) = account_with_key(&server, "other");
+    native(
+        server.native_port,
+        &format!("stream create topic events partitions 2 retention 0 account {account}"),
+    );
+    native(server.native_port, "stream create topic unowned");
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_tls(&server, method, path, query, &[], body, &key, Some(&secret)).1
+    };
+    assert_eq!(call("PUT", "/photos", "", b"").0, 200);
+    let config = format!(
+        "<NotificationConfiguration><TopicConfiguration>\
+         <Topic>arn:aws:sns:us-east-1:{account}:events</Topic>\
+         <Event>s3:ObjectCreated:*</Event></TopicConfiguration></NotificationConfiguration>"
+    );
+    assert_eq!(
+        call("PUT", "/photos", "notification", config.as_bytes()).0,
+        200
+    );
+    for name in ["a", "b", "c"] {
+        assert_eq!(call("PUT", &format!("/photos/{name}"), "", b"x").0, 200);
+    }
+    let created = |records: &serde_json::Value| -> Vec<String> {
+        let mut keys: Vec<String> = records
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|record| {
+                record[3]["Records"][0]["s3"]["object"]["key"]
+                    .as_str()
+                    .map(str::to_string)
+            })
+            .collect();
+        keys.sort();
+        keys
+    };
+
+    // The test event and three objects, then (from the committed offsets)
+    // only what came after.
+    let first = kafka_client(
+        &python,
+        &server,
+        &["read", &port, &key, &secret, ca, "g", "4"],
+    );
+    assert_eq!(first.as_array().unwrap().len(), 4, "{first}");
+    assert_eq!(created(&first), ["a", "b", "c"]);
+    for name in ["d", "e"] {
+        assert_eq!(call("PUT", &format!("/photos/{name}"), "", b"x").0, 200);
+    }
+    let second = kafka_client(
+        &python,
+        &server,
+        &["read", &port, &key, &secret, ca, "g", "2"],
+    );
+    assert_eq!(created(&second), ["d", "e"], "{second}");
+    // Another group starts from the beginning.
+    let other = kafka_client(
+        &python,
+        &server,
+        &["read", &port, &key, &secret, ca, "h", "6"],
+    );
+    assert_eq!(created(&other), ["a", "b", "c", "d", "e"]);
+
+    // Offsets: earliest, latest, by time.
+    let offsets = kafka_client(&python, &server, &["offsets", &port, &key, &secret, ca]);
+    assert_eq!(
+        offsets["topics"],
+        serde_json::json!(["events"]),
+        "{offsets}"
+    );
+    assert_eq!(offsets["begin"], serde_json::json!([0, 0]));
+    let end: Vec<u64> = serde_json::from_value(offsets["end"].clone()).unwrap();
+    assert_eq!(end.iter().sum::<u64>(), 6);
+    assert_eq!(
+        offsets["at_zero"],
+        serde_json::json!(
+            end.iter()
+                .map(|&n| (n > 0).then_some(0))
+                .collect::<Vec<_>>()
+        )
+    );
+    assert_eq!(offsets["future"], serde_json::json!([null, null]));
+
+    // Two members of a group split the partitions.
+    let group = |name: &'static str| {
+        let (python, port, key, secret, ca, dir) = (
+            python.clone(),
+            port.clone(),
+            key.clone(),
+            secret.clone(),
+            ca.to_string(),
+            server.dir.clone(),
+        );
+        std::thread::spawn(move || {
+            let output = Command::new(&python)
+                .arg("-I")
+                .arg(dir.join("kafka_client.py"))
+                .args(["group", &port, &key, &secret, &ca, name])
+                .output()
+                .expect("run the Kafka client");
+            String::from_utf8_lossy(&output.stdout).trim().to_string()
+        })
+    };
+    let (one, two) = (group("split"), group("split"));
+    let mut split = [one.join().unwrap(), two.join().unwrap()];
+    split.sort();
+    assert_eq!(split, ["[0]", "[1]"]);
+
+    // Another account sees none of these topics; a wrong secret is refused.
+    let theirs = kafka_client(
+        &python,
+        &server,
+        &["connect", &port, &other_key, &other_secret, ca],
+    );
+    assert_eq!(theirs, serde_json::json!([]));
+    let refused = kafka_client(&python, &server, &["connect", &port, &key, "wrong", ca]);
+    assert!(refused.is_string(), "{refused}");
 }

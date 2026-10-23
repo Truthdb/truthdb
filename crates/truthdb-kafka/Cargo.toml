@@ -1,0 +1,15 @@
+[package]
+name = "truthdb-kafka"
+version = "0.1.0"
+edition = "2024"
+description = "TruthDB's Kafka-compatible listener: consumers read the streams engine's topics."
+
+[dependencies]
+truthdb-core = { workspace = true }
+truthdb-engine = { workspace = true }
+truthdb-object = { workspace = true }
+truthdb-streams = { workspace = true }
+tokio = { workspace = true }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12"] }
+ring = "0.17"
+crc = "3.4"
