@@ -10542,3 +10542,188 @@ fn batch_jobs_restore_and_lock_what_a_manifest_lists() {
     let (status, answer) = call("POST", "/v20180820/jobs", "", &[], body.as_bytes()).1;
     assert_eq!(status, 400, "{answer}");
 }
+
+#[test]
+fn batch_jobs_run_on_a_manifest_they_generate() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "batchgen");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        let mut headers = vec![("x-amz-account-id", account.as_str())];
+        headers.extend_from_slice(extra);
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            &headers,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    for bucket in ["/data", "/out", "/reports"] {
+        assert_eq!(call("PUT", bucket, "", &[], b"").1.0, 200);
+    }
+    for (name, body, class) in [
+        ("logs/a.txt", &b"small"[..], "STANDARD"),
+        ("logs/b.txt", &[b'x'; 100][..], "STANDARD"),
+        ("logs/c.csv", &b"small"[..], "STANDARD"),
+        ("logs/d.txt", &b"tiny"[..], "STANDARD"),
+        ("logs/g.txt", &b"cold"[..], "GLACIER"),
+        ("img/x.txt", &b"small"[..], "STANDARD"),
+    ] {
+        let path = format!("/data/{name}");
+        assert_eq!(
+            call("PUT", &path, "", &[("x-amz-storage-class", class)], body)
+                .1
+                .0,
+            200
+        );
+    }
+    let body = |token: &str, generator: &str| {
+        format!(
+            "<CreateJobRequest xmlns=\"http://awss3control.amazonaws.com/doc/2018-08-20/\">\
+             <ClientRequestToken>{token}</ClientRequestToken>\
+             <Operation><S3PutObjectTagging><TagSet><S3Tag><Key>k</Key><Value>v</Value></S3Tag>\
+             </TagSet></S3PutObjectTagging></Operation>\
+             <ManifestGenerator><S3JobManifestGenerator>{generator}</S3JobManifestGenerator></ManifestGenerator>\
+             <Report><Enabled>true</Enabled><Bucket>arn:aws:s3:::reports</Bucket>\
+             <Format>Report_CSV_20180820</Format><ReportScope>AllTasks</ReportScope></Report>\
+             <Priority>1</Priority><RoleArn>arn:aws:iam::111122223333:role/batch</RoleArn>\
+             </CreateJobRequest>"
+        )
+    };
+    let filtered = "<SourceBucket>arn:aws:s3:::data</SourceBucket><EnableManifestOutput>true</EnableManifestOutput>\
+        <ManifestOutputLocation><Bucket>arn:aws:s3:::out</Bucket><ManifestPrefix>gen</ManifestPrefix>\
+        <ManifestFormat>S3InventoryReport_CSV_20211130</ManifestFormat></ManifestOutputLocation>\
+        <Filter><KeyNameConstraint><MatchAnyPrefix><member>logs/</member></MatchAnyPrefix>\
+        <MatchAnySuffix><member>.txt</member></MatchAnySuffix></KeyNameConstraint>\
+        <ObjectSizeLessThanBytes>50</ObjectSizeLessThanBytes>\
+        <MatchAnyStorageClass><member>STANDARD</member></MatchAnyStorageClass></Filter>";
+    let run = |job_key: &str, job_secret: &str, request: String| -> String {
+        let headers = [("x-amz-account-id", account.as_str())];
+        let (status, answer) = send_with(
+            server.s3_port,
+            "POST",
+            "/v20180820/jobs",
+            "",
+            &headers,
+            request.as_bytes(),
+            job_key,
+            Some(job_secret),
+        )
+        .1;
+        assert_eq!(status, 200, "{answer}");
+        let job = xml_value(&answer, "JobId");
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let described = call("GET", &format!("/v20180820/jobs/{job}"), "", &[], b"")
+                .1
+                .1;
+            let status = described
+                .rsplit("</ProgressSummary>")
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if ["Complete", "Failed"].contains(&xml_value(&status, "Status").as_str()) {
+                return described;
+            }
+            assert!(Instant::now() < deadline, "{described}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let described = run(&key, &secret, body("gen-1", filtered));
+    assert_eq!(
+        xml_value(&described, "TotalNumberOfTasks"),
+        "2",
+        "{described}"
+    );
+    assert_eq!(xml_value(&described, "NumberOfTasksSucceeded"), "2");
+    for (name, tagged) in [
+        ("logs/a.txt", true),
+        ("logs/d.txt", true),
+        ("logs/b.txt", false),
+        ("logs/g.txt", false),
+        ("img/x.txt", false),
+    ] {
+        let (_, (_, tags)) = call("GET", &format!("/data/{name}"), "tagging", &[], b"");
+        assert_eq!(tags.contains("<Key>k</Key>"), tagged, "{name}: {tags}");
+    }
+    // The generated manifest, written and described.
+    let descriptor = xml_value(&described, "GeneratedManifestDescriptor");
+    let arn = xml_value(&descriptor, "ObjectArn");
+    let path = arn.strip_prefix("arn:aws:s3:::").unwrap();
+    assert!(path.starts_with("out/gen/job-"), "{path}");
+    let (_, (status, lines)) = call("GET", &format!("/{path}"), "", &[], b"");
+    assert_eq!(
+        (status, lines.as_str()),
+        (200, "data,logs/a.txt,\ndata,logs/d.txt,\n")
+    );
+
+    // A generator that keeps nothing, writing nothing out: complete at once.
+    let none = "<SourceBucket>arn:aws:s3:::data</SourceBucket><EnableManifestOutput>false</EnableManifestOutput>\
+        <Filter><CreatedAfter>2099-01-01T00:00:00Z</CreatedAfter></Filter>";
+    let described = run(&key, &secret, body("gen-2", none));
+    assert_eq!(
+        xml_value(&described, "TotalNumberOfTasks"),
+        "0",
+        "{described}"
+    );
+    assert!(!described.contains("GeneratedManifestDescriptor"));
+
+    // Refused: both a manifest and a generator; a filter not offered; an
+    // output asked for nowhere.
+    let code = |request: String| {
+        let (status, answer) = call("POST", "/v20180820/jobs", "", &[], request.as_bytes()).1;
+        (status, xml_value(&answer, "Code"))
+    };
+    let both = body("gen-3", none).replace(
+        "<ManifestGenerator>",
+        "<Manifest><Spec><Format>S3BatchOperations_CSV_20180820</Format></Spec>\
+         <Location><ObjectArn>arn:aws:s3:::data/m</ObjectArn><ETag>e</ETag></Location></Manifest><ManifestGenerator>",
+    );
+    assert_eq!(code(both), (400, "InvalidRequest".to_string()));
+    let encryption = none.replace(
+        "<Filter>",
+        "<Filter><MatchAnyObjectEncryption><SSE-S3/></MatchAnyObjectEncryption>",
+    );
+    assert_eq!(
+        code(body("gen-4", &encryption)),
+        (501, "NotImplemented".to_string())
+    );
+    let nowhere = "<SourceBucket>arn:aws:s3:::data</SourceBucket><EnableManifestOutput>true</EnableManifestOutput>";
+    assert_eq!(
+        code(body("gen-5", nowhere)),
+        (400, "InvalidRequest".to_string())
+    );
+
+    // A listing over more than one page.
+    assert_eq!(call("PUT", "/many", "", &[], b"").1.0, 200);
+    for n in 0..1005 {
+        assert_eq!(
+            call("PUT", &format!("/many/k{n:04}"), "", &[], b"x").1.0,
+            200
+        );
+    }
+    let everything = "<SourceBucket>arn:aws:s3:::many</SourceBucket><EnableManifestOutput>false</EnableManifestOutput>";
+    let described = run(&key, &secret, body("gen-7", everything));
+    assert_eq!(
+        xml_value(&described, "TotalNumberOfTasks"),
+        "1005",
+        "{described}"
+    );
+    assert_eq!(xml_value(&described, "NumberOfTasksSucceeded"), "1005");
+
+    // Generating a manifest takes s3:PutInventoryConfiguration on the
+    // bucket, as AWS asks.
+    let policy = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:CreateJob", "s3:PutObject", "s3:PutObjectTagging"], "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (user_key, user_secret) = user_with_key(&server, &account, "lister", Some(&policy));
+    let described = run(&user_key, &user_secret, body("gen-6", none));
+    assert_eq!(
+        xml_value(&described, "FailureCode"),
+        "AccessDenied",
+        "{described}"
+    );
+}

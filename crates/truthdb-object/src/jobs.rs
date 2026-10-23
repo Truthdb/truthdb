@@ -17,7 +17,8 @@ use truthdb_core::storage::StorageError;
 use crate::codec::{Reader, Writer};
 use crate::documents::read;
 use crate::{
-    JOB_REQUESTS_TREE, JOB_RESULTS_TREE, JOBS_TREE, NEXT_JOB_KEY, ObjFile, ObjTxn, next_counter,
+    JOB_REQUESTS_TREE, JOB_RESULTS_TREE, JOB_TASKS_TREE, JOBS_TREE, NEXT_JOB_KEY, ObjFile, ObjTxn,
+    next_counter,
 };
 
 /// A job's status, as S3 Batch Operations names them.
@@ -126,6 +127,13 @@ pub struct Job {
     pub next_result: u64,
     /// Whether its results are still kept (until its report is written).
     pub results_left: bool,
+    /// A generated manifest's listing: the last key listed (`None`: none
+    /// yet), and whether the listing is done.
+    pub listed_after: Option<String>,
+    pub listing_done: bool,
+    /// The generated manifest written out: its bucket, key, S3 version id
+    /// (empty: none) and ETag.
+    pub generated: Option<(String, String, String, String)>,
 }
 
 impl Job {
@@ -156,6 +164,9 @@ impl Job {
             failed: 0,
             next_result: 0,
             results_left: true,
+            listed_after: None,
+            listing_done: false,
+            generated: None,
         }
     }
 
@@ -221,6 +232,24 @@ impl Job {
             out.u64(number);
         }
         out.u8(self.results_left as u8);
+        match &self.listed_after {
+            Some(key) => {
+                out.u8(1);
+                out.str(key);
+            }
+            None => out.u8(0),
+        }
+        out.u8(self.listing_done as u8);
+        match &self.generated {
+            Some((bucket, key, version, etag)) => {
+                out.u8(1);
+                out.str(bucket);
+                out.str(key);
+                out.str(version);
+                out.str(etag);
+            }
+            None => out.u8(0),
+        }
         out.0
     }
 
@@ -279,6 +308,17 @@ impl Job {
             failed: input.u64()?,
             next_result: input.u64()?,
             results_left: input.present()?,
+            listed_after: if input.present()? {
+                Some(input.str()?)
+            } else {
+                None
+            },
+            listing_done: input.present()?,
+            generated: if input.present()? {
+                Some((input.str()?, input.str()?, input.str()?, input.str()?))
+            } else {
+                None
+            },
         };
         if !input.rest().is_empty() {
             return Err(input.corrupt());
@@ -409,6 +449,43 @@ impl ObjTxn<'_, '_> {
         Ok(())
     }
 
+    /// Adds an object to a generated manifest's list, as task `job.total`
+    /// (which it counts): its key and S3 version id (empty: none).
+    pub fn add_job_task(
+        &mut self,
+        job: &mut Job,
+        key: &str,
+        version_id: &str,
+    ) -> Result<(), StorageError> {
+        let mut row = Writer::default();
+        row.str(key);
+        row.str(version_id);
+        self.trees.job_tasks().insert_unique(
+            self.ctx,
+            &mut OpMode::Txn(self.txn),
+            &result_key(job.number, job.total),
+            &row.0,
+        )?;
+        job.total += 1;
+        Ok(())
+    }
+
+    /// Removes up to `limit` of a generated manifest's list; whether none
+    /// are left.
+    pub fn drop_job_tasks(&mut self, number: u64, limit: usize) -> Result<bool, StorageError> {
+        let tree = self.trees.job_tasks();
+        let rows = tree.scan_range_limit(
+            self.ctx,
+            Some(&result_key(number, 0)),
+            Some(&result_key(number, u64::MAX)),
+            limit + 1,
+        )?;
+        for (key, _) in rows.iter().take(limit) {
+            tree.delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
+        }
+        Ok(rows.len() <= limit)
+    }
+
     /// Removes up to `limit` of a job's results; whether none are left.
     pub fn drop_job_results(&mut self, number: u64, limit: usize) -> Result<bool, StorageError> {
         let tree = self.trees.job_results();
@@ -488,6 +565,41 @@ impl ObjFile<'_> {
         };
         let mut ctx = self.core.page_ctx(0);
         read(&mut ctx, &tree, &number.to_be_bytes())
+    }
+
+    /// Up to `limit` objects of a generated manifest's list from task
+    /// `from`: (task, key, version id).
+    pub fn job_tasks(
+        &mut self,
+        number: u64,
+        from: u64,
+        limit: usize,
+    ) -> Result<Vec<(u64, String, String)>, StorageError> {
+        let Some(tree) = self.existing_tree(JOB_TASKS_TREE)? else {
+            return Ok(Vec::new());
+        };
+        let mut ctx = self.core.page_ctx(0);
+        tree.scan_range_limit(
+            &mut ctx,
+            Some(&result_key(number, from)),
+            Some(&result_key(number, u64::MAX)),
+            limit,
+        )?
+        .into_iter()
+        .map(|(key, row)| {
+            let seq = u64::from_be_bytes(
+                key.get(8..16)
+                    .and_then(|tail| tail.try_into().ok())
+                    .ok_or_else(|| crate::codec::corrupt("batch job task"))?,
+            );
+            let mut input = Reader::new(&row, "batch job task");
+            let task = (seq, input.str()?, input.str()?);
+            if !input.rest().is_empty() {
+                return Err(input.corrupt());
+            }
+            Ok(task)
+        })
+        .collect()
     }
 
     /// Up to `limit` of a job's results from sequence `from`.

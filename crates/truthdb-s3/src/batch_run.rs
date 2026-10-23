@@ -22,12 +22,14 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use truthdb_core::storage::StorageError;
 use truthdb_object::{
-    BodyWriter, Job, JobResult, JobStatus, ObjFile, ObjectAttrs, ObjectInfo, ObjectLock, Origin,
-    SealedBody, StorageClass, VersionSel, time::iso8601,
+    BodyWriter, Job, JobResult, JobStatus, ListAfter, ObjFile, ObjectAttrs, ObjectInfo, ObjectLock,
+    Origin, SealedBody, StorageClass, VersionSel, time::iso8601,
 };
 
 use crate::authz::{Authz, Resource};
-use crate::batch::{Field, Operation, Spec, spec, stored_request};
+use crate::batch::{
+    Field, GeneratorSpec, ManifestSpec, Operation, OutputSpec, Spec, spec, stored_request,
+};
 use crate::error::S3Error;
 use crate::objects::{DROP_GRACE_MS, now_ms, object_error};
 use crate::server::{Principal, S3State};
@@ -55,6 +57,16 @@ const MAX_RESULT_TEXT: usize = 256;
 /// What [`advance`] fails with when the job moved meanwhile (cancelled,
 /// say): the transaction rolls back, and the step ends.
 const MOVED: &str = "the batch job moved";
+/// How keys are written in reports and generated manifests: URL-encoded,
+/// '/' kept.
+const REPORT_KEY: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
+    .remove(b'-')
+    .remove(b'_')
+    .remove(b'.')
+    .remove(b'~')
+    .remove(b'/');
+/// Objects a generated manifest's listing takes a step.
+const LIST_PAGE: usize = 1000;
 const REPORT_SCHEMA: &str =
     "Bucket, Key, VersionId, TaskStatus, ErrorCode, HTTPStatusCode, ResultMessage";
 
@@ -188,7 +200,9 @@ async fn step(state: &S3State, waits: &mut Waits) -> bool {
         Work::DropResults => {
             object(state, move |file| {
                 file.transaction(|tx| {
+                    // Its results, then a generated manifest's list.
                     if tx.drop_job_results(number, RESULT_PAGE)?
+                        && tx.drop_job_tasks(number, RESULT_PAGE)?
                         && let Some(mut job) = tx.job(number)?
                     {
                         job.results_left = false;
@@ -309,12 +323,11 @@ type ManifestRead = Result<(Vec<u8>, u64), (&'static str, String)>;
 /// Up to `max` bytes of the manifest version `version` from `offset`.
 fn read_manifest(
     file: &mut ObjFile<'_>,
-    spec: &Spec,
+    manifest: &ManifestSpec,
     version: u64,
     offset: u64,
     max: u64,
 ) -> Result<ManifestRead, StorageError> {
-    let manifest = &spec.manifest;
     let info = match file.head_object(&manifest.bucket, &manifest.key, VersionSel::Seq(version))? {
         Ok(info) => info,
         Err(_) => {
@@ -346,173 +359,512 @@ fn read_manifest(
     Ok(Ok((out, info.size)))
 }
 
-/// Preparing: checks the manifest and the report's bucket, pins the
-/// manifest's version, and counts its lines (a step at a time).
+/// A generated manifest listed in full, to be written out: the job, where
+/// to, the bucket it lists, and whether the job waits for confirmation
+/// after.
+type ToWrite = Option<(Job, OutputSpec, String, bool)>;
+
+/// Preparing: checks the manifest (or the bucket a manifest is generated
+/// from) and the report's bucket, then a step of the manifest's work: a
+/// CSV manifest's version pinned and its lines counted, or a page of a
+/// generated one listed. A generated manifest asked to be written out is
+/// written, outside the lock, once it is listed.
 async fn prepare(state: &S3State, number: u64) -> Result<(), String> {
+    let now = now_ms();
+    let to_write = object(state, move |file| prepare_step(file, number, now)).await?;
+    if let Some((job, output, source, confirmation)) = to_write {
+        write_generated(state, job, output, source, confirmation).await?;
+    }
+    Ok(())
+}
+
+fn prepare_step(file: &mut ObjFile<'_>, number: u64, now: u64) -> Result<ToWrite, StorageError> {
+    let Some(job) = file.job(number)? else {
+        return Ok(None);
+    };
+    let Some(spec) = job_spec(file, &job)? else {
+        return finish_failed(
+            file,
+            number,
+            "InvalidJob",
+            "The job's request cannot be read",
+        )
+        .map(|()| None);
+    };
+    if !creator_holds(file, &job)? {
+        return finish_failed(file, number, "AccessDenied", CREATOR_GONE).map(|()| None);
+    }
+    if let Some(report) = &spec.report
+        && !owned_by(file, &report.bucket, &job.account, None)?
+    {
+        return finish_failed(
+            file,
+            number,
+            "ReportBucketNotOwned",
+            "The report's bucket does not exist or is not the job's account's",
+        )
+        .map(|()| None);
+    }
+    match (&spec.manifest, &spec.generator) {
+        (Some(manifest), _) => prepare_csv(file, &job, &spec, manifest, now).map(|()| None),
+        (None, Some(generator)) => prepare_listing(file, &job, &spec, generator, now),
+        (None, None) => {
+            finish_failed(file, number, "InvalidJob", "The job names no manifest").map(|()| None)
+        }
+    }
+}
+
+/// Whether `bucket` exists and is `account`'s (and, when given, the
+/// owner it is expected to have).
+fn owned_by(
+    file: &mut ObjFile<'_>,
+    bucket: &str,
+    account: &str,
+    expected: Option<&str>,
+) -> Result<bool, StorageError> {
+    Ok(file.bucket(bucket)?.is_some_and(|info| {
+        info.owner == account && expected.is_none_or(|expected| expected == info.owner)
+    }))
+}
+
+/// A Preparing job's next status: Suspended when it waits for
+/// confirmation, else Ready.
+fn prepared(job: &mut Job, confirmation: bool, now: u64) {
+    if confirmation {
+        job.status = JobStatus::Suspended;
+        job.suspended_ms = Some(now);
+    } else {
+        job.status = JobStatus::Ready;
+    }
+}
+
+fn prepare_csv(
+    file: &mut ObjFile<'_>,
+    job: &Job,
+    spec: &Spec,
+    manifest: &ManifestSpec,
+    now: u64,
+) -> Result<(), StorageError> {
+    let number = job.number;
+    if !owned_by(file, &manifest.bucket, &job.account, None)? {
+        return finish_failed(
+            file,
+            number,
+            "ManifestBucketNotOwned",
+            "The manifest's bucket does not exist or is not the job's account's",
+        );
+    }
+    let version = match job.manifest_version {
+        Some(version) => version,
+        None => {
+            let which = match manifest.version_id.as_deref() {
+                None => VersionSel::Latest,
+                Some(id) => match version_sel(id) {
+                    Some(which) => which,
+                    None => {
+                        return finish_failed(
+                            file,
+                            number,
+                            "ManifestNotFound",
+                            "The manifest's version id is not valid",
+                        );
+                    }
+                },
+            };
+            let action = match manifest.version_id {
+                Some(_) => "s3:GetObjectVersion",
+                None => "s3:GetObject",
+            };
+            let authz = Authz::load_now(
+                file,
+                &creator(job),
+                vec![manifest.bucket.clone()],
+                vec![(manifest.bucket.clone(), manifest.key.clone(), which)],
+                now,
+            )?;
+            let authz = match version_key(which) {
+                Some(version) => authz.with_keys(&[("s3:VersionId", version)]),
+                None => authz,
+            };
+            if authz
+                .check(action, Resource::Object(&manifest.bucket, &manifest.key))
+                .is_err()
+            {
+                return finish_failed(
+                    file,
+                    number,
+                    "AccessDenied",
+                    "The job's creator may not read the manifest",
+                );
+            }
+            let info = match file.head_object(&manifest.bucket, &manifest.key, which)? {
+                Ok(info) => info,
+                Err(_) => {
+                    return finish_failed(
+                        file,
+                        number,
+                        "ManifestNotFound",
+                        "The manifest object does not exist",
+                    );
+                }
+            };
+            if info.etag().trim_matches('"') != manifest.etag {
+                return finish_failed(
+                    file,
+                    number,
+                    "ManifestETagMismatch",
+                    "The manifest's ETag is not the one the job names",
+                );
+            }
+            if info.attrs.customer_key.is_some()
+                || file.archived_unreadable(info.version, info.storage_class, now)?
+            {
+                return finish_failed(
+                    file,
+                    number,
+                    "ManifestNotReadable",
+                    "The manifest is encrypted with a customer-provided key or archived",
+                );
+            }
+            info.version
+        }
+    };
+    let (bytes, size) = match read_manifest(file, manifest, version, job.cursor, PREPARE_BYTES)? {
+        Ok(read) => read,
+        Err((code, reason)) => return finish_failed(file, number, code, &reason),
+    };
+    let at_end = job.cursor + bytes.len() as u64 >= size;
+    // Whole lines only, unless the manifest ends here.
+    let taken = if at_end {
+        bytes.len()
+    } else {
+        match bytes.iter().rposition(|&byte| byte == b'\n') {
+            Some(last) => last + 1,
+            None => {
+                return finish_failed(
+                    file,
+                    number,
+                    "ManifestLineTooLong",
+                    "A manifest line is longer than 1 MiB",
+                );
+            }
+        }
+    };
+    let lines = bytes[..taken]
+        .split(|&byte| byte == b'\n')
+        .filter(|line| !blank(line))
+        .count() as u64;
+    let (cursor, confirmation) = (job.cursor, spec.confirmation);
+    file.transaction(|tx| {
+        let Some(mut job) = tx.job(number)? else {
+            return Ok(());
+        };
+        if job.status != JobStatus::Preparing || job.cursor != cursor {
+            return Ok(());
+        }
+        job.manifest_version = Some(version);
+        job.total += lines;
+        job.cursor += taken as u64;
+        if at_end {
+            job.cursor = 0;
+            prepared(&mut job, confirmation, now);
+        }
+        tx.put_job(&job)
+    })
+}
+
+/// A page of a generated manifest's listing: the source bucket's current
+/// versions passing the filter become its tasks. Generating one is
+/// authorized as AWS asks for it (s3:PutInventoryConfiguration on the
+/// bucket).
+fn prepare_listing(
+    file: &mut ObjFile<'_>,
+    job: &Job,
+    spec: &Spec,
+    generator: &GeneratorSpec,
+    now: u64,
+) -> Result<ToWrite, StorageError> {
+    let number = job.number;
+    let bucket = &generator.bucket;
+    if !owned_by(
+        file,
+        bucket,
+        &job.account,
+        generator.expected_owner.as_deref(),
+    )? {
+        return finish_failed(
+            file,
+            number,
+            "ManifestBucketNotOwned",
+            "The bucket to list does not exist or is not the job's account's (or the owner expected)",
+        )
+        .map(|()| None);
+    }
+    if let Some(output) = &generator.output
+        && !owned_by(
+            file,
+            &output.bucket,
+            &job.account,
+            output.expected_owner.as_deref(),
+        )?
+    {
+        return finish_failed(
+            file,
+            number,
+            "ManifestBucketNotOwned",
+            "The generated manifest's bucket does not exist or is not the job's account's",
+        )
+        .map(|()| None);
+    }
+    let authz = Authz::load_now(file, &creator(job), vec![bucket.clone()], Vec::new(), now)?;
+    if authz
+        .check("s3:PutInventoryConfiguration", Resource::Bucket(bucket))
+        .is_err()
+    {
+        return finish_failed(
+            file,
+            number,
+            "AccessDenied",
+            "The job's creator may not list the bucket for a manifest",
+        )
+        .map(|()| None);
+    }
+    if job.listing_done {
+        return Ok(match (&generator.output, &job.generated) {
+            (Some(output), None) => Some((
+                job.clone(),
+                output.clone(),
+                bucket.clone(),
+                spec.confirmation,
+            )),
+            _ => {
+                let confirmation = spec.confirmation;
+                file.transaction(|tx| {
+                    if let Some(mut job) = tx.job(number)?
+                        && job.status == JobStatus::Preparing
+                    {
+                        prepared(&mut job, confirmation, now);
+                        tx.put_job(&job)?;
+                    }
+                    Ok(())
+                })?;
+                None
+            }
+        });
+    }
+    let after = job.listed_after.clone();
+    // Only the keys under a prefix filter's prefix are listed.
+    let listing = match file.list_objects(
+        bucket,
+        generator.filter.prefix.as_deref().unwrap_or(""),
+        None,
+        after.as_deref().map(ListAfter::Key),
+        LIST_PAGE,
+    )? {
+        Ok(listing) => listing,
+        Err(_) => {
+            return finish_failed(
+                file,
+                number,
+                "ManifestNotFound",
+                "The bucket cannot be listed",
+            )
+            .map(|()| None);
+        }
+    };
+    let versioning = crate::objects::versioning_of(file, bucket)?;
+    let tasks: Vec<(String, String)> = listing
+        .objects
+        .iter()
+        .filter(|object| object.latest && !object.info.delete_marker)
+        .filter(|object| {
+            generator.filter.passes(
+                &object.key,
+                object.info.size,
+                object.info.mtime_ms,
+                object.info.storage_class,
+            )
+        })
+        .map(|object| {
+            let version = crate::objects::version_header(
+                versioning,
+                object.info.version,
+                object.info.null_version,
+            );
+            (object.key.clone(), version.unwrap_or_default())
+        })
+        .collect();
+    let last = listing.last.as_ref().map(|(key, _)| key.clone());
+    let done = !listing.truncated;
+    file.transaction(|tx| {
+        let Some(mut job) = tx.job(number)? else {
+            return Ok(());
+        };
+        if job.status != JobStatus::Preparing || job.listed_after != after || job.listing_done {
+            return Ok(());
+        }
+        for (key, version_id) in &tasks {
+            tx.add_job_task(&mut job, key, version_id)?;
+        }
+        if last.is_some() {
+            job.listed_after = last;
+        }
+        job.listing_done = done;
+        tx.put_job(&job)
+    })?;
+    Ok(None)
+}
+
+/// Writes a listed generated manifest (`bucket,key,versionId` lines, keys
+/// URL-encoded) to `<prefix>/job-<id>/manifest.csv` of its output bucket,
+/// authorized as the creator's PutObject, then the job moves on.
+async fn write_generated(
+    state: &S3State,
+    job: Job,
+    output: OutputSpec,
+    source: String,
+    confirmation: bool,
+) -> Result<(), String> {
+    let number = job.number;
+    let storage = Arc::clone(&state.storage);
+    let sealed = tokio::task::spawn_blocking({
+        let job = job.clone();
+        move || write_task_list(&storage, &job, &source)
+    })
+    .await
+    .map_err(|err| err.to_string())?
+    .map_err(|err| err.to_string())?;
+    let key = match output.prefix.trim_end_matches('/') {
+        "" => format!("job-{}/manifest.csv", job.id()),
+        prefix => format!("{prefix}/job-{}/manifest.csv", job.id()),
+    };
     let now = now_ms();
     object(state, move |file| {
         let Some(job) = file.job(number)? else {
             return Ok(());
         };
-        let Some(spec) = job_spec(file, &job)? else {
-            return finish_failed(
-                file,
-                number,
-                "InvalidJob",
-                "The job's request cannot be read",
-            );
-        };
-        if !creator_holds(file, &job)? {
-            return finish_failed(file, number, "AccessDenied", CREATOR_GONE);
+        if job.status != JobStatus::Preparing || job.generated.is_some() {
+            return Ok(());
         }
-        let owned = |file: &mut ObjFile<'_>, bucket: &str| -> Result<bool, StorageError> {
-            Ok(file
-                .bucket(bucket)?
-                .is_some_and(|info| info.owner == job.account))
-        };
-        if !owned(file, &spec.manifest.bucket)? {
+        if !owned_by(
+            file,
+            &output.bucket,
+            &job.account,
+            output.expected_owner.as_deref(),
+        )? {
             return finish_failed(
                 file,
                 number,
                 "ManifestBucketNotOwned",
-                "The manifest's bucket does not exist or is not the job's account's",
+                "The generated manifest's bucket does not exist or is not the job's account's",
             );
         }
-        if let Some(report) = &spec.report
-            && !owned(file, &report.bucket)?
+        let (bucket_lock, default) = crate::object_lock::bucket_state(file, &output.bucket)?;
+        let lock = crate::object_lock::new_object_lock(None, bucket_lock, default, now)
+            .ok()
+            .flatten();
+        let authz = Authz::load_now(
+            file,
+            &creator(&job),
+            vec![output.bucket.clone()],
+            Vec::new(),
+            now,
+        )?;
+        if authz
+            .check_storing(
+                "s3:PutObject",
+                Resource::Object(&output.bucket, &key),
+                None,
+                None,
+            )
+            .is_err()
         {
             return finish_failed(
                 file,
                 number,
-                "ReportBucketNotOwned",
-                "The report's bucket does not exist or is not the job's account's",
+                "AccessDenied",
+                "The job's creator may not write the generated manifest",
             );
         }
-        let version = match job.manifest_version {
-            Some(version) => version,
-            None => {
-                let manifest = &spec.manifest;
-                let which = match manifest.version_id.as_deref() {
-                    None => VersionSel::Latest,
-                    Some(id) => match version_sel(id) {
-                        Some(which) => which,
-                        None => {
-                            return finish_failed(
-                                file,
-                                number,
-                                "ManifestNotFound",
-                                "The manifest's version id is not valid",
-                            );
-                        }
-                    },
-                };
-                let action = match manifest.version_id {
-                    Some(_) => "s3:GetObjectVersion",
-                    None => "s3:GetObject",
-                };
-                let authz = Authz::load_now(
-                    file,
-                    &creator(&job),
-                    vec![manifest.bucket.clone()],
-                    vec![(manifest.bucket.clone(), manifest.key.clone(), which)],
-                    now,
-                )?;
-                let authz = match version_key(which) {
-                    Some(version) => authz.with_keys(&[("s3:VersionId", version)]),
-                    None => authz,
-                };
-                if authz
-                    .check(action, Resource::Object(&manifest.bucket, &manifest.key))
-                    .is_err()
-                {
-                    return finish_failed(
-                        file,
-                        number,
-                        "AccessDenied",
-                        "The job's creator may not read the manifest",
-                    );
-                }
-                let info = match file.head_object(&manifest.bucket, &manifest.key, which)? {
-                    Ok(info) => info,
-                    Err(_) => {
-                        return finish_failed(
-                            file,
-                            number,
-                            "ManifestNotFound",
-                            "The manifest object does not exist",
-                        );
-                    }
-                };
-                if info.etag().trim_matches('"') != manifest.etag {
-                    return finish_failed(
-                        file,
-                        number,
-                        "ManifestETagMismatch",
-                        "The manifest's ETag is not the one the job names",
-                    );
-                }
-                if info.attrs.customer_key.is_some()
-                    || file.archived_unreadable(info.version, info.storage_class, now)?
-                {
-                    return finish_failed(
-                        file,
-                        number,
-                        "ManifestNotReadable",
-                        "The manifest is encrypted with a customer-provided key or archived",
-                    );
-                }
-                info.version
-            }
+        file.set_origin(Origin {
+            operation: "PutObject".to_string(),
+            request_id: job.id(),
+            account: Some(job.account.clone()),
+            ..Origin::default()
+        });
+        let versioning = crate::objects::versioning_of(file, &output.bucket)?;
+        let attrs = ObjectAttrs {
+            content_type: Some("text/csv".to_string()),
+            ..ObjectAttrs::default()
         };
-        let (bytes, size) = match read_manifest(file, &spec, version, job.cursor, PREPARE_BYTES)? {
-            Ok(read) => read,
-            Err((code, reason)) => return finish_failed(file, number, code, &reason),
-        };
-        let at_end = job.cursor + bytes.len() as u64 >= size;
-        // Whole lines only, unless the manifest ends here.
-        let taken = if at_end {
-            bytes.len()
-        } else {
-            match bytes.iter().rposition(|&byte| byte == b'\n') {
-                Some(last) => last + 1,
-                None => {
-                    return finish_failed(
-                        file,
-                        number,
-                        "ManifestLineTooLong",
-                        "A manifest line is longer than 1 MiB",
-                    );
-                }
-            }
-        };
-        let lines = bytes[..taken]
-            .split(|&byte| byte == b'\n')
-            .filter(|line| !blank(line))
-            .count() as u64;
-        let (cursor, confirmation) = (job.cursor, spec.confirmation);
-        file.transaction(|tx| {
+        let written = file.transaction(|tx| {
             let Some(mut job) = tx.job(number)? else {
-                return Ok(());
+                return Ok(false);
             };
-            if job.status != JobStatus::Preparing || job.cursor != cursor {
-                return Ok(());
-            }
-            job.manifest_version = Some(version);
-            job.total += lines;
-            job.cursor += taken as u64;
-            if at_end {
-                job.cursor = 0;
-                if confirmation {
-                    job.status = JobStatus::Suspended;
-                    job.suspended_ms = Some(now);
-                } else {
-                    job.status = JobStatus::Ready;
+            match tx.put_object(
+                &output.bucket,
+                &key,
+                &sealed,
+                &attrs,
+                StorageClass::Standard,
+                now,
+                DROP_GRACE_MS,
+            )? {
+                Ok(info) => {
+                    if let Some(lock) = &lock {
+                        tx.set_lock(info.version, lock)?;
+                    }
+                    let version =
+                        crate::objects::version_header(versioning, info.version, info.null_version);
+                    job.generated = Some((
+                        output.bucket.clone(),
+                        key.clone(),
+                        version.unwrap_or_default(),
+                        info.etag(),
+                    ));
+                    prepared(&mut job, confirmation, now);
+                    tx.put_job(&job)?;
+                    Ok(true)
                 }
+                Err(_) => Ok(false),
             }
-            tx.put_job(&job)
-        })
+        })?;
+        if !written {
+            return finish_failed(
+                file,
+                number,
+                "ManifestNotWritten",
+                "The generated manifest could not be written",
+            );
+        }
+        Ok(())
     })
     .await
+}
+
+/// A generated manifest's lines as a body.
+fn write_task_list(
+    storage: &truthdb_core::storage::Storage,
+    job: &Job,
+    bucket: &str,
+) -> Result<SealedBody, StorageError> {
+    let now = now_ms();
+    let mut writer = BodyWriter::begin(storage, now)?;
+    let mut from = 0;
+    loop {
+        let page = ObjFile::new(&mut storage.lock()).job_tasks(job.number, from, RESULT_PAGE)?;
+        let Some(&(last, _, _)) = page.last() else {
+            break;
+        };
+        from = last + 1;
+        let mut text = String::new();
+        for (_, key, version_id) in &page {
+            let key = percent_encoding::utf8_percent_encode(key, REPORT_KEY).to_string();
+            text.push_str(&format!("{bucket},{key},{version_id}\n"));
+        }
+        writer.write(storage, text.as_bytes(), now)?;
+    }
+    writer.finish(storage, now)
 }
 
 /// Fails job `number` in its own transaction (it reports as any ending job).
@@ -835,7 +1187,8 @@ fn cut(text: &str, max: usize) -> String {
     text[..end].to_string()
 }
 
-/// Runs up to [`TASKS_PER_STEP`] tasks of Active job `number`.
+/// Runs up to [`TASKS_PER_STEP`] tasks of Active job `number`: the lines
+/// of its CSV manifest, or the objects its generated one lists.
 async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
     let now = now_ms();
     let delays = state.restore_delays;
@@ -857,18 +1210,6 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
         if !creator_holds(file, &job)? {
             return finish_failed(file, number, "AccessDenied", CREATOR_GONE);
         }
-        let Some(version) = job.manifest_version else {
-            return finish_failed(
-                file,
-                number,
-                "InvalidJob",
-                "The job's manifest was never prepared",
-            );
-        };
-        let (bytes, size) = match read_manifest(file, &spec, version, job.cursor, TASK_BYTES)? {
-            Ok(read) => read,
-            Err((code, reason)) => return finish_failed(file, number, code, &reason),
-        };
         file.set_origin(Origin {
             operation: match spec.operation {
                 Operation::Copy(_) => "CopyObject",
@@ -883,152 +1224,232 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
             account: Some(job.account.clone()),
             ..Origin::default()
         });
-        let who = creator(&job);
-        let mut at = 0usize;
-        let mut ran = 0;
-        while ran < TASKS_PER_STEP {
-            let start = job.cursor + at as u64;
-            if start >= size {
-                // Every line done: the job completes (a manifest of none, at once).
-                return file.transaction(|tx| {
-                    if let Some(mut job) = tx.job(number)?
-                        && job.status == JobStatus::Active
-                        && job.cursor == start
-                    {
-                        job.status = JobStatus::Completing;
-                        tx.put_job(&job)?;
-                    }
-                    Ok(())
-                });
-            }
-            let rest = &bytes[at..];
-            let (line, next) = match rest.iter().position(|&byte| byte == b'\n') {
-                Some(end) => (&rest[..end], at + end + 1),
-                None if start + rest.len() as u64 >= size => (rest, at + rest.len()),
-                // The rest of the line is past what was read: the next step.
-                None if at > 0 => break,
-                None => {
-                    return finish_failed(
-                        file,
-                        number,
-                        "ManifestLineTooLong",
-                        "A manifest line is longer than 64 KiB",
-                    );
-                }
-            };
-            at = next;
-            let end = job.cursor + at as u64;
-            let text = String::from_utf8_lossy(line);
-            let text = text.trim_end_matches('\r');
-            // The same test as Preparing's count.
-            if blank(line) {
-                // A blank line is no task: only the place moves.
-                if moved(file.transaction(|tx| advance(tx, number, start, end, None)))? {
-                    return Ok(());
-                }
-                continue;
-            }
-            ran += 1;
-            let (bucket, key, version_id, outcome) = match parse_line(text, &spec.manifest.fields) {
-                Err(why) => (
-                    cut(text, MAX_RESULT_TEXT),
-                    String::new(),
-                    String::new(),
-                    Err(S3Error::invalid_request(why)),
-                ),
-                Ok((bucket, key, version)) => {
-                    // What cannot be read of this object fails this task,
-                    // not the job.
-                    let planned = plan(
-                        file,
-                        delays,
-                        &who,
-                        &spec.operation,
-                        &bucket,
-                        &key,
-                        version.as_deref(),
-                        now,
-                    )
-                    .unwrap_or_else(|err| Err(S3Error::internal(err.to_string())));
-                    (bucket, key, version.unwrap_or_default(), planned)
-                }
-            };
-            let report = spec.report.as_ref();
-            let done = file.transaction(|tx| {
-                let outcome = match outcome {
-                    Err(err) => Err(err),
-                    Ok(Planned::Tags(which, tags)) => tx
-                        .set_tags(&bucket, &key, which, tags, now)?
-                        .map(|_| ())
-                        .map_err(|err| object_error(err, &bucket, &key)),
-                    Ok(Planned::Restore(which, request)) => tx
-                        .restore_object(&bucket, &key, which, request, now)?
-                        .map(|_| ())
-                        .map_err(|err| object_error(err, &bucket, &key)),
-                    Ok(Planned::Retention(which, change, bypass)) => tx
-                        .put_retention(&bucket, &key, which, change, bypass, now)?
-                        .map(|_| ())
-                        .map_err(|err| object_error(err, &bucket, &key)),
-                    Ok(Planned::LegalHold(which, on)) => tx
-                        .put_legal_hold(&bucket, &key, which, on)?
-                        .map(|_| ())
-                        .map_err(|err| object_error(err, &bucket, &key)),
-                    Ok(Planned::Copy {
-                        source,
-                        bucket: to,
-                        key: target,
-                        attrs,
-                        class,
-                        lock,
-                    }) => {
-                        match tx.copy_object(
-                            &to,
-                            &target,
-                            &source,
-                            &attrs,
-                            class,
-                            now,
-                            DROP_GRACE_MS,
-                        )? {
-                            Ok(copied) => {
-                                if let Some(lock) = &lock {
-                                    tx.set_lock(copied.version, lock)?;
-                                }
-                                Ok(())
-                            }
-                            Err(err) => Err(object_error(err, &to, &target)),
-                        }
-                    }
-                };
-                let result = JobResult {
-                    bucket: cut(&bucket, MAX_RESULT_TEXT),
-                    key: cut(&key, MAX_RESULT_KEY),
-                    version_id: cut(&version_id, MAX_RESULT_TEXT),
-                    succeeded: outcome.is_ok(),
-                    http_status: outcome.as_ref().map_or_else(|err| err.status, |()| 200),
-                    error_code: outcome
-                        .as_ref()
-                        .err()
-                        .map(|err| err.code.to_string())
-                        .unwrap_or_default(),
-                    message: cut(
-                        &outcome
-                            .as_ref()
-                            .err()
-                            .map_or_else(|| "Successful".to_string(), |err| err.message.clone()),
-                        MAX_RESULT_TEXT,
-                    ),
-                };
-                let keep = report.is_some_and(|report| !report.failed_only || !result.succeeded);
-                advance(tx, number, start, end, Some((result, keep)))
-            });
-            if moved(done)? {
-                return Ok(());
-            }
+        let task = Task {
+            number,
+            now,
+            delays,
+            who: creator(&job),
+            spec: &spec,
+        };
+        match (&spec.manifest, &spec.generator) {
+            (Some(manifest), _) => run_lines(file, &job, &task, manifest),
+            (None, Some(generator)) => run_listed(file, &job, &task, &generator.bucket),
+            (None, None) => finish_failed(file, number, "InvalidJob", "The job names no manifest"),
+        }
+    })
+    .await
+}
+
+/// What every task of a step shares.
+struct Task<'s> {
+    number: u64,
+    now: u64,
+    delays: crate::restore::RestoreDelays,
+    who: Principal,
+    spec: &'s Spec,
+}
+
+/// Completes job `number` when it is still Active at `cursor` (its last
+/// task done).
+fn complete(file: &mut ObjFile<'_>, number: u64, cursor: u64) -> Result<(), StorageError> {
+    file.transaction(|tx| {
+        if let Some(mut job) = tx.job(number)?
+            && job.status == JobStatus::Active
+            && job.cursor == cursor
+        {
+            job.status = JobStatus::Completing;
+            tx.put_job(&job)?;
         }
         Ok(())
     })
-    .await
+}
+
+/// A step of a CSV manifest's lines (the job's cursor a byte offset).
+fn run_lines(
+    file: &mut ObjFile<'_>,
+    job: &Job,
+    task: &Task<'_>,
+    manifest: &ManifestSpec,
+) -> Result<(), StorageError> {
+    let number = job.number;
+    let Some(version) = job.manifest_version else {
+        return finish_failed(
+            file,
+            number,
+            "InvalidJob",
+            "The job's manifest was never prepared",
+        );
+    };
+    let (bytes, size) = match read_manifest(file, manifest, version, job.cursor, TASK_BYTES)? {
+        Ok(read) => read,
+        Err((code, reason)) => return finish_failed(file, number, code, &reason),
+    };
+    let mut at = 0usize;
+    let mut ran = 0;
+    while ran < TASKS_PER_STEP {
+        let start = job.cursor + at as u64;
+        if start >= size {
+            // Every line done: the job completes (a manifest of none, at once).
+            return complete(file, number, start);
+        }
+        let rest = &bytes[at..];
+        let (line, next) = match rest.iter().position(|&byte| byte == b'\n') {
+            Some(end) => (&rest[..end], at + end + 1),
+            None if start + rest.len() as u64 >= size => (rest, at + rest.len()),
+            // The rest of the line is past what was read: the next step.
+            None if at > 0 => break,
+            None => {
+                return finish_failed(
+                    file,
+                    number,
+                    "ManifestLineTooLong",
+                    "A manifest line is longer than 64 KiB",
+                );
+            }
+        };
+        at = next;
+        let end = job.cursor + at as u64;
+        let text = String::from_utf8_lossy(line);
+        let text = text.trim_end_matches('\r');
+        // The same test as Preparing's count.
+        if blank(line) {
+            // A blank line is no task: only the place moves.
+            if moved(file.transaction(|tx| advance(tx, number, start, end, None)))? {
+                return Ok(());
+            }
+            continue;
+        }
+        ran += 1;
+        let object = parse_line(text, &manifest.fields).map_err(|why| (text.to_string(), why));
+        if run_one(file, task, start, end, object)? {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// A step of a generated manifest's objects (the job's cursor a task
+/// number).
+fn run_listed(
+    file: &mut ObjFile<'_>,
+    job: &Job,
+    task: &Task<'_>,
+    bucket: &str,
+) -> Result<(), StorageError> {
+    if job.cursor >= job.total {
+        return complete(file, job.number, job.cursor);
+    }
+    for (seq, key, version_id) in file.job_tasks(job.number, job.cursor, TASKS_PER_STEP)? {
+        let version = (!version_id.is_empty()).then_some(version_id);
+        if run_one(
+            file,
+            task,
+            seq,
+            seq + 1,
+            Ok((bucket.to_string(), key, version)),
+        )? {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+/// Runs one task (from `start` to `end` of the job's cursor) on `object`
+/// (a bucket, key and version; or a line that names none, and why): its
+/// change, its result and the job's place, one transaction. Whether the
+/// job moved meanwhile (the step then ends).
+fn run_one(
+    file: &mut ObjFile<'_>,
+    task: &Task<'_>,
+    start: u64,
+    end: u64,
+    object: Result<(String, String, Option<String>), (String, String)>,
+) -> Result<bool, StorageError> {
+    let (number, now, spec) = (task.number, task.now, task.spec);
+    let (bucket, key, version_id, outcome) = match object {
+        Err((text, why)) => (
+            cut(&text, MAX_RESULT_TEXT),
+            String::new(),
+            String::new(),
+            Err(S3Error::invalid_request(why)),
+        ),
+        Ok((bucket, key, version)) => {
+            // What cannot be read of this object fails this task, not the
+            // job.
+            let planned = plan(
+                file,
+                task.delays,
+                &task.who,
+                &spec.operation,
+                &bucket,
+                &key,
+                version.as_deref(),
+                now,
+            )
+            .unwrap_or_else(|err| Err(S3Error::internal(err.to_string())));
+            (bucket, key, version.unwrap_or_default(), planned)
+        }
+    };
+    let report = spec.report.as_ref();
+    let done = file.transaction(|tx| {
+        let outcome = match outcome {
+            Err(err) => Err(err),
+            Ok(Planned::Tags(which, tags)) => tx
+                .set_tags(&bucket, &key, which, tags, now)?
+                .map(|_| ())
+                .map_err(|err| object_error(err, &bucket, &key)),
+            Ok(Planned::Restore(which, request)) => tx
+                .restore_object(&bucket, &key, which, request, now)?
+                .map(|_| ())
+                .map_err(|err| object_error(err, &bucket, &key)),
+            Ok(Planned::Retention(which, change, bypass)) => tx
+                .put_retention(&bucket, &key, which, change, bypass, now)?
+                .map(|_| ())
+                .map_err(|err| object_error(err, &bucket, &key)),
+            Ok(Planned::LegalHold(which, on)) => tx
+                .put_legal_hold(&bucket, &key, which, on)?
+                .map(|_| ())
+                .map_err(|err| object_error(err, &bucket, &key)),
+            Ok(Planned::Copy {
+                source,
+                bucket: to,
+                key: target,
+                attrs,
+                class,
+                lock,
+            }) => match tx.copy_object(&to, &target, &source, &attrs, class, now, DROP_GRACE_MS)? {
+                Ok(copied) => {
+                    if let Some(lock) = &lock {
+                        tx.set_lock(copied.version, lock)?;
+                    }
+                    Ok(())
+                }
+                Err(err) => Err(object_error(err, &to, &target)),
+            },
+        };
+        let result = JobResult {
+            bucket: cut(&bucket, MAX_RESULT_TEXT),
+            key: cut(&key, MAX_RESULT_KEY),
+            version_id: cut(&version_id, MAX_RESULT_TEXT),
+            succeeded: outcome.is_ok(),
+            http_status: outcome.as_ref().map_or_else(|err| err.status, |()| 200),
+            error_code: outcome
+                .as_ref()
+                .err()
+                .map(|err| err.code.to_string())
+                .unwrap_or_default(),
+            message: cut(
+                &outcome
+                    .as_ref()
+                    .err()
+                    .map_or_else(|| "Successful".to_string(), |err| err.message.clone()),
+                MAX_RESULT_TEXT,
+            ),
+        };
+        let keep = report.is_some_and(|report| !report.failed_only || !result.succeeded);
+        advance(tx, number, start, end, Some((result, keep)))
+    });
+    moved(done)
 }
 
 /// Whether a task's transaction found its job moved (and so rolled back).
@@ -1235,12 +1656,6 @@ fn write_report(
         "" => format!("job-{}", job.id()),
         prefix => format!("{prefix}/job-{}", job.id()),
     };
-    const ENCODE: &percent_encoding::AsciiSet = &percent_encoding::NON_ALPHANUMERIC
-        .remove(b'-')
-        .remove(b'_')
-        .remove(b'.')
-        .remove(b'~')
-        .remove(b'/');
     let mut objects = Vec::new();
     let mut listed = Vec::new();
     for (succeeded, status) in [(true, "succeeded"), (false, "failed")] {
@@ -1258,7 +1673,8 @@ fn write_report(
                 .iter()
                 .filter(|(_, result)| result.succeeded == succeeded)
             {
-                let key = percent_encoding::utf8_percent_encode(&result.key, ENCODE).to_string();
+                let key =
+                    percent_encoding::utf8_percent_encode(&result.key, REPORT_KEY).to_string();
                 text.push_str(&format!(
                     "{},{},{},{status},{},{},{}\n",
                     csv(&result.bucket),

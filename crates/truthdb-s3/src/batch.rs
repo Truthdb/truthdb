@@ -112,12 +112,236 @@ pub(crate) struct ReportSpec {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Spec {
     pub operation: Operation,
-    pub manifest: ManifestSpec,
+    /// Where its objects come from: a CSV manifest, or a listing of a
+    /// bucket (exactly one).
+    pub manifest: Option<ManifestSpec>,
+    pub generator: Option<GeneratorSpec>,
     /// `None`: no report (Enabled false).
     pub report: Option<ReportSpec>,
     pub confirmation: bool,
     pub priority: u32,
     pub token: String,
+}
+
+/// A generated manifest (S3JobManifestGenerator): the current versions of
+/// `bucket`'s objects that pass the filter, written out to `output` when
+/// asked.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GeneratorSpec {
+    pub bucket: String,
+    pub expected_owner: Option<String>,
+    pub output: Option<OutputSpec>,
+    pub filter: Filter,
+}
+
+/// Where a generated manifest is written (as `<prefix>/job-<id>/manifest.csv`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutputSpec {
+    pub bucket: String,
+    pub prefix: String,
+    pub expected_owner: Option<String>,
+}
+
+/// What a generated manifest keeps: an object passing every condition
+/// given (times against its last-modified time, sizes and times strictly).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct Filter {
+    pub created_after_ms: Option<u64>,
+    pub created_before_ms: Option<u64>,
+    pub prefix: Option<String>,
+    pub substring: Option<String>,
+    pub suffix: Option<String>,
+    pub larger_than: Option<u64>,
+    pub smaller_than: Option<u64>,
+    pub classes: Vec<StorageClass>,
+}
+
+impl Filter {
+    pub(crate) fn passes(&self, key: &str, size: u64, mtime_ms: u64, class: StorageClass) -> bool {
+        self.created_after_ms.is_none_or(|after| mtime_ms > after)
+            && self
+                .created_before_ms
+                .is_none_or(|before| mtime_ms < before)
+            && self
+                .prefix
+                .as_deref()
+                .is_none_or(|prefix| key.starts_with(prefix))
+            && self
+                .substring
+                .as_deref()
+                .is_none_or(|part| key.contains(part))
+            && self
+                .suffix
+                .as_deref()
+                .is_none_or(|suffix| key.ends_with(suffix))
+            && self.larger_than.is_none_or(|bound| size > bound)
+            && self.smaller_than.is_none_or(|bound| size < bound)
+            && (self.classes.is_empty() || self.classes.contains(&class))
+    }
+}
+
+fn account_id(text: &str) -> Result<String, S3Error> {
+    if text.len() == 12 && text.bytes().all(|byte| byte.is_ascii_digit()) {
+        Ok(text.to_string())
+    } else {
+        Err(invalid("An expected bucket owner is a 12-digit account id"))
+    }
+}
+
+/// A list of one string (`<member>`), as KeyNameConstraint's lists are.
+fn one_member(element: &Element, what: &str) -> Result<String, S3Error> {
+    element.only(&["member"])?;
+    let members: Vec<&Element> = element.all("member").collect();
+    match members.as_slice() {
+        [member] if !member.text.is_empty() && member.text.len() <= 1024 => Ok(member.text.clone()),
+        _ => Err(invalid(format!(
+            "{what} takes one string of 1 to 1024 characters"
+        ))),
+    }
+}
+
+fn generator(element: &Element) -> Result<GeneratorSpec, S3Error> {
+    element.only(&["S3JobManifestGenerator"])?;
+    let generator = element
+        .one("S3JobManifestGenerator")?
+        .ok_or_else(|| invalid("A ManifestGenerator is an S3JobManifestGenerator"))?;
+    generator.only(&[
+        "ExpectedBucketOwner",
+        "SourceBucket",
+        "ManifestOutputLocation",
+        "Filter",
+        "EnableManifestOutput",
+    ])?;
+    let bucket = bucket_arn(
+        generator
+            .text_of("SourceBucket")?
+            .ok_or_else(|| invalid("SourceBucket is required"))?,
+        "SourceBucket",
+    )?;
+    let expected_owner = generator
+        .text_of("ExpectedBucketOwner")?
+        .map(account_id)
+        .transpose()?;
+    let enabled = flag(
+        generator
+            .text_of("EnableManifestOutput")?
+            .ok_or_else(|| invalid("EnableManifestOutput is required"))?,
+    )?;
+    let output = match (enabled, generator.one("ManifestOutputLocation")?) {
+        (false, _) => None,
+        (true, None) => {
+            return Err(invalid(
+                "EnableManifestOutput needs a ManifestOutputLocation",
+            ));
+        }
+        (true, Some(location)) => {
+            location.only(&[
+                "ExpectedManifestBucketOwner",
+                "Bucket",
+                "ManifestEncryption",
+                "ManifestPrefix",
+                "ManifestFormat",
+            ])?;
+            if location.one("ManifestEncryption")?.is_some() {
+                return Err(S3Error::not_implemented(
+                    "ManifestEncryption of a generated manifest",
+                ));
+            }
+            if location.text_of("ManifestFormat")? != Some("S3InventoryReport_CSV_20211130") {
+                return Err(invalid(
+                    "A generated manifest's ManifestFormat is S3InventoryReport_CSV_20211130",
+                ));
+            }
+            let prefix = location.text_of("ManifestPrefix")?.unwrap_or("");
+            if prefix.len() > 512 {
+                return Err(invalid("ManifestPrefix is at most 512 bytes"));
+            }
+            Some(OutputSpec {
+                bucket: bucket_arn(
+                    location
+                        .text_of("Bucket")?
+                        .ok_or_else(|| invalid("The ManifestOutputLocation needs its Bucket"))?,
+                    "The ManifestOutputLocation Bucket",
+                )?,
+                prefix: prefix.to_string(),
+                expected_owner: location
+                    .text_of("ExpectedManifestBucketOwner")?
+                    .map(account_id)
+                    .transpose()?,
+            })
+        }
+    };
+    let mut filter = Filter::default();
+    if let Some(given) = generator.one("Filter")? {
+        const OFFERED: [&str; 6] = [
+            "CreatedAfter",
+            "CreatedBefore",
+            "KeyNameConstraint",
+            "ObjectSizeGreaterThanBytes",
+            "ObjectSizeLessThanBytes",
+            "MatchAnyStorageClass",
+        ];
+        if let Some(other) = given
+            .children
+            .iter()
+            .find(|child| !OFFERED.contains(&child.name.as_str()))
+        {
+            return Err(S3Error::not_implemented(format!(
+                "{} in a manifest generator's filter",
+                other.name
+            )));
+        }
+        let date = |name: &str| -> Result<Option<u64>, S3Error> {
+            given
+                .text_of(name)?
+                .map(|text| {
+                    truthdb_iam::parse_date_ms(text)
+                        .and_then(|ms| u64::try_from(ms).ok())
+                        .ok_or_else(|| invalid(format!("{name} is not a valid date")))
+                })
+                .transpose()
+        };
+        let size = |name: &str| -> Result<Option<u64>, S3Error> {
+            given
+                .text_of(name)?
+                .map(|text| {
+                    text.parse::<u64>()
+                        .map_err(|_| invalid(format!("{name} is a whole number")))
+                })
+                .transpose()
+        };
+        filter.created_after_ms = date("CreatedAfter")?;
+        filter.created_before_ms = date("CreatedBefore")?;
+        filter.larger_than = size("ObjectSizeGreaterThanBytes")?;
+        filter.smaller_than = size("ObjectSizeLessThanBytes")?;
+        if let Some(names) = given.one("KeyNameConstraint")? {
+            names.only(&["MatchAnyPrefix", "MatchAnySubstring", "MatchAnySuffix"])?;
+            let constraint = |name: &str| -> Result<Option<String>, S3Error> {
+                names
+                    .one(name)?
+                    .map(|list| one_member(list, name))
+                    .transpose()
+            };
+            filter.prefix = constraint("MatchAnyPrefix")?;
+            filter.substring = constraint("MatchAnySubstring")?;
+            filter.suffix = constraint("MatchAnySuffix")?;
+        }
+        if let Some(classes) = given.one("MatchAnyStorageClass")? {
+            classes.only(&["member"])?;
+            for member in classes.all("member") {
+                filter.classes.push(
+                    StorageClass::parse(&member.text)
+                        .ok_or_else(|| invalid("The storage class you specified is not valid"))?,
+                );
+            }
+        }
+    }
+    Ok(GeneratorSpec {
+        bucket,
+        expected_owner,
+        output,
+        filter,
+    })
 }
 
 fn invalid(message: impl Into<String>) -> S3Error {
@@ -182,11 +406,6 @@ pub(crate) fn spec(request: &Element) -> Result<Spec, S3Error> {
         "Tags",
         "ManifestGenerator",
     ])?;
-    if request.one("ManifestGenerator")?.is_some() {
-        return Err(S3Error::not_implemented(
-            "A job made from a ManifestGenerator",
-        ));
-    }
     let token = request
         .text_of("ClientRequestToken")?
         .ok_or_else(|| invalid("ClientRequestToken is required"))?;
@@ -230,11 +449,16 @@ pub(crate) fn spec(request: &Element) -> Result<Spec, S3Error> {
             .one("Operation")?
             .ok_or_else(|| invalid("Operation is required"))?,
     )?;
-    let manifest = manifest(
-        request
-            .one("Manifest")?
-            .ok_or_else(|| invalid("Manifest is required"))?,
-    )?;
+    let (manifest, generator) = match (request.one("Manifest")?, request.one("ManifestGenerator")?)
+    {
+        (Some(given), None) => (Some(manifest(given)?), None),
+        (None, Some(given)) => (None, Some(generator(given)?)),
+        _ => {
+            return Err(invalid(
+                "A job has either a Manifest or a ManifestGenerator, not both",
+            ));
+        }
+    };
     let report = report(
         request
             .one("Report")?
@@ -243,6 +467,7 @@ pub(crate) fn spec(request: &Element) -> Result<Spec, S3Error> {
     Ok(Spec {
         operation,
         manifest,
+        generator,
         report,
         confirmation,
         priority,
@@ -863,6 +1088,20 @@ async fn describe(state: &S3State, account: &str, id: &str) -> Result<Response<B
         }
         out.push_str("</FailureReasons>");
     }
+    if let Some((bucket, key, version_id, etag)) = &job.generated {
+        let version = match version_id.as_str() {
+            "" => String::new(),
+            id => format!("<ObjectVersionId>{}</ObjectVersionId>", escape(id)),
+        };
+        out.push_str(&format!(
+            "<GeneratedManifestDescriptor><Format>S3InventoryReport_CSV_20211130</Format>\
+             <Location><ObjectArn>arn:aws:s3:::{}/{}</ObjectArn>{version}<ETag>{}</ETag></Location>\
+             </GeneratedManifestDescriptor>",
+            escape(bucket),
+            escape(key),
+            escape(etag)
+        ));
+    }
     out.push_str(&format!(
         "<JobArn>arn:aws:s3:{}:{}:job/{}</JobArn><JobId>{}</JobId>",
         escape(&state.region),
@@ -870,7 +1109,7 @@ async fn describe(state: &S3State, account: &str, id: &str) -> Result<Response<B
         job.id(),
         job.id()
     ));
-    for name in ["Manifest", "Operation"] {
+    for name in ["Manifest", "ManifestGenerator", "Operation"] {
         if let Some(element) = request.one(name)? {
             render(element, &mut out);
         }
@@ -1134,11 +1373,12 @@ mod tests {
             spec.operation,
             Operation::PutTagging(vec![("k".into(), "v".into())])
         );
-        assert_eq!(spec.manifest.bucket, "src");
-        assert_eq!(spec.manifest.key, "lists/m.csv");
-        assert_eq!(spec.manifest.etag, "abc", "quotes dropped");
+        let manifest = spec.manifest.as_ref().unwrap();
+        assert_eq!(manifest.bucket, "src");
+        assert_eq!(manifest.key, "lists/m.csv");
+        assert_eq!(manifest.etag, "abc", "quotes dropped");
         assert_eq!(
-            spec.manifest.fields,
+            manifest.fields,
             [Field::Bucket, Field::Key, Field::VersionId]
         );
         assert_eq!(
