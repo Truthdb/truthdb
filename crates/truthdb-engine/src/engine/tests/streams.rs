@@ -639,6 +639,28 @@ fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
         lone_connections.load(std::sync::atomic::Ordering::SeqCst),
         1
     );
+    // A POST that gets no answer fails at its timeout (shortened here) and
+    // waits its backoff, freeing its slot.
+    let mut posts =
+        crate::engine::WebhookPosts::with_timeout(std::time::Duration::from_millis(300));
+    let tried = |engine: &Engine| {
+        engine
+            .streams(|file| file.webhooks())
+            .unwrap()
+            .into_iter()
+            .find(|webhook| webhook.topic == "lone")
+            .unwrap()
+    };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    while tried(&engine).partitions[0].attempts == 0 && std::time::Instant::now() < deadline {
+        round += 1;
+        engine
+            .webhook_pump(&runtime, &poster, &mut posts, round)
+            .unwrap();
+    }
+    let lone = tried(&engine);
+    assert_eq!(lone.partitions[0].attempts, 1);
+    assert_eq!(lone.last_error, "no answer in time");
     drop(engine);
     let _ = std::fs::remove_file(path);
 }

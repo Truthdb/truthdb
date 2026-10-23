@@ -19,31 +19,65 @@ use super::{Engine, EngineError};
 /// POSTs in flight at most (one per webhook partition), and at most to one
 /// endpoint (host and port): an endpoint that hangs holds no more slots than
 /// that, however many topics post to it.
-const MAX_IN_FLIGHT: usize = 64;
+const MAX_IN_FLIGHT: usize = 256;
 const MAX_IN_FLIGHT_PER_ENDPOINT: usize = 8;
+/// How long a POST may take, connecting included: a slot that an endpoint
+/// that does not answer holds is free again after it (and the record waits
+/// its backoff, so others take the slot), whatever fills the slots.
+const POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
 /// How long a pump waits for a POST in flight to finish.
 const WAIT_FOR_ONE: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// The POSTs in flight, and the webhook partitions they are of: a
 /// partition has one at a time, so its records go out in order.
-#[derive(Default)]
 pub(crate) struct WebhookPosts {
     posts: tokio::task::JoinSet<Result<(), String>>,
     of: HashMap<tokio::task::Id, Delivery>,
     busy: HashSet<(u32, u32)>,
     /// POSTs in flight to each endpoint.
     to: HashMap<String, usize>,
+    timeout: std::time::Duration,
 }
 
-/// The endpoint (host and port) a URL posts to.
+impl Default for WebhookPosts {
+    fn default() -> Self {
+        WebhookPosts::with_timeout(POST_TIMEOUT)
+    }
+}
+
+impl WebhookPosts {
+    /// With POSTs given `timeout` each (a test's shorter one).
+    pub(crate) fn with_timeout(timeout: std::time::Duration) -> Self {
+        WebhookPosts {
+            posts: tokio::task::JoinSet::new(),
+            of: HashMap::new(),
+            busy: HashSet::new(),
+            to: HashMap::new(),
+            timeout,
+        }
+    }
+}
+
+/// The endpoint a URL posts to: its host (lowercased, without a final dot)
+/// and port (the scheme's when none is given), whatever user part or
+/// spelling the URL has.
 fn endpoint(url: &str) -> String {
-    truthdb_s3client::post_target(url)
-        .ok()
-        .and_then(|uri| {
-            uri.authority()
-                .map(|authority| authority.as_str().to_ascii_lowercase())
-        })
+    let Ok(uri) = truthdb_s3client::post_target(url) else {
+        return String::new();
+    };
+    let host = uri
+        .host()
         .unwrap_or_default()
+        .trim_end_matches('.')
+        .to_ascii_lowercase();
+    let port = uri
+        .port_u16()
+        .unwrap_or(if uri.scheme_str() == Some("https") {
+            443
+        } else {
+            80
+        });
+    format!("{host}:{port}")
 }
 
 /// The signature header's value for `body` posted as `delivery` at `secs`.
@@ -105,9 +139,15 @@ impl Engine {
             for delivery in starting {
                 let (poster, sent) = (Arc::clone(poster), delivery.clone());
                 // On the thread's runtime (this is outside it).
-                let task = posts
-                    .posts
-                    .spawn_on(async move { post(&poster, &sent).await }, runtime.handle());
+                let timeout = posts.timeout;
+                let task = posts.posts.spawn_on(
+                    async move {
+                        tokio::time::timeout(timeout, post(&poster, &sent))
+                            .await
+                            .unwrap_or_else(|_| Err("no answer in time".to_string()))
+                    },
+                    runtime.handle(),
+                );
                 posts.busy.insert((delivery.topic_id, delivery.partition));
                 *posts.to.entry(endpoint(&delivery.url)).or_default() += 1;
                 posts.of.insert(task.id(), delivery);
@@ -211,6 +251,22 @@ mod tests {
         assert_ne!(
             signature("key", 1, "t/0/3", b"{}"),
             signature("key", 1, "t/0/2", b"{}")
+        );
+    }
+
+    #[test]
+    fn an_endpoint_is_its_host_and_port_however_written() {
+        for url in [
+            "http://Hooks.Example/x",
+            "http://hooks.example:80/y",
+            "http://user@hooks.example./z",
+        ] {
+            assert_eq!(endpoint(url), "hooks.example:80", "{url}");
+        }
+        assert_eq!(endpoint("https://hooks.example/x"), "hooks.example:443");
+        assert_eq!(
+            endpoint("http://hooks.example:8080/x"),
+            "hooks.example:8080"
         );
     }
 }
