@@ -727,6 +727,10 @@ fn plan(
         && copy.tags.is_none()
         && copy.class == source.storage_class
         && (copy.bucket.as_str(), target.as_str()) == (bucket, key)
+        // As CopyObject: an older version copied onto its key restores it.
+        && file
+            .head_object(bucket, key, VersionSel::Latest)?
+            .is_ok_and(|current| current.version == source.version)
     {
         return Ok(Err(S3Error::invalid_request(
             "This copy request is illegal because it is trying to copy an object to itself without changing the object's metadata, storage class, website redirect location or encryption attributes.",

@@ -9862,6 +9862,37 @@ fn batch_jobs_tag_and_copy_what_a_manifest_lists_once_across_a_crash() {
             .0,
         200
     );
+    // A copy of an older version onto its own key restores it, as
+    // CopyObject does.
+    let put_version = |body: &[u8]| {
+        let (head, (status, _)) = call(&server, "PUT", "/src/v", "", body);
+        assert_eq!(status, 200);
+        response_header(&head, "x-amz-version-id").expect("a version id")
+    };
+    assert_eq!(
+        call(&server, "PUT", "/src", "versioning", enabled.as_bytes())
+            .1
+            .0,
+        200
+    );
+    let old_version = put_version(b"one");
+    put_version(b"two");
+    let etag = put_manifest(&server, "restore.csv", &format!("src,v,{old_version}\n"));
+    let restore =
+        "<S3PutObjectCopy><TargetResource>arn:aws:s3:::src</TargetResource></S3PutObjectCopy>";
+    let body = create_job_body("restore-1", restore, "lists/restore.csv", &etag, "").replace(
+        "<member>Key</member></Fields>",
+        "<member>Key</member><member>VersionId</member></Fields>",
+    );
+    let (_, (_, answer)) = call(&server, "POST", "/v20180820/jobs", "", body.as_bytes());
+    let restored = xml_value(&answer, "JobId");
+    let described = wait_for(&server, &restored, &["Complete"]);
+    assert_eq!(
+        xml_value(&described, "NumberOfTasksSucceeded"),
+        "1",
+        "{described}"
+    );
+    assert_eq!(call(&server, "GET", "/src/v", "", b"").1.1, "one");
     let lines: String = (0..3000)
         .map(|n| format!("src,{}\n", ["a", "b"][n % 2]))
         .collect();
@@ -9915,7 +9946,7 @@ fn batch_jobs_tag_and_copy_what_a_manifest_lists_once_across_a_crash() {
         server.native_port,
         "SELECT job_id, status, succeeded_tasks, failed_tasks FROM sys.dm_s3_batch_jobs",
     );
-    assert_eq!(rows.len(), 5);
+    assert_eq!(rows.len(), 6);
     assert!(
         rows.contains(&vec![
             job.clone(),
