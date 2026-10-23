@@ -671,12 +671,28 @@ fn plan(
         }
         Operation::Copy(copy) => copy,
     };
+    // A CopyObject's keys: its source, the class and the metadata
+    // directive, on both its checks (the source's read also keeps the
+    // source's version id; the target's write has none).
+    let mut source_id = format!("{bucket}/{key}");
+    if let Some(version) = version_key(which) {
+        source_id.push_str(&format!("?versionId={version}"));
+    }
+    let directive = match copy.metadata {
+        Some(_) => "REPLACE",
+        None => "COPY",
+    };
+    let copy_keys = [
+        ("s3:x-amz-copy-source", source_id),
+        ("s3:x-amz-storage-class", copy.class.as_str().to_string()),
+        ("s3:x-amz-metadata-directive", directive.to_string()),
+    ];
     let read = if versioned {
         "s3:GetObjectVersion"
     } else {
         "s3:GetObject"
     };
-    if let Err(err) = authz.check(read, object) {
+    if let Err(err) = authz.with_keys(&copy_keys).check(read, object) {
         return Ok(Err(err));
     }
     let source = match file.head_object(bucket, key, which)? {
@@ -726,22 +742,8 @@ fn plan(
     let lock = crate::object_lock::new_object_lock(None, bucket_lock, default, now)
         .ok()
         .flatten();
-    // A CopyObject's keys: its source, the class and the metadata
-    // directive; its version id is the source's, not the target's.
-    let mut source_id = format!("{bucket}/{key}");
-    if let Some(version) = version_key(which) {
-        source_id.push_str(&format!("?versionId={version}"));
-    }
-    let directive = match copy.metadata {
-        Some(_) => "REPLACE",
-        None => "COPY",
-    };
     let target_authz = Authz::load_now(file, creator, vec![copy.bucket.clone()], Vec::new(), now)?
-        .with_keys(&[
-            ("s3:x-amz-copy-source", source_id),
-            ("s3:x-amz-storage-class", copy.class.as_str().to_string()),
-            ("s3:x-amz-metadata-directive", directive.to_string()),
-        ]);
+        .with_keys(&copy_keys);
     if let Err(err) = target_authz.check_storing(
         "s3:PutObject",
         Resource::Object(&copy.bucket, &target),

@@ -10045,6 +10045,30 @@ fn batch_job_tasks_are_authorized_as_the_user_that_created_the_job() {
     );
     assert_eq!(root("GET", "/mine/cold/m1", "", b"").1.0, 404);
     assert_eq!(root("DELETE", "/mine", "policy", b"").1.0, 204);
+    // A source bucket refusing reads for copies: the copy's source read
+    // carries the copy's keys too.
+    let no_copies = r#"{"Version": "2012-10-17", "Statement": [{"Effect": "Deny", "Principal": "*",
+        "Action": "s3:GetObject", "Resource": "arn:aws:s3:::mine/*",
+        "Condition": {"Null": {"s3:x-amz-copy-source": "false"}}}]}"#;
+    assert_eq!(
+        root("PUT", "/mine", "policy", no_copies.as_bytes()).1.0,
+        204
+    );
+    let copy_again = "<S3PutObjectCopy><TargetResource>arn:aws:s3:::mine</TargetResource>\
+                      <TargetKeyPrefix>again/</TargetKeyPrefix></S3PutObjectCopy>";
+    let described = run(job_body("auth-nocopy", copy_again));
+    assert_eq!(
+        xml_value(&described, "NumberOfTasksSucceeded"),
+        "0",
+        "{described}"
+    );
+    assert_eq!(root("GET", "/mine/again/m1", "", b"").1.0, 404);
+    assert_eq!(
+        root("GET", "/mine/m1", "", b"").1.0,
+        200,
+        "a plain read still goes"
+    );
+    assert_eq!(root("DELETE", "/mine", "policy", b"").1.0, 204);
 
     // A job whose creator is gone fails, even when a user of the same name
     // is made again before it runs.
