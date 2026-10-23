@@ -341,7 +341,15 @@ fn send_paused(
     split: usize,
     pause: impl FnOnce(),
 ) -> (String, (u16, String)) {
-    let request = signed_request(port, method, path, query, extra, body, key, secret);
+    // A request paused within its body sends `Expect: 100-continue`: the
+    // server answers 100 Continue once its handler reads the body, so the
+    // head has been acted on before `pause`.
+    let paused = split < body.len();
+    let mut extra = extra.to_vec();
+    if paused {
+        extra.push(("expect", "100-continue"));
+    }
+    let request = signed_request(port, method, path, query, &extra, body, key, secret);
     let deadline = Instant::now() + DEADLINE;
     let mut stream = loop {
         match std::net::TcpStream::connect(("127.0.0.1", port)) {
@@ -351,6 +359,20 @@ fn send_paused(
         }
     };
     stream.write_all(request.as_bytes()).expect("send");
+    stream.flush().expect("flush");
+    if paused {
+        let mut interim = Vec::new();
+        let mut byte = [0u8];
+        while !interim.ends_with(b"\r\n\r\n") {
+            stream.read_exact(&mut byte).expect("read 100 Continue");
+            interim.push(byte[0]);
+        }
+        assert!(
+            interim.starts_with(b"HTTP/1.1 100"),
+            "no 100 Continue: {}",
+            String::from_utf8_lossy(&interim)
+        );
+    }
     stream.write_all(&body[..split]).expect("send body");
     stream.flush().expect("flush");
     pause();
@@ -6451,7 +6473,8 @@ fn a_write_decides_its_lock_when_it_is_stored() {
             );
         },
     );
-    assert_eq!(status, 403, "the request's bucket is gone: {reply}");
+    assert_eq!(status, 400, "the bucket has no Object Lock now: {reply}");
+    assert_eq!(xml_value(&reply, "Code"), "InvalidRequest");
     assert_eq!(plain_call("GET", "/racy/k", &[]).0, 404);
     // A default retention set while a PUT without an integrity check sends
     // its body applies to it, so the PUT is refused as if sent after it.
