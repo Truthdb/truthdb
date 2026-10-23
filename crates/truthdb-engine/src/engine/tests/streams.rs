@@ -16,10 +16,13 @@ fn append(engine: &Engine, topic: &str, partition: u32, values: &[&str], now_ms:
             value: value.as_bytes().to_vec(),
         })
         .collect();
-    engine
-        .streams(|file| file.transaction(|tx| tx.append(topic, partition, &records, None, now_ms)))
-        .unwrap()
-        .unwrap();
+    // Small records take a chunk each: an append holds as many.
+    for batch in records.chunks(truthdb_streams::MAX_APPEND_CHUNKS) {
+        engine
+            .streams(|file| file.transaction(|tx| tx.append(topic, partition, batch, None, now_ms)))
+            .unwrap()
+            .unwrap();
+    }
 }
 
 fn hex(text: &str) -> String {
