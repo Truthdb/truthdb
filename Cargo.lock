@@ -1819,7 +1819,6 @@ dependencies = [
  "anyhow",
  "clap",
  "directories",
- "http-body-util",
  "serde",
  "serde_json",
  "tokio",

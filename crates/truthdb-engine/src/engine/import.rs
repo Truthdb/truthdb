@@ -250,7 +250,7 @@ impl Engine {
         enum Stored {
             Dropped,
             Locked,
-            Put(Result<truthdb_object::ObjectInfo, ObjectError>),
+            Put(Result<(), ObjectError>),
         }
         let stored = self.object(move |file| {
             // Decided in the write's own lock hold: an import does not give
@@ -282,7 +282,7 @@ impl Engine {
                 if stored.is_ok() {
                     tx.update_import(&saved)?;
                 }
-                Ok(Stored::Put(stored))
+                Ok(Stored::Put(stored.map(|_| ())))
             })
         })?;
         Ok(match stored {

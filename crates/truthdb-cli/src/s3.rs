@@ -14,7 +14,6 @@ use std::time::{Duration, UNIX_EPOCH};
 
 use anyhow::{Context, Result, anyhow, bail};
 use clap::{Args, CommandFactory, FromArgMatches, Parser, Subcommand};
-use http_body_util::BodyExt;
 use tokio::io::AsyncWriteExt;
 use truthdb_s3client::{Bytes, Client, Config};
 
