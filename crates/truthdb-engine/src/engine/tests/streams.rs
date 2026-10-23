@@ -488,6 +488,12 @@ fn webhooks_are_set_on_topics_and_shown() {
     );
     let message = command_error(&engine, "stream drop webhook events");
     assert!(message.contains("has no webhook"), "{message}");
+    // The command's own `;` goes, a secret's stays.
+    engine
+        .execute("stream create webhook events url https://h/x secret k;;")
+        .unwrap();
+    let webhooks = engine.streams(|file| file.webhooks()).unwrap();
+    assert_eq!(webhooks[0].secret, "k;");
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
