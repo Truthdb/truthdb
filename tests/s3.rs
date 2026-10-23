@@ -9638,6 +9638,22 @@ fn batch_jobs_tag_and_copy_what_a_manifest_lists_once_across_a_crash() {
             200
         );
     }
+    // A source with a website redirect location.
+    assert_eq!(
+        send_with(
+            server.s3_port,
+            "PUT",
+            "/src/a",
+            "",
+            &[("x-amz-website-redirect-location", "/elsewhere")],
+            b"body",
+            &key,
+            Some(&secret),
+        )
+        .1
+        .0,
+        200
+    );
     let put_manifest = |server: &Server, name: &str, lines: &str| {
         let (head, (status, _)) = call(
             server,
@@ -9792,8 +9808,14 @@ fn batch_jobs_tag_and_copy_what_a_manifest_lists_once_across_a_crash() {
     let described = wait_for(&server, &copy_job, &["Complete"]);
     assert_eq!(xml_value(&described, "Priority"), "99");
     for name in ["a", "b"] {
-        let (_, (status, copied)) = call(&server, "GET", &format!("/dst/copies/{name}"), "", b"");
+        let (head, (status, copied)) =
+            call(&server, "GET", &format!("/dst/copies/{name}"), "", b"");
         assert_eq!((status, copied.as_str()), (200, "body"));
+        // The source's redirect location is not copied.
+        assert_eq!(
+            response_header(&head, "x-amz-website-redirect-location"),
+            None
+        );
     }
 
     // SSE-S3 on a database not encrypted at rest: refused, as CopyObject
@@ -11859,4 +11881,154 @@ http {{
     let (status, body, cache) = via("/sliced/edge/s", "Range: bytes=-3\r\n");
     assert_eq!((status, body.as_str(), cache.as_str()), (206, "xyz", "HIT"));
     drop(proxy);
+}
+
+#[test]
+fn objects_keep_the_website_redirect_location_their_write_names() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret))
+    };
+    let redirect = |path: &str| {
+        let (head, (status, _)) = call("HEAD", path, "", &[], b"");
+        assert_eq!(status, 200, "{path}");
+        response_header(&head, "x-amz-website-redirect-location")
+    };
+    const LOCATION: &str = "x-amz-website-redirect-location";
+    assert_eq!(call("PUT", "/hops", "", &[], b"").1.0, 200);
+    // A path in the bucket or an http(s) URL; nothing else.
+    for location in [
+        "/moved.html",
+        "http://example.com/a",
+        "https://example.com/",
+    ] {
+        assert_eq!(
+            call("PUT", "/hops/k", "", &[(LOCATION, location)], b"x")
+                .1
+                .0,
+            200
+        );
+        assert_eq!(redirect("/hops/k").as_deref(), Some(location));
+        let (head, (status, _)) = call("GET", "/hops/k", "", &[], b"");
+        assert_eq!(status, 200);
+        assert_eq!(response_header(&head, LOCATION).as_deref(), Some(location));
+    }
+    for location in ["moved.html", "ftp://example.com/", ""] {
+        let (_, (status, reply)) = call("PUT", "/hops/bad", "", &[(LOCATION, location)], b"x");
+        assert_eq!(status, 400, "{location:?}");
+        assert_eq!(xml_value(&reply, "Code"), "InvalidRedirectLocation");
+    }
+    assert_eq!(call("HEAD", "/hops/bad", "", &[], b"").1.0, 404);
+    // A plain overwrite has none.
+    assert_eq!(call("PUT", "/hops/k", "", &[], b"x").1.0, 200);
+    assert_eq!(redirect("/hops/k"), None);
+
+    // A copy has the location its request names, never the source's, with
+    // either metadata directive; naming one is a change of an object copied
+    // to itself.
+    assert_eq!(
+        call("PUT", "/hops/src", "", &[(LOCATION, "/from-source")], b"s")
+            .1
+            .0,
+        200
+    );
+    for (extra, expected) in [
+        (vec![("x-amz-copy-source", "/hops/src")], None),
+        (
+            vec![("x-amz-copy-source", "/hops/src"), (LOCATION, "/copied")],
+            Some("/copied"),
+        ),
+        (
+            vec![
+                ("x-amz-copy-source", "/hops/src"),
+                ("x-amz-metadata-directive", "REPLACE"),
+                (LOCATION, "/replaced"),
+            ],
+            Some("/replaced"),
+        ),
+    ] {
+        let (_, (status, reply)) = call("PUT", "/hops/copy", "", &extra, b"");
+        assert_eq!(status, 200, "{extra:?}: {reply}");
+        assert_eq!(redirect("/hops/copy").as_deref(), expected, "{extra:?}");
+    }
+    let (_, (status, reply)) = call(
+        "PUT",
+        "/hops/copy",
+        "",
+        &[("x-amz-copy-source", "/hops/copy")],
+        b"",
+    );
+    assert_eq!(status, 400, "{reply}");
+    let (_, (status, reply)) = call(
+        "PUT",
+        "/hops/copy",
+        "",
+        &[("x-amz-copy-source", "/hops/copy"), (LOCATION, "/again")],
+        b"",
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(redirect("/hops/copy").as_deref(), Some("/again"));
+    let (_, (status, reply)) = call(
+        "PUT",
+        "/hops/copy",
+        "",
+        &[("x-amz-copy-source", "/hops/src"), (LOCATION, "nowhere")],
+        b"",
+    );
+    assert_eq!(status, 400);
+    assert_eq!(xml_value(&reply, "Code"), "InvalidRedirectLocation");
+
+    // A multipart upload's, from its start.
+    let (_, (status, started)) = call(
+        "POST",
+        "/hops/parts",
+        "uploads",
+        &[(LOCATION, "/whole")],
+        b"",
+    );
+    assert_eq!(status, 200);
+    let upload = xml_value(&started, "UploadId");
+    let (head, (status, _)) = call(
+        "PUT",
+        "/hops/parts",
+        &format!("partNumber=1&uploadId={upload}"),
+        &[],
+        b"part",
+    );
+    assert_eq!(status, 200);
+    let etag = response_header(&head, "etag").expect("etag");
+    let complete = format!(
+        "<CompleteMultipartUpload><Part><PartNumber>1</PartNumber><ETag>{etag}</ETag></Part></CompleteMultipartUpload>"
+    );
+    let (_, (status, reply)) = call(
+        "POST",
+        "/hops/parts",
+        &format!("uploadId={upload}"),
+        &[],
+        complete.as_bytes(),
+    );
+    assert_eq!(status, 200, "{reply}");
+    assert_eq!(redirect("/hops/parts").as_deref(), Some("/whole"));
+
+    // A form upload's, from its field.
+    let conditions = [
+        serde_json::json!({"bucket": "hops"}),
+        serde_json::json!({"key": "formed"}),
+        serde_json::json!({LOCATION: "https://example.com/form"}),
+    ];
+    let fields = [("key", "formed"), (LOCATION, "https://example.com/form")];
+    let form = signed_form(
+        &key,
+        &secret,
+        "2099-01-01T00:00:00.000Z",
+        &conditions,
+        &fields,
+    );
+    let (_, (status, reply)) = post_form(port, "hops", &form, "f.txt", b"form", 1000);
+    assert_eq!(status, 204, "{reply}");
+    assert_eq!(
+        redirect("/hops/formed").as_deref(),
+        Some("https://example.com/form")
+    );
 }

@@ -192,7 +192,30 @@ pub fn metadata_from(headers: &HeaderMap) -> Result<ObjectAttrs, S3Error> {
         user,
         tags: Vec::new(),
         customer_key: None,
+        website_redirect: website_redirect_from(headers)?,
     })
+}
+
+/// A write's `x-amz-website-redirect-location`: a path in the bucket or an
+/// http(s) URL.
+pub fn website_redirect_from(headers: &HeaderMap) -> Result<Option<String>, S3Error> {
+    let Some(value) = headers.get("x-amz-website-redirect-location") else {
+        return Ok(None);
+    };
+    match value.to_str() {
+        Ok(location)
+            if ["/", "http://", "https://"]
+                .iter()
+                .any(|prefix| location.starts_with(prefix)) =>
+        {
+            Ok(Some(location.to_string()))
+        }
+        _ => Err(S3Error::new(
+            400,
+            "InvalidRedirectLocation",
+            "The website redirect location must have a prefix of 'http://' or 'https://' or '/'.",
+        )),
+    }
 }
 
 /// Receives a request body into a new staging body, verifying its framing,
@@ -687,6 +710,7 @@ fn object_headers(
         ("content-encoding", &attrs.content_encoding),
         ("content-language", &attrs.content_language),
         ("expires", &attrs.expires),
+        ("x-amz-website-redirect-location", &attrs.website_redirect),
     ] {
         if let Some(value) = value {
             builder = builder.header(name, value);

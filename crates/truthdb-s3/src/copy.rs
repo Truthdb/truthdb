@@ -190,6 +190,8 @@ async fn copy_whole(
         (None, None) => true,
         _ => false,
     };
+    // A copy's redirect location is the request's, never the source's.
+    let website_redirect = crate::objects::website_redirect_from(&headers)?;
     // Only what a directive replaces is read from the request.
     let new_metadata = if replace {
         metadata_from(&headers)?
@@ -219,8 +221,9 @@ async fn copy_whole(
         };
         let shared = source.attrs.customer_key.is_some() == target_record.is_some() && same_keys;
         // A copy to itself must change something: its metadata, its
-        // storage class, or its encryption.
+        // storage class, its redirect location, or its encryption.
         if !replace
+            && website_redirect.is_none()
             && shared
             && class == source.storage_class
             && (src_bucket.as_str(), src_key.as_str()) == (&dst_bucket, &dst_key)
@@ -239,6 +242,7 @@ async fn copy_whole(
         } else {
             source.attrs.clone()
         };
+        attrs.website_redirect = website_redirect;
         attrs.tags = if replace_tags {
             new_tags
         } else {
