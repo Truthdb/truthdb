@@ -512,9 +512,12 @@ fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
     // and counts the POSTs.
     let hanging = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let hang_port = hanging.local_addr().unwrap().port();
+    let connections = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let accepted = std::sync::Arc::clone(&connections);
     std::thread::spawn(move || {
         let mut held = Vec::new();
         for stream in hanging.incoming() {
+            accepted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             held.push(stream);
         }
     });
@@ -601,6 +604,8 @@ fn a_hanging_endpoint_holds_up_only_its_own_webhook() {
             .offset
     };
     assert_eq!((offset("ok"), offset("hang")), (3, 0));
+    // One POST in flight for the hanging partition, not one per turn.
+    assert_eq!(connections.load(std::sync::atomic::Ordering::SeqCst), 1);
     drop(engine);
     let _ = std::fs::remove_file(path);
 }
