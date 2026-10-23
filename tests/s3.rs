@@ -10727,3 +10727,383 @@ fn batch_jobs_run_on_a_manifest_they_generate() {
         "{described}"
     );
 }
+
+/// A function's webhook on a free port: answers each POSTed invocation
+/// with what `answer` makes of it (status, body), and keeps the requests.
+fn function_receiver(
+    answer: impl Fn(&serde_json::Value) -> (u16, String) + Send + 'static,
+) -> (u16, Received) {
+    use std::io::{BufRead, BufReader, Read, Write};
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+    let port = listener.local_addr().unwrap().port();
+    let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let kept = std::sync::Arc::clone(&seen);
+    std::thread::spawn(move || {
+        for stream in listener.incoming() {
+            let Ok(mut stream) = stream else { continue };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            loop {
+                let mut line = String::new();
+                if reader.read_line(&mut line).unwrap_or(0) == 0 {
+                    break;
+                }
+                let mut headers = Vec::new();
+                loop {
+                    let mut header = String::new();
+                    reader.read_line(&mut header).unwrap();
+                    let header = header.trim_end();
+                    if header.is_empty() {
+                        break;
+                    }
+                    let (name, value) = header.split_once(':').unwrap();
+                    headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
+                }
+                let len: usize = headers
+                    .iter()
+                    .find(|(name, _)| name == "content-length")
+                    .map_or(0, |(_, value)| value.parse().unwrap());
+                let mut body = vec![0; len];
+                reader.read_exact(&mut body).unwrap();
+                let event: serde_json::Value = serde_json::from_slice(&body).unwrap_or_default();
+                let (status, reply) = answer(&event);
+                kept.lock().unwrap().push((headers, body));
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 {status} X\r\ncontent-length: {}\r\n\r\n{reply}",
+                    reply.len()
+                );
+            }
+        }
+    });
+    (port, seen)
+}
+
+#[test]
+fn batch_jobs_invoke_a_function_for_each_object() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "batchfn");
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            &[("x-amz-account-id", account.as_str())],
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    for bucket in ["/src", "/data", "/reports"] {
+        assert_eq!(call("PUT", bucket, "", b"").1.0, 200);
+    }
+    for name in ["ok1", "ok2", "perm", "temp", "bad"] {
+        assert_eq!(call("PUT", &format!("/data/{name}"), "", b"x").1.0, 200);
+    }
+    let (port, received) = function_receiver(|event| {
+        let task = &event["tasks"][0];
+        let id = task["taskId"].clone();
+        let key = task["s3Key"].as_str().unwrap_or("").to_string();
+        let result = |code: &str, text: &str| {
+            serde_json::json!({
+                "invocationSchemaVersion": "2.0",
+                "invocationId": event["invocationId"],
+                "results": [{"taskId": id, "resultCode": code, "resultString": text}],
+            })
+            .to_string()
+        };
+        match key.as_str() {
+            "perm" => (200, result("PermanentFailure", "no")),
+            "temp" => (200, result("TemporaryFailure", "later")),
+            "bad" => (200, "not json".to_string()),
+            _ => (200, result("Succeeded", &format!("done:{key}"))),
+        }
+    });
+    native(
+        server.native_port,
+        &format!("stream create topic fn account {account}"),
+    );
+    native(
+        server.native_port,
+        &format!("stream create webhook fn url http://127.0.0.1:{port}/ secret s3cret"),
+    );
+    // Another account's bucket: never sent.
+    let (_, other_key, other_secret) = account_with_key(&server, "fnoutsider");
+    assert_eq!(
+        send(
+            server.s3_port,
+            "PUT",
+            "/theirs",
+            "",
+            b"",
+            &other_key,
+            Some(&other_secret)
+        )
+        .0,
+        200
+    );
+    assert_eq!(
+        send(
+            server.s3_port,
+            "PUT",
+            "/theirs/x",
+            "",
+            b"x",
+            &other_key,
+            Some(&other_secret)
+        )
+        .0,
+        200
+    );
+    let (head, (status, _)) = call(
+        "PUT",
+        "/src/fn.csv",
+        "",
+        b"data,ok1\ndata,ok2\ndata,perm\ndata,temp\ndata,bad\ntheirs,x\n",
+    );
+    assert_eq!(status, 200);
+    let etag = response_header(&head, "etag").unwrap();
+    let invoke = |function: &str| {
+        format!(
+            "<LambdaInvoke><FunctionArn>arn:aws:lambda:us-east-1:{account}:function:{function}</FunctionArn>\
+             <InvocationSchemaVersion>2.0</InvocationSchemaVersion>\
+             <UserArguments><entry><key>k</key><value>v</value></entry></UserArguments></LambdaInvoke>"
+        )
+    };
+    let run = |job_key: &str, job_secret: &str, token: &str, operation: &str| -> String {
+        let body = create_job_body(token, operation, "fn.csv", &etag, "");
+        let headers = [("x-amz-account-id", account.as_str())];
+        let (status, answer) = send_with(
+            server.s3_port,
+            "POST",
+            "/v20180820/jobs",
+            "",
+            &headers,
+            body.as_bytes(),
+            job_key,
+            Some(job_secret),
+        )
+        .1;
+        assert_eq!(status, 200, "{answer}");
+        let job = xml_value(&answer, "JobId");
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let described = call("GET", &format!("/v20180820/jobs/{job}"), "", b"").1.1;
+            let status = described
+                .rsplit("</ProgressSummary>")
+                .next()
+                .unwrap_or("")
+                .to_string();
+            if ["Complete", "Failed"].contains(&xml_value(&status, "Status").as_str()) {
+                return described;
+            }
+            assert!(Instant::now() < deadline, "{described}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let described = run(&key, &secret, "fn-1", &invoke("fn"));
+    let job = xml_value(&described, "JobId");
+    assert_eq!(
+        xml_value(&described, "NumberOfTasksSucceeded"),
+        "2",
+        "{described}"
+    );
+    assert_eq!(xml_value(&described, "NumberOfTasksFailed"), "4");
+    // The events: schema 2.0 (the bucket's name, the user arguments),
+    // signed; a temporary failure tried three times.
+    let requests = received.lock().unwrap().clone();
+    let events: Vec<serde_json::Value> = requests
+        .iter()
+        .map(|(_, body)| serde_json::from_slice(body).unwrap())
+        .collect();
+    assert_eq!(events[0]["invocationSchemaVersion"], "2.0");
+    assert_eq!(events[0]["job"]["userArguments"]["k"], "v");
+    assert_eq!(events[0]["job"]["id"], job.as_str());
+    assert_eq!(events[0]["tasks"][0]["s3Bucket"], "data");
+    let temp = events
+        .iter()
+        .filter(|event| event["tasks"][0]["s3Key"] == "temp")
+        .count();
+    assert_eq!(temp, 3, "a temporary failure is tried again");
+    assert!(
+        events.iter().all(|event| event["tasks"][0]["s3Key"] != "x"),
+        "another account's object is not sent"
+    );
+    for (headers, body) in &requests {
+        let header = |name: &str| {
+            headers
+                .iter()
+                .find(|(n, _)| n == name)
+                .map(|(_, v)| v.clone())
+                .unwrap()
+        };
+        let (delivery, signature) = (header("x-truthdb-delivery"), header("x-truthdb-signature"));
+        let (time, digest) = signature.split_once(",v1=").unwrap();
+        let secs = time.strip_prefix("t=").unwrap();
+        let mac = ring::hmac::Key::new(ring::hmac::HMAC_SHA256, b"s3cret");
+        let expected = ring::hmac::sign(
+            &mac,
+            &[format!("{secs}.{delivery}.").as_bytes(), body].concat(),
+        );
+        let expected: String = expected
+            .as_ref()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        assert_eq!(digest, expected, "signed");
+    }
+    // The report: results and why.
+    let (_, (_, manifest)) = call(
+        "GET",
+        &format!("/reports/rep/job-{job}/manifest.json"),
+        "",
+        b"",
+    );
+    let manifest: serde_json::Value = serde_json::from_str(&manifest).unwrap();
+    let rows: String = manifest["Results"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|result| {
+            call(
+                "GET",
+                &format!("/reports/{}", result["Key"].as_str().unwrap()),
+                "",
+                b"",
+            )
+            .1
+            .1
+        })
+        .collect();
+    assert!(rows.contains("data,ok1,,succeeded,200,,done:ok1"), "{rows}");
+    assert!(
+        rows.contains("data,perm,,failed,200,PermanentFailure,no"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains("data,temp,,failed,200,TemporaryFailure,later"),
+        "{rows}"
+    );
+    assert!(
+        rows.contains(
+            "data,bad,,failed,200,PermanentFailure,Invalid JSON returned in Lambda payload"
+        ),
+        "{rows}"
+    );
+    assert!(rows.contains("theirs,,,failed,403,AccessDenied"), "{rows}");
+
+    // A function that names no topic with a webhook: the job fails.
+    let described = run(&key, &secret, "fn-2", &invoke("missing"));
+    assert_eq!(
+        xml_value(&described, "FailureCode"),
+        "LambdaFunctionNotFound",
+        "{described}"
+    );
+    // Invoking takes lambda:InvokeFunction.
+    let policy = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:CreateJob", "s3:GetObject", "s3:PutObject"], "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (user_key, user_secret) = user_with_key(&server, &account, "caller", Some(&policy));
+    let described = run(&user_key, &user_secret, "fn-3", &invoke("fn"));
+    assert_eq!(
+        xml_value(&described, "FailureCode"),
+        "AccessDenied",
+        "{described}"
+    );
+    // A Deny on the function's ARN holds however the job names it: here by
+    // its bare name.
+    let deny = format!(
+        r#"{{"Version": "2012-10-17", "Statement": [
+        {{"Effect": "Allow", "Action": ["s3:CreateJob", "s3:GetObject", "s3:PutObject", "lambda:InvokeFunction"], "Resource": "*"}},
+        {{"Effect": "Deny", "Action": "lambda:InvokeFunction", "Resource": "arn:aws:lambda:*:{account}:function:fn"}}]}}"#
+    )
+    .replace('\n', " ");
+    let (denied_key, denied_secret) = user_with_key(&server, &account, "denied", Some(&deny));
+    let bare = "<LambdaInvoke><FunctionArn>fn</FunctionArn></LambdaInvoke>";
+    let described = run(&denied_key, &denied_secret, "fn-5", bare);
+    assert_eq!(
+        xml_value(&described, "FailureCode"),
+        "AccessDenied",
+        "{described}"
+    );
+
+    // User arguments need schema 2.0.
+    let old = invoke("fn").replace("2.0", "1.0");
+    let body = create_job_body("fn-4", &old, "fn.csv", &etag, "");
+    assert_eq!(
+        call("POST", "/v20180820/jobs", "", body.as_bytes()).1.0,
+        400
+    );
+}
+
+#[test]
+fn a_slow_function_holds_up_no_other_batch_job() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "batchslow");
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            &[("x-amz-account-id", account.as_str())],
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    for bucket in ["/src", "/data", "/reports"] {
+        assert_eq!(call("PUT", bucket, "", b"").1.0, 200);
+    }
+    assert_eq!(call("PUT", "/data/a", "", b"x").1.0, 200);
+    // A function taking 2 s an invocation.
+    let (port, _) = function_receiver(|event| {
+        std::thread::sleep(Duration::from_secs(2));
+        let result = serde_json::json!({
+            "results": [{"taskId": event["tasks"][0]["taskId"], "resultCode": "Succeeded", "resultString": ""}],
+        });
+        (200, result.to_string())
+    });
+    native(
+        server.native_port,
+        &format!("stream create topic slow account {account}"),
+    );
+    native(
+        server.native_port,
+        &format!("stream create webhook slow url http://127.0.0.1:{port}/ secret s3cret"),
+    );
+    let manifest = |name: &str, lines: &str| {
+        let (head, (status, _)) = call("PUT", &format!("/src/{name}"), "", lines.as_bytes());
+        assert_eq!(status, 200);
+        response_header(&head, "etag").unwrap()
+    };
+    let slow_lines: String = (0..16).map(|_| "data,a\n").collect();
+    let etag = manifest("slow.csv", &slow_lines);
+    let invoke = "<LambdaInvoke><FunctionArn>slow</FunctionArn></LambdaInvoke>";
+    let body = create_job_body("slow-1", invoke, "slow.csv", &etag, "")
+        .replace("<Priority>10</Priority>", "<Priority>99</Priority>");
+    assert_eq!(
+        call("POST", "/v20180820/jobs", "", body.as_bytes()).1.0,
+        200
+    );
+    // Once the slow job invokes, a tagging job still runs to its end.
+    std::thread::sleep(Duration::from_secs(1));
+    let etag = manifest("tag.csv", "data,a\n");
+    let tagging = "<S3PutObjectTagging><TagSet><S3Tag><Key>k</Key><Value>v</Value></S3Tag></TagSet></S3PutObjectTagging>";
+    let body = create_job_body("tag-1", tagging, "tag.csv", &etag, "");
+    let (_, (status, answer)) = call("POST", "/v20180820/jobs", "", body.as_bytes());
+    assert_eq!(status, 200, "{answer}");
+    let job = xml_value(&answer, "JobId");
+    let began = Instant::now();
+    loop {
+        let described = call("GET", &format!("/v20180820/jobs/{job}"), "", b"").1.1;
+        if xml_value(&described, "Status") == "Complete" {
+            break;
+        }
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "held up by the slow job: {described}"
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}

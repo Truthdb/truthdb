@@ -52,6 +52,57 @@ pub(crate) enum Operation {
         bypass: bool,
     },
     LegalHold(bool),
+    /// Invoke a function with each object: here, POST the invocation to
+    /// the webhook of the stream topic the function names (one of the
+    /// job's account's).
+    Lambda(Box<LambdaSpec>),
+}
+
+/// A LambdaInvoke: the function (a topic name, and the account its ARN
+/// names, if it does), the ARN as given, the invocation schema (2.0:
+/// bucket names and user arguments) and the user arguments.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct LambdaSpec {
+    pub function: String,
+    /// The version or alias it names, if any.
+    pub qualifier: Option<String>,
+    pub account: Option<String>,
+    pub arn: String,
+    pub schema_two: bool,
+    pub user_arguments: Vec<(String, String)>,
+}
+
+/// A function ARN (`arn:<partition>:lambda:<region>:<account>:function:
+/// <name>[:<qualifier>]`) or a bare name (`<name>[:<qualifier>]`): the
+/// name, its qualifier and the account named.
+fn function_name(arn: &str) -> Option<(String, Option<String>, Option<String>)> {
+    let (account, rest) = match arn.strip_prefix("arn:") {
+        Some(rest) => {
+            let parts: Vec<&str> = rest.splitn(6, ':').collect();
+            let [_, "lambda", _, account, "function", rest] = parts.as_slice() else {
+                return None;
+            };
+            let account = (account.len() == 12 && account.bytes().all(|b| b.is_ascii_digit()))
+                .then(|| account.to_string())?;
+            (Some(account), *rest)
+        }
+        None => (None, arn),
+    };
+    let mut parts = rest.split(':');
+    let name = parts.next()?;
+    let qualifier = parts.next().map(str::to_string);
+    if parts.next().is_some()
+        || qualifier.as_deref().is_some_and(|qualifier| {
+            qualifier.is_empty()
+                || !qualifier
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"$-_".contains(&byte))
+        })
+        || truthdb_streams::valid_topic_name(name).is_err()
+    {
+        return None;
+    }
+    Some((name.to_string(), qualifier, account))
 }
 
 impl Operation {
@@ -64,6 +115,7 @@ impl Operation {
             Operation::Restore { .. } => "S3InitiateRestoreObject",
             Operation::Retention { .. } => "S3PutObjectRetention",
             Operation::LegalHold(_) => "S3PutObjectLegalHold",
+            Operation::Lambda(_) => "LambdaInvoke",
         }
     }
 }
@@ -554,6 +606,50 @@ fn operation(element: &Element) -> Result<Operation, S3Error> {
             // reads it again with its own time.
             crate::object_lock::retention_change(document.as_bytes(), 0)?;
             Ok(Operation::Retention { document, bypass })
+        }
+        "LambdaInvoke" => {
+            chosen.only(&["FunctionArn", "InvocationSchemaVersion", "UserArguments"])?;
+            let arn = chosen
+                .text_of("FunctionArn")?
+                .ok_or_else(|| invalid("LambdaInvoke needs its FunctionArn"))?;
+            let (function, qualifier, account) =
+                function_name(arn)
+                    .filter(|_| arn.len() <= 1024)
+                    .ok_or_else(|| invalid("FunctionArn is not a function ARN"))?;
+            let schema_two = match chosen.text_of("InvocationSchemaVersion")? {
+                None | Some("1.0") => false,
+                Some("2.0") => true,
+                Some(_) => return Err(invalid("InvocationSchemaVersion is 1.0 or 2.0")),
+            };
+            let mut user_arguments = Vec::new();
+            if let Some(arguments) = chosen.one("UserArguments")? {
+                if !schema_two {
+                    return Err(invalid("UserArguments need InvocationSchemaVersion 2.0"));
+                }
+                arguments.only(&["entry"])?;
+                for entry in arguments.all("entry") {
+                    entry.only(&["key", "value"])?;
+                    let key = entry.text_of("key")?.ok_or_else(malformed)?;
+                    let value = entry.text_of("value")?.unwrap_or("");
+                    if key.is_empty() || key.chars().count() > 64 || value.chars().count() > 1024 {
+                        return Err(invalid(
+                            "A user argument's key is 1 to 64 characters, its value at most 1024",
+                        ));
+                    }
+                    user_arguments.push((key.to_string(), value.to_string()));
+                }
+                if user_arguments.len() > 10 {
+                    return Err(invalid("A job takes at most 10 user arguments"));
+                }
+            }
+            Ok(Operation::Lambda(Box::new(LambdaSpec {
+                function,
+                qualifier,
+                account,
+                arn: arn.to_string(),
+                schema_two,
+                user_arguments,
+            })))
         }
         "S3PutObjectLegalHold" => {
             chosen.only(&["LegalHold"])?;
@@ -1426,7 +1522,7 @@ mod tests {
             "InvalidRequest"
         );
         assert_eq!(
-            code(request("<LambdaInvoke/>", MANIFEST, REPORT)),
+            code(request("<S3ReplicateObject/>", MANIFEST, REPORT)),
             "NotImplemented"
         );
         let no_fields = MANIFEST.replace("<member>Bucket</member>", "");
