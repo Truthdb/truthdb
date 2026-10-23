@@ -18,14 +18,18 @@ use crate::{
 
 /// Partitions a topic may have.
 pub const MAX_PARTITIONS: u32 = 64;
-/// The largest record (its key and value), and the most one append writes.
-/// An append is one transaction, and the log it writes is several times its
-/// size (chunks, and the images of the pages they split), so these keep the
-/// largest within a transaction's log budget on the smallest log ring.
+/// The largest record (its key and value).
 pub const MAX_RECORD_BYTES: usize = 256 * 1024;
-pub const MAX_APPEND_BYTES: usize = 512 * 1024;
 /// Bytes per stored chunk of a record.
 const CHUNK: usize = 1500;
+/// The chunks one append stores at most: two of the largest records, or as
+/// many records as that of one chunk each. An append is one transaction,
+/// and every chunk is a tree insert whose log is several times its size
+/// (with the images of the pages it splits), so this keeps the largest
+/// append within a transaction's log budget on the smallest log ring.
+pub const MAX_APPEND_CHUNKS: usize = 2 * (MAX_RECORD_BYTES + RECORD_HEADER).div_ceil(CHUNK);
+/// A stored record's bytes besides its key and value (see `encode_record`).
+const RECORD_HEADER: usize = 17;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Topic {
@@ -377,7 +381,10 @@ impl StreamTxn<'_, '_> {
             .iter()
             .map(|record| record.key.as_ref().map_or(0, Vec::len) + record.value.len());
         if sizes.clone().any(|size| size > MAX_RECORD_BYTES)
-            || sizes.sum::<usize>() > MAX_APPEND_BYTES
+            || sizes
+                .map(|size| (size + RECORD_HEADER).div_ceil(CHUNK))
+                .sum::<usize>()
+                > MAX_APPEND_CHUNKS
         {
             return Ok(Err(StreamError::TooLarge));
         }

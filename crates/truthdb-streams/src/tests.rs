@@ -569,13 +569,30 @@ fn the_largest_append_fits_a_transactions_budget_on_the_smallest_ring() {
         key: None,
         value: vec![7u8; crate::MAX_RECORD_BYTES],
     };
-    let records = vec![largest; crate::MAX_APPEND_BYTES / crate::MAX_RECORD_BYTES];
-    let (written, budget) = in_txn(&storage, |tx| {
-        let start = tx.log_tail();
-        tx.append("big", 0, &records, None, 1)?.unwrap();
-        Ok((tx.log_since(start), tx.log_budget()))
-    });
-    assert!(written <= budget, "{written} bytes of log, budget {budget}");
+    let empty = NewRecord {
+        key: None,
+        value: Vec::new(),
+    };
+    // Two of the largest records, or as many of the smallest as chunks.
+    for (record, count) in [(largest, 2), (empty, crate::MAX_APPEND_CHUNKS)] {
+        let mut records = vec![record; count + 1];
+        assert_eq!(
+            in_txn(&storage, |tx| tx.append("big", 0, &records, None, 1)),
+            Err(StreamError::TooLarge),
+            "one more record than fits"
+        );
+        records.pop();
+        let (written, budget) = in_txn(&storage, |tx| {
+            let start = tx.log_tail();
+            tx.append("big", 0, &records, None, 1)?.unwrap();
+            Ok((tx.log_since(start), tx.log_budget()))
+        });
+        assert!(
+            written <= budget,
+            "{count} records: {written} bytes of log, budget {budget}"
+        );
+        storage.write_checkpoint(b"x", 1, 2, 1).expect("checkpoint");
+    }
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

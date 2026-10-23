@@ -33,7 +33,7 @@ use truthdb_core::storage::{
 use truthdb_core::wal::records::RelRecord;
 
 pub use store::{
-    Appended, MAX_APPEND_BYTES, MAX_PARTITIONS, MAX_RECORD_BYTES, NewRecord, Partition, Record,
+    Appended, MAX_APPEND_CHUNKS, MAX_PARTITIONS, MAX_RECORD_BYTES, NewRecord, Partition, Record,
     StreamError, Topic, valid_topic_name,
 };
 
