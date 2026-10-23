@@ -5438,6 +5438,28 @@ fn batch_jobs_are_kept_found_by_token_and_reported_durably() {
         })
         .unwrap();
     assert!(made, "the token went with its job");
+    // A generated manifest's list: kept in order, counted, dropped a step at
+    // a time.
+    let mut generated = fresh.clone();
+    file.transaction(|tx| {
+        for (key, version) in [("a", "7"), ("b/c", "null")] {
+            tx.add_job_task(&mut generated, key, version)?;
+        }
+        generated.listed_after = Some("b/c".into());
+        generated.listing_done = true;
+        generated.generated = Some(("out".into(), "m.csv".into(), "4".into(), "\"e\"".into()));
+        tx.put_job(&generated)
+    })
+    .unwrap();
+    assert_eq!(generated.total, 2);
+    assert_eq!(file.job(3).unwrap().unwrap(), generated);
+    assert_eq!(
+        file.job_tasks(3, 1, 10).unwrap(),
+        vec![(1, "b/c".to_string(), "null".to_string())]
+    );
+    assert!(!file.transaction(|tx| tx.drop_job_tasks(3, 1)).unwrap());
+    assert!(file.transaction(|tx| tx.drop_job_tasks(3, 1)).unwrap());
+    assert!(file.job_tasks(3, 0, 10).unwrap().is_empty());
     assert_eq!(fresh.number, 3);
     drop(guard);
     drop(storage);
