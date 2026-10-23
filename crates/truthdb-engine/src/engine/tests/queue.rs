@@ -127,6 +127,10 @@ fn a_queue_is_received_acknowledged_and_hidden_through_exec() {
         ("EXEC sys.sp_s3_queue_receive @queue = N'q', 1", 119),
         ("EXEC sys.sp_s3_queue_receive N'q', 11", 50000),
         ("EXEC sys.sp_s3_queue_receive N'q', N'x'", 245),
+        (
+            "EXEC sys.sp_s3_queue_receive N'q', 99999999999999999999.0",
+            8115,
+        ),
         ("EXEC sys.sp_s3_queue_receive N'q', 10.5, 43201", 50000),
         ("EXEC sys.sp_s3_queue_receive N'q', 1, 43201", 50000),
         ("EXEC sys.sp_s3_queue_receive 5", 206),

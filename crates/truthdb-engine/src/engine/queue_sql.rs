@@ -252,7 +252,14 @@ fn int_param(
         None | Some(SqlValue::Null) => return Ok(default),
         Some(SqlValue::Int(value)) => *value,
         Some(SqlValue::Decimal(decimal)) => {
-            i64::try_from(decimal.value / 10i128.pow(u32::from(decimal.scale))).unwrap_or(i64::MAX)
+            i64::try_from(decimal.value / 10i128.pow(u32::from(decimal.scale))).map_err(|_| {
+                SqlError::new(
+                    8115,
+                    16,
+                    8,
+                    "Arithmetic overflow error converting numeric to data type int.",
+                )
+            })?
         }
         Some(SqlValue::Str(text)) => text.trim().parse().map_err(|_| {
             SqlError::new(

@@ -117,7 +117,8 @@ fn parse_receipt(text: &str) -> Option<Receipt> {
 impl StreamTxn<'_, '_> {
     /// Up to `max` visible messages of `topic`, each hidden until
     /// `now_ms + visibility_ms`: in each partition, those visible again
-    /// first, then those never received, oldest first.
+    /// first, then those never received, oldest first. Fewer when the
+    /// transaction reaches its log budget first.
     pub fn queue_receive(
         &mut self,
         topic: &str,
@@ -130,6 +131,11 @@ impl StreamTxn<'_, '_> {
         };
         let visible_ms = now_ms.saturating_add(visibility_ms);
         let mut out = Vec::new();
+        // A receive stops at the log budget (dropping the leases of
+        // messages retention removed can be many): what it did commits,
+        // the rest waits for the next.
+        let start_tail = self.log_tail();
+        let budget = self.log_budget();
         // Starting from a partition the time picks, so a busy one does not
         // keep the others waiting.
         let first = (now_ms % u64::from(topic.partitions)) as u32;
@@ -146,7 +152,7 @@ impl StreamTxn<'_, '_> {
                 max - out.len() + GARBAGE_PER_RECEIVE,
             )?;
             for (key, _) in due {
-                if out.len() == max {
+                if out.len() == max || self.log_since(start_tail) >= budget {
                     break;
                 }
                 let offset = be_u64(&key[16..])?;
@@ -178,7 +184,7 @@ impl StreamTxn<'_, '_> {
             // Then those never received.
             let mut frontier = self.queue_frontier(topic.id, partition)?.max(state.start);
             let before = frontier;
-            while out.len() < max && frontier < state.next {
+            while out.len() < max && frontier < state.next && self.log_since(start_tail) < budget {
                 let lease = Lease {
                     visible_ms,
                     receives: 1,

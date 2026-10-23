@@ -879,3 +879,49 @@ fn an_acknowledgement_settles_one_message_whatever_is_done_behind_it() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_receive_stops_at_the_log_budget_dropping_removed_messages_leases() {
+    let path = temp_path("queue-garbage");
+    let storage = create(&path);
+    in_txn(&storage, |tx| tx.create_topic("q", 8, 1_000, None, 1)).unwrap();
+    let checkpoint = || storage.write_checkpoint(b"x", 1, 2, 1).expect("checkpoint");
+    for partition in 0..8 {
+        let records: Vec<NewRecord> = (0..200).map(|_| record("m")).collect();
+        in_txn(&storage, |tx| tx.append("q", partition, &records, None, 1)).unwrap();
+        checkpoint();
+    }
+    // All received, then all removed by retention while in flight.
+    let mut received = 0;
+    while received < 1_600 {
+        received += receive(&storage, 10, 100, 10).len();
+        if received % 200 == 0 {
+            checkpoint();
+        }
+    }
+    while in_txn(&storage, |tx| tx.trim_step(5_000, 500)).1 {
+        checkpoint();
+    }
+    checkpoint();
+    let mut receives = 0;
+    while queue_rows(&storage, crate::QUEUE_LEASES_TREE) > 0 {
+        let (handed, written, budget) = in_txn(&storage, |tx| {
+            let start = tx.log_tail();
+            let handed = tx.queue_receive("q", 10, 100, 6_000)?.unwrap().len();
+            Ok((handed, tx.log_since(start), tx.log_budget()))
+        });
+        assert_eq!(handed, 0);
+        // Past the budget by the last lease dropped at most.
+        assert!(
+            written < budget + 8 * 1024,
+            "{written} bytes, budget {budget}"
+        );
+        checkpoint();
+        receives += 1;
+        assert!(receives < 100);
+    }
+    assert!(receives > 1, "the budget stopped a receive: {receives}");
+    assert_eq!(queue_rows(&storage, crate::QUEUE_TIMES_TREE), 0);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
