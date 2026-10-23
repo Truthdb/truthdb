@@ -653,9 +653,10 @@ fn prepare_listing(
         });
     }
     let after = job.listed_after.clone();
+    // Only the keys under a prefix filter's prefix are listed.
     let listing = match file.list_objects(
         bucket,
-        "",
+        generator.filter.prefix.as_deref().unwrap_or(""),
         None,
         after.as_deref().map(ListAfter::Key),
         LIST_PAGE,
