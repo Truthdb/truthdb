@@ -105,12 +105,11 @@ fn a_queue_is_received_acknowledged_and_hidden_through_exec() {
         .iter()
         .find_map(|result| result["rows"].as_array())
         .unwrap_or_else(|| panic!("no rowset: {env}"));
-    let bodies: Vec<&str> = rows.iter().map(|row| row[2].as_str().unwrap()).collect();
-    assert_eq!(
-        bodies,
-        ["c", "b"],
-        "in the order they became visible: c's timeout of 0, then b made so"
-    );
+    let mut bodies: Vec<&str> = rows.iter().map(|row| row[2].as_str().unwrap()).collect();
+    // Both visible again (in the order they became so, which the clock may
+    // make one millisecond: the storage tests pin the order).
+    bodies.sort();
+    assert_eq!(bodies, ["b", "c"], "c's timeout of 0, and b made visible");
     assert!(
         received(&engine, "EXEC sys.sp_s3_queue_receive N'q'").is_empty(),
         "the rollback returned nothing"
