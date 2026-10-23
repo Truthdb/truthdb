@@ -1373,11 +1373,12 @@ mod tests {
             spec.operation,
             Operation::PutTagging(vec![("k".into(), "v".into())])
         );
-        assert_eq!(spec.manifest.bucket, "src");
-        assert_eq!(spec.manifest.key, "lists/m.csv");
-        assert_eq!(spec.manifest.etag, "abc", "quotes dropped");
+        let manifest = spec.manifest.as_ref().unwrap();
+        assert_eq!(manifest.bucket, "src");
+        assert_eq!(manifest.key, "lists/m.csv");
+        assert_eq!(manifest.etag, "abc", "quotes dropped");
         assert_eq!(
-            spec.manifest.fields,
+            manifest.fields,
             [Field::Bucket, Field::Key, Field::VersionId]
         );
         assert_eq!(
