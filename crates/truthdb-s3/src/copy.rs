@@ -157,6 +157,7 @@ pub async fn copy_object(
         signing_keys: state.signing_keys.clone(),
         storage: state.storage.clone(),
         restore_delays: state.restore_delays,
+        domains: state.domains.clone(),
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {
@@ -451,6 +452,7 @@ pub async fn upload_part_copy(
         signing_keys: state.signing_keys.clone(),
         storage: state.storage.clone(),
         restore_delays: state.restore_delays,
+        domains: state.domains.clone(),
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     let part = tokio::spawn(crate::scope::within(scope, async move {

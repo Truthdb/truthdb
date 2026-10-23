@@ -296,6 +296,12 @@ async fn main() -> ExitCode {
                         standard: config.s3.restore_seconds.standard,
                         bulk: config.s3.restore_seconds.bulk,
                     },
+                    domains: config
+                        .s3
+                        .domains
+                        .iter()
+                        .map(|domain| domain.to_ascii_lowercase())
+                        .collect(),
                 });
                 let shutdown_rx = shutdown_tx.subscribe();
                 Some(tokio::spawn(truthdb_s3::server::serve(

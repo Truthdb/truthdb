@@ -21,10 +21,46 @@ pub(crate) enum Target {
     Object(String, String),
 }
 
-pub(crate) fn target(raw_path: &str) -> Result<Target, S3Error> {
-    let path = crate::sigv4::decode_path(raw_path)
+/// The bucket a request's Host names (virtual-hosted addressing), in the
+/// request's extensions: the path is then the whole key.
+#[derive(Clone)]
+pub(crate) struct VirtualHost(pub String);
+
+/// The bucket named by `host` as `<bucket>.<domain>`, for the longest of
+/// `domains` it ends with; none for one of the domains itself (even when
+/// it is a subdomain of another), an IP address or another host
+/// (path-style addressing).
+pub(crate) fn host_bucket(host: &str, domains: &[String]) -> Option<String> {
+    let host = host.to_ascii_lowercase();
+    // The port, when there is one (an IPv6 literal names no bucket).
+    let host = match host.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|byte| byte.is_ascii_digit()) => name,
+        _ => &host,
+    };
+    if domains.iter().any(|domain| domain == host) {
+        return None;
+    }
+    domains
+        .iter()
+        .filter_map(|domain| {
+            let bucket = host.strip_suffix(domain.as_str())?.strip_suffix('.')?;
+            (!bucket.is_empty()).then_some((domain.len(), bucket))
+        })
+        .max_by_key(|(len, _)| *len)
+        .map(|(_, bucket)| bucket.to_string())
+}
+
+pub(crate) fn target<B>(request: &Request<B>) -> Result<Target, S3Error> {
+    let path = crate::sigv4::decode_path(request.uri().path())
         .ok_or_else(|| S3Error::invalid_request("the path is not UTF-8"))?;
     let path = path.strip_prefix('/').unwrap_or(&path);
+    if let Some(VirtualHost(bucket)) = request.extensions().get::<VirtualHost>() {
+        return Ok(if path.is_empty() {
+            Target::Bucket(bucket.clone())
+        } else {
+            Target::Object(bucket.clone(), path.to_string())
+        });
+    }
     if path.is_empty() {
         return Ok(Target::Service);
     }
@@ -206,23 +242,29 @@ pub async fn dispatch(
     auth: Authenticated,
 ) -> Result<Response<Body>, S3Error> {
     let method = request.method().clone();
-    // S3 Control's account-level Block Public Access (path-style, with the
-    // account in a header). A request to an object of a bucket named
-    // `v20180820` at that path, carrying that header, is taken for it: only
-    // S3 Control's own host (virtual-hosted addressing) would tell them apart.
-    if request.uri().path() == "/v20180820/configuration/publicAccessBlock"
-        && request.headers().contains_key("x-amz-account-id")
-    {
+    // S3 Control carries the account in a header, and in its host's first
+    // label when the host names one (virtual-hosted addressing). A
+    // path-style request to an object of a bucket named `v20180820` at an
+    // S3 Control path, carrying that header, is taken for S3 Control: only
+    // the host would tell them apart.
+    let s3_control = request
+        .headers()
+        .get("x-amz-account-id")
+        .and_then(|account| account.to_str().ok())
+        .is_some_and(|account| match request.extensions().get::<VirtualHost>() {
+            Some(VirtualHost(bucket)) => bucket == account,
+            None => true,
+        });
+    // S3 Control's account-level Block Public Access.
+    if s3_control && request.uri().path() == "/v20180820/configuration/publicAccessBlock" {
         return account_public_access(state, request, auth, method).await;
     }
-    // S3 Control's Batch Operations jobs, the same way.
+    // S3 Control's Batch Operations jobs.
     let path = request.uri().path();
-    if (path == "/v20180820/jobs" || path.starts_with("/v20180820/jobs/"))
-        && request.headers().contains_key("x-amz-account-id")
-    {
+    if s3_control && (path == "/v20180820/jobs" || path.starts_with("/v20180820/jobs/")) {
         return crate::batch::handle(state, request, auth, method).await;
     }
-    let target = target(request.uri().path())?;
+    let target = target(&request)?;
     let principal = auth.principal.clone();
     let raw_query = request.uri().query().unwrap_or("").to_string();
     // A bucket being created may be another account's: that is the
@@ -1162,6 +1204,31 @@ fn location_constraint(body: &[u8]) -> Result<Option<String>, S3Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_host_names_a_bucket_under_a_domain() {
+        let domains = ["test".to_string(), "s3.test".to_string()];
+        let bucket = |host| host_bucket(host, &domains);
+        assert_eq!(bucket("photos.s3.test"), Some("photos".to_string()));
+        assert_eq!(bucket("Photos.S3.Test:9000"), Some("photos".to_string()));
+        // The longest domain: `a` under `s3.test`, not `a.s3` under `test`.
+        assert_eq!(bucket("a.s3.test"), Some("a".to_string()));
+        assert_eq!(bucket("my.dotted.s3.test"), Some("my.dotted".to_string()));
+        assert_eq!(bucket("other.test"), Some("other".to_string()));
+        // A domain itself, though a subdomain of another: no bucket.
+        assert_eq!(bucket("s3.test:9000"), None);
+        // A name merely ending in a domain, an address: no bucket.
+        for host in [
+            ".s3.test",
+            "xs3.test",
+            "127.0.0.1:9000",
+            "[::1]:9000",
+            "elsewhere.example",
+        ] {
+            assert_eq!(host_bucket(host, &domains[1..]), None, "{host}");
+        }
+        assert_eq!(host_bucket("photos.s3.test", &[]), None);
+    }
 
     #[test]
     fn create_bucket_bodies_parse_or_are_malformed() {

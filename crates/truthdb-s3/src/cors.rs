@@ -265,7 +265,7 @@ pub async fn preflight(
     state: &S3State,
     request: &Request<Incoming>,
 ) -> Result<Response<Body>, S3Error> {
-    let bucket = match crate::api::target(request.uri().path())? {
+    let bucket = match crate::api::target(request)? {
         crate::api::Target::Bucket(bucket) | crate::api::Target::Object(bucket, _) => bucket,
         crate::api::Target::Service => {
             return Err(S3Error::new(

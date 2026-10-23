@@ -107,6 +107,12 @@ pub struct S3Config {
     /// How long a restore of an archived object (RestoreObject) takes.
     #[serde(default)]
     pub restore_seconds: RestoreSeconds,
+
+    /// Domains whose subdomains name buckets (virtual-hosted addressing):
+    /// with `s3.example.com`, a request to `photos.s3.example.com` is for
+    /// bucket `photos`. Other hosts are path-style.
+    #[serde(default)]
+    pub domains: Vec<String>,
 }
 
 /// Seconds a restore takes per retrieval tier: S3 takes minutes to hours;
@@ -132,6 +138,7 @@ impl Default for S3Config {
             tls_cert: None,
             tls_key: None,
             restore_seconds: RestoreSeconds::default(),
+            domains: Vec::new(),
         }
     }
 }
