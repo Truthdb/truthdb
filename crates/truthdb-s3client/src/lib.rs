@@ -498,6 +498,35 @@ impl Client {
         delimiter: Option<&str>,
         next: Option<&str>,
     ) -> Result<Page, Error> {
+        self.list_page(bucket, prefix, delimiter, next, None).await
+    }
+
+    /// One page of the objects whose keys start with `prefix`, from the
+    /// first key after `after` (a place that outlives a continuation token).
+    pub async fn list_objects_after(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        after: &str,
+    ) -> Result<Page, Error> {
+        self.list_page(
+            bucket,
+            prefix,
+            None,
+            None,
+            Some(after).filter(|key| !key.is_empty()),
+        )
+        .await
+    }
+
+    async fn list_page(
+        &self,
+        bucket: &str,
+        prefix: &str,
+        delimiter: Option<&str>,
+        next: Option<&str>,
+        start_after: Option<&str>,
+    ) -> Result<Page, Error> {
         let mut query = vec!["list-type=2".to_string()];
         if let Some(token) = next {
             query.push(format!("continuation-token={}", query_value(token)));
@@ -507,6 +536,9 @@ impl Client {
         }
         if !prefix.is_empty() {
             query.push(format!("prefix={}", query_value(prefix)));
+        }
+        if let Some(after) = start_after {
+            query.push(format!("start-after={}", query_value(after)));
         }
         let (_, body) = self
             .call(

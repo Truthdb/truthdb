@@ -90,6 +90,9 @@ impl ExternalRowsets for S3Rowsets {
             "sys.dm_s3_journal_consumers" => {
                 return Some(open_consumers(&self.core, name, args, caller));
             }
+            "sys.dm_s3_imports" | "sys.dm_s3_import_failures" => {
+                return Some(open_imports(&self.core, name, args, caller));
+            }
             "sys.s3_search" => return Some(self.open_search(name, args, caller)),
             "sys.s3_read" => {
                 return Some(
@@ -476,6 +479,106 @@ impl ExternalStream for ConsumerStream {
                 ]
             })
             .collect();
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// `sys.dm_s3_imports` (one row per import; its secret is not shown) and
+/// `sys.dm_s3_import_failures` (one row per object an import could not
+/// copy).
+fn open_imports(
+    core: &Arc<Storage>,
+    name: &str,
+    args: &[SqlValue],
+    caller: ExternalCaller,
+) -> Result<ExternalRowset, SqlError> {
+    check_admin(name, caller)?;
+    check_arg_count(name, args, 0, 0)?;
+    let failures = name == "sys.dm_s3_import_failures";
+    let columns = if failures {
+        vec![
+            bigint("import_id"),
+            nvarchar_max("key"),
+            nvarchar_max("error"),
+        ]
+    } else {
+        vec![
+            bigint("import_id"),
+            nvarchar("state", 16),
+            nvarchar_max("source_endpoint"),
+            nvarchar("source_region", 64),
+            nvarchar("source_access_key", 128),
+            nvarchar("source_bucket", 63),
+            nvarchar_max("source_prefix"),
+            nvarchar("bucket", 63),
+            nvarchar_max("prefix"),
+            nvarchar_max("last_key"),
+            bigint("copied"),
+            bigint("skipped"),
+            bigint("failed"),
+            bigint("bytes"),
+            datetime2("created"),
+            datetime2("updated"),
+            nvarchar_max("last_error"),
+        ]
+    };
+    Ok(ExternalRowset {
+        columns,
+        rows: Box::new(ImportStream {
+            core: Arc::clone(core),
+            failures,
+            done: false,
+        }),
+    })
+}
+
+struct ImportStream {
+    core: Arc<Storage>,
+    failures: bool,
+    done: bool,
+}
+
+impl ExternalStream for ImportStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let mut guard = self.core.lock();
+        let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+        let imports = file.imports().map_err(storage_error)?;
+        let mut rows: Vec<Vec<Datum>> = Vec::new();
+        for import in imports {
+            if self.failures {
+                for failure in file.import_failures(import.id).map_err(storage_error)? {
+                    rows.push(vec![
+                        Datum::BigInt(import.id as i64),
+                        text(&failure.key),
+                        text(&failure.error),
+                    ]);
+                }
+                continue;
+            }
+            rows.push(vec![
+                Datum::BigInt(import.id as i64),
+                text(import.state.as_str()),
+                text(&import.source.endpoint),
+                text(&import.source.region),
+                text(&import.source.access_key),
+                text(&import.source.bucket),
+                text(&import.source.prefix),
+                text(&import.bucket),
+                text(&import.prefix),
+                text(&import.after),
+                Datum::BigInt(import.copied as i64),
+                Datum::BigInt(import.skipped as i64),
+                Datum::BigInt(import.failed as i64),
+                Datum::BigInt(import.bytes as i64),
+                datetime(import.created_ms),
+                datetime(import.updated_ms),
+                text(&import.error),
+            ]);
+        }
         Ok((!rows.is_empty()).then_some(rows))
     }
 }
