@@ -98,7 +98,7 @@ fn encode_upload(
     out
 }
 
-fn decode_upload(upload: u64, row: &[u8]) -> Result<UploadInfo, StorageError> {
+pub(crate) fn decode_upload(upload: u64, row: &[u8]) -> Result<UploadInfo, StorageError> {
     let bucket_len = *row.first().ok_or_else(|| corrupt("upload row"))? as usize;
     let bucket = row
         .get(1..1 + bucket_len)
@@ -143,7 +143,7 @@ fn encode_part(part: &PartInfo) -> Vec<u8> {
     out
 }
 
-fn decode_part(number: u32, row: &[u8]) -> Result<PartInfo, StorageError> {
+pub(crate) fn decode_part(number: u32, row: &[u8]) -> Result<PartInfo, StorageError> {
     if row.len() != 40 {
         return Err(corrupt("part row"));
     }
@@ -157,7 +157,7 @@ fn decode_part(number: u32, row: &[u8]) -> Result<PartInfo, StorageError> {
     })
 }
 
-fn part_key(upload: u64, number: u32) -> [u8; 12] {
+pub(crate) fn part_key(upload: u64, number: u32) -> [u8; 12] {
     let mut key = [0u8; 12];
     key[..8].copy_from_slice(&upload.to_be_bytes());
     key[8..].copy_from_slice(&number.to_be_bytes());
@@ -327,6 +327,9 @@ impl ObjTxn<'_, '_> {
             md5: sealed.md5,
             mtime_ms: now_ms,
         };
+        let info = self
+            .upload_row(upload)?
+            .ok_or_else(|| corrupt("upload row"))?;
         let parts = self.trees.parts();
         let key = part_key(upload, number);
         match parts.insert_unique(
@@ -335,7 +338,9 @@ impl ObjTxn<'_, '_> {
             &key,
             &encode_part(&part),
         )? {
-            TreeInsert::Inserted => {}
+            TreeInsert::Inserted => {
+                self.count_parts(&info.bucket, &info.key, info.storage_class, 1, size as i64)?;
+            }
             TreeInsert::DuplicateKey => {
                 let old = parts
                     .update(
@@ -347,6 +352,13 @@ impl ObjTxn<'_, '_> {
                     .ok_or_else(|| corrupt("part row"))?;
                 let old = decode_part(number, &old)?;
                 self.drop_ref(old.body, now_ms, grace_ms)?;
+                self.count_parts(
+                    &info.bucket,
+                    &info.key,
+                    info.storage_class,
+                    0,
+                    size as i64 - old.size as i64,
+                )?;
             }
         }
         Ok(())
@@ -388,6 +400,16 @@ impl ObjTxn<'_, '_> {
         )?;
         uploads.delete(self.ctx, &mut OpMode::Txn(self.txn), &upload.to_be_bytes())?;
         self.take_upload_lock(upload)?;
+        if !removed.is_empty() {
+            let bytes: i64 = removed.iter().map(|part| part.size as i64).sum();
+            self.count_parts(
+                &info.bucket,
+                &info.key,
+                info.storage_class,
+                -(removed.len() as i64),
+                -bytes,
+            )?;
+        }
         Ok(removed)
     }
 

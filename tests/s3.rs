@@ -12364,3 +12364,98 @@ fn a_website_endpoint_serves_public_objects_anonymously() {
     let (status, body) = call("GET", "/site/index.html", "", &[], b"");
     assert_eq!((status, body.as_str()), (200, "home page"));
 }
+
+#[test]
+fn bucket_usage_counts_versions_markers_and_upload_parts() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret)).1
+    };
+    let usage = || {
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let rows = sql_rows(
+                server.native_port,
+                "SELECT bucket_name, version_kind, storage_class, object_count, size_bytes, complete \
+                 FROM sys.dm_s3_bucket_usage WHERE bucket_name = 'metered' \
+                 ORDER BY version_kind, storage_class",
+            );
+            if rows.iter().all(|row| row[5] == "1") || Instant::now() > deadline {
+                return rows
+                    .into_iter()
+                    .map(|row| format!("{} {} {} {}", row[1], row[2], row[3], row[4]))
+                    .collect::<Vec<_>>();
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+    assert_eq!(call("PUT", "/metered", "", &[], b"").0, 200);
+    let versioning = b"<VersioningConfiguration><Status>Enabled</Status></VersioningConfiguration>";
+    assert_eq!(
+        call("PUT", "/metered", "versioning", &[], versioning).0,
+        200
+    );
+    assert!(usage().is_empty());
+    assert_eq!(call("PUT", "/metered/a", "", &[], b"12345").0, 200);
+    assert_eq!(call("PUT", "/metered/a", "", &[], b"1234567").0, 200);
+    let glacier = [("x-amz-storage-class", "GLACIER")];
+    assert_eq!(call("PUT", "/metered/cold", "", &glacier, b"123").0, 200);
+    assert_eq!(call("PUT", "/metered/gone", "", &[], b"12").0, 200);
+    assert_eq!(call("DELETE", "/metered/gone", "", &[], b"").0, 204);
+    let (status, started) = call("POST", "/metered/big", "uploads", &glacier, b"");
+    assert_eq!(status, 200);
+    let upload = xml_value(&started, "UploadId");
+    for (number, part) in [(1, &b"part one"[..]), (2, b"two")] {
+        let query = format!("partNumber={number}&uploadId={upload}");
+        assert_eq!(call("PUT", "/metered/big", &query, &[], part).0, 200);
+    }
+    assert_eq!(
+        usage(),
+        [
+            "CURRENT GLACIER 1 3",
+            "CURRENT STANDARD 1 7",
+            "DELETE_MARKERS STANDARD 1 0",
+            "NONCURRENT STANDARD 2 7",
+            "UPLOAD_PARTS GLACIER 2 11",
+        ]
+    );
+    // Removing the marker makes "gone" current again; the upload's abort
+    // and the versions' removal empty the counts.
+    let listed = call("GET", "/metered", "versions", &[], b"").1;
+    let marker = listed
+        .split("<DeleteMarker>")
+        .nth(1)
+        .map(|rest| xml_value(rest, "VersionId"))
+        .expect("a delete marker");
+    assert_eq!(
+        call(
+            "DELETE",
+            "/metered/gone",
+            &format!("versionId={marker}"),
+            &[],
+            b""
+        )
+        .0,
+        204
+    );
+    assert_eq!(
+        call(
+            "DELETE",
+            "/metered/big",
+            &format!("uploadId={upload}"),
+            &[],
+            b""
+        )
+        .0,
+        204
+    );
+    assert_eq!(
+        usage(),
+        [
+            "CURRENT GLACIER 1 3",
+            "CURRENT STANDARD 2 9",
+            "NONCURRENT STANDARD 1 5",
+        ]
+    );
+}

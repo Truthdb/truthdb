@@ -305,7 +305,7 @@ pub fn validate_key(key: &str) -> Result<(), ObjectError> {
 }
 
 /// `bucket, 0, key, 0`: every version of the key starts with this.
-fn key_prefix(bucket: &str, key: &str) -> Vec<u8> {
+pub(crate) fn key_prefix(bucket: &str, key: &str) -> Vec<u8> {
     let mut out = Vec::with_capacity(bucket.len() + key.len() + 2);
     out.extend_from_slice(bucket.as_bytes());
     out.push(0);
@@ -328,24 +328,25 @@ pub(crate) fn version_from_key(row_key: &[u8]) -> Result<u64, StorageError> {
     Ok(!u64::from_be_bytes(row_key[tail..].try_into().unwrap()))
 }
 
-const FLAG_DELETE_MARKER: u8 = 1;
+pub(crate) const FLAG_DELETE_MARKER: u8 = 1;
 const FLAG_NULL_VERSION: u8 = 2;
 const FLAG_HAS_ATTRS: u8 = 4;
 /// Bits 3-5: the version's storage class (see [`StorageClass::code`]).
-const CLASS_SHIFT: u8 = 3;
+pub(crate) const CLASS_SHIFT: u8 = 3;
 
 fn class_of(flags: u8) -> StorageClass {
     StorageClass::from_code(flags >> CLASS_SHIFT)
 }
 
 /// A version's stored row.
-struct VersionRow {
+#[derive(Clone)]
+pub(crate) struct VersionRow {
     body: u64,
-    size: u64,
+    pub(crate) size: u64,
     md5: [u8; 16],
     parts: u16,
     mtime_ms: u64,
-    flags: u8,
+    pub(crate) flags: u8,
 }
 
 impl VersionRow {
@@ -360,7 +361,7 @@ impl VersionRow {
         out
     }
 
-    fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
+    pub(crate) fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         if bytes.len() != 43 {
             return Err(StorageError::InvalidFile("corrupt version row".to_string()));
         }
@@ -385,7 +386,7 @@ fn attrs_key(version: u64, chunk: u16) -> [u8; 10] {
 
 /// The version of `key` that `which` picks (a delete marker included), as
 /// its row key, number and row.
-fn find_version(
+pub(crate) fn find_version(
     ctx: &mut RelCtx<'_>,
     objects: &BTree,
     bucket: &str,
@@ -610,6 +611,7 @@ impl ObjTxn<'_, '_> {
                 | if has_attrs { FLAG_HAS_ATTRS } else { 0 }
                 | new.storage_class.code() << CLASS_SHIFT,
         };
+        let before = self.key_head(bucket, key)?;
         let objects = self.trees.objects();
         let inserted = objects.insert_unique(
             self.ctx,
@@ -618,6 +620,7 @@ impl ObjTxn<'_, '_> {
             &row.encode(),
         )?;
         debug_assert_eq!(inserted, TreeInsert::Inserted);
+        self.count_versions(bucket, key, before, &[], &[(version, row)])?;
         if has_attrs {
             self.write_attrs(version, attrs)?;
         }
@@ -777,6 +780,7 @@ impl ObjTxn<'_, '_> {
         if row.flags & FLAG_DELETE_MARKER != 0 {
             return Ok(Err(ObjectError::NoSuchVersion));
         }
+        let from = class_of(row.flags);
         row.flags = row.flags & !(7 << CLASS_SHIFT) | class.code() << CLASS_SHIFT;
         objects.update(
             self.ctx,
@@ -784,6 +788,7 @@ impl ObjTxn<'_, '_> {
             &row_key,
             &row.encode(),
         )?;
+        self.count_transition(bucket, key, version, &row, from, class)?;
         // A body under a customer-provided key is ciphertext: it would not
         // shrink.
         let sealed_by_customer = row.flags & FLAG_HAS_ATTRS != 0
@@ -918,9 +923,16 @@ impl ObjTxn<'_, '_> {
             }
             chosen.push((row_key, version, row));
         }
+        let before = if chosen.is_empty() {
+            None
+        } else {
+            self.key_head(bucket, key)?
+        };
         let mut removed = Vec::new();
+        let mut removed_rows = Vec::new();
         for (row_key, version, row) in chosen {
             objects.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
+            removed_rows.push((version, row.clone()));
             self.set_lock(version, &crate::ObjectLock::default())?;
             self.forget_restore(version)?;
             if row.flags & FLAG_HAS_ATTRS != 0 {
@@ -944,6 +956,9 @@ impl ObjTxn<'_, '_> {
                 )?;
             }
             removed.push(version);
+        }
+        if !removed_rows.is_empty() {
+            self.count_versions(bucket, key, before, &removed_rows, &[])?;
         }
         Ok(Ok(removed))
     }
@@ -990,6 +1005,7 @@ impl ObjTxn<'_, '_> {
             mtime_ms: now_ms,
             flags: FLAG_DELETE_MARKER | if null_version { FLAG_NULL_VERSION } else { 0 },
         };
+        let before = self.key_head(bucket, key)?;
         let objects = self.trees.objects();
         objects.insert_unique(
             self.ctx,
@@ -997,6 +1013,7 @@ impl ObjTxn<'_, '_> {
             &version_key(bucket, key, version),
             &row.encode(),
         )?;
+        self.count_versions(bucket, key, before, &[], &[(version, row)])?;
         self.record_change(
             Change {
                 record_type: RecordType::Delete,

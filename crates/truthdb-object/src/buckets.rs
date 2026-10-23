@@ -273,6 +273,7 @@ impl ObjTxn<'_, '_> {
         self.delete_bucket_configs(name)?;
         self.forget_pass(name)?;
         self.drop_fulltext(name)?;
+        self.forget_usage(name)?;
         Ok(Ok(()))
     }
 }

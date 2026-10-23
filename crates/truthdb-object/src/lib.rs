@@ -32,6 +32,7 @@ mod pack;
 mod restores;
 pub mod time;
 mod uploads;
+mod usage;
 
 #[cfg(test)]
 mod tests;
@@ -80,6 +81,7 @@ pub use objects::{
 pub use pack::{PackStep, PackWork, pack_segment};
 pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
+pub use usage::{BucketUsage, UsageKind};
 
 /// The object engine's id on the shared log (its root lives in the
 /// superblock's engine-roots table).
@@ -167,6 +169,9 @@ const JOB_RESULTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 34;
 const JOB_REQUESTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 35;
 /// (job number, task sequence) -> the object a generated manifest lists.
 const JOB_TASKS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 36;
+/// (bucket, 0, kind, storage class) -> the count and bytes of that kind
+/// (see `usage`).
+const USAGE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 37;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -291,7 +296,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 37;
+const TREE_COUNT: usize = 38;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -418,6 +423,9 @@ impl Trees {
     pub fn job_tasks(&self) -> BTree {
         self.tree(JOB_TASKS_TREE)
     }
+    pub fn usage(&self) -> BTree {
+        self.tree(USAGE_TREE)
+    }
 }
 
 /// One object-engine transaction in progress: the operations on it commit or
@@ -541,6 +549,12 @@ impl<'a> ObjFile<'a> {
             true,
         )?;
         self.eng.root = Some(tree.root);
+        // A new engine holds nothing: its storage usage is counted from the
+        // start, with no backfill.
+        self.in_txn(|ctx, txn| {
+            tree.insert_unique(ctx, &mut OpMode::Txn(txn), usage::DONE_KEY, &[1])?;
+            Ok(())
+        })?;
         Ok(tree)
     }
 
