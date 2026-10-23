@@ -18,6 +18,7 @@ members = [
     "crates/truthdb-s3",
     "crates/truthdb-s3client",
     "crates/truthdb-sigv4",
+    "crates/truthdb-streams",
     "crates/truthdb-cli",
     "crates/truthdb-bench",
     "crates/truthdb-proto",
@@ -47,6 +48,7 @@ truthdb-vector = { path = "crates/truthdb-vector", version = "0.1.0" }
 truthdb-iam = { path = "crates/truthdb-iam", version = "0.1.0" }
 truthdb-s3 = { path = "crates/truthdb-s3", version = "0.1.0" }
 truthdb-sigv4 = { path = "crates/truthdb-sigv4", version = "0.1.0" }
+truthdb-streams = { path = "crates/truthdb-streams", version = "0.1.0" }
 truthdb-s3client = { path = "crates/truthdb-s3client", version = "0.1.0" }
 truthdb-proto = { path = "crates/truthdb-proto", version = "0.1.0" }
 truthdb-net = { path = "crates/truthdb-net", version = "0.1.0" }

@@ -2012,6 +2012,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "truthdb-streams"
+version = "0.1.0"
+dependencies = [
+ "truthdb-core",
+]
+
+[[package]]
 name = "truthdb-tds"
 version = "0.1.0"
 dependencies = [

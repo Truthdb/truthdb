@@ -1,0 +1,11 @@
+[package]
+name = "truthdb-streams"
+version = "0.1.0"
+edition = "2024"
+description = "TruthDB streams engine: topics of partitions of ordered records over the shared log, read by offset, kept for a retention period."
+
+[dependencies]
+truthdb-core = { workspace = true }
+
+[dev-dependencies]
+truthdb-core = { workspace = true, features = ["test-hooks"] }
