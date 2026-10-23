@@ -404,6 +404,7 @@ pub(in crate::engine::relational) fn is_sys_view(name: &str) -> bool {
                 | "sys.dm_database_encryption_keys"
                 | "sys.dm_s3_journal_consumers"
                 | "sys.dm_s3_imports"
+                | "sys.dm_s3_batch_jobs"
                 | "sys.dm_s3_import_failures"
                 | "sys.stream_topics"
                 | "sys.stream_read"

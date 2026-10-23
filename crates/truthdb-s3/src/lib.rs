@@ -3,6 +3,8 @@
 
 pub mod api;
 pub mod authz;
+pub mod batch;
+pub mod batch_run;
 pub mod copy;
 pub mod delete;
 pub mod error;

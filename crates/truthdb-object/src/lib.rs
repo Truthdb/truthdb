@@ -21,6 +21,7 @@ mod documents;
 mod fulltext;
 mod gc;
 mod imports;
+mod jobs;
 mod journal;
 mod lifecycle;
 mod listing;
@@ -60,6 +61,7 @@ pub use fulltext::{
 };
 pub use gc::GcOutcome;
 pub use imports::{Import, ImportFailure, ImportSource, ImportState};
+pub use jobs::{Job, JobResult, JobStatus};
 pub use journal::{JournalObject, JournalRecord, Notice, Origin, RecordType};
 pub use lifecycle::{
     Expiration, Filter, LifecycleConfig, MinTransitionSize, NoncurrentExpiration,
@@ -155,6 +157,14 @@ const NOTIFY_HISTORY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 30;
 /// (ready time, version) -> (): restores yet to complete, for their
 /// `s3:ObjectRestore:Completed` events (see `restores`).
 const RESTORE_READY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 31;
+/// Job number -> a Batch Operations job, chunked (see `jobs`).
+const JOBS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 32;
+/// (account, 0, client request token) -> the job it made.
+const JOB_TOKENS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 33;
+/// (job number, task sequence) -> the task's result, for the report.
+const JOB_RESULTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 34;
+/// Job number -> the job's CreateJob request, chunked.
+const JOB_REQUESTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 35;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -173,6 +183,8 @@ const NEXT_UPLOAD_KEY: &[u8] = b"next_upload";
 const NEXT_CHANGE_KEY: &[u8] = b"next_change";
 /// META key of the next import id to hand out.
 const NEXT_IMPORT_KEY: &[u8] = b"next_import";
+/// META key of the next Batch Operations job number to hand out.
+const NEXT_JOB_KEY: &[u8] = b"next_job";
 /// META key of the last journal row the full-text indexer has applied, in a
 /// file written before journal consumers (see `consumers`).
 const FT_CURSOR_KEY: &[u8] = b"ft_cursor";
@@ -277,7 +289,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 32;
+const TREE_COUNT: usize = 36;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -388,6 +400,18 @@ impl Trees {
     }
     pub fn restore_ready(&self) -> BTree {
         self.tree(RESTORE_READY_TREE)
+    }
+    pub fn jobs(&self) -> BTree {
+        self.tree(JOBS_TREE)
+    }
+    pub fn job_tokens(&self) -> BTree {
+        self.tree(JOB_TOKENS_TREE)
+    }
+    pub fn job_results(&self) -> BTree {
+        self.tree(JOB_RESULTS_TREE)
+    }
+    pub fn job_requests(&self) -> BTree {
+        self.tree(JOB_REQUESTS_TREE)
     }
 }
 

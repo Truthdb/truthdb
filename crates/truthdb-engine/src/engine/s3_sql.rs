@@ -96,6 +96,7 @@ impl ExternalRowsets for S3Rowsets {
             "sys.dm_s3_imports" | "sys.dm_s3_import_failures" => {
                 return Some(open_imports(&self.core, name, args, caller));
             }
+            "sys.dm_s3_batch_jobs" => return Some(open_batch_jobs(&self.core, name, args, caller)),
             "sys.s3_search" => return Some(self.open_search(name, args, caller)),
             "sys.stream_topics" | "sys.stream_read" | "sys.dm_s3_webhooks" => {
                 return Some(super::stream_sql::open(&self.core, name, args, caller));
@@ -585,6 +586,80 @@ impl ExternalStream for ImportStream {
                 text(&import.error),
             ]);
         }
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// `sys.dm_s3_batch_jobs`: one row per Batch Operations job, of every
+/// account.
+fn open_batch_jobs(
+    core: &Arc<Storage>,
+    name: &str,
+    args: &[SqlValue],
+    caller: ExternalCaller,
+) -> Result<ExternalRowset, SqlError> {
+    check_admin(name, caller)?;
+    check_arg_count(name, args, 0, 0)?;
+    Ok(ExternalRowset {
+        columns: vec![
+            nvarchar("job_id", 33),
+            nvarchar("account_id", 12),
+            nvarchar("status", 16),
+            bigint("priority"),
+            bigint("total_tasks"),
+            bigint("succeeded_tasks"),
+            bigint("failed_tasks"),
+            datetime2("created"),
+            datetime2("terminated"),
+            nvarchar_max("status_reason"),
+            nvarchar_max("failure"),
+        ],
+        rows: Box::new(BatchJobStream {
+            core: Arc::clone(core),
+            done: false,
+        }),
+    })
+}
+
+struct BatchJobStream {
+    core: Arc<Storage>,
+    done: bool,
+}
+
+impl ExternalStream for BatchJobStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let mut guard = self.core.lock();
+        let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+        let rows: Vec<Vec<Datum>> = file
+            .jobs()
+            .map_err(storage_error)?
+            .into_iter()
+            .map(|job| {
+                let failure = job
+                    .failures
+                    .iter()
+                    .map(|(code, reason)| format!("{code}: {reason}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                vec![
+                    text(&job.id()),
+                    text(&job.account),
+                    text(job.status.as_str()),
+                    Datum::BigInt(i64::from(job.priority)),
+                    Datum::BigInt(job.total as i64),
+                    Datum::BigInt(job.succeeded as i64),
+                    Datum::BigInt(job.failed as i64),
+                    datetime(job.created_ms),
+                    job.terminated_ms.map_or(Datum::Null, datetime),
+                    text(&job.status_reason),
+                    text(&failure),
+                ]
+            })
+            .collect();
         Ok((!rows.is_empty()).then_some(rows))
     }
 }

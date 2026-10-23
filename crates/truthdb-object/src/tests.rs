@@ -5320,3 +5320,126 @@ fn a_restore_notes_its_start_completion_and_expiry() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn batch_jobs_are_kept_found_by_token_and_reported_durably() {
+    use crate::{Job, JobResult, JobStatus};
+    let path = temp_path("jobs");
+    let storage = create(&path);
+    let request = vec![7u8; 5000]; // over several chunks
+    let (first, made) = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_job(
+                Job::new("111122223333", Some("alice"), "token-1", vec![1, 2]),
+                &request,
+                0xabc,
+                10,
+            )
+        })
+        .unwrap();
+    assert!(made);
+    assert_eq!(first.number, 1);
+    assert_eq!(first.id(), "0000000000000001-0000000000000abc");
+    assert_eq!(Job::parse_id(&first.id()), Some((1, 0xabc)));
+    assert_eq!(Job::parse_id("1-abc"), None);
+    // The same token: the same job; another account's: another job.
+    let (again, made) = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_job(
+                Job::new("111122223333", None, "token-1", vec![9]),
+                &[],
+                1,
+                20,
+            )
+        })
+        .unwrap();
+    assert!(!made);
+    assert_eq!(again, first);
+    let (other, made) = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.create_job(
+                Job::new("444455556666", None, "token-1", vec![]),
+                b"x",
+                2,
+                30,
+            )
+        })
+        .unwrap();
+    assert!(made);
+    assert_eq!(other.number, 2);
+    // Progress and results.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            let mut job = tx.job(1)?.unwrap();
+            job.status = JobStatus::Active;
+            job.failures.push(("Code".into(), "reason".into()));
+            for n in 0..3 {
+                tx.add_job_result(
+                    &mut job,
+                    &JobResult {
+                        bucket: "b".into(),
+                        key: format!("k{n}"),
+                        version_id: String::new(),
+                        succeeded: n != 1,
+                        http_status: if n == 1 { 404 } else { 200 },
+                        error_code: if n == 1 {
+                            "NoSuchKey".into()
+                        } else {
+                            String::new()
+                        },
+                        message: "m".into(),
+                    },
+                )?;
+            }
+            job.succeeded = 2;
+            job.failed = 1;
+            tx.put_job(&job)
+        })
+        .unwrap();
+    drop(storage);
+    let storage = open(&path);
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    let jobs = file.jobs().unwrap();
+    assert_eq!(jobs.len(), 2);
+    let job = &jobs[0];
+    assert_eq!(job.user.as_deref(), Some("alice"));
+    assert_eq!(file.job_request(1).unwrap().as_deref(), Some(&request[..]));
+    assert_eq!(file.job_request(2).unwrap().as_deref(), Some(&b"x"[..]));
+    assert_eq!(job.status, JobStatus::Active);
+    assert_eq!((job.succeeded, job.failed, job.next_result), (2, 1, 3));
+    let results = file.job_results(1, 1, 10).unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0].0, 1);
+    assert_eq!(results[0].1.error_code, "NoSuchKey");
+    assert!(
+        file.job_results(2, 0, 10).unwrap().is_empty(),
+        "the other job's"
+    );
+    // Results go a step at a time, then the job and its token.
+    let job = job.clone();
+    assert!(!file.transaction(|tx| tx.drop_job_results(1, 2)).unwrap());
+    assert!(file.transaction(|tx| tx.drop_job_results(1, 2)).unwrap());
+    file.transaction(|tx| tx.drop_job(&job)).unwrap();
+    assert_eq!(file.job(1).unwrap(), None);
+    assert_eq!(
+        file.job_request(1).unwrap(),
+        None,
+        "its request went with it"
+    );
+    let (fresh, made) = file
+        .transaction(|tx| {
+            tx.create_job(
+                Job::new("111122223333", None, "token-1", vec![]),
+                &[],
+                3,
+                40,
+            )
+        })
+        .unwrap();
+    assert!(made, "the token went with its job");
+    assert_eq!(fresh.number, 3);
+    drop(guard);
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

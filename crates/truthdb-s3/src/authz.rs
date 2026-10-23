@@ -305,6 +305,49 @@ impl Authz {
         })
     }
 
+    /// [`Self::load`] for work done for `principal` outside a request (a
+    /// batch job's tasks, as the user that created the job), in the caller's
+    /// hold of the storage lock: no request headers or connection count.
+    pub fn load_now(
+        file: &mut ObjFile<'_>,
+        principal: &Principal,
+        buckets: Vec<String>,
+        objects: Vec<Named>,
+        now_ms: u64,
+    ) -> Result<Authz, StorageError> {
+        let loaded = load(file, Some(principal), &buckets, &objects)?;
+        Ok(Authz {
+            identity: loaded.identity,
+            policies: loaded.policies,
+            buckets: loaded.buckets,
+            existing_tags: loaded.existing_tags,
+            context: context(&HeaderMap::new(), "", &[], None, None, now_ms),
+        })
+    }
+
+    /// This authorization with condition keys set as the equivalent request
+    /// would carry them (for work done outside a request).
+    pub fn with_keys(&self, keys: &[(&str, String)]) -> Authz {
+        let mut authz = self.clone();
+        for (key, value) in keys {
+            authz.context.set(key, vec![value.clone()]);
+        }
+        authz
+    }
+
+    /// Checks `action` on `resource` with `tags` as its
+    /// `s3:RequestObjectTag/...` keys (a tag set being stored).
+    pub fn check_tags(
+        &self,
+        action: &str,
+        resource: Resource<'_>,
+        tags: &[(String, String)],
+    ) -> Result<(), S3Error> {
+        let mut context = self.context.clone();
+        set_request_tags(&mut context, tags);
+        self.check_with(action, resource, &context)
+    }
+
     /// Checks `action` on `resource` for an operation that stores the tags of
     /// an `x-amz-tagging` header (`tags`: `None` when it stores none): the
     /// tags are its `s3:RequestObjectTag/...`, and storing them also needs

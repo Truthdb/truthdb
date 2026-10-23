@@ -99,6 +99,8 @@ pub async fn serve(
     tls: Option<tokio_rustls::TlsAcceptor>,
     mut shutdown: watch::Receiver<bool>,
 ) {
+    // Batch Operations jobs run beside the listener.
+    tokio::spawn(crate::batch_run::run(Arc::clone(&state), shutdown.clone()));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let slot = tokio::select! {
