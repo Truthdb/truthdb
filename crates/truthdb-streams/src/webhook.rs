@@ -486,9 +486,9 @@ impl StreamFile<'_> {
     /// Up to `limit` records due for delivery at `now_ms`: each webhook
     /// partition's next one, once its wait is over, taken in turn from the
     /// `round`th webhook partition on (so a turn that cannot take them all
-    /// leaves out different ones each round), those `take` accepts (it is
-    /// asked before the record is read). A record retention removed is
-    /// passed over.
+    /// leaves out different ones each round), those not failing before
+    /// those being retried, those `take` accepts (it is asked before the
+    /// record is read). A record retention removed is passed over.
     pub fn webhook_due(
         &mut self,
         now_ms: u64,
@@ -523,6 +523,10 @@ impl StreamFile<'_> {
         }
         let first = round % candidates.len();
         candidates.rotate_left(first);
+        // Those not failing first: a failing endpoint takes what is left.
+        candidates.sort_by_key(|(webhook, partition, _)| {
+            webhook.partitions[*partition as usize].attempts > 0
+        });
         let mut out = Vec::new();
         let mut ctx = self.page_ctx();
         for (webhook, partition, offset) in candidates {

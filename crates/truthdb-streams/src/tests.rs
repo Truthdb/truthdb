@@ -1050,12 +1050,18 @@ fn a_webhook_delivers_in_order_retries_and_dead_letters() {
         tx.append("events", 1, &[record("y")], None, 6_000)
     })
     .unwrap();
-    let take = |round| {
+    let take = |now: u64, round| {
         at(&StreamFile::new(&mut storage.lock())
             .webhook_due(now, 1, round, &mut |_, _| true)
             .unwrap())
     };
-    assert_eq!((take(0), take(1)), (vec![(0, 2)], vec![(1, 1)]));
+    assert_eq!((take(now, 0), take(now, 1)), (vec![(0, 2)], vec![(1, 1)]));
+    // One failing and one not, room for one: the one not failing, whatever
+    // the round.
+    let both = due(now);
+    assert!(!in_txn(&storage, |tx| tx.webhook_failed(&both[0], "HTTP 500", now)));
+    now += 60_000;
+    assert_eq!((take(now, 0), take(now, 1)), (vec![(1, 1)], vec![(1, 1)]));
     // Too long, and a dead-letter topic too small for the topic.
     in_txn(&storage, |tx| tx.create_topic("other", 1, 0, None, 1)).unwrap();
     let long =

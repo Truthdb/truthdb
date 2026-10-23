@@ -6,7 +6,7 @@
 //! a repeat), and is signed: `x-truthdb-signature: t=<unix seconds>,v1=<hex
 //! HMAC-SHA256 of "<t>.<delivery>.<body>" under the webhook's secret>`, the
 //! time when it is sent. A 2xx answer delivers it; anything else, or no
-//! answer, is a failed try.
+//! answer within 10 seconds (more for a large body), is a failed try.
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -21,10 +21,13 @@ use super::{Engine, EngineError};
 /// that, however many topics post to it.
 const MAX_IN_FLIGHT: usize = 256;
 const MAX_IN_FLIGHT_PER_ENDPOINT: usize = 8;
-/// How long a POST may take, connecting included: a slot that an endpoint
-/// that does not answer holds is free again after it (and the record waits
-/// its backoff, so others take the slot), whatever fills the slots.
+/// How long a POST may take, connecting included, and more for its body at
+/// [`MIN_SEND_RATE`] bytes a second: a slot that an endpoint that does not
+/// answer holds is free again after it (and the record waits its backoff, so
+/// others take the slot), whatever fills the slots. A receiver that answers
+/// later fails the try.
 const POST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+const MIN_SEND_RATE: u64 = 32 * 1024;
 /// How long a pump waits for a POST in flight to finish.
 const WAIT_FOR_ONE: std::time::Duration = std::time::Duration::from_millis(200);
 
@@ -139,7 +142,8 @@ impl Engine {
             for delivery in starting {
                 let (poster, sent) = (Arc::clone(poster), delivery.clone());
                 // On the thread's runtime (this is outside it).
-                let timeout = posts.timeout;
+                let timeout = posts.timeout
+                    + std::time::Duration::from_secs(delivery.value.len() as u64 / MIN_SEND_RATE);
                 let task = posts.posts.spawn_on(
                     async move {
                         tokio::time::timeout(timeout, post(&poster, &sent))
