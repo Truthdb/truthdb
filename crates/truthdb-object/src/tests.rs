@@ -5246,7 +5246,48 @@ fn a_restore_notes_its_start_completion_and_expiry() {
     let again = start + 10 * crate::lifecycle::DAY_MS;
     restore("cold", again);
     let late = restore_expiry(again + 1_000, 1) + 5;
-    restore("cold", late);
+    // By a request: its Post is the requester's, the earlier restore's
+    // events S3's own.
+    {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        file.set_origin(crate::Origin {
+            operation: "RestoreObject".into(),
+            request_id: "0123456789ABCDEF".into(),
+            account: Some(DEFAULT_ACCOUNT.into()),
+            user: None,
+            source_ip: Some("10.0.0.1".into()),
+        });
+        file.transaction(|tx| {
+            tx.restore_object("bkt", "cold", VersionSel::Latest, ask(1, 1_000), late)
+        })
+        .unwrap()
+        .unwrap();
+    }
+    let requests: Vec<(String, String)> = ObjFile::new(&mut storage.lock())
+        .journal(0, 1_000)
+        .unwrap()
+        .into_iter()
+        .filter(|row| row.record_type == RecordType::Notice)
+        .skip(5)
+        .map(|row| {
+            (
+                row.notice.unwrap().event,
+                row.origin
+                    .map(|origin| origin.request_id)
+                    .unwrap_or_default(),
+            )
+        })
+        .collect();
+    let by = |event: &str, request: &str| (event.to_string(), request.to_string());
+    assert_eq!(
+        requests,
+        [
+            by("s3:ObjectRestore:Completed", ""),
+            by("s3:ObjectRestore:Delete", ""),
+            by("s3:ObjectRestore:Post", "0123456789ABCDEF"),
+        ]
+    );
     let events: Vec<String> = notices()
         .into_iter()
         .skip(4)

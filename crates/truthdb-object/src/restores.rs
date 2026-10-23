@@ -325,7 +325,12 @@ impl ObjTxn<'_, '_> {
             .get(self.ctx, &ready_key)?
             .is_some();
         self.forget_restore(version)?;
-        if let Some((bucket, object_key)) = names {
+        let Some((bucket, object_key)) = names else {
+            return Ok(());
+        };
+        // S3's own events, whatever request came upon them.
+        let origin = self.origin.take();
+        let noted = (|| {
             if pending {
                 self.send_completed(version, restore, &bucket, &object_key, now_ms)?;
             }
@@ -336,9 +341,10 @@ impl ObjTxn<'_, '_> {
                 "s3:ObjectRestore:Delete",
                 None,
                 now_ms,
-            )?;
-        }
-        Ok(())
+            )
+        })();
+        self.origin = origin;
+        noted
     }
 
     /// Removes up to `limit` restores expired by `now_ms`. Returns how many.
