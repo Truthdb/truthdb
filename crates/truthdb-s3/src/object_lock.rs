@@ -83,7 +83,7 @@ fn parse_until(text: &str, now_ms: u64) -> Result<u64, S3Error> {
     Ok(until)
 }
 
-fn parse_hold(text: &str) -> Result<bool, S3Error> {
+pub(crate) fn parse_hold(text: &str) -> Result<bool, S3Error> {
     match text {
         "ON" => Ok(true),
         "OFF" => Ok(false),
@@ -844,8 +844,36 @@ pub async fn retention(
     // Taken once the body is in (a slow body must not date the change
     // early); the engine takes its own when it applies it.
     let now = crate::objects::now_ms();
+    let change = retention_change(&body, now)?;
+    let mut context = authz.context().clone();
+    retention_keys(&mut context, change, now);
+    // Authorized in the change's own lock hold: a fixed date set on a held
+    // version releases its hold, which policies see as a release
+    // (s3:object-lock-event-hold OFF), from the version as it is then.
+    let (authz, action) = (authz.clone(), action.to_string());
+    let (bucket_name, key_name) = (bucket.clone(), key.clone());
+    crate::scope::object(state, move |file| {
+        release_keys(file, &bucket_name, &key_name, which, change, &mut context)?;
+        if let Err(err) =
+            authz.check_with(&action, Resource::Object(&bucket_name, &key_name), &context)
+        {
+            return Ok(Err(err));
+        }
+        let now = crate::objects::now_ms();
+        Ok(Ok(file.transaction(|tx| {
+            tx.put_retention(&bucket_name, &key_name, which, change, bypass, now)
+        })?))
+    })
+    .await??
+    .map_err(|err| crate::objects::object_error(err, &bucket, &key))?;
+    Ok(empty())
+}
+
+/// The change a Retention document asks for (an empty one removes the
+/// retention; with bypass, a GOVERNANCE one).
+pub(crate) fn retention_change(body: &[u8], now: u64) -> Result<RetentionChange, S3Error> {
     let found = leaves(
-        &body,
+        body,
         "Retention",
         &[
             "Mode",
@@ -863,27 +891,30 @@ pub async fn retention(
     if leaf(&found, "EventHoldDuration").is_some() && duration.is_none() {
         return Err(invalid("An event hold duration needs Days or Years"));
     }
-    // An empty Retention removes it (with bypass, for GOVERNANCE).
-    let change = match asked_retention(
-        leaf(&found, "Mode"),
-        leaf(&found, "RetainUntilDate"),
-        leaf(&found, "EventHold"),
-        duration,
-        now,
-    )? {
-        Asked::None => RetentionChange::Remove,
-        Asked::Retention(retention) => RetentionChange::Set(retention),
-        Asked::Release(mode, until) => RetentionChange::Release {
-            mode,
-            until_ms: until.unwrap_or(0),
+    Ok(
+        match asked_retention(
+            leaf(&found, "Mode"),
+            leaf(&found, "RetainUntilDate"),
+            leaf(&found, "EventHold"),
+            duration,
+            now,
+        )? {
+            Asked::None => RetentionChange::Remove,
+            Asked::Retention(retention) => RetentionChange::Set(retention),
+            Asked::Release(mode, until) => RetentionChange::Release {
+                mode,
+                until_ms: until.unwrap_or(0),
+            },
         },
-    };
-    // Authorized here, once, with the retention the body asks for (none,
-    // for a removal): headers say nothing about it.
-    let mut context = authz.context().clone();
+    )
+}
+
+/// The condition keys of a retention change (none, for a removal): what
+/// it asks for, which headers do not say.
+pub(crate) fn retention_keys(context: &mut Context, change: RetentionChange, now: u64) {
     match change {
         RetentionChange::Set(retention) => set_condition_keys(
-            &mut context,
+            context,
             &ObjectLock {
                 retention: Some(retention),
                 legal_hold: None,
@@ -907,36 +938,31 @@ pub async fn retention(
         }
         RetentionChange::Remove => {}
     }
-    // Authorized in the change's own lock hold: a fixed date set on a held
-    // version releases its hold, which policies see as a release
-    // (s3:object-lock-event-hold OFF), from the version as it is then.
-    let (authz, action) = (authz.clone(), action.to_string());
-    let (bucket_name, key_name) = (bucket.clone(), key.clone());
-    crate::scope::object(state, move |file| {
-        let fixed = matches!(change, RetentionChange::Set(retention) if retention.event.is_none());
-        if fixed && let Ok(info) = file.head_object(&bucket_name, &key_name, which)? {
-            let held = file
-                .object_lock(info.version)?
-                .retention
-                .and_then(|retention| retention.event)
-                .is_some_and(|event| event.on);
-            if held {
-                context.set("s3:object-lock-event-hold", vec!["OFF".to_string()]);
-            }
+}
+
+/// A fixed date set on a held version releases its hold, which policies
+/// see as a release (s3:object-lock-event-hold OFF): decided from the
+/// version as it is, in the change's own lock hold.
+pub(crate) fn release_keys(
+    file: &mut truthdb_object::ObjFile<'_>,
+    bucket: &str,
+    key: &str,
+    which: VersionSel,
+    change: RetentionChange,
+    context: &mut Context,
+) -> Result<(), truthdb_core::storage::StorageError> {
+    let fixed = matches!(change, RetentionChange::Set(retention) if retention.event.is_none());
+    if fixed && let Ok(info) = file.head_object(bucket, key, which)? {
+        let held = file
+            .object_lock(info.version)?
+            .retention
+            .and_then(|retention| retention.event)
+            .is_some_and(|event| event.on);
+        if held {
+            context.set("s3:object-lock-event-hold", vec!["OFF".to_string()]);
         }
-        if let Err(err) =
-            authz.check_with(&action, Resource::Object(&bucket_name, &key_name), &context)
-        {
-            return Ok(Err(err));
-        }
-        let now = crate::objects::now_ms();
-        Ok(Ok(file.transaction(|tx| {
-            tx.put_retention(&bucket_name, &key_name, which, change, bypass, now)
-        })?))
-    })
-    .await??
-    .map_err(|err| crate::objects::object_error(err, &bucket, &key))?;
-    Ok(empty())
+    }
+    Ok(())
 }
 
 /// PUT or GET `?legal-hold` on an object version. A PUT is authorized here,

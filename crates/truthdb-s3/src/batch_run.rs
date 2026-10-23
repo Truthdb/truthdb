@@ -576,6 +576,9 @@ fn parse_line(line: &str, fields: &[Field]) -> Result<(String, String, Option<St
 /// What a task will write, read in the lock hold it is written in.
 enum Planned {
     Tags(VersionSel, Vec<(String, String)>),
+    Restore(VersionSel, truthdb_object::RestoreRequest),
+    Retention(VersionSel, truthdb_object::RetentionChange, bool),
+    LegalHold(VersionSel, bool),
     Copy {
         source: Box<ObjectInfo>,
         bucket: String,
@@ -587,8 +590,10 @@ enum Planned {
 }
 
 /// Reads what a task needs; the error it ends with otherwise.
+#[allow(clippy::too_many_arguments)]
 fn plan(
     file: &mut ObjFile<'_>,
+    delays: crate::restore::RestoreDelays,
     creator: &Principal,
     operation: &Operation,
     bucket: &str,
@@ -668,6 +673,52 @@ fn plan(
                 return Ok(Err(err));
             }
             return Ok(Ok(Planned::Tags(which, Vec::new())));
+        }
+        Operation::Restore { days, bulk } => {
+            if let Err(err) = authz.check("s3:RestoreObject", object) {
+                return Ok(Err(err));
+            }
+            let seconds = if *bulk { delays.bulk } else { delays.standard };
+            return Ok(Ok(Planned::Restore(
+                which,
+                truthdb_object::RestoreRequest {
+                    days: *days,
+                    delay_ms: seconds.saturating_mul(1000),
+                    expedited: false,
+                },
+            )));
+        }
+        Operation::Retention { document, bypass } => {
+            // As a PutObjectRetention: its keys, from the change it asks
+            // for (and a release of a held version's hold), and the bypass
+            // only when the creator may bypass.
+            let change = match crate::object_lock::retention_change(document.as_bytes(), now) {
+                Ok(change) => change,
+                Err(err) => return Ok(Err(err)),
+            };
+            let mut context = authz.context().clone();
+            crate::object_lock::retention_keys(&mut context, change, now);
+            crate::object_lock::release_keys(file, bucket, key, which, change, &mut context)?;
+            if let Err(err) = authz.check_with("s3:PutObjectRetention", object, &context) {
+                return Ok(Err(err));
+            }
+            let bypass = *bypass && authz.check("s3:BypassGovernanceRetention", object).is_ok();
+            return Ok(Ok(Planned::Retention(which, change, bypass)));
+        }
+        Operation::LegalHold(on) => {
+            let mut context = authz.context().clone();
+            crate::object_lock::set_condition_keys(
+                &mut context,
+                &ObjectLock {
+                    retention: None,
+                    legal_hold: Some(*on),
+                },
+                now,
+            );
+            if let Err(err) = authz.check_with("s3:PutObjectLegalHold", object, &context) {
+                return Ok(Err(err));
+            }
+            return Ok(Ok(Planned::LegalHold(which, *on)));
         }
         Operation::Copy(copy) => copy,
     };
@@ -787,6 +838,7 @@ fn cut(text: &str, max: usize) -> String {
 /// Runs up to [`TASKS_PER_STEP`] tasks of Active job `number`.
 async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
     let now = now_ms();
+    let delays = state.restore_delays;
     object(state, move |file| {
         let Some(job) = file.job(number)? else {
             return Ok(());
@@ -822,6 +874,9 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
                 Operation::Copy(_) => "CopyObject",
                 Operation::PutTagging(_) => "PutObjectTagging",
                 Operation::DeleteTagging => "DeleteObjectTagging",
+                Operation::Restore { .. } => "RestoreObject",
+                Operation::Retention { .. } => "PutObjectRetention",
+                Operation::LegalHold(_) => "PutObjectLegalHold",
             }
             .to_string(),
             request_id: job.id(),
@@ -886,6 +941,7 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
                     // not the job.
                     let planned = plan(
                         file,
+                        delays,
                         &who,
                         &spec.operation,
                         &bucket,
@@ -903,6 +959,18 @@ async fn run_tasks(state: &S3State, number: u64) -> Result<(), String> {
                     Err(err) => Err(err),
                     Ok(Planned::Tags(which, tags)) => tx
                         .set_tags(&bucket, &key, which, tags, now)?
+                        .map(|_| ())
+                        .map_err(|err| object_error(err, &bucket, &key)),
+                    Ok(Planned::Restore(which, request)) => tx
+                        .restore_object(&bucket, &key, which, request, now)?
+                        .map(|_| ())
+                        .map_err(|err| object_error(err, &bucket, &key)),
+                    Ok(Planned::Retention(which, change, bypass)) => tx
+                        .put_retention(&bucket, &key, which, change, bypass, now)?
+                        .map(|_| ())
+                        .map_err(|err| object_error(err, &bucket, &key)),
+                    Ok(Planned::LegalHold(which, on)) => tx
+                        .put_legal_hold(&bucket, &key, which, on)?
                         .map(|_| ())
                         .map_err(|err| object_error(err, &bucket, &key)),
                     Ok(Planned::Copy {
