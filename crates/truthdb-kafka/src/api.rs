@@ -66,6 +66,9 @@ const MAX_FETCH_WAIT: Duration = Duration::from_secs(30);
 const FETCH_POLL: Duration = Duration::from_millis(100);
 /// A group id's bytes at most (it is part of a stored key).
 const MAX_GROUP_ID: usize = 255;
+/// The partition entries one request may list (in all its topics); a
+/// request with more closes the connection.
+const MAX_PARTITION_ENTRIES: usize = 4096;
 
 pub struct KafkaState {
     pub engine: EngineHandle,
@@ -327,6 +330,17 @@ fn stored_group(session: &Session, group: &str) -> String {
     format!("{}:{group}", session.account)
 }
 
+fn entries_within_limit<T>(topics: &[(String, Vec<T>)]) -> Result<(), Malformed> {
+    let entries: usize = topics
+        .iter()
+        .map(|(_, partitions)| partitions.len().max(1))
+        .sum();
+    if entries > MAX_PARTITION_ENTRIES {
+        return Err(Malformed);
+    }
+    Ok(())
+}
+
 fn valid_group(group: &str) -> bool {
     !group.is_empty() && group.len() <= MAX_GROUP_ID
 }
@@ -464,10 +478,15 @@ async fn list_offsets(
         })?;
         Ok((name, partitions))
     })?;
-    let account = session.account.clone();
-    let answers = streams(&state.engine, move |file| {
-        let mut out = Vec::new();
-        for (name, partitions) in topics {
+    entries_within_limit(&topics)?;
+    let mut answers = Vec::new();
+    for (name, partitions) in topics {
+        let account = session.account.clone();
+        let (topic, indexes) = (
+            name.clone(),
+            partitions.iter().map(|p| p.0).collect::<Vec<_>>(),
+        );
+        let answered = streams(&state.engine, move |file| {
             let owned = owned_topic(file, &account, &name)?;
             let mut answers = Vec::new();
             for (index, timestamp) in partitions {
@@ -502,27 +521,30 @@ async fn list_offsets(
                 };
                 answers.push(answer);
             }
-            out.push((name, answers));
-        }
-        Ok(out)
-    })
-    .await;
+            Ok(answers)
+        })
+        .await
+        .unwrap_or_else(|| {
+            indexes
+                .into_iter()
+                .map(|index| (index, UNKNOWN_SERVER_ERROR, -1, -1))
+                .collect()
+        });
+        answers.push((topic, answered));
+    }
     let mut out = Writer::default();
     if version >= 2 {
         out.i32(0);
     }
-    match answers {
-        Some(answers) => out.array(&answers, |out, (name, partitions)| {
-            out.string(name);
-            out.array(partitions, |out, &(index, error, timestamp, offset)| {
-                out.i32(index).i16(error).i64(timestamp).i64(offset);
-                if version >= 4 {
-                    out.i32(-1);
-                }
-            });
-        }),
-        None => out.i32(0),
-    };
+    out.array(&answers, |out, (name, partitions)| {
+        out.string(name);
+        out.array(partitions, |out, &(index, error, timestamp, offset)| {
+            out.i32(index).i16(error).i64(timestamp).i64(offset);
+            if version >= 4 {
+                out.i32(-1);
+            }
+        });
+    });
     Ok(out.bytes)
 }
 
@@ -580,6 +602,7 @@ async fn fetch(
         })?;
         Ok((name, partitions))
     })?;
+    entries_within_limit(&topics)?;
     // Forgotten topics (v7+) and the rack (v11) only matter to sessions.
     let mut out = Writer::default();
     out.i32(0);
@@ -643,6 +666,7 @@ async fn fetch_round(
     max_bytes: usize,
 ) -> Vec<(String, Vec<Fetched>)> {
     let mut left = max_bytes;
+    let mut returned_any = false;
     let mut out = Vec::new();
     for (name, partitions) in topics.iter() {
         let mut answers = Vec::new();
@@ -655,8 +679,9 @@ async fn fetch_round(
                 partition.offset,
             );
             // The first partition with records gets at least one record,
-            // whatever the limits (so a large record is not stuck).
-            let first = left == max_bytes;
+            // whatever the limits (so a large record is not stuck); after
+            // it, the limits hold.
+            let first = !returned_any;
             let fetched = streams(&state.engine, move |file| {
                 read_partition(file, &account, &topic, index, offset, want, first)
             })
@@ -668,6 +693,7 @@ async fn fetch_round(
                 records: Vec::new(),
             });
             left = left.saturating_sub(fetched.records.len());
+            returned_any |= !fetched.records.is_empty();
             answers.push(fetched);
         }
         out.push((name.clone(), answers));
@@ -768,6 +794,7 @@ async fn offset_commit(
         })?;
         Ok((name, partitions))
     })?;
+    entries_within_limit(&topics)?;
     let refused = if !valid_group(&group) {
         INVALID_GROUP_ID
     } else {
@@ -778,43 +805,31 @@ async fn offset_commit(
             Instant::now(),
         )
     };
-    let answers: Vec<(String, Vec<(i32, i16)>)> = if refused != NONE {
-        topics
-            .into_iter()
-            .map(|(name, partitions)| {
-                let errors = partitions
-                    .iter()
-                    .map(|&(index, _)| (index, refused))
-                    .collect();
-                (name, errors)
-            })
-            .collect()
-    } else {
-        let account = session.account.clone();
-        let stored = stored_group(session, &group);
-        let names: Vec<(String, Vec<i32>)> = topics
-            .iter()
-            .map(|(name, partitions)| (name.clone(), partitions.iter().map(|p| p.0).collect()))
-            .collect();
-        streams(&state.engine, move |file| {
-            commit(file, &account, &stored, topics)
+    let mut answers: Vec<(String, Vec<(i32, i16)>)> = Vec::new();
+    for (name, partitions) in topics {
+        let failed = |error| {
+            partitions
+                .iter()
+                .map(|&(index, _)| (index, error))
+                .collect()
+        };
+        if refused != NONE {
+            answers.push((name, failed(refused)));
+            continue;
+        }
+        let (account, stored, topic) = (
+            session.account.clone(),
+            stored_group(session, &group),
+            name.clone(),
+        );
+        let asked = partitions.clone();
+        let answered = streams(&state.engine, move |file| {
+            commit_topic(file, &account, &stored, &topic, &asked)
         })
         .await
-        .unwrap_or_else(|| {
-            names
-                .into_iter()
-                .map(|(name, indexes)| {
-                    (
-                        name,
-                        indexes
-                            .into_iter()
-                            .map(|index| (index, UNKNOWN_SERVER_ERROR))
-                            .collect(),
-                    )
-                })
-                .collect()
-        })
-    };
+        .unwrap_or_else(|| failed(UNKNOWN_SERVER_ERROR));
+        answers.push((name, answered));
+    }
     let mut out = Writer::default();
     if version >= 3 {
         out.i32(0);
@@ -828,45 +843,43 @@ async fn offset_commit(
     Ok(out.bytes)
 }
 
-/// Commits the offsets of the account's partitions, in transactions of at
-/// most this many.
-const COMMITS_PER_TRANSACTION: usize = 256;
-
-#[allow(clippy::type_complexity)]
-fn commit(
+/// Commits a topic's offsets in one transaction (a topic has at most
+/// `MAX_PARTITIONS` partitions, so at most that many commits), if the
+/// topic is the account's; the error for each partition asked.
+fn commit_topic(
     file: &mut StreamFile<'_>,
     account: &str,
     group: &str,
-    topics: Vec<(String, Vec<(i32, i64)>)>,
-) -> Result<Vec<(String, Vec<(i32, i16)>)>, truthdb_core::storage::StorageError> {
-    let mut answers = Vec::new();
-    let mut accepted = Vec::new();
-    for (name, partitions) in topics {
-        let count = owned_topic(file, account, &name)?.map_or(0, |(topic, _)| topic.partitions);
-        let mut errors = Vec::new();
-        for (index, offset) in partitions {
+    topic: &str,
+    partitions: &[(i32, i64)],
+) -> Result<Vec<(i32, i16)>, truthdb_core::storage::StorageError> {
+    let count = owned_topic(file, account, topic)?.map_or(0, |(topic, _)| topic.partitions);
+    let mut accepted = std::collections::BTreeMap::new();
+    let errors = partitions
+        .iter()
+        .map(|&(index, offset)| {
             let error = if index < 0 || index as u32 >= count {
                 UNKNOWN_TOPIC_OR_PARTITION
             } else if offset < 0 {
                 OFFSET_OUT_OF_RANGE
             } else {
-                accepted.push((name.clone(), index as u32, offset as u64));
+                // A partition listed twice: the last offset counts.
+                accepted.insert(index as u32, offset as u64);
                 NONE
             };
-            errors.push((index, error));
-        }
-        answers.push((name, errors));
-    }
-    for chunk in accepted.chunks(COMMITS_PER_TRANSACTION) {
+            (index, error)
+        })
+        .collect();
+    if !accepted.is_empty() {
         file.transaction(|tx| {
-            for (name, index, offset) in chunk {
+            for (&index, &offset) in &accepted {
                 // Owned and in range: checked above in this hold of the lock.
-                let _ = tx.commit_offset(group, name, *index, *offset)?;
+                let _ = tx.commit_offset(group, topic, index, offset)?;
             }
             Ok(())
         })?;
     }
-    Ok(answers)
+    Ok(errors)
 }
 
 /// OffsetFetch: the group's committed offsets (-1: none), of the
@@ -895,44 +908,57 @@ async fn offset_fetch(
         }
         return Ok(out.bytes);
     }
-    let account = session.account.clone();
-    let stored = stored_group(session, &group);
     let every = topics.is_none();
-    let answers = streams(&state.engine, move |file| {
-        let asked = match topics {
-            Some(topics) => topics,
-            None => file
-                .topics()?
+    let asked: Vec<(String, Vec<i32>)> = match topics {
+        Some(topics) => {
+            entries_within_limit(&topics)?;
+            topics
+        }
+        None => {
+            let Some(owned) = owned_topics(state, &session.account).await else {
+                out.i32(0);
+                if version >= 2 {
+                    out.i16(UNKNOWN_SERVER_ERROR);
+                }
+                return Ok(out.bytes);
+            };
+            owned
                 .into_iter()
-                .filter(|(topic, _)| topic.account.as_deref() == Some(account.as_str()))
                 .map(|(topic, _)| (topic.name, (0..topic.partitions as i32).collect()))
-                .collect(),
-        };
-        let mut out = Vec::new();
-        for (name, indexes) in asked {
+                .collect()
+        }
+    };
+    let mut answers = Vec::new();
+    for (name, indexes) in asked {
+        let (account, stored, topic) = (
+            session.account.clone(),
+            stored_group(session, &group),
+            name.clone(),
+        );
+        let wanted = indexes.clone();
+        let answered = streams(&state.engine, move |file| {
             let count =
-                owned_topic(file, &account, &name)?.map_or(0, |(topic, _)| topic.partitions);
+                owned_topic(file, &account, &topic)?.map_or(0, |(topic, _)| topic.partitions);
             let mut answers = Vec::new();
-            for index in indexes {
+            for index in wanted {
                 if index < 0 || index as u32 >= count {
                     answers.push((index, -1, UNKNOWN_TOPIC_OR_PARTITION));
                     continue;
                 }
-                let committed = file.committed_offset(&stored, &name, index as u32)?;
+                let committed = file.committed_offset(&stored, &topic, index as u32)?;
                 answers.push((index, committed.map_or(-1, |offset| offset as i64), NONE));
             }
-            out.push((name, answers));
-        }
-        Ok(out)
-    })
-    .await;
-    let Some(mut answers) = answers else {
-        out.i32(0);
-        if version >= 2 {
-            out.i16(UNKNOWN_SERVER_ERROR);
-        }
-        return Ok(out.bytes);
-    };
+            Ok(answers)
+        })
+        .await
+        .unwrap_or_else(|| {
+            indexes
+                .into_iter()
+                .map(|index| (index, -1, UNKNOWN_SERVER_ERROR))
+                .collect()
+        });
+        answers.push((name, answered));
+    }
     if every {
         // Asked for everything: only the partitions with a commit.
         for (_, partitions) in &mut answers {
@@ -992,10 +1018,12 @@ async fn join_group(
             protocols,
             require_member_id: version >= 4,
         };
-        let answer =
-            state
-                .coordinator
-                .join(&stored_group(session, &group), request, Instant::now());
+        let answer = state.coordinator.join(
+            &session.account,
+            &stored_group(session, &group),
+            request,
+            Instant::now(),
+        );
         match answer {
             Answer::Now(joined) => joined,
             Answer::Later(rx) => rx.await.unwrap_or(crate::group::Joined {

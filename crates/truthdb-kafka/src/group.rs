@@ -7,7 +7,8 @@
 //! drops those that have not), the leader is sent the members and their
 //! metadata, and its SyncGroup hands every member its assignment. A
 //! member that sends no heartbeat within its session timeout is dropped,
-//! which rebalances the group again.
+//! which rebalances the group again, as is one that has not sent its
+//! SyncGroup by the rebalance timeout after the join completed.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::Mutex;
@@ -16,13 +17,23 @@ use std::time::{Duration, Instant};
 use tokio::sync::oneshot;
 
 use crate::errors::{
-    ILLEGAL_GENERATION, INCONSISTENT_GROUP_PROTOCOL, INVALID_SESSION_TIMEOUT, MEMBER_ID_REQUIRED,
-    NONE, REBALANCE_IN_PROGRESS, UNKNOWN_MEMBER_ID,
+    GROUP_MAX_SIZE_REACHED, ILLEGAL_GENERATION, INCONSISTENT_GROUP_PROTOCOL,
+    INVALID_SESSION_TIMEOUT, MEMBER_ID_REQUIRED, NONE, REBALANCE_IN_PROGRESS, UNKNOWN_MEMBER_ID,
 };
 
 /// Kafka's `group.min.session.timeout.ms` and `group.max.session.timeout.ms`.
 const MIN_SESSION_TIMEOUT: Duration = Duration::from_secs(6);
 const MAX_SESSION_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+/// The longest a rebalance waits for members to rejoin, or to sync, whatever
+/// the members ask (Kafka takes their `max.poll.interval.ms`).
+const MAX_REBALANCE_TIMEOUT: Duration = MAX_SESSION_TIMEOUT;
+/// The memory one account's groups may take: member ids and protocol
+/// metadata, with an allowance per entry. A join past it is refused with
+/// GROUP_MAX_SIZE_REACHED.
+const MAX_ACCOUNT_BYTES: usize = 16 << 20;
+const ENTRY_BYTES: usize = 128;
+/// The bytes of a client id kept in the member ids made from it.
+const MAX_CLIENT_ID_IN_MEMBER_ID: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
@@ -46,10 +57,23 @@ struct Member {
     join: Option<oneshot::Sender<Joined>>,
     /// Its SyncGroup, waiting for the leader's assignments.
     sync: Option<oneshot::Sender<Synced>>,
+    /// Joined this generation and not yet sent its SyncGroup.
+    pending_sync: bool,
     assignment: Vec<u8>,
 }
 
 impl Member {
+    fn bytes(&self, id: &str) -> usize {
+        ENTRY_BYTES
+            + id.len()
+            + self
+                .protocols
+                .iter()
+                .map(|(name, metadata)| ENTRY_BYTES + name.len() + metadata.len())
+                .sum::<usize>()
+            + self.assignment.len()
+    }
+
     fn awaiting_join(&self) -> bool {
         self.join.as_ref().is_some_and(|join| !join.is_closed())
     }
@@ -68,6 +92,21 @@ struct Group {
     members: BTreeMap<String, Member>,
     /// Member ids handed out with MEMBER_ID_REQUIRED, until they expire.
     pending: HashMap<String, Instant>,
+    /// When members still to send their SyncGroup are dropped (in the
+    /// generation's Completing and Stable states).
+    sync_deadline: Instant,
+}
+
+impl Group {
+    fn bytes(&self) -> usize {
+        let members: usize = self
+            .members
+            .iter()
+            .map(|(id, member)| member.bytes(id))
+            .sum();
+        let pending: usize = self.pending.keys().map(|id| ENTRY_BYTES + id.len()).sum();
+        members + pending
+    }
 }
 
 /// A JoinGroup's answer.
@@ -137,7 +176,15 @@ pub struct Coordinator {
 }
 
 impl Coordinator {
-    pub fn join(&self, group_id: &str, request: Join, now: Instant) -> Answer<Joined> {
+    /// A JoinGroup to group `group_id` of `account` (whose groups are those
+    /// with ids starting `<account>:`).
+    pub fn join(
+        &self,
+        account: &str,
+        group_id: &str,
+        request: Join,
+        now: Instant,
+    ) -> Answer<Joined> {
         let session_timeout = Duration::from_millis(request.session_timeout_ms.max(0) as u64);
         if !(MIN_SESSION_TIMEOUT..=MAX_SESSION_TIMEOUT).contains(&session_timeout) {
             return Answer::Now(Joined::error(INVALID_SESSION_TIMEOUT, &request.member_id));
@@ -146,7 +193,7 @@ impl Coordinator {
         let rebalance_timeout = if request.rebalance_timeout_ms < 0 {
             session_timeout
         } else {
-            Duration::from_millis(request.rebalance_timeout_ms as u64)
+            Duration::from_millis(request.rebalance_timeout_ms as u64).min(MAX_REBALANCE_TIMEOUT)
         };
         if request.protocol_type.is_empty() || request.protocols.is_empty() {
             return Answer::Now(Joined::error(
@@ -155,6 +202,22 @@ impl Coordinator {
             ));
         }
         let mut groups = self.groups.lock().expect("groups poisoned");
+        let prefix = format!("{account}:");
+        let used: usize = groups
+            .iter()
+            .filter(|(id, _)| id.starts_with(&prefix))
+            .map(|(_, group)| group.bytes())
+            .sum();
+        let adding = ENTRY_BYTES
+            + request.member_id.len().max(MAX_CLIENT_ID_IN_MEMBER_ID + 33)
+            + request
+                .protocols
+                .iter()
+                .map(|(name, metadata)| ENTRY_BYTES + name.len() + metadata.len())
+                .sum::<usize>();
+        if used + adding > MAX_ACCOUNT_BYTES {
+            return Answer::Now(Joined::error(GROUP_MAX_SIZE_REACHED, &request.member_id));
+        }
         let group = groups.entry(group_id.to_string()).or_insert_with(|| Group {
             state: State::Empty,
             generation: 0,
@@ -163,6 +226,7 @@ impl Coordinator {
             leader: String::new(),
             members: BTreeMap::new(),
             pending: HashMap::new(),
+            sync_deadline: now,
         });
         let others = group
             .members
@@ -204,6 +268,7 @@ impl Coordinator {
             last_seen: now,
             join: None,
             sync: None,
+            pending_sync: false,
             assignment: Vec::new(),
         });
         member.protocols = request.protocols;
@@ -239,6 +304,9 @@ impl Coordinator {
         }
         let member = group.members.get_mut(member_id).expect("checked above");
         member.last_seen = now;
+        if matches!(group.state, State::Completing | State::Stable) {
+            member.pending_sync = false;
+        }
         match group.state {
             State::Empty => Answer::Now(Synced::error(UNKNOWN_MEMBER_ID)),
             State::Preparing { .. } => Answer::Now(Synced::error(REBALANCE_IN_PROGRESS)),
@@ -362,6 +430,15 @@ impl Coordinator {
             if group.members.len() < before {
                 member_left(group, now);
             }
+            // Joined but never synced: dropped at the sync deadline (as
+            // Kafka's expirePendingSync does), which rebalances the rest.
+            if matches!(group.state, State::Completing | State::Stable)
+                && now >= group.sync_deadline
+                && group.members.values().any(|member| member.pending_sync)
+            {
+                group.members.retain(|_, member| !member.pending_sync);
+                member_left(group, now);
+            }
             // A pending member id that expired may be what it waited for.
             if let State::Preparing { deadline } = group.state {
                 if now >= deadline {
@@ -387,7 +464,11 @@ fn new_member_id(client_id: &str) -> String {
         bytes = nanos.to_le_bytes();
     }
     let hex: String = bytes.iter().map(|byte| format!("{byte:02x}")).collect();
-    format!("{client_id}-{hex}")
+    let mut end = client_id.len().min(MAX_CLIENT_ID_IN_MEMBER_ID);
+    while !client_id.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}-{hex}", &client_id[..end])
 }
 
 /// Starts a rebalance: every member is to rejoin by the deadline (the
@@ -469,8 +550,16 @@ fn complete_join(group: &mut Group, now: Instant) {
             (id.clone(), metadata.clone())
         })
         .collect();
+    let timeout = group
+        .members
+        .values()
+        .map(|member| member.rebalance_timeout)
+        .max()
+        .unwrap_or_default();
+    group.sync_deadline = now + timeout;
     for (id, member) in &mut group.members {
         member.last_seen = now;
+        member.pending_sync = true;
         let joined = Joined {
             error: NONE,
             generation: group.generation,
@@ -532,9 +621,9 @@ mod tests {
         protocols: &[&str],
         now: Instant,
     ) -> (String, oneshot::Receiver<Joined>) {
-        let first = now_answer(coordinator.join("g", join("", protocols), now));
+        let first = now_answer(coordinator.join("a", "g", join("", protocols), now));
         assert_eq!(first.error, MEMBER_ID_REQUIRED);
-        let rx = later(coordinator.join("g", join(&first.member_id, protocols), now));
+        let rx = later(coordinator.join("a", "g", join(&first.member_id, protocols), now));
         (first.member_id, rx)
     }
 
@@ -552,12 +641,12 @@ mod tests {
 
         // A second member: the first learns of the rebalance from its
         // heartbeat and rejoins; the join completes with both.
-        let first = now_answer(coordinator.join("g", join("", &["range"]), t));
+        let first = now_answer(coordinator.join("a", "g", join("", &["range"]), t));
         let b = first.member_id;
-        let mut b_join = later(coordinator.join("g", join(&b, &["range"]), t));
+        let mut b_join = later(coordinator.join("a", "g", join(&b, &["range"]), t));
         assert!(b_join.try_recv().is_err(), "waits for the first member");
         assert_eq!(coordinator.heartbeat("g", 1, &a, t), REBALANCE_IN_PROGRESS);
-        let mut a_join = later(coordinator.join("g", join(&a, &["range"]), t));
+        let mut a_join = later(coordinator.join("a", "g", join(&a, &["range"]), t));
         let (a_joined, b_joined) = (a_join.try_recv().unwrap(), b_join.try_recv().unwrap());
         assert_eq!(a_joined.generation, 2);
         assert_eq!(a_joined.leader, a, "the leader stays");
@@ -588,7 +677,7 @@ mod tests {
             vec![NONE, UNKNOWN_MEMBER_ID]
         );
         assert_eq!(coordinator.heartbeat("g", 2, &b, t), REBALANCE_IN_PROGRESS);
-        let mut b_join = later(coordinator.join("g", join(&b, &["range"]), t));
+        let mut b_join = later(coordinator.join("a", "g", join(&b, &["range"]), t));
         let joined = b_join.try_recv().unwrap();
         assert_eq!((joined.generation, joined.leader), (3, b.clone()));
         assert_eq!(coordinator.heartbeat("g", 3, &a, t), UNKNOWN_MEMBER_ID);
@@ -643,31 +732,34 @@ mod tests {
         let mut short = join("", &["range"]);
         short.session_timeout_ms = 1000;
         assert_eq!(
-            now_answer(coordinator.join("g", short, t)).error,
+            now_answer(coordinator.join("a", "g", short, t)).error,
             INVALID_SESSION_TIMEOUT
         );
         assert_eq!(
-            now_answer(coordinator.join("g", join("unknown", &["range"]), t)).error,
+            now_answer(coordinator.join("a", "g", join("unknown", &["range"]), t)).error,
             UNKNOWN_MEMBER_ID
         );
         let (_, mut a_join) = join_new(&coordinator, &["range", "roundrobin"], t);
         a_join.try_recv().unwrap();
-        let first = now_answer(coordinator.join("g", join("", &["sticky"]), t));
+        let first = now_answer(coordinator.join("a", "g", join("", &["sticky"]), t));
         assert_eq!(
             first.error, INCONSISTENT_GROUP_PROTOCOL,
             "no common protocol"
         );
         // A pending member id expires after the session timeout.
-        let first = now_answer(coordinator.join("g", join("", &["roundrobin"]), t));
+        let first = now_answer(coordinator.join("a", "g", join("", &["roundrobin"]), t));
         coordinator.expire(t + Duration::from_secs(11));
         assert_eq!(
-            now_answer(coordinator.join("g", join(&first.member_id, &["roundrobin"]), t)).error,
+            now_answer(coordinator.join("a", "g", join(&first.member_id, &["roundrobin"]), t))
+                .error,
             UNKNOWN_MEMBER_ID
         );
         // Before v4 a member gets its id with its first join.
         let mut old = join("", &["range"]);
         old.require_member_id = false;
-        later(coordinator.join("h", old, t)).try_recv().unwrap();
+        later(coordinator.join("a", "h", old, t))
+            .try_recv()
+            .unwrap();
     }
 
     #[test]
@@ -678,7 +770,7 @@ mod tests {
         a_join.try_recv().unwrap();
         let (_, mut b_join) = join_new(&coordinator, &["roundrobin", "range"], t);
         let mut a_join =
-            later(coordinator.join("g", join(&a, &["sticky", "range", "roundrobin"]), t));
+            later(coordinator.join("a", "g", join(&a, &["sticky", "range", "roundrobin"]), t));
         let joined = a_join.try_recv().unwrap();
         assert_eq!(joined.protocol, "range");
         assert_eq!(b_join.try_recv().unwrap().protocol, "range");
@@ -688,5 +780,67 @@ mod tests {
                 .iter()
                 .all(|(_, metadata)| metadata == b"range")
         );
+    }
+
+    #[test]
+    fn a_leader_that_never_syncs_is_dropped_at_the_rebalance_timeout() {
+        let coordinator = Coordinator::default();
+        let t = Instant::now();
+        let (a, mut a_join) = join_new(&coordinator, &["range"], t);
+        a_join.try_recv().unwrap();
+        now_answer(coordinator.sync("g", 1, &a, Vec::new(), t));
+        let (b, mut b_join) = join_new(&coordinator, &["range"], t);
+        let mut a_join = later(coordinator.join("a", "g", join(&a, &["range"]), t));
+        assert_eq!(a_join.try_recv().unwrap().leader, a);
+        b_join.try_recv().unwrap();
+        // The follower syncs and waits; the leader keeps sending heartbeats
+        // but never syncs.
+        let mut b_sync = later(coordinator.sync("g", 2, &b, Vec::new(), t));
+        for secs in [5, 10, 15, 20, 25] {
+            let at = t + Duration::from_secs(secs);
+            assert_eq!(coordinator.heartbeat("g", 2, &a, at), NONE);
+            coordinator.expire(at);
+        }
+        assert!(b_sync.try_recv().is_err(), "still waiting");
+        coordinator.expire(t + Duration::from_secs(30));
+        assert_eq!(b_sync.try_recv().unwrap().error, REBALANCE_IN_PROGRESS);
+        assert_eq!(coordinator.heartbeat("g", 2, &a, t), UNKNOWN_MEMBER_ID);
+    }
+
+    #[test]
+    fn an_accounts_groups_take_a_bounded_amount_of_memory() {
+        let coordinator = Coordinator::default();
+        let t = Instant::now();
+        let big = |member_id: &str| Join {
+            protocols: vec![("range".to_string(), vec![0; 1 << 20])],
+            require_member_id: false,
+            ..join(member_id, &["range"])
+        };
+        // At most 64 tries: without a cap this ends instead of eating memory.
+        let refused =
+            (0..64).find(
+                |n| match coordinator.join("a", &format!("a:{n}"), big(""), t) {
+                    Answer::Later(_) => false,
+                    Answer::Now(refused) => {
+                        assert_eq!(refused.error, GROUP_MAX_SIZE_REACHED);
+                        true
+                    }
+                },
+            );
+        let joined = refused.expect("refused within 64 joins");
+        assert_eq!(joined, 15, "16 MiB of 1 MiB members, with their allowance");
+        // Another account is not held back.
+        assert!(matches!(
+            coordinator.join("b", "b:0", big(""), t),
+            Answer::Later(_)
+        ));
+    }
+
+    #[test]
+    fn member_ids_keep_a_bounded_part_of_the_client_id() {
+        let id = new_member_id(&"é".repeat(1000));
+        assert!(id.len() <= MAX_CLIENT_ID_IN_MEMBER_ID + 33, "{}", id.len());
+        assert!(id.starts_with("éé"));
+        assert_eq!(new_member_id("app").len(), 3 + 33);
     }
 }

@@ -397,6 +397,14 @@ fn send_tls(
 fn tls_stream(
     server: &Server,
 ) -> rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
+    tls_stream_to(server, server.s3_port)
+}
+
+/// [`tls_stream`] to another of `server`'s TLS listeners.
+fn tls_stream_to(
+    server: &Server,
+    port: u16,
+) -> rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream> {
     let mut roots = rustls::RootCertStore::empty();
     roots
         .add(rustls::pki_types::CertificateDer::from(
@@ -413,7 +421,7 @@ fn tls_stream(
     let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
     let connection =
         rustls::ClientConnection::new(std::sync::Arc::new(config), name).expect("a connection");
-    let tcp = std::net::TcpStream::connect(("127.0.0.1", server.s3_port)).expect("connect");
+    let tcp = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
     rustls::StreamOwned::new(connection, tcp)
 }
 
@@ -9312,4 +9320,220 @@ fn kafka_consumers_read_bucket_events_in_groups() {
     assert_eq!(theirs, serde_json::json!([]));
     let refused = kafka_client(&python, &server, &["connect", &port, &key, "wrong", ca]);
     assert!(refused.is_string(), "{refused}");
+}
+
+type KafkaStream = rustls::StreamOwned<rustls::ClientConnection, std::net::TcpStream>;
+
+/// Sends one Kafka request (header v1, client id "raw") and returns the
+/// answer's body, or `None` when the server closed the connection instead.
+fn kafka_request(stream: &mut KafkaStream, api: i16, version: i16, body: &[u8]) -> Option<Vec<u8>> {
+    let mut request = Vec::new();
+    request.extend_from_slice(&api.to_be_bytes());
+    request.extend_from_slice(&version.to_be_bytes());
+    request.extend_from_slice(&7i32.to_be_bytes());
+    request.extend_from_slice(&3i16.to_be_bytes());
+    request.extend_from_slice(b"raw");
+    request.extend_from_slice(body);
+    let mut frame = (request.len() as i32).to_be_bytes().to_vec();
+    frame.extend_from_slice(&request);
+    if stream
+        .write_all(&frame)
+        .and_then(|()| stream.flush())
+        .is_err()
+    {
+        return None;
+    }
+    let mut size = [0u8; 4];
+    stream.read_exact(&mut size).ok()?;
+    let mut answer = vec![0u8; i32::from_be_bytes(size) as usize];
+    stream.read_exact(&mut answer).ok()?;
+    assert_eq!(answer[..4], 7i32.to_be_bytes(), "the correlation id");
+    Some(answer[4..].to_vec())
+}
+
+/// A Kafka string (int16 length).
+fn kafka_string(out: &mut Vec<u8>, value: &str) {
+    out.extend_from_slice(&(value.len() as i16).to_be_bytes());
+    out.extend_from_slice(value.as_bytes());
+}
+
+/// A connection authenticated with SASL PLAIN as `key`; `None` when the
+/// secret was refused (the answer's error code is checked).
+fn kafka_login(server: &Server, key: &str, secret: &str) -> Option<KafkaStream> {
+    let mut stream = tls_stream_to(server, server.kafka_port.unwrap());
+    let mut body = Vec::new();
+    kafka_string(&mut body, "PLAIN");
+    let handshake = kafka_request(&mut stream, 17, 1, &body).expect("handshake");
+    assert_eq!(handshake[..2], [0, 0], "PLAIN is offered");
+    let token = format!("\0{key}\0{secret}");
+    let mut body = (token.len() as i32).to_be_bytes().to_vec();
+    body.extend_from_slice(token.as_bytes());
+    let answer = kafka_request(&mut stream, 36, 1, &body).expect("authenticate");
+    let error = i16::from_be_bytes([answer[0], answer[1]]);
+    if error == 0 {
+        return Some(stream);
+    }
+    assert_eq!(error, 58, "SASL_AUTHENTICATION_FAILED");
+    assert!(
+        kafka_request(&mut stream, 18, 0, &[]).is_none(),
+        "closed after a refusal"
+    );
+    None
+}
+
+/// A Fetch v4 body: no wait, `max_bytes` overall, the given (topic,
+/// partition, offset, partition max bytes) entries.
+fn fetch_body(max_bytes: i32, entries: &[(&str, i32, i64, i32)]) -> Vec<u8> {
+    let mut body = Vec::new();
+    for value in [-1i32, 0, 0, max_bytes] {
+        body.extend_from_slice(&value.to_be_bytes());
+    }
+    body.push(0); // isolation level
+    body.extend_from_slice(&(entries.len() as i32).to_be_bytes());
+    for &(topic, partition, offset, partition_max) in entries {
+        kafka_string(&mut body, topic);
+        body.extend_from_slice(&1i32.to_be_bytes());
+        body.extend_from_slice(&partition.to_be_bytes());
+        body.extend_from_slice(&offset.to_be_bytes());
+        body.extend_from_slice(&partition_max.to_be_bytes());
+    }
+    body
+}
+
+/// The record sets of a Fetch v4 answer, in order: (error, records' bytes).
+fn fetched_records(answer: &[u8]) -> Vec<(i16, usize)> {
+    let mut at = 4; // throttle time
+    let int = |at: &mut usize, n: usize| {
+        let mut value = 0i64;
+        for byte in &answer[*at..*at + n] {
+            value = value << 8 | i64::from(*byte);
+        }
+        *at += n;
+        // Sign-extend.
+        value << (64 - 8 * n) >> (64 - 8 * n)
+    };
+    let mut out = Vec::new();
+    let topics = int(&mut at, 4);
+    for _ in 0..topics {
+        let name = int(&mut at, 2) as usize;
+        at += name;
+        let partitions = int(&mut at, 4);
+        for _ in 0..partitions {
+            at += 4; // partition index
+            let error = int(&mut at, 2) as i16;
+            at += 8 + 8; // high watermark, last stable offset
+            let aborted = int(&mut at, 4);
+            at += 16 * aborted.max(0) as usize;
+            let records = int(&mut at, 4).max(0) as usize;
+            at += records;
+            out.push((error, records));
+        }
+    }
+    assert_eq!(at, answer.len(), "the whole answer read");
+    out
+}
+
+#[test]
+fn the_kafka_listener_bounds_what_one_request_takes() {
+    let server = start_server_full(false, true, true);
+    let (account, key, secret) = account_with_key(&server, "rawkafka");
+    native(
+        server.native_port,
+        &format!("stream create topic events partitions 2 retention 0 account {account}"),
+    );
+    native(server.native_port, "stream create topic unowned");
+    let call = |method: &str, path: &str, query: &str, body: &[u8]| {
+        send_tls(&server, method, path, query, &[], body, &key, Some(&secret)).1
+    };
+    assert_eq!(call("PUT", "/raw", "", b"").0, 200);
+    let config = format!(
+        "<NotificationConfiguration><TopicConfiguration>\
+         <Topic>arn:aws:sns:us-east-1:{account}:events</Topic>\
+         <Event>s3:ObjectCreated:*</Event></TopicConfiguration></NotificationConfiguration>"
+    );
+    assert_eq!(
+        call("PUT", "/raw", "notification", config.as_bytes()).0,
+        200
+    );
+    for name in ["a", "b", "c", "d", "e", "f"] {
+        assert_eq!(call("PUT", &format!("/raw/{name}"), "", b"x").0, 200);
+    }
+    // The events reach the topic (the notifier runs in the background).
+    let deadline = Instant::now() + DEADLINE;
+    while stream_events(server.native_port, "events").len() < 7 {
+        assert!(Instant::now() < deadline, "the events never arrived");
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    // Before authenticating, only ApiVersions and SASL are answered.
+    let mut anonymous = tls_stream_to(&server, server.kafka_port.unwrap());
+    assert!(
+        kafka_request(&mut anonymous, 18, 2, &[]).is_some(),
+        "ApiVersions"
+    );
+    assert!(
+        kafka_request(&mut anonymous, 3, 0, &0i32.to_be_bytes()).is_none(),
+        "Metadata"
+    );
+    assert!(kafka_login(&server, &key, "wrong").is_none());
+
+    // A fetch of no bytes, listing both partitions many times over: one
+    // record set comes back (the first non-empty one), not one per entry.
+    let mut stream = kafka_login(&server, &key, &secret).expect("logged in");
+    let entries: Vec<(&str, i32, i64, i32)> = (0..200).map(|n| ("events", n % 2, 0, 0)).collect();
+    let answer = kafka_request(&mut stream, 1, 4, &fetch_body(0, &entries)).expect("fetch");
+    let sets = fetched_records(&answer);
+    assert_eq!(sets.len(), 200);
+    assert!(sets.iter().all(|&(error, _)| error == 0));
+    assert_eq!(
+        sets.iter().filter(|&&(_, bytes)| bytes > 0).count(),
+        1,
+        "{sets:?}"
+    );
+    // With room, both partitions answer.
+    let both = [("events", 0, 0, 1 << 20), ("events", 1, 0, 1 << 20)];
+    let answer = kafka_request(&mut stream, 1, 4, &fetch_body(1 << 20, &both)).unwrap();
+    assert!(fetched_records(&answer).iter().all(|&(_, bytes)| bytes > 0));
+
+    // Commits: a partition listed twice keeps its last offset; a partition
+    // or topic not the account's is refused without holding back the rest.
+    let mut body = Vec::new();
+    kafka_string(&mut body, "raw-group");
+    body.extend_from_slice(&(-1i32).to_be_bytes());
+    kafka_string(&mut body, "");
+    body.extend_from_slice(&(-1i64).to_be_bytes()); // retention
+    body.extend_from_slice(&2i32.to_be_bytes());
+    for (topic, partitions) in [
+        ("events", vec![(0i32, 5i64), (0, 1), (9, 1)]),
+        ("unowned", vec![(0, 1)]),
+    ] {
+        kafka_string(&mut body, topic);
+        body.extend_from_slice(&(partitions.len() as i32).to_be_bytes());
+        for (partition, offset) in partitions {
+            body.extend_from_slice(&partition.to_be_bytes());
+            body.extend_from_slice(&offset.to_be_bytes());
+            body.extend_from_slice(&(-1i16).to_be_bytes()); // metadata: null
+        }
+    }
+    let answer = kafka_request(&mut stream, 8, 2, &body).expect("commit");
+    // v2 has no throttle time: topics, name, partitions, then (index, error)s.
+    let errors: Vec<i16> = [20, 26, 32, 51]
+        .iter()
+        .map(|&at| i16::from_be_bytes([answer[at], answer[at + 1]]))
+        .collect();
+    assert_eq!(errors, [0, 0, 3, 3], "{answer:?}");
+    let mut body = Vec::new();
+    kafka_string(&mut body, "raw-group");
+    body.extend_from_slice(&1i32.to_be_bytes());
+    kafka_string(&mut body, "events");
+    body.extend_from_slice(&1i32.to_be_bytes());
+    body.extend_from_slice(&0i32.to_be_bytes());
+    let answer = kafka_request(&mut stream, 9, 1, &body).expect("offset fetch");
+    // topics, name, partitions, index, then the committed offset.
+    let offset_at = 4 + 2 + 6 + 4 + 4;
+    assert_eq!(answer[offset_at..offset_at + 8], 1i64.to_be_bytes());
+
+    // A request listing more partitions than allowed closes the connection.
+    let entries: Vec<(&str, i32, i64, i32)> = (0..4097).map(|_| ("events", 0, 0, 0)).collect();
+    assert!(kafka_request(&mut stream, 1, 4, &fetch_body(0, &entries)).is_none());
 }
