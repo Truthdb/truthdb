@@ -39,6 +39,19 @@ pub(crate) enum Operation {
     Copy(Box<CopySpec>),
     PutTagging(Vec<(String, String)>),
     DeleteTagging,
+    /// Restore an archived version for `days`, at the BULK tier (else
+    /// STANDARD).
+    Restore {
+        days: u32,
+        bulk: bool,
+    },
+    /// Set (or, empty, remove) a retention: its Retention document, read
+    /// again with each task's time.
+    Retention {
+        document: String,
+        bypass: bool,
+    },
+    LegalHold(bool),
 }
 
 impl Operation {
@@ -48,6 +61,9 @@ impl Operation {
             Operation::Copy(_) => "S3PutObjectCopy",
             Operation::PutTagging(_) => "S3PutObjectTagging",
             Operation::DeleteTagging => "S3DeleteObjectTagging",
+            Operation::Restore { .. } => "S3InitiateRestoreObject",
+            Operation::Retention { .. } => "S3PutObjectRetention",
+            Operation::LegalHold(_) => "S3PutObjectLegalHold",
         }
     }
 }
@@ -283,6 +299,48 @@ fn operation(element: &Element) -> Result<Operation, S3Error> {
             Ok(Operation::PutTagging(tags))
         }
         "S3PutObjectCopy" => copy(chosen).map(|copy| Operation::Copy(Box::new(copy))),
+        "S3InitiateRestoreObject" => {
+            chosen.only(&["ExpirationInDays", "GlacierJobTier"])?;
+            let days = chosen
+                .text_of("ExpirationInDays")?
+                .and_then(|days| days.parse::<u32>().ok())
+                .filter(|days| *days >= 1)
+                .ok_or_else(|| invalid("ExpirationInDays is a whole number from 1"))?;
+            let bulk = match chosen.text_of("GlacierJobTier")? {
+                None | Some("STANDARD") => false,
+                Some("BULK") => true,
+                Some(_) => return Err(invalid("GlacierJobTier is BULK or STANDARD")),
+            };
+            Ok(Operation::Restore { days, bulk })
+        }
+        "S3PutObjectRetention" => {
+            chosen.only(&["BypassGovernanceRetention", "Retention"])?;
+            let bypass = match chosen.text_of("BypassGovernanceRetention")? {
+                Some(text) => flag(text)?,
+                None => false,
+            };
+            let retention = chosen
+                .one("Retention")?
+                .ok_or_else(|| invalid("S3PutObjectRetention needs its Retention"))?;
+            let mut document = String::new();
+            render(retention, &mut document);
+            // Its form only (as of time zero): a stored job is read whatever
+            // the time. Its date is checked at CreateJob, and each task
+            // reads it again with its own time.
+            crate::object_lock::retention_change(document.as_bytes(), 0)?;
+            Ok(Operation::Retention { document, bypass })
+        }
+        "S3PutObjectLegalHold" => {
+            chosen.only(&["LegalHold"])?;
+            let hold = chosen
+                .one("LegalHold")?
+                .ok_or_else(|| invalid("S3PutObjectLegalHold needs its LegalHold"))?;
+            hold.only(&["Status"])?;
+            let status = hold.text_of("Status")?.ok_or_else(malformed)?;
+            Ok(Operation::LegalHold(crate::object_lock::parse_hold(
+                status,
+            )?))
+        }
         other => Err(S3Error::not_implemented(format!(
             "The batch operation {other}"
         ))),
@@ -661,6 +719,10 @@ async fn create(
     let body = crate::server::read_body(request, auth, MAX_REQUEST_BYTES).await?;
     let parsed = xml::parse(&body, "CreateJobRequest")?;
     let spec = spec(&parsed)?;
+    // As a PutObjectRetention body: a date in the future, now.
+    if let Operation::Retention { document, .. } = &spec.operation {
+        crate::object_lock::retention_change(document.as_bytes(), crate::objects::now_ms())?;
+    }
     // As a CopyObject asking for it: SSE-S3 only on an encrypted database.
     if let Operation::Copy(copy) = &spec.operation
         && copy.sse

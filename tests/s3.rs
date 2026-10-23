@@ -10289,3 +10289,256 @@ fn an_account_keeps_a_bounded_number_of_batch_jobs() {
     let (status, answer) = call(&body(7));
     assert_eq!(status, 200, "{answer}");
 }
+
+#[test]
+fn batch_jobs_restore_and_lock_what_a_manifest_lists() {
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "batchlock");
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        let mut headers = vec![("x-amz-account-id", account.as_str())];
+        headers.extend_from_slice(extra);
+        send_with(
+            server.s3_port,
+            method,
+            path,
+            query,
+            &headers,
+            body,
+            &key,
+            Some(&secret),
+        )
+    };
+    for bucket in ["/src", "/reports", "/cold"] {
+        assert_eq!(call("PUT", bucket, "", &[], b"").1.0, 200);
+    }
+    assert_eq!(
+        call(
+            "PUT",
+            "/vault",
+            "",
+            &[("x-amz-bucket-object-lock-enabled", "true")],
+            b""
+        )
+        .1
+        .0,
+        200
+    );
+    assert_eq!(
+        call(
+            "PUT",
+            "/cold/g1",
+            "",
+            &[("x-amz-storage-class", "GLACIER")],
+            b"frozen"
+        )
+        .1
+        .0,
+        200
+    );
+    assert_eq!(call("PUT", "/cold/s1", "", &[], b"warm").1.0, 200);
+    for name in ["v1", "v2"] {
+        assert_eq!(
+            call("PUT", &format!("/vault/{name}"), "", &[], b"kept").1.0,
+            200
+        );
+    }
+    let manifest = |name: &str, lines: &str| {
+        let (head, (status, _)) = call("PUT", &format!("/src/{name}"), "", &[], lines.as_bytes());
+        assert_eq!(status, 200);
+        response_header(&head, "etag").unwrap()
+    };
+    let run_as = |job_key: &str,
+                  job_secret: &str,
+                  token: &str,
+                  operation: &str,
+                  list: &str,
+                  etag: &str|
+     -> String {
+        let body = create_job_body(token, operation, list, etag, "");
+        let headers = [("x-amz-account-id", account.as_str())];
+        let (status, answer) = send_with(
+            server.s3_port,
+            "POST",
+            "/v20180820/jobs",
+            "",
+            &headers,
+            body.as_bytes(),
+            job_key,
+            Some(job_secret),
+        )
+        .1;
+        assert_eq!(status, 200, "{answer}");
+        let job = xml_value(&answer, "JobId");
+        let deadline = Instant::now() + DEADLINE;
+        loop {
+            let described = call("GET", &format!("/v20180820/jobs/{job}"), "", &[], b"")
+                .1
+                .1;
+            // The job's own Status, after its progress (a legal hold has one).
+            let status = described.rsplit("</ProgressSummary>").next().unwrap_or("");
+            if ["Complete", "Failed"].contains(&xml_value(status, "Status").as_str()) {
+                return described;
+            }
+            assert!(Instant::now() < deadline, "{described}");
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+    let run = |token: &str, operation: &str, list: &str, etag: &str| {
+        run_as(&key, &secret, token, operation, list, etag)
+    };
+    let counts = |described: &str| {
+        (
+            xml_value(described, "NumberOfTasksSucceeded"),
+            xml_value(described, "NumberOfTasksFailed"),
+        )
+    };
+
+    // Restore: the archived object is restored; the other is in its active
+    // tier already.
+    let etag = manifest("restore.csv", "cold,g1\ncold,s1\n");
+    let restore = "<S3InitiateRestoreObject><ExpirationInDays>2</ExpirationInDays>\
+                   <GlacierJobTier>BULK</GlacierJobTier></S3InitiateRestoreObject>";
+    let described = run("restore-1", restore, "restore.csv", &etag);
+    assert_eq!(counts(&described), ("1".into(), "1".into()), "{described}");
+    let (head, _) = call("HEAD", "/cold/g1", "", &[], b"");
+    assert!(response_header(&head, "x-amz-restore").is_some(), "{head}");
+
+    // Retention: GOVERNANCE set on both versions; on a bucket without
+    // Object Lock, refused.
+    let etag = manifest("lock.csv", "vault,v1\nvault,v2\ncold,s1\n");
+    let governance = "<S3PutObjectRetention><Retention><Mode>GOVERNANCE</Mode>\
+                      <RetainUntilDate>2099-01-01T00:00:00Z</RetainUntilDate></Retention></S3PutObjectRetention>";
+    let described = run("retain-1", governance, "lock.csv", &etag);
+    assert_eq!(counts(&described), ("2".into(), "1".into()), "{described}");
+    let (_, (_, retention)) = call("GET", "/vault/v1", "retention", &[], b"");
+    assert!(retention.contains("<Mode>GOVERNANCE</Mode>"), "{retention}");
+    // Removing it needs the bypass, and the right to bypass: a user
+    // without it is refused.
+    let remove = "<S3PutObjectRetention><BypassGovernanceRetention>true</BypassGovernanceRetention>\
+                  <Retention/></S3PutObjectRetention>";
+    let etag = manifest("vault.csv", "vault,v1\n");
+    let policy = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:CreateJob", "s3:GetObject", "s3:PutObject", "s3:PutObjectRetention"],
+         "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (user_key, user_secret) = user_with_key(&server, &account, "keeper", Some(&policy));
+    let described = run_as(
+        &user_key,
+        &user_secret,
+        "remove-user",
+        remove,
+        "vault.csv",
+        &etag,
+    );
+    assert_eq!(counts(&described), ("0".into(), "1".into()), "{described}");
+    let described = run("remove-root", remove, "vault.csv", &etag);
+    assert_eq!(counts(&described), ("1".into(), "0".into()), "{described}");
+    let (status, _) = call("GET", "/vault/v1", "retention", &[], b"").1;
+    assert_eq!(status, 404, "the retention is gone");
+
+    // Legal hold: on, and the version is kept.
+    let hold =
+        "<S3PutObjectLegalHold><LegalHold><Status>ON</Status></LegalHold></S3PutObjectLegalHold>";
+    let described = run("hold-1", hold, "vault.csv", &etag);
+    assert_eq!(counts(&described), ("1".into(), "0".into()), "{described}");
+    let (_, (_, held)) = call("GET", "/vault/v1", "legal-hold", &[], b"");
+    assert!(held.contains("<Status>ON</Status>"), "{held}");
+    let (_, (_, versions)) = call("GET", "/vault", "versions&prefix=v1", &[], b"");
+    let version = xml_value(&versions, "VersionId");
+    let (status, _) = call(
+        "DELETE",
+        "/vault/v1",
+        &format!("versionId={version}"),
+        &[],
+        b"",
+    )
+    .1;
+    assert_eq!(status, 403, "a version under legal hold is not removed");
+
+    // A user allowed none of these operations: each task refused.
+    let reader = r#"{"Version": "2012-10-17", "Statement": [
+        {"Effect": "Allow", "Action": ["s3:CreateJob", "s3:GetObject", "s3:PutObject"], "Resource": "*"}]}"#
+        .replace('\n', " ");
+    let (reader_key, reader_secret) = user_with_key(&server, &account, "reader", Some(&reader));
+    let etag = manifest("v2.csv", "vault,v2\ncold,g1\n");
+    for (token, operation) in [
+        ("deny-retain", governance),
+        ("deny-hold", hold),
+        ("deny-restore", restore),
+    ] {
+        let described = run_as(
+            &reader_key,
+            &reader_secret,
+            token,
+            operation,
+            "v2.csv",
+            &etag,
+        );
+        assert_eq!(
+            xml_value(&described, "NumberOfTasksSucceeded"),
+            "0",
+            "{token}: {described}"
+        );
+    }
+
+    // A date that passes while the job waits: each task fails, and the job
+    // is still described and reports.
+    let soon = format!(
+        "<S3PutObjectRetention><Retention><Mode>GOVERNANCE</Mode>\
+         <RetainUntilDate>{}</RetainUntilDate></Retention></S3PutObjectRetention>",
+        iso_in(3)
+    );
+    let etag = manifest("late.csv", "vault,v2\n");
+    let body = create_job_body(
+        "late-1",
+        &soon,
+        "late.csv",
+        &etag,
+        "<ConfirmationRequired>true</ConfirmationRequired>",
+    );
+    let (status, answer) = call("POST", "/v20180820/jobs", "", &[], body.as_bytes()).1;
+    assert_eq!(status, 200, "{answer}");
+    let late = xml_value(&answer, "JobId");
+    std::thread::sleep(Duration::from_secs(5));
+    call(
+        "POST",
+        &format!("/v20180820/jobs/{late}/status"),
+        "requestedJobStatus=Ready",
+        &[],
+        b"",
+    );
+    let deadline = Instant::now() + DEADLINE;
+    let described = loop {
+        let (status, described) = call("GET", &format!("/v20180820/jobs/{late}"), "", &[], b"").1;
+        assert_eq!(status, 200, "{described}");
+        let job_status = described
+            .rsplit("</ProgressSummary>")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if xml_value(&job_status, "Status") == "Complete" {
+            break described;
+        }
+        assert!(Instant::now() < deadline, "{described}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        xml_value(&described, "NumberOfTasksFailed"),
+        "1",
+        "{described}"
+    );
+    let (_, (_, listed)) = call(
+        "GET",
+        "/reports",
+        &format!("list-type=2&prefix=rep/job-{late}/"),
+        &[],
+        b"",
+    );
+    assert!(listed.contains("manifest.json"), "{listed}");
+
+    // A retention in the past is refused at CreateJob, as the API refuses it.
+    let past = governance.replace("2099", "2001");
+    let body = create_job_body("past-1", &past, "lock.csv", "\"x\"", "");
+    let (status, answer) = call("POST", "/v20180820/jobs", "", &[], body.as_bytes()).1;
+    assert_eq!(status, 400, "{answer}");
+}
