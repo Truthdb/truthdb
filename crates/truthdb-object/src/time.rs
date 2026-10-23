@@ -1,4 +1,5 @@
-//! Timestamps as S3 writes them.
+//! Timestamps as S3 writes them (shared with the S3 layer and the event
+//! notifications).
 
 /// Milliseconds since the Unix epoch as ISO 8601 (`2024-05-24T00:00:00.000Z`).
 pub fn iso8601(ms: u64) -> String {

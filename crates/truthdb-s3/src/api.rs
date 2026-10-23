@@ -53,7 +53,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "metadataJournalTable",
     "metadataTable",
     "metrics",
-    "notification",
     "renameObject",
     "replication",
     "requestPayment",
@@ -72,6 +71,7 @@ const SUBRESOURCES: &[&str] = &[
     "legal-hold",
     "lifecycle",
     "location",
+    "notification",
     "object-lock",
     "ownershipControls",
     "policy",
@@ -495,6 +495,18 @@ async fn route(
         }
         (Target::Object(..), _) if has_param(&request, "lifecycle") => Err(
             S3Error::not_implemented("an object has no ?lifecycle configuration"),
+        ),
+        (Target::Bucket(bucket), method) if has_param(&request, "notification") => {
+            let action = match method {
+                Method::GET => "s3:GetBucketNotification",
+                Method::PUT => "s3:PutBucketNotification",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?notification"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::notification::bucket_notification(state, request, auth, bucket, method).await
+        }
+        (Target::Object(..), _) if has_param(&request, "notification") => Err(
+            S3Error::not_implemented("an object has no ?notification configuration"),
         ),
         (Target::Bucket(bucket), method) if has_param(&request, "object-lock") => {
             let action = match method {

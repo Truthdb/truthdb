@@ -29,6 +29,8 @@ pub const BUCKET_ENCRYPTION: u8 = 3;
 pub const OBJECT_LOCK_DEFAULT: u8 = 4;
 /// A bucket configuration: its lifecycle rules (see `lifecycle`).
 pub const BUCKET_LIFECYCLE: u8 = 5;
+/// A bucket configuration: its event notifications (see `notifications`).
+pub const BUCKET_NOTIFICATION: u8 = 6;
 
 fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
     [prefix, &chunk.to_be_bytes()].concat()

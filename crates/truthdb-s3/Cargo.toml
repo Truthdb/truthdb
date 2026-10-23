@@ -9,6 +9,7 @@ truthdb-core = { workspace = true }
 truthdb-engine = { workspace = true }
 truthdb-object = { workspace = true }
 truthdb-vector = { workspace = true }
+truthdb-streams = { workspace = true }
 truthdb-iam = { workspace = true }
 truthdb-sigv4 = { workspace = true }
 serde_json = { workspace = true }

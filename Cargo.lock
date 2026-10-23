@@ -1915,6 +1915,7 @@ name = "truthdb-object"
 version = "0.1.0"
 dependencies = [
  "md-5",
+ "serde_json",
  "truthdb-core",
  "truthdb-fulltext",
  "zstd",
@@ -1966,6 +1967,7 @@ dependencies = [
  "truthdb-iam",
  "truthdb-object",
  "truthdb-sigv4",
+ "truthdb-streams",
  "truthdb-vector",
  "zeroize",
 ]

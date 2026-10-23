@@ -1450,6 +1450,7 @@ fn render_sql_outcome(outcome: &crate::engine::BatchOutcome) -> String {
 
 mod fulltext;
 mod import;
+mod notifications;
 pub(crate) use import::ImportWaits;
 mod object_jobs;
 #[cfg(test)]

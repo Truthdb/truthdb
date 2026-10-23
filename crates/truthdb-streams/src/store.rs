@@ -57,6 +57,13 @@ pub struct NewRecord {
     pub value: Vec<u8>,
 }
 
+impl NewRecord {
+    /// The chunks it is stored in (what [`MAX_APPEND_CHUNKS`] counts).
+    pub fn chunks(&self) -> usize {
+        (self.key.as_ref().map_or(0, Vec::len) + self.value.len() + RECORD_HEADER).div_ceil(CHUNK)
+    }
+}
+
 /// A record as read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Record {
@@ -377,14 +384,9 @@ impl StreamTxn<'_, '_> {
         if partition >= topic.partitions {
             return Ok(Err(StreamError::InvalidPartition));
         }
-        let sizes = records
-            .iter()
-            .map(|record| record.key.as_ref().map_or(0, Vec::len) + record.value.len());
-        if sizes.clone().any(|size| size > MAX_RECORD_BYTES)
-            || sizes
-                .map(|size| (size + RECORD_HEADER).div_ceil(CHUNK))
-                .sum::<usize>()
-                > MAX_APPEND_CHUNKS
+        if records.iter().any(|record| {
+            record.key.as_ref().map_or(0, Vec::len) + record.value.len() > MAX_RECORD_BYTES
+        }) || records.iter().map(NewRecord::chunks).sum::<usize>() > MAX_APPEND_CHUNKS
         {
             return Ok(Err(StreamError::TooLarge));
         }

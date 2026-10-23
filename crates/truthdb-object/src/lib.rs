@@ -25,9 +25,11 @@ mod journal;
 mod lifecycle;
 mod listing;
 mod locks;
+mod notifications;
 mod objects;
 mod pack;
 mod restores;
+pub mod time;
 mod uploads;
 
 #[cfg(test)]
@@ -65,6 +67,10 @@ pub use lifecycle::{
 };
 pub use listing::{ListAfter, ListedObject, Listing};
 pub use locks::{EventHold, ObjectLock, Retention, RetentionChange, RetentionMode};
+pub use notifications::{
+    Destination, EVENT_TYPES, NOTIFICATIONS_CONSUMER, NotificationConfig, NotificationRule,
+    event_message, event_type, test_message,
+};
 pub use objects::{
     CustomerKey, Deleted, ObjectAttrs, ObjectError, ObjectInfo, StorageClass, VersionSel,
     version_id,
