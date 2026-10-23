@@ -10481,6 +10481,61 @@ fn batch_jobs_restore_and_lock_what_a_manifest_lists() {
         );
     }
 
+    // A date that passes while the job waits: each task fails, and the job
+    // is still described and reports.
+    let soon = format!(
+        "<S3PutObjectRetention><Retention><Mode>GOVERNANCE</Mode>\
+         <RetainUntilDate>{}</RetainUntilDate></Retention></S3PutObjectRetention>",
+        iso_in(3)
+    );
+    let etag = manifest("late.csv", "vault,v2\n");
+    let body = create_job_body(
+        "late-1",
+        &soon,
+        "late.csv",
+        &etag,
+        "<ConfirmationRequired>true</ConfirmationRequired>",
+    );
+    let (status, answer) = call("POST", "/v20180820/jobs", "", &[], body.as_bytes()).1;
+    assert_eq!(status, 200, "{answer}");
+    let late = xml_value(&answer, "JobId");
+    std::thread::sleep(Duration::from_secs(5));
+    call(
+        "POST",
+        &format!("/v20180820/jobs/{late}/status"),
+        "requestedJobStatus=Ready",
+        &[],
+        b"",
+    );
+    let deadline = Instant::now() + DEADLINE;
+    let described = loop {
+        let (status, described) = call("GET", &format!("/v20180820/jobs/{late}"), "", &[], b"").1;
+        assert_eq!(status, 200, "{described}");
+        let job_status = described
+            .rsplit("</ProgressSummary>")
+            .next()
+            .unwrap_or("")
+            .to_string();
+        if xml_value(&job_status, "Status") == "Complete" {
+            break described;
+        }
+        assert!(Instant::now() < deadline, "{described}");
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(
+        xml_value(&described, "NumberOfTasksFailed"),
+        "1",
+        "{described}"
+    );
+    let (_, (_, listed)) = call(
+        "GET",
+        "/reports",
+        &format!("list-type=2&prefix=rep/job-{late}/"),
+        &[],
+        b"",
+    );
+    assert!(listed.contains("manifest.json"), "{listed}");
+
     // A retention in the past is refused at CreateJob, as the API refuses it.
     let past = governance.replace("2099", "2001");
     let body = create_job_body("past-1", &past, "lock.csv", "\"x\"", "");

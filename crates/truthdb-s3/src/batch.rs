@@ -324,9 +324,10 @@ fn operation(element: &Element) -> Result<Operation, S3Error> {
                 .ok_or_else(|| invalid("S3PutObjectRetention needs its Retention"))?;
             let mut document = String::new();
             render(retention, &mut document);
-            // Checked now as a PutObjectRetention body is (each task reads
-            // it again with its own time).
-            crate::object_lock::retention_change(document.as_bytes(), crate::objects::now_ms())?;
+            // Its form only (as of time zero): a stored job is read whatever
+            // the time. Its date is checked at CreateJob, and each task
+            // reads it again with its own time.
+            crate::object_lock::retention_change(document.as_bytes(), 0)?;
             Ok(Operation::Retention { document, bypass })
         }
         "S3PutObjectLegalHold" => {
@@ -718,6 +719,10 @@ async fn create(
     let body = crate::server::read_body(request, auth, MAX_REQUEST_BYTES).await?;
     let parsed = xml::parse(&body, "CreateJobRequest")?;
     let spec = spec(&parsed)?;
+    // As a PutObjectRetention body: a date in the future, now.
+    if let Operation::Retention { document, .. } = &spec.operation {
+        crate::object_lock::retention_change(document.as_bytes(), crate::objects::now_ms())?;
+    }
     // As a CopyObject asking for it: SSE-S3 only on an encrypted database.
     if let Operation::Copy(copy) = &spec.operation
         && copy.sse
