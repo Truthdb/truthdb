@@ -367,6 +367,9 @@ impl Engine {
         if let Some(command) = parse_encryption_admin(input) {
             return self.execute_encryption_admin(command);
         }
+        if let Some(command) = streams::parse_stream_admin(input) {
+            return self.execute_stream_admin(command);
+        }
         // Routing: the legacy ES commands all carry a `{` JSON body; that
         // shape routes to the frozen search path. Everything else is SQL.
         match parse_command(input)? {
@@ -642,6 +645,9 @@ impl Engine {
                 txn_ctx,
                 emitter,
             ));
+        }
+        if let Some(command) = streams::parse_stream_admin(input) {
+            return Ok(self.admin_batch(|| self.execute_stream_admin(command), txn_ctx, emitter));
         }
         // Hold the execution gate shared for the whole batch: concurrent
         // relational batches run together, but a native writer is excluded (see
@@ -1453,6 +1459,8 @@ mod s3_read;
 mod s3_sql;
 #[cfg(test)]
 mod search_tests;
+mod stream_sql;
+mod streams;
 #[cfg(test)]
 mod test_support;
 #[cfg(test)]

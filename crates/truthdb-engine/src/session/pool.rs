@@ -265,6 +265,10 @@ pub(super) fn maintenance_loop(shared: &Arc<Shared>) {
         if let Err(err) = shared.engine.vector_purge() {
             eprintln!("vector index purge failed: {err}");
         }
+        // Dropped topics' records, and records past their retention.
+        if let Err(err) = shared.engine.streams_maintenance() {
+            eprintln!("streams maintenance failed: {err}");
+        }
         // Object bodies nothing references any more, and abandoned uploads.
         if let Err(err) = shared.engine.object_gc() {
             eprintln!("object garbage collection failed: {err}");

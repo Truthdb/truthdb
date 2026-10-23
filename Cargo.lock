@@ -1881,6 +1881,7 @@ dependencies = [
  "truthdb-s3client",
  "truthdb-search",
  "truthdb-sql",
+ "truthdb-streams",
  "truthdb-vector",
 ]
 
@@ -2009,6 +2010,13 @@ version = "0.1.0"
 dependencies = [
  "icu_collator",
  "icu_locale_core",
+]
+
+[[package]]
+name = "truthdb-streams"
+version = "0.1.0"
+dependencies = [
+ "truthdb-core",
 ]
 
 [[package]]
