@@ -14,6 +14,7 @@ pub mod error;
 pub mod iam_api;
 pub mod lifecycle;
 pub mod listing;
+pub mod logging_config;
 mod metering;
 pub mod metric_history;
 pub mod metrics_config;

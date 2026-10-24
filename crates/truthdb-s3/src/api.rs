@@ -117,7 +117,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "attributes",
     "intelligent-tiering",
     "inventory",
-    "logging",
     "metadataAnnotationTable",
     "metadataConfiguration",
     "metadataInventoryTable",
@@ -141,6 +140,7 @@ const SUBRESOURCES: &[&str] = &[
     "legal-hold",
     "lifecycle",
     "location",
+    "logging",
     "metrics",
     "notification",
     "object-lock",
@@ -584,6 +584,20 @@ async fn route(
         (Target::Object(..), _) if has_param(&request, "cors") => Err(S3Error::not_implemented(
             "an object has no ?cors configuration",
         )),
+        (Target::Bucket(bucket), method) if has_param(&request, "logging") => {
+            let action = match method {
+                Method::GET => "s3:GetBucketLogging",
+                Method::PUT => "s3:PutBucketLogging",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?logging"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            let account = authz.identity.account().map(str::to_string);
+            crate::logging_config::bucket_logging(state, request, auth, bucket, method, account)
+                .await
+        }
+        (Target::Object(..), _) if has_param(&request, "logging") => Err(
+            S3Error::not_implemented("an object has no ?logging configuration"),
+        ),
         (Target::Bucket(bucket), method) if has_param(&request, "metrics") => {
             let action = match method {
                 Method::GET => "s3:GetMetricsConfiguration",
