@@ -26,6 +26,7 @@ mod journal;
 mod lifecycle;
 mod listing;
 mod locks;
+mod metric_history;
 mod notifications;
 mod objects;
 mod pack;
@@ -71,6 +72,7 @@ pub use lifecycle::{
 };
 pub use listing::{ListAfter, ListedObject, Listing};
 pub use locks::{EventHold, ObjectLock, Retention, RetentionChange, RetentionMode};
+pub use metric_history::{MetricPoint, MetricSeries, RESOLUTIONS, SeriesBy, Stats};
 pub use notifications::{
     Destination, EVENT_TYPES, NOTIFICATIONS_CONSUMER, NotificationConfig, NotificationRule,
     event_message, event_type, test_message,
@@ -174,6 +176,13 @@ const JOB_TASKS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 36;
 /// (bucket, 0, kind, storage class) -> the count and bytes of that kind
 /// (see `usage`).
 const USAGE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 37;
+/// (series, resolution, period) -> the metric statistics of that period
+/// (see `metric_history`).
+const METRIC_POINTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 38;
+/// (expiry, point key) -> nothing: the points by when they go.
+const METRIC_EXPIRY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 39;
+/// Series -> the last minute it has.
+const METRIC_SERIES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 40;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -298,7 +307,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 38;
+const TREE_COUNT: usize = 41;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -427,6 +436,15 @@ impl Trees {
     }
     pub fn usage(&self) -> BTree {
         self.tree(USAGE_TREE)
+    }
+    pub fn metric_points(&self) -> BTree {
+        self.tree(METRIC_POINTS_TREE)
+    }
+    pub fn metric_expiry(&self) -> BTree {
+        self.tree(METRIC_EXPIRY_TREE)
+    }
+    pub fn metric_series(&self) -> BTree {
+        self.tree(METRIC_SERIES_TREE)
     }
 }
 
