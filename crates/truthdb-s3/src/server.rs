@@ -110,7 +110,9 @@ pub async fn serve(
     // Batch Operations jobs run beside the listener, and the metric
     // history's flushes.
     tokio::spawn(crate::batch_run::run(Arc::clone(&state), shutdown.clone()));
-    tokio::spawn(crate::metric_history::run(
+    // Its last flush is waited for: what was counted is written before
+    // the engine closes.
+    let flusher = tokio::spawn(crate::metric_history::run(
         Arc::clone(&state),
         shutdown.clone(),
     ));
@@ -120,6 +122,7 @@ pub async fn serve(
             slot = Arc::clone(&slots).acquire_owned() => slot.expect("the semaphore is never closed"),
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    let _ = flusher.await;
                     return;
                 }
                 continue;
@@ -136,6 +139,7 @@ pub async fn serve(
             },
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    let _ = flusher.await;
                     return;
                 }
                 continue;
@@ -272,12 +276,14 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         Err(err) => error_response(&err, &resource, &ids),
     };
     if let Some(metered) = metered.filter(|_| seen.seen()) {
+        // The latency to the first byte, before the lookups below.
+        let first_byte = started.elapsed();
         let counters = state.request_metrics.bucket(&metered.bucket);
         counters.answered(
             metered.kind,
             uploaded,
             response.status().as_u16(),
-            started.elapsed(),
+            first_byte,
         );
         // The source of a copy made (one the route copied from, and read).
         if let Some(source) = seen.copy_source()
@@ -299,7 +305,7 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                     metered.kind,
                     uploaded,
                     response.status().as_u16(),
-                    started.elapsed(),
+                    first_byte,
                 ),
             );
             (Arc::clone(&state.metric_recorder), series, arrived)

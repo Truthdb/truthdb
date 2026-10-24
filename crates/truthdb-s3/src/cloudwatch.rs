@@ -12,7 +12,7 @@
 //! latency's histogram (the bound a share of requests stays under).
 //! Metric math and Metrics Insights are not supported.
 
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use hyper::body::Incoming;
 use hyper::{Request, Response, StatusCode};
@@ -161,28 +161,28 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, CwE
     authz.check_arn(&format!("cloudwatch:{operation}"), "*", &principal.account)?;
     let account = principal.account.clone();
     let now = crate::objects::now_ms() / 1000;
-    state
+    // The caller's buckets, and when each was made: its series' points
+    // from then on (a bucket of the same name before it was another's).
+    let owned: Owned = state
         .engine
         .run_object(move |file| {
-            // The caller's buckets: the series it may read.
-            let owned: HashSet<String> = file
+            Ok(file
                 .list_buckets()?
                 .into_iter()
                 .filter(|bucket| bucket.owner == account)
-                .map(|bucket| bucket.name)
-                .collect();
-            Ok(match operation.as_str() {
-                "ListMetrics" => list_metrics(file, &input, &owned, now),
-                "GetMetricStatistics" => statistics(file, &input, &owned, now),
-                _ => metric_data(file, &input, &owned, now),
-            })
+                .map(|bucket| (bucket.name, bucket.created_ms / 1000))
+                .collect())
         })
-        .await?
+        .await?;
+    match operation.as_str() {
+        "ListMetrics" => list_metrics(state, &input, &owned, now).await,
+        "GetMetricStatistics" => statistics(state, &input, &owned, now).await,
+        _ => metric_data(state, &input, &owned, now).await,
+    }
 }
 
-fn storage_error(err: truthdb_core::storage::StorageError) -> CwError {
-    CwError::new(500, "InternalServiceError", err.to_string())
-}
+/// The caller's buckets, and when each was made (seconds).
+type Owned = HashMap<String, u64>;
 
 fn string<'a>(input: &'a Map<String, Value>, name: &str) -> Result<Option<&'a str>, CwError> {
     match input.get(name) {
@@ -213,6 +213,16 @@ fn time(input: &Map<String, Value>, name: &str) -> Result<u64, CwError> {
         )));
     }
     Ok(value as u64)
+}
+
+/// A query's time range is not empty.
+fn check_range(start: u64, end: u64) -> Result<(), CwError> {
+    if start >= end {
+        return Err(CwError::invalid(
+            "The parameter StartTime must be less than the parameter EndTime.",
+        ));
+    }
+    Ok(())
 }
 
 fn period(input: &Map<String, Value>) -> Result<u64, CwError> {
@@ -266,8 +276,8 @@ fn metric(name: &str) -> Option<(u8, &'static str)> {
 fn series_of(
     code: u8,
     dimensions: &[(String, Option<String>)],
-    owned: &HashSet<String>,
-) -> Option<MetricSeries> {
+    owned: &Owned,
+) -> Option<(MetricSeries, u64)> {
     let value = |name: &str| {
         dimensions
             .iter()
@@ -275,7 +285,8 @@ fn series_of(
             .and_then(|(_, value)| value.clone())
     };
     let bucket = value("BucketName")?;
-    if dimensions.len() != 2 || !owned.contains(&bucket) {
+    let created = *owned.get(&bucket)?;
+    if dimensions.len() != 2 {
         return None;
     }
     let by = match code {
@@ -286,7 +297,7 @@ fn series_of(
         }
         _ => SeriesBy::Filter(value("FilterId")?),
     };
-    Some(MetricSeries { bucket, by })
+    Some((MetricSeries { bucket, by }, created))
 }
 
 /// The resolution read for a start time at `now`, and the start rounded
@@ -303,11 +314,24 @@ fn resolution_for(start: u64, now: u64) -> (u64, u64) {
     (resolution, start - start % resolution)
 }
 
+/// Whether the point of `resolution` seconds at `at` is read: not past its
+/// `keep` at `now` (though not yet expired), and not over before `since`,
+/// when the bucket was made (those were another's of the same name;
+/// deleting it removed its points that could last past then).
+fn readable(at: u64, resolution: u64, keep: u64, since: u64, now: u64) -> bool {
+    at.saturating_add(resolution).saturating_add(keep) > now
+        && at.saturating_add(resolution) > since
+}
+
 /// A metric's statistics per period of `period` seconds from `start` to
-/// `end`, oldest first (only the periods with any).
-fn aggregate(
-    file: &mut truthdb_object::ObjFile<'_>,
+/// `end`, oldest first (only the periods with any), from the points that
+/// end after `since` (the bucket's making), read under a storage lock hold
+/// of their own.
+#[allow(clippy::too_many_arguments)]
+async fn aggregate(
+    state: &S3State,
     series: &MetricSeries,
+    since: u64,
     code: u8,
     start: u64,
     end: u64,
@@ -323,12 +347,13 @@ fn aggregate(
         .find(|(kept, _)| *kept == resolution)
         .map_or(0, |(_, keep)| *keep);
     let mut periods: BTreeMap<u64, Stats> = BTreeMap::new();
-    for (at, point) in file
-        .metric_points(series, resolution, start, end)
-        .map_err(storage_error)?
-    {
-        // Past its keep, though not yet expired.
-        if at + resolution + keep <= now {
+    let read = series.clone();
+    let points = state
+        .engine
+        .run_object(move |file| file.metric_points(&read, resolution, start, end))
+        .await?;
+    for (at, point) in points {
+        if !readable(at, resolution, keep, since, now) {
             continue;
         }
         let Some(stats) = point.get(&code) else {
@@ -405,10 +430,10 @@ fn strings(input: &Map<String, Value>, name: &str) -> Result<Vec<String>, CwErro
     }
 }
 
-fn statistics(
-    file: &mut truthdb_object::ObjFile<'_>,
+async fn statistics(
+    state: &S3State,
     input: &Map<String, Value>,
-    owned: &HashSet<String>,
+    owned: &Owned,
     now: u64,
 ) -> Result<Value, CwError> {
     let namespace = string(input, "Namespace")?.ok_or_else(|| CwError::missing("Namespace"))?;
@@ -418,6 +443,7 @@ fn statistics(
         time(input, "EndTime")?,
         period(input)?,
     );
+    check_range(start, end)?;
     let (plain, extended) = (
         strings(input, "Statistics")?,
         strings(input, "ExtendedStatistics")?,
@@ -468,9 +494,9 @@ fn statistics(
         .filter(|(_, metric_unit)| unit.is_none_or(|unit| unit == *metric_unit));
     let mut datapoints = Vec::new();
     if let Some((code, metric_unit)) = found
-        && let Some(series) = series_of(code, &dimensions(input)?, owned)
+        && let Some((series, since)) = series_of(code, &dimensions(input)?, owned)
     {
-        for (at, stats) in aggregate(file, &series, code, start, end, period, now)? {
+        for (at, stats) in aggregate(state, &series, since, code, start, end, period, now).await? {
             let mut point = Map::new();
             point.insert("Timestamp".to_string(), json!(at));
             for name in &plain {
@@ -503,13 +529,14 @@ struct QueryResult {
     points: Vec<(u64, f64)>,
 }
 
-fn metric_data(
-    file: &mut truthdb_object::ObjFile<'_>,
+async fn metric_data(
+    state: &S3State,
     input: &Map<String, Value>,
-    owned: &HashSet<String>,
+    owned: &Owned,
     now: u64,
 ) -> Result<Value, CwError> {
     let (start, end) = (time(input, "StartTime")?, time(input, "EndTime")?);
+    check_range(start, end)?;
     let Some(Value::Array(queries)) = input.get("MetricDataQueries") else {
         return Err(CwError::missing("MetricDataQueries"));
     };
@@ -600,9 +627,11 @@ fn metric_data(
         if namespace == NAMESPACE
             && let Some((code, metric_unit)) = metric(name)
             && unit.is_none_or(|unit| unit == metric_unit)
-            && let Some(series) = series_of(code, &dimensions(metric_map)?, owned)
+            && let Some((series, since)) = series_of(code, &dimensions(metric_map)?, owned)
         {
-            for (at, stats) in aggregate(file, &series, code, start, end, period, now)? {
+            for (at, stats) in
+                aggregate(state, &series, since, code, start, end, period, now).await?
+            {
                 if let Some(value) = statistic(&stats, stat_name) {
                     points.push((at, value));
                 }
@@ -651,10 +680,10 @@ fn metric_data(
     Ok(answer)
 }
 
-fn list_metrics(
-    file: &mut truthdb_object::ObjFile<'_>,
+async fn list_metrics(
+    state: &S3State,
     input: &Map<String, Value>,
-    owned: &HashSet<String>,
+    owned: &Owned,
     now: u64,
 ) -> Result<Value, CwError> {
     let namespace = string(input, "Namespace")?;
@@ -678,8 +707,13 @@ fn list_metrics(
     };
     let mut metrics = Vec::new();
     if namespace.is_none_or(|namespace| namespace == NAMESPACE) {
-        for (series, last) in file.metric_series().map_err(storage_error)? {
-            if last < since || !owned.contains(&series.bucket) {
+        let all = state.engine.run_object(|file| file.metric_series()).await?;
+        for (series, last) in all {
+            // Quiet lately, or not the caller's.
+            let Some(&created) = owned.get(&series.bucket) else {
+                continue;
+            };
+            if last < since {
                 continue;
             }
             let (dimension, value) = match &series.by {
@@ -696,11 +730,17 @@ fn list_metrics(
             }
             // The metrics the series has data for since then (its hours).
             let mut codes = std::collections::BTreeSet::new();
-            for (_, point) in file
-                .metric_points(&series, 3600, since - since % 3600, now + 1)
-                .map_err(storage_error)?
-            {
-                codes.extend(point.keys().copied());
+            let read = series.clone();
+            let points = state
+                .engine
+                .run_object(move |file| {
+                    file.metric_points(&read, 3600, since - since % 3600, now + 1)
+                })
+                .await?;
+            for (at, point) in points {
+                if at + 3600 > created {
+                    codes.extend(point.keys().copied());
+                }
             }
             for code in codes {
                 let Some((_, metric_name, _)) = METRICS.iter().find(|(known, _, _)| *known == code)
@@ -723,7 +763,7 @@ fn list_metrics(
     }
     let page: Vec<Value> = metrics.iter().skip(skip).take(LIST_PAGE).cloned().collect();
     let mut answer = json!({ "Metrics": page });
-    if metrics.len() > skip + LIST_PAGE {
+    if metrics.len() > skip.saturating_add(LIST_PAGE) {
         answer["NextToken"] = json!((skip + LIST_PAGE).to_string());
     }
     Ok(answer)
@@ -732,6 +772,16 @@ fn list_metrics(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn points_over_before_the_bucket_was_made_are_not_read() {
+        // A bucket made at 1000 s reads the minute it was made in, not the
+        // one before; nor a point past its keep.
+        assert!(readable(960, 60, 600, 1000, 1100));
+        assert!(!readable(900, 60, 600, 1000, 1100));
+        assert!(readable(0, 3600, 600, 1000, 1100));
+        assert!(!readable(0, 60, 600, 0, 660));
+    }
 
     #[test]
     fn percentiles_are_read_off_the_histogram() {

@@ -239,8 +239,12 @@ pub async fn bucket_metrics(
     let bucket_name = bucket.clone();
     match method {
         Method::PUT => {
-            // No checksum needed (the SDKs send none).
-            let body = crate::server::read_body(request, auth, MAX_BODY).await?;
+            // No checksum needed (the SDKs send none), but one sent is checked.
+            let body = if crate::object_lock::has_integrity_check(request.headers()) {
+                crate::object_lock::read_checked_body(request, auth, MAX_BODY).await?
+            } else {
+                crate::server::read_body(request, auth, MAX_BODY).await?
+            };
             let document = render(&parse(&body, &id)?);
             let refused = crate::scope::object(state, move |file| {
                 file.transaction(|tx| {

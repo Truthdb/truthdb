@@ -8,6 +8,7 @@
 //! metrics are best effort.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -157,15 +158,40 @@ pub struct MetricRecorder {
     pending: Mutex<HashMap<(MetricSeries, u64), MetricPoint>>,
     /// The day (since the epoch) storage was last sampled.
     sampled_day: Mutex<Option<u64>>,
+    /// Counts `forget`s: configurations read before one are not kept.
+    generation: AtomicU64,
 }
 
 impl MetricRecorder {
     /// Forgets `bucket`'s configurations (they changed, or it is gone).
     pub(crate) fn forget(&self, bucket: &str) {
-        self.configs
+        let mut configs = self
+            .configs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        configs.remove(bucket);
+    }
+
+    /// Forgets the deleted `bucket`: its configurations and what was
+    /// counted for it and not yet written.
+    pub(crate) fn forget_bucket(&self, bucket: &str) {
+        self.forget(bucket);
+        self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .remove(bucket);
+            .retain(|(series, _), _| series.bucket != bucket);
+    }
+
+    /// Forgets everything (a standby counts nothing).
+    fn clear(&self) {
+        let mut configs = self
+            .configs
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.generation.fetch_add(1, Ordering::Relaxed);
+        configs.clear();
+        self.take();
     }
 
     async fn configs(&self, state: &S3State, bucket: &str) -> Arc<Vec<MetricsConfig>> {
@@ -177,6 +203,7 @@ impl MetricRecorder {
         {
             return Arc::clone(found);
         }
+        let generation = self.generation.load(Ordering::Relaxed);
         let name = bucket.to_string();
         let loaded = state
             .engine
@@ -197,10 +224,14 @@ impl MetricRecorder {
             return Arc::new(Vec::new());
         };
         let configs = Arc::new(configs);
-        self.configs
+        let mut cache = self
+            .configs
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .insert(bucket.to_string(), Arc::clone(&configs));
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Kept unless forgotten meanwhile (then possibly read stale).
+        if self.generation.load(Ordering::Relaxed) == generation {
+            cache.insert(bucket.to_string(), Arc::clone(&configs));
+        }
         configs
     }
 
@@ -310,13 +341,20 @@ impl MetricRecorder {
     }
 }
 
-/// Writes each bucket's storage for `day` (at its first minute), unless it
-/// was already (before a restart); whether it is written.
+/// Writes each bucket's storage for `day` (at its first minute, or for a
+/// bucket made that day the minute it was made in: reads leave out the
+/// points over before then), unless it was already (before a restart);
+/// whether it is written.
 async fn sample_storage(state: &S3State, day: u64) -> bool {
     let start = day * DAY;
     state
         .engine
         .run_object(move |file| {
+            let made: HashMap<String, u64> = file
+                .list_buckets()?
+                .into_iter()
+                .map(|bucket| (bucket.name, bucket.created_ms / 1000 / 60 * 60))
+                .collect();
             let usage = file.bucket_usage()?;
             let mut points: HashMap<MetricSeries, MetricPoint> = HashMap::new();
             let mut objects: HashMap<String, f64> = HashMap::new();
@@ -351,16 +389,16 @@ async fn sample_storage(state: &S3State, day: u64) -> bool {
             // Sampled already today (this server restarted): not again.
             let mut fresh = Vec::new();
             for (series, point) in points {
-                if file
-                    .metric_points(&series, 60, start, start + 60)?
-                    .is_empty()
-                {
-                    fresh.push((series, point));
+                let at = made
+                    .get(&series.bucket)
+                    .map_or(start, |&made| made.max(start));
+                if file.metric_points(&series, 60, at, start + DAY)?.is_empty() {
+                    fresh.push((series, at, point));
                 }
             }
             file.transaction(|tx| {
-                for (series, point) in &fresh {
-                    tx.add_metrics(series, start, point)?;
+                for (series, at, point) in &fresh {
+                    tx.add_metrics(series, *at, point)?;
                 }
                 Ok(())
             })
@@ -370,14 +408,17 @@ async fn sample_storage(state: &S3State, day: u64) -> bool {
 }
 
 /// Flushes the metric history every `state.metrics_flush` until
-/// `shutdown`, and once more then. A standby writes nothing.
+/// `shutdown`, and once more then. A standby writes nothing (and keeps
+/// nothing counted or cached: a promotion starts afresh).
 pub async fn run(state: Arc<S3State>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     loop {
         let stopping = tokio::select! {
             _ = tokio::time::sleep(state.metrics_flush) => false,
             changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
         };
-        if !state.storage.is_standby() {
+        if state.storage.is_standby() {
+            state.metric_recorder.clear();
+        } else {
             state.metric_recorder.flush(&state).await;
         }
         if stopping {

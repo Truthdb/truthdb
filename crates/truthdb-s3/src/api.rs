@@ -1084,7 +1084,7 @@ async fn delete_bucket(state: &S3State, bucket: String) -> Result<Response<Body>
     .await?
     .map_err(|err| bucket_error(err, &bucket))?;
     // Its metrics configurations went with it.
-    state.metric_recorder.forget(&bucket);
+    state.metric_recorder.forget_bucket(&bucket);
     Ok(empty(StatusCode::NO_CONTENT))
 }
 

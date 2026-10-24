@@ -283,6 +283,32 @@ impl ObjTxn<'_, '_> {
         Ok(())
     }
 
+    /// Forgets the deleted `bucket`'s series, and each one's newest point
+    /// at each resolution: the older ones ended before it was deleted, so
+    /// before any bucket of its name made later, whose reads leave them
+    /// out.
+    pub(crate) fn forget_metrics(&mut self, bucket: &str) -> Result<(), StorageError> {
+        let (points, index) = (self.trees.metric_points(), self.trees.metric_series());
+        let lower = [bucket.as_bytes(), &[0]].concat();
+        let upper = [bucket.as_bytes(), &[1]].concat();
+        for (series_key, last) in index.scan_range(self.ctx, Some(&lower), Some(&upper))? {
+            let minute = u64::from_be_bytes(
+                last.as_slice()
+                    .try_into()
+                    .map_err(|_| corrupt("metric series"))?,
+            );
+            // Their expiry entries stay: one removes nothing, or the point
+            // a later bucket's series puts at the same key.
+            for (resolution, _) in RESOLUTIONS {
+                let period = minute - minute % resolution;
+                let key = point_key(&series_key, resolution, period);
+                points.delete(self.ctx, &mut OpMode::Txn(self.txn), &key)?;
+            }
+            index.delete(self.ctx, &mut OpMode::Txn(self.txn), &series_key)?;
+        }
+        Ok(())
+    }
+
     /// Removes up to `limit` points past their keep at `now` (seconds),
     /// and the series none of whose points can remain; returns how many
     /// points went.

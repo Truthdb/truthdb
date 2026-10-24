@@ -13053,6 +13053,16 @@ fn a_bucket_keeps_up_to_a_thousand_metrics_configurations() {
     );
     assert_eq!(status, 400);
     assert_eq!(xml_value(&reply, "Code"), "InvalidArgument");
+    // A Content-MD5 sent must match.
+    let (status, reply) = call(
+        "PUT",
+        "/measured",
+        "metrics&id=a",
+        &[("content-md5", &md5)],
+        b"<MetricsConfiguration><Id>a</Id> </MetricsConfiguration>",
+    );
+    assert_eq!(status, 400);
+    assert_eq!(xml_value(&reply, "Code"), "BadDigest");
     let documents = "<Filter><And><Prefix>documents/</Prefix><Tag><Key>class</Key>\
         <Value>blue</Value></Tag></And></Filter>";
     assert_eq!(put("Documents", documents).0, 200);
@@ -13244,6 +13254,55 @@ if phase == "requests":
     assert stranger.list_metrics(Namespace="AWS/S3")["Metrics"] == []
     assert stranger.get_metric_statistics(Namespace="AWS/S3", MetricName="AllRequests", Dimensions=dims("Docs"),
         StartTime=start, EndTime=end, Period=60, Statistics=["Sum"])["Datapoints"] == []
+    # An empty time range is refused; a token past the end is an empty page.
+    for call in [
+        lambda: cw.get_metric_statistics(Namespace="AWS/S3", MetricName="AllRequests", Dimensions=dims("Docs"),
+            StartTime=end, EndTime=end, Period=60, Statistics=["Sum"]),
+        lambda: cw.get_metric_data(StartTime=end, EndTime=start, MetricDataQueries=[
+            {"Id": "all", "MetricStat": {"Metric": {"Namespace": "AWS/S3", "MetricName": "AllRequests",
+                "Dimensions": dims("Docs")}, "Period": 60, "Stat": "Sum"}}]),
+    ]:
+        try:
+            call()
+            raise SystemExit("an empty range was answered")
+        except botocore.exceptions.ClientError as error:
+            assert error.response["Error"]["Code"] == "InvalidParameterValue", error.response
+    beyond = str(2**64 - 1)
+    listed = cw.list_metrics(Namespace="AWS/S3", NextToken=beyond)
+    assert listed["Metrics"] == [] and "NextToken" not in listed, listed
+    data = cw.get_metric_data(StartTime=start, EndTime=end, NextToken=beyond, MetricDataQueries=[
+        {"Id": "all", "MetricStat": {"Metric": {"Namespace": "AWS/S3", "MetricName": "AllRequests",
+            "Dimensions": dims("Docs")}, "Period": 60, "Stat": "Sum"}}])
+    assert data["MetricDataResults"][0]["Values"] == [] and "NextToken" not in data, data
+    # A bucket deleted and made again by another account: the new owner
+    # reads none of the old one's metrics.
+    s3.create_bucket(Bucket="handed")
+    s3.put_bucket_metrics_configuration(Bucket="handed", Id="All", MetricsConfiguration={"Id": "All"})
+    s3.put_object(Bucket="handed", Key="k", Body=b"x")
+    for _ in range(3):
+        s3.get_object(Bucket="handed", Key="k")["Body"].read()
+    handed = [{"Name": "BucketName", "Value": "handed"}, {"Name": "FilterId", "Value": "All"}]
+    def gets(reader, period, name="GetRequests"):
+        points = reader.get_metric_statistics(Namespace="AWS/S3", MetricName=name, Dimensions=handed,
+            StartTime=start, EndTime=end, Period=period, Statistics=["Sum"])["Datapoints"]
+        return sum(point["Sum"] for point in points)
+    wait_for(lambda: gets(cw, 60) == 3)
+    # Its last minute's points go with it; the earlier ones are left out.
+    time.sleep(60.5 - time.time() % 60)
+    s3.head_object(Bucket="handed", Key="k")
+    wait_for(lambda: gets(cw, 60, "HeadRequests") == 1)
+    s3.delete_object(Bucket="handed", Key="k")
+    s3.delete_bucket(Bucket="handed")
+    time.sleep(1.1)
+    other_s3 = client("s3", other_key, other_secret)
+    other_s3.create_bucket(Bucket="handed")
+    other_s3.put_bucket_metrics_configuration(Bucket="handed", Id="All", MetricsConfiguration={"Id": "All"})
+    for period in [60, 3600]:
+        assert gets(stranger, period) == 0, period
+        assert gets(stranger, period, "HeadRequests") == 0, period
+    # Its own are counted (in the minute the old one's last were).
+    other_s3.put_object(Bucket="handed", Key="mine", Body=b"y")
+    wait_for(lambda: gets(stranger, 60, "PutRequests") >= 1)
     print("ok")
 else:
     assert total("AllRequests", "Docs") == 3
