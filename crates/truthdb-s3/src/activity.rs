@@ -44,6 +44,8 @@ const HOUR_MS: u64 = 3_600_000;
 const WRITE_BATCH: usize = 256;
 /// The longest user agent and error message recorded (CloudTrail's limit).
 const MAX_FIELD: usize = 1024;
+/// The longest object key recorded (S3's key limit, bytes).
+const MAX_KEY: usize = 1024;
 
 /// An authenticated caller, and how it signed.
 type Caller = (Principal, Option<Signed>);
@@ -445,6 +447,8 @@ fn record(
         // of its objects; and a copy's source object.
         match &call.key {
             Some(key) => {
+                // At most S3's key length (a refused call's may be longer).
+                let key = truncated(key, MAX_KEY);
                 resources.insert(
                     0,
                     json!({ "type": "AWS::S3::Object", "ARN": format!("arn:aws:s3:::{bucket}/{key}") }),
@@ -464,7 +468,11 @@ fn record(
                 1,
                 json!({
                     "type": "AWS::S3::Object",
-                    "ARN": format!("arn:aws:s3:::{source_bucket}/{source_key}"),
+                    "ARN": format!(
+                        "arn:aws:s3:::{}/{}",
+                        truncated(&printable(source_bucket), 255),
+                        truncated(source_key, MAX_KEY)
+                    ),
                 }),
             );
         }
@@ -753,15 +761,10 @@ impl ActivityRecorder {
         if let Some(owner) = owner {
             accounts.push(owner.to_string());
         }
-        // A copy's source bucket's owner is told too (the source read was
-        // allowed: the route marked it).
-        if let Some(source) = copied_from
-            && let Ok(Some(info)) = state
-                .engine
-                .run_object(move |file| file.bucket(&source))
-                .await
-        {
-            accounts.push(info.owner);
+        // A copy's source bucket's owner is told too (as it was when the
+        // source read was allowed).
+        if let Some(source_owner) = copied_from {
+            accounts.push(source_owner);
         }
         accounts.sort();
         accounts.dedup();
@@ -773,6 +776,11 @@ impl ActivityRecorder {
                 .iter()
                 .any(|(_, _, selectors)| selectors.as_ref().is_some_and(|s| s.wants_data()))
             {
+                continue;
+            }
+            // Refused calls within the account's hourly budget, as its
+            // management events.
+            if !self.admit(&account, time_ms, error.is_some(), &state.region) {
                 continue;
             }
             // Whole: it goes to trails' files, not an activity row.

@@ -232,6 +232,31 @@ impl Selectors {
             if data && !fields.iter().any(|field| field.field == "resources.type") {
                 return Err(invalid("A data event selector names resources.type."));
             }
+            // Management or Data events; a management selector chooses by
+            // eventCategory, eventSource and readOnly only.
+            for field in fields.iter().filter(|field| field.field == "eventCategory") {
+                for (_, values) in &field.conditions {
+                    if let Some(other) = values
+                        .iter()
+                        .find(|value| !matches!(value.as_str(), "Management" | "Data"))
+                    {
+                        return Err(invalid(format!("{other} is not an event category.")));
+                    }
+                }
+            }
+            if !data
+                && let Some(field) = fields.iter().find(|field| {
+                    !matches!(
+                        field.field.as_str(),
+                        "eventCategory" | "eventSource" | "readOnly"
+                    )
+                })
+            {
+                return Err(invalid(format!(
+                    "A management event selector does not choose by {}.",
+                    field.field
+                )));
+            }
             parsed.push(Advanced {
                 name: selector["Name"].as_str().map(str::to_string),
                 fields,
@@ -596,6 +621,31 @@ mod tests {
             "InvalidEventSelectorsException"
         );
         let refused = |selectors: Value| code(None, Some(selectors));
+        // Only Management and Data; a management selector by eventCategory,
+        // eventSource and readOnly only.
+        assert_eq!(
+            refused(
+                json!([{ "FieldSelectors": [{ "Field": "eventCategory", "Equals": ["Bogus"] }] }])
+            ),
+            "InvalidEventSelectorsException"
+        );
+        assert_eq!(
+            refused(
+                json!([{ "FieldSelectors": [{ "Field": "eventCategory", "Equals": ["Management"] },
+            { "Field": "eventName", "Equals": ["PutBucketPolicy"] }] }])
+            ),
+            "InvalidEventSelectorsException"
+        );
+        assert!(
+            Selectors::parse(
+                None,
+                Some(&json!([{ "FieldSelectors": [
+            { "Field": "eventCategory", "Equals": ["Management"] },
+            { "Field": "readOnly", "Equals": ["false"] },
+            { "Field": "eventSource", "NotEquals": ["kms.amazonaws.com"] }] }]))
+            )
+            .is_ok()
+        );
         // Equals only for these; no field twice; known conditions only; a data
         // selector names resources.type.
         assert_eq!(

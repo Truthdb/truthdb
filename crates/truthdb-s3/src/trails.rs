@@ -727,6 +727,10 @@ impl TrailCache {
             return Arc::new(Vec::new());
         };
         let trails = Arc::new(found.remove(account).unwrap_or_default());
+        // A standby's trails change by replication, not here: not kept.
+        if state.storage.is_standby() {
+            return trails;
+        }
         let mut accounts = self
             .accounts
             .lock()

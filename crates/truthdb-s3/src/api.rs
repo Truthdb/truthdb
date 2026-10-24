@@ -917,13 +917,13 @@ async fn route(
             authz.check_with(action, Object(&source, &source_key), &context)?;
             // A copy reads its source (whose bucket exists): S3 counts a GET
             // there once the copy is made.
-            if authz
+            if let Some((_, Some(owner))) = authz
                 .owners()
-                .iter()
-                .any(|(name, owner)| *name == source && owner.is_some())
+                .into_iter()
+                .find(|(name, owner)| *name == source && owner.is_some())
                 && let Some(seen) = crate::metering::seen_of(&request)
             {
-                seen.mark_copy_source(&source);
+                seen.mark_copy_source(&source, &owner);
             }
             if has_param(&request, "uploadId") {
                 crate::copy::upload_part_copy(state, request, bucket, key).await

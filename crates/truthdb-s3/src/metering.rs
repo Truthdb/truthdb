@@ -36,7 +36,8 @@ struct Seen {
     /// Who sent the request and how it was signed (for its access log
     /// line).
     requester: Mutex<(Option<String>, Option<crate::server::Signed>)>,
-    copy_source: Mutex<Option<String>>,
+    /// A copy's source bucket, and its owner when the read was allowed.
+    copy_source: Mutex<Option<(String, String)>>,
 }
 
 impl BucketSeen {
@@ -91,12 +92,13 @@ impl BucketSeen {
             .clone()
     }
 
-    pub(crate) fn mark_copy_source(&self, bucket: &str) {
+    pub(crate) fn mark_copy_source(&self, bucket: &str, owner: &str) {
         *self
             .0
             .copy_source
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(bucket.to_string());
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) =
+            Some((bucket.to_string(), owner.to_string()));
     }
 
     pub(crate) fn copy_source(&self) -> Option<String> {
@@ -104,7 +106,18 @@ impl BucketSeen {
             .copy_source
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .clone()
+            .as_ref()
+            .map(|(bucket, _)| bucket.clone())
+    }
+
+    /// The copy source bucket's owner when the read was allowed.
+    pub(crate) fn copy_source_owner(&self) -> Option<String> {
+        self.0
+            .copy_source
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+            .map(|(_, owner)| owner.clone())
     }
 }
 
