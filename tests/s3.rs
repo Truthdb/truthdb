@@ -13433,6 +13433,30 @@ fn management_events_are_kept_as_api_activity_across_a_crash() {
         std::thread::sleep(Duration::from_millis(100));
     }
     assert_eq!(activity(&server)[6][2], "DeleteBucket");
+    // A refused call naming no bucket there can be is kept too (its name
+    // cut short).
+    let long = format!("/{}", "a".repeat(2000));
+    assert_eq!(
+        send(
+            server.s3_port,
+            "GET",
+            &long,
+            "versioning",
+            b"",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        404
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while activity(&server).len() < 8 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let last = activity(&server).pop().unwrap();
+    assert_eq!(last[2], "GetBucketVersioning");
+    assert_eq!(last[8], "a".repeat(255));
 }
 
 #[test]

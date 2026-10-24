@@ -11,6 +11,7 @@
 //! CloudTrail, delivery is best effort: events not yet written when the
 //! server stops abruptly are lost.
 
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
 use hyper::Method;
@@ -26,6 +27,9 @@ use crate::server::{Connection, Principal, S3State, Signed};
 /// dropped.
 const MAX_PENDING: usize = 10_000;
 const MAX_PENDING_PER_ACCOUNT: usize = 2_000;
+/// Events waiting that wake the writer before its interval ends (a burst
+/// of calls is written, not dropped).
+const WAKE_AT: usize = 1_000;
 /// Events written per transaction.
 const WRITE_BATCH: usize = 256;
 /// The longest user agent and error message recorded (CloudTrail's limit).
@@ -303,7 +307,8 @@ fn record(
         record["resources"] = json!([{
             "accountId": owner.unwrap_or(account),
             "type": "AWS::S3::Bucket",
-            "ARN": format!("arn:aws:s3:::{bucket}"),
+            // A name past a bucket name's length (a refused call) cut short.
+            "ARN": format!("arn:aws:s3:::{}", truncated(bucket, 255)),
         }]);
     }
     if let Some((code, message)) = error {
@@ -318,14 +323,39 @@ fn record(
     record
 }
 
-/// Whether one more event of `account` may be kept beside `pending`.
-fn admits(pending: &[Event], account: &str) -> bool {
-    pending.len() < MAX_PENDING
-        && pending
-            .iter()
-            .filter(|event| event.account == account)
-            .count()
-            < MAX_PENDING_PER_ACCOUNT
+/// The events waiting to be written, and how many of each account.
+#[derive(Default)]
+struct Pending {
+    events: Vec<Event>,
+    of_account: HashMap<String, usize>,
+}
+
+impl Pending {
+    /// Keeps `event` if its account and the whole may have one more;
+    /// whether it was kept.
+    fn push(&mut self, event: Event) -> bool {
+        let count = self.of_account.entry(event.account.clone()).or_default();
+        if self.events.len() >= MAX_PENDING || *count >= MAX_PENDING_PER_ACCOUNT {
+            return false;
+        }
+        *count += 1;
+        self.events.push(event);
+        true
+    }
+
+    fn take(&mut self) -> Vec<Event> {
+        self.of_account.clear();
+        std::mem::take(&mut self.events)
+    }
+
+    /// Puts `back` (not written) before the events kept since, as far as
+    /// the caps allow.
+    fn put_back(&mut self, back: Vec<Event>) {
+        let later = self.take();
+        for event in back.into_iter().chain(later) {
+            self.push(event);
+        }
+    }
 }
 
 /// A random event id: 16 bytes as a UUID (version 4), and its first 8 as
@@ -352,7 +382,9 @@ fn event_id() -> (String, [u8; 8]) {
 
 #[derive(Default)]
 pub struct ActivityRecorder {
-    pending: Mutex<Vec<Event>>,
+    pending: Mutex<Pending>,
+    /// Woken when `WAKE_AT` events wait.
+    due: tokio::sync::Notify,
 }
 
 impl ActivityRecorder {
@@ -390,31 +422,35 @@ impl ActivityRecorder {
         let Some(record) = bytes else {
             return;
         };
+        self.keep(Event {
+            account,
+            time_ms,
+            id,
+            record,
+        });
+    }
+
+    /// Keeps `event` (if the caps allow), waking the writer once `WAKE_AT`
+    /// events wait.
+    fn keep(&self, event: Event) {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if admits(&pending, &account) {
-            pending.push(Event {
-                account,
-                time_ms,
-                id,
-                record,
-            });
+        if pending.push(event) && pending.events.len() == WAKE_AT {
+            self.due.notify_one();
         }
     }
 
     fn take(&self) -> Vec<Event> {
-        std::mem::take(
-            &mut *self
-                .pending
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
+        self.pending
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take()
     }
 
-    /// Writes the events kept (put back, up to `MAX_PENDING`, if they could
-    /// not be).
+    /// Writes the events kept (put back, as far as the caps allow, if they
+    /// could not be).
     pub(crate) async fn flush(&self, state: &S3State) {
         let mut taken = self.take();
         while !taken.is_empty() {
@@ -438,17 +474,15 @@ impl ActivityRecorder {
                 })
                 .await;
             if stored.is_err() {
-                let mut pending = self
-                    .pending
-                    .lock()
-                    .unwrap_or_else(|poisoned| poisoned.into_inner());
                 let back: Vec<Event> = Arc::try_unwrap(batch)
                     .unwrap_or_default()
                     .into_iter()
                     .chain(rest)
                     .collect();
-                let room = MAX_PENDING.saturating_sub(pending.len());
-                pending.splice(0..0, back.into_iter().take(room));
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .put_back(back);
                 return;
             }
             taken = rest;
@@ -456,12 +490,14 @@ impl ActivityRecorder {
     }
 }
 
-/// Writes the activity every `state.activity_flush` until `shutdown`, and
-/// once more then. A standby writes (and keeps) nothing.
+/// Writes the activity every `state.activity_flush`, or as soon as
+/// `WAKE_AT` events wait, until `shutdown`, and once more then. A standby
+/// writes (and keeps) nothing.
 pub async fn run(state: Arc<S3State>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     loop {
         let stopping = tokio::select! {
             _ = tokio::time::sleep(state.activity_flush) => false,
+            _ = state.activity.due.notified() => false,
             changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
         };
         if state.storage.is_standby() {
@@ -487,15 +523,59 @@ mod tests {
             id: [0; 8],
             record: Vec::new(),
         };
-        let mut pending: Vec<Event> = (0..MAX_PENDING_PER_ACCOUNT)
-            .map(|_| event("111122223333"))
-            .collect();
-        assert!(!admits(&pending, "111122223333"));
-        assert!(admits(&pending, "444455556666"));
-        while pending.len() < MAX_PENDING {
-            pending.push(event(&format!("{:012}", pending.len())));
+        let mut pending = Pending::default();
+        for _ in 0..MAX_PENDING_PER_ACCOUNT {
+            assert!(pending.push(event("111122223333")));
         }
-        assert!(!admits(&pending, "444455556666"), "nor past the whole cap");
+        assert!(!pending.push(event("111122223333")));
+        assert!(pending.push(event("444455556666")));
+        let mut other = 0;
+        while pending.events.len() < MAX_PENDING {
+            assert!(pending.push(event(&format!("{other:012}"))));
+            other += 1;
+        }
+        assert!(
+            !pending.push(event("555566667777")),
+            "nor past the whole cap"
+        );
+        // Taken, the counts go with them; put back, they count again.
+        let taken = pending.take();
+        assert!(pending.push(event("111122223333")));
+        pending.put_back(taken);
+        assert_eq!(pending.events.len(), MAX_PENDING);
+        assert_eq!(pending.of_account["111122223333"], MAX_PENDING_PER_ACCOUNT);
+        assert_eq!(pending.events[0].account, "111122223333");
+    }
+
+    #[test]
+    fn a_burst_of_events_wakes_the_writer() {
+        let recorder = ActivityRecorder::default();
+        let woken = || {
+            tokio::runtime::Builder::new_current_thread()
+                .enable_time()
+                .build()
+                .unwrap()
+                .block_on(async {
+                    tokio::time::timeout(
+                        std::time::Duration::from_millis(50),
+                        recorder.due.notified(),
+                    )
+                    .await
+                    .is_ok()
+                })
+        };
+        let event = || Event {
+            account: "111122223333".to_string(),
+            time_ms: 0,
+            id: [0; 8],
+            record: Vec::new(),
+        };
+        for _ in 1..WAKE_AT {
+            recorder.keep(event());
+        }
+        assert!(!woken());
+        recorder.keep(event());
+        assert!(woken());
     }
 
     #[test]
