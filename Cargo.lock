@@ -1967,6 +1967,7 @@ dependencies = [
  "bytes",
  "crc",
  "crc32fast",
+ "flate2",
  "http-body",
  "http-body-util",
  "httpdate",

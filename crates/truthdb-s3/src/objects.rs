@@ -899,6 +899,8 @@ pub async fn get_object(
         access_log_flush: state.access_log_flush,
         activity: state.activity.clone(),
         activity_flush: state.activity_flush,
+        trail_logs: state.trail_logs.clone(),
+        trail_flush: state.trail_flush,
     };
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;
     tokio::spawn(crate::scope::within(scope, async move {

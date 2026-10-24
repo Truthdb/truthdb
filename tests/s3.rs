@@ -195,7 +195,7 @@ fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\nactivity_flush_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\nactivity_flush_seconds = 1\ntrail_flush_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
             dir.join("truth.db").display()
         ),
     )
@@ -13236,6 +13236,146 @@ s3.put_bucket_logging(Bucket="source", BucketLoggingStatus={"LoggingEnabled": en
 s3.delete_bucket(Bucket="source")
 s3.create_bucket(Bucket="source")
 assert "LoggingEnabled" not in s3.get_bucket_logging(Bucket="source")
+print("ok")
+"#;
+
+#[test]
+fn a_trail_delivers_its_accounts_events_as_log_files() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "trails");
+    let (_, other_key, other_secret) = account_with_key(&server, "neighbour");
+    let (user_key, user_secret) = user_with_key(&server, &account, "nobody", None);
+    let script = server.dir.join("trails.py");
+    std::fs::write(&script, TRAILS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other_key,
+            &other_secret,
+            &user_key,
+            &user_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const TRAILS_SCRIPT: &str = r#"
+import sys, time, json, gzip, re
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other_key, other_secret, user_key, user_secret = sys.argv[1:9]
+def client(service, access, secret_key):
+    return boto3.client(service, endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+s3 = client("s3", key, secret)
+ct = client("cloudtrail", key, secret)
+other_s3 = client("s3", other_key, other_secret)
+other_ct = client("cloudtrail", other_key, other_secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+def wait_for(check):
+    deadline = time.time() + 30
+    while not check():
+        assert time.time() < deadline, "never"
+        time.sleep(0.5)
+def files(prefix):
+    return [o["Key"] for o in s3.list_objects_v2(Bucket="trail-logs", Prefix=prefix).get("Contents", [])]
+def records(prefix):
+    out = []
+    for name in files(prefix):
+        body = s3.get_object(Bucket="trail-logs", Key=name)["Body"].read()
+        out += json.loads(gzip.decompress(body))["Records"]
+    return out
+s3.create_bucket(Bucket="trail-logs")
+other_s3.create_bucket(Bucket="foreign")
+arn = f"arn:aws:cloudtrail:us-east-1:{account}:trail/main"
+made = ct.create_trail(Name="main", S3BucketName="trail-logs", S3KeyPrefix="ct")
+assert made["TrailARN"] == arn and made["S3KeyPrefix"] == "ct" and made["Name"] == "main", made
+assert made["IncludeGlobalServiceEvents"] is True and made["IsMultiRegionTrail"] is False, made
+# Refused as CloudTrail refuses them.
+refused(lambda: ct.create_trail(Name="main", S3BucketName="trail-logs"), "TrailAlreadyExistsException")
+refused(lambda: ct.create_trail(Name="my--trail", S3BucketName="trail-logs"), "InvalidTrailNameException")
+refused(lambda: ct.create_trail(Name="nobucket", S3BucketName="missing"), "S3BucketDoesNotExistException")
+refused(lambda: ct.create_trail(Name="theirs", S3BucketName="foreign"), "InsufficientS3BucketPolicyException")
+refused(lambda: ct.create_trail(Name="keyed", S3BucketName="trail-logs", KmsKeyId="alias/x"), "UnsupportedOperationException")
+refused(lambda: ct.create_trail(Name="long", S3BucketName="trail-logs", S3KeyPrefix="p" * 201), "InvalidS3PrefixException")
+for n in range(4):
+    ct.create_trail(Name=f"extra{n}", S3BucketName="trail-logs")
+refused(lambda: ct.create_trail(Name="sixth", S3BucketName="trail-logs"), "MaximumNumberOfTrailsExceededException")
+listed = ct.list_trails()["Trails"]
+assert sorted(t["Name"] for t in listed) == ["extra0", "extra1", "extra2", "extra3", "main"], listed
+for n in range(4):
+    ct.delete_trail(Name=f"extra{n}")
+described = ct.describe_trails(trailNameList=["main", arn])["trailList"]
+assert len(described) == 1 and described[0]["TrailARN"] == arn and described[0]["HomeRegion"] == "us-east-1", described
+assert ct.get_trail(Name=arn)["Trail"]["S3BucketName"] == "trail-logs"
+# Not logging until started.
+assert ct.get_trail_status(Name="main")["IsLogging"] is False
+s3.create_bucket(Bucket="before")
+time.sleep(2.5)
+assert files("ct/") == []
+ct.start_logging(Name="main")
+status = ct.get_trail_status(Name="main")
+assert status["IsLogging"] is True and "StartLoggingTime" in status, status
+s3.create_bucket(Bucket="watched")
+s3.put_bucket_versioning(Bucket="watched", VersioningConfiguration={"Status": "Enabled"})
+wait_for(lambda: "PutBucketVersioning" in [r["eventName"] for r in records("ct/")])
+for name in files("ct/"):
+    assert re.fullmatch(rf"ct/AWSLogs/{account}/CloudTrail/us-east-1/\d{{4}}/\d{{2}}/\d{{2}}/{account}_CloudTrail_us-east-1_\d{{8}}T\d{{4}}Z_[A-Za-z0-9]{{16}}\.json\.gz", name), name
+got = records("ct/")
+assert all(r["recipientAccountId"] == account and r["eventSource"] == "s3.amazonaws.com" for r in got), got
+assert "before" not in [r.get("requestParameters", {}).get("bucketName") for r in got if r["eventName"] == "CreateBucket"]
+assert "LatestDeliveryTime" in ct.get_trail_status(Name="main")
+# Another account's events and trails are its own.
+other_s3.get_bucket_versioning(Bucket="foreign")
+refused(lambda: other_ct.get_trail(Name="main"), "TrailNotFoundException")
+refused(lambda: other_ct.get_trail(Name=arn), "TrailNotFoundException")
+refused(lambda: ct.get_trail(Name="arn:aws:s3:::trail-logs"), "CloudTrailARNInvalidException")
+assert other_ct.describe_trails()["trailList"] == []
+# A new prefix takes effect; a bucket gone is told in the status.
+ct.update_trail(Name="main", S3KeyPrefix="ct2")
+s3.get_bucket_versioning(Bucket="watched")
+wait_for(lambda: files("ct2/"))
+s3.create_bucket(Bucket="doomed")
+ct.update_trail(Name="main", S3BucketName="doomed")
+s3.delete_bucket(Bucket="doomed")
+s3.get_bucket_versioning(Bucket="watched")
+wait_for(lambda: ct.get_trail_status(Name="main").get("LatestDeliveryError") == "NoSuchBucket")
+# Made again by another account: not written into.
+other_s3.create_bucket(Bucket="doomed")
+s3.get_bucket_versioning(Bucket="watched")
+wait_for(lambda: ct.get_trail_status(Name="main").get("LatestDeliveryError") == "AccessDenied")
+assert other_s3.list_objects_v2(Bucket="doomed").get("Contents", []) == []
+ct.update_trail(Name="main", S3BucketName="trail-logs", S3KeyPrefix="ct3")
+# Stopped: nothing more.
+ct.stop_logging(Name="main")
+assert ct.get_trail_status(Name="main")["IsLogging"] is False
+s3.get_bucket_versioning(Bucket="watched")
+time.sleep(3)
+assert files("ct3/") == []
+# A user needs cloudtrail permissions; a deleted trail is gone.
+refused(lambda: client("cloudtrail", user_key, user_secret).create_trail(Name="mine", S3BucketName="trail-logs"), "AccessDenied")
+ct.delete_trail(Name="main")
+refused(lambda: ct.get_trail_status(Name="main"), "TrailNotFoundException")
 print("ok")
 "#;
 

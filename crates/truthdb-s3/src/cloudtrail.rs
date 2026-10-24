@@ -1,4 +1,5 @@
-//! A CloudTrail API over the API activity log (see `activity`): LookupEvents,
+//! A CloudTrail API over the API activity log (see `activity`): LookupEvents
+//! and an account's trails (see `trails`),
 //! in the AWS JSON 1.1 protocol the SDKs speak to it (`X-Amz-Target:
 //! com.amazonaws.cloudtrail.v20131101.CloudTrail_20131101.<operation>`,
 //! signed for `cloudtrail`). A caller reads its own account's management
@@ -37,14 +38,15 @@ const ATTRIBUTES: [&str; 8] = [
     "Username",
 ];
 
-struct CtError {
+#[derive(Debug)]
+pub(crate) struct CtError {
     status: u16,
-    code: &'static str,
+    pub(crate) code: &'static str,
     message: String,
 }
 
 impl CtError {
-    fn new(status: u16, code: &'static str, message: impl Into<String>) -> CtError {
+    pub(crate) fn new(status: u16, code: &'static str, message: impl Into<String>) -> CtError {
         CtError {
             status,
             code,
@@ -136,15 +138,35 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, CtE
         Vec::new(),
     )
     .await?;
-    if operation != "LookupEvents" {
+    if operation == "LookupEvents" {
+        authz.check_arn("cloudtrail:LookupEvents", "*", &principal.account)?;
+        return lookup_events(state, &input, &principal.account).await;
+    }
+    if !matches!(
+        operation.as_str(),
+        "CreateTrail"
+            | "GetTrail"
+            | "DescribeTrails"
+            | "ListTrails"
+            | "UpdateTrail"
+            | "DeleteTrail"
+            | "StartLogging"
+            | "StopLogging"
+            | "GetTrailStatus"
+    ) {
         return Err(CtError::new(
             400,
             "UnsupportedOperationException",
             format!("{operation} is not supported."),
         ));
     }
-    authz.check_arn("cloudtrail:LookupEvents", "*", &principal.account)?;
-    lookup_events(state, &input, &principal.account).await
+    let resource = crate::trails::resource(&operation, &input, &state.region, &principal.account)?;
+    authz.check_arn(
+        &format!("cloudtrail:{operation}"),
+        &resource,
+        &principal.account,
+    )?;
+    crate::trails::serve(state, &operation, &input, &principal.account).await
 }
 
 /// A lookup attribute: the event field it matches.

@@ -37,6 +37,9 @@ pub const BUCKET_CORS: u8 = 7;
 pub const BUCKET_WEBSITE: u8 = 8;
 /// Bucket configuration: its server access logging (the rendered XML).
 pub const BUCKET_LOGGING: u8 = 9;
+/// An account's CloudTrail trails, kept under the empty bucket name, by
+/// `<account>/<trail name>` (see `truthdb-s3`'s `trails`).
+pub const ACCOUNT_TRAIL: u8 = 12;
 /// Bucket configurations: its request metrics configurations, by id (the
 /// rendered XML).
 pub const BUCKET_METRICS: u8 = 11;

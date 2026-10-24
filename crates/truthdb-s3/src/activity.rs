@@ -637,9 +637,22 @@ impl ActivityRecorder {
                             )?;
                         }
                         Ok(())
-                    })
+                    })?;
+                    // The accounts' logging trails, which get them too.
+                    let mut accounts: Vec<String> =
+                        written.iter().map(|event| event.account.clone()).collect();
+                    accounts.sort();
+                    accounts.dedup();
+                    crate::trails::logging_trails(file, &accounts)
                 })
                 .await;
+            if let Ok(trails) = &stored {
+                for event in batch.iter() {
+                    for name in trails.get(&event.account).into_iter().flatten() {
+                        state.trail_logs.append(&event.account, name, &event.record);
+                    }
+                }
+            }
             if stored.is_err() {
                 let back: Vec<Event> = Arc::try_unwrap(batch)
                     .unwrap_or_default()
