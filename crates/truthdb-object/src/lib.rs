@@ -12,6 +12,7 @@
 //! `RelCtx::allocate_extent_in_txn`).
 
 mod accounts;
+mod activity;
 mod body;
 mod buckets;
 mod codec;
@@ -50,6 +51,7 @@ use truthdb_core::storage::{
 use truthdb_core::wal::records::RelRecord;
 
 pub use accounts::{AccountError, AccountInfo, DEFAULT_ACCOUNT, UserInfo, valid_account_id};
+pub use activity::{ACTIVITY_KEEP_MS, ActivityEvent, MAX_ACTIVITY_RECORD};
 pub use body::{BodyInfo, BodyLease, BodyWriter, SEGMENT_BYTES, SealedBody};
 pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use consumers::{Consumer, FULLTEXT_CONSUMER};
@@ -183,6 +185,11 @@ const METRIC_POINTS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 38;
 const METRIC_EXPIRY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 39;
 /// Series -> the last minute it has.
 const METRIC_SERIES_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 40;
+/// (account, 0, time newest first, id) -> a management event (see
+/// `activity`).
+const ACTIVITY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 41;
+/// (time, event key) -> nothing: the events by when they were made.
+const ACTIVITY_EXPIRY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 42;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -307,7 +314,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 41;
+const TREE_COUNT: usize = 43;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -445,6 +452,12 @@ impl Trees {
     }
     pub fn metric_series(&self) -> BTree {
         self.tree(METRIC_SERIES_TREE)
+    }
+    pub fn activity(&self) -> BTree {
+        self.tree(ACTIVITY_TREE)
+    }
+    pub fn activity_expiry(&self) -> BTree {
+        self.tree(ACTIVITY_EXPIRY_TREE)
     }
 }
 

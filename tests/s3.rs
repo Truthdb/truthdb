@@ -195,7 +195,7 @@ fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\nactivity_flush_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
             dir.join("truth.db").display()
         ),
     )
@@ -4873,10 +4873,6 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
         ("DELETE", "/subs", "metadataTable"),
         ("DELETE", "/subs", "metadataConfiguration"),
         ("PUT", "/subs/o", "renameObject"),
-        ("GET", "/subs", "uploads&delete"),
-        ("POST", "/subs/o", "uploads&policy"),
-        ("GET", "/subs/o", "uploadId=1&versioning"),
-        ("DELETE", "/subs/o", "uploadId=1&versioning"),
         ("PUT", "/subs/o", "annotation"),
         ("DELETE", "/subs/o", "annotation"),
         ("DELETE", "/subs", "object-lock"),
@@ -4900,6 +4896,19 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
     ] {
         let (status, reply) = call(method, path, query);
         assert_eq!(status, 501, "{method} {path}?{query}: {reply}");
+    }
+    // One naming two sub-resources is refused before any route.
+    for (method, path, query) in [
+        ("GET", "/subs", "uploads&delete"),
+        ("POST", "/subs/o", "uploads&policy"),
+        ("GET", "/subs/o", "uploadId=1&versioning"),
+        ("DELETE", "/subs/o", "uploadId=1&versioning"),
+        ("PUT", "/subs", "policy&logging"),
+        ("GET", "/subs", "policy&analytics"),
+    ] {
+        let (status, reply) = call(method, path, query);
+        assert_eq!(status, 400, "{method} {path}?{query}: {reply}");
+        assert_eq!(xml_value(&reply, "Code"), "InvalidArgument");
     }
     // Neither is any other write naming an unknown operation, whichever
     // route its other parameters select.
@@ -4944,7 +4953,8 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
         &key,
         Some(&secret),
     );
-    assert_eq!(status, 501, "{reply}");
+    assert_eq!(status, 400, "{reply}");
+    assert_eq!(xml_value(&reply, "Code"), "InvalidArgument");
     // Nothing was deleted, created or overwritten.
     assert_eq!(call("HEAD", "/subs", "").0, 200);
     assert_eq!(call("HEAD", "/new", "").0, 404);
@@ -13228,6 +13238,248 @@ s3.create_bucket(Bucket="source")
 assert "LoggingEnabled" not in s3.get_bucket_logging(Bucket="source")
 print("ok")
 "#;
+
+#[test]
+fn management_events_are_kept_as_api_activity_across_a_crash() {
+    let mut server = start_server();
+    let port = server.s3_port;
+    let (account, key, secret) = account_with_key(&server, "audited");
+    let (other_account, other_key, other_secret) = account_with_key(&server, "visitor");
+    let (user_key, user_secret) = user_with_key(
+        &server,
+        &account,
+        "auditor",
+        Some(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#,
+        ),
+    );
+    let call = |method: &str, path: &str, query: &str, key: &str, secret: Option<&str>| {
+        send(port, method, path, query, b"", key, secret)
+    };
+    assert_eq!(call("PUT", "/made", "", &key, Some(&secret)).0, 200);
+    assert_eq!(
+        call("GET", "/made", "versioning", &key, Some(&secret)).0,
+        200
+    );
+    let (status, reply) = call("GET", "/made", "policy", &key, Some(&secret));
+    assert_eq!(status, 404, "{reply}");
+    assert_eq!(call("GET", "/", "", &user_key, Some(&user_secret)).0, 200);
+    // Data events are not management events.
+    assert_eq!(
+        send(port, "PUT", "/made/k", "", b"x", &key, Some(&secret)).0,
+        200
+    );
+    assert_eq!(
+        call("GET", "/made", "list-type=2", &key, Some(&secret)).0,
+        200
+    );
+    assert_eq!(call("HEAD", "/made", "", &key, Some(&secret)).0, 200);
+    // An anonymous call is no account's; another account's is its own.
+    assert_eq!(call("GET", "/made", "acl", "", None).0, 403);
+    assert_eq!(
+        call("GET", "/made", "location", &other_key, Some(&other_secret)).0,
+        403
+    );
+    // A call naming two sub-resources is refused (and is no event).
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{account}:root"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::made/*"}}]}}"#
+    );
+    for query in ["location&policy", "policy&versioning"] {
+        let (status, reply) = send(
+            port,
+            "PUT",
+            "/made",
+            query,
+            policy.as_bytes(),
+            &key,
+            Some(&secret),
+        );
+        assert_eq!(status, 400, "{query}: {reply}");
+    }
+    // A user agent too long for the record is cut, and the event kept.
+    let quotes = "\"".repeat(1000);
+    let (_, (status, _)) = send_with(
+        port,
+        "GET",
+        "/made",
+        "versioning",
+        &[("user-agent", &quotes)],
+        b"",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 200);
+    let activity = |server: &Server| {
+        sql_rows(
+            server.native_port,
+            "SELECT account_id, event_source, event_name, ISNULL(user_name, '-'), \
+             ISNULL(access_key_id, '-'), source_ip, read_only, ISNULL(error_code, '-'), \
+             ISNULL(resource_name, '-'), event_id, cloudtrail_event \
+             FROM sys.dm_s3_api_activity ORDER BY event_time, event_name",
+        )
+    };
+    let deadline = Instant::now() + DEADLINE;
+    while activity(&server).len() < 6 {
+        assert!(Instant::now() < deadline, "{:?}", activity(&server));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let rows = activity(&server);
+    let summary: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{} {} {} {} {} {}",
+                if row[0] == account {
+                    "owner"
+                } else if row[0] == other_account {
+                    "other"
+                } else {
+                    "?"
+                },
+                row[2],
+                row[3],
+                row[6],
+                row[7],
+                row[8]
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            "owner CreateBucket - 0 - made",
+            "owner GetBucketVersioning - 1 - made",
+            "owner GetBucketPolicy - 1 NoSuchBucketPolicy made",
+            "owner ListBuckets auditor 1 - -",
+            "other GetBucketLocation - 1 AccessDenied made",
+            "owner GetBucketVersioning - 1 - made",
+        ],
+        "{rows:?}"
+    );
+    let cut: serde_json::Value = serde_json::from_str(&rows[5][10]).unwrap();
+    assert!(cut["requestParameters"].is_null(), "{cut}");
+    assert_eq!(cut["userAgent"].as_str().unwrap().len(), 256, "{cut}");
+    for row in &rows {
+        assert_eq!(row[1], "s3.amazonaws.com");
+        assert_eq!(row[5], "127.0.0.1");
+        assert_eq!(row[9].len(), 36, "{row:?}");
+        let record: serde_json::Value = serde_json::from_str(&row[10]).unwrap();
+        assert_eq!(record["eventVersion"], "1.11");
+        assert_eq!(record["eventCategory"], "Management");
+        assert_eq!(record["eventType"], "AwsApiCall");
+        assert_eq!(record["managementEvent"], true);
+        assert_eq!(record["recipientAccountId"], row[0].as_str());
+        assert_eq!(record["eventID"], row[9].as_str());
+        assert_eq!(record["awsRegion"], "us-east-1");
+    }
+    let record = |name: &str| -> serde_json::Value {
+        let row = rows.iter().find(|row| row[2] == name).unwrap();
+        serde_json::from_str(&row[10]).unwrap()
+    };
+    let versioning = record("GetBucketVersioning");
+    assert_eq!(versioning["userIdentity"]["type"], "Root");
+    assert_eq!(versioning["userIdentity"]["accountId"], account.as_str());
+    assert_eq!(versioning["userIdentity"]["accessKeyId"], key.as_str());
+    assert_eq!(versioning["requestParameters"]["bucketName"], "made");
+    assert_eq!(versioning["requestParameters"]["versioning"], "");
+    assert_eq!(versioning["resources"][0]["ARN"], "arn:aws:s3:::made");
+    assert_eq!(versioning["resources"][0]["type"], "AWS::S3::Bucket");
+    assert!(versioning["eventTime"].as_str().unwrap().ends_with('Z'));
+    let listing = record("ListBuckets");
+    assert_eq!(listing["userIdentity"]["type"], "IAMUser");
+    assert_eq!(listing["userIdentity"]["userName"], "auditor");
+    assert_eq!(
+        listing["userIdentity"]["arn"],
+        format!("arn:aws:iam::{account}:user/auditor")
+    );
+    assert_eq!(listing["userIdentity"]["accessKeyId"], user_key.as_str());
+    let refused = record("GetBucketLocation");
+    assert_eq!(refused["userIdentity"]["accountId"], other_account.as_str());
+    assert_eq!(refused["errorCode"], "AccessDenied");
+    assert!(refused["errorMessage"].is_string());
+    // Kept across a crash.
+    crash_and_restart(&mut server);
+    assert_eq!(activity(&server).len(), 6);
+    assert_eq!(
+        send(
+            server.s3_port,
+            "DELETE",
+            "/made/k",
+            "",
+            b"",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        204
+    );
+    assert_eq!(
+        send(
+            server.s3_port,
+            "DELETE",
+            "/made",
+            "",
+            b"",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        204
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while activity(&server).len() < 7 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(activity(&server)[6][2], "DeleteBucket");
+    // A refused call naming no bucket there can be is kept too (its name
+    // cut short).
+    let long = format!("/{}", "a".repeat(2000));
+    assert_eq!(
+        send(
+            server.s3_port,
+            "GET",
+            &long,
+            "versioning",
+            b"",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        404
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while activity(&server).len() < 8 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let last = activity(&server).pop().unwrap();
+    assert_eq!(last[2], "GetBucketVersioning");
+    assert_eq!(last[8], "a".repeat(255));
+    // Its control characters too.
+    let controls = format!("/{}", "%01".repeat(300));
+    let (status, _) = send(
+        server.s3_port,
+        "GET",
+        &controls,
+        "policy",
+        b"",
+        &key,
+        Some(&secret),
+    );
+    assert!(status >= 400, "{status}");
+    let deadline = Instant::now() + DEADLINE;
+    while activity(&server).len() < 9 {
+        assert!(Instant::now() < deadline, "{:?}", activity(&server));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let last = activity(&server)
+        .into_iter()
+        .find(|row| row[2] == "GetBucketPolicy" && row[8] != "made")
+        .unwrap();
+    assert_eq!(last[8], "?".repeat(255));
+}
 
 #[test]
 fn access_logs_are_written_into_the_target_bucket() {

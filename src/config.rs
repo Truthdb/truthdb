@@ -162,6 +162,11 @@ pub struct S3Config {
     /// How often the server access logs kept are written (seconds).
     #[serde(default = "default_access_log_flush_seconds")]
     pub access_log_flush_seconds: u64,
+
+    /// How often the API activity (management events) kept is written
+    /// (seconds).
+    #[serde(default = "default_activity_flush_seconds")]
+    pub activity_flush_seconds: u64,
 }
 
 fn default_metrics_flush_seconds() -> u64 {
@@ -170,6 +175,10 @@ fn default_metrics_flush_seconds() -> u64 {
 
 fn default_access_log_flush_seconds() -> u64 {
     300
+}
+
+fn default_activity_flush_seconds() -> u64 {
+    60
 }
 
 impl S3Config {
@@ -223,6 +232,7 @@ impl Default for S3Config {
             domains: Vec::new(),
             metrics_flush_seconds: default_metrics_flush_seconds(),
             access_log_flush_seconds: default_access_log_flush_seconds(),
+            activity_flush_seconds: default_activity_flush_seconds(),
         }
     }
 }

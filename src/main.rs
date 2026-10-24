@@ -315,6 +315,10 @@ async fn main() -> ExitCode {
                     access_log_flush: std::time::Duration::from_secs(
                         config.s3.access_log_flush_seconds.max(1),
                     ),
+                    activity: Default::default(),
+                    activity_flush: std::time::Duration::from_secs(
+                        config.s3.activity_flush_seconds.max(1),
+                    ),
                 });
                 let shutdown_rx = shutdown_tx.subscribe();
                 Some(tokio::spawn(truthdb_s3::server::serve(
