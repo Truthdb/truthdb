@@ -13457,6 +13457,28 @@ fn management_events_are_kept_as_api_activity_across_a_crash() {
     let last = activity(&server).pop().unwrap();
     assert_eq!(last[2], "GetBucketVersioning");
     assert_eq!(last[8], "a".repeat(255));
+    // Its control characters too.
+    let controls = format!("/{}", "%01".repeat(300));
+    let (status, _) = send(
+        server.s3_port,
+        "GET",
+        &controls,
+        "policy",
+        b"",
+        &key,
+        Some(&secret),
+    );
+    assert!(status >= 400, "{status}");
+    let deadline = Instant::now() + DEADLINE;
+    while activity(&server).len() < 9 {
+        assert!(Instant::now() < deadline, "{:?}", activity(&server));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    let last = activity(&server)
+        .into_iter()
+        .find(|row| row[2] == "GetBucketPolicy" && row[8] != "made")
+        .unwrap();
+    assert_eq!(last[8], "?".repeat(255));
 }
 
 #[test]

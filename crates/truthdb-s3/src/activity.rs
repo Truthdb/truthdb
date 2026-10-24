@@ -9,7 +9,11 @@
 //!
 //! Events are kept in memory and written every `activity_flush`; as in
 //! CloudTrail, delivery is best effort: events not yet written when the
-//! server stops abruptly are lost.
+//! server stops abruptly are lost. An account stores at most
+//! `HOURLY_BUDGET` refused calls an hour (its successful calls are all
+//! kept); an `ActivityEventsDropped` event (`serviceEventDetails`: how
+//! many, from when to when) tells of the events dropped, past the budget
+//! or while too many waited to be written.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -30,6 +34,12 @@ const MAX_PENDING_PER_ACCOUNT: usize = 2_000;
 /// Events waiting that wake the writer before its interval ends (a burst
 /// of calls is written, not dropped).
 const WAKE_AT: usize = 1_000;
+/// The refused calls an account stores in an hour; more are dropped
+/// (successful calls are all kept): a flood of refused calls costs bounded
+/// storage, and the account's real activity stays. What is dropped is told
+/// in a summary event.
+const HOURLY_BUDGET: u64 = 20_000;
+const HOUR_MS: u64 = 3_600_000;
 /// Events written per transaction.
 const WRITE_BATCH: usize = 256;
 /// The longest user agent and error message recorded (CloudTrail's limit).
@@ -207,6 +217,8 @@ struct Event {
     time_ms: u64,
     id: [u8; 8],
     record: Vec<u8>,
+    /// A summary of dropped events (kept past the caps).
+    summary: bool,
 }
 
 /// `text` cut to at most `max` bytes (at a character's end).
@@ -216,6 +228,13 @@ fn truncated(text: &str, max: usize) -> &str {
         end -= 1;
     }
     &text[..end]
+}
+
+/// `text` with its control characters as `?`.
+fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
 }
 
 /// How much of a record is kept, from all of it to what always fits a row:
@@ -307,8 +326,9 @@ fn record(
         record["resources"] = json!([{
             "accountId": owner.unwrap_or(account),
             "type": "AWS::S3::Bucket",
-            // A name past a bucket name's length (a refused call) cut short.
-            "ARN": format!("arn:aws:s3:::{}", truncated(bucket, 255)),
+            // A name no bucket can have (a refused call's) made printable
+            // and cut short.
+            "ARN": format!("arn:aws:s3:::{}", truncated(&printable(bucket), 255)),
         }]);
     }
     if let Some((code, message)) = error {
@@ -332,10 +352,12 @@ struct Pending {
 
 impl Pending {
     /// Keeps `event` if its account and the whole may have one more;
-    /// whether it was kept.
+    /// whether it was kept. A summary of drops is always kept (one an
+    /// account a flush at most).
     fn push(&mut self, event: Event) -> bool {
         let count = self.of_account.entry(event.account.clone()).or_default();
-        if self.events.len() >= MAX_PENDING || *count >= MAX_PENDING_PER_ACCOUNT {
+        if !event.summary && (self.events.len() >= MAX_PENDING || *count >= MAX_PENDING_PER_ACCOUNT)
+        {
             return false;
         }
         *count += 1;
@@ -355,6 +377,46 @@ impl Pending {
         for event in back.into_iter().chain(later) {
             self.push(event);
         }
+    }
+}
+
+/// The event telling of `budget`'s dropped refused calls of `account`.
+fn dropped_summary(account: &str, budget: &Budget, now_ms: u64, region: &str) -> Event {
+    let (event_id, id) = event_id();
+    let time = |ms: u64| {
+        let iso = crate::time::iso8601(ms);
+        format!("{}Z", &iso[..19])
+    };
+    let record = json!({
+        "eventVersion": "1.11",
+        "userIdentity": { "type": "AWSService", "invokedBy": "s3.amazonaws.com" },
+        "eventTime": time(now_ms),
+        "eventSource": "s3.amazonaws.com",
+        "eventName": "ActivityEventsDropped",
+        "awsRegion": region,
+        "sourceIPAddress": "s3.amazonaws.com",
+        "userAgent": "s3.amazonaws.com",
+        "requestParameters": Value::Null,
+        "responseElements": Value::Null,
+        "serviceEventDetails": {
+            "droppedEvents": budget.dropped,
+            "firstDropped": time(budget.first_dropped_ms),
+            "lastDropped": time(budget.last_dropped_ms),
+            "hourlyBudget": HOURLY_BUDGET,
+        },
+        "eventID": event_id,
+        "readOnly": false,
+        "eventType": "AwsServiceEvent",
+        "managementEvent": true,
+        "recipientAccountId": account,
+        "eventCategory": "Management",
+    });
+    Event {
+        account: account.to_string(),
+        time_ms: now_ms,
+        id,
+        record: record.to_string().into_bytes(),
+        summary: true,
     }
 }
 
@@ -380,11 +442,33 @@ fn event_id() -> (String, [u8; 8]) {
     )
 }
 
+/// An account's events of the current hour: how many refused calls were
+/// stored, and the events dropped (how many, the first's and last's time).
+#[derive(Default)]
+struct Budget {
+    hour: u64,
+    refused: u64,
+    dropped: u64,
+    first_dropped_ms: u64,
+    last_dropped_ms: u64,
+}
+
 #[derive(Default)]
 pub struct ActivityRecorder {
+    budgets: Mutex<HashMap<String, Budget>>,
     pending: Mutex<Pending>,
     /// Woken when `WAKE_AT` events wait.
     due: tokio::sync::Notify,
+}
+
+impl Budget {
+    fn drop_one(&mut self, time_ms: u64) {
+        if self.dropped == 0 {
+            self.first_dropped_ms = time_ms;
+        }
+        self.dropped += 1;
+        self.last_dropped_ms = time_ms;
+    }
 }
 
 impl ActivityRecorder {
@@ -405,6 +489,10 @@ impl ActivityRecorder {
         };
         let account = who.0.account.clone();
         let time_ms = crate::objects::now_ms();
+        let refused = error.is_some();
+        if !self.admit(&account, time_ms, refused, &state.region) {
+            return;
+        }
         let (event_id, id) = event_id();
         // As much of it as fits a row.
         let mut bytes = None;
@@ -422,24 +510,100 @@ impl ActivityRecorder {
         let Some(record) = bytes else {
             return;
         };
-        self.keep(Event {
-            account,
-            time_ms,
-            id,
-            record,
-        });
+        self.keep_or_count(
+            Event {
+                account,
+                time_ms,
+                id,
+                record,
+                summary: false,
+            },
+            refused,
+        );
+    }
+
+    /// Keeps `event` (an admitted one, a refused call's if `refused`); if
+    /// too many wait, counts it dropped (and not against the budget).
+    fn keep_or_count(&self, event: Event, refused: bool) {
+        let (account, time_ms) = (event.account.clone(), event.time_ms);
+        if self.keep(event) {
+            return;
+        }
+        let mut budgets = self
+            .budgets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(budget) = budgets.get_mut(&account) {
+            if refused {
+                budget.refused = budget.refused.saturating_sub(1);
+            }
+            budget.drop_one(time_ms);
+        }
+    }
+
+    /// Whether an event of `account` at `time_ms` (a refused call's if
+    /// `refused`) is kept: a successful call's always, a refused call's
+    /// within the hour's budget. A new hour after drops first keeps the
+    /// summary of the last one's.
+    fn admit(&self, account: &str, time_ms: u64, refused: bool, region: &str) -> bool {
+        let (admitted, ended) = {
+            let mut budgets = self
+                .budgets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let budget = budgets.entry(account.to_string()).or_default();
+            let hour = time_ms / HOUR_MS;
+            let ended = (budget.hour != hour)
+                .then(|| {
+                    let ended = std::mem::take(budget);
+                    budget.hour = hour;
+                    ended
+                })
+                .filter(|ended| ended.dropped > 0);
+            let admitted = !refused || budget.refused < HOURLY_BUDGET;
+            if !admitted {
+                budget.drop_one(time_ms);
+            } else if refused {
+                budget.refused += 1;
+            }
+            (admitted, ended)
+        };
+        if let Some(ended) = ended {
+            self.keep(dropped_summary(account, &ended, time_ms, region));
+        }
+        admitted
+    }
+
+    /// The summaries of the events dropped so far (written with the next
+    /// flush; the counts start again).
+    fn summaries(&self, now_ms: u64, region: &str) -> Vec<Event> {
+        let mut budgets = self
+            .budgets
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        budgets
+            .iter_mut()
+            .filter(|(_, budget)| budget.dropped > 0)
+            .map(|(account, budget)| {
+                let event = dropped_summary(account, budget, now_ms, region);
+                budget.dropped = 0;
+                event
+            })
+            .collect()
     }
 
     /// Keeps `event` (if the caps allow), waking the writer once `WAKE_AT`
-    /// events wait.
-    fn keep(&self, event: Event) {
+    /// events wait; whether it was kept.
+    fn keep(&self, event: Event) -> bool {
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if pending.push(event) && pending.events.len() == WAKE_AT {
+        let kept = pending.push(event);
+        if kept && pending.events.len() == WAKE_AT {
             self.due.notify_one();
         }
+        kept
     }
 
     fn take(&self) -> Vec<Event> {
@@ -452,6 +616,9 @@ impl ActivityRecorder {
     /// Writes the events kept (put back, as far as the caps allow, if they
     /// could not be).
     pub(crate) async fn flush(&self, state: &S3State) {
+        for summary in self.summaries(crate::objects::now_ms(), &state.region) {
+            self.keep(summary);
+        }
         let mut taken = self.take();
         while !taken.is_empty() {
             let rest = taken.split_off(taken.len().min(WRITE_BATCH));
@@ -522,6 +689,7 @@ mod tests {
             time_ms: 0,
             id: [0; 8],
             record: Vec::new(),
+            summary: false,
         };
         let mut pending = Pending::default();
         for _ in 0..MAX_PENDING_PER_ACCOUNT {
@@ -548,6 +716,80 @@ mod tests {
     }
 
     #[test]
+    fn an_account_stores_its_refused_calls_within_an_hourly_budget() {
+        let recorder = ActivityRecorder::default();
+        let account = "111122223333";
+        let hour = 500 * HOUR_MS;
+        for _ in 0..HOURLY_BUDGET {
+            assert!(recorder.admit(account, hour + 10, true, "us-east-1"));
+        }
+        // Past it: refused calls dropped, successful ones kept; another
+        // account has its own.
+        assert!(!recorder.admit(account, hour + 20, true, "us-east-1"));
+        assert!(!recorder.admit(account, hour + 30, true, "us-east-1"));
+        assert!(recorder.admit(account, hour + 40, false, "us-east-1"));
+        assert!(recorder.admit("444455556666", hour + 40, true, "us-east-1"));
+        // The drops are told once.
+        let summaries = recorder.summaries(hour + 50, "us-east-1");
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].account, account);
+        let told: Value = serde_json::from_slice(&summaries[0].record).unwrap();
+        assert_eq!(told["eventName"], "ActivityEventsDropped");
+        assert_eq!(told["recipientAccountId"], account);
+        assert_eq!(told["serviceEventDetails"]["droppedEvents"], 2);
+        assert_eq!(told["serviceEventDetails"]["hourlyBudget"], HOURLY_BUDGET);
+        assert!(told.to_string().len() <= MAX_ACTIVITY_RECORD);
+        assert!(recorder.summaries(hour + 60, "us-east-1").is_empty());
+        // Drops not yet told when the hour ends are told then; the new hour
+        // has its budget.
+        assert!(!recorder.admit(account, hour + 70, true, "us-east-1"));
+        assert!(recorder.admit(account, hour + HOUR_MS, true, "us-east-1"));
+        let kept = recorder.take();
+        assert_eq!(kept.len(), 1);
+        let told: Value = serde_json::from_slice(&kept[0].record).unwrap();
+        assert_eq!(told["serviceEventDetails"]["droppedEvents"], 1);
+        assert!(recorder.summaries(hour + HOUR_MS, "us-east-1").is_empty());
+        assert_eq!(printable("a\u{1}b\n"), "a?b?");
+        // Successful calls use none of it.
+        let busy = "777788889999";
+        for _ in 0..HOURLY_BUDGET + 10 {
+            assert!(recorder.admit(busy, hour, false, "us-east-1"));
+        }
+        assert!(recorder.admit(busy, hour, true, "us-east-1"));
+    }
+
+    #[test]
+    fn events_dropped_while_too_many_wait_are_told_of() {
+        let recorder = ActivityRecorder::default();
+        let account = "111122223333";
+        let event = |summary: bool| Event {
+            account: account.to_string(),
+            time_ms: 5,
+            id: [0; 8],
+            record: Vec::new(),
+            summary,
+        };
+        for _ in 0..MAX_PENDING_PER_ACCOUNT {
+            assert!(recorder.admit(account, 5, true, "us-east-1"));
+            recorder.keep_or_count(event(false), true);
+        }
+        // One more admitted refused call finds no room: counted dropped,
+        // and not against the budget.
+        assert!(recorder.admit(account, 5, true, "us-east-1"));
+        recorder.keep_or_count(event(false), true);
+        {
+            let budgets = recorder.budgets.lock().unwrap();
+            assert_eq!(budgets[account].dropped, 1);
+            assert_eq!(budgets[account].refused, MAX_PENDING_PER_ACCOUNT as u64);
+        }
+        // Its summary is kept past the caps.
+        let summaries = recorder.summaries(6, "us-east-1");
+        assert_eq!(summaries.len(), 1);
+        assert!(recorder.keep(summaries.into_iter().next().unwrap()));
+        assert_eq!(recorder.take().len(), MAX_PENDING_PER_ACCOUNT + 1);
+    }
+
+    #[test]
     fn a_burst_of_events_wakes_the_writer() {
         let recorder = ActivityRecorder::default();
         let woken = || {
@@ -569,6 +811,7 @@ mod tests {
             time_ms: 0,
             id: [0; 8],
             record: Vec::new(),
+            summary: false,
         };
         for _ in 1..WAKE_AT {
             recorder.keep(event());
