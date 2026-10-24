@@ -28,11 +28,19 @@ use truthdb_object::{BUCKET_LOGGING, BodyWriter, ObjectAttrs, Origin, StorageCla
 use crate::logging_config::{DateSource, KeyFormat, LoggingConfig};
 use crate::server::{Connection, S3State};
 
-/// A key's characters written escaped (a line's fields are separated by
-/// spaces).
-const KEY: &AsciiSet = &CONTROLS.add(b' ').add(b'"').add(b'%');
+/// The characters of what a client sent that are written escaped (as
+/// `%XX`, as are all but ASCII): in a field between quotes, controls (a
+/// line break would start a line of the client's) and quotes; in another
+/// field, spaces too (they separate fields); in a key, `%` too (it is
+/// written encoded, as the client's own text is not).
+const QUOTED: &AsciiSet = &CONTROLS.add(b'"');
+const UNQUOTED: &AsciiSet = &QUOTED.add(b' ');
+const KEY: &AsciiSet = &UNQUOTED.add(b'%');
 /// A bucket's lines written at once when they reach this size.
 const FLUSH_BYTES: usize = 1024 * 1024;
+/// A bucket's lines kept at most (while they cannot be written): more are
+/// dropped.
+const MAX_KEPT: usize = 4 * FLUSH_BYTES;
 const GRACE_MS: u64 = 60_000;
 
 /// What a request's line says that is known before it is routed.
@@ -56,13 +64,10 @@ impl Request {
                 .map(str::to_string)
         };
         let query = request.uri().query().unwrap_or("");
+        // As sent (still percent-encoded).
         let version_id = query.split('&').find_map(|pair| {
             let (name, value) = pair.split_once('=')?;
-            (name == "versionId").then(|| {
-                percent_encoding::percent_decode_str(value)
-                    .decode_utf8_lossy()
-                    .into_owned()
-            })
+            (name == "versionId").then(|| value.to_string())
         });
         Request {
             operation: operation(request),
@@ -139,7 +144,9 @@ pub(crate) struct Entry {
     pub error_code: Option<String>,
     pub object_size: Option<u64>,
     pub turnaround_ms: u64,
-    /// `AuthHeader` or `QueryString` (none: anonymous).
+    /// Whether it was signed (SigV4), and `AuthHeader` or `QueryString`
+    /// (none: anonymous, or a form upload).
+    pub signed: bool,
     pub auth_type: Option<&'static str>,
     pub request: Request,
 }
@@ -148,7 +155,20 @@ impl Entry {
     /// The line, with the body's bytes sent and the request's total time.
     pub(crate) fn line(&self, sent: u64, total_ms: u64) -> String {
         let dash = |value: Option<&str>| value.unwrap_or("-").to_string();
-        let quoted = |value: Option<&str>| format!("\"{}\"", value.unwrap_or("-"));
+        // What the client sent, escaped.
+        let sent_text = |value: Option<&str>| {
+            value.map_or("-".to_string(), |value| {
+                utf8_percent_encode(value, UNQUOTED).to_string()
+            })
+        };
+        let quoted = |value: Option<&str>| {
+            format!(
+                "\"{}\"",
+                value.map_or("-".to_string(), |value| {
+                    utf8_percent_encode(value, QUOTED).to_string()
+                })
+            )
+        };
         let number = |value: Option<u64>| value.map_or("-".to_string(), |value| value.to_string());
         let request = &self.request;
         let fields = [
@@ -156,13 +176,13 @@ impl Entry {
             self.bucket.clone(),
             format!("[{}]", log_time(self.arrived_ms)),
             dash(request.remote_ip.as_deref()),
-            dash(self.requester.as_deref()),
+            sent_text(self.requester.as_deref()),
             self.request_id.clone(),
             request.operation.clone(),
             self.key.as_deref().map_or("-".to_string(), |key| {
                 utf8_percent_encode(key, KEY).to_string()
             }),
-            format!("\"{}\"", request.request_uri),
+            quoted(Some(&request.request_uri)),
             self.status.to_string(),
             dash(self.error_code.as_deref()),
             number(Some(sent).filter(|sent| *sent > 0)),
@@ -171,12 +191,12 @@ impl Entry {
             self.turnaround_ms.to_string(),
             quoted(request.referer.as_deref()),
             quoted(request.user_agent.as_deref()),
-            dash(request.version_id.as_deref()),
+            sent_text(request.version_id.as_deref()),
             self.host_id.clone(),
-            self.auth_type.map_or("-", |_| "SigV4").to_string(),
+            if self.signed { "SigV4" } else { "-" }.to_string(),
             "-".to_string(),
             dash(self.auth_type),
-            dash(request.host.as_deref()),
+            sent_text(request.host.as_deref()),
             "-".to_string(),
             "-".to_string(),
             "-".to_string(),
@@ -249,7 +269,7 @@ impl AccessLogger {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         self.generation.fetch_add(1, Ordering::Relaxed);
         configs.clear();
-        self.take();
+        self.take(false);
     }
 
     async fn logged(&self, state: &S3State, bucket: &str) -> Arc<Logged> {
@@ -320,27 +340,42 @@ impl AccessLogger {
                 lines: String::new(),
                 first_ms: entry.arrived_ms,
             });
+        let before = buffer.lines.len();
+        if before + line.len() > MAX_KEPT {
+            return;
+        }
         buffer.lines.push_str(&line);
-        if buffer.lines.len() >= FLUSH_BYTES {
+        // Woken once, as the bucket's lines reach the size.
+        if before < FLUSH_BYTES && buffer.lines.len() >= FLUSH_BYTES {
             self.full.notify_one();
         }
     }
 
-    fn take(&self) -> Vec<((String, String), Buffer)> {
-        std::mem::take(
-            &mut *self
-                .buffers
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner()),
-        )
-        .into_iter()
-        .collect()
+    /// The buffers kept (only those that reached `FLUSH_BYTES` if `full`).
+    fn take(&self, full: bool) -> Vec<((String, String), Buffer)> {
+        let mut buffers = self
+            .buffers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if !full {
+            return std::mem::take(&mut *buffers).into_iter().collect();
+        }
+        let names: Vec<(String, String)> = buffers
+            .iter()
+            .filter(|(_, buffer)| buffer.lines.len() >= FLUSH_BYTES)
+            .map(|(name, _)| name.clone())
+            .collect();
+        names
+            .into_iter()
+            .filter_map(|name| buffers.remove_entry(&name))
+            .collect()
     }
 
-    /// Writes each bucket's lines into its target (put back to try again
-    /// if the engine could not be reached).
-    pub(crate) async fn flush(&self, state: &S3State) {
-        for ((bucket, owner), buffer) in self.take() {
+    /// Writes the buckets' lines into their targets (all, or only those
+    /// that reached `FLUSH_BYTES` if `full`); lines that could not be
+    /// written are kept to try again, up to `MAX_KEPT` a bucket.
+    pub(crate) async fn flush(&self, state: &S3State, full: bool) {
+        for ((bucket, owner), buffer) in self.take(full) {
             if let Err(buffer) = deliver(state, &bucket, &owner, buffer).await {
                 let mut buffers = self
                     .buffers
@@ -350,8 +385,10 @@ impl AccessLogger {
                     lines: String::new(),
                     first_ms: buffer.first_ms,
                 });
-                kept.lines.insert_str(0, &buffer.lines);
-                kept.first_ms = kept.first_ms.min(buffer.first_ms);
+                if kept.lines.len() + buffer.lines.len() <= MAX_KEPT {
+                    kept.lines.insert_str(0, &buffer.lines);
+                    kept.first_ms = kept.first_ms.min(buffer.first_ms);
+                }
             }
         }
     }
@@ -362,6 +399,17 @@ impl AccessLogger {
 /// could not be reached.
 async fn deliver(state: &S3State, bucket: &str, owner: &str, buffer: Buffer) -> Result<(), Buffer> {
     let now = crate::objects::now_ms();
+    // Nothing written (not even its body) for lines that go nowhere.
+    let (name, account) = (bucket.to_string(), owner.to_string());
+    match state
+        .engine
+        .run_object(move |file| target_of(file, &name, &account))
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return Ok(()),
+        Err(_) => return Err(buffer),
+    }
     let storage = Arc::clone(&state.storage);
     let text = buffer.lines.clone();
     let sealed = tokio::task::spawn_blocking(move || {
@@ -379,23 +427,10 @@ async fn deliver(state: &S3State, bucket: &str, owner: &str, buffer: Buffer) -> 
     let written = state
         .engine
         .run_object(move |file| {
-            // The bucket still the owner's, its logging on, and its target
-            // still one it may have: the owner's, without Object Lock.
-            if file.bucket(&bucket)?.is_none_or(|info| info.owner != owner) {
-                return Ok(());
-            }
-            let Some(config) = file
-                .bucket_config(&bucket, BUCKET_LOGGING, "")?
-                .and_then(|document| crate::logging_config::parse(&document).ok().flatten())
-            else {
+            // Checked again where it is written.
+            let Some(config) = target_of(file, &bucket, &owner)? else {
                 return Ok(());
             };
-            if file
-                .bucket(&config.target_bucket)?
-                .is_none_or(|target| target.owner != owner || target.object_lock)
-            {
-                return Ok(());
-            }
             let key = log_key(&config, &owner, &region, &bucket, first_ms, now);
             file.set_origin(Origin {
                 operation: "PutObject".to_string(),
@@ -425,6 +460,32 @@ async fn deliver(state: &S3State, bucket: &str, owner: &str, buffer: Buffer) -> 
         Ok(()) => Ok(()),
         _ => Err(buffer),
     }
+}
+
+/// `bucket`'s logging configuration, if it is still `owner`'s, its logging
+/// is on, and its target is one it may have: the owner's, without Object
+/// Lock.
+fn target_of(
+    file: &mut truthdb_object::ObjFile<'_>,
+    bucket: &str,
+    owner: &str,
+) -> Result<Option<LoggingConfig>, truthdb_core::storage::StorageError> {
+    if file.bucket(bucket)?.is_none_or(|info| info.owner != owner) {
+        return Ok(None);
+    }
+    let Some(config) = file
+        .bucket_config(bucket, BUCKET_LOGGING, "")?
+        .and_then(|document| crate::logging_config::parse(&document).ok().flatten())
+    else {
+        return Ok(None);
+    };
+    if file
+        .bucket(&config.target_bucket)?
+        .is_none_or(|target| target.owner != owner || target.object_lock)
+    {
+        return Ok(None);
+    }
+    Ok(Some(config))
 }
 
 /// A log object's key: the prefix, then (partitioned) the source's account,
@@ -482,15 +543,17 @@ fn unique() -> String {
 /// writes nothing.
 pub async fn run(state: Arc<S3State>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     loop {
-        let stopping = tokio::select! {
-            _ = tokio::time::sleep(state.access_log_flush) => false,
-            _ = state.access_logger.full.notified() => false,
-            changed = shutdown.changed() => changed.is_err() || *shutdown.borrow(),
+        // Stopping, and whether only the buckets whose lines reached
+        // `FLUSH_BYTES` are written.
+        let (stopping, full) = tokio::select! {
+            _ = tokio::time::sleep(state.access_log_flush) => (false, false),
+            _ = state.access_logger.full.notified() => (false, true),
+            changed = shutdown.changed() => (changed.is_err() || *shutdown.borrow(), false),
         };
         if state.storage.is_standby() {
             state.access_logger.clear();
         } else {
-            state.access_logger.flush(&state).await;
+            state.access_logger.flush(&state, full).await;
         }
         if stopping {
             return;
@@ -502,10 +565,8 @@ pub async fn run(state: Arc<S3State>, mut shutdown: tokio::sync::watch::Receiver
 mod tests {
     use super::*;
 
-    #[test]
-    fn a_bucket_whose_lines_reach_a_mebibyte_is_written_at_once() {
-        let logger = AccessLogger::default();
-        let entry = |uri_bytes: usize| Entry {
+    fn entry(uri_bytes: usize) -> Entry {
+        Entry {
             bucket: "src".into(),
             owner: "111122223333".into(),
             arrived_ms: 0,
@@ -517,6 +578,7 @@ mod tests {
             error_code: None,
             object_size: None,
             turnaround_ms: 0,
+            signed: false,
             auth_type: None,
             request: Request {
                 operation: "REST.GET.BUCKET".into(),
@@ -527,7 +589,40 @@ mod tests {
                 version_id: None,
                 remote_ip: None,
             },
-        };
+        }
+    }
+
+    #[test]
+    fn what_a_client_sends_cannot_add_lines_or_fields() {
+        let mut hostile = entry(0);
+        hostile.request.request_uri = "GET /b/a\"b?x=\" 1 HTTP/1.1".into();
+        hostile.request.user_agent = Some("UA\" 999 \"x".into());
+        hostile.request.referer = Some("r\"\r\nINJECTED".into());
+        hostile.request.host = Some("a b c".into());
+        hostile.request.version_id = Some("v1%0A INJECTED".into());
+        hostile.requester = Some("arn:aws:iam::1:user/a b".into());
+        hostile.key = Some("k \"\n%".into());
+        let line = hostile.line(0, 0);
+        assert_eq!(line.matches('\n').count(), 1, "{line}");
+        assert!(line.ends_with('\n'));
+        // Outside the quoted fields, a space separates fields; inside them,
+        // no quote.
+        let quoted: Vec<&str> = line.split('"').collect();
+        assert_eq!(quoted.len(), 7, "three quoted fields: {line}");
+        let unquoted: usize = quoted
+            .iter()
+            .step_by(2)
+            .map(|part| part.split(' ').filter(|field| !field.is_empty()).count())
+            .sum();
+        assert_eq!(unquoted + 3, 27 + 1, "27 fields (the time is two): {line}");
+        assert!(line.contains(" \"UA%22 999 %22x\" "), "{line}");
+        assert!(line.contains(" v1%0A%20INJECTED "), "{line}");
+        assert!(line.contains(" k%20%22%0A%25 "), "{line}");
+    }
+
+    #[test]
+    fn a_bucket_whose_lines_reach_a_mebibyte_is_written_at_once() {
+        let logger = AccessLogger::default();
         let woken = || {
             tokio::runtime::Builder::new_current_thread()
                 .enable_time()
@@ -546,6 +641,27 @@ mod tests {
         assert!(!woken(), "a small bucket waits for the next flush");
         logger.record(&entry(FLUSH_BYTES), 0, 0);
         assert!(woken());
+        // Once, as it reaches the size.
+        logger.record(&entry(1000), 0, 0);
+        assert!(!woken());
+        // Only the full buckets are taken then.
+        let mut other = entry(10);
+        other.bucket = "other".into();
+        logger.record(&other, 0, 0);
+        let taken = logger.take(true);
+        assert_eq!(taken.len(), 1);
+        assert_eq!(taken[0].0.0, "src");
+        // At most MAX_KEPT a bucket.
+        for _ in 0..5 {
+            logger.record(&entry(FLUSH_BYTES), 0, 0);
+        }
+        let kept: usize = logger
+            .take(false)
+            .iter()
+            .filter(|((bucket, _), _)| bucket == "src")
+            .map(|(_, buffer)| buffer.lines.len())
+            .sum();
+        assert!(kept <= MAX_KEPT && kept > 3 * FLUSH_BYTES, "{kept}");
     }
 
     #[test]

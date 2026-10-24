@@ -13314,7 +13314,16 @@ url = signer.generate_presigned_url("get_object", Params={"Bucket": "src", "Key"
 assert urllib.request.urlopen(url).read() == b"0123456789"
 s3.list_objects_v2(Bucket="src")
 s3.get_bucket_versioning(Bucket="src")
-wait_for(lambda: len(lines("logs", "src/")) >= 9)
+# What a client sends cannot add lines or fields.
+for target in ['/src/a"b', "/src?versionId=v1%0AINJECTED"]:
+    hostile = http.client.HTTPConnection("127.0.0.1", int(port))
+    hostile.putrequest("GET", target, skip_accept_encoding=True)
+    hostile.putheader("User-Agent", 'UA" 999 "x')
+    hostile.putheader("Referer", 'r" INJECTED')
+    hostile.endheaders()
+    status = hostile.getresponse().status
+    assert status == 403, (target, status)
+wait_for(lambda: len(lines("logs", "src/")) >= 11)
 got = lines("logs", "src/")
 for name in objects(s3, "logs", "src/"):
     assert re.fullmatch(r"src/\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-[0-9A-F]{16}", name), name
@@ -13337,7 +13346,12 @@ assert all(line["sent"] == "10" and line["size"] == "10" for line in read), read
 assert by_op[("REST.HEAD.OBJECT", "200")][0]["size"] == "10"
 (missing,) = by_op[("REST.GET.OBJECT", "404")]
 assert missing["error"] == "NoSuchKey" and missing["key"] == "missing", missing
-(anonymous,) = by_op[("REST.GET.OBJECT", "403")]
+(anonymous, quoted) = sorted(by_op[("REST.GET.OBJECT", "403")], key=lambda line: line["key"])
+assert quoted["key"] == "a%22b" and quoted["uri"] == "GET /src/a%22b HTTP/1.1", quoted
+(versioned,) = by_op[("REST.GET.BUCKET", "403")]
+assert versioned["version"] == "v1%0AINJECTED", versioned
+for line in [quoted, versioned]:
+    assert line["agent"] == "UA%22 999 %22x" and line["referer"] == "r%22 INJECTED", line
 assert anonymous["error"] == "AccessDenied" and anonymous["requester"] == "-" and anonymous["auth"] == "-", anonymous
 assert anonymous["signature"] == "-" and anonymous["uri"].endswith("?x-user=anon HTTP/1.1"), anonymous
 assert ("REST.GET.BUCKET", "200") in by_op and ("REST.GET.VERSIONING", "200") in by_op, sorted(by_op)

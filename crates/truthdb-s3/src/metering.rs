@@ -65,20 +65,21 @@ impl BucketSeen {
             .unwrap_or_else(|poisoned| poisoned.into_inner()) = (requester, signed);
     }
 
-    /// Who sent the request, and `AuthHeader` or `QueryString` (none:
-    /// anonymous, or not known).
-    pub(crate) fn requester(&self) -> (Option<String>, Option<&'static str>) {
+    /// Who sent the request, whether it was signed, and `AuthHeader` or
+    /// `QueryString` (none: anonymous, a form upload, or not known).
+    pub(crate) fn requester(&self) -> (Option<String>, bool, Option<&'static str>) {
         let (requester, signed) = self
             .0
             .requester
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
-        let auth_type = signed.map(|signed| match signed.auth_type {
-            "REST-QUERY-STRING" => "QueryString",
-            _ => "AuthHeader",
+        let auth_type = signed.and_then(|signed| match signed.auth_type {
+            "REST-HEADER" => Some("AuthHeader"),
+            "REST-QUERY-STRING" => Some("QueryString"),
+            _ => None,
         });
-        (requester, auth_type)
+        (requester, signed.is_some(), auth_type)
     }
 
     /// The owner the bucket had when the request was authorized.

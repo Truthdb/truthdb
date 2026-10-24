@@ -334,7 +334,7 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                 .logs(state, &metered.bucket, seen.owner().as_deref())
                 .await
         {
-            let (requester, auth_type) = seen.requester();
+            let (requester, signed, auth_type) = seen.requester();
             let status = response.status().as_u16();
             log = Some((
                 Arc::clone(&state.access_logger),
@@ -356,6 +356,7 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                     }),
                     object_size: object_size(&response, &metered, uploaded),
                     turnaround_ms: first_byte.as_millis() as u64,
+                    signed,
                     auth_type,
                     request,
                 },
