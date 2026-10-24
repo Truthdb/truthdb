@@ -1001,6 +1001,8 @@ fn a_user_without_policies_is_refused_every_operation() {
             &[],
         ),
         ("DELETE", "/cov", "metrics&id=a", b"", &[]),
+        ("GET", "/cov", "logging", b"", &[]),
+        ("PUT", "/cov", "logging", b"<BucketLoggingStatus/>", &[]),
         ("GET", "/cov", "website", b"", &[]),
         (
             "PUT",
@@ -3096,6 +3098,7 @@ fn listings_page_through_keys_and_common_prefixes() {
     for (path, query) in [
         ("/lst/a", "website"),
         ("/lst/a", "cors"),
+        ("/lst/a", "logging"),
         ("/lst/a", "restore"),
     ] {
         let (status, body) = call("GET", path, query, b"");
@@ -13131,6 +13134,100 @@ fn a_bucket_keeps_up_to_a_thousand_metrics_configurations() {
     assert_eq!(call("GET", "/measured/k", "metrics&id=a", &[], b"").0, 501);
     assert_eq!(call("PUT", "/measured/k", "id=a", &[], b"x").0, 501);
 }
+
+#[test]
+fn bucket_logging_is_set_by_the_owner_to_a_bucket_of_its_own() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (_, key, secret) = account_with_key(&server, "logger");
+    let (other_account, other_key, other_secret) = account_with_key(&server, "outsider");
+    let script = server.dir.join("bucket_logging.py");
+    std::fs::write(&script, LOGGING_CONFIG_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &key,
+            &secret,
+            &other_key,
+            &other_secret,
+            &other_account,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const LOGGING_CONFIG_SCRIPT: &str = r#"
+import sys, json
+import boto3, botocore.config, botocore.exceptions
+port, key, secret, other_key, other_secret, other_account = sys.argv[1:7]
+def client(access, secret_key):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+s3 = client(key, secret)
+other = client(other_key, other_secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+for bucket in ["source", "logs"]:
+    s3.create_bucket(Bucket=bucket)
+other.create_bucket(Bucket="elsewhere")
+s3.create_bucket(Bucket="locked", ObjectLockEnabledForBucket=True)
+# Off at first.
+assert "LoggingEnabled" not in s3.get_bucket_logging(Bucket="source")
+enabled = {"TargetBucket": "logs", "TargetPrefix": "source/"}
+s3.put_bucket_logging(Bucket="source", BucketLoggingStatus={"LoggingEnabled": enabled})
+assert s3.get_bucket_logging(Bucket="source")["LoggingEnabled"] == enabled
+partitioned = {"TargetBucket": "logs", "TargetPrefix": "p/",
+    "TargetObjectKeyFormat": {"PartitionedPrefix": {"PartitionDateSource": "EventTime"}}}
+s3.put_bucket_logging(Bucket="source", BucketLoggingStatus={"LoggingEnabled": partitioned})
+assert s3.get_bucket_logging(Bucket="source")["LoggingEnabled"] == partitioned
+# A bucket may log into itself.
+s3.put_bucket_logging(Bucket="logs", BucketLoggingStatus={"LoggingEnabled": {"TargetBucket": "logs", "TargetPrefix": ""}})
+# The target exists, is the owner's, and has no Object Lock.
+for target in ["missing", "elsewhere", "locked"]:
+    refused(lambda: s3.put_bucket_logging(Bucket="source",
+        BucketLoggingStatus={"LoggingEnabled": {"TargetBucket": target, "TargetPrefix": ""}}),
+        "InvalidTargetBucketForLogging")
+assert s3.get_bucket_logging(Bucket="source")["LoggingEnabled"] == partitioned, "unchanged when refused"
+refused(lambda: s3.put_bucket_logging(Bucket="source", BucketLoggingStatus={"LoggingEnabled": {
+    "TargetBucket": "logs", "TargetPrefix": "",
+    "TargetGrants": [{"Grantee": {"Type": "Group", "URI": "http://acs.amazonaws.com/groups/global/AllUsers"},
+        "Permission": "READ"}]}}), "AccessControlListNotSupported")
+refused(lambda: s3.put_bucket_logging(Bucket="nowhere",
+    BucketLoggingStatus={"LoggingEnabled": enabled}), "NoSuchBucket")
+# Only the owner sets it, even where a policy allows another account.
+s3.put_bucket_policy(Bucket="source", Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{other_account}:root"},
+    "Action": ["s3:PutBucketLogging", "s3:GetBucketLogging"],
+    "Resource": "arn:aws:s3:::source"}]}))
+refused(lambda: other.put_bucket_logging(Bucket="source", BucketLoggingStatus={}), "AccessDenied")
+assert other.get_bucket_logging(Bucket="source")["LoggingEnabled"] == partitioned
+s3.delete_bucket_policy(Bucket="source")
+refused(lambda: other.get_bucket_logging(Bucket="source"), "AccessDenied")
+# Off again; and gone with its bucket.
+s3.put_bucket_logging(Bucket="source", BucketLoggingStatus={})
+assert "LoggingEnabled" not in s3.get_bucket_logging(Bucket="source")
+s3.put_bucket_logging(Bucket="source", BucketLoggingStatus={"LoggingEnabled": enabled})
+s3.delete_bucket(Bucket="source")
+s3.create_bucket(Bucket="source")
+assert "LoggingEnabled" not in s3.get_bucket_logging(Bucket="source")
+print("ok")
+"#;
 
 #[test]
 fn cloudwatch_reads_the_request_and_storage_metrics_of_a_bucket() {

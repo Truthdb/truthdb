@@ -35,6 +35,8 @@ pub const BUCKET_NOTIFICATION: u8 = 6;
 pub const BUCKET_CORS: u8 = 7;
 /// Bucket configuration: its website configuration (the rendered XML).
 pub const BUCKET_WEBSITE: u8 = 8;
+/// Bucket configuration: its server access logging (the rendered XML).
+pub const BUCKET_LOGGING: u8 = 9;
 /// Bucket configurations: its request metrics configurations, by id (the
 /// rendered XML).
 pub const BUCKET_METRICS: u8 = 11;
