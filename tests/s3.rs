@@ -13350,6 +13350,13 @@ middle = events[3]["EventTime"]
 assert [e["EventName"] for e in everything(EndTime=middle)][0] == "PutBucketVersioning"
 assert everything(StartTime=before + datetime.timedelta(days=1)) == []
 assert len(everything(StartTime=before)) == 6
+# StartTime is inclusive; an EndTime in whole seconds takes in its second.
+assert [e["EventId"] for e in everything(StartTime=events[2]["EventTime"])][-1] == events[2]["EventId"]
+second = events[3]["EventTime"].replace(microsecond=0)
+assert events[3]["EventId"] in [e["EventId"] for e in loose.lookup_events(EndTime=int(second.timestamp()))["Events"]]
+# A page filled by the last event has no token.
+full = trail.lookup_events(MaxResults=6)
+assert len(full["Events"]) == 6 and "NextToken" not in full, full.get("NextToken")
 # Pages of MaxResults, with a token for the same parameters only.
 page = trail.lookup_events(MaxResults=4)
 assert len(page["Events"]) == 4 and "NextToken" in page

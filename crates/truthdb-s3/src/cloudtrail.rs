@@ -206,12 +206,21 @@ fn resources(event: &Value) -> Vec<(String, String)> {
         .unwrap_or_default()
 }
 
-/// A timestamp parameter (epoch seconds, fractions kept as milliseconds).
-fn time(input: &Map<String, Value>, name: &str) -> Result<Option<u64>, CtError> {
+/// A timestamp parameter (epoch seconds, fractions kept as milliseconds);
+/// a whole second given as an end is its last millisecond (records name
+/// their time to the second).
+fn time(input: &Map<String, Value>, name: &str, end: bool) -> Result<Option<u64>, CtError> {
     match input.get(name) {
         None | Some(Value::Null) => Ok(None),
         Some(Value::Number(number)) => match number.as_f64() {
-            Some(secs) if (0.0..=4e9).contains(&secs) => Ok(Some((secs * 1000.0) as u64)),
+            Some(secs) if (0.0..=4e9).contains(&secs) => {
+                let ms = (secs * 1000.0) as u64;
+                Ok(Some(if end && secs.fract() == 0.0 {
+                    ms + 999
+                } else {
+                    ms
+                }))
+            }
             _ => Err(CtError::new(
                 400,
                 "InvalidTimeRangeException",
@@ -280,7 +289,10 @@ async fn lookup_events(
             ));
         }
     };
-    let (start, end) = (time(input, "StartTime")?, time(input, "EndTime")?);
+    let (start, end) = (
+        time(input, "StartTime", false)?,
+        time(input, "EndTime", true)?,
+    );
     if let (Some(start), Some(end)) = (start, end)
         && start > end
     {
@@ -339,6 +351,21 @@ async fn lookup_events(
         }
         Some(_) => return Err(CtError::token()),
     };
+    // With an end and no token, the reading starts at the end (newest
+    // first, so past every later event).
+    if after.is_none()
+        && let Some(end) = end
+    {
+        after = Some(
+            ActivityEvent {
+                account: account.to_string(),
+                time_ms: end.saturating_add(1),
+                id: [0xff; 8],
+                record: Vec::new(),
+            }
+            .resume_key(),
+        );
+    }
     let mut events = Vec::new();
     let mut scanned = 0;
     let mut more = false;
@@ -351,9 +378,9 @@ async fn lookup_events(
                 .engine
                 .run_object(move |file| file.activity(Some(&owner), from.as_deref(), SLICE))
                 .await?;
-            let exhausted = page.len() < SLICE;
+            let (count, exhausted) = (page.len(), page.len() < SLICE);
             let mut stopped = false;
-            for event in page {
+            for (index, event) in page.into_iter().enumerate() {
                 scanned += 1;
                 after = Some(event.resume_key());
                 // Newest first: past the start, nothing more matches.
@@ -361,16 +388,19 @@ async fn lookup_events(
                     stopped = true;
                     break;
                 }
-                if end.is_some_and(|end| event.time_ms > end) {
-                    continue;
-                }
-                let Ok(record) = serde_json::from_slice::<Value>(&event.record) else {
-                    continue;
-                };
-                if lookup.as_ref().is_none_or(|lookup| lookup.matches(&record)) {
+                if end.is_none_or(|end| event.time_ms <= end)
+                    && let Ok(record) = serde_json::from_slice::<Value>(&event.record)
+                    && lookup.as_ref().is_none_or(|lookup| lookup.matches(&record))
+                {
                     events.push(found(&event, &record));
                 }
-                if events.len() as u64 == max || scanned >= MAX_SCANNED {
+                // Full (more only if any event follows), or read enough.
+                if events.len() as u64 == max {
+                    more = !(exhausted && index + 1 == count);
+                    stopped = true;
+                    break;
+                }
+                if scanned >= MAX_SCANNED {
                     more = true;
                     stopped = true;
                     break;
