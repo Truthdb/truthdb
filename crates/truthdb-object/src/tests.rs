@@ -6008,6 +6008,123 @@ fn stored_bodies_tell_their_use_logical_stored_and_allocated_bytes() {
 }
 
 #[test]
+fn activity_events_list_newest_first_per_account_and_expire_after_90_days() {
+    use crate::{ACTIVITY_KEEP_MS, MAX_ACTIVITY_RECORD};
+    let path = temp_path("activity");
+    let storage = create(&path);
+    let day = 86_400_000;
+    let start = 400 * day;
+    let mut file_guard = storage.lock();
+    let mut file = ObjFile::new(&mut file_guard);
+    // Two accounts' events, written out of order.
+    for (account, offset, id) in [
+        ("111122223333", 2, 1u8),
+        ("111122223333", 0, 2),
+        ("444455556666", 1, 3),
+        ("111122223333", 1, 4),
+    ] {
+        let record = format!("{{\"n\":{id}}}");
+        file.transaction(|tx| {
+            tx.add_activity(account, start + offset * day, &[id; 8], record.as_bytes())
+        })
+        .unwrap();
+    }
+    let ids = |events: &[crate::ActivityEvent]| events.iter().map(|e| e.id[0]).collect::<Vec<_>>();
+    let mine = file.activity(Some("111122223333"), None, 10).unwrap();
+    assert_eq!(ids(&mine), [1, 4, 2], "newest first");
+    assert_eq!(mine[0].time_ms, start + 2 * day);
+    assert_eq!(mine[0].record, b"{\"n\":1}");
+    assert!(mine.iter().all(|event| event.account == "111122223333"));
+    // Paged.
+    let first = file.activity(Some("111122223333"), None, 2).unwrap();
+    let rest = file
+        .activity(Some("111122223333"), Some(&first[1].resume_key()), 2)
+        .unwrap();
+    assert_eq!(ids(&first), [1, 4]);
+    assert_eq!(ids(&rest), [2]);
+    assert_eq!(
+        ids(&file.activity(Some("444455556666"), None, 10).unwrap()),
+        [3]
+    );
+    assert_eq!(file.activity(None, None, 10).unwrap().len(), 4);
+    assert!(file.activity(Some("1111"), None, 10).unwrap().is_empty());
+    // Too large, or no account: refused.
+    let large = vec![b'x'; MAX_ACTIVITY_RECORD + 1];
+    assert!(
+        file.transaction(|tx| tx.add_activity("111122223333", start, &[9; 8], &large))
+            .is_err()
+    );
+    assert!(
+        file.transaction(|tx| tx.add_activity("", start, &[9; 8], b"{}"))
+            .is_err()
+    );
+    // Kept 90 days: the first day's event goes a day before the others.
+    assert!(!file.activity_due(start + ACTIVITY_KEEP_MS).unwrap());
+    assert!(file.activity_due(start + ACTIVITY_KEEP_MS + 1).unwrap());
+    let expired = file
+        .transaction(|tx| tx.expire_activity(start + ACTIVITY_KEEP_MS + 1, 10))
+        .unwrap();
+    assert_eq!(expired, 1);
+    assert_eq!(
+        ids(&file.activity(Some("111122223333"), None, 10).unwrap()),
+        [1, 4]
+    );
+    let expired = file
+        .transaction(|tx| tx.expire_activity(start + 2 * day + ACTIVITY_KEEP_MS + 1, 2))
+        .unwrap();
+    assert_eq!(expired, 2, "a bounded batch");
+    assert!(
+        file.activity_due(start + 2 * day + ACTIVITY_KEEP_MS + 1)
+            .unwrap()
+    );
+    file.transaction(|tx| tx.expire_activity(start + 2 * day + ACTIVITY_KEEP_MS + 1, 10))
+        .unwrap();
+    assert!(file.activity(None, None, 10).unwrap().is_empty());
+    assert!(!file.activity_due(u64::MAX).unwrap());
+    drop(file);
+    drop(file_guard);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn an_activity_event_is_kept_with_its_expiry_or_not_at_all_across_a_crash() {
+    let mut crash_at = 0;
+    loop {
+        let path = temp_path("activity-crash");
+        let storage = create(&path);
+        FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(Some(crash_at)));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ft_txn(&storage, |tx| {
+                tx.add_activity("111122223333", 1000, &[7; 8], b"{}")
+            });
+        }))
+        .is_err();
+        FAIL_APPLY_OPS_AFTER.with(|fail| fail.replace(None));
+        drop(storage);
+        let storage = open(&path);
+        let kept = ObjFile::new(&mut storage.lock())
+            .activity(None, None, 10)
+            .unwrap()
+            .len();
+        assert_eq!(kept, usize::from(!crashed), "crash at {crash_at}");
+        let expired = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.expire_activity(u64::MAX, 10))
+            .unwrap();
+        assert_eq!(
+            expired, kept,
+            "crash at {crash_at}: its expiry entry with it"
+        );
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+        if !crashed {
+            assert!(crash_at > 1);
+            break;
+        }
+        crash_at += 1;
+    }
+}
+
+#[test]
 fn a_deleted_bucket_forgets_its_series_and_their_newest_points() {
     use crate::{MetricPoint, MetricSeries, SeriesBy, Stats};
     let path = temp_path("metrics-forget");

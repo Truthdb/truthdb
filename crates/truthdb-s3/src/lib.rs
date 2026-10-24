@@ -2,6 +2,7 @@
 //! with AWS Signature Version 4, served over the object engine.
 
 pub mod access_log;
+pub mod activity;
 pub mod admin;
 pub mod api;
 pub mod authz;

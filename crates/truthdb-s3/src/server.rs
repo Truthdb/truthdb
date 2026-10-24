@@ -61,6 +61,10 @@ pub struct S3State {
     /// The server access logs being kept, and how often they are written.
     pub access_logger: std::sync::Arc<crate::access_log::AccessLogger>,
     pub access_log_flush: std::time::Duration,
+    /// The API activity (management events) being kept, and how often it
+    /// is written.
+    pub activity: std::sync::Arc<crate::activity::ActivityRecorder>,
+    pub activity_flush: std::time::Duration,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
@@ -120,6 +124,7 @@ pub async fn serve(
         shutdown.clone(),
     ));
     let logger = tokio::spawn(crate::access_log::run(Arc::clone(&state), shutdown.clone()));
+    let activity = tokio::spawn(crate::activity::run(Arc::clone(&state), shutdown.clone()));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let slot = tokio::select! {
@@ -128,6 +133,7 @@ pub async fn serve(
                 if *shutdown.borrow() {
                     let _ = flusher.await;
                     let _ = logger.await;
+                    let _ = activity.await;
                     return;
                 }
                 continue;
@@ -146,6 +152,7 @@ pub async fn serve(
                 if *shutdown.borrow() {
                     let _ = flusher.await;
                     let _ = logger.await;
+                    let _ = activity.await;
                     return;
                 }
                 continue;
@@ -282,10 +289,28 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         .map(|_| crate::access_log::Request::of(&request));
     let seen = crate::metering::BucketSeen::default();
     request.extensions_mut().insert(seen.clone());
-    let (mut response, error_code) = match route(state, request).await {
-        Ok(response) => (response, None),
-        Err(err) => (error_response(&err, &resource, &ids), Some(err.code)),
+    // The management event it makes, if any, and who makes it.
+    let call = crate::activity::Call::of(&request);
+    let who = crate::activity::Who::default();
+    request.extensions_mut().insert(who.clone());
+    let (mut response, error_code, error_message) = match route(state, request).await {
+        Ok(response) => (response, None, None),
+        Err(err) => (
+            error_response(&err, &resource, &ids),
+            Some(err.code),
+            Some(err.message),
+        ),
     };
+    if let Some(call) = &call {
+        state.activity.record(
+            state,
+            call,
+            &who,
+            seen.owner().as_deref(),
+            &ids.request_id,
+            error_code.zip(error_message.as_deref()),
+        );
+    }
     if let Some(metered) = metered.filter(|_| seen.seen()) {
         // The latency to the first byte, before the lookups below.
         let first_byte = started.elapsed();
@@ -496,6 +521,9 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
         }
         None => authenticate_presigned(state, &mut request).await?,
     };
+    if let Some(who) = request.extensions().get::<crate::activity::Who>() {
+        who.set(auth.principal.clone(), auth.signed);
+    }
     crate::api::dispatch(state, request, auth).await
 }
 

@@ -195,7 +195,7 @@ fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\nactivity_flush_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
             dir.join("truth.db").display()
         ),
     )
@@ -13228,6 +13228,170 @@ s3.create_bucket(Bucket="source")
 assert "LoggingEnabled" not in s3.get_bucket_logging(Bucket="source")
 print("ok")
 "#;
+
+#[test]
+fn management_events_are_kept_as_api_activity_across_a_crash() {
+    let mut server = start_server();
+    let port = server.s3_port;
+    let (account, key, secret) = account_with_key(&server, "audited");
+    let (other_account, other_key, other_secret) = account_with_key(&server, "visitor");
+    let (user_key, user_secret) = user_with_key(
+        &server,
+        &account,
+        "auditor",
+        Some(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"s3:*","Resource":"*"}]}"#,
+        ),
+    );
+    let call = |method: &str, path: &str, query: &str, key: &str, secret: Option<&str>| {
+        send(port, method, path, query, b"", key, secret)
+    };
+    assert_eq!(call("PUT", "/made", "", &key, Some(&secret)).0, 200);
+    assert_eq!(
+        call("GET", "/made", "versioning", &key, Some(&secret)).0,
+        200
+    );
+    let (status, reply) = call("GET", "/made", "policy", &key, Some(&secret));
+    assert_eq!(status, 404, "{reply}");
+    assert_eq!(call("GET", "/", "", &user_key, Some(&user_secret)).0, 200);
+    // Data events are not management events.
+    assert_eq!(
+        send(port, "PUT", "/made/k", "", b"x", &key, Some(&secret)).0,
+        200
+    );
+    assert_eq!(
+        call("GET", "/made", "list-type=2", &key, Some(&secret)).0,
+        200
+    );
+    assert_eq!(call("HEAD", "/made", "", &key, Some(&secret)).0, 200);
+    // An anonymous call is the bucket owner's; another account's, its own.
+    assert_eq!(call("GET", "/made", "acl", "", None).0, 403);
+    assert_eq!(
+        call("GET", "/made", "location", &other_key, Some(&other_secret)).0,
+        403
+    );
+    let activity = |server: &Server| {
+        sql_rows(
+            server.native_port,
+            "SELECT account_id, event_source, event_name, ISNULL(user_name, '-'), \
+             ISNULL(access_key_id, '-'), source_ip, read_only, ISNULL(error_code, '-'), \
+             ISNULL(resource_name, '-'), event_id, cloudtrail_event \
+             FROM sys.dm_s3_api_activity ORDER BY event_time, event_name",
+        )
+    };
+    let deadline = Instant::now() + DEADLINE;
+    while activity(&server).len() < 6 {
+        assert!(Instant::now() < deadline, "{:?}", activity(&server));
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    std::thread::sleep(Duration::from_millis(1500));
+    let rows = activity(&server);
+    let summary: Vec<String> = rows
+        .iter()
+        .map(|row| {
+            format!(
+                "{} {} {} {} {} {}",
+                if row[0] == account {
+                    "owner"
+                } else if row[0] == other_account {
+                    "other"
+                } else {
+                    "?"
+                },
+                row[2],
+                row[3],
+                row[6],
+                row[7],
+                row[8]
+            )
+        })
+        .collect();
+    assert_eq!(
+        summary,
+        [
+            "owner CreateBucket - 0 - made",
+            "owner GetBucketVersioning - 1 - made",
+            "owner GetBucketPolicy - 1 NoSuchBucketPolicy made",
+            "owner ListBuckets auditor 1 - -",
+            "owner GetBucketAcl - 1 AccessDenied made",
+            "other GetBucketLocation - 1 AccessDenied made",
+        ],
+        "{rows:?}"
+    );
+    for row in &rows {
+        assert_eq!(row[1], "s3.amazonaws.com");
+        assert_eq!(row[5], "127.0.0.1");
+        assert_eq!(row[9].len(), 36, "{row:?}");
+        let record: serde_json::Value = serde_json::from_str(&row[10]).unwrap();
+        assert_eq!(record["eventVersion"], "1.11");
+        assert_eq!(record["eventCategory"], "Management");
+        assert_eq!(record["eventType"], "AwsApiCall");
+        assert_eq!(record["managementEvent"], true);
+        assert_eq!(record["recipientAccountId"], row[0].as_str());
+        assert_eq!(record["eventID"], row[9].as_str());
+        assert_eq!(record["awsRegion"], "us-east-1");
+    }
+    let record = |name: &str| -> serde_json::Value {
+        let row = rows.iter().find(|row| row[2] == name).unwrap();
+        serde_json::from_str(&row[10]).unwrap()
+    };
+    let versioning = record("GetBucketVersioning");
+    assert_eq!(versioning["userIdentity"]["type"], "Root");
+    assert_eq!(versioning["userIdentity"]["accountId"], account.as_str());
+    assert_eq!(versioning["userIdentity"]["accessKeyId"], key.as_str());
+    assert_eq!(versioning["requestParameters"]["bucketName"], "made");
+    assert_eq!(versioning["requestParameters"]["versioning"], "");
+    assert_eq!(versioning["resources"][0]["ARN"], "arn:aws:s3:::made");
+    assert_eq!(versioning["resources"][0]["type"], "AWS::S3::Bucket");
+    assert!(versioning["eventTime"].as_str().unwrap().ends_with('Z'));
+    let listing = record("ListBuckets");
+    assert_eq!(listing["userIdentity"]["type"], "IAMUser");
+    assert_eq!(listing["userIdentity"]["userName"], "auditor");
+    assert_eq!(
+        listing["userIdentity"]["arn"],
+        format!("arn:aws:iam::{account}:user/auditor")
+    );
+    assert_eq!(listing["userIdentity"]["accessKeyId"], user_key.as_str());
+    let anonymous = record("GetBucketAcl");
+    assert_eq!(anonymous["userIdentity"]["accountId"], "anonymous");
+    assert_eq!(anonymous["errorCode"], "AccessDenied");
+    assert!(anonymous["errorMessage"].is_string());
+    // Kept across a crash.
+    crash_and_restart(&mut server);
+    assert_eq!(activity(&server).len(), 6);
+    assert_eq!(
+        send(
+            server.s3_port,
+            "DELETE",
+            "/made/k",
+            "",
+            b"",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        204
+    );
+    assert_eq!(
+        send(
+            server.s3_port,
+            "DELETE",
+            "/made",
+            "",
+            b"",
+            &key,
+            Some(&secret)
+        )
+        .0,
+        204
+    );
+    let deadline = Instant::now() + DEADLINE;
+    while activity(&server).len() < 7 {
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert_eq!(activity(&server)[6][2], "DeleteBucket");
+}
 
 #[test]
 fn access_logs_are_written_into_the_target_bucket() {

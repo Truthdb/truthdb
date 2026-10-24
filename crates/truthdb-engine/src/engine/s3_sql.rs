@@ -102,6 +102,9 @@ impl ExternalRowsets for S3Rowsets {
                 return Some(open_bucket_usage(&self.core, name, args, caller));
             }
             "sys.dm_s3_storage" => return Some(open_storage(&self.core, name, args, caller)),
+            "sys.dm_s3_api_activity" => {
+                return Some(open_api_activity(&self.core, name, args, caller));
+            }
             "sys.dm_s3_requests" | "sys.dm_s3_request_latency" => {
                 return Some(open_requests(&self.request_metrics, name, args, caller));
             }
@@ -726,6 +729,97 @@ impl ExternalStream for BucketUsageStream {
                     Datum::BigInt(usage.objects as i64),
                     Datum::BigInt(usage.bytes as i64),
                     Datum::Bit(complete),
+                ]
+            })
+            .collect();
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// How many events `sys.dm_s3_api_activity` reads per storage-lock hold.
+const ACTIVITY_SLICE: usize = 512;
+
+/// `sys.dm_s3_api_activity`: the S3 management events of the last 90 days
+/// (CloudTrail's), by account and newest first within each: when, who,
+/// what, from where, with what error, on which bucket, and the whole
+/// CloudTrail record.
+fn open_api_activity(
+    core: &Arc<Storage>,
+    name: &str,
+    args: &[SqlValue],
+    caller: ExternalCaller,
+) -> Result<ExternalRowset, SqlError> {
+    check_admin(name, caller)?;
+    check_arg_count(name, args, 0, 0)?;
+    Ok(ExternalRowset {
+        columns: vec![
+            datetime2("event_time"),
+            nvarchar("account_id", 12),
+            nvarchar("event_source", 64),
+            nvarchar("event_name", 128),
+            nvarchar("user_name", 128),
+            nvarchar("access_key_id", 128),
+            nvarchar("source_ip", 64),
+            bit("read_only"),
+            nvarchar("error_code", 128),
+            nvarchar("resource_name", 1024),
+            nvarchar("event_id", 36),
+            nvarchar_max("cloudtrail_event"),
+        ],
+        rows: Box::new(ActivityStream {
+            core: Arc::clone(core),
+            after: None,
+            done: false,
+        }),
+    })
+}
+
+struct ActivityStream {
+    core: Arc<Storage>,
+    after: Option<Vec<u8>>,
+    done: bool,
+}
+
+impl ExternalStream for ActivityStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        let events = {
+            let mut guard = self.core.lock();
+            let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+            file.activity(None, self.after.as_deref(), ACTIVITY_SLICE)
+                .map_err(storage_error)?
+        };
+        self.done = events.len() < ACTIVITY_SLICE;
+        self.after = events.last().map(|event| event.resume_key());
+        let rows: Vec<Vec<Datum>> = events
+            .iter()
+            .map(|event| {
+                let record: serde_json::Value =
+                    serde_json::from_slice(&event.record).unwrap_or_default();
+                let field = |path: &[&str]| {
+                    path.iter()
+                        .try_fold(&record, |value, name| value.get(name))
+                        .and_then(serde_json::Value::as_str)
+                        .map_or(Datum::Null, text)
+                };
+                vec![
+                    datetime(event.time_ms),
+                    text(&event.account),
+                    field(&["eventSource"]),
+                    field(&["eventName"]),
+                    field(&["userIdentity", "userName"]),
+                    field(&["userIdentity", "accessKeyId"]),
+                    field(&["sourceIPAddress"]),
+                    record
+                        .get("readOnly")
+                        .and_then(serde_json::Value::as_bool)
+                        .map_or(Datum::Null, Datum::Bit),
+                    field(&["errorCode"]),
+                    field(&["requestParameters", "bucketName"]),
+                    field(&["eventID"]),
+                    text(&String::from_utf8_lossy(&event.record)),
                 ]
             })
             .collect();
