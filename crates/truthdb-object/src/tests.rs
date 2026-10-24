@@ -6088,6 +6088,22 @@ fn metric_points_roll_up_into_five_minutes_and_hours_and_expire_in_turn() {
         ),
         (4, 18.0, 1.0, 9.0, vec![2, 2])
     );
+    // Only the resolutions kept are read.
+    assert!(read(120, 0, u64::MAX).is_empty());
+    assert!(read((1 << 32) + 60, 0, u64::MAX).is_empty());
+    // A point past what a row holds is refused whole (the tree refuses
+    // the cell; the transaction rolls back): nothing written.
+    let mut wide = MetricPoint::new();
+    for metric in 0..8u8 {
+        let mut stats = Stats::of(1.0);
+        stats.histogram = vec![1; 32];
+        wide.insert(metric, stats);
+    }
+    let refused = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.add_metrics(&series, hour + 3000, &wide));
+    assert!(refused.is_err(), "{refused:?}");
+    assert!(read(60, hour + 3000, hour + 3060).is_empty());
+    assert_eq!(read(300, hour + 3000, hour + 3300).len(), 0);
     // Ranges are by period start, the end left out.
     assert_eq!(read(60, hour + 61, hour + 360).len(), 1);
     assert!(read(60, hour + 120, hour + 120).is_empty());

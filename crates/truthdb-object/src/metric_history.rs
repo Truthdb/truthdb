@@ -153,6 +153,9 @@ fn decode(mut bytes: &[u8]) -> Result<MetricPoint, StorageError> {
     };
     while !bytes.is_empty() {
         let metric = take(1, &mut bytes)?[0];
+        if point.contains_key(&metric) {
+            return Err(corrupt());
+        }
         let count = u64::from_le_bytes(take(8, &mut bytes)?.try_into().unwrap());
         let mut values = [0f64; 3];
         for value in &mut values {
@@ -190,7 +193,7 @@ fn stale(last: &[u8], now: u64) -> Result<bool, StorageError> {
         .map(|(period, keep)| period + keep)
         .max()
         .unwrap_or(0);
-    Ok(last + longest < now)
+    Ok(last.saturating_add(longest) < now)
 }
 
 /// A point's key: the series', the resolution, the period's start.
@@ -235,24 +238,29 @@ impl ObjTxn<'_, '_> {
         for (resolution, keep) in RESOLUTIONS {
             let period = minute - minute % resolution;
             let key = point_key(&series_key, resolution, period);
+            let existing = points.get(self.ctx, &key)?;
+            let mut merged = match &existing {
+                Some(row) => decode(row)?,
+                None => MetricPoint::new(),
+            };
+            for (metric, stats) in point {
+                merged
+                    .entry(*metric)
+                    .and_modify(|kept| kept.merge(stats))
+                    .or_insert_with(|| stats.clone());
+            }
+            let row = encode(&merged);
             let mode = &mut OpMode::Txn(self.txn);
-            match points.get(self.ctx, &key)? {
-                Some(row) => {
-                    let mut merged = decode(&row)?;
-                    for (metric, stats) in point {
-                        merged
-                            .entry(*metric)
-                            .and_modify(|kept| kept.merge(stats))
-                            .or_insert_with(|| stats.clone());
-                    }
-                    points.update(self.ctx, mode, &key, &encode(&merged))?;
+            match existing {
+                Some(_) => {
+                    points.update(self.ctx, mode, &key, &row)?;
                 }
                 None => {
-                    points.insert_unique(self.ctx, mode, &key, &encode(point))?;
+                    points.insert_unique(self.ctx, mode, &key, &row)?;
                     expiry.insert_unique(
                         self.ctx,
                         &mut OpMode::Txn(self.txn),
-                        &expiry_key(period + resolution + keep, &key),
+                        &expiry_key(period.saturating_add(resolution).saturating_add(keep), &key),
                         &[],
                     )?;
                 }
@@ -283,7 +291,12 @@ impl ObjTxn<'_, '_> {
             self.trees.metric_expiry(),
             self.trees.metric_series(),
         );
-        let due = expiry.scan_range_limit(self.ctx, None, Some(&(now + 1).to_be_bytes()), limit)?;
+        let due = expiry.scan_range_limit(
+            self.ctx,
+            None,
+            Some(&now.saturating_add(1).to_be_bytes()),
+            limit,
+        )?;
         let removed = due.len();
         for (key, _) in due {
             let point = key.get(8..).ok_or_else(|| corrupt("metric expiry"))?;
@@ -333,7 +346,8 @@ impl ObjFile<'_> {
         let Some(points) = self.existing_tree(METRIC_POINTS_TREE)? else {
             return Ok(Vec::new());
         };
-        if from >= to {
+        // Only the resolutions kept (a key holds the period as 32 bits).
+        if from >= to || !RESOLUTIONS.iter().any(|(kept, _)| *kept == resolution) {
             return Ok(Vec::new());
         }
         let key = series.key();
@@ -366,7 +380,12 @@ impl ObjFile<'_> {
         let mut ctx = self.core.page_ctx(0);
         if let Some(expiry) = expiry
             && !expiry
-                .scan_range_limit(&mut ctx, None, Some(&(now + 1).to_be_bytes()), 1)?
+                .scan_range_limit(
+                    &mut ctx,
+                    None,
+                    Some(&now.saturating_add(1).to_be_bytes()),
+                    1,
+                )?
                 .is_empty()
         {
             return Ok(true);
@@ -380,5 +399,19 @@ impl ObjFile<'_> {
             }
         }
         Ok(false)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_repeated_metric_is_corruption() {
+        let point: MetricPoint = [(4u8, Stats::of(1.0))].into_iter().collect();
+        let row = encode(&point);
+        assert_eq!(decode(&row).unwrap(), point);
+        assert!(decode(&[row.clone(), row].concat()).is_err());
+        assert!(decode(&encode(&point)[..10]).is_err());
     }
 }
