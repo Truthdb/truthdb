@@ -149,13 +149,34 @@ fn counts(config: &MetricsConfig, key: Option<&str>, tags: &[(String, String)]) 
     filter.tags.iter().all(|tag| tags.contains(tag))
 }
 
+/// A bucket's metrics configurations, and when it was made (ms): counts
+/// for it are written only while that bucket is the one of its name.
+#[derive(Default)]
+struct BucketConfigs {
+    made_ms: u64,
+    configs: Vec<MetricsConfig>,
+}
+
+/// The series a request counts in, and when their bucket was made (ms).
+pub(crate) struct Matched {
+    made_ms: u64,
+    series: Vec<MetricSeries>,
+}
+
+impl Matched {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.series.is_empty()
+    }
+}
+
 #[derive(Default)]
 pub struct MetricRecorder {
     /// Each bucket's metrics configurations, read once and forgotten when
     /// they change (only this server changes them).
-    configs: Mutex<HashMap<String, Arc<Vec<MetricsConfig>>>>,
-    /// What was counted and not yet flushed, by series and minute.
-    pending: Mutex<HashMap<(MetricSeries, u64), MetricPoint>>,
+    configs: Mutex<HashMap<String, Arc<BucketConfigs>>>,
+    /// What was counted and not yet flushed, by series, the making of its
+    /// bucket (ms) and minute.
+    pending: Mutex<HashMap<(MetricSeries, u64, u64), MetricPoint>>,
     /// The day (since the epoch) storage was last sampled.
     sampled_day: Mutex<Option<u64>>,
     /// Counts `forget`s: configurations read before one are not kept.
@@ -174,13 +195,14 @@ impl MetricRecorder {
     }
 
     /// Forgets the deleted `bucket`: its configurations and what was
-    /// counted for it and not yet written.
+    /// counted for it and not yet written (counts that come later are
+    /// dropped when flushed: their bucket is gone).
     pub(crate) fn forget_bucket(&self, bucket: &str) {
         self.forget(bucket);
         self.pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .retain(|(series, _), _| series.bucket != bucket);
+            .retain(|(series, _, _), _| series.bucket != bucket);
     }
 
     /// Forgets everything (a standby counts nothing).
@@ -194,7 +216,7 @@ impl MetricRecorder {
         self.take();
     }
 
-    async fn configs(&self, state: &S3State, bucket: &str) -> Arc<Vec<MetricsConfig>> {
+    async fn configs(&self, state: &S3State, bucket: &str) -> Arc<BucketConfigs> {
         if let Some(found) = self
             .configs
             .lock()
@@ -208,6 +230,9 @@ impl MetricRecorder {
         let loaded = state
             .engine
             .run_object(move |file| {
+                let Some(info) = file.bucket(&name)? else {
+                    return Ok(BucketConfigs::default());
+                };
                 let mut configs = Vec::new();
                 for id in file.bucket_config_ids(&name, BUCKET_METRICS)? {
                     if let Some(document) = file.bucket_config(&name, BUCKET_METRICS, &id)?
@@ -216,12 +241,15 @@ impl MetricRecorder {
                         configs.push(config);
                     }
                 }
-                Ok(configs)
+                Ok(BucketConfigs {
+                    made_ms: info.created_ms,
+                    configs,
+                })
             })
             .await;
         // Not read (the engine busy or gone): nothing counted, nothing kept.
         let Ok(configs) = loaded else {
-            return Arc::new(Vec::new());
+            return Arc::new(BucketConfigs::default());
         };
         let configs = Arc::new(configs);
         let mut cache = self
@@ -242,10 +270,14 @@ impl MetricRecorder {
         state: &S3State,
         bucket: &str,
         key: Option<&str>,
-    ) -> Vec<MetricSeries> {
-        let configs = self.configs(state, bucket).await;
+    ) -> Matched {
+        let loaded = self.configs(state, bucket).await;
+        let configs = &loaded.configs;
         if configs.is_empty() {
-            return Vec::new();
+            return Matched {
+                made_ms: loaded.made_ms,
+                series: Vec::new(),
+            };
         }
         // The object's tags, read only when a filter names some.
         let mut tags = Vec::new();
@@ -266,25 +298,33 @@ impl MetricRecorder {
                 tags = info.attrs.tags;
             }
         }
-        configs
-            .iter()
-            .filter(|config| counts(config, key, &tags))
-            .map(|config| MetricSeries {
-                bucket: bucket.to_string(),
-                by: SeriesBy::Filter(config.id.clone()),
-            })
-            .collect()
+        Matched {
+            made_ms: loaded.made_ms,
+            series: configs
+                .iter()
+                .filter(|config| counts(config, key, &tags))
+                .map(|config| MetricSeries {
+                    bucket: bucket.to_string(),
+                    by: SeriesBy::Filter(config.id.clone()),
+                })
+                .collect(),
+        }
     }
 
-    /// Adds `point` to each of `series` at the minute `at` (seconds) is in.
-    pub(crate) fn record(&self, series: &[MetricSeries], at: u64, point: &MetricPoint) {
+    /// Adds `point` to each of the matched series at the minute `at`
+    /// (seconds) is in.
+    pub(crate) fn record(&self, matched: &Matched, at: u64, point: &MetricPoint) {
+        self.record_series(&matched.series, matched.made_ms, at, point);
+    }
+
+    fn record_series(&self, series: &[MetricSeries], made_ms: u64, at: u64, point: &MetricPoint) {
         let minute = at - at % 60;
         let mut pending = self
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         for one in series {
-            let kept = pending.entry((one.clone(), minute)).or_default();
+            let kept = pending.entry((one.clone(), made_ms, minute)).or_default();
             for (metric, stats) in point {
                 kept.entry(*metric)
                     .and_modify(|kept| kept.merge(stats))
@@ -293,7 +333,7 @@ impl MetricRecorder {
         }
     }
 
-    fn take(&self) -> Vec<((MetricSeries, u64), MetricPoint)> {
+    fn take(&self) -> Vec<((MetricSeries, u64, u64), MetricPoint)> {
         std::mem::take(
             &mut *self
                 .pending
@@ -313,8 +353,26 @@ impl MetricRecorder {
             let stored = state
                 .engine
                 .run_object(move |file| {
+                    // Only the counts of buckets still the ones counted for
+                    // (one deleted since, or made again, keeps none).
+                    let mut made: HashMap<String, Option<u64>> = HashMap::new();
+                    let mut kept = Vec::new();
+                    for ((series, made_ms, minute), point) in &written {
+                        let current = match made.get(&series.bucket) {
+                            Some(current) => *current,
+                            None => {
+                                let current =
+                                    file.bucket(&series.bucket)?.map(|info| info.created_ms);
+                                made.insert(series.bucket.clone(), current);
+                                current
+                            }
+                        };
+                        if current == Some(*made_ms) {
+                            kept.push((series, *minute, point));
+                        }
+                    }
                     file.transaction(|tx| {
-                        for ((series, minute), point) in &written {
+                        for (series, minute, point) in &kept {
                             tx.add_metrics(series, *minute, point)?;
                         }
                         Ok(())
@@ -322,8 +380,8 @@ impl MetricRecorder {
                 })
                 .await;
             if stored.is_err() {
-                for ((series, minute), point) in taken {
-                    self.record(&[series], minute, &point);
+                for ((series, made_ms, minute), point) in taken {
+                    self.record_series(&[series], made_ms, minute, &point);
                 }
             }
         }

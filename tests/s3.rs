@@ -13291,6 +13291,11 @@ if phase == "requests":
     time.sleep(60.5 - time.time() % 60)
     s3.head_object(Bucket="handed", Key="k")
     wait_for(lambda: gets(cw, 60, "HeadRequests") == 1)
+    # A download still going when the bucket goes: what it counts at its
+    # end is not the next bucket's.
+    s3.put_object(Bucket="handed", Key="big", Body=b"z" * (32 << 20))
+    late = s3.get_object(Bucket="handed", Key="big")
+    s3.delete_object(Bucket="handed", Key="big")
     s3.delete_object(Bucket="handed", Key="k")
     s3.delete_bucket(Bucket="handed")
     time.sleep(1.1)
@@ -13300,9 +13305,15 @@ if phase == "requests":
     for period in [60, 3600]:
         assert gets(stranger, period) == 0, period
         assert gets(stranger, period, "HeadRequests") == 0, period
+    late["Body"].close()
+    time.sleep(2.5)
+    assert gets(stranger, 60, "BytesDownloaded") == 0
     # Its own are counted (in the minute the old one's last were).
     other_s3.put_object(Bucket="handed", Key="mine", Body=b"y")
     wait_for(lambda: gets(stranger, 60, "PutRequests") >= 1)
+    named = {m["MetricName"] for m in stranger.list_metrics(Namespace="AWS/S3")["Metrics"]
+             if {"Name": "BucketName", "Value": "handed"} in m["Dimensions"]}
+    assert "PutRequests" in named and not named & {"GetRequests", "HeadRequests", "BytesDownloaded"}, named
     print("ok")
 else:
     assert total("AllRequests", "Docs") == 3

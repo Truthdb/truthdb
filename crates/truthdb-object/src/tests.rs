@@ -6008,6 +6008,58 @@ fn stored_bodies_tell_their_use_logical_stored_and_allocated_bytes() {
 }
 
 #[test]
+fn a_deleted_bucket_forgets_its_series_and_their_newest_points() {
+    use crate::{MetricPoint, MetricSeries, SeriesBy, Stats};
+    let path = temp_path("metrics-forget");
+    let storage = create(&path);
+    let series = |bucket: &str| MetricSeries {
+        bucket: bucket.to_string(),
+        by: SeriesBy::Filter("All".to_string()),
+    };
+    let point: MetricPoint = [(0u8, Stats::of(1.0))].into_iter().collect();
+    let hour = 10 * 3600;
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    for bucket in ["bkt", "bkt-2"] {
+        file.transaction(|tx| tx.create_bucket(bucket, DEFAULT_ACCOUNT, 4))
+            .unwrap()
+            .unwrap();
+        for minute in [hour + 60, hour + 3000] {
+            file.transaction(|tx| tx.add_metrics(&series(bucket), minute, &point))
+                .unwrap();
+        }
+    }
+    file.transaction(|tx| tx.delete_bucket("bkt"))
+        .unwrap()
+        .unwrap();
+    let periods = |file: &mut ObjFile<'_>, bucket: &str, resolution: u64| {
+        file.metric_points(&series(bucket), resolution, 0, hour + 3600)
+            .unwrap()
+            .into_iter()
+            .map(|(period, _)| period)
+            .collect::<Vec<_>>()
+    };
+    // The points holding its last minute went at every resolution; the
+    // older ones stay (to expire), ended before any later bucket of its
+    // name was made.
+    assert_eq!(periods(&mut file, "bkt", 60), [hour + 60]);
+    assert_eq!(periods(&mut file, "bkt", 300), [hour]);
+    assert_eq!(periods(&mut file, "bkt", 3600), Vec::<u64>::new());
+    assert_eq!(periods(&mut file, "bkt-2", 60), [hour + 60, hour + 3000]);
+    assert_eq!(periods(&mut file, "bkt-2", 3600), [hour]);
+    let listed: Vec<String> = file
+        .metric_series()
+        .unwrap()
+        .into_iter()
+        .map(|(series, _)| series.bucket)
+        .collect();
+    assert_eq!(listed, ["bkt-2"]);
+    drop(file);
+    drop(guard);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
 fn metric_points_roll_up_into_five_minutes_and_hours_and_expire_in_turn() {
     use crate::{MetricPoint, MetricSeries, SeriesBy, Stats};
     let path = temp_path("metrics");

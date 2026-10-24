@@ -15,9 +15,8 @@ use hyper::{Method, Request};
 use truthdb_engine::metrics::{BucketRequests, RequestKind};
 
 use crate::api::{Target, has_param, plain};
-use crate::metric_history::MetricRecorder;
+use crate::metric_history::{Matched, MetricRecorder};
 use crate::server::Body;
-use truthdb_object::MetricSeries;
 
 /// What the route found of a request's buckets, in its extensions: whether
 /// the bucket it names exists (set where the route loads the bucket to
@@ -149,7 +148,7 @@ pub(crate) struct MeteredBody {
     started: Instant,
     /// The metric history's series the request counts in, and when it
     /// came (seconds).
-    history: Option<(Arc<MetricRecorder>, Vec<MetricSeries>, u64)>,
+    history: Option<(Arc<MetricRecorder>, Matched, u64)>,
     sent: u64,
     done: bool,
 }
@@ -159,7 +158,7 @@ impl MeteredBody {
         inner: Body,
         counters: Arc<BucketRequests>,
         started: Instant,
-        history: Option<(Arc<MetricRecorder>, Vec<MetricSeries>, u64)>,
+        history: Option<(Arc<MetricRecorder>, Matched, u64)>,
     ) -> Self {
         MeteredBody {
             inner,

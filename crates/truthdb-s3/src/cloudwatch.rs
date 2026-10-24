@@ -170,7 +170,7 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, CwE
                 .list_buckets()?
                 .into_iter()
                 .filter(|bucket| bucket.owner == account)
-                .map(|bucket| (bucket.name, bucket.created_ms / 1000))
+                .map(|bucket| (bucket.name, bucket.created_ms))
                 .collect())
         })
         .await?;
@@ -181,7 +181,8 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, CwE
     }
 }
 
-/// The caller's buckets, and when each was made (seconds).
+/// The caller's buckets, and when each was made (ms). Each read checks,
+/// under its own storage lock hold, that the bucket is still that one.
 type Owned = HashMap<String, u64>;
 
 fn string<'a>(input: &'a Map<String, Value>, name: &str) -> Result<Option<&'a str>, CwError> {
@@ -314,6 +315,18 @@ fn resolution_for(start: u64, now: u64) -> (u64, u64) {
     (resolution, start - start % resolution)
 }
 
+/// Whether `bucket` is still the one made at `made_ms` (not deleted, or
+/// made again since).
+fn still(
+    file: &mut truthdb_object::ObjFile<'_>,
+    bucket: &str,
+    made_ms: u64,
+) -> Result<bool, truthdb_core::storage::StorageError> {
+    Ok(file
+        .bucket(bucket)?
+        .is_some_and(|info| info.created_ms == made_ms))
+}
+
 /// Whether the point of `resolution` seconds at `at` is read: not past its
 /// `keep` at `now` (though not yet expired), and not over before `since`,
 /// when the bucket was made (those were another's of the same name;
@@ -325,13 +338,13 @@ fn readable(at: u64, resolution: u64, keep: u64, since: u64, now: u64) -> bool {
 
 /// A metric's statistics per period of `period` seconds from `start` to
 /// `end`, oldest first (only the periods with any), from the points that
-/// end after `since` (the bucket's making), read under a storage lock hold
-/// of their own.
+/// end after the bucket was made (at `made_ms`), read under a storage lock
+/// hold of their own (none if the bucket is no longer that one).
 #[allow(clippy::too_many_arguments)]
 async fn aggregate(
     state: &S3State,
     series: &MetricSeries,
-    since: u64,
+    made_ms: u64,
     code: u8,
     start: u64,
     end: u64,
@@ -350,10 +363,15 @@ async fn aggregate(
     let read = series.clone();
     let points = state
         .engine
-        .run_object(move |file| file.metric_points(&read, resolution, start, end))
+        .run_object(move |file| {
+            if !still(file, &read.bucket, made_ms)? {
+                return Ok(Vec::new());
+            }
+            file.metric_points(&read, resolution, start, end)
+        })
         .await?;
     for (at, point) in points {
-        if !readable(at, resolution, keep, since, now) {
+        if !readable(at, resolution, keep, made_ms / 1000, now) {
             continue;
         }
         let Some(stats) = point.get(&code) else {
@@ -494,9 +512,10 @@ async fn statistics(
         .filter(|(_, metric_unit)| unit.is_none_or(|unit| unit == *metric_unit));
     let mut datapoints = Vec::new();
     if let Some((code, metric_unit)) = found
-        && let Some((series, since)) = series_of(code, &dimensions(input)?, owned)
+        && let Some((series, made_ms)) = series_of(code, &dimensions(input)?, owned)
     {
-        for (at, stats) in aggregate(state, &series, since, code, start, end, period, now).await? {
+        for (at, stats) in aggregate(state, &series, made_ms, code, start, end, period, now).await?
+        {
             let mut point = Map::new();
             point.insert("Timestamp".to_string(), json!(at));
             for name in &plain {
@@ -627,10 +646,10 @@ async fn metric_data(
         if namespace == NAMESPACE
             && let Some((code, metric_unit)) = metric(name)
             && unit.is_none_or(|unit| unit == metric_unit)
-            && let Some((series, since)) = series_of(code, &dimensions(metric_map)?, owned)
+            && let Some((series, made_ms)) = series_of(code, &dimensions(metric_map)?, owned)
         {
             for (at, stats) in
-                aggregate(state, &series, since, code, start, end, period, now).await?
+                aggregate(state, &series, made_ms, code, start, end, period, now).await?
             {
                 if let Some(value) = statistic(&stats, stat_name) {
                     points.push((at, value));
@@ -710,7 +729,7 @@ async fn list_metrics(
         let all = state.engine.run_object(|file| file.metric_series()).await?;
         for (series, last) in all {
             // Quiet lately, or not the caller's.
-            let Some(&created) = owned.get(&series.bucket) else {
+            let Some(&made_ms) = owned.get(&series.bucket) else {
                 continue;
             };
             if last < since {
@@ -734,11 +753,14 @@ async fn list_metrics(
             let points = state
                 .engine
                 .run_object(move |file| {
+                    if !still(file, &read.bucket, made_ms)? {
+                        return Ok(Vec::new());
+                    }
                     file.metric_points(&read, 3600, since - since % 3600, now + 1)
                 })
                 .await?;
             for (at, point) in points {
-                if at + 3600 > created {
+                if at + 3600 > made_ms / 1000 {
                     codes.extend(point.keys().copied());
                 }
             }
