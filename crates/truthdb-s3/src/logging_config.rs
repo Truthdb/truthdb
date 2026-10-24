@@ -56,10 +56,11 @@ pub fn parse(body: &[u8]) -> Result<Option<LoggingConfig>, S3Error> {
         "TargetPrefix",
         "TargetObjectKeyFormat",
     ])?;
-    if enabled
-        .one("TargetGrants")?
-        .is_some_and(|grants| !grants.children.is_empty())
-    {
+    let grants = enabled.one("TargetGrants")?;
+    if grants.is_some_and(|grants| !grants.text.trim().is_empty()) {
+        return Err(malformed());
+    }
+    if grants.is_some_and(|grants| !grants.children.is_empty()) {
         return Err(S3Error::new(
             400,
             "AccessControlListNotSupported",
@@ -83,7 +84,11 @@ pub fn parse(body: &[u8]) -> Result<Option<LoggingConfig>, S3Error> {
                 format.one("SimplePrefix")?,
                 format.one("PartitionedPrefix")?,
             ) {
-                (Some(simple), None) if simple.children.is_empty() => Some(KeyFormat::Simple),
+                (Some(simple), None)
+                    if simple.children.is_empty() && simple.text.trim().is_empty() =>
+                {
+                    Some(KeyFormat::Simple)
+                }
                 (None, Some(partitioned)) => {
                     partitioned.only(&["PartitionDateSource"])?;
                     Some(KeyFormat::Partitioned(
@@ -287,6 +292,11 @@ mod tests {
              </LoggingEnabled>",
             "<LoggingEnabled><TargetBucket>logs</TargetBucket><TargetPrefix>p</TargetPrefix>\
              <Other/></LoggingEnabled>",
+            "<LoggingEnabled><TargetBucket>logs</TargetBucket><TargetPrefix>p</TargetPrefix>\
+             <TargetObjectKeyFormat><SimplePrefix>junk</SimplePrefix></TargetObjectKeyFormat>\
+             </LoggingEnabled>",
+            "<LoggingEnabled><TargetBucket>logs</TargetBucket><TargetPrefix>p</TargetPrefix>\
+             <TargetGrants>junk</TargetGrants></LoggingEnabled>",
         ] {
             assert_eq!(code(status(refused)), "MalformedXML", "{refused}");
         }
