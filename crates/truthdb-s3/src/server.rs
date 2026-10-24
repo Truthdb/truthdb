@@ -65,6 +65,9 @@ pub struct S3State {
     /// is written.
     pub activity: std::sync::Arc<crate::activity::ActivityRecorder>,
     pub activity_flush: std::time::Duration,
+    /// The trails' log files being kept, and how often they are written.
+    pub trail_logs: std::sync::Arc<crate::trails::TrailLogs>,
+    pub trail_flush: std::time::Duration,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
@@ -125,6 +128,9 @@ pub async fn serve(
     ));
     let logger = tokio::spawn(crate::access_log::run(Arc::clone(&state), shutdown.clone()));
     let activity = tokio::spawn(crate::activity::run(Arc::clone(&state), shutdown.clone()));
+    // The trails stop after the activity: its last write feeds them.
+    let (trails_stop, trails_stopping) = watch::channel(false);
+    let trails = tokio::spawn(crate::trails::run(Arc::clone(&state), trails_stopping));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let slot = tokio::select! {
@@ -134,6 +140,8 @@ pub async fn serve(
                     let _ = flusher.await;
                     let _ = logger.await;
                     let _ = activity.await;
+                    let _ = trails_stop.send(true);
+                    let _ = trails.await;
                     return;
                 }
                 continue;
@@ -153,6 +161,8 @@ pub async fn serve(
                     let _ = flusher.await;
                     let _ = logger.await;
                     let _ = activity.await;
+                    let _ = trails_stop.send(true);
+                    let _ = trails.await;
                     return;
                 }
                 continue;

@@ -37,6 +37,9 @@ pub const BUCKET_CORS: u8 = 7;
 pub const BUCKET_WEBSITE: u8 = 8;
 /// Bucket configuration: its server access logging (the rendered XML).
 pub const BUCKET_LOGGING: u8 = 9;
+/// An account's CloudTrail trails, kept under the empty bucket name, by
+/// `<account>/<trail name>` (see `truthdb-s3`'s `trails`).
+pub const ACCOUNT_TRAIL: u8 = 12;
 /// Bucket configurations: its request metrics configurations, by id (the
 /// rendered XML).
 pub const BUCKET_METRICS: u8 = 11;
@@ -473,6 +476,26 @@ impl ObjFile<'_> {
             return Ok(Vec::new());
         };
         let (lower, upper) = config_kind_range(bucket, kind);
+        let keys = tree
+            .scan_range(&mut self.core.page_ctx(0), Some(&lower), Some(&upper))?
+            .into_iter()
+            .map(|(key, _)| key);
+        Ok(config_ids(keys, bucket))
+    }
+
+    /// The ids of the bucket's configurations of `kind` starting with
+    /// `prefix` (ASCII), in order.
+    pub fn bucket_config_ids_with(
+        &mut self,
+        bucket: &str,
+        kind: u8,
+        prefix: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let Some(tree) = self.existing_tree(BUCKET_CONFIG_TREE)? else {
+            return Ok(Vec::new());
+        };
+        let lower = [bucket.as_bytes(), &[0, kind], prefix.as_bytes()].concat();
+        let upper = [&lower[..], &[0xff]].concat();
         let keys = tree
             .scan_range(&mut self.core.page_ctx(0), Some(&lower), Some(&upper))?
             .into_iter()

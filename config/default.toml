@@ -87,6 +87,7 @@ reserved_ratio = 0.17
 # metrics_flush_seconds = 60       # how often the CloudWatch metric history is written
 # access_log_flush_seconds = 300   # how often server access logs are written (or at 1 MiB)
 # activity_flush_seconds = 60      # how often API activity (management events) is written
+# trail_flush_seconds = 300        # how often CloudTrail trails' log files are written (or at 1 MiB)
 # domains = ["s3.example.com"]   # photos.s3.example.com/key = bucket photos, key "key"
 #
 # [admin]
