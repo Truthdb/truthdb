@@ -30,16 +30,33 @@ pub(crate) struct BucketSeen(Arc<Seen>);
 #[derive(Default)]
 struct Seen {
     bucket: AtomicBool,
+    /// The bucket's owner when the request was authorized (none: not
+    /// known where it was marked).
+    owner: Mutex<Option<String>>,
     copy_source: Mutex<Option<String>>,
 }
 
 impl BucketSeen {
-    pub(crate) fn mark(&self) {
+    pub(crate) fn mark(&self, owner: Option<&str>) {
+        *self
+            .0
+            .owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = owner.map(str::to_string);
         self.0.bucket.store(true, Ordering::Relaxed);
     }
 
     pub(crate) fn seen(&self) -> bool {
         self.0.bucket.load(Ordering::Relaxed)
+    }
+
+    /// The owner the bucket had when the request was authorized.
+    pub(crate) fn owner(&self) -> Option<String> {
+        self.0
+            .owner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     pub(crate) fn mark_copy_source(&self, bucket: &str) {
@@ -64,10 +81,11 @@ pub(crate) fn seen_of<B>(request: &Request<B>) -> Option<BucketSeen> {
     request.extensions().get::<BucketSeen>().cloned()
 }
 
-/// Marks, in `request`'s extensions, that the bucket it names exists.
-pub(crate) fn mark_seen<B>(request: &Request<B>) {
+/// Marks, in `request`'s extensions, that the bucket it names exists (and
+/// whose it is, if known).
+pub(crate) fn mark_seen<B>(request: &Request<B>, owner: Option<&str>) {
     if let Some(seen) = request.extensions().get::<BucketSeen>() {
-        seen.mark();
+        seen.mark(owner);
     }
 }
 

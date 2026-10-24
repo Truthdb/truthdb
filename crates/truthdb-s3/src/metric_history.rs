@@ -154,6 +154,7 @@ fn counts(config: &MetricsConfig, key: Option<&str>, tags: &[(String, String)]) 
 #[derive(Default)]
 struct BucketConfigs {
     made_ms: u64,
+    owner: String,
     configs: Vec<MetricsConfig>,
 }
 
@@ -243,6 +244,7 @@ impl MetricRecorder {
                 }
                 Ok(BucketConfigs {
                     made_ms: info.created_ms,
+                    owner: info.owner,
                     configs,
                 })
             })
@@ -264,16 +266,19 @@ impl MetricRecorder {
     }
 
     /// The series a request for `bucket`'s `key` (none: the bucket's own)
-    /// counts in.
+    /// counts in, if `bucket` is still `owner`'s (when known).
     pub(crate) async fn matching(
         &self,
         state: &S3State,
         bucket: &str,
         key: Option<&str>,
+        owner: Option<&str>,
     ) -> Matched {
         let loaded = self.configs(state, bucket).await;
         let configs = &loaded.configs;
-        if configs.is_empty() {
+        // Not counted for another account's bucket of the name, made while
+        // the request ran.
+        if configs.is_empty() || owner.is_some_and(|owner| owner != loaded.owner) {
             return Matched {
                 made_ms: loaded.made_ms,
                 series: Vec::new(),

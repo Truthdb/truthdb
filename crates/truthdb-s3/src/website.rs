@@ -552,21 +552,21 @@ pub async fn serve(state: &S3State, request: Request<Incoming>, bucket: String) 
         .engine
         .run_object(move |file| {
             Ok((
-                file.bucket(&name)?.is_some(),
+                file.bucket(&name)?.map(|info| info.owner),
                 file.bucket_config(&name, BUCKET_WEBSITE, "")?,
             ))
         })
         .await;
     // The bucket exists: the request counts in the request metrics.
-    if let Ok((true, _)) = &loaded {
-        crate::metering::mark_seen(&request);
+    if let Ok((Some(owner), _)) = &loaded {
+        crate::metering::mark_seen(&request, Some(owner));
     }
     let config = match loaded {
-        Ok((false, _)) => {
+        Ok((None, _)) => {
             let err = S3Error::new(404, "NoSuchBucket", "The specified bucket does not exist");
             return page(&err, None, &ids, head_only);
         }
-        Ok((true, None)) => {
+        Ok((Some(_), None)) => {
             let err = S3Error::new(
                 404,
                 "NoSuchWebsiteConfiguration",
@@ -574,7 +574,7 @@ pub async fn serve(state: &S3State, request: Request<Incoming>, bucket: String) 
             );
             return page(&err, None, &ids, head_only);
         }
-        Ok((true, Some(document))) => match parse(&document) {
+        Ok((Some(_), Some(document))) => match parse(&document) {
             Ok(config) => config,
             Err(err) => return page(&err, None, &ids, head_only),
         },

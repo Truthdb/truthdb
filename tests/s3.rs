@@ -13174,7 +13174,7 @@ fn cloudwatch_reads_the_request_and_storage_metrics_of_a_bucket() {
 }
 
 const CLOUDWATCH_SCRIPT: &str = r#"
-import sys, time, datetime
+import sys, time, datetime, http.client, urllib.parse
 import boto3, botocore.config, botocore.exceptions
 phase, port, key, secret, other_key, other_secret = sys.argv[1:7]
 def client(service, access, secret_key):
@@ -13314,6 +13314,32 @@ if phase == "requests":
     named = {m["MetricName"] for m in stranger.list_metrics(Namespace="AWS/S3")["Metrics"]
              if {"Name": "BucketName", "Value": "handed"} in m["Dimensions"]}
     assert "PutRequests" in named and not named & {"GetRequests", "HeadRequests", "BytesDownloaded"}, named
+    # A request authorized for one owner's bucket, still running when
+    # another account makes the name again, counts in neither's series.
+    s3.create_bucket(Bucket="swapped")
+    signer = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=key, aws_secret_access_key=secret,
+        config=botocore.config.Config(signature_version="s3v4"))
+    url = urllib.parse.urlsplit(signer.generate_presigned_url("put_object",
+        Params={"Bucket": "swapped", "Key": "slow"}, ExpiresIn=300))
+    slow = http.client.HTTPConnection("127.0.0.1", int(port))
+    slow.putrequest("PUT", f"{url.path}?{url.query}", skip_accept_encoding=True)
+    slow.putheader("Content-Length", "10")
+    slow.endheaders()
+    slow.send(b"01234")
+    time.sleep(1)
+    s3.delete_bucket(Bucket="swapped")
+    other_s3.create_bucket(Bucket="swapped")
+    other_s3.put_bucket_metrics_configuration(Bucket="swapped", Id="All", MetricsConfiguration={"Id": "All"})
+    slow.send(b"56789")
+    status = slow.getresponse().status
+    assert status >= 400, status
+    time.sleep(2.5)
+    swapped = [{"Name": "BucketName", "Value": "swapped"}, {"Name": "FilterId", "Value": "All"}]
+    for name in ["4xxErrors", "5xxErrors"]:
+        points = stranger.get_metric_statistics(Namespace="AWS/S3", MetricName=name, Dimensions=swapped,
+            StartTime=start, EndTime=end, Period=60, Statistics=["Sum"])["Datapoints"]
+        assert sum(point["Sum"] for point in points) == 0, (name, points)
     print("ok")
 else:
     assert total("AllRequests", "Docs") == 3

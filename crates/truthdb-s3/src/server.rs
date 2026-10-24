@@ -295,7 +295,12 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         // matches.
         let series = state
             .metric_recorder
-            .matching(state, &metered.bucket, metered.key.as_deref())
+            .matching(
+                state,
+                &metered.bucket,
+                metered.key.as_deref(),
+                seen.owner().as_deref(),
+            )
             .await;
         let history = (!series.is_empty()).then(|| {
             state.metric_recorder.record(
