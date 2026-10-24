@@ -1002,6 +1002,9 @@ fn a_user_without_policies_is_refused_every_operation() {
         ),
         ("DELETE", "/cov", "metrics&id=a", b"", &[]),
         ("GET", "/cov", "logging", b"", &[]),
+        ("GET", "/cov", "inventory", b"", &[]),
+        ("GET", "/cov", "inventory&id=a", b"", &[]),
+        ("DELETE", "/cov", "inventory&id=a", b"", &[]),
         ("PUT", "/cov", "logging", b"<BucketLoggingStatus/>", &[]),
         ("GET", "/cov", "website", b"", &[]),
         (
@@ -3099,6 +3102,7 @@ fn listings_page_through_keys_and_common_prefixes() {
         ("/lst/a", "website"),
         ("/lst/a", "cors"),
         ("/lst/a", "logging"),
+        ("/lst/a", "inventory"),
         ("/lst/a", "restore"),
     ] {
         let (status, body) = call("GET", path, query, b"");
@@ -13236,6 +13240,97 @@ s3.put_bucket_logging(Bucket="source", BucketLoggingStatus={"LoggingEnabled": en
 s3.delete_bucket(Bucket="source")
 s3.create_bucket(Bucket="source")
 assert "LoggingEnabled" not in s3.get_bucket_logging(Bucket="source")
+print("ok")
+"#;
+
+#[test]
+fn inventory_configurations_are_kept_per_bucket() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "inventoried");
+    let (_, other_key, other_secret) = account_with_key(&server, "nextdoor");
+    let script = server.dir.join("inventory_config.py");
+    std::fs::write(&script, INVENTORY_CONFIG_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other_key,
+            &other_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const INVENTORY_CONFIG_SCRIPT: &str = r#"
+import sys
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other_key, other_secret = sys.argv[1:7]
+def client(access, secret_key):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+s3, other = client(key, secret), client(other_key, other_secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+for bucket in ["source", "lists"]:
+    s3.create_bucket(Bucket=bucket)
+other.create_bucket(Bucket="theirs")
+def configuration(id, bucket="lists", fmt="CSV", **extra):
+    config = {"Id": id, "IsEnabled": True, "IncludedObjectVersions": "Current",
+        "Schedule": {"Frequency": "Daily"},
+        "Destination": {"S3BucketDestination": {"Bucket": f"arn:aws:s3:::{bucket}", "Format": fmt}}}
+    config.update(extra)
+    return config
+assert s3.list_bucket_inventory_configurations(Bucket="source").get("InventoryConfigurationList", []) == []
+refused(lambda: s3.get_bucket_inventory_configuration(Bucket="source", Id="none"), "NoSuchConfiguration")
+weekly = configuration("weekly", fmt="Parquet", Filter={"Prefix": "docs/"}, IncludedObjectVersions="All",
+    OptionalFields=["Size", "ETag", "LastModifiedDate"], Schedule={"Frequency": "Weekly"})
+weekly["Destination"]["S3BucketDestination"].update({"AccountId": account, "Prefix": "inv",
+    "Encryption": {"SSES3": {}}})
+s3.put_bucket_inventory_configuration(Bucket="source", Id="weekly", InventoryConfiguration=weekly)
+s3.put_bucket_inventory_configuration(Bucket="source", Id="daily", InventoryConfiguration=configuration("daily"))
+got = s3.get_bucket_inventory_configuration(Bucket="source", Id="weekly")["InventoryConfiguration"]
+assert got == weekly, got
+listed = s3.list_bucket_inventory_configurations(Bucket="source")
+assert [c["Id"] for c in listed["InventoryConfigurationList"]] == ["daily", "weekly"] and not listed["IsTruncated"], listed
+# Refused: another account's or a missing destination, ORC, KMS.
+refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="x",
+    InventoryConfiguration=configuration("x", bucket="theirs")), "InvalidArgument")
+refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="x",
+    InventoryConfiguration=configuration("x", bucket="missing")), "InvalidArgument")
+refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="x",
+    InventoryConfiguration=configuration("x", fmt="ORC")), "InvalidArgument")
+kms = configuration("x")
+kms["Destination"]["S3BucketDestination"]["Encryption"] = {"SSEKMS": {"KeyId": "k"}}
+refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="x", InventoryConfiguration=kms),
+    "InvalidArgument")
+refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="y",
+    InventoryConfiguration=configuration("x")), "InvalidArgument")
+# Another account may not read them; deleted, gone; gone with the bucket.
+refused(lambda: other.get_bucket_inventory_configuration(Bucket="source", Id="daily"), "AccessDenied")
+s3.delete_bucket_inventory_configuration(Bucket="source", Id="daily")
+refused(lambda: s3.delete_bucket_inventory_configuration(Bucket="source", Id="daily"), "NoSuchConfiguration")
+s3.delete_bucket(Bucket="source")
+s3.create_bucket(Bucket="source")
+refused(lambda: s3.get_bucket_inventory_configuration(Bucket="source", Id="weekly"), "NoSuchConfiguration")
 print("ok")
 "#;
 
