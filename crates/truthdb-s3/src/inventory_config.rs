@@ -310,6 +310,15 @@ pub async fn bucket_inventory(
                 crate::server::read_body(request, auth, MAX_BODY).await?
             };
             let config = parse(&body, &id)?;
+            if config
+                .destination_account
+                .as_ref()
+                .is_some_and(|account| *account != owner)
+            {
+                return Err(invalid(
+                    "The destination account is not the source bucket owner",
+                ));
+            }
             let document = config.encode();
             // The lists go to a bucket of the same owner (checked again
             // when one is written).

@@ -13318,6 +13318,16 @@ refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="x",
     InventoryConfiguration=configuration("x", bucket="missing")), "InvalidArgument")
 refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="x",
     InventoryConfiguration=configuration("x", fmt="ORC")), "InvalidArgument")
+foreign = configuration("x")
+foreign["Destination"]["S3BucketDestination"]["AccountId"] = "999999999999"
+refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="x", InventoryConfiguration=foreign),
+    "InvalidArgument")
+def bad_md5(request, **kwargs):
+    request.headers["Content-MD5"] = "AAAAAAAAAAAAAAAAAAAAAA=="
+s3.meta.events.register("before-sign.s3.PutBucketInventoryConfiguration", bad_md5)
+refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="x",
+    InventoryConfiguration=configuration("x")), "BadDigest")
+s3.meta.events.unregister("before-sign.s3.PutBucketInventoryConfiguration", bad_md5)
 kms = configuration("x")
 kms["Destination"]["S3BucketDestination"]["Encryption"] = {"SSEKMS": {"KeyId": "k"}}
 refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="x", InventoryConfiguration=kms),
@@ -13326,6 +13336,21 @@ refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="y",
     InventoryConfiguration=configuration("x")), "InvalidArgument")
 # Another account may not read them; deleted, gone; gone with the bucket.
 refused(lambda: other.get_bucket_inventory_configuration(Bucket="source", Id="daily"), "AccessDenied")
+# Up to 1,000 per bucket, listed 100 at a time; a replaced one still fits.
+for n in range(998):
+    s3.put_bucket_inventory_configuration(Bucket="source", Id=f"n{n:03}", InventoryConfiguration=configuration(f"n{n:03}"))
+refused(lambda: s3.put_bucket_inventory_configuration(Bucket="source", Id="over",
+    InventoryConfiguration=configuration("over")), "TooManyConfigurations")
+s3.put_bucket_inventory_configuration(Bucket="source", Id="n000", InventoryConfiguration=configuration("n000"))
+ids, pages, token = [], 0, None
+while True:
+    page = s3.list_bucket_inventory_configurations(Bucket="source", **({"ContinuationToken": token} if token else {}))
+    ids += [c["Id"] for c in page["InventoryConfigurationList"]]
+    pages += 1
+    if not page["IsTruncated"]:
+        break
+    token = page["NextContinuationToken"]
+assert pages == 10 and ids == sorted(["daily", "weekly"] + [f"n{n:03}" for n in range(998)]), (pages, len(ids))
 s3.delete_bucket_inventory_configuration(Bucket="source", Id="daily")
 refused(lambda: s3.delete_bucket_inventory_configuration(Bucket="source", Id="daily"), "NoSuchConfiguration")
 s3.delete_bucket(Bucket="source")
