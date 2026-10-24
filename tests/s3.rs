@@ -991,6 +991,16 @@ fn a_user_without_policies_is_refused_every_operation() {
         ("GET", "/cov", "cors", b"", &[]),
         ("PUT", "/cov", "cors", b"<CORSConfiguration/>", &[]),
         ("DELETE", "/cov", "cors", b"", &[]),
+        ("GET", "/cov", "metrics", b"", &[]),
+        ("GET", "/cov", "metrics&id=a", b"", &[]),
+        (
+            "PUT",
+            "/cov",
+            "metrics&id=a",
+            b"<MetricsConfiguration><Id>a</Id></MetricsConfiguration>",
+            &[],
+        ),
+        ("DELETE", "/cov", "metrics&id=a", b"", &[]),
         ("GET", "/cov", "website", b"", &[]),
         (
             "PUT",
@@ -12999,4 +13009,113 @@ fn the_admin_listener_serves_metrics_health_and_readiness() {
     assert!(sample("truthdb_wal_tail_lsn") >= sample("truthdb_wal_head_lsn"));
     let ratio = sample("truthdb_wal_usage_ratio");
     assert!((0.0..=1.0).contains(&ratio), "{ratio}");
+}
+
+#[test]
+fn a_bucket_keeps_up_to_a_thousand_metrics_configurations() {
+    let (server, key, secret) = server_with_key();
+    let port = server.s3_port;
+    let call = |method: &str, path: &str, query: &str, extra: &[(&str, &str)], body: &[u8]| {
+        send_with(port, method, path, query, extra, body, &key, Some(&secret)).1
+    };
+    let put = |id: &str, filter: &str| {
+        let body = format!("<MetricsConfiguration><Id>{id}</Id>{filter}</MetricsConfiguration>");
+        let md5 = content_md5(body.as_bytes());
+        call(
+            "PUT",
+            "/measured",
+            &format!("metrics&id={id}"),
+            &[("content-md5", &md5)],
+            body.as_bytes(),
+        )
+    };
+    assert_eq!(put("a", "").0, 404, "no bucket");
+    assert_eq!(call("PUT", "/measured", "", &[], b"").0, 200);
+    let (status, listed) = call("GET", "/measured", "metrics", &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(xml_value(&listed, "IsTruncated"), "false");
+    assert!(!listed.contains("<MetricsConfiguration>"), "{listed}");
+    let (status, missing) = call("GET", "/measured", "metrics&id=none", &[], b"");
+    assert_eq!(status, 404);
+    assert_eq!(xml_value(&missing, "Code"), "NoSuchConfiguration");
+    // The body needs its Content-MD5; its Id must be the one named.
+    let plain = b"<MetricsConfiguration><Id>a</Id></MetricsConfiguration>";
+    assert_eq!(call("PUT", "/measured", "metrics&id=a", &[], plain).0, 400);
+    let md5 = content_md5(plain);
+    let (status, reply) = call(
+        "PUT",
+        "/measured",
+        "metrics&id=b",
+        &[("content-md5", &md5)],
+        plain,
+    );
+    assert_eq!(status, 400);
+    assert_eq!(xml_value(&reply, "Code"), "InvalidArgument");
+    let documents = "<Filter><And><Prefix>documents/</Prefix><Tag><Key>class</Key>\
+        <Value>blue</Value></Tag></And></Filter>";
+    assert_eq!(put("Documents", documents).0, 200);
+    let (status, shown) = call("GET", "/measured", "metrics&id=Documents", &[], b"");
+    assert_eq!(status, 200);
+    assert_eq!(xml_value(&shown, "Prefix"), "documents/");
+    assert_eq!(xml_value(&shown, "Value"), "blue");
+    // Replaced whole.
+    assert_eq!(
+        put("Documents", "<Filter><Prefix>docs/</Prefix></Filter>").0,
+        200
+    );
+    let (_, shown) = call("GET", "/measured", "metrics&id=Documents", &[], b"");
+    assert_eq!(xml_value(&shown, "Prefix"), "docs/");
+    assert!(!shown.contains("<Tag>"), "{shown}");
+    // A thousand at most; one of them may still be replaced.
+    for index in 0..999 {
+        assert_eq!(put(&format!("m{index:04}"), "").0, 200, "{index}");
+    }
+    let (status, refused) = put("one-more", "");
+    assert_eq!(status, 400);
+    assert_eq!(xml_value(&refused, "Code"), "TooManyConfigurations");
+    assert_eq!(put("m0007", "<Filter><Prefix>x</Prefix></Filter>").0, 200);
+    // Listed a hundred at a time, in id order.
+    let mut ids = Vec::new();
+    let mut token: Option<String> = None;
+    loop {
+        let query = match &token {
+            Some(token) => format!("metrics&continuation-token={token}"),
+            None => "metrics".to_string(),
+        };
+        let (status, page) = call("GET", "/measured", &query, &[], b"");
+        assert_eq!(status, 200);
+        let found = page.matches("<MetricsConfiguration>").count();
+        assert!(found <= 100, "{found}");
+        ids.extend(
+            page.split("<Id>")
+                .skip(1)
+                .map(|rest| rest.split("</Id>").next().unwrap().to_string()),
+        );
+        if xml_value(&page, "IsTruncated") == "true" {
+            token = Some(xml_value(&page, "NextContinuationToken"));
+        } else {
+            break;
+        }
+    }
+    assert_eq!(ids.len(), 1000);
+    let mut sorted = ids.clone();
+    sorted.sort();
+    assert_eq!(ids, sorted);
+    assert_eq!(ids[0], "Documents");
+    // Deleted, then gone; deleting it again is refused.
+    assert_eq!(
+        call("DELETE", "/measured", "metrics&id=Documents", &[], b"").0,
+        204
+    );
+    assert_eq!(
+        call("GET", "/measured", "metrics&id=Documents", &[], b"").0,
+        404
+    );
+    assert_eq!(
+        call("DELETE", "/measured", "metrics&id=Documents", &[], b"").0,
+        404
+    );
+    // An object has none; a plain write naming an id is not taken for one.
+    assert_eq!(call("GET", "/measured/k", "metrics&id=a", &[], b"").0, 501);
+    assert_eq!(call("PUT", "/measured/k", "id=a", &[], b"x").0, 501);
 }

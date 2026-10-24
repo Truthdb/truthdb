@@ -54,8 +54,8 @@ pub use buckets::{BucketError, BucketInfo, Versioning};
 pub use consumers::{Consumer, FULLTEXT_CONSUMER};
 pub use credentials::AccessKey;
 pub use documents::{
-    BUCKET_CORS, BUCKET_ENCRYPTION, BUCKET_LIFECYCLE, BUCKET_POLICY, BUCKET_WEBSITE, ManagedPolicy,
-    OBJECT_LOCK_DEFAULT, PUBLIC_ACCESS_BLOCK,
+    BUCKET_CORS, BUCKET_ENCRYPTION, BUCKET_LIFECYCLE, BUCKET_METRICS, BUCKET_POLICY,
+    BUCKET_WEBSITE, ManagedPolicy, OBJECT_LOCK_DEFAULT, PUBLIC_ACCESS_BLOCK,
 };
 pub use fulltext::{
     DEFAULT_FULLTEXT_MAX_BYTES, FtBucket, FtError, FtKey, FtState, FtStatus, MAX_FULLTEXT_BYTES,

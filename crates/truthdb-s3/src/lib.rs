@@ -14,6 +14,7 @@ pub mod iam_api;
 pub mod lifecycle;
 pub mod listing;
 mod metering;
+pub mod metrics_config;
 pub mod multipart;
 pub mod notification;
 pub mod object_lock;
