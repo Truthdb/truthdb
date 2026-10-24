@@ -51,17 +51,16 @@ pub struct Histogram {
 }
 
 impl Histogram {
+    /// Counts a latency under the first bound it does not pass (to the
+    /// microsecond: 1.9 ms is past 1 ms).
     pub fn record(&self, latency: Duration) {
-        let ms = latency.as_millis().min(u128::from(u64::MAX)) as u64;
+        let micros = latency.as_micros().min(u128::from(u64::MAX)) as u64;
         let index = LATENCY_BOUNDS_MS
             .iter()
-            .position(|bound| ms <= *bound)
+            .position(|bound| micros <= bound * 1000)
             .unwrap_or(LATENCY_BOUNDS_MS.len());
         self.counts[index].fetch_add(1, Ordering::Relaxed);
-        self.sum_micros.fetch_add(
-            latency.as_micros().min(u128::from(u64::MAX)) as u64,
-            Ordering::Relaxed,
-        );
+        self.sum_micros.fetch_add(micros, Ordering::Relaxed);
     }
 
     /// Each bound (`None`: past the last) and its count, every one.
@@ -267,6 +266,12 @@ mod tests {
             [(Some(1), 1), (Some(4), 1), (None, 1)]
         );
         assert_eq!(bucket.total.snapshot(), [(Some(16), 1)]);
+        // A bound holds what does not pass it, to the microsecond.
+        let exact = Histogram::default();
+        exact.record(Duration::from_micros(1_000));
+        exact.record(Duration::from_micros(1_001));
+        exact.record(Duration::from_micros(1_900));
+        assert_eq!(exact.snapshot(), [(Some(1), 1), (Some(2), 2)]);
         assert_eq!(bucket.total.sum(), Duration::from_millis(9));
         assert_eq!(
             bucket.first_byte.sum(),

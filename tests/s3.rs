@@ -12892,6 +12892,17 @@ fn the_admin_listener_serves_metrics_health_and_readiness() {
         admin_call(admin, "GET", "/metrics", "Authorization: Bearer wrong\r\n").0,
         401
     );
+    // The scheme's case does not matter.
+    assert_eq!(
+        admin_call(
+            admin,
+            "GET",
+            "/metrics",
+            &format!("Authorization: bearer {ADMIN_TOKEN}\r\n")
+        )
+        .0,
+        200
+    );
     assert_eq!(admin_call(admin, "POST", "/metrics", &bearer).0, 405);
     assert_eq!(admin_call(admin, "GET", "/elsewhere", &bearer).0, 404);
 

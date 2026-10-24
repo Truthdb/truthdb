@@ -156,8 +156,10 @@ fn authorized(state: &AdminState, request: &Request<Incoming>) -> bool {
         .headers()
         .get(hyper::header::AUTHORIZATION)
         .and_then(|value| value.to_str().ok())
-        .and_then(|value| value.strip_prefix("Bearer "))
-        .is_some_and(|given| digest(given).as_ref() == digest(token).as_ref())
+        .and_then(|value| value.split_once(' '))
+        // The scheme's case does not matter (RFC 9110).
+        .filter(|(scheme, _)| scheme.eq_ignore_ascii_case("bearer"))
+        .is_some_and(|(_, given)| digest(given.trim()).as_ref() == digest(token).as_ref())
 }
 
 /// A label value as Prometheus' text format writes it.
@@ -332,21 +334,34 @@ fn render(state: &AdminState) -> Result<String, StorageError> {
     );
     let _ = writeln!(out, "truthdb_standby {}", u8::from(storage.is_standby()));
 
-    // The object store, read under one storage-lock hold.
+    // The object store's: left out (and said so) when it cannot be read, a
+    // wedged store say, so the rest is still there when it matters most.
+    let mut objects = String::new();
+    match render_objects(storage, &mut objects) {
+        Ok(()) => out.push_str(&objects),
+        Err(err) => {
+            let _ = writeln!(out, "# the object store's metrics are left out: {err}");
+        }
+    }
+    Ok(out)
+}
+
+/// The object store's metrics, read under one storage-lock hold.
+fn render_objects(storage: &Storage, out: &mut String) -> Result<(), StorageError> {
     let mut guard = storage.lock();
     let Some(mut file) = ObjFile::try_new(&mut guard) else {
-        return Ok(out);
+        return Ok(());
     };
     let backlogs = file.backlogs()?;
     family(
-        &mut out,
+        out,
         "truthdb_s3_gc_backlog_bodies",
         "gauge",
         "Bodies held by nothing, waiting to be freed.",
     );
     let _ = writeln!(out, "truthdb_s3_gc_backlog_bodies {}", backlogs.collect);
     family(
-        &mut out,
+        out,
         "truthdb_s3_pack_backlog_bodies",
         "gauge",
         "Bodies of cold storage classes waiting to be packed.",
@@ -354,7 +369,7 @@ fn render(state: &AdminState) -> Result<String, StorageError> {
     let _ = writeln!(out, "truthdb_s3_pack_backlog_bodies {}", backlogs.pack);
     let last = file.last_change()?;
     family(
-        &mut out,
+        out,
         "truthdb_s3_journal_consumer_lag",
         "gauge",
         "Change journal rows a consumer has yet to apply.",
@@ -381,7 +396,7 @@ fn render(state: &AdminState) -> Result<String, StorageError> {
             |usage| usage.bytes,
         ),
     ] {
-        family(&mut out, name, "gauge", help);
+        family(out, name, "gauge", help);
         for row in &usage {
             let _ = writeln!(
                 out,
@@ -393,7 +408,7 @@ fn render(state: &AdminState) -> Result<String, StorageError> {
             );
         }
     }
-    Ok(out)
+    Ok(())
 }
 
 #[cfg(test)]
