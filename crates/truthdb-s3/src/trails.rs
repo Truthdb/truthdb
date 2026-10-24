@@ -50,6 +50,8 @@ pub(crate) struct Trail {
     pub stopped_ms: Option<u64>,
     pub delivered_ms: Option<u64>,
     pub delivery_error: Option<String>,
+    /// When it was made (a trail of the same name made again is another).
+    pub created_ms: u64,
 }
 
 impl Trail {
@@ -66,6 +68,7 @@ impl Trail {
             "stopped_ms": self.stopped_ms,
             "delivered_ms": self.delivered_ms,
             "delivery_error": self.delivery_error,
+            "created_ms": self.created_ms,
         })
         .to_string()
         .into_bytes()
@@ -86,6 +89,7 @@ impl Trail {
             stopped_ms: value["stopped_ms"].as_u64(),
             delivered_ms: value["delivered_ms"].as_u64(),
             delivery_error: text("delivery_error"),
+            created_ms: value["created_ms"].as_u64().unwrap_or(0),
         })
     }
 
@@ -299,7 +303,7 @@ fn trails_of(
 ) -> Result<Vec<Trail>, truthdb_core::storage::StorageError> {
     let prefix = format!("{account}/");
     let mut trails = Vec::new();
-    for id in file.bucket_config_ids("", ACCOUNT_TRAIL)? {
+    for id in file.bucket_config_ids_with("", ACCOUNT_TRAIL, &prefix)? {
         if let Some(name) = id.strip_prefix(&prefix)
             && let Some(trail) = load(file, account, name)?
         {
@@ -307,6 +311,45 @@ fn trails_of(
         }
     }
     Ok(trails)
+}
+
+/// Where a CreateTrail or UpdateTrail would have the trail's logs written:
+/// its bucket and prefix, as given or (for an update) as kept; none if the
+/// call names neither, or the trail does not exist.
+pub(crate) async fn target(
+    state: &S3State,
+    operation: &str,
+    input: &Map<String, Value>,
+    account: &str,
+) -> Result<Option<(String, Option<String>)>, CtError> {
+    let bucket = string(input, "S3BucketName")?.map(str::to_string);
+    let prefix = string(input, "S3KeyPrefix")?.map(str::to_string);
+    if bucket.is_none() && prefix.is_none() {
+        return Ok(None);
+    }
+    let kept = match operation {
+        "UpdateTrail" => {
+            let name = trail_name(
+                string(input, "Name")?.unwrap_or_default(),
+                &state.region,
+                account,
+            )?;
+            let owner = account.to_string();
+            state
+                .engine
+                .run_object(move |file| load(file, &owner, &name))
+                .await?
+        }
+        _ => None,
+    };
+    let Some(bucket) = bucket.or_else(|| kept.as_ref().map(|trail| trail.bucket.clone())) else {
+        return Ok(None);
+    };
+    let prefix = match prefix {
+        Some(prefix) => (!prefix.is_empty()).then_some(prefix),
+        None => kept.and_then(|trail| trail.prefix),
+    };
+    Ok(Some((bucket, prefix)))
 }
 
 /// The resource a trail operation acts on, for its authorization: the
@@ -387,6 +430,7 @@ pub(crate) async fn serve(
                                 name: name.clone(),
                                 include_global: true,
                                 recursive: true,
+                                created_ms: crate::objects::now_ms(),
                                 ..Trail::default()
                             }
                         }
@@ -478,12 +522,19 @@ pub(crate) async fn serve(
             })
         }
         "DescribeTrails" | "ListTrails" => {
+            // Names of trails of other accounts or regions match none.
             let names: Option<Vec<String>> = match input.get("trailNameList") {
-                Some(Value::Array(list)) if !list.is_empty() => Some(
-                    list.iter()
-                        .map(|name| trail_name(name.as_str().unwrap_or_default(), &region, account))
-                        .collect::<Result<_, _>>()?,
-                ),
+                Some(Value::Array(list)) if !list.is_empty() => {
+                    let mut names = Vec::new();
+                    for name in list {
+                        match trail_name(name.as_str().unwrap_or_default(), &region, account) {
+                            Ok(name) => names.push(name),
+                            Err(err) if err.code == "TrailNotFoundException" => {}
+                            Err(err) => return Err(err),
+                        }
+                    }
+                    Some(names)
+                }
                 _ => None,
             };
             let trails = state
@@ -523,17 +574,17 @@ pub(crate) async fn serve(
     }
 }
 
-/// The names of the logging trails of each of `accounts`.
+/// The logging trails of each of `accounts`: each one's name and making.
 pub(crate) fn logging_trails(
     file: &mut ObjFile<'_>,
     accounts: &[String],
-) -> Result<HashMap<String, Vec<String>>, truthdb_core::storage::StorageError> {
+) -> Result<HashMap<String, Vec<(String, u64)>>, truthdb_core::storage::StorageError> {
     let mut found = HashMap::new();
     for account in accounts {
-        let names: Vec<String> = trails_of(file, account)?
+        let names: Vec<(String, u64)> = trails_of(file, account)?
             .into_iter()
             .filter(|trail| trail.logging)
-            .map(|trail| trail.name)
+            .map(|trail| (trail.name, trail.created_ms))
             .collect();
         if !names.is_empty() {
             found.insert(account.clone(), names);
@@ -550,7 +601,7 @@ struct Buffer {
 /// The trails' events waiting to be written, by account and trail.
 #[derive(Default)]
 pub struct TrailLogs {
-    buffers: Mutex<HashMap<(String, String), Buffer>>,
+    buffers: Mutex<HashMap<(String, String, u64), Buffer>>,
     /// Woken when a trail's records reach `FLUSH_BYTES`.
     full: tokio::sync::Notify,
 }
@@ -558,13 +609,13 @@ pub struct TrailLogs {
 impl TrailLogs {
     /// Adds `record` to trail `name` of `account` (dropped past
     /// `MAX_KEPT`).
-    pub(crate) fn append(&self, account: &str, name: &str, record: &[u8]) {
+    pub(crate) fn append(&self, account: &str, trail: &(String, u64), record: &[u8]) {
         let mut buffers = self
             .buffers
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let buffer = buffers
-            .entry((account.to_string(), name.to_string()))
+            .entry((account.to_string(), trail.0.clone(), trail.1))
             .or_insert_with(|| Buffer {
                 records: String::new(),
             });
@@ -581,7 +632,7 @@ impl TrailLogs {
         }
     }
 
-    fn take(&self) -> Vec<((String, String), Buffer)> {
+    fn take(&self) -> Vec<((String, String, u64), Buffer)> {
         std::mem::take(
             &mut *self
                 .buffers
@@ -595,15 +646,17 @@ impl TrailLogs {
     /// Writes each trail's records as one log file (put back, up to
     /// `MAX_KEPT`, if the engine could not be reached).
     pub(crate) async fn flush(&self, state: &S3State) {
-        for ((account, name), buffer) in self.take() {
-            if !deliver(state, &account, &name, &buffer.records).await {
+        for ((account, name, created), buffer) in self.take() {
+            if !deliver(state, &account, &name, created, &buffer.records).await {
                 let mut buffers = self
                     .buffers
                     .lock()
                     .unwrap_or_else(|poisoned| poisoned.into_inner());
-                let kept = buffers.entry((account, name)).or_insert_with(|| Buffer {
-                    records: String::new(),
-                });
+                let kept = buffers
+                    .entry((account, name, created))
+                    .or_insert_with(|| Buffer {
+                        records: String::new(),
+                    });
                 if kept.records.len() + buffer.records.len() < MAX_KEPT {
                     if !kept.records.is_empty() {
                         kept.records.insert(0, ',');
@@ -649,7 +702,7 @@ fn gzipped(records: &str) -> std::io::Result<Vec<u8>> {
 /// still exists (the events are dropped otherwise, and when its bucket
 /// cannot take them, which its status then tells); whether the engine was
 /// reached.
-async fn deliver(state: &S3State, account: &str, name: &str, records: &str) -> bool {
+async fn deliver(state: &S3State, account: &str, name: &str, created: u64, records: &str) -> bool {
     let now = crate::objects::now_ms();
     let Ok(body) = gzipped(records) else {
         return true;
@@ -670,10 +723,17 @@ async fn deliver(state: &S3State, account: &str, name: &str, records: &str) -> b
         .run_object(move |file| {
             // Its events were taken while it logged; a trail since deleted
             // gets none.
-            let Some(mut trail) = load(file, &account, &name)? else {
+            let Some(mut trail) =
+                load(file, &account, &name)?.filter(|trail| trail.created_ms == created)
+            else {
                 return Ok(());
             };
             let problem = bucket_problem(file, &trail.bucket, &account)?;
+            // A bucket's default retention holds for its log files too.
+            let (bucket_lock, default) = crate::object_lock::bucket_state(file, &trail.bucket)?;
+            let lock = crate::object_lock::new_object_lock(None, bucket_lock, default, now)
+                .ok()
+                .flatten();
             let key = log_key(trail.prefix.as_deref(), &account, &region, now);
             file.set_origin(Origin {
                 operation: "PutObject".to_string(),
@@ -697,7 +757,10 @@ async fn deliver(state: &S3State, account: &str, name: &str, records: &str) -> b
                         now,
                         GRACE_MS,
                     )? {
-                        Ok(_) => {
+                        Ok(info) => {
+                            if let Some(lock) = &lock {
+                                tx.set_lock(info.version, lock)?;
+                            }
                             trail.delivered_ms = Some(now);
                             trail.delivery_error = None;
                         }
@@ -722,7 +785,8 @@ async fn deliver(state: &S3State, account: &str, name: &str, records: &str) -> b
 }
 
 /// Writes the trails' logs every `state.trail_flush`, or when a trail's
-/// reach `FLUSH_BYTES`, until `shutdown`, and once more then. A standby
+/// reach `FLUSH_BYTES`, until `shutdown` (sent once the activity, which
+/// feeds the trails, has written its last), and once more then. A standby
 /// writes (and keeps) nothing.
 pub async fn run(state: Arc<S3State>, mut shutdown: tokio::sync::watch::Receiver<bool>) {
     loop {

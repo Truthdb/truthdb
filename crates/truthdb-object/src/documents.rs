@@ -483,6 +483,26 @@ impl ObjFile<'_> {
         Ok(config_ids(keys, bucket))
     }
 
+    /// The ids of the bucket's configurations of `kind` starting with
+    /// `prefix` (ASCII), in order.
+    pub fn bucket_config_ids_with(
+        &mut self,
+        bucket: &str,
+        kind: u8,
+        prefix: &str,
+    ) -> Result<Vec<String>, StorageError> {
+        let Some(tree) = self.existing_tree(BUCKET_CONFIG_TREE)? else {
+            return Ok(Vec::new());
+        };
+        let lower = [bucket.as_bytes(), &[0, kind], prefix.as_bytes()].concat();
+        let upper = [&lower[..], &[0xff]].concat();
+        let keys = tree
+            .scan_range(&mut self.core.page_ctx(0), Some(&lower), Some(&upper))?
+            .into_iter()
+            .map(|(key, _)| key);
+        Ok(config_ids(keys, bucket))
+    }
+
     /// Managed policy `name` of `account`, if it exists.
     pub fn managed_policy(
         &mut self,

@@ -119,21 +119,23 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, CtE
             }
         }
     };
+    let signed = crate::server::Signed {
+        auth_type: "REST-HEADER",
+        at_ms: parts
+            .headers
+            .get("x-amz-date")
+            .and_then(|value| value.to_str().ok())
+            .and_then(crate::server::parse_amz_date)
+            .map(|secs| secs * 1000),
+    };
+    let connection = parts.extensions.get::<Connection>().copied();
     let authz = crate::authz::Authz::load(
         state,
         Some(&principal),
-        Some(crate::server::Signed {
-            auth_type: "REST-HEADER",
-            at_ms: parts
-                .headers
-                .get("x-amz-date")
-                .and_then(|value| value.to_str().ok())
-                .and_then(crate::server::parse_amz_date)
-                .map(|secs| secs * 1000),
-        }),
+        Some(signed),
         &parts.headers,
         "",
-        parts.extensions.get::<Connection>().copied(),
+        connection,
         Vec::new(),
         Vec::new(),
     )
@@ -166,6 +168,38 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, CtE
         &resource,
         &principal.account,
     )?;
+    // A trail's logs go where its maker may write: the caller is allowed
+    // s3:PutObject where the trail would write (its bucket and prefix as
+    // given, else as kept).
+    if matches!(operation.as_str(), "CreateTrail" | "UpdateTrail")
+        && let Some((bucket, prefix)) =
+            crate::trails::target(state, &operation, &input, &principal.account).await?
+    {
+        let bucket = bucket.as_str();
+        let prefix = prefix.map_or(String::new(), |prefix| format!("{prefix}/"));
+        let key = format!("{prefix}AWSLogs/{}/", principal.account);
+        let writes = crate::authz::Authz::load(
+            state,
+            Some(&principal),
+            Some(signed),
+            &parts.headers,
+            "",
+            connection,
+            vec![bucket.to_string()],
+            Vec::new(),
+        )
+        .await?;
+        if writes
+            .check("s3:PutObject", crate::authz::Resource::Object(bucket, &key))
+            .is_err()
+        {
+            return Err(CtError::new(
+                400,
+                "InsufficientS3BucketPolicyException",
+                format!("Incorrect S3 bucket policy is detected for bucket: {bucket}"),
+            ));
+        }
+    }
     crate::trails::serve(state, &operation, &input, &principal.account).await
 }
 

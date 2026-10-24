@@ -128,7 +128,9 @@ pub async fn serve(
     ));
     let logger = tokio::spawn(crate::access_log::run(Arc::clone(&state), shutdown.clone()));
     let activity = tokio::spawn(crate::activity::run(Arc::clone(&state), shutdown.clone()));
-    let trails = tokio::spawn(crate::trails::run(Arc::clone(&state), shutdown.clone()));
+    // The trails stop after the activity: its last write feeds them.
+    let (trails_stop, trails_stopping) = watch::channel(false);
+    let trails = tokio::spawn(crate::trails::run(Arc::clone(&state), trails_stopping));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let slot = tokio::select! {
@@ -138,7 +140,7 @@ pub async fn serve(
                     let _ = flusher.await;
                     let _ = logger.await;
                     let _ = activity.await;
-                    // After the activity's last write, which feeds it.
+                    let _ = trails_stop.send(true);
                     let _ = trails.await;
                     return;
                 }
@@ -159,7 +161,7 @@ pub async fn serve(
                     let _ = flusher.await;
                     let _ = logger.await;
                     let _ = activity.await;
-                    // After the activity's last write, which feeds it.
+                    let _ = trails_stop.send(true);
                     let _ = trails.await;
                     return;
                 }

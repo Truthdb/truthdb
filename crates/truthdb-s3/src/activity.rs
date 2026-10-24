@@ -643,13 +643,17 @@ impl ActivityRecorder {
                         written.iter().map(|event| event.account.clone()).collect();
                     accounts.sort();
                     accounts.dedup();
-                    crate::trails::logging_trails(file, &accounts)
+                    // Written already: a failed read of the trails does not
+                    // write the events again (the trails miss them).
+                    Ok(crate::trails::logging_trails(file, &accounts).unwrap_or_default())
                 })
                 .await;
             if let Ok(trails) = &stored {
                 for event in batch.iter() {
-                    for name in trails.get(&event.account).into_iter().flatten() {
-                        state.trail_logs.append(&event.account, name, &event.record);
+                    for trail in trails.get(&event.account).into_iter().flatten() {
+                        state
+                            .trail_logs
+                            .append(&event.account, trail, &event.record);
                     }
                 }
             }

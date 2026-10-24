@@ -13250,6 +13250,22 @@ fn a_trail_delivers_its_accounts_events_as_log_files() {
     let (account, key, secret) = account_with_key(&server, "trails");
     let (_, other_key, other_secret) = account_with_key(&server, "neighbour");
     let (user_key, user_secret) = user_with_key(&server, &account, "nobody", None);
+    let (maker_key, maker_secret) = user_with_key(
+        &server,
+        &account,
+        "maker",
+        Some(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":"cloudtrail:*","Resource":"*"}]}"#,
+        ),
+    );
+    let (scoped_key, scoped_secret) = user_with_key(
+        &server,
+        &account,
+        "scoped",
+        Some(&format!(
+            r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Action":"cloudtrail:*","Resource":"*"}},{{"Effect":"Allow","Action":"s3:PutObject","Resource":"arn:aws:s3:::trail-logs/allowed/AWSLogs/{account}/*"}}]}}"#
+        )),
+    );
     let script = server.dir.join("trails.py");
     std::fs::write(&script, TRAILS_SCRIPT).expect("script");
     let output = Command::new(&python)
@@ -13263,6 +13279,10 @@ fn a_trail_delivers_its_accounts_events_as_log_files() {
             &other_secret,
             &user_key,
             &user_secret,
+            &maker_key,
+            &maker_secret,
+            &scoped_key,
+            &scoped_secret,
         ])
         .output()
         .expect("run python");
@@ -13277,7 +13297,7 @@ fn a_trail_delivers_its_accounts_events_as_log_files() {
 const TRAILS_SCRIPT: &str = r#"
 import sys, time, json, gzip, re
 import boto3, botocore.config, botocore.exceptions
-port, account, key, secret, other_key, other_secret, user_key, user_secret = sys.argv[1:9]
+port, account, key, secret, other_key, other_secret, user_key, user_secret, maker_key, maker_secret, scoped_key, scoped_secret = sys.argv[1:13]
 def client(service, access, secret_key):
     return boto3.client(service, endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
         aws_access_key_id=access, aws_secret_access_key=secret_key,
@@ -13297,12 +13317,14 @@ def wait_for(check):
     while not check():
         assert time.time() < deadline, "never"
         time.sleep(0.5)
-def files(prefix):
-    return [o["Key"] for o in s3.list_objects_v2(Bucket="trail-logs", Prefix=prefix).get("Contents", [])]
-def records(prefix):
+def files(prefix, bucket="trail-logs", reader=None):
+    reader = reader or s3
+    return [o["Key"] for o in reader.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])]
+def records(prefix, bucket="trail-logs", reader=None):
+    reader = reader or s3
     out = []
-    for name in files(prefix):
-        body = s3.get_object(Bucket="trail-logs", Key=name)["Body"].read()
+    for name in files(prefix, bucket, reader):
+        body = reader.get_object(Bucket=bucket, Key=name)["Body"].read()
         out += json.loads(gzip.decompress(body))["Records"]
     return out
 s3.create_bucket(Bucket="trail-logs")
@@ -13346,11 +13368,23 @@ assert all(r["recipientAccountId"] == account and r["eventSource"] == "s3.amazon
 assert "before" not in [r.get("requestParameters", {}).get("bucketName") for r in got if r["eventName"] == "CreateBucket"]
 assert "LatestDeliveryTime" in ct.get_trail_status(Name="main")
 # Another account's events and trails are its own.
-other_s3.get_bucket_versioning(Bucket="foreign")
+other_ct.create_trail(Name="theirs", S3BucketName="foreign")
+other_ct.start_logging(Name="theirs")
+# Calls of both accounts written together.
+for _ in range(10):
+    other_s3.get_bucket_versioning(Bucket="foreign")
+    s3.get_bucket_versioning(Bucket="watched")
+wait_for(lambda: "GetBucketVersioning" in [r["eventName"] for r in records("", "foreign", other_s3)])
+theirs = records("", "foreign", other_s3)
+assert all(r["recipientAccountId"] != account for r in theirs), theirs
+time.sleep(2.5)
+mine = records("ct/")
+assert all(r["recipientAccountId"] == account for r in mine), mine
+assert ct.describe_trails(trailNameList=[f"arn:aws:cloudtrail:us-east-1:{account[:-1]}9:trail/theirs"])["trailList"] == []
 refused(lambda: other_ct.get_trail(Name="main"), "TrailNotFoundException")
 refused(lambda: other_ct.get_trail(Name=arn), "TrailNotFoundException")
 refused(lambda: ct.get_trail(Name="arn:aws:s3:::trail-logs"), "CloudTrailARNInvalidException")
-assert other_ct.describe_trails()["trailList"] == []
+assert [t["Name"] for t in other_ct.describe_trails()["trailList"]] == ["theirs"]
 # A new prefix takes effect; a bucket gone is told in the status.
 ct.update_trail(Name="main", S3KeyPrefix="ct2")
 s3.get_bucket_versioning(Bucket="watched")
@@ -13372,6 +13406,27 @@ assert ct.get_trail_status(Name="main")["IsLogging"] is False
 s3.get_bucket_versioning(Bucket="watched")
 time.sleep(3)
 assert files("ct3/") == []
+# Log files in an Object Lock bucket keep its default retention.
+s3.create_bucket(Bucket="locked-logs", ObjectLockEnabledForBucket=True)
+s3.put_object_lock_configuration(Bucket="locked-logs", ObjectLockConfiguration={"ObjectLockEnabled": "Enabled",
+    "Rule": {"DefaultRetention": {"Mode": "GOVERNANCE", "Days": 1}}})
+ct.create_trail(Name="locked", S3BucketName="locked-logs")
+ct.start_logging(Name="locked")
+s3.get_bucket_versioning(Bucket="watched")
+wait_for(lambda: files("", "locked-logs"))
+held = s3.head_object(Bucket="locked-logs", Key=files("", "locked-logs")[0])
+assert held.get("ObjectLockMode") == "GOVERNANCE", held
+ct.delete_trail(Name="locked")
+# A trail's maker may write where its logs go.
+maker = client("cloudtrail", maker_key, maker_secret)
+refused(lambda: maker.create_trail(Name="sneaky", S3BucketName="trail-logs"), "InsufficientS3BucketPolicyException")
+scoped = client("cloudtrail", scoped_key, scoped_secret)
+scoped.create_trail(Name="scoped", S3BucketName="trail-logs", S3KeyPrefix="allowed")
+refused(lambda: scoped.update_trail(Name="scoped", S3KeyPrefix="forbidden"), "InsufficientS3BucketPolicyException")
+s3.create_bucket(Bucket="elsewhere-logs")
+refused(lambda: scoped.update_trail(Name="scoped", S3BucketName="elsewhere-logs"), "InsufficientS3BucketPolicyException")
+scoped.update_trail(Name="scoped", S3BucketName="trail-logs")
+scoped.delete_trail(Name="scoped")
 # A user needs cloudtrail permissions; a deleted trail is gone.
 refused(lambda: client("cloudtrail", user_key, user_secret).create_trail(Name="mine", S3BucketName="trail-logs"), "AccessDenied")
 ct.delete_trail(Name="main")
