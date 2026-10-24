@@ -195,7 +195,7 @@ fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\naccess_log_flush_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
             dir.join("truth.db").display()
         ),
     )
@@ -13226,6 +13226,180 @@ s3.put_bucket_logging(Bucket="source", BucketLoggingStatus={"LoggingEnabled": en
 s3.delete_bucket(Bucket="source")
 s3.create_bucket(Bucket="source")
 assert "LoggingEnabled" not in s3.get_bucket_logging(Bucket="source")
+print("ok")
+"#;
+
+#[test]
+fn access_logs_are_written_into_the_target_bucket() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "logged");
+    let (_, other_key, other_secret) = account_with_key(&server, "bystander");
+    let script = server.dir.join("access_logs.py");
+    std::fs::write(&script, ACCESS_LOG_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other_key,
+            &other_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const ACCESS_LOG_SCRIPT: &str = r#"
+import sys, time, re, http.client, urllib.parse, urllib.request, urllib.error
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other_key, other_secret = sys.argv[1:7]
+def client(access, secret_key, **config):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, **config))
+s3 = client(key, secret)
+other = client(other_key, other_secret)
+LINE = re.compile(r'(\S+) (\S+) \[([^\]]+)\] (\S+) (\S+) (\S+) (\S+) (\S+) "([^"]*)" (\S+) (\S+) (\S+) (\S+) '
+    r'(\S+) (\S+) "([^"]*)" "([^"]*)" (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+) (\S+)$')
+NAMES = ["owner", "bucket", "time", "ip", "requester", "request_id", "operation", "key", "uri", "status",
+    "error", "sent", "size", "total", "turnaround", "referer", "agent", "version", "host_id", "signature",
+    "cipher", "auth", "host", "tls", "access_point", "acl", "region"]
+def objects(client, bucket, prefix=""):
+    return [o["Key"] for o in client.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", [])]
+def lines(bucket, prefix):
+    out = []
+    for name in objects(s3, bucket, prefix):
+        text = s3.get_object(Bucket=bucket, Key=name)["Body"].read().decode()
+        for line in text.splitlines():
+            match = LINE.match(line)
+            assert match, line
+            out.append(dict(zip(NAMES, match.groups())))
+    return out
+def wait_for(check):
+    deadline = time.time() + 30
+    while not check():
+        assert time.time() < deadline, "never"
+        time.sleep(0.5)
+
+for bucket in ["src", "logs", "src2", "src3", "tmp", "src4", "lockme"]:
+    s3.create_bucket(Bucket=bucket)
+s3.put_bucket_logging(Bucket="src", BucketLoggingStatus={"LoggingEnabled": {"TargetBucket": "logs", "TargetPrefix": "src/"}})
+put = s3.put_object(Bucket="src", Key="a b.txt", Body=b"0123456789")
+assert s3.get_object(Bucket="src", Key="a b.txt")["Body"].read() == b"0123456789"
+s3.head_object(Bucket="src", Key="a b.txt")
+try:
+    s3.get_object(Bucket="src", Key="missing")
+    raise SystemExit("found")
+except botocore.exceptions.ClientError:
+    pass
+try:
+    urllib.request.urlopen(f"http://127.0.0.1:{port}/src/a%20b.txt?x-user=anon")
+    raise SystemExit("anonymous read")
+except urllib.error.HTTPError as error:
+    assert error.code == 403
+signer = client(key, secret, signature_version="s3v4")
+url = signer.generate_presigned_url("get_object", Params={"Bucket": "src", "Key": "a b.txt"})
+assert urllib.request.urlopen(url).read() == b"0123456789"
+s3.list_objects_v2(Bucket="src")
+s3.get_bucket_versioning(Bucket="src")
+# What a client sends cannot add lines or fields.
+for target in ['/src/a"b', "/src?versionId=v1%0AINJECTED"]:
+    hostile = http.client.HTTPConnection("127.0.0.1", int(port))
+    hostile.putrequest("GET", target, skip_accept_encoding=True)
+    hostile.putheader("User-Agent", 'UA" 999 "x')
+    hostile.putheader("Referer", 'r" INJECTED')
+    hostile.endheaders()
+    status = hostile.getresponse().status
+    assert status == 403, (target, status)
+wait_for(lambda: len(lines("logs", "src/")) >= 11)
+got = lines("logs", "src/")
+for name in objects(s3, "logs", "src/"):
+    assert re.fullmatch(r"src/\d{4}-\d{2}-\d{2}-\d{2}-\d{2}-\d{2}-[0-9A-F]{16}", name), name
+by_op = {}
+for line in got:
+    assert line["owner"] == account and line["bucket"] == "src", line
+    assert re.fullmatch(r"\d{2}/[A-Z][a-z]{2}/\d{4}:\d{2}:\d{2}:\d{2} \+0000", line["time"]), line
+    assert line["ip"] == "127.0.0.1" and line["host"] == f"127.0.0.1:{port}", line
+    assert line["cipher"] == line["tls"] == line["access_point"] == line["acl"] == line["region"] == "-", line
+    by_op.setdefault((line["operation"], line["status"]), []).append(line)
+(written,) = by_op[("REST.PUT.OBJECT", "200")]
+assert written["request_id"] == put["ResponseMetadata"]["RequestId"], written
+assert written["key"] == "a%20b.txt" and written["size"] == "10" and written["sent"] == "-", written
+assert written["requester"] == account and written["auth"] == "AuthHeader" and written["signature"] == "SigV4", written
+assert written["uri"].startswith("PUT /src/a%20b.txt") and written["uri"].endswith(" HTTP/1.1"), written
+assert written["agent"].startswith("Boto3/") and written["referer"] == "-", written
+read = [line for line in by_op[("REST.GET.OBJECT", "200")]]
+assert {line["auth"] for line in read} == {"AuthHeader", "QueryString"}, read
+assert all(line["sent"] == "10" and line["size"] == "10" for line in read), read
+assert by_op[("REST.HEAD.OBJECT", "200")][0]["size"] == "10"
+(missing,) = by_op[("REST.GET.OBJECT", "404")]
+assert missing["error"] == "NoSuchKey" and missing["key"] == "missing", missing
+(anonymous, quoted) = sorted(by_op[("REST.GET.OBJECT", "403")], key=lambda line: line["key"])
+assert quoted["key"] == "a%22b" and quoted["uri"] == "GET /src/a%22b HTTP/1.1", quoted
+(versioned,) = by_op[("REST.GET.BUCKET", "403")]
+assert versioned["version"] == "v1%0AINJECTED", versioned
+for line in [quoted, versioned]:
+    assert line["agent"] == "UA%22 999 %22x" and line["referer"] == "r%22 INJECTED", line
+assert anonymous["error"] == "AccessDenied" and anonymous["requester"] == "-" and anonymous["auth"] == "-", anonymous
+assert anonymous["signature"] == "-" and anonymous["uri"].endswith("?x-user=anon HTTP/1.1"), anonymous
+assert ("REST.GET.BUCKET", "200") in by_op and ("REST.GET.VERSIONING", "200") in by_op, sorted(by_op)
+# Partitioned keys, by the first request's day; a bucket requested while
+# its logging was off is logged once it is on.
+s3.list_objects_v2(Bucket="src2")
+s3.put_bucket_logging(Bucket="src2", BucketLoggingStatus={"LoggingEnabled": {"TargetBucket": "logs", "TargetPrefix": "p/",
+    "TargetObjectKeyFormat": {"PartitionedPrefix": {"PartitionDateSource": "EventTime"}}}})
+s3.list_objects_v2(Bucket="src2")
+wait_for(lambda: objects(s3, "logs", "p/"))
+for name in objects(s3, "logs", "p/"):
+    assert re.fullmatch(rf"p/{account}/us-east-1/src2/\d{{4}}/\d{{2}}/\d{{2}}/\d{{4}}-\d{{2}}-\d{{2}}-\d{{2}}-\d{{2}}-\d{{2}}-[0-9A-F]{{16}}", name), name
+# A target deleted and made again by another account, or given Object
+# Lock, gets no logs.
+s3.put_bucket_logging(Bucket="src3", BucketLoggingStatus={"LoggingEnabled": {"TargetBucket": "tmp", "TargetPrefix": ""}})
+s3.put_bucket_logging(Bucket="src4", BucketLoggingStatus={"LoggingEnabled": {"TargetBucket": "lockme", "TargetPrefix": ""}})
+s3.delete_bucket(Bucket="tmp")
+other.create_bucket(Bucket="tmp")
+s3.put_bucket_versioning(Bucket="lockme", VersioningConfiguration={"Status": "Enabled"})
+s3.put_object_lock_configuration(Bucket="lockme", ObjectLockConfiguration={"ObjectLockEnabled": "Enabled"})
+s3.list_objects_v2(Bucket="src3")
+s3.list_objects_v2(Bucket="src4")
+# A request to one owner's bucket, still running when another account
+# makes the name again, is in neither's logs.
+s3.create_bucket(Bucket="src5")
+other.create_bucket(Bucket="blogs")
+s3.put_bucket_logging(Bucket="src5", BucketLoggingStatus={"LoggingEnabled": {"TargetBucket": "logs", "TargetPrefix": "five/"}})
+url = urllib.parse.urlsplit(signer.generate_presigned_url("put_object", Params={"Bucket": "src5", "Key": "slow"}))
+slow = http.client.HTTPConnection("127.0.0.1", int(port))
+slow.putrequest("PUT", f"{url.path}?{url.query}", skip_accept_encoding=True)
+slow.putheader("Content-Length", "10")
+slow.endheaders()
+slow.send(b"01234")
+time.sleep(1)
+s3.delete_bucket(Bucket="src5")
+other.create_bucket(Bucket="src5")
+other.put_bucket_logging(Bucket="src5", BucketLoggingStatus={"LoggingEnabled": {"TargetBucket": "blogs", "TargetPrefix": ""}})
+slow.send(b"56789")
+assert slow.getresponse().status >= 400
+# Logging off: nothing more.
+s3.put_bucket_logging(Bucket="src", BucketLoggingStatus={})
+s3.put_object(Bucket="src", Key="after-off", Body=b"x")
+time.sleep(3)
+assert objects(other, "tmp") == [] and objects(s3, "lockme") == []
+for name in objects(other, "blogs"):
+    text = other.get_object(Bucket="blogs", Key=name)["Body"].read().decode()
+    assert " slow " not in text, text
+assert not [line for line in lines("logs", "src/") if line["key"] == "after-off"]
 print("ok")
 "#;
 

@@ -158,6 +158,24 @@ const SUBRESOURCES: &[&str] = &[
     "website",
 ];
 
+/// Who sent a request, as an access log names them: an account's root by
+/// its id, a user by its ARN (none: anonymous).
+pub(crate) fn requester(identity: &truthdb_iam::Identity) -> Option<String> {
+    match identity {
+        truthdb_iam::Identity::Root { account } => Some(account.clone()),
+        other => other.arn(),
+    }
+}
+
+/// The first sub-resource `request` names, implemented or not.
+pub(crate) fn subresource(request: &Request<Incoming>) -> Option<&'static str> {
+    SUBRESOURCES
+        .iter()
+        .chain(UNIMPLEMENTED)
+        .copied()
+        .find(|name| has_param(request, name))
+}
+
 /// Whether `request` names no sub-resource but those in `allowed`: only
 /// then may it be taken for the plain operation on its path. A sub-resource
 /// with a method or target it has no route for is refused instead (DELETE
@@ -352,6 +370,9 @@ pub async fn dispatch(
             .find(|(name, owner)| name == bucket && owner.is_some())
     {
         crate::metering::mark_seen(&request, Some(&owner));
+        if let Some(seen) = crate::metering::seen_of(&request) {
+            seen.mark_requester(requester(&authz.identity), auth.signed);
+        }
     }
     let scope = crate::scope::Scope {
         key: principal
@@ -1099,6 +1120,7 @@ async fn delete_bucket(state: &S3State, bucket: String) -> Result<Response<Body>
     .map_err(|err| bucket_error(err, &bucket))?;
     // Its metrics configurations went with it.
     state.metric_recorder.forget_bucket(&bucket);
+    state.access_logger.forget(&bucket);
     Ok(empty(StatusCode::NO_CONTENT))
 }
 

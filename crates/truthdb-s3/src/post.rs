@@ -578,6 +578,13 @@ pub async fn post_object(
             .find(|(name, owner)| *name == bucket && owner.is_some())
     {
         seen.mark(Some(&owner));
+        seen.mark_requester(
+            crate::api::requester(&authz.identity),
+            principal.as_ref().map(|(_, at_ms)| Signed {
+                auth_type: "POST",
+                at_ms: Some(*at_ms),
+            }),
+        );
     }
     authz.check_storing(
         "s3:PutObject",

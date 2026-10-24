@@ -33,6 +33,9 @@ struct Seen {
     /// The bucket's owner when the request was authorized (none: not
     /// known where it was marked).
     owner: Mutex<Option<String>>,
+    /// Who sent the request and how it was signed (for its access log
+    /// line).
+    requester: Mutex<(Option<String>, Option<crate::server::Signed>)>,
     copy_source: Mutex<Option<String>>,
 }
 
@@ -48,6 +51,35 @@ impl BucketSeen {
 
     pub(crate) fn seen(&self) -> bool {
         self.0.bucket.load(Ordering::Relaxed)
+    }
+
+    pub(crate) fn mark_requester(
+        &self,
+        requester: Option<String>,
+        signed: Option<crate::server::Signed>,
+    ) {
+        *self
+            .0
+            .requester
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = (requester, signed);
+    }
+
+    /// Who sent the request, whether it was signed, and `AuthHeader` or
+    /// `QueryString` (none: anonymous, a form upload, or not known).
+    pub(crate) fn requester(&self) -> (Option<String>, bool, Option<&'static str>) {
+        let (requester, signed) = self
+            .0
+            .requester
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let auth_type = signed.and_then(|signed| match signed.auth_type {
+            "REST-HEADER" => Some("AuthHeader"),
+            "REST-QUERY-STRING" => Some("QueryString"),
+            _ => None,
+        });
+        (requester, signed.is_some(), auth_type)
     }
 
     /// The owner the bucket had when the request was authorized.
@@ -167,6 +199,11 @@ pub(crate) struct MeteredBody {
     /// The metric history's series the request counts in, and when it
     /// came (seconds).
     history: Option<(Arc<MetricRecorder>, Matched, u64)>,
+    /// The request's access log line, if its bucket's logging is on.
+    log: Option<(
+        Arc<crate::access_log::AccessLogger>,
+        crate::access_log::Entry,
+    )>,
     sent: u64,
     done: bool,
 }
@@ -177,12 +214,17 @@ impl MeteredBody {
         counters: Arc<BucketRequests>,
         started: Instant,
         history: Option<(Arc<MetricRecorder>, Matched, u64)>,
+        log: Option<(
+            Arc<crate::access_log::AccessLogger>,
+            crate::access_log::Entry,
+        )>,
     ) -> Self {
         MeteredBody {
             inner,
             counters,
             started,
             history,
+            log,
             sent: 0,
             done: false,
         }
@@ -199,6 +241,9 @@ impl MeteredBody {
                     *at,
                     &crate::metric_history::finished(self.sent, total),
                 );
+            }
+            if let Some((logger, entry)) = &self.log {
+                logger.record(entry, self.sent, total.as_millis() as u64);
             }
         }
     }

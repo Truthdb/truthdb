@@ -158,10 +158,18 @@ pub struct S3Config {
     /// How often what the metric history counted is written (seconds).
     #[serde(default = "default_metrics_flush_seconds")]
     pub metrics_flush_seconds: u64,
+
+    /// How often the server access logs kept are written (seconds).
+    #[serde(default = "default_access_log_flush_seconds")]
+    pub access_log_flush_seconds: u64,
 }
 
 fn default_metrics_flush_seconds() -> u64 {
     60
+}
+
+fn default_access_log_flush_seconds() -> u64 {
+    300
 }
 
 impl S3Config {
@@ -214,6 +222,7 @@ impl Default for S3Config {
             restore_seconds: RestoreSeconds::default(),
             domains: Vec::new(),
             metrics_flush_seconds: default_metrics_flush_seconds(),
+            access_log_flush_seconds: default_access_log_flush_seconds(),
         }
     }
 }
