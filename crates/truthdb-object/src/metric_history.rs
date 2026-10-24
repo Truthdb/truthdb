@@ -99,7 +99,8 @@ impl Stats {
         }
     }
 
-    fn merge(&mut self, other: &Stats) {
+    /// Adds `other` to these statistics.
+    pub fn merge(&mut self, other: &Stats) {
         if other.count == 0 {
             return;
         }

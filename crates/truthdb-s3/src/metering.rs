@@ -15,7 +15,9 @@ use hyper::{Method, Request};
 use truthdb_engine::metrics::{BucketRequests, RequestKind};
 
 use crate::api::{Target, has_param, plain};
+use crate::metric_history::MetricRecorder;
 use crate::server::Body;
+use truthdb_object::MetricSeries;
 
 /// What the route found of a request's buckets, in its extensions: whether
 /// the bucket it names exists (set where the route loads the bucket to
@@ -74,6 +76,9 @@ pub(crate) fn mark_seen<B>(request: &Request<B>) {
 pub(crate) struct Metered {
     pub bucket: String,
     pub kind: RequestKind,
+    /// The object's key (none: the bucket's own request), which metrics
+    /// configurations filter on.
+    pub key: Option<String>,
 }
 
 /// What `request` counts as, if it is for a bucket: not for the service
@@ -86,23 +91,27 @@ pub(crate) fn metered(request: &Request<Incoming>) -> Option<Metered> {
             Method::HEAD => RequestKind::Head,
             _ => RequestKind::Other,
         };
+        let key = crate::sigv4::decode_path(request.uri().path())
+            .map(|path| path.trim_start_matches('/').to_string());
         return Some(Metered {
             bucket: bucket.clone(),
             kind,
+            key,
         });
     }
     if matches!(
         crate::server::request_service(request).as_deref(),
-        Some("s3vectors" | "iam" | "sts")
+        Some("s3vectors" | "iam" | "sts" | "monitoring")
     ) || crate::api::control_route(request).is_some()
     {
         return None;
     }
-    let (bucket, object) = match crate::api::target(request).ok()? {
+    let (bucket, key) = match crate::api::target(request).ok()? {
         Target::Service => return None,
-        Target::Bucket(bucket) => (bucket, false),
-        Target::Object(bucket, _) => (bucket, true),
+        Target::Bucket(bucket) => (bucket, None),
+        Target::Object(bucket, key) => (bucket, Some(key)),
     };
+    let object = key.is_some();
     let kind = match (object, method.clone()) {
         (_, Method::HEAD) => RequestKind::Head,
         (true, Method::GET) if !has_param(request, "uploadId") => RequestKind::Get,
@@ -113,7 +122,7 @@ pub(crate) fn metered(request: &Request<Incoming>) -> Option<Metered> {
         (false, Method::GET) if plain(request, &["versions", "uploads"]) => RequestKind::List,
         _ => RequestKind::Other,
     };
-    Some(Metered { bucket, kind })
+    Some(Metered { bucket, kind, key })
 }
 
 /// The bytes a request's head says its payload has: an aws-chunked body's
@@ -138,16 +147,25 @@ pub(crate) struct MeteredBody {
     inner: Body,
     counters: Arc<BucketRequests>,
     started: Instant,
+    /// The metric history's series the request counts in, and when it
+    /// came (seconds).
+    history: Option<(Arc<MetricRecorder>, Vec<MetricSeries>, u64)>,
     sent: u64,
     done: bool,
 }
 
 impl MeteredBody {
-    pub(crate) fn new(inner: Body, counters: Arc<BucketRequests>, started: Instant) -> Self {
+    pub(crate) fn new(
+        inner: Body,
+        counters: Arc<BucketRequests>,
+        started: Instant,
+        history: Option<(Arc<MetricRecorder>, Vec<MetricSeries>, u64)>,
+    ) -> Self {
         MeteredBody {
             inner,
             counters,
             started,
+            history,
             sent: 0,
             done: false,
         }
@@ -156,7 +174,15 @@ impl MeteredBody {
     fn finish(&mut self) {
         if !self.done {
             self.done = true;
-            self.counters.finished(self.sent, self.started.elapsed());
+            let total = self.started.elapsed();
+            self.counters.finished(self.sent, total);
+            if let Some((recorder, series, at)) = &self.history {
+                recorder.record(
+                    series,
+                    *at,
+                    &crate::metric_history::finished(self.sent, total),
+                );
+            }
         }
     }
 }

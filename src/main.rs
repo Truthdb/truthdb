@@ -307,6 +307,10 @@ async fn main() -> ExitCode {
                     },
                     domains,
                     request_metrics: request_metrics.clone(),
+                    metric_recorder: Default::default(),
+                    metrics_flush: std::time::Duration::from_secs(
+                        config.s3.metrics_flush_seconds.max(1),
+                    ),
                 });
                 let shutdown_rx = shutdown_tx.subscribe();
                 Some(tokio::spawn(truthdb_s3::server::serve(

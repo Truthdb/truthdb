@@ -195,7 +195,7 @@ fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\nmetrics_flush_seconds = 1\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
             dir.join("truth.db").display()
         ),
     )
@@ -13038,9 +13038,11 @@ fn a_bucket_keeps_up_to_a_thousand_metrics_configurations() {
     let (status, missing) = call("GET", "/measured", "metrics&id=none", &[], b"");
     assert_eq!(status, 404);
     assert_eq!(xml_value(&missing, "Code"), "NoSuchConfiguration");
-    // The body needs its Content-MD5; its Id must be the one named.
+    // The body needs no Content-MD5 (the SDKs send none); its Id must be
+    // the one named.
     let plain = b"<MetricsConfiguration><Id>a</Id></MetricsConfiguration>";
-    assert_eq!(call("PUT", "/measured", "metrics&id=a", &[], plain).0, 400);
+    assert_eq!(call("PUT", "/measured", "metrics&id=a", &[], plain).0, 200);
+    assert_eq!(call("DELETE", "/measured", "metrics&id=a", &[], b"").0, 204);
     let md5 = content_md5(plain);
     let (status, reply) = call(
         "PUT",
@@ -13119,3 +13121,145 @@ fn a_bucket_keeps_up_to_a_thousand_metrics_configurations() {
     assert_eq!(call("GET", "/measured/k", "metrics&id=a", &[], b"").0, 501);
     assert_eq!(call("PUT", "/measured/k", "id=a", &[], b"x").0, 501);
 }
+
+#[test]
+fn cloudwatch_reads_the_request_and_storage_metrics_of_a_bucket() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let mut server = start_server();
+    let port = server.s3_port;
+    let (_, key, secret) = account_with_key(&server, "watcher");
+    let (_, other_key, other_secret) = account_with_key(&server, "stranger");
+    let run = |server: &Server, phase: &str| {
+        let script = server.dir.join("cloudwatch.py");
+        std::fs::write(&script, CLOUDWATCH_SCRIPT).expect("script");
+        let output = Command::new(&python)
+            .arg(&script)
+            .args([
+                phase,
+                &port.to_string(),
+                &key,
+                &secret,
+                &other_key,
+                &other_secret,
+            ])
+            .output()
+            .expect("run python");
+        assert!(
+            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+            "{phase}\n{}\n{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run(&server, "requests");
+    // Flushed points outlive a crash; the storage is sampled on the way up.
+    crash_and_restart(&mut server);
+    run(&server, "after-restart");
+    crash_and_restart(&mut server);
+    run(&server, "after-restart");
+}
+
+const CLOUDWATCH_SCRIPT: &str = r#"
+import sys, time, datetime
+import boto3, botocore.config, botocore.exceptions
+phase, port, key, secret, other_key, other_secret = sys.argv[1:7]
+def client(service, access, secret_key):
+    return boto3.client(service, endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+s3 = client("s3", key, secret)
+cw = client("cloudwatch", key, secret)
+now = datetime.datetime.now(datetime.timezone.utc)
+start, end = now - datetime.timedelta(minutes=30), now + datetime.timedelta(minutes=5)
+def dims(filter_id):
+    return [{"Name": "BucketName", "Value": "watched"}, {"Name": "FilterId", "Value": filter_id}]
+def total(name, filter_id, stat="Sum"):
+    points = cw.get_metric_statistics(Namespace="AWS/S3", MetricName=name, Dimensions=dims(filter_id),
+        StartTime=start, EndTime=end, Period=60, Statistics=[stat])["Datapoints"]
+    return sum(point[stat] for point in points)
+def wait_for(check):
+    deadline = time.time() + 30
+    while True:
+        try:
+            if check():
+                return
+        except AssertionError:
+            pass
+        if time.time() > deadline:
+            assert check(), "never"
+        time.sleep(0.5)
+
+if phase == "requests":
+    s3.create_bucket(Bucket="watched")
+    s3.put_bucket_metrics_configuration(Bucket="watched", Id="EntireBucket",
+        MetricsConfiguration={"Id": "EntireBucket"})
+    s3.put_bucket_metrics_configuration(Bucket="watched", Id="Docs",
+        MetricsConfiguration={"Id": "Docs", "Filter": {"Prefix": "docs/"}})
+    s3.put_object(Bucket="watched", Key="docs/a", Body=b"0123456789")
+    assert s3.get_object(Bucket="watched", Key="docs/a")["Body"].read() == b"0123456789"
+    s3.head_object(Bucket="watched", Key="docs/a")
+    try:
+        s3.get_object(Bucket="watched", Key="img/missing")
+        raise SystemExit("a missing key was found")
+    except botocore.exceptions.ClientError:
+        pass
+    # The prefix filter counts the three requests under docs/.
+    wait_for(lambda: total("AllRequests", "Docs") == 3 and total("TotalRequestLatency", "Docs", "SampleCount") == 3)
+    for name, expected in [("GetRequests", 1), ("PutRequests", 1), ("HeadRequests", 1),
+                           ("BytesUploaded", 10), ("BytesDownloaded", 10), ("4xxErrors", 0)]:
+        assert total(name, "Docs") == expected, (name, total(name, "Docs"))
+    assert total("AllRequests", "EntireBucket") >= 5
+    assert total("4xxErrors", "EntireBucket") >= 1
+    metrics = cw.list_metrics(Namespace="AWS/S3")["Metrics"]
+    found = {(m["MetricName"], tuple((d["Name"], d["Value"]) for d in m["Dimensions"])) for m in metrics}
+    assert ("AllRequests", (("BucketName", "watched"), ("FilterId", "Docs"))) in found, found
+    assert ("FirstByteLatency", (("BucketName", "watched"), ("FilterId", "EntireBucket"))) in found, found
+    data = cw.get_metric_data(StartTime=start, EndTime=end, MetricDataQueries=[
+        {"Id": "all", "MetricStat": {"Metric": {"Namespace": "AWS/S3", "MetricName": "AllRequests",
+            "Dimensions": dims("Docs")}, "Period": 300, "Stat": "Sum"}},
+        {"Id": "slow", "Label": "p99 first byte", "MetricStat": {"Metric": {"Namespace": "AWS/S3",
+            "MetricName": "FirstByteLatency", "Dimensions": dims("Docs")}, "Period": 300, "Stat": "p99"}},
+    ])["MetricDataResults"]
+    assert data[0]["Label"] == "AWS/S3 AllRequests", data
+    assert sum(data[0]["Values"]) == 3, data
+    assert data[1]["Label"] == "p99 first byte" and data[1]["Values"], data
+    # Errors as CloudWatch answers them.
+    for call, code in [
+        (lambda: cw.get_metric_statistics(Namespace="AWS/S3", MetricName="AllRequests", Dimensions=dims("Docs"),
+            StartTime=start, EndTime=end, Period=60), "InvalidParameterCombination"),
+        (lambda: cw.get_metric_data(StartTime=start, EndTime=end, MetricDataQueries=[
+            {"Id": "e1", "Expression": "SUM(METRICS())"}]), "InvalidParameterValue"),
+    ]:
+        try:
+            call()
+            raise SystemExit("not refused")
+        except botocore.exceptions.ClientError as error:
+            assert error.response["Error"]["Code"] == code, error.response
+    # Another account sees none of them.
+    stranger = client("cloudwatch", other_key, other_secret)
+    assert stranger.list_metrics(Namespace="AWS/S3")["Metrics"] == []
+    assert stranger.get_metric_statistics(Namespace="AWS/S3", MetricName="AllRequests", Dimensions=dims("Docs"),
+        StartTime=start, EndTime=end, Period=60, Statistics=["Sum"])["Datapoints"] == []
+    print("ok")
+else:
+    assert total("AllRequests", "Docs") == 3
+    day = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    def stored(storage, name):
+        points = cw.get_metric_statistics(Namespace="AWS/S3", MetricName=name,
+            Dimensions=[{"Name": "BucketName", "Value": "watched"}, {"Name": "StorageType", "Value": storage}],
+            StartTime=day, EndTime=day + datetime.timedelta(days=1), Period=86400, Statistics=["Average"])["Datapoints"]
+        return [point["Average"] for point in points]
+    wait_for(lambda: stored("StandardStorage", "BucketSizeBytes") == [10.0])
+    assert stored("AllStorageTypes", "NumberOfObjects") == [1.0]
+    # Sampled once a day, restarts or not (after this start's first flushes).
+    time.sleep(2.5)
+    samples = cw.get_metric_statistics(Namespace="AWS/S3", MetricName="NumberOfObjects",
+        Dimensions=[{"Name": "BucketName", "Value": "watched"}, {"Name": "StorageType", "Value": "AllStorageTypes"}],
+        StartTime=day, EndTime=day + datetime.timedelta(days=1), Period=86400, Statistics=["SampleCount"])["Datapoints"]
+    assert [point["SampleCount"] for point in samples] == [1.0], samples
+    print("ok")
+"#;

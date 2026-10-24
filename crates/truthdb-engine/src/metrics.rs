@@ -37,7 +37,7 @@ pub enum RequestKind {
 
 /// The latency histograms' upper bounds, in milliseconds: powers of two up
 /// to about 17 minutes; slower requests fall in the last, unbounded one.
-const LATENCY_BOUNDS_MS: [u64; 21] = [
+pub const LATENCY_BOUNDS_MS: [u64; 21] = [
     1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072,
     262144, 524288, 1048576,
 ];

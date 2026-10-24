@@ -154,6 +154,14 @@ pub struct S3Config {
     /// bucket `photos`. Other hosts are path-style.
     #[serde(default)]
     pub domains: Vec<String>,
+
+    /// How often what the metric history counted is written (seconds).
+    #[serde(default = "default_metrics_flush_seconds")]
+    pub metrics_flush_seconds: u64,
+}
+
+fn default_metrics_flush_seconds() -> u64 {
+    60
 }
 
 impl S3Config {
@@ -205,6 +213,7 @@ impl Default for S3Config {
             tls_key: None,
             restore_seconds: RestoreSeconds::default(),
             domains: Vec::new(),
+            metrics_flush_seconds: default_metrics_flush_seconds(),
         }
     }
 }
