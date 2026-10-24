@@ -8,6 +8,7 @@ pub mod api;
 pub mod authz;
 pub mod batch;
 pub mod batch_run;
+pub mod cloudtrail;
 pub mod cloudwatch;
 pub mod copy;
 pub mod cors;
