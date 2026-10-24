@@ -8,7 +8,7 @@ use hyper::{Method, Request, Response, StatusCode};
 use truthdb_object::BUCKET_METRICS;
 
 use crate::error::{S3Error, escape};
-use crate::object_lock::{malformed, read_checked_body};
+use crate::object_lock::malformed;
 use crate::server::{Authenticated, Body, S3State, full};
 use crate::xml::{self, Element};
 
@@ -236,9 +236,15 @@ pub async fn bucket_metrics(
             "A metrics configuration's id is 1 to 64 letters, numbers, periods, dashes and underscores",
         ));
     }
+    let bucket_name = bucket.clone();
     match method {
         Method::PUT => {
-            let body = read_checked_body(request, auth, MAX_BODY).await?;
+            // No checksum needed (the SDKs send none), but one sent is checked.
+            let body = if crate::object_lock::has_integrity_check(request.headers()) {
+                crate::object_lock::read_checked_body(request, auth, MAX_BODY).await?
+            } else {
+                crate::server::read_body(request, auth, MAX_BODY).await?
+            };
             let document = render(&parse(&body, &id)?);
             let refused = crate::scope::object(state, move |file| {
                 file.transaction(|tx| {
@@ -251,6 +257,7 @@ pub async fn bucket_metrics(
                 })
             })
             .await?;
+            state.metric_recorder.forget(&bucket_name);
             if refused {
                 return Err(S3Error::new(
                     400,
@@ -273,6 +280,7 @@ pub async fn bucket_metrics(
                 file.transaction(|tx| tx.delete_bucket_config(&bucket, BUCKET_METRICS, &id))
             })
             .await?;
+            state.metric_recorder.forget(&bucket_name);
             if !deleted {
                 return Err(no_configuration());
             }

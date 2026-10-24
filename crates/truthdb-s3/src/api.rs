@@ -346,12 +346,12 @@ pub async fn dispatch(
     .await?;
     // The request's bucket exists: it counts in the request metrics.
     if let Target::Bucket(bucket) | Target::Object(bucket, _) = &target
-        && authz
+        && let Some((_, Some(owner))) = authz
             .owners()
-            .iter()
-            .any(|(name, owner)| name == bucket && owner.is_some())
+            .into_iter()
+            .find(|(name, owner)| name == bucket && owner.is_some())
     {
-        crate::metering::mark_seen(&request);
+        crate::metering::mark_seen(&request, Some(&owner));
     }
     let scope = crate::scope::Scope {
         key: principal
@@ -1083,6 +1083,8 @@ async fn delete_bucket(state: &S3State, bucket: String) -> Result<Response<Body>
     })
     .await?
     .map_err(|err| bucket_error(err, &bucket))?;
+    // Its metrics configurations went with it.
+    state.metric_recorder.forget_bucket(&bucket);
     Ok(empty(StatusCode::NO_CONTENT))
 }
 

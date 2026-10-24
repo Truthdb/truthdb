@@ -55,6 +55,9 @@ pub struct S3State {
     pub domains: Vec<String>,
     /// The requests counted per bucket (`sys.dm_s3_requests`).
     pub request_metrics: std::sync::Arc<truthdb_engine::metrics::RequestMetrics>,
+    /// The metric history being counted, and how often it is flushed.
+    pub metric_recorder: std::sync::Arc<crate::metric_history::MetricRecorder>,
+    pub metrics_flush: std::time::Duration,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
@@ -104,14 +107,22 @@ pub async fn serve(
     tls: Option<tokio_rustls::TlsAcceptor>,
     mut shutdown: watch::Receiver<bool>,
 ) {
-    // Batch Operations jobs run beside the listener.
+    // Batch Operations jobs run beside the listener, and the metric
+    // history's flushes.
     tokio::spawn(crate::batch_run::run(Arc::clone(&state), shutdown.clone()));
+    // Its last flush is waited for: what was counted is written before
+    // the engine closes.
+    let flusher = tokio::spawn(crate::metric_history::run(
+        Arc::clone(&state),
+        shutdown.clone(),
+    ));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let slot = tokio::select! {
             slot = Arc::clone(&slots).acquire_owned() => slot.expect("the semaphore is never closed"),
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    let _ = flusher.await;
                     return;
                 }
                 continue;
@@ -128,6 +139,7 @@ pub async fn serve(
             },
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
+                    let _ = flusher.await;
                     return;
                 }
                 continue;
@@ -200,6 +212,7 @@ impl RequestIds {
 
 async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Body> {
     let started = std::time::Instant::now();
+    let arrived = crate::objects::now_ms() / 1000;
     let resource = request.uri().path().to_string();
     // Virtual-hosted addressing: the bucket named by the Host, decided once
     // for every reader of the request's target.
@@ -263,12 +276,14 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         Err(err) => error_response(&err, &resource, &ids),
     };
     if let Some(metered) = metered.filter(|_| seen.seen()) {
+        // The latency to the first byte, before the lookups below.
+        let first_byte = started.elapsed();
         let counters = state.request_metrics.bucket(&metered.bucket);
         counters.answered(
             metered.kind,
             uploaded,
             response.status().as_u16(),
-            started.elapsed(),
+            first_byte,
         );
         // The source of a copy made (one the route copied from, and read).
         if let Some(source) = seen.copy_source()
@@ -276,8 +291,33 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         {
             state.request_metrics.bucket(&source).copied_from();
         }
-        response =
-            response.map(|body| crate::metering::MeteredBody::new(body, counters, started).boxed());
+        // And in the metric history, under each metrics configuration it
+        // matches.
+        let series = state
+            .metric_recorder
+            .matching(
+                state,
+                &metered.bucket,
+                metered.key.as_deref(),
+                seen.owner().as_deref(),
+            )
+            .await;
+        let history = (!series.is_empty()).then(|| {
+            state.metric_recorder.record(
+                &series,
+                arrived,
+                &crate::metric_history::answered(
+                    metered.kind,
+                    uploaded,
+                    response.status().as_u16(),
+                    first_byte,
+                ),
+            );
+            (Arc::clone(&state.metric_recorder), series, arrived)
+        });
+        response = response.map(|body| {
+            crate::metering::MeteredBody::new(body, counters, started, history).boxed()
+        });
     }
     if let Some((bucket, origin, method)) = cross_origin {
         let headers = response.headers_mut();
@@ -343,6 +383,8 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
             let service = service.to_string();
             return Ok(crate::iam_api::handle(state, request, &service).await);
         }
+        // CloudWatch, over the S3 metric history.
+        Some("monitoring") => return Ok(crate::cloudwatch::handle(state, request).await),
         _ => {}
     }
     // The signature covers parameter names decoded, while operations are

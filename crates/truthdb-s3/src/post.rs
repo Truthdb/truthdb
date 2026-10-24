@@ -572,12 +572,12 @@ pub async fn post_object(
     .await?;
     // The bucket exists: the upload counts in the request metrics.
     if let Some(seen) = &seen
-        && authz
+        && let Some((_, Some(owner))) = authz
             .owners()
-            .iter()
-            .any(|(name, owner)| *name == bucket && owner.is_some())
+            .into_iter()
+            .find(|(name, owner)| *name == bucket && owner.is_some())
     {
-        seen.mark();
+        seen.mark(Some(&owner));
     }
     authz.check_storing(
         "s3:PutObject",
