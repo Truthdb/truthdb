@@ -35,6 +35,9 @@ pub const BUCKET_NOTIFICATION: u8 = 6;
 pub const BUCKET_CORS: u8 = 7;
 /// Bucket configuration: its website configuration (the rendered XML).
 pub const BUCKET_WEBSITE: u8 = 8;
+/// Bucket configurations: its S3 Inventory configurations, by id (see
+/// `inventory`).
+pub const BUCKET_INVENTORY: u8 = 10;
 /// Bucket configuration: its server access logging (the rendered XML).
 pub const BUCKET_LOGGING: u8 = 9;
 /// An account's CloudTrail trails, kept under the empty bucket name, by
