@@ -76,6 +76,11 @@ pub(crate) struct Call {
     name: &'static str,
     read_only: bool,
     bucket: Option<String>,
+    /// The object a data event acts on.
+    key: Option<String>,
+    /// A data event (an object-level operation, logged only to trails that
+    /// select it) rather than a management event.
+    data: bool,
     sub: Option<&'static str>,
     host: Option<String>,
     user_agent: Option<String>,
@@ -115,6 +120,33 @@ impl Call {
                 _ => return None,
             }
         };
+        Some(Call::build(request, name, bucket, None, false))
+    }
+
+    /// The data event `request` makes, if it is one (S3's object-level
+    /// operations, HeadBucket and listings).
+    pub(crate) fn data(request: &hyper::Request<Incoming>) -> Option<Call> {
+        if request
+            .extensions()
+            .get::<crate::website::WebsiteHost>()
+            .is_some()
+            || crate::server::request_service(request).is_some_and(|service| service != "s3")
+            || crate::api::subresource_count(request) > 1
+            || crate::api::control_route(request).is_some()
+        {
+            return None;
+        }
+        let (name, bucket, key) = data_event(request)?;
+        Some(Call::build(request, name, Some(bucket), key, true))
+    }
+
+    fn build(
+        request: &hyper::Request<Incoming>,
+        name: &'static str,
+        bucket: Option<String>,
+        key: Option<String>,
+        data: bool,
+    ) -> Call {
         let header = |name: &str| {
             request
                 .headers()
@@ -123,17 +155,85 @@ impl Call {
                 .map(str::to_string)
         };
         let connection = request.extensions().get::<Connection>();
-        Some(Call {
+        Call {
             name,
-            read_only: name.starts_with("Get") || name.starts_with("List"),
+            read_only: ["Get", "List", "Head"]
+                .iter()
+                .any(|verb| name.starts_with(verb)),
             bucket,
+            key,
+            data,
             sub: subresource(request),
             host: header("host"),
             user_agent: header("user-agent"),
             source_ip: connection.map(|connection| connection.peer.ip().to_string()),
             tls: connection.is_some_and(|connection| connection.tls),
-        })
+        }
     }
+}
+
+/// The data event a request makes: its name, bucket and object (S3's
+/// AWS::S3::Object data events, and HeadBucket and listings of a bucket).
+fn data_event(
+    request: &hyper::Request<Incoming>,
+) -> Option<(&'static str, String, Option<String>)> {
+    let method = request.method();
+    let copy = request.headers().contains_key("x-amz-copy-source");
+    let (bucket, key) = match crate::api::target(request).ok()? {
+        Target::Bucket(bucket) => (bucket, None),
+        Target::Object(bucket, key) => (bucket, Some(key)),
+        Target::Service => return None,
+    };
+    let by = |get: &'static str, put: Option<&'static str>, delete: Option<&'static str>| {
+        match *method {
+            Method::GET => Some(get),
+            Method::PUT => put,
+            Method::DELETE => delete,
+            _ => None,
+        }
+    };
+    let name = match (key.is_some(), subresource(request)) {
+        (false, None) => match *method {
+            Method::HEAD => "HeadBucket",
+            Method::GET => "ListObjects",
+            _ => return None,
+        },
+        (false, Some("versions")) if *method == Method::GET => "ListObjectVersions",
+        (false, Some("delete")) if *method == Method::POST => "DeleteObjects",
+        (false, _) => return None,
+        (true, None) => match *method {
+            Method::GET => "GetObject",
+            Method::HEAD => "HeadObject",
+            Method::PUT if copy => "CopyObject",
+            Method::PUT => "PutObject",
+            Method::DELETE => "DeleteObject",
+            _ => return None,
+        },
+        (true, Some("uploads")) if *method == Method::POST => "CreateMultipartUpload",
+        (true, Some("uploadId")) => match *method {
+            Method::PUT if copy => "UploadPartCopy",
+            Method::PUT => "UploadPart",
+            Method::POST => "CompleteMultipartUpload",
+            Method::DELETE => "AbortMultipartUpload",
+            Method::GET => "ListParts",
+            _ => return None,
+        },
+        (true, Some("tagging")) => by(
+            "GetObjectTagging",
+            Some("PutObjectTagging"),
+            Some("DeleteObjectTagging"),
+        )?,
+        (true, Some("acl")) => by("GetObjectAcl", Some("PutObjectAcl"), None)?,
+        // AWS records PutObjectRetention as PutObjectLockRetention.
+        (true, Some("retention")) => {
+            by("GetObjectRetention", Some("PutObjectLockRetention"), None)?
+        }
+        (true, Some("legal-hold")) => by("GetObjectLegalHold", Some("PutObjectLegalHold"), None)?,
+        (true, Some("restore")) if *method == Method::POST => "RestoreObject",
+        (true, Some("attributes")) if *method == Method::GET => "GetObjectAttributes",
+        (true, _) => return None,
+    };
+    Some((name, bucket, key))
 }
 
 /// The event name of a request on a bucket, if it is a management event.
@@ -255,6 +355,7 @@ fn record(
     state: &S3State,
     call: &Call,
     who: &Caller,
+    recipient: &str,
     owner: Option<&str>,
     time_ms: u64,
     request_id: &str,
@@ -318,18 +419,30 @@ fn record(
         "eventID": event_id,
         "readOnly": call.read_only,
         "eventType": "AwsApiCall",
-        "managementEvent": true,
-        "recipientAccountId": account,
-        "eventCategory": "Management",
+        "managementEvent": !call.data,
+        "recipientAccountId": recipient,
+        "eventCategory": if call.data { "Data" } else { "Management" },
     });
     if let Some(bucket) = &call.bucket {
-        record["resources"] = json!([{
+        // A name no bucket can have (a refused call's) made printable and
+        // cut short.
+        let bucket = truncated(&printable(bucket), 255).to_string();
+        let mut resources = vec![json!({
             "accountId": owner.unwrap_or(account),
             "type": "AWS::S3::Bucket",
-            // A name no bucket can have (a refused call's) made printable
-            // and cut short.
-            "ARN": format!("arn:aws:s3:::{}", truncated(&printable(bucket), 255)),
-        }]);
+            "ARN": format!("arn:aws:s3:::{bucket}"),
+        })];
+        if let Some(key) = &call.key {
+            let key = truncated(&printable(key), 512).to_string();
+            resources.insert(
+                0,
+                json!({ "type": "AWS::S3::Object", "ARN": format!("arn:aws:s3:::{bucket}/{key}") }),
+            );
+            if fit == Fit::Whole {
+                record["requestParameters"]["key"] = json!(key);
+            }
+        }
+        record["resources"] = json!(resources);
     }
     if let Some((code, message)) = error {
         record["errorCode"] = json!(code);
@@ -498,7 +611,7 @@ impl ActivityRecorder {
         let mut bytes = None;
         for fit in [Fit::Whole, Fit::NoParameters, Fit::Short, Fit::Bare] {
             let built = record(
-                state, call, &who, owner, time_ms, request_id, &event_id, error, fit,
+                state, call, &who, &account, owner, time_ms, request_id, &event_id, error, fit,
             )
             .to_string()
             .into_bytes();
@@ -592,6 +705,56 @@ impl ActivityRecorder {
             .collect()
     }
 
+    /// Hands the data event of `call` (answered with `error`, if it failed)
+    /// to the trails that select it: the requester's account's and the
+    /// bucket owner's (`owner`), as CloudTrail delivers object-level events
+    /// to both. Anonymous calls are not recorded.
+    pub(crate) async fn record_data(
+        &self,
+        state: &S3State,
+        call: &Call,
+        who: &Who,
+        owner: Option<&str>,
+        request_id: &str,
+        error: Option<(&str, &str)>,
+    ) {
+        let Some(who) = who.get() else {
+            return;
+        };
+        let mut accounts = vec![who.0.account.clone()];
+        if let Some(owner) = owner
+            && owner != who.0.account
+        {
+            accounts.push(owner.to_string());
+        }
+        let time_ms = crate::objects::now_ms();
+        let (event_id, _) = event_id();
+        for account in accounts {
+            let trails = state.trail_selectors.logging(state, &account).await;
+            if !trails
+                .iter()
+                .any(|(_, _, selectors)| selectors.as_ref().is_some_and(|s| s.wants_data()))
+            {
+                continue;
+            }
+            for fit in [Fit::Whole, Fit::NoParameters, Fit::Short, Fit::Bare] {
+                let built = record(
+                    state, call, &who, &account, owner, time_ms, request_id, &event_id, error, fit,
+                );
+                let bytes = built.to_string().into_bytes();
+                if bytes.len() > MAX_ACTIVITY_RECORD {
+                    continue;
+                }
+                for trail in trails.iter() {
+                    if crate::selectors::logs(trail.2.as_ref(), &built) {
+                        state.trail_logs.append(&account, trail, &bytes);
+                    }
+                }
+                break;
+            }
+        }
+    }
+
     /// Keeps `event` (if the caps allow), waking the writer once `WAKE_AT`
     /// events wait; whether it was kept.
     fn keep(&self, event: Event) -> bool {
@@ -650,10 +813,18 @@ impl ActivityRecorder {
                 .await;
             if let Ok(trails) = &stored {
                 for event in batch.iter() {
-                    for trail in trails.get(&event.account).into_iter().flatten() {
-                        state
-                            .trail_logs
-                            .append(&event.account, trail, &event.record);
+                    let Some(of_account) = trails.get(&event.account) else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_slice::<Value>(&event.record) else {
+                        continue;
+                    };
+                    for trail in of_account {
+                        if crate::selectors::logs(trail.2.as_ref(), &value) {
+                            state
+                                .trail_logs
+                                .append(&event.account, trail, &event.record);
+                        }
                     }
                 }
             }
