@@ -86,6 +86,14 @@ reserved_ratio = 0.17
 # restore_seconds = { expedited = 0, standard = 0, bulk = 0 }  # RestoreObject delay per tier
 # domains = ["s3.example.com"]   # photos.s3.example.com/key = bucket photos, key "key"
 #
+# [admin]
+# Prometheus /metrics (S3 requests and storage, the log, queues, consumer
+# lag), /healthz and /readyz.
+# enabled = true
+# addr = "127.0.0.1"
+# port = 9625
+# token = "a-long-random-secret"   # /metrics then needs Authorization: Bearer <token>
+#
 # [kafka]
 # Kafka-compatible listener for consumers of stream topics (TLS only). Clients
 # authenticate with SASL PLAIN: username = an S3 account root's access key id,

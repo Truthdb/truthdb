@@ -5934,12 +5934,27 @@ fn stored_bodies_tell_their_use_logical_stored_and_allocated_bytes() {
     // Compressible: packed for GLACIER to a fraction of it.
     let cold = vec![b'a'; 2 * SEGMENT_BYTES as usize];
     put_object("cold", &cold, StorageClass::Glacier);
+    assert_eq!(
+        ObjFile::new(&mut storage.lock()).backlogs().unwrap().pack,
+        1
+    );
     pack_all(&storage);
+    assert_eq!(
+        ObjFile::new(&mut storage.lock()).backlogs().unwrap().pack,
+        0
+    );
     put_object("gone", &bytes(2, 5_000), StorageClass::Standard);
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| tx.delete_object("bkt", "gone", None, false, now(), GRACE))
         .unwrap()
         .unwrap();
+    assert_eq!(
+        ObjFile::new(&mut storage.lock()).backlogs().unwrap(),
+        crate::Backlogs {
+            collect: 1,
+            pack: 0
+        }
+    );
     // A body still being written: its first segment stored, the rest held
     // by the writer.
     let mut staging = BodyWriter::begin(&storage, now()).unwrap();

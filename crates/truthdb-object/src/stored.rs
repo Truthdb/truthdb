@@ -7,7 +7,7 @@ use truthdb_core::storage::StorageError;
 use truthdb_core::storage_layout::PAGE_SIZE;
 
 use crate::codec::{BodyRow, BodyState, SegmentRow, body_key, segment_key};
-use crate::{BODIES_TREE, ObjFile, SEGMENTS_TREE};
+use crate::{BODIES_TREE, GC_TREE, ObjFile, PACK_QUEUE_TREE, SEGMENTS_TREE};
 
 /// What a body is used for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -48,7 +48,47 @@ fn body_of(key: &[u8]) -> Result<u64, StorageError> {
     ))
 }
 
+/// Work the object store has queued: bodies waiting to be freed (each
+/// past its grace or not) and bodies waiting to be packed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Backlogs {
+    pub collect: u64,
+    pub pack: u64,
+}
+
+/// How many queue rows a count reads per scan.
+const COUNT_BATCH: usize = 4096;
+
 impl ObjFile<'_> {
+    /// How many bodies wait to be freed and to be packed.
+    pub fn backlogs(&mut self) -> Result<Backlogs, StorageError> {
+        let mut backlogs = Backlogs::default();
+        for (tree, count) in [
+            (GC_TREE, &mut backlogs.collect),
+            (PACK_QUEUE_TREE, &mut backlogs.pack),
+        ] {
+            let Some(tree) = self.existing_tree(tree)? else {
+                continue;
+            };
+            let mut ctx = self.core.page_ctx(0);
+            let mut after: Option<Vec<u8>> = None;
+            loop {
+                let mut rows =
+                    tree.scan_range_limit(&mut ctx, after.as_deref(), None, COUNT_BATCH + 1)?;
+                // The scan starts at `after` itself, counted already.
+                if after.is_some() && !rows.is_empty() {
+                    rows.remove(0);
+                }
+                *count += rows.len() as u64;
+                match rows.last() {
+                    Some((key, _)) if rows.len() >= COUNT_BATCH => after = Some(key.clone()),
+                    _ => break,
+                }
+            }
+        }
+        Ok(backlogs)
+    }
+
     /// The bodies after `after` (by id), at most `limit` of them, and the
     /// last id read (`None` once there are no more). A body made of others
     /// (a completed multipart upload's) takes no pages of its own and is

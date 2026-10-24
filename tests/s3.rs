@@ -37,7 +37,13 @@ struct Server {
     /// The Kafka listener's port, when it runs (with the S3 listener's
     /// certificate).
     kafka_port: Option<u16>,
+    /// The admin listener's port, when it runs (with `ADMIN_TOKEN`; in
+    /// place of the Kafka listener).
+    admin_port: Option<u16>,
 }
+
+/// The admin listener's token in the test servers.
+const ADMIN_TOKEN: &str = "admin-test-token";
 
 impl Drop for Server {
     fn drop(&mut self) {
@@ -85,6 +91,7 @@ fn start_server_full(encrypted: bool, tls: bool, kafka: bool) -> Server {
             if [running.native_port, running.s3_port]
                 .into_iter()
                 .chain(running.kafka_port)
+                .chain(running.admin_port)
                 .all(|port| listens(pid, port))
             {
                 return server.take().unwrap();
@@ -177,10 +184,18 @@ fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
     } else {
         (None, String::new())
     };
+    // The admin listener, on the port the Kafka listener would take.
+    let admin_config = if kafka {
+        String::new()
+    } else {
+        format!(
+            "\n[admin]\nenabled = true\naddr = \"127.0.0.1\"\nport = {kafka_port}\ntoken = \"{ADMIN_TOKEN}\"\n"
+        )
+    };
     std::fs::write(
         &config,
         format!(
-            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\n{RESTORE_SECONDS}{tls_config}{encryption}",
+            "[network]\naddr = \"127.0.0.1\"\nport = {native_port}\n\n[storage]\npath = \"{}\"\nsize_gib = 1\n\n[s3]\nenabled = true\naddr = \"127.0.0.1\"\nport = {s3_port}\ndomains = [\"s3.test\"]\n{RESTORE_SECONDS}{tls_config}{encryption}{admin_config}",
             dir.join("truth.db").display()
         ),
     )
@@ -199,6 +214,7 @@ fn spawn_server(encrypted: bool, tls: bool, kafka: bool) -> Server {
         s3_port,
         cert,
         kafka_port: kafka.then_some(kafka_port),
+        admin_port: (!kafka).then_some(kafka_port),
     }
 }
 
@@ -12841,4 +12857,146 @@ fn requests_are_counted_per_bucket_by_kind_bytes_errors_and_latency() {
             ["TOTAL".to_string(), (count - 1).to_string()]
         ]
     );
+}
+
+/// An admin listener's answer to `method path` (with `extra` header
+/// lines): its status, head and body.
+fn admin_call(port: u16, method: &str, path: &str, extra: &str) -> (u16, String, String) {
+    let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).expect("connect");
+    stream
+        .write_all(
+            format!("{method} {path} HTTP/1.1\r\nHost: admin\r\n{extra}Connection: close\r\n\r\n")
+                .as_bytes(),
+        )
+        .expect("send");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).expect("read");
+    let (head, (status, body)) = parse_response(&raw);
+    (status, head, body)
+}
+
+#[test]
+fn the_admin_listener_serves_metrics_health_and_readiness() {
+    let (server, key, secret) = server_with_key();
+    let admin = server.admin_port.expect("an admin listener");
+    let call = |method: &str, path: &str, body: &[u8]| {
+        send(server.s3_port, method, path, "", body, &key, Some(&secret)).0
+    };
+    assert_eq!(admin_call(admin, "GET", "/healthz", "").0, 200);
+    let (status, _, body) = admin_call(admin, "GET", "/readyz", "");
+    assert_eq!((status, body.as_str()), (200, "ready: primary\n"));
+    // /metrics needs the token.
+    let bearer = format!("Authorization: Bearer {ADMIN_TOKEN}\r\n");
+    assert_eq!(admin_call(admin, "GET", "/metrics", "").0, 401);
+    assert_eq!(
+        admin_call(admin, "GET", "/metrics", "Authorization: Bearer wrong\r\n").0,
+        401
+    );
+    // The scheme's case does not matter.
+    assert_eq!(
+        admin_call(
+            admin,
+            "GET",
+            "/metrics",
+            &format!("Authorization: bearer {ADMIN_TOKEN}\r\n")
+        )
+        .0,
+        200
+    );
+    assert_eq!(admin_call(admin, "POST", "/metrics", &bearer).0, 405);
+    assert_eq!(admin_call(admin, "GET", "/elsewhere", &bearer).0, 404);
+
+    assert_eq!(call("PUT", "/scraped", b""), 200);
+    assert_eq!(call("PUT", "/scraped/kept", b"0123456789"), 200);
+    assert_eq!(call("GET", "/scraped/kept", b""), 200);
+    assert_eq!(call("PUT", "/scraped/dropped", b"x"), 200);
+    assert_eq!(call("DELETE", "/scraped/dropped", b""), 204);
+    let deadline = Instant::now() + DEADLINE;
+    let page = loop {
+        let (status, head, page) = admin_call(admin, "GET", "/metrics", &bearer);
+        assert_eq!(status, 200, "{page}");
+        assert_eq!(
+            response_header(&head, "content-type").as_deref(),
+            Some("text/plain; version=0.0.4; charset=utf-8")
+        );
+        // The last answer's body is counted once it is sent.
+        if page.contains("truthdb_s3_bytes_downloaded_total{bucket=\"scraped\"} 10")
+            || Instant::now() > deadline
+        {
+            break page;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    // Every sample is a name, labels and a number, under its family's TYPE.
+    let mut typed = std::collections::HashSet::new();
+    for line in page.lines() {
+        if let Some(rest) = line.strip_prefix("# TYPE ") {
+            typed.insert(rest.split(' ').next().unwrap().to_string());
+            continue;
+        }
+        if line.starts_with('#') {
+            continue;
+        }
+        let (series, value) = line.rsplit_once(' ').unwrap_or_else(|| panic!("{line}"));
+        value
+            .parse::<f64>()
+            .unwrap_or_else(|_| panic!("not a number: {line}"));
+        let name = series.split('{').next().unwrap();
+        let family = ["_bucket", "_sum", "_count"]
+            .iter()
+            .find_map(|suffix| {
+                name.strip_suffix(suffix)
+                    .filter(|base| typed.contains(*base))
+            })
+            .unwrap_or(name);
+        assert!(typed.contains(family), "no TYPE for {line}");
+    }
+    let sample = |series: &str| -> f64 {
+        page.lines()
+            .find_map(|line| line.strip_prefix(&format!("{series} ")))
+            .unwrap_or_else(|| panic!("no {series} in\n{page}"))
+            .parse()
+            .unwrap()
+    };
+    assert_eq!(sample("truthdb_s3_requests_total{bucket=\"scraped\"}"), 4.0);
+    assert_eq!(
+        sample("truthdb_s3_requests_by_kind_total{bucket=\"scraped\",kind=\"put\"}"),
+        2.0
+    );
+    assert_eq!(
+        sample("truthdb_s3_bytes_uploaded_total{bucket=\"scraped\"}"),
+        11.0
+    );
+    assert_eq!(
+        sample("truthdb_s3_bytes_downloaded_total{bucket=\"scraped\"}"),
+        10.0
+    );
+    assert_eq!(
+        sample("truthdb_s3_first_byte_latency_seconds_bucket{bucket=\"scraped\",le=\"+Inf\"}"),
+        4.0
+    );
+    assert_eq!(
+        sample("truthdb_s3_first_byte_latency_seconds_count{bucket=\"scraped\"}"),
+        4.0
+    );
+    assert!(sample("truthdb_s3_total_latency_seconds_sum{bucket=\"scraped\"}") > 0.0);
+    assert_eq!(
+        sample(
+            "truthdb_s3_bucket_objects{bucket=\"scraped\",kind=\"CURRENT\",storage_class=\"STANDARD\"}"
+        ),
+        1.0
+    );
+    assert_eq!(
+        sample(
+            "truthdb_s3_bucket_bytes{bucket=\"scraped\",kind=\"CURRENT\",storage_class=\"STANDARD\"}"
+        ),
+        10.0
+    );
+    assert_eq!(sample("truthdb_s3_gc_backlog_bodies"), 1.0);
+    assert_eq!(sample("truthdb_s3_pack_backlog_bodies"), 0.0);
+    assert_eq!(sample("truthdb_standby"), 0.0);
+    assert!(sample("truthdb_wal_tail_lsn") > 0.0);
+    assert!(sample("truthdb_wal_tail_lsn") >= sample("truthdb_wal_head_lsn"));
+    let ratio = sample("truthdb_wal_usage_ratio");
+    assert!((0.0..=1.0).contains(&ratio), "{ratio}");
 }
