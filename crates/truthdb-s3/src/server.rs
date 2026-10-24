@@ -68,6 +68,8 @@ pub struct S3State {
     /// The trails' log files being kept, and how often they are written.
     pub trail_logs: std::sync::Arc<crate::trails::TrailLogs>,
     pub trail_flush: std::time::Duration,
+    /// Each account's logging trails, for data events.
+    pub trail_selectors: std::sync::Arc<crate::trails::TrailCache>,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
@@ -299,8 +301,9 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         .map(|_| crate::access_log::Request::of(&request));
     let seen = crate::metering::BucketSeen::default();
     request.extensions_mut().insert(seen.clone());
-    // The management event it makes, if any, and who makes it.
+    // The management or data event it makes, if any, and who makes it.
     let call = crate::activity::Call::of(&request);
+    let data = crate::activity::Call::data(&request);
     let who = crate::activity::Who::default();
     request.extensions_mut().insert(who.clone());
     let (mut response, error_code, error_message) = match route(state, request).await {
@@ -320,6 +323,20 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
             &ids.request_id,
             error_code.zip(error_message.as_deref()),
         );
+    }
+    if let Some(data) = &data {
+        state
+            .activity
+            .record_data(
+                state,
+                data,
+                &who,
+                seen.owner().as_deref(),
+                seen.copy_source_owner(),
+                &ids.request_id,
+                error_code.zip(error_message.as_deref()),
+            )
+            .await;
     }
     if let Some(metered) = metered.filter(|_| seen.seen()) {
         // The latency to the first byte, before the lookups below.

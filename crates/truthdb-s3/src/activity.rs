@@ -44,6 +44,8 @@ const HOUR_MS: u64 = 3_600_000;
 const WRITE_BATCH: usize = 256;
 /// The longest user agent and error message recorded (CloudTrail's limit).
 const MAX_FIELD: usize = 1024;
+/// The longest object key recorded (S3's key limit, bytes).
+const MAX_KEY: usize = 1024;
 
 /// An authenticated caller, and how it signed.
 type Caller = (Principal, Option<Signed>);
@@ -76,7 +78,14 @@ pub(crate) struct Call {
     name: &'static str,
     read_only: bool,
     bucket: Option<String>,
+    /// The object a data event acts on.
+    key: Option<String>,
+    /// A data event (an object-level operation, logged only to trails that
+    /// select it) rather than a management event.
+    data: bool,
     sub: Option<&'static str>,
+    /// A copy's source object (its bucket and key).
+    source: Option<(String, String)>,
     host: Option<String>,
     user_agent: Option<String>,
     source_ip: Option<String>,
@@ -115,6 +124,39 @@ impl Call {
                 _ => return None,
             }
         };
+        Some(Call::build(request, name, bucket, None, false))
+    }
+
+    /// The data event `request` makes, if it is one (S3's object-level
+    /// operations, HeadBucket and listings).
+    pub(crate) fn data(request: &hyper::Request<Incoming>) -> Option<Call> {
+        if request
+            .extensions()
+            .get::<crate::website::WebsiteHost>()
+            .is_some()
+            || crate::server::request_service(request).is_some_and(|service| service != "s3")
+            || crate::api::subresource_count(request) > 1
+            || crate::api::control_route(request).is_some()
+        {
+            return None;
+        }
+        let (name, bucket, key) = data_event(request)?;
+        let mut call = Call::build(request, name, Some(bucket), key, true);
+        if matches!(name, "CopyObject" | "UploadPartCopy") {
+            call.source = crate::copy::copy_source(request.headers())
+                .ok()
+                .map(|(bucket, key, _)| (bucket, key));
+        }
+        Some(call)
+    }
+
+    fn build(
+        request: &hyper::Request<Incoming>,
+        name: &'static str,
+        bucket: Option<String>,
+        key: Option<String>,
+        data: bool,
+    ) -> Call {
         let header = |name: &str| {
             request
                 .headers()
@@ -123,17 +165,85 @@ impl Call {
                 .map(str::to_string)
         };
         let connection = request.extensions().get::<Connection>();
-        Some(Call {
+        Call {
             name,
-            read_only: name.starts_with("Get") || name.starts_with("List"),
+            read_only: ["Get", "List", "Head"]
+                .iter()
+                .any(|verb| name.starts_with(verb)),
             bucket,
+            key,
+            data,
             sub: subresource(request),
+            source: None,
             host: header("host"),
             user_agent: header("user-agent"),
             source_ip: connection.map(|connection| connection.peer.ip().to_string()),
             tls: connection.is_some_and(|connection| connection.tls),
-        })
+        }
     }
+}
+
+/// The data event a request makes: its name, bucket and object (S3's
+/// AWS::S3::Object data events, and HeadBucket and listings of a bucket).
+fn data_event(
+    request: &hyper::Request<Incoming>,
+) -> Option<(&'static str, String, Option<String>)> {
+    let method = request.method();
+    let copy = request.headers().contains_key("x-amz-copy-source");
+    let (bucket, key) = match crate::api::target(request).ok()? {
+        Target::Bucket(bucket) => (bucket, None),
+        Target::Object(bucket, key) => (bucket, Some(key)),
+        Target::Service => return None,
+    };
+    let by = |get: &'static str, put: Option<&'static str>, delete: Option<&'static str>| {
+        match *method {
+            Method::GET => Some(get),
+            Method::PUT => put,
+            Method::DELETE => delete,
+            _ => None,
+        }
+    };
+    let name = match (key.is_some(), subresource(request)) {
+        (false, None) => match *method {
+            Method::HEAD => "HeadBucket",
+            Method::GET => "ListObjects",
+            _ => return None,
+        },
+        (false, Some("versions")) if *method == Method::GET => "ListObjectVersions",
+        (false, Some("delete")) if *method == Method::POST => "DeleteObjects",
+        (false, _) => return None,
+        (true, None) => match *method {
+            Method::GET => "GetObject",
+            Method::HEAD => "HeadObject",
+            Method::PUT if copy => "CopyObject",
+            Method::PUT => "PutObject",
+            Method::DELETE => "DeleteObject",
+            _ => return None,
+        },
+        (true, Some("uploads")) if *method == Method::POST => "CreateMultipartUpload",
+        (true, Some("uploadId")) => match *method {
+            Method::PUT if copy => "UploadPartCopy",
+            Method::PUT => "UploadPart",
+            Method::POST => "CompleteMultipartUpload",
+            Method::DELETE => "AbortMultipartUpload",
+            Method::GET => "ListParts",
+            _ => return None,
+        },
+        (true, Some("tagging")) => by(
+            "GetObjectTagging",
+            Some("PutObjectTagging"),
+            Some("DeleteObjectTagging"),
+        )?,
+        (true, Some("acl")) => by("GetObjectAcl", Some("PutObjectAcl"), None)?,
+        // AWS records PutObjectRetention as PutObjectLockRetention.
+        (true, Some("retention")) => {
+            by("GetObjectRetention", Some("PutObjectLockRetention"), None)?
+        }
+        (true, Some("legal-hold")) => by("GetObjectLegalHold", Some("PutObjectLegalHold"), None)?,
+        (true, Some("restore")) if *method == Method::POST => "RestoreObject",
+        (true, _) => return None,
+    };
+    Some((name, bucket, key))
 }
 
 /// The event name of a request on a bucket, if it is a management event.
@@ -255,6 +365,7 @@ fn record(
     state: &S3State,
     call: &Call,
     who: &Caller,
+    recipient: &str,
     owner: Option<&str>,
     time_ms: u64,
     request_id: &str,
@@ -318,18 +429,54 @@ fn record(
         "eventID": event_id,
         "readOnly": call.read_only,
         "eventType": "AwsApiCall",
-        "managementEvent": true,
-        "recipientAccountId": account,
-        "eventCategory": "Management",
+        "managementEvent": !call.data,
+        "recipientAccountId": recipient,
+        "eventCategory": if call.data { "Data" } else { "Management" },
     });
     if let Some(bucket) = &call.bucket {
-        record["resources"] = json!([{
+        // A name no bucket can have (a refused call's) made printable and
+        // cut short.
+        let bucket = truncated(&printable(bucket), 255).to_string();
+        let mut resources = vec![json!({
             "accountId": owner.unwrap_or(account),
             "type": "AWS::S3::Bucket",
-            // A name no bucket can have (a refused call's) made printable
-            // and cut short.
-            "ARN": format!("arn:aws:s3:::{}", truncated(&printable(bucket), 255)),
-        }]);
+            "ARN": format!("arn:aws:s3:::{bucket}"),
+        })];
+        // A data event's object (its whole key: data events go to trails'
+        // files, not activity rows), or, for one on the bucket, the prefix
+        // of its objects; and a copy's source object.
+        match &call.key {
+            Some(key) => {
+                // At most S3's key length (a refused call's may be longer).
+                let key = truncated(key, MAX_KEY);
+                resources.insert(
+                    0,
+                    json!({ "type": "AWS::S3::Object", "ARN": format!("arn:aws:s3:::{bucket}/{key}") }),
+                );
+                if fit == Fit::Whole {
+                    record["requestParameters"]["key"] = json!(key);
+                }
+            }
+            None if call.data => resources.insert(
+                0,
+                json!({ "type": "AWS::S3::Object", "ARNPrefix": format!("arn:aws:s3:::{bucket}/") }),
+            ),
+            None => {}
+        }
+        if let Some((source_bucket, source_key)) = &call.source {
+            resources.insert(
+                1,
+                json!({
+                    "type": "AWS::S3::Object",
+                    "ARN": format!(
+                        "arn:aws:s3:::{}/{}",
+                        truncated(&printable(source_bucket), 255),
+                        truncated(source_key, MAX_KEY)
+                    ),
+                }),
+            );
+        }
+        record["resources"] = json!(resources);
     }
     if let Some((code, message)) = error {
         record["errorCode"] = json!(code);
@@ -380,8 +527,9 @@ impl Pending {
     }
 }
 
-/// The event telling of `budget`'s dropped refused calls of `account`.
-fn dropped_summary(account: &str, budget: &Budget, now_ms: u64, region: &str) -> Event {
+/// The event telling of `budget`'s dropped events of `account` (its data
+/// events' if `data`).
+fn dropped_summary(account: &str, budget: &Budget, data: bool, now_ms: u64, region: &str) -> Event {
     let (event_id, id) = event_id();
     let time = |ms: u64| {
         let iso = crate::time::iso8601(ms);
@@ -400,6 +548,7 @@ fn dropped_summary(account: &str, budget: &Budget, now_ms: u64, region: &str) ->
         "responseElements": Value::Null,
         "serviceEventDetails": {
             "droppedEvents": budget.dropped,
+            "droppedCategory": if data { "Data" } else { "Management" },
             "firstDropped": time(budget.first_dropped_ms),
             "lastDropped": time(budget.last_dropped_ms),
             "hourlyBudget": HOURLY_BUDGET,
@@ -456,6 +605,10 @@ struct Budget {
 #[derive(Default)]
 pub struct ActivityRecorder {
     budgets: Mutex<HashMap<String, Budget>>,
+    /// The same for data events, apart: one account's calls on another's
+    /// objects (which both are told of) cannot use up the other's budget
+    /// for its management events.
+    data_budgets: Mutex<HashMap<String, Budget>>,
     pending: Mutex<Pending>,
     /// Woken when `WAKE_AT` events wait.
     due: tokio::sync::Notify,
@@ -498,7 +651,7 @@ impl ActivityRecorder {
         let mut bytes = None;
         for fit in [Fit::Whole, Fit::NoParameters, Fit::Short, Fit::Bare] {
             let built = record(
-                state, call, &who, owner, time_ms, request_id, &event_id, error, fit,
+                state, call, &who, &account, owner, time_ms, request_id, &event_id, error, fit,
             )
             .to_string()
             .into_bytes();
@@ -546,11 +699,26 @@ impl ActivityRecorder {
     /// within the hour's budget. A new hour after drops first keeps the
     /// summary of the last one's.
     fn admit(&self, account: &str, time_ms: u64, refused: bool, region: &str) -> bool {
+        self.admit_in(false, account, time_ms, refused, region)
+    }
+
+    /// `admit`, against the budgets of data events if `data`.
+    fn admit_in(
+        &self,
+        data: bool,
+        account: &str,
+        time_ms: u64,
+        refused: bool,
+        region: &str,
+    ) -> bool {
         let (admitted, ended) = {
-            let mut budgets = self
-                .budgets
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut budgets = if data {
+                &self.data_budgets
+            } else {
+                &self.budgets
+            }
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
             let budget = budgets.entry(account.to_string()).or_default();
             let hour = time_ms / HOUR_MS;
             let ended = (budget.hour != hour)
@@ -569,7 +737,7 @@ impl ActivityRecorder {
             (admitted, ended)
         };
         if let Some(ended) = ended {
-            self.keep(dropped_summary(account, &ended, time_ms, region));
+            self.keep(dropped_summary(account, &ended, data, time_ms, region));
         }
         admitted
     }
@@ -577,19 +745,87 @@ impl ActivityRecorder {
     /// The summaries of the events dropped so far (written with the next
     /// flush; the counts start again).
     fn summaries(&self, now_ms: u64, region: &str) -> Vec<Event> {
-        let mut budgets = self
-            .budgets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        budgets
-            .iter_mut()
-            .filter(|(_, budget)| budget.dropped > 0)
-            .map(|(account, budget)| {
-                let event = dropped_summary(account, budget, now_ms, region);
+        let mut events = Vec::new();
+        for (data, budgets) in [(false, &self.budgets), (true, &self.data_budgets)] {
+            let mut budgets = budgets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (account, budget) in budgets.iter_mut().filter(|(_, budget)| budget.dropped > 0) {
+                events.push(dropped_summary(account, budget, data, now_ms, region));
                 budget.dropped = 0;
-                event
-            })
-            .collect()
+            }
+        }
+        events
+    }
+
+    /// Hands the data event of `call` (answered with `error`, if it failed)
+    /// to the trails that select it: the requester's account's and the
+    /// bucket owner's (`owner`), as CloudTrail delivers object-level events
+    /// to both. Anonymous calls are not recorded.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn record_data(
+        &self,
+        state: &S3State,
+        call: &Call,
+        who: &Who,
+        owner: Option<&str>,
+        copied_from: Option<String>,
+        request_id: &str,
+        error: Option<(&str, &str)>,
+    ) {
+        let Some(who) = who.get() else {
+            return;
+        };
+        let mut accounts = vec![who.0.account.clone()];
+        if let Some(owner) = owner {
+            accounts.push(owner.to_string());
+        }
+        // A copy's source bucket's owner is told too (as it was when the
+        // source read was allowed).
+        if let Some(source_owner) = copied_from {
+            accounts.push(source_owner);
+        }
+        accounts.sort();
+        accounts.dedup();
+        let time_ms = crate::objects::now_ms();
+        let (event_id, _) = event_id();
+        for account in accounts {
+            let trails = state.trail_selectors.logging(state, &account).await;
+            if !trails
+                .iter()
+                .any(|(_, _, selectors)| selectors.as_ref().is_some_and(|s| s.wants_data()))
+            {
+                continue;
+            }
+            // Whole: it goes to trails' files, not an activity row.
+            let built = record(
+                state,
+                call,
+                &who,
+                &account,
+                owner,
+                time_ms,
+                request_id,
+                &event_id,
+                error,
+                Fit::Whole,
+            );
+            let chosen: Vec<_> = trails
+                .iter()
+                .filter(|trail| crate::selectors::logs(trail.2.as_ref(), &built))
+                .collect();
+            // Refused calls a trail takes, within the account's hourly
+            // budget of data events.
+            if chosen.is_empty()
+                || !self.admit_in(true, &account, time_ms, error.is_some(), &state.region)
+            {
+                continue;
+            }
+            let bytes = built.to_string().into_bytes();
+            for trail in chosen {
+                state.trail_logs.append(&account, trail, &bytes);
+            }
+        }
     }
 
     /// Keeps `event` (if the caps allow), waking the writer once `WAKE_AT`
@@ -650,10 +886,18 @@ impl ActivityRecorder {
                 .await;
             if let Ok(trails) = &stored {
                 for event in batch.iter() {
-                    for trail in trails.get(&event.account).into_iter().flatten() {
-                        state
-                            .trail_logs
-                            .append(&event.account, trail, &event.record);
+                    let Some(of_account) = trails.get(&event.account) else {
+                        continue;
+                    };
+                    let Ok(value) = serde_json::from_slice::<Value>(&event.record) else {
+                        continue;
+                    };
+                    for trail in of_account {
+                        if crate::selectors::logs(trail.2.as_ref(), &value) {
+                            state
+                                .trail_logs
+                                .append(&event.account, trail, &event.record);
+                        }
                     }
                 }
             }
@@ -773,6 +1017,23 @@ mod tests {
             assert!(recorder.admit(busy, hour, false, "us-east-1"));
         }
         assert!(recorder.admit(busy, hour, true, "us-east-1"));
+    }
+
+    #[test]
+    fn data_events_have_a_budget_of_their_own() {
+        let recorder = ActivityRecorder::default();
+        let account = "111122223333";
+        for _ in 0..HOURLY_BUDGET {
+            assert!(recorder.admit_in(true, account, 10, true, "us-east-1"));
+        }
+        assert!(!recorder.admit_in(true, account, 20, true, "us-east-1"));
+        // Its management events' budget is untouched.
+        assert!(recorder.admit(account, 30, true, "us-east-1"));
+        let summaries = recorder.summaries(40, "us-east-1");
+        assert_eq!(summaries.len(), 1);
+        let told: Value = serde_json::from_slice(&summaries[0].record).unwrap();
+        assert_eq!(told["serviceEventDetails"]["droppedCategory"], "Data");
+        assert_eq!(told["serviceEventDetails"]["droppedEvents"], 1);
     }
 
     #[test]

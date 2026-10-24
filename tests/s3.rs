@@ -13240,6 +13240,148 @@ print("ok")
 "#;
 
 #[test]
+fn trail_event_selectors_choose_management_and_data_events() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "selecting");
+    let (other_account, other_key, other_secret) = account_with_key(&server, "reading");
+    let script = server.dir.join("trail_selectors.py");
+    std::fs::write(&script, SELECTORS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other_account,
+            &other_key,
+            &other_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const SELECTORS_SCRIPT: &str = r#"
+import sys, time, json, gzip
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other_account, other_key, other_secret = sys.argv[1:8]
+def client(service, access, secret_key):
+    return boto3.client(service, endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+s3, ct = client("s3", key, secret), client("cloudtrail", key, secret)
+other_s3, other_ct = client("s3", other_key, other_secret), client("cloudtrail", other_key, other_secret)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+def records(reader, bucket, prefix):
+    out = []
+    for o in reader.list_objects_v2(Bucket=bucket, Prefix=prefix).get("Contents", []):
+        out += json.loads(gzip.decompress(reader.get_object(Bucket=bucket, Key=o["Key"])["Body"].read()))["Records"]
+    return out
+def wait_for(check):
+    deadline = time.time() + 30
+    while not check():
+        assert time.time() < deadline, "never"
+        time.sleep(0.5)
+def seen(reader, bucket, prefix):
+    return {(r["eventCategory"], r["eventName"], r.get("requestParameters", {}).get("key"), r["recipientAccountId"])
+        for r in records(reader, bucket, prefix)}
+for bucket in ["logs", "watched"]:
+    s3.create_bucket(Bucket=bucket)
+other_s3.create_bucket(Bucket="their-logs")
+ct.create_trail(Name="data", S3BucketName="logs", S3KeyPrefix="data")
+# The default: every management event, no data event.
+assert ct.get_event_selectors(TrailName="data")["EventSelectors"] == [
+    {"ReadWriteType": "All", "IncludeManagementEvents": True, "DataResources": []}]
+assert ct.get_trail(Name="data")["Trail"]["HasCustomEventSelectors"] is False
+refused(lambda: ct.put_event_selectors(TrailName="data", EventSelectors=[{"ReadWriteType": "All"}],
+    AdvancedEventSelectors=[{"FieldSelectors": [{"Field": "eventCategory", "Equals": ["Data"]}]}]),
+    "InvalidParameterCombinationException")
+refused(lambda: ct.put_event_selectors(TrailName="data", EventSelectors=[{"DataResources": [
+    {"Type": "AWS::Lambda::Function", "Values": ["arn:aws:lambda"]}]}]), "InvalidEventSelectorsException")
+refused(lambda: ct.put_event_selectors(TrailName="missing", EventSelectors=[{"ReadWriteType": "All"}]),
+    "TrailNotFoundException")
+# Objects under docs/ only, no management events.
+chosen = [{"ReadWriteType": "All", "IncludeManagementEvents": False,
+    "DataResources": [{"Type": "AWS::S3::Object", "Values": ["arn:aws:s3:::watched/docs/"]}]}]
+put = ct.put_event_selectors(TrailName="data", EventSelectors=chosen)
+assert put["TrailARN"].endswith(":trail/data") and put["EventSelectors"] == chosen, put
+assert ct.get_event_selectors(TrailName="data")["EventSelectors"] == chosen
+assert ct.get_trail(Name="data")["Trail"]["HasCustomEventSelectors"] is True
+# Read while it does not log (its trails cached so), then started.
+s3.list_objects_v2(Bucket="watched", Prefix="docs/early")
+ct.start_logging(Name="data")
+# The other account's trail: every data event it is told of.
+other_ct.create_trail(Name="mine", S3BucketName="their-logs")
+other_ct.put_event_selectors(TrailName="mine", AdvancedEventSelectors=[{"Name": "data", "FieldSelectors": [
+    {"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": ["AWS::S3::Object"]}]}])
+other_s3.create_bucket(Bucket="their-copies")
+other_ct.start_logging(Name="mine")
+s3.put_bucket_policy(Bucket="watched", Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{other_account}:root"},
+    "Action": "s3:GetObject", "Resource": "arn:aws:s3:::watched/docs/*"}]}))
+s3.put_object(Bucket="watched", Key="docs/a", Body=b"x")
+s3.put_object(Bucket="watched", Key="img/b", Body=b"y")
+s3.get_object(Bucket="watched", Key="docs/a")["Body"].read()
+other_s3.get_object(Bucket="watched", Key="docs/a")["Body"].read()
+# A copy out of the bucket tells its owner too; a listing of it is an event
+# on its objects.
+other_s3.copy_object(Bucket="their-copies", Key="c", CopySource="watched/docs/a")
+s3.list_objects_v2(Bucket="watched")
+s3.get_bucket_versioning(Bucket="watched")
+wait_for(lambda: ("Data", "GetObject", "docs/a", other_account) in seen(other_s3, "their-logs", ""))
+time.sleep(2.5)
+mine = seen(s3, "logs", "data/")
+assert mine == {("Data", "PutObject", "docs/a", account), ("Data", "GetObject", "docs/a", account),
+    ("Data", "CopyObject", "c", account), ("Data", "ListObjects", None, account)}, mine
+# The owner's trail has the reader's read too (told to the owner).
+assert [r["userIdentity"]["accountId"] for r in records(s3, "logs", "data/")
+    if r["eventName"] == "GetObject"].count(other_account) == 1
+for record in records(s3, "logs", "data/"):
+    assert record["managementEvent"] is False and record["eventCategory"] == "Data", record
+    if record["eventName"] in ("PutObject", "GetObject"):
+        kinds = [resource["type"] for resource in record["resources"]]
+        assert kinds == ["AWS::S3::Object", "AWS::S3::Bucket"], record
+        assert record["resources"][0]["ARN"] == "arn:aws:s3:::watched/docs/a", record
+    if record["eventName"] == "CopyObject":
+        assert record["resources"][1]["ARN"] == "arn:aws:s3:::watched/docs/a", record
+        assert record["userIdentity"]["accountId"] == other_account, record
+    if record["eventName"] == "ListObjects":
+        assert record["resources"][0]["ARNPrefix"] == "arn:aws:s3:::watched/", record
+# The reader's trail has its own read, told to its account; not the owner's calls.
+# (It also logs its own reads of its log bucket: every data event.)
+theirs = {event for event in seen(other_s3, "their-logs", "")
+    if event[2] is not None and event[2].startswith(("docs/", "img/"))}
+assert theirs == {("Data", "GetObject", "docs/a", other_account)}, theirs
+# Advanced: PutObject only, anywhere.
+ct.put_event_selectors(TrailName="data", AdvancedEventSelectors=[{"FieldSelectors": [
+    {"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": ["AWS::S3::Object"]},
+    {"Field": "eventName", "Equals": ["PutObject"]}]}])
+assert "EventSelectors" not in ct.get_event_selectors(TrailName="data")
+s3.put_object(Bucket="watched", Key="img/c", Body=b"z")
+s3.get_object(Bucket="watched", Key="img/c")["Body"].read()
+wait_for(lambda: ("Data", "PutObject", "img/c", account) in seen(s3, "logs", "data/"))
+time.sleep(2.5)
+assert ("Data", "GetObject", "img/c", account) not in seen(s3, "logs", "data/")
+print("ok")
+"#;
+
+#[test]
 fn a_trail_delivers_its_accounts_events_as_log_files() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {

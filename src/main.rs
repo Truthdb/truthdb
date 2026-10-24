@@ -320,6 +320,7 @@ async fn main() -> ExitCode {
                         config.s3.activity_flush_seconds.max(1),
                     ),
                     trail_logs: Default::default(),
+                    trail_selectors: Default::default(),
                     trail_flush: std::time::Duration::from_secs(
                         config.s3.trail_flush_seconds.max(1),
                     ),

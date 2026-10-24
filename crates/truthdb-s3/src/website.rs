@@ -495,6 +495,7 @@ async fn read(
         activity_flush: state.activity_flush,
         trail_logs: state.trail_logs.clone(),
         trail_flush: state.trail_flush,
+        trail_selectors: state.trail_selectors.clone(),
     };
     let (headers, bucket) = (headers.clone(), bucket.to_string());
     let scope = crate::scope::current().ok_or_else(|| S3Error::internal("no request scope"))?;

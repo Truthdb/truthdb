@@ -25,6 +25,7 @@ use serde_json::{Map, Value, json};
 use truthdb_object::{ACCOUNT_TRAIL, BodyWriter, ObjFile, ObjectAttrs, Origin, StorageClass};
 
 use crate::cloudtrail::CtError;
+use crate::selectors::Selectors;
 use crate::server::S3State;
 
 /// Trails an account has at most.
@@ -37,7 +38,7 @@ const MAX_KEPT: usize = 4 * FLUSH_BYTES;
 const GRACE_MS: u64 = 60_000;
 
 /// A trail as kept: its settings and its logging status.
-#[derive(Debug, Clone, Default, PartialEq)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct Trail {
     pub name: String,
     pub bucket: String,
@@ -52,6 +53,8 @@ pub(crate) struct Trail {
     pub delivery_error: Option<String>,
     /// When it was made (a trail of the same name made again is another).
     pub created_ms: u64,
+    /// Its event selectors (none: every management event).
+    pub selectors: Option<Selectors>,
 }
 
 impl Trail {
@@ -69,6 +72,8 @@ impl Trail {
             "delivered_ms": self.delivered_ms,
             "delivery_error": self.delivery_error,
             "created_ms": self.created_ms,
+            "event_selectors": self.selectors.as_ref().map(|s| s.render().0),
+            "advanced_event_selectors": self.selectors.as_ref().map(|s| s.render().1),
         })
         .to_string()
         .into_bytes()
@@ -90,6 +95,10 @@ impl Trail {
             delivered_ms: value["delivered_ms"].as_u64(),
             delivery_error: text("delivery_error"),
             created_ms: value["created_ms"].as_u64().unwrap_or(0),
+            selectors: Selectors::from_rendered(
+                &value["event_selectors"],
+                &value["advanced_event_selectors"],
+            ),
         })
     }
 
@@ -103,7 +112,7 @@ impl Trail {
             "HomeRegion": region,
             "TrailARN": trail_arn(region, account, &self.name),
             "LogFileValidationEnabled": false,
-            "HasCustomEventSelectors": false,
+            "HasCustomEventSelectors": self.selectors.is_some(),
             "HasInsightSelectors": false,
             "IsOrganizationTrail": false,
             "RecursiveLogging": self.recursive,
@@ -363,8 +372,16 @@ pub(crate) fn resource(
     match operation {
         "DescribeTrails" | "ListTrails" => Ok("*".to_string()),
         _ => {
-            let name = string(input, "Name")?.ok_or_else(|| {
-                CtError::new(400, "InvalidParameterException", "Name is required.")
+            let parameter = match operation {
+                "PutEventSelectors" | "GetEventSelectors" => "TrailName",
+                _ => "Name",
+            };
+            let name = string(input, parameter)?.ok_or_else(|| {
+                CtError::new(
+                    400,
+                    "InvalidParameterException",
+                    format!("{parameter} is required."),
+                )
             })?;
             Ok(trail_arn(
                 region,
@@ -454,6 +471,7 @@ pub(crate) async fn serve(
                     Ok(Ok(trail))
                 })
                 .await??;
+            state.trail_selectors.forget(account);
             let mut answer = made.describe(&region, account);
             if let Some(object) = answer.as_object_mut() {
                 object.remove("HomeRegion");
@@ -497,6 +515,9 @@ pub(crate) async fn serve(
                     Ok(Some(trail))
                 })
                 .await?;
+            if matches!(operation, "DeleteTrail" | "StartLogging" | "StopLogging") {
+                state.trail_selectors.forget(account);
+            }
             let trail = trail
                 .ok_or_else(|| not_found(string(input, "Name").ok().flatten().unwrap_or("")))?;
             Ok(match operation {
@@ -520,6 +541,64 @@ pub(crate) async fn serve(
                 }
                 _ => json!({}),
             })
+        }
+        "PutEventSelectors" | "GetEventSelectors" => {
+            let name = trail_name(
+                string(input, "TrailName")?.unwrap_or_default(),
+                &region,
+                account,
+            )?;
+            let set = match operation {
+                "PutEventSelectors" => Some(Selectors::parse(
+                    input.get("EventSelectors"),
+                    input.get("AdvancedEventSelectors"),
+                )?),
+                _ => None,
+            };
+            let trail = state
+                .engine
+                .run_object(move |file| {
+                    let Some(mut trail) = load(file, &owner, &name)? else {
+                        return Ok(None);
+                    };
+                    if let Some(set) = set {
+                        trail.selectors = Some(set);
+                        let document = trail.to_document();
+                        let id = trail_id(&owner, &name);
+                        file.transaction(|tx| {
+                            tx.put_bucket_config("", ACCOUNT_TRAIL, &id, &document)
+                        })?;
+                    }
+                    Ok(Some(trail))
+                })
+                .await?
+                .ok_or_else(|| {
+                    not_found(string(input, "TrailName").ok().flatten().unwrap_or(""))
+                })?;
+            if operation == "PutEventSelectors" {
+                state.trail_selectors.forget(account);
+            }
+            let mut answer = json!({ "TrailARN": trail_arn(&region, account, &trail.name) });
+            match &trail.selectors {
+                Some(selectors) => {
+                    let (basic, advanced) = selectors.render();
+                    if !basic.is_null() {
+                        answer["EventSelectors"] = basic;
+                    }
+                    if !advanced.is_null() {
+                        answer["AdvancedEventSelectors"] = advanced;
+                    }
+                }
+                // The default: every management event.
+                None => {
+                    answer["EventSelectors"] = json!([{
+                        "ReadWriteType": "All",
+                        "IncludeManagementEvents": true,
+                        "DataResources": [],
+                    }]);
+                }
+            }
+            Ok(answer)
         }
         "DescribeTrails" | "ListTrails" => {
             // Names of trails of other accounts or regions match none.
@@ -574,23 +653,93 @@ pub(crate) async fn serve(
     }
 }
 
-/// The logging trails of each of `accounts`: each one's name and making.
+/// A logging trail: its name, making and selectors.
+pub(crate) type Logging = (String, u64, Option<Selectors>);
+
+/// The logging trails of each of `accounts`.
 pub(crate) fn logging_trails(
     file: &mut ObjFile<'_>,
     accounts: &[String],
-) -> Result<HashMap<String, Vec<(String, u64)>>, truthdb_core::storage::StorageError> {
+) -> Result<HashMap<String, Vec<Logging>>, truthdb_core::storage::StorageError> {
     let mut found = HashMap::new();
     for account in accounts {
-        let names: Vec<(String, u64)> = trails_of(file, account)?
+        let names: Vec<Logging> = trails_of(file, account)?
             .into_iter()
             .filter(|trail| trail.logging)
-            .map(|trail| (trail.name, trail.created_ms))
+            .map(|trail| (trail.name, trail.created_ms, trail.selectors))
             .collect();
         if !names.is_empty() {
             found.insert(account.clone(), names);
         }
     }
     Ok(found)
+}
+
+/// Each account's logging trails, read once and forgotten when a trail of
+/// it changes (only this server changes them): data events consult it for
+/// every object request.
+#[derive(Default)]
+pub struct TrailCache {
+    accounts: Mutex<HashMap<String, Arc<Vec<Logging>>>>,
+    /// Counts `forget`s: trails read before one are not kept.
+    generation: std::sync::atomic::AtomicU64,
+}
+
+impl TrailCache {
+    pub(crate) fn forget(&self, account: &str) {
+        let mut accounts = self
+            .accounts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        accounts.remove(account);
+    }
+
+    /// Forgets every account's trails.
+    pub(crate) fn clear(&self) {
+        let mut accounts = self
+            .accounts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        accounts.clear();
+    }
+
+    /// `account`'s logging trails (none if they cannot be read).
+    pub(crate) async fn logging(&self, state: &S3State, account: &str) -> Arc<Vec<Logging>> {
+        if let Some(found) = self
+            .accounts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(account)
+        {
+            return Arc::clone(found);
+        }
+        let generation = self.generation.load(std::sync::atomic::Ordering::Relaxed);
+        let owner = account.to_string();
+        let Ok(mut found) = state
+            .engine
+            .run_object(move |file| logging_trails(file, std::slice::from_ref(&owner)))
+            .await
+        else {
+            return Arc::new(Vec::new());
+        };
+        let trails = Arc::new(found.remove(account).unwrap_or_default());
+        // A standby's trails change by replication, not here: not kept.
+        if state.storage.is_standby() {
+            return trails;
+        }
+        let mut accounts = self
+            .accounts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if self.generation.load(std::sync::atomic::Ordering::Relaxed) == generation {
+            accounts.insert(account.to_string(), Arc::clone(&trails));
+        }
+        trails
+    }
 }
 
 /// A trail's records not yet written (each a JSON record, comma-joined).
@@ -609,7 +758,7 @@ pub struct TrailLogs {
 impl TrailLogs {
     /// Adds `record` to trail `name` of `account` (dropped past
     /// `MAX_KEPT`).
-    pub(crate) fn append(&self, account: &str, trail: &(String, u64), record: &[u8]) {
+    pub(crate) fn append(&self, account: &str, trail: &Logging, record: &[u8]) {
         let mut buffers = self
             .buffers
             .lock()
@@ -797,6 +946,9 @@ pub async fn run(state: Arc<S3State>, mut shutdown: tokio::sync::watch::Receiver
         };
         if state.storage.is_standby() {
             state.trail_logs.take();
+            // What it read of the trails (replicated, not changed here) is
+            // read again once it is promoted.
+            state.trail_selectors.clear();
         } else {
             state.trail_logs.flush(&state).await;
         }

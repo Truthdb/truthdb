@@ -155,6 +155,8 @@ async fn serve(state: &S3State, request: Request<Incoming>) -> Result<Value, CtE
             | "StartLogging"
             | "StopLogging"
             | "GetTrailStatus"
+            | "PutEventSelectors"
+            | "GetEventSelectors"
     ) {
         return Err(CtError::new(
             400,

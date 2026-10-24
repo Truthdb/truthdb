@@ -31,6 +31,7 @@ pub mod post;
 pub mod public_access;
 pub mod restore;
 pub mod scope;
+pub mod selectors;
 pub mod server;
 pub mod signed_body;
 pub use truthdb_sigv4 as sigv4;
