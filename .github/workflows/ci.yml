@@ -95,8 +95,19 @@ jobs:
           path: target
           key: ${{ runner.os }}-target-test-${{ hashFiles('**/Cargo.lock') }}
 
+      # The S3 tests that drive the server with boto3 (as an AWS SDK client)
+      # run only when TRUTHDB_TEST_BOTO3_PYTHON names a Python that has it.
+      - name: Install boto3 for the S3 client tests
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends python3 python3-venv
+          python3 -m venv /opt/boto3
+          /opt/boto3/bin/pip install boto3==1.43.118
+
       - name: Run tests
         run: cargo test --workspace -- --test-threads=1
+        env:
+          TRUTHDB_TEST_BOTO3_PYTHON: /opt/boto3/bin/python
 
       - name: Run the storage and engine suites with every database encrypted
         run: >-
