@@ -527,8 +527,9 @@ impl Pending {
     }
 }
 
-/// The event telling of `budget`'s dropped refused calls of `account`.
-fn dropped_summary(account: &str, budget: &Budget, now_ms: u64, region: &str) -> Event {
+/// The event telling of `budget`'s dropped events of `account` (its data
+/// events' if `data`).
+fn dropped_summary(account: &str, budget: &Budget, data: bool, now_ms: u64, region: &str) -> Event {
     let (event_id, id) = event_id();
     let time = |ms: u64| {
         let iso = crate::time::iso8601(ms);
@@ -547,6 +548,7 @@ fn dropped_summary(account: &str, budget: &Budget, now_ms: u64, region: &str) ->
         "responseElements": Value::Null,
         "serviceEventDetails": {
             "droppedEvents": budget.dropped,
+            "droppedCategory": if data { "Data" } else { "Management" },
             "firstDropped": time(budget.first_dropped_ms),
             "lastDropped": time(budget.last_dropped_ms),
             "hourlyBudget": HOURLY_BUDGET,
@@ -603,6 +605,10 @@ struct Budget {
 #[derive(Default)]
 pub struct ActivityRecorder {
     budgets: Mutex<HashMap<String, Budget>>,
+    /// The same for data events, apart: one account's calls on another's
+    /// objects (which both are told of) cannot use up the other's budget
+    /// for its management events.
+    data_budgets: Mutex<HashMap<String, Budget>>,
     pending: Mutex<Pending>,
     /// Woken when `WAKE_AT` events wait.
     due: tokio::sync::Notify,
@@ -693,11 +699,26 @@ impl ActivityRecorder {
     /// within the hour's budget. A new hour after drops first keeps the
     /// summary of the last one's.
     fn admit(&self, account: &str, time_ms: u64, refused: bool, region: &str) -> bool {
+        self.admit_in(false, account, time_ms, refused, region)
+    }
+
+    /// `admit`, against the budgets of data events if `data`.
+    fn admit_in(
+        &self,
+        data: bool,
+        account: &str,
+        time_ms: u64,
+        refused: bool,
+        region: &str,
+    ) -> bool {
         let (admitted, ended) = {
-            let mut budgets = self
-                .budgets
-                .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut budgets = if data {
+                &self.data_budgets
+            } else {
+                &self.budgets
+            }
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
             let budget = budgets.entry(account.to_string()).or_default();
             let hour = time_ms / HOUR_MS;
             let ended = (budget.hour != hour)
@@ -716,7 +737,7 @@ impl ActivityRecorder {
             (admitted, ended)
         };
         if let Some(ended) = ended {
-            self.keep(dropped_summary(account, &ended, time_ms, region));
+            self.keep(dropped_summary(account, &ended, data, time_ms, region));
         }
         admitted
     }
@@ -724,19 +745,17 @@ impl ActivityRecorder {
     /// The summaries of the events dropped so far (written with the next
     /// flush; the counts start again).
     fn summaries(&self, now_ms: u64, region: &str) -> Vec<Event> {
-        let mut budgets = self
-            .budgets
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
-        budgets
-            .iter_mut()
-            .filter(|(_, budget)| budget.dropped > 0)
-            .map(|(account, budget)| {
-                let event = dropped_summary(account, budget, now_ms, region);
+        let mut events = Vec::new();
+        for (data, budgets) in [(false, &self.budgets), (true, &self.data_budgets)] {
+            let mut budgets = budgets
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            for (account, budget) in budgets.iter_mut().filter(|(_, budget)| budget.dropped > 0) {
+                events.push(dropped_summary(account, budget, data, now_ms, region));
                 budget.dropped = 0;
-                event
-            })
-            .collect()
+            }
+        }
+        events
     }
 
     /// Hands the data event of `call` (answered with `error`, if it failed)
@@ -778,11 +797,6 @@ impl ActivityRecorder {
             {
                 continue;
             }
-            // Refused calls within the account's hourly budget, as its
-            // management events.
-            if !self.admit(&account, time_ms, error.is_some(), &state.region) {
-                continue;
-            }
             // Whole: it goes to trails' files, not an activity row.
             let built = record(
                 state,
@@ -796,11 +810,20 @@ impl ActivityRecorder {
                 error,
                 Fit::Whole,
             );
+            let chosen: Vec<_> = trails
+                .iter()
+                .filter(|trail| crate::selectors::logs(trail.2.as_ref(), &built))
+                .collect();
+            // Refused calls a trail takes, within the account's hourly
+            // budget of data events.
+            if chosen.is_empty()
+                || !self.admit_in(true, &account, time_ms, error.is_some(), &state.region)
+            {
+                continue;
+            }
             let bytes = built.to_string().into_bytes();
-            for trail in trails.iter() {
-                if crate::selectors::logs(trail.2.as_ref(), &built) {
-                    state.trail_logs.append(&account, trail, &bytes);
-                }
+            for trail in chosen {
+                state.trail_logs.append(&account, trail, &bytes);
             }
         }
     }
@@ -994,6 +1017,23 @@ mod tests {
             assert!(recorder.admit(busy, hour, false, "us-east-1"));
         }
         assert!(recorder.admit(busy, hour, true, "us-east-1"));
+    }
+
+    #[test]
+    fn data_events_have_a_budget_of_their_own() {
+        let recorder = ActivityRecorder::default();
+        let account = "111122223333";
+        for _ in 0..HOURLY_BUDGET {
+            assert!(recorder.admit_in(true, account, 10, true, "us-east-1"));
+        }
+        assert!(!recorder.admit_in(true, account, 20, true, "us-east-1"));
+        // Its management events' budget is untouched.
+        assert!(recorder.admit(account, 30, true, "us-east-1"));
+        let summaries = recorder.summaries(40, "us-east-1");
+        assert_eq!(summaries.len(), 1);
+        let told: Value = serde_json::from_slice(&summaries[0].record).unwrap();
+        assert_eq!(told["serviceEventDetails"]["droppedCategory"], "Data");
+        assert_eq!(told["serviceEventDetails"]["droppedEvents"], 1);
     }
 
     #[test]
