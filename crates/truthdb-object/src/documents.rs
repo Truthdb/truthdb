@@ -35,6 +35,9 @@ pub const BUCKET_NOTIFICATION: u8 = 6;
 pub const BUCKET_CORS: u8 = 7;
 /// Bucket configuration: its website configuration (the rendered XML).
 pub const BUCKET_WEBSITE: u8 = 8;
+/// Bucket configurations: its request metrics configurations, by id (the
+/// rendered XML).
+pub const BUCKET_METRICS: u8 = 11;
 
 fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
     [prefix, &chunk.to_be_bytes()].concat()
@@ -43,6 +46,32 @@ fn chunk_key(prefix: &[u8], chunk: u16) -> Vec<u8> {
 /// A bucket configuration's key prefix: bucket, 0, kind, id, 0.
 fn config_prefix(bucket: &str, kind: u8, id: &str) -> Vec<u8> {
     [bucket.as_bytes(), &[0, kind], id.as_bytes(), &[0]].concat()
+}
+
+/// The ids among keys of a bucket's configurations of one kind (`bucket,
+/// 0, kind, id, 0, chunk`), in order.
+fn config_ids(keys: impl Iterator<Item = Vec<u8>>, bucket: &str) -> Vec<String> {
+    let skip = bucket.len() + 2;
+    let mut ids: Vec<String> = Vec::new();
+    for key in keys {
+        let Some(rest) = key.get(skip..) else {
+            continue;
+        };
+        let id = rest.split(|byte| *byte == 0).next().unwrap_or_default();
+        let id = String::from_utf8_lossy(id).into_owned();
+        if ids.last() != Some(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+/// The range of a bucket's configuration keys of `kind`.
+fn config_kind_range(bucket: &str, kind: u8) -> (Vec<u8>, Vec<u8>) {
+    (
+        [bucket.as_bytes(), &[0, kind]].concat(),
+        [bucket.as_bytes(), &[0, kind + 1]].concat(),
+    )
 }
 
 /// A user policy's key prefix: account, 0, user, 0, policy name, 0.
@@ -225,6 +254,21 @@ impl ObjTxn<'_, '_> {
     ) -> Result<bool, StorageError> {
         let tree = self.trees.bucket_config();
         self.delete_document(&tree, &config_prefix(bucket, kind, id))
+    }
+
+    /// The ids of the bucket's configurations of `kind`, in order.
+    pub fn bucket_config_ids(
+        &mut self,
+        bucket: &str,
+        kind: u8,
+    ) -> Result<Vec<String>, StorageError> {
+        let tree = self.trees.bucket_config();
+        let (lower, upper) = config_kind_range(bucket, kind);
+        let keys = tree
+            .scan_range(self.ctx, Some(&lower), Some(&upper))?
+            .into_iter()
+            .map(|(key, _)| key);
+        Ok(config_ids(keys, bucket))
     }
 
     /// Deletes every configuration of a bucket being deleted.
@@ -415,6 +459,23 @@ impl ObjFile<'_> {
             &tree,
             &config_prefix(bucket, kind, id),
         )
+    }
+
+    /// The ids of the bucket's configurations of `kind`, in order.
+    pub fn bucket_config_ids(
+        &mut self,
+        bucket: &str,
+        kind: u8,
+    ) -> Result<Vec<String>, StorageError> {
+        let Some(tree) = self.existing_tree(BUCKET_CONFIG_TREE)? else {
+            return Ok(Vec::new());
+        };
+        let (lower, upper) = config_kind_range(bucket, kind);
+        let keys = tree
+            .scan_range(&mut self.core.page_ctx(0), Some(&lower), Some(&upper))?
+            .into_iter()
+            .map(|(key, _)| key);
+        Ok(config_ids(keys, bucket))
     }
 
     /// Managed policy `name` of `account`, if it exists.

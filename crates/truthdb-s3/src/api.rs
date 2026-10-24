@@ -123,7 +123,6 @@ const UNIMPLEMENTED: &[&str] = &[
     "metadataInventoryTable",
     "metadataJournalTable",
     "metadataTable",
-    "metrics",
     "renameObject",
     "replication",
     "requestPayment",
@@ -142,6 +141,7 @@ const SUBRESOURCES: &[&str] = &[
     "legal-hold",
     "lifecycle",
     "location",
+    "metrics",
     "notification",
     "object-lock",
     "ownershipControls",
@@ -483,9 +483,16 @@ async fn route(
     // not implemented, perhaps one added since) is refused, whichever route
     // its other parameters would select.
     if matches!(method, Method::PUT | Method::POST | Method::DELETE) {
+        // A metrics configuration is named by its id.
+        let configuration_id: &[&str] = if has_param(&request, "metrics") {
+            &["id"]
+        } else {
+            &[]
+        };
         let known: Vec<&str> = SUBRESOURCES
             .iter()
             .chain(&["versionId", "partNumber"])
+            .chain(configuration_id)
             .copied()
             .collect();
         if !plain_write(&request, &known) {
@@ -577,6 +584,18 @@ async fn route(
         (Target::Object(..), _) if has_param(&request, "cors") => Err(S3Error::not_implemented(
             "an object has no ?cors configuration",
         )),
+        (Target::Bucket(bucket), method) if has_param(&request, "metrics") => {
+            let action = match method {
+                Method::GET => "s3:GetMetricsConfiguration",
+                Method::PUT | Method::DELETE => "s3:PutMetricsConfiguration",
+                _ => return Err(S3Error::not_implemented(format!("{method} ?metrics"))),
+            };
+            authz.check(action, Bucket(&bucket))?;
+            crate::metrics_config::bucket_metrics(state, request, auth, bucket, method).await
+        }
+        (Target::Object(..), _) if has_param(&request, "metrics") => Err(
+            S3Error::not_implemented("an object has no ?metrics configuration"),
+        ),
         (Target::Bucket(bucket), method) if has_param(&request, "website") => {
             let action = match method {
                 Method::GET => "s3:GetBucketWebsite",
