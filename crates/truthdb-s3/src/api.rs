@@ -167,6 +167,15 @@ pub(crate) fn requester(identity: &truthdb_iam::Identity) -> Option<String> {
     }
 }
 
+/// How many sub-resources `request` names, implemented or not.
+pub(crate) fn subresource_count(request: &Request<Incoming>) -> usize {
+    SUBRESOURCES
+        .iter()
+        .chain(UNIMPLEMENTED)
+        .filter(|name| has_param(request, name))
+        .count()
+}
+
 /// The first sub-resource `request` names, implemented or not.
 pub(crate) fn subresource(request: &Request<Incoming>) -> Option<&'static str> {
     SUBRESOURCES
@@ -296,6 +305,15 @@ pub async fn dispatch(
     auth: Authenticated,
 ) -> Result<Response<Body>, S3Error> {
     let method = request.method().clone();
+    // A request names one sub-resource at most: the operation served is the
+    // one it names, and the one its activity event names.
+    if subresource_count(&request) > 1 {
+        return Err(S3Error::new(
+            400,
+            "InvalidArgument",
+            "A request names at most one sub-resource",
+        ));
+    }
     match control_route(&request) {
         Some(ControlRoute::PublicAccessBlock) => {
             return account_public_access(state, request, auth, method).await;

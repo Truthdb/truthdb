@@ -2,9 +2,10 @@
 //! account-level operations, as CloudTrail names them: `CreateBucket`,
 //! `PutBucketLifecycle`, `GetBucketPolicy`, `ListBuckets`, ...), recorded as
 //! CloudTrail records and kept 90 days by the object engine (see
-//! `truthdb_object::ActivityEvent`), in the account that made the call (an
-//! anonymous call: the bucket owner's). Object-level operations are data
-//! events, not recorded here.
+//! `truthdb_object::ActivityEvent`), in the account that made the call.
+//! Anonymous calls (no account made them) are not recorded, nor are calls
+//! naming more than one sub-resource (refused). Object-level operations are
+//! data events, not recorded here.
 //!
 //! Events are kept in memory and written every `activity_flush`; as in
 //! CloudTrail, delivery is best effort: events not yet written when the
@@ -20,8 +21,11 @@ use truthdb_object::MAX_ACTIVITY_RECORD;
 use crate::api::{Target, has_param, subresource};
 use crate::server::{Connection, Principal, S3State, Signed};
 
-/// Events kept at most while they cannot be written: more are dropped.
+/// Events kept at most while they cannot be written, and at most of one
+/// account (one account's calls cannot crowd out the others'): more are
+/// dropped.
 const MAX_PENDING: usize = 10_000;
+const MAX_PENDING_PER_ACCOUNT: usize = 2_000;
 /// Events written per transaction.
 const WRITE_BATCH: usize = 256;
 /// The longest user agent and error message recorded (CloudTrail's limit).
@@ -73,6 +77,7 @@ impl Call {
             .get::<crate::website::WebsiteHost>()
             .is_some()
             || crate::server::request_service(request).is_some_and(|service| service != "s3")
+            || crate::api::subresource_count(request) > 1
         {
             return None;
         }
@@ -200,48 +205,62 @@ struct Event {
     record: Vec<u8>,
 }
 
-/// `text` cut to at most `MAX_FIELD` bytes (at a character's end).
-fn truncated(text: &str) -> &str {
-    let mut end = text.len().min(MAX_FIELD);
+/// `text` cut to at most `max` bytes (at a character's end).
+fn truncated(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
     while !text.is_char_boundary(end) {
         end -= 1;
     }
     &text[..end]
 }
 
-/// The CloudTrail record of `call`, answered with `status` and (an error)
-/// `error`, by `who` (none: anonymous) for `account`.
+/// How much of a record is kept, from all of it to what always fits a row:
+/// without its request parameters, then with its user agent, error message
+/// and host cut short, then without them.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Fit {
+    Whole,
+    NoParameters,
+    Short,
+    Bare,
+}
+
+/// The CloudTrail record of `call`, answered with (an error) `error`, by
+/// `who`, kept as `fit` says.
 #[allow(clippy::too_many_arguments)]
 fn record(
     state: &S3State,
     call: &Call,
-    who: Option<&Caller>,
-    account: &str,
+    who: &Caller,
     owner: Option<&str>,
     time_ms: u64,
     request_id: &str,
     event_id: &str,
     error: Option<(&str, &str)>,
-    with_parameters: bool,
+    fit: Fit,
 ) -> Value {
-    let identity = match who {
-        Some((principal, _)) => match &principal.user {
-            None => json!({
-                "type": "Root",
-                "principalId": principal.account,
-                "arn": format!("arn:aws:iam::{}:root", principal.account),
-                "accountId": principal.account,
-                "accessKeyId": principal.access_key,
-            }),
-            Some(user) => json!({
-                "type": "IAMUser",
-                "arn": format!("arn:aws:iam::{}:user/{user}", principal.account),
-                "accountId": principal.account,
-                "accessKeyId": principal.access_key,
-                "userName": user,
-            }),
-        },
-        None => json!({ "type": "AWSAccount", "principalId": "", "accountId": "anonymous" }),
+    let (principal, signed) = who;
+    let account = &principal.account;
+    let identity = match &principal.user {
+        None => json!({
+            "type": "Root",
+            "principalId": account,
+            "arn": format!("arn:aws:iam::{account}:root"),
+            "accountId": account,
+            "accessKeyId": principal.access_key,
+        }),
+        Some(user) => json!({
+            "type": "IAMUser",
+            "arn": format!("arn:aws:iam::{account}:user/{user}"),
+            "accountId": account,
+            "accessKeyId": principal.access_key,
+            "userName": user,
+        }),
+    };
+    let max = match fit {
+        Fit::Whole | Fit::NoParameters => MAX_FIELD,
+        Fit::Short => 256,
+        Fit::Bare => 0,
     };
     let iso = crate::time::iso8601(time_ms);
     let mut parameters = json!({});
@@ -262,15 +281,14 @@ fn record(
         "eventName": call.name,
         "awsRegion": state.region,
         "sourceIPAddress": call.source_ip.as_deref().unwrap_or("-"),
-        "userAgent": truncated(call.user_agent.as_deref().unwrap_or("")),
-        "requestParameters": if with_parameters { parameters } else { Value::Null },
+        "userAgent": truncated(call.user_agent.as_deref().unwrap_or(""), max),
+        "requestParameters": if fit == Fit::Whole { parameters } else { Value::Null },
         "responseElements": Value::Null,
         "additionalEventData": {
-            "SignatureVersion": if who.is_some() { "SigV4" } else { "" },
-            "AuthenticationMethod": match who.and_then(|(_, signed)| signed.as_ref()) {
+            "SignatureVersion": "SigV4",
+            "AuthenticationMethod": match signed {
                 Some(signed) if signed.auth_type == "REST-QUERY-STRING" => "QueryString",
-                Some(_) => "AuthHeader",
-                None => "",
+                _ => "AuthHeader",
             },
         },
         "requestID": request_id,
@@ -290,14 +308,24 @@ fn record(
     }
     if let Some((code, message)) = error {
         record["errorCode"] = json!(code);
-        record["errorMessage"] = json!(truncated(message));
+        record["errorMessage"] = json!(truncated(message, max));
     }
-    if call.tls {
+    if call.tls && fit != Fit::Bare {
         record["tlsDetails"] = json!({
-            "clientProvidedHostHeader": call.host.as_deref().unwrap_or(""),
+            "clientProvidedHostHeader": truncated(call.host.as_deref().unwrap_or(""), max),
         });
     }
     record
+}
+
+/// Whether one more event of `account` may be kept beside `pending`.
+fn admits(pending: &[Event], account: &str) -> bool {
+    pending.len() < MAX_PENDING
+        && pending
+            .iter()
+            .filter(|event| event.account == account)
+            .count()
+            < MAX_PENDING_PER_ACCOUNT
 }
 
 /// A random event id: 16 bytes as a UUID (version 4), and its first 8 as
@@ -329,9 +357,8 @@ pub struct ActivityRecorder {
 
 impl ActivityRecorder {
     /// Keeps the event of `call`, answered with `error` (if it failed), in
-    /// the account that made it (an anonymous call: `owner`'s, the bucket
-    /// owner's; none known: not kept).
-    #[allow(clippy::too_many_arguments)]
+    /// the account that made it (an anonymous call: not kept). `owner` is the
+    /// bucket's owner, if known.
     pub(crate) fn record(
         &self,
         state: &S3State,
@@ -341,30 +368,17 @@ impl ActivityRecorder {
         request_id: &str,
         error: Option<(&str, &str)>,
     ) {
-        let who = who.get();
-        let Some(account) = who
-            .as_ref()
-            .map(|(principal, _)| principal.account.clone())
-            .or_else(|| owner.map(str::to_string))
-        else {
+        let Some(who) = who.get() else {
             return;
         };
+        let account = who.0.account.clone();
         let time_ms = crate::objects::now_ms();
         let (event_id, id) = event_id();
-        // Too large with its parameters (a long host): kept without them.
+        // As much of it as fits a row.
         let mut bytes = None;
-        for with_parameters in [true, false] {
+        for fit in [Fit::Whole, Fit::NoParameters, Fit::Short, Fit::Bare] {
             let built = record(
-                state,
-                call,
-                who.as_ref(),
-                &account,
-                owner,
-                time_ms,
-                request_id,
-                &event_id,
-                error,
-                with_parameters,
+                state, call, &who, owner, time_ms, request_id, &event_id, error, fit,
             )
             .to_string()
             .into_bytes();
@@ -380,7 +394,7 @@ impl ActivityRecorder {
             .pending
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if pending.len() < MAX_PENDING {
+        if admits(&pending, &account) {
             pending.push(Event {
                 account,
                 time_ms,
@@ -466,6 +480,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn one_account_cannot_crowd_out_the_others() {
+        let event = |account: &str| Event {
+            account: account.to_string(),
+            time_ms: 0,
+            id: [0; 8],
+            record: Vec::new(),
+        };
+        let mut pending: Vec<Event> = (0..MAX_PENDING_PER_ACCOUNT)
+            .map(|_| event("111122223333"))
+            .collect();
+        assert!(!admits(&pending, "111122223333"));
+        assert!(admits(&pending, "444455556666"));
+        while pending.len() < MAX_PENDING {
+            pending.push(event(&format!("{:012}", pending.len())));
+        }
+        assert!(!admits(&pending, "444455556666"), "nor past the whole cap");
+    }
+
+    #[test]
     fn event_ids_are_version_4_uuids() {
         let (id, key) = event_id();
         assert_eq!(id.len(), 36);
@@ -477,7 +510,8 @@ mod tests {
                 .collect::<String>(),
             id.replace('-', "")[..16]
         );
-        assert_eq!(truncated(&"é".repeat(600)).len(), 1024);
-        assert_eq!(truncated("short"), "short");
+        assert_eq!(truncated(&"é".repeat(600), 1024).len(), 1024);
+        assert_eq!(truncated(&"é".repeat(600), 255).len(), 254);
+        assert_eq!(truncated("short", 1024), "short");
     }
 }

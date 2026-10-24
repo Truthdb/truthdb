@@ -817,7 +817,14 @@ impl ExternalStream for ActivityStream {
                         .and_then(serde_json::Value::as_bool)
                         .map_or(Datum::Null, Datum::Bit),
                     field(&["errorCode"]),
-                    field(&["requestParameters", "bucketName"]),
+                    record
+                        .get("resources")
+                        .and_then(|resources| resources.get(0))
+                        .and_then(|resource| resource.get("ARN"))
+                        .and_then(serde_json::Value::as_str)
+                        .map_or(Datum::Null, |arn| {
+                            text(arn.strip_prefix("arn:aws:s3:::").unwrap_or(arn))
+                        }),
                     field(&["eventID"]),
                     text(&String::from_utf8_lossy(&event.record)),
                 ]

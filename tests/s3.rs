@@ -4873,10 +4873,6 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
         ("DELETE", "/subs", "metadataTable"),
         ("DELETE", "/subs", "metadataConfiguration"),
         ("PUT", "/subs/o", "renameObject"),
-        ("GET", "/subs", "uploads&delete"),
-        ("POST", "/subs/o", "uploads&policy"),
-        ("GET", "/subs/o", "uploadId=1&versioning"),
-        ("DELETE", "/subs/o", "uploadId=1&versioning"),
         ("PUT", "/subs/o", "annotation"),
         ("DELETE", "/subs/o", "annotation"),
         ("DELETE", "/subs", "object-lock"),
@@ -4900,6 +4896,19 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
     ] {
         let (status, reply) = call(method, path, query);
         assert_eq!(status, 501, "{method} {path}?{query}: {reply}");
+    }
+    // One naming two sub-resources is refused before any route.
+    for (method, path, query) in [
+        ("GET", "/subs", "uploads&delete"),
+        ("POST", "/subs/o", "uploads&policy"),
+        ("GET", "/subs/o", "uploadId=1&versioning"),
+        ("DELETE", "/subs/o", "uploadId=1&versioning"),
+        ("PUT", "/subs", "policy&logging"),
+        ("GET", "/subs", "policy&analytics"),
+    ] {
+        let (status, reply) = call(method, path, query);
+        assert_eq!(status, 400, "{method} {path}?{query}: {reply}");
+        assert_eq!(xml_value(&reply, "Code"), "InvalidArgument");
     }
     // Neither is any other write naming an unknown operation, whichever
     // route its other parameters select.
@@ -4944,7 +4953,8 @@ fn a_sub_resource_with_a_method_or_target_it_has_no_route_for_is_refused() {
         &key,
         Some(&secret),
     );
-    assert_eq!(status, 501, "{reply}");
+    assert_eq!(status, 400, "{reply}");
+    assert_eq!(xml_value(&reply, "Code"), "InvalidArgument");
     // Nothing was deleted, created or overwritten.
     assert_eq!(call("HEAD", "/subs", "").0, 200);
     assert_eq!(call("HEAD", "/new", "").0, 404);
@@ -13264,12 +13274,41 @@ fn management_events_are_kept_as_api_activity_across_a_crash() {
         200
     );
     assert_eq!(call("HEAD", "/made", "", &key, Some(&secret)).0, 200);
-    // An anonymous call is the bucket owner's; another account's, its own.
+    // An anonymous call is no account's; another account's is its own.
     assert_eq!(call("GET", "/made", "acl", "", None).0, 403);
     assert_eq!(
         call("GET", "/made", "location", &other_key, Some(&other_secret)).0,
         403
     );
+    // A call naming two sub-resources is refused (and is no event).
+    let policy = format!(
+        r#"{{"Version":"2012-10-17","Statement":[{{"Effect":"Allow","Principal":{{"AWS":"arn:aws:iam::{account}:root"}},"Action":"s3:GetObject","Resource":"arn:aws:s3:::made/*"}}]}}"#
+    );
+    for query in ["location&policy", "policy&versioning"] {
+        let (status, reply) = send(
+            port,
+            "PUT",
+            "/made",
+            query,
+            policy.as_bytes(),
+            &key,
+            Some(&secret),
+        );
+        assert_eq!(status, 400, "{query}: {reply}");
+    }
+    // A user agent too long for the record is cut, and the event kept.
+    let quotes = "\"".repeat(1000);
+    let (_, (status, _)) = send_with(
+        port,
+        "GET",
+        "/made",
+        "versioning",
+        &[("user-agent", &quotes)],
+        b"",
+        &key,
+        Some(&secret),
+    );
+    assert_eq!(status, 200);
     let activity = |server: &Server| {
         sql_rows(
             server.native_port,
@@ -13313,11 +13352,14 @@ fn management_events_are_kept_as_api_activity_across_a_crash() {
             "owner GetBucketVersioning - 1 - made",
             "owner GetBucketPolicy - 1 NoSuchBucketPolicy made",
             "owner ListBuckets auditor 1 - -",
-            "owner GetBucketAcl - 1 AccessDenied made",
             "other GetBucketLocation - 1 AccessDenied made",
+            "owner GetBucketVersioning - 1 - made",
         ],
         "{rows:?}"
     );
+    let cut: serde_json::Value = serde_json::from_str(&rows[5][10]).unwrap();
+    assert!(cut["requestParameters"].is_null(), "{cut}");
+    assert_eq!(cut["userAgent"].as_str().unwrap().len(), 256, "{cut}");
     for row in &rows {
         assert_eq!(row[1], "s3.amazonaws.com");
         assert_eq!(row[5], "127.0.0.1");
@@ -13352,10 +13394,10 @@ fn management_events_are_kept_as_api_activity_across_a_crash() {
         format!("arn:aws:iam::{account}:user/auditor")
     );
     assert_eq!(listing["userIdentity"]["accessKeyId"], user_key.as_str());
-    let anonymous = record("GetBucketAcl");
-    assert_eq!(anonymous["userIdentity"]["accountId"], "anonymous");
-    assert_eq!(anonymous["errorCode"], "AccessDenied");
-    assert!(anonymous["errorMessage"].is_string());
+    let refused = record("GetBucketLocation");
+    assert_eq!(refused["userIdentity"]["accountId"], other_account.as_str());
+    assert_eq!(refused["errorCode"], "AccessDenied");
+    assert!(refused["errorMessage"].is_string());
     // Kept across a crash.
     crash_and_restart(&mut server);
     assert_eq!(activity(&server).len(), 6);
