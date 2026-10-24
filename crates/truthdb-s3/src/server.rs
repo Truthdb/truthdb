@@ -58,6 +58,9 @@ pub struct S3State {
     /// The metric history being counted, and how often it is flushed.
     pub metric_recorder: std::sync::Arc<crate::metric_history::MetricRecorder>,
     pub metrics_flush: std::time::Duration,
+    /// The server access logs being kept, and how often they are written.
+    pub access_logger: std::sync::Arc<crate::access_log::AccessLogger>,
+    pub access_log_flush: std::time::Duration,
 }
 
 /// Who sent a request: an account, acting as its root or as one of its
@@ -110,12 +113,13 @@ pub async fn serve(
     // Batch Operations jobs run beside the listener, and the metric
     // history's flushes.
     tokio::spawn(crate::batch_run::run(Arc::clone(&state), shutdown.clone()));
-    // Its last flush is waited for: what was counted is written before
-    // the engine closes.
+    // Their last flushes are waited for: what was counted and logged is
+    // written before the engine closes.
     let flusher = tokio::spawn(crate::metric_history::run(
         Arc::clone(&state),
         shutdown.clone(),
     ));
+    let logger = tokio::spawn(crate::access_log::run(Arc::clone(&state), shutdown.clone()));
     let slots = Arc::new(tokio::sync::Semaphore::new(MAX_CONNECTIONS));
     loop {
         let slot = tokio::select! {
@@ -123,6 +127,7 @@ pub async fn serve(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     let _ = flusher.await;
+                    let _ = logger.await;
                     return;
                 }
                 continue;
@@ -140,6 +145,7 @@ pub async fn serve(
             _ = shutdown.changed() => {
                 if *shutdown.borrow() {
                     let _ = flusher.await;
+                    let _ = logger.await;
                     return;
                 }
                 continue;
@@ -212,7 +218,8 @@ impl RequestIds {
 
 async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Body> {
     let started = std::time::Instant::now();
-    let arrived = crate::objects::now_ms() / 1000;
+    let arrived_ms = crate::objects::now_ms();
+    let arrived = arrived_ms / 1000;
     let resource = request.uri().path().to_string();
     // Virtual-hosted addressing: the bucket named by the Host, decided once
     // for every reader of the request's target.
@@ -269,11 +276,15 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
     // turns out to exist.
     let metered = crate::metering::metered(&request);
     let uploaded = crate::metering::uploaded(&request);
+    // What its access log line says that the request itself tells.
+    let logged = metered
+        .as_ref()
+        .map(|_| crate::access_log::Request::of(&request));
     let seen = crate::metering::BucketSeen::default();
     request.extensions_mut().insert(seen.clone());
-    let mut response = match route(state, request).await {
-        Ok(response) => response,
-        Err(err) => error_response(&err, &resource, &ids),
+    let (mut response, error_code) = match route(state, request).await {
+        Ok(response) => (response, None),
+        Err(err) => (error_response(&err, &resource, &ids), Some(err.code)),
     };
     if let Some(metered) = metered.filter(|_| seen.seen()) {
         // The latency to the first byte, before the lookups below.
@@ -315,8 +326,43 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
             );
             (Arc::clone(&state.metric_recorder), series, arrived)
         });
+        // And in its bucket's access log, if that is on.
+        let mut log = None;
+        if let Some(request) = logged
+            && let Some(owner) = state
+                .access_logger
+                .logs(state, &metered.bucket, seen.owner().as_deref())
+                .await
+        {
+            let (requester, auth_type) = seen.requester();
+            let status = response.status().as_u16();
+            log = Some((
+                Arc::clone(&state.access_logger),
+                crate::access_log::Entry {
+                    bucket: metered.bucket.clone(),
+                    owner,
+                    arrived_ms,
+                    requester,
+                    request_id: ids.request_id.clone(),
+                    host_id: ids.host_id.clone(),
+                    key: metered.key.clone(),
+                    status,
+                    error_code: error_code.map(str::to_string).or_else(|| {
+                        response
+                            .headers()
+                            .get("x-amz-error-code")
+                            .and_then(|value| value.to_str().ok())
+                            .map(str::to_string)
+                    }),
+                    object_size: object_size(&response, &metered, uploaded),
+                    turnaround_ms: first_byte.as_millis() as u64,
+                    auth_type,
+                    request,
+                },
+            ));
+        }
         response = response.map(|body| {
-            crate::metering::MeteredBody::new(body, counters, started, history).boxed()
+            crate::metering::MeteredBody::new(body, counters, started, history, log).boxed()
         });
     }
     if let Some((bucket, origin, method)) = cross_origin {
@@ -337,6 +383,33 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
         }
     }
     response
+}
+
+/// The size of the object a request read or wrote, for its access log line:
+/// a successful object GET or HEAD's (its Content-Range total, else its
+/// Content-Length), or an object PUT's upload.
+fn object_size(
+    response: &Response<Body>,
+    metered: &crate::metering::Metered,
+    uploaded: u64,
+) -> Option<u64> {
+    let header = |name: &str| {
+        response
+            .headers()
+            .get(name)
+            .and_then(|value| value.to_str().ok())
+    };
+    match metered.kind {
+        _ if !response.status().is_success() => None,
+        truthdb_engine::metrics::RequestKind::Get | truthdb_engine::metrics::RequestKind::Head => {
+            header("content-range")
+                .and_then(|range| range.rsplit_once('/'))
+                .and_then(|(_, total)| total.parse().ok())
+                .or_else(|| header("content-length").and_then(|length| length.parse().ok()))
+        }
+        truthdb_engine::metrics::RequestKind::Put => Some(uploaded),
+        _ => None,
+    }
 }
 
 pub fn error_response(err: &S3Error, resource: &str, ids: &RequestIds) -> Response<Body> {

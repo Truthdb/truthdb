@@ -144,7 +144,7 @@ pub async fn bucket_logging(
     method: Method,
     account: Option<String>,
 ) -> Result<Response<Body>, S3Error> {
-    let name = bucket.clone();
+    let (name, bucket_name) = (bucket.clone(), bucket.clone());
     let Some(owner) = crate::scope::object(state, move |file| {
         Ok(file.bucket(&name)?.map(|info| info.owner))
     })
@@ -196,6 +196,7 @@ pub async fn bucket_logging(
             if let Some(message) = refused {
                 return Err(invalid_target(message));
             }
+            state.access_logger.forget(&bucket_name);
             Ok(Response::builder()
                 .status(StatusCode::OK)
                 .body(full(bytes::Bytes::new()))

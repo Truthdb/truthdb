@@ -85,6 +85,7 @@ reserved_ratio = 0.17
 # tls_key = "/etc/truthdb/s3.key"
 # restore_seconds = { expedited = 0, standard = 0, bulk = 0 }  # RestoreObject delay per tier
 # metrics_flush_seconds = 60       # how often the CloudWatch metric history is written
+# access_log_flush_seconds = 300   # how often server access logs are written (or at 1 MiB)
 # domains = ["s3.example.com"]   # photos.s3.example.com/key = bucket photos, key "key"
 #
 # [admin]
