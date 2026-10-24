@@ -6006,3 +6006,229 @@ fn stored_bodies_tell_their_use_logical_stored_and_allocated_bytes() {
     drop(staging);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn metric_points_roll_up_into_five_minutes_and_hours_and_expire_in_turn() {
+    use crate::{MetricPoint, MetricSeries, SeriesBy, Stats};
+    let path = temp_path("metrics");
+    let storage = create(&path);
+    let series = MetricSeries {
+        bucket: "bkt".to_string(),
+        by: SeriesBy::Filter("EntireBucket".to_string()),
+    };
+    let other = MetricSeries {
+        bucket: "bkt".to_string(),
+        by: SeriesBy::StorageType("StandardStorage".to_string()),
+    };
+    let point = |value: f64, histogram: Vec<u64>| -> MetricPoint {
+        let mut stats = Stats::of(value);
+        stats.histogram = histogram;
+        [(0u8, Stats::of(1.0)), (7u8, stats)].into_iter().collect()
+    };
+    // Three minutes of one hour (two in its first five minutes), the
+    // second written in two parts, and one of another series.
+    let hour = 10 * 3600;
+    let writes = [
+        (hour + 60, point(5.0, vec![1, 0])),
+        (hour + 120, point(3.0, vec![0, 1])),
+        (hour + 120, point(9.0, vec![0, 1])),
+        (hour + 360, point(1.0, vec![1, 0])),
+    ];
+    for (minute, written) in &writes {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.add_metrics(&series, *minute, written))
+            .unwrap();
+    }
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| tx.add_metrics(&other, hour + 3540, &point(1e9, vec![])))
+        .unwrap();
+    let read = |resolution: u64, from: u64, to: u64| {
+        ObjFile::new(&mut storage.lock())
+            .metric_points(&series, resolution, from, to)
+            .unwrap()
+    };
+    let minutes = read(60, hour, hour + 3600);
+    assert_eq!(
+        minutes
+            .iter()
+            .map(|(period, _)| *period)
+            .collect::<Vec<_>>(),
+        [hour + 60, hour + 120, hour + 360]
+    );
+    let second = &minutes[1].1[&7];
+    assert_eq!(
+        (
+            second.count,
+            second.sum,
+            second.min,
+            second.max,
+            second.histogram.clone()
+        ),
+        (2, 12.0, 3.0, 9.0, vec![0, 2])
+    );
+    assert_eq!(minutes[1].1[&0].count, 2);
+    let fives = read(300, hour, hour + 3600);
+    assert_eq!(
+        fives
+            .iter()
+            .map(|(period, point)| (*period, point[&7].count, point[&7].sum))
+            .collect::<Vec<_>>(),
+        [(hour, 3, 17.0), (hour + 300, 1, 1.0)]
+    );
+    let hours = read(3600, 0, u64::MAX);
+    assert_eq!(hours.len(), 1);
+    let whole = &hours[0].1[&7];
+    assert_eq!(
+        (
+            whole.count,
+            whole.sum,
+            whole.min,
+            whole.max,
+            whole.histogram.clone()
+        ),
+        (4, 18.0, 1.0, 9.0, vec![2, 2])
+    );
+    // Ranges are by period start, the end left out.
+    assert_eq!(read(60, hour + 61, hour + 360).len(), 1);
+    assert!(read(60, hour + 120, hour + 120).is_empty());
+    let series_listed = ObjFile::new(&mut storage.lock()).metric_series().unwrap();
+    assert_eq!(series_listed.len(), 2);
+    assert!(series_listed.contains(&(series.clone(), hour + 360)));
+
+    // Each resolution goes after its keep (from its period's end), in turn.
+    let day = 86_400;
+    let expire = |now: u64| {
+        let mut gone = 0;
+        loop {
+            let batch = ObjFile::new(&mut storage.lock())
+                .transaction(|tx| tx.expire_metrics(now, 2))
+                .unwrap();
+            gone += batch;
+            if batch < 2 {
+                return gone;
+            }
+        }
+    };
+    assert!(
+        !ObjFile::new(&mut storage.lock())
+            .metrics_due(hour + 60 + 60 + 15 * day - 1)
+            .unwrap()
+    );
+    assert_eq!(expire(hour + 60 + 60 + 15 * day - 1), 0);
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .metrics_due(hour + 60 + 60 + 15 * day)
+            .unwrap()
+    );
+    assert_eq!(expire(hour + 60 + 60 + 15 * day), 1);
+    assert_eq!(read(60, 0, u64::MAX).len(), 2);
+    assert_eq!(
+        expire(hour + 3600 + 15 * day),
+        3,
+        "the other minutes, and the other series'"
+    );
+    assert!(read(60, 0, u64::MAX).is_empty());
+    assert_eq!(read(300, 0, u64::MAX).len(), 2);
+    assert_eq!(
+        expire(hour + 3600 + 63 * day),
+        3,
+        "the five minutes of both series"
+    );
+    assert!(read(300, 0, u64::MAX).is_empty());
+    assert_eq!(read(3600, 0, u64::MAX).len(), 1);
+    assert_eq!(expire(hour + 3600 + 455 * day), 2);
+    assert!(read(3600, 0, u64::MAX).is_empty());
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .metric_series()
+            .unwrap()
+            .len(),
+        2
+    );
+    // The series go once none of their points can remain.
+    assert_eq!(expire(hour + 3540 + 3600 + 455 * day), 0);
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .metric_series()
+            .unwrap()
+            .len(),
+        1,
+        "the other series' last minute is later"
+    );
+    // No point is due then; the stale series still is.
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .metrics_due(hour + 3540 + 3600 + 455 * day + 1)
+            .unwrap()
+    );
+    assert_eq!(expire(hour + 3540 + 3600 + 455 * day + 1), 0);
+    assert!(
+        !ObjFile::new(&mut storage.lock())
+            .metrics_due(hour + 3540 + 3600 + 455 * day + 1)
+            .unwrap()
+    );
+    assert!(
+        ObjFile::new(&mut storage.lock())
+            .metric_series()
+            .unwrap()
+            .is_empty()
+    );
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn a_metric_write_reaches_every_resolution_or_none_across_a_crash() {
+    use crate::{MetricPoint, MetricSeries, SeriesBy, Stats};
+    let series = MetricSeries {
+        bucket: "bkt".to_string(),
+        by: SeriesBy::Filter("all".to_string()),
+    };
+    let point: MetricPoint = [(3u8, Stats::of(2.0))].into_iter().collect();
+    let minute = 7 * 3600 + 120;
+    let mut crash_at = 0;
+    loop {
+        let path = temp_path("metrics-crash");
+        let storage = create(&path);
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.add_metrics(&series, minute - 60, &point))
+            .unwrap();
+        FAIL_APPLY_OPS_AFTER.with(|fail| fail.set(Some(crash_at)));
+        let crashed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ft_txn(&storage, |tx| tx.add_metrics(&series, minute, &point));
+        }))
+        .is_err();
+        FAIL_APPLY_OPS_AFTER.with(|fail| fail.replace(None));
+        drop(storage);
+        let storage = open(&path);
+        let counts: Vec<u64> = crate::RESOLUTIONS
+            .iter()
+            .map(|(resolution, _)| {
+                ObjFile::new(&mut storage.lock())
+                    .metric_points(&series, *resolution, 0, u64::MAX)
+                    .unwrap()
+                    .iter()
+                    .map(|(_, point)| point[&3].count)
+                    .sum()
+            })
+            .collect();
+        // The earlier minute everywhere; the crashed one everywhere or
+        // nowhere.
+        assert!(
+            counts == [1, 1, 1] || counts == [2, 2, 2],
+            "crash at {crash_at}: {counts:?}"
+        );
+        assert_eq!(counts == [2, 2, 2], !crashed, "crash at {crash_at}");
+        // Its expiry entries match its points.
+        let expired = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.expire_metrics(u64::MAX - 1, 100))
+            .unwrap();
+        assert_eq!(expired, if crashed { 3 } else { 4 }, "crash at {crash_at}");
+        drop(storage);
+        std::fs::remove_file(&path).ok();
+        if !crashed {
+            assert!(crash_at > 3);
+            break;
+        }
+        crash_at += 1;
+    }
+}

@@ -277,6 +277,8 @@ const OBJECT_JOURNAL_TRIM_BATCH: usize = 512;
 /// Expired restores one transaction removes (and ready ones it sends the
 /// events of) at most.
 const OBJECT_RESTORE_EXPIRY_BATCH: usize = 512;
+/// Metric history points a transaction expires at most.
+const OBJECT_METRIC_EXPIRY_BATCH: usize = 512;
 
 /// A multipart upload left open this long is abandoned: garbage collection
 /// aborts it, releasing its parts (as an S3 lifecycle rule would).
@@ -1332,6 +1334,18 @@ impl Engine {
                 file.transaction(|tx| tx.expire_restores(now_ms, OBJECT_RESTORE_EXPIRY_BATCH))
             })?;
             if expired < OBJECT_RESTORE_EXPIRY_BATCH {
+                break;
+            }
+        }
+        // Metric history points past their keep, the same way.
+        for _ in 0..8 {
+            let expired = self.object(|file| {
+                if !file.metrics_due(now_ms / 1000)? {
+                    return Ok(0);
+                }
+                file.transaction(|tx| tx.expire_metrics(now_ms / 1000, OBJECT_METRIC_EXPIRY_BATCH))
+            })?;
+            if expired < OBJECT_METRIC_EXPIRY_BATCH {
                 break;
             }
         }
