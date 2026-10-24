@@ -515,7 +515,9 @@ pub(crate) async fn serve(
                     Ok(Some(trail))
                 })
                 .await?;
-            state.trail_selectors.forget(account);
+            if matches!(operation, "DeleteTrail" | "StartLogging" | "StopLogging") {
+                state.trail_selectors.forget(account);
+            }
             let trail = trail
                 .ok_or_else(|| not_found(string(input, "Name").ok().flatten().unwrap_or("")))?;
             Ok(match operation {
@@ -573,7 +575,9 @@ pub(crate) async fn serve(
                 .ok_or_else(|| {
                     not_found(string(input, "TrailName").ok().flatten().unwrap_or(""))
                 })?;
-            state.trail_selectors.forget(account);
+            if operation == "PutEventSelectors" {
+                state.trail_selectors.forget(account);
+            }
             let mut answer = json!({ "TrailARN": trail_arn(&region, account, &trail.name) });
             match &trail.selectors {
                 Some(selectors) => {
@@ -690,6 +694,17 @@ impl TrailCache {
         self.generation
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         accounts.remove(account);
+    }
+
+    /// Forgets every account's trails.
+    pub(crate) fn clear(&self) {
+        let mut accounts = self
+            .accounts
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        self.generation
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        accounts.clear();
     }
 
     /// `account`'s logging trails (none if they cannot be read).
@@ -927,6 +942,9 @@ pub async fn run(state: Arc<S3State>, mut shutdown: tokio::sync::watch::Receiver
         };
         if state.storage.is_standby() {
             state.trail_logs.take();
+            // What it read of the trails (replicated, not changed here) is
+            // read again once it is promoted.
+            state.trail_selectors.clear();
         } else {
             state.trail_logs.flush(&state).await;
         }

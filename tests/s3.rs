@@ -13323,11 +13323,14 @@ put = ct.put_event_selectors(TrailName="data", EventSelectors=chosen)
 assert put["TrailARN"].endswith(":trail/data") and put["EventSelectors"] == chosen, put
 assert ct.get_event_selectors(TrailName="data")["EventSelectors"] == chosen
 assert ct.get_trail(Name="data")["Trail"]["HasCustomEventSelectors"] is True
+# Read while it does not log (its trails cached so), then started.
+s3.list_objects_v2(Bucket="watched", Prefix="docs/early")
 ct.start_logging(Name="data")
 # The other account's trail: every data event it is told of.
 other_ct.create_trail(Name="mine", S3BucketName="their-logs")
 other_ct.put_event_selectors(TrailName="mine", AdvancedEventSelectors=[{"Name": "data", "FieldSelectors": [
-    {"Field": "eventCategory", "Equals": ["Data"]}]}])
+    {"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": ["AWS::S3::Object"]}]}])
+other_s3.create_bucket(Bucket="their-copies")
 other_ct.start_logging(Name="mine")
 s3.put_bucket_policy(Bucket="watched", Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
     "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{other_account}:root"},
@@ -13336,19 +13339,30 @@ s3.put_object(Bucket="watched", Key="docs/a", Body=b"x")
 s3.put_object(Bucket="watched", Key="img/b", Body=b"y")
 s3.get_object(Bucket="watched", Key="docs/a")["Body"].read()
 other_s3.get_object(Bucket="watched", Key="docs/a")["Body"].read()
+# A copy out of the bucket tells its owner too; a listing of it is an event
+# on its objects.
+other_s3.copy_object(Bucket="their-copies", Key="c", CopySource="watched/docs/a")
+s3.list_objects_v2(Bucket="watched")
 s3.get_bucket_versioning(Bucket="watched")
 wait_for(lambda: ("Data", "GetObject", "docs/a", other_account) in seen(other_s3, "their-logs", ""))
 time.sleep(2.5)
 mine = seen(s3, "logs", "data/")
-assert mine == {("Data", "PutObject", "docs/a", account), ("Data", "GetObject", "docs/a", account)}, mine
+assert mine == {("Data", "PutObject", "docs/a", account), ("Data", "GetObject", "docs/a", account),
+    ("Data", "CopyObject", "c", account), ("Data", "ListObjects", None, account)}, mine
 # The owner's trail has the reader's read too (told to the owner).
 assert [r["userIdentity"]["accountId"] for r in records(s3, "logs", "data/")
     if r["eventName"] == "GetObject"].count(other_account) == 1
 for record in records(s3, "logs", "data/"):
     assert record["managementEvent"] is False and record["eventCategory"] == "Data", record
-    kinds = [resource["type"] for resource in record["resources"]]
-    assert kinds == ["AWS::S3::Object", "AWS::S3::Bucket"], record
-    assert record["resources"][0]["ARN"] == "arn:aws:s3:::watched/docs/a", record
+    if record["eventName"] in ("PutObject", "GetObject"):
+        kinds = [resource["type"] for resource in record["resources"]]
+        assert kinds == ["AWS::S3::Object", "AWS::S3::Bucket"], record
+        assert record["resources"][0]["ARN"] == "arn:aws:s3:::watched/docs/a", record
+    if record["eventName"] == "CopyObject":
+        assert record["resources"][1]["ARN"] == "arn:aws:s3:::watched/docs/a", record
+        assert record["userIdentity"]["accountId"] == other_account, record
+    if record["eventName"] == "ListObjects":
+        assert record["resources"][0]["ARNPrefix"] == "arn:aws:s3:::watched/", record
 # The reader's trail has its own read, told to its account; not the owner's calls.
 # (It also logs its own reads of its log bucket: every data event.)
 theirs = {event for event in seen(other_s3, "their-logs", "")
@@ -13356,7 +13370,8 @@ theirs = {event for event in seen(other_s3, "their-logs", "")
 assert theirs == {("Data", "GetObject", "docs/a", other_account)}, theirs
 # Advanced: PutObject only, anywhere.
 ct.put_event_selectors(TrailName="data", AdvancedEventSelectors=[{"FieldSelectors": [
-    {"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "eventName", "Equals": ["PutObject"]}]}])
+    {"Field": "eventCategory", "Equals": ["Data"]}, {"Field": "resources.type", "Equals": ["AWS::S3::Object"]},
+    {"Field": "eventName", "Equals": ["PutObject"]}]}])
 assert "EventSelectors" not in ct.get_event_selectors(TrailName="data")
 s3.put_object(Bucket="watched", Key="img/c", Body=b"z")
 s3.get_object(Bucket="watched", Key="img/c")["Body"].read()

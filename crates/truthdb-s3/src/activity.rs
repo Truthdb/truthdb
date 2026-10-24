@@ -82,6 +82,8 @@ pub(crate) struct Call {
     /// select it) rather than a management event.
     data: bool,
     sub: Option<&'static str>,
+    /// A copy's source object (its bucket and key).
+    source: Option<(String, String)>,
     host: Option<String>,
     user_agent: Option<String>,
     source_ip: Option<String>,
@@ -137,7 +139,13 @@ impl Call {
             return None;
         }
         let (name, bucket, key) = data_event(request)?;
-        Some(Call::build(request, name, Some(bucket), key, true))
+        let mut call = Call::build(request, name, Some(bucket), key, true);
+        if matches!(name, "CopyObject" | "UploadPartCopy") {
+            call.source = crate::copy::copy_source(request.headers())
+                .ok()
+                .map(|(bucket, key, _)| (bucket, key));
+        }
+        Some(call)
     }
 
     fn build(
@@ -164,6 +172,7 @@ impl Call {
             key,
             data,
             sub: subresource(request),
+            source: None,
             host: header("host"),
             user_agent: header("user-agent"),
             source_ip: connection.map(|connection| connection.peer.ip().to_string()),
@@ -230,7 +239,6 @@ fn data_event(
         }
         (true, Some("legal-hold")) => by("GetObjectLegalHold", Some("PutObjectLegalHold"), None)?,
         (true, Some("restore")) if *method == Method::POST => "RestoreObject",
-        (true, Some("attributes")) if *method == Method::GET => "GetObjectAttributes",
         (true, _) => return None,
     };
     Some((name, bucket, key))
@@ -432,15 +440,33 @@ fn record(
             "type": "AWS::S3::Bucket",
             "ARN": format!("arn:aws:s3:::{bucket}"),
         })];
-        if let Some(key) = &call.key {
-            let key = truncated(&printable(key), 512).to_string();
-            resources.insert(
-                0,
-                json!({ "type": "AWS::S3::Object", "ARN": format!("arn:aws:s3:::{bucket}/{key}") }),
-            );
-            if fit == Fit::Whole {
-                record["requestParameters"]["key"] = json!(key);
+        // A data event's object (its whole key: data events go to trails'
+        // files, not activity rows), or, for one on the bucket, the prefix
+        // of its objects; and a copy's source object.
+        match &call.key {
+            Some(key) => {
+                resources.insert(
+                    0,
+                    json!({ "type": "AWS::S3::Object", "ARN": format!("arn:aws:s3:::{bucket}/{key}") }),
+                );
+                if fit == Fit::Whole {
+                    record["requestParameters"]["key"] = json!(key);
+                }
             }
+            None if call.data => resources.insert(
+                0,
+                json!({ "type": "AWS::S3::Object", "ARNPrefix": format!("arn:aws:s3:::{bucket}/") }),
+            ),
+            None => {}
+        }
+        if let Some((source_bucket, source_key)) = &call.source {
+            resources.insert(
+                1,
+                json!({
+                    "type": "AWS::S3::Object",
+                    "ARN": format!("arn:aws:s3:::{source_bucket}/{source_key}"),
+                }),
+            );
         }
         record["resources"] = json!(resources);
     }
@@ -709,12 +735,14 @@ impl ActivityRecorder {
     /// to the trails that select it: the requester's account's and the
     /// bucket owner's (`owner`), as CloudTrail delivers object-level events
     /// to both. Anonymous calls are not recorded.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) async fn record_data(
         &self,
         state: &S3State,
         call: &Call,
         who: &Who,
         owner: Option<&str>,
+        copied_from: Option<String>,
         request_id: &str,
         error: Option<(&str, &str)>,
     ) {
@@ -722,11 +750,21 @@ impl ActivityRecorder {
             return;
         };
         let mut accounts = vec![who.0.account.clone()];
-        if let Some(owner) = owner
-            && owner != who.0.account
-        {
+        if let Some(owner) = owner {
             accounts.push(owner.to_string());
         }
+        // A copy's source bucket's owner is told too (the source read was
+        // allowed: the route marked it).
+        if let Some(source) = copied_from
+            && let Ok(Some(info)) = state
+                .engine
+                .run_object(move |file| file.bucket(&source))
+                .await
+        {
+            accounts.push(info.owner);
+        }
+        accounts.sort();
+        accounts.dedup();
         let time_ms = crate::objects::now_ms();
         let (event_id, _) = event_id();
         for account in accounts {
@@ -737,20 +775,24 @@ impl ActivityRecorder {
             {
                 continue;
             }
-            for fit in [Fit::Whole, Fit::NoParameters, Fit::Short, Fit::Bare] {
-                let built = record(
-                    state, call, &who, &account, owner, time_ms, request_id, &event_id, error, fit,
-                );
-                let bytes = built.to_string().into_bytes();
-                if bytes.len() > MAX_ACTIVITY_RECORD {
-                    continue;
+            // Whole: it goes to trails' files, not an activity row.
+            let built = record(
+                state,
+                call,
+                &who,
+                &account,
+                owner,
+                time_ms,
+                request_id,
+                &event_id,
+                error,
+                Fit::Whole,
+            );
+            let bytes = built.to_string().into_bytes();
+            for trail in trails.iter() {
+                if crate::selectors::logs(trail.2.as_ref(), &built) {
+                    state.trail_logs.append(&account, trail, &bytes);
                 }
-                for trail in trails.iter() {
-                    if crate::selectors::logs(trail.2.as_ref(), &built) {
-                        state.trail_logs.append(&account, trail, &bytes);
-                    }
-                }
-                break;
             }
         }
     }

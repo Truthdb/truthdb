@@ -179,11 +179,21 @@ impl Selectors {
         let mut parsed = Vec::new();
         let mut values = 0;
         for selector in selectors {
-            let mut fields = Vec::new();
+            let mut fields: Vec<Field> = Vec::new();
             for field in selector["FieldSelectors"].as_array().into_iter().flatten() {
                 let name = field["Field"].as_str().unwrap_or_default();
                 if !FIELDS.contains(&name) {
                     return Err(invalid(format!("{name} is not a supported field.")));
+                }
+                if fields.iter().any(|known| known.field == name) {
+                    return Err(invalid(format!("The field {name} is given twice.")));
+                }
+                if let Some(object) = field.as_object()
+                    && let Some(unknown) = object
+                        .keys()
+                        .find(|key| *key != "Field" && !CONDITIONS.contains(&key.as_str()))
+                {
+                    return Err(invalid(format!("{unknown} is not a condition.")));
                 }
                 let mut conditions = Vec::new();
                 for condition in CONDITIONS {
@@ -196,6 +206,14 @@ impl Selectors {
                 if conditions.is_empty() {
                     return Err(invalid(format!("The field {name} has no condition.")));
                 }
+                // These take Equals only (as CloudTrail).
+                if matches!(name, "eventCategory" | "readOnly" | "resources.type")
+                    && conditions
+                        .iter()
+                        .any(|(condition, _)| condition != "Equals")
+                {
+                    return Err(invalid(format!("The field {name} takes Equals only.")));
+                }
                 fields.push(Field {
                     field: name.to_string(),
                     conditions,
@@ -203,6 +221,16 @@ impl Selectors {
             }
             if !fields.iter().any(|field| field.field == "eventCategory") {
                 return Err(invalid("Each advanced event selector names eventCategory."));
+            }
+            let data = fields.iter().any(|field| {
+                field.field == "eventCategory"
+                    && field
+                        .conditions
+                        .iter()
+                        .any(|(_, values)| values.iter().any(|value| value == "Data"))
+            });
+            if data && !fields.iter().any(|field| field.field == "resources.type") {
+                return Err(invalid("A data event selector names resources.type."));
             }
             parsed.push(Advanced {
                 name: selector["Name"].as_str().map(str::to_string),
@@ -290,10 +318,10 @@ impl Selectors {
             Selectors::Advanced(selectors) => selectors.iter().any(|selector| {
                 selector.fields.iter().any(|field| {
                     field.field == "eventCategory"
-                        && field.conditions.iter().any(|(condition, values)| {
-                            condition.starts_with("Not")
-                                || values.iter().any(|value| value == "Data")
-                        })
+                        && field
+                            .conditions
+                            .iter()
+                            .any(|(_, values)| values.iter().any(|value| value == "Data"))
                 })
             }),
         }
@@ -325,11 +353,14 @@ pub(crate) fn logs(selectors: Option<&Selectors>, event: &Value) -> bool {
                                 .any(|excluded| excluded == source)
                         })
                 }
-                "Data" => object_arns(event).iter().any(|arn| {
-                    selector
-                        .objects
-                        .iter()
-                        .any(|prefix| prefix == "arn:aws:s3" || arn.starts_with(prefix.as_str()))
+                "Data" => object_arns(event).iter().any(|(arn, of_prefix)| {
+                    selector.objects.iter().any(|value| {
+                        value == "arn:aws:s3"
+                            || arn.starts_with(value.as_str())
+                            // An event on a bucket's objects (a listing) for
+                            // a value naming some of them.
+                            || (*of_prefix && value.starts_with(arn))
+                    })
                 }),
                 _ => false,
             }
@@ -343,14 +374,18 @@ pub(crate) fn logs(selectors: Option<&Selectors>, event: &Value) -> bool {
     }
 }
 
-/// The ARNs of an event's S3 objects.
-fn object_arns(event: &Value) -> Vec<&str> {
+/// The ARNs of an event's S3 objects, each with whether it is a prefix of
+/// the objects (`ARNPrefix`, an event on a bucket's objects).
+fn object_arns(event: &Value) -> Vec<(&str, bool)> {
     event["resources"]
         .as_array()
         .into_iter()
         .flatten()
         .filter(|resource| resource["type"] == S3_OBJECT)
-        .filter_map(|resource| resource["ARN"].as_str())
+        .filter_map(|resource| match resource["ARN"].as_str() {
+            Some(arn) => Some((arn, false)),
+            None => resource["ARNPrefix"].as_str().map(|prefix| (prefix, true)),
+        })
         .collect()
 }
 
@@ -360,16 +395,18 @@ fn field_matches(field: &Field, event: &Value) -> bool {
     let values: Vec<String> = match field.field.as_str() {
         "readOnly" => vec![event["readOnly"].as_bool().unwrap_or(false).to_string()],
         "resources.type" | "resources.ARN" => {
-            let key = if field.field == "resources.type" {
-                "type"
-            } else {
-                "ARN"
-            };
+            let types = field.field == "resources.type";
             event["resources"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .filter_map(|resource| resource[key].as_str().map(str::to_string))
+                .filter_map(|resource| {
+                    match types {
+                        true => resource["type"].as_str(),
+                        false => resource["ARN"].as_str().or(resource["ARNPrefix"].as_str()),
+                    }
+                    .map(str::to_string)
+                })
                 .collect()
         }
         name => event[name]
@@ -439,6 +476,7 @@ mod tests {
             None,
             Some(&json!([{ "Name": "puts", "FieldSelectors": [
                 { "Field": "eventCategory", "Equals": ["Data"] },
+                { "Field": "resources.type", "Equals": ["AWS::S3::Object"] },
                 { "Field": "eventName", "Equals": ["PutObject", "DeleteObject"] },
                 { "Field": "resources.ARN", "NotStartsWith": ["arn:aws:s3:::logs/docs/"] },
             ]}])),
@@ -450,6 +488,28 @@ mod tests {
             &event("Data", "PutObject", false, Some("docs/c"))
         ));
         assert!(advanced.wants_data() && !basic(json!([{ "ReadWriteType": "All" }])).wants_data());
+        // A listing of a bucket names its objects by prefix: a value for some
+        // of them, or for all of S3, takes it; a value for another bucket does
+        // not; nor does a selector of keys outside the bucket's prefix.
+        let mut listing = event("Data", "ListObjects", true, None);
+        listing["resources"].as_array_mut().unwrap().insert(
+            0,
+            json!({ "type": S3_OBJECT, "ARNPrefix": "arn:aws:s3:::logs/" }),
+        );
+        assert!(logs(Some(&docs), &listing));
+        let elsewhere = basic(json!([{ "DataResources": [{ "Type": S3_OBJECT,
+            "Values": ["arn:aws:s3:::other/"] }] }]));
+        assert!(!logs(Some(&elsewhere), &listing));
+        let typed = Selectors::parse(
+            None,
+            Some(&json!([{ "FieldSelectors": [
+                { "Field": "eventCategory", "Equals": ["Data"] },
+                { "Field": "resources.type", "Equals": ["AWS::S3::Object"] },
+                { "Field": "resources.ARN", "StartsWith": ["arn:aws:s3:::logs/"] },
+            ]}])),
+        )
+        .unwrap();
+        assert!(logs(Some(&typed), &listing) && logs(Some(&typed), &get));
         // Kept as rendered, read back the same.
         for selectors in [&docs, &writes, &advanced] {
             let (b, a) = selectors.render();
@@ -532,6 +592,42 @@ mod tests {
                     json!([{ "FieldSelectors": [{ "Field": "eventCategory", "Equals": ["Data"] },
             { "Field": "eventName", "Equals": many }] }])
                 )
+            ),
+            "InvalidEventSelectorsException"
+        );
+        let refused = |selectors: Value| code(None, Some(selectors));
+        // Equals only for these; no field twice; known conditions only; a data
+        // selector names resources.type.
+        assert_eq!(
+            refused(
+                json!([{ "FieldSelectors": [{ "Field": "eventCategory", "StartsWith": ["Da"] }] }])
+            ),
+            "InvalidEventSelectorsException"
+        );
+        assert_eq!(
+            refused(
+                json!([{ "FieldSelectors": [{ "Field": "eventCategory", "Equals": ["Management"] },
+            { "Field": "readOnly", "NotEquals": ["true"] }] }])
+            ),
+            "InvalidEventSelectorsException"
+        );
+        assert_eq!(
+            refused(
+                json!([{ "FieldSelectors": [{ "Field": "eventCategory", "Equals": ["Management"] },
+            { "Field": "eventCategory", "Equals": ["Data"] }] }])
+            ),
+            "InvalidEventSelectorsException"
+        );
+        assert_eq!(
+            refused(
+                json!([{ "FieldSelectors": [{ "Field": "eventCategory", "Equals": ["Management"],
+            "Matches": ["x"] }] }])
+            ),
+            "InvalidEventSelectorsException"
+        );
+        assert_eq!(
+            refused(
+                json!([{ "FieldSelectors": [{ "Field": "eventCategory", "Equals": ["Data"] }] }])
             ),
             "InvalidEventSelectorsException"
         );

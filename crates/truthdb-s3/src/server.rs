@@ -332,6 +332,7 @@ async fn handle(state: &S3State, mut request: Request<Incoming>) -> Response<Bod
                 data,
                 &who,
                 seen.owner().as_deref(),
+                seen.copy_source(),
                 &ids.request_id,
                 error_code.zip(error_message.as_deref()),
             )
