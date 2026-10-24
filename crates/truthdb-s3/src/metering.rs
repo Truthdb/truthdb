@@ -150,7 +150,7 @@ pub(crate) fn metered(request: &Request<Incoming>) -> Option<Metered> {
     }
     if matches!(
         crate::server::request_service(request).as_deref(),
-        Some("s3vectors" | "iam" | "sts" | "monitoring")
+        Some("s3vectors" | "iam" | "sts" | "monitoring" | "cloudtrail")
     ) || crate::api::control_route(request).is_some()
     {
         return None;

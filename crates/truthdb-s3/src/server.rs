@@ -484,6 +484,8 @@ async fn route(state: &S3State, mut request: Request<Incoming>) -> Result<Respon
         }
         // CloudWatch, over the S3 metric history.
         Some("monitoring") => return Ok(crate::cloudwatch::handle(state, request).await),
+        // CloudTrail, over the API activity log.
+        Some("cloudtrail") => return Ok(crate::cloudtrail::handle(state, request).await),
         _ => {}
     }
     // The signature covers parameter names decoded, while operations are

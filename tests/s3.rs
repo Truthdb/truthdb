@@ -13240,6 +13240,144 @@ print("ok")
 "#;
 
 #[test]
+fn lookup_events_reads_an_accounts_management_events() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "trailed");
+    let (_, other_key, other_secret) = account_with_key(&server, "elsewhere");
+    let (user_key, user_secret) = user_with_key(
+        &server,
+        &account,
+        "reader",
+        Some(
+            r#"{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Action":["s3:ListAllMyBuckets","s3:GetBucketVersioning"],"Resource":"*"}]}"#,
+        ),
+    );
+    let script = server.dir.join("lookup_events.py");
+    std::fs::write(&script, LOOKUP_EVENTS_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &account,
+            &key,
+            &secret,
+            &other_key,
+            &other_secret,
+            &user_key,
+            &user_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const LOOKUP_EVENTS_SCRIPT: &str = r#"
+import sys, time, json, datetime
+import boto3, botocore.config, botocore.exceptions
+port, account, key, secret, other_key, other_secret, user_key, user_secret = sys.argv[1:9]
+def client(service, access, secret_key, validate=True):
+    return boto3.client(service, endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=access, aws_secret_access_key=secret_key,
+        config=botocore.config.Config(retries={"max_attempts": 1}, parameter_validation=validate))
+s3 = client("s3", key, secret)
+trail = client("cloudtrail", key, secret)
+loose = client("cloudtrail", key, secret, validate=False)
+def refused(call, code):
+    try:
+        call()
+        raise SystemExit(f"not refused: {code}")
+    except botocore.exceptions.ClientError as error:
+        assert error.response["Error"]["Code"] == code, error.response
+before = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(seconds=2)
+s3.create_bucket(Bucket="alpha")
+s3.create_bucket(Bucket="beta")
+s3.put_bucket_versioning(Bucket="alpha", VersioningConfiguration={"Status": "Enabled"})
+s3.get_bucket_versioning(Bucket="beta")
+user = client("s3", user_key, user_secret)
+user.list_buckets()
+try:
+    user.get_bucket_policy(Bucket="alpha")
+except botocore.exceptions.ClientError:
+    pass
+def everything(**args):
+    events, token = [], None
+    while True:
+        page = trail.lookup_events(**args, **({"NextToken": token} if token else {}))
+        events += page["Events"]
+        token = page.get("NextToken")
+        if not token:
+            return events
+deadline = time.time() + 30
+while len(everything()) < 6:
+    assert time.time() < deadline, everything()
+    time.sleep(0.5)
+time.sleep(1.5)
+events = everything()
+names = [event["EventName"] for event in events]
+assert names == ["GetBucketPolicy", "ListBuckets", "GetBucketVersioning", "PutBucketVersioning",
+    "CreateBucket", "CreateBucket"], names
+times = [event["EventTime"] for event in events]
+assert times == sorted(times, reverse=True), times
+first = events[0]
+record = json.loads(first["CloudTrailEvent"])
+assert record["eventID"] == first["EventId"] and record["errorCode"] == "AccessDenied", record
+assert first["Username"] == "reader" and first["AccessKeyId"] == user_key, first
+assert first["ReadOnly"] == "true" and first["EventSource"] == "s3.amazonaws.com", first
+assert first["Resources"] == [{"ResourceType": "AWS::S3::Bucket", "ResourceName": "alpha"}], first
+def named(**lookup):
+    return [event["EventName"] for event in everything(LookupAttributes=[lookup])]
+assert named(AttributeKey="EventName", AttributeValue="CreateBucket") == ["CreateBucket"] * 2
+assert named(AttributeKey="Username", AttributeValue="root") == names[2:]
+assert named(AttributeKey="Username", AttributeValue="reader") == names[:2]
+assert named(AttributeKey="ReadOnly", AttributeValue="false") == ["PutBucketVersioning", "CreateBucket", "CreateBucket"]
+assert named(AttributeKey="ResourceName", AttributeValue="beta") == ["GetBucketVersioning", "CreateBucket"]
+assert named(AttributeKey="ResourceType", AttributeValue="AWS::S3::Bucket") == [n for n in names if n != "ListBuckets"]
+assert named(AttributeKey="AccessKeyId", AttributeValue=key) == names[2:]
+assert named(AttributeKey="EventId", AttributeValue=first["EventId"]) == ["GetBucketPolicy"]
+assert named(AttributeKey="EventSource", AttributeValue="s3.amazonaws.com") == names
+# A time window (StartTime and EndTime both inclusive).
+middle = events[3]["EventTime"]
+assert [e["EventName"] for e in everything(EndTime=middle)][0] == "PutBucketVersioning"
+assert everything(StartTime=before + datetime.timedelta(days=1)) == []
+assert len(everything(StartTime=before)) == 6
+# Pages of MaxResults, with a token for the same parameters only.
+page = trail.lookup_events(MaxResults=4)
+assert len(page["Events"]) == 4 and "NextToken" in page
+rest = trail.lookup_events(MaxResults=4, NextToken=page["NextToken"])
+assert [e["EventName"] for e in page["Events"] + rest["Events"]] == names and "NextToken" not in rest
+refused(lambda: trail.lookup_events(MaxResults=3, NextToken=page["NextToken"]), "InvalidNextTokenException")
+refused(lambda: trail.lookup_events(NextToken="garbage"), "InvalidNextTokenException")
+# Errors as CloudTrail answers them.
+refused(lambda: trail.lookup_events(LookupAttributes=[
+    {"AttributeKey": "EventName", "AttributeValue": "a"}, {"AttributeKey": "Username", "AttributeValue": "b"}]),
+    "InvalidLookupAttributesException")
+refused(lambda: loose.lookup_events(LookupAttributes=[{"AttributeKey": "Color", "AttributeValue": "a"}]),
+    "InvalidLookupAttributesException")
+refused(lambda: loose.lookup_events(MaxResults=51), "InvalidMaxResultsException")
+refused(lambda: loose.lookup_events(MaxResults=0), "InvalidMaxResultsException")
+refused(lambda: trail.lookup_events(StartTime=before + datetime.timedelta(hours=1), EndTime=before),
+    "InvalidTimeRangeException")
+refused(lambda: loose.lookup_events(EventCategory="data"), "InvalidEventCategoryException")
+assert trail.lookup_events(EventCategory="insight")["Events"] == []
+# Another account reads none of them; a user needs cloudtrail:LookupEvents.
+other = client("cloudtrail", other_key, other_secret)
+assert other.lookup_events()["Events"] == []
+refused(lambda: other.lookup_events(MaxResults=4, NextToken=page["NextToken"]), "InvalidNextTokenException")
+refused(lambda: client("cloudtrail", user_key, user_secret).lookup_events(), "AccessDenied")
+print("ok")
+"#;
+
+#[test]
 fn management_events_are_kept_as_api_activity_across_a_crash() {
     let mut server = start_server();
     let port = server.s3_port;
