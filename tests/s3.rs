@@ -13416,6 +13416,165 @@ print("ok")
 "#;
 
 #[test]
+fn replicas_keep_their_sources_version_and_are_made_once_across_a_crash() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let mut server = start_server();
+    let (account, key, secret) = account_with_key(&server, "replicating");
+    let script = server.dir.join("replication.py");
+    std::fs::write(&script, REPLICATION_SCRIPT).expect("script");
+    let run = |phase: &str, port: u16| {
+        let output = Command::new(&python)
+            .arg(&script)
+            .args([phase, &port.to_string(), &account, &key, &secret])
+            .output()
+            .expect("run python");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+        assert!(
+            output.status.success() && stdout.contains("ok"),
+            "{phase}\n{stdout}\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    };
+    run("replicas", server.s3_port);
+    // Versions written just before a crash are replicated once after it.
+    run("arm", server.s3_port);
+    crash_and_restart(&mut server);
+    run("after", server.s3_port);
+}
+
+const REPLICATION_SCRIPT: &str = r#"
+import sys, time, json, datetime
+import boto3, botocore.config
+phase, port, account, key, secret = sys.argv[1:6]
+s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+ROLE = f"arn:aws:iam::{account}:role/replication"
+def versioned(bucket, **extra):
+    s3.create_bucket(Bucket=bucket, **extra)
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+def rule(destination, prefix="", priority=1, **extra):
+    r = {"ID": f"{destination}-{prefix}", "Priority": priority, "Status": "Enabled",
+        "Filter": {"Prefix": prefix}, "DeleteMarkerReplication": {"Status": "Disabled"},
+        "Destination": {"Bucket": f"arn:aws:s3:::{destination}"}}
+    r.update(extra)
+    return r
+def replicate(bucket, *rules):
+    s3.put_bucket_replication(Bucket=bucket,
+        ReplicationConfiguration={"Role": ROLE, "Rules": list(rules)})
+def status(bucket, key, version):
+    return s3.head_object(Bucket=bucket, Key=key, VersionId=version).get("ReplicationStatus")
+def wait(test, what):
+    deadline = time.time() + 30
+    while not test():
+        assert time.time() < deadline, what
+        time.sleep(0.1)
+def versions(bucket, prefix=""):
+    return [(v["Key"], v["VersionId"]) for v in
+        s3.list_object_versions(Bucket=bucket, Prefix=prefix).get("Versions", [])]
+if phase == "replicas":
+    for bucket in ["src", "dst", "other"]:
+        versioned(bucket)
+    replicate("src", rule("dst", "docs/"), rule("dst", "docs/cold/", 2,
+        Destination={"Bucket": "arn:aws:s3:::dst", "StorageClass": "STANDARD_IA"}))
+    put = s3.put_object(Bucket="src", Key="docs/a.txt", Body=b"hello", ContentType="text/plain",
+        Metadata={"m": "v"}, Tagging="t=1")
+    version = put["VersionId"]
+    # PENDING at once (or already COMPLETED), then COMPLETED; the replica is
+    # REPLICA, with the same version id, time, metadata and tags.
+    assert status("src", "docs/a.txt", version) in ("PENDING", "COMPLETED")
+    wait(lambda: status("src", "docs/a.txt", version) == "COMPLETED", "replicated")
+    source = s3.head_object(Bucket="src", Key="docs/a.txt", VersionId=version)
+    replica = s3.head_object(Bucket="dst", Key="docs/a.txt", VersionId=version)
+    assert replica["ReplicationStatus"] == "REPLICA", replica
+    for field in ["ETag", "LastModified", "ContentType", "Metadata", "ContentLength"]:
+        assert replica[field] == source[field], (field, replica, source)
+    assert s3.get_object(Bucket="dst", Key="docs/a.txt", VersionId=version)["Body"].read() == b"hello"
+    assert s3.get_object_tagging(Bucket="dst", Key="docs/a.txt", VersionId=version)["TagSet"] == [
+        {"Key": "t", "Value": "1"}]
+    # A tag change of the source reaches the replica.
+    s3.put_object_tagging(Bucket="src", Key="docs/a.txt", VersionId=version,
+        Tagging={"TagSet": [{"Key": "t", "Value": "2"}]})
+    wait(lambda: s3.get_object_tagging(Bucket="dst", Key="docs/a.txt", VersionId=version)["TagSet"]
+        == [{"Key": "t", "Value": "2"}], "tags replicated")
+    # The rule of highest priority gives the class; keys no rule names are
+    # not replicated and have no status.
+    cold = s3.put_object(Bucket="src", Key="docs/cold/b", Body=b"b")["VersionId"]
+    wait(lambda: status("src", "docs/cold/b", cold) == "COMPLETED", "cold replicated")
+    assert s3.head_object(Bucket="dst", Key="docs/cold/b", VersionId=cold)["StorageClass"] == "STANDARD_IA"
+    plain = s3.put_object(Bucket="src", Key="elsewhere", Body=b"x")["VersionId"]
+    assert status("src", "elsewhere", plain) is None
+    # Two ways: the replicas in dst are not replicated back.
+    replicate("dst", rule("src", "docs/"))
+    back = s3.put_object(Bucket="dst", Key="docs/back", Body=b"back")["VersionId"]
+    wait(lambda: status("dst", "docs/back", back) == "COMPLETED", "replicated back")
+    again = s3.put_object(Bucket="src", Key="docs/again", Body=b"a")["VersionId"]
+    wait(lambda: status("src", "docs/again", again) == "COMPLETED", "replicated again")
+    time.sleep(1.5)
+    assert sorted(versions("src", "docs/")) == sorted([("docs/a.txt", version),
+        ("docs/cold/b", cold), ("docs/back", back), ("docs/again", again)]), versions("src", "docs/")
+    assert status("dst", "docs/again", again) == "REPLICA", "a replica stays one"
+    assert status("src", "docs/back", back) == "REPLICA"
+    s3.delete_bucket_replication(Bucket="dst")
+    # A destination that cannot take a replica any more: FAILED.
+    s3.put_bucket_versioning(Bucket="dst", VersioningConfiguration={"Status": "Suspended"})
+    failed = s3.put_object(Bucket="src", Key="docs/failed", Body=b"f")["VersionId"]
+    wait(lambda: status("src", "docs/failed", failed) == "FAILED", "failed")
+    assert ("docs/failed", failed) not in versions("dst")
+    s3.put_bucket_versioning(Bucket="dst", VersioningConfiguration={"Status": "Enabled"})
+    # Object Lock: the replica keeps the source's retention.
+    versioned("locked-src", ObjectLockEnabledForBucket=True)
+    versioned("locked-dst", ObjectLockEnabledForBucket=True)
+    replicate("locked-src", rule("locked-dst"))
+    until = (datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(days=2)).replace(microsecond=0)
+    locked = s3.put_object(Bucket="locked-src", Key="k", Body=b"l", ObjectLockMode="GOVERNANCE",
+        ObjectLockRetainUntilDate=until)["VersionId"]
+    wait(lambda: status("locked-src", "k", locked) == "COMPLETED", "locked replicated")
+    retention = s3.get_object_retention(Bucket="locked-dst", Key="k", VersionId=locked)["Retention"]
+    assert retention == {"Mode": "GOVERNANCE", "RetainUntilDate": until}, retention
+    # Without a retention of its own, the replica takes the destination's
+    # default one; a legal hold put on the source reaches it.
+    s3.put_object_lock_configuration(Bucket="locked-dst", ObjectLockConfiguration={
+        "ObjectLockEnabled": "Enabled",
+        "Rule": {"DefaultRetention": {"Mode": "COMPLIANCE", "Days": 1}}})
+    bare = s3.put_object(Bucket="locked-src", Key="bare", Body=b"b")["VersionId"]
+    wait(lambda: status("locked-src", "bare", bare) == "COMPLETED", "bare replicated")
+    assert s3.get_object_retention(Bucket="locked-dst", Key="bare",
+        VersionId=bare)["Retention"]["Mode"] == "COMPLIANCE"
+    s3.put_object_legal_hold(Bucket="locked-src", Key="bare", VersionId=bare,
+        LegalHold={"Status": "ON"})
+    def hold():
+        try:
+            return s3.get_object_legal_hold(Bucket="locked-dst", Key="bare",
+                VersionId=bare)["LegalHold"]["Status"]
+        except s3.exceptions.ClientError:
+            return None
+    assert hold() is None
+    wait(lambda: hold() == "ON", "hold replicated")
+    assert s3.get_object_retention(Bucket="locked-dst", Key="bare",
+        VersionId=bare)["Retention"]["Mode"] == "COMPLIANCE", "the replica keeps its retention"
+    print("ok")
+elif phase == "arm":
+    versioned("burst-src")
+    versioned("burst-dst")
+    replicate("burst-src", rule("burst-dst"))
+    for i in range(200):
+        s3.put_object(Bucket="burst-src", Key=f"k{i:03}", Body=b"x")
+    print("ok")
+else:
+    source = versions("burst-src")
+    assert len(source) == 200
+    for k, v in source:
+        wait(lambda: status("burst-src", k, v) == "COMPLETED", f"{k} replicated")
+    assert sorted(versions("burst-dst")) == sorted(source), "each replicated once"
+    print("ok")
+"#;
+
+#[test]
 fn inventory_configurations_are_kept_per_bucket() {
     // A Python with boto3 installed (pip install boto3).
     let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {

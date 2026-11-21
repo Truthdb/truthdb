@@ -361,6 +361,7 @@ impl ObjTxn<'_, '_> {
             detail,
             now_ms,
         )?;
+        self.queue_metadata_replication(bucket, key, version)?;
         Ok(Ok((version, null_version)))
     }
 
@@ -380,6 +381,7 @@ impl ObjTxn<'_, '_> {
         };
         lock.legal_hold = Some(on);
         self.set_lock(bucket, key, version, &lock)?;
+        self.queue_metadata_replication(bucket, key, version)?;
         Ok(Ok((version, null_version)))
     }
 }

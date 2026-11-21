@@ -32,6 +32,7 @@ mod metric_history;
 mod notifications;
 mod objects;
 mod pack;
+mod replication;
 mod restores;
 mod stored;
 pub mod time;
@@ -88,6 +89,10 @@ pub use objects::{
     version_id,
 };
 pub use pack::{PackStep, PackWork, pack_segment};
+pub use replication::{
+    QueuedReplication, ReplicationConfig, ReplicationDestination, ReplicationRule,
+    ReplicationStatus, ReplicationWork,
+};
 pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
 pub use stored::{Backlogs, BodyUse, StoredBody};
 pub use uploads::{MAX_PART_NUMBER, MIN_PART_BYTES, PartInfo, UploadError, UploadInfo};
@@ -197,6 +202,11 @@ const ACTIVITY_EXPIRY_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 42;
 /// (bucket, 0, inventory configuration id) -> when its last report run
 /// started (see `inventory`).
 const INVENTORY_STATE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 43;
+/// (bucket, 0, key, 0, !version) -> a version's replication status (see
+/// `replication`).
+const REPLICATION_STATUS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 44;
+/// number -> a queued replication (see `replication`).
+const REPLICATION_QUEUE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 45;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -321,7 +331,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 44;
+const TREE_COUNT: usize = 46;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -468,6 +478,12 @@ impl Trees {
     }
     pub fn inventory_state(&self) -> BTree {
         self.tree(INVENTORY_STATE_TREE)
+    }
+    pub fn replication_status(&self) -> BTree {
+        self.tree(REPLICATION_STATUS_TREE)
+    }
+    pub fn replication_queue(&self) -> BTree {
+        self.tree(REPLICATION_QUEUE_TREE)
     }
 }
 

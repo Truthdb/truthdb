@@ -32,6 +32,7 @@ pub mod policy;
 pub mod post;
 pub mod public_access;
 pub mod replication_config;
+pub mod replication_run;
 pub mod restore;
 pub mod scope;
 pub mod selectors;

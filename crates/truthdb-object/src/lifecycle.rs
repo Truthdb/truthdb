@@ -18,7 +18,7 @@ use crate::codec::{Reader, Writer};
 use crate::documents::BUCKET_LIFECYCLE;
 use crate::journal::Origin;
 use crate::objects::{StorageClass, VersionSel, decode_version, version_from_key};
-use crate::{LIFECYCLE_STATE_TREE, OBJECTS_TREE, ObjFile, ObjTxn};
+use crate::{LIFECYCLE_STATE_TREE, OBJECTS_TREE, ObjFile, ObjTxn, ReplicationStatus};
 
 pub const DAY_MS: u64 = 86_400_000;
 
@@ -889,6 +889,17 @@ impl ObjFile<'_> {
                         && self
                             .object_lock(bucket, &key, version)?
                             .blocks_delete(now_ms, false) =>
+                {
+                    None
+                }
+                // S3 takes no expiration or transition on a version whose
+                // replication is pending or failed.
+                Some(_)
+                    if !info.delete_marker
+                        && matches!(
+                            self.replication_status(bucket, &key, version)?,
+                            Some(ReplicationStatus::Pending | ReplicationStatus::Failed)
+                        ) =>
                 {
                     None
                 }

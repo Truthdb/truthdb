@@ -575,7 +575,9 @@ impl ObjTxn<'_, '_> {
     }
 
     /// Writes a version of `key` holding `version.body`'s one reference and,
-    /// unless versioning is enabled, replaces the key's null version.
+    /// unless versioning is enabled, replaces the key's null version. A
+    /// rule of the bucket's replication configuration that applies to it
+    /// queues its replication (see `replication`).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn insert_version(
         &mut self,
@@ -584,6 +586,26 @@ impl ObjTxn<'_, '_> {
         versioning: Versioning,
         new: NewVersion,
         attrs: &ObjectAttrs,
+        now_ms: u64,
+        grace_ms: u64,
+    ) -> Result<ObjectInfo, StorageError> {
+        let info =
+            self.insert_version_as(bucket, key, versioning, new, attrs, None, now_ms, grace_ms)?;
+        self.queue_replication(bucket, key, &info)?;
+        Ok(info)
+    }
+
+    /// [`Self::insert_version`], numbered and dated as `given` says (a
+    /// replica: its source's number and time) or anew; queues nothing.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn insert_version_as(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        versioning: Versioning,
+        new: NewVersion,
+        attrs: &ObjectAttrs,
+        given: Option<(u64, u64)>,
         now_ms: u64,
         grace_ms: u64,
     ) -> Result<ObjectInfo, StorageError> {
@@ -598,14 +620,17 @@ impl ObjTxn<'_, '_> {
                 )));
             }
         }
-        let version = next_counter(self, NEXT_VERSION_KEY)?;
+        let (version, mtime_ms) = match given {
+            Some(given) => given,
+            None => (next_counter(self, NEXT_VERSION_KEY)?, now_ms),
+        };
         let has_attrs = !attrs.is_empty();
         let row = VersionRow {
             body: new.body,
             size: new.size,
             md5: new.md5,
             parts: new.parts,
-            mtime_ms: now_ms,
+            mtime_ms,
             flags: if null_version { FLAG_NULL_VERSION } else { 0 }
                 | if has_attrs { FLAG_HAS_ATTRS } else { 0 }
                 | new.storage_class.code() << CLASS_SHIFT,
@@ -641,7 +666,7 @@ impl ObjTxn<'_, '_> {
                     size: new.size,
                     md5: new.md5,
                     parts: new.parts,
-                    last_modified_ms: now_ms,
+                    last_modified_ms: mtime_ms,
                     storage_class: new.storage_class,
                 }),
             },
@@ -655,7 +680,7 @@ impl ObjTxn<'_, '_> {
             size: new.size,
             md5: new.md5,
             parts: new.parts,
-            mtime_ms: now_ms,
+            mtime_ms,
             storage_class: new.storage_class,
             attrs: attrs.clone(),
         })
@@ -762,6 +787,7 @@ impl ObjTxn<'_, '_> {
             },
             now_ms,
         )?;
+        self.queue_metadata_replication(bucket, key, version)?;
         Ok(Ok((version, null_version)))
     }
 
@@ -944,6 +970,7 @@ impl ObjTxn<'_, '_> {
             removed_rows.push((version, row.clone()));
             self.set_lock(bucket, key, version, &crate::ObjectLock::default())?;
             self.forget_restore(bucket, key, version)?;
+            self.forget_replication_status(bucket, key, version)?;
             if row.flags & FLAG_HAS_ATTRS != 0 {
                 let state = self.version_state_key(bucket, key, version)?;
                 self.remove_attrs(&state)?;

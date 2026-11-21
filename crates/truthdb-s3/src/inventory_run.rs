@@ -563,7 +563,11 @@ async fn make_report(
                     true => file.object_lock(&name, &object.key, object.info.version)?,
                     false => ObjectLock::default(),
                 };
-                rows.push(row.values(object, &lock, started));
+                let status = match row.statuses {
+                    true => file.replication_status(&name, &object.key, object.info.version)?,
+                    false => None,
+                };
+                rows.push(row.values(object, &lock, status, started));
             }
             let next = listing.last.map(|(key, _)| (key, listing.last_version));
             Ok(Some((rows, next, listing.truncated)))
@@ -897,6 +901,8 @@ struct Row {
     /// Whether any Object Lock column is asked for (each row then reads its
     /// version's lock).
     locks: bool,
+    /// Whether the replication status is asked for (each row then reads it).
+    statuses: bool,
     encrypted: bool,
     /// The owner's canonical id, and its full control as an ACL document
     /// (base64), as S3 writes them.
@@ -927,6 +933,7 @@ impl Row {
             locks: columns
                 .iter()
                 .any(|column| column.starts_with("ObjectLock")),
+            statuses: columns.contains(&"ReplicationStatus"),
             columns,
             encrypted,
             owner_id,
@@ -936,7 +943,13 @@ impl Row {
 
     /// `object`'s values, a column each, at `now_ms` (an event hold's
     /// retain-until date moves with it).
-    fn values(&self, object: &ListedObject, lock: &ObjectLock, now_ms: u64) -> Vec<Value> {
+    fn values(
+        &self,
+        object: &ListedObject,
+        lock: &ObjectLock,
+        replication: Option<truthdb_object::ReplicationStatus>,
+        now_ms: u64,
+    ) -> Vec<Value> {
         let info = &object.info;
         let marker = info.delete_marker;
         let text = |text: &str| Value::Text(text.to_string());
@@ -989,6 +1002,9 @@ impl Row {
                 }),
                 "ObjectAccessControlList" if !marker => text(&self.acl),
                 "ObjectOwner" => text(&self.owner_id),
+                "ReplicationStatus" => {
+                    replication.map_or(Value::Null, |status| text(status.as_str()))
+                }
                 // Nothing kept fills the others (and a delete marker has no
                 // size, ETag, class or encryption).
                 _ => Value::Null,
@@ -1240,6 +1256,7 @@ mod tests {
             fields(csv_line(&row.values(
                 &object(false, false),
                 &lock,
+                None,
                 10 * DAY_MS
             ))),
             [
@@ -1279,7 +1296,7 @@ mod tests {
             verifier: String::new(),
         });
         let none = ObjectLock::default();
-        let line = fields(csv_line(&row.values(&keyed, &none, 0)));
+        let line = fields(csv_line(&row.values(&keyed, &none, None, 0)));
         assert_eq!(
             &line[2..12],
             [
@@ -1297,10 +1314,18 @@ mod tests {
         );
         assert_eq!(&line[12..18], ["", "", "OFF", "", "", ""]);
         keyed.info.delete_marker = false;
-        assert_eq!(fields(csv_line(&row.values(&keyed, &none, 0)))[11], "SSE-C");
+        assert_eq!(
+            fields(csv_line(&row.values(&keyed, &none, None, 0)))[11],
+            "SSE-C"
+        );
         let plain = Row::new(&config, "src", "111111111111", Versioning::Enabled, false);
         assert_eq!(
-            fields(csv_line(&plain.values(&object(false, false), &none, 0)))[11],
+            fields(csv_line(&plain.values(
+                &object(false, false),
+                &none,
+                None,
+                0
+            )))[11],
             "NOT-SSE"
         );
     }
