@@ -788,8 +788,15 @@ fn replicate(
             .transaction(|tx| tx.drop_replication(queued))
             .map(|()| None);
     };
-    let rule_class = rule_naming(&config, queued, &source.attrs.tags)
-        .and_then(|rule| rule.destination.storage_class);
+    // The class of the rule its tags name now, or (sent as written, by
+    // another rule naming the destination) the one it was queued with.
+    let rule_class = match config
+        .rule_for(&queued.key, &source.attrs.tags)
+        .filter(|rule| rule.destination.bucket == queued.destination)
+    {
+        Some(rule) => rule.destination.storage_class,
+        None => queued.storage_class,
+    };
     // A bucket of this server first, then one on another service.
     if file.bucket(&queued.destination)?.is_none()
         && let Some(remote) = file.remote_bucket(&queued.destination)?
@@ -872,9 +879,17 @@ fn replicate(
             // A change sent back reaches a source only if it asks for them
             // too, as S3 needs replica modification sync on both buckets:
             // its own rule to the replicas' bucket enables it.
-            let consents = match file.replication_status(&destination, &key, queued.version)? {
-                Some(ReplicationStatus::Replica) => true,
-                _ => match (file.replication(&destination)?, &there) {
+            // A change sent on (from a source to its replica) reaches only
+            // the replica; one sent back (from a replica) reaches only a
+            // bucket that asks for it, whatever its version is.
+            let back = file.replication_status(&queued.bucket, &key, queued.version)?
+                == Some(ReplicationStatus::Replica);
+            let consents = match back {
+                false => {
+                    file.replication_status(&destination, &key, queued.version)?
+                        == Some(ReplicationStatus::Replica)
+                }
+                true => match (file.replication(&destination)?, &there) {
                     (Some(theirs), Some(there)) => theirs
                         .rule_for(&key, &there.attrs.tags)
                         .is_some_and(|rule| {
