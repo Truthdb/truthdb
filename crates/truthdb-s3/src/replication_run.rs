@@ -134,54 +134,89 @@ fn store_anew(file: &mut ObjFile<'_>) -> Result<(), StorageError> {
     Ok(())
 }
 
+/// Why a replica was not sent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Fail {
+    /// The service refused it, and would again: the source is FAILED.
+    Lasting(String),
+    /// The service could not be reached or answered with a passing error:
+    /// it stays PENDING, the bucket is waited for, as long as it takes.
+    Passing(String),
+    /// The source's body could not be read whole: it stays PENDING, until
+    /// it happened [`MAX_TRIES`] times.
+    Unreadable(String),
+    /// Not tried: an older replica for the same bucket is not sent yet.
+    Skipped,
+}
+
 /// What the runner keeps between steps: the remote buckets being waited
-/// for, where the next step looks in the queue, and how often each queued
-/// replication for another service failed for a while.
+/// for; where the next step looks in the queue; the remote buckets held in
+/// this pass over the queue (an entry for them was left queued: theirs are
+/// sent in the queue's order, so no later one goes before it); and how
+/// often each queued replication's body could not be read.
 #[derive(Default)]
 struct Runner {
     waits: Waits,
     after: Option<u64>,
+    held: HashSet<String>,
     tries: HashMap<u64, u32>,
 }
 
-/// How often a replication for another service may fail for a while
-/// before it is FAILED.
+/// How often a replication's body may fail to be read before it is FAILED.
 const MAX_TRIES: u32 = 10;
 
 impl Runner {
+    /// The remote buckets held for this step: none at the start of a pass,
+    /// and those being waited for, which stay held until the pass ends.
+    fn held_now(&mut self) -> HashSet<String> {
+        if self.after.is_none() {
+            self.held.clear();
+        }
+        let now = Instant::now();
+        for (name, (until, _)) in &self.waits {
+            if *until > now {
+                self.held.insert(name.clone());
+            }
+        }
+        self.held.clone()
+    }
+
     /// Notes how sending queued replication `number` to remote bucket
-    /// `name` went, and returns how it is to be finished: a failure that
-    /// may clear makes the bucket wait (doubling), and is FAILED once it
-    /// happened [`MAX_TRIES`] times. A send skipped (no reason given, the
-    /// bucket being waited for) counts for nothing.
-    fn record(
-        &mut self,
-        name: &str,
-        number: u64,
-        outcome: Result<(), (bool, String)>,
-    ) -> Result<(), (bool, String)> {
+    /// `name` went, and returns how it is to be finished. One left queued
+    /// holds the bucket for the rest of the pass; a passing failure makes
+    /// the bucket wait (doubling); a body not read [`MAX_TRIES`] times is
+    /// FAILED.
+    fn record(&mut self, name: &str, number: u64, outcome: Result<(), Fail>) -> Result<(), Fail> {
         match outcome {
-            Ok(()) | Err((true, _)) => {
+            Ok(()) | Err(Fail::Lasting(_)) => {
                 self.waits.remove(name);
                 self.tries.remove(&number);
                 outcome
             }
-            Err((false, why)) if !why.is_empty() => {
+            Err(Fail::Passing(why)) => {
+                self.held.insert(name.to_string());
                 let wait = self
                     .waits
                     .get(name)
                     .map_or(IDLE, |(_, wait)| (*wait * 2).clamp(IDLE, MAX_WAIT));
                 self.waits
                     .insert(name.to_string(), (Instant::now() + wait, wait));
+                Err(Fail::Passing(why))
+            }
+            Err(Fail::Unreadable(why)) => {
                 let tries = self.tries.entry(number).or_default();
                 *tries += 1;
                 if *tries >= MAX_TRIES {
                     self.tries.remove(&number);
-                    return Err((true, format!("{why} (tried {MAX_TRIES} times)")));
+                    return Err(Fail::Lasting(format!("{why} (tried {MAX_TRIES} times)")));
                 }
-                Err((false, why))
+                self.held.insert(name.to_string());
+                Err(Fail::Unreadable(why))
             }
-            skipped => skipped,
+            Err(Fail::Skipped) => {
+                self.held.insert(name.to_string());
+                Err(Fail::Skipped)
+            }
         }
     }
 }
@@ -196,23 +231,17 @@ fn part_size(size: u64) -> usize {
 /// Those in this server are made in one lock hold; those for another
 /// service are prepared there (their bodies leased), sent without the lock,
 /// and finished in a hold each. A step goes on in the queue where the last
-/// one stopped, and from its start once it reaches the end, so the work for
-/// a remote bucket being waited for holds no other back.
+/// one stopped, and from its start once it reaches the end (a new pass),
+/// so the work for a remote bucket being waited for holds no other back.
 async fn step(state: &S3State, runner: &mut Runner) -> Result<bool, String> {
-    let now = Instant::now();
-    let waiting: HashSet<String> = runner
-        .waits
-        .iter()
-        .filter(|(_, (until, _))| *until > now)
-        .map(|(name, _)| name.clone())
-        .collect();
+    let held = runner.held_now();
     let after = runner.after;
     let (jobs, made, next) = object(state, move |file| {
         if !file.versions_keyed()? {
             return Ok((Vec::new(), 0, after));
         }
         let mut jobs = Vec::new();
-        match prepare(file, after, &waiting, &mut jobs) {
+        match prepare(file, after, &held, &mut jobs) {
             Ok((made, next)) => Ok((jobs, made, next)),
             Err(err) => {
                 // Nothing prepared is sent: its leases go.
@@ -229,10 +258,10 @@ async fn step(state: &S3State, runner: &mut Runner) -> Result<bool, String> {
     for job in jobs {
         let name = job.remote.name.clone();
         let number = job.queued.number;
-        // A remote bucket that just failed is not tried again in this step.
-        let outcome = match runner.waits.get(&name) {
-            Some((until, _)) if *until > Instant::now() => Err((false, String::new())),
-            _ => send(state, &job).await,
+        // After one of the bucket's was left queued, its later ones wait.
+        let outcome = match runner.held.contains(&name) {
+            true => Err(Fail::Skipped),
+            false => send(state, &job).await,
         };
         let outcome = runner.record(&name, number, outcome);
         // Every job is finished (its lease released), whatever one did.
@@ -242,18 +271,19 @@ async fn step(state: &S3State, runner: &mut Runner) -> Result<bool, String> {
     }
     match failed {
         Some(err) => Err(err),
-        None => Ok(made == BATCH),
+        // A full scan with nothing to make goes on at once.
+        None => Ok(made == BATCH || next.is_some()),
     }
 }
 
 /// Prepares the queued replications after `after`, making those in this
-/// server, up to [`BATCH`], those for a remote bucket in `waiting` passed
+/// server, up to [`BATCH`], those for a remote bucket in `held` passed
 /// over; returns how many were made or prepared, and where the next step
 /// goes on (none: from the start).
 fn prepare(
     file: &mut ObjFile<'_>,
     after: Option<u64>,
-    waiting: &HashSet<String>,
+    held: &HashSet<String>,
     jobs: &mut Vec<RemoteJob>,
 ) -> Result<(usize, Option<u64>), StorageError> {
     let queue = file.replication_queue(after, SCAN)?;
@@ -268,7 +298,7 @@ fn prepare(
             next = Some(queued.number - 1);
             break;
         }
-        if waiting.contains(&queued.destination) {
+        if held.contains(&queued.destination) {
             continue;
         }
         made += 1;
@@ -279,10 +309,8 @@ fn prepare(
     Ok((made, next))
 }
 
-/// Sends `job`'s replica: in one PUT, or in parts past [`PART`]. An error
-/// says whether it would fail again (`true`: the source is FAILED) or may
-/// clear (it stays PENDING and is sent again).
-async fn send(state: &S3State, job: &RemoteJob) -> Result<(), (bool, String)> {
+/// Sends `job`'s replica: in one PUT, or in parts past [`PART`].
+async fn send(state: &S3State, job: &RemoteJob) -> Result<(), Fail> {
     let remote = &job.remote;
     let client = truthdb_s3client::Client::new(truthdb_s3client::Config {
         endpoint: remote.endpoint.clone(),
@@ -291,8 +319,7 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), (bool, String)> {
         secret: remote.secret.clone(),
         ca_pem: remote.ca_pem.clone(),
     })
-    .map_err(|err| (err.permanent(), err.to_string()))?;
-    let service = |err: truthdb_s3client::Error| (err.permanent(), err.to_string());
+    .map_err(service)?;
     let (tx, mut rx) = mpsc::channel(4);
     let engine = state.engine.clone();
     let (layout, size) = (job.layout.clone(), job.size);
@@ -365,6 +392,14 @@ async fn send(state: &S3State, job: &RemoteJob) -> Result<(), (bool, String)> {
     }
 }
 
+/// A service's error, as a reason a replica was not sent.
+fn service(err: truthdb_s3client::Error) -> Fail {
+    match err.permanent() {
+        true => Fail::Lasting(err.to_string()),
+        false => Fail::Passing(err.to_string()),
+    }
+}
+
 /// Stops a task when dropped.
 struct StopOnDrop(tokio::task::AbortHandle);
 
@@ -380,11 +415,10 @@ async fn read_whole(
     reader: tokio::task::JoinHandle<bool>,
     read: u64,
     size: u64,
-) -> Result<(), (bool, String)> {
+) -> Result<(), Fail> {
     match reader.await {
         Ok(true) if read == size => Ok(()),
-        _ => Err((
-            false,
+        _ => Err(Fail::Unreadable(
             "the source's body could not be read whole".to_string(),
         )),
     }
@@ -395,28 +429,28 @@ async fn read_whole(
 fn finish_remote(
     file: &mut ObjFile<'_>,
     job: &RemoteJob,
-    outcome: Result<(), (bool, String)>,
+    outcome: Result<(), Fail>,
 ) -> Result<(), StorageError> {
     file.release_lease(job.body);
     let queued = &job.queued;
+    let why = match &outcome {
+        Ok(()) | Err(Fail::Skipped) => None,
+        Err(Fail::Lasting(why) | Fail::Passing(why) | Fail::Unreadable(why)) => Some(why),
+    };
+    if let Some(why) = why {
+        eprintln!(
+            "replication: {}/{} version {} was not sent to {}: {why}",
+            queued.bucket, queued.key, queued.version, queued.destination
+        );
+    }
     match outcome {
         Ok(()) => {
             file.transaction(|tx| tx.finish_replication(queued, Some(ReplicationStatus::Completed)))
         }
-        Err((permanent, why)) => {
-            if !why.is_empty() {
-                eprintln!(
-                    "replication: {}/{} version {} was not sent to {}: {why}",
-                    queued.bucket, queued.key, queued.version, queued.destination
-                );
-            }
-            match permanent {
-                true => file.transaction(|tx| {
-                    tx.finish_replication(queued, Some(ReplicationStatus::Failed))
-                }),
-                false => Ok(()),
-            }
+        Err(Fail::Lasting(_)) => {
+            file.transaction(|tx| tx.finish_replication(queued, Some(ReplicationStatus::Failed)))
         }
+        Err(_) => Ok(()),
     }
 }
 
@@ -1115,7 +1149,7 @@ mod tests {
         finish_remote(
             &mut ObjFile::new(&mut storage.lock()),
             &job,
-            Err((false, "connection refused".into())),
+            Err(Fail::Passing("connection refused".into())),
         )
         .unwrap();
         assert_eq!(status("later", later), Some(ReplicationStatus::Pending));
@@ -1157,21 +1191,40 @@ mod tests {
     #[test]
     fn a_send_failing_for_a_while_waits_then_fails_and_parts_fit_s3s_count() {
         let mut runner = Runner::default();
-        let failing = || Err((false, "connection refused".to_string()));
-        for _ in 1..MAX_TRIES {
-            assert_eq!(runner.record("far", 7, failing()), failing());
+        // The service down: PENDING however long it lasts; the bucket waits
+        // and is held for the rest of the pass.
+        let down = || Err(Fail::Passing("connection refused".to_string()));
+        for _ in 0..3 * MAX_TRIES {
+            assert_eq!(runner.record("far", 7, down()), down());
         }
         assert!(runner.waits["far"].0 > Instant::now(), "the bucket waits");
-        assert!(matches!(runner.record("far", 7, failing()), Err((true, _))));
-        assert!(!runner.tries.contains_key(&7));
-        // A skipped send counts for nothing; a sent one ends the wait.
-        assert_eq!(
-            runner.record("far", 8, Err((false, String::new()))),
-            Err((false, String::new()))
-        );
-        assert!(!runner.tries.contains_key(&8));
+        assert!(runner.held.contains("far"));
+        // A body not read: FAILED after MAX_TRIES.
+        let unread = || Err(Fail::Unreadable("short".to_string()));
+        for _ in 1..MAX_TRIES {
+            assert_eq!(runner.record("near", 9, unread()), unread());
+        }
+        assert!(matches!(
+            runner.record("near", 9, unread()),
+            Err(Fail::Lasting(_))
+        ));
+        assert!(!runner.tries.contains_key(&9));
+        // A skipped send holds the bucket; a sent one ends its wait.
+        let mut fresh = Runner::default();
+        assert_eq!(fresh.record("x", 1, Err(Fail::Skipped)), Err(Fail::Skipped));
+        assert!(fresh.held.contains("x"));
         assert_eq!(runner.record("far", 8, Ok(())), Ok(()));
         assert!(!runner.waits.contains_key("far"));
+        // Held until the pass ends, even once its wait is over; a new pass
+        // starts with nothing held but what is waited for.
+        runner.after = Some(5);
+        assert!(runner.held_now().contains("far"));
+        runner.after = None;
+        assert!(!runner.held_now().contains("far"));
+        runner
+            .waits
+            .insert("down".into(), (Instant::now() + MAX_WAIT, MAX_WAIT));
+        assert!(runner.held_now().contains("down"));
         // Parts: at least 8 MiB, at most 10,000 of them.
         assert_eq!(part_size(1), PART);
         assert_eq!(part_size(10_000 * PART as u64), PART);

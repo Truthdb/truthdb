@@ -100,6 +100,18 @@ impl ObjTxn<'_, '_> {
         Ok(inserted == TreeInsert::Inserted)
     }
 
+    /// Whether a remote bucket is recorded for account `account`.
+    pub(crate) fn has_remote_buckets(&mut self, account: &str) -> Result<bool, StorageError> {
+        for (key, row) in self.trees.remote_buckets().scan(self.ctx)? {
+            let name = String::from_utf8(key)
+                .map_err(|_| StorageError::InvalidFile("corrupt remote bucket".to_string()))?;
+            if RemoteBucket::decode(&name, &row)?.account == account {
+                return Ok(true);
+            }
+        }
+        Ok(false)
+    }
+
     /// Forgets remote bucket `name`; whether it was recorded.
     pub fn drop_remote_bucket(&mut self, name: &str) -> Result<bool, StorageError> {
         Ok(self
