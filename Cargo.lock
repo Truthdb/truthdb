@@ -1974,6 +1974,7 @@ dependencies = [
  "hyper",
  "hyper-util",
  "md-5",
+ "parquet",
  "percent-encoding",
  "quick-xml",
  "ring",

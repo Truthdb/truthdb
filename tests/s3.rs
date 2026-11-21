@@ -13376,14 +13376,36 @@ fn inventory_reports_list_a_buckets_objects_once_a_day_across_a_crash() {
             .args([phase, &port.to_string(), &key, &secret])
             .output()
             .expect("run python");
+        let stdout = String::from_utf8_lossy(&output.stdout).to_string();
         assert!(
-            output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
-            "{phase}\n{}\n{}",
-            String::from_utf8_lossy(&output.stdout),
+            output.status.success() && stdout.contains("ok"),
+            "{phase}\n{stdout}\n{}",
             String::from_utf8_lossy(&output.stderr)
         );
+        stdout
     };
-    run("reports", server.s3_port);
+    let out = run("reports", server.s3_port);
+    // The Parquet list reads back as a table.
+    let parquet = out
+        .lines()
+        .find_map(|line| line.strip_prefix("parquet="))
+        .expect("the Parquet list's key");
+    assert_eq!(
+        sql_rows(
+            server.native_port,
+            &format!(
+                "SELECT [key], size, is_latest FROM sys.s3_read('lists', '{parquet}', 'parquet') \
+                 ORDER BY [key], is_latest DESC, is_delete_marker DESC"
+            )
+        ),
+        [
+            ["docs/a b.txt", "6", "1"],
+            ["docs/gone", "null", "1"],
+            ["docs/gone", "1", "0"],
+            ["docs/x", "6", "1"],
+            ["docs/x", "3", "0"],
+        ]
+    );
     // A configuration put just before a crash: its run, cut short or not,
     // is made once; the reports made before are not made again the same day.
     run("arm", server.s3_port);
@@ -13416,7 +13438,7 @@ def wait_manifest(bucket, prefix):
             return found
         time.sleep(0.2)
     raise SystemExit(f"no manifest under {bucket}/{prefix}")
-def report(bucket, prefix):
+def report(bucket, prefix, extension="csv.gz"):
     [manifest_key] = wait_manifest(bucket, prefix)
     raw = read(bucket, manifest_key)
     manifest = json.loads(raw)
@@ -13425,10 +13447,12 @@ def report(bucket, prefix):
     [listed] = manifest["files"]
     data = read(bucket, listed["key"])
     assert listed["size"] == len(data) and listed["MD5checksum"] == hashlib.md5(data).hexdigest(), listed
-    assert listed["key"].startswith(prefix) and "/data/" in listed["key"] and listed["key"].endswith(".csv.gz")
+    assert listed["key"].startswith(prefix) and "/data/" in listed["key"] and listed["key"].endswith("." + extension)
     stamp = manifest_key.split("/")[-2]
     hive = prefix + "hive/dt=" + stamp[:10] + "-" + stamp[11:13] + "-" + stamp[14:16] + "/symlink.txt"
     assert read(bucket, hive).decode() == f"s3://{bucket}/{listed['key']}\n"
+    if extension != "csv.gz":
+        return manifest, data, manifest_key
     rows = list(csv.reader(io.StringIO(gzip.decompress(data).decode())))
     return manifest, sorted(rows), manifest_key
 
@@ -13467,6 +13491,9 @@ if phase == "reports":
     for id, versions in [("many", "Current"), ("manyall", "All")]:
         s3.put_bucket_inventory_configuration(Bucket="big", Id=id, InventoryConfiguration=configuration(
             id, "lists", Filter={"Prefix": "many/"}, IncludedObjectVersions=versions))
+    s3.put_bucket_inventory_configuration(Bucket="source", Id="pq", InventoryConfiguration=configuration(
+        "pq", "lists", Filter={"Prefix": "docs/"}, IncludedObjectVersions="All", OptionalFields=["Size"],
+        Destination={"S3BucketDestination": {"Bucket": "arn:aws:s3:::lists", "Format": "Parquet"}}))
     off = configuration("off", "lists")
     off["IsEnabled"] = False
     s3.put_bucket_inventory_configuration(Bucket="source", Id="off", InventoryConfiguration=off)
@@ -13493,6 +13520,12 @@ if phase == "reports":
         ["source", "early", "", "True", "False", "5", "OFF"],
         ["source", "other/y", rows[-1][2], "True", "False", "1", "OFF"],
     ]), rows
+    manifest, data, _ = report("lists", "source/pq/", "parquet")
+    assert manifest["fileFormat"] == "Parquet" and data[:4] == data[-4:] == b"PAR1", manifest
+    assert manifest["fileSchema"] == ("message s3.inventory { required binary bucket (UTF8); "
+        "required binary key (UTF8); optional binary version_id (UTF8); optional boolean is_latest; "
+        "optional boolean is_delete_marker; optional int64 size;}"), manifest
+    print("parquet=" + manifest["files"][0]["key"])
     for id in ["many", "manyall"]:
         _, rows, _ = report("lists", f"big/{id}/")
         assert [row[1] for row in rows] == [f"many/{n:04}" for n in range(1001)], (id, len(rows))
