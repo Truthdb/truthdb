@@ -7127,3 +7127,116 @@ fn an_account_with_remote_buckets_is_not_dropped() {
     drop(storage);
     std::fs::remove_file(&path).ok();
 }
+
+#[test]
+fn a_version_replicated_to_several_destinations_is_completed_once_all_are_made() {
+    use crate::{
+        ReplicationConfig, ReplicationDestination, ReplicationFilter, ReplicationRule,
+        ReplicationStatus, StorageClass, Versioning,
+    };
+    let path = temp_path("replication-several");
+    let storage = create(&path);
+    let to = |bucket: &str| ReplicationRule {
+        id: bucket.to_string(),
+        priority: 1,
+        enabled: true,
+        filter: ReplicationFilter::All,
+        replica_modifications: false,
+        destination: ReplicationDestination {
+            bucket: bucket.to_string(),
+            account: None,
+            storage_class: None,
+            owner_override: false,
+            owner: None,
+        },
+    };
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            for bucket in ["src", "one", "two"] {
+                tx.create_bucket(bucket, DEFAULT_ACCOUNT, T0)?.unwrap();
+                tx.set_versioning(bucket, Versioning::Enabled)?.unwrap();
+            }
+            tx.put_replication(
+                "src",
+                &ReplicationConfig {
+                    role: "role".into(),
+                    rules: vec![to("one"), to("two")],
+                    account: DEFAULT_ACCOUNT.into(),
+                    user: None,
+                },
+            )
+        })
+        .unwrap();
+    let status = |key: &str, version: u64| {
+        ObjFile::new(&mut storage.lock())
+            .replication_status("src", key, version)
+            .unwrap()
+    };
+    let queued = |key: &str| {
+        ObjFile::new(&mut storage.lock())
+            .replication_queue(None, 100)
+            .unwrap()
+            .into_iter()
+            .filter(|q| q.key == key)
+            .collect::<Vec<_>>()
+    };
+    let finish = |q: &crate::QueuedReplication, how: Option<ReplicationStatus>| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.finish_replication(q, how))
+            .unwrap()
+    };
+    let drop_one = |q: &crate::QueuedReplication| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.drop_replication(q))
+            .unwrap()
+    };
+    // One queued replication a destination; PENDING until both are made.
+    let a = put_at(&storage, "src", "a", 10, StorageClass::Standard, T0);
+    let a_queue = queued("a");
+    assert_eq!(
+        a_queue
+            .iter()
+            .map(|q| q.destination.as_str())
+            .collect::<Vec<_>>(),
+        ["one", "two"]
+    );
+    finish(&a_queue[0], Some(ReplicationStatus::Completed));
+    assert_eq!(status("a", a), Some(ReplicationStatus::Pending));
+    finish(&a_queue[1], Some(ReplicationStatus::Completed));
+    assert_eq!(status("a", a), Some(ReplicationStatus::Completed));
+    // FAILED as soon as one fails, the other still to be made.
+    let b = put_at(&storage, "src", "b", 10, StorageClass::Standard, T0);
+    let b_queue = queued("b");
+    finish(&b_queue[1], Some(ReplicationStatus::Failed));
+    assert_eq!(status("b", b), Some(ReplicationStatus::Failed));
+    finish(&b_queue[0], Some(ReplicationStatus::Completed));
+    assert_eq!(status("b", b), Some(ReplicationStatus::Failed));
+    // A destination no rule sends to any more does not count: one made and
+    // one dropped is COMPLETED, both dropped is no status.
+    let c = put_at(&storage, "src", "c", 10, StorageClass::Standard, T0);
+    let c_queue = queued("c");
+    drop_one(&c_queue[0]);
+    assert_eq!(status("c", c), Some(ReplicationStatus::Pending));
+    finish(&c_queue[1], Some(ReplicationStatus::Completed));
+    assert_eq!(status("c", c), Some(ReplicationStatus::Completed));
+    let d = put_at(&storage, "src", "d", 10, StorageClass::Standard, T0);
+    for q in queued("d") {
+        drop_one(&q);
+    }
+    assert_eq!(status("d", d), None);
+    // A row written for one destination (one byte) still reads.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.trees.replication_status().insert_unique(
+                tx.ctx,
+                &mut truthdb_core::relstore::ctx::OpMode::Txn(tx.txn),
+                &crate::objects::version_key("src", "old", 999),
+                &[2],
+            )?;
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(status("old", 999), Some(ReplicationStatus::Completed));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}

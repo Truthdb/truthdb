@@ -742,8 +742,7 @@ fn rule_naming<'c>(
 ) -> Option<&'c truthdb_object::ReplicationRule> {
     match queued.work {
         ReplicationWork::Create => config
-            .rule_for(&queued.key, tags)
-            .filter(|rule| rule.destination.bucket == queued.destination)
+            .rule_to(&queued.key, tags, &queued.destination)
             .or_else(|| {
                 config.rules.iter().find(|rule| {
                     rule.enabled
@@ -751,9 +750,7 @@ fn rule_naming<'c>(
                         && rule.filter.names_key(&queued.key)
                 })
             }),
-        ReplicationWork::Metadata => config
-            .rule_for(&queued.key, tags)
-            .filter(|rule| rule.destination.bucket == queued.destination),
+        ReplicationWork::Metadata => config.rule_to(&queued.key, tags, &queued.destination),
     }
 }
 
@@ -790,10 +787,7 @@ fn replicate(
     };
     // The class of the rule its tags name now, or (sent as written, by
     // another rule naming the destination) the one it was queued with.
-    let rule_class = match config
-        .rule_for(&queued.key, &source.attrs.tags)
-        .filter(|rule| rule.destination.bucket == queued.destination)
-    {
+    let rule_class = match config.rule_to(&queued.key, &source.attrs.tags, &queued.destination) {
         Some(rule) => rule.destination.storage_class,
         None => queued.storage_class,
     };
@@ -891,10 +885,8 @@ fn replicate(
                 }
                 true => match (file.replication(&destination)?, &there) {
                     (Some(theirs), Some(there)) => theirs
-                        .rule_for(&key, &there.attrs.tags)
-                        .is_some_and(|rule| {
-                            rule.destination.bucket == queued.bucket && rule.replica_modifications
-                        }),
+                        .rule_to(&key, &there.attrs.tags, &queued.bucket)
+                        .is_some_and(|rule| rule.replica_modifications),
                     _ => false,
                 },
             };

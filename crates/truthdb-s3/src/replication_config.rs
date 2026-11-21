@@ -278,12 +278,6 @@ pub fn parse(body: &[u8]) -> Result<ReplicationConfig, S3Error> {
             "Rule ID must be unique. Found same ID for more than one rule",
         ));
     }
-    if rules
-        .iter()
-        .any(|rule| rule.destination.bucket != rules[0].destination.bucket)
-    {
-        return Err(not_yet("Replication to more than one destination"));
-    }
     // Who puts it is the request's (see `bucket_replication`).
     Ok(ReplicationConfig {
         role,
@@ -396,8 +390,8 @@ pub(crate) fn blocks_object_lock(
     Ok(false)
 }
 
-/// Why the destination of `config`, for source `source` (of `owner`, with
-/// Object Lock or not), cannot be replicated to, if it cannot.
+/// Why a destination of `config`, for source `source` (of `owner`, with
+/// Object Lock or not), cannot be replicated to, if one cannot.
 fn refused_destination(
     file: &mut truthdb_object::ObjFile<'_>,
     source: &str,
@@ -405,7 +399,35 @@ fn refused_destination(
     source_lock: bool,
     config: &ReplicationConfig,
 ) -> Result<Option<S3Error>, truthdb_core::storage::StorageError> {
-    let destination = &config.rules[0].destination;
+    let mut checked: Vec<&str> = Vec::new();
+    for rule in &config.rules {
+        let bucket = rule.destination.bucket.as_str();
+        if checked.contains(&bucket) {
+            continue;
+        }
+        checked.push(bucket);
+        if let Some(refused) = refused_one(file, source, owner, source_lock, config, bucket)? {
+            return Ok(Some(refused));
+        }
+    }
+    Ok(None)
+}
+
+/// [`refused_destination`] for destination bucket `name`.
+fn refused_one(
+    file: &mut truthdb_object::ObjFile<'_>,
+    source: &str,
+    owner: &str,
+    source_lock: bool,
+    config: &ReplicationConfig,
+    name: &str,
+) -> Result<Option<S3Error>, truthdb_core::storage::StorageError> {
+    let destination = config
+        .rules
+        .iter()
+        .map(|rule| &rule.destination)
+        .find(|destination| destination.bucket == name)
+        .expect("a destination of the configuration");
     if destination.bucket == source {
         return Ok(Some(S3Error::invalid_request(
             "Destination bucket cannot be the same as the source bucket",
@@ -427,10 +449,12 @@ fn refused_destination(
             "Destination bucket must exist",
         )));
     };
-    // As S3: an Account named (in any rule) must be the destination's owner.
+    // As S3: an Account named (in any rule to it) must be the
+    // destination's owner.
     if config
         .rules
         .iter()
+        .filter(|rule| rule.destination.bucket == name)
         .filter_map(|rule| rule.destination.account.as_ref())
         .any(|account| *account != info.owner)
     {
@@ -850,13 +874,20 @@ mod tests {
             ),
             unbuilt
         );
+        // Several destinations.
+        let several = config(&format!(
+            "{}{}",
+            rule_with("<ID>a</ID><Filter/>"),
+            with_destination("<Bucket>arn:aws:s3:::elsewhere</Bucket>")
+        ))
+        .unwrap();
         assert_eq!(
-            code(&format!(
-                "{}{}",
-                rule_with("<ID>a</ID><Filter/>"),
-                with_destination("<Bucket>arn:aws:s3:::elsewhere</Bucket>")
-            )),
-            unbuilt
+            several
+                .rules
+                .iter()
+                .map(|rule| rule.destination.bucket.as_str())
+                .collect::<Vec<_>>(),
+            ["copies", "elsewhere"]
         );
     }
 }

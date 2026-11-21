@@ -290,17 +290,44 @@ impl ReplicationConfig {
         }
     }
 
-    /// The rule that replicates a version of `key` with `tags`: of the
-    /// enabled rules whose filter names it, the one of highest priority (the
-    /// first listed of those of equal priority).
-    pub fn rule_for(&self, key: &str, tags: &[(String, String)]) -> Option<&ReplicationRule> {
+    /// The rule that replicates a version of `key` with `tags` to bucket
+    /// `destination`: of the enabled rules naming it whose filter names the
+    /// version, the one of highest priority (the first listed of those of
+    /// equal priority). Priority settles only between rules of the same
+    /// destination, as S3's does.
+    pub fn rule_to(
+        &self,
+        key: &str,
+        tags: &[(String, String)],
+        destination: &str,
+    ) -> Option<&ReplicationRule> {
         self.rules
             .iter()
-            .filter(|rule| rule.enabled && rule.filter.matches(key, tags))
+            .filter(|rule| {
+                rule.enabled
+                    && rule.destination.bucket == destination
+                    && rule.filter.matches(key, tags)
+            })
             .fold(None, |best: Option<&ReplicationRule>, rule| match best {
                 Some(best) if best.priority >= rule.priority => Some(best),
                 _ => Some(rule),
             })
+    }
+
+    /// The rules that replicate a version of `key` with `tags`: one for each
+    /// destination (see [`Self::rule_to`]), in the order they are first
+    /// named.
+    pub fn rules_for(&self, key: &str, tags: &[(String, String)]) -> Vec<&ReplicationRule> {
+        let mut destinations: Vec<&str> = Vec::new();
+        for rule in &self.rules {
+            if !destinations.contains(&rule.destination.bucket.as_str()) {
+                destinations.push(&rule.destination.bucket);
+            }
+        }
+        destinations
+            .into_iter()
+            .filter_map(|destination| self.rule_to(key, tags, destination))
+            .collect()
     }
 }
 
@@ -323,23 +350,82 @@ impl ReplicationStatus {
         }
     }
 
-    fn code(self) -> u8 {
-        match self {
-            ReplicationStatus::Pending => 1,
-            ReplicationStatus::Completed => 2,
-            ReplicationStatus::Failed => 3,
-            ReplicationStatus::Replica => 4,
+    fn from_row(row: &[u8]) -> Result<Option<Self>, StorageError> {
+        Ok(match StatusRow::decode(row)? {
+            StatusRow::Replica => Some(ReplicationStatus::Replica),
+            StatusRow::Source(tally) => tally.status(),
+        })
+    }
+}
+
+/// A source version's replications: to how many of its destinations each
+/// is yet to be made, was made, or failed. As S3 answers it, the version is
+/// FAILED once one failed, PENDING until every one is made, then COMPLETED.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Tally {
+    pending: u16,
+    completed: u16,
+    failed: u16,
+}
+
+impl Tally {
+    fn status(self) -> Option<ReplicationStatus> {
+        if self.failed > 0 {
+            Some(ReplicationStatus::Failed)
+        } else if self.pending > 0 {
+            Some(ReplicationStatus::Pending)
+        } else if self.completed > 0 {
+            Some(ReplicationStatus::Completed)
+        } else {
+            None
         }
     }
+}
 
-    fn from_row(row: &[u8]) -> Result<Self, StorageError> {
+/// A status row: a replica's, or a source version's tally. A row of one
+/// byte (1 PENDING, 2 COMPLETED, 3 FAILED) was written for a single
+/// destination; 4 is a replica; 0x10 heads a tally.
+enum StatusRow {
+    Replica,
+    Source(Tally),
+}
+
+const TALLY_ROW: u8 = 0x10;
+
+impl StatusRow {
+    fn decode(row: &[u8]) -> Result<Self, StorageError> {
+        let one = |pending, completed, failed| {
+            StatusRow::Source(Tally {
+                pending,
+                completed,
+                failed,
+            })
+        };
         Ok(match row {
-            [1] => ReplicationStatus::Pending,
-            [2] => ReplicationStatus::Completed,
-            [3] => ReplicationStatus::Failed,
-            [4] => ReplicationStatus::Replica,
+            [1] => one(1, 0, 0),
+            [2] => one(0, 1, 0),
+            [3] => one(0, 0, 1),
+            [4] => StatusRow::Replica,
+            [TALLY_ROW, p0, p1, c0, c1, f0, f1] => one(
+                u16::from_le_bytes([*p0, *p1]),
+                u16::from_le_bytes([*c0, *c1]),
+                u16::from_le_bytes([*f0, *f1]),
+            ),
             _ => return Err(corrupt("replication status")),
         })
+    }
+
+    fn encode(&self) -> Vec<u8> {
+        match self {
+            StatusRow::Replica => vec![4],
+            StatusRow::Source(tally) => {
+                let mut out = vec![TALLY_ROW];
+                for count in [tally.pending, tally.completed, tally.failed] {
+                    out.extend_from_slice(&count.to_le_bytes());
+                }
+                out
+            }
+        }
     }
 }
 
@@ -442,26 +528,58 @@ impl ObjTxn<'_, '_> {
         key: &str,
         version: u64,
     ) -> Result<Option<ReplicationStatus>, StorageError> {
-        self.trees
-            .replication_status()
-            .get(self.ctx, &version_key(bucket, key, version))?
-            .map(|row| ReplicationStatus::from_row(&row))
-            .transpose()
+        Ok(self
+            .status_row(bucket, key, version)?
+            .and_then(|row| match row {
+                StatusRow::Replica => Some(ReplicationStatus::Replica),
+                StatusRow::Source(tally) => tally.status(),
+            }))
     }
 
-    fn set_replication_status(
+    fn status_row(
         &mut self,
         bucket: &str,
         key: &str,
         version: u64,
-        status: ReplicationStatus,
+    ) -> Result<Option<StatusRow>, StorageError> {
+        self.trees
+            .replication_status()
+            .get(self.ctx, &version_key(bucket, key, version))?
+            .map(|row| StatusRow::decode(&row))
+            .transpose()
+    }
+
+    fn set_status_row(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+        row: &StatusRow,
     ) -> Result<(), StorageError> {
         let tree = self.trees.replication_status();
         let row_key = version_key(bucket, key, version);
         let mode = &mut OpMode::Txn(self.txn);
         tree.delete(self.ctx, mode, &row_key)?;
-        tree.insert_unique(self.ctx, mode, &row_key, &[status.code()])?;
+        tree.insert_unique(self.ctx, mode, &row_key, &row.encode())?;
         Ok(())
+    }
+
+    /// Changes the tally of the source version of `queued` by `change`, if
+    /// it has one; a tally left empty goes.
+    fn count_replication(
+        &mut self,
+        queued: &QueuedReplication,
+        change: impl FnOnce(&mut Tally),
+    ) -> Result<(), StorageError> {
+        let (bucket, key, version) = (&queued.bucket, &queued.key, queued.version);
+        let Some(StatusRow::Source(mut tally)) = self.status_row(bucket, key, version)? else {
+            return Ok(());
+        };
+        change(&mut tally);
+        match tally == Tally::default() {
+            true => self.forget_replication_status(bucket, key, version),
+            false => self.set_status_row(bucket, key, version, &StatusRow::Source(tally)),
+        }
     }
 
     /// Forgets the replication status of a version being removed.
@@ -502,23 +620,27 @@ impl ObjTxn<'_, '_> {
         let Some(config) = self.replication_config(bucket)? else {
             return Ok(());
         };
-        let Some(rule) = config.rule_for(key, &info.attrs.tags) else {
-            return Ok(());
-        };
-        if info.storage_class.is_archived() {
+        let rules = config.rules_for(key, &info.attrs.tags);
+        if rules.is_empty() || info.storage_class.is_archived() {
             return Ok(());
         }
-        let queued = QueuedReplication {
-            number: 0,
-            work: ReplicationWork::Create,
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version: info.version,
-            destination: rule.destination.bucket.clone(),
-            storage_class: rule.destination.storage_class,
+        let tally = Tally {
+            pending: rules.len() as u16,
+            ..Tally::default()
         };
-        self.set_replication_status(bucket, key, info.version, ReplicationStatus::Pending)?;
-        self.enqueue(queued)
+        self.set_status_row(bucket, key, info.version, &StatusRow::Source(tally))?;
+        for rule in rules {
+            self.enqueue(QueuedReplication {
+                number: 0,
+                work: ReplicationWork::Create,
+                bucket: bucket.to_string(),
+                key: key.to_string(),
+                version: info.version,
+                destination: rule.destination.bucket.clone(),
+                storage_class: rule.destination.storage_class,
+            })?;
+        }
+        Ok(())
     }
 
     /// Queues a change of a version's tags (now `tags`) for its replica,
@@ -536,31 +658,30 @@ impl ObjTxn<'_, '_> {
         let Some(config) = self.replication_config(bucket)? else {
             return Ok(());
         };
-        let Some(rule) = config.rule_for(key, tags) else {
-            return Ok(());
-        };
-        let sent = match status {
-            Some(ReplicationStatus::Pending | ReplicationStatus::Completed) => true,
-            Some(ReplicationStatus::Replica) => rule.replica_modifications,
-            _ => false,
-        };
-        if !sent {
-            return Ok(());
+        for rule in config.rules_for(key, tags) {
+            let sent = match status {
+                Some(ReplicationStatus::Pending | ReplicationStatus::Completed) => true,
+                Some(ReplicationStatus::Replica) => rule.replica_modifications,
+                _ => false,
+            };
+            if sent {
+                self.enqueue(QueuedReplication {
+                    number: 0,
+                    work: ReplicationWork::Metadata,
+                    bucket: bucket.to_string(),
+                    key: key.to_string(),
+                    version,
+                    destination: rule.destination.bucket.clone(),
+                    storage_class: None,
+                })?;
+            }
         }
-        let queued = QueuedReplication {
-            number: 0,
-            work: ReplicationWork::Metadata,
-            bucket: bucket.to_string(),
-            key: key.to_string(),
-            version,
-            destination: rule.destination.bucket.clone(),
-            storage_class: None,
-        };
-        self.enqueue(queued)
+        Ok(())
     }
 
-    /// Takes queued replication `number` off the queue, setting its source
-    /// version's status to `status` if given (and the version is there).
+    /// Takes queued replication `number` off the queue, counting it in its
+    /// source version's tally as `status` says (COMPLETED or FAILED), if
+    /// given and the version has a tally.
     pub fn finish_replication(
         &mut self,
         queued: &QueuedReplication,
@@ -571,32 +692,34 @@ impl ObjTxn<'_, '_> {
             &mut OpMode::Txn(self.txn),
             &queued.number.to_be_bytes(),
         )?;
-        if let Some(status) = status
-            && self
-                .replication_status_of(&queued.bucket, &queued.key, queued.version)?
-                .is_some()
-        {
-            self.set_replication_status(&queued.bucket, &queued.key, queued.version, status)?;
-        }
-        Ok(())
+        let Some(status) = status else {
+            return Ok(());
+        };
+        self.count_replication(queued, |tally| {
+            tally.pending = tally.pending.saturating_sub(1);
+            match status {
+                ReplicationStatus::Failed => tally.failed = tally.failed.saturating_add(1),
+                _ => tally.completed = tally.completed.saturating_add(1),
+            }
+        })
     }
 
     /// Takes queued replication `number` off the queue unmade, as no rule
-    /// sends its version there any more: a version still PENDING is no
-    /// longer replicated, and has no status.
+    /// sends its version there any more: it no longer counts in its
+    /// version's tally (a version no destination is left for has no
+    /// status).
     pub fn drop_replication(&mut self, queued: &QueuedReplication) -> Result<(), StorageError> {
         self.trees.replication_queue().delete(
             self.ctx,
             &mut OpMode::Txn(self.txn),
             &queued.number.to_be_bytes(),
         )?;
-        if queued.work == ReplicationWork::Create
-            && self.replication_status_of(&queued.bucket, &queued.key, queued.version)?
-                == Some(ReplicationStatus::Pending)
-        {
-            self.forget_replication_status(&queued.bucket, &queued.key, queued.version)?;
+        if queued.work != ReplicationWork::Create {
+            return Ok(());
         }
-        Ok(())
+        self.count_replication(queued, |tally| {
+            tally.pending = tally.pending.saturating_sub(1);
+        })
     }
 
     /// Writes the replica of `source` in `bucket` as `key`: the same version
@@ -650,7 +773,7 @@ impl ObjTxn<'_, '_> {
             grace_ms,
         )?;
         self.set_lock(bucket, key, source.version, lock)?;
-        self.set_replication_status(bucket, key, source.version, ReplicationStatus::Replica)?;
+        self.set_status_row(bucket, key, source.version, &StatusRow::Replica)?;
         Ok(Ok(true))
     }
 }
@@ -689,6 +812,7 @@ impl ObjFile<'_> {
         )?
         .map(|row| ReplicationStatus::from_row(&row))
         .transpose()
+        .map(Option::flatten)
     }
 
     /// Up to `limit` queued replications, in order, those numbered after
