@@ -787,7 +787,7 @@ impl ObjTxn<'_, '_> {
             },
             now_ms,
         )?;
-        self.queue_metadata_replication(bucket, key, version)?;
+        self.queue_metadata_replication(bucket, key, version, &attrs.tags)?;
         Ok(Ok((version, null_version)))
     }
 

@@ -13381,7 +13381,8 @@ other.create_bucket(Bucket="fleeting", ObjectLockEnabledForBucket=True)
 refused(lambda: s3.put_object_lock_configuration(Bucket="relocking",
     ObjectLockConfiguration=LOCK), "InvalidBucketState")
 # What later steps build is refused, not ignored.
-refused(lambda: put("source", rule(Filter={"Tag": {"Key": "a", "Value": "b"}})), "NotImplemented")
+put("source", rule(Filter={"Tag": {"Key": "a", "Value": "b"}}))
+s3.delete_bucket_replication(Bucket="source")
 refused(lambda: put("source", rule(DeleteMarkerReplication={"Status": "Enabled"})), "NotImplemented")
 refused(lambda: put("source", rule(), dict(rule("locked-copies"), ID="two")), "NotImplemented")
 # Kept as given and read back.
@@ -13899,6 +13900,127 @@ c.put_bucket_policy(Bucket="a-dst", Policy=json.dumps({"Version": "2012-10-17", 
 claimed = a.put_object(Bucket="a-src", Key="claimed", Body=b"secret")["VersionId"]
 wait(lambda: status("claimed", claimed) == "FAILED", "not to a bucket made again by another")
 assert "Versions" not in c.list_object_versions(Bucket="a-dst")
+print("ok")
+"#;
+
+#[test]
+fn replication_selects_by_tags_and_syncs_replica_changes_back_when_asked() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (account, key, secret) = account_with_key(&server, "selective");
+    let script = server.dir.join("selective_replication.py");
+    std::fs::write(&script, SELECTIVE_REPLICATION_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([&server.s3_port.to_string(), &account, &key, &secret])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The two-way sync has ended: no tag change goes on being made.
+    let changes = || {
+        sql_rows(
+            server.native_port,
+            "SELECT COUNT(*) FROM sys.s3_journal('src')",
+        )
+    };
+    let settled = changes();
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(changes(), settled, "tag changes go on back and forth");
+}
+
+const SELECTIVE_REPLICATION_SCRIPT: &str = r#"
+import sys, time
+import boto3, botocore.config
+port, account, key, secret = sys.argv[1:5]
+s3 = boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+    aws_access_key_id=key, aws_secret_access_key=secret,
+    config=botocore.config.Config(retries={"max_attempts": 1}))
+ROLE = f"arn:aws:iam::{account}:role/replication"
+def status(bucket, key, version):
+    return s3.head_object(Bucket=bucket, Key=key, VersionId=version).get("ReplicationStatus")
+def tags(bucket, key, version):
+    return {t["Key"]: t["Value"] for t in
+        s3.get_object_tagging(Bucket=bucket, Key=key, VersionId=version)["TagSet"]}
+def wait(test, what):
+    deadline = time.time() + 30
+    while not test():
+        assert time.time() < deadline, what
+        time.sleep(0.1)
+for bucket in ["src", "dst"]:
+    s3.create_bucket(Bucket=bucket)
+    s3.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+def rule(id, priority, filter, **destination):
+    return {"ID": id, "Priority": priority, "Status": "Enabled", "Filter": filter,
+        "DeleteMarkerReplication": {"Status": "Disabled"},
+        "Destination": dict({"Bucket": "arn:aws:s3:::dst"}, **destination)}
+s3.put_bucket_replication(Bucket="src", ReplicationConfiguration={"Role": ROLE, "Rules": [
+    rule("gold", 2, {"Tag": {"Key": "tier", "Value": "gold"}}, StorageClass="STANDARD_IA"),
+    rule("team", 1, {"And": {"Prefix": "docs/", "Tags": [{"Key": "team", "Value": "a"}]}}),
+]})
+got = s3.get_bucket_replication(Bucket="src")["ReplicationConfiguration"]["Rules"]
+assert got[0]["Filter"] == {"Tag": {"Key": "tier", "Value": "gold"}}, got
+assert got[1]["Filter"] == {"And": {"Prefix": "docs/", "Tags": [{"Key": "team", "Value": "a"}]}}, got
+# By tag; by prefix and tag; the rule of highest priority gives the class.
+gold = s3.put_object(Bucket="src", Key="docs/gold", Body=b"g", Tagging="tier=gold&team=a")["VersionId"]
+team = s3.put_object(Bucket="src", Key="docs/team", Body=b"t", Tagging="team=a")["VersionId"]
+for k, v in [("docs/gold", gold), ("docs/team", team)]:
+    wait(lambda: status("src", k, v) == "COMPLETED", f"{k} replicated")
+assert s3.head_object(Bucket="dst", Key="docs/gold", VersionId=gold)["StorageClass"] == "STANDARD_IA"
+assert "StorageClass" not in s3.head_object(Bucket="dst", Key="docs/team", VersionId=team)
+# No rule names it: an untagged key, a tag on another prefix, or a tag put
+# after the write (S3 replicates tag-filtered objects as written).
+plain = s3.put_object(Bucket="src", Key="docs/plain", Body=b"p")["VersionId"]
+other = s3.put_object(Bucket="src", Key="other/team", Body=b"o", Tagging="team=a")["VersionId"]
+for k, v in [("docs/plain", plain), ("other/team", other)]:
+    assert status("src", k, v) is None, k
+s3.put_object_tagging(Bucket="src", Key="docs/plain", VersionId=plain,
+    Tagging={"TagSet": [{"Key": "tier", "Value": "gold"}]})
+time.sleep(1.5)
+assert status("src", "docs/plain", plain) is None
+assert "Versions" not in s3.list_object_versions(Bucket="dst", Prefix="docs/plain")
+# A replica's tag change is not sent back without replica modification sync,
+# even with a rule on the replicas' bucket back to the source.
+back = {"ID": "back", "Priority": 1, "Status": "Enabled", "Filter": {},
+    "DeleteMarkerReplication": {"Status": "Disabled"},
+    "Destination": {"Bucket": "arn:aws:s3:::src"}}
+s3.put_bucket_replication(Bucket="dst", ReplicationConfiguration={"Role": ROLE, "Rules": [back]})
+s3.put_object_tagging(Bucket="dst", Key="docs/team", VersionId=team,
+    Tagging={"TagSet": [{"Key": "team", "Value": "a"}, {"Key": "seen", "Value": "1"}]})
+time.sleep(1.5)
+assert tags("src", "docs/team", team) == {"team": "a"}
+# With it (a rule on the replicas' bucket back to the source), it is; the
+# sync ends (no change goes back and forth).
+# Sync asked for on the replicas' bucket only (as AWS writes it, without
+# SseKmsEncryptedObjects): the source has not asked for it, nothing reaches it.
+s3.put_bucket_replication(Bucket="dst", ReplicationConfiguration={"Role": ROLE, "Rules": [dict(back,
+    SourceSelectionCriteria={"ReplicaModifications": {"Status": "Enabled"}})]})
+s3.put_object_tagging(Bucket="dst", Key="docs/team", VersionId=team,
+    Tagging={"TagSet": [{"Key": "team", "Value": "a"}, {"Key": "seen", "Value": "2"}]})
+time.sleep(1.5)
+assert tags("src", "docs/team", team) == {"team": "a"}, "not without the source's consent"
+# The source's rule asks for it too: the change reaches it.
+sync = {"ReplicaModifications": {"Status": "Enabled"}}
+s3.put_bucket_replication(Bucket="src", ReplicationConfiguration={"Role": ROLE, "Rules": [
+    rule("gold", 2, {"Tag": {"Key": "tier", "Value": "gold"}}, StorageClass="STANDARD_IA"),
+    dict(rule("team", 1, {"And": {"Prefix": "docs/", "Tags": [{"Key": "team", "Value": "a"}]}}),
+        SourceSelectionCriteria=sync),
+]})
+s3.put_object_tagging(Bucket="dst", Key="docs/team", VersionId=team,
+    Tagging={"TagSet": [{"Key": "team", "Value": "a"}, {"Key": "seen", "Value": "3"}]})
+wait(lambda: tags("src", "docs/team", team) == {"team": "a", "seen": "3"}, "synced back")
+time.sleep(2)
+assert tags("dst", "docs/team", team) == {"team": "a", "seen": "3"}
+versions = lambda b: len(s3.list_object_versions(Bucket=b, Prefix="docs/team")["Versions"])
+assert versions("src") == 1 and versions("dst") == 1
 print("ok")
 "#;
 

@@ -92,8 +92,8 @@ pub use objects::{
 pub use pack::{PackStep, PackWork, pack_segment};
 pub use remote_buckets::RemoteBucket;
 pub use replication::{
-    QueuedReplication, ReplicationConfig, ReplicationDestination, ReplicationRule,
-    ReplicationStatus, ReplicationWork,
+    QueuedReplication, ReplicationConfig, ReplicationDestination, ReplicationFilter,
+    ReplicationRule, ReplicationStatus, ReplicationWork,
 };
 pub use restores::{Restore, RestoreRequest, RestoreState, Restored, restore_expiry, unreadable};
 pub use stored::{Backlogs, BodyUse, StoredBody};

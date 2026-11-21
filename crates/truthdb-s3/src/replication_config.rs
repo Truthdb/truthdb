@@ -26,7 +26,8 @@
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};
 use truthdb_object::{
-    ReplicationConfig, ReplicationDestination as Destination, ReplicationRule, Versioning,
+    ReplicationConfig, ReplicationDestination as Destination, ReplicationFilter, ReplicationRule,
+    Versioning,
 };
 
 use crate::error::{S3Error, escape};
@@ -158,15 +159,29 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
     if filter.children.len() > 1 {
         return Err(malformed());
     }
-    let prefix = match filter.children.first() {
-        None => None,
+    let filter = match filter.children.first() {
+        None => ReplicationFilter::All,
         Some(only) if only.name == "Prefix" => {
             if !only.children.is_empty() {
                 return Err(malformed());
             }
-            Some(only.text.clone())
+            ReplicationFilter::Prefix(only.text.clone())
         }
-        Some(_) => return Err(not_yet("Filtering replication by tags")),
+        Some(only) if only.name == "Tag" => {
+            let (name, value) = tag(only)?;
+            ReplicationFilter::Tag(name, value)
+        }
+        Some(and) => {
+            and.only(&["Prefix", "Tag"])?;
+            let prefix = text(and, "Prefix")?.map(str::to_string);
+            let tags = and.all("Tag").map(tag).collect::<Result<Vec<_>, _>>()?;
+            let mut names: Vec<&str> = tags.iter().map(|(name, _)| name.as_str()).collect();
+            names.sort_unstable();
+            if names.windows(2).any(|pair| pair[0] == pair[1]) {
+                return Err(invalid("Duplicate Tag Keys are not allowed."));
+            }
+            ReplicationFilter::And { prefix, tags }
+        }
     };
     let priority = element.text_of("Priority")?.ok_or_else(|| {
         S3Error::invalid_request(
@@ -190,9 +205,28 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
     if status(markers)? {
         return Err(not_yet("Delete marker replication"));
     }
-    if element.one("SourceSelectionCriteria")?.is_some() {
-        return Err(not_yet("SourceSelectionCriteria"));
-    }
+    // Replica modification sync; objects under KMS keys (there is no KMS
+    // here) are not offered.
+    let replica_modifications = match element.one("SourceSelectionCriteria")? {
+        None => false,
+        Some(criteria) => {
+            criteria.only(&["ReplicaModifications", "SseKmsEncryptedObjects"])?;
+            // Objects under KMS keys are not offered (there is no KMS).
+            if let Some(kms) = criteria.one("SseKmsEncryptedObjects")? {
+                kms.only(&["Status"])?;
+                if status(kms)? {
+                    return Err(not_yet("Replication of objects under KMS keys"));
+                }
+            }
+            match criteria.one("ReplicaModifications")? {
+                None => false,
+                Some(modifications) => {
+                    modifications.only(&["Status"])?;
+                    status(modifications)?
+                }
+            }
+        }
+    };
     if element.one("ExistingObjectReplication")?.is_some() {
         return Err(not_yet("ExistingObjectReplication"));
     }
@@ -201,9 +235,23 @@ fn rule(element: &Element) -> Result<ReplicationRule, S3Error> {
         id,
         priority,
         enabled,
-        prefix,
+        filter,
+        replica_modifications,
         destination,
     })
+}
+
+/// A Filter's `Tag`: a key of 1 to 128 characters, a value of at most 256.
+fn tag(element: &Element) -> Result<(String, String), S3Error> {
+    element.only(&["Key", "Value"])?;
+    let name = text(element, "Key")?.ok_or_else(malformed)?;
+    let value = text(element, "Value")?.ok_or_else(malformed)?;
+    if name.is_empty() || name.chars().count() > 128 || value.chars().count() > 256 {
+        return Err(invalid(
+            "A tag's key is 1 to 128 characters, its value at most 256",
+        ));
+    }
+    Ok((name.to_string(), value.to_string()))
 }
 
 /// Parses a PutBucketReplication body.
@@ -261,12 +309,40 @@ pub fn render(config: &ReplicationConfig) -> String {
             "<Status>{}</Status>",
             if rule.enabled { "Enabled" } else { "Disabled" }
         ));
-        match &rule.prefix {
-            None => out.push_str("<Filter></Filter>"),
-            Some(prefix) => out.push_str(&format!(
+        let tag = |(name, value): &(String, String)| {
+            format!(
+                "<Tag><Key>{}</Key><Value>{}</Value></Tag>",
+                escape(name),
+                escape(value)
+            )
+        };
+        match &rule.filter {
+            ReplicationFilter::All => out.push_str("<Filter></Filter>"),
+            ReplicationFilter::Prefix(prefix) => out.push_str(&format!(
                 "<Filter><Prefix>{}</Prefix></Filter>",
                 escape(prefix)
             )),
+            ReplicationFilter::Tag(name, value) => out.push_str(&format!(
+                "<Filter>{}</Filter>",
+                tag(&(name.clone(), value.clone()))
+            )),
+            ReplicationFilter::And { prefix, tags } => {
+                out.push_str("<Filter><And>");
+                if let Some(prefix) = prefix {
+                    out.push_str(&format!("<Prefix>{}</Prefix>", escape(prefix)));
+                }
+                for pair in tags {
+                    out.push_str(&tag(pair));
+                }
+                out.push_str("</And></Filter>");
+            }
+        }
+        if rule.replica_modifications {
+            out.push_str(
+                "<SourceSelectionCriteria><ReplicaModifications><Status>Enabled</Status>\
+                 </ReplicaModifications><SseKmsEncryptedObjects><Status>Disabled</Status>\
+                 </SseKmsEncryptedObjects></SourceSelectionCriteria>",
+            );
         }
         out.push_str(
             "<DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>",
@@ -533,7 +609,8 @@ mod tests {
                 id: "logs".into(),
                 priority: 2,
                 enabled: true,
-                prefix: Some("logs/ & more".into()),
+                filter: ReplicationFilter::Prefix("logs/ & more".into()),
+                replica_modifications: false,
                 destination: Destination {
                     bucket: "copies".into(),
                     account: Some("000000000001".into()),
@@ -543,7 +620,11 @@ mod tests {
                 },
             }
         );
-        assert_eq!(parsed.rules[1].prefix, None, "an empty Filter: every key");
+        assert_eq!(
+            parsed.rules[1].filter,
+            ReplicationFilter::All,
+            "an empty Filter: every key"
+        );
         // An owner override is kept and answered.
         let overridden = config(
             "<Rule><Priority>1</Priority><Status>Enabled</Status><Filter/>\
@@ -554,6 +635,34 @@ mod tests {
         )
         .unwrap();
         assert!(overridden.rules[0].destination.owner_override);
+        // Tag and And filters, and replica modification sync, read and render
+        // back alike.
+        for filter in [
+            "<Filter><Tag><Key>a b</Key><Value>c &amp; d</Value></Tag></Filter>",
+            "<Filter><And><Prefix>p/</Prefix><Tag><Key>a</Key><Value>1</Value></Tag>\
+             <Tag><Key>b</Key><Value>2</Value></Tag></And></Filter>\
+             <SourceSelectionCriteria><ReplicaModifications><Status>Enabled</Status>\
+             </ReplicaModifications><SseKmsEncryptedObjects><Status>Disabled</Status>\
+             </SseKmsEncryptedObjects></SourceSelectionCriteria>",
+        ] {
+            let parsed = config(&rule_with(filter)).unwrap();
+            assert_eq!(parse(render(&parsed).as_bytes()), Ok(parsed));
+        }
+        let synced = config(&rule_with(
+            "<Filter><And><Prefix>p/</Prefix><Tag><Key>a</Key><Value>1</Value></Tag></And>\
+             </Filter><SourceSelectionCriteria><ReplicaModifications><Status>Enabled</Status>\
+             </ReplicaModifications><SseKmsEncryptedObjects><Status>Disabled</Status>\
+             </SseKmsEncryptedObjects></SourceSelectionCriteria>",
+        ))
+        .unwrap();
+        assert!(synced.rules[0].replica_modifications);
+        assert_eq!(
+            synced.rules[0].filter,
+            ReplicationFilter::And {
+                prefix: Some("p/".into()),
+                tags: vec![("a".into(), "1".into())],
+            }
+        );
         assert_eq!(parse(render(&overridden).as_bytes()), Ok(overridden));
         assert!(!parsed.rules[1].enabled);
         assert_eq!(parse(render(&parsed).as_bytes()), Ok(parsed));
@@ -640,18 +749,31 @@ mod tests {
                     .to_string(),
                 unbuilt.clone(),
             ),
+            // A Tag's key, duplicate keys in an And, criteria without the
+            // KMS element (S3 requires it), and KMS objects (no KMS here).
             (
-                rule_with("<Filter><Tag><Key>a</Key><Value>b</Value></Tag></Filter>"),
-                unbuilt.clone(),
-            ),
-            (
-                rule_with("<Filter><And><Prefix>a</Prefix></And></Filter>"),
-                unbuilt.clone(),
+                rule_with("<Filter><Tag><Key></Key><Value>b</Value></Tag></Filter>"),
+                invalid.clone(),
             ),
             (
                 rule_with(
-                    "<Filter/><SourceSelectionCriteria><ReplicaModifications><Status>Enabled\
-                     </Status></ReplicaModifications></SourceSelectionCriteria>",
+                    "<Filter><And><Tag><Key>a</Key><Value>1</Value></Tag><Tag><Key>a</Key>\
+                     <Value>2</Value></Tag></And></Filter>",
+                ),
+                invalid.clone(),
+            ),
+            (
+                rule_with("<Filter><And><Other/></And></Filter>"),
+                malformed.clone(),
+            ),
+            (
+                rule_with("<Filter/><SourceSelectionCriteria><Other/></SourceSelectionCriteria>"),
+                malformed.clone(),
+            ),
+            (
+                rule_with(
+                    "<Filter/><SourceSelectionCriteria><SseKmsEncryptedObjects><Status>Enabled\
+                     </Status></SseKmsEncryptedObjects></SourceSelectionCriteria>",
                 ),
                 unbuilt.clone(),
             ),
