@@ -150,15 +150,15 @@ enum Fail {
 }
 
 /// What the runner keeps between steps: the remote buckets being waited
-/// for; where the next step looks in the queue; the remote buckets held in
-/// this pass over the queue (an entry for them was left queued: theirs are
-/// sent in the queue's order, so no later one goes before it); and how
+/// for; where the next step looks in the queue; the remote buckets held,
+/// each with the first queued replication of theirs left queued (theirs
+/// are sent in the queue's order, so no later one goes before it); and how
 /// often each queued replication's body could not be read.
 #[derive(Default)]
 struct Runner {
     waits: Waits,
     after: Option<u64>,
-    held: HashSet<String>,
+    held: HashMap<String, u64>,
     tries: HashMap<u64, u32>,
 }
 
@@ -166,19 +166,42 @@ struct Runner {
 const MAX_TRIES: u32 = 10;
 
 impl Runner {
-    /// The remote buckets held for this step: none at the start of a pass,
-    /// and those being waited for, which stay held until the pass ends.
+    /// Holds remote bucket `name` from queued replication `number` on.
+    fn hold(&mut self, name: &str, number: u64) {
+        let first = self.held.entry(name.to_string()).or_insert(number);
+        *first = (*first).min(number);
+    }
+
+    /// The remote buckets held for this step: those being waited for, and
+    /// those held before and still waited for. A bucket no longer waited
+    /// for is let go, and the queue is read again from its first entry
+    /// left queued: every entry between it and where the step would go on
+    /// is finished, or a held bucket's (passed over again).
     fn held_now(&mut self) -> HashSet<String> {
         if self.after.is_none() {
             self.held.clear();
         }
         let now = Instant::now();
-        for (name, (until, _)) in &self.waits {
-            if *until > now {
-                self.held.insert(name.clone());
-            }
+        let waited: HashSet<String> = self
+            .waits
+            .iter()
+            .filter(|(_, (until, _))| *until > now)
+            .map(|(name, _)| name.clone())
+            .collect();
+        let released: Vec<(String, u64)> = self
+            .held
+            .iter()
+            .filter(|(name, _)| !waited.contains(*name))
+            .map(|(name, first)| (name.clone(), *first))
+            .collect();
+        for (name, first) in released {
+            self.held.remove(&name);
+            let back = first.saturating_sub(1);
+            self.after = Some(self.after.map_or(back, |after| after.min(back)));
         }
-        self.held.clone()
+        let mut held = waited;
+        held.extend(self.held.keys().cloned());
+        held
     }
 
     /// Notes how sending queued replication `number` to remote bucket
@@ -194,7 +217,7 @@ impl Runner {
                 outcome
             }
             Err(Fail::Passing(why)) => {
-                self.held.insert(name.to_string());
+                self.hold(name, number);
                 let wait = self
                     .waits
                     .get(name)
@@ -210,11 +233,11 @@ impl Runner {
                     self.tries.remove(&number);
                     return Err(Fail::Lasting(format!("{why} (tried {MAX_TRIES} times)")));
                 }
-                self.held.insert(name.to_string());
+                self.hold(name, number);
                 Err(Fail::Unreadable(why))
             }
             Err(Fail::Skipped) => {
-                self.held.insert(name.to_string());
+                self.hold(name, number);
                 Err(Fail::Skipped)
             }
         }
@@ -236,13 +259,14 @@ fn part_size(size: u64) -> usize {
 async fn step(state: &S3State, runner: &mut Runner) -> Result<bool, String> {
     let held = runner.held_now();
     let after = runner.after;
-    let (jobs, made, next) = object(state, move |file| {
+    let (jobs, made, next, passed) = object(state, move |file| {
         if !file.versions_keyed()? {
-            return Ok((Vec::new(), 0, after));
+            return Ok((Vec::new(), 0, after, HashMap::new()));
         }
         let mut jobs = Vec::new();
-        match prepare(file, after, &held, &mut jobs) {
-            Ok((made, next)) => Ok((jobs, made, next)),
+        let mut passed = HashMap::new();
+        match prepare(file, after, &held, &mut jobs, &mut passed) {
+            Ok((made, next)) => Ok((jobs, made, next, passed)),
             Err(err) => {
                 // Nothing prepared is sent: its leases go.
                 for job in &jobs {
@@ -254,18 +278,23 @@ async fn step(state: &S3State, runner: &mut Runner) -> Result<bool, String> {
     })
     .await?;
     runner.after = next;
+    for (name, first) in passed {
+        runner.hold(&name, first);
+    }
     let mut failed = None;
     for job in jobs {
         let name = job.remote.name.clone();
         let number = job.queued.number;
         // After one of the bucket's was left queued, its later ones wait.
-        let outcome = match runner.held.contains(&name) {
+        let outcome = match runner.held.contains_key(&name) {
             true => Err(Fail::Skipped),
             false => send(state, &job).await,
         };
         let outcome = runner.record(&name, number, outcome);
-        // Every job is finished (its lease released), whatever one did.
+        // Every job is finished (its lease released), whatever one did. One
+        // not finished is still queued: its bucket is held.
         if let Err(err) = object(state, move |file| finish_remote(file, &job, outcome)).await {
+            runner.hold(&name, number);
             failed.get_or_insert(err);
         }
     }
@@ -278,13 +307,14 @@ async fn step(state: &S3State, runner: &mut Runner) -> Result<bool, String> {
 
 /// Prepares the queued replications after `after`, making those in this
 /// server, up to [`BATCH`], those for a remote bucket in `held` passed
-/// over; returns how many were made or prepared, and where the next step
-/// goes on (none: from the start).
+/// over (the first of each noted in `passed`); returns how many were made
+/// or prepared, and where the next step goes on (none: from the start).
 fn prepare(
     file: &mut ObjFile<'_>,
     after: Option<u64>,
     held: &HashSet<String>,
     jobs: &mut Vec<RemoteJob>,
+    passed: &mut HashMap<String, u64>,
 ) -> Result<(usize, Option<u64>), StorageError> {
     let queue = file.replication_queue(after, SCAN)?;
     let mut next = if queue.len() < SCAN {
@@ -299,6 +329,9 @@ fn prepare(
             break;
         }
         if held.contains(&queued.destination) {
+            passed
+                .entry(queued.destination.clone())
+                .or_insert(queued.number);
             continue;
         }
         made += 1;
@@ -1198,7 +1231,7 @@ mod tests {
             assert_eq!(runner.record("far", 7, down()), down());
         }
         assert!(runner.waits["far"].0 > Instant::now(), "the bucket waits");
-        assert!(runner.held.contains("far"));
+        assert!(runner.held.contains_key("far"));
         // A body not read: FAILED after MAX_TRIES.
         let unread = || Err(Fail::Unreadable("short".to_string()));
         for _ in 1..MAX_TRIES {
@@ -1212,19 +1245,35 @@ mod tests {
         // A skipped send holds the bucket; a sent one ends its wait.
         let mut fresh = Runner::default();
         assert_eq!(fresh.record("x", 1, Err(Fail::Skipped)), Err(Fail::Skipped));
-        assert!(fresh.held.contains("x"));
+        assert!(fresh.held.contains_key("x"));
+        // A hold keeps the first entry left queued.
+        fresh.hold("x", 10);
+        fresh.hold("x", 4);
+        fresh.hold("x", 9);
+        assert_eq!(fresh.held["x"], 1);
+        fresh.hold("y", 10);
+        fresh.hold("y", 4);
+        fresh.hold("y", 9);
+        assert_eq!(fresh.held["y"], 4);
         assert_eq!(runner.record("far", 8, Ok(())), Ok(()));
         assert!(!runner.waits.contains_key("far"));
-        // Held until the pass ends, even once its wait is over; a new pass
-        // starts with nothing held but what is waited for.
-        runner.after = Some(5);
-        assert!(runner.held_now().contains("far"));
-        runner.after = None;
+        // Its wait over, the bucket is let go and the queue read again from
+        // the first of its entries left queued (7).
+        runner.after = Some(100);
         assert!(!runner.held_now().contains("far"));
+        assert_eq!(runner.after, Some(6));
+        // Held while waited for; a new pass starts with nothing else held.
         runner
             .waits
             .insert("down".into(), (Instant::now() + MAX_WAIT, MAX_WAIT));
+        runner.hold("down", 40);
+        runner.after = Some(50);
         assert!(runner.held_now().contains("down"));
+        assert_eq!(runner.after, Some(50), "not read again while waited for");
+        runner.hold("gone", 3);
+        runner.after = None;
+        let held = runner.held_now();
+        assert!(held.contains("down") && !held.contains("gone"));
         // Parts: at least 8 MiB, at most 10,000 of them.
         assert_eq!(part_size(1), PART);
         assert_eq!(part_size(10_000 * PART as u64), PART);
@@ -1393,8 +1442,13 @@ mod tests {
             let mut lock = storage.lock();
             let mut file = ObjFile::new(&mut lock);
             let mut jobs = Vec::new();
-            let (_, next) = prepare(&mut file, after, &waiting, &mut jobs).unwrap();
+            let mut passed = HashMap::new();
+            let (_, next) = prepare(&mut file, after, &waiting, &mut jobs, &mut passed).unwrap();
             assert!(jobs.is_empty());
+            if steps == 0 {
+                // The first of far's entries passed over is noted.
+                assert_eq!(passed.get("far"), Some(&1));
+            }
             steps += 1;
             after = next;
             if after.is_none() || steps > 3 {
