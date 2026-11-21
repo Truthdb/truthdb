@@ -205,7 +205,7 @@ impl Runner {
             .collect();
         // Not before the last reading again has caught up.
         let caught_up = match (self.rewound_from, self.after) {
-            (Some(from), Some(after)) => after >= from,
+            (Some(from), Some(after)) => after > from,
             _ => true,
         };
         let released: Vec<(String, u64)> = match caught_up {
@@ -256,6 +256,7 @@ impl Runner {
                     return Err(Fail::Lasting(format!("{why} (tried {MAX_TRIES} times)")));
                 }
                 self.hold(name, number);
+                self.wait(name);
                 Err(Fail::Unreadable(why))
             }
             Err(Fail::Skipped) => {
@@ -1296,8 +1297,13 @@ mod tests {
         assert!(again.held_now().contains("near"));
         assert_eq!(again.after, Some(6));
         again.after = Some(100);
+        assert!(
+            again.held_now().contains("near"),
+            "back where it was: no gain yet"
+        );
+        again.after = Some(101);
         assert!(!again.held_now().contains("near"));
-        assert_eq!((again.after, again.rewound_from), (Some(19), Some(100)));
+        assert_eq!((again.after, again.rewound_from), (Some(19), Some(101)));
         // Held while waited for; a new pass starts with nothing else held.
         runner
             .waits
