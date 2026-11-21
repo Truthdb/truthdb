@@ -11,9 +11,11 @@
 //!
 //! The `Role` is kept as given: there are no IAM roles, so replication acts
 //! as the one who put the configuration (its account, and its user): it
-//! writes a replica only where they may `s3:ReplicateObject`. The object engine keeps the configuration
-//! and queues what it replicates (see `truthdb_object::ReplicationConfig`);
-//! `replication_run` writes the replicas.
+//! replicates a version only if they may `s3:GetObjectVersionForReplication`
+//! it and `s3:ReplicateObject` in the destination. The object engine keeps
+//! the configuration and queues what it replicates (see
+//! `truthdb_object::ReplicationConfig`); `replication_run` writes the
+//! replicas.
 
 use hyper::body::Incoming;
 use hyper::{Method, Request, Response, StatusCode};

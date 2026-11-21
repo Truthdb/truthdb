@@ -9,7 +9,10 @@
 //! the body shared (see `insert_replica`). Then the source is COMPLETED, or
 //! FAILED when the destination cannot take it, and the replica is REPLICA.
 //! A replica is never queued itself. A change to a queued or replicated
-//! version's tags or lock is queued for its replica too.
+//! version's tags is queued for its replica too. A change to its lock is
+//! not: the replica's lock is the source's when it is written, and then the
+//! destination's own (merging two locks would either weaken one or lock
+//! beyond both).
 //!
 //! A version's status is kept in the replication status tree under its row
 //! key in the objects tree; it goes with the version. A version in an
@@ -225,7 +228,7 @@ impl ReplicationStatus {
 pub enum ReplicationWork {
     /// Writes it.
     Create,
-    /// Gives it the source's tags and lock as they are now.
+    /// Gives it the source's tags as they are now.
     Metadata,
 }
 
@@ -398,7 +401,7 @@ impl ObjTxn<'_, '_> {
         self.enqueue(queued)
     }
 
-    /// Queues a change of a version's tags or lock for its replica, if it
+    /// Queues a change of a version's tags for its replica, if it
     /// is queued or replicated (not a replica, nor one that failed) and a
     /// rule still applies to it.
     pub(crate) fn queue_metadata_replication(

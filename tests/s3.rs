@@ -13537,7 +13537,9 @@ if phase == "replicas":
     retention = s3.get_object_retention(Bucket="locked-dst", Key="k", VersionId=locked)["Retention"]
     assert retention == {"Mode": "GOVERNANCE", "RetainUntilDate": until}, retention
     # Without a retention of its own, the replica takes the destination's
-    # default one; a legal hold put on the source reaches it.
+    # default one. A legal hold the source has when the replica is made is
+    # the replica's; one put on the source later is not (the replica's lock
+    # is the destination's own once made).
     s3.put_object_lock_configuration(Bucket="locked-dst", ObjectLockConfiguration={
         "ObjectLockEnabled": "Enabled",
         "Rule": {"DefaultRetention": {"Mode": "COMPLIANCE", "Days": 1}}})
@@ -13553,10 +13555,18 @@ if phase == "replicas":
                 VersionId=bare)["LegalHold"]["Status"]
         except s3.exceptions.ClientError:
             return None
-    assert hold() is None
-    wait(lambda: hold() == "ON", "hold replicated")
+    s3.put_object_tagging(Bucket="locked-src", Key="bare", VersionId=bare,
+        Tagging={"TagSet": [{"Key": "after", "Value": "hold"}]})
+    wait(lambda: s3.get_object_tagging(Bucket="locked-dst", Key="bare", VersionId=bare)["TagSet"]
+        == [{"Key": "after", "Value": "hold"}], "tags replicated after the hold")
+    assert hold() is None, "a later hold does not reach the replica"
     assert s3.get_object_retention(Bucket="locked-dst", Key="bare",
         VersionId=bare)["Retention"]["Mode"] == "COMPLIANCE", "the replica keeps its retention"
+    held = s3.put_object(Bucket="locked-src", Key="held", Body=b"h",
+        ObjectLockLegalHoldStatus="ON")["VersionId"]
+    wait(lambda: status("locked-src", "held", held) == "COMPLETED", "held replicated")
+    assert s3.get_object_legal_hold(Bucket="locked-dst", Key="held",
+        VersionId=held)["LegalHold"]["Status"] == "ON"
     print("ok")
 elif phase == "arm":
     versioned("burst-src")
