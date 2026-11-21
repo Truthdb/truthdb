@@ -8,10 +8,12 @@
 //! Each replication is checked when it is made, not only when the
 //! configuration was put. A rule of the source's configuration must still
 //! send the version there (or it is not replicated, and has no status). The
-//! destination must still exist, be the source owner's, have versioning
-//! enabled, and have Object Lock when the source has it, and the one who put
-//! the configuration must be allowed `s3:GetObjectVersionForReplication` on
-//! the source version and `s3:ReplicateObject` there. Otherwise the source
+//! destination must still exist, have versioning enabled, and have Object
+//! Lock when the source has it, and the one who put the configuration must
+//! be allowed `s3:GetObjectVersionForReplication` on the source version
+//! and `s3:ReplicateObject` there (in another account's bucket, by its
+//! bucket policy). A replica is the destination owner's, as every object
+//! of a bucket here is. Otherwise the source
 //! version is FAILED: S3 retries it no more (Batch Replication does). A
 //! change of the source's tags gives the replica the same tags; a change of
 //! its lock does not reach the replica, whose lock is the destination's own
@@ -585,14 +587,28 @@ fn remote_headers(
 fn refused(
     file: &mut ObjFile<'_>,
     source: &BucketInfo,
+    version: &ObjectInfo,
     config: &ReplicationConfig,
     queued: &QueuedReplication,
 ) -> Result<Option<&'static str>, StorageError> {
     let Some(destination) = file.bucket(&queued.destination)? else {
         return Ok(Some("the destination bucket does not exist"));
     };
-    Ok(if destination.owner != source.owner {
-        Some("the destination bucket is another account's")
+    // The owner it had when the configuration was put (the source's, for a
+    // configuration stored before owners were noted): a bucket deleted and
+    // made again by another account takes none. Another account's bucket
+    // takes replicas as its bucket policy allows (checked below, as the
+    // configuration's creator).
+    let owner = config
+        .rule_for(&queued.key)
+        .and_then(|rule| rule.destination.owner.clone())
+        .unwrap_or_else(|| source.owner.clone());
+    Ok(if destination.owner != owner {
+        Some("the destination bucket's owner is not the one it had when replication was set")
+    } else if version.attrs.customer_key.is_some()
+        && crate::sse::sse_c_blocked(file, &queued.destination)?
+    {
+        Some("the destination bucket blocks objects under customer-provided keys")
     } else if destination.versioning != Versioning::Enabled {
         Some("the destination bucket does not have versioning enabled")
     } else if source.object_lock && !destination.object_lock {
@@ -633,11 +649,19 @@ fn creator_authz(
         file,
         &principal,
         vec![queued.destination.clone(), queued.bucket.clone()],
-        vec![(
-            queued.bucket.clone(),
-            queued.key.clone(),
-            VersionSel::Seq(queued.version),
-        )],
+        // The replica's too, for the destination's conditions on its tags.
+        vec![
+            (
+                queued.bucket.clone(),
+                queued.key.clone(),
+                VersionSel::Seq(queued.version),
+            ),
+            (
+                queued.destination.clone(),
+                queued.key.clone(),
+                VersionSel::Seq(queued.version),
+            ),
+        ],
         now_ms(),
     )
 }
@@ -748,7 +772,7 @@ fn replicate(
     {
         return remote_job(file, &config, queued, &source, remote, rule_class, now);
     }
-    if let Some(why) = refused(file, &bucket, &config, queued)? {
+    if let Some(why) = refused(file, &bucket, &source, &config, queued)? {
         eprintln!(
             "replication: {}/{} version {} is not replicated to {}: {why}",
             queued.bucket, queued.key, queued.version, queued.destination
@@ -778,10 +802,16 @@ fn replicate(
         // A tag change only: the lock is not used.
         ReplicationWork::Create | ReplicationWork::Metadata => source_lock,
     };
+    // Journalled as the configuration's creator; in another account's
+    // bucket, as its account only (its user's name is not told there).
+    let same_owner = file
+        .bucket(&queued.destination)?
+        .is_some_and(|destination| destination.owner == bucket.owner);
     file.set_origin(Origin {
         operation: "Replicate".to_string(),
         request_id: format!("replication-{}", queued.number),
-        account: Some(bucket.owner.clone()),
+        account: Some(config.account.clone()),
+        user: config.user.clone().filter(|_| same_owner),
         ..Origin::default()
     });
     let destination = queued.destination.clone();
@@ -876,6 +906,8 @@ mod tests {
                     bucket: "dst".into(),
                     account: None,
                     storage_class: None,
+                    owner_override: false,
+                    owner: None,
                 },
             }],
             account: me.into(),
@@ -984,6 +1016,70 @@ mod tests {
         );
         ObjFile::new(&mut storage.lock())
             .transaction(|tx| tx.delete_bucket_config("src", truthdb_object::BUCKET_POLICY, ""))
+            .unwrap();
+        // An object under a customer-provided key, to a destination that
+        // blocks them: FAILED.
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.put_bucket_config(
+                    "dst",
+                    truthdb_object::BUCKET_ENCRYPTION,
+                    "",
+                    &[crate::sse::SSE_C_BLOCKED],
+                )
+            })
+            .unwrap();
+        let mut writer = BodyWriter::begin(&storage, 1).unwrap();
+        writer.write(&storage, b"ciphertext", 1).unwrap();
+        let body = writer.finish(&storage, 1).unwrap();
+        let keyed = ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.put_object(
+                    "src",
+                    "keyed",
+                    &body,
+                    &ObjectAttrs {
+                        customer_key: Some(truthdb_object::CustomerKey {
+                            key_md5: "md5".into(),
+                            verifier: "v".into(),
+                        }),
+                        ..ObjectAttrs::default()
+                    },
+                    StorageClass::Standard,
+                    1,
+                    0,
+                )
+            })
+            .unwrap()
+            .unwrap()
+            .version;
+        step();
+        assert_eq!(
+            status("src", "keyed", keyed),
+            Some(ReplicationStatus::Failed)
+        );
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_bucket_config("dst", truthdb_object::BUCKET_ENCRYPTION, ""))
+            .unwrap();
+        // A configuration noting no owner (stored before owners were
+        // noted): the destination must be the source owner's.
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| {
+                tx.create_bucket("theirs", "222222222222", 1)?.unwrap();
+                tx.set_versioning("theirs", Versioning::Enabled)?.unwrap();
+                let mut legacy = config(None);
+                legacy.rules[0].destination.bucket = "theirs".into();
+                tx.put_replication("src", &legacy)
+            })
+            .unwrap();
+        let unnoted = put_tagged("unnoted", &[]);
+        step();
+        assert_eq!(
+            status("src", "unnoted", unnoted),
+            Some(ReplicationStatus::Failed)
+        );
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.put_replication("src", &config(None)))
             .unwrap();
         // The rule's class is the one it names when the replica is made.
         let queued_standard = put("classed");
@@ -1111,6 +1207,8 @@ mod tests {
                                 bucket: "far".into(),
                                 account: None,
                                 storage_class: Some(StorageClass::StandardIa),
+                                owner_override: false,
+                                owner: None,
                             },
                         }],
                         account: me.into(),
@@ -1387,6 +1485,8 @@ mod tests {
                 bucket: bucket.into(),
                 account: None,
                 storage_class: None,
+                owner_override: false,
+                owner: None,
             },
         };
         ObjFile::new(&mut storage.lock())

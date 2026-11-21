@@ -1,14 +1,18 @@
 //! A bucket's replication configuration: PUT, GET and DELETE
 //! `?replication`, validated as S3 validates it. The rules' destination is
-//! a bucket of the same owner on this server, with versioning enabled (as
-//! the source must have it, and keeps while the configuration is set), and
-//! with Object Lock when the source has it; or a bucket on another S3
-//! service recorded with `s3 create remote bucket`, which that service
-//! checks. Rules filter by key prefix. What later replication steps build
-//! is refused rather than accepted and ignored: tag filters, rules without
-//! a Filter (whose delete markers replicate), delete-marker replication,
-//! several destinations, another account's bucket, replica ownership, KMS
-//! encryption, replication time and metrics, and existing-object
+//! a bucket on this server: of the same owner, with versioning enabled (as
+//! the source must have it, and keeps while the configuration is set) and
+//! with Object Lock when the source has it; or another account's, whose
+//! state is checked as each replica is written and whose bucket policy
+//! decides whether it takes them. Or it is a bucket on another S3 service
+//! recorded with `s3 create remote bucket` for the source's owner, which
+//! that service checks. An owner override (`AccessControlTranslation`) is
+//! kept: replicas are the destination owner's anyway, under the bucket
+//! owner enforced ownership every bucket here has. Rules filter by key
+//! prefix. What later replication steps build is refused rather than
+//! accepted and ignored: tag filters, rules without a Filter (whose delete
+//! markers replicate), delete-marker replication, several destinations,
+//! KMS encryption, replication time and metrics, and existing-object
 //! replication.
 //!
 //! The `Role` is kept as given: there are no IAM roles, so replication acts
@@ -83,15 +87,24 @@ fn destination(element: &Element) -> Result<Destination, S3Error> {
             "The <Account> element is empty. It must contain a valid account ID.",
         ));
     }
-    if element.one("AccessControlTranslation")?.is_some() {
-        if account.is_none() {
-            return Err(S3Error::invalid_request(
-                "The <Owner> in <AccessControlTranslation> has a value, so the <Account> \
-                 element must be specified.",
-            ));
+    // The owner override: replicas the destination owner's (as they are
+    // anyway: a bucket here has bucket owner enforced ownership).
+    let owner_override = match element.one("AccessControlTranslation")? {
+        None => false,
+        Some(translation) => {
+            translation.only(&["Owner"])?;
+            if translation.text_of("Owner")? != Some("Destination") {
+                return Err(malformed());
+            }
+            if account.is_none() {
+                return Err(S3Error::invalid_request(
+                    "The <Owner> in <AccessControlTranslation> has a value, so the <Account> \
+                     element must be specified.",
+                ));
+            }
+            true
         }
-        return Err(not_yet("AccessControlTranslation"));
-    }
+    };
     if element.one("EncryptionConfiguration")?.is_some() {
         return Err(not_yet(
             "Replication with KMS keys (EncryptionConfiguration)",
@@ -104,10 +117,13 @@ fn destination(element: &Element) -> Result<Destination, S3Error> {
         .text_of("StorageClass")?
         .map(|name| crate::objects::storage_class(Some(name)))
         .transpose()?;
+    // Its owner is noted as the configuration is put.
     Ok(Destination {
         bucket,
         account,
         storage_class,
+        owner_override,
+        owner: None,
     })
 }
 
@@ -266,6 +282,11 @@ pub fn render(config: &ReplicationConfig) -> String {
         if let Some(class) = destination.storage_class {
             out.push_str(&format!("<StorageClass>{}</StorageClass>", class.as_str()));
         }
+        if destination.owner_override {
+            out.push_str(
+                "<AccessControlTranslation><Owner>Destination</Owner></AccessControlTranslation>",
+            );
+        }
         out.push_str("</Destination></Rule>");
     }
     out.push_str("</ReplicationConfiguration>");
@@ -330,18 +351,23 @@ fn refused_destination(
             "Destination bucket must exist",
         )));
     };
-    // Whose bucket it is, before the Account is compared with its owner:
-    // another account's owner is not told.
-    if info.owner != owner {
-        return Ok(Some(not_yet("Replication to another account's bucket")));
-    }
-    if let Some(account) = &destination.account
-        && *account != info.owner
+    // As S3: an Account named (in any rule) must be the destination's owner.
+    if config
+        .rules
+        .iter()
+        .filter_map(|rule| rule.destination.account.as_ref())
+        .any(|account| *account != info.owner)
     {
         return Ok(Some(invalid(
             "The AWS account specified in the <Account> element must match the destination \
              bucket owner.",
         )));
+    }
+    // Another account's bucket: its versioning and Object Lock are checked
+    // as each replica is written, not told here; its bucket policy decides
+    // whether replicas may be written there.
+    if info.owner != owner {
+        return Ok(None);
     }
     if info.versioning != Versioning::Enabled {
         return Ok(Some(S3Error::invalid_request(
@@ -409,6 +435,7 @@ pub async fn bucket_replication(
             // The buckets are checked and the configuration set in one
             // transaction: versioning cannot be suspended in between.
             crate::scope::object(state, move |file| {
+                let mut config = config;
                 let Some(info) = file.bucket(&name)? else {
                     return Ok(Err(None));
                 };
@@ -422,6 +449,13 @@ pub async fn bucket_replication(
                     refused_destination(file, &name, &info.owner, info.object_lock, &config)?
                 {
                     return Ok(Err(Some(refused)));
+                }
+                // The owner a destination of this server has now: replicas
+                // go there only while it has it.
+                for rule in &mut config.rules {
+                    rule.destination.owner = file
+                        .bucket(&rule.destination.bucket)?
+                        .map(|destination| destination.owner);
                 }
                 file.transaction(|tx| tx.put_replication(&name, &config))?;
                 Ok(Ok(()))
@@ -504,10 +538,23 @@ mod tests {
                     bucket: "copies".into(),
                     account: Some("000000000001".into()),
                     storage_class: Some(StorageClass::StandardIa),
+                    owner_override: false,
+                    owner: None,
                 },
             }
         );
         assert_eq!(parsed.rules[1].prefix, None, "an empty Filter: every key");
+        // An owner override is kept and answered.
+        let overridden = config(
+            "<Rule><Priority>1</Priority><Status>Enabled</Status><Filter/>\
+             <DeleteMarkerReplication><Status>Disabled</Status></DeleteMarkerReplication>\
+             <Destination><Bucket>arn:aws:s3:::copies</Bucket><Account>000000000002</Account>\
+             <AccessControlTranslation><Owner>Destination</Owner></AccessControlTranslation>\
+             </Destination></Rule>",
+        )
+        .unwrap();
+        assert!(overridden.rules[0].destination.owner_override);
+        assert_eq!(parse(render(&overridden).as_bytes()), Ok(overridden));
         assert!(!parsed.rules[1].enabled);
         assert_eq!(parse(render(&parsed).as_bytes()), Ok(parsed));
     }
@@ -646,9 +693,9 @@ mod tests {
             ),
             (
                 "<Bucket>arn:aws:s3:::copies</Bucket><Account>000000000001</Account>\
-                 <AccessControlTranslation><Owner>Destination</Owner>\
+                 <AccessControlTranslation><Owner>Source</Owner>\
                  </AccessControlTranslation>",
-                unbuilt.clone(),
+                malformed.clone(),
             ),
             (
                 "<Bucket>arn:aws:s3:::copies</Bucket><EncryptionConfiguration>\

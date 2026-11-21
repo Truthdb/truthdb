@@ -38,7 +38,9 @@ use crate::{
 
 /// META key of the next queue entry's number.
 const NEXT_REPLICATION_KEY: &[u8] = b"next_replication";
-const FORMAT: u8 = 1;
+/// The configuration's stored form; 1 has no owner override nor
+/// destination owner.
+const FORMAT: u8 = 2;
 
 /// A bucket's replication configuration (as PutBucketReplication sets it).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +71,17 @@ pub struct ReplicationDestination {
     pub account: Option<String>,
     /// The replicas' class (none: the source version's).
     pub storage_class: Option<StorageClass>,
+    /// `AccessControlTranslation` `Owner` `Destination`: the replicas are
+    /// the destination owner's (as every object is under the bucket owner
+    /// enforced ownership a bucket here has; kept to be answered).
+    pub owner_override: bool,
+    /// The owner of the destination (a bucket of this server) when the
+    /// configuration was put: replicas go there only while it has that
+    /// owner (a bucket deleted and made again by another account takes
+    /// none). None for a bucket on another service, and in a configuration
+    /// stored before it was kept (its destination must be the source
+    /// owner's).
+    pub owner: Option<String>,
 }
 
 impl ReplicationConfig {
@@ -108,13 +121,22 @@ impl ReplicationConfig {
             out.u8(destination
                 .storage_class
                 .map_or(0, |class| 1 + class.code()));
+            out.u8(destination.owner_override as u8);
+            match &destination.owner {
+                None => out.u8(0),
+                Some(owner) => {
+                    out.u8(1);
+                    out.str(owner);
+                }
+            }
         }
         out.0
     }
 
     pub fn decode(bytes: &[u8]) -> Result<Self, StorageError> {
         let mut input = Reader::new(bytes, "replication configuration");
-        if input.u8()? != FORMAT {
+        let format = input.u8()?;
+        if !(1..=FORMAT).contains(&format) {
             return Err(input.corrupt());
         }
         let role = input.str()?;
@@ -133,6 +155,11 @@ impl ReplicationConfig {
                 code @ 1..=8 => Some(StorageClass::from_code(code - 1)),
                 _ => return Err(input.corrupt()),
             };
+            let owner_override = format >= 2 && input.present()?;
+            let owner = match format >= 2 && input.present()? {
+                true => Some(input.str()?),
+                false => None,
+            };
             rules.push(ReplicationRule {
                 id,
                 priority,
@@ -142,6 +169,8 @@ impl ReplicationConfig {
                     bucket,
                     account,
                     storage_class,
+                    owner_override,
+                    owner,
                 },
             });
         }
