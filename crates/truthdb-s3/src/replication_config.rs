@@ -284,11 +284,14 @@ pub fn render(config: &ReplicationConfig) -> String {
 }
 
 /// Whether `bucket`'s replication configuration, if it has one, names a
-/// destination without Object Lock: enabling Object Lock on the bucket is
-/// then refused, as the configuration could not be put with it.
+/// destination without Object Lock or not of `owner` (the bucket's):
+/// enabling Object Lock on the bucket is then refused, as the configuration
+/// could not be put with it. Another account's bucket blocks whatever its
+/// state, which its owner is not told.
 pub(crate) fn blocks_object_lock(
     file: &mut truthdb_object::ObjFile<'_>,
     bucket: &str,
+    owner: &str,
 ) -> Result<bool, truthdb_core::storage::StorageError> {
     let Some(document) = file.bucket_config(bucket, BUCKET_REPLICATION, "")? else {
         return Ok(false);
@@ -299,7 +302,7 @@ pub(crate) fn blocks_object_lock(
     };
     for rule in &config.rules {
         match file.bucket(&rule.destination.bucket)? {
-            Some(info) if info.object_lock => {}
+            Some(info) if info.object_lock && info.owner == owner => {}
             _ => return Ok(true),
         }
     }

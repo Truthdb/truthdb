@@ -13362,6 +13362,16 @@ s3.put_bucket_replication(Bucket="unlocked",
     ReplicationConfiguration={"Role": ROLE, "Rules": [rule("locked-copies")]})
 s3.put_object_lock_configuration(Bucket="unlocked", ObjectLockConfiguration=LOCK)
 assert s3.get_object_lock_configuration(Bucket="unlocked")["ObjectLockConfiguration"] == LOCK
+# A destination deleted and created again by another account blocks it
+# whatever that bucket's state: its Object Lock is not told.
+versioned(s3, "fleeting")
+versioned(s3, "relocking")
+s3.put_bucket_replication(Bucket="relocking",
+    ReplicationConfiguration={"Role": ROLE, "Rules": [rule("fleeting")]})
+s3.delete_bucket(Bucket="fleeting")
+other.create_bucket(Bucket="fleeting", ObjectLockEnabledForBucket=True)
+refused(lambda: s3.put_object_lock_configuration(Bucket="relocking",
+    ObjectLockConfiguration=LOCK), "InvalidBucketState")
 # What later steps build is refused, not ignored.
 refused(lambda: put("source", rule(Filter={"Tag": {"Key": "a", "Value": "b"}})), "NotImplemented")
 refused(lambda: put("source", rule(DeleteMarkerReplication={"Status": "Enabled"})), "NotImplemented")
