@@ -8,10 +8,12 @@
 //! Each replication is checked when it is made, not only when the
 //! configuration was put. A rule of the source's configuration must still
 //! send the version there (or it is not replicated, and has no status). The
-//! destination must still exist, be the source owner's, have versioning
-//! enabled, and have Object Lock when the source has it, and the one who put
-//! the configuration must be allowed `s3:GetObjectVersionForReplication` on
-//! the source version and `s3:ReplicateObject` there. Otherwise the source
+//! destination must still exist, have versioning enabled, and have Object
+//! Lock when the source has it, and the one who put the configuration must
+//! be allowed `s3:GetObjectVersionForReplication` on the source version
+//! and `s3:ReplicateObject` there (in another account's bucket, by its
+//! bucket policy). A replica is the destination owner's, as every object
+//! of a bucket here is. Otherwise the source
 //! version is FAILED: S3 retries it no more (Batch Replication does). A
 //! change of the source's tags gives the replica the same tags; a change of
 //! its lock does not reach the replica, whose lock is the destination's own
@@ -591,9 +593,9 @@ fn refused(
     let Some(destination) = file.bucket(&queued.destination)? else {
         return Ok(Some("the destination bucket does not exist"));
     };
-    Ok(if destination.owner != source.owner {
-        Some("the destination bucket is another account's")
-    } else if destination.versioning != Versioning::Enabled {
+    // Another account's bucket takes replicas as its bucket policy allows
+    // (checked below, as the configuration's creator).
+    Ok(if destination.versioning != Versioning::Enabled {
         Some("the destination bucket does not have versioning enabled")
     } else if source.object_lock && !destination.object_lock {
         Some("the destination bucket does not have Object Lock")
@@ -876,6 +878,7 @@ mod tests {
                     bucket: "dst".into(),
                     account: None,
                     storage_class: None,
+                    owner_override: false,
                 },
             }],
             account: me.into(),
@@ -1111,6 +1114,7 @@ mod tests {
                                 bucket: "far".into(),
                                 account: None,
                                 storage_class: Some(StorageClass::StandardIa),
+                                owner_override: false,
                             },
                         }],
                         account: me.into(),
@@ -1387,6 +1391,7 @@ mod tests {
                 bucket: bucket.into(),
                 account: None,
                 storage_class: None,
+                owner_override: false,
             },
         };
         ObjFile::new(&mut storage.lock())

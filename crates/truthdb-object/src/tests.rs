@@ -6831,6 +6831,7 @@ fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_num
                     bucket: "dst".to_string(),
                     account: None,
                     storage_class: class,
+                    owner_override: false,
                 },
             };
             let mut off = rule("off", 9, "", None);
@@ -6848,6 +6849,20 @@ fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_num
             // Kept as given.
             tx.put_replication("src", &config)?;
             assert_eq!(ReplicationConfig::decode(&config.encode()).unwrap(), config);
+            // A configuration stored in the first form (no owner override):
+            // the same less the last byte of each rule.
+            let first: Vec<u8> = {
+                let stored = ReplicationConfig {
+                    rules: config.rules[..1].to_vec(),
+                    ..config.clone()
+                };
+                let mut bytes = stored.encode();
+                bytes[0] = 1;
+                bytes.pop();
+                bytes
+            };
+            let read = ReplicationConfig::decode(&first).unwrap();
+            assert_eq!(read.rules, config.rules[..1].to_vec());
             Ok(())
         })
         .unwrap();

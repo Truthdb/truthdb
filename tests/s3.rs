@@ -13340,12 +13340,17 @@ refused(lambda: put("source", rule("plain")), "InvalidRequest")
 refused(lambda: put("source", rule("missing")), "InvalidRequest")
 refused(lambda: put("source", rule("source")), "InvalidRequest")
 refused(lambda: put("nowhere", rule()), "NoSuchBucket")
-refused(lambda: put("source", rule("theirs")), "NotImplemented")
-# Another account's bucket is refused alike whatever Account is named: its
-# owner is not told.
-for named in [other_account, account, "000000000999"]:
+# Another account's bucket is a destination; an Account named must be its
+# owner, as S3 checks.
+put("source", rule("theirs"))
+put("source", rule(Destination={"Bucket": "arn:aws:s3:::theirs", "Account": other_account,
+    "AccessControlTranslation": {"Owner": "Destination"}}))
+got = s3.get_bucket_replication(Bucket="source")["ReplicationConfiguration"]["Rules"][0]["Destination"]
+assert got["AccessControlTranslation"] == {"Owner": "Destination"}, got
+for named in [account, "000000000999"]:
     refused(lambda: put("source", rule(Destination={"Bucket": "arn:aws:s3:::theirs",
-        "Account": named})), "NotImplemented")
+        "Account": named})), "InvalidArgument")
+s3.delete_bucket_replication(Bucket="source")
 refused(lambda: put("source", rule(Destination={"Bucket": "arn:aws:s3:::copies",
     "Account": other_account})), "InvalidArgument")
 # Object Lock on the source needs it on the destination, also when it is
@@ -13782,6 +13787,88 @@ else:
     # At least once: a replica sent just before the crash may be sent again.
     assert 40 <= len(sent) <= 80, len(sent)
     print("ok")
+"#;
+
+#[test]
+fn replicas_reach_another_accounts_bucket_as_its_bucket_policy_allows() {
+    // A Python with boto3 installed (pip install boto3).
+    let Some(python) = std::env::var_os("TRUTHDB_TEST_BOTO3_PYTHON").map(PathBuf::from) else {
+        eprintln!("skipped: TRUTHDB_TEST_BOTO3_PYTHON names no Python with boto3");
+        return;
+    };
+    let server = start_server();
+    let (a_account, a_key, a_secret) = account_with_key(&server, "sender");
+    let (b_account, b_key, b_secret) = account_with_key(&server, "receiver");
+    let script = server.dir.join("cross_account_replication.py");
+    std::fs::write(&script, CROSS_ACCOUNT_REPLICATION_SCRIPT).expect("script");
+    let output = Command::new(&python)
+        .arg(&script)
+        .args([
+            &server.s3_port.to_string(),
+            &a_account,
+            &a_key,
+            &a_secret,
+            &b_account,
+            &b_key,
+            &b_secret,
+        ])
+        .output()
+        .expect("run python");
+    assert!(
+        output.status.success() && String::from_utf8_lossy(&output.stdout).contains("ok"),
+        "{}\n{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+const CROSS_ACCOUNT_REPLICATION_SCRIPT: &str = r#"
+import sys, time, json
+import boto3, botocore.config, botocore.exceptions
+port, a_account, a_key, a_secret, b_account, b_key, b_secret = sys.argv[1:8]
+def client(k, s):
+    return boto3.client("s3", endpoint_url=f"http://127.0.0.1:{port}", region_name="us-east-1",
+        aws_access_key_id=k, aws_secret_access_key=s,
+        config=botocore.config.Config(retries={"max_attempts": 1}))
+a, b = client(a_key, a_secret), client(b_key, b_secret)
+def status(key, version):
+    return a.head_object(Bucket="a-src", Key=key, VersionId=version).get("ReplicationStatus")
+def wait(test, what):
+    deadline = time.time() + 30
+    while not test():
+        assert time.time() < deadline, what
+        time.sleep(0.1)
+for c, bucket in [(a, "a-src"), (b, "b-dst")]:
+    c.create_bucket(Bucket=bucket)
+    c.put_bucket_versioning(Bucket=bucket, VersioningConfiguration={"Status": "Enabled"})
+a.put_bucket_replication(Bucket="a-src", ReplicationConfiguration={
+    "Role": f"arn:aws:iam::{a_account}:role/replication",
+    "Rules": [{"ID": "to-b", "Priority": 1, "Status": "Enabled", "Filter": {},
+        "DeleteMarkerReplication": {"Status": "Disabled"},
+        "Destination": {"Bucket": "arn:aws:s3:::b-dst", "Account": b_account,
+            "AccessControlTranslation": {"Owner": "Destination"}}}]})
+# Without a grant in the destination's bucket policy: FAILED.
+denied = a.put_object(Bucket="a-src", Key="in/denied", Body=b"no")["VersionId"]
+wait(lambda: status("in/denied", denied) == "FAILED", "failed without a grant")
+# The destination's owner grants the source's owner replication under in/.
+b.put_bucket_policy(Bucket="b-dst", Policy=json.dumps({"Version": "2012-10-17", "Statement": [{
+    "Effect": "Allow", "Principal": {"AWS": f"arn:aws:iam::{a_account}:root"},
+    "Action": ["s3:ReplicateObject"], "Resource": "arn:aws:s3:::b-dst/in/*"}]}))
+sent = a.put_object(Bucket="a-src", Key="in/sent", Body=b"yes", Metadata={"m": "v"})["VersionId"]
+wait(lambda: status("in/sent", sent) == "COMPLETED", "replicated with a grant")
+outside = a.put_object(Bucket="a-src", Key="out/x", Body=b"x")["VersionId"]
+wait(lambda: status("out/x", outside) == "FAILED", "outside the grant")
+# The replica is the destination owner's: it reads it, the source's owner
+# does not.
+replica = b.get_object(Bucket="b-dst", Key="in/sent", VersionId=sent)
+assert replica["Body"].read() == b"yes" and replica["Metadata"] == {"m": "v"}
+assert replica["ReplicationStatus"] == "REPLICA"
+try:
+    a.get_object(Bucket="b-dst", Key="in/sent")
+    raise SystemExit("the source's owner read the replica")
+except botocore.exceptions.ClientError as error:
+    assert error.response["Error"]["Code"] == "AccessDenied", error.response
+print("ok")
 "#;
 
 #[test]
