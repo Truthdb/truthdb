@@ -613,7 +613,13 @@ fn prepare_csv(
                 );
             }
             if info.attrs.customer_key.is_some()
-                || file.archived_unreadable(info.version, info.storage_class, now)?
+                || file.archived_unreadable(
+                    &manifest.bucket,
+                    &manifest.key,
+                    info.version,
+                    info.storage_class,
+                    now,
+                )?
             {
                 return finish_failed(
                     file,
@@ -908,7 +914,7 @@ async fn write_generated(
             )? {
                 Ok(info) => {
                     if let Some(lock) = &lock {
-                        tx.set_lock(info.version, lock)?;
+                        tx.set_lock(&output.bucket, &key, info.version, lock)?;
                     }
                     let version =
                         crate::objects::version_header(versioning, info.version, info.null_version);
@@ -1210,7 +1216,7 @@ fn plan(
             "An object encrypted with a customer-provided key is not copied by a batch job",
         )));
     }
-    if file.archived_unreadable(source.version, source.storage_class, now)? {
+    if file.archived_unreadable(bucket, key, source.version, source.storage_class, now)? {
         return Ok(Err(S3Error::new(
             403,
             "InvalidObjectState",
@@ -1955,7 +1961,7 @@ fn run_one(
             }) => match tx.copy_object(&to, &target, &source, &attrs, class, now, DROP_GRACE_MS)? {
                 Ok(copied) => {
                     if let Some(lock) = &lock {
-                        tx.set_lock(copied.version, lock)?;
+                        tx.set_lock(&to, &target, copied.version, lock)?;
                     }
                     Ok(())
                 }
@@ -2137,7 +2143,7 @@ async fn finish(state: &S3State, job: Job) -> Result<(), String> {
                     )? {
                         Ok(info) => {
                             if let Some(lock) = &lock {
-                                tx.set_lock(info.version, lock)?;
+                                tx.set_lock(&files.bucket, key, info.version, lock)?;
                             }
                         }
                         Err(_) => {

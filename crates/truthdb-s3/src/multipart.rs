@@ -367,7 +367,7 @@ pub async fn complete_upload(
     check_upload(state, upload, &bucket, &key).await?;
     let body = read_body(request, auth, MAX_COMPLETE_BODY).await?;
     let listed = parse_complete(&body)?;
-    let bucket_name = bucket.clone();
+    let (bucket_name, key_name) = (bucket.clone(), key.clone());
     let (completed, versioning) =
         crate::scope::object_as(state, "CompleteMultipartUpload", move |file| {
             let now = now_ms();
@@ -377,10 +377,10 @@ pub async fn complete_upload(
                 // The object has the lock its upload asked for; without a
                 // retention, the bucket's default one, from now.
                 if let (Ok(info), Some(default)) = (&completed, default) {
-                    let mut lock = tx.lock_of(info.version)?;
+                    let mut lock = tx.lock_of(&bucket_name, &key_name, info.version)?;
                     if lock.retention.is_none() {
                         lock.retention = Some(default.retention(now));
-                        tx.set_lock(info.version, &lock)?;
+                        tx.set_lock(&bucket_name, &key_name, info.version, &lock)?;
                     }
                 }
                 Ok(completed)

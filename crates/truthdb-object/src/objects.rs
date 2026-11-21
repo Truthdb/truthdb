@@ -314,7 +314,7 @@ pub(crate) fn key_prefix(bucket: &str, key: &str) -> Vec<u8> {
     out
 }
 
-fn version_key(bucket: &str, key: &str, version: u64) -> Vec<u8> {
+pub(crate) fn version_key(bucket: &str, key: &str, version: u64) -> Vec<u8> {
     let mut out = key_prefix(bucket, key);
     out.extend_from_slice(&(!version).to_be_bytes());
     out
@@ -377,11 +377,10 @@ impl VersionRow {
     }
 }
 
-fn attrs_key(version: u64, chunk: u16) -> [u8; 10] {
-    let mut key = [0u8; 10];
-    key[..8].copy_from_slice(&version.to_be_bytes());
-    key[8..].copy_from_slice(&chunk.to_be_bytes());
-    key
+/// The key of one chunk of a version's attributes: its state key (see
+/// `version_state`), then the chunk's number.
+fn attrs_key(state: &[u8], chunk: u16) -> Vec<u8> {
+    [state, &chunk.to_be_bytes()].concat()
 }
 
 /// The version of `key` that `which` picks (a delete marker included), as
@@ -428,13 +427,13 @@ pub(crate) fn find_version(
 fn read_attrs(
     ctx: &mut RelCtx<'_>,
     attrs_tree: &BTree,
-    version: u64,
+    state: &[u8],
 ) -> Result<ObjectAttrs, StorageError> {
     let mut bytes = Vec::new();
     for (_, chunk) in attrs_tree.scan_range(
         ctx,
-        Some(&attrs_key(version, 0)),
-        Some(&attrs_key(version, u16::MAX)),
+        Some(&attrs_key(state, 0)),
+        Some(&attrs_key(state, u16::MAX)),
     )? {
         bytes.extend_from_slice(&chunk);
     }
@@ -622,7 +621,8 @@ impl ObjTxn<'_, '_> {
         debug_assert_eq!(inserted, TreeInsert::Inserted);
         self.count_versions(bucket, key, before, &[], &[(version, row)])?;
         if has_attrs {
-            self.write_attrs(version, attrs)?;
+            let state = self.version_state_key(bucket, key, version)?;
+            self.write_attrs(&state, attrs)?;
         }
         // A cold class's body is packed (one under a customer-provided key
         // is ciphertext: it would not shrink).
@@ -661,25 +661,30 @@ impl ObjTxn<'_, '_> {
         })
     }
 
-    fn write_attrs(&mut self, version: u64, attrs: &ObjectAttrs) -> Result<(), StorageError> {
+    fn write_attrs(&mut self, state: &[u8], attrs: &ObjectAttrs) -> Result<(), StorageError> {
         let attrs_tree = self.trees.attrs();
         for (index, chunk) in attrs.encode().chunks(ATTRS_CHUNK).enumerate() {
-            attrs_tree.insert_unique(
+            let inserted = attrs_tree.insert_unique(
                 self.ctx,
                 &mut OpMode::Txn(self.txn),
-                &attrs_key(version, index as u16),
+                &attrs_key(state, index as u16),
                 chunk,
             )?;
+            if inserted != TreeInsert::Inserted {
+                return Err(StorageError::InvalidFile(
+                    "a version's attributes are already stored".to_string(),
+                ));
+            }
         }
         Ok(())
     }
 
-    fn remove_attrs(&mut self, version: u64) -> Result<(), StorageError> {
+    fn remove_attrs(&mut self, state: &[u8]) -> Result<(), StorageError> {
         let attrs_tree = self.trees.attrs();
         for (row_key, _) in attrs_tree.scan_range(
             self.ctx,
-            Some(&attrs_key(version, 0)),
-            Some(&attrs_key(version, u16::MAX)),
+            Some(&attrs_key(state, 0)),
+            Some(&attrs_key(state, u16::MAX)),
         )? {
             attrs_tree.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
         }
@@ -718,9 +723,10 @@ impl ObjTxn<'_, '_> {
                 _ => ObjectError::DeleteMarker,
             }));
         }
+        let state = self.version_state_key(bucket, key, version)?;
         let mut attrs = if row.flags & FLAG_HAS_ATTRS != 0 {
-            let attrs = read_attrs(self.ctx, &self.trees.attrs(), version)?;
-            self.remove_attrs(version)?;
+            let attrs = read_attrs(self.ctx, &self.trees.attrs(), &state)?;
+            self.remove_attrs(&state)?;
             attrs
         } else {
             ObjectAttrs::default()
@@ -728,7 +734,7 @@ impl ObjTxn<'_, '_> {
         attrs.tags = tags;
         row.flags &= !FLAG_HAS_ATTRS;
         if !attrs.is_empty() {
-            self.write_attrs(version, &attrs)?;
+            self.write_attrs(&state, &attrs)?;
             row.flags |= FLAG_HAS_ATTRS;
         }
         objects.update(
@@ -791,8 +797,9 @@ impl ObjTxn<'_, '_> {
         self.count_transition(bucket, key, version, &row, from, class)?;
         // A body under a customer-provided key is ciphertext: it would not
         // shrink.
+        let state = self.version_state_key(bucket, key, version)?;
         let sealed_by_customer = row.flags & FLAG_HAS_ATTRS != 0
-            && read_attrs(self.ctx, &self.trees.attrs(), version)?
+            && read_attrs(self.ctx, &self.trees.attrs(), &state)?
                 .customer_key
                 .is_some();
         if !sealed_by_customer {
@@ -917,7 +924,9 @@ impl ObjTxn<'_, '_> {
             }
             // A delete marker has no lock.
             if row.flags & FLAG_DELETE_MARKER == 0
-                && self.lock_of(version)?.blocks_delete(now_ms, bypass)
+                && self
+                    .lock_of(bucket, key, version)?
+                    .blocks_delete(now_ms, bypass)
             {
                 return Ok(Err(ObjectError::Locked));
             }
@@ -933,10 +942,11 @@ impl ObjTxn<'_, '_> {
         for (row_key, version, row) in chosen {
             objects.delete(self.ctx, &mut OpMode::Txn(self.txn), &row_key)?;
             removed_rows.push((version, row.clone()));
-            self.set_lock(version, &crate::ObjectLock::default())?;
-            self.forget_restore(version)?;
+            self.set_lock(bucket, key, version, &crate::ObjectLock::default())?;
+            self.forget_restore(bucket, key, version)?;
             if row.flags & FLAG_HAS_ATTRS != 0 {
-                self.remove_attrs(version)?;
+                let state = self.version_state_key(bucket, key, version)?;
+                self.remove_attrs(&state)?;
             }
             if row.flags & FLAG_DELETE_MARKER == 0 {
                 self.drop_ref(row.body, now_ms, grace_ms)?;
@@ -1125,10 +1135,17 @@ impl ObjTxn<'_, '_> {
 }
 
 impl ObjFile<'_> {
-    /// The attributes of version `version` (none when it has none, or is gone).
-    pub fn version_attrs(&mut self, version: u64) -> Result<ObjectAttrs, StorageError> {
+    /// The attributes of version `version` of `bucket`'s `key` (none when
+    /// it has none, or is gone).
+    pub fn version_attrs(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+    ) -> Result<ObjectAttrs, StorageError> {
+        let state = self.version_state_key(bucket, key, version)?;
         match self.existing_tree(ATTRS_TREE)? {
-            Some(attrs_tree) => read_attrs(&mut self.core.page_ctx(0), &attrs_tree, version),
+            Some(attrs_tree) => read_attrs(&mut self.core.page_ctx(0), &attrs_tree, &state),
             None => Ok(ObjectAttrs::default()),
         }
     }
@@ -1175,6 +1192,7 @@ impl ObjFile<'_> {
         ) else {
             return Ok(Err(ObjectError::NoSuchKey));
         };
+        let keyed = self.keyed(bucket, key)?;
         let mut ctx = self.core.page_ctx(0);
         let Some((_, version, row)) = find_version(&mut ctx, &objects, bucket, key, which)? else {
             return Ok(Err(match which {
@@ -1183,7 +1201,11 @@ impl ObjFile<'_> {
             }));
         };
         let attrs = match (row.flags & FLAG_HAS_ATTRS != 0, attrs_tree) {
-            (true, Some(attrs_tree)) => read_attrs(&mut ctx, &attrs_tree, version)?,
+            (true, Some(attrs_tree)) => read_attrs(
+                &mut ctx,
+                &attrs_tree,
+                &crate::version_state::state_key(keyed, bucket, key, version),
+            )?,
             _ => ObjectAttrs::default(),
         };
         Ok(Ok(ObjectInfo {

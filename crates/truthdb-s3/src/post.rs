@@ -677,7 +677,7 @@ pub async fn post_object(
                     crate::objects::DROP_GRACE_MS,
                 )?;
                 if let (Ok(info), Some(lock)) = (&stored, &lock) {
-                    tx.set_lock(info.version, lock)?;
+                    tx.set_lock(&bucket_name, &key_name, info.version, lock)?;
                 }
                 Ok(stored)
             })?;

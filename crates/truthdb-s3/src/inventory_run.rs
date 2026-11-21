@@ -560,7 +560,7 @@ async fn make_report(
                     continue;
                 }
                 let lock = match row.locks {
-                    true => file.object_lock(object.info.version)?,
+                    true => file.object_lock(&name, &object.key, object.info.version)?,
                     false => ObjectLock::default(),
                 };
                 rows.push(row.values(object, &lock, started));
@@ -792,7 +792,7 @@ fn deliver_in(
                 )? {
                     Ok(info) => {
                         if let Some(lock) = &lock {
-                            tx.set_lock(info.version, lock)?;
+                            tx.set_lock(destination, key, info.version, lock)?;
                         }
                     }
                     // The files are written all or none: the transaction

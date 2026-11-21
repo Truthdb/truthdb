@@ -2822,7 +2822,9 @@ fn object_lock_keeps_protected_versions_until_their_retention_or_hold_allows() {
     );
     hold(VersionSel::Latest, false).unwrap();
     assert_eq!(
-        ObjFile::new(&mut storage.lock()).object_lock(v1).unwrap(),
+        ObjFile::new(&mut storage.lock())
+            .object_lock("bkt", "k", v1)
+            .unwrap(),
         ObjectLock {
             retention: Some(governance(until)),
             legal_hold: Some(false),
@@ -2862,12 +2864,16 @@ fn object_lock_keeps_protected_versions_until_their_retention_or_hold_allows() {
     // the lock goes with the version.
     delete(Some(VersionSel::Seq(v1)), true, now()).unwrap();
     assert_eq!(
-        ObjFile::new(&mut storage.lock()).object_lock(v1).unwrap(),
+        ObjFile::new(&mut storage.lock())
+            .object_lock("bkt", "k", v1)
+            .unwrap(),
         ObjectLock::default()
     );
     delete(Some(VersionSel::Seq(v2)), false, until).unwrap();
     assert_eq!(
-        ObjFile::new(&mut storage.lock()).object_lock(v2).unwrap(),
+        ObjFile::new(&mut storage.lock())
+            .object_lock("bkt", "k", v2)
+            .unwrap(),
         ObjectLock::default()
     );
     // Lock changes need a bucket with Object Lock, and a live version.
@@ -2943,7 +2949,7 @@ fn an_uploads_lock_passes_to_its_object_or_goes_with_the_abort() {
         .unwrap();
     assert_eq!(
         ObjFile::new(&mut storage.lock())
-            .object_lock(object.version)
+            .object_lock("bkt", "k", object.version)
             .unwrap(),
         held
     );
@@ -3028,7 +3034,7 @@ fn an_event_hold_keeps_a_version_until_its_duration_after_release() {
     };
     let retention_of = |version: u64| {
         ObjFile::new(&mut storage.lock())
-            .object_lock(version)
+            .object_lock("bkt", "k", version)
             .unwrap()
             .retention
             .unwrap()
@@ -3839,14 +3845,18 @@ fn an_archived_version_is_read_only_while_restored() {
             .transaction(|tx| tx.restore_object("bkt", key, which, ask(days, delay), at))
             .unwrap()
     };
-    let unreadable = |info: &crate::ObjectInfo, at: u64| {
+    let unreadable = |key: &str, info: &crate::ObjectInfo, at: u64| {
         ObjFile::new(&mut storage.lock())
-            .archived_unreadable(info.version, info.storage_class, at)
+            .archived_unreadable("bkt", key, info.version, info.storage_class, at)
             .unwrap()
     };
-    let window = |version: u64| ObjFile::new(&mut storage.lock()).restore(version).unwrap();
-    assert!(unreadable(&cold, now()));
-    assert!(!unreadable(&ir, now()), "GLACIER_IR is read directly");
+    let window = |version: u64| {
+        ObjFile::new(&mut storage.lock())
+            .restore("bkt", "cold", version)
+            .unwrap()
+    };
+    assert!(unreadable("cold", &cold, now()));
+    assert!(!unreadable("ir", &ir, now()), "GLACIER_IR is read directly");
     assert_eq!(
         restore("ir", VersionSel::Latest, 1, 0, now()),
         Err(ObjectError::NotArchived)
@@ -3883,12 +3893,12 @@ fn an_archived_version_is_read_only_while_restored() {
             expiry_ms: expiry
         })
     );
-    assert!(unreadable(&cold, now() + delay - 1));
+    assert!(unreadable("cold", &cold, now() + delay - 1));
     assert_eq!(
         restore("cold", VersionSel::Seq(cold.version), 9, 0, now() + 1),
         Err(ObjectError::RestoreInProgress)
     );
-    assert!(!unreadable(&cold, now() + delay));
+    assert!(!unreadable("cold", &cold, now() + delay));
     // Asked again while restored, only the expiry moves, from the new time.
     let later = now() + delay + 1;
     assert_eq!(
@@ -3897,8 +3907,8 @@ fn an_archived_version_is_read_only_while_restored() {
     );
     let extended = restore_expiry(later, 7);
     assert_eq!(window(cold.version).unwrap().expiry_ms, extended);
-    assert!(!unreadable(&cold, extended - 1));
-    assert!(unreadable(&cold, extended));
+    assert!(!unreadable("cold", &cold, extended - 1));
+    assert!(unreadable("cold", &cold, extended));
 
     // A restore that takes longer than the days it keeps the copy is still
     // readable for those days once it completes; DEEP_ARCHIVE has no
@@ -3932,9 +3942,9 @@ fn an_archived_version_is_read_only_while_restored() {
             .0,
         Restored::Started
     );
-    assert!(unreadable(&deep, now() + slow - 1));
-    assert!(!unreadable(&deep, now() + slow));
-    assert!(!unreadable(&deep, now() + slow + 86_400_000 - 1));
+    assert!(unreadable("deep", &deep, now() + slow - 1));
+    assert!(!unreadable("deep", &deep, now() + slow));
+    assert!(!unreadable("deep", &deep, now() + slow + 86_400_000 - 1));
     // Extending it retrieves nothing, so any tier is accepted.
     assert_eq!(
         ObjFile::new(&mut storage.lock())
@@ -3981,7 +3991,7 @@ fn an_archived_version_is_read_only_while_restored() {
     assert!(!file(&storage, u64::MAX).unwrap());
     assert_eq!(
         ObjFile::new(&mut storage.lock())
-            .restore(cold.version)
+            .restore("bkt", "cold", cold.version)
             .unwrap(),
         None
     );
@@ -4011,7 +4021,7 @@ fn an_archived_version_is_read_only_while_restored() {
         .unwrap();
     assert_eq!(
         ObjFile::new(&mut storage.lock())
-            .restore(cold.version)
+            .restore("bkt", "cold", cold.version)
             .unwrap(),
         None
     );
@@ -4057,7 +4067,7 @@ fn a_restore_is_whole_after_a_crash_at_any_op_and_ships_to_a_standby() {
         drop(storage);
         let storage = open(&path);
         let window = ObjFile::new(&mut storage.lock())
-            .restore(cold.version)
+            .restore("bkt", "k", cold.version)
             .unwrap()
             .unwrap();
         let expected = if crashed {
@@ -4113,7 +4123,7 @@ fn a_restore_is_whole_after_a_crash_at_any_op_and_ships_to_a_standby() {
         .unwrap();
     let window = |storage: &Storage| {
         ObjFile::new(&mut storage.lock())
-            .restore(cold.version)
+            .restore("bkt", "k", cold.version)
             .unwrap()
     };
     let expected = window(&primary);
@@ -4346,6 +4356,8 @@ fn lifecycle_scene(storage: &Storage) {
             )?
             .unwrap();
             tx.set_lock(
+                "lck",
+                "k",
                 locked,
                 &ObjectLock {
                     retention: Some(Retention {
@@ -4912,6 +4924,8 @@ fn lifecycle_passes_go_by_tags_suspended_versioning_and_noncurrent_rules() {
     ObjFile::new(&mut storage.lock())
         .transaction(|tx| {
             tx.set_lock(
+                "non",
+                "k",
                 versions[0],
                 &ObjectLock {
                     retention: Some(Retention {
@@ -6545,4 +6559,251 @@ fn a_bucket_with_replication_keeps_its_versioning_enabled() {
     assert_eq!(bucket.versioning, Versioning::Suspended);
     drop(storage);
     std::fs::remove_file(&path).ok();
+}
+
+/// The rows of the attrs, locks and restores trees still keyed by a
+/// version's number alone, and of the restore timer trees naming one so.
+fn rows_keyed_by_number(storage: &Storage) -> usize {
+    let mut guard = storage.lock();
+    let file = ObjFile::new(&mut guard);
+    let mut count = 0;
+    for (id, old) in [
+        (
+            crate::ATTRS_TREE,
+            (|key: &[u8]| key[0] == 0) as fn(&[u8]) -> bool,
+        ),
+        (crate::LOCKS_TREE, |key| key[0] == 0),
+        (crate::RESTORES_TREE, |key| key[0] == 0),
+        (crate::RESTORE_TIMERS_TREE, |key| key.len() == 16),
+        (crate::RESTORE_READY_TREE, |key| key.len() == 16),
+    ] {
+        if let Some(tree) = file.existing_tree(id).unwrap() {
+            let rows = tree.scan(&mut file.core.page_ctx(0)).unwrap();
+            count += rows.iter().filter(|(key, _)| old(key)).count();
+        }
+    }
+    count
+}
+
+#[test]
+fn version_state_moves_to_keys_of_its_own_and_reads_alike_meanwhile() {
+    use crate::{ObjectAttrs, ObjectLock, Restore, StorageClass, VersionSel, Versioning};
+    let path = temp_path("rekey-src");
+    let bak = temp_path("rekey-bak");
+    let log = temp_path("rekey-log");
+    let seed = temp_path("rekey-seed");
+    let dst = temp_path("rekey-dst");
+    let mut storage = create(&path);
+    storage.lock().commit_db_options(0, Some(true)).unwrap();
+    let summary = storage.backup_full(&bak).unwrap();
+    // A file written before: its versions' state is keyed by their number.
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.unkey_versions()?;
+            tx.create_bucket("bkt", DEFAULT_ACCOUNT, now())?.unwrap();
+            tx.set_versioning("bkt", Versioning::Enabled)?.unwrap();
+            tx.enable_object_lock("bkt")
+        })
+        .unwrap()
+        .unwrap();
+    let mut versions: Vec<(String, u64)> = Vec::new();
+    for key in ["k0", "k1", "k2", "k3", "k4", "k5"] {
+        for text in ["one", "two"] {
+            versions.push((key.to_string(), put_text(&storage, "bkt", key, text)));
+        }
+    }
+    let cold = put_classed(&storage, "bkt", "cold", b"frozen", StorageClass::Glacier);
+    versions.push(("cold".to_string(), cold.version));
+    let delay = 60_000;
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.set_tags(
+                "bkt",
+                "k1",
+                VersionSel::Latest,
+                vec![("a".into(), "b".into())],
+                now(),
+            )?
+            .unwrap();
+            tx.put_legal_hold("bkt", "k2", VersionSel::Latest, true)?
+                .unwrap();
+            tx.restore_object("bkt", "cold", VersionSel::Latest, ask(1, delay), now())?
+                .unwrap();
+            tx.delete_object("bkt", "k3", None, false, now(), 0)
+        })
+        .unwrap()
+        .unwrap();
+    type State = (ObjectAttrs, ObjectLock, Option<Restore>);
+    let state = |storage: &Storage| -> Vec<State> {
+        let mut guard = storage.lock();
+        let mut file = ObjFile::new(&mut guard);
+        versions
+            .iter()
+            .map(|(key, version)| {
+                let attrs = file
+                    .head_object("bkt", key, VersionSel::Seq(*version))
+                    .unwrap()
+                    .unwrap()
+                    .attrs;
+                assert_eq!(attrs, file.version_attrs("bkt", key, *version).unwrap());
+                (
+                    attrs,
+                    file.object_lock("bkt", key, *version).unwrap(),
+                    file.restore("bkt", key, *version).unwrap(),
+                )
+            })
+            .collect()
+    };
+    let before = state(&storage);
+    assert_eq!(before[3].0.tags, [("a".to_string(), "b".to_string())]);
+    assert_eq!(before[5].1.legal_hold, Some(true));
+    assert!(before[12].2.is_some());
+    // Attrs of the twelve text versions, the hold and the restore with its
+    // two timers.
+    assert_eq!(rows_keyed_by_number(&storage), 12 + 1 + 3);
+    assert!(!ObjFile::new(&mut storage.lock()).versions_keyed().unwrap());
+
+    // The move goes a few versions a step, across restarts, while versions
+    // are changed on both sides of its position.
+    let mut steps = 0;
+    let mut after = before.clone();
+    while ObjFile::new(&mut storage.lock()).rekey_versions(2).unwrap() {
+        steps += 1;
+        if steps == 2 {
+            // "cold" and "k0" are moved, "k4" and "k5" not yet.
+            ObjFile::new(&mut storage.lock())
+                .transaction(|tx| {
+                    tx.set_tags(
+                        "bkt",
+                        "k0",
+                        VersionSel::Latest,
+                        vec![("x".into(), "y".into())],
+                        now(),
+                    )?
+                    .unwrap();
+                    tx.put_legal_hold("bkt", "k5", VersionSel::Latest, true)?
+                        .unwrap();
+                    tx.set_tags(
+                        "bkt",
+                        "k5",
+                        VersionSel::Latest,
+                        vec![("p".into(), "q".into())],
+                        now(),
+                    )
+                })
+                .unwrap()
+                .unwrap();
+            after[1].0.tags = vec![("x".into(), "y".into())];
+            after[11].1.legal_hold = Some(true);
+            after[11].0.tags = vec![("p".into(), "q".into())];
+            assert_eq!(state(&storage), after, "read alike half moved");
+        }
+        drop(storage);
+        storage = open(&path);
+        assert_eq!(state(&storage), after, "after step {steps}");
+    }
+    assert!(steps >= 4, "{steps} steps");
+    assert!(ObjFile::new(&mut storage.lock()).versions_keyed().unwrap());
+    assert_eq!(rows_keyed_by_number(&storage), 0);
+    assert_eq!(state(&storage), after);
+
+    // What the moved rows do still works: the hold blocks a delete, the
+    // restore completes and expires by its timers, and a version's removal
+    // takes its rows along.
+    let k2 = versions[5].1;
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| tx.delete_object(
+                "bkt",
+                "k2",
+                Some(VersionSel::Seq(k2)),
+                false,
+                now(),
+                0
+            ))
+            .unwrap(),
+        Err(crate::ObjectError::Locked)
+    );
+    let window = after[12].2.unwrap();
+    let (completed, expired) = ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            Ok((
+                tx.complete_restores(window.ready_ms, 100)?,
+                tx.expire_restores(window.expiry_ms, 100)?,
+            ))
+        })
+        .unwrap();
+    assert_eq!((completed, expired), (1, 1));
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .restore("bkt", "cold", cold.version)
+            .unwrap(),
+        None
+    );
+    ObjFile::new(&mut storage.lock())
+        .transaction(|tx| {
+            tx.delete_object(
+                "bkt",
+                "k1",
+                Some(VersionSel::Seq(versions[3].1)),
+                false,
+                now(),
+                0,
+            )
+        })
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        ObjFile::new(&mut storage.lock())
+            .version_attrs("bkt", "k1", versions[3].1)
+            .unwrap(),
+        ObjectAttrs::default()
+    );
+
+    // A standby applying the log, and a restore from a log backup, hold the
+    // same.
+    let expected = state_of(&storage, &versions);
+    let delta = storage
+        .read_wal_range(summary.backup_end_lsn, storage.wal_flushed_lsn())
+        .unwrap();
+    storage.backup_log(&log, true, false).unwrap();
+    Storage::restore_full_standby(&seed, &bak, &[], engines).unwrap();
+    let standby = open(&seed);
+    standby
+        .apply_wal_stream(summary.backup_end_lsn, &delta)
+        .unwrap();
+    assert_eq!(state_of(&standby, &versions), expected);
+    drop(standby);
+    Storage::restore_full_with_logs(&dst, &bak, &[log.clone()], None, engines).unwrap();
+    let restored = open(&dst);
+    assert_eq!(state_of(&restored, &versions), expected);
+    assert!(ObjFile::new(&mut restored.lock()).versions_keyed().unwrap());
+    drop(restored);
+    drop(storage);
+    for p in [&path, &bak, &log, &seed, &dst] {
+        std::fs::remove_file(p).ok();
+    }
+}
+
+/// Each version's attributes, lock and restore (none for one gone).
+fn state_of(
+    storage: &Storage,
+    versions: &[(String, u64)],
+) -> Vec<(
+    crate::ObjectAttrs,
+    crate::ObjectLock,
+    Option<crate::Restore>,
+)> {
+    let mut guard = storage.lock();
+    let mut file = ObjFile::new(&mut guard);
+    versions
+        .iter()
+        .map(|(key, version)| {
+            (
+                file.version_attrs("bkt", key, *version).unwrap(),
+                file.object_lock("bkt", key, *version).unwrap(),
+                file.restore("bkt", key, *version).unwrap(),
+            )
+        })
+        .collect()
 }

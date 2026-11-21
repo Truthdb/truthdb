@@ -1089,7 +1089,7 @@ impl ObjectStream {
                 if object.info.delete_marker {
                     Ok(ObjectAttrs::default())
                 } else {
-                    file.version_attrs(object.info.version)
+                    file.version_attrs(&self.bucket, &object.key, object.info.version)
                 }
             })
             .collect::<Result<Vec<_>, _>>()

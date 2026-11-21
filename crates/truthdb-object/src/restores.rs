@@ -2,7 +2,8 @@
 //! class (GLACIER, DEEP_ARCHIVE) cannot be read until it is restored. Its
 //! body is not copied: a restore is a window of time, from when it is ready
 //! until it expires, during which reads are allowed. The window lives in the
-//! restores tree under the version's number, and the restore timers tree
+//! restores tree under the version's state key (see `version_state`), and
+//! the restore timers tree
 //! orders the windows by expiry, so expired ones are removed in the
 //! background. A window past its expiry no longer counts, removed or not.
 //!
@@ -16,8 +17,9 @@
 use truthdb_core::relstore::ctx::OpMode;
 use truthdb_core::storage::StorageError;
 
-use crate::codec::{self, timed_key};
+use crate::codec::timed_key;
 use crate::objects::{ObjectError, StorageClass, VersionSel, validate_key};
+use crate::version_state::{decode_timer_key, state_version, timer_key};
 use crate::{ObjFile, ObjTxn, RESTORE_READY_TREE, RESTORE_TIMERS_TREE, RESTORES_TREE};
 
 /// A version's restore window.
@@ -68,13 +70,18 @@ impl Restore {
     }
 }
 
+/// A restore row's restore.
+pub(crate) fn restore_times(bytes: &[u8]) -> Result<Restore, StorageError> {
+    Restore::decode(bytes)
+}
+
 /// A restore row: the restore, and its object's bucket and key (none in a
 /// row written before restores had events).
 fn decode_row(bytes: &[u8]) -> Result<(Restore, Option<(String, String)>), StorageError> {
     let corrupt = || StorageError::InvalidFile("corrupt restore".to_string());
     let restore = Restore {
-        ready_ms: codec::u64_le(bytes.get(..8).ok_or_else(corrupt)?)?,
-        expiry_ms: codec::u64_le(bytes.get(8..16).ok_or_else(corrupt)?)?,
+        ready_ms: crate::codec::u64_le(bytes.get(..8).ok_or_else(corrupt)?)?,
+        expiry_ms: crate::codec::u64_le(bytes.get(8..16).ok_or_else(corrupt)?)?,
     };
     let names = match bytes.get(16..) {
         None | Some([]) => None,
@@ -155,10 +162,11 @@ impl ObjTxn<'_, '_> {
         if !class.is_archived() {
             return Ok(Err(ObjectError::NotArchived));
         }
-        let mut current = self.restore_of(version)?;
+        let state = self.version_state_key(bucket, key, version)?;
+        let mut current = self.restore_at(&state)?;
         // One expired that no sweep has removed yet: its events first.
         if current.is_some_and(|restore| restore.state(now_ms).is_none()) {
-            self.retire_restore(version, now_ms)?;
+            self.retire_restore(&state, now_ms)?;
             current = None;
         }
         let (done, restore) = match current.and_then(|restore| restore.state(now_ms)) {
@@ -190,29 +198,29 @@ impl ObjTxn<'_, '_> {
             Some(current) => self
                 .trees
                 .restore_ready()
-                .get(self.ctx, &timed_key(current.ready_ms, version))?
+                .get(self.ctx, &timer_key(current.ready_ms, &state))?
                 .is_some(),
             None => false,
         };
-        self.forget_restore(version)?;
+        self.forget_restore_at(&state)?;
         let mode = &mut OpMode::Txn(self.txn);
         self.trees.restores().insert_unique(
             self.ctx,
             mode,
-            &version.to_be_bytes(),
+            &state,
             &restore.encode(bucket, key),
         )?;
         self.trees.restore_timers().insert_unique(
             self.ctx,
             mode,
-            &timed_key(restore.expiry_ms, version),
+            &timer_key(restore.expiry_ms, &state),
             &[],
         )?;
         if done == Restored::Started || pending {
             self.trees.restore_ready().insert_unique(
                 self.ctx,
                 mode,
-                &timed_key(restore.ready_ms, version),
+                &timer_key(restore.ready_ms, &state),
                 &[],
             )?;
         }
@@ -222,31 +230,40 @@ impl ObjTxn<'_, '_> {
         Ok(Ok((done, version, null_version)))
     }
 
-    fn restore_of(&mut self, version: u64) -> Result<Option<Restore>, StorageError> {
+    /// The restore under state key `state`, if any.
+    fn restore_at(&mut self, state: &[u8]) -> Result<Option<Restore>, StorageError> {
         self.trees
             .restores()
-            .get(self.ctx, &version.to_be_bytes())?
+            .get(self.ctx, state)?
             .map(|row| Restore::decode(&row))
             .transpose()
     }
 
-    /// Removes a version's restore and its timer, if it has one.
-    pub(crate) fn forget_restore(&mut self, version: u64) -> Result<(), StorageError> {
-        let Some(restore) = self.restore_of(version)? else {
+    /// Removes the restore of version `version` of `bucket`'s `key` and its
+    /// timers, if it has one.
+    pub(crate) fn forget_restore(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+    ) -> Result<(), StorageError> {
+        let state = self.version_state_key(bucket, key, version)?;
+        self.forget_restore_at(&state)
+    }
+
+    /// Removes the restore under state key `state` and its timers, if any.
+    fn forget_restore_at(&mut self, state: &[u8]) -> Result<(), StorageError> {
+        let Some(restore) = self.restore_at(state)? else {
             return Ok(());
         };
         let mode = &mut OpMode::Txn(self.txn);
+        self.trees.restores().delete(self.ctx, mode, state)?;
         self.trees
-            .restores()
-            .delete(self.ctx, mode, &version.to_be_bytes())?;
-        self.trees.restore_timers().delete(
-            self.ctx,
-            mode,
-            &timed_key(restore.expiry_ms, version),
-        )?;
+            .restore_timers()
+            .delete(self.ctx, mode, &timer_key(restore.expiry_ms, state))?;
         self.trees
             .restore_ready()
-            .delete(self.ctx, mode, &timed_key(restore.ready_ms, version))?;
+            .delete(self.ctx, mode, &timer_key(restore.ready_ms, state))?;
         Ok(())
     }
 
@@ -260,15 +277,12 @@ impl ObjTxn<'_, '_> {
             limit,
         )?;
         for (key, _) in &due {
-            let (_, version) = codec::decode_timed_key(key)?;
+            let (_, state) = decode_timer_key(key)?;
+            let version = state_version(state)?;
             self.trees
                 .restore_ready()
                 .delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
-            let Some(row) = self
-                .trees
-                .restores()
-                .get(self.ctx, &version.to_be_bytes())?
-            else {
+            let Some(row) = self.trees.restores().get(self.ctx, state)? else {
                 continue;
             };
             if let (restore, Some((bucket, object_key))) = decode_row(&row)? {
@@ -306,25 +320,22 @@ impl ObjTxn<'_, '_> {
         )
     }
 
-    /// Removes an expired restore of `version` (its row and timers),
-    /// noting its completion if not yet sent, and its
+    /// Removes the expired restore under state key `state` (its row and
+    /// timers), noting its completion if not yet sent, and its
     /// `s3:ObjectRestore:Delete`.
-    fn retire_restore(&mut self, version: u64, now_ms: u64) -> Result<(), StorageError> {
-        let Some(row) = self
-            .trees
-            .restores()
-            .get(self.ctx, &version.to_be_bytes())?
-        else {
+    fn retire_restore(&mut self, state: &[u8], now_ms: u64) -> Result<(), StorageError> {
+        let Some(row) = self.trees.restores().get(self.ctx, state)? else {
             return Ok(());
         };
+        let version = state_version(state)?;
         let (restore, names) = decode_row(&row)?;
-        let ready_key = timed_key(restore.ready_ms, version);
+        let ready_key = timer_key(restore.ready_ms, state);
         let pending = self
             .trees
             .restore_ready()
             .get(self.ctx, &ready_key)?
             .is_some();
-        self.forget_restore(version)?;
+        self.forget_restore_at(state)?;
         let Some((bucket, object_key)) = names else {
             return Ok(());
         };
@@ -356,19 +367,15 @@ impl ObjTxn<'_, '_> {
             limit,
         )?;
         for (key, _) in &due {
-            let (expiry_ms, version) = codec::decode_timed_key(key)?;
+            let (expiry_ms, state) = decode_timer_key(key)?;
             self.trees
                 .restore_timers()
                 .delete(self.ctx, &mut OpMode::Txn(self.txn), key)?;
-            let Some(row) = self
-                .trees
-                .restores()
-                .get(self.ctx, &version.to_be_bytes())?
-            else {
+            let Some(row) = self.trees.restores().get(self.ctx, state)? else {
                 continue;
             };
             if decode_row(&row)?.0.expiry_ms == expiry_ms {
-                self.retire_restore(version, now_ms)?;
+                self.retire_restore(state, now_ms)?;
             }
         }
         Ok(due.len())
@@ -376,13 +383,20 @@ impl ObjTxn<'_, '_> {
 }
 
 impl ObjFile<'_> {
-    /// A version's restore window, if it has one (expired or not).
-    pub fn restore(&mut self, version: u64) -> Result<Option<Restore>, StorageError> {
+    /// The restore window of version `version` of `bucket`'s `key`, if it
+    /// has one (expired or not).
+    pub fn restore(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+    ) -> Result<Option<Restore>, StorageError> {
+        let state = self.version_state_key(bucket, key, version)?;
         let Some(restores) = self.existing_tree(RESTORES_TREE)? else {
             return Ok(None);
         };
         restores
-            .get(&mut self.core.page_ctx(0), &version.to_be_bytes())?
+            .get(&mut self.core.page_ctx(0), &state)?
             .map(|row| Restore::decode(&row))
             .transpose()
     }
@@ -391,6 +405,8 @@ impl ObjFile<'_> {
     /// archived and not restored.
     pub fn archived_unreadable(
         &mut self,
+        bucket: &str,
+        key: &str,
         version: u64,
         class: StorageClass,
         now_ms: u64,
@@ -398,7 +414,7 @@ impl ObjFile<'_> {
         if !class.is_archived() {
             return Ok(false);
         }
-        let restore = self.restore(version)?;
+        let restore = self.restore(bucket, key, version)?;
         Ok(unreadable(
             class,
             restore.and_then(|restore| restore.state(now_ms)),

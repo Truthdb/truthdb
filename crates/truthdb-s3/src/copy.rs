@@ -75,6 +75,8 @@ fn resolve_source(
     }
     // An archived source is copied only while restored.
     if file.archived_unreadable(
+        bucket,
+        key,
         source.version,
         source.storage_class,
         crate::objects::now_ms(),
@@ -297,7 +299,7 @@ async fn copy_whole(
                 DROP_GRACE_MS,
             )?;
             if let (Ok(copied), Some(lock)) = (&copied, &shared_lock) {
-                tx.set_lock(copied.version, lock)?;
+                tx.set_lock(&dst_bucket, &dst_key, copied.version, lock)?;
             }
             Ok(copied)
         })?;
@@ -367,7 +369,7 @@ async fn copy_whole(
                         DROP_GRACE_MS,
                     )?;
                     if let (Ok(info), Some(lock)) = (&stored, &lock) {
-                        tx.set_lock(info.version, lock)?;
+                        tx.set_lock(&dst_bucket, &dst_key, info.version, lock)?;
                     }
                     Ok(stored)
                 })?;

@@ -188,18 +188,33 @@ fn upload_key(upload: u64) -> [u8; 9] {
 }
 
 impl ObjTxn<'_, '_> {
-    /// The lock of a version (none when it has none).
-    pub fn lock_of(&mut self, version: u64) -> Result<ObjectLock, StorageError> {
+    /// The lock of version `version` of `bucket`'s `key` (none when it has
+    /// none).
+    pub fn lock_of(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+    ) -> Result<ObjectLock, StorageError> {
+        let state = self.version_state_key(bucket, key, version)?;
         self.trees
             .locks()
-            .get(self.ctx, &version.to_be_bytes())?
+            .get(self.ctx, &state)?
             .map_or(Ok(ObjectLock::default()), |row| ObjectLock::decode(&row))
     }
 
-    /// Sets the lock of a version (none removes it). The caller checks that
-    /// the bucket has Object Lock and the change is allowed.
-    pub fn set_lock(&mut self, version: u64, lock: &ObjectLock) -> Result<(), StorageError> {
-        self.write_lock(&version.to_be_bytes(), lock)
+    /// Sets the lock of version `version` of `bucket`'s `key` (none removes
+    /// it). The caller checks that the bucket has Object Lock and the change
+    /// is allowed.
+    pub fn set_lock(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+        lock: &ObjectLock,
+    ) -> Result<(), StorageError> {
+        let state = self.version_state_key(bucket, key, version)?;
+        self.write_lock(&state, lock)
     }
 
     /// Sets the lock the object of `upload` will have when it completes.
@@ -247,7 +262,11 @@ impl ObjTxn<'_, '_> {
             Ok(found) => found,
             Err(err) => return Ok(Err(err)),
         };
-        Ok(Ok((version, null_version, self.lock_of(version)?)))
+        Ok(Ok((
+            version,
+            null_version,
+            self.lock_of(bucket, key, version)?,
+        )))
     }
 
     /// Changes the retention of the version `which` picks (S3
@@ -314,7 +333,7 @@ impl ObjTxn<'_, '_> {
             }
         }
         lock.retention = retention;
-        self.set_lock(version, &lock)?;
+        self.set_lock(bucket, key, version, &lock)?;
         // The retention after the change (none after a removal).
         let detail = retention.map(|retention| {
             let mut data = serde_json::json!({
@@ -360,19 +379,26 @@ impl ObjTxn<'_, '_> {
             Err(err) => return Ok(Err(err)),
         };
         lock.legal_hold = Some(on);
-        self.set_lock(version, &lock)?;
+        self.set_lock(bucket, key, version, &lock)?;
         Ok(Ok((version, null_version)))
     }
 }
 
 impl ObjFile<'_> {
-    /// The Object Lock settings of a version (none when it has none).
-    pub fn object_lock(&mut self, version: u64) -> Result<ObjectLock, StorageError> {
+    /// The Object Lock settings of version `version` of `bucket`'s `key`
+    /// (none when it has none).
+    pub fn object_lock(
+        &mut self,
+        bucket: &str,
+        key: &str,
+        version: u64,
+    ) -> Result<ObjectLock, StorageError> {
+        let state = self.version_state_key(bucket, key, version)?;
         let Some(locks) = self.existing_tree(LOCKS_TREE)? else {
             return Ok(ObjectLock::default());
         };
         locks
-            .get(&mut self.core.page_ctx(0), &version.to_be_bytes())?
+            .get(&mut self.core.page_ctx(0), &state)?
             .map_or(Ok(ObjectLock::default()), |row| ObjectLock::decode(&row))
     }
 }

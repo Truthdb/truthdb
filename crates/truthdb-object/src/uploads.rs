@@ -509,7 +509,7 @@ impl ObjTxn<'_, '_> {
             now_ms,
             grace_ms,
         )?;
-        self.set_lock(object.version, &lock)?;
+        self.set_lock(&info.bucket, &info.key, object.version, &lock)?;
         Ok(Ok(object))
     }
 }
