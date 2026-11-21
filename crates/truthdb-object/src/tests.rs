@@ -6858,7 +6858,7 @@ fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_num
     };
     let queue = || {
         ObjFile::new(&mut storage.lock())
-            .replication_queue(100)
+            .replication_queue(None, 100)
             .unwrap()
     };
     // Written: PENDING and queued at once, under the rule of highest
@@ -7063,6 +7063,41 @@ fn a_replicated_version_is_queued_as_it_is_written_and_its_replica_keeps_its_num
         .collect_garbage(u64::MAX, 0, 1000)
         .unwrap();
     assert_eq!(read(&storage, replica.body, 0, 10).unwrap(), bytes(3, 10));
+    drop(storage);
+    std::fs::remove_file(&path).ok();
+}
+
+#[test]
+fn an_account_with_remote_buckets_is_not_dropped() {
+    use crate::{AccountError, RemoteBucket};
+    let path = temp_path("remote-account");
+    let storage = create(&path);
+    let txn = |body: &mut dyn FnMut(&mut crate::ObjTxn<'_, '_>) -> Result<_, StorageError>| {
+        ObjFile::new(&mut storage.lock())
+            .transaction(|tx| body(tx))
+            .unwrap()
+    };
+    txn(&mut |tx| tx.create_account("222222222222", "far", now())).unwrap();
+    txn(&mut |tx| {
+        tx.create_remote_bucket(&RemoteBucket {
+            name: "offsite".into(),
+            account: "222222222222".into(),
+            endpoint: "https://s3.example".into(),
+            region: "us-east-1".into(),
+            access_key: "k".into(),
+            secret: "s".into(),
+            ca_pem: None,
+            created_ms: 1,
+        })
+        .map(|_| Ok(()))
+    })
+    .unwrap();
+    assert_eq!(
+        txn(&mut |tx| tx.drop_account("222222222222")),
+        Err(AccountError::NotEmpty("remote buckets"))
+    );
+    txn(&mut |tx| tx.drop_remote_bucket("offsite").map(|_| Ok(()))).unwrap();
+    txn(&mut |tx| tx.drop_account("222222222222")).unwrap();
     drop(storage);
     std::fs::remove_file(&path).ok();
 }

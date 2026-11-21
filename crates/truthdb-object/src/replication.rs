@@ -566,24 +566,35 @@ impl ObjFile<'_> {
         .transpose()
     }
 
-    /// Up to `limit` queued replications, in order.
+    /// Up to `limit` queued replications, in order, those numbered after
+    /// `after` (none: from the first).
     pub fn replication_queue(
         &mut self,
+        after: Option<u64>,
         limit: usize,
     ) -> Result<Vec<QueuedReplication>, StorageError> {
         let Some(tree) = self.existing_tree(REPLICATION_QUEUE_TREE)? else {
             return Ok(Vec::new());
         };
-        tree.scan_range_limit(&mut self.core.page_ctx(0), None, None, limit)?
-            .into_iter()
-            .map(|(key, row)| {
-                let number = u64::from_be_bytes(
-                    key.as_slice()
-                        .try_into()
-                        .map_err(|_| corrupt("replication queue key"))?,
-                );
-                QueuedReplication::decode(number, &row)
-            })
-            .collect()
+        let lower = after.map(|number| (number.saturating_add(1)).to_be_bytes());
+        if after == Some(u64::MAX) {
+            return Ok(Vec::new());
+        }
+        tree.scan_range_limit(
+            &mut self.core.page_ctx(0),
+            lower.as_ref().map(|key| &key[..]),
+            None,
+            limit,
+        )?
+        .into_iter()
+        .map(|(key, row)| {
+            let number = u64::from_be_bytes(
+                key.as_slice()
+                    .try_into()
+                    .map_err(|_| corrupt("replication queue key"))?,
+            );
+            QueuedReplication::decode(number, &row)
+        })
+        .collect()
     }
 }

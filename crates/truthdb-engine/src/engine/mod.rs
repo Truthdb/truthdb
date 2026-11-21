@@ -57,6 +57,11 @@ enum S3Admin {
     /// s3://source[/prefix] s3://destination[/prefix]`.
     CreateImport([String; 6]),
     DropImport(String),
+    /// `s3 create remote bucket <name> <account> <endpoint> <region>
+    /// <access key> <secret> [<CA PEM file>]`: a bucket the account's
+    /// buckets may replicate to.
+    CreateRemoteBucket([String; 6], Option<String>),
+    DropRemoteBucket(String),
 }
 
 fn parse_s3_admin(input: &str) -> Option<S3Admin> {
@@ -120,6 +125,18 @@ fn parse_s3_admin(input: &str) -> Option<S3Admin> {
             [3, 4, 5, 6, 7, 8].map(|i| words[i].to_string()),
         )),
         ["s3", "drop", "import", _] => Some(S3Admin::DropImport(words[3].to_string())),
+        ["s3", "create", "remote", "bucket", _, _, _, _, _, _] => Some(
+            S3Admin::CreateRemoteBucket([4, 5, 6, 7, 8, 9].map(|i| words[i].to_string()), None),
+        ),
+        ["s3", "create", "remote", "bucket", _, _, _, _, _, _, _] => {
+            Some(S3Admin::CreateRemoteBucket(
+                [4, 5, 6, 7, 8, 9].map(|i| words[i].to_string()),
+                Some(words[10].to_string()),
+            ))
+        }
+        ["s3", "drop", "remote", "bucket", _] => {
+            Some(S3Admin::DropRemoteBucket(words[4].to_string()))
+        }
         _ => None,
     }
 }
@@ -1149,6 +1166,70 @@ impl Engine {
                 })?;
                 let dropped = self.object(move |file| file.transaction(|tx| tx.drop_import(id)))?;
                 json!({ "import_id": id, "dropped": dropped })
+            }
+            S3Admin::CreateRemoteBucket(
+                [name, account, endpoint, region, access_key, secret],
+                ca_file,
+            ) => {
+                let invalid = |why: String| EngineError::from(CommandError::InvalidCommand(why));
+                // S3's characters: the client refuses others.
+                if name.is_empty()
+                    || !name.bytes().all(|b| {
+                        b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'.' || b == b'-'
+                    })
+                {
+                    return Err(invalid(format!("{name} is not a bucket name")));
+                }
+                let ca_pem = ca_file
+                    .map(|path| {
+                        std::fs::read(&path).map_err(|err| {
+                            invalid(format!("the CA file {path} cannot be read: {err}"))
+                        })
+                    })
+                    .transpose()?;
+                // The endpoint must be one the client can reach.
+                truthdb_s3client::Client::new(truthdb_s3client::Config {
+                    endpoint: endpoint.clone(),
+                    region: region.clone(),
+                    access_key: access_key.clone(),
+                    secret: secret.clone(),
+                    ca_pem: ca_pem.clone(),
+                })
+                .map_err(|err| invalid(err.to_string()))?;
+                let remote = truthdb_object::RemoteBucket {
+                    name: name.clone(),
+                    account: account.clone(),
+                    endpoint: endpoint.clone(),
+                    region,
+                    access_key,
+                    secret,
+                    ca_pem,
+                    created_ms: now_ms(),
+                };
+                let outcome = self.object(move |file| {
+                    // A bucket of this server would always be taken first.
+                    if file.bucket(&remote.name)?.is_some() {
+                        return Ok(Err("a bucket of this server has that name"));
+                    }
+                    if file.account(&remote.account)?.is_none() {
+                        return Ok(Err("no account has that id"));
+                    }
+                    Ok(
+                        match file.transaction(|tx| tx.create_remote_bucket(&remote))? {
+                            true => Ok(()),
+                            false => Err("a remote bucket of that name is recorded"),
+                        },
+                    )
+                })?;
+                outcome.map_err(|why| invalid(format!("{name}: {why}")))?;
+                json!({ "remote_bucket": name, "account": account, "endpoint": endpoint })
+            }
+            S3Admin::DropRemoteBucket(name) => {
+                let dropped = {
+                    let name = name.clone();
+                    self.object(move |file| file.transaction(|tx| tx.drop_remote_bucket(&name)))?
+                };
+                json!({ "remote_bucket": name, "dropped": dropped })
             }
         };
         render_json(&rendered).map_err(EngineError::from)

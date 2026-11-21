@@ -32,6 +32,7 @@ mod metric_history;
 mod notifications;
 mod objects;
 mod pack;
+mod remote_buckets;
 mod replication;
 mod restores;
 mod stored;
@@ -89,6 +90,7 @@ pub use objects::{
     version_id,
 };
 pub use pack::{PackStep, PackWork, pack_segment};
+pub use remote_buckets::RemoteBucket;
 pub use replication::{
     QueuedReplication, ReplicationConfig, ReplicationDestination, ReplicationRule,
     ReplicationStatus, ReplicationWork,
@@ -207,6 +209,8 @@ const INVENTORY_STATE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 43;
 const REPLICATION_STATUS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 44;
 /// number -> a queued replication (see `replication`).
 const REPLICATION_QUEUE_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 45;
+/// bucket name -> a bucket on another S3 service (see `remote_buckets`).
+const REMOTE_BUCKETS_TREE: u32 = FIRST_ENGINE_OBJECT_ID + 46;
 
 /// The object id stamped into every body page's header. Not a tree.
 pub const BODY_PAGES_OBJECT: u32 = FIRST_ENGINE_OBJECT_ID + 0x100;
@@ -331,7 +335,7 @@ fn meta_tree(root: u64) -> BTree {
 
 /// The trees an object transaction may work on: object ids
 /// `FIRST_ENGINE_OBJECT_ID` (the directory tree) up to this many after it.
-const TREE_COUNT: usize = 46;
+const TREE_COUNT: usize = 47;
 
 /// The root pages of the trees an object transaction works on, resolved
 /// before it begins, by object id.
@@ -484,6 +488,9 @@ impl Trees {
     }
     pub fn replication_queue(&self) -> BTree {
         self.tree(REPLICATION_QUEUE_TREE)
+    }
+    pub fn remote_buckets(&self) -> BTree {
+        self.tree(REMOTE_BUCKETS_TREE)
     }
 }
 

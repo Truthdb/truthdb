@@ -97,6 +97,9 @@ impl ExternalRowsets for S3Rowsets {
             "sys.dm_s3_imports" | "sys.dm_s3_import_failures" => {
                 return Some(open_imports(&self.core, name, args, caller));
             }
+            "sys.dm_s3_remote_buckets" => {
+                return Some(open_remote_buckets(&self.core, name, args, caller));
+            }
             "sys.dm_s3_batch_jobs" => return Some(open_batch_jobs(&self.core, name, args, caller)),
             "sys.dm_s3_bucket_usage" => {
                 return Some(open_bucket_usage(&self.core, name, args, caller));
@@ -597,6 +600,70 @@ impl ExternalStream for ImportStream {
                 text(&import.error),
             ]);
         }
+        Ok((!rows.is_empty()).then_some(rows))
+    }
+}
+
+/// `sys.dm_s3_remote_buckets`: one row per bucket on another S3 service
+/// replication may send to (its secret is not shown).
+fn open_remote_buckets(
+    core: &Arc<Storage>,
+    name: &str,
+    args: &[SqlValue],
+    caller: ExternalCaller,
+) -> Result<ExternalRowset, SqlError> {
+    check_admin(name, caller)?;
+    check_arg_count(name, args, 0, 0)?;
+    Ok(ExternalRowset {
+        columns: vec![
+            nvarchar("bucket", 63),
+            nvarchar("account_id", 12),
+            nvarchar_max("endpoint"),
+            nvarchar("region", 64),
+            nvarchar("access_key", 128),
+            nvarchar("ca", 8),
+            datetime2("created"),
+        ],
+        rows: Box::new(RemoteBucketStream {
+            core: Arc::clone(core),
+            done: false,
+        }),
+    })
+}
+
+struct RemoteBucketStream {
+    core: Arc<Storage>,
+    done: bool,
+}
+
+impl ExternalStream for RemoteBucketStream {
+    fn next_slice(&mut self) -> Result<Option<Vec<Vec<Datum>>>, SqlError> {
+        if self.done {
+            return Ok(None);
+        }
+        self.done = true;
+        let mut guard = self.core.lock();
+        let mut file = ObjFile::try_new(&mut guard).ok_or_else(no_object_engine)?;
+        let rows: Vec<Vec<Datum>> = file
+            .remote_buckets()
+            .map_err(storage_error)?
+            .into_iter()
+            .map(|remote| {
+                vec![
+                    text(&remote.name),
+                    text(&remote.account),
+                    text(&remote.endpoint),
+                    text(&remote.region),
+                    text(&remote.access_key),
+                    text(if remote.ca_pem.is_some() {
+                        "GIVEN"
+                    } else {
+                        "SYSTEM"
+                    }),
+                    datetime(remote.created_ms),
+                ]
+            })
+            .collect();
         Ok((!rows.is_empty()).then_some(rows))
     }
 }

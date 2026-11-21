@@ -194,6 +194,11 @@ impl ObjTxn<'_, '_> {
         if self.account_has_managed_policies(id)? {
             return Ok(Err(AccountError::NotEmpty("policies")));
         }
+        // Its remote buckets' keys would pass to an account made later
+        // with its id.
+        if self.has_remote_buckets(id)? {
+            return Ok(Err(AccountError::NotEmpty("remote buckets")));
+        }
         for (_, row) in self.trees.buckets().scan(self.ctx)? {
             if BucketRow::decode(&row)?.owner == id {
                 return Ok(Err(AccountError::NotEmpty("buckets")));

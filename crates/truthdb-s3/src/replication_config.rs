@@ -2,12 +2,14 @@
 //! `?replication`, validated as S3 validates it. The rules' destination is
 //! a bucket of the same owner on this server, with versioning enabled (as
 //! the source must have it, and keeps while the configuration is set), and
-//! with Object Lock when the source has it. Rules filter by key prefix.
-//! What later replication steps build is refused rather than accepted and
-//! ignored: tag filters, rules without a Filter (whose delete markers
-//! replicate), delete-marker replication, several destinations, another
-//! account's or another server's bucket, replica ownership, KMS encryption,
-//! replication time and metrics, and existing-object replication.
+//! with Object Lock when the source has it; or a bucket on another S3
+//! service recorded with `s3 create remote bucket`, which that service
+//! checks. Rules filter by key prefix. What later replication steps build
+//! is refused rather than accepted and ignored: tag filters, rules without
+//! a Filter (whose delete markers replicate), delete-marker replication,
+//! several destinations, another account's bucket, replica ownership, KMS
+//! encryption, replication time and metrics, and existing-object
+//! replication.
 //!
 //! The `Role` is kept as given: there are no IAM roles, so replication acts
 //! as the one who put the configuration (its account, and its user): it
@@ -313,6 +315,17 @@ fn refused_destination(
         )));
     }
     let Some(info) = file.bucket(&destination.bucket)? else {
+        // A bucket on another S3 service, recorded with `s3 create remote
+        // bucket` for the source's owner: what it is there is that
+        // service's to check, as it takes each replica. One recorded for
+        // another account is refused as another account's bucket is.
+        if let Some(remote) = file.remote_bucket(&destination.bucket)? {
+            return Ok(if remote.account != owner {
+                Some(not_yet("Replication to another account's bucket"))
+            } else {
+                None
+            });
+        }
         return Ok(Some(S3Error::invalid_request(
             "Destination bucket must exist",
         )));
