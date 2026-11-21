@@ -215,6 +215,13 @@ impl ObjTxn<'_, '_> {
                 "Object Lock is enabled on the bucket, so its versioning cannot be suspended",
             )));
         }
+        if versioning != Versioning::Enabled
+            && self.has_bucket_config(name, crate::BUCKET_REPLICATION, "")?
+        {
+            return Ok(Err(BucketError::InvalidBucketState(
+                "Replication is configured on the bucket, so its versioning cannot be suspended",
+            )));
+        }
         row.versioning = versioning;
         self.trees.buckets().update(
             self.ctx,

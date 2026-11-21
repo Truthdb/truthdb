@@ -309,6 +309,11 @@ fn bucket_event(request: &hyper::Request<Incoming>, method: &Method) -> Option<&
             Some("DeleteBucketPolicy"),
         ),
         Some("policyStatus") if *method == Method::GET => Some("GetBucketPolicyStatus"),
+        Some("replication") => by_method(
+            "GetBucketReplication",
+            "PutBucketReplication",
+            Some("DeleteBucketReplication"),
+        ),
         Some("publicAccessBlock") => by_method(
             "GetBucketPublicAccessBlock",
             "PutBucketPublicAccessBlock",

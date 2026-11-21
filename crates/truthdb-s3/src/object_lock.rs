@@ -725,6 +725,15 @@ pub async fn bucket_configuration(
         let body = read_checked_body(request, auth, MAX_BODY).await?;
         let default = parse_configuration(&body)?;
         crate::scope::object(state, move |file| {
+            if let Some(info) = file.bucket(&name)?
+                && !info.object_lock
+                && crate::replication_config::blocks_object_lock(file, &name, &info.owner)?
+            {
+                return Ok(Err(BucketError::InvalidBucketState(
+                    "The bucket replicates to a bucket without Object Lock, so Object Lock \
+                     cannot be enabled on it",
+                )));
+            }
             file.transaction(|tx| {
                 if let Err(err) = tx.enable_object_lock(&name)? {
                     return Ok(Err(err));
