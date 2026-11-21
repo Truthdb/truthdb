@@ -38,9 +38,10 @@ use crate::{
 
 /// META key of the next queue entry's number.
 const NEXT_REPLICATION_KEY: &[u8] = b"next_replication";
-/// The configuration's stored form; 1 has no owner override nor
-/// destination owner.
-const FORMAT: u8 = 2;
+/// The configuration's stored form: 1 has no owner override nor
+/// destination owner, 2 filters by prefix only, 3 has tag filters and
+/// replica modification sync.
+const FORMAT: u8 = 3;
 
 /// A bucket's replication configuration (as PutBucketReplication sets it).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -60,9 +61,50 @@ pub struct ReplicationRule {
     pub id: String,
     pub priority: u32,
     pub enabled: bool,
-    /// The keys it applies to: those under this prefix (none: every key).
-    pub prefix: Option<String>,
+    /// The versions it applies to.
+    pub filter: ReplicationFilter,
+    /// `SourceSelectionCriteria` `ReplicaModifications` `Enabled`: a tag
+    /// change of a replica in this bucket is sent back to the bucket its
+    /// rule names.
+    pub replica_modifications: bool,
     pub destination: ReplicationDestination,
+}
+
+/// The versions a rule applies to, as its `Filter` names them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplicationFilter {
+    /// An empty Filter: every version.
+    All,
+    /// Those of keys under the prefix.
+    Prefix(String),
+    /// Those with the tag in their tag set.
+    Tag(String, String),
+    /// Those under the prefix (if any) with every one of the tags.
+    And {
+        prefix: Option<String>,
+        tags: Vec<(String, String)>,
+    },
+}
+
+impl ReplicationFilter {
+    /// Whether a version of `key` with `tags` is one this filter names.
+    pub fn matches(&self, key: &str, tags: &[(String, String)]) -> bool {
+        let tagged = |name: &str, value: &str| {
+            tags.iter()
+                .any(|(tag, tag_value)| tag == name && tag_value == value)
+        };
+        match self {
+            ReplicationFilter::All => true,
+            ReplicationFilter::Prefix(prefix) => key.starts_with(prefix.as_str()),
+            ReplicationFilter::Tag(name, value) => tagged(name, value),
+            ReplicationFilter::And { prefix, tags } => {
+                prefix
+                    .as_deref()
+                    .is_none_or(|prefix| key.starts_with(prefix))
+                    && tags.iter().all(|(name, value)| tagged(name, value))
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -102,13 +144,34 @@ impl ReplicationConfig {
             out.str(&rule.id);
             out.u32(rule.priority);
             out.u8(rule.enabled as u8);
-            match &rule.prefix {
-                None => out.u8(0),
-                Some(prefix) => {
+            match &rule.filter {
+                ReplicationFilter::All => out.u8(0),
+                ReplicationFilter::Prefix(prefix) => {
                     out.u8(1);
                     out.str(prefix);
                 }
+                ReplicationFilter::Tag(name, value) => {
+                    out.u8(2);
+                    out.str(name);
+                    out.str(value);
+                }
+                ReplicationFilter::And { prefix, tags } => {
+                    out.u8(3);
+                    match prefix {
+                        None => out.u8(0),
+                        Some(prefix) => {
+                            out.u8(1);
+                            out.str(prefix);
+                        }
+                    }
+                    out.u32(tags.len() as u32);
+                    for (name, value) in tags {
+                        out.str(name);
+                        out.str(value);
+                    }
+                }
             }
+            out.u8(rule.replica_modifications as u8);
             let destination = &rule.destination;
             out.str(&destination.bucket);
             match &destination.account {
@@ -147,7 +210,27 @@ impl ReplicationConfig {
             let id = input.str()?;
             let priority = input.u32()?;
             let enabled = input.present()?;
-            let prefix = input.present()?.then(|| input.str()).transpose()?;
+            let filter = match format {
+                1 | 2 => match input.present()? {
+                    true => ReplicationFilter::Prefix(input.str()?),
+                    false => ReplicationFilter::All,
+                },
+                _ => match input.u8()? {
+                    0 => ReplicationFilter::All,
+                    1 => ReplicationFilter::Prefix(input.str()?),
+                    2 => ReplicationFilter::Tag(input.str()?, input.str()?),
+                    3 => {
+                        let prefix = input.present()?.then(|| input.str()).transpose()?;
+                        let mut tags = Vec::new();
+                        for _ in 0..input.count()? {
+                            tags.push((input.str()?, input.str()?));
+                        }
+                        ReplicationFilter::And { prefix, tags }
+                    }
+                    _ => return Err(input.corrupt()),
+                },
+            };
+            let replica_modifications = format >= 3 && input.present()?;
             let bucket = input.str()?;
             let account = input.present()?.then(|| input.str()).transpose()?;
             let storage_class = match input.u8()? {
@@ -164,7 +247,8 @@ impl ReplicationConfig {
                 id,
                 priority,
                 enabled,
-                prefix,
+                filter,
+                replica_modifications,
                 destination: ReplicationDestination {
                     bucket,
                     account,
@@ -193,19 +277,13 @@ impl ReplicationConfig {
         }
     }
 
-    /// The rule that replicates a new version of `key`: of the enabled rules
-    /// whose prefix it has, the one of highest priority (the first listed of
-    /// those of equal priority).
-    pub fn rule_for(&self, key: &str) -> Option<&ReplicationRule> {
+    /// The rule that replicates a version of `key` with `tags`: of the
+    /// enabled rules whose filter names it, the one of highest priority (the
+    /// first listed of those of equal priority).
+    pub fn rule_for(&self, key: &str, tags: &[(String, String)]) -> Option<&ReplicationRule> {
         self.rules
             .iter()
-            .filter(|rule| {
-                rule.enabled
-                    && rule
-                        .prefix
-                        .as_deref()
-                        .is_none_or(|prefix| key.starts_with(prefix))
-            })
+            .filter(|rule| rule.enabled && rule.filter.matches(key, tags))
             .fold(None, |best: Option<&ReplicationRule>, rule| match best {
                 Some(best) if best.priority >= rule.priority => Some(best),
                 _ => Some(rule),
@@ -411,7 +489,7 @@ impl ObjTxn<'_, '_> {
         let Some(config) = self.replication_config(bucket)? else {
             return Ok(());
         };
-        let Some(rule) = config.rule_for(key) else {
+        let Some(rule) = config.rule_for(key, &info.attrs.tags) else {
             return Ok(());
         };
         if info.storage_class.is_archived() {
@@ -430,27 +508,32 @@ impl ObjTxn<'_, '_> {
         self.enqueue(queued)
     }
 
-    /// Queues a change of a version's tags for its replica, if it
-    /// is queued or replicated (not a replica, nor one that failed) and a
-    /// rule still applies to it.
+    /// Queues a change of a version's tags (now `tags`) for its replica,
+    /// if it is queued or replicated (not one that failed) and a rule still
+    /// applies to it; or, for a replica, back to the bucket its rule names
+    /// when the rule enables replica modification sync.
     pub(crate) fn queue_metadata_replication(
         &mut self,
         bucket: &str,
         key: &str,
         version: u64,
+        tags: &[(String, String)],
     ) -> Result<(), StorageError> {
-        if !matches!(
-            self.replication_status_of(bucket, key, version)?,
-            Some(ReplicationStatus::Pending | ReplicationStatus::Completed)
-        ) {
-            return Ok(());
-        }
+        let status = self.replication_status_of(bucket, key, version)?;
         let Some(config) = self.replication_config(bucket)? else {
             return Ok(());
         };
-        let Some(rule) = config.rule_for(key) else {
+        let Some(rule) = config.rule_for(key, tags) else {
             return Ok(());
         };
+        let sent = match status {
+            Some(ReplicationStatus::Pending | ReplicationStatus::Completed) => true,
+            Some(ReplicationStatus::Replica) => rule.replica_modifications,
+            _ => false,
+        };
+        if !sent {
+            return Ok(());
+        }
         let queued = QueuedReplication {
             number: 0,
             work: ReplicationWork::Metadata,

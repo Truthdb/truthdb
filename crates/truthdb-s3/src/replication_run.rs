@@ -600,7 +600,7 @@ fn refused(
     // takes replicas as its bucket policy allows (checked below, as the
     // configuration's creator).
     let owner = config
-        .rule_for(&queued.key)
+        .rule_for(&queued.key, &version.attrs.tags)
         .and_then(|rule| rule.destination.owner.clone())
         .unwrap_or_else(|| source.owner.clone());
     Ok(if destination.owner != owner {
@@ -755,7 +755,7 @@ fn replicate(
     // names now.
     let config = file.replication(&queued.bucket)?.filter(|config| {
         config
-            .rule_for(&queued.key)
+            .rule_for(&queued.key, &source.attrs.tags)
             .is_some_and(|rule| rule.destination.bucket == queued.destination)
     });
     let Some(config) = config else {
@@ -764,7 +764,7 @@ fn replicate(
             .map(|()| None);
     };
     let rule_class = config
-        .rule_for(&queued.key)
+        .rule_for(&queued.key, &source.attrs.tags)
         .and_then(|rule| rule.destination.storage_class);
     // A bucket of this server first, then one on another service.
     if file.bucket(&queued.destination)?.is_none()
@@ -837,10 +837,17 @@ fn replicate(
             }
         }),
         ReplicationWork::Metadata => {
-            let replica = file.replication_status(&destination, &key, queued.version)?
-                == Some(ReplicationStatus::Replica);
+            // The version of that number there: the replica, or (a change
+            // of a replica sent back) its source; version numbers are one
+            // count for every bucket. Tags it has already are not set again,
+            // so a two-way sync ends.
+            let differs = file
+                .object_version(&destination, &key, VersionSel::Seq(queued.version))?
+                .ok()
+                .filter(|there| !there.delete_marker)
+                .is_some_and(|there| there.attrs.tags != source.attrs.tags);
             file.transaction(|tx| {
-                if replica {
+                if differs {
                     tx.set_tags(
                         &destination,
                         &key,
@@ -901,7 +908,8 @@ mod tests {
                 id: String::new(),
                 priority: 1,
                 enabled: true,
-                prefix: None,
+                filter: truthdb_object::ReplicationFilter::All,
+                replica_modifications: false,
                 destination: ReplicationDestination {
                     bucket: "dst".into(),
                     account: None,
@@ -1202,7 +1210,8 @@ mod tests {
                             id: String::new(),
                             priority: 1,
                             enabled: true,
-                            prefix: None,
+                            filter: truthdb_object::ReplicationFilter::All,
+                            replica_modifications: false,
                             destination: ReplicationDestination {
                                 bucket: "far".into(),
                                 account: None,
@@ -1480,7 +1489,8 @@ mod tests {
             id: prefix.into(),
             priority: 1,
             enabled: true,
-            prefix: Some(prefix.into()),
+            filter: truthdb_object::ReplicationFilter::Prefix(prefix.into()),
+            replica_modifications: false,
             destination: ReplicationDestination {
                 bucket: bucket.into(),
                 account: None,
